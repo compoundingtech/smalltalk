@@ -931,6 +931,7 @@ pub(crate) fn normalized_record(
                 "SELECT id, time_created, data FROM message WHERE rowid = ?1 AND session_id = ?2",
                 params![message_row, session.native_id],
                 |row| {
+                    sqlite_row_guard(row, &[0, 1, 2])?;
                     Ok((
                         sqlite_bytes(row, 0)?,
                         row.get::<_, Option<i64>>(1).ok().flatten(),
@@ -946,7 +947,10 @@ pub(crate) fn normalized_record(
             let (part_id, encoded) = connection.query_row(
                 "SELECT id, data FROM part WHERE rowid = ?1 AND session_id = ?2 AND message_id = (SELECT id FROM message WHERE rowid = ?3 AND session_id = ?2)",
                 params![part_row, session.native_id, message_row],
-                |row| Ok((sqlite_bytes(row, 0)?, sqlite_bytes(row, 1)?)),
+                |row| {
+                    sqlite_row_guard(row, &[0, 1])?;
+                    Ok((sqlite_bytes(row, 0)?, sqlite_bytes(row, 1)?))
+                },
             )?;
             anyhow::ensure!(
                 sqlite_part_digest(&part_id, &encoded) == *expected,
@@ -982,6 +986,7 @@ pub(crate) fn normalized_record(
                 "SELECT id, time_created, data FROM message WHERE rowid=?1 AND session_id=?2",
                 params![message_row, session.native_id],
                 |row| {
+                    sqlite_row_guard(row, &[0, 1, 2])?;
                     Ok((
                         sqlite_bytes(row, 0)?,
                         sqlite_bytes(row, 1)?,
@@ -1066,7 +1071,9 @@ pub(crate) fn normalized_timeline(session: &ExternalSession) -> Result<Vec<Value
             "system",
             "truncation",
             json!({
-                "reason": "the native transcript prefix is outside the bounded read window",
+                "reason": "the native transcript prefix is outside the bounded read window; not fetchable through this owner read",
+                "fetchable": false,
+                "limit_bytes": MAX_TIMELINE_BYTES,
                 "omitted_from_sequence": 0,
                 "omitted_to_sequence": 0
             }),
@@ -2057,23 +2064,17 @@ fn normalized_opencode_timeline(session: &ExternalSession) -> Result<Vec<Value>>
              WHERE session_id = ?1 ORDER BY time_created DESC, id DESC LIMIT ?2\
          ) ORDER BY time_created, id",
     )?;
-    let mut messages = message_statement
-        .query_map(
-            params![session.native_id, MAX_TIMELINE_LINES as i64 + 1],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    sqlite_bytes(row, 1)?,
-                    row.get::<_, Option<i64>>(2).ok().flatten(),
-                    sqlite_bytes(row, 2)?,
-                    sqlite_bytes(row, 3)?,
-                ))
-            },
-        )?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut truncated = messages.len() > MAX_TIMELINE_LINES;
+    // Count only row identities, then stream native bytes. Never collect 4,097 payload rows.
+    let message_count: usize = connection.query_row(
+        "SELECT count(*) FROM (SELECT 1 FROM message WHERE session_id=?1 LIMIT ?2)",
+        params![session.native_id, MAX_TIMELINE_LINES as i64 + 1],
+        |row| row.get(0),
+    )?;
+    let mut messages =
+        message_statement.query(params![session.native_id, MAX_TIMELINE_LINES as i64 + 1])?;
+    let mut truncated = message_count > MAX_TIMELINE_LINES;
     if truncated {
-        messages.remove(0);
+        messages.next()?;
     }
     // A database from an OpenCode release without the part table still shows its messages.
     let mut part_statement = connection
@@ -2089,7 +2090,28 @@ fn normalized_opencode_timeline(session: &ExternalSession) -> Result<Vec<Value>>
     let mut serialized_bytes = 2_usize;
     let mut sequence = 1_u64;
     let mut last_created = session.started_at_unix_ms;
-    for (message_row, id_bytes, created, created_bytes, encoded) in messages {
+    while let Some(row) = messages.next()? {
+        let message_row = row.get::<_, i64>(0)?;
+        let created = row.get::<_, Option<i64>>(2).ok().flatten();
+        if let Some(created) = created {
+            last_created = created.max(0) as u128;
+        }
+        let at = timestamp(last_created);
+        let row_bytes = sqlite_row_bytes(row, &[1, 2, 3])?;
+        if row_bytes > MAX_TIMELINE_BYTES as usize {
+            let notice = oversized_sqlite_row(&mut sequence, &at, "message", row_bytes)?;
+            extend_bounded_opencode_timeline(
+                &mut items,
+                &mut serialized_bytes,
+                &mut truncated,
+                vec![notice],
+            );
+            // Its parts have no trustworthy display context until the message fits the bound.
+            continue;
+        }
+        let id_bytes = sqlite_bytes(row, 1)?;
+        let created_bytes = sqlite_bytes(row, 2)?;
+        let encoded = sqlite_bytes(row, 3)?;
         let message = serde_json::from_slice::<Value>(&encoded).unwrap_or(Value::Null);
         let message_digest = native_message_digest(&id_bytes, created, &message);
         let native_role = message.get("role").and_then(Value::as_str);
@@ -2098,10 +2120,6 @@ fn normalized_opencode_timeline(session: &ExternalSession) -> Result<Vec<Value>>
             | None => normalized_role(native_role),
             Some(role) => role,
         };
-        if let Some(created) = created {
-            last_created = created.max(0) as u128;
-        }
-        let at = timestamp(last_created);
         let mut additions = Vec::with_capacity(2);
         let entry_sequence = next_opencode_sequence(&mut sequence)?;
         let mut record =
@@ -2122,16 +2140,22 @@ fn normalized_opencode_timeline(session: &ExternalSession) -> Result<Vec<Value>>
         let Some(part_statement) = part_statement.as_mut() else {
             continue;
         };
-        let parts = part_statement
-            .query_map(params![session.native_id, message_row], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    sqlite_bytes(row, 1)?,
-                    sqlite_bytes(row, 2)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        for (part_row, part_id, encoded_part) in parts {
+        let mut parts = part_statement.query(params![session.native_id, message_row])?;
+        while let Some(row) = parts.next()? {
+            let part_row = row.get::<_, i64>(0)?;
+            let row_bytes = sqlite_row_bytes(row, &[1, 2])?;
+            if row_bytes > MAX_TIMELINE_BYTES as usize {
+                let notice = oversized_sqlite_row(&mut sequence, &at, "part", row_bytes)?;
+                extend_bounded_opencode_timeline(
+                    &mut items,
+                    &mut serialized_bytes,
+                    &mut truncated,
+                    vec![notice],
+                );
+                continue;
+            }
+            let part_id = sqlite_bytes(row, 1)?;
+            let encoded_part = sqlite_bytes(row, 2)?;
             let mut additions = Vec::with_capacity(2);
             let entry_sequence = sequence;
             normalize_opencode_bytes(
@@ -2193,7 +2217,9 @@ fn normalized_opencode_timeline(session: &ExternalSession) -> Result<Vec<Value>>
                 "system",
                 "truncation",
                 json!({
-                    "reason": "the native OpenCode history prefix is outside the bounded read window",
+                    "reason": "the native OpenCode history prefix is outside the bounded read window; not fetchable through this owner read",
+                    "fetchable": false,
+                    "limit_bytes": MAX_TIMELINE_BYTES,
                     "omitted_from_sequence": 0,
                     "omitted_to_sequence": 0
                 }),
@@ -2203,14 +2229,58 @@ fn normalized_opencode_timeline(session: &ExternalSession) -> Result<Vec<Value>>
     Ok(items.into_iter().map(|(item, _)| item).collect())
 }
 
+// Inspect SQLite's borrowed cells before allocating any Rust payload copies. Numeric values
+// are measured as their small textual representation; text/blob payloads stay borrowed.
+fn sqlite_row_bytes(row: &rusqlite::Row<'_>, columns: &[usize]) -> rusqlite::Result<usize> {
+    use rusqlite::types::ValueRef;
+    columns.iter().try_fold(0_usize, |total, column| {
+        let size = match row.get_ref(*column)? {
+            ValueRef::Text(bytes) | ValueRef::Blob(bytes) => bytes.len(),
+            ValueRef::Null => 4,
+            ValueRef::Integer(value) => value.to_string().len(),
+            ValueRef::Real(value) => value.to_string().len(),
+        };
+        Ok(total.saturating_add(size))
+    })
+}
+
+fn sqlite_row_guard(row: &rusqlite::Row<'_>, columns: &[usize]) -> rusqlite::Result<()> {
+    if sqlite_row_bytes(row, columns)? > MAX_TIMELINE_BYTES as usize {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            columns[0],
+            row.get_ref(columns[0])?.data_type(),
+            Box::new(std::io::Error::other(
+                "native SQLite row exceeds the 32 MiB owner-read bound",
+            )),
+        ));
+    }
+    Ok(())
+}
+
 fn sqlite_bytes(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Result<Vec<u8>> {
     use rusqlite::types::ValueRef;
+    sqlite_row_guard(row, &[column])?;
     Ok(match row.get_ref(column)? {
         ValueRef::Text(bytes) | ValueRef::Blob(bytes) => bytes.to_vec(),
         ValueRef::Null => b"null".to_vec(),
         ValueRef::Integer(value) => value.to_string().into_bytes(),
         ValueRef::Real(value) => value.to_string().into_bytes(),
     })
+}
+
+fn oversized_sqlite_row(sequence: &mut u64, at: &str, kind: &str, bytes: usize) -> Result<Value> {
+    Ok(timeline_item(
+        next_opencode_sequence(sequence)?,
+        at,
+        "system",
+        "error",
+        json!({
+            "code":"native-record-size-limit",
+            "message":format!("not fetchable: OpenCode {kind} row exceeds the 32 MiB owner-read bound ({bytes} source bytes); its contents are unavailable through this read"),
+            "retryable":false,
+            "details":{"source_type":format!("opencode/{kind}"),"limit_bytes":MAX_TIMELINE_BYTES,"original_bytes":bytes,"fetchable":false,"parts_unavailable":kind == "message"}
+        }),
+    ))
 }
 
 // SQL IDs are part of native identity, even when a rowid survives a rename/rebind.
@@ -5057,50 +5127,123 @@ mod tests {
     #[test]
     fn every_native_record_is_preserved_unless_the_omission_table_justifies_it() {
         let stamp = timestamp(0);
-        for driver in [
-            ExternalDriver::Codex,
-            ExternalDriver::Claude,
-            ExternalDriver::Pi,
-            ExternalDriver::Omp,
-        ] {
-            for kind in [
-                "session_meta",
-                "session",
-                "response_item",
-                "message",
-                "user",
-                "assistant",
-                "attachment",
-                "system",
-                "custom_message",
-                "event_msg",
-                "turn_context",
-                "snapshot",
-                "future-kind",
-            ] {
-                for role in ["user", "assistant", "system", "developer", "future-role"] {
-                    for display in [true, false] {
-                        let record = json!({"type":kind,"display":display,"payload":{"type":"message","role":role,"content":[]},"message":{"role":role,"content":[]},"unknown":{"token":"invented-token"}});
-                        let mut entries = Vec::new();
-                        normalize_native_line(driver, &record, 16, &stamp, &mut entries);
-                        assert_eq!(
-                            entries.is_empty(),
-                            omission_reason(driver, &record).is_some(),
-                            "{driver:?} {record}"
-                        );
-                        if !entries.is_empty() {
-                            assert!(
-                                entries
-                                    .iter()
-                                    .flat_map(|entry| entry["body"]["blocks"].as_array().unwrap())
-                                    .any(|block| block["kind"] == "source_record"
-                                        && block["payload"]["raw"] == record)
-                            );
-                        }
-                    }
+        let fixtures = [
+            (
+                ExternalDriver::Codex,
+                include_str!("../fixtures/native-records/codex.jsonl"),
+            ),
+            (
+                ExternalDriver::Claude,
+                include_str!("../fixtures/native-records/claude.jsonl"),
+            ),
+            (
+                ExternalDriver::Omp,
+                include_str!("../fixtures/omp-resume/run4-08-after-retry.jsonl"),
+            ),
+            (
+                ExternalDriver::Pi,
+                include_str!("../fixtures/omp-resume/run4-08-after-retry.jsonl"),
+            ),
+            (
+                ExternalDriver::Omp,
+                include_str!("../fixtures/omp-tool-results.jsonl"),
+            ),
+        ];
+        for (driver, fixture) in fixtures {
+            let mut records = fixture
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            // Unknown types are deliberate probes, not invented cross-harness known types.
+            records.push(json!({"type":"future-kind","raw":"fixture-unknown"}));
+            if matches!(driver, ExternalDriver::Omp | ExternalDriver::Pi) {
+                records.extend([
+                    json!({"type":"custom_message","display":false,"content":"fixture hidden"}),
+                    json!({"type":"custom_message","display":true,"content":"fixture visible"}),
+                ]);
+            }
+            for record in records {
+                let mut entries = Vec::new();
+                normalize_native_line(driver, &record, 16, &stamp, &mut entries);
+                assert_eq!(
+                    entries.is_empty(),
+                    omission_reason(driver, &record).is_some(),
+                    "{driver:?} {record}"
+                );
+                if !entries.is_empty() {
+                    assert!(
+                        entries
+                            .iter()
+                            .flat_map(|entry| entry["body"]["blocks"].as_array().unwrap())
+                            .any(|block| block["kind"] == "source_record"
+                                && block["payload"]["raw"] == record),
+                        "{driver:?} {record}"
+                    );
                 }
             }
         }
+        // Real OpenCode capture: test the native row objects, not the SSE envelope.
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../st-drivers/tests/fixtures/harness-admission/opencode-1.18.34.json"
+        ))
+        .unwrap();
+        let mut part_types = BTreeSet::new();
+        let mut message_count = 0;
+        for event in fixture["events"].as_array().unwrap() {
+            if event["type"] == "message.updated" {
+                let record = &event["properties"]["info"];
+                let encoded = serde_json::to_vec(record).unwrap();
+                let entry = opencode_message_record(b"fixture-id", b"1", &encoded, 16, &stamp);
+                assert!(omission_reason(ExternalDriver::OpenCode, record).is_none());
+                assert_eq!(entry["body"]["blocks"][0]["payload"]["raw"], *record);
+                message_count += 1;
+            } else if event["type"] == "message.part.updated" {
+                let record = &event["properties"]["part"];
+                part_types.insert(record["type"].as_str().unwrap());
+                let mut entries = Vec::new();
+                normalize_opencode_bytes(
+                    &serde_json::to_vec(record).unwrap(),
+                    b"fixture-id",
+                    &mut 16,
+                    &stamp,
+                    "assistant",
+                    &mut entries,
+                )
+                .unwrap();
+                assert_eq!(
+                    entries.is_empty(),
+                    omission_reason(ExternalDriver::OpenCode, record).is_some(),
+                    "OpenCode {record}"
+                );
+                assert!(
+                    entries
+                        .iter()
+                        .flat_map(|entry| entry["body"]["blocks"].as_array().unwrap())
+                        .any(|block| block["kind"] == "source_record"
+                            && block["payload"]["raw"] == *record)
+                );
+            }
+        }
+        assert!(message_count > 0);
+        for kind in ["text", "tool", "step-start", "step-finish"] {
+            assert!(
+                part_types.contains(kind),
+                "real capture must exercise {kind}"
+            );
+        }
+        let unknown = json!({"type":"future-part","payload":"fixture"});
+        let mut entries = Vec::new();
+        normalize_opencode_bytes(
+            &serde_json::to_vec(&unknown).unwrap(),
+            b"fixture-id",
+            &mut 16,
+            &stamp,
+            "assistant",
+            &mut entries,
+        )
+        .unwrap();
+        assert_eq!(entries[0]["body"]["blocks"][0]["kind"], "unknown");
+        assert_eq!(entries[0]["body"]["blocks"][0]["payload"]["raw"], unknown);
         assert!(
             omission_reason(ExternalDriver::Codex, &json!({"type":"session_meta"}))
                 .unwrap()
@@ -5142,6 +5285,78 @@ mod tests {
                 entry["body"]
             );
         }
+    }
+
+    #[test]
+    fn opencode_oversized_rows_are_explicit_and_do_not_hide_later_rows() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("opencode.db");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT); CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT);").unwrap();
+        db.execute(
+            "INSERT INTO message VALUES ('oversized','ses',1,zeroblob(?1))",
+            params![MAX_TIMELINE_BYTES as i64 + 1],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO message VALUES ('msg','ses',2,?1)",
+            params![r#"{"role":"assistant"}"#],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO part VALUES ('oversized','msg','ses',1,zeroblob(?1))",
+            params![MAX_TIMELINE_BYTES as i64 + 1],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO part VALUES ('part','msg','ses',2,?1)",
+            params![r#"{"type":"text","text":"later row is visible"}"#],
+        )
+        .unwrap();
+        let mut session = transcript_session(ExternalDriver::OpenCode, &path);
+        session.native_id = "ses".into();
+        let entries = normalized_timeline(&session).unwrap();
+        let notices = entries
+            .iter()
+            .filter(|entry| entry["body"]["code"] == "native-record-size-limit")
+            .collect::<Vec<_>>();
+        assert_eq!(notices.len(), 2);
+        for notice in notices {
+            assert_eq!(notice["body"]["details"]["fetchable"], false);
+            assert!(
+                notice["body"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("not fetchable")
+            );
+            assert!(
+                notice.get("_source").is_none(),
+                "no unusable continuation ref"
+            );
+        }
+        assert!(texts(&entries).contains(&"later row is visible"));
+        db.query_row("SELECT data FROM message WHERE id='oversized'", [], |row| {
+            assert!(
+                sqlite_bytes(row, 0).is_err(),
+                "cell is checked before copying"
+            );
+            Ok(())
+        })
+        .unwrap();
+        let entry = entries
+            .iter()
+            .find(|entry| entry["body"]["text"] == "later row is visible")
+            .unwrap();
+        let locator = serde_json::from_value(entry["_source"].clone()).unwrap();
+        db.execute(
+            "UPDATE part SET data=zeroblob(?1) WHERE id='part'",
+            params![MAX_TIMELINE_BYTES as i64 + 1],
+        )
+        .unwrap();
+        assert!(
+            normalized_record(&session, &locator).is_err(),
+            "direct ref reads share the row guard"
+        );
     }
 
     #[test]

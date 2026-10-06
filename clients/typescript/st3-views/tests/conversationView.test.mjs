@@ -159,6 +159,12 @@ assert.equal(shownToolLines({ ...tool, state: 'failed' }, false).hidden, 14, 'fa
   assert.deepEqual(shown.slice(1).map(entry => entry.body.text), ['first', 'second']);
 }
 
+// A source-window omission distinguishes an unavailable remainder from an owner chunk.
+{
+  const notice = e('truncation', 'system', { reason: 'native transcript prefix; not fetchable through this owner read', omitted_from_sequence: 0, omitted_to_sequence: 0 });
+  assert.match(conversationEntries([notice], names)[0].body.text, /not fetchable/);
+}
+
 // A conversation st is refusing says why, how old what is shown is, and that the phone retries.
 {
   const { staleLine } = await import('@smalltalk/st3-views/conversationView');

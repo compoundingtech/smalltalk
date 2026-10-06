@@ -50,9 +50,11 @@ The sole omission table is `omission_reason` in
 `crates/st3/src/external_sessions.rs`: one named match arm per permitted type with
 an explicit reason. It omits only the four categories below. Nothing else may be
 dropped by a parser branch: an otherwise empty projection falls back to raw JSON.
-The coverage test exercises each harness/type/role/display combination and fails
-if an empty result has no table justification; fixtures also prove unknown and
-unparseable records and direct owner reads. When visibility is unproven, retain it.
+The coverage test uses harness-specific native record fixtures, the redacted OMP
+resume/tool captures (also exercising Pi’s shared format), and message/part objects
+from the OpenCode 1.18.34 admission capture. It fails if an empty result has no
+table justification; separate probes cover unknown types, malformed bytes and
+direct owner reads. Fixture provenance is in `crates/st3/fixtures/native-records/SOURCES.md`. When visibility is unproven, retain it.
 
 | Harness records | Decision and reason |
 | --- | --- |
@@ -71,8 +73,10 @@ unparseable records and direct owner reads. When visibility is unproven, retain 
 
 These decisions avoid silent per-type exclusions. Bounded native input windows and
 read failures still produce visible size/read notices; they are transport
-limitations. Unparseable records themselves remain accessible as raw bytes. Oversized OpenCode items receive bounded display stubs and full owner
-continuations, rather than being dropped before ref generation.
+limitations. Unparseable records within the input bounds remain accessible as raw bytes.
+OpenCode items whose native rows fit the input bound receive bounded display stubs
+and full owner continuations. Rows exceeding that bound produce explicit
+not-fetchable notices, rather than disappearing or acquiring unusable refs.
 
 Start in `crates/st3/src/external_sessions.rs`; use the same normalizer for owner
 side-input updates, reads and follow. Remove deliberate visible-reasoning exclusions, image
@@ -144,6 +148,35 @@ The initial chunk contract returns up to 256 KiB decoded bytes; image reads have
 a visible 32 MiB decoded limit. Four expensive owner timeline/chunk reads can run
 concurrently; excess reads, including managed timeline reads, return HTTP 429
 `rate-limited`, without a queued backlog. Clients must back off and retry.
+Input bounds are distinct from response clipping. A JSONL read captures at most
+32 MiB of source bytes and retains at most 4,096 complete lines from that window.
+The partial first line and older prefix are marked **not fetchable through this
+owner read**; there is no prefix continuation in this slice. A line exceeding the
+window can therefore have no complete record in this response, with the same
+explicit marker. Within the window, clipped values have fetchable continuations.
+
+A single 32 MiB text-heavy JSONL line is held several times during parsing,
+source-record attachment, normalization and response preparation: budget roughly
+150–250 MiB transient per read, or 600 MiB–1 GiB for four concurrent reads, in
+addition to the daemon's other work. This is an estimate, not a strict RSS limit:
+dense JSON, many projected parts, allocator overhead and encoded/base64 expansion
+can exceed it. The source-byte limit and four-read admission limit are enforced;
+a hard heap/AST budget and streaming normalization are follow-up work.
+
+OpenCode streams selected messages and their parts instead of copying up to
+4,097 message rows and every part into Rust vectors. Before any Rust byte copy,
+the total ID/time/data cells of a message row, or ID/data cells of a part row,
+must fit 32 MiB; `sqlite_bytes` also checks each cell. At most one accepted
+message row and one part row are being normalized at a time, alongside the
+32 MiB encoded/4,096-entry timeline suffix. Parsing and projection incur the
+same transient-copy/AST overhead as JSONL. SQLite can materialize cells or sort
+rows inside its engine before the borrowed-cell guard, so this is a Rust payload
+copy bound, not a SQLite-engine or process RSS guarantee. Over-limit rows emit
+`native-record-size-limit`, original source size and `fetchable:false`, visibly
+**not fetchable**; a rejected message's parts also lack usable display context.
+Direct chunk reads apply the same row bound; enlargement invalidates an old ref.
+The native source is still authoritative and is not modified by these limits.
+
 An authenticated ref contains a JSONL offset/length/digest or SQLite part/message
 identity/digest (message role/time, independent of streaming usage updates),
 entry/revision, session and stable native file identity. Its encrypted source

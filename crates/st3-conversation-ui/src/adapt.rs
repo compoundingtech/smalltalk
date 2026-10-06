@@ -409,7 +409,11 @@ pub fn conversation_with_filters(
             (_, TimelineBody::Truncation(truncation))
                 if truncation.reason.contains("native transcript prefix") =>
             {
-                Body::Event(NATIVE_PREFIX_NOTE.into())
+                let mut notice = NATIVE_PREFIX_NOTE.to_owned();
+                if truncation.reason.contains("not fetchable") {
+                    notice.push_str("; earlier history is not fetchable through this read");
+                }
+                Body::Event(notice)
             }
             (_, TimelineBody::Truncation(truncation)) => Body::Event(format!(
                 "history omitted: {} (sequences {}–{}{})",
@@ -449,7 +453,7 @@ pub fn conversation_with_filters(
     // That earlier history is not shown is said at the start, where the history would be, not at
     // the time st stamped the note with (the session's last update: the bottom, by the box).
     stamped.sort_by_key(|(_, entry)| {
-        !matches!(&entry.body, Body::Event(text) if text == NATIVE_PREFIX_NOTE)
+        !matches!(&entry.body, Body::Event(text) if text.starts_with(NATIVE_PREFIX_NOTE))
     });
     for (_, entry) in &mut stamped {
         if let Body::Mail {

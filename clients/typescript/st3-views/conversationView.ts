@@ -456,7 +456,7 @@ export function conversationEntries(timeline: Entry[], names: Names, filters: re
       case 'redaction': push(entry, entry.id, { kind: 'event', tone: 'quiet', text: `withheld: ${str(body.reason) ?? 'redacted'}` }); break;
       // Older entries were left out: it heads the conversation whatever time st stamped it with
       // (the time it was read, which sorted it among the newest).
-      case 'truncation': stamped.push({ id: entry.id, at: '', timestamp: '', body: { kind: 'event', tone: 'quiet', text: 'older entries are not shown' } }); break;
+      case 'truncation': stamped.push({ id: entry.id, at: '', timestamp: '', body: { kind: 'event', tone: 'quiet', text: (str(body.reason) ?? '').includes('not fetchable') ? 'older entries are not shown; not fetchable through this read' : 'older entries are not shown' } }); break;
       case 'status':
       case 'usage': break;
       default: {

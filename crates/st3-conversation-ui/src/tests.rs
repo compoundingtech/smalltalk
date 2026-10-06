@@ -1125,3 +1125,14 @@ fn display_filters_hide_context_but_raw_mode_keeps_every_entry_and_byte() {
     );
     assert_eq!(serde_json::to_value(content).unwrap(), original);
 }
+
+#[test]
+fn native_window_notice_explains_that_the_remainder_is_not_fetchable() {
+    let entry = serde_json::from_value(serde_json::json!({
+        "id":"cut","sequence":0,"revision":1,"timestamp":"2026-10-05T10:00:00Z",
+        "role":"system","final":true,"type":"truncation",
+        "body":{"reason":"the native transcript prefix is outside the bounded read window; not fetchable through this owner read","omitted_from_sequence":0,"omitted_to_sequence":0}
+    })).unwrap();
+    let rendered = crate::adapt::conversation(&[entry], &Default::default());
+    assert!(rendered.iter().any(|entry|matches!(&entry.body,crate::Body::Event(text) if text.contains("not fetchable"))));
+}
