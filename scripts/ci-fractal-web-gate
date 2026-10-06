@@ -1,0 +1,35 @@
+#!/usr/bin/env python3
+"""The always-emitted fractal-web check: pass only for a deliberate skip or a successful run.
+
+Detection must have succeeded. A relevant change then requires a successful execution job; a
+change without web inputs requires that execution was skipped. Failure, timeout, cancellation and
+an unexpected skip all fail the gate.
+"""
+
+import os
+import sys
+
+
+def verdict(changes, relevant, execution):
+    if changes != "success":
+        return f"change detection ended with {changes or 'no result'}"
+    if relevant == "true":
+        return None if execution == "success" else f"web inputs changed but execution ended with {execution or 'no result'}"
+    if relevant == "false":
+        return None if execution == "skipped" else f"no web inputs changed but execution ended with {execution or 'no result'}"
+    return f"change detection reported no decision ({relevant!r})"
+
+
+def main():
+    changes, relevant, execution = (os.environ.get(name, "") for name in ("CHANGES_RESULT", "RELEVANT", "EXECUTION_RESULT"))
+    print(f"detection: {changes}, relevant: {relevant}, execution: {execution}")
+    failure = verdict(changes, relevant, execution)
+    if failure:
+        print(f"::error::fractal-web gate failed: {failure}")
+        return 1
+    print("fractal-web gate passed")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

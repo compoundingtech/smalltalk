@@ -1,0 +1,30 @@
+# Generated file - DO NOT EDIT
+# Source: .buckconfig.genie.ts
+
+[cells]
+  smalltalk = .
+  rules = .buck2/rules
+  capabilities = .buck2/capabilities
+  prelude = .buck2/rules/prelude
+
+[cell_aliases]
+  config = prelude
+  ovr_config = prelude
+  fbsource = prelude
+  toolchains = smalltalk
+
+[parser]
+  target_platform_detector_spec = target:smalltalk//...->rules//buck2/platforms:host_platform
+
+[build]
+  execution_platforms = rules//buck2/platforms:host_execution_platform
+
+[buck2]
+  file_watcher = notify
+  digest_algorithms = SHA256
+  remote_cache_enabled = false
+  allow_cache_uploads = false
+
+[project]
+  ignore = **/__pycache__,**/dist,**/node_modules,**/target,.devenv,.git,buck-out,node_modules,repos,target,tmp
+

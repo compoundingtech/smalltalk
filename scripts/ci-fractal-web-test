@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""Exercise fractal-web change detection, its fail-closed paths, the gate and the generated jobs."""
+
+import os
+from pathlib import Path
+import re
+import runpy
+import subprocess
+import tempfile
+
+root = Path(__file__).resolve().parent.parent
+detector = root / "scripts/ci-fractal-web-changes"
+verdict = runpy.run_path(str(root / "scripts/ci-fractal-web-gate"))["verdict"]
+
+
+def git(repo, *args):
+    command = ["git", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "-C", str(repo), *args]
+    return subprocess.run(command, check=True, capture_output=True, text=True).stdout.strip()
+
+
+def commit(repo, message, write=(), remove=(), move=()):
+    for path in write:
+        (repo / path).parent.mkdir(parents=True, exist_ok=True)
+        (repo / path).write_text(f"{message} {path}\n")
+    for path in remove:
+        git(repo, "rm", "--quiet", path)
+    for source, destination in move:
+        (repo / destination).parent.mkdir(parents=True, exist_ok=True)
+        git(repo, "mv", source, destination)
+    git(repo, "add", "--all")
+    git(repo, "commit", "--quiet", "--allow-empty", "-m", message)
+    return git(repo, "rev-parse", "HEAD")
+
+
+def detect(remote, event, base="", head=""):
+    with tempfile.TemporaryDirectory() as scratch:
+        output, summary = Path(scratch, "output"), Path(scratch, "summary")
+        env = {**os.environ, "EVENT": event, "REMOTE": str(remote), "BASE_SHA": base, "HEAD_SHA": head,
+               "GITHUB_OUTPUT": str(output), "GITHUB_STEP_SUMMARY": str(summary)}
+        result = subprocess.run(["python3", str(detector)], env=env, capture_output=True, text=True)
+        relevant = output.read_text().strip() if output.exists() else ""
+        return result.returncode, relevant, result.stderr
+
+
+def check(name, outcome, expected):
+    assert outcome[:2] == expected, (name, outcome)
+    print("passed:", name)
+
+
+with tempfile.TemporaryDirectory() as scratch:
+    repo = Path(scratch)
+    git(repo, "init", "--quiet", "--initial-branch=main")
+    git(repo, "config", "user.email", "ci@example.invalid")
+    git(repo, "config", "user.name", "ci")
+    base = commit(repo, "base", write=["src/main.rs", "clients/typescript/st3-client/index.ts", "docs/guide.md"])
+    rust = commit(repo, "rust", write=["src/main.rs", "crates/st3/src/lib.rs"])
+    git(repo, "checkout", "--quiet", "-b", "web", base)
+    client = commit(repo, "client", write=["clients/typescript/st3-client/index.ts"])
+    git(repo, "checkout", "--quiet", "-b", "schema", base)
+    schema = commit(repo, "schema", write=["crates/st3-schema/src/lib.rs"])
+    git(repo, "checkout", "--quiet", "-b", "lock", base)
+    lock = commit(repo, "lock", write=["pnpm-lock.yaml"])
+    git(repo, "checkout", "--quiet", "-b", "rename-out", base)
+    renamed_out = commit(repo, "rename out", move=[("clients/typescript/st3-client/index.ts", "archive/index.ts")])
+    git(repo, "checkout", "--quiet", "-b", "rename-in", base)
+    renamed_in = commit(repo, "rename in", move=[("docs/guide.md", "apps/fractal-web/README.md")])
+    git(repo, "checkout", "--quiet", "-b", "delete", base)
+    deleted = commit(repo, "delete", remove=["clients/typescript/st3-client/index.ts"])
+    git(repo, "checkout", "--quiet", "-b", "nested", base)
+    nested = commit(repo, "nested lookalike", write=["crates/st3/package.json", "docs/BUCK.md"])
+    git(repo, "checkout", "--quiet", "-b", "newline", base)
+    newline = commit(repo, "newline path", write=["apps/fractal-web/component\nname.ts"])
+    # main moved on with a web change; a Rust-only PR based on the older main stays Rust-only.
+    git(repo, "checkout", "--quiet", "main")
+    advanced = commit(repo, "main web", write=["pnpm-workspace.yaml"])
+
+    check("Rust-only pull request schedules no web execution", detect(repo, "pull_request", base, rust), (0, "relevant=false"))
+    check("pull requests diff from the merge base", detect(repo, "pull_request", advanced, rust), (0, "relevant=false"))
+    check("client change executes", detect(repo, "pull_request", base, client), (0, "relevant=true"))
+    check("schema change executes", detect(repo, "pull_request", base, schema), (0, "relevant=true"))
+    check("lock change executes", detect(repo, "pull_request", base, lock), (0, "relevant=true"))
+    check("rename out of a web path executes", detect(repo, "pull_request", base, renamed_out), (0, "relevant=true"))
+    check("rename into a web path executes", detect(repo, "pull_request", base, renamed_in), (0, "relevant=true"))
+    check("deletion executes", detect(repo, "pull_request", base, deleted), (0, "relevant=true"))
+    check("root-only patterns do not match nested files", detect(repo, "pull_request", base, nested), (0, "relevant=false"))
+    check("a web path containing a newline executes", detect(repo, "pull_request", base, newline), (0, "relevant=true"))
+    check("Rust-only merge group schedules no web execution", detect(repo, "merge_group", base, rust), (0, "relevant=false"))
+    check("merge group covers the whole queued range", detect(repo, "merge_group", base, advanced), (0, "relevant=true"))
+    check("manual runs force execution", detect(repo, "workflow_dispatch"), (0, "relevant=true"))
+    for event in ("pull_request", "merge_group"):
+        check(f"{event}: missing head fails closed", detect(repo, event, base, ""), (1, ""))
+        check(f"{event}: malformed base fails closed", detect(repo, event, "main", rust), (1, ""))
+        check(f"{event}: unknown commit fails closed", detect(repo, event, base, "f" * 40), (1, ""))
+        check(f"{event}: unreachable remote fails closed", detect(Path(scratch, "missing"), event, base, rust), (1, ""))
+    check("unknown event fails closed", detect(repo, "push", base, rust), (1, ""))
+
+gate = [
+    (("success", "true", "success"), True, "relevant change that executed"),
+    (("success", "false", "skipped"), True, "deliberate skip"),
+    (("success", "true", "skipped"), False, "relevant change whose execution was skipped"),
+    (("success", "true", "failure"), False, "relevant change whose execution failed"),
+    (("success", "true", "cancelled"), False, "relevant change whose execution was cancelled or timed out"),
+    (("success", "false", "success"), False, "execution without a relevant change"),
+    (("failure", "", "skipped"), False, "failed detection"),
+    (("cancelled", "", "skipped"), False, "cancelled detection"),
+    (("success", "", "skipped"), False, "detection without a decision"),
+]
+for args, passes, name in gate:
+    assert (verdict(*args) is None) == passes, (name, verdict(*args))
+    print("passed: gate,", name)
+
+workflow = (root / ".github/workflows/fleet.yml").read_text()
+header, jobs = workflow.split("\njobs:\n", 1)
+assert "paths" not in header, "required checks need no workflow-level path filter"
+for event in ("pull_request", "merge_group", "workflow_dispatch"):
+    assert f"  {event}:" in header, event
+blocks = dict(re.findall(r"(?ms)^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)", jobs))
+changes, execution, gate_job = blocks["fractal-web-changes"], blocks["fractal-web-execution"], blocks["fractal-web"]
+for block in (changes, execution, gate_job):
+    assert "runs-on: ubuntu-latest" in block
+assert "timeout-minutes: 1" in changes and "timeout-minutes: 1" in gate_job and "timeout-minutes: 25" in execution
+assert "github.event.pull_request.base.sha || github.event.merge_group.base_sha" in changes
+assert "github.event.pull_request.head.sha || github.event.merge_group.head_sha" in changes
+assert not re.search(r"(?m)^    if:", changes) and "actions/checkout" not in changes, "detection always runs on embedded source"
+assert "needs: [fractal-web-changes, genie-freshness]" in execution
+assert "needs.fractal-web-changes.outputs.relevant == 'true'" in execution
+assert "needs.genie-freshness.result == 'success'" in execution
+assert "nix develop '.#web' -c bash scripts/ci-fractal-web" in execution
+assert "actions/cache/restore@" in execution and "actions/cache/save@" not in execution, "only main upkeep publishes caches"
+assert "if: always()" in gate_job and "needs: [fractal-web-changes, fractal-web-execution]" in gate_job
+assert "fractal-web" not in blocks["linux-gate"], "Rust-only gates never wait for web execution"
+settings = (root / ".github/repo-settings.json").read_text()
+assert '"fractal-web"' not in settings, "fractal-web becomes required only after PR and queue runs emit it"
+print("passed: generated jobs are unfiltered, hosted, bounded and fail closed")
