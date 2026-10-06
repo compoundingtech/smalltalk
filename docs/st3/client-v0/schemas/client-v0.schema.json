@@ -2211,7 +2211,8 @@
         "kind": { "const": "pairing-challenge" },
         "pairing_id": { "$ref": "#/$defs/Id" },
         "code": { "type": "string", "pattern": "^[A-Z2-9]{8}$" },
-        "expires_at": { "$ref": "#/$defs/Timestamp" }
+        "expires_at": { "$ref": "#/$defs/Timestamp" },
+        "person_root_fingerprint": { "type": "string", "pattern": "^sha256:[A-Za-z0-9_-]{43}$" }
       }
     },
     "PairingComplete": {
@@ -2238,7 +2239,8 @@
         "scopes": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
         "expires_at": { "$ref": "#/$defs/Timestamp" },
         "device_key_chain": { "type": "array", "items": { "type": "string" } },
-        "device_key_proofs": { "type": "array", "items": { "type": "object" }, "maxItems": 2 }
+        "device_key_proofs": { "type": "array", "items": { "type": "object" }, "maxItems": 2 },
+        "person_root_key_proof": { "type": "object" }
       }
     },
     "DeviceSignature": {

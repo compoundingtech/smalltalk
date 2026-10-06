@@ -225,7 +225,13 @@ async fn pair(root: &Path, local: &Client, url: &str) {
 
 async fn complete_challenge(root: &Path, url: &str, challenge: &st3_client::PairingChallenge) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_stui"))
-        .args(["pair", url, &challenge.pairing_id])
+        .args([
+            "pair",
+            url,
+            &challenge.pairing_id,
+            "--fingerprint",
+            challenge.person_root_fingerprint.as_deref().unwrap(),
+        ])
         .env_clear()
         .env("HOME", root)
         .env("XDG_CONFIG_HOME", root.join("config"))

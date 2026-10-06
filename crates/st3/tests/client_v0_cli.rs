@@ -111,6 +111,8 @@ async fn devices_complete_needs_no_daemon_config_and_never_prints_or_loses_secre
                 profile.to_str().unwrap().into(),
                 "--algorithm".into(),
                 algorithm.into(),
+                "--fingerprint".into(),
+                challenge.person_root_fingerprint.clone().unwrap(),
             ];
             let key_file = root.path().join("import.der");
             let key_bytes = if import {
@@ -132,6 +134,18 @@ async fn devices_complete_needs_no_daemon_config_and_never_prints_or_loses_secre
                 None
             };
             let previous = std::fs::read(&profile).ok();
+            let mut missing_pin = args.clone();
+            let pin_option = missing_pin.iter().position(|arg| arg == "--fingerprint").unwrap();
+            missing_pin.drain(pin_option..pin_option + 2);
+            let missing = run(missing_pin, challenge.code.clone()).await.unwrap();
+            assert!(!missing.status.success());
+            assert!(String::from_utf8_lossy(&missing.stderr).contains("fingerprint"));
+            assert_eq!(std::fs::read(&profile).ok(), previous);
+            let mut conflicting = args.clone();
+            conflicting.push("--unpinned".into());
+            let conflict = run(conflicting, challenge.code.clone()).await.unwrap();
+            assert!(!conflict.status.success());
+            assert_eq!(std::fs::read(&profile).ok(), previous);
             let mut blocked_args = args.clone();
             blocked_args[3] = "http://203.0.113.1".into();
             let blocked = run(blocked_args, challenge.code.clone()).await.unwrap();
@@ -243,6 +257,8 @@ async fn devices_complete_needs_no_daemon_config_and_never_prints_or_loses_secre
         "complete".into(),
         base.replace("127.0.0.1", "localhost"),
         challenge.pairing_id,
+        "--fingerprint".into(),
+        challenge.person_root_fingerprint.unwrap(),
     ];
     let output = run(args, challenge.code).await.unwrap();
     assert!(
@@ -258,6 +274,17 @@ async fn devices_complete_needs_no_daemon_config_and_never_prints_or_loses_secre
     assert!(loaded.devices[0].signing_key.is_none());
     assert!(!loaded.devices[0].allow_public_http);
     assert!(loaded.devices[0].session.device_key_chain.is_empty());
+    assert!(loaded.devices[0].person_root_fingerprint.is_some());
+    let challenge = local.pairing_begin(&PairingBegin {
+        api_version: st3_client::API_VERSION.into(), device_name: "Explicit unpinned CLI".into(),
+        person_id: "person/avery".into(), full_control: Some(true), scopes: None,
+    }).await.unwrap().value;
+    let unpinned_profile = root.path().join("unpinned/devices.json");
+    let output = run(vec!["devices".into(), "complete".into(), base.clone(), challenge.pairing_id,
+        "--unpinned".into(), "--profile".into(), unpinned_profile.to_str().unwrap().into()], challenge.code).await.unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("UNPINNED PAIRING"));
+    assert!(Profile::load(&unpinned_profile).unwrap().unwrap().devices[0].person_root_fingerprint.is_none());
     assert!(
         !String::from_utf8_lossy(&output.stdout).contains(&loaded.devices[0].session.credential)
     );

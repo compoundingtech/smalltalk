@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useFocusEffect } from '@react-navigation/native';
 import { plainError, type ClientConnections } from '../../../clients/typescript/st3-client';
 import { ActionSheetIOS, Alert, ScrollView, View } from 'react-native';
@@ -12,6 +12,7 @@ import { TABS } from '../tabs';
 import { theme } from '../theme';
 import { Button, Field, ListRow, Note, Screen, SectionHeader, T } from '../ui';
 import { UsageCard } from './Usage';
+import { UNPINNED_WARNING } from '../pairingProof';
 
 function machineGlyph(state: string): { glyph: string; color: string } {
   if (state === 'local' || state === 'reachable' || state === 'dial-out') return { glyph: '●', color: theme.idle };
@@ -130,20 +131,34 @@ export function FleetScreen() {
 
 // Pairing: the one screen before a device has a credential.
 export function PairScreen() {
-  const { url, urlDraft, setUrlDraft, busy, actions } = useStore();
-  const [id, setId] = useState(''), [code, setCode] = useState('');
+  const { url, urlDraft, setUrlDraft, pairDraft, busy, actions } = useStore();
+  const [id, setId] = useState(pairDraft?.id ?? ''), [code, setCode] = useState(pairDraft?.code ?? '');
+  const [fingerprint, setFingerprint] = useState(''), [unpinned, setUnpinned] = useState(false);
+  useEffect(() => {
+    if (pairDraft) { setId(pairDraft.id); setCode(pairDraft.code); setFingerprint(''); setUnpinned(false); }
+  }, [pairDraft]);
+  const submit = () => void actions.pair(id, code, fingerprint, unpinned).then(done => { if (done) { setId(''); setCode(''); setFingerprint(''); } });
   return <Screen>
     <Banners />
     <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ padding: 12, paddingBottom: 48 }} keyboardShouldPersistTaps="handled" keyboardDismissMode="interactive">
-      <T soft>Use the paired-only gateway: its HTTPS URL; http:// with the host's Tailscale address (100.x.y.z), which Tailscale encrypts; or http:// with its .local name or private LAN address, which is not encrypted. Begin pairing on a trusted st machine, then enter its short-lived ID and code.</T>
+      <T soft>Begin pairing on a trusted st machine, then enter its short-lived ID, code, and the person-root fingerprint copied separately. Use HTTPS or an already encrypted path such as Tailscale for the paired-only gateway.</T>
+      {pairDraft ? <T soft>Pairing with {pairDraft.gateway}</T> : <>
       <Field autoCapitalize="none" autoCorrect={false} spellCheck={false} keyboardType="url" placeholder="https://gateway, http://100.x.y.z:port, or http://host.local:port" value={urlDraft} onChangeText={setUrlDraft} />
       {gatewayTransport(urlDraft) === 'lan' ? <T color={theme.waiting}>{LAN_HTTP_WARNING}</T> : null}
       <Button label="save gateway" onPress={() => void actions.saveUrl()} />
-      {url ? <>
+      </>}
+      {url || pairDraft ? <>
         <SectionHeader title="pair" />
         <Field autoCapitalize="none" autoCorrect={false} spellCheck={false} placeholder="pairing ID" value={id} onChangeText={setId} />
         <Field autoCapitalize="none" autoCorrect={false} spellCheck={false} placeholder="pairing code" value={code} onChangeText={setCode} />
-        <Button label="pair this device" disabled={busy} onPress={() => void actions.pair(id, code).then(done => { if (done) { setId(''); setCode(''); } })} />
+        <Field autoCapitalize="none" autoCorrect={false} spellCheck={false} placeholder="person-root fingerprint (sha256:…)" value={fingerprint} onChangeText={value => { setFingerprint(value); setUnpinned(false); }} />
+        {unpinned ? <Note tone="warning">{UNPINNED_WARNING}</Note> : null}
+        <Button label="pair this device" disabled={busy} onPress={submit} />
+        <Button label={unpinned ? 'require fingerprint again' : 'pair without a trusted fingerprint…'} disabled={busy} onPress={() => {
+          if (unpinned) { setUnpinned(false); return; }
+          Alert.alert('Pair without identity verification?', UNPINNED_WARNING, [{ text: 'Cancel', style: 'cancel' }, { text: 'Use unpinned pairing', style: 'destructive', onPress: () => { setFingerprint(''); setUnpinned(true); } }]);
+        }} />
+        {pairDraft ? <Button label="cancel re-pairing" disabled={busy} onPress={actions.cancelPairDraft} /> : null}
       </> : null}
     </ScrollView>
   </Screen>;

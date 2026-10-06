@@ -2624,12 +2624,12 @@ mod device_stream_policy_tests {
     #[tokio::test]
     async fn every_remote_stream_refuses_public_http_even_without_a_signing_key() {
         let device = device::Device {
-            endpoint: "http://localhost:1".into(), allow_public_http: false, signing_key: None,
+            endpoint: "http://localhost:1".into(), allow_public_http: false, person_root_fingerprint: None, signing_key: None,
             session: PairedSession {
                 kind: "paired-session".into(), device_id: "device/policy".into(),
                 person_id: "person/avery".into(), session_actor: "person/avery/session/policy".into(),
                 credential: "stream-bearer-never-sent".into(), scopes: vec!["read.projections".into()],
-                expires_at: "2026-11-01T00:00:00Z".into(), device_key_chain: vec![], device_key_proofs: vec![],
+                expires_at: "2026-11-01T00:00:00Z".into(), device_key_chain: vec![], device_key_proofs: vec![], person_root_key_proof: None,
             },
         };
         let mut client = device.client().unwrap();

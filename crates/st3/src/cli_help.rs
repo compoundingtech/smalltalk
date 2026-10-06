@@ -246,7 +246,7 @@ pub(super) fn pairing_next_steps(person: &str) -> String {
         &[
             (
                 "Complete on the device",
-                "st devices complete MEMBER_URL PAIRING_ID".to_owned(),
+                "st devices complete MEMBER_URL PAIRING_ID --fingerprint SHA256".to_owned(),
             ),
             ("Show paired devices", format!("st devices --as {person}")),
             (

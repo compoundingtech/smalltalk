@@ -21,6 +21,29 @@ use st3_client::{
 };
 use tokio::sync::{Notify, watch};
 
+// Existing transport/failure cases exercise the explicit unpinned escape hatch. Pinned
+// completion and its trust boundary have dedicated cases below.
+async fn complete(
+    path: &Path,
+    endpoint: &str,
+    pairing_id: &str,
+    code: &str,
+    key: st3_client::device::SigningKey,
+) -> anyhow::Result<st3_client::device::Device> {
+    st3_client::device::complete_with_options(
+        path,
+        endpoint,
+        pairing_id,
+        code,
+        key,
+        st3_client::device::CompletionOptions {
+            unpinned: true,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
 const PERSON: &str = "person/avery";
 const FLEET: &str = "3c9a1f2e-8b7d-4e6c-a5f4-1d2e3c4b5a69";
 const SIGNED_FIELDS: [&str; 7] = [
@@ -35,6 +58,359 @@ const SIGNED_FIELDS: [&str; 7] = [
 
 fn encode(bytes: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn grant_proofs(store: &Store, chain: &[String]) -> Vec<Value> {
+    store.seal_local_batches().unwrap();
+    chain
+        .iter()
+        .map(|id| {
+            let grant = store.claim_by_id(id).unwrap().unwrap();
+            let signature = store.claim_signature(id).unwrap().unwrap();
+            json!({ "id": grant.id, "batch_id": grant.batch_id, "subject": grant.subject,
+            "kind": grant.kind, "origin": grant.origin, "actor": grant.actor,
+            "body": grant.body, "predecessors": grant.predecessors, "signature": signature })
+        })
+        .collect()
+}
+
+#[test]
+fn shared_pairing_vectors_match_the_rust_verifier_and_fingerprint_encoding() {
+    let vector: Value = serde_json::from_str(include_str!(
+        "../../../fixtures/clients/device-pairing-proofs-v1.json"
+    ))
+    .unwrap();
+    let chain: Vec<String> = serde_json::from_value(vector["chain"].clone()).unwrap();
+    let proofs = vector["proofs"].as_array().unwrap();
+    let person = vector["person"].as_str().unwrap();
+    let key = vector["device_key"].as_str().unwrap();
+    let pin = vector["fingerprint"].as_str().unwrap();
+    st3_client::device::verify_device_key_proofs_pinned(person, &chain, proofs, key, pin).unwrap();
+    let root_key = proofs[1]["body"]["fields"]["key"].as_str().unwrap();
+    assert_eq!(
+        st3_client::device::person_root_fingerprint(root_key).unwrap(),
+        pin
+    );
+    assert!(
+        st3_client::device::verify_device_key_proofs_pinned(
+            person,
+            &chain,
+            proofs,
+            key,
+            vector["other_fingerprint"].as_str().unwrap()
+        )
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn a_self_consistent_forged_chain_passes_unpinned_checks_but_cannot_replace_a_pinned_profile()
+{
+    use st3_client::device::{
+        CompletionOptions, KeyAlgorithm, SigningKey, complete_with_options, person_root_fingerprint,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let root = tempfile::tempdir().unwrap();
+    let trusted = state(root.path());
+    let attacker_dir = tempfile::tempdir().unwrap();
+    let attacker = state(attacker_dir.path());
+    let (trusted_key, _) = trusted.store.person_root_grant(PERSON).unwrap().unwrap();
+    let pin = person_root_fingerprint(&trusted_key).unwrap();
+    let key = SigningKey::generate(KeyAlgorithm::P256).unwrap();
+    let public = key.public_key().unwrap();
+    let chain = attacker
+        .store
+        .enroll_device_key(PERSON, &public, "Forged receipt")
+        .unwrap();
+    let proofs = grant_proofs(&attacker.store, &chain);
+    st3_client::device::verify_device_key_proofs(PERSON, &chain, &proofs, &public).unwrap();
+    let error =
+        st3_client::device::verify_device_key_proofs_pinned(PERSON, &chain, &proofs, &public, &pin)
+            .unwrap_err();
+    assert!(error.to_string().contains("fingerprint mismatch"));
+    // Export public receipts only when explicitly generating the cross-client fixture.
+    if let Ok(path) = std::env::var("ST3_PAIRING_PROOF_VECTOR_OUT") {
+        let forged_pin =
+            person_root_fingerprint(proofs[1]["body"]["fields"]["key"].as_str().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            serde_json::to_vec_pretty(&json!({
+                "person": PERSON, "device_key": public, "chain": chain, "proofs": proofs,
+                "fingerprint": forged_pin, "other_fingerprint": pin,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+    let posts = Arc::new(AtomicUsize::new(0));
+    let observed = posts.clone();
+    let app = axum::Router::new()
+        .route("/v1/client/capabilities", axum::routing::get(|| async { axum::Json(json!({
+            "api_version": st3_client::API_VERSION, "capabilities": [{"id":"device-key-proofs", "version":1, "state":"granted"}],
+        })) }))
+        .route("/v1/client/pairings/{id}/complete", axum::routing::post(move || {
+            let observed = observed.clone(); let chain = chain.clone(); let proofs = proofs.clone();
+            async move {
+                observed.fetch_add(1, Ordering::SeqCst);
+                axum::Json(json!({ "api_version": st3_client::API_VERSION, "request_id": "request/forged", "snapshot": {
+                    "id":"snapshot/forged", "host_id":"host/forged", "store_index":1, "projection_version":"client-projection.v0", "created_at":"2026-10-01T00:00:00Z"
+                }, "value": { "kind":"paired-session", "device_id":"device/0123456789abcdef01234567", "person_id":PERSON,
+                    "session_actor":"person/avery/session/forged", "credential":"forged-bearer-not-to-be-retained-0000000000",
+                    "scopes":["control.messages"], "expires_at":"2026-11-01T00:00:00Z", "device_key_chain":chain, "device_key_proofs":proofs } }))
+            }
+        }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let path = root.path().join("client/devices.json");
+    for fingerprint in [None, Some("sha256:short")] {
+        let error = complete_with_options(
+            &path,
+            &base,
+            "pairing/forged",
+            "ABCDEFGH",
+            key.clone(),
+            CompletionOptions {
+                fingerprint,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("fingerprint"));
+        assert_eq!(posts.load(Ordering::SeqCst), 0);
+        assert!(!path.exists());
+    }
+    // Explicit override still performs every existing chain check, and saves no invented pin.
+    let unpinned = complete_with_options(
+        &path,
+        &base,
+        "pairing/forged",
+        "ABCDEFGH",
+        key.clone(),
+        CompletionOptions {
+            unpinned: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(unpinned.person_root_fingerprint.is_none());
+    let previous = std::fs::read(&path).unwrap();
+    let error = complete_with_options(
+        &path,
+        &base,
+        "pairing/forged",
+        "ABCDEFGH",
+        key,
+        CompletionOptions {
+            fingerprint: Some(&pin),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("fingerprint mismatch"));
+    assert!(format!("{error:#}").contains("Possible orphaned device"));
+    assert_eq!(std::fs::read(&path).unwrap(), previous);
+    server.abort();
+}
+
+#[tokio::test]
+async fn pinned_read_only_pairing_verifies_the_root_without_enrolling_a_signing_device() {
+    use st3_client::device::{
+        CompletionOptions, KeyAlgorithm, Profile, SigningKey, complete_with_options,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let state = state(root.path());
+    let socket = root.path().join("st3.sock");
+    let served = socket.clone();
+    let app = st3::api::router(state.clone());
+    let local_server = tokio::spawn(async move { st3::api::serve_unix(&served, app).await });
+    wait_for_socket(&socket).await;
+    let local = Client::unix_as(&socket, PERSON);
+    let challenge = local
+        .pairing_begin(&PairingBegin {
+            api_version: st3_client::API_VERSION.into(),
+            device_name: "Pinned display".into(),
+            person_id: PERSON.into(),
+            full_control: None,
+            scopes: Some(vec!["read.projections".into()]),
+        })
+        .await
+        .unwrap()
+        .value;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = st3::api::fabric_router(state.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let path = root.path().join("client/devices.json");
+    let key = SigningKey::generate(KeyAlgorithm::P256).unwrap();
+    let public = key.public_key().unwrap();
+    let device = complete_with_options(
+        &path,
+        &base,
+        &challenge.pairing_id,
+        &challenge.code,
+        key,
+        CompletionOptions {
+            fingerprint: challenge.person_root_fingerprint.as_deref(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(device.signing_key.is_none());
+    assert!(device.session.device_key_chain.is_empty());
+    assert!(device.session.person_root_key_proof.is_some());
+    assert_eq!(
+        device.person_root_fingerprint,
+        challenge.person_root_fingerprint
+    );
+    let reloaded = Profile::load(&path).unwrap().unwrap();
+    assert_eq!(
+        reloaded.devices[0].person_root_fingerprint,
+        challenge.person_root_fingerprint
+    );
+    assert!(
+        state
+            .store
+            .claims_for(PERSON, Some(smallclaims::principal::KEY_GRANTED))
+            .unwrap()
+            .iter()
+            .all(|grant| grant.body["fields"]["key"] != public)
+    );
+    local_server.abort();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs ST3_PRE_PIN_BIN: a released CLI with v1 device proofs but no fingerprint support"]
+async fn a_pre_pin_cli_completes_against_the_current_daemon() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    use std::io::Write as _;
+    use std::process::Stdio;
+    let old = std::env::var("ST3_PRE_PIN_BIN").expect("pre-pin CLI path");
+    let help = st3::test_support::command(&old)
+        .args(["devices", "complete", "--help"])
+        .output()
+        .unwrap();
+    assert!(help.status.success());
+    assert!(!String::from_utf8_lossy(&help.stdout).contains("--fingerprint"));
+    let root = tempfile::tempdir().unwrap();
+    let state = state(root.path());
+    let socket = root.path().join("st3.sock");
+    let served = socket.clone();
+    let app = st3::api::router(state.clone());
+    let local_server = tokio::spawn(async move { st3::api::serve_unix(&served, app).await });
+    wait_for_socket(&socket).await;
+    let local = Client::unix_as(&socket, PERSON);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = st3::api::fabric_router(state.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    for signs in [true, false] {
+        let challenge = local
+            .pairing_begin(&PairingBegin {
+                api_version: st3_client::API_VERSION.into(),
+                device_name: "Older CLI".into(),
+                person_id: PERSON.into(),
+                full_control: signs.then_some(true),
+                scopes: None,
+            })
+            .await
+            .unwrap()
+            .value;
+        assert!(challenge.person_root_fingerprint.is_some());
+        let profile = root.path().join(format!("client-{signs}/devices.json"));
+        let old = old.clone();
+        let endpoint = base.clone();
+        let path = profile.clone();
+        let output = tokio::task::spawn_blocking(move || {
+            let mut child = st3::test_support::command(old)
+                .env_clear()
+                .env("HOME", path.parent().unwrap())
+                .args([
+                    "devices",
+                    "complete",
+                    &endpoint,
+                    &challenge.pairing_id,
+                    "--profile",
+                    path.to_str().unwrap(),
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            writeln!(child.stdin.take().unwrap(), "{}", challenge.code).unwrap();
+            child.wait_with_output().unwrap()
+        })
+        .await
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "Older CLI refused additive response: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let profile = st3_client::device::Profile::load(&profile)
+            .unwrap()
+            .unwrap();
+        assert!(profile.devices[0].person_root_fingerprint.is_none());
+        assert_eq!(profile.devices[0].signing_key.is_some(), signs);
+        assert!(profile.clients().unwrap()[0].capabilities().await.is_ok());
+    }
+    local_server.abort();
+    server.abort();
+}
+
+#[tokio::test]
+async fn pre_pin_response_shapes_work_for_pinned_messages_and_explicitly_unpinned_observers() {
+    use st3_client::device::{CompletionOptions, KeyAlgorithm, SigningKey, complete_with_options};
+    let root = tempfile::tempdir().unwrap();
+    let state = state(root.path());
+    let socket = root.path().join("st3.sock");
+    let served = socket.clone();
+    let app = st3::api::router(state.clone());
+    let local_server = tokio::spawn(async move { st3::api::serve_unix(&served, app).await });
+    wait_for_socket(&socket).await;
+    let local = Client::unix_as(&socket, PERSON);
+    // An old v1 proof-capable member returns no new optional root-proof field.
+    let remove_new_fields = axum::middleware::map_response(|response: axum::response::Response| async {
+        let (mut parts, body) = response.into_parts();
+        let bytes = axum::body::to_bytes(body, 4 * 1024 * 1024).await.unwrap();
+        let mut value: Value = serde_json::from_slice(&bytes).unwrap();
+        if let Some(value) = value.get_mut("value").and_then(Value::as_object_mut) {
+            value.remove("person_root_key_proof");
+        }
+        parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+        axum::response::Response::from_parts(parts, axum::body::Body::from(serde_json::to_vec(&value).unwrap()))
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = st3::api::fabric_router(state.clone()).layer(remove_new_fields);
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let profile = root.path().join("client/devices.json");
+    for (signs, unpinned) in [(true, false), (false, false), (false, true)] {
+        let challenge = local.pairing_begin(&PairingBegin { api_version: st3_client::API_VERSION.into(), device_name: "Earlier member".into(), person_id: PERSON.into(), full_control: signs.then_some(true), scopes: None }).await.unwrap().value;
+        let previous = std::fs::read(&profile).ok();
+        let key = SigningKey::generate(KeyAlgorithm::P256).unwrap();
+        let result = complete_with_options(&profile, &base, &challenge.pairing_id, &challenge.code, key,
+            CompletionOptions { fingerprint: if unpinned { None } else { challenge.person_root_fingerprint.as_deref() }, unpinned, ..Default::default() }).await;
+        if !signs && !unpinned {
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(error.contains("upgrade the member"));
+            assert!(error.contains("Possible orphaned device"));
+            assert_eq!(std::fs::read(&profile).ok(), previous);
+        } else {
+            let device = result.unwrap();
+            assert_eq!(device.signing_key.is_some(), signs);
+            assert_eq!(device.person_root_fingerprint.is_some(), !unpinned);
+        }
+    }
+    local_server.abort(); server.abort();
 }
 
 /// A phone's key, kept by the phone.
@@ -133,7 +509,7 @@ fn now_ms() -> u64 {
 
 #[tokio::test]
 async fn shared_completion_persists_both_key_types_and_preserves_a_working_device_on_failure() {
-    use st3_client::device::{KeyAlgorithm, Profile, SigningKey, complete};
+    use st3_client::device::{KeyAlgorithm, Profile, SigningKey};
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
     let root = tempfile::tempdir().unwrap();
     let state = state(root.path());
@@ -226,16 +602,24 @@ async fn shared_completion_persists_both_key_types_and_preserves_a_working_devic
             );
             assert_eq!(std::fs::read(&path).ok(), previous);
             drop(lock);
-            let device = complete(
+            let device = st3_client::device::complete_with_options(
                 &path,
                 &base,
                 &challenge.pairing_id,
                 &challenge.code,
                 key.clone(),
+                st3_client::device::CompletionOptions {
+                    fingerprint: challenge.person_root_fingerprint.as_deref(),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
             assert_eq!(device.session.person_id, PERSON);
+            assert_eq!(
+                device.person_root_fingerprint,
+                challenge.person_root_fingerprint
+            );
             assert_eq!(device.session.device_key_chain.len(), 2);
             // This fixture has no background daemon sealing loop; seal before querying cached verdicts.
             state.store.replication_snapshot().unwrap();
@@ -737,7 +1121,7 @@ async fn anonymous_pairing_advertisement_is_static_and_never_notes_presence() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn refused_attacker_key_is_revoked_and_code_remains_usable_for_a_fresh_key() {
-    use st3_client::device::{KeyAlgorithm, SigningKey, complete};
+    use st3_client::device::{KeyAlgorithm, SigningKey};
     let root = tempfile::tempdir().unwrap();
     let state = state(root.path());
     let anchor = Arc::new(smallclaims::fleet::MemberKey::generate().unwrap().0);
@@ -884,7 +1268,7 @@ async fn refused_attacker_key_is_revoked_and_code_remains_usable_for_a_fresh_key
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn missing_sealed_root_proof_does_not_consume_code_or_create_a_bearer() {
-    use st3_client::device::{KeyAlgorithm, SigningKey, complete};
+    use st3_client::device::{KeyAlgorithm, SigningKey};
     let root = tempfile::tempdir().unwrap();
     let state = state(root.path());
     let socket = root.path().join("st3.sock");

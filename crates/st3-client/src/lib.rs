@@ -3832,6 +3832,7 @@ mod device_stream_policy_tests {
         let device = device::Device {
             endpoint: "http://localhost:1".into(),
             allow_public_http: false,
+            person_root_fingerprint: None,
             signing_key: None,
             session: PairedSession {
                 kind: "paired-session".into(),
@@ -3843,6 +3844,7 @@ mod device_stream_policy_tests {
                 expires_at: "2026-11-01T00:00:00Z".into(),
                 device_key_chain: vec![],
                 device_key_proofs: vec![],
+                person_root_key_proof: None,
             },
         };
         let mut client = device.client().unwrap();
