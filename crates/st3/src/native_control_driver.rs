@@ -8,12 +8,15 @@ use tokio::io::AsyncWriteExt as _;
 use st3::client::Client;
 use st3::mailbox::Fence;
 use st3_schema::harness_control::{Binding, ControlCommand, NativeObservation, NativeReceipt};
+use st3_schema::harness_control::AskTerminalInput;
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct NativeControls {
     observation: Option<NativeObservation>,
     binding: Option<Binding>,
     outbox: Option<PathBuf>,
+    #[serde(skip)]
+    terminal_input: Option<AskTerminalInput>,
 }
 impl NativeControls {
     pub fn is_active(&self) -> bool {
@@ -32,6 +35,12 @@ impl NativeControls {
                 self.observation = Some(serde_json::from_value(frame)?);
                 // A native lifecycle observation invalidates the previous delivery baseline.
                 self.binding = None;
+                Ok(true)
+            }
+            Some("harness_ask_terminal_input") => {
+                frame.as_object_mut().context("native terminal request is not an object")?.remove("type");
+                if self.terminal_input.is_some() { anyhow::bail!("native ask emitted overlapping terminal tokens"); }
+                self.terminal_input = Some(serde_json::from_value(frame)?);
                 Ok(true)
             }
             Some("harness_control_receipt") => {
@@ -84,6 +93,15 @@ impl NativeControls {
             stdout.flush().await?;
             self.binding = Some(binding);
             self.observation = None;
+        }
+        if let Some(input) = self.terminal_input.take() {
+            // Never retry a token after an uncertain write. The native input guard consumes
+            // stale tokens, and only a real tool_result settles the owner operation.
+            if let Err(error) = client.post::<_, Value>("/v1/harness-control/ask-terminal-input", &json!({"fence":fence,"input":input})).await {
+                tracing::warn!("native ask terminal input not confirmed: {error:#}");
+                stdout.write_all(format!("{}\n", json!({"type":"harness_control","command":{"type":"harness_ask_terminal_failure","operation_id":input.operation_id,"binding":input.binding,"tool_call_id":input.tool_call_id}})).as_bytes()).await?;
+                stdout.flush().await?;
+            }
         }
         if dispatch && self.binding.is_some() {
             let command: Option<ControlCommand> = client.post("/v1/harness-control/next", fence).await?;

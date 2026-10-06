@@ -473,6 +473,7 @@ mod tests {
             idle: true,
             input_supported: true,
             steer: Default::default(),
+            pending_ask: None, ask_supported: false, ask_reason: None,
             models: Models {
                 choices, selected: None, revision: "models-one".into(),
                 atomic_model_effort: false, available: true, complete: true,

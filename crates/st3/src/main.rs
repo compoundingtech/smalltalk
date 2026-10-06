@@ -18986,6 +18986,9 @@ async fn run_pi_channel(
                         }
                     }
                     while let Some(line) = state.lines.next_line() {
+                        if driver == "omp" && state.controls.accept(&line, subject, state.pending.fence.as_ref())? {
+                            continue;
+                        }
                         publish |= accept_managed_channel_frame(
                             &mut state, &mut observer, &line,
                             // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
@@ -18998,6 +19001,11 @@ async fn run_pi_channel(
                             .pending
                             .publish(client, subject, driver, &incarnation, &session)
                             .await;
+                    }
+                    // Drain native frames as well: an unattempted terminal token must be
+                    // delivered once (or explicitly failed), never discarded by re-exec.
+                    if driver == "omp" {
+                        state.controls.flush(client, state.pending.fence.as_ref(), &mut stdout, false).await?;
                     }
                     stdout.flush().await?;
                     let state_root = if std::env::var_os(st_drivers::driver_paths::ROOT_ENV).is_some() { catalog } else { catalog.parent().unwrap_or(catalog) };

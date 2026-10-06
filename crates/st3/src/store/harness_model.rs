@@ -243,6 +243,7 @@ mod tests {
         let state = NativeState {
             subject: SUBJECT.into(), binding: Binding { desired_revision: store.harness_control_desired_revision(&fence).unwrap(), incarnation_id: "incarnation-1".into(), session_id: "session-1".into(), turn_id: Some("turn-1".into()) }, idle: true, input_supported: true,
             steer: Default::default(),
+            pending_ask: None, ask_supported: false, ask_reason: None,
             models: Models {
                 choices: vec![
                     ModelChoice { provider: "provider".into(), id: "reasoner".into(), reasoning: true, supported_efforts: vec!["medium".into(), "high".into()] },

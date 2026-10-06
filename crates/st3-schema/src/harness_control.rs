@@ -105,6 +105,12 @@ pub struct NativeState {
     pub steer: SteerCapability,
     pub models: Models,
     pub approval: Approval,
+    #[serde(default)]
+    pub pending_ask: Option<PendingAsk>,
+    #[serde(default)]
+    pub ask_supported: bool,
+    #[serde(default)]
+    pub ask_reason: Option<String>,
     pub reason: Option<String>,
 }
 
@@ -173,6 +179,12 @@ pub struct NativeObservation {
     pub steer: SteerCapability,
     pub models: Models,
     pub approval: Approval,
+    #[serde(default)]
+    pub pending_ask: Option<PendingAsk>,
+    #[serde(default)]
+    pub ask_supported: bool,
+    #[serde(default)]
+    pub ask_reason: Option<String>,
     pub reason: Option<String>,
 }
 
@@ -200,6 +212,7 @@ pub struct QueueView {
 pub enum NativeResult {
     Input(InputResult),
     Model(ModelResult),
+    Ask(AskResult),
 }
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -247,7 +260,7 @@ pub struct ModelCommand {
 }
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum ControlCommand { Input(InputCommand), SetModel(ModelCommand) }
+pub enum ControlCommand { Input(InputCommand), SetModel(ModelCommand), AnswerAsk(AskCommand) }
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelReceipt {
@@ -266,6 +279,7 @@ pub struct ModelReceipt {
 pub enum ControlOperationReceipt {
     Queue(Receipt),
     Model(ModelReceipt),
+    Ask(AskReceipt),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -289,6 +303,12 @@ pub struct ControlState {
     pub steer: SteerCapability,
     pub models: ModelsSummary,
     pub approval: Approval,
+    #[serde(default)]
+    pub pending_ask: Option<PendingAskView>,
+    #[serde(default)]
+    pub ask_supported: bool,
+    #[serde(default)]
+    pub ask_reason: Option<String>,
     pub reason: Option<String>,
 }
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -306,3 +326,128 @@ pub struct ModelCatalogPage {
     pub cursor: Option<String>,
     pub total: usize,
 }
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AskOption {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AskQuestion {
+    pub id: String,
+    pub question: String,
+    pub options: Vec<AskOption>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multi: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommended: Option<usize>,
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingAsk {
+    pub tool_call_id: String,
+    pub questions: Vec<AskQuestion>,
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingAskView {
+    pub ask_ref: String,
+    pub tool_call_id: String,
+    pub questions: Vec<AskQuestion>,
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicAskAnswer {
+    #[serde(rename = "questionId")]
+    pub question_id: String,
+    pub options: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "_tag", deny_unknown_fields)]
+pub enum PublicAskParameters {
+    Selection { #[serde(rename = "askRef")] ask_ref: String, answers: Vec<PublicAskAnswer> },
+    Text { #[serde(rename = "askRef")] ask_ref: String, text: String },
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AskAnswer {
+    pub id: String,
+    pub selected_options: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_input: Option<String>,
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AskParameters {
+    pub subject: String,
+    pub binding: Binding,
+    pub tool_call_id: String,
+    pub answers: Vec<AskAnswer>,
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AskRequest {
+    pub actor: String,
+    pub idempotency_key: String,
+    pub parameters: AskParameters,
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AskCommand {
+    pub operation_id: String,
+    pub binding: Binding,
+    pub tool_call_id: String,
+    pub answers: Vec<AskAnswer>,
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AskResult {
+    pub native_event: String,
+    pub tool_call_id: String,
+    pub answers: Vec<AskAnswer>,
+}
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum AskIndeterminateReason {
+    #[serde(rename = "terminal-input-conflict")]
+    TerminalInputConflict,
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "_tag", deny_unknown_fields)]
+pub enum AskOutcome {
+    Indeterminate { reason: AskIndeterminateReason },
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AskReceipt {
+    pub operation_id: String,
+    pub subject: String,
+    pub binding: Binding,
+    pub tool_call_id: String,
+    pub status: Outcome,
+    pub reason: Option<String>,
+    pub result: Option<AskResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<AskOutcome>,
+}
+/// A one-use opaque terminal input token. The native public input hook translates
+/// it into a single key only while the exact ask operation owns its input guard.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AskTerminalInput {
+    pub operation_id: String,
+    pub binding: Binding,
+    pub tool_call_id: String,
+    pub token: String,
+    pub question_index: usize,
+    pub surface: AskSurface,
+}
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AskSurface { Question, Custom, Review }

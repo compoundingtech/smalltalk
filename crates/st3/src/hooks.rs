@@ -16,12 +16,13 @@ use sha2::{Digest as _, Sha256};
 
 /// Each file in the set, by name. The pi and omp extensions belong to st's
 /// daemon channel; historical seats retain the shared driver's original assets.
-pub const FILES: [(&str, &[u8]); 5] = [
+pub const FILES: [(&str, &[u8]); 6] = [
     ("claude-observe.sh", include_bytes!("../hooks/claude-observe.sh")),
     ("claude-statusline.sh", include_bytes!("../hooks/claude-statusline.sh")),
     ("pi-channel.ts", include_bytes!("../hooks/pi-channel.ts")),
     ("omp-channel.ts", include_bytes!("../hooks/omp-channel.ts")),
     ("omp-harness-control.ts", include_bytes!("../hooks/omp-harness-control.ts")),
+    ("omp-harness-ask.ts", include_bytes!("../hooks/omp-harness-ask.ts")),
 ];
 
 /// The file that makes a directory an st3 hook set. st2 skips an `$ST_HOOKS` that holds it.

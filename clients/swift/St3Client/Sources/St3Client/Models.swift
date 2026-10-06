@@ -43,6 +43,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
     case invalidQueueContent, invalidIdempotencyKey, staleQueue, queueFull, invalidQueueMove
     case queueRevisionExhausted, staleQueueCursor, queueMetadataTooLarge, queueEntryTooLarge
     case unsupportedHarnessModel, staleHarnessModel, unavailableHarnessModel, unsupportedHarnessEffort, harnessControlBusy
+    case askNoLongerPending, invalidHarnessAnswers, unsupportedHarnessAsk
     case terminalUnavailable, terminalEnded, timelineHistoryIncomplete
     case blobTooLarge, unsupportedMediaType, blobContentMismatch, blobQuotaExceeded, blobNotFound, blobExpired
     case unknown(String)
@@ -70,6 +71,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
         case "unsupported-harness-model": .unsupportedHarnessModel; case "stale-harness-model": .staleHarnessModel
         case "unavailable-harness-model": .unavailableHarnessModel; case "unsupported-harness-effort": .unsupportedHarnessEffort
         case "harness-control-busy": .harnessControlBusy
+        case "ask-no-longer-pending": .askNoLongerPending; case "invalid-harness-answers": .invalidHarnessAnswers; case "unsupported-harness-ask": .unsupportedHarnessAsk
         default: .unknown(raw)
         }
     }
@@ -95,6 +97,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
         case .unsupportedHarnessModel: "unsupported-harness-model"; case .staleHarnessModel: "stale-harness-model"
         case .unavailableHarnessModel: "unavailable-harness-model"; case .unsupportedHarnessEffort: "unsupported-harness-effort"
         case .harnessControlBusy: "harness-control-busy"
+        case .askNoLongerPending: "ask-no-longer-pending"; case .invalidHarnessAnswers: "invalid-harness-answers"; case .unsupportedHarnessAsk: "unsupported-harness-ask"
         case .unknown(let value): value
         }
         var container = encoder.singleValueContainer(); try container.encode(raw)
@@ -269,7 +272,7 @@ public enum HarnessSteerCapability: Codable, Sendable {
         }
     }
 }
-public struct HarnessControlState: Codable, Sendable { public let subject: String; public let binding: HarnessBinding; public let idle, inputSupported: Bool; public let steer: HarnessSteerCapability; public let models: HarnessModelsSummary; public let approval: HarnessApproval; public let reason: String?; enum CodingKeys: String, CodingKey { case subject, binding, idle, inputSupported = "input_supported", steer, models, approval, reason } }
+public struct HarnessControlState: Codable, Sendable { public let subject: String; public let binding: HarnessBinding; public let idle, inputSupported: Bool; public let steer: HarnessSteerCapability; public let models: HarnessModelsSummary; public let approval: HarnessApproval; public let pendingAsk: HarnessPendingAsk?; public let askSupported: Bool; public let askReason, reason: String?; enum CodingKeys: String, CodingKey { case subject, binding, idle, inputSupported = "input_supported", steer, models, approval, pendingAsk = "pending_ask", askSupported = "ask_supported", askReason = "ask_reason", reason } }
 public struct HarnessQueueView: Codable, Sendable { public let schema, subject: String; public let queue: HarnessQueue; public let native: HarnessControlState?; public let cursor: String?; public let total: UInt }
 public struct HarnessInputResult: Codable, Sendable {
     public let nativeEvent: String
@@ -285,11 +288,67 @@ public struct HarnessModelResult: Codable, Sendable {
     enum CodingKeys: String, CodingKey { case provider, id, effectiveEffort = "effective_effort", atomicModelEffort = "atomic_model_effort" }
     public func encode(to encoder: Encoder) throws { var box = encoder.container(keyedBy: CodingKeys.self); try box.encode(provider, forKey: .provider); try box.encode(id, forKey: .id); try box.encode(effectiveEffort, forKey: .effectiveEffort); try box.encode(atomicModelEffort, forKey: .atomicModelEffort) }
 }
+public struct HarnessAskOption: Codable, Sendable { public let label: String; public let description, preview: String? }
+public struct HarnessAskQuestion: Codable, Sendable { public let id, question: String; public let options: [HarnessAskOption]; public let multi: Bool?; public let recommended: UInt? }
+public struct HarnessPendingAsk: Codable, Sendable { public let askRef, toolCallID: String; public let questions: [HarnessAskQuestion]; enum CodingKeys: String, CodingKey { case askRef = "ask_ref", toolCallID = "tool_call_id", questions } }
+public struct HarnessAskAnswer: Codable, Sendable {
+    public let id: String
+    public let selectedOptions: [String]
+    public let customInput: String?
+    public init(id: String, selectedOptions: [String], customInput: String? = nil) { self.id = id; self.selectedOptions = selectedOptions; self.customInput = customInput }
+    enum CodingKeys: String, CodingKey { case id, selectedOptions = "selected_options", customInput = "custom_input" }
+}
+public struct HarnessAskSelectionAnswer: Codable, Sendable {
+    public let questionId: String
+    public let options: [String]
+    public let text: String?
+    public init(questionId: String, options: [String], text: String? = nil) { self.questionId = questionId; self.options = options; self.text = text }
+}
+public enum HarnessAskParameters: Codable, Sendable {
+    case selection(askRef: String, answers: [HarnessAskSelectionAnswer])
+    case text(askRef: String, text: String)
+    private enum Tag: String, Codable { case selection = "Selection", text = "Text" }
+    private enum CodingKeys: String, CodingKey { case tag = "_tag", askRef, answers, text }
+    public init(from decoder: Decoder) throws {
+        let box = try decoder.container(keyedBy: CodingKeys.self)
+        switch try box.decode(Tag.self, forKey: .tag) {
+        case .selection: self = .selection(askRef: try box.decode(String.self, forKey: .askRef), answers: try box.decode([HarnessAskSelectionAnswer].self, forKey: .answers))
+        case .text: self = .text(askRef: try box.decode(String.self, forKey: .askRef), text: try box.decode(String.self, forKey: .text))
+        }
+    }
+    public func encode(to encoder: Encoder) throws {
+        var box = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .selection(let askRef, let answers): try box.encode(Tag.selection, forKey: .tag); try box.encode(askRef, forKey: .askRef); try box.encode(answers, forKey: .answers)
+        case .text(let askRef, let text): try box.encode(Tag.text, forKey: .tag); try box.encode(askRef, forKey: .askRef); try box.encode(text, forKey: .text)
+        }
+    }
+}
+public struct HarnessAskResult: Codable, Sendable { public let nativeEvent, toolCallID: String; public let answers: [HarnessAskAnswer]; enum CodingKeys: String, CodingKey { case nativeEvent = "native_event", toolCallID = "tool_call_id", answers } }
+public enum HarnessAskIndeterminateReason: String, Codable, Sendable { case terminalInputConflict = "terminal-input-conflict" }
+public enum HarnessAskOutcome: Codable, Sendable {
+    case indeterminate(reason: HarnessAskIndeterminateReason)
+    private enum Tag: String, Codable { case indeterminate = "Indeterminate" }
+    private enum CodingKeys: String, CodingKey { case tag = "_tag", reason }
+    public init(from decoder: Decoder) throws {
+        let box = try decoder.container(keyedBy: CodingKeys.self)
+        switch try box.decode(Tag.self, forKey: .tag) {
+        case .indeterminate: self = .indeterminate(reason: try box.decode(HarnessAskIndeterminateReason.self, forKey: .reason))
+        }
+    }
+    public func encode(to encoder: Encoder) throws {
+        var box = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .indeterminate(let reason): try box.encode(Tag.indeterminate, forKey: .tag); try box.encode(reason, forKey: .reason)
+        }
+    }
+}
+public struct HarnessAskReceipt: Codable, Sendable { public let operationID, subject, toolCallID: String; public let binding: HarnessBinding; public let status: HarnessOutcome; public let reason: String?; public let result: HarnessAskResult?; public let outcome: HarnessAskOutcome?; enum CodingKeys: String, CodingKey { case operationID = "operation_id", subject, toolCallID = "tool_call_id", binding, status, reason, result, outcome } }
 public enum HarnessNativeResult: Codable, Sendable {
-    case input(HarnessInputResult), model(HarnessModelResult)
-    private enum CodingKeys: String, CodingKey { case nativeEvent = "native_event" }
-    public init(from decoder: Decoder) throws { let box = try decoder.container(keyedBy: CodingKeys.self); if box.contains(.nativeEvent) { self = .input(try HarnessInputResult(from: decoder)) } else { self = .model(try HarnessModelResult(from: decoder)) } }
-    public func encode(to encoder: Encoder) throws { switch self { case .input(let value): try value.encode(to: encoder); case .model(let value): try value.encode(to: encoder) } }
+    case input(HarnessInputResult), model(HarnessModelResult), ask(HarnessAskResult)
+    private enum CodingKeys: String, CodingKey { case nativeEvent = "native_event", toolCallID = "tool_call_id" }
+    public init(from decoder: Decoder) throws { let box = try decoder.container(keyedBy: CodingKeys.self); if box.contains(.toolCallID) { self = .ask(try HarnessAskResult(from: decoder)) } else if box.contains(.nativeEvent) { self = .input(try HarnessInputResult(from: decoder)) } else { self = .model(try HarnessModelResult(from: decoder)) } }
+    public func encode(to encoder: Encoder) throws { switch self { case .input(let value): try value.encode(to: encoder); case .model(let value): try value.encode(to: encoder); case .ask(let value): try value.encode(to: encoder) } }
 }
 public struct HarnessControlReceipt: Codable, Sendable { public let operationID, subject: String; public let entryID: String?; public let status: HarnessOutcome; public let queueRevision: UInt64; public let reason: String?; public let result: HarnessNativeResult?; public let binding: HarnessBinding; enum CodingKeys: String, CodingKey { case operationID = "operation_id", subject, entryID = "entry_id", status, queueRevision = "queue_revision", reason, result, binding } }
 public struct HarnessModelParameters: Codable, Sendable {
@@ -302,10 +361,10 @@ public struct HarnessModelParameters: Codable, Sendable {
 }
 public struct HarnessModelReceipt: Codable, Sendable { public let operationID, subject: String; public let binding: HarnessBinding; public let modelRevision: String; public let status: HarnessOutcome; public let reason: String?; public let result: HarnessModelResult?; enum CodingKeys: String, CodingKey { case operationID = "operation_id", subject, binding, modelRevision = "model_revision", status, reason, result } }
 public enum HarnessControlOperationReceipt: Codable, Sendable {
-    case queue(HarnessControlReceipt), model(HarnessModelReceipt)
-    private enum CodingKeys: String, CodingKey { case queueRevision = "queue_revision" }
-    public init(from decoder: Decoder) throws { let box = try decoder.container(keyedBy: CodingKeys.self); if box.contains(.queueRevision) { self = .queue(try HarnessControlReceipt(from: decoder)) } else { self = .model(try HarnessModelReceipt(from: decoder)) } }
-    public func encode(to encoder: Encoder) throws { switch self { case .queue(let value): try value.encode(to: encoder); case .model(let value): try value.encode(to: encoder) } }
+    case queue(HarnessControlReceipt), model(HarnessModelReceipt), ask(HarnessAskReceipt)
+    private enum CodingKeys: String, CodingKey { case queueRevision = "queue_revision", toolCallID = "tool_call_id" }
+    public init(from decoder: Decoder) throws { let box = try decoder.container(keyedBy: CodingKeys.self); if box.contains(.toolCallID) { self = .ask(try HarnessAskReceipt(from: decoder)) } else if box.contains(.queueRevision) { self = .queue(try HarnessControlReceipt(from: decoder)) } else { self = .model(try HarnessModelReceipt(from: decoder)) } }
+    public func encode(to encoder: Encoder) throws { switch self { case .queue(let value): try value.encode(to: encoder); case .model(let value): try value.encode(to: encoder); case .ask(let value): try value.encode(to: encoder) } }
 }
 public struct HarnessModelCatalogPage: Codable, Sendable { public let schema, subject, modelRevision: String; public let selected: HarnessSelectedModel?; public let atomicModelEffort, available, complete: Bool; public let source: String; public let choices: [HarnessModelChoice]; public let cursor: String?; public let total: UInt; enum CodingKeys: String, CodingKey { case schema, subject, modelRevision = "model_revision", selected, atomicModelEffort = "atomic_model_effort", available, complete, source, choices, cursor, total } }
 public struct HarnessQueueMutation: Codable, Sendable {
@@ -503,6 +562,7 @@ public struct ActionRequest: Codable, Sendable {
     public static func agentSuspend(id: String, idempotencyKey: String, fence: Fence, parameters: AgentSuspendParameters) throws -> Self { try .init(id: id, type: .agentSuspend, idempotencyKey: idempotencyKey, fence: fence, typedParameters: parameters) }
     public static func attentionResolve(id: String, idempotencyKey: String, fence: Fence, parameters: AttentionResolveParameters) throws -> Self { try .init(id: id, type: .attentionResolve, idempotencyKey: idempotencyKey, fence: fence, typedParameters: parameters) }
     public static func customReply(id: String, idempotencyKey: String, fence: Fence, parameters: CustomReplyParameters) throws -> Self { try .init(id: id, type: .customReply, idempotencyKey: idempotencyKey, fence: fence, typedParameters: parameters) }
+    public static func harnessAnswerAsk(id: String, idempotencyKey: String, fence: Fence, parameters: HarnessAskParameters) throws -> Self { try .init(id: id, type: .harnessAnswerAsk, idempotencyKey: idempotencyKey, fence: fence, typedParameters: parameters) }
     public static func harnessModelSet(id: String, idempotencyKey: String, fence: Fence, parameters: HarnessModelParameters) throws -> Self { try .init(id: id, type: .harnessModelSet, idempotencyKey: idempotencyKey, fence: fence, typedParameters: parameters) }
     public static func harnessQueueMutate(id: String, idempotencyKey: String, fence: Fence, parameters: HarnessQueueParameters) throws -> Self { try .init(id: id, type: .harnessQueueMutate, idempotencyKey: idempotencyKey, fence: fence, typedParameters: parameters) }
     public static func laneApprove(id: String, idempotencyKey: String, fence: Fence, parameters: LaneChangeParameters) throws -> Self { try .init(id: id, type: .laneApprove, idempotencyKey: idempotencyKey, fence: fence, typedParameters: parameters) }
@@ -603,7 +663,7 @@ public enum TerminalInputMode: String, Codable, Sendable { case line, raw, key }
 public struct TerminalInputParameters: Codable, Sendable { public var terminalID: String; public var mode: TerminalInputMode; public var value: String; public init(terminalID: String, mode: TerminalInputMode, value: String) { self.terminalID = terminalID; self.mode = mode; self.value = value }; enum CodingKeys: String, CodingKey { case terminalID = "terminal_id", mode, value } }
 public struct TerminalResizeParameters: Codable, Sendable { public var terminalID: String; public var rows: UInt16; public var columns: UInt16; public init(terminalID: String, rows: UInt16, columns: UInt16) { self.terminalID = terminalID; self.rows = rows; self.columns = columns }; enum CodingKeys: String, CodingKey { case terminalID = "terminal_id", rows, columns } }
 public struct TerminalAttachment: Codable, Sendable { public let attachmentID: String; public let terminalID: String; public let runtimeIncarnation: String; public let ownerHostID: String; public let streamURL: String; public let streamCapability: String?; public let state: String; public let expiresAt: String; public let reusable: Bool?; public let ttlS: UInt64?; public let retryHint: String?; enum CodingKeys: String, CodingKey { case attachmentID = "attachment_id", terminalID = "terminal_id", runtimeIncarnation = "runtime_incarnation", ownerHostID = "owner_host_id", streamURL = "stream_url", streamCapability = "stream_capability", state, expiresAt = "expires_at", reusable, ttlS = "ttl_s", retryHint = "retry_hint" } }
-public struct ActionResult: Codable, Sendable { public let kind: String; public let actionID: String; public let operationID: String; public let status: String; public let affectedIDs: [String]; public let snapshotID: String; public let terminalAttachment: TerminalAttachment?; public let harnessControl: HarnessControlReceipt?; public let harnessModel: HarnessModelReceipt?; enum CodingKeys: String, CodingKey { case kind, actionID = "action_id", operationID = "operation_id", status, affectedIDs = "affected_ids", snapshotID = "snapshot_id", terminalAttachment = "terminal_attachment", harnessControl = "harness_control", harnessModel = "harness_model" } }
+public struct ActionResult: Codable, Sendable { public let kind: String; public let actionID: String; public let operationID: String; public let status: String; public let affectedIDs: [String]; public let snapshotID: String; public let terminalAttachment: TerminalAttachment?; public let harnessControl: HarnessControlReceipt?; public let harnessModel: HarnessModelReceipt?; public let harnessAsk: HarnessAskReceipt?; enum CodingKeys: String, CodingKey { case kind, actionID = "action_id", operationID = "operation_id", status, affectedIDs = "affected_ids", snapshotID = "snapshot_id", terminalAttachment = "terminal_attachment", harnessControl = "harness_control", harnessModel = "harness_model", harnessAsk = "harness_ask" } }
 
 public struct PairingBegin: Codable, Sendable { public let apiVersion: String; public let deviceName: String; public let personID: String; public let fullControl: Bool?; public let scopes: [String]?; public init(apiVersion: String, deviceName: String, personID: String, fullControl: Bool? = nil, scopes: [String]? = nil) { self.apiVersion = apiVersion; self.deviceName = deviceName; self.personID = personID; self.fullControl = fullControl; self.scopes = scopes }; enum CodingKeys: String, CodingKey { case apiVersion = "api_version", deviceName = "device_name", personID = "person_id", fullControl = "full_control", scopes } }
 public struct PairingChallenge: Codable, Sendable { public let kind: String; public let pairingID: String; public let code: String; public let expiresAt: String; enum CodingKeys: String, CodingKey { case kind, pairingID = "pairing_id", code, expiresAt = "expires_at" } }

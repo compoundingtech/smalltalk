@@ -2,6 +2,7 @@
 // A void ExtensionAPI sendMessage return proves nothing: only the exact native message event settles input.
 import { createHash, randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { createHarnessAsk } from "./omp-harness-ask.ts";
 // OMP's native thinking selector includes max, unlike older pi-family declarations.
 type NativeControlAPI = Omit<ExtensionAPI, "setThinkingLevel"> & {
   setThinkingLevel(level: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"): void;
@@ -65,11 +66,13 @@ export const createHarnessControl = (pi: NativeControlAPI, send: (frame: Record<
     }
     return { ...values, revision: createHash("sha256").update(JSON.stringify(values)).digest("hex") };
   };
+  const askControl = createHarnessAsk(pi, send, current, () => snapshot());
   const snapshot = (force = false) => {
     if (!context) return;
     const frame = { type: "harness_control_state", session_id: context.sessionManager.getSessionId(), turn_id: turnId, idle: idle(), input_supported: !transitioning && !!current(), reason: transitioning ? "session-transition-state-unknown" : undefined,
       steer: { state: "unsupported", reason: "native-pre-dequeue-api-unavailable" },
       models: modelDescriptor(),
+      ...askControl.state(),
       approval: { supported: false, reason: "native-live-approval-api-unavailable" } };
     const serialized = JSON.stringify(frame);
     if (force || serialized !== lastSnapshot) {
@@ -92,7 +95,7 @@ export const createHarnessControl = (pi: NativeControlAPI, send: (frame: Record<
   for (const name of ["session_before_switch", "session_before_branch", "session_before_tree"] as const) {
     pi.on(name, (_event, ctx) => {
       if ((ctx as ExtensionContext & { agent?: { kind?: string } }).agent?.kind === "sub") return;
-      if (pending.size || mutation) return { cancel: true };
+      if (pending.size || mutation || askControl.busy()) return { cancel: true };
       transitioning = true;
       snapshot();
     });
@@ -199,7 +202,12 @@ export const createHarnessControl = (pi: NativeControlAPI, send: (frame: Record<
     };
     const live = current();
     if (!live || !sameBinding(binding, live)) { reject("stale-native-binding"); return true; }
+    if ((wire.type === "answer_ask" || wire.type === "harness_ask_terminal_failure") && !transitioning && !mutation && !pending.size) {
+      askControl.handle(wire, binding);
+      return true;
+    }
     if (transitioning || mutation || pending.size) { reject(transitioning ? "session-transition-state-unknown" : "native-control-busy"); return true; }
+    if (askControl.busy()) { reject("native-ask-answer-in-flight"); return true; }
     if (wire.type === "input" && wire.lane === "steer") { reject("native-pre-dequeue-api-unavailable"); return true; }
     if (wire.type === "input" && typeof wire.entry_id === "string" && typeof wire.actor === "string" && typeof wire.content === "string" && wire.lane === "follow_up") {
       if (!idle()) { reject("native-not-idle"); return true; }
@@ -216,5 +224,5 @@ export const createHarnessControl = (pi: NativeControlAPI, send: (frame: Record<
     } else reject("command-unsupported");
     return true;
   };
-  return { handle, observe: () => snapshot(), replay: () => { snapshot(true); for (const receipt of receipts.values()) send(receipt); } };
+  return { handle, observe: () => snapshot(), replay: () => { snapshot(true); for (const receipt of receipts.values()) send(receipt); askControl.replay(); } };
 };

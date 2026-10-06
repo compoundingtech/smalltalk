@@ -13,6 +13,42 @@ fn decode<T: serde::de::DeserializeOwned>(name: &str) -> T {
 }
 
 #[test]
+fn native_ask_receipt_does_not_decode_as_an_input_receipt() {
+    let value = serde_json::json!({
+        "operation_id": "operation/answer",
+        "subject": "agent/worker",
+        "binding": {
+            "desired_revision": "revision/one",
+            "incarnation_id": "incarnation/one",
+            "session_id": "session/one",
+            "turn_id": "turn/one"
+        },
+        "tool_call_id": "ask/one",
+        "status": "applied",
+        "reason": null,
+        "result": {
+            "native_event": "tool_result",
+            "tool_call_id": "ask/one",
+            "answers": [
+                { "id": "custom", "selected_options": [], "custom_input": "A different answer" },
+                { "id": "multi", "selected_options": [] }
+            ]
+        }
+    });
+    let receipt: HarnessControlOperationReceipt = serde_json::from_value(value).unwrap();
+    let HarnessControlOperationReceipt::Ask(receipt) = receipt else {
+        panic!("an ask result must not be interpreted as queue input or a model switch");
+    };
+    let result = receipt.result.unwrap();
+    assert_eq!(result.tool_call_id, receipt.tool_call_id);
+    assert_eq!(result.answers[0].custom_input.as_deref(), Some("A different answer"));
+    assert!(result.answers[1].selected_options.is_empty());
+    assert_eq!(result.answers[1].custom_input, None);
+    let native: HarnessNativeResult = serde_json::from_value(serde_json::to_value(result).unwrap()).unwrap();
+    assert!(matches!(native, HarnessNativeResult::Ask(_)));
+}
+
+#[test]
 fn search_fixture_preserves_result_targets_and_incomplete_history() {
     let search: Envelope<ConversationSearch> = decode("conversation-search.json");
     assert_eq!(search.value.items[0].entry_id, "timeline-entry/note");

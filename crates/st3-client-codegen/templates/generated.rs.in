@@ -6,6 +6,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 pub use st3_schema::harness_control::{
+    AskAnswer as HarnessAskAnswer, AskOption as HarnessAskOption, AskQuestion as HarnessAskQuestion,
+    PendingAskView as HarnessPendingAsk, PublicAskParameters as HarnessAskParameters,
+    PublicAskAnswer as HarnessAskSelectionAnswer,
+    AskReceipt as HarnessAskReceipt, AskResult as HarnessAskResult,
+    AskOutcome as HarnessAskOutcome, AskIndeterminateReason as HarnessAskIndeterminateReason,
     Approval as HarnessApproval, Binding as HarnessBinding, ControlState as HarnessControlState,
     ControlOperationReceipt as HarnessControlOperationReceipt,
     InputResult as HarnessInputResult, Lane as HarnessLane, ModelCatalogPage as HarnessModelCatalogPage,
@@ -87,6 +92,9 @@ pub enum ErrorCode {
     UnavailableHarnessModel,
     UnsupportedHarnessEffort,
     HarnessControlBusy,
+    AskNoLongerPending,
+    InvalidHarnessAnswers,
+    UnsupportedHarnessAsk,
     RemoteUnavailable,
     TerminalUnavailable,
     TerminalEnded,
@@ -2114,6 +2122,8 @@ pub struct Fence {
 pub enum ActionType {
     #[serde(rename="custom.reply")]
     CustomReply,
+    #[serde(rename = "harness.answer_ask")]
+    HarnessAnswerAsk,
     #[serde(rename = "harness.queue.mutate")]
     HarnessQueueMutate,
     #[serde(rename = "harness.model.set")]
@@ -2631,6 +2641,8 @@ pub struct ActionResult {
     pub harness_control: Option<HarnessControlReceipt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness_model: Option<HarnessModelReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_ask: Option<HarnessAskReceipt>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
