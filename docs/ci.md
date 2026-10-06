@@ -343,8 +343,8 @@ warm caches kept on the machine. GitHub has no overflow between runner labels, s
 starts with `pick-runner`, a GitHub-hosted job that lists the organization's self-hosted runners
 through the API and picks the primary test partition's pool:
 
-- `ci1` when at least `CI1_MIN_IDLE` (default 4) general runners are online and idle. This leaves
-  CPU capacity for the priority and merge reservations;
+- `ci1` when at least `CI1_MIN_IDLE` (default 1) general runners are online and idle. Priority
+  and merge-only workers are excluded from this ordinary pool;
 - `ci1-priority` for trusted PRs labelled `ci-priority`, without an idle-count or token dependency.
   Pending urgent checks get the next free general runners; one slot stays reserved for priority
   and merge work after urgent checks finish;
@@ -356,9 +356,19 @@ through the API and picks the primary test partition's pool:
   unavailable, and always for a pull request from a fork. The repository is public and a self-hosted
   runner runs whatever a job asks, so fork code never reaches ci1 (and forks receive no secrets).
 
-Only `linux-tests` reads `pick-runner`'s output and falls back to Namespace when it is empty.
-The second shard, Clippy, compatibility, generated-file checks, TypeScript, isolation and cost
-jobs always use existing Namespace capacity, keeping their builds off ci1's test cores. The
+`linux-tests` reads the primary output and falls back to Namespace when it is empty.
+The second shard and mail canaries read separate outputs, each choosing only `ci1` general
+capacity. The picker counts online, idle general runners and subtracts one slot when the primary
+may also use that pool. It offers the remaining slots to the second shard, then the canaries;
+each falls back to the same Namespace priority and run affinity when no slot remains. The
+primary's admission threshold does not strand idle slots for these two extra jobs. A previous
+threshold of four sent the primary to Namespace even when three general workers were free;
+the one-slot default lets both shards and canaries use those three workers.
+Neither extra output can select `ci1-priority` or `ci1-merge`. A missing status token, failed
+lookup, or malformed response leaves the extra jobs on Namespace, while reserved primary
+routing remains available without that token. Forks never reach any ci1 output.
+Clippy, compatibility, generated-file checks, TypeScript, isolation and cost
+jobs always use existing Namespace capacity. The
 aggregate stays on GitHub-hosted capacity regardless of that choice. The required check names
 are unchanged; `linux-gate` names both test shards, its supporting stages and the redelivery
 canary instead of `needs.*`, because `pick-runner` is skipped whenever ci1 is off.
@@ -368,14 +378,16 @@ label while urgent required checks are pending. It also lends the other general 
 priority work during that interval, so queued ordinary work cannot take the next free slot.
 A guard applies labels after every ephemeral registration, before the runner accepts work.
 It changes labels without interrupting running jobs; the dedicated merge runner stays available.
-Two runs that pick at the same moment can both choose ci1; the later run's jobs then wait for
-runners on ci1.
+This is a snapshot of idle capacity, not an atomic reservation. Two runs that pick at the same
+moment can both choose ci1; the later run's jobs then wait for runners on ci1. Each picker allocates
+distinct slots within its own run; it never promises one idle worker to both extra jobs.
 
 The switch is the repository variable `CI1_RUNNERS`: unset (the default), `pick-runner` is skipped
 and all workload jobs go to Namespace. `on` turns the choice on, and unsetting it turns
 it off again without a pull request. `pick-runner` reads the runners with the
 `CI1_RUNNERS_READ_TOKEN` secret, a token that may only read the organization's self-hosted runners;
-without it non-queue runs go to Namespace. Merge-group runs need no organization status token; a failed PR-label lookup retains merge capacity.
+without it ordinary primary and extra jobs go to Namespace. Reserved merge/priority primary
+selection needs no organization status token; a failed PR-label lookup retains merge capacity.
 
 On ci1 each runner is ephemeral: it takes one job, runs it as its own user in a fresh work directory
 with its own `/tmp`, and nothing the job started outlives it. The runner names a Cargo home in
