@@ -101,7 +101,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     self.record_once(&subject.subject, "runtime.observed", fields)?;
                 }
                 if subject.kind != "stop"
-                    && self.defer_declared_restart(subject, observation, now_ms())?
+                    && self.defer_declared_restart(subject, observation, now_ms(), None)?
                 {
                     let screen = member.terminal
                         .then(|| self.member_screen(&member.runtime_id).ok()).flatten();

@@ -2375,7 +2375,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                                 if let Some(changes) =
                                     self.declared_launch_changes(subject, member, &observation)?
                                 {
-                                    if self.defer_declared_restart(subject, &observation, now_ms())? {
+                                    if self.defer_declared_restart(subject, &observation, now_ms(), blocked.as_ref())? {
                                         incumbent = observation.incarnation_id.as_deref()
                                             .map(|incarnation| crate::rollout::launched_member(
                                                 &self.store, &subject.subject, incarnation,

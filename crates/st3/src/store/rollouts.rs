@@ -10,23 +10,43 @@ fn restart_frontier(connection: &Connection) -> Result<(u64, u64)> {
     ).map_err(Into::into)
 }
 
-fn restart_cutover(connection: &Connection, subject: &str) -> Result<bool> {
+fn restart_cutover_request(connection: &Connection, subject: &str) -> Result<Option<ClaimRecord>> {
     let Some(desired) = current_desired_row(connection, subject)? else {
-        return Ok(false);
+        return Ok(None);
     };
     let (_, owner, conflict) = selected_actual_source_at(connection, subject, None, None)?;
     let Some(actual) = latest_actual(connection, subject)?.filter(|actual| actual["status"] == "running") else {
-        return Ok(false);
+        return Ok(None);
     };
-    if conflict { return Ok(false); }
+    if conflict { return Ok(None); }
     let incarnation = actual["incarnation_id"].as_str();
-    Ok(connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM claims WHERE subject=?1 AND kind='runtime.action.requested'
+    let request = connection.query_row(&canonical_sql(
+        "SELECT id,store_index,batch_id,subject,kind,origin,actor,body,predecessors,accepted_at_unix_ms
+         FROM claims WHERE subject=?1 AND kind='runtime.action.requested'
             AND origin=?2 AND json_extract(body,'$.fields.action')='apply-restart-cutover'
             AND json_extract(body,'$.fields.rollout.desired_token')=?3
-            AND json_extract(body,'$.fields.incarnation_id')=?4)",
-        params![subject, owner, desired.claim_id, incarnation], |row| row.get(0),
-    )?)
+            AND json_extract(body,'$.fields.incarnation_id')=?4
+            AND NOT EXISTS (SELECT 1 FROM claims ended WHERE ended.subject=claims.subject
+                AND ended.origin=claims.origin AND ended.kind='runtime.action.failed'
+                AND json_extract(ended.body,'$.fields.operation')=claims.id
+                AND json_extract(ended.body,'$.fields.operation_status')='aborted')
+         ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
+        params![subject, owner, desired.claim_id, incarnation], claim_from_row,
+    ).optional()?;
+    if request.is_none() { return Ok(None); }
+    let evaluated = connection.query_row(
+        "SELECT subject,kind,body,member,owner_run,owner_generation,owner_step FROM desired WHERE subject=?1",
+        [subject], desired_from_row,
+    )?;
+    // Old or externally produced barriers cannot hold a seat whose launch is already current.
+    if running_restart_at(connection, &evaluated, None).map_err(internal)?.is_none() {
+        return Ok(None);
+    }
+    Ok(request)
+}
+
+fn restart_cutover(connection: &Connection, subject: &str) -> Result<bool> {
+    Ok(restart_cutover_request(connection, subject)?.is_some())
 }
 
 fn selection(connection: &Connection, subject: &str) -> Result<Option<Selection>, St3Error> {
@@ -342,6 +362,39 @@ pub(super) fn message_allowed(
 }
 
 impl Store {
+    /// Bind the policy/token to the declaration the caller actually evaluated, before proof reads.
+    pub(crate) fn restart_policy_for(
+        &self, evaluated: &DesiredSubject,
+    ) -> Result<Option<(String, Option<crate::rollout::DeferredRestart>)>> {
+        let connection = self.readers.get();
+        let Some(row) = current_desired_row(&connection, &evaluated.subject)? else {
+            return Ok(None);
+        };
+        let current = connection.query_row(
+            "SELECT subject,kind,body,member,owner_run,owner_generation,owner_step FROM desired WHERE subject=?1",
+            [&evaluated.subject], desired_from_row,
+        )?;
+        if current != *evaluated { return Ok(None); }
+        let claim = claim_by_id_tx(&connection, &row.claim_id)?;
+        let pending = claim.and_then(|claim| claim.body.get("deferred_restart").cloned())
+            .map(serde_json::from_value).transpose()?;
+        Ok(Some((row.claim_id, pending)))
+    }
+
+    pub(crate) fn abort_restart_cutover(&self, subject: &str, token: &str, reason: &str) -> Result<()> {
+        self.connection.batched(|tx| -> Result<()> {
+            let Some(request) = restart_cutover_request(tx, subject)? else { return Ok(()); };
+            if request.body.pointer("/fields/rollout/desired_token").and_then(Value::as_str) != Some(token) {
+                return Ok(());
+            }
+            append_claim_tx(tx, self.origin(), subject, "runtime.action.failed", Some(subject),
+                &json!({"fields":{"action":"apply-restart-cutover","operation":request.id,
+                    "operation_status":"aborted","reason":reason},"evidence":[request.id]}),
+                &[], None)?;
+            Ok(())
+        }).map_err(anyhow::Error::msg)?
+    }
+
     pub(crate) fn restart_cutover(&self, subject: &str) -> Result<bool> {
         restart_cutover(&self.readers.get(), subject)
     }
@@ -365,9 +418,10 @@ impl Store {
     /// A proof taken outside the writer is accepted only if neither frontier changed.
     /// Claim intake uses this same writer, so it either precedes the proof or sees the fence.
     pub(crate) fn commit_restart_cutover(
-        &self, subject: &str, desired_token: &str, incarnation: &str,
+        &self, evaluated: &DesiredSubject, desired_token: &str, incarnation: &str,
         frontier: (u64, u64), deadline: u128,
     ) -> Result<bool> {
+        let subject = &evaluated.subject;
         self.connection.batched(|tx| -> Result<bool> {
             if restart_frontier(tx)? != frontier || now_ms() >= deadline {
                 return Ok(false);
@@ -375,8 +429,14 @@ impl Store {
             let Some(desired) = current_desired_row(tx, subject)? else { return Ok(false); };
             let (_, owner, conflict) = selected_actual_source_at(tx, subject, None, None)?;
             let actual = latest_actual(tx, subject)?;
-            if desired.claim_id != desired_token || conflict || owner.as_deref() != Some(self.origin())
+            let current = tx.query_row(
+                "SELECT subject,kind,body,member,owner_run,owner_generation,owner_step FROM desired WHERE subject=?1",
+                [subject], desired_from_row,
+            )?;
+            if desired.claim_id != desired_token || current != *evaluated || conflict
+                || owner.as_deref() != Some(self.origin())
                 || actual.as_ref().is_none_or(|a| a["status"] != "running" || a["incarnation_id"] != incarnation)
+                || running_restart_at(tx, &current, None).map_err(internal)?.is_none()
             {
                 return Ok(false);
             }

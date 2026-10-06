@@ -8,10 +8,21 @@ impl<R: RuntimeControl> Reconciler<R> {
         subject: &DesiredSubject,
         observation: &RuntimeObservation,
         now: u128,
+        blocked: Option<&anyhow::Error>,
     ) -> Result<bool> {
-        let Some(pending) = rollout::deferred_restart(&self.store, &subject.subject)? else {
-            return Ok(false);
+        let Some((token, pending)) = self.store.restart_policy_for(subject)? else {
+            // The pass evaluated a superseded declaration. Do not stop for stale launch changes.
+            self.arm_restart(&format!("deferred-restart:{}", subject.subject), now);
+            return Ok(true);
         };
+        let Some(pending) = pending else { return Ok(false); };
+        if let Some(error) = blocked {
+            self.store.abort_restart_cutover(&subject.subject, &token, &format!("{error:#}"))?;
+            if now < pending.deadline_unix_ms {
+                self.arm_restart(&format!("deferred-restart:{}", subject.subject), pending.deadline_unix_ms);
+            }
+            return Ok(true);
+        }
         if self.store.restart_cutover(&subject.subject)? {
             return Ok(false);
         }
@@ -21,10 +32,8 @@ impl<R: RuntimeControl> Reconciler<R> {
         let blockers = rollout::restart_blockers(&self.store, &subject.subject, incarnation)?;
         let expired = now >= pending.deadline_unix_ms;
         if !expired && blockers.is_empty() {
-            let token = self.store.selected_desired_token(&subject.subject)?
-                .context("deferred restart needs a desired claim")?;
             self.store.commit_restart_cutover(
-                &subject.subject, &token, incarnation, frontier, pending.deadline_unix_ms,
+                subject, &token, incarnation, frontier, pending.deadline_unix_ms,
             )?;
             // A separate pass renders only after the durable barrier is visible.
             self.arm_restart(&format!("deferred-restart:{}", subject.subject), now);

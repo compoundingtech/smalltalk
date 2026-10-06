@@ -266,6 +266,9 @@ impl Seat {
             "version 2\nagent \"garden/orchard\" {{ host \"amber\"; workspace {:?}; harness \"claude\" {{ model {model:?}; }} }}",
             self.root.path().display().to_string(),
         );
+        self.publish_plain_source(source, policy, key);
+    }
+    fn publish_plain_source(&self, source: String, policy: Option<&Policy>, key: &str) {
         let intent = parse_intent(&source, "amber").unwrap();
         let preview = self.store.mission(&intent, crate::model::IntentInput {
             kdl: source, source_name: None,
@@ -371,11 +374,11 @@ fn apply_restart_cutover_serializes_with_claim_and_expires_with_incarnation() {
         idempotency_key: key.into(),
     };
     seat.store.work_action(&run.steps[0].subject, "claim", &request("claim-before")).unwrap();
-    assert!(!seat.store.commit_restart_cutover(SUBJECT, &token, "original-1", frontier, deadline).unwrap());
+    assert!(!seat.store.commit_restart_cutover(&seat.desired(), &token, "original-1", frontier, deadline).unwrap());
     seat.store.work_action(&run.steps[0].subject, "complete", &request("done")).unwrap();
     let frontier = seat.store.restart_frontier().unwrap();
     assert!(rollout::restart_blockers(&seat.store, SUBJECT, "original-1").unwrap().is_empty());
-    assert!(seat.store.commit_restart_cutover(SUBJECT, &token, "original-1", frontier, deadline).unwrap());
+    assert!(seat.store.commit_restart_cutover(&seat.desired(), &token, "original-1", frontier, deadline).unwrap());
     assert_eq!(seat.store.work_action(&run.steps[1].subject, "claim", &request("claim-after"))
         .unwrap_err().code, "seat-rollout-draining");
     seat.append("runtime.observed", json!({
@@ -386,6 +389,86 @@ fn apply_restart_cutover_serializes_with_claim_and_expires_with_incarnation() {
     seat.store.work_action(&run.steps[1].subject, "claim", &crate::model::WorkRequest {
         incarnation: Some("replacement-1".into()), ..request("replacement-claim")
     }).unwrap();
+}
+
+#[test]
+fn apply_restart_aborts_cutover_when_render_or_workspace_preparation_fails() {
+    for missing_workspace in [false, true] {
+        let seat = Seat::new_with_owned(false);
+        let workspace = if missing_workspace {
+            seat.root.path().join("missing")
+        } else {
+            fs::write(seat.root.path().join("blocked"), "not a directory").unwrap();
+            seat.root.path().to_path_buf()
+        };
+        seat.publish_plain_source(format!(
+            "version 2\nagent \"garden/orchard\" {{ host \"amber\"; workspace {:?}; harness \"claude\" {{ model \"second\"; }}; render {{ file \"blocked/output\" \"new\"; }} }}",
+            workspace.display().to_string(),
+        ), Some(&Policy::when_idle(1_800_000, false)), "broken-target");
+        seat.busy(false);
+        let token = seat.store.selected_desired_token(SUBJECT).unwrap().unwrap();
+        let deadline = rollout::deferred_restart(&seat.store, SUBJECT).unwrap().unwrap().deadline_unix_ms;
+        assert!(seat.store.commit_restart_cutover(
+            &seat.desired(), &token, "original-1", seat.store.restart_frontier().unwrap(), deadline,
+        ).unwrap());
+        seat.plain_step();
+        assert!(seat.runtime.stops.lock().is_empty());
+        assert!(!seat.store.restart_cutover(SUBJECT).unwrap());
+        assert_eq!(rollout::status(&seat.store, SUBJECT).unwrap().unwrap()["phase"], "pending");
+        assert!(seat.store.claims_for(SUBJECT, Some("runtime.action.failed")).unwrap().iter()
+            .any(|claim| claim.body["fields"]["action"] == "apply-restart-cutover"
+                && claim.body["fields"]["operation_status"] == "aborted"));
+        let run = seat.work();
+        seat.store.work_action(&run.steps[0].subject, "claim", &crate::model::WorkRequest {
+            actor: Some(SUBJECT.into()), incarnation: Some("original-1".into()),
+            summary: Some("keep tending".into()), reason: None, evidence: Vec::new(),
+            idempotency_key: "after-abort".into(),
+        }).unwrap();
+    }
+}
+
+#[test]
+fn apply_restart_superseding_revert_rejects_stale_proof_and_releases_hidden_barrier() {
+    let seat = Seat::new_with_owned(false);
+    let policy = Policy::when_idle(1_800_000, false);
+    seat.publish_plain("second", Some(&policy), "changed");
+    let evaluated = seat.desired();
+    let changed_token = seat.store.selected_desired_token(SUBJECT).unwrap().unwrap();
+    seat.publish_plain("first", Some(&policy), "reverted");
+    seat.busy(false);
+    let token = seat.store.selected_desired_token(SUBJECT).unwrap().unwrap();
+    let deadline = rollout::deferred_restart(&seat.store, SUBJECT).unwrap().unwrap().deadline_unix_ms;
+    let frontier = seat.store.restart_frontier().unwrap();
+    assert!(!seat.store.commit_restart_cutover(
+        &evaluated, &changed_token, "original-1", frontier, deadline,
+    ).unwrap());
+    // Even a newly re-fetched token cannot relabel the stale evaluated declaration.
+    assert!(!seat.store.commit_restart_cutover(
+        &evaluated, &token, "original-1", frontier, deadline,
+    ).unwrap());
+    assert!(!seat.store.commit_restart_cutover(
+        &seat.desired(), &token, "original-1", frontier, deadline,
+    ).unwrap());
+    let reconciler = Reconciler::new(
+        seat.store.clone(), seat.runtime.clone(), "amber".into(), Arc::new(Notify::new()),
+    );
+    assert!(reconciler.defer_declared_restart(
+        &evaluated, &seat.runtime.observation.lock().clone().unwrap(), now_ms(), None,
+    ).unwrap());
+    // Upgrade/recovery of an old buggy barrier must preserve the same invariant.
+    seat.append("runtime.action.requested", json!({
+        "action":"apply-restart-cutover","incarnation_id":"original-1",
+        "rollout":{"desired_token":token},
+    }));
+    assert!(!seat.store.restart_cutover(SUBJECT).unwrap());
+    assert!(rollout::status(&seat.store, SUBJECT).unwrap().is_none());
+    let run = seat.work();
+    seat.store.work_action(&run.steps[0].subject, "claim", &crate::model::WorkRequest {
+        actor: Some(SUBJECT.into()), incarnation: Some("original-1".into()),
+        summary: Some("keep tending".into()), reason: None, evidence: Vec::new(),
+        idempotency_key: "after-revert".into(),
+    }).unwrap();
+    assert!(seat.runtime.stops.lock().is_empty());
 }
 
 #[test]
@@ -407,7 +490,7 @@ fn apply_restart_deadline_keeps_change_held_until_explicit_restart_now() {
     );
     let observed = seat.runtime.observation.lock().clone().unwrap();
     assert!(reconciler.defer_declared_restart(
-        &seat.desired(), &observed, pending.deadline_unix_ms,
+        &seat.desired(), &observed, pending.deadline_unix_ms, None,
     ).unwrap());
     assert_eq!(
         seat.store.latest_observation(SUBJECT, "runtime.reconcile-decision")
