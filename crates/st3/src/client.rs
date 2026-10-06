@@ -1571,10 +1571,13 @@ mod tests {
             "the follow read exited during the outage"
         );
         let server = tokio::spawn(async move {
-            crate::api::serve_unix(&socket, test_router()).await.unwrap();
+            crate::api::serve_unix(&socket, test_api()).await.unwrap();
         });
         let value = tokio::time::timeout(Duration::from_secs(10), read)
-            .await.unwrap().unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         assert_eq!(value, json!({"method": "get"}));
         server.abort();
     }
