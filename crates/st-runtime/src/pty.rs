@@ -1662,7 +1662,9 @@ exit 0
         let binary = fake_pty(root.path(), "fake-pty-unresolved-publication", "");
         let runtime = PtyRuntime::new(root.path().join("registry"))
             .with_binary(binary.to_string_lossy())
-            .with_spawn_timeout(Duration::from_millis(30));
+            // Parallel tests may briefly inherit the lock while forking their fake PTYs.
+            // Allow that contention without changing production deadlines.
+            .with_spawn_timeout(Duration::from_secs(1));
         let fence = runtime.spawn_state_path("work", "pending");
 
         for expected_launches in 1..=3 {
