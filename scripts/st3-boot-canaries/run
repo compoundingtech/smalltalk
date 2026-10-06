@@ -15,9 +15,15 @@ step it names. SCENARIO is one of
                     takes a message
     concurrent      five seats launch at once
     suspend         the booted seat finishes its step and is suspended: no process remains, a
-                    message waits, and resume brings back the same native session, which reads
-                    it. Then a resume whose transcript is gone fails with a typed reason and the
+                    message waits, and resume brings back the same native session, which holds
+                    that old mail and reads a fresh message. Then a resume whose transcript is gone fails with a typed reason and the
                     seat stays suspended.
+    import          a saved Codex session binds its exact ID and originating home on first import
+                    and restart, while a stale copy exists in the daemon's default environment
+    utf8            Codex recovers a receipt from a split UTF-8 transcript and keeps delivering
+                    through discovery I/O failures, with private, rate-limited warnings.
+    idle-hold       Codex/OpenCode make zero hold calls during a real idle minute, then deliver
+                    fresh mail and retain native consumption across hold, release and expiry.
 
 Every seat must, within the time bound, claim its step with its current incarnation and read an
 st message, and none may park in the crash-loop guard. The verdict is in EVIDENCE_DIR/result.json.
@@ -37,13 +43,14 @@ import time
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 sys.dont_write_bytecode = True
-from st_boundary import fresh_seat_findings
+from st_boundary import fresh_seat_findings, output_findings
 
 HARNESSES = ("claude", "codex", "pi", "omp", "opencode")
-SCENARIOS = ("fresh", "restart", "daemon-restart", "reexec", "concurrent", "suspend")
+SCENARIOS = ("fresh", "restart", "daemon-restart", "reexec", "concurrent", "suspend", "utf8", "idle-hold", "channel-missing", "channel-uninitialized", "channel-parked", "import")
 RUN_ID = "c1"
 MISSION = "canary/boot"
 LETTERS = "abcde"
+IMPORTED_SUBJECT = None
 
 
 class Failure(Exception):
@@ -91,10 +98,11 @@ class Node:
         # binary. A link, because a debug st3 is hundreds of megabytes and /tmp is a small tmpfs.
         self.binary = root / "bin/st3"
         self.binary.symlink_to(binary)
-        pty = shutil.which("pty")
-        if not pty:
-            raise SystemExit("pty must be on PATH")
-        (root / "bin/pty").symlink_to(pty)
+        for tool in ("pty", "git"):
+            executable = shutil.which(tool)
+            if not executable:
+                raise SystemExit(f"{tool} must be on PATH")
+            (root / "bin" / tool).symlink_to(executable)
         install_stub(root / "bin", harness)
         self.path = f"{root / 'bin'}:/usr/bin:/bin"
         self.endpoint = root / "run/st.sock"
@@ -120,6 +128,9 @@ client_gateway_socket = "{root / 'run/client.sock'}"
         self.daemon = None
 
     def start(self):
+        if not (self.root / "ws/.git").exists():
+            subprocess.run(["git", "init", "-q", str(self.root / "ws")], env=self.env, check=True)
+            subprocess.run(["git", "-C", str(self.root / "ws"), "-c", "user.name=Canary", "-c", "user.email=canary@example.invalid", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-qm", "Canary workspace"], env=self.env, check=True)
         self.daemon = subprocess.Popen([str(self.binary), "up", "--config", str(self.root / "config.toml")],
                                        env=self.env, cwd=self.root / "ws", stdin=subprocess.DEVNULL,
                                        stdout=self.log, stderr=self.log, start_new_session=True)
@@ -201,7 +212,7 @@ client_gateway_socket = "{root / 'run/client.sock'}"
 
 
 def seat_subject(letter):
-    return f"agent/{RUN_ID}/seat-{letter}"
+    return IMPORTED_SUBJECT or f"agent/{RUN_ID}/seat-{letter}"
 
 
 def mission_source(node, count, harness, hold=False):
@@ -215,7 +226,8 @@ def mission_source(node, count, harness, hold=False):
     gate "never" { exists "mission-run/${ST_MISSION_RUN}/never" }
   }""" if hold else ""
     for letter in LETTERS[:count]:
-        seats += f'''
+        if not IMPORTED_SUBJECT:
+            seats += f'''
   agent "seat-{letter}" {{
     workspace "{node.root / 'ws'}"
     restart "always"
@@ -223,7 +235,7 @@ def mission_source(node, count, harness, hold=False):
   }}'''
         steps += f'''
   step "work-{letter}" {{
-    assigned-to "agent/${{ST_MISSION_RUN}}/seat-{letter}"
+    assigned-to "{IMPORTED_SUBJECT or ('agent/${ST_MISSION_RUN}/seat-' + letter)}"
     goal "Boot canary: claim this step."
   }}'''
     return f'''version 2
@@ -249,6 +261,8 @@ def parked(node, subject):
         body = row.get("body", row)
         fields = body.get("fields", body)
         if row.get("kind") == "runtime.reconcile-decision" and "crash-loop" in str(fields.get("key", "")):
+            return fields
+        if row.get("kind") == "runtime.action.failed" and fields.get("action") == "claude-channel-recovery":
             return fields
     return None
 
@@ -339,10 +353,15 @@ def driver_processes(node):
     return rows
 
 
-def check_boundary(node):
+def check_boundary(node, stopped=False):
     """A fresh seat's processes stay inside st's boundary."""
     processes = node.seat_processes(with_environment=True)
-    violations = list(fresh_seat_findings(node.root, processes))
+    if stopped:
+        if processes:
+            fail("a parked seat still has live processes")
+        violations = list(output_findings(node.root))
+    else:
+        violations = list(fresh_seat_findings(node.root, processes))
     if violations:
         fail("fresh seat boundary: " + "; ".join(violations))
 
@@ -401,6 +420,45 @@ def forget_native_session(node, harness, session):
         path.unlink()
 
 
+def native_offer_count(node, reference):
+    """Count provider handoffs, independently of idempotent graph receipt claims."""
+    return sum((row.get("event") == "channel" and reference in row.get("content", ""))
+               or (row.get("event") == "turn" and reference in row.get("text", ""))
+               for row in receipts(node, "a"))
+
+
+def age_mail_fixture(node, subject):
+    """Backdate isolated mail while preserving the store's transactional row digest."""
+    import hashlib
+    import sqlite3
+
+    def projection_change(accumulator, table, columns, old, new, version):
+        # Matches smallclaims::store::projection_digest's version-one row accumulator.
+        if version != 1:
+            raise ValueError("unsupported fixture projection digest version")
+        total = int.from_bytes(accumulator, "big")
+        for row, sign in ((old, -1), (new, 1)):
+            if row is None:
+                continue
+            digest = hashlib.sha512(b"st3-projection-row-v1\0")
+            for value in (table, columns, row):
+                data = value.encode()
+                digest.update(len(data).to_bytes(8, "big"))
+                digest.update(data)
+            total += sign * int.from_bytes(digest.digest(), "big")
+        return (total % (1 << 512)).to_bytes(64, "big")
+
+    with sqlite3.connect(node.root / "state/claims.sqlite3", timeout=10) as connection:
+        connection.execute("PRAGMA recursive_triggers=ON")
+        connection.create_function("st_projection_change", 6, projection_change, deterministic=True)
+        changed = connection.execute(
+            "UPDATE claims SET accepted_at_unix_ms=? WHERE subject=? AND kind='message.sent'",
+            (str(time.time_ns() // 1_000_000 - 3_600_001), subject),
+        ).rowcount
+        if changed != 1:
+            fail("the hour-old fixture has no unique sent claim")
+
+
 def suspend_and_resume(node, seats, harness):
     subject = seat_subject("a")
     step = seats.step("a")
@@ -432,6 +490,8 @@ def suspend_and_resume(node, seats, harness):
     # Mail to a suspended seat waits, and its restart policy does not wake it.
     sent = node.json("conversations", "send", subject, "--from", "person/eval",
                      "--subject", "while suspended", "--body", "boot canary suspended")["subject"]
+    # Old means the same one-hour age as the backlog; only this isolated fixture is changed.
+    age_mail_fixture(node, sent)
     time.sleep(5)
     held = node.api("/v1/messages/read/" + sent) or {}
     if held.get("status") in ("read", "closed"):
@@ -439,6 +499,8 @@ def suspend_and_resume(node, seats, harness):
     if node.json("agents", "show", subject)["value"].get("state") != "suspended":
         fail("a suspended seat did not stay suspended")
 
+    recent = node.json("conversations", "send", subject, "--from", "person/eval",
+                       "--subject", "recent while suspended", "--body", "boot canary recent resume")["subject"]
     resumed = json.loads(node.cli("agents", "resume", subject, "--as", "person/eval",
                                   "--timeout", f"{seats.bound:.0f}s", "--json"))
     after = resumed.get("suspension") or {}
@@ -447,8 +509,25 @@ def suspend_and_resume(node, seats, harness):
     latest = native_sessions(node, "a")[-1]
     if latest != (native, True):
         fail(f"the resumed harness ran {latest}, not session {native} resumed")
-    until(lambda: (node.api("/v1/messages/read/" + sent) or {}).get("status") in ("read", "closed"),
-          seats.bound, "the resumed seat did not read the message that waited for it")
+    # Recent never-offered mail survives the boot, while hour-old mail stays listable.
+    until(lambda: (node.api("/v1/messages/read/" + recent) or {}).get("status") in ("read", "closed"),
+          seats.bound, "the resumed seat did not recover recent unoffered mail")
+    if native_offer_count(node, recent) != 1:
+        fail("recent unoffered mail was not consumed exactly once after resume")
+    # Resuming a native session is still a new seat boot. Its old mail remains listable,
+    # and a fresh message proves that the resumed provider's delivery path works.
+    until(lambda: (node.json("agents", "show", subject).get("value", {}).get("delivery") or {}).get("state") in ("current", "legacy"),
+          seats.bound, "the resumed seat's channel did not become ready")
+    fresh = node.json("conversations", "send", subject, "--from", "person/eval",
+                      "--subject", "after resume", "--body", "boot canary fresh resume")["subject"]
+    until(lambda: (node.api("/v1/messages/read/" + fresh) or {}).get("status") in ("read", "closed"),
+          seats.bound, "the resumed seat did not read fresh mail")
+    if (node.api("/v1/messages/read/" + sent) or {}).get("status") != held.get("status"):
+        fail("resuming a seat automatically advanced its old mail")
+    if native_offer_count(node, sent) != 0:
+        fail("resuming a seat offered old mail to the provider")
+    if native_offer_count(node, recent) != 1:
+        fail("recovered recent mail reached the provider again")
     wait_drained(list((node.root / "state/drivers").rglob("st-harness-events.sqlite")), seats.bound)
     check_boundary(node)
 
@@ -480,6 +559,275 @@ def continued_session(node, label):
         fail(f"{label}: the relaunched harness ran {latest}, not session {previous} continued")
 
 
+def codex_transcript_recovery(node, seats):
+    """Recover a bounded receipt, and survive failed discovery, in a private real daemon."""
+    if node.harness != "codex":
+        fail("the utf8 scenario needs Codex")
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("canary_codex", HERE / "stub-codex.py")
+    stub = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(stub)
+    subject = seat_subject("a")
+    native = native_sessions(node, "a")[-1][0]
+    sessions = node.root / "home/.codex/sessions"
+    rollout = next(sessions.rglob(f"rollout-*-{native}.jsonl"))
+    stub.split_utf8_rollout(rollout, native)
+    (node.root / "ws/codex-transcript-mode").write_text("utf8")
+
+    def send(label):
+        return node.json("conversations", "send", subject, "--from", "person/eval",
+                         "--subject", label, "--body", "transcript regression €")["subject"]
+
+    first = send("split UTF-8 receipt")
+    until(lambda: any(row.get("event") == "transcript-steer" and first in row.get("text", "")
+                      for row in receipts(node, "a")), seats.bound, "the first steer never reached Codex")
+    second = send("while receipt recovery is needed")
+    for message in (first, second):
+        until(lambda: (node.api("/v1/messages/read/" + message) or {}).get("status") in ("read", "closed"),
+              seats.bound, "split UTF-8 stopped receipt recovery or the next delivery")
+
+    # Force a real discovery I/O error. A stale systemError asks auxiliary turn recovery to
+    # run; the subsequent live idle status and receipt must still be processed on this socket.
+    (node.root / "ws/codex-transcript-mode").write_text("failure")
+    saved = sessions.with_name("sessions-saved")
+    sessions.rename(saved)
+    sessions.write_text("not a directory")
+    try:
+        third = send("during transcript discovery failure")
+        until(lambda: (node.api("/v1/messages/read/" + third) or {}).get("status") in ("read", "closed"),
+              seats.bound, "a discovery failure stopped live delivery/receipts")
+        logs = list((node.root / "state/drivers").rglob("driver.log"))
+        until(lambda: any("bounded transcript" in path.read_text() for path in logs), seats.bound,
+              "the discovery warning never reached the private driver log")
+        time.sleep(3)
+        warnings = [json.loads(line) for path in logs for line in path.read_text().splitlines()
+                    if "bounded transcript" in line]
+        if len(warnings) > 2:
+            fail(f"transcript warnings were not rate-limited: {len(warnings)}")
+        terminal = node.pty("peek", "--plain", "--full", "c1.seat-a")
+        if "bounded transcript" in terminal.stdout + terminal.stderr:
+            fail("a driver warning reached the harness PTY")
+    finally:
+        sessions.unlink()
+        saved.rename(sessions)
+        (node.root / "ws/codex-transcript-mode").unlink()
+    if node.json("agents", "show", subject)["value"].get("incarnation_id") != seats.incarnations["a"]:
+        fail("transcript recovery replaced the seat instead of preserving delivery")
+
+
+def claude_attachment(node, seats, mode):
+    """Hooks can be idle with no usable MCP channel. Hold early mail, then recover once."""
+    control = node.root / "ws/claude-channel-mode"
+    control.write_text("missing-once" if mode == "missing" else mode)
+    old = seats.incarnations["a"]
+    node.cli("agents", "restart", seat_subject("a"), "--as", "person/eval", check=False)
+    early = node.json("conversations", "send", seat_subject("a"), "--from", "person/eval",
+                      "--subject", "early attachment probe", "--body", "mail immediately after restart")["subject"]
+
+    def blocked():
+        agent, _ = seats.view("a")
+        return (agent.get("incarnation_id") != old and agent.get("harness_state") == "blocked"
+                and agent.get("reason") == "claude-channel-unattached")
+
+    until(blocked, 45, "idle hooks hid an unattached Claude channel")
+    delivery = (node.api("/v1/messages/delivery/" + early) or {}).get("delivery")
+    if not delivery or delivery.get("state") != "waiting" or "channel" not in delivery.get("reason", ""):
+        fail(f"unattached channel did not visibly hold early mail: {delivery}")
+    if native_offer_count(node, early) != 0:
+        fail("an unattached channel offered early mail")
+    blocked_incarnation = seats.view("a")[0].get("incarnation_id")
+    if mode == "uninitialized":
+        control.unlink()
+    seats.prove("channel-recovered", fresh_incarnation=mode == "missing")
+    recovered_incarnation = seats.view("a")[0].get("incarnation_id")
+    recovery_claims = (node.api("/v1/claims?subject=" + seat_subject("a") + "&limit=100") or {}).get("claims", [])
+    automatic = [row for row in recovery_claims if row.get("kind") == "runtime.action.requested"
+                 and row.get("body", {}).get("fields", {}).get("operation") == "claude-channel-recovery"]
+    if mode == "missing":
+        if recovered_incarnation == blocked_incarnation or len(automatic) != 1:
+            fail(f"the missing channel did not recover with one automatic restart: {automatic}")
+        continued_session(node, "automatic channel recovery")
+    elif recovered_incarnation != blocked_incarnation or automatic:
+        fail("a channel initialized during recheck was unnecessarily restarted")
+    until(lambda: (node.api("/v1/messages/read/" + early) or {}).get("status") in ("read", "closed"),
+          seats.bound, "early mail did not recover after channel attachment")
+    until(lambda: native_offer_count(node, early) == 1, seats.bound, "early mail was not offered once")
+    def exact_receipts(reference):
+        claims = (node.api("/v1/claims?subject=" + reference + "&limit=100") or {}).get("claims", [])
+        phases = Counter(row.get("kind") for row in claims)
+        for kind in ("message.staged", "message.delivered", "message.read"):
+            if phases[kind] != 1:
+                fail(f"{reference} has {phases[kind]} {kind} receipts, expected one")
+    exact_receipts(early)
+    for probe in seats.read_probes:
+        if native_offer_count(node, probe) != 1:
+            fail(f"channel recovery replayed a boot probe: {probe}")
+    # Restart twice more and send within startup, while retaining the first probe's proof.
+    for index in range(2):
+        node.cli("agents", "restart", seat_subject("a"), "--as", "person/eval", check=False)
+        fresh = node.json("conversations", "send", seat_subject("a"), "--from", "person/eval",
+                          "--subject", f"immediate probe {index}", "--body", "early fresh mail")["subject"]
+        seats.prove(f"channel-restart-{index}")
+        until(lambda: (node.api("/v1/messages/read/" + fresh) or {}).get("status") in ("read", "closed"),
+              seats.bound, "mail sent during startup was never read")
+        until(lambda: native_offer_count(node, fresh) == 1, seats.bound, "startup mail was not offered once")
+        exact_receipts(fresh)
+    time.sleep(3)
+    if native_offer_count(node, early) != 1:
+        fail("a second restart replayed the recovered mail")
+    exact_receipts(early)
+
+
+def claude_channel_parked(node, seats):
+    """A permanently missing channel exhausts a durable budget and keeps mail held."""
+    (node.root / "ws/claude-channel-mode").write_text("missing")
+    node.cli("agents", "restart", seat_subject("a"), "--as", "person/eval", check=False)
+    early = node.json("conversations", "send", seat_subject("a"), "--from", "person/eval",
+                      "--subject", "parked attachment probe", "--body", "mail while unattached")["subject"]
+    check_boundary(node)
+    until(lambda: parked(node, seat_subject("a")), 180, "permanent channel failure never parked")
+    until(lambda: "claude-channel-unattached" in json.dumps(seats.view("a")[0]),
+          10, "parked channel failure lost its visible reason")
+
+    def attempts():
+        claims = (node.api("/v1/claims?subject=" + seat_subject("a") + "&limit=500") or {}).get("claims", [])
+        return [row for row in claims if row.get("kind") == "runtime.action.requested"
+                and row.get("body", {}).get("fields", {}).get("operation") == "claude-channel-recovery"]
+
+    if len(attempts()) != 3:
+        fail(f"channel failure used {len(attempts())} recovery attempts, expected three")
+    starts = len([row for row in receipts(node, "a") if row.get("event") == "started"])
+    until(lambda: len([row for row in receipts(node, "a") if row.get("event") == "ended"]) == starts,
+          20, "parked channel did not stop its provider")
+    node.kill_daemon()
+    node.start()
+    time.sleep(30)
+    if len(attempts()) != 3 or len([row for row in receipts(node, "a") if row.get("event") == "started"]) != starts:
+        fail("parked channel restarted after the daemon lost its in-memory budget")
+    if native_offer_count(node, early) != 0:
+        fail("parked channel offered mail without attachment")
+    delivery = (node.api("/v1/messages/delivery/" + early) or {}).get("delivery")
+    if not delivery or delivery.get("state") != "waiting" or not delivery.get("reason"):
+        fail(f"parked channel lost the mail hold: {delivery}")
+
+
+def prepare_codex_import(node):
+    """Discovery sees a symlinked home; the launch environment contains a stale copy."""
+    global IMPORTED_SUBJECT
+    native = "019fae17-c215-7882-a4d9-5f247168ffce"
+    origin = node.root / "home/.codex-origin"
+    stale = node.root / "home/.codex-stale"
+    for home in (origin, stale):
+        directory = home / "sessions/2026/09/21"
+        directory.mkdir(parents=True)
+        (directory / f"rollout-2026-09-21T08-00-00-{native}.jsonl").write_text(
+            json.dumps({"type": "session_meta", "payload": {
+                "id": native, "cwd": str(node.root / "ws"), "source": "test"}}) + "\n")
+    (node.root / "home/.codex").symlink_to(origin)
+    node.env["CODEX_HOME"] = str(stale)
+    node.start()
+    listed = node.json("import", "ls", "--all")
+    items = listed.get("value", listed)["items"]
+    external = next(item for item in items if item.get("native_session_id") == native)
+    imported = node.json("import", "run", external["id"], "--as", "person/eval")
+    IMPORTED_SUBJECT = next(subject for subject in imported.get("value", imported)["affected_ids"]
+                            if subject.startswith("agent/import/"))
+    return native, origin
+
+
+def prove_codex_import(node, seats, native, origin):
+    def exact_binding():
+        view = node.json("agents", "show", seat_subject("a")).get("value", {})
+        if view.get("incarnation_id") != seats.incarnations["a"]:
+            return False
+        for row in trace(node, seat_subject("a")):
+            fields = row.get("body", {}).get("fields", {})
+            if (row.get("kind") == "harness.session-file" and
+                    fields.get("incarnation_id") == seats.incarnations["a"]):
+                if fields.get("session_id") != native:
+                    fail(f"the imported incarnation bound another native ID: {fields}")
+                return True
+        return False
+    until(exact_binding, seats.bound, "the imported incarnation did not bind the selected native ID")
+    sessions = native_sessions(node, "a")
+    if not sessions or any(session != (native, True) for session in sessions):
+        fail(f"the imported seat selected another session: {sessions}")
+    providers = [environment for _, argv, environment in node.seat_processes(True)
+                 if "stub-codex.py" in argv]
+    if not providers or any(f"CODEX_HOME={origin}" not in env for env in providers):
+        fail("an imported provider did not use the pinned originating CODEX_HOME")
+
+
+def idle_delivery_control(node, seats):
+    """Count real API calls for an idle minute, then prove hold/release/expiry on native mail."""
+    if node.harness not in ("codex", "opencode"):
+        fail("the idle hold canary requires Codex or OpenCode")
+    subject = seat_subject("a")
+
+    def read(reference):
+        return (node.api("/v1/messages/read/" + reference) or {}).get("status") in ("read", "closed")
+
+    def calls():
+        result = subprocess.run(["curl", "-sf", "--max-time", "10", "--unix-socket", str(node.endpoint),
+                                 "-H", "x-st3-person: person/eval",
+                                 "http://localhost/v1/client/request-latency"],
+                                capture_output=True, text=True, check=True)
+        report = json.loads(result.stdout)["value"]
+        return sum(row["count"] for row in report["routes"] if row["route"] == "/v1/delivery/hold")
+
+    # Let the boot receipt settle before measuring. Its permit must expire without fresh mail.
+    time.sleep(4)
+    original = set(driver_processes(node))
+    before = calls()
+    start = time.monotonic()
+    time.sleep(60)
+    after = calls()
+    measured = {"idle_seconds": round(time.monotonic() - start, 3),
+                "hold_calls_before": before, "hold_calls_after": after,
+                "calls_per_idle_minute": after - before}
+    node.idle_delivery_control = measured
+    if after != before:
+        fail(f"idle provider polled delivery hold: {measured}")
+    if not original or set(driver_processes(node)) != original:
+        fail("the idle provider's driver exited or was replaced during measurement")
+
+    def send(label):
+        return node.json("conversations", "send", subject, "--from", "person/eval",
+                         "--subject", label, "--body", label)["subject"]
+
+    def finish(reference, label):
+        start = time.monotonic()
+        until(lambda: read(reference), 10, label + " did not reach consumption/read")
+        measured[label + "_seconds"] = round(time.monotonic() - start, 3)
+        until(lambda: sum(row.get("event") == "read" and row.get("reference") == reference
+                          for row in receipts(node, "a")) == 1,
+              10, label + " has no unique native read receipt")
+
+    # First mail after the minute must obtain a fresh permit immediately, not wait for a poll.
+    fresh = send("after-idle")
+    finish(fresh, "after_idle")
+    node.cli("agents", "hold", subject, "--for", "30s", "--reason", "fixture quiet interval",
+             "--as", "person/eval")
+    held = send("held-delivery")
+    time.sleep(4)
+    if read(held) or any(row.get("reference") == held for row in receipts(node, "a")):
+        fail("a held message reached the native provider")
+    node.cli("agents", "hold", subject, "--release", "--reason", "fixture release", "--as", "person/eval")
+    finish(held, "released")
+    node.cli("agents", "hold", subject, "--for", "4s", "--reason", "fixture expiry", "--as", "person/eval")
+    expiry = send("expiry-delivery")
+    time.sleep(1)
+    if read(expiry) or any(row.get("reference") == expiry for row in receipts(node, "a")):
+        fail("a message reached the native provider before hold expiry")
+    finish(expiry, "expired")
+    time.sleep(3)
+    counts = Counter(row.get("reference") for row in receipts(node, "a") if row.get("event") == "read")
+    for reference in seats.read_probes | {fresh, held, expiry}:
+        if counts[reference] != 1:
+            fail(f"hold/idle recovery replayed native input {reference}: {counts[reference]} reads")
+    return measured
+
+
 def scenario(node, seats, name, scratch, replacement_binary=None):
     if name in ("fresh", "concurrent"):
         return
@@ -491,10 +839,28 @@ def scenario(node, seats, name, scratch, replacement_binary=None):
                        for row in receipts(node, letter) if row.get("event") == "read")
     until(lambda: all(probe_reads()[ref] >= 1 for ref in previous_probes), seats.bound,
           "the providers did not record their boot probe reads")
+    if name == "idle-hold":
+        idle_delivery_control(node, seats)
+        return
+    if name == "utf8":
+        codex_transcript_recovery(node, seats)
+        return
     if name == "suspend":
         suspend_and_resume(node, seats, node.harness)
         return
-    if name == "restart":
+    if name == "channel-parked":
+        claude_channel_parked(node, seats)
+        return
+    if name.startswith("channel-"):
+        claude_attachment(node, seats, name.removeprefix("channel-"))
+        return
+    if name == "import":
+        native, origin = node.import_selection
+        prove_codex_import(node, seats, native, origin)
+        node.cli("agents", "restart", seat_subject("a"), "--as", "person/eval")
+        seats.prove("import-restart")
+        prove_codex_import(node, seats, native, origin)
+    elif name == "restart":
         node.cli("agents", "restart", seat_subject("a"), "--as", "person/eval", check=False)
         seats.prove("restart")
         continued_session(node, "restart")
@@ -538,6 +904,8 @@ def scenario(node, seats, name, scratch, replacement_binary=None):
         fail(f"unknown scenario {name}")
     # Keep watching after the new mail succeeds, through several channel polls.
     time.sleep(3)
+    if name == "import":
+        prove_codex_import(node, seats, *node.import_selection)
     counts = probe_reads()
     repeated = {ref: counts[ref] for ref in previous_probes if counts[ref] != 1}
     if repeated:
@@ -550,7 +918,12 @@ def run(args, root, evidence):
     letters = LETTERS[:count]
     seats = Seats(node, letters, args.bound)
     try:
-        node.start()
+        if args.scenario == "import":
+            if args.harness != "codex":
+                fail("the import regression uses Codex")
+            node.import_selection = prepare_codex_import(node)
+        else:
+            node.start()
         source = root / "mission.kdl"
         source.write_text(mission_source(node, count, args.harness, hold=args.scenario == "suspend"))
         node.cli("missions", "publish", str(source), "--as", "person/eval")
@@ -574,44 +947,52 @@ def run(args, root, evidence):
                 fail("fresh native seats used polled harness records: " + str(records))
             if len(spools) != len(letters):
                 fail("a fresh native seat has no durable observation spool")
-            # A suspended seat has no driver to acknowledge what its last one committed while it
-            # stopped, and no process to inspect; `suspend` checks both while the resumed seat runs.
-            if args.scenario != "suspend":
+            # Suspended and parked seats have no driver to acknowledge their final spool or
+            # process to inspect; both scenarios check the launch boundary while still running.
+            if args.scenario not in ("suspend", "channel-parked"):
                 wait_drained(spools, args.bound)
                 check_boundary(node)
+            elif args.scenario == "channel-parked":
+                check_boundary(node, stopped=True)
         return {"verdict": "pass", "harness": args.harness, "scenario": args.scenario,
-                "seconds_to_boot": seats.timings, "catalog_files": len(catalogs_after),
+                "seconds_to_boot": seats.timings,
+                "idle_delivery_control": getattr(node, "idle_delivery_control", None),
+                "catalog_files": len(catalogs_after),
                 "harness_record_files": len(records), "observation_spools": len(spools)}
     except (Failure, subprocess.TimeoutExpired) as error:
         return {"verdict": "fail", "harness": args.harness, "scenario": args.scenario,
-                "failure": str(error), "seconds_to_boot": seats.timings}
+                "failure": str(error), "seconds_to_boot": seats.timings,
+                "idle_delivery_control": getattr(node, "idle_delivery_control", None)}
     finally:
-        for letter in letters:
-            terminal = node.pty("peek", "--plain", "--full", f"c1.seat-{letter}")
-            (evidence / f"terminal-{letter}.txt").write_text(terminal.stdout + terminal.stderr)
-            if node.daemon.poll() is None:
-                (evidence / f"trace-{letter}.jsonl").write_text(
-                    node.cli("trace", "show", seat_subject(letter), "--json", "--limit", "500", check=False))
-        for index, record in enumerate(sorted((root / "state").rglob("harness-state"))):
-            (evidence / f"harness-state-{index}.json").write_text(record.read_text(errors="replace"))
-        # The outbox and driver warnings explain a stalled observation without depending on
-        # the temporary runtime surviving cleanup. Keep fixture evidence, never native content.
-        import sqlite3
-        summaries = []
-        for database in (root / "state/drivers").rglob("st-harness-events.sqlite"):
-            try:
-                with sqlite3.connect(database) as connection:
-                    pending = connection.execute("SELECT sequence,kind FROM events ORDER BY sequence").fetchall()
-                    metadata = connection.execute("SELECT key,value FROM metadata WHERE key='runtime' OR key LIKE 'provider-runtime:%'").fetchall()
-                    snapshots = connection.execute("SELECT kind,body FROM snapshots WHERE kind='harness-state'").fetchall()
-                    states = [{"kind": kind, "state": json.loads(body).get("state"), "incarnation": json.loads(body).get("incarnation")} for kind, body in snapshots]
-                summaries.append({"pending": pending, "metadata": metadata, "states": states})
-            except sqlite3.Error as error:
-                summaries.append({"error": str(error)})
-        (evidence / "observation-outboxes.json").write_text(json.dumps(summaries, indent=2) + "\n")
-        for index, log in enumerate((root / "home/.local/state/st3").rglob("*.log")):
-            (evidence / f"driver-{index}.log").write_text(log.read_text(errors="replace"))
-        node.stop()
+        try:
+            for letter in letters:
+                terminal = node.pty("peek", "--plain", "--full", seat_subject(letter).removeprefix("agent/").replace("/", "."))
+                (evidence / f"terminal-{letter}.txt").write_text(terminal.stdout + terminal.stderr)
+                if node.daemon is not None and node.daemon.poll() is None:
+                    (evidence / f"trace-{letter}.jsonl").write_text(
+                        node.cli("trace", "show", seat_subject(letter), "--json", "--limit", "500", check=False))
+            for index, record in enumerate(sorted((root / "state").rglob("harness-state"))):
+                (evidence / f"harness-state-{index}.json").write_text(record.read_text(errors="replace"))
+            # The outbox and driver warnings explain a stalled observation without depending on
+            # the temporary runtime surviving cleanup. Keep fixture evidence, never native content.
+            import sqlite3
+            summaries = []
+            for database in (root / "state/drivers").rglob("st-harness-events.sqlite"):
+                try:
+                    with sqlite3.connect(database) as connection:
+                        pending = connection.execute("SELECT sequence,kind FROM events ORDER BY sequence").fetchall()
+                        metadata = connection.execute("SELECT key,value FROM metadata WHERE key='runtime' OR key LIKE 'provider-runtime:%'").fetchall()
+                        snapshots = connection.execute("SELECT kind,body FROM snapshots WHERE kind='harness-state'").fetchall()
+                        states = [{"kind": kind, "state": json.loads(body).get("state"), "incarnation": json.loads(body).get("incarnation")} for kind, body in snapshots]
+                    summaries.append({"pending": pending, "metadata": metadata, "states": states})
+                except sqlite3.Error as error:
+                    summaries.append({"error": str(error)})
+            (evidence / "observation-outboxes.json").write_text(json.dumps(summaries, indent=2) + "\n")
+            for index, log in enumerate([*(root / "home/.local/state/st3").rglob("*.log"),
+                                        *(root / "state/drivers").rglob("driver.log")]):
+                (evidence / f"driver-{index}.log").write_text(log.read_text(errors="replace"))
+        finally:
+            node.stop()
         for path in [root / "daemon.log", *sorted((root / "ws").glob("receipts-*.jsonl"))]:
             if path.exists():
                 (evidence / path.name).write_text(path.read_text(errors="replace"))
@@ -681,4 +1062,6 @@ def main():
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from st3_test_process import supervised_main
+    raise SystemExit(supervised_main(main))

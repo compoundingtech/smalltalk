@@ -12,7 +12,7 @@
 
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+use std::io::{BufReader, Read as _, Write as _};
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 
@@ -533,7 +533,6 @@ const CHECKPOINT_SCHEMA: &str = "st.claude-residency-checkpoint.v1";
 const BINDING_FILE: &str = "binding.json";
 const PENDING_BINDING_FILE: &str = "binding.pending.json";
 const CHECKPOINT_FILE: &str = "residency-checkpoint.json";
-const TRANSCRIPT_RECORD_LIMIT: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -760,31 +759,36 @@ fn validate_transcript(
         "Claude transcript {} is not a regular file",
         transcript_path.display()
     );
-    let mut reader = BufReader::new(file);
-    let mut line = Vec::new();
-    let mut digest = Sha256::new();
+    // Native tool results can exceed a megabyte. Stream their JSON without retaining the
+    // payload, while still validating session/workspace metadata anywhere in each record.
+    // Ignored fields are consumed by Serde rather than skipped as an unverified large line.
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Lineage {
+        session_id: Option<String>,
+        cwd: Option<PathBuf>,
+    }
+    struct DigestReader {
+        file: std::fs::File,
+        digest: Sha256,
+    }
+    impl std::io::Read for DigestReader {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            let count = self.file.read(bytes)?;
+            self.digest.update(&bytes[..count]);
+            Ok(count)
+        }
+    }
+    let mut reader = BufReader::new(DigestReader {
+        file,
+        digest: Sha256::new(),
+    });
     let mut workspaces = BTreeSet::new();
     let mut identity_seen = false;
-    loop {
-        line.clear();
-        let read = reader
-            .read_until(b'\n', &mut line)
-            .with_context(|| format!("reading Claude transcript {}", transcript_path.display()))?;
-        if read == 0 {
-            break;
-        }
-        digest.update(&line);
-        anyhow::ensure!(
-            line.len() <= TRANSCRIPT_RECORD_LIMIT,
-            "Claude transcript {} contains an oversized JSONL record",
-            transcript_path.display()
-        );
-        if line.iter().all(u8::is_ascii_whitespace) {
-            continue;
-        }
-        let value: serde_json::Value = serde_json::from_slice(&line)
+    for record in serde_json::Deserializer::from_reader(&mut reader).into_iter::<Lineage>() {
+        let record = record
             .with_context(|| format!("parsing Claude transcript {}", transcript_path.display()))?;
-        if let Some(session_id) = value.get("sessionId").and_then(serde_json::Value::as_str) {
+        if let Some(session_id) = record.session_id {
             anyhow::ensure!(
                 session_id == native_session_id,
                 "Claude transcript {} carries a different native session id",
@@ -792,8 +796,8 @@ fn validate_transcript(
             );
             identity_seen = true;
         }
-        if let Some(cwd) = value.get("cwd").and_then(serde_json::Value::as_str) {
-            workspaces.insert(PathBuf::from(cwd));
+        if let Some(cwd) = record.cwd {
+            workspaces.insert(cwd);
         }
     }
     let mut roots = workspaces
@@ -828,7 +832,7 @@ fn validate_transcript(
         recorded_workspace.display(),
         expected_workspace.display()
     );
-    Ok(format!("{:x}", digest.finalize()))
+    Ok(format!("{:x}", reader.into_inner().digest.finalize()))
 }
 
 fn load_binding_file(
@@ -893,6 +897,61 @@ pub fn channel_transcript_paths(
     Ok(load_binding(session_dir, identity, runtime_id)?
         .filter(|binding| binding.runtime_incarnation == incarnation)
         .map(|binding| binding.transcript_path))
+}
+
+/// Recover a SessionStart binding that ran before Claude created its transcript.
+/// The lightweight hook binding is fenced by this wrapper; never discover a
+/// session by recency or use an older wrapper's transcript as receipt evidence.
+pub fn channel_transcript_recovering(
+    paths: &crate::driver_paths::Paths,
+    identity: &str,
+    runtime_id: &str,
+    incarnation: &str,
+) -> Result<Option<PathBuf>> {
+    let hook_path = paths.agent_dir.join("claude-native-session");
+    let hook = match fs::read(&hook_path) {
+        Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::Value::Null,
+        Err(error) => return Err(error.into()),
+    };
+    let native = (hook["incarnation"].as_str() == Some(incarnation))
+        .then(|| hook["native_session_id"].as_str())
+        .flatten();
+    let binding = load_binding(&paths.session_dir, identity, runtime_id)?
+        .filter(|binding| binding.runtime_incarnation == incarnation);
+    if let Some(binding) = binding.as_ref()
+        && native.is_none_or(|native| native == binding.native_session_id)
+    {
+        return Ok(Some(binding.transcript_path.clone()));
+    }
+    let Some(native) = native else {
+        return Ok(None);
+    };
+    let (claude_root, codex_root) = managed_transcript_roots()?;
+    let candidates = transcript_matches(&claude_root, native, false)?;
+    anyhow::ensure!(
+        candidates.len() == 1,
+        "Claude hook-bound transcript {native} is not yet uniquely available"
+    );
+    let path = resolve_managed_transcript(&candidates[0], native, &claude_root, &codex_root)?;
+    let payload = serde_json::json!({"session_id":native,"transcript_path":path});
+    // Reuse the SessionStart validation, including managed-store uniqueness and
+    // workspace lineage. This ordinary recovery never satisfies a mandatory
+    // residency resume: its pending binding remains owned by the resume driver.
+    anyhow::ensure!(
+        !paths.session_dir.join(PENDING_BINDING_FILE).exists(),
+        "Claude mandatory resume binding is still pending"
+    );
+    let binding = record_session_start_binding(
+        &paths.session_dir,
+        identity,
+        runtime_id,
+        incarnation,
+        &payload,
+        None,
+        None,
+    )?;
+    Ok(Some(binding.transcript_path))
 }
 
 fn load_pending_binding(
@@ -1347,9 +1406,12 @@ fn observe_payload(
     if let Some(edge) = turn_failure_edge(event, &payload) {
         driver_diagnostic::publish_turn_failure(agent_dir, driver_diagnostic::Driver::Claude, edge);
     }
-    let Some(observation) = observe_hook_event(event, &payload) else {
+    let Some(mut observation) = observe_hook_event(event, &payload) else {
         return Ok(());
     };
+    if let Some(edge) = provider_auth_edge(event, &payload) {
+        observation.provider_auth = Some(edge == ProviderAuthEdge::Accepted);
+    }
     let mut writer = observe_writer(
         agent_dir,
         identity,
@@ -1359,6 +1421,9 @@ fn observe_payload(
         exported_session,
         exported_seq,
     );
+    if observation.provider_auth.is_some() {
+        writer.interrupt();
+    }
     if event == "SessionStart" {
         // The one event that names a session boundary: even if the new session's first state
         // matches a fresh predecessor record, continuity must not be claimed across the restart.
@@ -1785,11 +1850,20 @@ pub fn observe_hook_event(event: &str, payload: &serde_json::Value) -> Option<Ob
             BlockedOn::None,
             InputBuffer::Unknown,
         )),
-        "Stop" => Some(Observation::new(
-            Activity::Idle,
-            BlockedOn::None,
-            InputBuffer::Unknown,
-        )),
+        "Stop" => Some({
+            let rejected = payload
+                .get("last_assistant_message")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(claude_login_reply);
+            let observation =
+                Observation::new(Activity::Idle, BlockedOn::None, InputBuffer::Unknown)
+                    .with_provider_auth(!rejected);
+            if rejected {
+                observation.with_reason("providerAuth")
+            } else {
+                observation
+            }
+        }),
         // `StopFailure` fires INSTEAD of `Stop` when an API error ended the turn (Claude Code's
         // own words, 2.1.259), at the same lifecycle point — so the categorical truth is the one
         // `Stop` writes and only the reason differs. Deliberately not `ended`: the TUI is still
@@ -1896,20 +1970,52 @@ fn turn_failure_edge(
             Some(CLAUDE_AUTH_REJECTED_ERROR) => None,
             other => Some(TurnFailureEdge::Failed(claude_turn_failure_class(other).0)),
         },
-        "Stop" => Some(TurnFailureEdge::Recovered),
+        "Stop" if provider_auth_edge(event, payload) == Some(ProviderAuthEdge::Accepted) => {
+            Some(TurnFailureEdge::Recovered)
+        }
         _ => None,
     }
+}
+
+/// A standalone native login diagnostic, not a quotation or tool transcript.
+pub fn claude_login_reply(text: &str) -> bool {
+    let text = text.trim();
+    text.len() <= 512
+        && (matches!(
+            text,
+            "Login expired · Please run /login"
+                | "Please run /login"
+                | "Not logged in · Run /login"
+                | "Invalid API key"
+        ) || text.starts_with("Invalid API key · ") && text.ends_with("/login"))
 }
 
 /// Read the credential edge out of one hook event, or `None` when the event proves nothing about
 /// it — which must leave a standing rejection alone rather than clearing it.
 fn provider_auth_edge(event: &str, payload: &serde_json::Value) -> Option<ProviderAuthEdge> {
+    if payload
+        .get("agent_id")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|id| !id.is_empty())
+    {
+        return None;
+    }
     match event {
         "StopFailure" => (stop_failure_error(payload) == Some(CLAUDE_AUTH_REJECTED_ERROR))
             .then_some(ProviderAuthEdge::Rejected),
         // A turn that reached its ordinary end is positive proof the credential was accepted.
         // `SessionStart` is not: a fresh session has made no provider call yet.
-        "Stop" => Some(ProviderAuthEdge::Accepted),
+        "Stop" => Some(
+            if payload
+                .get("last_assistant_message")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(claude_login_reply)
+            {
+                ProviderAuthEdge::Rejected
+            } else {
+                ProviderAuthEdge::Accepted
+            },
+        ),
         _ => None,
     }
 }
@@ -2241,6 +2347,36 @@ mod tests {
         // Unmapped events say nothing rather than guessing.
         assert_eq!(observe_hook_event("Notification", &none), None);
         assert_eq!(observe_hook_event("SubagentStop", &none), None);
+    }
+
+    #[test]
+    fn successful_login_error_reply_is_a_rejection_not_recovery() {
+        for text in [
+            "Login expired · Please run /login",
+            "Please run /login",
+            "Invalid API key",
+        ] {
+            let payload = serde_json::json!({"last_assistant_message": text});
+            assert_eq!(
+                provider_auth_edge("Stop", &payload),
+                Some(ProviderAuthEdge::Rejected)
+            );
+            let observed = observe_hook_event("Stop", &payload).unwrap();
+            assert_eq!(observed.provider_auth, Some(false));
+            assert_eq!(observed.reason.as_deref(), Some("providerAuth"));
+        }
+        for text in [
+            "The tool printed: Please run /login",
+            "`Invalid API key`",
+            "You can run /login to switch accounts.",
+            "Login expired · Please run /login\nHere is the code.",
+        ] {
+            assert!(!claude_login_reply(text));
+            assert_eq!(
+                provider_auth_edge("Stop", &serde_json::json!({"last_assistant_message":text})),
+                Some(ProviderAuthEdge::Accepted)
+            );
+        }
     }
 
     /// The measured `StopFailure` payload shape (Claude Code 2.1.259: `hook_event_name`, the
@@ -3329,6 +3465,38 @@ mod tests {
             load_binding(&state, "h.worker", "h.worker").unwrap(),
             Some(switched)
         );
+    }
+
+    #[test]
+    fn claude_transcript_lineage_streams_large_native_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let transcript = temp.path().join(format!("{RESUME_ID}.jsonl"));
+        // Put lineage after a legitimate large tool payload. Skipping the line wholesale
+        // would miss this metadata; collecting the whole JSON value would retain its body.
+        let large = "tool output ".repeat(200_000);
+        let record = format!(
+            "{{\"payload\":{},\"sessionId\":{},\"cwd\":{}}}\n",
+            serde_json::to_string(&large).unwrap(),
+            serde_json::to_string(RESUME_ID).unwrap(),
+            serde_json::to_string(&workspace).unwrap(),
+        );
+        fs::write(&transcript, &record).unwrap();
+        assert_eq!(
+            validate_transcript(&transcript, RESUME_ID, &workspace).unwrap(),
+            format!("{:x}", Sha256::digest(record.as_bytes())),
+        );
+        let other = "019fae17-c215-7882-a4d9-5f247168ffce";
+        fs::write(&transcript, record.replace(RESUME_ID, other)).unwrap();
+        assert!(
+            validate_transcript(&transcript, RESUME_ID, &workspace)
+                .unwrap_err()
+                .to_string()
+                .contains("different native session id")
+        );
+        fs::write(&transcript, &record[..record.len() - 3]).unwrap();
+        assert!(validate_transcript(&transcript, RESUME_ID, &workspace).is_err());
     }
 
     #[test]

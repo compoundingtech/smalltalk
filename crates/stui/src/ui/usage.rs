@@ -110,6 +110,18 @@ impl Total {
         self.unpriced += row.unpriced_tokens;
     }
 
+    /// What the tokens were: re-read from the cache, written to it, fresh input, or output, as
+    /// shares of the total.
+    pub fn mix(&self) -> String {
+        format!(
+            "{} cached · {} written to cache · {} fresh input · {} output",
+            share(self.cached, self.tokens),
+            share(self.cache_write, self.tokens),
+            share(self.input, self.tokens),
+            share(self.output, self.tokens),
+        )
+    }
+
     /// The cost, with a `+` when some tokens had no price: the true cost is higher, never
     /// lower.
     pub fn money(&self) -> String {
@@ -128,6 +140,22 @@ pub fn money(microusd: u64) -> String {
         format!("${dollars:.2}")
     } else {
         format!("${dollars:.0}")
+    }
+}
+
+/// `part` of `whole` as a percentage: whole numbers from 10% up, a decimal below, and `<0.1%`
+/// for a sliver, so a small bucket never reads as none.
+pub fn share(part: u64, whole: u64) -> String {
+    if whole == 0 || part == 0 {
+        return "0%".into();
+    }
+    let percent = part as f64 * 100.0 / whole as f64;
+    if percent >= 10.0 {
+        format!("{percent:.0}%")
+    } else if percent >= 0.1 {
+        format!("{percent:.1}%")
+    } else {
+        "<0.1%".into()
     }
 }
 
@@ -205,7 +233,7 @@ pub fn label(world: &World, id: &str) -> String {
     }
     if let Some(rest) = id.strip_prefix("usage/no-") {
         return match rest {
-            "account" => "no account recorded (before st kept accounts)".into(),
+            "account" => "no account recorded".into(),
             "mission" => "no mission (standing seats)".into(),
             "step" => "no step (standing seats)".into(),
             other => format!("unknown {other}"),
@@ -253,7 +281,7 @@ pub fn list(world: &World, by: By, hours: u64) -> Listing {
     let rows = world.usage.items();
     let mut items = Vec::new();
     let mut ids = Vec::new();
-    let mut row = |items: &mut Vec<Item>, id: String, first, right, second| {
+    let row = |items: &mut Vec<Item>, ids: &mut Vec<String>, id: String, first, right, second| {
         items.push(Item::Row {
             index: ids.len(),
             first,
@@ -271,19 +299,21 @@ pub fn list(world: &World, by: By, hours: u64) -> Listing {
             color: theme::ACCENT,
         });
         for (id, spent, limit) in accounts {
-            row(
-                &mut items,
-                id.clone(),
-                vec![span(format!(" {}", label(world, &id)), theme::bold())],
-                vec![span(spent.money(), theme::fg(theme::ACCENT))],
-                limit_line(limit, &spent),
-            );
+            // Each limit on a line of its own beneath the account, so a narrow pane reads whole.
+            items.push(Item::Row {
+                index: ids.len(),
+                first: vec![span(format!(" {}", label(world, &id)), theme::bold())],
+                right: vec![span(spent.money(), theme::fg(theme::ACCENT))],
+                second: Vec::new(),
+                children: limit_lines(&id, limit, &spent),
+            });
+            ids.push(id.clone());
         }
         let mut total = Total::default();
         rows.iter().for_each(|row| total.add(row));
         items.push(Item::Header {
             title: "summary".into(),
-            count: rows.len(),
+            count: 0,
             color: theme::OVERLAY1,
         });
         items.push(Item::Note(Line::from(vec![
@@ -297,6 +327,10 @@ pub fn list(world: &World, by: By, hours: u64) -> Listing {
                 ),
                 theme::dim(),
             ),
+        ])));
+        items.push(Item::Note(Line::from(vec![
+            span(" ", theme::dim()),
+            span(total.mix(), theme::dim()),
         ])));
         for (name, grouping) in [("agent", By::Agent), ("mission", By::Mission)] {
             if let Some((id, spent)) = groups(rows.iter(), grouping)
@@ -320,6 +354,14 @@ pub fn list(world: &World, by: By, hours: u64) -> Listing {
             ))));
         }
     }
+    if let Some(estimate) = &world.agent_messages {
+        items.push(Item::Header {
+            title: "agent messages, daily (UTC)".into(),
+            count: estimate.days.len(),
+            color: theme::OVERLAY1,
+        });
+        items.extend(estimate_lines(estimate).into_iter().map(Item::Note));
+    }
     let grouped = groups(rows.iter(), by);
     if !grouped.is_empty() {
         items.push(Item::Header {
@@ -336,6 +378,7 @@ pub fn list(world: &World, by: By, hours: u64) -> Listing {
         };
         row(
             &mut items,
+            &mut ids,
             id.clone(),
             vec![span(format!(" {}", label(world, &id)), theme::bold())],
             vec![span(total.money(), theme::fg(theme::ACCENT))],
@@ -352,7 +395,11 @@ pub fn list(world: &World, by: By, hours: u64) -> Listing {
     let state = match &world.usage {
         Load::Loading => ListState::Loading("Loading usage…"),
         Load::Failed(why) => ListState::Failed(why.clone()),
-        Load::Ready(rows) if rows.is_empty() && world.usage_limits.is_empty() => {
+        Load::Ready(rows)
+            if rows.is_empty()
+                && world.usage_limits.is_empty()
+                && world.agent_messages.is_none() =>
+        {
             ListState::Empty("No spend recorded in this period.")
         }
         Load::Ready(_) => ListState::Ready,
@@ -371,6 +418,62 @@ pub fn list(world: &World, by: By, hours: u64) -> Listing {
             Line::from(span("Costs are API-equivalent list prices.", theme::dim())),
         ],
     }
+}
+
+fn estimate_lines(estimate: &st3_client::AgentMessageEstimate) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(span(
+            " Messages × each recipient's allowance, as a share of priced usage; includes useful work.",
+            theme::dim(),
+        )),
+        Line::from(span(
+            format!(
+                " Fleet fallback ${:.2}–${:.2} per message.",
+                estimate.fallback_low_microusd as f64 / 1_000_000.0,
+                estimate.fallback_high_microusd as f64 / 1_000_000.0
+            ),
+            theme::dim(),
+        )),
+        Line::from(span(format!(" {}", estimate.source), theme::dim())),
+    ];
+    for day in &estimate.days {
+        let date = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(day.day_start_ms as i64)
+            .map_or_else(|| "?".into(), |at| at.format("%Y-%m-%d").to_string());
+        let partial = if day.until_ms.saturating_sub(day.since_ms) < 86_400_000 {
+            " (part of the day)"
+        } else {
+            ""
+        };
+        let share = match (day.low_percent, day.high_percent) {
+            (Some(low), Some(high)) => format!(
+                "{low:.1}–{high:.1}%{}",
+                if day.unpriced_tokens > 0 { "*" } else { "" }
+            ),
+            _ => "share unknown".into(),
+        };
+        lines.push(Line::from(vec![
+            span(format!(" {date}"), theme::text()),
+            span(format!("{partial} · {} messages", day.messages), theme::dim()),
+        ]));
+        let calibrated = if day.calibrated_messages < day.messages {
+            format!(" · {}/{} calibrated", day.calibrated_messages, day.messages)
+        } else {
+            String::new()
+        };
+        lines.push(Line::from(span(
+            format!(
+                "   ${:.2}–${:.2} · {share}{calibrated}",
+                day.low_microusd as f64 / 1_000_000.0,
+                day.high_microusd as f64 / 1_000_000.0
+            ),
+            theme::text(),
+        )));
+    }
+    lines.push(Line::from(span(
+        " * Unpriced tokens excluded. Latest 31 UTC days; edges clipped.",
+        theme::dim(),
+    )));
+    lines
 }
 
 /// Every account that spent in the period or reported its limits, the largest spender first,
@@ -396,13 +499,15 @@ fn accounts(world: &World) -> Vec<(String, Total, Option<&UsageLimit>)> {
     accounts
 }
 
-/// An account's limits as one line: weekly first, since that is the one that stops seats.
-fn limit_line(limit: Option<&UsageLimit>, spent: &Total) -> Vec<Span<'static>> {
+/// An account's limits, a line each: weekly first, since that is the one that stops seats.
+fn limit_lines(id: &str, limit: Option<&UsageLimit>, spent: &Total) -> Vec<Line<'static>> {
     let Some(limit) = limit else {
-        return vec![span(
-            format!("   {} tokens · no limits reported", tokens(spent.tokens)),
-            theme::dim(),
-        )];
+        let note = if id == "usage/no-account" {
+            format!("   {} tokens · from before st kept accounts", tokens(spent.tokens))
+        } else {
+            format!("   {} tokens · no limits reported", tokens(spent.tokens))
+        };
+        return vec![Line::from(span(note, theme::dim()))];
     };
     let now = now_ms();
     let share = |percent: Option<f64>| match percent {
@@ -422,20 +527,25 @@ fn limit_line(limit: Option<&UsageLimit>, spent: &Total) -> Vec<Span<'static>> {
     let (five, five_color) = share(limit.five_hour_percent);
     let resets = limit
         .weekly_resets_at_unix_ms
-        .map(|at| format!(" resets in {}", span_of(at.saturating_sub(now))))
+        .map(|at| format!(" · resets {}", span_of(at.saturating_sub(now))))
         .unwrap_or_default();
     vec![
-        span("   weekly ", theme::dim()),
-        span(weekly, theme::strong(weekly_color)),
-        span(format!("{resets} · 5-hour "), theme::dim()),
-        span(five, theme::strong(five_color)),
-        span(
-            format!(
-                " · measured {} ago",
-                span_of(now.saturating_sub(limit.measured_at_unix_ms))
+        Line::from(vec![
+            span("   weekly   ", theme::dim()),
+            span(weekly, theme::strong(weekly_color)),
+            span(resets, theme::dim()),
+        ]),
+        Line::from(vec![
+            span("   5-hour   ", theme::dim()),
+            span(five, theme::strong(five_color)),
+            span(
+                format!(
+                    " · as of {} ago",
+                    span_of(now.saturating_sub(limit.measured_at_unix_ms))
+                ),
+                theme::dim(),
             ),
-            theme::dim(),
-        ),
+        ]),
     ]
 }
 
@@ -484,6 +594,21 @@ pub fn detail(world: &World, id: Option<&str>, hours: u64, width: usize) -> Doc 
         None => "All spend".into(),
     };
     doc.line(Line::from(span(title, theme::bold())));
+    if id.is_none()
+        && let Some(estimate) = &world.agent_messages
+    {
+        let mut card = Doc::new();
+        for line in estimate_lines(estimate) {
+            card.line(line);
+        }
+        doc.card(
+            "agent messages · daily estimate · UTC",
+            theme::OVERLAY1,
+            false,
+            card,
+            width,
+        );
+    }
     if mine.is_empty() {
         doc.line(Line::from(span(
             format!("No spend recorded in {}.", period_name(hours)),
@@ -584,7 +709,9 @@ pub fn detail(world: &World, id: Option<&str>, hours: u64, width: usize) -> Doc 
                 label(world, &format!("account/{}", limit.account)),
                 theme::bold(),
             )));
-            card.line(Line::from(limit_line(Some(limit), &spent)));
+            for line in limit_lines(&format!("account/{}", limit.account), Some(limit), &spent) {
+                card.line(line);
+            }
             card.line(Line::from(span(
                 format!(
                     "   {} seat{} · measured by {} on {}",
@@ -609,6 +736,60 @@ pub fn detail(world: &World, id: Option<&str>, hours: u64, width: usize) -> Doc 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daily_estimate_is_visible_in_the_list_and_whole_period_pane() {
+        let mut world = super::super::demo::world();
+        world.agent_messages = Some(
+            serde_json::from_value(serde_json::json!({
+                "source":"dated audit", "method":"count times allowance",
+                "fallback_low_microusd":220000, "fallback_high_microusd":330000,
+                "days":[{"day_start_ms":0,"since_ms":0,"until_ms":86400000,
+                    "messages":10,"calibrated_messages":8,"low_microusd":2200000,
+                    "high_microusd":3300000,"usage_cost_microusd":1000000,
+                    "unpriced_tokens":100,"low_percent":220.0,"high_percent":330.0}]
+            }))
+            .unwrap(),
+        );
+        let listing = list(&world, By::Agent, 24);
+        let notes = listing
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Note(line) => Some(line.to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let pane = detail(&world, None, 24, 120)
+            .lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let narrow_pane = detail(&world, None, 24, 40)
+            .lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        for text in [&notes, &pane, &narrow_pane] {
+            assert!(text.contains("10 messages"));
+            assert!(text.contains("$2.20–$3.30"));
+            assert!(
+                text.contains("220.0–330.0%"),
+                "allowance shares are not capped"
+            );
+            assert!(text.contains("includes useful work"));
+            assert!(text.contains("8/10 calibrated"));
+        }
+        assert!(
+            !detail(&world, Some("agent/example/atlas/builder"), 24, 120)
+                .lines
+                .iter()
+                .any(|line| line.to_string().contains("10 messages"))
+        );
+    }
 
     #[test]
     fn groups_rank_by_cost_and_name_what_st_does_not_know() {
@@ -667,6 +848,40 @@ mod tests {
     }
 
     #[test]
+    fn the_token_mix_shows_cached_written_input_and_output_shares() {
+        assert_eq!(share(0, 100), "0%");
+        assert_eq!(share(5, 0), "0%");
+        assert_eq!(share(98_260, 100_000), "98%");
+        assert_eq!(share(890, 100_000), "0.9%");
+        assert_eq!(share(40, 100_000), "<0.1%");
+        let total = Total {
+            tokens: 100_000,
+            cached: 98_260,
+            cache_write: 890,
+            input: 630,
+            output: 210,
+            ..Total::default()
+        };
+        assert_eq!(
+            total.mix(),
+            "98% cached · 0.9% written to cache · 0.6% fresh input · 0.2% output"
+        );
+        // The summary shows it under the total.
+        let world = super::super::demo::world();
+        let summary = list(&world, By::Agent, 24)
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Note(line) => Some(text::plain(line)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(summary.contains("cached ·"), "{summary}");
+        assert!(summary.contains("written to cache"), "{summary}");
+    }
+
+    #[test]
     fn a_groups_detail_shows_only_its_rows() {
         let world = super::super::demo::world();
         let plain = |doc: &Doc| {
@@ -686,17 +901,26 @@ mod tests {
         assert!(mission.contains("compare"), "{mission}");
         assert!(!mission.contains("captain"), "{mission}");
         let all = plain(&detail(&world, None, 24, 60));
-        assert!(all.contains("weekly 23%"), "{all}");
+        assert!(all.contains("weekly   23%"), "{all}");
         let listed = list(&world, By::Agent, 24)
             .items
             .iter()
             .map(|item| match item {
                 Item::Header { title, .. } => format!("# {title}"),
-                Item::Row { first, second, .. } => {
+                Item::Row {
+                    first,
+                    second,
+                    children,
+                    ..
+                } => {
                     format!(
-                        "{} {}",
+                        "{} {}{}",
                         text::plain(&Line::from(first.clone())),
-                        text::plain(&Line::from(second.clone()))
+                        text::plain(&Line::from(second.clone())),
+                        children
+                            .iter()
+                            .map(|child| format!("\n{}", text::plain(child)))
+                            .collect::<String>()
                     )
                 }
                 Item::Note(line) | Item::Folder(line) => text::plain(line),
@@ -713,7 +937,7 @@ mod tests {
             at("# accounts") < at("# summary") && at("# summary") < at("# by agent"),
             "{listed}"
         );
-        assert!(listed.contains("weekly 23% resets in"), "{listed}");
+        assert!(listed.contains("weekly   23% · resets"), "{listed}");
         assert!(listed.contains("most by agent   Atlas Builder"), "{listed}");
     }
 }

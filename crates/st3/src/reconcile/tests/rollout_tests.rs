@@ -312,6 +312,25 @@ fn rollout_drains_then_resumes_once_across_disk_reopens() {
         "{:?}",
         seat.operation().reason
     );
+    // Real push channels must bind their mailbox before reporting the native session.
+    // Verification must publish runtime liveness without releasing the rollout's intake fence.
+    assert!(
+        rollout::binding(&seat.store, SUBJECT, "replacement-1")
+            .unwrap()
+            .is_none()
+    );
+    let mailbox = crate::mailbox::Fence::new(SUBJECT, "replacement-1", "claude-channel");
+    seat.store.bind_mailbox(&mailbox).unwrap();
+    assert!(seat.operation().holds_intake());
+    assert!(
+        seat.store
+            .bind_mailbox(&crate::mailbox::Fence::new(
+                SUBJECT,
+                "original-1",
+                "claude-channel"
+            ))
+            .is_err()
+    );
     seat.binding("replacement-1", "native-one");
     seat.step();
     assert_eq!(seat.operation().phase, "running");
@@ -827,6 +846,7 @@ fn rollout_pending_person_work_can_resume_and_finish_while_new_work_waits() {
             seat.store
                 .finish_person_step(
                     &crate::model::PersonStepResponse {
+                        delegation: None,
                         subject: ask.subject.clone(),
                         actor: "person/operator".into(),
                         summary: "The north bed".into(),

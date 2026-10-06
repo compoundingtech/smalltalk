@@ -176,6 +176,189 @@ fn live(pid: i32) -> bool {
     })
 }
 
+#[test]
+fn isolated_daemon_deduplicates_completed_reviews_and_cancels_a_superseded_head() {
+    use st3::model::{ClaimInput, MissionRunRequest};
+    use st3::store::Store;
+    use std::collections::BTreeMap;
+
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state/st3");
+    std::fs::create_dir_all(&state).unwrap();
+    let store = Store::open(&state.join("claims.sqlite3"), "orchid").unwrap();
+    let source = r#"version 2
+mission "review" state="ready" {
+  goal "Review one immutable pull request snapshot."
+  input "source" kind="resource"
+  completion { when "all-steps-exhausted" }
+  step "inspect" {
+    agentless
+    exec "writer" {
+      command "echo $$ > exec.pid; while :; do echo writing >> draft; sleep 0.05; done"
+      restart "never"
+    }
+    gate "wait" { document "doc/review-ready" }
+  }
+  finally {
+    step "cleanup" {
+      agentless
+      gate "the writer stopped before removing its draft" {
+        exec "while kill -0 $(cat exec.pid) 2>/dev/null; do sleep 0.05; done; rm -f draft; echo cleaned > cleanup"
+        host "orchid"
+        workspace "."
+        time-limit "1m"
+      }
+    }
+  }
+}
+resource "repo" { kind "vcs.repository" }
+observer "repo" { resource "resource/repo"; provider "github.repository"; locator "acme/garden"; field "pull_requests" }
+subscription "reviews" { observer "observer/repo"; on "pull_requests"; delivery "mission" { mission "review"; resource "source"; workspace "/tmp/example-reviews" } }
+"#;
+    // Standalone observers and subscriptions use the owned-set publication grammar.
+    let intent = st3::graph::parse_owned_set_intent(source, "orchid").unwrap();
+    let plan = store
+        .mission(
+            &intent,
+            st3::model::IntentInput {
+                kdl: source.into(),
+                source_name: None,
+            },
+        )
+        .unwrap();
+    store
+        .apply(&intent, &plan.subject_tokens, "fixture")
+        .unwrap();
+    let append = |subject: &str, kind: &str, fields: Value| {
+        store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: kind.into(),
+                actor: None,
+                fields: serde_json::from_value(fields).unwrap(),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap()
+            .id
+    };
+    let observe = |number: u64| {
+        append(
+            &format!("resource/repo/pull-request/{number}"),
+            "resource.observed",
+            serde_json::json!({"kind":"vcs.pull-request", "facts":{
+                "number":number, "state":"open", "draft":false, "head_sha":"a".repeat(40)
+            }}),
+        )
+    };
+    let run_request = |number: u64, snapshot: &str, key: &str| MissionRunRequest {
+        mission: "review".into(),
+        revision: None,
+        workspace: root.path().to_string_lossy().into_owned(),
+        requester: Some("person/operator".into()),
+        mode: None,
+        inputs: BTreeMap::from([(
+            "source".into(),
+            format!("resource/repo/pull-request/{number}@{snapshot}"),
+        )]),
+        idempotency_key: key.into(),
+    };
+    let queue = |number: u64, snapshot: &str| {
+        append(
+            "subscription/reviews",
+            "subscription.mission-requested",
+            serde_json::json!({
+                "mission":"mission/review", "resource":format!("resource/repo/pull-request/{number}"),
+                "discovery":snapshot, "resource_input":"source", "workspace":root.path().to_str().unwrap(),
+                "requester":"person/operator"
+            }),
+        )
+    };
+    let first_snapshot = observe(7);
+    let completed = store
+        .create_mission_run(&run_request(7, &first_snapshot, "completed"))
+        .unwrap();
+    store
+        .set_mission_run_state(&completed.id, "completed", "terminal", None)
+        .unwrap();
+    let duplicate = queue(7, &first_snapshot);
+    let second_snapshot = observe(8);
+    let active_request = queue(8, &second_snapshot);
+    let active = store
+        .create_subscription_mission_run(
+            &run_request(8, &second_snapshot, "active"),
+            None,
+            "subscription/reviews",
+            "resource/repo/pull-request/8",
+            &second_snapshot,
+        )
+        .unwrap();
+    append(
+        "subscription/reviews",
+        "subscription.mission-started",
+        serde_json::json!({
+            "request":active_request, "mission_run":active.subject,
+        }),
+    );
+    drop(store);
+
+    let mut daemon = Daemon::start(root.path());
+    wait_for("the completed snapshot request to be cancelled", || {
+        daemon
+            .command(&["missions", "requests", "subscription/reviews", "--all"])
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|request| request["request"] == duplicate && request["status"] == "cancelled")
+    });
+    assert_eq!(
+        daemon.command(&["missions", "show", &active.subject])["status"],
+        "running"
+    );
+    wait_for("the review writer to be writing its draft", || {
+        root.path().join("draft").exists()
+    });
+    let writer = std::fs::read_to_string(root.path().join("exec.pid"))
+        .unwrap()
+        .trim()
+        .parse::<i32>()
+        .unwrap();
+    assert!(live(writer));
+    daemon.command(&[
+        "claim",
+        "resource/repo/pull-request/8",
+        "resource.observed",
+        "--field",
+        "kind=vcs.pull-request",
+        "--field",
+        &format!(
+            "facts={{\"number\":8,\"state\":\"open\",\"draft\":false,\"head_sha\":\"{}\"}}",
+            "b".repeat(40)
+        ),
+    ]);
+    wait_for("the superseded review to cancel", || {
+        daemon.command(&["missions", "show", &active.subject])["status"] == "cancelled"
+    });
+    assert!(!live(writer));
+    assert!(root.path().join("cleanup").exists());
+    assert!(!root.path().join("draft").exists());
+    daemon.restart();
+    assert_eq!(
+        daemon.command(&["missions", "show", &active.subject])["status"],
+        "cancelled"
+    );
+    let requests = daemon.command(&["missions", "requests", "subscription/reviews", "--all"]);
+    assert_eq!(requests.as_array().unwrap().len(), 2);
+    assert!(
+        requests
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["request"] == duplicate && r["status"] == "cancelled")
+    );
+}
+
 fn cancellation_stops_owned_work(restart: bool) {
     let root = tempfile::tempdir().unwrap();
     let lane = File::create(root.path().join("lane.lock")).unwrap();
@@ -356,10 +539,254 @@ mission "orchid/cancellation" state="ready" {
 
 #[test]
 fn cancellation_stops_execs_and_waiting_gates_before_finally_finishes() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     cancellation_stops_owned_work(false);
 }
 
 #[test]
 fn cancellation_adopts_and_stops_gate_processes_after_daemon_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     cancellation_stops_owned_work(true);
+}
+
+fn processless_cancellation(cancel_during_final: bool, with_exited_exec: bool) {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(root.path());
+    let file = root.path().join("mission.kdl");
+    let mut source = r#"version 2
+mission "orchid/processless" state="ready" {
+  goal "Release the active run slot on cancellation."
+  step "work" { agentless }
+  finally {
+    step "evidence" timeout="90m" {
+      agentless
+      gate "evidence arrives" { field "state" "resource/orchid/evidence" is "ready" }
+    }
+    step "report" {
+      agentless
+      depends-on { step "evidence" terminal }
+      gate "report is posted" {
+        exec "echo posted > report"
+        host "orchid"
+        workspace "."
+        time-limit "1m"
+      }
+    }
+  }
+}
+"#
+    .to_owned();
+    if !cancel_during_final {
+        source = source.replace(
+            "step \"work\" { agentless }",
+            "step \"work\" { agentless; gate \"work waits\" { field \"state\" \"resource/orchid/work\" is \"ready\" } }",
+        );
+    }
+    if with_exited_exec {
+        source = source.replace(
+            "step \"evidence\" timeout=\"90m\" {",
+            "step \"evidence\" timeout=\"90m\" { exec \"collector\" { command \"echo collected > collected\"; restart \"never\" }",
+        );
+    }
+    std::fs::write(&file, source).unwrap();
+    daemon.command(&[
+        "missions",
+        "publish",
+        file.to_str().unwrap(),
+        "--as",
+        "person/operator",
+        "--no-gate-check",
+    ]);
+    daemon.command(&[
+        "missions",
+        "start",
+        "orchid/processless",
+        "--id",
+        "orchid/cancel",
+        "--workspace",
+        root.path().to_str().unwrap(),
+        "--as",
+        "person/operator",
+    ]);
+    let (phase, working_step) = if cancel_during_final {
+        ("final", "evidence")
+    } else {
+        ("normal", "work")
+    };
+    wait_for("processless work before cancellation", || {
+        let run = daemon.run();
+        run["phase"] == phase
+            && run["steps"].as_array().unwrap().iter().any(|step| {
+                step["step"] == working_step && step["status"] == "working"
+            })
+            && (!with_exited_exec || root.path().join("collected").exists())
+    });
+    let cancelled_at = Instant::now();
+    daemon.command(&[
+        "missions",
+        "cancel",
+        "mission-run/orchid/cancel",
+        "--reason",
+        "the evidence is no longer needed",
+        "--as",
+        "person/operator",
+    ]);
+    wait_for("processless cancellation to reach terminal", || {
+        daemon.run()["phase"] == "terminal"
+    });
+    let run = daemon.run();
+    eprintln!(
+        "processless cancellation reached terminal after {:?}",
+        cancelled_at.elapsed()
+    );
+    assert_eq!(run["status"], "cancelled", "{run}");
+    let evidence = run["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|step| step["step"] == "evidence")
+        .unwrap();
+    assert_eq!(evidence["status"], "cancelled", "{run}");
+    assert!(
+        evidence["blocked_reason"]
+            .as_str()
+            .unwrap()
+            .contains("no live process")
+    );
+    assert_eq!(evidence["timeout_ms"], 90 * 60 * 1000);
+    assert!(root.path().join("report").exists(), "finally did not run");
+    daemon.command(&[
+        "missions",
+        "start",
+        "orchid/processless",
+        "--id",
+        "orchid/next",
+        "--workspace",
+        root.path().to_str().unwrap(),
+        "--as",
+        "person/operator",
+    ]);
+    let next = daemon.command(&["missions", "show", "mission-run/orchid/next"]);
+    assert_ne!(next["phase"], "terminal", "{next}");
+}
+
+#[test]
+fn cancellation_ends_processless_final_work_and_frees_the_mission_slot() {
+    processless_cancellation(true, false);
+}
+
+#[test]
+fn cancellation_ends_final_evidence_after_its_exec_exits() {
+    processless_cancellation(true, true);
+}
+
+#[test]
+fn cancellation_runs_fresh_final_work_and_frees_the_mission_slot() {
+    processless_cancellation(false, false);
+}
+
+#[test]
+fn cancellation_waits_for_a_used_missions_live_final_cleanup() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(root.path());
+    let file = root.path().join("child.kdl");
+    std::fs::write(
+        &file,
+        r#"version 2
+mission "orchid/child" state="ready" {
+  goal "Keep final cleanup live until it finishes."
+  step "work" { agentless }
+  finally {
+    step "cleanup" {
+      agentless
+      gate "cleanup finishes" {
+        exec "echo $$ > final.pid; while [ ! -e finish ]; do sleep 0.05; done"
+        host "orchid"
+        workspace "."
+        time-limit "1m"
+      }
+    }
+  }
+}
+"#,
+    )
+    .unwrap();
+    let published = daemon.command(&[
+        "missions",
+        "publish",
+        file.to_str().unwrap(),
+        "--as",
+        "person/operator",
+        "--no-gate-check",
+    ]);
+    let revision = published["published_missions"][0]["revision"]
+        .as_str()
+        .unwrap();
+    let file = root.path().join("parent.kdl");
+    std::fs::write(
+        &file,
+        format!(
+            r#"version 2
+mission "orchid/parent" state="ready" {{
+  goal "Let child final cleanup settle before ending its parent."
+  step "work" {{ agentless }}
+  finally {{ step "report" {{ agentless; uses-mission "orchid/child@{revision}" }} }}
+}}
+"#
+        ),
+    )
+    .unwrap();
+    daemon.command(&[
+        "missions",
+        "publish",
+        file.to_str().unwrap(),
+        "--as",
+        "person/operator",
+        "--no-gate-check",
+    ]);
+    daemon.command(&[
+        "missions",
+        "start",
+        "orchid/parent",
+        "--id",
+        "orchid/cancel",
+        "--workspace",
+        root.path().to_str().unwrap(),
+        "--as",
+        "person/operator",
+    ]);
+    wait_for("the child final cleanup", || {
+        root.path().join("final.pid").exists()
+    });
+    let pid = std::fs::read_to_string(root.path().join("final.pid"))
+        .unwrap()
+        .trim()
+        .parse::<i32>()
+        .unwrap();
+    assert!(live(pid));
+    daemon.command(&[
+        "missions",
+        "cancel",
+        "mission-run/orchid/cancel",
+        "--reason",
+        "normal work is no longer needed",
+        "--as",
+        "person/operator",
+    ]);
+    std::thread::sleep(Duration::from_millis(250));
+    let run = daemon.run();
+    assert_eq!(run["phase"], "final-cancelled", "{run}");
+    assert!(
+        live(pid),
+        "the parent stopped its child's final cleanup early"
+    );
+    std::fs::write(root.path().join("finish"), "").unwrap();
+    wait_for("parent cancellation after child cleanup", || {
+        daemon.run()["phase"] == "terminal"
+    });
+    assert_eq!(daemon.run()["status"], "cancelled");
 }

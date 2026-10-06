@@ -1,6 +1,9 @@
 # st documentation
 
-The root [README](../../README.md) explains the product and the normal command workflow.
+The root [README](../../README.md) introduces the product and links its guides.
+[Getting started](../getting-started.md) walks through installation and a first mission.
+[Development](../development.md) covers source builds, CI, shared UI models, and repository layout.
+[Home Manager](../home-manager.md) covers declarative installation and user services.
 
 Use these documents for implementation details:
 
@@ -11,9 +14,15 @@ Use these documents for implementation details:
 - [Seat rollout](owned-seat-cutover.md) defines idle cutover, strict native-session continuity and source status.
 - [Free mode](kdl-lifecycle.md#free-mode): within a fleet, an agent may do anything the person who
   runs the fleet may do, as itself, until principals and grants land.
+- [Person delegation](person-delegation.md): record a person's prior answer or instruction as
+  the agent, with the person's allowed list, exact episode, and quoted evidence.
 - [Schema registry](schema.md) lists the generated public subject, resource, and claim vocabulary.
+- [Typed custom subjects](custom-subjects.md) defines immutable registrations, generic reads and replies, and derived-state freshness,
+  and the decision-tree manifest.
 - [Data authority](data-authority.md) separates durable facts from projections and caches.
 - [Claim backups](backups.md) explains live snapshots, offline restore, and recovered writer identities.
+- [Founder signing audit](founder-signing-audit.md) explains read-only capture, preserved unsealed
+  upgrades, and the remaining warnings for already-sealed unsigned delegations.
 - [Fleet replication](replication.md) defines convergence, inspection, and repair.
 - [Agent seat queues](seat-queue.md) explains how each seat orders its mission runs and how moves
   are recorded and replicated.
@@ -40,6 +49,8 @@ Use these documents for implementation details:
   on the seat, with a lease, and ends them when their harness, session or seat goes away.
 - [Model accounts](accounts.md) explains how a person declares several Claude and Codex accounts, how a
   seat binds one or a pool, and how a pooled seat at its limit restarts on another account.
+- [Sekrets](sekrets.md) explains the opt-in gateway that runs any CLI with a credential no seat
+  can read: profiles, policies, grants, how it tells a seat from its person, and its sandbox.
 - [Command recorder](command-recorder.md) explains how every `git` and `gh` call st starts is
   recorded, the log format, and what the recorder cannot see.
 - [Profiling the daemon](profiling.md) explains how the daemon accounts for its own time: waits

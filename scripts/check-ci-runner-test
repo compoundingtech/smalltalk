@@ -15,7 +15,7 @@ workflow = (ROOT / ".github/workflows/fleet.yml").read_text()
 picker = workflow.split("  pick-runner:\n", 1)[1].split("  namespace-capacity:\n", 1)[0]
 assert "if: vars.CI1_RUNNERS == 'on'" in picker, "ci1 must ship disabled"
 # Read this generated YAML block scalar without adding a YAML dependency to the CI shell.
-script = textwrap.dedent(picker.split("        run: |\n", 1)[1])
+script = textwrap.dedent(picker.split("        run: |\n", 1)[1].split("\n      - ", 1)[0])
 bash = shutil.which("bash")
 assert bash, "runner selection tests require bash on PATH"
 
@@ -28,7 +28,9 @@ def check(name, pages, expected=None, api=True, **overrides):
     with tempfile.TemporaryDirectory() as scratch:
         tmp = Path(scratch)
         gh = tmp / "gh"
-        gh.write_text(f"#!{bash}\necho called >> \"$API_CALLS\"\nprintf '%s' \"$API_RESPONSE\"\nexit \"$API_EXIT\"\n")
+        gh.write_text(f"#!{bash}\necho called >> \"$API_CALLS\"\n"
+                      "if [[ \"$*\" == *'/pulls/'* ]]; then printf '%s' \"$API_LABEL_RESPONSE\"; "
+                      "else printf '%s' \"$API_RESPONSE\"; fi\nexit \"$API_EXIT\"\n")
         gh.chmod(0o755)
         output, summary, calls = (tmp / n for n in ("output", "summary", "calls"))
         output.touch()
@@ -40,35 +42,114 @@ def check(name, pages, expected=None, api=True, **overrides):
             "REPOSITORY": "example/project",
             "HEAD_REPOSITORY": "example/project",
             "OWNER": "example",
-            "NEED": "5",
+            "PR_LABELS": "[]",
+            "QUEUE_REF": "",
+            "GH_REPO_TOKEN": "",
+            "NEED": "1",
             "GITHUB_OUTPUT": str(output),
             "GITHUB_STEP_SUMMARY": str(summary),
             "API_CALLS": str(calls),
             "API_RESPONSE": json.dumps(pages),
+            "API_LABEL_RESPONSE": "[]",
             "API_EXIT": "0",
             **overrides,
         }
         result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", script], env=env, capture_output=True, text=True)
         assert result.returncode == 0, (name, result.stdout, result.stderr)
-        selected = output.read_text().strip()
-        assert selected == (f'ci1=["{expected}"]' if expected else ""), (name, selected)
+        selected = {key: json.loads(value) for key, value in
+                    (line.split('=', 1) for line in output.read_text().splitlines())}
+        expected = expected if isinstance(expected, dict) else ({'ci1': [expected]} if expected else {})
+        assert selected == expected, (name, selected, expected)
         assert calls.exists() == api, (name, "unexpected API call")
         assert ("**ci1**" if expected else "**Namespace**") in summary.read_text(), name
         print(f"passed: {name}")
 
 
-idle = [{"runners": [runner() for _ in range(5)]}]
+idle = [{"runners": [runner()]}]
 check("trusted PR with capacity", idle, "ci1")
 check("main push with capacity", idle, "ci1", EVENT="push", HEAD_REPOSITORY="")
 check("manual run with capacity", idle, "ci1", EVENT="workflow_dispatch")
 check("fork with capacity cannot call the API", idle, api=False, HEAD_REPOSITORY="fork/project")
 check("missing fork identity fails closed", idle, api=False, HEAD_REPOSITORY="")
 check("missing token", idle, api=False, GH_TOKEN="")
-check("busy and offline runners do not count", [{"runners": [runner() for _ in range(4)] + [runner(busy=True), runner(status="offline")]}])
-check("merge-only runner excluded from PRs", [{"runners": [runner() for _ in range(4)] + [runner("ci1-merge")]}])
-check("merge groups select their reserved label", [{"runners": [runner("ci1-merge") for _ in range(5)]}], "ci1-merge", EVENT="merge_group")
-check("runner list spans API pages", [{"runners": [runner() for _ in range(2)]}, {"runners": [runner() for _ in range(3)]}], "ci1")
+check("busy and offline runners do not count", [{"runners": [runner(busy=True), runner(status="offline")]}])
+check("three free slots serve both shards and canaries", [{"runners": [runner() for _ in range(3)] + [runner(busy=True), runner(status="offline")]}],
+      {'ci1': ['ci1'], 'ci1_secondary': ['ci1'], 'ci1_mail': ['ci1']})
+check("merge-only runner excluded from PRs", [{"runners": [runner("ci1-merge")]}])
+check("merge groups wait for their reserved pool", [{"runners": [runner("ci1-merge", busy=True)]}], "ci1-merge", EVENT="merge_group")
+check("merge groups need no status token", [], "ci1-merge", EVENT="merge_group", GH_TOKEN="", api=False)
+check("runner list spans API pages", [{"runners": [runner(busy=True)]}, {"runners": [runner()]}], "ci1")
 check("API failure falls back", idle, API_EXIT="1")
 check("invalid API response falls back", idle, API_RESPONSE="not JSON")
 check("zero minimum fails closed", idle, api=False, NEED="0")
 check("invalid minimum fails closed", idle, api=False, NEED="invalid")
+
+check("priority PR uses reserved capacity even while all ordinary runners are busy", [], "ci1-priority", PR_LABELS='["ci-priority"]')
+check("priority PR needs no status token", [], "ci1-priority", PR_LABELS='["ci-priority"]', GH_TOKEN="", api=False)
+check("priority cannot bypass the fork boundary", idle, PR_LABELS='["ci-priority"]', HEAD_REPOSITORY="fork/project", api=False)
+check("unrelated labels preserve normal routing", idle, "ci1", PR_LABELS='["area:ci"]')
+check("malformed labels preserve normal routing", idle, "ci1", PR_LABELS='invalid')
+
+check("priority merge group uses the urgent pool", [], "ci1-priority", EVENT="merge_group", GH_REPO_TOKEN="stand-in", QUEUE_REF="refs/heads/gh-readonly-queue/main/pr-42-" + "a"*40, API_LABEL_RESPONSE='["ci-priority"]')
+check("ordinary merge group retains reserved merge capacity", [], "ci1-merge", EVENT="merge_group", GH_REPO_TOKEN="stand-in", QUEUE_REF="refs/heads/gh-readonly-queue/main/pr-42-" + "a"*40, API_LABEL_RESPONSE='["area:ci"]')
+check("merge-label API failure retains reserved capacity", [], "ci1-merge", EVENT="merge_group", GH_REPO_TOKEN="stand-in", QUEUE_REF="refs/heads/gh-readonly-queue/main/pr-42-" + "a"*40, API_EXIT="1")
+check("malformed queue ref never requests a PR", [], "ci1-merge", EVENT="merge_group", GH_REPO_TOKEN="stand-in", QUEUE_REF="refs/heads/unrelated")
+
+four = [{'runners': [runner() for _ in range(4)]}]
+check("configured primary minimum permits all three jobs", four,
+      {'ci1': ['ci1'], 'ci1_secondary': ['ci1'], 'ci1_mail': ['ci1']}, NEED='4')
+check("primary minimum does not strand three idle general runners", [{'runners': [runner() for _ in range(3)]}],
+      {'ci1_secondary': ['ci1'], 'ci1_mail': ['ci1']}, NEED='4')
+check("one extra slot serves second shard before canaries", idle, {'ci1_secondary': ['ci1']}, NEED='4')
+check("one general slot cannot be promised to two jobs", idle, "ci1-merge", EVENT='merge_group', NEED='4')
+check("two general slots let merge primary and secondary start", [{'runners': [runner(), runner()]}],
+      {'ci1': ['ci1-merge'], 'ci1_secondary': ['ci1']}, EVENT='merge_group', NEED='4')
+check("priority primary leaves general slots for extra tests", four,
+      {'ci1': ['ci1-priority'], 'ci1_secondary': ['ci1'], 'ci1_mail': ['ci1']}, PR_LABELS='["ci-priority"]', NEED='4')
+check("reserved workers never count as extra general capacity", [{'runners': [runner('ci1-priority'), runner('ci1-merge')]}],
+      'ci1-priority', PR_LABELS='["ci-priority"]')
+check("status lookup failure preserves priority primary", four, 'ci1-priority', PR_LABELS='["ci-priority"]', API_EXIT='1')
+check("invalid status response preserves merge primary", four, 'ci1-merge', EVENT='merge_group', API_RESPONSE='not JSON')
+
+# Supporting jobs must never spend ordinary CI work on priority/merge capacity.
+import re
+blocks = dict(re.findall(r"(?ms)^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)", workflow.split("\njobs:\n", 1)[1]))
+for job in ("linux-clippy", "linux-fleet-compat", "genie-freshness", "typescript-client", "isolation-vm", "perf-cost"):
+    assert "outputs.ci1" not in blocks[job], (job, "supporting job consumes reserved cores")
+    assert ";job.priority=1" in blocks[job], (job, "one class prevents perpetual benchmark starvation")
+    assert "github.run-id=" in blocks[job], (job, "prevent cross-run assignment")
+    if job in ("genie-freshness", "typescript-client", "isolation-vm"):
+        assert "namespace-profile-linux-x86-64;job.priority=1;github.run-id=" in blocks[job], (job, "profile controls must be inline")
+        assert "namespace-features:" not in blocks[job], (job, "separate feature labels are unsupported with profiles")
+    else:
+        assert "namespace-features:github.run-id=" in blocks[job], (job, "shape labels need a separate features label")
+for job, output in [('linux-tests-shard-2', 'ci1_secondary'), ('mail-redelivery-canaries', 'ci1_mail')]:
+    assert f'outputs.{output} ||' in blocks[job], (job, 'extra jobs need their own idle-slot output')
+    assert not re.search(r'outputs\.ci1\b', blocks[job]), (job, 'extra jobs must never take the primary reserved lane')
+    assert 'job.priority=1' in blocks[job] and 'github.run-id={0}' in blocks[job], (job, 'Namespace fallback must retain priority and run affinity')
+assert "outputs.ci1" in blocks["linux-tests"], "primary shard must retain reserved routing"
+canaries = blocks['mail-redelivery-canaries']
+assert 'needs: [pick-runner]' in canaries and 'needs: [linux-tests]' not in canaries, "canaries must run beside both test shards"
+assert 'scripts/ci-linux mail-redelivery-canaries' in canaries, "the required check must execute the canaries itself"
+assert 'cargo-linux-tests-' in canaries and 'nix5-linux-tests-' in canaries, "reuse protected-main test dependency caches"
+assert 'CI_TEST_PARTITION' not in canaries, "every required canary must run"
+assert 'mail_redelivery' not in blocks['linux-tests'] and 'scripts/ci-mail-redelivery-canaries' not in blocks['linux-tests'], "canaries cannot serialize the primary shard"
+assert 'needs.mail-redelivery-canaries.result' in blocks['linux-gate'], "failures and skips must still fail the Linux gate"
+assert "job.priority=1" in blocks["linux-tests"] and "github.run-id={0}" in blocks["linux-tests"], "same class for Namespace fallback with an evaluated run id"
+for path in ("perf.yml", "main-upkeep.yml", "public-repo.yml", "release-daily.yml", "release-portable.yml", "release-smalltalk.yml"):
+    generated = (ROOT / ".github/workflows" / path).read_text()
+    assert ";job.priority=1" in generated, (path, "Linux optional work must share the class")
+    assert "github.run-id=" in generated, (path, "avoid nondeterministic runner pickup")
+    assert ";job.priority=10" not in generated, path
+for path in ("public-repo.yml", "release-daily.yml", "release-portable.yml", "release-smalltalk.yml", "macos.yml"):
+    generated = (ROOT / ".github/workflows" / path).read_text()
+    assert "namespace-features:" not in generated, (path, "profile workflows must use inline controls")
+release = (ROOT / ".github/workflows/release-smalltalk.yml").read_text()
+assert "${{ matrix.runner }};github.run-id=${{ github.run_id }}" in release, "both release profile matrix entries need evaluated inline affinity"
+assert "linux-tests-shard-2" in blocks["linux-gate"], "both shards must be required"
+assert 'CI_TEST_PARTITION: "hash:1/2"' in blocks["linux-tests"]
+assert 'CI_TEST_PARTITION: "hash:2/2"' in blocks["linux-tests-shard-2"]
+for job in ("linux-tests", "linux-tests-shard-2"):
+    assert 'CI_TEST_THREADS: "8"' in blocks[job], "bound each shard's test concurrency"
+assert "vars.CI1_MIN_IDLE || '1'" in picker, "use an idle general slot without requiring the entire pool"
+print("passed: bounded test shards, reserved primary lane, idle general slots, Namespace fallback, and required aggregation")

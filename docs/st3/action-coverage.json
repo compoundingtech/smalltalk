@@ -44,11 +44,35 @@
       "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
     },
     {
+      "action": "arrangement.edit",
+      "tests": [
+        "crates/st3/src/api/client_v0/arrangements.rs::arrangement_actions_merge_layout_fences_replay_receipts_and_preserve_owner",
+        "crates/st3/src/api/client_v0/arrangements.rs::arrangement_edit_recovers_receipt_gap_without_accepting_a_changed_action_id",
+        "crates/st3/src/api/client_v0/arrangements.rs::arrangement_actions_accept_current_projected_launch_fences_and_refuse_stale_ones",
+        "crates/st3/src/api/client_v0/arrangements.rs::arrangement_retire_fences_refuse_concurrent_edits_and_replay_receipts",
+        "crates/st3/src/api/client_v0/arrangements.rs::arrangement_fenced_retire_recovers_receipt_gap",
+        "crates/st3/src/api/client_v0/arrangements.rs::arrangement_create_race_returns_typed_exists_and_exact_retry_receipt",
+        "crates/st3/src/api/client_v0/arrangements.rs::arrangement_folder_race_and_validation_refusals_stay_typed",
+        "crates/st3/src/api/client_v0/arrangements.rs::selected_arrangement_survives_byte_window_edits_and_retirement",
+        "crates/st3/src/store/arrangements_tests.rs::owner_admission_real_agent_and_atomic_identity_fences",
+        "crates/st3/src/store/arrangements_tests.rs::heads_survive_reopen_and_an_upgrade_backfills_once"
+      ],
+      "behavior": "real API handler and store tests: stale layout fences merge; fenced retirement compares the current revision and refuses concurrent edits without writes; unfenced retirement remains unconditional; stale authority and launch fences refuse without edits; replay preserves receipts and rejects changed action identity; fenced retirement recovers receipt gaps; agent attribution preserves person ownership; projected heads survive reopen, upgrade backfill and replication"
+    },
+    {
       "action": "attention.resolve",
       "tests": [
         "crates/st3/tests/action_coverage.rs::unavailable_actions_refuse_before_and_after_restart_without_writes"
       ],
       "behavior": "refused without writes across restart"
+    },
+    {
+      "action": "custom.reply",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::custom_reply_survives_fences_cli_and_daemon_restarts",
+        "crates/st3/tests/action_coverage.rs::decision_tree_manifest_cards_fences_retries_damage_and_restarts"
+      ],
+      "behavior": "stale source/card fences and wrong actor refused; client and CLI answers survive restart; exact replay writes no duplicate answer"
     },
     {
       "action": "lane.approve",
@@ -376,6 +400,22 @@
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
     },
     {
+      "command": "st admission override",
+      "description": "Explicitly allow an installed exact harness build with a recorded reason",
+      "tests": [
+        "crates/st3/tests/client_v0_cli.rs::person_admission_exception_is_local_reversible_and_never_spawns_the_producer"
+      ],
+      "verification": "real local CLI; environment guard, exact-build record, revoke, and no daemon or producer child"
+    },
+    {
+      "command": "st admission revoke",
+      "description": "Remove the installed exact harness build exception",
+      "tests": [
+        "crates/st3/tests/client_v0_cli.rs::person_admission_exception_is_local_reversible_and_never_spawns_the_producer"
+      ],
+      "verification": "real local CLI; environment guard, exact-build record, revoke, and no daemon or producer child"
+    },
+    {
       "command": "st agents apply",
       "description": "Preview and apply one KDL file containing durable agent seats",
       "tests": [
@@ -465,6 +505,14 @@
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
     },
     {
+      "command": "st agents workspace",
+      "description": "Print one seat's declared workspace directory on its owning host, even when stopped",
+      "tests": [
+        "crates/st3/tests/client_v0_cli.rs::agent_workspace_cli_and_client_read_the_same_declaration_even_after_retirement"
+      ],
+      "verification": "real CLI and generated Rust client over a private Unix socket; current and stopped declarations"
+    },
+    {
       "command": "st agents start",
       "description": "Start a durable seat, patching only explicitly supplied declaration fields. A stopped mission seat starts again on its run's own declaration",
       "tests": [
@@ -504,11 +552,13 @@
     },
     {
       "command": "st apply",
-      "description": "Publish a complete source-fenced owned set",
+      "description": "Preview and publish KDL files or a complete source-fenced owned set",
       "tests": [
-        "crates/st3/tests/owned_sets.rs::disconnected_daemons_heal_to_newest_source_and_pruning_requires_confirmation"
+        "crates/st3/tests/owned_sets.rs::disconnected_daemons_heal_to_newest_source_and_pruning_requires_confirmation",
+        "crates/st3/tests/broken_gates.rs::apply_bundles_seats_missions_and_schedules_and_refuses_partial_publication",
+        "crates/st3/tests/broken_gates.rs::apply_can_check_exec_gates_during_plain_and_owned_dry_runs"
       ],
-      "verification": "real CLI over isolated disk-backed Unix daemons; source fences, partition/heal and retirement confirmation"
+      "verification": "real CLI over isolated disk-backed Unix daemons; mixed-file atomic publication, dry-run side effects, gate checks, source fences, partition/heal and retirement confirmation"
     },
     {
       "command": "st attention approve",
@@ -517,6 +567,14 @@
         "crates/st3/tests/action_coverage.rs::cli_human_reviews_act_on_the_current_card_after_restart"
       ],
       "verification": "real CLI over private Unix socket; current source review and durable verdict"
+    },
+    {
+      "command": "st attention discuss",
+      "description": "Chat about an item: send a message to the agent involved, titled after the item, with a reference to what it is about. This is what \"Chat about this\" does in stui",
+      "tests": [
+        "crates/st3/tests/client_v0_cli.rs::attention_discuss_sends_the_message_stui_chat_about_this_sends"
+      ],
+      "verification": "real CLI over private Unix socket; the agent reads the message with the item named"
     },
     {
       "command": "st attention ls",
@@ -641,6 +699,14 @@
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
     },
     {
+      "command": "st conversations cleanup",
+      "description": "Archive aged unread mail in one mailbox or all mailboxes, with dry-run preview",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_aged_unread_cleanup_preserves_fresh_and_read_mail_across_restart"
+      ],
+      "verification": "real CLI over private Unix socket; dry run, mailbox scope and repeated cleanup across disk-store restarts"
+    },
+    {
       "command": "st conversations export",
       "description": "Write a disposable mailbox tree for translated tools",
       "tests": [
@@ -736,6 +802,15 @@
         "crates/st3/tests/action_coverage.rs::cli_devices_and_native_import_survive_restart"
       ],
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st devices complete",
+      "description": "Complete a single-use pairing and privately persist its credential and signing key",
+      "tests": [
+        "crates/st3/tests/client_v0_cli.rs::devices_complete_needs_no_daemon_config_and_never_prints_or_loses_secrets",
+        "crates/st3-client/tests/device_signing.rs::shared_completion_persists_both_key_types_and_preserves_a_working_device_on_failure"
+      ],
+      "verification": "real CLI against an isolated paired gateway; generated/imported Ed25519/P-256 keys; credential/key profile reloaded; signed messages verify"
     },
     {
       "command": "st devices ls",
@@ -1418,6 +1493,30 @@
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
     },
     {
+      "command": "st schema register",
+      "description": "Publish an immutable typed custom schema and bounded projection.",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::custom_reply_survives_fences_cli_and_daemon_restarts"
+      ],
+      "verification": "real CLI over private Unix socket; registered reads and fenced person replies across restart"
+    },
+    {
+      "command": "st schema registration",
+      "description": "Read an exact custom registration by kind and hash.",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::custom_reply_survives_fences_cli_and_daemon_restarts"
+      ],
+      "verification": "real CLI over private Unix socket; registered reads and fenced person replies across restart"
+    },
+    {
+      "command": "st schema registrations",
+      "description": "List registered custom kinds and their pinned hashes.",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::custom_reply_survives_fences_cli_and_daemon_restarts"
+      ],
+      "verification": "real CLI over private Unix socket; registered reads and fenced person replies across restart"
+    },
+    {
       "command": "st schema resources",
       "description": "List registered resource kinds",
       "tests": [
@@ -1440,6 +1539,166 @@
         "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
       ],
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st sekrets",
+      "description": "Run any CLI with credentials no seat can read, through the sekrets gateway",
+      "tests": [
+        "crates/st3/src/sekrets/tests.rs::a_person_runs_their_profile_without_seeing_the_store_or_other_profiles",
+        "crates/st3/src/sekrets/tests.rs::a_seat_uses_only_what_it_was_granted_and_only_with_its_daemons_word",
+        "crates/st3/src/sekrets/tests.rs::git_in_a_checkout_runs_none_of_the_checkouts_programs",
+        "crates/st3/src/sekrets/tests.rs::a_terminal_command_gets_a_controlling_terminal_whose_side_the_caller_holds"
+      ],
+      "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
+    },
+    {
+      "command": "st sekrets enable",
+      "description": "Register this host's daemon key with the gateway, so seats can be told from their person",
+      "tests": [
+        "crates/st3/src/sekrets/tests.rs::a_seat_uses_only_what_it_was_granted_and_only_with_its_daemons_word"
+      ],
+      "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
+    },
+    {
+      "command": "st sekrets grant",
+      "description": "Give an agent or another person the use of a profile, narrowed by a policy",
+      "tests": [
+        "crates/st3/src/sekrets/tests.rs::a_seat_uses_only_what_it_was_granted_and_only_with_its_daemons_word",
+        "crates/st3/src/sekrets/tests.rs::owners_manage_their_profiles_and_only_they_log_them_in"
+      ],
+      "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
+    },
+    {
+      "command": "st sekrets grants",
+      "description": "List grants of this person's profiles, and grants to this caller",
+      "tests": [
+        "crates/st3/src/sekrets/tests.rs::owners_manage_their_profiles_and_only_they_log_them_in"
+      ],
+      "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
+    },
+    {
+      "command": "st sekrets lock",
+      "description": "Stop all use of sekrets, or one person's",
+      "tests": [
+        "crates/st3/src/sekrets/tests.rs::a_seat_uses_only_what_it_was_granted_and_only_with_its_daemons_word"
+      ],
+      "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
+    },
+    {
+      "command": "st sekrets log",
+      "description": "Show the calls and changes this person may read",
+      "tests": [
+        "crates/st3/src/sekrets/tests.rs::a_person_runs_their_profile_without_seeing_the_store_or_other_profiles"
+      ],
+      "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
+    },
+    {
+      "command": "st sekrets login",
+      "description": "Run a tool's own login as the sekrets user, so the credential lands in a profile",
+      "tests": [
+        "crates/st3/src/sekrets/tests.rs::owners_manage_their_profiles_and_only_they_log_them_in",
+        "crates/st3/src/sekrets/tests.rs::a_terminal_command_gets_a_controlling_terminal_whose_side_the_caller_holds"
+      ],
+      "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
+    },
+    {
+      "command": "st sekrets presets",
+      "description": "List policy presets",
+      "tests": [
+        "crates/st3/src/sekrets/policy.rs::deny_follows_allow_and_options_match_long_short_and_bundled_forms"
+      ],
+      "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
+    },
+    {
+      "command": "st sekrets profile create",
+      "description": "Create a profile you own, with its command policy",
+      "tests": [
+        "crates/st3/src/sekrets/tests.rs::a_person_runs_their_profile_without_seeing_the_store_or_other_profiles",
+        "crates/st3/src/sekrets/tests.rs::owners_manage_their_profiles_and_only_they_log_them_in"
+      ],
+      "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
+    },
+    {
+      "command": "st sekrets profile policy",
+      "description": "Replace a profile's policy",
+      "tests": [
+        "crates/st3/src/sekrets/tests.rs::owners_manage_their_profiles_and_only_they_log_them_in",
+        "crates/st3/src/sekrets/tests.rs::a_seat_uses_only_what_it_was_granted_and_only_with_its_daemons_word"
+      ],
+      "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
+    },
+    {
+      "command": "st sekrets profile rm",
+      "description": "Remove a profile, its home and its values, and end its grants",
+      "tests": [
+        "crates/st3/src/sekrets/tests.rs::owners_manage_their_profiles_and_only_they_log_them_in"
+      ],
+      "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
+    },
+    {
+      "command": "st sekrets profile show",
+      "description": "Show a profile you own or were granted, with its policy and the names of its values",
+      "tests": [
+        "crates/st3/src/sekrets/tests.rs::owners_manage_their_profiles_and_only_they_log_them_in"
+      ],
+      "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
+    },
+    {
+      "command": "st sekrets profiles",
+      "description": "List profiles this caller may use",
+      "tests": [
+        "crates/st3/src/sekrets/tests.rs::owners_manage_their_profiles_and_only_they_log_them_in"
+      ],
+      "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
+    },
+    {
+      "command": "st sekrets put",
+      "description": "Put a value read from standard input into a profile, as an environment variable its commands get",
+      "tests": [
+        "crates/st3/src/sekrets/tests.rs::a_person_runs_their_profile_without_seeing_the_store_or_other_profiles",
+        "crates/st3/src/sekrets/tests.rs::owners_manage_their_profiles_and_only_they_log_them_in"
+      ],
+      "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
+    },
+    {
+      "command": "st sekrets revoke",
+      "description": "Remove a grant",
+      "tests": [
+        "crates/st3/src/sekrets/tests.rs::owners_manage_their_profiles_and_only_they_log_them_in"
+      ],
+      "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
+    },
+    {
+      "command": "st sekrets setup",
+      "description": "Print the root commands that create the sekrets user, its store and the gateway service",
+      "tests": [
+        "crates/st3/src/sekrets/cli.rs::the_setup_script_names_each_person_and_a_root_owned_binary"
+      ],
+      "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
+    },
+    {
+      "command": "st sekrets unlock",
+      "description": "Allow use again",
+      "tests": [
+        "crates/st3/src/sekrets/tests.rs::a_seat_uses_only_what_it_was_granted_and_only_with_its_daemons_word"
+      ],
+      "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
+    },
+    {
+      "command": "st sekrets unset",
+      "description": "Remove a value from a profile",
+      "tests": [
+        "crates/st3/src/sekrets/tests.rs::owners_manage_their_profiles_and_only_they_log_them_in"
+      ],
+      "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
+    },
+    {
+      "command": "st sekrets whoami",
+      "description": "Show who the gateway takes this caller for",
+      "tests": [
+        "crates/st3/src/sekrets/tests.rs::a_seat_uses_only_what_it_was_granted_and_only_with_its_daemons_word"
+      ],
+      "verification": "in-process gateway on a real socket with bubblewrap and git; real Unix users, an ssh login session and a daemon in nix/sekrets-vm.nix"
     },
     {
       "command": "st service install",
@@ -1530,12 +1789,28 @@
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
     },
     {
+      "command": "st subject basis",
+      "description": "Read the complete raw input-set token for a derived-state basis.",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::custom_reply_survives_fences_cli_and_daemon_restarts"
+      ],
+      "verification": "real CLI over private Unix socket; registered reads and fenced person replies across restart"
+    },
+    {
       "command": "st subject history",
       "description": "Show bounded immutable history for one subject",
       "tests": [
         "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
       ],
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st subject reply",
+      "description": "Answer a current custom source with its declared fields and fences.",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::custom_reply_survives_fences_cli_and_daemon_restarts"
+      ],
+      "verification": "real CLI over private Unix socket; registered reads and fenced person replies across restart"
     },
     {
       "command": "st subject show",
@@ -1690,6 +1965,15 @@
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
     },
     {
+      "command": "st work acknowledge",
+      "description": "Record the recipient read receipt and acknowledge an exact handoff note",
+      "tests": [
+        "crates/st3/tests/adhoc_work.rs::spontaneous_work_survives_restart_handoff_acknowledgment_and_close",
+        "crates/st3/tests/adhoc_work.rs::person_handoff_is_visible_acknowledged_and_closed_with_evidence"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened and replayed between actions"
+    },
+    {
       "command": "st work ask",
       "description": "Ask a person through a runtime step owned by live work",
       "tests": [
@@ -1722,6 +2006,14 @@
       "verification": "shared API restart case"
     },
     {
+      "command": "st work delegation",
+      "description": "Replace or revoke the person's allowed delegation list with decision evidence",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_delegation_policy_and_answers_preserve_identity_across_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
       "command": "st work done",
       "description": "Complete a person-assigned step with a response",
       "tests": [
@@ -1744,6 +2036,15 @@
         "crates/st3/tests/action_coverage.rs::cli_missions_publish_cancel_outcome_retire_and_work_leases_survive_restart"
       ],
       "verification": "shared API restart case"
+    },
+    {
+      "command": "st work handoff",
+      "description": "Release the current lease and assign a leaf step with a durable recipient note",
+      "tests": [
+        "crates/st3/tests/adhoc_work.rs::spontaneous_work_survives_restart_handoff_acknowledgment_and_close",
+        "crates/st3/tests/adhoc_work.rs::person_handoff_is_visible_acknowledged_and_closed_with_evidence"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened and replayed between actions"
     },
     {
       "command": "st work ls",
@@ -1848,6 +2149,15 @@
         "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
       ],
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st work start",
+      "description": "Open a minimal spontaneous work run for the calling seat",
+      "tests": [
+        "crates/st3/tests/adhoc_work.rs::spontaneous_work_survives_restart_handoff_acknowledgment_and_close",
+        "crates/st3/tests/adhoc_work.rs::person_handoff_is_visible_acknowledged_and_closed_with_evidence"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened and replayed between actions"
     },
     {
       "command": "st work update",
@@ -1971,6 +2281,15 @@
         "crates/st3/tests/action_coverage.rs::glasses_save_delete_and_read_survive_stale_bases_and_restarts"
       ],
       "verification": "UI reducer and corresponding real daemon action; local effects have no graph fence"
+    },
+    {
+      "effect": "AgentControl",
+      "tests": [
+        "crates/stui/src/ui/glass.rs::ctrl_a_opens_an_agents_actions_and_restart_asks_first",
+        "crates/st3/tests/action_coverage.rs::creation_and_declaration_actions_survive_stale_fences_and_restarts",
+        "crates/st3/tests/action_coverage.rs::suspension_requests_survive_stale_incarnations_and_restarts"
+      ],
+      "verification": "UI reducer and corresponding real daemon actions (agent.stop, agent.start, agent.suspend, agent.resume)"
     },
     {
       "effect": "StopAgent",

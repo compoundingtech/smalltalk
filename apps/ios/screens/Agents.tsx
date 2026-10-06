@@ -53,7 +53,7 @@ export function AgentsScreen() {
     }), 250);
     return () => { live = false; clearTimeout(timer); };
   }, [query, status]); // eslint-disable-line react-hooks/exhaustive-deps
-  const rows = useMemo(() => filterAgentRows(agentRows(data.agents, data.sessions, gatewayHost || '?'), filter), [data.agents, data.sessions, gatewayHost, filter]);
+  const rows = useMemo(() => filterAgentRows(agentRows(data.agents, data.sessions, gatewayHost || '?', Date.now(), data.missions), filter), [data.agents, data.sessions, data.missions, gatewayHost, filter]);
   const open = (row: AgentRowView) => navigation.navigate('Conversation', { target: row.target, ...(row.unmanaged ? { sessionId: row.id } : {}), title: row.name });
   const menu = (row: AgentRowView): MenuAction[] => {
     const agent = data.agents.find(candidate => candidate.id === row.id);
@@ -133,7 +133,7 @@ export function AgentsScreen() {
       keyExtractor={item => item.id}
       stickySectionHeadersEnabled={false}
       renderSectionHeader={({ section }) => <SectionHeader title={section.title} count={section.count} color={section.person ? theme.person : theme.overlay1} />}
-      renderItem={({ item }) => row(item, 0, item.path)}
+      renderItem={({ item }) => row(item, 0, item.progress ?? item.path)}
       ListHeaderComponent={header}
       ListEmptyComponent={empty}
       ListFooterComponent={footer}

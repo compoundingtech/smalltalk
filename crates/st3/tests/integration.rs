@@ -4,8 +4,11 @@
 //! `mod NAME;` line here or an explicit test target for every new file.
 
 mod action_coverage;
+mod adhoc_work;
 mod agents_restart;
+mod authored_resume;
 mod backup;
+mod binary_payloads;
 mod boot_canaries;
 mod broken_gates;
 mod client_creation;
@@ -27,6 +30,7 @@ mod delivery_probe;
 mod examples;
 mod fault_isolation;
 mod first_sync;
+mod follow_retry;
 mod fleet;
 mod gate_kinds;
 mod getting_started;
@@ -45,6 +49,7 @@ mod placement_handoff;
 mod reconcile_pass_perf;
 mod recorder_report;
 mod seat_queue_perf;
+mod startup_readiness;
 mod subagent_publisher;
 mod subagents_seat;
 mod terminal_attach;

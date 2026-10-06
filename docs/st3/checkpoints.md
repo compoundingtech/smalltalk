@@ -58,6 +58,11 @@ reaches a live store. If they match, the node publishes one `checkpoint.verified
 digests of the drops, the kept claims, the graph and the readers' answers. A node verifies a
 checkpoint once.
 
+The rules identity covers projection inputs and replay as well as retention. Version 11 includes
+`arrangements` and `arrangement_registers`, even when empty, and rebuilds them from sealed claims.
+Different builds' rules digests must match exactly, not by version ordering: a mixed-version
+fleet waits at sealing until its participants use compatible rules, including during rollback.
+
 **Stable.** A checkpoint is stable when every participant has published a verification that names
 the same participants and carries identical digests. Stability is a pure function of claims, like
 the membership fold: no clock, no order, so every node that holds the same claims reaches the same
@@ -348,3 +353,29 @@ A new rule changes the rules digest, so it takes effect only once every particip
 adding one, list every reader of the kind, give each kept claim a reason in terms of a reader's
 answer, and add a test in `checkpoint_tests.rs` that names the dropped and the kept claims, as the
 examples above do.
+
+The observed seat status history rule (rules version 9) preserves the last 200 canonical
+transition and runtime reset sources per seat within seven days before the cut, across runtime
+incarnations. It also preserves the start of the current observed state, including idle or
+blocked states older than that window, so trimming cannot reset `since`. Existing operational
+witnesses can retain other claims; the client read independently enforces its seven-day/200-item
+bound. Checkpoint tombstones make unprovable completeness explicit instead of treating deleted
+observations as evidence of continuity.
+
+Rules version 10 also treats native credential refusal and recovery as observed status
+transitions within the same seven-day / 200-transition cap. It preserves the beginning
+of the current credential episode and its latest native evidence fields, so trimming
+cannot clear a login refusal or reset its start time. Checkpoint participants must run
+matching rules before verifying a new certificate.
+
+During a rules-v9 to rules-v10 rollout, participants on different versions can seal
+identical inventories with different rules digests. They cannot verify that cut together,
+so checkpoint verification and trimming stall fleet-wide until all participants use v10.
+Replication and ordinary work continue; the mismatch does not authorize dropping data.
+Coordinate the participant upgrades before resuming checkpoint verification. Previously
+verified certificate terms stay unchanged.
+
+The first observation on upgrade can reset `since` once when the legacy snapshot has no
+`provider_auth` field and its successor explicitly records null. That is an evidence-shape
+change, not proof that a login succeeded or that a runtime restarted. Later unchanged
+observations preserve `since`; a held credential refusal persists until positive recovery.

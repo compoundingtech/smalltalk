@@ -28,6 +28,22 @@ public actor St3Client {
         if history { query.append(.init(name: "history", value: "true")) }
         return try await get("v1/client/\(collection)", query: query)
     }
+    /// Exact server-side filters; refuses older servers that ignore them.
+    public func terminalsListFiltered(owner: String? = nil, state: String? = nil, cursor: String? = nil, limit: Int? = nil, history: Bool = false) async throws -> Envelope<ResourcePage> {
+        var query: [URLQueryItem] = []
+        if let owner { query.append(.init(name: "owner", value: owner)) }
+        if let state { query.append(.init(name: "state", value: state)) }
+        if let cursor { query.append(.init(name: "cursor", value: cursor)) }
+        if let limit { query.append(.init(name: "limit", value: String(limit))) }
+        if history { query.append(.init(name: "history", value: "true")) }
+        let response: Envelope<ResourcePage> = try await get("v1/client/terminals", query: query)
+        for (name, value) in [("owner", owner), ("state", state)] {
+            if let value, response.value.filters[name] != value {
+                throw NSError(domain: "st3.client.protocol", code: 1, userInfo: [NSLocalizedDescriptionKey: "The server does not support the terminal \(name) filter; upgrade the server"])
+            }
+        }
+        return response
+    }
     public func nowList(ownerRun: String, cursor: String? = nil, limit: Int? = nil, history: Bool = false) async throws -> Envelope<ResourcePage> {
         var query: [URLQueryItem] = [.init(name: "owner_run", value: ownerRun)]
         if let cursor { query.append(.init(name: "cursor", value: cursor)) }
@@ -51,7 +67,7 @@ public actor St3Client {
         var components = URLComponents(url: baseURL.appending(path: "v1/client/conversations/\(Self.routedSessionID(sessionID))/stream"), resolvingAgainstBaseURL: false)!
         components.scheme = components.scheme == "https" ? "wss" : "ws"
         if let after { components.queryItems = [.init(name: "after", value: after)] }
-        var request = URLRequest(url: components.url!); request.setValue("st3.client.conversation.v0", forHTTPHeaderField: "Sec-WebSocket-Protocol"); if let credential { request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization") }; if let client { request.setValue(client, forHTTPHeaderField: "x-st3-client") }
+        var request = URLRequest(url: components.url!); request.setValue("custom-subjects.v1", forHTTPHeaderField: "x-st3-features"); request.setValue("st3.client.conversation.v0", forHTTPHeaderField: "Sec-WebSocket-Protocol"); if let credential { request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization") }; if let client { request.setValue(client, forHTTPHeaderField: "x-st3-client") }
         let task = session.webSocketTask(with: request)
         return AsyncThrowingStream { continuation in
             continuation.onTermination = { _ in task.cancel(with: .normalClosure, reason: nil) }
@@ -83,7 +99,7 @@ public actor St3Client {
     public func glassesStream(subscriptionID: String = "glasses") -> AsyncThrowingStream<GlassCollectionFrame, Error> {
         var components = URLComponents(url: baseURL.appending(path: "v1/client/collections/stream"), resolvingAgainstBaseURL: false)!
         components.scheme = components.scheme == "https" ? "wss" : "ws"
-        var request = URLRequest(url: components.url!); request.setValue("st3.client.collections.v0", forHTTPHeaderField: "Sec-WebSocket-Protocol"); if let credential { request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization") }; if let client { request.setValue(client, forHTTPHeaderField: "x-st3-client") }
+        var request = URLRequest(url: components.url!); request.setValue("custom-subjects.v1", forHTTPHeaderField: "x-st3-features"); request.setValue("st3.client.collections.v0", forHTTPHeaderField: "Sec-WebSocket-Protocol"); if let credential { request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization") }; if let client { request.setValue(client, forHTTPHeaderField: "x-st3-client") }
         let task = session.webSocketTask(with: request)
         return AsyncThrowingStream { continuation in
             continuation.onTermination = { _ in task.cancel(with: .normalClosure, reason: nil) }
@@ -96,6 +112,31 @@ public actor St3Client {
                         let data = try Self.websocketData(from: try await task.receive())
                         let frame = try JSONDecoder().decode(GlassCollectionFrame.self, from: data)
                         if frame.kind == "error" { throw NSError(domain: "St3Client", code: 0, userInfo: [NSLocalizedDescriptionKey: frame.message ?? "Glass subscription failed"]) }
+                        if frame.kind == "resync" { try await task.send(.string(String(decoding: command, as: UTF8.self))); continue }
+                        continuation.yield(frame)
+                    }
+                } catch { continuation.finish(throwing: task.closeCode == .normalClosure ? nil : error); task.cancel(with: .normalClosure, reason: nil) }
+            }
+        }
+    }
+    public func arrangementsStream(person: String, subscriptionID: String = "arrangements", limit: Int = 100, subject: String? = nil) -> AsyncThrowingStream<ArrangementCollectionFrame, Error> {
+        var components = URLComponents(url: baseURL.appending(path: "v1/client/collections/stream"), resolvingAgainstBaseURL: false)!
+        components.scheme = components.scheme == "https" ? "wss" : "ws"
+        var request = URLRequest(url: components.url!); request.setValue("st3.client.collections.v0", forHTTPHeaderField: "Sec-WebSocket-Protocol"); if let credential { request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization") }
+        let task = session.webSocketTask(with: request)
+        return AsyncThrowingStream { continuation in
+            continuation.onTermination = { _ in task.cancel(with: .normalClosure, reason: nil) }
+            task.resume()
+            Task {
+                do {
+                    var subscription: [String: Any] = ["kind":"subscribe", "id":subscriptionID, "collection":"arrangements", "person":person, "limit":limit]
+                    if let subject { subscription["subject"] = subject }
+                    let command = try JSONSerialization.data(withJSONObject: subscription)
+                    try await task.send(.string(String(decoding: command, as: UTF8.self)))
+                    while true {
+                        let data = try Self.websocketData(from: try await task.receive())
+                        let frame = try JSONDecoder().decode(ArrangementCollectionFrame.self, from: data)
+                        if frame.kind == "error" { throw NSError(domain: "St3Client", code: 0, userInfo: [NSLocalizedDescriptionKey: frame.message ?? "Arrangement subscription failed"]) }
                         if frame.kind == "resync" { try await task.send(.string(String(decoding: command, as: UTF8.self))); continue }
                         continuation.yield(frame)
                     }
@@ -135,7 +176,7 @@ public actor St3Client {
         var components = URLComponents(url: baseURL.appending(path: "v1/client/terminals/\(id.replacingOccurrences(of: "terminal/", with: ""))/stream"), resolvingAgainstBaseURL: false)!
         components.scheme = components.scheme == "https" ? "wss" : "ws"
         if let incarnation { components.queryItems = [.init(name: "incarnation", value: incarnation)] }
-        var request = URLRequest(url: components.url!); request.setValue("\(st3ClientTerminalSubprotocol), st3.cap.\(streamCapability)", forHTTPHeaderField: "Sec-WebSocket-Protocol"); if let credential { request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization") }; if let client { request.setValue(client, forHTTPHeaderField: "x-st3-client") }
+        var request = URLRequest(url: components.url!); request.setValue("custom-subjects.v1", forHTTPHeaderField: "x-st3-features"); request.setValue("\(st3ClientTerminalSubprotocol), st3.cap.\(streamCapability)", forHTTPHeaderField: "Sec-WebSocket-Protocol"); if let credential { request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization") }; if let client { request.setValue(client, forHTTPHeaderField: "x-st3-client") }
         let task = session.webSocketTask(with: request)
         return AsyncThrowingStream { continuation in
             continuation.onTermination = { _ in task.cancel(with: .normalClosure, reason: nil) }
@@ -165,7 +206,7 @@ public actor St3Client {
         var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)!; let basePath = components.percentEncodedPath.trimmingCharacters(in: CharacterSet(charactersIn: "/")); components.percentEncodedPath = "/" + ([basePath, path].filter { !$0.isEmpty }.joined(separator: "/")); if !query.isEmpty { components.queryItems = query }
         // Query parameters are decoded as form data by the server, where an unescaped "+" is a space.
         components.percentEncodedQuery = components.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B")
-        var request = URLRequest(url: components.url!); request.httpMethod = method; request.httpBody = body; request.setValue("application/json", forHTTPHeaderField: "Accept")
+        var request = URLRequest(url: components.url!); request.setValue("custom-subjects.v1", forHTTPHeaderField: "x-st3-features"); request.httpMethod = method; request.httpBody = body; request.setValue("application/json", forHTTPHeaderField: "Accept")
         if body != nil { request.setValue(contentType, forHTTPHeaderField: "Content-Type") }; if let credential { request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization") }; if let client { request.setValue(client, forHTTPHeaderField: "x-st3-client") }
         if let idempotencyKey { request.setValue(idempotencyKey, forHTTPHeaderField: "Idempotency-Key") }
         let (data, response) = try await session.data(for: request); let status = (response as? HTTPURLResponse)?.statusCode ?? 0

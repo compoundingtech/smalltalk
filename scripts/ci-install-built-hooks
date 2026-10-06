@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Selected integration targets build this matching executable before tests start.
+set -euo pipefail
+target=$(cargo metadata --locked --no-deps --format-version 1 | jq -er .target_directory)
+test -x "$target/debug/st2"
+"$target/debug/st2" hooks install

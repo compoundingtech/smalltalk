@@ -21,8 +21,11 @@ use smallclaims::store::checkpoint_agreement::*;
 /// incompatible one-time graph or reader verification under the same terms. Version 7 selects
 /// one initial definition when members independently create the same scheduled occurrence.
 /// Version 8 preserves quota source observations: a later claim can report an older or lower
-/// reading, so it no longer witnesses the reading the account fold selects.
-pub const RULES_VERSION: u32 = 8;
+/// reading, so it no longer witnesses the reading the account fold selects. Version 9 preserves
+/// bounded observed status history and the beginning of the current state.
+/// Version 10 retains native credential edges and their bounded status transitions.
+/// Version 11 includes arrangement tables in the graph proof and rebuilds them during replay.
+pub const RULES_VERSION: u32 = 11;
 
 /// Kinds that are now local observations are dropped only when they are dated at least five days
 /// before the cut, so they are seven days old when the checkpoint is due. That matches the local
@@ -37,7 +40,7 @@ pub(crate) const USAGE_WINDOW_MS: u128 = 7 * DAY_MS;
 const HOUR_MS: u128 = 60 * 60 * 1000;
 
 /// The optional fields `current_harness_at` folds newest first from a harness's observations.
-pub(crate) const HARNESS_OPTIONAL_FIELDS: [&str; 7] = [
+pub(crate) const HARNESS_OPTIONAL_FIELDS: [&str; 10] = [
     "driver",
     "transport",
     "reason",
@@ -45,6 +48,9 @@ pub(crate) const HARNESS_OPTIONAL_FIELDS: [&str; 7] = [
     "ask",
     "input_buffer",
     "exit",
+    "provider_auth",
+    "provider_auth_sequence",
+    "ownership_sequence",
 ];
 
 /// The claims that close a subscription's mission request, as `pending_subscription_mission_requests`
@@ -57,7 +63,8 @@ pub(crate) const REQUEST_CLOSERS: [&str; 3] = [
 
 /// A canonical description of every rule. The rules digest hashes it with `RULES_VERSION`.
 pub(crate) const RULES_DESCRIPTION: &str = "\
-harness.observed slot=subject,incarnation_id keep=first,first-ready,first-ready-not-provider-auth,newest,newest-not-working,every-working-after,newest-carrier-of-each-optional-field
+harness.observed slot=subject,incarnation_id keep=first,first-ready,first-ready-not-provider-auth,newest,newest-not-working,every-working-after,newest-carrier-of-each-optional-field,current-native-auth-run-start
+seat.status-history slot=subject keep=last-200-transition-including-native-auth-and-runtime-reset-sources-within-7d-before-cut,current-state-run-start
 harness.timeline slot=subject,incarnation_id keep=newest min-age-before-cut=5d
 loop.state slot=subject keep=first-and-last-of-each-run-of-status-and-round,first-with-items
 subscription.mission-deferred slot=subject,request keep=all-while-open,newest
@@ -77,6 +84,8 @@ render.applied slot=subject keep=newest min-age-before-cut=5d
 runtime.readiness-deadline-reached slot=subject keep=newest min-age-before-cut=5d
 sealed=every-admitted-claim-of-an-envelope-before-the-cut-but-repaired-originals
 proof=the-sealed-claims-and-the-blobs-they-reference
+graph=shared-projection-tables-including-arrangements-and-arrangement_registers-even-when-empty
+replay=clear-arrangements-and-arrangement_registers,rebuild-from-sealed-arrangement-claims
 guards=person-actor,once-cardinality,record-not-valid,repair-replacement,projection-reference,claim-in-two-envelopes,cited-as-evidence,mission-run-input,shared-operation,writer-newest-envelope,whole-envelope
 witness=every-field-set-again-by-a-later-kept-claim-of-the-slot
 carriers=every-rule-but-loop.state-keeps-the-newest-carrier-of-each-field";
@@ -275,6 +284,31 @@ pub(crate) fn harness_keep(claims: &[&ClaimRecord]) -> BTreeSet<usize> {
             keep.insert(position);
         }
     }
+    // A credential refusal can outlive the history window while activity keeps changing.
+    // Preserve the beginning of the current auth run as well as its newest carrier.
+    let auth = |claim: &ClaimRecord| {
+        fields(claim)
+            .and_then(|fields| fields.get("provider_auth"))
+            .and_then(Value::as_bool)
+    };
+    if let Some(last_auth) = claims.iter().rev().find_map(|claim| auth(claim)) {
+        let after = claims
+            .iter()
+            .rposition(|claim| auth(claim).is_some_and(|value| value != last_auth))
+            .map_or(0, |position| position + 1);
+        if let Some(offset) = claims[after..]
+            .iter()
+            .position(|claim| auth(claim) == Some(last_auth))
+        {
+            keep.insert(after + offset);
+        }
+    }
+    if let Some(last_state) = claims.last().and_then(|claim| state(claim)) {
+        let start = claims.iter().rposition(|claim| state(claim).as_deref() != Some(last_state.as_str()))
+            .map_or(0, |position| position + 1);
+        keep.insert(start);
+    }
+
     keep
 }
 
@@ -406,6 +440,32 @@ pub fn plan_drops(sealed: &SealedSet) -> DropPlan {
             slots.entry(key).or_default().push(index);
         }
     }
+    let mut status_seats: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for index in first.iter().copied() {
+        let claim = &claims[index].claim;
+        if matches!(claim.kind.as_str(), "harness.observed" | "runtime.observed" | "harness.diagnostic") {
+            status_seats.entry(&claim.subject).or_default().push(index);
+        }
+    }
+    let mut status_keep = BTreeSet::new();
+    for members in status_seats.values() {
+        let sources = members.iter().map(|index| &claims[*index].claim).collect::<Vec<_>>();
+        let positions = seat_status::transition_positions(&sources);
+        for position in positions.into_iter().rev()
+            .filter(|position| seat_status::observation_time(sources[*position]) >= cut.saturating_sub(seat_status::WINDOW_MS))
+            .take(seat_status::MAX_TRANSITIONS) {
+            status_keep.insert(members[position]);
+            // A restored prompt exposes the most recent underlying harness state. Its source
+            // can be hidden while the prompt is active, but still witnesses this transition.
+            let source = sources[position];
+            if source.kind == "harness.diagnostic" && matches!(field_str(source, "code"), Some("provider-auth-restored" | "provider-update-restored"))
+                && let Some(dependency) = sources[..position].iter().rposition(|claim| {
+                    claim.kind == "harness.observed"
+                        && field_str(claim, "incarnation_id") == field_str(source, "incarnation_id")
+                        && fields(claim).and_then(|fields| fields.get("status_transition")).and_then(Value::as_bool) != Some(false)
+                }) { status_keep.insert(members[dependency]); }
+        }
+    }
     let closed_requests = claims
         .iter()
         .filter(|sealed_claim| REQUEST_CLOSERS.contains(&sealed_claim.claim.kind.as_str()))
@@ -443,7 +503,7 @@ pub fn plan_drops(sealed: &SealedSet) -> DropPlan {
             let old_enough = *rule != Rule::NewestAged
                 || claims[*index].claim.accepted_at_unix_ms
                     < cut.saturating_sub(LOCAL_KIND_MIN_AGE_MS);
-            if !keep.contains(&position) && old_enough {
+            if !keep.contains(&position) && !status_keep.contains(index) && old_enough {
                 dropped[*index] = true;
             }
         }
@@ -627,8 +687,10 @@ pub fn plan_drops(sealed: &SealedSet) -> DropPlan {
 }
 
 /// Tables projected from claims, children before the tables their foreign keys name.
-pub(crate) const PROJECTION_TABLES: [&str; 21] = [
+pub(crate) const PROJECTION_TABLES: [&str; 23] = [
     "operations",
+    "arrangement_registers",
+    "arrangements",
     "resource_observations",
     "glass_heads",
     "local_glass_head_pending",
@@ -669,6 +731,7 @@ pub(crate) fn replay_from_nothing(transaction: &Transaction<'_>) -> Result<()> {
     rebuild_planning_tx(transaction)?;
     resources::rebuild(transaction)?;
     glass_heads::rebuild(transaction)?;
+    arrangements::rebuild(transaction)?;
     Ok(())
 }
 
@@ -686,6 +749,11 @@ pub(crate) fn subject_answers(connection: &Connection, subject: &str, cut: u128)
             )?),
         );
     }
+    if subject.starts_with("arrangement/") {
+        let person = st3_schema::arrangements::owner(subject).map_err(anyhow::Error::new)?;
+        answers.insert("arrangements".into(), json!(super::arrangements::arrangements_at(connection, person, i64::MAX as u64)?));
+        answers.insert("arrangement".into(), json!(super::arrangements::arrangement_at(connection, subject, i64::MAX as u64)?));
+    }
     answers.insert(
         "actual".into(),
         json!(latest_actual_at(connection, subject, None)?),
@@ -694,6 +762,13 @@ pub(crate) fn subject_answers(connection: &Connection, subject: &str, cut: u128)
         "harness".into(),
         json!(current_harness_at(connection, subject, None)?),
     );
+    if subject.starts_with("agent/") {
+        // Completeness metadata may change deliberately when old claims are tombstoned;
+        // every transition still inside the published retention bound must stay identical.
+        answers.insert("status_history".into(), seat_status::history_at(
+            connection, subject, cut, i64::MAX as u64,
+        )?["items"].clone());
+    }
     // Which claim a status shows, its origin, and whether its runtime observations conflict.
     answers.insert(
         "source".into(),

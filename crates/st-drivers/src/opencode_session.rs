@@ -42,18 +42,16 @@ use crate::provider_session::{
     describe_exit, install_signal_handler,
 };
 use crate::session_control::SessionControl;
-use crate::{delivery_ledger, ding, harness_context, harness_version, message, status};
+use crate::{delivery_ledger, ding, harness_context, message, status};
 
-/// OpenCode MINORS whose `/event`, `/session`, and `prompt_async` surfaces were verified
-/// (1.18, measured at 1.18.19). The live `/doc` check below guards the shape; this list guards
-/// the semantics behind it.
-///
-/// Admission is per minor so a patch bump inside a verified minor keeps native delivery instead
-/// of silently degrading to none — the profile shipping 1.18.25 against a 1.18.19 allowlist is
-/// exactly that case. The tradeoff is explicit: `/doc` still catches a SHAPE change on any
-/// version, but a SEMANTIC change within an admitted minor would not be caught, which is the
-/// risk this widening accepts. A new MINOR still needs the surfaces re-verified.
-const SUPPORTED_OPENCODE_MINORS: [(u32, u32); 1] = [(1, 18)];
+mod admission;
+
+pub(crate) fn probe_admission(
+    binary: &Path,
+    scratch: &crate::harness_admission::Scratch,
+) -> Result<Vec<crate::harness_admission::Measurement>> {
+    admission::probe(binary, scratch)
+}
 
 const STOP_GRACE: Duration = Duration::from_secs(5);
 const INBOX_REFRESH_FALLBACK: Duration = Duration::from_secs(2);
@@ -129,37 +127,14 @@ pub fn run_with_paths(
         !opencode_argv.is_empty(),
         "opencode driver '{runtime_id}' has no provider argv"
     );
-    let version_probe = supported_version(&opencode_argv[0]);
-    let (version_ok, producer_version, support, version_failure) = match version_probe {
-        Ok(version) => {
-            let supported = version_is_supported(&version);
-            if !supported {
-                tracing::warn!(
-                    "st opencode-session: version {version} is unverified (supported minors: {}); native delivery disabled",
-                    harness_version::series_display(&SUPPORTED_OPENCODE_MINORS)
-                );
-            }
-            (
-                supported,
-                Some(version),
-                if supported {
-                    DiagnosticSupport::Supported
-                } else {
-                    DiagnosticSupport::Unsupported
-                },
-                (!supported).then_some(DiagnosticReason::UnsupportedVersion),
-            )
-        }
-        Err(error) => {
-            tracing::warn!("st opencode-session: cannot read opencode version: {error:#}");
-            (
-                false,
-                None,
-                DiagnosticSupport::Unknown,
-                Some(DiagnosticReason::VersionProbeFailed),
-            )
-        }
-    };
+    let admission =
+        crate::harness_admission::admit(&opencode_argv[0], DiagnosticDriver::OpenCode, None);
+    let version_ok = admission.passed();
+    let producer_version = admission.version.clone();
+    let support = admission.support();
+    if !version_ok {
+        tracing::warn!("{}", admission.explanation(DiagnosticDriver::OpenCode));
+    }
 
     let port = allocate_port()?;
     let password = random_password()?;
@@ -185,15 +160,7 @@ pub fn run_with_paths(
             producer_version.clone(),
             support,
         );
-        if let Some(reason) = version_failure {
-            diagnostics.publish(
-                DiagnosticStage::VersionGate,
-                reason,
-                DiagnosticSource::VersionProbe,
-            );
-        } else {
-            diagnostics.clear(DiagnosticStage::VersionGate);
-        }
+        admission.publish(&mut diagnostics);
         Session {
             client,
             version_ok,
@@ -544,7 +511,7 @@ fn run_session(mut session: Session, child: &mut ProviderProcess, agent_dir: &Pa
         while let Ok(event) = event_rx.try_recv() {
             match event {
                 SseMessage::Connected => {
-                    machine = EventMachine::default();
+                    machine.reseed_activity(EventMachine::default());
                     sse_connected = true;
                     session.diagnostics.clear(DiagnosticStage::Sse);
                     // Evidence turns on only once the level seed succeeds: resuming heartbeats
@@ -610,8 +577,15 @@ fn run_session(mut session: Session, child: &mut ProviderProcess, agent_dir: &Pa
         if evidence {
             session.delivery.confirm_pinned(&session.client);
         }
-        if evidence && let Some(observation) = machine.observation() {
-            let _ = session.writer.observe(observation);
+        if evidence && let Some(mut observation) = machine.observation() {
+            if machine.auth_edge {
+                session.writer.interrupt();
+            } else {
+                observation.provider_auth = None;
+            }
+            if session.writer.observe(observation).is_ok() {
+                machine.auth_edge = false;
+            }
         }
 
         let now = Instant::now();
@@ -688,32 +662,6 @@ fn stop_provider_group(child: &mut ProviderProcess) -> Result<Option<ExitStatus>
     Ok(child.wait().ok())
 }
 
-fn supported_version(binary: &str) -> Result<String> {
-    let output = std::process::Command::new(binary)
-        .arg("--version")
-        .output()
-        .with_context(|| format!("running {binary} --version"))?;
-    anyhow::ensure!(output.status.success(), "{binary} --version failed");
-    let version = String::from_utf8_lossy(&output.stdout);
-    let version = version
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    anyhow::ensure!(!version.is_empty(), "{binary} --version printed nothing");
-    Ok(version)
-}
-
-/// Whether a reported opencode version is inside a verified MINOR. This is the whole admission
-/// decision, named so a test can exercise the same code the wrapper runs rather than re-deriving
-/// it — an assertion that re-implements the rule cannot notice the rule changing.
-fn version_is_supported(version: &str) -> bool {
-    harness_version::find_release(version, "opencode")
-        .is_some_and(|(_, release)| SUPPORTED_OPENCODE_MINORS.contains(&release.series()))
-}
-
 /// Verify the served OpenAPI document still carries every arm st2 consumes. Substring markers are
 /// deliberate: the document nests these identifiers at unstable depths across versions, and the
 /// check must name what went missing rather than fail on structure.
@@ -758,6 +706,8 @@ struct Client {
     auth: String,
     /// The SSE silence horizon; [`SSE_SILENCE`] in production, shrunk only by tests.
     sse_silence: Duration,
+    /// Admission bounds disposable response captures without changing live transport policy.
+    response_limit: Option<u64>,
 }
 
 impl Client {
@@ -766,6 +716,7 @@ impl Client {
             addr: format!("127.0.0.1:{port}"),
             auth: base64(format!("opencode:{password}").as_bytes()),
             sse_silence: SSE_SILENCE,
+            response_limit: None,
         }
     }
 
@@ -806,7 +757,12 @@ impl Client {
             line.clear();
         }
         let mut body = Vec::new();
-        reader.read_to_end(&mut body)?;
+        if let Some(limit) = self.response_limit {
+            reader.take(limit + 1).read_to_end(&mut body)?;
+            anyhow::ensure!(body.len() as u64 <= limit, "admission HTTP response exceeded capture bound");
+        } else {
+            reader.read_to_end(&mut body)?;
+        }
         Ok((status, body))
     }
 
@@ -1013,7 +969,7 @@ fn seed_from_server(
             seeded.seed_ask(id.to_string(), kind);
         }
     }
-    *machine = seeded;
+    machine.reseed_activity(seeded);
     Ok(())
 }
 
@@ -1053,11 +1009,23 @@ struct EventMachine {
     poisoned: bool,
     /// Terminal reason, once observed.
     ended: Option<&'static str>,
+    provider_auth: Option<bool>,
+    auth_edge: bool,
+    auth_session: Option<String>,
     /// The most recent non-terminal session error, surfaced as the idle reason once.
     last_error: Option<String>,
 }
 
 impl EventMachine {
+    fn reseed_activity(&mut self, mut seeded: Self) {
+        // A reconnect replaces activity evidence, not the credential failure or its session.
+        // Otherwise an unrelated session's completion after reconnect could clear the refusal.
+        seeded.provider_auth = self.provider_auth;
+        seeded.auth_session = self.auth_session.clone();
+        seeded.auth_edge = self.auth_edge;
+        *self = seeded;
+    }
+
     fn seed_idle(&mut self) {
         self.seen_level = true;
     }
@@ -1131,13 +1099,35 @@ impl EventMachine {
                     .and_then(Value::as_str)
                     .unwrap_or("unknown");
                 if name == "ProviderAuthError" {
+                    self.auth_session = session_id();
                     self.ended = Some("providerAuth");
+                    self.provider_auth = Some(false);
+                    self.auth_edge = true;
                 } else {
                     if let Some(session_id) = session_id() {
                         self.busy.remove(&session_id);
                     }
                     self.seen_level = true;
                     self.last_error = Some(format!("error:{name}"));
+                }
+            }
+            "message.updated" => {
+                let info = &properties["info"];
+                if info["role"] == "assistant"
+                    && info
+                        .pointer("/time/completed")
+                        .is_some_and(|v| !v.is_null())
+                    && info.get("error").is_none_or(Value::is_null)
+                    && self
+                        .auth_session
+                        .as_deref()
+                        .is_none_or(|session| info["sessionID"].as_str() == Some(session))
+                {
+                    self.provider_auth = Some(true);
+                    self.auth_edge = true;
+                    if self.ended == Some("providerAuth") {
+                        self.ended = None;
+                    }
                 }
             }
             "permission.asked" => {
@@ -1166,6 +1156,12 @@ impl EventMachine {
     }
 
     fn observation(&self) -> Option<Observation> {
+        let mut observation = self.activity_observation()?;
+        observation.provider_auth = self.provider_auth;
+        Some(observation)
+    }
+
+    fn activity_observation(&self) -> Option<Observation> {
         // A sticky terminal outranks poison: `ended` does not depend on the busy map the
         // unknown word made untrustworthy, and withholding it would lose the terminal to the
         // forced reseed's fresh machine.
@@ -2149,34 +2145,6 @@ mod tests {
 
     /// Pins the admitted set itself: widening opencode has to be a deliberate edit here, beside
     /// the verification the minor was admitted on.
-    #[test]
-    fn admitted_opencode_minors_are_exactly_the_measured_set() {
-        assert_eq!(SUPPORTED_OPENCODE_MINORS, [(1, 18)]);
-    }
-
-    /// The principal's actual case: the profile ships 1.18.25 against a list built at 1.18.19.
-    /// A patch inside the verified minor must keep native delivery rather than degrade to none.
-    #[test]
-    fn a_patch_inside_an_admitted_opencode_minor_keeps_native_delivery() {
-        for version in ["1.18.19", "1.18.25"] {
-            assert!(
-                version_is_supported(version),
-                "{version} is inside verified minor 1.18"
-            );
-        }
-    }
-
-    /// Fail closed the other way: a different minor, a neighbouring minor sharing a prefix, and
-    /// unparseable output must all leave native delivery disabled.
-    #[test]
-    fn other_minors_and_garbled_versions_stay_unverified() {
-        for version in ["1.19.0", "1.180.0", "2.18.0", "1.18", "not-a-version", ""] {
-            assert!(
-                !version_is_supported(version),
-                "{version} must not be treated as verified"
-            );
-        }
-    }
     use std::collections::BTreeSet;
     use std::sync::{Arc, Mutex};
 
@@ -2347,6 +2315,20 @@ mod tests {
         let ended = observed(&machine);
         assert_eq!(ended.state, Activity::Ended);
         assert_eq!(ended.reason.as_deref(), Some("providerAuth"));
+        assert_eq!(ended.provider_auth, Some(false));
+        machine.reseed_activity(EventMachine::default());
+        let mut seed = EventMachine::default();
+        seed.seed_idle();
+        machine.reseed_activity(seed);
+        machine.apply(&event(r#"{"type":"message.updated","properties":{"info":{"role":"assistant","sessionID":"ses_b","time":{"completed":1}}}}"#));
+        assert_eq!(observed(&machine).provider_auth, Some(false));
+        machine.apply(&event(
+            r#"{"type":"session.idle","properties":{"sessionID":"ses_a"}}"#,
+        ));
+        assert_eq!(observed(&machine).provider_auth, Some(false));
+        machine.apply(&event(r#"{"type":"message.updated","properties":{"info":{"role":"assistant","sessionID":"ses_a","time":{"completed":2}}}}"#));
+        assert_eq!(observed(&machine).provider_auth, Some(true));
+        assert_ne!(observed(&machine).state, Activity::Ended);
     }
 
     #[test]

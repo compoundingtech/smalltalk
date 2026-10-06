@@ -11,12 +11,13 @@ export type ActionCommon = {
   parameters: {
 
 };
-  type: "attention.resolve" | "review.approve" | "review.reject" | "review.request-changes" | "message.send" | "message.read" | "message.close" | "launch.create" | "launch.revise" | "launch.preview" | "launch.approve" | "launch.cancel" | "mission.start" | "mission.revise" | "mission.approve-revision" | "mission.cancel-revision" | "mission.cancel" | "session.import" | "work.ask" | "work.done" | "work.cancel-ask" | "work.claim" | "work.renew" | "work.progress" | "work.complete" | "work.fail" | "work.release" | "work.retry" | "work.publish-mission" | "agent.create" | "agent.stop" | "agent.start" | "agent.suspend" | "agent.resume" | "terminal.create" | "terminal.end" | "agent.queue-move" | "lane.join" | "lane.leave" | "lane.move" | "lane.mark" | "lane.approve" | "runtime.stop" | "runtime.restart" | "runtime.reset" | "runtime.context-clear" | "runtime.signal" | "terminal.input" | "terminal.resize" | "terminal.attach" | "terminal.detach" | "pairing.revoke";
+  type: "arrangement.edit" | "custom.reply" | "attention.resolve" | "review.approve" | "review.reject" | "review.request-changes" | "message.send" | "message.read" | "message.close" | "launch.create" | "launch.revise" | "launch.preview" | "launch.approve" | "launch.cancel" | "mission.start" | "mission.revise" | "mission.approve-revision" | "mission.cancel-revision" | "mission.cancel" | "session.import" | "work.ask" | "work.done" | "work.cancel-ask" | "work.claim" | "work.renew" | "work.progress" | "work.complete" | "work.fail" | "work.release" | "work.retry" | "work.publish-mission" | "agent.create" | "agent.stop" | "agent.start" | "agent.suspend" | "agent.resume" | "terminal.create" | "terminal.end" | "agent.queue-move" | "lane.join" | "lane.leave" | "lane.move" | "lane.mark" | "lane.approve" | "runtime.stop" | "runtime.restart" | "runtime.reset" | "runtime.context-clear" | "runtime.signal" | "terminal.input" | "terminal.resize" | "terminal.attach" | "terminal.detach" | "pairing.revoke";
 };
 
 export type ActionResult = {
   action_id: Id;
   affected_ids: Array<Id>;
+  arrangement_revision?: Revision;
   kind: "action-result";
   operation_id: Id;
   snapshot_id: Id;
@@ -38,6 +39,7 @@ export type Agent = ResourceHeader & {
   driver?: string | null;
   fault?: string | null;
   handoff?: (AgentHandoff | null);
+  harness_error_state?: string | null;
   harness_state?: string | null;
   host_id?: (HostId | null);
   id?: AgentId;
@@ -47,6 +49,7 @@ export type Agent = ResourceHeader & {
   name: string;
   next_work?: (WorkLabel | null);
   next_work_id?: (Id | null);
+  observation?: "current" | "stale" | "missing";
   owner_run_id?: (MissionRunId | null);
   queued_work_count?: number;
   reachability: AgentReachability;
@@ -56,6 +59,7 @@ export type Agent = ResourceHeader & {
 } | null;
   runtime_ids: Array<RuntimeId>;
   silent_since?: (Timestamp | null);
+  since?: (Timestamp | null);
   state: AgentState;
   subagents?: Array<AgentSubagent>;
   suspension?: (AgentSuspension | null);
@@ -116,6 +120,29 @@ export type AgentHandoff = {
 
 export type AgentId = string;
 
+export type AgentMessageDay = {
+  calibrated_messages: number;
+  day_start_ms: number;
+  high_microusd: number;
+  high_percent?: number | null;
+  low_microusd: number;
+  low_percent?: number | null;
+  messages: number;
+  since_ms: number;
+  unpriced_tokens: number;
+  until_ms: number;
+  usage_cost_microusd: number;
+};
+
+export type AgentMessageEstimate = {
+  calibration?: string | null;
+  days: Array<AgentMessageDay>;
+  fallback_high_microusd: number;
+  fallback_low_microusd: number;
+  method: string;
+  source: string;
+};
+
 export type AgentQueue = {
   agent_id: Id;
   current_work_ids: Array<Id>;
@@ -163,6 +190,7 @@ export type AgentRepository = {
 
 export type AgentResumeParameters = {
   agent: Id;
+  host?: string;
 };
 
 export type AgentStartParameters = {
@@ -197,11 +225,13 @@ export type AgentSuspension = {
   blocking: Array<string>;
   code?: string | null;
   harness?: string | null;
+  host?: string | null;
   incarnation_id?: string | null;
   native_session_id?: string | null;
   operation_id: string;
-  phase: "quiescing" | "snapshotting" | "suspended" | "failed" | "restoring" | "verifying" | "resumed";
+  phase: "quiescing" | "snapshotting" | "suspended" | "failed" | "fencing-source" | "transferring" | "restoring" | "verifying" | "resumed";
   reason?: string | null;
+  source_host?: string | null;
   suspended_at?: (Timestamp | null);
   updated_at: Timestamp;
 };
@@ -211,6 +241,142 @@ export type AgentTodo = {
   claim_id: string;
   snapshot: HarnessTodoSnapshot;
   stale: boolean;
+};
+
+export type AgentWorkspace = {
+  agent_id: AgentId;
+  declaration_token: string;
+  desired_token: string;
+  host_id: HostId;
+  kind: "agent-workspace";
+  workspace: string;
+};
+
+export type Arrangement = ResourceHeader & {
+  body: ArrangementBody;
+  deleted: false;
+  kind: "arrangement";
+  owner: ArrangementPerson;
+  resolved?: ArrangementResolved;
+};
+
+export type ArrangementBody = {
+  folders: {
+  [key: string]: ArrangementFolder;
+};
+  name: ArrangementNameRegister;
+  placements: {
+  [key: string]: ArrangementPlacementRegister;
+};
+  version: 1;
+};
+
+export type ArrangementEditParameters = {
+  operations: Array<ArrangementOperation>;
+  owner: ArrangementPerson;
+  subject: ArrangementId;
+};
+
+export type ArrangementFolder = {
+  name: ArrangementNameRegister;
+  position: ArrangementPositionRegister;
+  tombstone: (ArrangementTombstoneRegister | null);
+};
+
+export type ArrangementFolderId = string;
+
+export type ArrangementId = string;
+
+export type ArrangementKey = string;
+
+export type ArrangementName = string;
+
+export type ArrangementNameRegister = {
+  revision: Revision;
+  value: ArrangementName;
+};
+
+export type ArrangementOperation = ({
+  name: ArrangementName;
+  op: "create";
+} | {
+  name: ArrangementName;
+  op: "rename";
+} | {
+  id: ArrangementFolderId;
+  key: ArrangementKey;
+  name: ArrangementName;
+  op: "folder.create";
+  parent: (ArrangementFolderId | null);
+} | {
+  id: ArrangementFolderId;
+  name: ArrangementName;
+  op: "folder.rename";
+} | {
+  id: ArrangementFolderId;
+  key: ArrangementKey;
+  op: "folder.move";
+  parent: (ArrangementFolderId | null);
+} | {
+  id: ArrangementFolderId;
+  op: "folder.delete";
+} | {
+  folder: (ArrangementFolderId | null);
+  key: ArrangementKey;
+  op: "subject.place";
+  subject: ArrangementSubject;
+} | {
+  op: "retire";
+});
+
+export type ArrangementPage = {
+  collection: "arrangements";
+  filters: {
+  [key: string]: string;
+};
+  items: Array<Arrangement>;
+  kind: "page";
+  page: PageInfo;
+  replicated?: ReplicatedNotice;
+  sync?: SyncNotice;
+};
+
+export type ArrangementPerson = string;
+
+export type ArrangementPlacement = {
+  folder: (ArrangementFolderId | null);
+  key: ArrangementKey;
+};
+
+export type ArrangementPlacementRegister = {
+  revision: Revision;
+  value: ArrangementPlacement;
+};
+
+export type ArrangementPosition = {
+  key: ArrangementKey;
+  parent: (ArrangementFolderId | null);
+};
+
+export type ArrangementPositionRegister = {
+  revision: Revision;
+  value: ArrangementPosition;
+};
+
+export type ArrangementResolved = {
+  folders: {
+  [key: string]: (ArrangementFolderId | null);
+};
+  parents: {
+  [key: string]: (ArrangementFolderId | null);
+};
+};
+
+export type ArrangementSubject = string;
+
+export type ArrangementTombstoneRegister = {
+  revision: Revision;
+  value: true;
 };
 
 export type Attachment = {
@@ -232,9 +398,13 @@ export type Attention = ResourceHeader & {
   action_parameters?: {
 
 };
-  actions: Array<"work.done" | "review.approve" | "review.reject" | "review.request-changes" | "launch.approve" | "launch.cancel" | "mission.approve-revision" | "mission.cancel-revision" | "message.read">;
-  attention_kind: "human-gate" | "launch-approval" | "revision-approval" | "unread-message" | "person-step" | "agent-request" | "fault";
+  actions: Array<"custom.reply" | "work.done" | "review.approve" | "review.reject" | "review.request-changes" | "launch.approve" | "launch.cancel" | "mission.approve-revision" | "mission.cancel-revision" | "message.read">;
+  attention_kind: ("human-gate" | "launch-approval" | "revision-approval" | "unread-message" | "person-step" | "agent-request" | "fault" | string);
   because?: string;
+  blocked?: AttentionBlocked;
+  custom_form?: {
+
+};
   detail: string;
   episode?: string;
   fix?: {
@@ -263,6 +433,13 @@ export type Attention = ResourceHeader & {
   update?: PersonUpdate;
   variant_id?: Id;
   what?: string;
+};
+
+export type AttentionBlocked = {
+  attempt: number;
+  goal: string;
+  step: string;
+  step_run_id: Id;
 };
 
 export type AttentionTargetState = {
@@ -299,6 +476,14 @@ export type Capabilities = {
   event_cursor: Cursor;
   kind: "capabilities";
   limits: {
+  max_arrangement_body_bytes?: number;
+  max_arrangement_folders?: number;
+  max_arrangement_key_bytes?: number;
+  max_arrangement_name_bytes?: number;
+  max_arrangement_operations?: number;
+  max_arrangement_placements?: number;
+  max_arrangement_resource_bytes?: number;
+  max_arrangements?: number;
   max_event_items: number;
   max_glass_body_bytes?: number;
   max_glass_depth?: number;
@@ -344,12 +529,19 @@ export type ClientConnections = {
 
 export type CollectionCommand = ({
   actor?: string | null;
-  collection: CollectionName;
+  collection: "missions" | "attention" | "agents" | "work" | "glasses";
   id: string;
   kind: "subscribe";
   limit?: number;
   person?: string | null;
   status?: string | null;
+} | {
+  collection: "arrangements";
+  id: string;
+  kind: "subscribe";
+  limit?: number;
+  person: ArrangementPerson;
+  subject?: ArrangementId;
 } | {
   capability: string;
   collection: "terminal";
@@ -414,7 +606,7 @@ export type CollectionFrame = ({
   retryable?: boolean;
 });
 
-export type CollectionName = "missions" | "attention" | "agents" | "work" | "glasses";
+export type CollectionName = "missions" | "attention" | "agents" | "work" | "glasses" | "arrangements";
 
 export type ConversationChanges = {
   items: Array<TimelineEntry>;
@@ -443,6 +635,16 @@ export type ConversationSearchHit = {
 };
 
 export type Cursor = string;
+
+export type CustomReplyParameters = {
+  episode: string;
+  fields: {
+
+};
+  registration: string;
+  revision: string;
+  target_id: Id;
+};
 
 export type DecisionOption = {
   description?: string | null;
@@ -501,10 +703,10 @@ export type Envelope = {
   api_version: "st3.client.v0";
   request_id: RequestId;
   snapshot: Snapshot;
-  value: (Capabilities | DocumentContent | SubjectDefinition | Page | ResourcesPage | Resource | TimelinePage | ConversationChanges | ConversationSearch | EventPage | ActionResult | PairingChallenge | PairedSession | TerminalScreen | AgentQueue | UsagePeriod);
+  value: (Capabilities | DocumentContent | SubjectDefinition | PublicationDefinition | AgentWorkspace | Page | ResourcesPage | Resource | TimelinePage | ConversationChanges | ConversationSearch | EventPage | ActionResult | PairingChallenge | PairedSession | TerminalScreen | StatusHistory | AgentQueue | UsagePeriod | MailBacklog);
 };
 
-export type ErrorCode = ("attention-migrated" | "not-found" | "forbidden" | "unsupported-capability" | "validation-failed" | "idempotency-conflict" | "stale-fence" | "cursor-gap" | "page-cursor-expired" | "rate-limited" | "runtime-not-local" | "runtime-authority-indeterminate" | "remote-unavailable" | "terminal-unavailable" | "terminal-ended" | "timeline-history-incomplete" | "blob-too-large" | "unsupported-media-type" | "blob-content-mismatch" | "blob-quota-exceeded" | "blob-not-found" | "blob-expired" | "internal" | string);
+export type ErrorCode = ("attention-migrated" | "arrangement-exists" | "arrangement-folder-exists" | "arrangement-retired" | "arrangement-limit" | "arrangement-folder-deleted" | "arrangement-cycle" | "arrangement-body-too-large" | "arrangement-owner-forbidden" | "invalid-arrangement-subject" | "invalid-arrangement-action" | "invalid-arrangement-operations" | "invalid-arrangement-folder" | "invalid-arrangement-name" | "invalid-arrangement-key" | "invalid-subject-reference" | "not-found" | "forbidden" | "unsupported-capability" | "validation-failed" | "idempotency-conflict" | "stale-fence" | "cursor-gap" | "page-cursor-expired" | "rate-limited" | "runtime-not-local" | "runtime-authority-indeterminate" | "remote-unavailable" | "terminal-unavailable" | "terminal-ended" | "timeline-history-incomplete" | "blob-too-large" | "unsupported-media-type" | "blob-content-mismatch" | "blob-quota-exceeded" | "blob-not-found" | "blob-expired" | "internal" | string);
 
 export type ErrorEnvelope = {
   api_version: "st3.client.v0";
@@ -778,6 +980,12 @@ export type MachineTransport = {
   status: "local" | "up" | "down" | "unknown";
 };
 
+export type MailBacklog = {
+  cleanup_command: string;
+  count: number;
+  threshold_ms: number;
+};
+
 export type Message = ResourceHeader & {
   attachments?: Array<Attachment>;
   content: string;
@@ -864,15 +1072,32 @@ export type MissionStep = {
   attempt: number;
   blocked_reason?: string | null;
   blockers?: Array<Id>;
+  claim_expires_at?: (Timestamp | null);
   claimant?: (AgentId | null);
   constraints?: Array<string>;
   goals?: Array<string>;
   id: Id;
   last_progress?: string | null;
+  loop_max_rounds?: number | null;
+  loop_reason?: string | null;
+  loop_round?: number | null;
+  next_wake_at?: (Timestamp | null);
   path: string;
   since: Timestamp;
   state: WorkState;
   title?: string | null;
+  wake?: (MissionWake | null);
+  wake_reason?: string | null;
+};
+
+export type MissionWake = {
+  acknowledged_by?: string | null;
+  assignee: AgentId;
+  assignee_state: string;
+  attempts: number;
+  failure?: string | null;
+  incarnation_id: string;
+  last_attempt_at?: (Timestamp | null);
 };
 
 export type MustAct = ("you" | "agent" | "system" | "blocked" | "nobody" | string);
@@ -952,11 +1177,26 @@ export type PairedSession = {
   credential: string;
   device_id: Id;
   device_key_chain?: Array<string>;
+  device_key_proofs?: Array<{
+
+}>;
   expires_at: Timestamp;
   kind: "paired-session";
   person_id: string;
+  person_root_key_proof?: {
+
+};
   scopes: Array<string>;
   session_actor: Id;
+};
+
+export type PairingAdvertisement = {
+  api_version: "st3.client.v0";
+  capabilities: Array<{
+  id: "device-key-proofs";
+  state: "granted";
+  version: 1;
+}>;
 };
 
 export type PairingBegin = {
@@ -972,6 +1212,7 @@ export type PairingChallenge = {
   expires_at: Timestamp;
   kind: "pairing-challenge";
   pairing_id: Id;
+  person_root_fingerprint?: string;
 };
 
 export type PairingComplete = {
@@ -997,6 +1238,7 @@ export type PersonAnswerInput = {
 };
 
 export type PersonAnswerRecord = {
+  acted_for?: Id;
   answer?: PersonAnswer;
   answered_at_unix_ms: number;
   ask: Id;
@@ -1052,6 +1294,16 @@ export type ProjectionEvent = Omit<{
   type: "upsert" | "delete" | "timeline.delta" | "terminal.available" | "capabilities.changed";
 }, 'type' | 'body'> & ({ type: "timeline.delta"; body: TimelineDelta });
 
+export type PublicationDefinition = {
+  declaration: {
+
+};
+  kind: "publication-definition";
+  revision: Revision;
+  subject: string;
+  token: string;
+};
+
 export type ReplicatedNotice = {
   complete: boolean;
   owner_host_id: Id;
@@ -1078,11 +1330,11 @@ export type RequestSubject = {
   url?: string;
 };
 
-export type Resource = (Attention | Message | Launch | LaunchVariant | LaunchDecision | LaunchApproval | Mission | Work | Agent | Runtime | Observer | Subscription | Lane | Machine | Device | Operation | History | Session | Glass | OwnedSet);
+export type Resource = (Attention | Message | Launch | LaunchVariant | LaunchDecision | LaunchApproval | Mission | Work | Agent | Runtime | Observer | Subscription | Lane | Machine | Device | Operation | History | Session | Glass | Arrangement | OwnedSet);
 
 export type ResourceHeader = {
   id: Id;
-  kind: ("attention" | "message" | "launch" | "launch-variant" | "launch-decision" | "launch-approval" | "mission" | "work" | "agent" | "runtime" | "observer" | "subscription" | "lane" | "machine" | "device" | "operation" | "history" | "session" | "glass" | string);
+  kind: ("attention" | "message" | "launch" | "launch-variant" | "launch-decision" | "launch-approval" | "mission" | "work" | "agent" | "runtime" | "observer" | "subscription" | "lane" | "machine" | "device" | "operation" | "history" | "session" | "glass" | "arrangement" | string);
   operational?: Operational;
   revision: Revision;
   updated_at: Timestamp;
@@ -1161,6 +1413,22 @@ export type Snapshot = {
 };
 
 export type SnapshotId = string;
+
+export type StatusHistory = {
+  complete: boolean;
+  items: Array<StatusTransition>;
+  kind: "status-history";
+  retained_from: Timestamp;
+  seat: AgentId;
+};
+
+export type StatusTransition = {
+  observed_at: Timestamp;
+  reset: boolean;
+  runtime_incarnation: string;
+  seat: AgentId;
+  state: string | null;
+};
 
 export type StepRunId = string;
 
@@ -1491,6 +1759,7 @@ export type UsageLimit = {
   five_hour_percent?: number;
   five_hour_resets_at_unix_ms?: number;
   host: string;
+  identified?: boolean;
   measured_at_unix_ms: number;
   measured_by: string;
   plan?: string;
@@ -1500,10 +1769,35 @@ export type UsageLimit = {
 };
 
 export type UsagePeriod = {
+  agent_messages?: AgentMessageEstimate;
   limits?: Array<UsageLimit>;
   rows: Array<UsageRow>;
   since_ms: number;
   until_ms: number;
+};
+
+export type UsagePricing = {
+  cache_write_1h_tokens: number;
+  cache_write_tokens: number;
+  cached_tokens: number;
+  cost_microusd: number;
+  cost_source: "provider_reported" | "computed" | "unpriced";
+  input_tokens: number;
+  output_tokens: number;
+  price_table_id?: string;
+  price_table_version?: string;
+  rates_usd_per_million_tokens?: UsagePricingRates;
+  reported_cost_microusd: number;
+  total_tokens: number;
+  unpriced_tokens: number;
+};
+
+export type UsagePricingRates = {
+  cache_read: number;
+  cache_write_1h: number;
+  cache_write_5m: number;
+  input: number;
+  output: number;
 };
 
 export type UsageRow = {
@@ -1517,8 +1811,10 @@ export type UsageRow = {
   input_tokens: number;
   mission_run?: Id;
   model?: string;
+  native_session_id?: string;
   output_tokens: number;
   pricing?: string;
+  pricing_provenance?: Array<UsagePricing>;
   reported_cost_microusd: number;
   step?: Id;
   total_tokens: number;
@@ -1666,11 +1962,13 @@ export type ActionRequest =
   (Omit<ActionCommon, 'type' | 'parameters' | 'fence'> & { type: 'agent.start'; parameters: AgentStartParameters; fence: Fence & Required<Pick<Fence, 'runtime_desired_revision'>> }) |
   (Omit<ActionCommon, 'type' | 'parameters' | 'fence'> & { type: 'agent.stop'; parameters: AgentStopParameters; fence: Fence & Required<Pick<Fence, 'runtime_desired_revision'>> }) |
   (Omit<ActionCommon, 'type' | 'parameters' | 'fence'> & { type: 'agent.suspend'; parameters: AgentSuspendParameters; fence: Fence & Required<Pick<Fence, 'runtime_incarnation' | 'runtime_desired_revision'>> }) |
+  (Omit<ActionCommon, 'type' | 'parameters' | 'fence'> & { type: 'arrangement.edit'; parameters: ArrangementEditParameters; fence: Fence }) |
   (Omit<ActionCommon, 'type' | 'parameters' | 'fence'> & { type: 'attention.resolve'; parameters: {
   attention_id: Id;
   outcome: string;
   reason?: string;
 }; fence: Fence }) |
+  (Omit<ActionCommon, 'type' | 'parameters' | 'fence'> & { type: 'custom.reply'; parameters: CustomReplyParameters; fence: Fence }) |
   (Omit<ActionCommon, 'type' | 'parameters' | 'fence'> & { type: 'lane.approve'; parameters: {
   anchor_id?: Id;
   detail?: string;

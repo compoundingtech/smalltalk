@@ -77,7 +77,8 @@ def sqlite_findings(path):
                     # These are opaque base64, not labels. Their decoded claims are also stored
                     # in semantic tables checked below; random bytes can contain the letters st2.
                     if (name, column) in {("replica_envelopes", "payload"),
-                                          ("replica_envelope_signatures", "signature")}:
+                                          ("replica_envelope_signatures", "signature"),
+                                          ("claim_signatures", "signature")}:
                         continue
                     yield from record_findings(
                         f"SQLite record {path.name}/{name}/{column}", value, TOKEN

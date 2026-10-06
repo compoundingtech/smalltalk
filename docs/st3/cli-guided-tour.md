@@ -65,7 +65,8 @@ st missions ls --help
 st missions ls
 st missions show --help
 st missions show mission-run/64bcc9227e0166a571e09117d35c572e
-st missions publish --help
+st apply --help
+st apply mission.kdl --as person/alex --dry-run
 st missions check --help
 st missions start --help
 st missions cancel --help
@@ -76,6 +77,12 @@ st missions retire --help
 `ls` and `show` are live reads. Publication, start, cancel, setting a finished run's outcome, and
 retirement are reviewed through help here and are mutation-tested only in the disposable fixture
 run.
+
+`apply --dry-run` (alias `--preview`) prints the resolved intent and publication diagnostics,
+including blockers, without publishing or running exec gates. Add `--json` for the complete
+preview object. `apply FILE --dry-run --check` runs gate commands during the preview;
+`missions check FILE` checks gates alone. The legacy `missions publish` and `agents apply`
+commands still work and print a notice naming `st apply`.
 
 ### 3. `work` — the truthful queue and worker lifecycle
 
@@ -93,6 +100,9 @@ st work show step-run/e3e841ba011236a21fe8bd3e50c21a1d/walkthrough-and-followup
 Then inspect every lifecycle and revision action:
 
 ```sh
+st work start --help
+st work handoff --help
+st work acknowledge --help
 st work claim --help
 st work renew --help
 st work progress --help
@@ -259,7 +269,10 @@ stayed held.
 
 `agents suspend` is a mutation. Suspend only a seat we agreed to stop. Check that a busy seat is
 refused with its reasons, that a quiet one shows `suspended` with its native session in `agents
-show`, and that `agents resume` reports the same session.
+show`, and that `agents resume` reports the same session. `agents resume --host HOST` carries a pi
+or omp snapshot to another fleet host under the same seat identity. The target needs the same
+absolute workspace path, unoccupied; non-Git workspaces refuse suspend. Follow `suspension.phase`
+and the typed refusal reason in `agents show`.
 
 `agents new --print-kdl` shows the seat declaration without applying it. Check that its workspace is
 a new directory below that host's home and that the harness defaults match the fleet's existing
@@ -418,6 +431,22 @@ st trace wait --help
 
 We do not leave a wait running. Check the boundary between product detail (`agents show`) and expert
 history (`subject`/`trace`).
+
+`st trace show SUBJECT --follow`, `st missions show RUN --follow`, and the viewer started by
+`st missions start --follow` retry request timeouts with a 5–15 s initial delay, doubling with
+jitter up to a 60 s cap. Deadline backoff persists across successful reads for the lifetime of
+the viewer: timing out a client read does not cancel the server's work. Unreachable-daemon
+retries start at 100 ms with jitter, double up to 5 s, and exit nonzero after five continuous
+minutes without an answer, including refused or absent sockets. These follow policies take
+precedence over `--daemon-wait`, including `--daemon-wait 0`.
+
+One `follow gap` line on stderr reports the interruption's duration and next retry delay;
+after a complete page or snapshot is delivered, one `follow recovered after N s` line reports
+its total duration. Trace resumes after the last delivered index and uses a 30 s event long poll
+with a 35 s client deadline. Mission viewers retain their last displayed snapshot and keep the
+250 ms healthy polling interval. Authentication, not-found, validation, and other non-transient
+errors still stop the viewer immediately with a nonzero exit. Request timeouts may retry
+indefinitely; Ctrl-C stops either viewer.
 
 ### 16. `schema` and `claim` — discover and use the graph vocabulary
 

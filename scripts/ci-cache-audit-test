@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""Misses must be visible, skipped archives are not misses, pruning never evicts open PRs."""
+import contextlib
+import importlib.machinery
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+sys.dont_write_bytecode = True
+root = Path(__file__).resolve().parent.parent
+
+def load(name):
+    loader = importlib.machinery.SourceFileLoader(name.replace('-', '_'), str(root / 'scripts' / name))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+audit, prune = load('ci-cache-audit'), load('ci-cache-prune')
+with tempfile.TemporaryDirectory() as tmp:
+    summary = Path(tmp) / 'summary'
+    entries = [dict(name='Cargo', outcome='success', hit='true'),
+               dict(name='Nix', outcome='success', hit='false', matched='previous-recipe'),
+               dict(name='Store', outcome='success', hit=''),
+               dict(name='Release', outcome='failure', hit=''),
+               dict(name='Probe', outcome='success', hit='true', lookup=True),
+               dict(name='Conditional', outcome='skipped', hit='')]
+    os.environ.update(GITHUB_STEP_SUMMARY=str(summary), CACHE_ENTRIES=json.dumps(entries))
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out): audit.main()
+    written = summary.read_text()
+    assert '| Cargo | HIT |' in written and '| Probe | HIT (lookup only) |' in written
+    assert 'FALLBACK; exact key MISS' in written and '| Store | MISS |' in written
+    assert written.count('⚠️ **P0:') == 3 and out.getvalue().count('::warning::P0:') == 3
+    assert 'Conditional cache MISS' not in written, 'conditional skip must not claim a cold cache'
+    os.environ['CI_LOCAL_CACHES'] = '1'
+    rows, warnings = audit.coverage([entries[-1]])
+    assert 'persistent runner store' in rows[0] and not warnings
+    os.environ.pop('CI_LOCAL_CACHES')
+    rows, warnings = audit.coverage([dict(name='Cargo', outcome='success', hit='false', opaqueFallback=True)])
+    assert 'fallback status not exposed' in rows[0] and len(warnings) == 1
+
+rows, warnings = audit.coverage([dict(name='Build', outcome='success', hit='false', sourceOnly=True, avoidable='true')])
+assert len(warnings) == 1 and warnings[0].startswith('P0:'), warnings
+
+caches = [dict(id=1, key='cargo-example', ref='refs/pull/1/merge'),
+          dict(id=2, key='cargo-example', ref='refs/pull/2/merge'),
+          dict(id=3, key='cargo-example', ref='refs/heads/main'),
+          dict(id=4, key='other-cache', ref='refs/heads/example'),
+          dict(id=5, key='setup-zig-cache-v2-build-zig-x86_64-linux-0.15.2--100-1', ref='refs/heads/main', last_accessed_at='2026-01-02'),
+          dict(id=6, key='setup-zig-cache-v2-build-zig-x86_64-linux-0.15.2--99-1', ref='refs/heads/main', last_accessed_at='2026-01-01'),
+          dict(id=7, key='setup-zig-cache-v2-build-zig-aarch64-macos-0.15.2--99-1', ref='refs/heads/main')]
+assert {entry['id'] for entry in prune.obsolete(caches, lambda number: number == 1)} == {1, 6}
+for ref, event in [('refs/pull/1/merge', 'pull_request'), ('refs/heads/example', 'workflow_dispatch'), ('refs/heads/main', 'schedule')]:
+    os.environ.update(GITHUB_REF=ref, GITHUB_EVENT_NAME=event)
+    try: prune.main()
+    except SystemExit as error: assert 'protected main' in str(error)
+    else: raise AssertionError('pruning must reject untrusted or unintended events')
+
+# Generated jobs must have a reporter or an existing custom cache proof. This catches
+# new jobs/workflows which accidentally bypass the policy wrapper without a YAML dependency.
+import re
+count = 0
+dependency_restores = 0
+main_dependency_saves = 0
+for workflow in sorted((root / '.github/workflows').glob('*.yml')):
+    jobs = workflow.read_text().split('\njobs:\n', 1)[1]
+    blocks = re.split(r'(?m)^  [A-Za-z0-9_-]+:\n', jobs)[1:]
+    for block in blocks:
+        count += 1
+        if 'scripts/ci-linux' in block or 'scripts/ci-perf cost' in block or 'Archive the st2 integration test binary' in block:
+            assert 'CI_CACHE_DEV_SHELL: default' in block, 'workspace shell closure must be retained'
+        if workflow.name == 'nix.yml':
+            assert 'scripts/ci-nix-release build' in block and 'scripts/ci-nix-release verify-cache' in block
+        elif workflow.name == 'perf.yml':
+            assert 'python3 scripts/ci-perf-cache restore' in block
+        else:
+            assert 'name: Report job cache coverage' in block, workflow
+            assert 'if: always()' in block, workflow
+        for step in re.split(r'(?m)^      - ', block):
+            if re.search(r'(?m)^        id: (cargo|nix)-cache$', step):
+                dependency_restores += 1
+                assert 'uses: actions/cache/restore@v4' in step, 'PR/queue dependency archives must not auto-save branch copies'
+            if 'uses: actions/cache/save@v4' in step and re.search(r'(?m)^          key: .*?(cargo-|nix5-)', step):
+                main_dependency_saves += 1
+                assert "github.ref == 'refs/heads/main'" in step.replace("''", "'"), 'dependency writes require protected main'
+assert dependency_restores >= 10, dependency_restores
+assert main_dependency_saves >= 8, main_dependency_saves
+assert count >= 25, count
+print(f'CI cache audit tests passed: honest coverage, visible P0 misses, bounded pruning, {count} generated jobs')

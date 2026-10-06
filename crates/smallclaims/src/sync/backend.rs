@@ -96,6 +96,15 @@ pub trait Backend: Clone + Send + Sync + 'static {
         error: &str,
     ) -> impl Future<Output = Result<()>> + Send;
 
+    /// Publish host-local worker progress without adding replicated claims.
+    fn record_worker(
+        &self,
+        _peer: &str,
+        _worker: crate::replication::ReplicationWorkerStatus,
+    ) -> impl Future<Output = Result<()>> + Send {
+        async { Ok(()) }
+    }
+
     /// The store took in something new from a peer. A backend whose store has readers
     /// elsewhere tells them here; the default does nothing.
     fn changed(&self) -> impl Future<Output = ()> + Send {
@@ -153,16 +162,27 @@ where
         summary_only: bool,
         signature_requests: &[ReplicaEnvelopeId],
     ) -> Result<ReplicationExportResponse> {
-        let store = self.store();
-        let exchange = if summary_only {
-            store.export_replication_summary(fleet_id)?
-        } else {
-            store.export_replication_exchange_answering(fleet_id, inventory, signature_requests)?
-        };
-        Ok(ReplicationExportResponse {
-            exchange,
-            store_index: store.index()?,
+        let backend = self.clone();
+        let fleet_id = fleet_id.to_owned();
+        let inventory = inventory.clone();
+        let signature_requests = signature_requests.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let store = backend.store();
+            let exchange = if summary_only {
+                store.export_replication_summary(&fleet_id)?
+            } else {
+                store.export_replication_exchange_answering(
+                    &fleet_id,
+                    &inventory,
+                    &signature_requests,
+                )?
+            };
+            Ok(ReplicationExportResponse {
+                exchange,
+                store_index: store.index()?,
+            })
         })
+        .await?
     }
 
     async fn receive(
@@ -172,22 +192,34 @@ where
         exchange: &ReplicationExchange,
         round_trip: Option<Duration>,
     ) -> Result<ReplicationReceiveResponse> {
-        let store = self.store();
-        if let Some(round_trip) = round_trip {
-            store.record_replication_round_trip(round_trip);
-        }
-        let receipt = store
-            .receive_replication_exchange_asking(peer, fleet_id, exchange, round_trip.is_some())
-            .map_err(anyhow::Error::msg)?;
-        store.record_transport_observation(peer, "up", None, None)?;
-        let admission = store.validate_replication_backlog()?;
-        let repairs = store.apply_replication_repairs()?;
-        let projected = store.project_replication_backlog()?;
-        Ok(ReplicationReceiveResponse {
-            receipt,
-            changed: projected && (admission.changed || repairs != 0),
-            store_index: store.index()?,
+        let backend = self.clone();
+        let peer = peer.to_owned();
+        let fleet_id = fleet_id.to_owned();
+        let exchange = exchange.clone();
+        tokio::task::spawn_blocking(move || {
+            let store = backend.store();
+            if let Some(round_trip) = round_trip {
+                store.record_replication_round_trip(round_trip);
+            }
+            let receipt = store
+                .receive_replication_exchange_asking(
+                    &peer,
+                    &fleet_id,
+                    &exchange,
+                    round_trip.is_some(),
+                )
+                .map_err(anyhow::Error::msg)?;
+            store.record_transport_observation(&peer, "up", None, None)?;
+            let admission = store.validate_replication_backlog()?;
+            let repairs = store.apply_replication_repairs()?;
+            let projected = store.project_replication_backlog()?;
+            Ok(ReplicationReceiveResponse {
+                receipt,
+                changed: projected && (admission.changed || repairs != 0),
+                store_index: store.index()?,
+            })
         })
+        .await?
     }
 
     async fn heal_answer(
@@ -239,6 +271,15 @@ where
 
     async fn fleet_view(&self) -> Result<FleetView> {
         self.store().fleet_view()
+    }
+
+    async fn record_worker(
+        &self,
+        peer: &str,
+        worker: crate::replication::ReplicationWorkerStatus,
+    ) -> Result<()> {
+        self.store().record_replication_worker(peer, worker);
+        Ok(())
     }
 
     async fn record_failure(&self, peer: &str, status: &str, error: &str) -> Result<()> {

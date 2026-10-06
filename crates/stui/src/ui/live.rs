@@ -9,7 +9,7 @@
 use super::adapt::{self, Extras};
 use super::glass::GlassWrite;
 use super::view::{Load, MissionPreview};
-use super::{Effect, Guard, Ui};
+use super::{AgentControl, Effect, Guard, Ui};
 use crate::feed::{self, Command, TerminalUpdate, Window};
 use crate::model::{self, Collection, Model};
 use anyhow::Result;
@@ -120,6 +120,8 @@ struct Following {
 
 /// How often usage on screen is read again.
 const USAGE_EVERY: Duration = Duration::from_secs(60);
+/// How often the connected clients are read again while the fleet shows.
+const CLIENTS_EVERY: Duration = Duration::from_secs(10);
 
 /// Why usage could not be read, saying so plainly when the daemon predates the read.
 fn usage_error(error: &st3_client::ClientError) -> String {
@@ -143,6 +145,8 @@ enum Fetched {
         target: String,
         session_id: String,
         page: Result<OlderPage, String>,
+        /// How long st took to answer, so a slow st is not asked for more than the person scrolled to.
+        took: Duration,
     },
     Preview(String, Load<MissionPreview>),
     /// The message behind an unread-message item: sender, title and text.
@@ -155,6 +159,11 @@ enum Fetched {
     Repositories(String, Load<Vec<String>>),
     /// Token spend over a period of this many hours, or why st could not say.
     Usage(u64, Result<st3_client::UsagePeriod, String>),
+    /// The clients connected to this member, or why they could not be read.
+    Clients(
+        Result<st3_client::ClientConnections, String>,
+        Option<String>,
+    ),
     /// st's conversation search for the palette's query, or why st could not say.
     Said(String, Result<st3_client::ConversationSearch, String>),
     Devices(Collection),
@@ -254,6 +263,8 @@ pub fn run(context: Context) -> Result<()> {
     // Each conversation st has sent, kept after it closes so reopening it shows its last entries.
     let mut timelines: BTreeMap<String, st3_conversation_ui::Timeline> = BTreeMap::new();
     let mut failed: BTreeMap<String, String> = BTreeMap::new();
+    // How many earlier pages each conversation read on its own to fill its first screen.
+    let mut filled: BTreeMap<String, usize> = BTreeMap::new();
     // The agent or session whose conversation the feed holds.
     let mut conversing: Vec<String> = Vec::new();
     // The session each conversation was last subscribed again for, so it is asked once.
@@ -280,6 +291,12 @@ pub fn run(context: Context) -> Result<()> {
         ui.flash("The old screens are gone: this is spaces, and ? shows its keys");
     }
 
+    // A stui killed from outside leaves its last picture on the screen; the next one says so.
+    let (_run, earlier) = super::lastrun::begin(&crate::version::short(crate::version::now()));
+    if let Some(note) = earlier {
+        // Long enough to read: the usual flash ends after four seconds.
+        ui.flash = Some((note, Instant::now() + Duration::from_secs(26)));
+    }
     let _guard = Guard::enter(ui.glasses.is_some())?;
     // The release smoke test's probe: the terminal is restored after a panic too.
     #[cfg(debug_assertions)]
@@ -303,8 +320,11 @@ pub fn run(context: Context) -> Result<()> {
     let mut attached: Option<Following> = None;
     // The runtimes of the agent whose terminal view is open, to follow it again after a pause.
     let mut terminal_runtimes: Option<Vec<String>> = None;
+    let mut terminal_runtimes_by_agent: BTreeMap<String, Vec<String>> = BTreeMap::new();
     // Attaching a dropped terminal again: whether a try is out, and how many failed.
     let mut reattaching = false;
+    // When a terminal was asked for, while it connects: the wait is shown, and a long one named.
+    let mut attach_started: Option<Instant> = None;
     let mut reattach_tries = 0_u32;
     // The cursor shape last set, so it changes only when the attached terminal asks.
     let mut cursor_style: Option<crossterm::cursor::SetCursorStyle> = None;
@@ -313,6 +333,9 @@ pub fn run(context: Context) -> Result<()> {
     let mut repositories_asked: Option<String> = None;
     // When usage was last asked for and over how many hours, and whether that read is out.
     let mut usage_read: Option<(Instant, u64)> = None;
+    // When the connected clients were last read, while the fleet shows, and whether a read is out.
+    let mut clients_read: Option<Instant> = None;
+    let mut clients_reading = false;
     let mut usage_reading = false;
     // The palette's conversation search: what st was last asked, and what is typed since when.
     let mut said_asked: Option<String> = None;
@@ -331,6 +354,18 @@ pub fn run(context: Context) -> Result<()> {
             .is_some_and(|(_, at)| at.elapsed() > Duration::from_secs(4))
         {
             ui.flash = None;
+        }
+        // A terminal still connecting says how long it has waited, so a slow st does not look
+        // like a stuck screen (Nathan, 2026-10-05: attaching took a long time).
+        if let (Some(started), Some(view)) = (attach_started, ui.terminal.as_mut())
+            && view.native.is_none()
+            && view.ended.is_none()
+            && view
+                .stale
+                .as_deref()
+                .is_some_and(|stale| stale.starts_with("connecting"))
+        {
+            view.stale = Some(connecting_text(started.elapsed()));
         }
         while let Ok(update) = incoming.try_recv() {
             match update {
@@ -398,6 +433,9 @@ pub fn run(context: Context) -> Result<()> {
                     items,
                 } => {
                     failed.remove(&target);
+                    if replace && !timelines.get(&target).is_some_and(|timeline| timeline.older.paged) {
+                        filled.remove(&target);
+                    }
                     ui.conversation_updated(&target);
                     timelines
                         .entry(target)
@@ -536,13 +574,17 @@ pub fn run(context: Context) -> Result<()> {
                     if ui.agent_repository_host().as_ref() == Some(&host) {
                         ui.agent_repositories = Some((host, load));
                     }
-                    changed = true;
                 }
                 Fetched::Older {
                     target,
                     session_id,
                     page,
+                    took,
                 } => {
+                    // A slow st is not asked to fill the first screen any further.
+                    if slow_page(took) {
+                        filled.insert(target.clone(), FILL_PAGES);
+                    }
                     if let Some(timeline) = timelines.get_mut(&target) {
                         match page {
                             Ok(page) => timeline.older_page(
@@ -558,6 +600,13 @@ pub fn run(context: Context) -> Result<()> {
                 Fetched::Said(query, outcome) => {
                     ui.said = Some((query, outcome));
                     changed = true;
+                }
+                Fetched::Clients(outcome, member_build) => {
+                    clients_reading = false;
+                    model.clients = Some(outcome);
+                    if member_build.is_some() {
+                        model.member_build = member_build;
+                    }
                 }
                 Fetched::Usage(hours, outcome) => {
                     usage_reading = false;
@@ -577,11 +626,18 @@ pub fn run(context: Context) -> Result<()> {
                 Fetched::AgentStarted(id) => ui.agent_started(id),
                 Fetched::TerminalStarted(id) => ui.terminal_started(id),
                 Fetched::Native { agent, direct } => {
+                    if let Some(waited) = attach_started.take().map(|at| at.elapsed())
+                        && waited >= Duration::from_secs(3)
+                    {
+                        ui.flash(format!(
+                            "Attached after {}s: st was slow to answer",
+                            waited.as_secs()
+                        ));
+                    }
                     let (rows, columns) = ui.terminal_size.get();
                     if let Some(view) = ui
-                        .terminal
-                        .as_mut()
-                        .filter(|view| view.agent == agent && view.native.is_none())
+                        .terminal_view_mut(&agent)
+                        .filter(|view| view.native.is_none())
                     {
                         view.native = Some(super::pty::NativeTerminal::spawn(
                             direct.stream,
@@ -596,9 +652,7 @@ pub fn run(context: Context) -> Result<()> {
                 Fetched::Reattached { agent, outcome } => {
                     reattaching = false;
                     if let Some(native) = ui
-                        .terminal
-                        .as_ref()
-                        .filter(|view| view.agent == agent)
+                        .terminal_view(&agent)
                         .and_then(|view| view.native.as_ref())
                     {
                         match outcome {
@@ -614,13 +668,13 @@ pub fn run(context: Context) -> Result<()> {
                     runtime_ids,
                     reason,
                 } => {
+                    attach_started = None;
                     if agent.starts_with("terminal/") {
                         // A shell has no other view to fall back to.
-                        if let Some(view) = ui.terminal.as_mut().filter(|view| view.agent == agent)
-                        {
+                        if let Some(view) = ui.terminal_view_mut(&agent) {
                             view.ended = Some(format!("could not attach: {reason}"));
                         }
-                    } else if ui.terminal.as_ref().is_some_and(|view| view.agent == agent) {
+                    } else if ui.terminal_view(&agent).is_some() {
                         ui.flash(format!(
                             "No direct terminal ({reason}); showing st's view of it"
                         ));
@@ -742,6 +796,38 @@ pub fn run(context: Context) -> Result<()> {
                 said_typed = None;
             }
             _ => {}
+        }
+        // Who is connected has no stream either: read while the fleet shows, every few seconds,
+        // since clients come and go.
+        if ui.clients_wanted() && extras.live {
+            let due = clients_read.is_none_or(|at| at.elapsed() >= CLIENTS_EVERY);
+            if due && !clients_reading {
+                clients_read = Some(Instant::now());
+                clients_reading = true;
+                let client = client.clone();
+                let tx = fetched_tx.clone();
+                runtime.spawn(async move {
+                    let member_build = client
+                        .capabilities()
+                        .await
+                        .ok()
+                        .and_then(|envelope| envelope.value.machine_version);
+                    let outcome = client
+                        .clients_list()
+                        .await
+                        .map(|envelope| envelope.value)
+                        .map_err(|error| match &error {
+                            ClientError::Api(st3_client::ErrorCode::NotFound, ..) => {
+                                "this st does not list its clients yet: its daemon needs an update"
+                                    .to_owned()
+                            }
+                            _ => error.plain(),
+                        });
+                    let _ = tx.send(Fetched::Clients(outcome, member_build));
+                });
+            }
+        } else {
+            clients_read = None;
         }
         // Usage has no stream: it is read while something shows it, again each minute, and at
         // once over a new period.
@@ -889,6 +975,17 @@ pub fn run(context: Context) -> Result<()> {
                     let runtime_ids = found
                         .map(|candidate| candidate.runtime_ids.clone())
                         .unwrap_or_default();
+                    // What st already said of the agent: its terminal is named after it, and its
+                    // incarnation is the one running, so the attach needs no runtime read first.
+                    let known = found.and_then(|candidate| {
+                        let name = candidate
+                            .runtime_ids
+                            .first()?
+                            .trim_start_matches("runtime/");
+                        candidate.incarnation_id.clone().map(|incarnation| {
+                            (name.to_owned(), format!("terminal/{agent}"), incarnation)
+                        })
+                    });
                     let name = found.map(crate::agent_label).unwrap_or_else(|| {
                         if agent.starts_with("terminal/") {
                             "shell".into()
@@ -898,13 +995,17 @@ pub fn run(context: Context) -> Result<()> {
                     });
                     attached = None;
                     terminal_runtimes = Some(runtime_ids.clone());
+                    terminal_runtimes_by_agent.insert(agent.clone(), runtime_ids.clone());
+                    attach_started = Some(Instant::now());
                     let _ = commands.send(Command::Unfollow);
                     {
                         let client = client.clone();
                         let tx = fetched_tx.clone();
                         let agent = agent.clone();
                         runtime.spawn(async move {
-                            let attached = attach_direct(&client, &agent, &runtime_ids, None).await;
+                            let attached =
+                                attach_known_then_direct(&client, &agent, known, &runtime_ids)
+                                    .await;
                             let _ = tx.send(match attached {
                                 Ok(direct) => Fetched::Native { agent, direct },
                                 Err(reason) => Fetched::NativeFailed {
@@ -916,6 +1017,7 @@ pub fn run(context: Context) -> Result<()> {
                         });
                     }
                     {
+                        ui.park_for(&agent);
                         ui.terminal = Some(super::TerminalView {
                             agent: agent.clone(),
                             title: name.clone(),
@@ -960,7 +1062,29 @@ pub fn run(context: Context) -> Result<()> {
             }
         }
         // Scrolling to the top of a conversation asks for the page before it; one at a time.
-        for target in ui.take_older_wanted() {
+        // A first load that shows little (a page that is mostly tool calls) reads on by itself,
+        // a few pages at most, until about a screenful of rows is there.
+        let mut wanted = ui.take_older_wanted();
+        let mut names = None;
+        // One page is asked for at a time across every conversation, so opening several at
+        // once is not a burst of reads on a daemon that may already be busy.
+        let reading = timelines.values().any(|timeline| timeline.older.loading);
+        for (target, timeline) in &timelines {
+            if reading || !wanted.is_empty() {
+                break;
+            }
+            let pages = filled.get(target).copied().unwrap_or(0);
+            if !extras.live || !wants_fill(timeline, pages) {
+                continue;
+            }
+            let names = names.get_or_insert_with(|| adapt::names(&model, &person));
+            let entries = adapt::conversation(&timeline.items, names);
+            if st3_conversation_ui::display_rows(&entries) < FILL_ROWS {
+                *filled.entry(target.clone()).or_default() += 1;
+                wanted.insert(target.clone());
+            }
+        }
+        for target in wanted {
             let Some(timeline) = timelines.get_mut(&target) else {
                 continue;
             };
@@ -985,11 +1109,13 @@ pub fn run(context: Context) -> Result<()> {
             let client = client.clone();
             let tx = fetched_tx.clone();
             runtime.spawn(async move {
+                let started = Instant::now();
                 let page = older_page(&client, &session_id, cursor, oldest).await;
                 let _ = tx.send(Fetched::Older {
                     target,
                     session_id,
                     page,
+                    took: started.elapsed(),
                 });
             });
         }
@@ -1169,17 +1295,26 @@ pub fn run(context: Context) -> Result<()> {
         // after a wait that grows with each try.
         if !reattaching
             && extras.live
-            && let Some(view) = ui.terminal.as_ref()
-            && let Some(native) = view.native.as_ref()
-            && let Some(at) = native.dropped()
-            && at.elapsed() >= Duration::from_secs(2_u64.pow(reattach_tries.min(5)))
+            && let Some((view, native)) = ui
+                .terminal
+                .iter()
+                .chain(ui.parked.iter())
+                .filter_map(|view| view.native.as_ref().map(|native| (view, native)))
+                .find(|(_, native)| {
+                    native.dropped().is_some_and(|at| {
+                        at.elapsed() >= Duration::from_secs(2_u64.pow(reattach_tries.min(5)))
+                    })
+                })
         {
             reattaching = true;
             let client = client.clone();
             let tx = fetched_tx.clone();
             let agent = view.agent.clone();
             let expected = native.incarnation.clone();
-            let runtime_ids = terminal_runtimes.clone().unwrap_or_default();
+            let runtime_ids = terminal_runtimes_by_agent
+                .get(&agent)
+                .cloned()
+                .unwrap_or_default();
             runtime.spawn(async move {
                 let outcome = attach_direct(&client, &agent, &runtime_ids, Some(&expected)).await;
                 let _ = tx.send(Fetched::Reattached { agent, outcome });
@@ -1187,9 +1322,9 @@ pub fn run(context: Context) -> Result<()> {
         }
         if ui
             .terminal
-            .as_ref()
-            .and_then(|view| view.native.as_ref())
-            .is_none()
+            .iter()
+            .chain(ui.parked.iter())
+            .all(|view| view.native.is_none())
         {
             reattach_tries = 0;
         }
@@ -1198,9 +1333,10 @@ pub fn run(context: Context) -> Result<()> {
         let flowing = ui.voice.is_some()
             || ui
                 .terminal
-                .as_ref()
-                .and_then(|view| view.native.as_ref())
-                .is_some_and(|native| native.flowing());
+                .iter()
+                .chain(ui.parked.iter())
+                .filter_map(|view| view.native.as_ref())
+                .any(|native| native.flowing());
         if event::poll(Duration::from_millis(if flowing { 16 } else { 80 }))? {
             // crossterm's read never returns on a closed terminal, so check for one before each.
             while !stopping.load(std::sync::atomic::Ordering::Relaxed) && !crate::stdin_hung_up() {
@@ -1212,10 +1348,7 @@ pub fn run(context: Context) -> Result<()> {
                     {
                         let _ = commands.send(Command::Reconnect);
                     }
-                    Event::Key(key) => ui.key(key),
-                    Event::Paste(text) => ui.paste(text),
-                    Event::Mouse(mouse) => ui.mouse(mouse),
-                    _ => {}
+                    input => ui.input_event(input),
                 }
                 if !event::poll(Duration::ZERO)? {
                     break;
@@ -1323,6 +1456,28 @@ fn conversations(
 
 /// Entries per page read back: st's largest, so a long session takes few requests.
 const OLDER_PAGE: usize = 200;
+
+/// About this many rows, as the person sees them, are there once a conversation opens.
+const FILL_ROWS: usize = 200;
+
+/// The most earlier pages one conversation reads on its own to get there.
+const FILL_PAGES: usize = 7;
+
+/// A page st took this long to give is a sign it is busy: no more pages are read on their own.
+const FILL_SLOW: Duration = Duration::from_millis(1500);
+
+fn slow_page(took: Duration) -> bool {
+    took > FILL_SLOW
+}
+
+/// Whether a conversation may read one more earlier page on its own: there is more before it,
+/// no page is in flight or has just failed, and it has not used up its pages.
+fn wants_fill(timeline: &st3_conversation_ui::Timeline, pages_read: usize) -> bool {
+    !timeline.older.loading
+        && timeline.older.failed.is_none()
+        && timeline.more_before()
+        && pages_read < FILL_PAGES
+}
 
 /// st keeps a page cursor for five minutes; one older than this starts again from the newest.
 const OLDER_CURSOR_LIFE: Duration = Duration::from_secs(240);
@@ -1536,6 +1691,79 @@ pub(crate) fn plain(error: &anyhow::Error) -> String {
         .unwrap_or_else(|| error.to_string())
 }
 
+/// One agent action, fenced to the seat's current declaration as st asks. A restart is a stop
+/// and then a start, each on the declaration st selects at that moment.
+async fn agent_control(client: &Client, agent: &str, control: AgentControl) -> Result<()> {
+    let fence = |definition: st3_client::Envelope<st3_client::SubjectDefinition>| Fence {
+        snapshot_id: definition.snapshot.id,
+        runtime_desired_revision: Some(definition.value.desired_token),
+        ..Fence::default()
+    };
+    let reason = Some("from stui's agent actions".to_owned());
+    let steps: &[AgentControl] = match control {
+        AgentControl::Restart => &[AgentControl::Retire, AgentControl::Start],
+        _ => std::slice::from_ref(&control),
+    };
+    for step in steps {
+        let fence = fence(client.subject_definition(agent, false).await?);
+        let (id, idem) = crate::action_pair();
+        match step {
+            AgentControl::Retire | AgentControl::Restart => {
+                client
+                    .agent_stop(
+                        id,
+                        idem,
+                        fence,
+                        st3_client::AgentStopParameters {
+                            agent: agent.to_owned(),
+                            reason: reason.clone(),
+                        },
+                    )
+                    .await?;
+            }
+            AgentControl::Start => {
+                client
+                    .agent_start(
+                        id,
+                        idem,
+                        fence,
+                        st3_client::AgentStartParameters {
+                            agent: agent.to_owned(),
+                        },
+                    )
+                    .await?;
+            }
+            AgentControl::Suspend => {
+                client
+                    .agent_suspend(
+                        id,
+                        idem,
+                        fence,
+                        st3_client::AgentSuspendParameters {
+                            agent: agent.to_owned(),
+                            reason: reason.clone(),
+                        },
+                    )
+                    .await?;
+            }
+            AgentControl::Resume => {
+                client
+                    .agent_resume(
+                        id,
+                        idem,
+                        fence,
+                        st3_client::AgentResumeParameters {
+                            agent: agent.to_owned(),
+                            host: None,
+                        },
+                    )
+                    .await?;
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn perform(
     client: &Client,
     person: &str,
@@ -1547,6 +1775,17 @@ async fn perform(
         // Glass writes and retries never reach here: the loop handles them itself.
         Effect::SaveGlass(_) | Effect::Resend { .. } | Effect::Forget { .. } => {
             Ok((String::new(), None))
+        }
+        Effect::AgentControl { agent, control } => {
+            agent_control(client, &agent, control).await?;
+            Ok((
+                format!(
+                    "{} {}: asked st",
+                    control.verb(),
+                    agent.trim_start_matches("agent/")
+                ),
+                None,
+            ))
         }
         Effect::StopAgent { agent } => {
             let runtime = model
@@ -1993,6 +2232,43 @@ async fn send_message(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_slow_page_stops_the_first_screen_reading_on() {
+        assert!(!super::slow_page(Duration::from_millis(400)));
+        assert!(super::slow_page(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn a_first_screen_reads_earlier_pages_only_while_it_may() {
+        let mut timeline = st3_conversation_ui::Timeline {
+            has_more: true,
+            ..Default::default()
+        };
+        assert!(super::wants_fill(&timeline, 0));
+        assert!(super::wants_fill(&timeline, super::FILL_PAGES - 1));
+        assert!(!super::wants_fill(&timeline, super::FILL_PAGES));
+        timeline.older.loading = true;
+        assert!(!super::wants_fill(&timeline, 0));
+        timeline.older.loading = false;
+        timeline.older.failed = Some("st is slow".into());
+        assert!(!super::wants_fill(&timeline, 0));
+        timeline.older.failed = None;
+        timeline.has_more = false;
+        assert!(!super::wants_fill(&timeline, 0));
+    }
+
+    #[test]
+    fn a_terminal_that_is_slow_to_connect_says_how_long_and_who_is_slow() {
+        use super::connecting_text;
+        use std::time::Duration;
+        assert_eq!(connecting_text(Duration::from_millis(900)), "connecting");
+        assert_eq!(connecting_text(Duration::from_secs(3)), "connecting 3s");
+        assert_eq!(
+            connecting_text(Duration::from_secs(12)),
+            "connecting 12s, st is slow to answer"
+        );
+    }
+
     use super::*;
 
     #[tokio::test]
@@ -2748,6 +3024,34 @@ struct Direct {
 /// terminal's incarnation and routed to the host that owns it. `subject` is an agent (its
 /// terminal is the first of `runtime_ids` that has one) or a shell's terminal. With `expected`,
 /// only that incarnation: a terminal that restarted since is not quietly swapped in.
+/// Attach straight to the terminal st already named, the quick way (each runtime read is a full
+/// round trip to the daemon, a second or more on a busy one: Nathan, 2026-10-04, "attaching
+/// … feels kinda slow"); when that terminal is not there, find it through the agent's runtimes.
+/// What a terminal that is still connecting says: nothing special at first, then how long it has
+/// waited, then that st is the slow part.
+fn connecting_text(waited: Duration) -> String {
+    match waited.as_secs() {
+        0..2 => "connecting".into(),
+        2..8 => format!("connecting {}s", waited.as_secs()),
+        seconds => format!("connecting {seconds}s, st is slow to answer"),
+    }
+}
+
+async fn attach_known_then_direct(
+    client: &Client,
+    agent: &str,
+    known: Option<(String, String, String)>,
+    runtime_ids: &[String],
+) -> Result<Direct, String> {
+    if let Some((name, terminal, incarnation)) = known
+        && !agent.starts_with("terminal/")
+        && let Ok(direct) = attach_terminal(client, name, &terminal, incarnation).await
+    {
+        return Ok(direct);
+    }
+    attach_direct(client, agent, runtime_ids, None).await
+}
+
 async fn attach_direct(
     client: &Client,
     subject: &str,
@@ -2794,29 +3098,35 @@ async fn attach_direct(
             reason = "the terminal restarted; Ctrl+] attaches the new one".into();
             continue;
         }
-        let attachment = match client
-            .raw_terminal_attachment(&terminal, &incarnation, st3_client::RawTerminalMode::Attach)
-            .await
-        {
-            Ok(attachment) => attachment,
-            Err(error) => {
-                reason = error.plain();
-                continue;
-            }
-        };
-        match client.raw_terminal_stream(&attachment).await {
-            Ok(stream) => {
-                return stream
-                    .into_std()
-                    .map(|stream| Direct {
-                        name,
-                        incarnation,
-                        stream,
-                    })
-                    .map_err(|error| error.to_string());
-            }
-            Err(error) => reason = error.plain(),
+        match attach_terminal(client, name, &terminal, incarnation).await {
+            Ok(direct) => return Ok(direct),
+            Err(error) => reason = error,
         }
     }
     Err(reason)
+}
+
+/// A raw attachment to one terminal's PTY session at one incarnation, and its stream.
+async fn attach_terminal(
+    client: &Client,
+    name: String,
+    terminal: &str,
+    incarnation: String,
+) -> Result<Direct, String> {
+    let attachment = client
+        .raw_terminal_attachment(terminal, &incarnation, st3_client::RawTerminalMode::Attach)
+        .await
+        .map_err(|error| error.plain())?;
+    let stream = client
+        .raw_terminal_stream(&attachment)
+        .await
+        .map_err(|error| error.plain())?;
+    stream
+        .into_std()
+        .map(|stream| Direct {
+            name,
+            incarnation,
+            stream,
+        })
+        .map_err(|error| error.to_string())
 }

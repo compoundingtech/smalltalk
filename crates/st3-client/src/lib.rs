@@ -4,6 +4,7 @@
 mod checkout;
 pub use checkout::{agent_branch, checkout_label};
 mod contract;
+pub mod device;
 mod generated;
 pub use contract::*;
 pub use generated::*;
@@ -23,7 +24,7 @@ use std::sync::{
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio_tungstenite::{
-    WebSocketStream, connect_async,
+    WebSocketStream,
     tungstenite::{
         Message as WsMessage, client::IntoClientRequest as _, protocol::WebSocketConfig,
     },
@@ -126,6 +127,8 @@ pub struct Client {
     endpoint: Endpoint,
     credential: Option<String>,
     local_person: Option<String>,
+    signing_device: Option<Arc<device::Device>>,
+    device_http_policy: Option<bool>,
     http: reqwest::Client,
     max_response_bytes: Arc<AtomicUsize>,
     outage_wait: Duration,
@@ -208,6 +211,20 @@ pub struct CollectionStream {
 impl CollectionStream {
     pub async fn subscribe_glasses(&mut self, id: &str) -> Result<(), ClientError> {
         self.subscribe(id, "glasses", 100, None, None).await
+    }
+    /// Select the owner's fleet explicitly; agent identity is not an owner selector.
+    pub async fn subscribe_arrangements(
+        &mut self,
+        id: &str,
+        person: &str,
+        limit: usize,
+        subject: Option<&str>,
+    ) -> Result<(), ClientError> {
+        let mut command = serde_json::json!({"kind":"subscribe", "id":id, "collection":"arrangements", "person":person, "limit":limit});
+        if let Some(subject) = subject {
+            command["subject"] = serde_json::json!(subject);
+        }
+        self.send(&command).await
     }
     pub async fn subscribe(
         &mut self,
@@ -330,7 +347,8 @@ pub enum CollectionEvent {
         session_id: String,
         replace: bool,
         items: Vec<TimelineEntry>,
-        has_more: bool,
+        /// Availability before the live window; absent on deltas means unchanged.
+        has_more: Option<bool>,
     },
     /// Subscribe again: the server could not bring this subscription up to date.
     /// `code` and `message` say why when a temporary failure caused it, such as a conversation
@@ -389,7 +407,7 @@ impl CollectionEvent {
                 session_id: field(&frame, "session_id")?,
                 replace: field(&frame, "replace")?,
                 items: field(&frame, "items")?,
-                has_more: field::<Option<bool>>(&frame, "has_more")?.unwrap_or(false),
+                has_more: field(&frame, "has_more")?,
                 id,
             }),
             Some("resync") => Ok(Self::Resync {
@@ -559,6 +577,21 @@ pub fn plain_message(code: Option<&ErrorCode>, message: &str) -> String {
         ErrorCode::ValidationFailed
         | ErrorCode::AttentionMigrated
         | ErrorCode::RuntimeNotLocal
+        | ErrorCode::ArrangementExists
+        | ErrorCode::ArrangementFolderExists
+        | ErrorCode::ArrangementRetired
+        | ErrorCode::ArrangementLimit
+        | ErrorCode::ArrangementFolderDeleted
+        | ErrorCode::ArrangementCycle
+        | ErrorCode::ArrangementBodyTooLarge
+        | ErrorCode::ArrangementOwnerForbidden
+        | ErrorCode::InvalidArrangementSubject
+        | ErrorCode::InvalidArrangementAction
+        | ErrorCode::InvalidArrangementOperations
+        | ErrorCode::InvalidArrangementFolder
+        | ErrorCode::InvalidArrangementName
+        | ErrorCode::InvalidArrangementKey
+        | ErrorCode::InvalidSubjectReference
         | ErrorCode::Unknown => message.to_owned(),
     }
 }
@@ -667,6 +700,8 @@ impl Client {
             endpoint: Endpoint::Unix(path.as_ref().to_owned()),
             credential: None,
             local_person: None,
+            signing_device: None,
+            device_http_policy: None,
             http: reqwest::Client::new(),
             max_response_bytes: Arc::new(AtomicUsize::new(HARD_MAX_RESPONSE_BYTES)),
             outage_wait: Duration::ZERO,
@@ -679,6 +714,8 @@ impl Client {
             endpoint: Endpoint::Unix(path.as_ref().to_owned()),
             credential: None,
             local_person: Some(person_id.into()),
+            signing_device: None,
+            device_http_policy: None,
             http: reqwest::Client::new(),
             max_response_bytes: Arc::new(AtomicUsize::new(HARD_MAX_RESPONSE_BYTES)),
             outage_wait: Duration::ZERO,
@@ -694,6 +731,8 @@ impl Client {
             endpoint: Endpoint::Unix(path.as_ref().to_owned()),
             credential: Some(credential.into()),
             local_person: None,
+            signing_device: None,
+            device_http_policy: None,
             http: reqwest::Client::new(),
             max_response_bytes: Arc::new(AtomicUsize::new(HARD_MAX_RESPONSE_BYTES)),
             outage_wait: Duration::ZERO,
@@ -702,12 +741,14 @@ impl Client {
     }
 
     /// Connect to the remote gateway before a device credential exists. The server permits only
-    /// pairing completion on this unauthenticated transport.
+    /// pairing compatibility advertisement and completion on this unauthenticated transport.
     pub fn fabric_pairing(base_url: impl Into<String>) -> Self {
         Self {
             endpoint: Endpoint::FabricLoopback(base_url.into().trim_end_matches('/').to_owned()),
             credential: None,
             local_person: None,
+            signing_device: None,
+            device_http_policy: None,
             http: reqwest::Client::new(),
             max_response_bytes: Arc::new(AtomicUsize::new(HARD_MAX_RESPONSE_BYTES)),
             outage_wait: Duration::ZERO,
@@ -720,6 +761,8 @@ impl Client {
             endpoint: Endpoint::FabricLoopback(base_url.into().trim_end_matches('/').to_owned()),
             credential: Some(credential.into()),
             local_person: None,
+            signing_device: None,
+            device_http_policy: None,
             http: reqwest::Client::new(),
             max_response_bytes: Arc::new(AtomicUsize::new(HARD_MAX_RESPONSE_BYTES)),
             outage_wait: Duration::ZERO,
@@ -837,6 +880,33 @@ impl Client {
             format!("?{}", query.join("&"))
         };
         self.get(&format!("/v1/client/{collection}{suffix}")).await
+    }
+
+    /// Exact terminal filters, applied by the server before pagination.
+    /// Older servers that ignore these filters are refused, never scanned client-side.
+    pub async fn terminals_list_filtered(
+        &self,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+        history: bool,
+        owner: Option<&str>,
+        state: Option<&str>,
+    ) -> Result<Envelope<Page>, ClientError> {
+        let filters = [("owner", owner), ("state", state)]
+            .into_iter()
+            .filter_map(|(name, value)| value.map(|value| (name, value)))
+            .collect::<Vec<_>>();
+        let response: Envelope<Page> = self
+            .list_internal_with_filters("terminals", cursor, limit, history, &filters)
+            .await?;
+        for (name, value) in filters {
+            if response.value.filters.get(name).map(String::as_str) != Some(value) {
+                return Err(ClientError::Protocol(format!(
+                    "the server does not support the terminal {name} filter; upgrade the server"
+                )));
+            }
+        }
+        Ok(response)
     }
 
     pub async fn messages_list_for_recipient(
@@ -1140,6 +1210,25 @@ impl Client {
         .await
     }
 
+    pub async fn custom_subjects_list(
+        &self,
+        kind: Option<&str>,
+        version: Option<u32>,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Envelope<Page>, ClientError> {
+        let version = version.map(|v| v.to_string());
+        let values = [("kind", kind), ("version", version.as_deref())];
+        let filters = values
+            .into_iter()
+            .filter_map(|(k, v)| v.map(|v| (k, v)))
+            .collect::<Vec<_>>();
+        self.list_internal_with_filters("custom-subjects", cursor, limit, false, &filters)
+            .await
+    }
+    pub async fn custom_subjects_get(&self, id: &str) -> Result<Envelope<Resource>, ClientError> {
+        self.resource_internal("custom-subjects", id).await
+    }
     pub async fn host_repositories(
         &self,
         host: &str,
@@ -1171,6 +1260,16 @@ impl Client {
         ))
         .await
     }
+    pub async fn publication_definition(
+        &self,
+        subject: &str,
+    ) -> Result<Envelope<PublicationDefinition>, ClientError> {
+        self.get(&format!(
+            "/v1/client/publication-definition?subject={}",
+            percent_encode(subject)
+        ))
+        .await
+    }
     pub async fn subject_definition(
         &self,
         subject: &str,
@@ -1181,6 +1280,9 @@ impl Client {
             percent_encode(subject)
         ))
         .await
+    }
+    pub async fn mail_backlog_summary(&self) -> Result<Envelope<MailBacklog>, ClientError> {
+        self.get("/v1/client/mail-backlog").await
     }
     pub async fn usage_period(
         &self,
@@ -1344,6 +1446,16 @@ impl Client {
     pub async fn agents_get(&self, id: &str) -> Result<Envelope<Resource>, ClientError> {
         self.resource_internal("agents", id).await
     }
+    pub async fn agent_workspace_get(
+        &self,
+        id: &str,
+    ) -> Result<Envelope<AgentWorkspace>, ClientError> {
+        self.get(&format!(
+            "/v1/client/agent-workspaces/{}",
+            percent_encode(id)
+        ))
+        .await
+    }
     pub async fn agent_declaration_get(
         &self,
         id: &str,
@@ -1360,6 +1472,13 @@ impl Client {
             path
         };
         self.get(&path).await
+    }
+    pub async fn status_history_get(
+        &self,
+        id: &str,
+    ) -> Result<Envelope<StatusHistory>, ClientError> {
+        self.get(&format!("/v1/client/status-history/{}", percent_encode(id)))
+            .await
     }
     pub async fn agent_queue(&self, agent_id: &str) -> Result<Envelope<AgentQueue>, ClientError> {
         self.agent_queue_internal(agent_id).await
@@ -1507,6 +1626,33 @@ impl Client {
     ) -> Result<Envelope<TerminalScreen>, ClientError> {
         self.terminal_screen_internal(terminal_id).await
     }
+    pub async fn arrangements_list(
+        &self,
+        person: &str,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Envelope<ArrangementPage>, ClientError> {
+        let mut path = format!("/v1/client/arrangements?person={}", percent_encode(person));
+        if let Some(cursor) = cursor {
+            path.push_str(&format!("&cursor={}", percent_encode(cursor)));
+        }
+        if let Some(limit) = limit {
+            path.push_str(&format!("&limit={limit}"));
+        }
+        self.get(&path).await
+    }
+    pub async fn arrangements_get(
+        &self,
+        person_name: &str,
+        uuid: &str,
+    ) -> Result<Envelope<Arrangement>, ClientError> {
+        self.get(&format!(
+            "/v1/client/arrangements/{}/{}",
+            percent_encode(person_name),
+            percent_encode(uuid)
+        ))
+        .await
+    }
     pub async fn glasses_list(
         &self,
         cursor: Option<&str>,
@@ -1584,6 +1730,17 @@ impl Client {
             .map_err(|error| ClientError::Protocol(error.to_string()))?;
         self.action_internal(&request).await
     }
+    pub async fn arrangement_edit(
+        &self,
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: ArrangementEditParameters,
+    ) -> Result<Envelope<ActionResult>, ClientError> {
+        let request = ActionRequest::arrangement_edit(id, idempotency_key, fence, parameters)
+            .map_err(|error| ClientError::Protocol(error.to_string()))?;
+        self.action_internal(&request).await
+    }
     pub async fn attention_resolve(
         &self,
         id: impl Into<String>,
@@ -1592,6 +1749,17 @@ impl Client {
         parameters: AttentionResolveParameters,
     ) -> Result<Envelope<ActionResult>, ClientError> {
         let request = ActionRequest::attention_resolve(id, idempotency_key, fence, parameters)
+            .map_err(|error| ClientError::Protocol(error.to_string()))?;
+        self.action_internal(&request).await
+    }
+    pub async fn custom_reply(
+        &self,
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: CustomReplyParameters,
+    ) -> Result<Envelope<ActionResult>, ClientError> {
+        let request = ActionRequest::custom_reply(id, idempotency_key, fence, parameters)
             .map_err(|error| ClientError::Protocol(error.to_string()))?;
         self.action_internal(&request).await
     }
@@ -1732,8 +1900,18 @@ impl Client {
         id: impl Into<String>,
         idempotency_key: impl Into<String>,
         fence: Fence,
-        parameters: MessageSendParameters,
+        mut parameters: MessageSendParameters,
     ) -> Result<Envelope<ActionResult>, ClientError> {
+        let idempotency_key = idempotency_key.into();
+        if parameters.signature.is_none()
+            && let Some(device) = &self.signing_device
+        {
+            parameters.signature = Some(
+                device
+                    .sign_message(&idempotency_key, &parameters)
+                    .map_err(|error| ClientError::Protocol(error.to_string()))?,
+            );
+        }
         let request = ActionRequest::message_send(id, idempotency_key, fence, parameters)
             .map_err(|error| ClientError::Protocol(error.to_string()))?;
         self.action_internal(&request).await
@@ -2280,11 +2458,7 @@ impl Client {
                 };
                 let (websocket, response) = tokio::time::timeout(
                     STREAM_HANDSHAKE_DEADLINE,
-                    tokio_tungstenite::connect_async_with_config(
-                        request_for(&websocket_base)?,
-                        Some(config),
-                        false,
-                    ),
+                    self.remote_websocket(request_for(&websocket_base)?, Some(config)),
                 )
                 .await
                 .map_err(|_| {
@@ -2356,15 +2530,15 @@ impl Client {
                     None,
                     Some(stream_capability),
                 )?;
-                let (websocket, response) =
-                    tokio::time::timeout(STREAM_HANDSHAKE_DEADLINE, connect_async(request))
-                        .await
-                        .map_err(|_| {
-                            ClientError::Transport(
-                                "terminal WebSocket handshake deadline exceeded".into(),
-                            )
-                        })?
-                        .map_err(|error| ClientError::Transport(error.to_string()))?;
+                let (websocket, response) = tokio::time::timeout(
+                    STREAM_HANDSHAKE_DEADLINE,
+                    self.remote_websocket(request, None),
+                )
+                .await
+                .map_err(|_| {
+                    ClientError::Transport("terminal WebSocket handshake deadline exceeded".into())
+                })?
+                .map_err(|error| ClientError::Transport(error.to_string()))?;
                 validate_terminal_subprotocol(&response)?;
                 TerminalSocket::Remote(websocket)
             }
@@ -2425,7 +2599,7 @@ impl Client {
                 };
                 let (socket, response) = tokio::time::timeout(
                     STREAM_HANDSHAKE_DEADLINE,
-                    connect_async(request_for(&websocket_base)?),
+                    self.remote_websocket(request_for(&websocket_base)?, None),
                 )
                 .await
                 .map_err(|_| {
@@ -2500,7 +2674,7 @@ impl Client {
                 };
                 let (socket, response) = tokio::time::timeout(
                     STREAM_HANDSHAKE_DEADLINE,
-                    connect_async(request_for(&websocket_base)?),
+                    self.remote_websocket(request_for(&websocket_base)?, None),
                 )
                 .await
                 .map_err(|_| {
@@ -2515,6 +2689,38 @@ impl Client {
             socket,
             limit: self.response_limit(),
         })
+    }
+
+    /// Reconnects carry the same destination policy as REST, including keyless devices.
+    async fn remote_websocket(
+        &self,
+        request: Request<()>,
+        config: Option<WebSocketConfig>,
+    ) -> Result<
+        (
+            WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+            tokio_tungstenite::tungstenite::handshake::client::Response,
+        ),
+        ClientError,
+    > {
+        if self.device_http_policy == Some(false) && request.uri().scheme_str() == Some("ws") {
+            let url = reqwest::Url::parse(&request.uri().to_string())
+                .map_err(|error| ClientError::Protocol(error.to_string()))?;
+            let stream = device::transport::websocket_tcp(&url)
+                .await
+                .map_err(|error| ClientError::Transport(error.to_string()))?;
+            // Use exactly the socket connected to the admitted addresses; never resolve again.
+            return tokio_tungstenite::client_async_with_config(
+                request,
+                tokio_tungstenite::MaybeTlsStream::Plain(stream),
+                config,
+            )
+            .await
+            .map_err(|error| ClientError::Transport(error.to_string()));
+        }
+        tokio_tungstenite::connect_async_with_config(request, config, false)
+            .await
+            .map_err(|error| ClientError::Transport(error.to_string()))
     }
 
     fn response_limit(&self) -> usize {
@@ -2626,7 +2832,10 @@ impl Client {
                     .await
                 }
                 Endpoint::FabricLoopback(base) => {
-                    let mut request = self.http.request(method, format!("{base}{path}"));
+                    let mut request = self
+                        .http
+                        .request(method, format!("{base}{path}"))
+                        .header("x-st3-features", "custom-subjects.v1");
                     if let Some(key) = key {
                         request = request.header("idempotency-key", key);
                     }
@@ -2747,7 +2956,8 @@ async fn unix_request(
     let mut builder = Request::builder()
         .method(method)
         .uri(path)
-        .header("host", "localhost");
+        .header("host", "localhost")
+        .header("x-st3-features", "custom-subjects.v1");
     if let Some(credential) = credential {
         builder = builder.header("authorization", format!("Bearer {credential}"));
     }
@@ -2819,6 +3029,10 @@ fn websocket_request(
     let mut request = url
         .into_client_request()
         .map_err(|error| ClientError::Protocol(error.to_string()))?;
+    request.headers_mut().insert(
+        hyper::header::HeaderName::from_static("x-st3-features"),
+        hyper::header::HeaderValue::from_static("custom-subjects.v1"),
+    );
     request.headers_mut().insert(
         hyper::header::SEC_WEBSOCKET_PROTOCOL,
         hyper::header::HeaderValue::from_str(&match stream_capability {
@@ -3312,6 +3526,45 @@ mod tests {
     }
 
     #[test]
+    fn terminal_filters_refuse_legacy_servers_and_preserve_unfiltered_reads() {
+        runtime().block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let socket = directory.path().join("legacy.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let server = tokio::spawn(async move {
+                let mut requests = Vec::new();
+                for _ in 0..3 {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut request = Vec::new();
+                    let mut chunk = [0_u8; 1024];
+                    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        let read = stream.read(&mut chunk).await.unwrap();
+                        assert_ne!(read, 0);
+                        request.extend_from_slice(&chunk[..read]);
+                    }
+                    requests.push(String::from_utf8(request).unwrap().lines().next().unwrap().to_owned());
+                    // The old server's response has no owner/state filter acknowledgment.
+                    let body = EMPTY_PAGE.replace("launch-children", "terminals").replace("resource-page", "page");
+                    let response = format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}", body.len(), body);
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                }
+                requests
+            });
+            let client = Client::unix(&socket);
+            for (owner, state) in [(Some("agent/lookup/seat+064"), None), (None, Some("running"))] {
+                let error = client.terminals_list_filtered(None, Some(1), false, owner, state).await.unwrap_err();
+                assert!(matches!(error, ClientError::Protocol(message) if message.contains("upgrade the server")));
+            }
+            client.terminals_list(None, None, false).await.unwrap();
+            assert_eq!(server.await.unwrap(), [
+                "GET /v1/client/terminals?limit=1&owner=agent/lookup/seat%2B064 HTTP/1.1",
+                "GET /v1/client/terminals?limit=1&state=running HTTP/1.1",
+                "GET /v1/client/terminals HTTP/1.1",
+            ]);
+        });
+    }
+
+    #[test]
     fn launch_child_methods_use_the_contract_routes_and_pagination_query() {
         runtime().block_on(async {
             let directory = tempfile::tempdir().unwrap();
@@ -3569,5 +3822,74 @@ mod tests {
             ));
             server.await.unwrap();
         });
+    }
+}
+
+#[cfg(test)]
+mod device_stream_policy_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn every_remote_stream_refuses_public_http_even_without_a_signing_key() {
+        let device = device::Device {
+            endpoint: "http://localhost:1".into(),
+            allow_public_http: false,
+            person_root_fingerprint: None,
+            signing_key: None,
+            session: PairedSession {
+                kind: "paired-session".into(),
+                device_id: "device/policy".into(),
+                person_id: "person/avery".into(),
+                session_actor: "person/avery/session/policy".into(),
+                credential: "stream-bearer-never-sent".into(),
+                scopes: vec!["read.projections".into()],
+                expires_at: "2026-11-01T00:00:00Z".into(),
+                device_key_chain: vec![],
+                device_key_proofs: vec![],
+                person_root_key_proof: None,
+            },
+        };
+        let mut client = device.client().unwrap();
+        assert!(client.signing_device.is_none());
+        // The client already exists; a later destination must still pass admission.
+        client.endpoint = Endpoint::FabricLoopback("http://203.0.113.1".into());
+        for _reconnect in 0..2 {
+            let mut errors = Vec::new();
+            errors.push(client.collection_stream().await.err().unwrap().to_string());
+            errors.push(
+                client
+                    .conversation_stream("session/policy", None)
+                    .await
+                    .err()
+                    .unwrap()
+                    .to_string(),
+            );
+            errors.push(
+                client
+                    .terminal_stream("terminal/policy", None, "fake-capability")
+                    .await
+                    .err()
+                    .unwrap()
+                    .to_string(),
+            );
+            errors.push(
+                client
+                    .raw_terminal_stream(&RawTerminalAttachment {
+                        terminal_id: "terminal/policy".into(),
+                        runtime_incarnation: "policy-incarnation".into(),
+                        owner_host_id: "host/alder".into(),
+                        mode: RawTerminalMode::Peek,
+                        stream_capability: "fake-capability".into(),
+                    })
+                    .await
+                    .err()
+                    .unwrap()
+                    .to_string(),
+            );
+            for error in errors {
+                assert!(error.contains("HTTP requires loopback"), "{error}");
+                assert!(!error.contains("stream-bearer-never-sent"));
+            }
+        }
     }
 }

@@ -53,7 +53,11 @@ fn strip_internal_markup(input: &str) -> String {
         .filter(|line| {
             let trimmed = line.trim();
             if trimmed.starts_with("<channel ")
-                && trimmed.contains("source=\"plugin:st3-channel:st3\"")
+                && trimmed
+                    .split("source=\"")
+                    .nth(1)
+                    .and_then(|rest| rest.split('"').next())
+                    .is_some_and(crate::adapt::channel_source)
                 && trimmed.ends_with('>')
             {
                 in_st3_channel = true;

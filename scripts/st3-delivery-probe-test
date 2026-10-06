@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Probe crash/replay/deadline tests, and an isolated native two-node proof."""
 import asyncio
+import io
 from importlib.machinery import SourceFileLoader
 from importlib.util import module_from_spec, spec_from_loader
 import json
@@ -11,6 +12,7 @@ import shutil
 import signal
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 import uuid
@@ -37,6 +39,22 @@ if "--scratch" in sys.argv:
     del sys.argv[index:index + 2]
 
 
+async def wait_for_healthy_probe_reports(node, timeout=10):
+    async def healthy():
+        doctor = json.loads(await node.cli("doctor", "--json", check=False))
+        node.last_probe_doctor = doctor
+        if doctor["status"] == "fail":
+            # Retain the first failed report even if the next observation recovers.
+            path = node.root / "probe-doctor-failed.json"
+            if not path.exists():
+                probe.save(path, doctor)
+                path.chmod(0o600)
+            return None
+        return doctor if any(check["name"] == "delivery-probes" and check["status"] == "pass"
+                             for check in doctor["checks"]) else None
+    return await faults.until(healthy, timeout)
+
+
 class FakeApi:
     def __init__(self):
         self.posts = []
@@ -45,8 +63,13 @@ class FakeApi:
         self.advanced = False
         self.online = True
         self.refused = False
+        self.agent = {"driver": "omp", "observation": "current", "state": "running", "harness_state": "idle"}
 
     async def get(self, path):
+        if path.startswith("/v1/client/agents/"):
+            if self.agent is None:
+                raise probe.ApiError("not-found", "recipient does not exist")
+            return self.agent
         if path == "/v1/replication/status":
             if self.refused:
                 return {"peers": [{"peer": "cobalt", "status": "refused"}, {"peer": "indigo", "status": "up" if self.online else "last-seen"}]}
@@ -82,6 +105,191 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
         self.monitor.lock.close()
         self.directory.cleanup()
 
+    async def test_channel_stderr_flood_keeps_native_stdout_and_exit_context(self):
+        child = Path(self.directory.name) / "channel"
+        child.write_text("#!" + sys.executable + "\n" +
+                         "import sys\n"
+                         "sys.stderr.write('noise' * 100000 + '\\n')\n"
+                         "sys.stderr.write('st: current runtime incarnation did not appear\\n')\n"
+                         "sys.stderr.flush()\n"
+                         "print('{\"type\":\"hello\"}', flush=True)\n"
+                         "sys.stdin.readline()\n"
+                         "sys.exit(2)\n")
+        child.chmod(0o700)
+        self.monitor.st3 = str(child)
+        self.monitor.api.socket = "/private-fixture/socket"
+        self.monitor.api.agent.update(incarnation_id="fixture-incarnation", owner_run_id="fixture-run",
+                                      host_id="amber", revision="fixture-revision",
+                                      operational={"owner_generation": 7, "runtime_incarnation": "fixture-incarnation"})
+        with patch.dict(os.environ, ST3_INCARNATION="inherited-fixture", ST_MISSION_RUN="inherited-run",
+                        ST_OMP_CHANNEL_RUNTIME_ID="fixture-provider", ST_OMP_CHANNEL_SEQ="7"):
+            receiver = asyncio.create_task(self.monitor.receiver())
+            try:
+                async def exited():
+                    path = Path(self.directory.name) / "events.jsonl"
+                    events = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+                    return events if any(event["event"] == "channel-exited" for event in events) else None
+                events = await faults.until(exited, 5)
+            finally:
+                receiver.cancel()
+                await asyncio.gather(receiver, return_exceptions=True)
+        started, ended = events
+        self.assertEqual(started["channel_id"], ended["channel_id"])
+        self.assertEqual(started["pid"], ended["pid"])
+        self.assertEqual(ended["exit"], 2)
+        self.assertTrue(ended["hello_seen"])
+        self.assertEqual(ended["inherited_incarnation"], "inherited-fixture")
+        self.assertEqual(ended["provider_runtime"], "fixture-provider")
+        self.assertEqual(ended["ownership_sequence"], "7")
+        self.assertEqual(ended["observed_owner"]["incarnation_id"], "fixture-incarnation")
+        self.assertEqual(ended["observed_owner"]["owner_generation"], 7)
+        self.assertEqual(ended["observed_owner_at_exit"]["incarnation_id"], "fixture-incarnation")
+        self.assertGreaterEqual(ended["observed_owner_at_exit"]["observed_at_unix_ms"],
+                                ended["observed_owner"]["observed_at_unix_ms"])
+        self.assertEqual(ended["stderr"]["bytes"], 500001 + len("st: current runtime incarnation did not appear\n"))
+        self.assertTrue(ended["stderr"]["truncated"])
+        self.assertFalse(ended["stderr"]["incomplete"])
+        self.assertEqual(ended["stderr"]["diagnostic"], "st: current runtime incarnation did not appear")
+        self.assertEqual((Path(self.directory.name) / "events.jsonl").stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.monitor.state["receipts"], {})
+        self.assertEqual(self.monitor.api.posts, [])
+        self.assertNotIn("channel", json.dumps(self.monitor.report()))
+
+    async def test_channel_stderr_omits_credentials_and_multiline_native_payload(self):
+        with patch.dict(os.environ, PROBE_TEST_API_KEY="fixture-private-key"):
+            capture = probe.ChannelStderr()
+        reader = asyncio.StreamReader()
+        reader.feed_data(b"st: failure fixture-private-key token=fixture-token Bearer fixture-bearer\n"
+                         b"st: failed https://fixture-user:fixture-password@example.invalid/\n"
+                         b"st: Authorization: fixture-auth\n"
+                         b"<smalltalk-message>\nst: private message body\n</smalltalk-message>\n")
+        reader.feed_eof()
+        await capture.drain(reader)
+        report = capture.report()
+        self.assertIn("st: failure", report["diagnostic"])
+        for private in ("fixture-private-key", "fixture-token", "fixture-bearer", "fixture-user",
+                        "fixture-password", "fixture-auth", "private message body"):
+            self.assertNotIn(private, json.dumps(report))
+        self.assertIn("[redacted]", report["diagnostic"])
+        self.assertLessEqual(len(capture.tail), probe.CHANNEL_STDERR_BYTES)
+        # The envelope boundary may fall outside the retained tail. Its body can
+        # resemble a CLI error, but must still never become a diagnostic.
+        capture = probe.ChannelStderr()
+        reader = asyncio.StreamReader()
+        reader.feed_data(b"<smalltalk-message>\n" + b"private body\n" * 1000 + b"st: private trailing body\n")
+        reader.feed_eof()
+        await capture.drain(reader)
+        self.assertTrue(capture.report()["truncated"])
+        self.assertEqual(capture.report()["diagnostic"], "")
+
+    async def test_channel_owner_lookup_failure_keeps_context_without_response_body(self):
+        self.monitor.api.agent = None
+        context = await self.monitor.channel_owner()
+        self.assertTrue(context["unavailable"])
+        self.assertEqual(context["error_type"], "ApiError")
+        self.assertNotIn("recipient does not exist", json.dumps(context))
+
+    async def test_channel_exit_before_hello_does_not_wait_for_descendant_stderr(self):
+        child = Path(self.directory.name) / "channel"
+        descendant = Path(self.directory.name) / "descendant-pid"
+        child.write_text("#!" + sys.executable + "\n" +
+                         "import subprocess, sys\n"
+                         "descendant = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], "
+                         "stdout=subprocess.DEVNULL)\n"
+                         f"open({str(descendant)!r}, 'w').write(str(descendant.pid))\n"
+                         "sys.stderr.write('st: startup refused before hello\\n')\n"
+                         "sys.exit(2)\n")
+        child.chmod(0o700)
+        self.monitor.st3 = str(child)
+        self.monitor.api.socket = "/private-fixture/socket"
+        self.monitor.api.agent = None
+        loop = asyncio.get_running_loop()
+        connect = loop.connect_read_pipe
+        transports = []
+        async def track_transport(*args, **kwargs):
+            transport, protocol = await connect(*args, **kwargs)
+            transports.append(transport)
+            return transport, protocol
+        tracking = patch.object(loop, "connect_read_pipe", track_transport)
+        tracking.start()
+        receiver = asyncio.create_task(self.monitor.receiver())
+        try:
+            async def exited():
+                path = Path(self.directory.name) / "events.jsonl"
+                events = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+                return next((event for event in events if event["event"] == "channel-exited"), None)
+            ended = await faults.until(exited, 5)
+            self.assertEqual(ended["exit"], 2)
+            self.assertFalse(ended["hello_seen"])
+            self.assertTrue(ended["stderr"]["incomplete"])
+            self.assertEqual(ended["stderr"]["diagnostic"], "st: startup refused before hello")
+            self.assertTrue(ended["observed_owner"]["unavailable"])
+            self.assertTrue(ended["observed_owner_at_exit"]["unavailable"])
+            os.kill(int(descendant.read_text()), 0)  # The inherited writer is still alive.
+            self.assertTrue(transports)
+            self.assertTrue(all(transport.is_closing() for transport in transports))
+            self.assertEqual(self.monitor.state["receipts"], {})
+            self.assertEqual(self.monitor.api.posts, [])
+        finally:
+            receiver.cancel()
+            await asyncio.gather(receiver, return_exceptions=True)
+            tracking.stop()
+            if descendant.exists():
+                try:
+                    os.kill(int(descendant.read_text()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    async def test_probe_cancellation_records_channel_exit_and_reaps_child(self):
+        child = Path(self.directory.name) / "channel"
+        child.write_text("#!" + sys.executable + "\n" +
+                         "import sys, time\n"
+                         "print('{\"type\":\"hello\"}', flush=True)\n"
+                         "sys.stdin.readline()\n"
+                         "time.sleep(30)\n")
+        child.chmod(0o700)
+        self.monitor.st3 = str(child)
+        self.monitor.api.socket = "/private-fixture/socket"
+        async def waiting_monitor():
+            await asyncio.Future()
+        self.monitor.monitor = waiting_monitor
+        running = asyncio.create_task(self.monitor.run())
+        try:
+            async def started():
+                return self.monitor.child is not None
+            await faults.until(started, 5)
+        finally:
+            running.cancel()
+            await asyncio.wait_for(asyncio.gather(running, return_exceptions=True), 5)
+        self.assertIsNotNone(self.monitor.child.returncode)
+        events = [json.loads(line) for line in (Path(self.directory.name) / "events.jsonl").read_text().splitlines()]
+        self.assertEqual([event["event"] for event in events], ["channel-started", "channel-exited"])
+        self.assertEqual(events[0]["pid"], events[1]["pid"])
+        self.assertEqual(events[1]["exit"], self.monitor.child.returncode)
+
+    async def test_native_doctor_wait_requires_recovery_and_keeps_its_deadline(self):
+        class Node:
+            root = Path(self.directory.name)
+            reports = [
+                {"status": "fail", "checks": [{"name": "delivery-probes", "status": "pass"}]},
+                {"status": "pass", "checks": [{"name": "delivery-probes", "status": "warn"}]},
+                {"status": "pass", "checks": [{"name": "delivery-probes", "status": "pass"}]},
+            ]
+            async def cli(node, *args, check=True):
+                self.assertFalse(check)
+                return json.dumps(node.reports.pop(0) if len(node.reports) > 1 else node.reports[0])
+        node = Node()
+        result = await wait_for_healthy_probe_reports(node, 1)
+        self.assertEqual(result["status"], "pass")
+        self.assertEqual(result["checks"][0]["status"], "pass")
+        failed = node.root / "probe-doctor-failed.json"
+        self.assertEqual(json.loads(failed.read_text())["status"], "fail")
+        self.assertEqual(failed.stat().st_mode & 0o777, 0o600)
+        node.reports = [{"status": "fail", "checks": [{"name": "delivery-probes", "status": "pass"}]}]
+        with self.assertRaises(TimeoutError):
+            await wait_for_healthy_probe_reports(node, 0.15)
+        self.assertEqual(node.last_probe_doctor["status"], "fail")
+
     async def test_timeout_replays_exact_send_and_alerts_even_if_send_is_unaccepted(self):
         self.monitor.api.fail_send = True
         await self.monitor.route(self.target)
@@ -96,6 +304,213 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(route["status"], "sending")
         await self.monitor.route(self.target)
         self.assertEqual(sum(path == "/v1/work/ask" for path, _ in self.monitor.api.posts), 1)
+
+    async def test_overdue_accepted_probe_refreshes_without_clearing_its_attention(self):
+        await self.monitor.route(self.target)
+        original = self.monitor.state["routes"][self.target]
+        self.monitor.measuring[self.target] -= 61_000_000_000
+        await self.monitor.route(self.target)
+        self.assertEqual(original["status"], "overdue")
+        original["started_at_unix_ms"] -= self.monitor.interval
+        await self.monitor.route(self.target)
+        fresh = self.monitor.state["routes"][self.target]
+        self.assertNotEqual(fresh["message"], original["message"])
+        self.assertEqual(fresh["attention"], original["attention"])
+        self.assertEqual(fresh["status"], "pending")
+        self.assertNotIn("previous_read", fresh)
+        self.assertFalse(any(path == "/v1/work/cancel-ask" for path, _ in self.monitor.api.posts))
+        self.monitor.api.records = [{"kind": "message.read", "actor": self.target,
+                                     "accepted_at_unix_ms": 3}]
+        await self.monitor.route(self.target)
+        self.assertEqual(fresh["status"], "read")
+        self.assertNotIn("attention", fresh)
+
+    def restart_monitor(self):
+        api = self.monitor.api
+        self.monitor.lock.close()
+        with patch.dict(os.environ, ST_AGENT=self.config["agent"]):
+            self.monitor = probe.Probe(self.config)
+        self.monitor.api = api
+
+    def alert_posts(self, tag):
+        return [body for path, body in self.monitor.api.posts
+                if path == "/v1/messages" and tag in body.get("tags", [])]
+
+    async def test_agent_alert_overrides_reviewer_and_survives_refresh_and_restart(self):
+        self.config["alert_agent"] = "agent/operations/amber"
+        self.restart_monitor()
+        await self.monitor.route(self.target)
+        original = self.monitor.state["routes"][self.target]
+        self.monitor.measuring[self.target] -= 61_000_000_000
+        await self.monitor.route(self.target)
+        alert = self.alert_posts("delivery-probe-alert")[0]
+        self.assertEqual(alert["to"], self.config["alert_agent"])
+        for hint in (self.monitor.actor, self.target, original["nonce"], original["message"], "st doctor --json"):
+            self.assertIn(hint, alert["content"])
+        self.assertFalse(any(path == "/v1/work/ask" for path, _ in self.monitor.api.posts))
+        original["started_at_unix_ms"] -= self.monitor.interval
+        self.monitor.persist()
+        self.restart_monitor()
+        await self.monitor.route(self.target)
+        fresh = self.monitor.state["routes"][self.target]
+        self.assertNotEqual(fresh["message"], original["message"])
+        self.assertEqual(fresh["attention"], original["attention"])
+        self.monitor.measuring[self.target] -= 61_000_000_000
+        await self.monitor.route(self.target)
+        self.assertEqual(len(self.alert_posts("delivery-probe-alert")), 1)
+        self.monitor.api.records = [{"kind": "message.delivered", "actor": self.target,
+                                     "accepted_at_unix_ms": 1},
+                                    {"kind": "message.read", "actor": "agent/probe/other",
+                                     "accepted_at_unix_ms": 2}]
+        await self.monitor.route(self.target)
+        self.assertIn("attention", fresh)
+        self.assertFalse(self.alert_posts("delivery-probe-recovery"))
+        self.monitor.api.records.append({"kind": "message.read", "actor": self.target,
+                                         "accepted_at_unix_ms": 3})
+        await self.monitor.route(self.target)
+        await self.monitor.route(self.target)
+        self.assertNotIn("attention", fresh)
+        self.assertNotIn("agent_alert", fresh)
+        recoveries = self.alert_posts("delivery-probe-recovery")
+        self.assertEqual(len(recoveries), 1)
+        self.assertEqual(recoveries[0]["to"], alert["to"])
+        self.assertIn(original["attention"], recoveries[0]["content"])
+        self.assertIn(fresh["message"], recoveries[0]["content"])
+        self.assertFalse(any(path == "/v1/work/cancel-ask" for path, _ in self.monitor.api.posts))
+
+    async def test_agent_alert_and_recovery_replay_exact_bodies_after_lost_responses(self):
+        self.config["alert_agent"] = "agent/operations/amber"
+        self.restart_monitor()
+        await self.monitor.route(self.target)
+        self.monitor.measuring[self.target] -= 61_000_000_000
+        post = self.monitor.api.post
+        lost = {"delivery-probe-alert", "delivery-probe-recovery"}
+        async def timeout_once(path, body):
+            result = await post(path, body)
+            tags = set(body.get("tags", [])) & lost
+            if tags:
+                lost.difference_update(tags)
+                raise TimeoutError("committed; response lost")
+            return result
+        self.monitor.api.post = timeout_once
+        with self.assertRaises(TimeoutError):
+            await self.monitor.route(self.target)
+        self.restart_monitor()
+        route = self.monitor.state["routes"][self.target]
+        route["started_at_unix_ms"] -= self.monitor.interval
+        # Recovery can arrive before the uncertain alert has been acknowledged locally.
+        self.monitor.api.records = [{"kind": "message.read", "actor": self.target,
+                                     "accepted_at_unix_ms": 3}]
+        with self.assertRaises(TimeoutError):
+            await self.monitor.route(self.target)
+        self.assertEqual(self.alert_posts("delivery-probe-alert")[0], self.alert_posts("delivery-probe-alert")[1])
+        self.restart_monitor()
+        route = self.monitor.state["routes"][self.target]
+        route["next_at_unix_ms"] = 0
+        await self.monitor.route(self.target)
+        recoveries = self.alert_posts("delivery-probe-recovery")
+        self.assertEqual(len(recoveries), 2)
+        self.assertEqual(recoveries[0], recoveries[1])
+        self.assertNotIn("agent_alert", self.monitor.state["routes"][self.target])
+
+    async def test_agent_alert_absence_sends_pause_without_claiming_recovery(self):
+        self.config["alert_agent"] = "agent/operations/amber"
+        self.restart_monitor()
+        await self.monitor.route(self.target)
+        self.monitor.measuring[self.target] -= 61_000_000_000
+        await self.monitor.route(self.target)
+        self.monitor.api.online = False
+        await self.monitor.route(self.target)
+        await self.monitor.route(self.target)
+        self.assertEqual(len(self.alert_posts("delivery-probe-paused")), 1)
+        self.assertFalse(self.alert_posts("delivery-probe-recovery"))
+        self.assertNotIn("attention", self.monitor.state["routes"][self.target])
+
+    def test_alert_agent_rejects_person_and_empty_identities(self):
+        for value in ("person/eval", "agent/", "", None, 3):
+            with self.subTest(value=value), patch.dict(os.environ, ST_AGENT=self.config["agent"]):
+                with self.assertRaisesRegex(ValueError, "alert_agent must be an agent identity"):
+                    probe.Probe({**self.config, "alert_agent": value})
+
+    async def test_unavailable_agent_falls_back_once_to_reviewer_and_recovers(self):
+        self.config["alert_agent"] = "agent/operations/amber"
+        self.restart_monitor()
+        for card in (None, {"driver": None, "observation": "current"},
+                     {"driver": "omp", "observation": "missing"},
+                     {"driver": "omp", "observation": "current", "state": "failed", "harness_state": "ended"}):
+            with self.subTest(card=card):
+                self.monitor.state["routes"] = {}
+                self.monitor.api = FakeApi()
+                self.monitor.api.agent = card
+                await self.monitor.route(self.target)
+                self.monitor.measuring[self.target] -= 61_000_000_000
+                with patch("sys.stderr", new_callable=io.StringIO) as log:
+                    await self.monitor.route(self.target)
+                    await self.monitor.route(self.target)
+                self.assertIn("Falling back", log.getvalue())
+                asks = [body for path, body in self.monitor.api.posts if path == "/v1/work/ask"]
+                self.assertEqual(len(asks), 1)
+                self.assertIn(self.config["alert_agent"], asks[0]["reason"])
+                self.assertIn("Falling back", asks[0]["reason"])
+                self.assertFalse(self.alert_posts("delivery-probe-alert"))
+                self.restart_monitor()
+                self.monitor.api.agent = FakeApi().agent
+                await self.monitor.route(self.target)
+                self.assertEqual(sum(path == "/v1/work/ask" for path, _ in self.monitor.api.posts), 1)
+                self.monitor.api.records = [{"kind": "message.read", "actor": self.target,
+                                             "accepted_at_unix_ms": 3}]
+                await self.monitor.route(self.target)
+                route = self.monitor.state["routes"][self.target]
+                self.assertNotIn("attention", route)
+                self.assertNotIn("alert_warning", route)
+                self.assertTrue(any(path == "/v1/work/cancel-ask" for path, _ in self.monitor.api.posts))
+
+    async def test_unavailable_agent_without_reviewer_retains_alert_until_live(self):
+        self.config["alert_agent"] = "agent/operations/amber"
+        self.config.pop("reviewer")
+        self.restart_monitor()
+        self.monitor.api.agent["driver"] = None
+        await self.monitor.route(self.target)
+        self.monitor.measuring[self.target] -= 61_000_000_000
+        with patch("sys.stderr", new_callable=io.StringIO) as log:
+            await self.monitor.route(self.target)
+            await self.monitor.route(self.target)
+        self.assertEqual(len(log.getvalue().splitlines()), 1)
+        self.assertIn("retaining the alert for retry", log.getvalue())
+        self.assertFalse(self.alert_posts("delivery-probe-alert"))
+        self.assertFalse(any(path == "/v1/work/ask" for path, _ in self.monitor.api.posts))
+        self.monitor.api.agent = FakeApi().agent
+        await self.monitor.route(self.target)
+        self.assertEqual(len(self.alert_posts("delivery-probe-alert")), 1)
+
+    async def test_fallback_ask_retries_same_body_even_after_agent_recovers(self):
+        self.config["alert_agent"] = "agent/operations/amber"
+        self.restart_monitor()
+        self.monitor.api.agent = None
+        await self.monitor.route(self.target)
+        self.monitor.measuring[self.target] -= 61_000_000_000
+        post = self.monitor.api.post
+        async def lost_ask(path, body):
+            result = await post(path, body)
+            if path == "/v1/work/ask":
+                raise TimeoutError("ask committed; response lost")
+            return result
+        self.monitor.api.post = lost_ask
+        with patch("sys.stderr", new_callable=io.StringIO), self.assertRaises(TimeoutError):
+            await self.monitor.route(self.target)
+        self.monitor.api.post = post
+        self.restart_monitor()
+        self.monitor.api.agent = FakeApi().agent
+        route = self.monitor.state["routes"][self.target]
+        route["started_at_unix_ms"] -= self.monitor.interval
+        self.monitor.api.records = [{"kind": "message.read", "actor": self.target,
+                                     "accepted_at_unix_ms": 3}]
+        await self.monitor.route(self.target)
+        asks = [body for path, body in self.monitor.api.posts if path == "/v1/work/ask"]
+        self.assertEqual(len(asks), 2)
+        self.assertEqual(asks[0], asks[1])
+        self.assertFalse(self.alert_posts("delivery-probe-alert"))
+        self.assertNotIn("attention", self.monitor.state["routes"][self.target])
 
     async def test_routes_share_one_replication_status_read_while_it_is_fresh(self):
         reads = []
@@ -213,7 +628,23 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
 
 @unittest.skipUnless(BINARY, "pass --binary to prove the actual native path")
 class NativeProbeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_native_read_waits_for_runtime_publication(self):
+        await self.native_read_outage_and_recovery(agent_alert=False, publication_gap=True)
+
     async def test_native_read_outage_attention_and_recovery(self):
+        await self.native_read_outage_and_recovery(agent_alert=False)
+
+    async def test_native_read_outage_agent_message_and_recovery(self):
+        await self.native_read_outage_and_recovery(agent_alert=True)
+
+    async def test_native_unavailable_alert_agent_falls_back_to_reviewer(self):
+        await self.native_read_outage_and_recovery(agent_alert=True, unavailable=True)
+
+    async def native_read_outage_and_recovery(self, agent_alert, unavailable=False, publication_gap=False):
+        expect_agent_alert = agent_alert and not unavailable
+        # This is a receipt/attention regression, not a latency benchmark. Leave room for
+        # parallel CI's scheduling and fsyncs while retaining a real bounded deadline.
+        deadline_ms = 10_000
         directory = Path(tempfile.mkdtemp(prefix="delivery-probe-"))
         binary_directory = Path(tempfile.mkdtemp(prefix="delivery-probe-binaries-", dir=SCRATCH))
         nodes = []
@@ -223,6 +654,26 @@ class NativeProbeTests(unittest.IsolatedAsyncioTestCase):
             if os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
                 env["DBUS_SESSION_BUS_ADDRESS"] = os.environ["DBUS_SESSION_BUS_ADDRESS"]
             nodes = [faults.Node(directory, host, BINARY, env, binary_directory) for host in ("amber", "cobalt")]
+            if publication_gap:
+                # Hold the launcher's return after the real PTY is published. The
+                # native channel can already see its local incarnation while the
+                # reconciler has not yet reported that incarnation as running.
+                # Keep the original delivery, outage and recovery deadlines.
+                pty = shutil.which("pty")
+                self.assertIsNotNone(pty)
+                for node in nodes:
+                    wrapper = node.root / "bin/pty"
+                    wrapper.write_text(f"#!/bin/sh\n{shlex.quote(pty)} \"$@\"\n"
+                                       "result=$?\n"
+                                       'if [ "$1" = run ] && [ "$result" = 0 ]; then sleep 2; fi\n'
+                                       'exit "$result"\n')
+                    wrapper.chmod(0o755)
+            # Doctor also builds a scratch crate. Its compiler check is independent of the
+            # real native receipt check; report that tool unavailable in this private fixture.
+            for node in nodes:
+                cargo = node.root / "bin/cargo"
+                cargo.write_text("#!/bin/sh\necho 'compiler unavailable in native receipt fixture' >&2\nexit 1\n")
+                cargo.chmod(0o755)
             ports = [faults.free_port(), faults.free_port()]
             secret = directory / "secret"
             secret.write_text("9" * 64)
@@ -244,15 +695,38 @@ name = "{other.name}"
 url = "http://127.0.0.1:{ports[1 - index]}"
 ''')
                 await node.start()
+                if index == 0 and expect_agent_alert:
+                    # A live operations harness, using the existing token-free omp stand-in.
+                    wrapper = node.root / "bin/omp"
+                    wrapper.write_text(f"#!/bin/sh\nexec {shlex.quote(shutil.which('node'))} {shlex.quote(str(faults.HERE / 'provider.mjs'))} \"$@\"\n")
+                    wrapper.chmod(0o755)
+                    operations_workspace = node.root / "operations"
+                    operations_workspace.mkdir()
+                    declaration = node.root / "operations.kdl"
+                    declaration.write_text(f'''version 2
+agent "operations/amber" {{
+  workspace "{operations_workspace}"
+  restart "always"
+  harness "omp" {{}}
+}}
+''')
+                    await node.cli("agents", "apply", str(declaration), "--as", "person/eval")
+                    async def operations_ready():
+                        card = await node.api("/v1/client/agents/agent/operations/amber")
+                        return card if card and card.get("driver") and card.get("state") == "running" else None
+                    await faults.until(operations_ready, 30)
                 config = {"host": node.name, "agent": f"agent/probe/{node.name}",
                           "binary": str(node.binary), "socket": str(node.endpoint),
                           "state_dir": str(node.root / "probe"), "reviewer": "person/eval",
-                          "interval_ms": 4000, "deadline_ms": 3000,
+                          "interval_ms": 12_000, "deadline_ms": deadline_ms,
                           "peers": [{"host": other.name, "agent": f"agent/probe/{other.name}"}]}
+                if agent_alert:
+                    config["alert_agent"] = "agent/operations/amber"
                 (node.root / "probe.json").write_text(json.dumps(config))
                 argv = [sys.executable, str(HERE / "st3-delivery-probe"), "--config", str(node.root / "probe.json")]
                 (node.root / "seat.kdl").write_text(f'''version 2
 agent "probe/{node.name}" {{
+  name "Delivery probe ({node.name})"
   workspace "{node.root / 'ws'}"
   restart "always"
   argv {' '.join(json.dumps(arg) for arg in argv)}
@@ -269,17 +743,17 @@ agent "probe/{node.name}" {{
                 rows = [await route(node) for node in nodes]
                 return rows if all(row and row["status"] == "read" and not row.get("late") for row in rows) else None
 
-            first = await faults.until(both_read, 40)
-            self.assertTrue(all(row["latency_ms"] < 3000 for row in first), first)
+            first = await faults.until(both_read, 60)
+            self.assertTrue(all(row["latency_ms"] < deadline_ms for row in first), first)
+            if publication_gap:
+                for node in nodes:
+                    events = [json.loads(line) for line in (node.root / "probe/events.jsonl").read_text().splitlines()]
+                    self.assertFalse([event for event in events if event["event"] == "channel-exited"
+                                      and "stale-mailbox-session" in event["stderr"]["diagnostic"]], events)
             # latest.json is written locally after publishing its report. The other
             # node's doctor can still have the preceding report until replication
             # carries the new success, especially after a late startup probe.
-            async def healthy_reports():
-                doctor = json.loads(await nodes[0].cli("doctor", "--json"))
-                return doctor if any(check["name"] == "delivery-probes" and check["status"] == "pass"
-                                     for check in doctor["checks"]) else None
-
-            doctor = await faults.until(healthy_reports, 10)
+            doctor = await wait_for_healthy_probe_reports(nodes[0], 10)
             self.assertTrue(any(check["name"] == "delivery-probes" and check["status"] == "pass" for check in doctor["checks"]), doctor)
             # Kill only this test's declared recipient, never a shared seat.
             await nodes[1].cli("agents", "stop", "agent/probe/cobalt", "--as", "person/eval")
@@ -288,30 +762,99 @@ agent "probe/{node.name}" {{
                 row = await route(nodes[0])
                 return row if row and row.get("attention") else None
 
-            blocked = await faults.until(alerted, 20)
+            blocked = await faults.until(alerted, 30)
             self.assertEqual(blocked["status"], "overdue")
             attention = await nodes[0].api("/v1/attention?person=person%2Feval")
-            self.assertTrue(any(item["subject"] == blocked["attention"] for item in attention), attention)
+            if expect_agent_alert:
+                self.assertFalse(attention, attention)
+                alert = await nodes[0].api("/v1/messages/read/" + blocked["attention"])
+                self.assertEqual(alert["to"], "agent/operations/amber")
+                self.assertIn(blocked["nonce"], alert["content"])
+                self.assertIn("st doctor --json", alert["content"])
+                alert_claims = await nodes[0].api("/v1/claims?" + probe.urlencode({"subject": blocked["attention"]}))
+                self.assertEqual(sum(claim["kind"] == "message.sent" for claim in alert_claims["claims"]), 1)
+            else:
+                self.assertTrue(any(item["subject"] == blocked["attention"] for item in attention), attention)
+                if unavailable:
+                    self.assertIn("agent/operations/amber", blocked["alert_warning"])
+                    self.assertIn("Falling back", blocked["alert_warning"])
             doctor = json.loads(await nodes[0].cli("doctor", "--json"))
             self.assertTrue(any(check["name"] == "delivery-probes" and check["status"] == "warn" for check in doctor["checks"]))
+            # This probe is seconds old and was never offered while its recipient was
+            # stopped. Restart must recover it once, as well as reading new live probes.
+            before = await nodes[1].api("/v1/claims?" + probe.urlencode({"subject": blocked["message"]}))
+            self.assertFalse(any(claim["kind"] in ("message.staged", "message.delivered", "message.read")
+                                 for claim in before["claims"]))
+            restarted_at = time.time_ns() // 1_000_000
             await nodes[1].cli("agents", "apply", str(nodes[1].root / "seat.kdl"), "--as", "person/eval")
 
             async def recovered():
                 row = await route(nodes[0])
-                return row if row and row["message"] == blocked["message"] and row["status"] == "read" and not row.get("attention") else None
+                return row if row and row["message"] != blocked["message"] and row["status"] == "read" and not row.get("attention") else None
 
-            recovered_row = await faults.until(recovered, 20)
-            self.assertTrue(recovered_row["late"])
-            self.assertGreater(recovered_row["latency_ms"], 3000)
-            claims = await nodes[0].api("/v1/claims?" + probe.urlencode({"subject": blocked["message"]}))
+            recovered_row = await faults.until(recovered, 30)
+            if expect_agent_alert:
+                key = "delivery-probe-recovered:" + blocked["attention"]
+                recovery_id = "message/" + probe.hashlib.sha256(key.encode()).hexdigest()[:16]
+                recovery = await nodes[0].api("/v1/messages/read/" + recovery_id)
+                self.assertEqual(recovery["to"], "agent/operations/amber")
+                self.assertIn(blocked["attention"], recovery["content"])
+                recovery_claims = await nodes[0].api("/v1/claims?" + probe.urlencode({"subject": recovery_id}))
+                self.assertEqual(sum(claim["kind"] == "message.sent" for claim in recovery_claims["claims"]), 1)
+                self.assertFalse(await nodes[0].api("/v1/attention?person=person%2Feval"))
+            else:
+                self.assertFalse(any(item["subject"] == blocked["attention"]
+                                     for item in await nodes[0].api("/v1/attention?person=person%2Feval")))
+            self.assertFalse(recovered_row["late"])
+            self.assertLess(recovered_row["latency_ms"], deadline_ms)
+            async def recovered_outage_probe():
+                claims = await nodes[0].api("/v1/claims?" + probe.urlencode({"subject": blocked["message"]}))
+                return claims if any(claim["kind"] == "message.read" for claim in claims["claims"]) else None
+
+            claims = await faults.until(recovered_outage_probe, 30)
             self.assertEqual(sum(claim["kind"] == "message.read" for claim in claims["claims"]), 1)
-            # No provider binary was launched: only Python and the real native channel.
+            events = [json.loads(line) for line in (nodes[1].root / "probe/events.jsonl").read_text().splitlines()]
+            consumed = [event for event in events if event["event"] == "consumed" and event["message"] == blocked["message"]]
+            self.assertEqual(len(consumed), 1)
+            self.assertGreaterEqual(consumed[0]["at_unix_ms"], restarted_at)
+            claims = await nodes[0].api("/v1/claims?" + probe.urlencode({"subject": recovered_row["message"]}))
+            self.assertEqual(sum(claim["kind"] == "message.read" for claim in claims["claims"]), 1)
+            # Probe recipients use Python and the native channel; the operations fixture
+            # alone uses a token-free provider stand-in, never a real model.
             for node in nodes:
                 events = [json.loads(line) for line in (node.root / "probe/events.jsonl").read_text().splitlines()]
                 self.assertTrue(any(event["event"] == "consumed" for event in events))
+                starts = {event["channel_id"]: event for event in events if event["event"] == "channel-started"}
+                for event in events:
+                    if event["event"] == "channel-exited":
+                        self.assertEqual(starts[event["channel_id"]]["pid"], event["pid"])
+                        self.assertIn("observed_owner_at_exit", event)
+                        self.assertIn("diagnostic", event["stderr"])
+                        if event["exit"] == 2:
+                            # A fixture wrapper must not redirect away the real CLI refusal.
+                            self.assertGreater(event["stderr"]["bytes"], 0)
+                self.assertEqual((node.root / "probe/events.jsonl").stat().st_mode & 0o777, 0o600)
                 await node.cli("agents", "stop", f"agent/probe/{node.name}", "--as", "person/eval")
+            if expect_agent_alert:
+                await nodes[0].cli("agents", "stop", "agent/operations/amber", "--as", "person/eval")
         except Exception:
             print(f"failed native probe fixture retained: {directory}", file=sys.stderr)
+            for node in nodes:
+                if getattr(node, "last_probe_doctor", None):
+                    failed = [check for check in node.last_probe_doctor["checks"] if check["status"] == "fail"]
+                    print(f"{node.name} last observed failed doctor checks: {json.dumps(failed)[-8000:]}", file=sys.stderr)
+                # cli(check=True) discards stdout on doctor failure. Retain a
+                # separately labelled follow-up snapshot without accepting that failure.
+                try:
+                    doctor = json.loads(await node.cli("doctor", "--json", check=False))
+                    failed = [check for check in doctor["checks"] if check["status"] == "fail"]
+                    print(f"{node.name} follow-up failed doctor checks: {json.dumps(failed)[-8000:]}", file=sys.stderr)
+                except Exception as error:
+                    print(f"{node.name} follow-up doctor unavailable: {type(error).__name__}", file=sys.stderr)
+                for name in ("probe/latest.json", "probe/events.jsonl"):
+                    path = node.root / name
+                    if path.exists():
+                        print(f"{node.name} {name}: {path.read_text()[-8000:]}", file=sys.stderr)
             raise
         finally:
             for node in reversed(nodes):
@@ -320,4 +863,5 @@ agent "probe/{node.name}" {{
 
 
 if __name__ == "__main__":
-    unittest.main()
+    from st3_test_process import supervised_main
+    raise SystemExit(supervised_main(lambda: 0 if unittest.main(exit=False).result.wasSuccessful() else 1))

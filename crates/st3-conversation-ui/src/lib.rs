@@ -26,7 +26,7 @@ pub mod timeline;
 pub use clean::clean_message_text;
 #[cfg(feature = "ratatui")]
 pub use conversation::Cache;
-pub use entry::{Body, Density, Entry, MailImage, ToolState, bundle_id, folds};
+pub use entry::{Body, Density, Entry, MailImage, ToolState, bundle_id, display_rows, folds};
 pub use pane::{PaneIntent, PaneState, Selection, SelectionLine, State};
 #[cfg(feature = "ratatui")]
 pub use theme::Theme;

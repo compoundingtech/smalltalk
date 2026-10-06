@@ -48,6 +48,21 @@ pub enum ErrorCode {
     Forbidden,
     UnsupportedCapability,
     AttentionMigrated,
+    ArrangementExists,
+    ArrangementFolderExists,
+    ArrangementRetired,
+    ArrangementLimit,
+    ArrangementFolderDeleted,
+    ArrangementCycle,
+    ArrangementBodyTooLarge,
+    ArrangementOwnerForbidden,
+    InvalidArrangementSubject,
+    InvalidArrangementAction,
+    InvalidArrangementOperations,
+    InvalidArrangementFolder,
+    InvalidArrangementName,
+    InvalidArrangementKey,
+    InvalidSubjectReference,
     ValidationFailed,
     IdempotencyConflict,
     StaleFence,
@@ -99,6 +114,14 @@ pub struct Limits {
     pub max_glasses: Option<usize>,
     pub max_glass_depth: Option<usize>,
     pub max_glass_nodes: Option<usize>,
+    pub max_arrangement_body_bytes: Option<usize>,
+    pub max_arrangement_resource_bytes: Option<usize>,
+    pub max_arrangements: Option<usize>,
+    pub max_arrangement_name_bytes: Option<usize>,
+    pub max_arrangement_key_bytes: Option<usize>,
+    pub max_arrangement_operations: Option<usize>,
+    pub max_arrangement_folders: Option<usize>,
+    pub max_arrangement_placements: Option<usize>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -269,6 +292,8 @@ pub struct Operational {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Attention {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_form: Option<Value>,
     #[serde(default)]
     pub episode: String,
     #[serde(default)]
@@ -301,6 +326,9 @@ pub struct Attention {
     /// Information the person asked for; reading it clears the card.
     #[serde(default)]
     pub update: Option<PersonUpdate>,
+    /// The mission step waiting on this ask, on an ask a mission step made.
+    #[serde(default)]
+    pub blocked: Option<AttentionBlocked>,
     pub title: String,
     pub detail: String,
     pub priority: String,
@@ -312,6 +340,16 @@ pub struct Attention {
     pub target_states: Vec<AttentionTargetState>,
     #[serde(default)]
     pub actions: Vec<String>,
+}
+/// The mission step that asked and waits for the answer.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct AttentionBlocked {
+    pub step_run_id: String,
+    /// That step's name within its mission.
+    pub step: String,
+    /// What that step is for.
+    pub goal: String,
+    pub attempt: u64,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct AttentionTargetState {
@@ -360,6 +398,13 @@ pub struct ClientConnection {
     pub follows: Vec<String>,
 }
 
+/// Undelivered retained mail past the reported age threshold, across all mailboxes.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct MailBacklog {
+    pub count: u64,
+    pub threshold_ms: u64,
+    pub cleanup_command: String,
+}
 /// Token spend over a period, one row per agent, mission run, step, model, account and host.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct UsagePeriod {
@@ -369,6 +414,37 @@ pub struct UsagePeriod {
     /// Each account's freshest limits reading; empty from a daemon that reports none.
     #[serde(default)]
     pub limits: Vec<UsageLimit>,
+    /// Daily planning estimate, including useful work; absent on older daemons.
+    #[serde(default)]
+    pub agent_messages: Option<AgentMessageEstimate>,
+}
+/// Count times receiving-seat allowance, with a fleet fallback. Not causal overhead.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct AgentMessageEstimate {
+    #[serde(default)]
+    pub calibration: Option<String>,
+    pub source: String,
+    pub method: String,
+    pub fallback_low_microusd: u64,
+    pub fallback_high_microusd: u64,
+    pub days: Vec<AgentMessageDay>,
+}
+/// One UTC day clipped to the period; percentage is unknown when priced usage is zero.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct AgentMessageDay {
+    pub day_start_ms: u64,
+    pub since_ms: u64,
+    pub until_ms: u64,
+    pub messages: u64,
+    pub calibrated_messages: u64,
+    pub low_microusd: u64,
+    pub high_microusd: u64,
+    pub usage_cost_microusd: u64,
+    pub unpriced_tokens: u64,
+    #[serde(default)]
+    pub low_percent: Option<f64>,
+    #[serde(default)]
+    pub high_percent: Option<f64>,
 }
 /// An account's 5-hour and weekly limits, as the seat that measured it most recently read them.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -377,6 +453,10 @@ pub struct UsageLimit {
     /// The declared account the measuring seat ran on, when it was bound to one.
     #[serde(default)]
     pub account_ref: Option<String>,
+    /// Whether the source named a provider identity or declared account, independent of freshness.
+    /// Older servers omit this metadata.
+    #[serde(default)]
+    pub identified: Option<bool>,
     pub driver: String,
     #[serde(default)]
     pub plan: Option<String>,
@@ -409,6 +489,41 @@ pub struct UsageRow {
     pub host: Option<String>,
     #[serde(default)]
     pub pricing: Option<String>,
+    #[serde(default)]
+    pub native_session_id: Option<String>,
+    #[serde(default)]
+    pub pricing_provenance: Option<Vec<UsagePricing>>,
+    pub total_tokens: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub cache_write_1h_tokens: u64,
+    pub cached_tokens: u64,
+    pub cost_microusd: u64,
+    pub reported_cost_microusd: u64,
+    pub unpriced_tokens: u64,
+}
+
+/// Effective USD-per-million rates applied to the disjoint token buckets.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct UsagePricingRates {
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: f64,
+    pub cache_write_5m: f64,
+    pub cache_write_1h: f64,
+}
+
+/// A price/source contribution, cumulative on claims and differenced on period reads.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct UsagePricing {
+    #[serde(default)]
+    pub price_table_id: Option<String>,
+    #[serde(default)]
+    pub price_table_version: Option<String>,
+    pub cost_source: String,
+    #[serde(default)]
+    pub rates_usd_per_million_tokens: Option<UsagePricingRates>,
     pub total_tokens: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -432,6 +547,16 @@ pub struct CanonicalNode {
     pub children: Vec<CanonicalNode>,
 }
 
+/// Canonical compiler values of an applied seat, mission, or schedule publication.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct PublicationDefinition {
+    pub kind: String,
+    pub subject: String,
+    pub declaration: BTreeMap<String, Value>,
+    pub revision: String,
+    pub token: String,
+}
+
 /// Applied desired state, not the original declaration file or a proposed mission revision.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct SubjectDefinition {
@@ -442,6 +567,15 @@ pub struct SubjectDefinition {
     pub desired_revision: String,
     pub desired_token: String,
     pub conflicts: Vec<String>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct AgentWorkspace {
+    pub kind: String,
+    pub agent_id: String,
+    pub host_id: String,
+    pub workspace: String,
+    pub desired_token: String,
+    pub declaration_token: String,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct AgentDeclaration {
@@ -818,6 +952,34 @@ pub struct MissionStep {
     pub goals: Vec<String>,
     #[serde(default)]
     pub constraints: Vec<String>,
+    #[serde(default)]
+    pub loop_round: Option<u32>,
+    #[serde(default)]
+    pub loop_max_rounds: Option<u32>,
+    #[serde(default)]
+    pub loop_reason: Option<String>,
+    /// Earliest work eligibility, not a promise of wake dispatch.
+    #[serde(default)]
+    pub next_wake_at: Option<String>,
+    #[serde(default)]
+    pub wake_reason: Option<String>,
+    #[serde(default)]
+    pub wake: Option<MissionWake>,
+    #[serde(default)]
+    pub claim_expires_at: Option<String>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct MissionWake {
+    pub assignee: String,
+    pub assignee_state: String,
+    pub incarnation_id: String,
+    pub attempts: u32,
+    #[serde(default)]
+    pub last_attempt_at: Option<String>,
+    #[serde(default)]
+    pub acknowledged_by: Option<String>,
+    #[serde(default)]
+    pub failure: Option<String>,
 }
 /// A step named for display: its mission, run, path, title and first goal.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -900,6 +1062,12 @@ pub struct Agent {
     pub driver: Option<String>,
     #[serde(default)]
     pub harness_state: Option<String>,
+    #[serde(default)]
+    pub harness_error_state: Option<String>,
+    #[serde(default)]
+    pub since: Option<String>,
+    #[serde(default)]
+    pub observation: Option<String>,
     #[serde(default)]
     pub blocked_on: Option<String>,
     #[serde(default)]
@@ -1024,6 +1192,10 @@ pub struct HarnessTodoTotals {
 /// Where a seat's latest suspend or resume stands.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct AgentSuspension {
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub source_host: Option<String>,
     /// `suspend` or `resume`.
     pub action: String,
     /// suspend: quiescing, snapshotting, suspended, or failed (refused; the seat keeps running).
@@ -1090,6 +1262,23 @@ pub enum AgentQueuePlacement {
     After,
 }
 /// One agent seat's current claim and its ordered queue of mission runs.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct StatusHistory {
+    pub kind: String,
+    pub seat: String,
+    pub items: Vec<StatusTransition>,
+    pub retained_from: String,
+    pub complete: bool,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct StatusTransition {
+    pub seat: String,
+    pub runtime_incarnation: String,
+    pub state: Option<String>,
+    pub observed_at: String,
+    pub reset: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct AgentQueue {
     pub kind: String,
@@ -1412,6 +1601,7 @@ pub enum Resource {
     History(History),
     Session(Session),
     Glass(Glass),
+    Arrangement(Arrangement),
     OwnedSet(OwnedSet),
     /// A kind this client does not know, from a member newer than it. It keeps the header and
     /// the whole resource as sent, so an older client skips it or shows it plainly instead of
@@ -1441,6 +1631,7 @@ pub const KNOWN_RESOURCE_KINDS: &[&str] = &[
     "history",
     "session",
     "glass",
+    "arrangement",
     "owned-set",
 ];
 
@@ -1504,6 +1695,7 @@ impl Resource {
             Self::History(v) => &v.header,
             Self::Session(v) => &v.header,
             Self::Glass(v) => &v.header,
+            Self::Arrangement(v) => &v.header,
             Self::OwnedSet(v) => &v.header,
             Self::Unknown(v) => &v.header,
         }
@@ -1926,6 +2118,10 @@ pub struct Fence {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub enum ActionType {
+    #[serde(rename = "custom.reply")]
+    CustomReply,
+    #[serde(rename = "arrangement.edit")]
+    ArrangementEdit,
     #[serde(rename = "attention.resolve")]
     AttentionResolve,
     #[serde(rename = "review.approve")]
@@ -2148,6 +2344,20 @@ impl ActionRequest {
             &parameters,
         )
     }
+    pub fn arrangement_edit(
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: ArrangementEditParameters,
+    ) -> Result<Self, serde_json::Error> {
+        Self::new(
+            id,
+            ActionType::ArrangementEdit,
+            idempotency_key,
+            fence,
+            &parameters,
+        )
+    }
     pub fn attention_resolve(
         id: impl Into<String>,
         idempotency_key: impl Into<String>,
@@ -2157,6 +2367,20 @@ impl ActionRequest {
         Self::new(
             id,
             ActionType::AttentionResolve,
+            idempotency_key,
+            fence,
+            &parameters,
+        )
+    }
+    pub fn custom_reply(
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: CustomReplyParameters,
+    ) -> Result<Self, serde_json::Error> {
+        Self::new(
+            id,
+            ActionType::CustomReply,
             idempotency_key,
             fence,
             &parameters,
@@ -2905,6 +3129,8 @@ pub struct PersonAnswerRecord {
     pub status: String,
     pub summary: String,
     pub respondent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acted_for: Option<String>,
     pub answered_at_unix_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answer: Option<PersonAnswer>,
@@ -2936,6 +3162,8 @@ pub struct AgentSuspendParameters {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentResumeParameters {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
     pub agent: String,
 }
 
@@ -3163,6 +3391,8 @@ pub struct ActionResult {
     pub snapshot_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_attachment: Option<TerminalAttachment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arrangement_revision: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -3214,6 +3444,8 @@ pub struct PairingChallenge {
     pub pairing_id: String,
     pub code: String,
     pub expires_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub person_root_fingerprint: Option<String>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct PairingComplete {
@@ -3237,6 +3469,11 @@ pub struct PairedSession {
     /// root key's.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub device_key_chain: Vec<String>,
+    /// Public grant content and signatures, in the same order as device_key_chain.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub device_key_proofs: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub person_root_key_proof: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -3438,6 +3675,48 @@ pub struct GlassDelete {
     pub base_revision: Option<String>,
 }
 
+/// The durable claim operation type is shared with admission, not duplicated here.
+pub type ArrangementOperation = st3_schema::arrangements::Operation;
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ArrangementEditParameters {
+    pub subject: String,
+    pub owner: String,
+    pub operations: Vec<ArrangementOperation>,
+}
+pub type ArrangementRegister<T> = st3_schema::arrangements::Register<T>;
+pub type ArrangementPosition = st3_schema::arrangements::Position;
+pub type ArrangementPlacement = st3_schema::arrangements::Placement;
+pub type ArrangementFolder = st3_schema::arrangements::Folder;
+pub type ArrangementBody = st3_schema::arrangements::Body;
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ArrangementResolved {
+    pub parents: std::collections::BTreeMap<String, Option<String>>,
+    pub folders: std::collections::BTreeMap<String, Option<String>>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct Arrangement {
+    #[serde(flatten)]
+    pub header: ResourceHeader,
+    pub owner: String,
+    pub body: ArrangementBody,
+    pub deleted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved: Option<ArrangementResolved>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ArrangementPage {
+    pub kind: String,
+    pub collection: String,
+    #[serde(default)]
+    pub filters: BTreeMap<String, String>,
+    pub items: Vec<Arrangement>,
+    pub page: PageInfo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync: Option<SyncNotice>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replicated: Option<ReplicatedNotice>,
+}
+
 /// Repositories already used by a host's declared agents, read from replicated graph evidence.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct HostRepositories {
@@ -3449,4 +3728,14 @@ pub struct AgentRepository {
     pub path: String,
     pub workspaces: Vec<String>,
     pub agent_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CustomReplyParameters {
+    pub target_id: String,
+    pub registration: String,
+    pub revision: String,
+    pub episode: String,
+    pub fields: BTreeMap<String, Value>,
 }

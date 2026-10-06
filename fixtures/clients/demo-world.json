@@ -9,6 +9,7 @@
           "fault": null,
           "goal": "Cut over to the new store once a person approves.",
           "harness_state": "idle, waiting for review",
+          "model": "claude-sonnet-5-5",
           "next": "Move the atlas store › cleanup",
           "queue": [
             "Atlas nightly build › build (tonight)"
@@ -50,6 +51,7 @@
           "fault": null,
           "goal": "Draft the pricing page and get feedback.",
           "harness_state": "idle, waiting for feedback",
+          "model": "claude-sonnet-5-5",
           "next": "A new pricing page › publish",
           "queue": [],
           "queued": 0,
@@ -75,6 +77,7 @@
           "fault": "401 Unauthorized: the API key expired at 08:40.",
           "goal": "Tag this week's release.",
           "harness_state": "exited 4 times in 10 minutes",
+          "model": "gpt-5.5-codex",
           "next": "Weekly release › publish",
           "queue": [],
           "queued": 0,
@@ -100,6 +103,7 @@
           "fault": null,
           "goal": "Keep Robin's fleet moving; answer questions.",
           "harness_state": "working",
+          "model": "claude-sonnet-5-5",
           "next": null,
           "queue": [
             "Rotate harbor's signing keys › report"
@@ -127,6 +131,7 @@
           "fault": null,
           "goal": "Review pull request #218.",
           "harness_state": "working",
+          "model": "claude-sonnet-5-5",
           "next": "Review harbor #218 › route",
           "queue": [],
           "queued": 0,
@@ -152,6 +157,7 @@
           "fault": null,
           "goal": null,
           "harness_state": null,
+          "model": null,
           "next": null,
           "queue": [],
           "queued": 0,
@@ -177,6 +183,7 @@
           "fault": null,
           "goal": null,
           "harness_state": null,
+          "model": null,
           "next": null,
           "queue": [],
           "queued": 0,
@@ -202,6 +209,7 @@
           "fault": null,
           "goal": null,
           "harness_state": null,
+          "model": null,
           "next": null,
           "queue": [],
           "queued": 0,
@@ -227,6 +235,7 @@
           "fault": null,
           "goal": null,
           "harness_state": null,
+          "model": null,
           "next": null,
           "queue": [],
           "queued": 0,
@@ -252,6 +261,7 @@
           "fault": null,
           "goal": null,
           "harness_state": null,
+          "model": null,
           "next": null,
           "queue": [],
           "queued": 0,
@@ -279,6 +289,7 @@
         "actions": [],
         "age": "33m",
         "agent": "agent/example/atlas/builder",
+        "blocked": null,
         "id": "attention/1",
         "kind": {
           "because": "cut-over cannot start until you answer; the old store stays read-only meanwhile",
@@ -312,6 +323,7 @@
         "actions": [],
         "age": "12m",
         "agent": "agent/example/docs/writer",
+        "blocked": null,
         "id": "attention/2",
         "kind": {
           "excerpt": [
@@ -339,6 +351,7 @@
         "actions": [],
         "age": "1h",
         "agent": "agent/example/planner",
+        "blocked": null,
         "id": "attention/3",
         "kind": {
           "kind": "launch",
@@ -411,6 +424,7 @@
         "actions": [],
         "age": "8m",
         "agent": "agent/example/release/captain",
+        "blocked": null,
         "id": "attention/4",
         "kind": {
           "because": "the weekly release cannot tag until this seat is back",
@@ -430,6 +444,7 @@
         "actions": [],
         "age": "19m",
         "agent": "agent/example/rekey/worker",
+        "blocked": null,
         "id": "attention/5",
         "kind": {
           "changes": [
@@ -456,6 +471,7 @@
         "actions": [],
         "age": "2h",
         "agent": "agent/example/cos",
+        "blocked": null,
         "id": "attention/6",
         "kind": {
           "body": "Usage this week is **up 18%**, almost all from the atlas store move (reruns of the compare step).\n\nNo action needed; it should fall back once the cut-over is done.",
@@ -468,6 +484,50 @@
         "tier": "later",
         "title": "Weekly usage is up 18%",
         "waiting": null
+      }
+    ]
+  },
+  "clients": {
+    "state": "ready",
+    "value": [
+      {
+        "client": "stui 0.1.0+1ecae71",
+        "connected": true,
+        "device": null,
+        "follows": [
+          "glass:main",
+          "conversation:agent/lark/planner"
+        ],
+        "member": "lark",
+        "older": false,
+        "via": "local",
+        "when": "since 2h",
+        "who": "person/robin"
+      },
+      {
+        "client": "smalltalk-ios 1.0 (42)",
+        "connected": true,
+        "device": "Robin's phone",
+        "follows": [
+          "now",
+          "terminal:terminal/agent/lark/planner"
+        ],
+        "member": "lark",
+        "older": false,
+        "via": "gateway",
+        "when": "since 12m",
+        "who": "person/robin"
+      },
+      {
+        "client": "stui 0.0.9+77d0a13",
+        "connected": false,
+        "device": null,
+        "follows": [],
+        "member": "lark",
+        "older": true,
+        "via": "tailscale",
+        "when": "seen 3m ago",
+        "who": "person/robin"
       }
     ]
   },
@@ -1055,6 +1115,7 @@
         "kdl": "version 2\n\nmission \"fleet/atlas/store-move\" state=\"ready\" {\n  goal \"Move every row to the new store without losing a value.\"\n  goal \"Prove the two stores agree before anything cuts over.\"\n  goal \"Leave the old store readable until a person says otherwise.\"\n  constraint \"Never write to the old store.\"\n\n  step \"snapshot\" { assigned-to \"agent/example/atlas/builder\" }\n  step \"convert\" {\n    assigned-to \"agent/example/atlas/builder\"\n    depends-on { step \"snapshot\" completed }\n    gate \"conversion-check\" { exec \"atlas-cli check --converted\" }\n  }\n  step \"compare\" {\n    assigned-to \"agent/example/atlas/builder\"\n    depends-on { step \"convert\" completed }\n  }\n  step \"cut-over\" {\n    agentless\n    depends-on { step \"compare\" completed }\n    gate \"cut-over-review\" type=\"human\" {\n      reviewer \"person/robin\"\n      question \"The row counts agree and the contract check passed. Cut over?\"\n      review \"doc/atlas/compare-report\"\n    }\n  }\n  step \"cleanup\" {\n    assigned-to \"agent/example/atlas/builder\"\n    depends-on { step \"cut-over\" completed }\n  }\n}\n",
         "outcome": null,
         "parent": null,
+        "step_metadata": {},
         "steps": [
           {
             "after": [],
@@ -1184,6 +1245,7 @@
         "kdl": null,
         "outcome": null,
         "parent": null,
+        "step_metadata": {},
         "steps": [
           {
             "after": [],
@@ -1246,6 +1308,7 @@
         "kdl": null,
         "outcome": null,
         "parent": null,
+        "step_metadata": {},
         "steps": [
           {
             "after": [],
@@ -1331,6 +1394,7 @@
         "kdl": null,
         "outcome": null,
         "parent": null,
+        "step_metadata": {},
         "steps": [
           {
             "after": [],
@@ -1393,6 +1457,7 @@
         "kdl": null,
         "outcome": null,
         "parent": null,
+        "step_metadata": {},
         "steps": [
           {
             "after": [],
@@ -1476,6 +1541,7 @@
         "kdl": null,
         "outcome": null,
         "parent": null,
+        "step_metadata": {},
         "steps": [
           {
             "after": [],
@@ -1515,6 +1581,7 @@
         "kdl": null,
         "outcome": null,
         "parent": null,
+        "step_metadata": {},
         "steps": [
           {
             "after": [],

@@ -1,10 +1,17 @@
-use st3_client::TimelineEntry;
+use st3_client::{TimelineBody, TimelineEntry};
+
+fn is_projection_notice(entry: &TimelineEntry) -> bool {
+    matches!(&entry.body, TimelineBody::Error(error)
+        if matches!(error.code.as_str(),
+            "timeline-query-limited" | "timeline-history-incomplete"))
+}
 
 /// Metadata and entries from a native conversation frame, preserved at the UI boundary.
 #[derive(Clone, Debug, Default)]
 pub struct Frame {
     pub replace: bool,
-    pub has_more: bool,
+    /// Availability before the live window; absent on deltas means unchanged.
+    pub has_more: Option<bool>,
     pub items: Vec<TimelineEntry>,
     /// The session the entries belong to, when the stream says.
     pub session_id: Option<String>,
@@ -38,10 +45,14 @@ pub struct Older {
 impl Timeline {
     pub fn apply(&mut self, frame: Frame) {
         self.replace = frame.replace;
-        self.has_more = frame.has_more;
         let other_session = frame.session_id.is_some()
             && self.session_id.is_some()
             && frame.session_id != self.session_id;
+        if frame.replace || other_session {
+            self.has_more = frame.has_more.unwrap_or(false);
+        } else if let Some(has_more) = frame.has_more {
+            self.has_more = has_more;
+        }
         if frame.session_id.is_some() {
             self.session_id = frame.session_id;
         }
@@ -51,20 +62,25 @@ impl Timeline {
         if frame.replace {
             // A new window keeps the pages read before it, unless it no longer meets them:
             // entries could be missing between the two, and a gap must never look whole.
-            let meets = frame
-                .items
-                .iter()
-                .any(|item| self.items.iter().any(|held| held.id == item.id));
+            // Session-stable availability notices cannot establish history continuity.
+            let meets = frame.items.iter().any(|item| {
+                !is_projection_notice(item)
+                    && self.items.iter().any(|held| {
+                        !is_projection_notice(held) && held.id == item.id
+                    })
+            });
             let oldest = frame
                 .items
-                .first()
-                .map(|first| (first.timestamp.clone(), first.sequence));
-            if self.older.paged && !other_session && (meets || !frame.has_more) {
+                .iter()
+                .find(|item| !is_projection_notice(item))
+                .map(|first| (first.timestamp.as_str(), first.sequence));
+            if self.older.paged && !other_session && (meets || !self.has_more) {
                 let mut items = std::mem::take(&mut self.items);
                 items.retain(|held| {
-                    oldest.as_ref().is_some_and(|(at, sequence)| {
-                        (&held.timestamp, held.sequence) < (at, *sequence)
-                    })
+                    !is_projection_notice(held)
+                        && oldest.is_some_and(|(at, sequence)| {
+                            (held.timestamp.as_str(), held.sequence) < (at, sequence)
+                        })
                 });
                 items.extend(frame.items);
                 self.items = items;

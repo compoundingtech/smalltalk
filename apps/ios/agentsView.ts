@@ -1,4 +1,4 @@
-import type { Agent } from '../../clients/typescript/st3-client';
+import type { Agent, Mission } from '../../clients/typescript/st3-client';
 import { ago } from './presentation';
 import type { SessionView } from '@smalltalk/st3-views';
 import { harnessColor, theme } from './theme';
@@ -8,7 +8,7 @@ import { harnessColor, theme } from './theme';
 // st found running but did not start listed last.
 
 // Declaration order is the sort order, as in stui's AgentState.
-export const AGENT_STATES = ['needs-you', 'fault', 'working', 'idle', 'starting', 'stopped', 'unknown'] as const;
+export const AGENT_STATES = ['needs-you', 'needs-login', 'fault', 'working', 'idle', 'starting', 'stopped', 'unknown'] as const;
 export type AgentState = typeof AGENT_STATES[number];
 
 export type AgentRowView = {
@@ -24,6 +24,8 @@ export type AgentRowView = {
   activity: string;
   /** The graph path under the name. */
   path: string;
+  /** What the step it holds last reported (`st work progress`), on one line: the status read first. */
+  progress?: string;
   host: string;
   parent?: string;
 };
@@ -34,11 +36,20 @@ function label(slug: string): string {
 }
 
 /** An agent's readable name, as stui names it: the last path segment, and `Parent · OMP` for an omp seat. */
-export function agentName(agent: Pick<Agent, 'id' | 'name'>): string {
+export function agentName(agent: Pick<Agent, 'id' | 'name'> & { host_id?: string | null }): string {
   const parts = (agent.name || agent.id).split('/').filter(Boolean);
-  const slug = parts.at(-1) ?? agent.id;
+  // `st agents new NAME` names a seat HOST.NAME; the host shows beside it, so the label is NAME.
+  const host = agent.host_id?.replace(/^host\//, '').toLowerCase();
+  const dotted = parts.at(-1) ?? agent.id;
+  const dot = dotted.indexOf('.');
+  const slug = host && dot > 0 && dot < dotted.length - 1 && dotted.slice(0, dot).toLowerCase() === host ? dotted.slice(dot + 1) : dotted;
   if (slug.toLowerCase() === 'omp' && parts.length > 1) return `${label(parts.at(-2)!)} · OMP`;
   return label(slug);
+}
+
+// The model its harness last reported using, as reported ("claude-sonnet-5-5"); null when st says none.
+export function agentModel(agent: { usage?: { context?: { model?: string | null } | null } | null }): string | null {
+  return agent.usage?.context?.model?.trim() || null;
 }
 
 export function harnessName(driver: string | null | undefined): string {
@@ -50,7 +61,7 @@ export function harnessName(driver: string | null | undefined): string {
   return '?';
 }
 
-type StateAgent = Pick<Agent, 'state' | 'harness_state' | 'fault' | 'delivery'>;
+type StateAgent = Pick<Agent, 'state' | 'harness_state' | 'fault' | 'delivery'> & { harness_error_state?: string | null; reason?: string | null; observation?: string | null; reachability?: string | null };
 export function agentState(agent: StateAgent): AgentState {
   if (agent.fault) return 'fault';
   // A seat whose message path runs a replaced binary or stopped polling takes no messages,
@@ -59,7 +70,11 @@ export function agentState(agent: StateAgent): AgentState {
   switch (agent.state) {
     case 'failed': return 'fault';
     case 'running': return agent.harness_state === 'working' ? 'working' : 'idle';
-    case 'waiting': return agent.harness_state === 'unauthenticated' || agent.harness_state === 'blocked' ? 'needs-you' : 'starting';
+    // Signed out of its provider: a login on its host fixes it, without a restart (Nathan, 2026-10-04).
+    // st withdraws an idle claim it has not heard renewed lately: the harness reads "indeterminate"
+    // and the seat "waiting", though it is up and reachable. That is an idle seat nobody has
+    // spoken to, not one starting (Nathan, 2026-10-05).
+    case 'waiting': return agent.harness_error_state === 'needs-login' ? 'needs-login' : agent.harness_state === 'indeterminate' && agent.observation === 'stale' && (agent.reachability === 'reachable' || agent.reachability === 'local') ? 'idle' : agent.harness_state === 'unauthenticated' || agent.harness_state === 'needs-login' || agent.reason === 'providerAuth' ? 'needs-login' : agent.harness_state === 'blocked' ? 'needs-you' : 'starting';
     case 'starting':
     case 'desired': return 'starting';
     case 'stopped': return 'stopped';
@@ -71,6 +86,7 @@ export const SPINNER = '⠿';
 export function agentGlyph(state: AgentState, spinner = SPINNER): { glyph: string; color: string } {
   switch (state) {
     case 'needs-you': return { glyph: '◆', color: theme.person };
+    case 'needs-login': return { glyph: '⚿', color: theme.person };
     case 'fault': return { glyph: '✕', color: theme.fault };
     case 'working': return { glyph: spinner, color: theme.working };
     case 'idle': return { glyph: '●', color: theme.idle };
@@ -83,6 +99,7 @@ export function agentGlyph(state: AgentState, spinner = SPINNER): { glyph: strin
 export function agentWord(state: AgentState): string {
   switch (state) {
     case 'needs-you': return 'needs you';
+    case 'needs-login': return 'needs login';
     case 'fault': return 'broken';
     case 'working': return 'working';
     case 'idle': return 'idle';
@@ -97,6 +114,7 @@ export function agentGroup(row: Pick<AgentRowView, 'state' | 'unmanaged'>): stri
   if (row.unmanaged) return UNMANAGED_GROUP;
   switch (row.state) {
     case 'needs-you': return 'waiting on you';
+    case 'needs-login': return 'needs login';
     case 'fault': return 'broken';
     case 'working': return 'working';
     case 'idle':
@@ -108,12 +126,25 @@ export function agentGroup(row: Pick<AgentRowView, 'state' | 'unmanaged'>): stri
 
 export const AGENT_LEGEND: ReadonlyArray<{ state: AgentState; word: string }> = [
   { state: 'needs-you', word: 'needs you' },
+  { state: 'needs-login', word: 'needs login' },
   { state: 'working', word: 'working' },
   { state: 'idle', word: 'idle' },
   { state: 'fault', word: 'broken' },
   { state: 'stopped', word: 'stopped' },
   { state: 'unknown', word: 'unmanaged' },
 ];
+
+/** What a step last reported, on one line; the step run's id names it in whichever run holds it. */
+export function stepProgress(missions: Mission[], stepId: string): string | undefined {
+  for (const mission of missions) {
+    for (const run of mission.run_details ?? []) {
+      const step = (run.steps ?? []).find(candidate => candidate.id === stepId);
+      const line = step?.last_progress?.split(/\s+/).filter(Boolean).join(' ');
+      if (step) return line || undefined;
+    }
+  }
+  return undefined;
+}
 
 function host(id: string | null | undefined): string {
   return id ? id.replace(/^host\//, '') : '?';
@@ -123,8 +154,9 @@ function host(id: string | null | undefined): string {
  * Every seat st declares, then every running session st found but did not start. Undeclared
  * sessions are named `driver in workspace` and belong to the gateway's host.
  */
-export function agentRows(agents: Agent[], sessions: SessionView[], gatewayHost: string, now = Date.now()): AgentRowView[] {
+export function agentRows(agents: Agent[], sessions: SessionView[], gatewayHost: string, now = Date.now(), missions: Mission[] = []): AgentRowView[] {
   const declared = agents.map((agent): AgentRowView => ({
+    progress: agent.current_work?.[0] ? stepProgress(missions, agent.current_work[0].id) : undefined,
     id: agent.id,
     target: agent.id,
     name: agentName(agent),
@@ -180,7 +212,7 @@ export function agentSections(rows: AgentRowView[]): AgentSection[] {
     const title = agentGroup(row);
     const last = sections.at(-1);
     if (last?.title === title) { last.rows.push(row); last.count++; }
-    else sections.push({ title, count: 1, person: row.state === 'needs-you' && !row.unmanaged, rows: [row] });
+    else sections.push({ title, count: 1, person: (row.state === 'needs-you' || row.state === 'needs-login') && !row.unmanaged, rows: [row] });
   }
   return sections;
 }
@@ -246,3 +278,12 @@ export function compactFolders(paths: string[][]): string[][] {
 }
 
 export { harnessColor };
+
+/** What a person does for an agent signed out of its provider, as stui says it. */
+export function loginGuidance(agent: { driver?: string | null; host_id?: string | null }): string {
+  const host = agent.host_id?.replace(/^host\//, '') ?? 'its host';
+  const harness = harnessName(agent.driver);
+  const how = harness === 'claude' ? 'open its terminal and run /login' : harness === 'codex' ? `run \`codex login\` on ${host} (or in its terminal)` : 'open its terminal and log it in';
+  const provider = harness === 'claude' ? 'Claude' : harness === 'codex' ? 'Codex' : 'Its provider';
+  return `${provider} login required on ${host}: ${how}. Messages wait until it is signed in; it carries on without a restart.`;
+}

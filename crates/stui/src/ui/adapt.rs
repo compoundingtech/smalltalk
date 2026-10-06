@@ -142,7 +142,7 @@ pub fn world(model: &Model, person: &str, extras: &Extras) -> World {
         link,
         diverged,
         attention: loaded(model.now.snapshot.is_some(), attention),
-        agents: loaded(model.agents.snapshot.is_some(), agents(model)),
+        agents: loaded(model.agents.snapshot.is_some(), agents(model, &missions)),
         missions: loaded(model.missions.snapshot.is_some(), missions),
         machines: loaded(model.machines.snapshot.is_some(), machines(model)),
         worktrees: Load::Ready(super::demo::world().worktrees.items().to_vec()),
@@ -172,6 +172,59 @@ pub fn world(model: &Model, person: &str, extras: &Extras) -> World {
             Some(Ok(period)) => period.limits.clone(),
             _ => Vec::new(),
         },
+        agent_messages: match &model.usage {
+            Some(Ok(period)) => period.agent_messages.clone(),
+            _ => None,
+        },
+        clients: match &model.clients {
+            Some(Ok(list)) => Load::Ready(
+                list.items
+                    .iter()
+                    .map(|item| connected(item, model.member_build.as_deref()))
+                    .collect(),
+            ),
+            Some(Err(why)) => Load::Failed(why.clone()),
+            None => Load::Loading,
+        },
+    }
+}
+
+fn connected(item: &st3_client::ClientConnection, member_build: Option<&str>) -> Connected {
+    let client = item.client.clone().unwrap_or_default();
+    Connected {
+        older: member_build.is_some_and(|member| older_than_member(&client, member)),
+        client,
+        who: item.person.clone(),
+        device: item.device_name.clone().or_else(|| item.device_id.clone()),
+        member: item.member.clone(),
+        via: item.via.clone(),
+        connected: item.connected,
+        when: if item.connected {
+            format!("since {}", age(&item.since))
+        } else {
+            format!("seen {} ago", age(&item.last_seen))
+        },
+        follows: item.follows.clone(),
+    }
+}
+
+/// Whether a client's reported build is an older version than the member's own. Only st's own
+/// builds share the member's version line ("stui 0.1.0+ab12cd3", "st 0.1.0+ab12cd3"); any other
+/// client, and any build that does not parse, is never called older.
+fn older_than_member(client: &str, member: &str) -> bool {
+    fn version(build: &str) -> Option<Vec<u64>> {
+        let base = build.split(['+', '-', ' ']).next()?;
+        base.split('.').map(|part| part.parse().ok()).collect()
+    }
+    let Some((name, build)) = client.split_once(' ') else {
+        return false;
+    };
+    if !matches!(name, "stui" | "st") {
+        return false;
+    }
+    match (version(build), version(member)) {
+        (Some(client), Some(member)) => client < member,
+        _ => false,
     }
 }
 
@@ -275,6 +328,20 @@ fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
                         structured: item.request.clone().map(Box::new),
                     },
                 ),
+                custom if custom.starts_with("custom.") => (
+                    Tier::Today,
+                    AttentionKind::Request {
+                        from: requester_name(model, item.requester_id.as_deref()),
+                        from_id: item.requester_id.clone().unwrap_or_default(),
+                        question: format!(
+                            "{}\n\n{}\nSource: {}",
+                            item.detail,
+                            crate::custom_form_hint(item.custom_form.as_ref()),
+                            item.source_id
+                        ),
+                        structured: None,
+                    },
+                ),
                 // Home holds only requests and reviews. Messages stay in conversations, and st
                 // sends each fault to the agent that owns it.
                 _ => return None,
@@ -360,6 +427,10 @@ fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
                 agent,
                 related,
                 raised_by,
+                blocked: item.blocked.as_ref().map(|blocked| Blocked {
+                    step: blocked.step.clone(),
+                    goal: clean_message_text(&blocked.goal),
+                }),
                 tier,
                 title: extras
                     .bodies
@@ -482,7 +553,21 @@ fn harness(driver: Option<&str>) -> Harness {
     }
 }
 
-fn agents(model: &Model) -> Vec<Agent> {
+/// What a step last reported, on one line. A step run's ID names it in whichever mission holds it.
+fn step_progress(missions: &[Mission], step: &str) -> Option<String> {
+    let reported = missions
+        .iter()
+        .find_map(|mission| mission.step_metadata.get(step))?
+        .last_progress
+        .as_deref()?;
+    let line = clean_message_text(reported)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!line.is_empty()).then_some(line)
+}
+
+fn agents(model: &Model, missions: &[Mission]) -> Vec<Agent> {
     let mut agents = model
         .agents()
         .map(|agent| {
@@ -498,6 +583,17 @@ fn agents(model: &Model) -> Vec<Agent> {
                     AgentState::Fault
                 }
                 ("failed", _) => AgentState::Fault,
+                // Signed out of its provider (Claude "Not logged in · Run /login"): a login on
+                // its host fixes it, not a restart (Nathan, 2026-10-04).
+                // st's additive detail names the known error outright; the legacy `unauthenticated`
+                // harness state below says the same to clients that predate it.
+                ("waiting", _) if agent.harness_error_state.as_deref() == Some("needs-login") => {
+                    AgentState::NeedsLogin
+                }
+                ("waiting", Some("unauthenticated" | "needs-login")) => AgentState::NeedsLogin,
+                ("waiting", _) if agent.reason.as_deref() == Some("providerAuth") => {
+                    AgentState::NeedsLogin
+                }
                 ("running", Some("working")) => AgentState::Working,
                 ("running", _) => AgentState::Idle,
                 ("waiting", Some("ready" | "working" | "idle"))
@@ -505,7 +601,16 @@ fn agents(model: &Model) -> Vec<Agent> {
                 {
                     AgentState::NeedsYou
                 }
-                ("waiting", Some("unauthenticated" | "blocked")) => AgentState::NeedsYou,
+                ("waiting", Some("blocked")) => AgentState::NeedsYou,
+                // st withdraws an idle claim it has not heard renewed lately: the harness reads
+                // "indeterminate" and the seat "waiting", though it is up and reachable. That is an
+                // idle seat nobody has spoken to, not one starting (Nathan, 2026-10-05).
+                ("waiting", Some("indeterminate"))
+                    if agent.observation.as_deref() == Some("stale")
+                        && matches!(agent.reachability.as_str(), "reachable" | "local") =>
+                {
+                    AgentState::Idle
+                }
                 ("waiting" | "starting" | "desired", _) => AgentState::Starting,
                 ("stopped", _) => AgentState::Stopped,
                 _ => AgentState::Unknown,
@@ -536,6 +641,7 @@ fn agents(model: &Model) -> Vec<Agent> {
                     .first()
                     .map(|relation| relation.agent_id.clone()),
                 details: AgentDetails {
+                    progress: work.and_then(|work| step_progress(missions, &work.id)),
                     goal: work.and_then(|work| work.goal.as_deref().map(clean_message_text)),
                     claimed: work.map(|work| format!("{} ago", age(&work.since))),
                     next: agent
@@ -550,7 +656,17 @@ fn agents(model: &Model) -> Vec<Agent> {
                     queued: agent.queued_work_count,
                     harness_state: agent.harness_state.clone(),
                     runtime: None,
-                    fault: agent.fault.clone(),
+                    model: agent
+                        .usage
+                        .as_ref()
+                        .and_then(|usage| usage.context.as_ref())
+                        .and_then(|context| context.model.clone()),
+                    fault: agent.fault.clone().or_else(|| {
+                        agent.delivery.as_ref()
+                            .filter(|delivery| delivery.state == "stale")
+                            .and_then(|delivery| delivery.reason.clone())
+                            .filter(|reason| reason.starts_with("delivery-control-unavailable:"))
+                    }),
                     under: agent.under.first().map(|relation| {
                         model
                             .agents()
@@ -779,11 +895,9 @@ mod tests {
         ]))
         .unwrap();
         let entries = conversation(&timeline, &BTreeMap::new());
-        let Body::Mail { body, images, .. } = &entries[0].body else {
+        let Body::Mail { images, .. } = &entries[0].body else {
             panic!("{entries:#?}");
         };
-        // An image alone is the message, not a "(notification)".
-        assert_eq!(body, "");
         assert_eq!(
             images,
             &[st3_conversation_ui::MailImage {
@@ -1009,6 +1123,32 @@ mod tests {
     }
 
     #[test]
+    fn a_delivery_by_the_current_channel_plugin_leaves_no_empty_shell_behind() {
+        // Nathan, 2026-10-05: "I see xml in stui tonight": plugin:st-channel:st was not a name
+        // the delivery recognised, so its envelope was taken out and `<channel …></channel>` stayed.
+        let delivery = "<channel source=\"plugin:st-channel:st\" from=\"person/example\" messageId=\"message/c4\" threadId=\"message/c4\" identity=\"fleet/example/quay\">\n<smalltalk-message id=\"c4\" from=\"person/example\" to=\"agent/example/quay\" subject=\"(no subject)\" sha256=\"00\" graph=\"message/c4\">\nhow is it going?\n</smalltalk-message>\nThe person reads replies in st, not in the agent's session.\n</channel>";
+        let shown = BTreeSet::from(["message/c4".to_owned()]);
+        let bodies = from_harness(true, delivery, &shown);
+        assert!(bodies.is_empty(), "{bodies:?}");
+        let bodies = from_harness(true, delivery, &BTreeSet::new());
+        assert!(
+            matches!(&bodies[..], [Body::Mail { body, .. }] if body == "how is it going?"),
+            "{bodies:?}"
+        );
+        // Every name the plugin has had, and no other, is st's.
+        for source in [
+            "plugin:st-channel:st",
+            "plugin:st3-channel:st3",
+            "plugin:st2-channel:st2",
+        ] {
+            assert!(st3_conversation_ui::adapt::channel_source(source), "{source}");
+        }
+        for source in ["plugin:slack-channel:slack", "plugin:st-channel", "st-channel:st", ""] {
+            assert!(!st3_conversation_ui::adapt::channel_source(source), "{source}");
+        }
+    }
+
+    #[test]
     fn the_persons_mail_says_when_the_agent_has_it_and_its_delivery_is_not_a_line() {
         let timeline: Vec<TimelineEntry> = serde_json::from_value(json!([
             {"id":"m","sequence":1,"revision":1,"timestamp":"2026-10-01T10:00:00Z","role":"user","type":"message","final":true,
@@ -1054,27 +1194,6 @@ mod tests {
             "{text:?}"
         );
         assert!(text.iter().any(|line| line.contains("✓ sent")), "{text:?}");
-    }
-
-    #[test]
-    fn a_seat_that_has_said_nothing_since_it_started_shows_its_small_talk() {
-        let timeline: Vec<TimelineEntry> = serde_json::from_value(json!([
-            {"id":"m","sequence":1,"revision":1,"timestamp":"2026-10-01T10:00:00Z","role":"user","type":"message","final":true,
-             "body":{"message_id":"message/one","from":"person/avery","to":"agent/example/harbor/keeper","title":"Status?"}},
-            {"id":"c","sequence":2,"revision":1,"timestamp":"2026-10-01T10:00:00Z","role":"user","type":"content","final":true,
-             "body":{"media_type":"text/plain","text":"How is the audit going?"}},
-            {"id":"n","sequence":3,"revision":1,"timestamp":"2026-10-01T10:00:01Z","role":"system","type":"error","final":true,
-             "body":{"code":"transcript-not-bound","message":"transcript not bound: Claude session 0190 has no transcript file yet","retryable":true,
-                     "details":{"driver":"claude","not_yet":true}}},
-        ]))
-        .unwrap();
-        assert_eq!(unreadable_transcript(&timeline), None, "nothing is wrong");
-        let entries = conversation(&timeline, &BTreeMap::new());
-        assert!(matches!(&entries[0].body, Body::Mail { subject, .. } if subject == "Status?"));
-        assert!(
-            matches!(&entries[1].body, Body::Event(line) if line == "nothing in the harness yet since this seat started"),
-            "{entries:?}"
-        );
     }
 
     #[test]
@@ -1219,6 +1338,73 @@ mod tests {
             .map(super::super::text::plain)
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn claude_skill_model_folds_the_expansion_and_stui_draws_real_lines() {
+        let fixture = include_str!("../../../../fixtures/clients/transcripts/claude-skill.json");
+        let timeline: Vec<TimelineEntry> = serde_json::from_str(fixture).unwrap();
+        let entries = conversation(&timeline, &BTreeMap::new());
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        let Body::Tool { output, .. } = &entries[0].body else {
+            panic!("{entries:?}")
+        };
+        assert!(output.iter().any(|line| line == "## Messages"));
+        assert!(
+            output
+                .iter()
+                .any(|line| line.starts_with("`<smalltalk-message>`, followed"))
+        );
+        let folded = rendered(fixture);
+        assert!(folded.contains("Skill st"), "{folded}");
+        assert!(!folded.contains("## Messages"), "{folded}");
+        let opened = super::super::conversation::Cache::default().render(
+            &entries,
+            100,
+            &std::collections::HashSet::from(["skill-call".into()]),
+            "",
+            st3_conversation_ui::Density::Full,
+        );
+        assert!(
+            opened
+                .lines
+                .iter()
+                .all(|line| !super::super::text::plain(line).contains('\n'))
+        );
+        let text = opened
+            .lines
+            .iter()
+            .map(super::super::text::plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        for kept in [
+            "# st",
+            "## Messages",
+            "`<smalltalk-message>`, followed by a bounded preview.",
+            "it prints nothing, st did not start the session and nothing here applies.",
+        ] {
+            assert!(text.contains(kept), "{text}");
+        }
+        // A paged window without the call renders the skill as one user block, with real rows.
+        let orphan = conversation(&timeline[2..3], &BTreeMap::new());
+        assert_eq!(orphan.len(), 1);
+        let doc = super::super::conversation::Cache::default().render(
+            &orphan,
+            100,
+            &Default::default(),
+            "",
+            st3_conversation_ui::Density::Full,
+        );
+        assert!(
+            doc.lines
+                .iter()
+                .all(|line| !super::super::text::plain(line).contains('\n'))
+        );
+        assert!(
+            doc.lines
+                .iter()
+                .any(|line| super::super::text::plain(line).trim() == "## Messages")
+        );
     }
 
     fn assert_clean(text: &str) {
@@ -1438,6 +1624,29 @@ mod tests {
     }
 
     #[test]
+    fn a_seats_status_is_what_its_step_last_reported_on_one_line() {
+        let mut mission = crate::ui::demo::world().missions.items()[0].clone();
+        mission.step_metadata.insert(
+            "step-run/example/build".into(),
+            st3_ui_model::missions::StepMetadata {
+                blocked_reason: None,
+                last_progress: Some("  Tests pass on\nmain; opening the PR \n".into()),
+            },
+        );
+        mission.step_metadata.insert(
+            "step-run/example/quiet".into(),
+            st3_ui_model::missions::StepMetadata::default(),
+        );
+        let missions = [mission];
+        assert_eq!(
+            step_progress(&missions, "step-run/example/build").as_deref(),
+            Some("Tests pass on main; opening the PR")
+        );
+        assert_eq!(step_progress(&missions, "step-run/example/quiet"), None);
+        assert_eq!(step_progress(&missions, "step-run/example/unknown"), None);
+    }
+
+    #[test]
     fn a_waiting_human_ask_needs_you_even_while_the_harness_activity_is_working() {
         let mut model = Model::default();
         let resource = |state: &str, activity: &str, blocked_on: Option<&str>| {
@@ -1449,13 +1658,81 @@ mod tests {
             })
         };
         model.agents = window(vec![resource("waiting", "working", Some("human"))]);
-        assert_eq!(agents(&model)[0].state, AgentState::NeedsYou);
+        assert_eq!(agents(&model, &[])[0].state, AgentState::NeedsYou);
         model.agents = window(vec![resource("running", "working", None)]);
-        assert_eq!(agents(&model)[0].state, AgentState::Working);
+        assert_eq!(agents(&model, &[])[0].state, AgentState::Working);
         model.agents = window(vec![resource("failed", "working", Some("human"))]);
-        assert_eq!(agents(&model)[0].state, AgentState::Fault);
+        assert_eq!(agents(&model, &[])[0].state, AgentState::Fault);
         model.agents = window(vec![resource("waiting", "indeterminate", Some("human"))]);
-        assert_eq!(agents(&model)[0].state, AgentState::Starting);
+        assert_eq!(agents(&model, &[])[0].state, AgentState::Starting);
+    }
+
+    #[test]
+    fn an_idle_seat_st_has_not_heard_from_lately_reads_idle_not_starting() {
+        let mut model = Model::default();
+        let resource = |state: &str, harness: &str, observation: Option<&str>| {
+            serde_json::json!({
+                "id": "agent/example/quiet", "kind": "agent", "revision": "r1",
+                "updated_at": "2026-10-05T12:00:00Z", "name": "example/quiet",
+                "state": state, "reachability": "reachable", "harness_state": harness,
+                "observation": observation, "blocked_on": "none", "runtime_ids": [], "under": [],
+            })
+        };
+        // Its idle claim went stale: st says waiting/indeterminate; the seat is just idle.
+        model.agents = window(vec![resource("waiting", "indeterminate", Some("stale"))]);
+        assert_eq!(agents(&model, &[])[0].state, AgentState::Idle);
+        // Without that staleness, an indeterminate waiting seat is still starting.
+        model.agents = window(vec![resource("waiting", "indeterminate", Some("current"))]);
+        assert_eq!(agents(&model, &[])[0].state, AgentState::Starting);
+        model.agents = window(vec![resource("waiting", "indeterminate", None)]);
+        assert_eq!(agents(&model, &[])[0].state, AgentState::Starting);
+        // A stale observation on an unreachable seat is no news that it is idle.
+        let mut gone = resource("waiting", "indeterminate", Some("stale"));
+        gone["reachability"] = "unreachable".into();
+        model.agents = window(vec![gone]);
+        assert_eq!(agents(&model, &[])[0].state, AgentState::Starting);
+    }
+
+    #[test]
+    fn a_signed_out_harness_needs_login_and_clears_once_signed_in() {
+        let mut model = Model::default();
+        let resource = |state: &str, harness: &str, reason: Option<&str>| {
+            serde_json::json!({
+                "id": "agent/example/seat", "kind": "agent", "revision": "r1",
+                "updated_at": "2026-10-04T12:00:00Z", "name": "example/seat",
+                "state": state, "reachability": "local", "harness_state": harness,
+                "blocked_on": "human", "reason": reason, "driver": "claude",
+                "host_id": "host/harbor", "runtime_ids": ["runtime/seat"], "under": [],
+            })
+        };
+        // st's own word for it (st-drivers' needs-login) reads the same.
+        model.agents = window(vec![resource("waiting", "needs-login", None)]);
+        assert_eq!(agents(&model, &[])[0].state, AgentState::NeedsLogin);
+        // The additive field alone is enough, even when the harness state reads as stale.
+        let mut detail = resource("waiting", "indeterminate", None);
+        detail["harness_error_state"] = "needs-login".into();
+        detail["observation"] = "stale".into();
+        model.agents = window(vec![detail]);
+        assert_eq!(agents(&model, &[])[0].state, AgentState::NeedsLogin);
+        model.agents = window(vec![resource("waiting", "unauthenticated", Some("providerAuth"))]);
+        let agent = &agents(&model, &[])[0];
+        assert_eq!(agent.state, AgentState::NeedsLogin);
+        let guidance = super::super::screens::login_guidance(agent);
+        assert!(guidance.contains("Claude login required on harbor"), "{guidance}");
+        assert!(guidance.contains("/login") && guidance.contains("without a restart"), "{guidance}");
+        let header = super::super::screens::agent_header(&super::super::demo::world(), agent, 100, "⠋")
+            .lines
+            .iter()
+            .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(header.contains("needs login") && header.contains("run /login"), "{header}");
+        // st's reason alone says so too.
+        model.agents = window(vec![resource("waiting", "idle", Some("providerAuth"))]);
+        assert_eq!(agents(&model, &[])[0].state, AgentState::NeedsLogin);
+        // Signed in again on the same run: it is simply idle, with nothing to restart.
+        model.agents = window(vec![resource("running", "idle", None)]);
+        assert_eq!(agents(&model, &[])[0].state, AgentState::Idle);
     }
 
     #[test]
@@ -1566,5 +1843,103 @@ mod tests {
         );
         assert_eq!(agent.details.queue, ["fleet/harbor · Audit › report"]);
         assert_eq!(world.host, "harbor");
+    }
+
+    #[test]
+    fn the_agent_header_names_the_model_beside_the_harness() {
+        let world = crate::ui::demo::world();
+        let mut agent = world.agents.items()[0].clone();
+        assert_eq!(agent.details.model.as_deref(), Some("claude-sonnet-5-5"));
+        let line = |agent: &Agent| -> String {
+            let doc = crate::ui::screens::agent_header(&world, agent, 100, "⠋");
+            doc.lines[0]
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect()
+        };
+        let with = line(&agent);
+        assert!(
+            with.contains(&format!("{} · claude-sonnet-5-5 · ", agent.harness.name())),
+            "{with}"
+        );
+        agent.details.model = None;
+        let without = line(&agent);
+        assert!(!without.contains("sonnet"), "{without}");
+        assert!(
+            without.contains(&format!("{} · {} ", agent.harness.name(), agent.host)),
+            "{without}"
+        );
+    }
+
+    #[test]
+    fn only_an_older_st_build_is_called_older_than_its_member() {
+        assert!(older_than_member("stui 0.0.9+77d0a13", "0.1.0+1ecae71"));
+        assert!(older_than_member("st 0.1.0+local.ab12cd3", "0.2.0+1ecae71"));
+        assert!(!older_than_member("stui 0.1.0+77d0a13", "0.1.0+1ecae71"));
+        assert!(!older_than_member("stui 0.2.0+77d0a13", "0.1.0+1ecae71"));
+        // Another client's version line is its own, and an unnamed or odd build is never older.
+        assert!(!older_than_member(
+            "smalltalk-ios 0.0.1 (3)",
+            "0.1.0+1ecae71"
+        ));
+        assert!(!older_than_member("", "0.1.0+1ecae71"));
+        assert!(!older_than_member("stui dev", "0.1.0+1ecae71"));
+    }
+
+    #[test]
+    fn the_clients_card_says_who_is_connected_and_notes_an_older_build_quietly() {
+        let world = crate::ui::demo::world();
+        let doc = crate::ui::screens::clients_card(&world, 100);
+        let text: Vec<String> = doc
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+        let text = text.join("\n");
+        assert!(text.contains("CONNECTED CLIENTS"), "{text}");
+        assert!(text.contains("stui 0.1.0+1ecae71"), "{text}");
+        assert!(text.contains("person/robin · Robin's phone"), "{text}");
+        // The follows list may wrap, so its words are checked apart.
+        assert!(text.contains("follows now,"), "{text}");
+        assert!(
+            text.contains("terminal:terminal/agent/lark/planner"),
+            "{text}"
+        );
+        assert!(text.contains("seen 3m ago"), "{text}");
+        assert_eq!(text.matches("older than this member").count(), 1, "{text}");
+    }
+
+    #[test]
+    fn the_clients_card_wraps_a_long_client_instead_of_clipping_it() {
+        let world = crate::ui::demo::world();
+        let doc = crate::ui::screens::clients_card(&world, 44);
+        let lines: Vec<String> = doc
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+        for line in &lines {
+            assert!(
+                crate::ui::text::width(line) <= 44,
+                "clipped at the card's edge: {line:?}"
+            );
+        }
+        let text = lines.join("\n");
+        assert!(text.contains("smalltalk-ios 1.0 (42)"), "{text}");
+        assert!(
+            text.contains("terminal:terminal/agent/lark/planner"),
+            "{text}"
+        );
     }
 }

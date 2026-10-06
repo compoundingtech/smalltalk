@@ -9,6 +9,10 @@ if (process.argv.includes('--version')) {
   console.log('omp v18.4.4');
   process.exit(0);
 }
+if (process.env.ST_ADMISSION_TRACE) {
+  const { admit } = await import('../st3-boot-canaries/admission-omp.mjs');
+  await admit();
+} else {
 const directory = process.cwd();
 // Exercise an actual historical channel with today's daemon/driver/extension,
 // avoiding unrelated historical daemon startup and prompt contracts.
@@ -29,6 +33,19 @@ const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 // that metadata without changing the bytes given to the actual extension.
 // A wire frame is NOT a receipt; only sendUserMessage below records consumption.
 const pendingFrames = [];
+const children = new Set();
+const killChannel = (child) => {
+  if (!child.pid) return; // spawn can fail before assigning a PID
+  try { process.kill(-child.pid, 'SIGKILL'); } catch (error) {
+    if (error.code !== 'ESRCH') throw error;
+  }
+};
+// The extension's channels get private groups. This synchronous exit hook also
+// covers startup errors and rejected shutdown hooks; the eval guardian covers
+// SIGKILL of the provider or controller, when no JavaScript hook can run.
+process.on('exit', () => {
+  for (const child of children) killChannel(child);
+});
 const spawn = childProcess.spawn;
 childProcess.spawn = (...args) => {
   if (args[0] === process.env.FAULT_OLD_CHANNEL_BIN && process.env.ST_DRIVER_ROOT
@@ -38,7 +55,13 @@ childProcess.spawn = (...args) => {
     // fabricating declarations or restoring catalog arguments in the current extension.
     args[1] = ['--catalog', process.env.ST_DRIVER_ROOT, ...args[1]];
   }
+  args[2] = { ...args[2], detached: true };
   const child = spawn(...args);
+  children.add(child);
+  child.on('close', () => {
+    killChannel(child);
+    children.delete(child);
+  });
   let partial = '';
   child.stdout.setEncoding('utf8');
   child.stdout.on('data', chunk => {
@@ -122,8 +145,18 @@ extension(api);
 await events.get('session_start')({}, ctx);
 record({ event: 'ready' });
 const keepalive = setInterval(() => {}, 1000);
-for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, async () => {
-  await events.get('session_shutdown')?.({}, ctx);
-  clearInterval(keepalive);
-  process.exit(0);
+let shuttingDown = false;
+for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, async () => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  // A stuck extension must not hold the driver in provider shutdown indefinitely.
+  const deadline = setTimeout(() => process.exit(1), 1000);
+  try {
+    await events.get('session_shutdown')?.({}, ctx);
+  } finally {
+    clearTimeout(deadline);
+    clearInterval(keepalive);
+    process.exit(0);
+  }
 });
+}

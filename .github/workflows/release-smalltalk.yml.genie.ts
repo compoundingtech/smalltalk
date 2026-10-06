@@ -1,10 +1,13 @@
-import { defaultActionlintConfig, githubWorkflow } from '../../repos/effect-utils/genie/external.ts'
+import { linuxActionlintConfig, linuxRunner, linuxRunnerProfile, macosRunnerProfile } from './workspace-ci.ts'
+import { buildSnapshotPrepare, buildSnapshotRestore, buildSnapshotSave } from './build-snapshot.ts'
+import { auditCaches } from './cache-audit.ts'
+import { githubWorkflow } from '../../repos/effect-utils/genie/external.ts'
 
 // Preserve release triggers, source verification and publishing permissions. Every commit on main
 // also builds and verifies both archives and keeps them as short-lived artifacts, so release
 // breakage fails on main instead of at tag time (the daily release publishes those artifacts).
-export default githubWorkflow({
-  actionlint: defaultActionlintConfig,
+export default githubWorkflow(auditCaches({
+  actionlint: linuxActionlintConfig,
   "name": "Smalltalk tag release",
   "on": {
     "push": {
@@ -24,6 +27,11 @@ export default githubWorkflow({
         "build.rs",
         "crates/st-drivers/src/version.rs",
         "scripts/release-smalltalk*",
+        "scripts/release_notes*",
+        "scripts/ci-build-snapshot*",
+        "scripts/ci-cache-audit*",
+        "scripts/ci-perf-cache",
+        ".github/workflows/build-snapshot.ts",
         "scripts/install-release*",
         "scripts/install-macos*",
         "docs/st3/binary-releases.md",
@@ -32,7 +40,8 @@ export default githubWorkflow({
     }
   },
   "permissions": {
-    "contents": "read"
+    "contents": "read",
+    "actions": "read"
   },
   "concurrency": {
     "group": "smalltalk-release-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}",
@@ -45,14 +54,13 @@ export default githubWorkflow({
         "fail-fast": false,
         "matrix": {
           "runner": [
-            "namespace-profile-linux-x86-64",
-            "namespace-profile-macos-arm64"
+            linuxRunnerProfile,
+            macosRunnerProfile
           ]
         }
       },
       "runs-on": [
-        "${{ matrix.runner }}",
-        "namespace-features:github.run-id=${{ github.run_id }}"
+        "${{ matrix.runner }};github.run-id=${{ github.run_id }}"
       ],
       "timeout-minutes": 5,
       "steps": [
@@ -64,7 +72,7 @@ export default githubWorkflow({
         },
         {
           "name": "Test install entry points and isolated app transactions",
-          "run": "scripts/install-test\nscripts/install-release-test\npython3 scripts/install-macos-test\n"
+          "run": "scripts/install-test\nscripts/install-release-test\npython3 scripts/install-macos-test\npython3 scripts/release_notes_test.py\n"
         }
       ]
     },
@@ -76,23 +84,23 @@ export default githubWorkflow({
         "matrix": {
           "include": [
             {
-              "runner": "namespace-profile-linux-x86-64",
+              "runner": linuxRunnerProfile,
               "target": "x86_64-unknown-linux-gnu"
             },
             {
-              "runner": "namespace-profile-macos-arm64",
+              "runner": macosRunnerProfile,
               "target": "aarch64-apple-darwin"
             }
           ]
         }
       },
       "runs-on": [
-        "${{ matrix.runner }}",
-        "namespace-features:github.run-id=${{ github.run_id }}"
+        "${{ matrix.runner }};github.run-id=${{ github.run_id }}"
       ],
       "timeout-minutes": 90,
       "env": {
         "MACOSX_DEPLOYMENT_TARGET": "15.0",
+        CI_NATIVE_SNAPSHOT: '1',
         "RELEASE_TAG": "${{ github.ref_type == 'tag' && github.ref_name || '' }}"
       },
       "steps": [
@@ -105,7 +113,10 @@ export default githubWorkflow({
         {
           "uses": "dtolnay/rust-toolchain@stable"
         },
+        { name: 'Name the pinned compiler cache', run: `printf 'CI_ZIG_CACHE_DIR=%s/zig/0.15.2\\n' \"$RUNNER_TOOL_CACHE\" >> \"$GITHUB_ENV\"` },
+        buildSnapshotRestore,
         {
+          if: "env.CI_BUILD_SNAPSHOT_HIT != '1'",
           "uses": "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6",
           "with": {
             "key": "release-${{ matrix.target }}",
@@ -113,19 +124,31 @@ export default githubWorkflow({
           }
         },
         {
-          "uses": "mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29",
-          "with": {
-            "version": "0.15.2"
-          }
+          name: 'Restore the pinned Zig compiler',
+          if: "env.CI_BUILD_SNAPSHOT_ZIG_HIT != '1'",
+          uses: 'actions/cache@v4',
+          with: {
+            path: '${{ env.CI_ZIG_CACHE_DIR }}',
+            key: 'zig-tool-v1-${{ runner.os }}-${{ runner.arch }}-0.15.2',
+          },
         },
         {
+          "uses": "mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29",
+          "with": {
+            "version": "0.15.2",
+            "use-cache": false
+          }
+        },
+        buildSnapshotPrepare,
+        {
           "name": "Test installer",
-          "run": "scripts/install-release-test\npython3 scripts/install-macos-test\npython3 scripts/release-smalltalk-test\n"
+          "run": "scripts/install-release-test\npython3 scripts/install-macos-test\npython3 scripts/release-smalltalk-test\npython3 scripts/release_notes_test.py\n"
         },
         {
           "name": "Build, package, and test extracted tools",
           "run": "scripts/release-smalltalk '${{ matrix.target }}' dist"
         },
+        ...buildSnapshotSave,
         {
           "uses": "actions/upload-artifact@v4",
           "with": {
@@ -143,7 +166,7 @@ export default githubWorkflow({
         "build",
         "installer"
       ],
-      "runs-on": "namespace-profile-linux-x86-64",
+      "runs-on": linuxRunner,
       "steps": [
         {
           "uses": "actions/checkout@v4",
@@ -181,7 +204,7 @@ export default githubWorkflow({
       "name": "release-publish",
       "if": "github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && github.event.deleted == false",
       "needs": "assemble",
-      "runs-on": "namespace-profile-linux-x86-64",
+      "runs-on": linuxRunner,
       "permissions": {
         "contents": "write"
       },
@@ -207,9 +230,9 @@ export default githubWorkflow({
         },
         {
           "name": "Publish the verified tag artifacts",
-          "run": "set -euo pipefail\ngit fetch origin \"refs/tags/$TAG\"\ntest \"$(git rev-parse 'FETCH_HEAD^{commit}')\" = \"$SOURCE_SHA\"\ncd dist\nsha256sum --check SHA256SUMS\npython3 ../scripts/release-smalltalk-manifest.py \"$SOURCE_SHA\"\n# Refuse to replace any existing release or its assets. A partial draft stays private\n# for inspection; delete that draft before retrying, never move the tag.\ngh release create \"$TAG\" --verify-tag --draft --title \"Smalltalk $TAG\" \\\n  --notes-file RELEASE-NOTES.md ./*.tar.gz ./*.sha256 SHA256SUMS RELEASE.json\ngh release edit \"$TAG\" --draft=false\n"
+          "run": "set -euo pipefail\ngit fetch origin \"refs/tags/$TAG\"\ntest \"$(git rev-parse 'FETCH_HEAD^{commit}')\" = \"$SOURCE_SHA\"\npython3 scripts/release_notes.py --source \"$SOURCE_SHA\" --tag \"$TAG\" --output dist/RELEASE-NOTES.md --manifest dist/UPGRADE-IMPACT.json\ncd dist\nsha256sum --check SHA256SUMS\npython3 ../scripts/release-smalltalk-manifest.py \"$SOURCE_SHA\"\n# Refuse to replace any existing release or its assets. A partial draft stays private\n# for inspection; delete that draft before retrying, never move the tag.\ngh release create \"$TAG\" --verify-tag --draft --title \"Smalltalk $TAG\" \\\n  --notes-file RELEASE-NOTES.md ./*.tar.gz ./*.sha256 SHA256SUMS RELEASE.json UPGRADE-IMPACT.json\ngh release edit \"$TAG\" --draft=false\n"
         }
       ]
     }
   }
-})
+}, {"installer": "Runs isolated installer fixtures without downloads or compilation.", "assemble": "Downloads verified build artifacts; builds nothing.", "publish": "Publishes verified assembled artifacts; builds nothing."}))

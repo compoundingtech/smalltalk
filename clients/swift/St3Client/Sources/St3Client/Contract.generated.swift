@@ -9,7 +9,9 @@ public enum ActionType: String, Codable, CaseIterable, Sendable {
     case agentStart = "agent.start"
     case agentStop = "agent.stop"
     case agentSuspend = "agent.suspend"
+    case arrangementEdit = "arrangement.edit"
     case attentionResolve = "attention.resolve"
+    case customReply = "custom.reply"
     case laneApprove = "lane.approve"
     case laneJoin = "lane.join"
     case laneLeave = "lane.leave"
@@ -58,12 +60,16 @@ public enum ActionType: String, Codable, CaseIterable, Sendable {
 }
 
 public enum ReadOperation: String, CaseIterable, Sendable {
+    case customSubjectsList = "custom-subjects.list"
+    case customSubjectsGet = "custom-subjects.get"
     case hostRepositories = "host.repositories"
     case setsList = "sets.list"
     case setsGet = "sets.get"
     case capabilitiesGet = "capabilities.get"
     case documentGet = "document.get"
+    case publicationDefinition = "publication.definition"
     case subjectDefinition = "subject.definition"
+    case mailBacklogSummary = "mail-backlog.summary"
     case usagePeriod = "usage.period"
     case clientsList = "clients.list"
     case nowList = "now.list"
@@ -85,7 +91,9 @@ public enum ReadOperation: String, CaseIterable, Sendable {
     case resourcesList = "resources.list"
     case agentsList = "agents.list"
     case agentsGet = "agents.get"
+    case agentWorkspaceGet = "agent-workspace.get"
     case agentDeclarationGet = "agent-declaration.get"
+    case statusHistoryGet = "status-history.get"
     case agentQueueGet = "agent-queue.get"
     case runtimesList = "runtimes.list"
     case runtimesGet = "runtimes.get"
@@ -107,17 +115,23 @@ public enum ReadOperation: String, CaseIterable, Sendable {
     case conversationChanges = "conversation.changes"
     case eventsList = "events.list"
     case terminalScreen = "terminal.screen"
+    case arrangementsList = "arrangements.list"
+    case arrangementsGet = "arrangements.get"
     case glassesList = "glasses.list"
     case glassesGet = "glasses.get"
 }
 
 public let st3ClientReadPaths: [ReadOperation: String] = [
+    .customSubjectsList: "/v1/client/custom-subjects",
+    .customSubjectsGet: "/v1/client/custom-subjects/{id}",
     .hostRepositories: "/v1/client/hosts/{id}/repositories",
     .setsList: "/v1/client/sets",
     .setsGet: "/v1/client/sets/{id}",
     .capabilitiesGet: "/v1/client/capabilities",
     .documentGet: "/v1/client/documents/content",
+    .publicationDefinition: "/v1/client/publication-definition",
     .subjectDefinition: "/v1/client/subject-definition",
+    .mailBacklogSummary: "/v1/client/mail-backlog",
     .usagePeriod: "/v1/client/usage",
     .clientsList: "/v1/client/clients",
     .nowList: "/v1/client/now",
@@ -139,7 +153,9 @@ public let st3ClientReadPaths: [ReadOperation: String] = [
     .resourcesList: "/v1/client/resources",
     .agentsList: "/v1/client/agents",
     .agentsGet: "/v1/client/agents/{id}",
+    .agentWorkspaceGet: "/v1/client/agent-workspaces/{id}",
     .agentDeclarationGet: "/v1/client/agent-declarations/{id}",
+    .statusHistoryGet: "/v1/client/status-history/{id}",
     .agentQueueGet: "/v1/client/agent-queues/{id}",
     .runtimesList: "/v1/client/runtimes",
     .runtimesGet: "/v1/client/runtimes/{id}",
@@ -161,6 +177,8 @@ public let st3ClientReadPaths: [ReadOperation: String] = [
     .conversationChanges: "/v1/client/conversations/{id}/changes",
     .eventsList: "/v1/client/events",
     .terminalScreen: "/v1/client/terminals/{id}/screen",
+    .arrangementsList: "/v1/client/arrangements",
+    .arrangementsGet: "/v1/client/arrangements/{person_name}/{uuid}",
     .glassesList: "/v1/client/glasses",
     .glassesGet: "/v1/client/glasses/{id}",
 ]

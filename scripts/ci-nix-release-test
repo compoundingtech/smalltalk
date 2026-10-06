@@ -27,7 +27,7 @@ with tempfile.TemporaryDirectory() as temporary:
     cache = root / 'persistent-cache'
     cache.mkdir()
     env = {**os.environ, 'CI_LOCAL_CARGO_HOME': str(cache), 'RUNNER_TEMP': str(root)}
-    env.pop('GITHUB_STEP_SUMMARY', None)
+    env['GITHUB_STEP_SUMMARY'] = str(root / 'summary')
     name = 'example-cache-proof-' + uuid.uuid4().hex
     flake = fixture / 'flake.nix'
     flake.write_text('''{
@@ -51,6 +51,7 @@ with tempfile.TemporaryDirectory() as temporary:
            '-c', 'commit.gpgsign=false', '-c', 'core.hooksPath=/dev/null',
            'commit', '-qm', 'Example cache fixture', cwd=fixture)
     subprocess.run([str(script), 'build'], cwd=fixture, env=env, check=True)
+    assert '⚠️ **P0: Nix store cache MISS before build' in (root / 'summary').read_text()
     report = json.loads((root / 'nix-release-build.json').read_text())
     assert len(report['targets']) == 3, report
     contents = {Path(path).read_text().strip() for result in report['results']
@@ -58,6 +59,11 @@ with tempfile.TemporaryDirectory() as temporary:
     assert contents == {'example-one', 'example-check'}, contents
     assert list((cache / 'smalltalk-nix-release').glob('result*'))
     subprocess.run([str(script), 'verify-cache'], cwd=fixture, env=env, check=True)
+
+    (root / 'summary').write_text('')
+    subprocess.run([str(script), 'build'], cwd=fixture, env=env, check=True)
+    assert 'Nix store cache HIT before build' in (root / 'summary').read_text()
+    assert 'MISS' not in (root / 'summary').read_text()
 
     # A changed, uncached derivation must fail verification without being built.
     flake.write_text(flake.read_text().replace('echo example-one', 'echo example-two'))

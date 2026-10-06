@@ -14,8 +14,12 @@ pub mod demo;
 pub mod doc;
 mod edit;
 mod glass;
+#[cfg(test)]
+#[path = "../../tests/support/terminal_tab.rs"]
+mod terminal_tab;
 pub use glass::set_glasses_version;
 mod glass_store;
+mod lastrun;
 pub mod layout;
 pub mod live;
 pub mod pane;
@@ -96,6 +100,8 @@ struct FrameInfo {
     agent_narrow: bool,
     /// The first palette row drawn.
     palette_top: usize,
+    /// Glasses: where the right-click menu was drawn, while it is open.
+    menu: Option<Rect>,
 }
 
 struct Demo {
@@ -113,6 +119,31 @@ struct Demo {
 const UPDATE_READ_AFTER: Duration = Duration::from_secs(3);
 
 /// A request the live loop sends to st. The demo never produces these.
+/// What the agent actions menu does to a seat; each is st's own agent action.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentControl {
+    /// A new process for the same seat: stop, then start on its declaration.
+    Restart,
+    /// Stop it and take it off the lists; start brings it back.
+    Retire,
+    Start,
+    /// Stop at a quiet moment, keeping its native session.
+    Suspend,
+    Resume,
+}
+
+impl AgentControl {
+    pub fn verb(self) -> &'static str {
+        match self {
+            AgentControl::Restart => "Restart",
+            AgentControl::Retire => "Retire",
+            AgentControl::Start => "Start",
+            AgentControl::Suspend => "Suspend",
+            AgentControl::Resume => "Resume",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
     /// Read an image a message carries from st, keep it here, and show it.
@@ -172,6 +203,11 @@ pub enum Effect {
     /// Interrupt an agent's turn, as Esc does in its harness's own TUI.
     StopAgent {
         agent: String,
+    },
+    /// Restart, retire (stop), start, suspend or resume an agent's seat, from its actions menu.
+    AgentControl {
+        agent: String,
+        control: AgentControl,
     },
     /// Start a new agent; its first message is what the person asked of it.
     /// Start a plain shell for the person; it opens in a new tab.
@@ -279,6 +315,8 @@ pub struct Ui {
     cache: conversation::Cache,
     editing: bool,
     confirm: Option<char>,
+    /// What an agent's actions menu will do once y confirms it.
+    pending_control: Option<(String, AgentControl)>,
     flash: Option<(String, Instant)>,
     tick: u64,
     help: bool,
@@ -324,6 +362,11 @@ pub struct Ui {
     pub(crate) simple: bool,
     /// An attached terminal shown in place of the conversation.
     pub(crate) terminal: Option<TerminalView>,
+    /// Glasses: the other terminals still attached, each behind its own tab or split. The one
+    /// whose tab has focus is `terminal`; they swap places as focus moves.
+    pub(crate) parked: Vec<TerminalView>,
+    /// Glasses: the right-click menu, while it is open.
+    pub(crate) context: Option<glass::ContextMenu>,
     /// A Ctrl-C or Ctrl-D pressed once in a terminal, waiting for its confirming second press.
     terminal_confirm: Option<(KeyCode, Instant)>,
     /// The New mission form: title, request, mission id, workspace; and the focused field.
@@ -379,6 +422,22 @@ pub struct Ui {
     stalled: HashMap<String, String>,
 }
 
+/// What clicking a link says it did: an address is pasted in a browser; a path names a file on the
+/// machine the writer works on, which stui cannot open.
+fn link_note(target: &str) -> String {
+    let shown = text::truncate(target, 60);
+    if target.starts_with('/') || target.starts_with("~/") {
+        format!("Copied {shown} · a file on the writer's machine")
+    } else {
+        format!("Copied {shown} · paste it in a browser")
+    }
+}
+
+/// Whether `c` can be part of a written-out web address.
+fn is_address_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "-._~:/?#[]@!$&'()*+,;=%".contains(c)
+}
+
 impl Ui {
     /// Call only after the terminal successfully presented this frame.
     pub(crate) fn visible_messages(&self) -> HashSet<String> {
@@ -404,6 +463,7 @@ impl Ui {
             cache: conversation::Cache::default(),
             editing: false,
             confirm: None,
+            pending_control: None,
             flash: None,
             tick: 0,
             help: false,
@@ -420,6 +480,8 @@ impl Ui {
             older_wanted: RefCell::default(),
             popover: None,
             chat: None,
+            parked: Vec::new(),
+            context: None,
             said: None,
             voice: None,
             answering: None,
@@ -555,6 +617,7 @@ impl Ui {
     pub(crate) fn usage_period_next(&mut self) {
         self.usage_hours = usage::next_period(self.usage_hours);
         self.world.usage = Load::Loading;
+        self.world.agent_messages = None;
         self.flash(format!(
             "Usage over {}",
             usage::period_name(self.usage_hours)
@@ -562,6 +625,14 @@ impl Ui {
     }
 
     /// The period to read usage over while something on screen shows it, or `None`.
+    /// Whether the clients connected to this member show: the Fleet tab or a machine pane.
+    pub(crate) fn clients_wanted(&self) -> bool {
+        match &self.glasses {
+            Some(glasses) => glasses.shows_machine() || self.tab == 3,
+            None => self.tab == 3,
+        }
+    }
+
     pub(crate) fn usage_wanted(&self) -> Option<u64> {
         let shown = match &self.glasses {
             Some(glasses) => glasses.shows_usage(),
@@ -602,8 +673,14 @@ impl Ui {
     }
 
     /// Make the links drawn in `area` clickable: addresses written out, and markdown links by
-    /// the text they were drawn with.
+    /// the text they were drawn with. An address the renderer wrapped at the edge is one link on
+    /// every row it covers, so a click on any part of it opens or copies all of it.
     fn links(&self, buf: &Buffer, area: Rect) {
+        let chars = |y: u16| -> Vec<(u16, char)> {
+            (area.x..area.x + area.width)
+                .map(|x| (x, buf[(x, y)].symbol().chars().next().unwrap_or(' ')))
+                .collect()
+        };
         for y in area.y..area.y + area.height {
             let cells = (area.x..area.x + area.width)
                 .map(|x| (x, &buf[(x, y)]))
@@ -622,25 +699,59 @@ impl Ui {
                     from = start + 4;
                     continue;
                 }
-                let url = tail
-                    .split(char::is_whitespace)
-                    .next()
-                    .unwrap_or("")
-                    .trim_end_matches(['.', ',', ')', ']', ';', ':', '"', '\'', '>']);
+                let token = tail.split(char::is_whitespace).next().unwrap_or("");
                 let column = text[..start].chars().count();
-                let width = url.chars().count();
+                // Each part of the address: where it sits on its row, and how wide it is.
+                let mut parts = Vec::new();
+                let mut url = token.to_owned();
                 if let Some((x, _)) = cells.get(column) {
-                    self.hit(
-                        Rect {
-                            x: *x,
-                            y,
-                            width: width as u16,
-                            height: 1,
-                        },
-                        Hit::Link(url.to_owned()),
-                    );
+                    parts.push((*x, y, token.chars().count()));
                 }
-                from = start + url.len().max(1);
+                // An address that runs to the right edge goes on at the start of the next row.
+                let mut reaches_edge = token.len() == tail.trim_end().len()
+                    && column + token.chars().count() >= usize::from(area.width).saturating_sub(3);
+                let mut next = y + 1;
+                while reaches_edge && next < area.y + area.height {
+                    let below = chars(next);
+                    let indent = below.iter().take_while(|(_, c)| *c == ' ').count();
+                    let more = below[indent..]
+                        .iter()
+                        .take_while(|(_, c)| !c.is_whitespace())
+                        .collect::<Vec<_>>();
+                    if indent > 4
+                        || more.is_empty()
+                        || more.iter().any(|(_, c)| !is_address_char(*c))
+                    {
+                        break;
+                    }
+                    url.extend(more.iter().map(|(_, c)| *c));
+                    parts.push((below[indent].0, next, more.len()));
+                    reaches_edge = indent + more.len() >= below.len().saturating_sub(3)
+                        && below[indent + more.len()..].iter().all(|(_, c)| *c == ' ');
+                    next += 1;
+                }
+                let trimmed = url
+                    .trim_end_matches(['.', ',', ')', ']', ';', ':', '"', '\'', '>'])
+                    .to_owned();
+                // The last part loses whatever trailing punctuation the address lost.
+                let cut = url.chars().count() - trimmed.chars().count();
+                if let Some(last) = parts.last_mut() {
+                    last.2 = last.2.saturating_sub(cut);
+                }
+                for (x, row_y, width) in parts {
+                    if width > 0 {
+                        self.hit(
+                            Rect {
+                                x,
+                                y: row_y,
+                                width: width as u16,
+                                height: 1,
+                            },
+                            Hit::Link(trimmed.clone()),
+                        );
+                    }
+                }
+                from = start + token.len().max(1);
             }
             // Markdown links: underlined runs whose text names a link.
             let mut index = 0;
@@ -821,6 +932,41 @@ impl Ui {
     }
 
     /// Attach the image on this machine's clipboard to the message being written.
+    /// The top bar's connection word, clicked: live opens this machine, where its clients and
+    /// links show; anything else says why it is not reached (Nathan, 2026-10-06).
+    fn show_connection(&mut self) {
+        match self.world.link.clone() {
+            Link::Live => {
+                let machine = format!("machine/{}", self.world.host);
+                let known = self
+                    .world
+                    .machines
+                    .items()
+                    .iter()
+                    .any(|candidate| format!("machine/{}", candidate.name) == machine);
+                if !self.world.diverged.is_empty() {
+                    self.flash(format!(
+                        "Diverged from {}: what shows here can be wrong until that host is repaired",
+                        self.world.diverged.join(", ")
+                    ));
+                }
+                if known {
+                    self.open(&machine);
+                } else if self.world.diverged.is_empty() {
+                    self.flash(format!(
+                        "Connected to {} as {}",
+                        self.world.host, self.world.person
+                    ));
+                }
+            }
+            Link::Connecting => self.flash(format!(
+                "Connecting to {}: st has not answered yet",
+                self.world.host
+            )),
+            Link::Offline(reason) => self.flash(reason),
+        }
+    }
+
     fn attach_clipboard(&mut self) {
         let Some(key) = self.draft_key() else { return };
         // kitty hands over the person's own clipboard through the terminal, wherever stui
@@ -920,7 +1066,7 @@ impl Ui {
             1 if self.tree => screens::agents_tree(&self.world, self.spinner(), width),
             1 => screens::agents_list(&self.world, self.spinner(), width),
             2 if self.tree => screens::missions_tree(&self.world, self.spinner(), self.system),
-            2 => screens::missions_list(&self.world, self.spinner(), self.system),
+            2 => screens::missions_list(&self.world, width, self.spinner(), self.system),
             3 => screens::fleet_list(&self.world),
             4 => usage::list(&self.world, self.usage_by, self.usage_hours),
             _ => screens::worktrees_list(&self.world),
@@ -1437,7 +1583,12 @@ impl Ui {
         let selected = selected.min(listing.ids.len().saturating_sub(1));
         let mut rows: Vec<(Option<usize>, Line<'static>, bool)> = Vec::new();
         let mut selected_range = (0, 0);
+        // Whether the item before was a heading or a note: a note joins it without a gap.
+        let mut joined = false;
         for item in &listing.items {
+            let before = joined;
+            joined = matches!(item, Item::Header { .. } | Item::Note(_));
+            let joined = before;
             match item {
                 Item::Header {
                     title,
@@ -1448,7 +1599,8 @@ impl Ui {
                         rows.push((None, Line::default(), false));
                     }
                     let label = format!(" {title}");
-                    let count = format!("{count} ");
+                    // A heading with nothing to count (usage's summary) shows no number.
+                    let count = if *count == 0 { String::new() } else { format!("{count} ") };
                     let fill = width.saturating_sub(text::width(&label) + text::width(&count) + 1);
                     rows.push((
                         None,
@@ -1501,10 +1653,26 @@ impl Ui {
                 }
                 Item::Folder(line) => rows.push((None, line.clone(), false)),
                 Item::Note(line) => {
-                    if !rows.is_empty() {
+                    // Notes straight after a heading or another note read as one block; a note
+                    // after rows stands apart. Each wraps to the width instead of being cut.
+                    if !rows.is_empty() && !joined {
                         rows.push((None, Line::default(), false));
                     }
-                    rows.push((None, line.clone(), false));
+                    let runs = line
+                        .spans
+                        .iter()
+                        .map(|span| text::run(span.content.to_string(), span.style))
+                        .collect::<Vec<_>>();
+                    let lead = text::run(" ", theme::dim());
+                    for wrapped in text::wrap(
+                        &runs,
+                        width.saturating_sub(1),
+                        &[],
+                        std::slice::from_ref(&lead),
+                        None,
+                    ) {
+                        rows.push((None, wrapped, false));
+                    }
                 }
             }
         }
@@ -2168,7 +2336,7 @@ impl Ui {
                     .map(|target| target.line);
                 if let Some(first) = lines.next() {
                     let last = lines
-                        .last()
+                        .next_back()
                         .unwrap_or(first)
                         .min(first + height.saturating_sub(1));
                     if first < state.top {
@@ -2310,9 +2478,16 @@ impl Ui {
     /// A floating card for one graph subject, with a way to go to it.
     fn draw_popover(&self, buf: &mut Buffer, area: Rect, subject: &str) {
         let width = 72.min(area.width.saturating_sub(4));
-        let inner = screens::peek(&self.world, subject, width as usize - 4, self.spinner());
+        let menu_for = subject.strip_prefix("actions:").and_then(|id| {
+            self.world.agents.items().iter().find(|agent| agent.id == id)
+        });
+        let inner = match menu_for {
+            Some(agent) => screens::agent_actions_doc(agent, width as usize - 4, self.spinner()),
+            None => screens::peek(&self.world, subject, width as usize - 4, self.spinner()),
+        };
         let mut doc = Doc::new();
         let title = match subject.split('/').next().unwrap_or("") {
+            _ if menu_for.is_some() => "actions",
             "agent" | "session" => "agent",
             "mission" => "mission",
             "attention" => "needs you",
@@ -2355,7 +2530,7 @@ impl Ui {
     }
 
     fn draw_terminal(&self, buf: &mut Buffer, area: Rect, agent: &str) {
-        let Some(view) = self.terminal.as_ref().filter(|view| view.agent == agent) else {
+        let Some(view) = self.terminal_view(agent) else {
             buf.set_stringn(
                 area.x,
                 area.y + 1,
@@ -2396,12 +2571,19 @@ impl Ui {
                 height: area.height.saturating_sub(1),
                 ..area
             };
-            self.terminal_size
-                .set((body.height.max(1), body.width.max(1)));
-            self.terminal_body.set(Some(body));
+            // Where the mouse maps and where a new attach starts is the focused terminal's body;
+            // every attached terminal fits its own.
+            let focused = self.terminal.as_ref().is_some_and(|view| view.agent == agent)
+                || self.parked.is_empty();
+            if focused {
+                self.terminal_size
+                    .set((body.height.max(1), body.width.max(1)));
+                self.terminal_body.set(Some(body));
+            }
             native.fit(body.height, body.width);
             // The person's own cursor only where nothing is drawn over the terminal.
             let real = self.terminal_focused()
+                && self.focused_pane() == Some(Pane::Terminal(agent.to_owned()))
                 && !self.help
                 && self.popover.is_none()
                 && !self.palette_open();
@@ -2737,6 +2919,10 @@ impl Ui {
                 ("wheel pgup pgdn ↑↓", "scroll the pane under the pointer"),
                 ("end", "jump to the newest message and follow it"),
                 ("ctrl+f", "find in this conversation"),
+                (
+                    "ctrl+a",
+                    "the agent's actions: restart, suspend, retire, terminal…",
+                ),
                 ("ctrl+e", "expand or collapse tool output"),
                 (
                     "ctrl+p",
@@ -2981,10 +3167,24 @@ impl Ui {
         }
     }
 
+    /// Dispatch the outer terminal's decoded input, shared by the live and demo loops.
+    fn input_event(&mut self, event: Event) {
+        match event {
+            Event::Key(key) => self.key(key),
+            Event::Paste(text) => {
+                self.sync_terminal_slot();
+                self.paste(text)
+            }
+            Event::Mouse(mouse) => self.mouse(mouse),
+            _ => {}
+        }
+    }
+
     pub fn key(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Press {
             return;
         }
+        self.sync_terminal_slot();
         // Listening takes every key until the words are sent, kept or dropped.
         if self.voice_key(key) {
             return;
@@ -3152,6 +3352,12 @@ impl Ui {
         }
         if let Some(subject) = self.popover.clone() {
             self.popover = None;
+            if let Some(agent) = subject.strip_prefix("actions:") {
+                if let KeyCode::Char(letter) = key.code {
+                    self.agent_action(agent.to_owned(), letter);
+                }
+                return;
+            }
             match key.code {
                 KeyCode::Char('g') | KeyCode::Enter => self.open(&subject),
                 KeyCode::Char('t') if subject.starts_with("agent/") => {
@@ -3354,6 +3560,10 @@ impl Ui {
         let Some(id) = self.attention_focus() else {
             return;
         };
+        self.read_update_id(id);
+    }
+
+    fn read_update_id(&mut self, id: String) {
         if !self.updates_read.insert(id.clone()) {
             return;
         }
@@ -3369,20 +3579,26 @@ impl Ui {
         }
     }
 
-    /// An update left open on Home for a moment has been read (docs: it clears when the person
-    /// opens it). Passing over it with the arrows does not count.
+    /// An update opened on Home is read once the person leaves it, after it was open for a
+    /// moment: marking it read closes it, and it must stay put while it is being read (Nathan,
+    /// 2026-10-05: updates vanished mid-read). Passing over it with the arrows does not count,
+    /// and `x` still reads it at once.
     pub(crate) fn read_open_update(&mut self) {
         let open = self
             .attention_focus()
             .filter(|_| !self.help && self.popover.is_none())
             .filter(|_| self.current_kind() == Some("update"));
+        if let Some((shown, since)) = &self.update_open
+            && open.as_ref() != Some(shown)
+            && since.elapsed() >= UPDATE_READ_AFTER
+        {
+            let shown = shown.clone();
+            self.update_open = None;
+            self.read_update_id(shown);
+        }
         match (open, &self.update_open) {
             (None, _) => self.update_open = None,
-            (Some(id), Some((shown, since))) if *shown == id => {
-                if since.elapsed() >= UPDATE_READ_AFTER {
-                    self.read_update();
-                }
-            }
+            (Some(id), Some((shown, _))) if *shown == id => {}
             (Some(id), _) => self.update_open = Some((id, Instant::now())),
         }
     }
@@ -3442,10 +3658,38 @@ impl Ui {
                 let Some(kind) = self.current_kind() else {
                     return;
                 };
+                if self.current_item().is_some_and(|item| item.actions.iter().any(|a| a == "custom.reply"))
+                    && matches!(key, 'y' | 'n' | 'r' | 'x') {
+                    self.flash("Reply with c using this source's declared fields");
+                    return;
+                }
                 match (kind, key) {
                     // x dismisses whatever can be dismissed, one key for every kind (Nathan,
                     // 2026-10-03): a request is closed with word to its asker that there is
                     // nothing for the person to do, after a y; an update or a message is read.
+                    // A decision or choice needs one of its named answers, which a dismissal
+                    // is not, so x says so rather than sending something st would refuse.
+                    ("request", 'x')
+                        if self
+                            .structured_request()
+                            .is_some_and(|(_, request)| !request.answers.is_empty()) =>
+                    {
+                        // A decision usually has an answer that declines; name it, since that
+                        // is the way to close it without agreeing (Nathan, 2026-10-06).
+                        let decline = self.structured_request().and_then(|(_, request)| {
+                            request
+                                .answers
+                                .iter()
+                                .find(|answer| answer.outcome.as_deref() == Some("decline"))
+                                .map(|answer| answer.label.clone())
+                        });
+                        self.flash(match decline {
+                            Some(label) => format!(
+                                "x cannot dismiss a question that needs an answer; a opens its answers, and \"{label}\" declines it"
+                            ),
+                            None => "This asks you to choose, so x cannot dismiss it: a chooses one of its answers".to_owned(),
+                        })
+                    }
                     ("request", 'x') => self.confirm = Some('r'),
                     ("update", 'x') => self.read_update(),
                     ("message", 'x') => self.act('m'),
@@ -3587,6 +3831,63 @@ impl Ui {
         self.attach_terminal(&agent.id);
     }
 
+    /// The view of the terminal attached for `agent`, the focused one or one behind another tab.
+    pub(crate) fn terminal_view(&self, agent: &str) -> Option<&TerminalView> {
+        self.terminal
+            .as_ref()
+            .filter(|view| view.agent == agent)
+            .or_else(|| self.parked.iter().find(|view| view.agent == agent))
+    }
+
+    pub(crate) fn terminal_view_mut(&mut self, agent: &str) -> Option<&mut TerminalView> {
+        if self.terminal.as_ref().is_some_and(|view| view.agent == agent) {
+            return self.terminal.as_mut();
+        }
+        self.parked.iter_mut().find(|view| view.agent == agent)
+    }
+
+    /// About to attach `agent`: in a glass another attached terminal stays attached behind its
+    /// own tab (Nathan, 2026-10-06: two terminals in two splits); elsewhere it is let go.
+    pub(crate) fn park_for(&mut self, agent: &str) {
+        self.parked.retain(|view| view.agent != agent);
+        if let Some(old) = self.terminal.take()
+            && old.agent != agent
+            && self.glasses.is_some()
+        {
+            self.parked.push(old);
+        }
+    }
+
+    /// Put the terminal whose tab has focus in `terminal`, where keys and the mouse find it.
+    pub(crate) fn sync_terminal_slot(&mut self) {
+        if self.glasses.is_none() || self.parked.is_empty() {
+            return;
+        }
+        let Some(Pane::Terminal(agent)) = self.focused_pane() else {
+            return;
+        };
+        if self.terminal.as_ref().is_some_and(|view| view.agent == agent) {
+            return;
+        }
+        if let Some(index) = self.parked.iter().position(|view| view.agent == agent) {
+            let wanted = self.parked.remove(index);
+            if let Some(old) = self.terminal.replace(wanted) {
+                self.parked.push(old);
+            }
+        }
+    }
+
+    /// Let go of `agent`'s terminal wherever it is attached; whether there was one.
+    pub(crate) fn drop_terminal(&mut self, agent: &str) -> bool {
+        let before = self.parked.len();
+        self.parked.retain(|view| view.agent != agent);
+        let focused = self.terminal.as_ref().is_some_and(|view| view.agent == agent);
+        if focused {
+            self.terminal = None;
+        }
+        focused || self.parked.len() != before
+    }
+
     /// Attach `agent`'s terminal: followed live, or the demo's in demo mode.
     pub(crate) fn attach_terminal(&mut self, agent: &str) {
         // A plain shell is a terminal of its own, not an agent's.
@@ -3597,6 +3898,7 @@ impl Ui {
                 });
                 self.flash("Opening the terminal…");
             } else {
+                self.park_for(agent);
                 self.terminal = Some(TerminalView {
                     agent: agent.to_owned(),
                     title: "shell · demo terminal".into(),
@@ -3624,6 +3926,7 @@ impl Ui {
             self.effects.push(Effect::OpenTerminal { agent: agent.id });
             self.flash("Opening the terminal…");
         } else {
+            self.park_for(&agent.id);
             self.terminal = Some(TerminalView {
                 agent: agent.id.clone(),
                 title: format!("{} · demo terminal", agent.name),
@@ -3992,11 +4295,13 @@ impl Ui {
             }
             context.push(')');
             self.effects.push(Effect::Discuss {
-                to: chat.to,
+                to: chat.to.clone(),
                 title,
                 text: context,
             });
             self.flash("Sending…");
+            // Go where the reply will appear (Nathan, 2026-10-06).
+            self.open(&chat.to);
             return;
         }
         let at = chrono::Local::now().format("%H:%M").to_string();
@@ -4029,6 +4334,7 @@ impl Ui {
             });
         }
         self.flash("Sent · demo: nothing left this machine");
+        self.open(&chat.to);
     }
 
     fn submit(&mut self) {
@@ -4100,7 +4406,15 @@ impl Ui {
                     }),
                     Some(AttentionKind::Request { .. }) => Some(Effect::Attention {
                         id: id.clone(),
-                        action: "work.done".into(),
+                        action: if self
+                            .current_item()
+                            .is_some_and(|item| item.actions.iter().any(|a| a == "custom.reply"))
+                        {
+                            "custom.reply"
+                        } else {
+                            "work.done"
+                        }
+                        .into(),
                         reason: Some(draft),
                         answer: self.changes_answer.take(),
                     }),
@@ -4192,7 +4506,82 @@ impl Ui {
             .map(|agent| agent.name.clone())
     }
 
+    /// A key from an agent's actions menu. What changes the seat asks y first; Esc keeps it.
+    fn agent_action(&mut self, agent: String, key: char) {
+        let name = self
+            .world
+            .agents
+            .items()
+            .iter()
+            .find(|candidate| candidate.id == agent)
+            .map(|candidate| candidate.name.clone())
+            .unwrap_or_else(|| agent.trim_start_matches("agent/").to_owned());
+        let control = match key {
+            'r' => Some(AgentControl::Restart),
+            'p' => Some(AgentControl::Suspend),
+            'x' => Some(AgentControl::Retire),
+            's' => Some(AgentControl::Start),
+            'u' => Some(AgentControl::Resume),
+            _ => None,
+        };
+        match (key, control) {
+            (_, Some(control @ (AgentControl::Start | AgentControl::Resume))) => {
+                self.control_agent(agent, control, &name)
+            }
+            (_, Some(control)) => {
+                self.flash(format!(
+                    "{} {name}? y to {} · Esc keeps it",
+                    control.verb(),
+                    control.verb().to_lowercase()
+                ));
+                self.pending_control = Some((agent, control));
+                self.confirm = Some('A');
+            }
+            ('i', None) => {
+                if self.live {
+                    self.effects.push(Effect::StopAgent { agent });
+                    self.flash("Interrupting…");
+                } else {
+                    self.flash("Interrupted · demo: nothing was sent");
+                }
+            }
+            ('t', None) => {
+                self.open(&agent);
+                self.open_terminal();
+            }
+            ('d', None) => {
+                self.open(&agent);
+                self.toggle_details();
+            }
+            ('f', None) => {
+                self.open(&agent);
+                self.find_in(&agent, "");
+            }
+            ('c', None) => {
+                copy(&agent);
+                self.flash(format!("Copied {agent}"));
+            }
+            _ => {}
+        }
+    }
+
+    fn control_agent(&mut self, agent: String, control: AgentControl, name: &str) {
+        if self.live {
+            self.effects.push(Effect::AgentControl { agent, control });
+            self.flash(format!("{} {name}…", control.verb()));
+        } else {
+            self.flash(format!("{} {name} · demo: nothing was sent", control.verb()));
+        }
+    }
+
     fn act(&mut self, action: char) {
+        if action == 'A' {
+            if let Some((agent, control)) = self.pending_control.take() {
+                let name = agent.trim_start_matches("agent/").to_owned();
+                self.control_agent(agent, control, &name);
+            }
+            return;
+        }
         if action == 's' {
             // Stop the agent's turn: its harness gets Esc, as in its own TUI.
             let Some(agent) = self.selected_id().filter(|_| self.tab == 1) else {
@@ -4235,6 +4624,12 @@ impl Ui {
         let Some(id) = self.attention_focus() else {
             return;
         };
+        if self
+            .current_item()
+            .is_some_and(|item| item.actions.iter().any(|a| a == "custom.reply"))
+        {
+            return;
+        }
         if matches!(action, 'y' | 'n' | 'r') && self.current_kind() == Some("request") {
             // r closes a request that needs nothing from the person; the step continues.
             let answer = match action {
@@ -4331,13 +4726,30 @@ impl Ui {
     }
 
     pub fn mouse(&mut self, mouse: MouseEvent) {
+        self.sync_terminal_slot();
         if self.help {
             if matches!(mouse.kind, MouseEventKind::Down(_)) {
                 self.help = false;
             }
             return;
         }
+        // The right-click menu takes the next press: a row acts, anywhere else only closes it.
+        if self.context.is_some() && matches!(mouse.kind, MouseEventKind::Down(_)) {
+            let inside = self
+                .frame
+                .borrow()
+                .menu
+                .is_some_and(|rect| contains(rect, mouse.column, mouse.row));
+            if !inside || !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                self.context = None;
+                return;
+            }
+        }
         if self.terminal_mouse(mouse) {
+            return;
+        }
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) && self.glasses.is_some() {
+            self.open_context_menu(mouse.column, mouse.row);
             return;
         }
         // A tab dragged to another place or a split's edge.
@@ -4563,16 +4975,13 @@ impl Ui {
             Hit::GlassMenu => self.open_palette(Some(4), glass::Open::Here),
             Hit::PaletteSection(section) => self.open_palette(Some(section), glass::Open::Here),
             Hit::NewAgent => self.open_new_agent(None),
-            Hit::Home if self.home_open() => self.close_home(),
+            Hit::Home if self.home_open() && !self.usage_open() => self.close_home(),
             Hit::Home => self.open_home(),
             // The terminal may be on another machine than stui (over SSH or fabric): the
             // clipboard is the person's, so the link lands where their browser is.
             Hit::Link(url) => {
                 copy(&url);
-                self.flash(format!(
-                    "Copied {} · paste it in a browser",
-                    text::truncate(&url, 60)
-                ));
+                self.flash(link_note(&url));
             }
             Hit::Split(right) => self.split(right),
             Hit::GlassTab(group, tab) => self.show_in(group, tab),
@@ -4592,11 +5001,24 @@ impl Ui {
                 self.open_from_sidebar();
             }
             Hit::Usage => self.toggle_usage(),
+            Hit::Connection => self.show_connection(),
+            Hit::Menu(action) => self.run_menu_action(action),
             Hit::SidebarSection(section) => {
                 if let Some(glasses) = self.glasses.as_mut() {
                     glasses.sidebar.section = section;
                     glasses.sidebar.focused = true;
                 }
+            }
+            Hit::Actions(agent) => self.popover = Some(format!("actions:{agent}")),
+            Hit::Key(key)
+                if self
+                    .popover
+                    .as_deref()
+                    .is_some_and(|subject| subject.starts_with("actions:")) =>
+            {
+                let subject = self.popover.take().unwrap_or_default();
+                let agent = subject.trim_start_matches("actions:").to_owned();
+                self.agent_action(agent, key);
             }
             Hit::Key(key) if self.popover.is_some() => {
                 let subject = self.popover.take().unwrap_or_default();
@@ -4780,6 +5202,7 @@ impl Ui {
                 self.world.machines = full.machines.clone();
                 self.world.usage = full.usage.clone();
                 self.world.usage_limits = full.usage_limits.clone();
+                self.world.agent_messages = full.agent_messages.clone();
                 self.world.worktrees = full.worktrees.clone();
                 self.world.conversations = full.conversations;
                 if let Some(Load::Ready(entries)) = self
@@ -5140,12 +5563,7 @@ pub fn run_demo(args: &[String]) -> Result<()> {
             // Drain everything queued so a fast wheel does not lag behind. crossterm's read never
             // returns on a closed terminal, so check for one before each read.
             while !stopping.load(std::sync::atomic::Ordering::Relaxed) && !crate::stdin_hung_up() {
-                match event::read()? {
-                    Event::Key(key) => ui.key(key),
-                    Event::Paste(text) => ui.paste(text),
-                    Event::Mouse(mouse) => ui.mouse(mouse),
-                    _ => {}
-                }
+                ui.input_event(event::read()?);
                 if !event::poll(Duration::ZERO)? {
                     break;
                 }
@@ -5260,6 +5678,54 @@ fn dump(args: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_custom_request_sends_the_generic_reply_and_has_no_yes_no_shortcut() {
+        let mut world = demo::world();
+        world.attention = Load::Ready(vec![Attention {
+            id: "attention/garden".into(),
+            tier: Tier::Today,
+            title: "Retain the seed history?".into(),
+            waiting: None,
+            age: "1m".into(),
+            mission: None,
+            agent: None,
+            kind: AttentionKind::Request {
+                from: "Seed".into(),
+                from_id: "agent/garden/seed".into(),
+                question: "selection (keep / discard)".into(),
+                structured: None,
+            },
+            actions: vec!["custom.reply".into()],
+            related: vec![],
+            raised_by: None,
+            blocked: None,
+        }]);
+        let mut ui = Ui::new(world);
+        ui.live = true;
+        ui.tab = 0;
+        ui.selected[0] = ui
+            .listing(60)
+            .ids
+            .iter()
+            .position(|id| id == "attention/garden")
+            .unwrap();
+        let rendered = frame(&ui, 120, 50).join("\n");
+        assert!(rendered.contains("Reply with fields"));
+        assert!(!rendered.contains("Dismiss: nothing to do"));
+        ui.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(ui.effects.is_empty());
+        assert!(ui.confirm.is_none());
+        ui.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert!(ui.editing);
+        for letter in "keep".chars() {
+            ui.key(KeyEvent::new(KeyCode::Char(letter), KeyModifiers::NONE));
+        }
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(ui.effects.last(),Some(Effect::Attention{action,reason:Some(reason),..}) if action=="custom.reply" && reason=="keep")
+        );
+    }
 
     #[test]
     fn drafts_take_the_terminal_editing_keys() {
@@ -5383,6 +5849,7 @@ mod tests {
             actions: vec!["work.done".into()],
             related: Vec::new(),
             raised_by: None,
+            blocked: None,
         };
         if let Load::Ready(items) = &mut world.attention {
             items.insert(0, asks("attention/request-one"));
@@ -5446,7 +5913,7 @@ mod tests {
             missions.push(today);
             missions.push(failed);
         }
-        let shown = screens::missions_list(&world, "⠋", false);
+        let shown = screens::missions_list(&world, 40, "⠋", false);
         assert!(shown.ids.iter().any(|id| id == "mission/example/failed-today"));
         assert!(!shown.ids.iter().any(|id| id == "mission/example/failed-yesterday"));
         let note = shown
@@ -5459,8 +5926,124 @@ mod tests {
             .unwrap_or_default();
         assert!(note.contains("1 failed before today"), "{note}");
         // x shows it again.
-        let all = screens::missions_list(&world, "⠋", true);
+        let all = screens::missions_list(&world, 40, "⠋", true);
         assert!(all.ids.iter().any(|id| id == "mission/example/failed-yesterday"));
+    }
+
+    #[test]
+    fn clicking_a_link_says_whether_it_copied_an_address_or_a_file_path() {
+        assert_eq!(
+            link_note("https://example.com/a"),
+            "Copied https://example.com/a · paste it in a browser"
+        );
+        assert_eq!(
+            link_note("/srv/repo/spec.md"),
+            "Copied /srv/repo/spec.md · a file on the writer's machine"
+        );
+        assert!(link_note("~/notes/a.md").contains("a file on the writer's machine"));
+    }
+
+    #[test]
+    fn a_feedback_request_offers_words_and_a_dismissal_not_an_answer_to_choose() {
+        // Nathan, 2026-10-05: "why can't I dismiss this attention item?"
+        let feedback = |kind: &str, answers: Vec<st3_client::RequestAnswerOption>| {
+            let mut world = demo::world();
+            let request = st3_client::StructuredRequest {
+                version: 1,
+                entry_type: kind.into(),
+                question: "What did you run and what did you see?".into(),
+                why_person: "Only you saw the failure.".into(),
+                summary: None,
+                reasons: Vec::new(),
+                subjects: Vec::new(),
+                recommendation: None,
+                answers,
+                custom: false,
+            };
+            let item = Attention {
+                id: "attention/feedback".into(),
+                tier: Tier::Stopped,
+                title: "What went wrong?".into(),
+                waiting: None,
+                age: "1h".into(),
+                mission: None,
+                agent: Some("agent/example/cos".into()),
+                kind: AttentionKind::Request {
+                    from: "Chief of Staff".into(),
+                    from_id: "agent/example/cos".into(),
+                    question: request.question.clone(),
+                    structured: Some(Box::new(request)),
+                },
+                actions: vec!["work.done".into()],
+                related: Vec::new(),
+                raised_by: None,
+                blocked: None,
+            };
+            if let Load::Ready(items) = &mut world.attention {
+                items.insert(0, item);
+            }
+            let mut ui = Ui::new(world);
+            ui.live = true;
+            ui.tab = 0;
+            let at = ui
+                .listing(60)
+                .ids
+                .iter()
+                .position(|id| id == "attention/feedback")
+                .unwrap();
+            ui.select(at);
+            ui
+        };
+        let mut ui = feedback("feedback", Vec::new());
+        let screen = frame(&ui, 140, 50).join("\n");
+        for shown in ["Answer in words", "Dismiss: nothing to do"] {
+            assert!(screen.contains(shown), "{shown}: {screen}");
+        }
+        assert!(!screen.contains("Choose an answer"), "{screen}");
+        // x then y closes it with word to its asker, as a plain request does.
+        ui.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(frame(&ui, 140, 50).join("\n").contains("tell Chief of Staff there is nothing"));
+        ui.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(
+            matches!(&ui.effects[..], [Effect::Attention { id, action, reason: Some(reason), .. }]
+                if id == "attention/feedback" && action == "work.done" && reason.contains("Nothing for me")),
+            "{:?}",
+            ui.effects
+        );
+        // A choice has named answers: it offers those, and x says why it cannot dismiss.
+        let answer = st3_client::RequestAnswerOption {
+            id: "yes".into(),
+            label: "Yes".into(),
+            consequence: "Goes ahead.".into(),
+            outcome: None,
+            conditions: Vec::new(),
+        };
+        let mut ui = feedback("choice", vec![answer]);
+        let screen = frame(&ui, 140, 50).join("\n");
+        assert!(screen.contains("Choose an answer"), "{screen}");
+        assert!(!screen.contains("Dismiss: nothing to do"), "{screen}");
+        ui.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(ui.confirm.is_none());
+        assert!(ui.effects.is_empty());
+        // A decision with an answer that declines names it: that is the way to close it
+        // without agreeing (Nathan, 2026-10-06).
+        let hold = st3_client::RequestAnswerOption {
+            id: "hold".into(),
+            label: "Hold".into(),
+            consequence: "Nothing is approved.".into(),
+            outcome: Some("decline".into()),
+            conditions: Vec::new(),
+        };
+        let mut ui = feedback("decision", vec![hold]);
+        ui.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(ui.confirm.is_none());
+        assert!(
+            ui.flash
+                .as_ref()
+                .is_some_and(|(text, _)| text.contains("\"Hold\" declines it")),
+            "{:?}",
+            ui.flash
+        );
     }
 
     #[test]
@@ -5519,6 +6102,7 @@ mod tests {
             actions: vec!["work.done".into()],
             related: Vec::new(),
             raised_by: None,
+            blocked: None,
         };
         if let Load::Ready(items) = &mut world.attention {
             items.insert(0, item);
@@ -5559,6 +6143,57 @@ mod tests {
     }
 
     #[test]
+    fn a_mission_backed_ask_names_its_mission_and_the_step_that_waits() {
+        // Nathan, 2026-10-05: a request a mission step made lost its mission link.
+        let mut world = demo::world();
+        let mission = "mission/release-proof";
+        let item = Attention {
+            id: "attention/capacity".into(),
+            tier: Tier::Stopped,
+            title: "Allocate capacity?".into(),
+            waiting: None,
+            age: "1m".into(),
+            mission: Some(mission.into()),
+            agent: Some("agent/example/cos".into()),
+            kind: AttentionKind::Request {
+                from: "Chief of Staff".into(),
+                from_id: "agent/example/cos".into(),
+                question: "The proof needs a runner.".into(),
+                structured: None,
+            },
+            actions: vec!["work.done".into()],
+            related: Vec::new(),
+            raised_by: None,
+            blocked: Some(Blocked {
+                step: "tag-proof".into(),
+                goal: "Prove the published tag builds.".into(),
+            }),
+        };
+        if let Load::Ready(items) = &mut world.attention {
+            items.insert(0, item);
+        }
+        let mut ui = Ui::new(world);
+        ui.live = true;
+        ui.tab = 0;
+        let at = ui
+            .listing(60)
+            .ids
+            .iter()
+            .position(|id| id == "attention/capacity")
+            .unwrap();
+        ui.select(at);
+        let screen = frame(&ui, 140, 50).join("\n");
+        for shown in [
+            "release-proof",
+            "waits    tag-proof · Prove the published tag builds.",
+            "it continues once you answer",
+            "Go to the mission",
+        ] {
+            assert!(screen.contains(shown), "{shown}: {screen}");
+        }
+    }
+
+    #[test]
     fn an_update_shows_what_was_asked_for_and_clears_once_read() {
         let mut world = demo::world();
         let item = Attention {
@@ -5578,6 +6213,7 @@ mod tests {
             actions: vec!["work.done".into()],
             related: Vec::new(),
             raised_by: None,
+            blocked: None,
         };
         if let Load::Ready(items) = &mut world.attention {
             items.insert(0, item);
@@ -5613,15 +6249,26 @@ mod tests {
             "{:?}",
             ui.effects
         );
-        // Left open a moment, it counts as read without a key.
+        // Left open a good while, it stays: it is read only once the person moves off it.
         ui.effects.clear();
         ui.updates_read.clear();
         ui.update_open = Some((
             "attention/update".into(),
-            Instant::now() - UPDATE_READ_AFTER,
+            Instant::now() - UPDATE_READ_AFTER * 10,
         ));
         ui.read_open_update();
-        assert_eq!(ui.effects.len(), 1);
+        assert!(ui.effects.is_empty(), "still being read: {:?}", ui.effects);
+        assert!(ui.updates_read.is_empty());
+        // Moving off it (here, to nothing) after it was open a moment reads it.
+        ui.select(0);
+        ui.read_open_update();
+        assert_eq!(ui.effects.len(), 1, "{:?}", ui.effects);
+        // Moving off one that was only passed over does not.
+        ui.effects.clear();
+        ui.updates_read.clear();
+        ui.update_open = Some(("attention/update".into(), Instant::now()));
+        ui.read_open_update();
+        assert!(ui.effects.is_empty(), "{:?}", ui.effects);
     }
 
     #[test]
@@ -5652,6 +6299,7 @@ mod tests {
                     actions: vec!["work.done".into()],
                     related: Vec::new(),
                     raised_by: None,
+                    blocked: None,
                 },
             );
         }
@@ -6256,12 +6904,11 @@ mod tests {
             press(&mut ui, KeyCode::Char(character));
         }
         press(&mut ui, KeyCode::Enter);
+        // Sending goes to the agent's conversation, where the reply will appear.
+        assert_eq!(ui.tab, 1);
+        assert_eq!(ui.selected_id().as_deref(), Some("agent/example/atlas/builder"));
+        assert!(ui.chat.is_none());
         let screen = frame(&ui, 150, 70).join("\n");
-        assert!(
-            screen.contains("CHAT WITH ATLAS BUILDER")
-                || screen.contains("chat with Atlas Builder"),
-            "{screen}"
-        );
         assert!(screen.contains("why now?"), "{screen}");
     }
 
@@ -6277,6 +6924,47 @@ mod tests {
         ui.set_world(world);
         let item = ui.world.attention.items()[3].clone();
         assert_eq!(ui.chat_target(&item).unwrap().0, "agent/example/cos");
+    }
+
+    #[test]
+    fn what_a_seats_step_last_reported_leads_in_the_sidebar_and_on_its_card() {
+        let mut world = demo::world();
+        if let Load::Ready(agents) = &mut world.agents {
+            agents[0].details.progress = Some("Cut over 2 of 3 stores; waiting on the signer".into());
+        }
+        let mut ui = Ui::new(world);
+        ui.switch_tab(1);
+        let screen = frame(&ui, 150, 40).join("\n");
+        assert!(screen.contains("Cut over 2 of 3 stores"), "{screen}");
+        // The details pane says it whole, above the step it comes from.
+        let whole = screen.replace('\n', " ");
+        assert!(whole.contains("Cut over 2 of 3 stores; waiting on"), "{whole}");
+        // A run in progress says what its step last reported on its row in Missions.
+        let mut world = demo::world();
+        if let Load::Ready(missions) = &mut world.missions {
+            let mission = missions
+                .iter_mut()
+                .find(|mission| mission.steps.iter().any(|step| step.state == StepState::Working))
+                .unwrap();
+            let id = mission
+                .steps
+                .iter()
+                .find(|step| step.state == StepState::Working)
+                .unwrap()
+                .id
+                .clone();
+            mission.step_metadata.insert(
+                id,
+                st3_ui_model::missions::StepMetadata {
+                    blocked_reason: None,
+                    last_progress: Some("Tests pass; opening the PR".into()),
+                },
+            );
+        }
+        let mut ui = Ui::new(world);
+        ui.switch_tab(2);
+        let listed = frame(&ui, 150, 40).join("\n");
+        assert!(listed.contains("Tests pass; opening the PR"), "{listed}");
     }
 
     #[test]

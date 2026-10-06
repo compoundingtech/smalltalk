@@ -1,6 +1,6 @@
 import { ago } from '@smalltalk/st3-views';
 export { ago } from '@smalltalk/st3-views';
-import type { Agent, Attention, Device, Mission, MissionStep, WorkState } from '../../clients/typescript/st3-client';
+import type { Agent, Attention, ClientConnection, Device, Mission, MissionStep, WorkState } from '../../clients/typescript/st3-client';
 
 // The daemon annotates every resource with its operational layer. It is not part of the
 // generated resource types, so read it at the UI boundary.
@@ -22,6 +22,7 @@ export function attentionHeadline({ count, loaded, error }: { count: number; loa
 }
 
 const actionLabels: Record<Attention['actions'][number], string> = {
+  'custom.reply': 'Reply with the declared fields',
   'work.done': 'Complete step',
   'review.approve': 'Approve review',
   'review.reject': 'Reject review',
@@ -129,6 +130,41 @@ export function deviceTitle(device: DeviceView, connectedActor: string | undefin
 }
 export function deviceDetail(device: DeviceView, now = Date.now()): string {
   return `${device.state} · paired ${ago(device.updated_at, now)} ago · expires ${device.expires_at.slice(0, 10)}`;
+}
+
+// The mission step waiting on an ask a mission step made, and what it is for.
+export function blockedLine(item: { blocked?: { step: string; goal: string } | null }): string | null {
+  if (!item.blocked) return null;
+  const goal = item.blocked.goal.trim();
+  return `waits ${item.blocked.step}${goal ? ` · ${goal}` : ''} — it continues once you answer`;
+}
+
+// A connected client as it describes itself: its reported name and build, never identity.
+export function clientTitle(item: ClientConnection, connectedActor: string | undefined): string {
+  const name = item.client?.trim() || 'unnamed client';
+  return connectedActor && item.actor === connectedActor ? `${name} · this phone` : name;
+}
+export function clientDetail(item: ClientConnection, now = Date.now()): string {
+  const who = item.device_name || item.device_id ? `${item.person} · ${item.device_name ?? item.device_id}` : item.person;
+  const when = item.connected ? `since ${ago(item.since, now)}` : `seen ${ago(item.last_seen, now)} ago`;
+  const follows = item.follows.length ? ` · follows ${item.follows.join(', ')}` : '';
+  return `${who} · ${item.via} · ${item.member} · ${when}${follows}`;
+}
+// Only st's own builds share the member's version line ("stui 0.1.0+ab12cd3"); another client,
+// or a build that does not parse, is never called older. The note is quiet: nothing else changes.
+export function olderThanMember(client: string | null | undefined, member: string | null | undefined): boolean {
+  const version = (build: string) => {
+    const parts = build.split(/[+\- ]/)[0].split('.').map(Number);
+    return parts.every(Number.isInteger) ? parts : null;
+  };
+  const [name, build] = (client ?? '').split(' ', 2);
+  if (!build || !member || (name !== 'stui' && name !== 'st')) return false;
+  const a = version(build), b = version(member);
+  if (!a || !b) return false;
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    if ((a[i] ?? 0) !== (b[i] ?? 0)) return (a[i] ?? 0) < (b[i] ?? 0);
+  }
+  return false;
 }
 
 // Mission titles are paths such as `fleet/app-apple/issue-triage`. The leaf is the readable name;

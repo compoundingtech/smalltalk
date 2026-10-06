@@ -1,9 +1,15 @@
-import { defaultActionlintConfig, githubWorkflow } from '../../repos/effect-utils/genie/external.ts'
+import { linuxActionlintConfig, linuxRunner } from './workspace-ci.ts'
+import { auditCaches } from './cache-audit.ts'
+import { githubWorkflow } from '../../repos/effect-utils/genie/external.ts'
 
 // Preserve the public-content guard on all PRs and main pushes.
-export default githubWorkflow({
-  actionlint: defaultActionlintConfig,
+export default githubWorkflow(auditCaches({
+  actionlint: linuxActionlintConfig,
   "name": "Public repository check",
+  concurrency: {
+    group: "public-repo-${{ github.event.pull_request.number || (github.event_name == 'push' && github.ref == 'refs/heads/main' && 'main') || github.run_id }}",
+    'cancel-in-progress': "${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}",
+  },
   "on": {
     "pull_request": null,
     "push": {
@@ -14,7 +20,7 @@ export default githubWorkflow({
   },
   "jobs": {
     "public-repo": {
-      "runs-on": "namespace-profile-linux-x86-64",
+      "runs-on": linuxRunner,
       "steps": [
         {
           "uses": "actions/checkout@v4"
@@ -30,4 +36,4 @@ export default githubWorkflow({
       ]
     }
   }
-})
+}, {"public-repo": "Runs standard-library source checks without downloads or compilation."}))

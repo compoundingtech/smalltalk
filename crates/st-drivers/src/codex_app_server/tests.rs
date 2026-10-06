@@ -2114,6 +2114,93 @@ fn a_working_turn_reconciles_a_missed_steer_receipt_and_delivers_the_next_ping()
 }
 
 #[test]
+fn split_utf8_window_recovers_a_receipt_and_delivers_the_next_message() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = delivery_config(tmp.path());
+    let first =
+        message::send_to_inbox(&config.inbox, "h.sender", None, None, &[], "first €").unwrap();
+    let mut delivery = inbox_delivery(tmp.path(), config.clone());
+    let mut state = subscribed_state(CodexObservedState::Active {
+        turn_id: "turn-live".into(),
+    });
+    let snapshot = delivery.maybe_snapshot_request(&state).unwrap().unwrap();
+    delivery
+        .accept_snapshot_response(
+            &json!({"id": snapshot["id"], "result": {"thread": {
+                "id": "thread-main", "status": {"type": "active"}, "turns": []
+            }}}),
+            &mut state,
+        )
+        .unwrap();
+    let request = delivery.maybe_request(&state).unwrap().unwrap();
+    let client_id = request["params"]["clientUserMessageId"].as_str().unwrap();
+    delivery
+        .accept_response(
+            &json!({"id": request["id"], "result": {"turnId": "turn-live"}}),
+            state.observed(),
+        )
+        .unwrap();
+
+    let transcript = tmp.path().join("rollout.jsonl");
+    let mut file = File::create(&transcript).unwrap();
+    writeln!(file, "€").unwrap();
+    writeln!(
+        file,
+        "{}",
+        json!({"type": "event_msg", "payload": {
+            "type": "item_completed", "thread_id": "thread-main", "turn_id": "turn-live",
+            "item": {"type": "UserMessage", "client_id": client_id}
+        }})
+    )
+    .unwrap();
+    // The metadata snapshot ends one byte into the final euro sign; the file grows before
+    // the read. Its fixed window also starts one byte into the first euro sign.
+    let length = TRANSCRIPT_TURN_RECOVERY_BYTES + 1;
+    let padding = length - 1 - file.stream_position().unwrap();
+    file.write_all(&vec![b' '; padding as usize]).unwrap();
+    writeln!(file, "€").unwrap();
+    drop(file);
+    assert!(std::str::from_utf8(&fs::read(&transcript).unwrap()).is_ok());
+    let second =
+        message::send_to_inbox(&config.inbox, "h.sender", None, None, &[], "second €").unwrap();
+    let (frames, bytes_read) =
+        codex_transcript_window(File::open(&transcript).unwrap(), length).unwrap();
+    assert_eq!(bytes_read, TRANSCRIPT_TURN_RECOVERY_BYTES);
+    assert_eq!(frames.len(), 1);
+    assert_eq!(
+        active_turn_from_codex_frames(&frames).as_deref(),
+        Some("turn-live")
+    );
+    delivery
+        .accept_transcript_receipts(&frames, "thread-main")
+        .unwrap();
+    assert_eq!(
+        delivery.ledger.entry(&first).unwrap().phase,
+        delivery_ledger::Phase::Consumed
+    );
+    let next = delivery
+        .maybe_request(&state)
+        .unwrap()
+        .expect("next message must reach the live turn");
+    assert_eq!(next["method"], "turn/steer");
+    assert_eq!(
+        next["params"]["clientUserMessageId"],
+        stable_client_user_message_id("h.worker", "thread-main", &second)
+    );
+}
+
+#[test]
+fn a_partial_utf8_append_does_not_discard_complete_transcript_records() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("rollout.jsonl");
+    fs::write(&path, b"{\"complete\":true}\n{\"text\":\"\xe2\x82").unwrap();
+    assert_eq!(
+        codex_transcript_tail(&path).unwrap(),
+        [json!({"complete": true})]
+    );
+}
+
+#[test]
 fn a_delivery_on_a_history_larger_than_the_control_limit_uses_bounded_reads() {
     let mut request_lengths = Vec::new();
     let mut transcript_bytes_read = Vec::new();
@@ -3558,6 +3645,109 @@ fn missing_saved_rollout_fails_without_rebinding_the_incarnation() {
 }
 
 #[test]
+fn a_resume_returning_another_thread_fails_without_rebinding_the_incarnation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _stop_exclusive = stop_flag_tests();
+    let binding_path = tmp.path().join("state/binding.json");
+    let control_state_path = tmp.path().join("state/control-state.json");
+    let prior_runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+    let prior_binding = CodexThreadBinding::new(&prior_runtime, "thread-prior".into());
+    atomic_json(&binding_path, &prior_binding).unwrap();
+
+    let socket = tmp.path().join("server.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut websocket = tungstenite::accept(stream).unwrap();
+        assert_eq!(
+            read_json_message(&mut websocket).unwrap().unwrap()["method"],
+            "initialize"
+        );
+        write_json_message(
+            &mut websocket,
+            &json!({ "id": 0, "result": { "userAgent": "fake" } }),
+        )
+        .unwrap();
+        assert_eq!(
+            read_json_message(&mut websocket).unwrap().unwrap()["method"],
+            "initialized"
+        );
+        let loaded = read_json_message(&mut websocket).unwrap().unwrap();
+        assert_eq!(loaded["method"], "thread/loaded/list");
+        write_json_message(
+            &mut websocket,
+            &json!({
+                "id": CONTROL_TUI_LOADED_REQUEST_ID,
+                "result": { "data": ["thread-prior"] }
+            }),
+        )
+        .unwrap();
+        let resume = read_json_message(&mut websocket).unwrap().unwrap();
+        assert_eq!(resume["method"], "thread/resume");
+        assert_eq!(resume["params"]["threadId"], "thread-prior");
+        write_json_message(
+            &mut websocket,
+            &json!({
+                "id": CONTROL_SUBSCRIBE_REQUEST_ID,
+                "result": {
+                    "thread": { "id": "thread-other", "status": { "type": "idle" } }
+                }
+            }),
+        )
+        .unwrap();
+    });
+
+    let stream = UnixStream::connect(&socket).unwrap();
+    let shutdown = stream.try_clone().unwrap();
+    let websocket = initialize_control(stream)
+        .unwrap()
+        .expect("no stop raised in tests");
+    let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+    let (tx, rx) = mpsc::channel();
+    let (resume_ready_tx, resume_ready_rx) = mpsc::channel();
+    let runtime_for_pump = runtime.clone();
+    let binding_for_pump = binding_path.clone();
+    let control_state_for_pump = control_state_path.clone();
+    let pump = thread::spawn(move || {
+        pump_control(
+            websocket,
+            &binding_for_pump,
+            &control_state_for_pump,
+            &runtime_for_pump,
+            Some(ControlResume {
+                thread_id: "thread-prior",
+                ready: resume_ready_rx,
+                tui_loaded_timeout: TUI_LOADED_TIMEOUT,
+                permission_overrides: None,
+                preload: false,
+                preloaded: None,
+            }),
+            None,
+            Arc::new(AtomicBool::new(false)),
+            tx,
+        )
+    });
+    resume_ready_tx.send(()).unwrap();
+    acknowledge_tui_thread_loaded(&rx);
+    let ControlEvent::Failed(error) = rx.recv_timeout(TEST_EVENT_TIMEOUT).unwrap() else {
+        panic!("a different thread did not fail closed");
+    };
+    assert!(
+        error.contains("expected thread-prior, received thread-other"),
+        "{error}"
+    );
+
+    server.join().unwrap();
+    let _ = shutdown.shutdown(Shutdown::Both);
+    pump.join().unwrap();
+    assert_eq!(
+        serde_json::from_slice::<CodexThreadBinding>(&fs::read(&binding_path).unwrap()).unwrap(),
+        prior_binding
+    );
+    assert!(!control_state_path.exists());
+}
+
+#[test]
 fn a_binding_from_another_runtime_incarnation_is_rejected() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("binding.json");
@@ -4346,15 +4536,94 @@ fn the_transcript_snapshot_recovers_and_clears_the_active_turn() {
 }
 
 #[test]
+fn a_long_failed_turn_recovers_from_recent_typed_transcript_evidence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("rollout-thread-main.jsonl");
+    let mut content = String::from(
+        "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-long\"}}\n",
+    );
+    content.push_str(&" ".repeat(TRANSCRIPT_TURN_RECOVERY_BYTES as usize));
+    content.push('\n');
+    content.push_str(concat!(
+        "{\"type\":\"event_msg\",\"payload\":{\"type\":\"item_completed\",\"turn_id\":\"turn-long\"}}\n",
+        "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"turn-long\",",
+        "\"error\":{\"message\":\"Selected model is at capacity. Please try a different model.\",",
+        "\"codex_error_info\":\"server_overloaded\"}}}\n",
+    ));
+    fs::write(&transcript, content).unwrap();
+    let frames = codex_transcript_tail(&transcript).unwrap();
+    assert!(
+        frames
+            .iter()
+            .all(|frame| frame.pointer("/payload/type") != Some(&json!("task_started")))
+    );
+    assert_eq!(
+        failed_completed_turn_from_codex_frames(&frames),
+        Some(("turn-long".into(), CodexTerminalError::ProviderCapacity)),
+        "recent typed evidence and its matching failed completion prove the turn ended"
+    );
+    let config = delivery_config(tmp.path());
+    message::send_to_inbox(&config.inbox, "h.sender", None, None, &[], "retry").unwrap();
+    let mut delivery = Some(inbox_delivery(tmp.path(), config.clone()));
+    let mut state = subscribed_state(CodexObservedState::Held {
+        reason: CodexHoldReason::SystemError,
+        turn_id: None,
+    });
+    let (events, received) = mpsc::channel();
+    let control_path = tmp.path().join("control-state.json");
+    recover_transcript_turn_from_frames(&mut state, &mut delivery, &frames, &control_path, &events)
+        .unwrap();
+    assert_eq!(
+        state.observed(),
+        &CodexObservedState::TerminalError {
+            reason: CodexTerminalError::ProviderCapacity,
+        }
+    );
+    let saved: CodexControlState =
+        serde_json::from_slice(&fs::read(control_path).unwrap()).unwrap();
+    assert_eq!(saved.observed(), state.observed());
+    assert!(matches!(
+        received.try_recv().unwrap(),
+        ControlEvent::Observed
+    ));
+    let observed =
+        harness_state::read(&harness_state::harness_state_path(&config.agent_dir), None).unwrap();
+    assert_eq!(observed.state, harness_state::Activity::Idle);
+    assert_eq!(observed.reason.as_deref(), Some("providerCapacity"));
+    assert_eq!(
+        delivery
+            .as_mut()
+            .unwrap()
+            .maybe_request(&state)
+            .unwrap()
+            .unwrap()["method"],
+        "turn/start"
+    );
+}
+
+#[test]
 fn transcript_proves_only_the_latest_matching_failed_completion() {
     let started = |id| json!({"type":"event_msg","payload":{"type":"task_started","turn_id":id}});
     let completed = |id, error: Option<&str>| json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":id,"error":error}});
+    assert_eq!(
+        failed_completed_turn_from_codex_frames(&[completed("one", Some("error"))]),
+        None,
+        "a completion without matching turn evidence is not enough"
+    );
+    assert_eq!(
+        failed_completed_turn_from_codex_frames(&[
+            started("one"),
+            json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"one","error":false}}),
+        ]),
+        None,
+        "a malformed error cannot prove a terminal failure"
+    );
     assert_eq!(
         failed_completed_turn_from_codex_frames(&[
             started("old"),
             completed("old", Some("unauthorized")),
         ]),
-        Some("old".into())
+        Some(("old".into(), CodexTerminalError::SystemError))
     );
     assert_eq!(
         failed_completed_turn_from_codex_frames(&[
@@ -4378,6 +4647,120 @@ fn transcript_proves_only_the_latest_matching_failed_completion() {
         None,
         "a successful completion cannot prove a terminal system error"
     );
+    for newer in [
+        json!({"type":"event_msg","payload":{"type":"item_completed","turn_id":"new"}}),
+        json!({"type":"response_item","payload":{"type":"reasoning","internal_chat_message_metadata_passthrough":{"turn_id":"new"}}}),
+        completed("new", None),
+        json!({"type":"event_msg","payload":{"type":"turn_aborted","turn_id":"new"}}),
+    ] {
+        assert_eq!(
+            failed_completed_turn_from_codex_frames(&[
+                started("old"),
+                completed("old", Some("error")),
+                newer,
+            ]),
+            None,
+            "later evidence cannot resurrect an older failed turn"
+        );
+    }
+    assert_eq!(
+        failed_completed_turn_from_codex_frames(&[
+            json!({"type":"response_item","payload":{"type":"reasoning","internal_chat_message_metadata_passthrough":{"turn_id":"one"}}}),
+            completed("other", Some("error")),
+        ]),
+        None,
+        "recent typed evidence must still match the failed completion"
+    );
+    for late in [
+        json!({"type":"event_msg","payload":{"type":"item_completed","turn_id":"old"}}),
+        json!({"type":"response_item","payload":{"type":"reasoning","internal_chat_message_metadata_passthrough":{"turn_id":"old"}}}),
+    ] {
+        assert_eq!(
+            failed_completed_turn_from_codex_frames(&[
+                started("old"),
+                completed("old", Some("error")),
+                late,
+            ]),
+            Some(("old".into(), CodexTerminalError::SystemError)),
+            "late frames from the completed turn cannot reopen it"
+        );
+    }
+}
+
+#[test]
+fn failed_turn_recovery_preserves_the_native_error_class() {
+    for (error, reason) in [
+        (
+            json!({"codex_error_info":"unauthorized"}),
+            CodexTerminalError::ProviderAuthRejected,
+        ),
+        (
+            json!({"codex_error_info":"usageLimitExceeded"}),
+            CodexTerminalError::ProviderCapacity,
+        ),
+        (
+            json!({"codex_error_info":"usage_limit_exceeded"}),
+            CodexTerminalError::ProviderCapacity,
+        ),
+        (
+            json!({"message":"Selected model is at capacity. Please try a different model.","codex_error_info":"server_overloaded"}),
+            CodexTerminalError::ProviderCapacity,
+        ),
+        (
+            json!({"message":"provider failed"}),
+            CodexTerminalError::SystemError,
+        ),
+    ] {
+        assert_eq!(
+            failed_completed_turn_from_codex_frames(&[
+                json!({"type":"response_item","payload":{"type":"reasoning","internal_chat_message_metadata_passthrough":{"turn_id":"one"}}}),
+                json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"one","error":error}}),
+            ]),
+            Some(("one".into(), reason))
+        );
+    }
+}
+
+#[test]
+fn generic_system_error_status_preserves_a_proven_terminal_cause() {
+    for reason in [
+        CodexTerminalError::ProviderCapacity,
+        CodexTerminalError::ProviderAuthRejected,
+        CodexTerminalError::SystemError,
+    ] {
+        let expected = CodexObservedState::TerminalError { reason };
+        let mut state = subscribed_state(expected.clone());
+        assert!(
+            !state
+                .observe(&json!({
+                    "method":"thread/status/changed",
+                    "params":{"threadId":"thread-main","status":{"type":"systemError"}},
+                }))
+                .unwrap()
+        );
+        assert_eq!(state.observed(), &expected);
+        assert_eq!(
+            observed_from_thread_snapshot(
+                &json!({
+                    "result":{"thread":{"id":"thread-main","status":{"type":"systemError"}}},
+                }),
+                "thread-main",
+                &expected
+            )
+            .unwrap(),
+            expected
+        );
+        // A new live status is a recovery boundary, so the old failure does not stick.
+        assert!(
+            state
+                .observe(&json!({
+                    "method":"thread/status/changed",
+                    "params":{"threadId":"thread-main","status":{"type":"idle"}},
+                }))
+                .unwrap()
+        );
+        assert_eq!(state.observed(), &CodexObservedState::Idle);
+    }
 }
 
 #[test]
@@ -5657,6 +6040,22 @@ fn a_controlled_tui_starts_without_the_update_notice() {
             "thread-prior"
         ]
     );
+    for args in [
+        vec![],
+        vec!["--remote".into(), "unix:///server.sock".into()],
+        vec![
+            "--remote".into(),
+            "unix:///server.sock".into(),
+            "--model".into(),
+            "gpt-test".into(),
+        ],
+    ] {
+        let command = controlled_tui_command("codex", &args);
+        assert_eq!(
+            command.get_args().take(2).collect::<Vec<_>>(),
+            ["-c", "check_for_update_on_startup=false"]
+        );
+    }
 }
 
 #[test]
@@ -6972,4 +7371,39 @@ fn adopted_codex_records_keep_their_schema_family() {
     runtime.schema = "st2.codex-runtime.v2".into();
     atomic_json(&path, &runtime).unwrap();
     assert!(load_runtime(&path, "h.worker", "runtime").is_err());
+}
+
+#[test]
+fn native_codex_login_recovery_requires_a_successful_current_thread_turn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = delivery_config(tmp.path());
+    let mut delivery = inbox_delivery(tmp.path(), config);
+    let mut state = subscribed_state(CodexObservedState::Idle);
+    let rejected = serde_json::json!({"method":"turn/completed","params":{"threadId":"thread-main","turn":{"id":"turn-auth","status":"failed","error":{"codexErrorInfo":"unauthorized"}}}});
+    state.observe(&rejected).unwrap();
+    delivery.observe_provider_auth(&rejected, "thread-main");
+    assert_eq!(delivery.provider_auth_edge, Some(false));
+    assert_eq!(
+        state
+            .observed()
+            .harness_observation()
+            .unwrap()
+            .provider_auth,
+        Some(false)
+    );
+    let foreign = serde_json::json!({"method":"turn/completed","params":{"threadId":"thread-other","turn":{"id":"turn-ok","status":"completed"}}});
+    delivery.observe_provider_auth(&foreign, "thread-main");
+    assert_eq!(delivery.provider_auth_edge, Some(false));
+    let accepted = serde_json::json!({"method":"turn/completed","params":{"threadId":"thread-main","turn":{"id":"turn-ok","status":"completed"}}});
+    state.observe(&accepted).unwrap();
+    delivery.observe_provider_auth(&accepted, "thread-main");
+    assert_eq!(delivery.provider_auth_edge, Some(true));
+    assert_eq!(state.observed(), &CodexObservedState::Idle);
+    assert_eq!(
+        CodexObservedState::Idle
+            .harness_observation()
+            .unwrap()
+            .provider_auth,
+        None
+    );
 }

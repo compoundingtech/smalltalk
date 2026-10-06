@@ -8,6 +8,7 @@ use super::*;
 /// the graph for the caches its reads use.
 #[derive(Default)]
 pub struct SmalltalkRuntime {
+    pub(crate) mailbox_wakes: std::sync::OnceLock<Arc<mailbox_wakes::Wakes>>,
     #[cfg(test)]
     pub(crate) work_extension_roots_rebuilt: std::sync::atomic::AtomicUsize,
     /// Simulate different build registries on isolated nodes in compatibility tests.
@@ -20,7 +21,7 @@ pub struct SmalltalkRuntime {
     pub(crate) subject_cache: Mutex<SubjectCache>,
     pub(crate) message_cache: Mutex<HashMap<String, MessageCacheEntry>>,
     pub(crate) agent_status_cache: Mutex<VecDeque<AgentStatusEntry>>,
-    pub(crate) agent_resources_cache: Mutex<VecDeque<(u64, u64, bool, Arc<Vec<Value>>)>>,
+    pub(crate) agent_resources_cache: Mutex<VecDeque<(u64, bool, Arc<Vec<Value>>)>>,
 }
 
 impl SmalltalkRuntime {
@@ -40,15 +41,22 @@ impl Runtime for SmalltalkRuntime {
 
     fn create_schema(&self, connection: &Connection) -> Result<()> {
         connection.execute_batch(SCHEMA)?;
+        connection.execute_batch(arrangements::SCHEMA)?;
         migrate_local_usage_seen(connection)?;
         backfill_message_index(connection)?;
+        unread_mail::create_schema(connection)?;
         resources::create_schema(connection)?;
+        custom::create_schema(connection)?;
+        agent_messages::create_schema(connection)?;
         glass_heads::create_schema(connection)
     }
 
     fn open_projections(&self, transaction: &Transaction<'_>, shared_memory: bool) -> Result<()> {
+        custom::open(transaction)?;
         resources::open(transaction)?;
         glass_heads::open(transaction)?;
+        agent_messages::open(transaction)?;
+        arrangements::open(transaction)?;
         if shared_memory {
             rebuild_operations_tx(transaction)?;
             rebuild_planning_tx(transaction)?;
@@ -143,7 +151,7 @@ impl Runtime for SmalltalkRuntime {
         transaction: &Transaction<'_>,
         origin: &str,
         through: u64,
-    ) -> Result<bool, St3Error> {
+    ) -> Result<IncrementalProjection, St3Error> {
         try_project_simple_replication_tx(transaction, origin, through)
     }
 
@@ -151,9 +159,19 @@ impl Runtime for SmalltalkRuntime {
         replay_graph_from_nothing_tx(transaction)
     }
 
+    fn replay_from_nothing_with_progress(
+        &self,
+        transaction: &Transaction<'_>,
+        progress: &mut dyn FnMut(ReplayProgress),
+    ) -> Result<(), St3Error> {
+        replay_graph_from_nothing_with_progress_tx(transaction, progress)
+    }
+
     fn after_projection(&self, transaction: &Transaction<'_>) -> Result<(), St3Error> {
+        custom::flush(transaction).map_err(internal)?;
         resources::flush(transaction).map_err(internal)?;
         glass_heads::flush(transaction).map_err(internal)?;
+        agent_messages::flush(transaction).map_err(internal)?;
         reapply_local_work_lease_renewals_tx(transaction)
     }
 
@@ -211,7 +229,7 @@ impl Runtime for SmalltalkRuntime {
 
 /// The version of smalltalk's shared projection layout, beside the claim vocabulary. Nodes whose
 /// layouts differ keep exchanging claim authority but do not compare projection maps.
-const SHARED_PROJECTION_LAYOUT: &str = "st3.shared-projections.one-shot-seats.v1";
+const SHARED_PROJECTION_LAYOUT: &str = "st3.shared-projections.arrangements.v2";
 
 /// The replication `schema_digest`: the claim vocabulary digest and the shared projection layout.
 pub(crate) fn compatibility_digest(registry_digest: &str) -> String {

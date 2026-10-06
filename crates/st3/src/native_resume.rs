@@ -267,6 +267,106 @@ pub fn pi_family_transcript(sessions: &Path, id: &str) -> Option<PathBuf> {
         .find(|path| pi_family_header_id(path).as_deref() == Some(id))
 }
 
+/// Make an authored pi/omp resume visible to the managed transcript inventory, without copying
+/// a file the provider will keep appending to. `Ok(false)` means no link was needed.
+#[cfg(unix)]
+pub fn pi_family_link_transcript(argv: &[String], sessions: &Path) -> Result<bool, Refusal> {
+    use std::os::unix::fs::{MetadataExt as _, symlink};
+
+    let mut arguments = argv
+        .iter()
+        .skip(1)
+        .take_while(|argument| argument.as_str() != "--");
+    let mut selected = None;
+    while let Some(argument) = arguments.next() {
+        if argument == "--resume" {
+            selected = arguments.next().map(String::as_str);
+            break;
+        }
+        if let Some(path) = argument.strip_prefix("--resume=") {
+            selected = Some(path);
+            break;
+        }
+    }
+    let Some(selected) = selected else {
+        return Ok(false);
+    };
+    let transcript = Path::new(selected);
+    if !transcript.is_absolute() {
+        return Err(Refusal::new(
+            "resume-path-relative",
+            "authored resume is not an absolute path",
+        ));
+    }
+    let source = fs::metadata(transcript)
+        .map_err(|error| Refusal::new("transcript-missing", error.to_string()))?;
+    if !source.is_file() {
+        return Err(Refusal::new(
+            "transcript-missing",
+            "authored resume is not a file",
+        ));
+    }
+    let filename = transcript.file_name().and_then(|name| name.to_str());
+    let id = filename
+        .and_then(|name| name.strip_suffix(".jsonl"))
+        .and_then(|name| name.rsplit_once('_'))
+        .map(|(_, id)| id)
+        .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+        .ok_or_else(|| Refusal::new("transcript-name-mismatch", "expected <time>_<uuid>.jsonl"))?;
+    if pi_family_header_id(transcript).as_deref() != Some(id) {
+        return Err(Refusal::new(
+            "transcript-header-mismatch",
+            "filename and session header disagree",
+        ));
+    }
+    let parent = fs::canonicalize(transcript.parent().expect("absolute file has a parent"))
+        .map_err(|error| Refusal::new("transcript-unreadable", error.to_string()))?;
+    match fs::symlink_metadata(sessions) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            if fs::canonicalize(sessions).ok().as_ref() == Some(&parent) {
+                return Ok(false);
+            }
+            return Err(Refusal::new(
+                "managed-directory-foreign-link",
+                "managed directory links elsewhere",
+            ));
+        }
+        Ok(metadata) if metadata.is_dir() => {
+            if fs::read_dir(sessions)
+                .map_err(|error| Refusal::new("managed-directory-unreadable", error.to_string()))?
+                .filter_map(Result::ok)
+                .any(|entry| {
+                    fs::metadata(entry.path()).is_ok_and(|target| {
+                        target.dev() == source.dev() && target.ino() == source.ino()
+                    })
+                })
+            {
+                return Ok(false);
+            }
+            // remove_dir is the empty-directory check too: never recursively remove contents.
+            fs::remove_dir(sessions)
+                .map_err(|error| Refusal::new("managed-directory-not-empty", error.to_string()))?;
+        }
+        Ok(_) => {
+            return Err(Refusal::new(
+                "managed-directory-not-directory",
+                "managed path is not a directory",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(Refusal::new(
+                "managed-directory-unreadable",
+                error.to_string(),
+            ));
+        }
+    }
+    // Creation is exclusive: a concurrent starter's directory or link is never overwritten.
+    symlink(&parent, sessions)
+        .map_err(|error| Refusal::new("managed-directory-link-failed", error.to_string()))?;
+    Ok(true)
+}
+
 /// pi resumes by transcript path, omp by session ID. pi silently starts a new session at a
 /// path that does not exist, so both check the transcript first.
 pub fn pi_family_argv(
@@ -388,6 +488,200 @@ mod tests {
 
     fn argv(items: &[&str]) -> Vec<String> {
         items.iter().map(|item| (*item).to_owned()).collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_family_links_authored_transcripts_without_copying_or_replacing_inventory() {
+        use std::io::Write as _;
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let legacy = root.path().join("legacy");
+        fs::create_dir(&legacy).unwrap();
+        let id = "5f9a6e16-5e30-4bce-b327-9a8241321bd6";
+        let transcript = legacy.join(format!("2026-10-04_{id}.jsonl"));
+        fs::write(
+            &transcript,
+            format!("{{\"type\":\"session\",\"id\":\"{id}\"}}\n"),
+        )
+        .unwrap();
+        let arguments = argv(&["omp", "--resume", transcript.to_str().unwrap()]);
+        let original_arguments = arguments.clone();
+        let managed = root.path().join("provider-sessions");
+        // Absent, then already linked. Appending remains visible through both paths.
+        assert!(pi_family_link_transcript(&arguments, &managed).unwrap());
+        assert!(!pi_family_link_transcript(&arguments, &managed).unwrap());
+        assert_eq!(fs::read_link(&managed).unwrap(), legacy);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap()
+            .write_all(b"{\"turn\":2}\n")
+            .unwrap();
+        assert_eq!(
+            fs::read(managed.join(transcript.file_name().unwrap())).unwrap(),
+            fs::read(&transcript).unwrap()
+        );
+        assert_eq!(arguments, original_arguments);
+        fs::remove_file(&managed).unwrap();
+        // Empty directory and the equals form.
+        fs::create_dir(&managed).unwrap();
+        assert!(
+            pi_family_link_transcript(
+                &argv(&["pi", &format!("--resume={}", transcript.display())]),
+                &managed
+            )
+            .unwrap()
+        );
+        fs::remove_file(&managed).unwrap();
+        // An existing inventory with the same inode is left as a directory.
+        fs::create_dir(&managed).unwrap();
+        fs::hard_link(&transcript, managed.join(transcript.file_name().unwrap())).unwrap();
+        assert!(!pi_family_link_transcript(&arguments, &managed).unwrap());
+        let alternate = managed.join(format!("earlier_{id}.jsonl"));
+        fs::hard_link(&transcript, &alternate).unwrap();
+        fs::remove_file(managed.join(transcript.file_name().unwrap())).unwrap();
+        assert!(!pi_family_link_transcript(&arguments, &managed).unwrap());
+        assert!(
+            !fs::symlink_metadata(&managed)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        fs::remove_file(&alternate).unwrap();
+        fs::write(managed.join("other.jsonl"), "preserve me").unwrap();
+        assert_eq!(
+            pi_family_link_transcript(&arguments, &managed)
+                .unwrap_err()
+                .code,
+            "managed-directory-not-empty"
+        );
+        assert_eq!(
+            fs::read_to_string(managed.join("other.jsonl")).unwrap(),
+            "preserve me"
+        );
+        fs::remove_file(managed.join("other.jsonl")).unwrap();
+        fs::remove_dir(&managed).unwrap();
+        // Foreign and dangling symlinks are never replaced.
+        for target in [root.path().to_path_buf(), root.path().join("missing")] {
+            symlink(&target, &managed).unwrap();
+            assert_eq!(
+                pi_family_link_transcript(&arguments, &managed)
+                    .unwrap_err()
+                    .code,
+                "managed-directory-foreign-link"
+            );
+            assert_eq!(fs::read_link(&managed).unwrap(), target);
+            fs::remove_file(&managed).unwrap();
+        }
+        // Invalid authored paths never prepare an inventory.
+        assert_eq!(
+            pi_family_link_transcript(&argv(&["omp", "--resume", "relative.jsonl"]), &managed)
+                .unwrap_err()
+                .code,
+            "resume-path-relative"
+        );
+        let missing = legacy.join("missing.jsonl");
+        assert_eq!(
+            pi_family_link_transcript(
+                &argv(&["omp", "--resume", missing.to_str().unwrap()]),
+                &managed
+            )
+            .unwrap_err()
+            .code,
+            "transcript-missing"
+        );
+        let bad_name = legacy.join("not-a-uuid.jsonl");
+        fs::write(&bad_name, "{}\n").unwrap();
+        assert_eq!(
+            pi_family_link_transcript(
+                &argv(&["omp", "--resume", bad_name.to_str().unwrap()]),
+                &managed
+            )
+            .unwrap_err()
+            .code,
+            "transcript-name-mismatch"
+        );
+        fs::write(&transcript, "{\"type\":\"session\",\"id\":\"other\"}\n").unwrap();
+        assert_eq!(
+            pi_family_link_transcript(&arguments, &managed)
+                .unwrap_err()
+                .code,
+            "transcript-header-mismatch"
+        );
+        assert!(!managed.exists());
+        assert!(!pi_family_link_transcript(&argv(&["omp"]), &managed).unwrap());
+        assert!(
+            !pi_family_link_transcript(&argv(&["omp", "--", "--resume", "relative"]), &managed)
+                .unwrap()
+        );
+        // A title can precede the matching header; multi-session directories remain intact.
+        fs::write(
+            &transcript,
+            format!("{{\"type\":\"title\"}}\n{{\"type\":\"session\",\"id\":\"{id}\"}}\n"),
+        )
+        .unwrap();
+        fs::write(legacy.join("another.jsonl"), "another session").unwrap();
+        fs::write(&managed, "not a directory").unwrap();
+        assert_eq!(
+            pi_family_link_transcript(&arguments, &managed)
+                .unwrap_err()
+                .code,
+            "managed-directory-not-directory"
+        );
+        assert_eq!(fs::read_to_string(&managed).unwrap(), "not a directory");
+        fs::remove_file(&managed).unwrap();
+        assert!(pi_family_link_transcript(&arguments, &managed).unwrap());
+        assert_eq!(
+            pi_family_transcript(&managed, id).unwrap(),
+            managed.join(transcript.file_name().unwrap())
+        );
+        assert_eq!(
+            fs::read_to_string(managed.join("another.jsonl")).unwrap(),
+            "another session"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_pi_family_links_never_overwrite_each_other() {
+        let root = tempfile::tempdir().unwrap();
+        let legacy = root.path().join("legacy");
+        fs::create_dir(&legacy).unwrap();
+        let id = "5f9a6e16-5e30-4bce-b327-9a8241321bd6";
+        let transcript = legacy.join(format!("time_{id}.jsonl"));
+        fs::write(
+            &transcript,
+            format!("{{\"type\":\"session\",\"id\":\"{id}\"}}\n"),
+        )
+        .unwrap();
+        let arguments = argv(&["omp", "--resume", transcript.to_str().unwrap()]);
+        let managed = root.path().join("provider-sessions");
+        fs::create_dir(&managed).unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let starts: Vec<_> = (0..2)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        pi_family_link_transcript(&arguments, &managed)
+                    })
+                })
+                .collect();
+            for start in starts {
+                if let Err(skip) = start.join().unwrap() {
+                    assert!(matches!(
+                        skip.code,
+                        "managed-directory-not-empty"
+                            | "managed-directory-link-failed"
+                            | "managed-directory-unreadable"
+                    ));
+                }
+            }
+        });
+        assert_eq!(fs::read_link(&managed).unwrap(), legacy);
+        assert_eq!(pi_family_header_id(&transcript).as_deref(), Some(id));
     }
 
     #[test]

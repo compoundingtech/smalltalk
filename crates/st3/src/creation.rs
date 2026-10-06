@@ -167,13 +167,20 @@ pub fn terminal_document(
     creation_key: &str,
 ) -> String {
     let identity = format!("{person}/{id}");
+    // With no directory named, the shell starts in the host user's home: a service's own working
+    // directory is `/` (Nathan, 2026-10-05). A home that is unset or missing leaves it where it is.
+    let command = if cwd == "." {
+        "cd \"${HOME:-.}\" 2>/dev/null; exec \"${SHELL:-/bin/sh}\" -i"
+    } else {
+        "exec \"${SHELL:-/bin/sh}\" -i"
+    };
     let mut terminal = kdl_node("pty", [identity.as_str()]);
     let mut body = KdlDocument::new();
     body.nodes_mut().extend([
         kdl_node("name", [args.name.as_str()]),
         kdl_node("host", [host]),
         kdl_node("workspace", [cwd]),
-        kdl_node("command", ["exec \"${SHELL:-/bin/sh}\" -i"]),
+        kdl_node("command", [command]),
         kdl_node("restart", ["never"]),
         creation_tags(creation_key),
     ]);
@@ -252,6 +259,42 @@ pub async fn claim_initial_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_shell_with_no_directory_starts_in_home_and_one_with_a_directory_keeps_it() {
+        let args = st3_client::TerminalCreateParameters {
+            name: "scratch".into(),
+            ..Default::default()
+        };
+        let plain = terminal_document("person/example", "one", &args, "host", ".", "key");
+        // The command is quoted for KDL, so its own quotes are escaped.
+        assert!(
+            plain.contains("cd \\\"${HOME:-.}\\\" 2>/dev/null; exec"),
+            "{plain}"
+        );
+        assert!(plain.contains("${SHELL:-/bin/sh}"), "{plain}");
+        let placed = terminal_document("person/example", "two", &args, "host", "/srv/work", "key");
+        assert!(!placed.contains("HOME"), "{placed}");
+        assert!(placed.contains("workspace \"/srv/work\""), "{placed}");
+        // The command really lands in HOME, and falls back when HOME is unset or missing.
+        for (home, expected) in [(Some("/tmp"), "/tmp"), (Some("/no/such/dir"), "/")] {
+            let mut shell = std::process::Command::new("sh");
+            shell.current_dir("/");
+            shell.args(["-c", "cd \"${HOME:-.}\" 2>/dev/null; pwd"]);
+            match home {
+                Some(home) => shell.env("HOME", home),
+                None => shell.env_remove("HOME"),
+            };
+            let out = shell.output().unwrap();
+            let expected = std::fs::canonicalize(expected).unwrap();
+            let got = String::from_utf8(out.stdout).unwrap();
+            assert_eq!(
+                std::fs::canonicalize(got.trim()).unwrap(),
+                expected,
+                "HOME={home:?}"
+            );
+        }
+    }
     #[test]
     fn created_agents_use_checkout_for_new_and_existing_branches_and_keep_plain_workspaces() {
         use crate::checkout::Checkout;

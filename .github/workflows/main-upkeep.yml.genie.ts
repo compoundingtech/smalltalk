@@ -1,8 +1,11 @@
+import { buildSnapshotSave } from './build-snapshot.ts'
+import { auditCaches } from './cache-audit.ts'
 import { defaultActionlintConfig, githubWorkflow, nixDevelopStep } from '../../repos/effect-utils/genie/external.ts'
 import {
   buildEnv,
   cargoCacheStep,
   commonSetupSteps,
+  linuxRunner,
   linuxStageJob,
   linuxStageRunner,
   nixCacheStep,
@@ -11,23 +14,23 @@ import {
 } from './workspace-ci.ts'
 
 const missing = "steps.cargo-probe.outputs.cache-hit != 'true' || steps.nix-probe.outputs.cache-hit != 'true'"
-const whenMissing = (steps: readonly unknown[]) => steps.map((value) => {
+const whenMissing = (steps: readonly unknown[], conditionMissing = missing) => steps.map((value) => {
   const step = value as Record<string, unknown>
   const condition = String(step.if ?? 'success()').replace(/\$\{\{|\}\}/g, '')
-  return { ...step, if: `success() && (${missing}) && (${condition})` }
+  return { ...step, if: `success() && (${conditionMissing}) && (${condition})` }
 })
 
 // Cache scope includes the ref: merge-group saves cannot replace main's cache saves. Probe main's
 // exact entries before provisioning Nix or restoring gigabytes; fill only missing entries.
-const warmJob = (stage: string, setup: readonly unknown[]) => ({
+const warmJob = (stage: string, setup: readonly unknown[], nixOnly = false) => ({
   name: `warm-${stage}`,
   'runs-on': linuxStageRunner,
   'timeout-minutes': 120,
   defaults: { run: { shell: 'bash' } },
-  env: buildEnv,
+  env: { ...buildEnv, CI_CACHE_DEV_SHELL: stage === 'genie' ? 'genie' : 'default' },
   steps: [
     { uses: 'actions/checkout@v4', with: { 'persist-credentials': false } },
-    ...[cargoCacheStep, nixCacheStep].map((step) => ({
+    ...(nixOnly ? [nixCacheStep] : [cargoCacheStep, nixCacheStep]).map((step) => ({
       ...step,
       if: 'success()',
       id: step.id === 'cargo-cache' ? 'cargo-probe' : 'nix-probe',
@@ -36,29 +39,41 @@ const warmJob = (stage: string, setup: readonly unknown[]) => ({
     })),
     {
       name: 'Report cache coverage',
-      env: { CARGO_HIT: '${{ steps.cargo-probe.outputs.cache-hit }}', NIX_HIT: '${{ steps.nix-probe.outputs.cache-hit }}' },
+      env: { CARGO_HIT: nixOnly ? 'not used' : '${{ steps.cargo-probe.outputs.cache-hit }}', NIX_HIT: '${{ steps.nix-probe.outputs.cache-hit }}' },
       run: `printf 'Main cache coverage: Cargo=%s, Nix=%s\\n' "$CARGO_HIT" "$NIX_HIT" >> "$GITHUB_STEP_SUMMARY"
-if [ "$CARGO_HIT" != true ] || [ "$NIX_HIT" != true ]; then
+if ${nixOnly ? '[ \"$NIX_HIT\" != true ]' : '[ \"$CARGO_HIT\" != true ] || [ \"$NIX_HIT\" != true ]'}; then
   echo "::warning::P0: missing main-scope cache; filling it for Namespace overflow and pull requests"
 fi`,
     },
     ...whenMissing([
       ...setup,
-      nixDevelopStep({ name: 'Build missing cache contents', command: ['bash', 'scripts/ci-cache-warm', stage] }),
+      nixDevelopStep({ name: 'Build missing cache contents', flake: stage === 'genie' ? '.#genie' : '.', command: ['bash', 'scripts/ci-cache-warm', stage] }),
       { name: 'Save Nix outputs', run: 'bash scripts/ci-nix-cache save' },
-    ]),
+      // PR/merge builds restore these entries and retain exact-source artifacts. Only
+      // protected main fills the shared dependency quota, including after eviction.
+      ...(nixOnly ? [nixCacheStep] : [cargoCacheStep, nixCacheStep]).map((step) => ({
+        name: `Save the missing main ${step.id}`,
+        if: `github.ref == 'refs/heads/main' && steps.${step.id === 'cargo-cache' ? 'cargo-probe' : 'nix-probe'}.outputs.cache-hit != 'true'`,
+        uses: 'actions/cache/save@v4',
+        with: { path: step.with.path, key: step.with.key },
+      })),
+      ...buildSnapshotSave,
+    ], nixOnly ? "steps.nix-probe.outputs.cache-hit != 'true'" : missing),
   ],
 })
 
-export default githubWorkflow({
+export default githubWorkflow(auditCaches({
   name: 'Main upkeep',
   on: { push: { branches: ['main'] }, workflow_dispatch: {} },
-  permissions: { contents: 'read' },
-  // Every main SHA keeps its upkeep run; a later merge must not cancel cache saves or cost checks.
-  concurrency: { group: 'main-upkeep-${{ github.run_id }}', 'cancel-in-progress': false },
+  permissions: { contents: 'read', actions: 'read' },
+  // Fill caches for current main; keep pinned manual runs independent.
+  concurrency: {
+    group: "main-upkeep-${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'main' || github.run_id }}",
+    'cancel-in-progress': "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}",
+  },
   actionlint: {
     ...defaultActionlintConfig,
-    selfHostedRunnerLabels: [...(defaultActionlintConfig.selfHostedRunnerLabels ?? []), ...linuxStageRunner],
+    selfHostedRunnerLabels: [...(defaultActionlintConfig.selfHostedRunnerLabels ?? []), ...linuxRunner, ...linuxStageRunner],
   },
   jobs: {
     'main-checks': {
@@ -71,10 +86,23 @@ export default githubWorkflow({
         { name: 'Confirm main retains the queue checks', env: { GH_TOKEN: '${{ github.token }}' }, run: 'python3 scripts/check-main-ci' },
       ],
     },
+    'cache-maintenance': {
+      name: 'cache-maintenance',
+      needs: ['main-checks'],
+      'runs-on': 'ubuntu-latest',
+      'timeout-minutes': 5,
+      permissions: { contents: 'read', actions: 'write', 'pull-requests': 'read' },
+      steps: [
+        { uses: 'actions/checkout@v4', with: { 'persist-credentials': false } },
+        { name: 'Prune closed-PR and redundant Zig caches', env: { GH_TOKEN: '${{ github.token }}' }, run: 'python3 scripts/ci-cache-prune' },
+      ],
+    },
     // Keep these IDs: commonSetupSteps keys the existing caches with github.job.
     'linux-tests': warmJob('tests', workspacePreparationSteps),
     'linux-clippy': warmJob('clippy', commonSetupSteps),
     'linux-fleet-compat': warmJob('fleet-compat', commonSetupSteps),
+    'genie-freshness': warmJob('genie', commonSetupSteps.filter((step) => !('id' in step && step.id === 'cargo-cache')), true),
+    'isolation-vm': warmJob('isolation-vm', commonSetupSteps),
     'typescript-cache': {
       name: 'warm-typescript',
       'runs-on': linuxStageRunner,
@@ -108,4 +136,4 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
       before: [perfStoresCache('cost')],
     }),
   },
-})
+}, {"main-checks": "Verifies exact queue checks through the API and builds nothing.", "cache-maintenance": "Cache maintenance uses live API data and builds nothing."}))

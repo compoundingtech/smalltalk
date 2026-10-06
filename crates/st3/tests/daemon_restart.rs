@@ -24,7 +24,9 @@ struct Daemon {
     root: PathBuf,
     socket: PathBuf,
     store: Arc<Store>,
+    event_notify: watch::Sender<u64>,
     server: Option<tokio::task::JoinHandle<()>>,
+    isolated_server: Option<(tokio::sync::oneshot::Sender<()>, std::thread::JoinHandle<()>)>,
 }
 
 impl Daemon {
@@ -33,7 +35,9 @@ impl Daemon {
             root: root.to_path_buf(),
             socket: root.join("st3.sock"),
             store: Arc::new(Store::open(&root.join("daemon.sqlite3"), "restart-node").unwrap()),
+            event_notify: watch::channel(0_u64).0,
             server: None,
+            isolated_server: None,
         }
     }
 
@@ -41,11 +45,11 @@ impl Daemon {
         self.start_with_binding(false).await;
     }
 
-    async fn start_with_binding(&mut self, native: bool) {
-        let state = AppState {
+    fn state(&self) -> AppState {
+        AppState {
             store: self.store.clone(),
             notify: Arc::new(Notify::new()),
-            event_notify: watch::channel(0_u64).0,
+            event_notify: self.event_notify.clone(),
             node: "restart-node".into(),
             state_dir: self.root.join("daemon"),
             pty_root: self.root.join("pty"),
@@ -55,7 +59,44 @@ impl Daemon {
             client_relay: None,
             native_session_home: None,
             planner_default: st3::model::PlannerSpec::default(),
-        };
+        }
+    }
+
+    // Dropping this runtime also closes upgraded WebSocket connections, just as exiting
+    // the daemon does. Aborting only the listener would leave those tasks alive.
+    async fn start_isolated(&mut self) {
+        self.start_isolated_app(st3::api::router(self.state())).await;
+    }
+
+    async fn start_isolated_app(&mut self, app: axum::Router) {
+        let socket = self.socket.clone();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                tokio::select! {
+                    result = st3::api::serve_unix_bound(&socket, &socket, app) => {
+                        result.unwrap();
+                    }
+                    _ = stopped => {}
+                }
+            });
+        });
+        self.isolated_server = Some((stop, thread));
+        wait_until(
+            "the isolated daemon accepts connections",
+            Duration::from_secs(5),
+            || std::os::unix::net::UnixStream::connect(&self.socket).is_ok(),
+        )
+        .await;
+    }
+
+    async fn start_with_binding(&mut self, native: bool) {
+        let state = self.state();
         let socket = self.socket.clone();
         self.server = Some(tokio::spawn(async move {
             let app = st3::api::router(state);
@@ -75,6 +116,10 @@ impl Daemon {
 
     /// Stop the API the way an exiting daemon does: the socket file stays and refuses.
     async fn stop(&mut self) {
+        if let Some((stop, thread)) = self.isolated_server.take() {
+            let _ = stop.send(());
+            tokio::task::spawn_blocking(move || thread.join().unwrap()).await.unwrap();
+        }
         if let Some(server) = self.server.take() {
             server.abort();
             let _ = server.await;
@@ -99,6 +144,7 @@ impl Daemon {
                 idempotency_key: None,
             })
             .unwrap();
+        self.event_notify.send_modify(|value| *value = value.wrapping_add(1));
     }
 
     /// The runtime observation the reconciler recorded before the restart.
@@ -168,6 +214,18 @@ impl Daemon {
     }
 }
 
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        if let Some(server) = self.server.take() {
+            server.abort();
+        }
+        if let Some((stop, thread)) = self.isolated_server.take() {
+            let _ = stop.send(());
+            let _ = thread.join();
+        }
+    }
+}
+
 async fn wait_until(what: &str, limit: Duration, mut condition: impl FnMut() -> bool) {
     let deadline = Instant::now() + limit;
     while !condition() {
@@ -192,8 +250,7 @@ fn seat_command(root: &Path, socket: &Path) -> Command {
         .env("XDG_RUNTIME_DIR", root.join("runtime"))
         .env("ST3_DRIVER_STATE_DIR", root.join("drivers"))
         .env("ST3_DAEMON_WAIT", "0")
-        .arg("--endpoint")
-        .arg(socket);
+        .env("ST3_ENDPOINT", socket);
     for directory in ["workspace", "home", "state", "config", "runtime", "drivers"] {
         std::fs::create_dir_all(root.join(directory)).unwrap();
     }
@@ -244,8 +301,528 @@ fn stop(mut child: Child) -> String {
     stderr
 }
 
+/// A failed assertion must also stop this test's provider process group.
+struct TestSeat(Option<Child>);
+impl std::ops::Deref for TestSeat {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        self.0.as_ref().unwrap()
+    }
+}
+impl std::ops::DerefMut for TestSeat {
+    fn deref_mut(&mut self) -> &mut Child {
+        self.0.as_mut().unwrap()
+    }
+}
+impl TestSeat {
+    fn stop(mut self) -> String {
+        stop(self.0.take().unwrap())
+    }
+}
+impl Drop for TestSeat {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.take() {
+            let _ = stop(child);
+        }
+    }
+}
+
+/// An actual native driver with a controlled provider. All signals and files belong to the
+/// test's process group and temporary home; TestSeat also cleans up on a failed assertion.
+async fn native_exit_driver(root: &Path, daemon: &mut Daemon) -> TestSeat {
+    let seat = "agent/grove/exit-orchid";
+    let mut command = seat_command(root, &daemon.socket);
+    declare_claude(daemon, seat);
+    daemon.observe_running(seat, "exit-orchid:one");
+    daemon.start_isolated().await;
+    let provider = r#"
+import os, signal, time
+from pathlib import Path
+home = Path(os.environ['HOME'])
+def stopped(signum, frame):
+    (home / 'provider-stopped').touch()
+    raise SystemExit(0)
+signal.signal(signal.SIGTERM, stopped)
+(home / 'provider-pid').write_text(str(os.getpid()))
+while not (home / 'provider-finish').exists():
+    time.sleep(0.05)
+(home / 'provider-finished').touch()
+"#;
+    let mut driver = TestSeat(Some(
+        command
+            .env("ST_AGENT", seat)
+            .env("ST3_MAILBOX_TRANSPORT", "push")
+            .args([
+                "driver",
+                "claude",
+                "--subject",
+                seat,
+                "--",
+                "python3",
+                "-c",
+                provider,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    ));
+    wait_until(
+        "the native provider starts",
+        Duration::from_secs(10),
+        || {
+            assert_alive(&mut driver, "the starting exit-report driver");
+            root.join("home/provider-pid").exists()
+                && daemon.has_diagnostic(seat, "exit-orchid:one", "claude-channel-unattached")
+        },
+    )
+    .await;
+    driver
+}
+
+fn request_driver_stop(driver: &Child) {
+    // Signal only the driver: its normal provider supervision must stop the child itself.
+    assert_eq!(unsafe { libc::kill(driver.id() as i32, libc::SIGTERM) }, 0);
+}
+
+async fn native_exit_finishes(root: &Path, driver: &mut TestSeat, limit: Duration) {
+    wait_until("the stopped driver exits", limit, || {
+        driver.try_wait().unwrap().is_some()
+    })
+    .await;
+    let status = driver.try_wait().unwrap().unwrap();
+    if !status.success() {
+        let mut stderr = String::new();
+        driver
+            .stderr
+            .as_mut()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        panic!("{status}: {stderr}; {}", driver_log(root));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_exit_stops_provider_and_driver_with_daemon_down() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    // Exercise both transient Unix-socket errors that previously retried forever.
+    for missing_socket in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        let mut daemon = Daemon::new(root);
+        let mut driver = native_exit_driver(root, &mut daemon).await;
+        let provider_pid = std::fs::read_to_string(root.join("home/provider-pid"))
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        daemon.stop().await;
+        if missing_socket {
+            std::fs::remove_file(&daemon.socket).unwrap();
+        }
+        let requested = Instant::now();
+        request_driver_stop(&driver);
+        wait_until(
+            "the provider handles the driver's stop",
+            Duration::from_secs(5),
+            || root.join("home/provider-stopped").exists(),
+        )
+        .await;
+        let provider_stopped_after = requested.elapsed();
+        // Provider polling + five-second stop grace + 250-ms flag polling + two-second
+        // reporting budget fit inside eight seconds from the signal.
+        native_exit_finishes(
+            root,
+            &mut driver,
+            Duration::from_secs(8).saturating_sub(requested.elapsed()),
+        )
+        .await;
+        eprintln!(
+            "native exit: missing_socket={missing_socket}, provider stopped after {provider_stopped_after:?}, driver exited after {:?}",
+            requested.elapsed()
+        );
+        assert!(requested.elapsed() < Duration::from_secs(8));
+        assert_eq!(
+            unsafe { libc::kill(provider_pid, 0) },
+            -1,
+            "provider survived its driver"
+        );
+        assert!(driver_log(root).contains("two-second exit-report deadline"));
+        assert!(
+            driver.stop().is_empty(),
+            "exit reporting reached the terminal"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_exit_retries_past_stop_budget_without_signal_and_reports_on_recovery() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let mut daemon = Daemon::new(root);
+    let mut driver = native_exit_driver(root, &mut daemon).await;
+    daemon.stop().await;
+    std::fs::write(root.join("home/provider-finish"), "").unwrap();
+    wait_until(
+        "the provider finishes during the outage",
+        Duration::from_secs(5),
+        || root.join("home/provider-finished").exists(),
+    )
+    .await;
+    // Longer than the stop budget: a provider ending normally must not start a deadline.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    if driver.try_wait().unwrap().is_some() {
+        native_exit_finishes(root, &mut driver, Duration::ZERO).await;
+        panic!("driver exited before daemon recovery");
+    }
+    daemon.start_isolated().await;
+    native_exit_finishes(root, &mut driver, Duration::from_secs(5)).await;
+    let claims = daemon
+        .store
+        .claims_for("agent/grove/exit-orchid", Some("runtime.observed"))
+        .unwrap();
+    let terminal = claims
+        .iter()
+        .filter(|claim| claim.body["fields"]["status"] == "exited")
+        .collect::<Vec<_>>();
+    assert_eq!(terminal.len(), 1, "{claims:?}");
+    assert_eq!(
+        terminal[0].body["fields"]["incarnation_id"],
+        "exit-orchid:one"
+    );
+    assert_eq!(
+        terminal[0].body["fields"]["runtime_id"],
+        "grove/exit-orchid"
+    );
+    assert_eq!(terminal[0].body["fields"]["exit_code"], 0);
+    assert!(!driver_log(root).contains("exit-report deadline"));
+    assert!(driver.stop().is_empty());
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_exit_signal_after_provider_end_bounds_an_in_flight_request() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let mut daemon = Daemon::new(root);
+    let mut driver = native_exit_driver(root, &mut daemon).await;
+    daemon.stop().await;
+    // Recovery serves the final observation drain but never answers the terminal claim.
+    // This proves the budget cancels an in-flight report even when SIGTERM arrives later.
+    let posting_exit = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed = posting_exit.clone();
+    let app = st3::api::router(daemon.state()).layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let observed = observed.clone();
+            async move {
+                let (parts, body) = request.into_parts();
+                let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+                if parts.uri.path() == "/v1/claims"
+                    && serde_json::from_slice::<Value>(&bytes).is_ok_and(|claim| {
+                        claim["kind"] == "runtime.observed" && claim["fields"]["status"] == "exited"
+                    })
+                {
+                    observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return std::future::pending::<axum::response::Response>().await;
+                }
+                next.run(axum::extract::Request::from_parts(
+                    parts,
+                    axum::body::Body::from(bytes),
+                ))
+                .await
+            }
+        },
+    ));
+    daemon.start_isolated_app(app).await;
+    std::fs::write(root.join("home/provider-finish"), "").unwrap();
+    wait_until(
+        "the driver's terminal claim is in flight",
+        Duration::from_secs(5),
+        || posting_exit.load(std::sync::atomic::Ordering::SeqCst),
+    )
+    .await;
+    assert!(root.join("home/provider-finished").exists());
+    assert_alive(&mut driver, "the driver with an in-flight exit report");
+    let requested = Instant::now();
+    request_driver_stop(&driver);
+    // Two-second deadline + 250-ms polling; allow CI scheduling margin, with no provider grace.
+    native_exit_finishes(root, &mut driver, Duration::from_secs(5)).await;
+    eprintln!(
+        "native exit: cancelled in-flight terminal report and exited after {:?}",
+        requested.elapsed()
+    );
+    assert!(driver_log(root).contains("two-second exit-report deadline"));
+    assert!(driver.stop().is_empty());
+    daemon.stop().await;
+}
+
+fn declare_claude(daemon: &Daemon, seat: &str) {
+    let source = format!(
+        "version 2\nagent {:?} {{ workspace {:?}; harness \"claude\" {{ model \"example-model\"; }} }}\n",
+        seat.trim_start_matches("agent/"),
+        daemon.root.join("workspace"),
+    );
+    let intent = st3::parse_intent(&source, "restart-node").unwrap();
+    let preview = daemon
+        .store
+        .mission(
+            &intent,
+            st3::model::IntentInput {
+                kdl: source,
+                source_name: None,
+            },
+        )
+        .unwrap();
+    daemon
+        .store
+        .apply_as(
+            &intent,
+            &preview.subject_tokens,
+            "declare",
+            Some("person/operator"),
+        )
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_quiet_idle_seat_reports_current_after_daemon_restart_without_seat_restart() {
+    use sha2::{Digest as _, Sha256};
+    use st_drivers::harness_state::{Activity, BlockedOn, InputBuffer, Observation, Writer};
+
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let seat = "agent/grove/quiet-cedar";
+    let incarnation = "quiet-cedar:one";
+    let mut daemon = Daemon::new(root);
+    let mut command = seat_command(root, &daemon.socket);
+    declare_claude(&daemon, seat);
+    daemon.observe_running(seat, incarnation);
+    daemon.start_isolated().await;
+    // A healthy quiet Claude seat includes its initialized delivery channel. The provider
+    // emits no further hook events; the wrapper must keep the owned idle evidence current.
+    let provider = r#"
+import json, os, subprocess, sys, time
+channel = subprocess.Popen(
+    [sys.argv[1], 'driver', 'claude-mcp', '--subject', os.environ['ST_AGENT']],
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+channel.stdin.write(json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'initialize'}) + '\n')
+channel.stdin.flush()
+assert json.loads(channel.stdout.readline())['id'] == 1
+channel.stdin.write(json.dumps({'jsonrpc': '2.0', 'method': 'notifications/initialized'}) + '\n')
+channel.stdin.flush()
+time.sleep(300)
+"#;
+    let mut driver = TestSeat(Some(
+        command
+            .env("ST_AGENT", seat)
+            .env("ST3_MAILBOX_TRANSPORT", "push")
+            .args(["driver", "claude", "--subject", seat, "--", "python3", "-c", provider,
+                env!("CARGO_BIN_EXE_st3-fixture")])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    ));
+    let original_pid = driver.id();
+    let agent_dir = root
+        .join("drivers")
+        .join(&hex::encode(Sha256::digest(seat.as_bytes()))[..24])
+        .join("observations");
+    let record = st_drivers::harness_state::harness_state_path(&agent_dir);
+    wait_until(
+        "the wrapper claims its harness record",
+        Duration::from_secs(10),
+        || {
+            st_drivers::harness_state::read(&record, None)
+                .is_some_and(|state| state.evidence_incarnation.is_some())
+        },
+    )
+    .await;
+    let owned = st_drivers::harness_state::read(&record, None).unwrap();
+    wait_until("the quiet seat's channel attaches", Duration::from_secs(10), || {
+        daemon.has_diagnostic(seat, incarnation, "claude-channel-attached")
+    })
+    .await;
+    // Stand in for this wrapper's Stop hook. The live wrapper must heartbeat that exact
+    // owned idle evidence; no subsequent provider event or test observation is supplied.
+    Writer::new(
+        &agent_dir,
+        "grove/quiet-cedar",
+        "claude",
+        Some("grove/quiet-cedar".into()),
+    )
+    .with_ownership(
+        owned.evidence_incarnation.unwrap(),
+        owned.ownership_sequence.unwrap(),
+    )
+    .observe(Observation::new(
+        Activity::Idle,
+        BlockedOn::None,
+        InputBuffer::Empty,
+    ))
+    .unwrap();
+    wait_until("the driver publishes idle", Duration::from_secs(10), || {
+        daemon
+            .harness_states(seat, incarnation)
+            .contains(&"idle".into())
+    })
+    .await;
+
+    let client = st3::client::Client::unix(&daemon.socket);
+    let before: Value = client.get("/v1/client/agents").await.unwrap();
+    let before = before["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == seat)
+        .unwrap();
+    assert_eq!(before["harness_state"], "idle", "{before}");
+    assert_eq!(before["observation"], "current", "{before}");
+    daemon.stop().await;
+    // Exceed the real client freshness horizon, not a test-only shortened timeout. Open a
+    // fresh Store too: the driver's spool and mailbox fence must survive real cache loss.
+    tokio::time::sleep(Duration::from_secs(95)).await;
+    assert_alive(&mut driver, "the quiet driver");
+    daemon.store = Arc::new(Store::open(&root.join("daemon.sqlite3"), "restart-node").unwrap());
+    daemon.start_isolated().await;
+    let deadline = Instant::now() + Duration::from_secs(40);
+    let recovered = loop {
+        let view: Value = client.get("/v1/client/agents").await.unwrap();
+        let row = view["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == seat)
+            .cloned()
+            .unwrap();
+        if (row["observation"] == "current" && row["harness_state"] == "idle")
+            || Instant::now() >= deadline
+        {
+            break row;
+        }
+        assert_alive(&mut driver, "the quiet driver after daemon restart");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(driver.id(), original_pid);
+    let terminal = driver.stop();
+    daemon.stop().await;
+    assert_eq!(recovered["observation"], "current", "{recovered}");
+    assert_eq!(recovered["harness_state"], "idle", "{recovered}");
+    assert!(
+        terminal.is_empty(),
+        "the driver wrote into the terminal: {terminal}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn title_failures_use_the_bound_pty_name_and_a_rate_limited_driver_log() {
+    title_failure(Some("cedar-pty-7f3a"), "cedar-pty-7f3a").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn title_fallback_converts_a_slash_seat_id_to_its_dot_pty_id() {
+    title_failure(None, "grove.title-cedar").await;
+}
+
+async fn title_failure(pty_session: Option<&str>, expected_session: &str) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let seat = "agent/grove/title-cedar";
+    let mut daemon = Daemon::new(root);
+    let mut command = seat_command(root, &daemon.socket);
+    declare_claude(&daemon, seat);
+    daemon.observe_running(seat, "title-cedar:one");
+    daemon.start_with_binding(true).await;
+    let bin = root.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let pty = bin.join("pty");
+    std::fs::write(&pty, format!(
+        "#!{}\nprintf '%s\\n' \"$@\" >> \"$HOME/title-arguments\"\nprintf 'Session missing\\n' >&2\nexit 1\n",
+        env!("ST3_FIXTURE_BASH"),
+    )).unwrap();
+    std::fs::set_permissions(&pty, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .unwrap();
+    command.env_remove("PTY_SESSION");
+    if let Some(session) = pty_session {
+        command.env("PTY_SESSION", session);
+    }
+    let mut driver = TestSeat(Some(
+        command
+            .env("PATH", path)
+            .env("ST_AGENT", seat)
+            .env("ST3_MAILBOX_TRANSPORT", "push")
+            .args(["driver", "claude", "--subject", seat, "--", "sleep", "300"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    ));
+    let arguments = root.join("home/title-arguments");
+    wait_until("the first title update", Duration::from_secs(10), || {
+        arguments.exists()
+    })
+    .await;
+    for (index, label) in ["Cedar A", "Cedar B"].into_iter().enumerate() {
+        daemon
+            .store
+            .rename_agent(seat, Some(label), &format!("title-{index}"))
+            .unwrap();
+        daemon
+            .event_notify
+            .send_modify(|value| *value = value.wrapping_add(1));
+        wait_until(
+            "the changed title reaches the driver",
+            Duration::from_secs(5),
+            || {
+                std::fs::read_to_string(&arguments)
+                    .unwrap_or_default()
+                    .contains(label)
+            },
+        )
+        .await;
+    }
+    assert_alive(&mut driver, "the driver with a failed title update");
+    let terminal = driver.stop();
+    let calls = std::fs::read_to_string(arguments).unwrap();
+    for call in calls.lines().collect::<Vec<_>>().chunks_exact(3) {
+        assert_eq!(call[0], "rename");
+        assert_eq!(call[1], expected_session, "{calls}");
+    }
+    let log = driver_log(root);
+    assert_eq!(
+        log.matches("could not update seat title").count(),
+        1,
+        "{log}"
+    );
+    assert!(log.contains("Session missing"), "{log}");
+    assert!(log.contains(seat), "{log}");
+    assert!(
+        terminal.is_empty(),
+        "title failures reached the seat's terminal: {terminal}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_claude_seat_starts_through_a_daemon_restart_and_then_keeps_its_mail() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let root = root.path();
     let seat = "agent/restart-claude";
@@ -371,6 +948,9 @@ async fn a_claude_seat_starts_through_a_daemon_restart_and_then_keeps_its_mail()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pi_family_channel_keeps_state_and_mail_through_a_daemon_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let root = root.path();
     let seat = "agent/restart-omp";
@@ -462,6 +1042,9 @@ async fn a_pi_family_channel_keeps_state_and_mail_through_a_daemon_restart() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn todo_graph_lag_on_first_open_keeps_delivery_and_publishes_hydration_after_catchup() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let root = root.path();
     let seat = "agent/restart-todo";
@@ -568,6 +1151,9 @@ async fn todo_graph_lag_on_first_open_keeps_delivery_and_publishes_hydration_aft
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_outbox_drain_preserves_captured_limits_and_usage_account_attribution() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     use sha2::Digest as _;
     let root = tempfile::tempdir().unwrap();
     let root = root.path();
@@ -634,6 +1220,9 @@ async fn native_outbox_drain_preserves_captured_limits_and_usage_account_attribu
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_omp_ask_clears_without_poisoning_the_next_incarnation() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let root = root.path();
     let seat = "agent/human-omp";
@@ -719,6 +1308,9 @@ agent "human-omp" { workspace "/tmp"; harness "omp" {} }
 
 #[test]
 fn a_cli_command_says_the_daemon_is_unreachable_and_never_to_start_it() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let socket = root.path().join("st3.sock");
     drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
@@ -744,11 +1336,16 @@ fn a_cli_command_says_the_daemon_is_unreachable_and_never_to_start_it() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cli_command_waits_out_a_daemon_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let root = root.path();
     let mut daemon = Daemon::new(root);
     daemon.start().await;
     daemon.stop().await;
+    let startup = st3::startup::Startup::begin(&daemon.socket).unwrap();
+    startup.phase("open-store");
     let mut command = seat_command(root, &daemon.socket);
     command.env("ST3_DAEMON_WAIT", "20").args([
         "--json",
@@ -760,6 +1357,7 @@ async fn a_cli_command_waits_out_a_daemon_restart() {
     let pending = tokio::task::spawn_blocking(move || command.output().unwrap());
     tokio::time::sleep(Duration::from_millis(1_000)).await;
     daemon.start().await;
+    startup.serving();
     let output = pending.await.unwrap();
     assert!(
         output.status.success(),
@@ -767,15 +1365,133 @@ async fn a_cli_command_waits_out_a_daemon_restart() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
+    #[cfg(target_os = "linux")]
+    assert!(stderr.contains("daemon starting · open-store"), "{stderr}");
+    #[cfg(not(target_os = "linux"))]
+    assert!(stderr.contains("retrying for up to 20s"), "{stderr}");
+    let _: Value = serde_json::from_slice(&output.stdout).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cli_command_tries_a_bound_listener_before_refusing_startup() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let mut daemon = Daemon::new(root);
+    let startup = st3::startup::Startup::begin(&daemon.socket).unwrap();
+    startup.phase("full-replay/flush");
+    daemon.start().await;
+    // Deliberately leave the record at starting: the API has bound, while a second listener
+    // or the final readiness publication has not completed yet.
+    let output = seat_command(root, &daemon.socket)
+        .env("ST3_DAEMON_WAIT", "20")
+        .args([
+            "--json",
+            "work",
+            "ls",
+            "--as",
+            "agent/startup-listener-probe",
+        ])
+        .output()
+        .unwrap();
     assert!(
-        stderr.contains("it may be restarting; retrying for up to 20s"),
-        "{stderr}"
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
     let _: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        st3::startup::read(&daemon.socket).unwrap().status,
+        "starting"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn doctor_reports_starting_without_failing_an_answering_api() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let mut daemon = Daemon::new(root);
+    fn response(value: Value) -> axum::Json<st3::model::ApiResponse<Value>> {
+        axum::Json(st3::model::ApiResponse {
+            api_version: "st3.v1".into(),
+            request_id: "fixture-doctor-request".into(),
+            snapshot_host: "restart-node".into(),
+            store_index: 1,
+            value,
+        })
+    }
+    let startup = st3::startup::Startup::begin(&daemon.socket).unwrap();
+    startup.phase("bind");
+    daemon
+        .start_isolated_app(
+            axum::Router::new()
+                .route(
+                    "/v1/doctor",
+                    axum::routing::get(|| async {
+                        response(json!({"status":"pass", "checks":[], "performance":{}}))
+                    }),
+                )
+                .route(
+                    "/v1/performance",
+                    axum::routing::get(|| async { response(json!({"fixture":"performance"})) }),
+                ),
+        )
+        .await;
+    let output = seat_command(root, &daemon.socket)
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["status"], "pass");
+    assert_eq!(report["startup"]["status"], "starting");
+    assert_eq!(report["startup"]["phase"], "bind");
+    let output = seat_command(root, &daemon.socket)
+        .arg("doctor")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.contains("info\tstartup\tdaemon starting · bind"),
+        "{text}"
+    );
+    assert!(!text.contains("API is not ready"), "{text}");
+    let output = seat_command(root, &daemon.socket)
+        .args(["doctor", "--performance", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["fixture"], "performance");
+    assert_eq!(report["startup"]["status"], "starting");
+    daemon.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_read_mail_is_settled_before_and_after_reopening_the_daemon() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     for driver in ["omp", "pi"] {
         for transport in ["poll", "push"] {
             let root = tempfile::tempdir().unwrap();
@@ -786,10 +1502,17 @@ async fn native_read_mail_is_settled_before_and_after_reopening_the_daemon() {
             daemon.store = Arc::new(Store::open(&graph, "restart-node").unwrap());
             daemon.observe_running(seat, "same-incarnation");
             daemon.start_with_binding(true).await;
-            daemon.send("message/consumed", seat, "CONSUMED SIGNAL");
 
             let socket = daemon.socket.clone();
-            let open_channel = || {
+            daemon.send("message/ready-probe", seat, "READINESS PROBE");
+            for lifecycle in ["delivered", "read", "closed"] {
+                daemon.store.append_claim(&ClaimInput {
+                    subject: "message/ready-probe".into(), kind: format!("message.{lifecycle}"),
+                    actor: Some(seat.into()), fields: BTreeMap::from([("status".into(), json!(lifecycle))]),
+                    evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+                }).unwrap();
+            }
+            let open_channel = || async {
                 let mut channel = seat_command(root, &socket)
                     .env("ST_AGENT", seat)
                     .env("ST3_MAILBOX_TRANSPORT", transport)
@@ -823,9 +1546,22 @@ async fn native_read_mail_is_settled_before_and_after_reopening_the_daemon() {
                 );
                 writeln!(input, "{}", json!({"type":"state", "state":"idle"})).unwrap();
                 input.flush().unwrap();
+                let client = st3::client::Client::new(st3::client::Endpoint::Unix(socket.clone()));
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    let status: Value = client.get("/v1/messages/delivery/ready-probe").await.unwrap();
+                    let delivery = &status["delivery"]["recipient_delivery"];
+                    let ready = matches!(delivery["state"].as_str(), Some("current" | "outdated" | "legacy"));
+                    let own_pid = delivery["state"] == "current" || delivery["reason"].as_str()
+                        .is_some_and(|reason| reason.contains(&format!("pid {}", channel.id())));
+                    if ready && own_pid { break; }
+                    assert!(Instant::now() < deadline, "{driver}/{transport}: channel not ready: {status}");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
                 (channel, input, received)
             };
-            let (channel, mut input, received) = open_channel();
+            let (channel, mut input, received) = open_channel().await;
+            daemon.send("message/consumed", seat, "CONSUMED SIGNAL");
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
                 let frame = received
@@ -867,8 +1603,8 @@ async fn native_read_mail_is_settled_before_and_after_reopening_the_daemon() {
             daemon.stop().await;
             daemon.store = Arc::new(Store::open(&graph, "restart-node").unwrap());
             daemon.start_with_binding(true).await;
+            let (channel, _input, received) = open_channel().await;
             daemon.send("message/unread", seat, "UNREAD SIGNAL");
-            let (channel, _input, received) = open_channel();
             let deadline = Instant::now() + Duration::from_secs(3);
             let mut offered = Vec::new();
             while let Ok(frame) =
@@ -912,7 +1648,10 @@ async fn native_read_mail_is_settled_before_and_after_reopening_the_daemon() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn delivered_unread_mail_replays_after_seat_restart_without_repeating_settled_mail() {
+async fn delivered_unread_mail_stays_in_the_mailbox_after_seat_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     for driver in ["omp", "pi"] {
         for transport in ["push", "poll"] {
             let root = tempfile::tempdir().unwrap();
@@ -971,27 +1710,7 @@ async fn delivered_unread_mail_replays_after_seat_restart_without_repeating_sett
             assert_eq!(received.recv_timeout(Duration::from_secs(10)).unwrap()["type"], "hello");
             writeln!(input, "{}", json!({"type":"state", "state":"idle"})).unwrap();
             input.flush().unwrap();
-            let mut replayed = Vec::new();
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while replayed.len() < 2 {
-                match received.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                    Ok(frame) if frame["type"] == "message" => {
-                        replayed.push(frame["meta"]["messageId"].as_str().unwrap().to_owned());
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        let stderr = stop(channel);
-                        panic!("{driver}/{transport}: delivered-unread mail did not replay: {error}; {stderr}");
-                    }
-                }
-            }
-            replayed.sort();
-            assert_eq!(replayed, ["message/unread-one", "message/unread-two"], "{driver}/{transport}");
-            // Several mailbox ticks and a delivered receipt must not reinject into this channel.
-            writeln!(input, "{}", json!({
-                "type":"delivered", "meta":{"messageId":"message/unread-one"},
-            })).unwrap();
-            input.flush().unwrap();
+            // Several mailbox ticks must not reoffer old mail, regardless of native receipts.
             let deadline = Instant::now() + Duration::from_millis(2_200);
             while let Ok(frame) = received.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                 assert_ne!(frame["type"], "message", "{driver}/{transport}: duplicate or settled mail: {frame}");
@@ -1005,4 +1724,464 @@ async fn delivered_unread_mail_replays_after_seat_restart_without_repeating_sett
             daemon.stop().await;
         }
     }
+}
+
+// Claude can create its transcript after SessionStart. Its channel must recover the
+// exact hook-bound session, and consumption need not run UserPromptSubmit.
+struct ClaudeChannelFixture {
+    paths: st_drivers::driver_paths::Paths,
+    transcript: PathBuf,
+}
+impl ClaudeChannelFixture {
+    fn new(root: &Path, daemon: &Daemon, wrapper: &str) -> Self {
+        let paths = st_drivers::driver_paths::Paths {
+            root: root.join("claude-driver"),
+            agent_dir: root.join("claude-driver/observations"),
+            session_dir: root.join("claude-driver/sessions/claude"),
+        };
+        std::fs::create_dir_all(&paths.agent_dir).unwrap();
+        let transcript =
+            root.join("home/.claude/projects/quartz/019fae17-c215-7882-a4d9-5f247168ffce.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        let fixture = Self { paths, transcript };
+        // No transcript yet: reproduce a real SessionStart binding failure. The
+        // lightweight hook binding still identifies this wrapper's native session.
+        let mut hook = fixture
+            .command(root, daemon, wrapper)
+            .args(["driver-hook", "claude-observe", "SessionStart"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        writeln!(hook.stdin.take().unwrap(), "{}", json!({
+            "session_id":"019fae17-c215-7882-a4d9-5f247168ffce",
+            "transcript_path":fixture.transcript, "cwd":root.join("workspace"), "source":"startup",
+        })).unwrap();
+        let output = hook.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "SessionStart failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        daemon.send("message/quartz-ready", "agent/quartz", "READINESS PROBE");
+        for lifecycle in ["delivered", "read", "closed"] {
+            daemon.store.append_claim(&ClaimInput {
+                subject: "message/quartz-ready".into(), kind: format!("message.{lifecycle}"),
+                actor: Some("agent/quartz".into()), fields: BTreeMap::from([("status".into(), json!(lifecycle))]),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+        }
+        fixture
+    }
+    fn command(&self, root: &Path, daemon: &Daemon, wrapper: &str) -> Command {
+        let mut command = seat_command(root, &daemon.socket);
+        command
+            .envs(self.paths.environment("quartz"))
+            .env("ST_AGENT", "agent/quartz")
+            .env("ST3_SUBJECT", "agent/quartz")
+            .env("ST3_MAILBOX_TRANSPORT", "push")
+            .env("ST_CLAUDE_IDENTITY", "quartz")
+            .env("ST_CLAUDE_RUNTIME_ID", "quartz")
+            .env("ST_CLAUDE_SESSION", wrapper)
+            .env("ST_CLAUDE_SESSION_SEQ", "1");
+        command
+    }
+    async fn open(
+        &self,
+        root: &Path,
+        daemon: &Daemon,
+        wrapper: &str,
+    ) -> (
+        Child,
+        std::process::ChildStdin,
+        std::sync::mpsc::Receiver<Value>,
+    ) {
+        let mut channel = self
+            .command(root, daemon, wrapper)
+            .args(["driver", "claude-mcp", "--subject", "agent/quartz"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = channel.stdin.take().unwrap();
+        let (sender, received) = std::sync::mpsc::channel::<Value>();
+        let output = channel.stdout.take().unwrap();
+        std::thread::spawn(move || {
+            for line in BufReader::new(output).lines() {
+                let Ok(line) = line else { break };
+                if let Ok(frame) = serde_json::from_str(&line) {
+                    let _ = sender.send(frame);
+                }
+            }
+        });
+        writeln!(
+            input,
+            "{}",
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize"})
+        )
+        .unwrap();
+        input.flush().unwrap();
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(10)).unwrap()["id"],
+            1
+        );
+        writeln!(
+            input,
+            "{}",
+            json!({"jsonrpc":"2.0","method":"notifications/initialized"})
+        )
+        .unwrap();
+        input.flush().unwrap();
+        let client = st3::client::Client::new(st3::client::Endpoint::Unix(daemon.socket.clone()));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let view: Value = client.get("/v1/messages/delivery/quartz-ready").await.unwrap();
+            let delivery = &view["delivery"]["recipient_delivery"];
+            let ready = matches!(delivery["state"].as_str(), Some("current" | "outdated" | "legacy"));
+            let own_pid = delivery["state"] == "current" || delivery["reason"].as_str()
+                .is_some_and(|reason| reason.contains(&format!("pid {}", channel.id())));
+            if ready && own_pid { break; }
+            assert!(Instant::now() < deadline, "Claude channel not ready: {view}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        (channel, input, received)
+    }
+    fn append(&self, root: &Path, record: Value) {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.transcript)
+            .unwrap();
+        let mut record = record;
+        record["sessionId"] = json!("019fae17-c215-7882-a4d9-5f247168ffce");
+        record["cwd"] = json!(root.join("workspace"));
+        writeln!(file, "{record}").unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_idle_staged_mail_recovers_startup_binding_and_both_native_receipt_forms() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    for mid_turn in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        let mut daemon = Daemon::new(root);
+        daemon.observe_running("agent/quartz", "first");
+        daemon.start_with_binding(true).await;
+        let fixture = ClaudeChannelFixture::new(root, &daemon, "wrapper-first");
+        let (channel, _input, received) = fixture.open(root, &daemon, "wrapper-first").await;
+        daemon.send("message/idle", "agent/quartz", "QUARTZ IDLE SIGNAL");
+        let frame = received.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(frame["method"], "notifications/claude/channel");
+        assert!(daemon.has_diagnostic("agent/quartz", "first", "claude-receipt-unavailable"));
+        assert_eq!(
+            daemon
+                .store
+                .message("message/idle")
+                .unwrap()
+                .unwrap()
+                .status,
+            "staged"
+        );
+        let content = &frame["params"]["content"];
+        fixture.append(
+            root,
+            json!({"type":"queue-operation","operation":"enqueue","content":content}),
+        );
+        // Enqueue proves native transport acceptance, but not consumption.
+        wait_until(
+            "the native Claude acceptance receipt",
+            Duration::from_secs(6),
+            || {
+                daemon
+                    .store
+                    .message("message/idle")
+                    .unwrap()
+                    .unwrap()
+                    .status
+                    == "delivered"
+            },
+        )
+        .await;
+        assert!(
+            daemon
+                .store
+                .claims_for("message/idle", Some("message.read"))
+                .unwrap()
+                .is_empty()
+        );
+        if mid_turn {
+            fixture.append(root, json!({"type":"queue-operation","operation":"remove",
+                "reason":"absorbed_mid_turn","content":content,"commandUuid":"native-command","deliveryId":"native-delivery"}));
+        } else {
+            fixture.append(
+                root,
+                json!({"type":"user","isMeta":true,"message":{"role":"user","content":content}}),
+            );
+        }
+        wait_until(
+            "the native Claude consumption receipt",
+            Duration::from_secs(6),
+            || {
+                daemon
+                    .store
+                    .message("message/idle")
+                    .unwrap()
+                    .unwrap()
+                    .status
+                    == "read"
+            },
+        )
+        .await;
+        for kind in ["message.delivered", "message.read"] {
+            assert_eq!(
+                daemon
+                    .store
+                    .claims_for("message/idle", Some(kind))
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        assert!(received.recv_timeout(Duration::from_millis(1200)).is_err());
+        assert!(stop(channel).is_empty());
+        daemon.stop().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_staged_mail_receipted_after_restart_is_not_injected_on_second_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let mut daemon = Daemon::new(root);
+    daemon.observe_running("agent/quartz", "first");
+    daemon.start_with_binding(true).await;
+    let fixture = ClaudeChannelFixture::new(root, &daemon, "wrapper-first");
+    let (channel, _input, received) = fixture.open(root, &daemon, "wrapper-first").await;
+    daemon.send("message/restart", "agent/quartz", "QUARTZ RESTART SIGNAL");
+    let frame = received.recv_timeout(Duration::from_secs(10)).unwrap();
+    let content = frame["params"]["content"].clone();
+    assert!(stop(channel).is_empty());
+    assert_eq!(
+        daemon
+            .store
+            .message("message/restart")
+            .unwrap()
+            .unwrap()
+            .status,
+        "staged"
+    );
+    // Claude consumed the old notification while the channel was down. Native
+    // proof precedes restarting the channel; reoffering it would duplicate work.
+    fixture.append(
+        root,
+        json!({"type":"user","isMeta":true,"message":{"role":"user","content":content}}),
+    );
+    for incarnation in ["second", "third"] {
+        daemon.observe_running("agent/quartz", incarnation);
+        // A wrapper restart keeps the provider's resumed transcript and records
+        // its lightweight binding before the channel's first mailbox replay.
+        std::fs::write(fixture.paths.agent_dir.join("claude-native-session"),
+            json!({"incarnation":incarnation,"native_session_id":"019fae17-c215-7882-a4d9-5f247168ffce"}).to_string()).unwrap();
+        let (channel, _input, received) = fixture.open(root, &daemon, incarnation).await;
+        wait_until(
+            "the recovered startup receipt",
+            Duration::from_secs(6),
+            || {
+                daemon
+                    .store
+                    .message("message/restart")
+                    .unwrap()
+                    .unwrap()
+                    .status
+                    == "read"
+            },
+        )
+        .await;
+        assert!(
+            received.recv_timeout(Duration::from_millis(1200)).is_err(),
+            "{incarnation} reinjected consumed mail"
+        );
+        assert!(stop(channel).is_empty());
+    }
+    for kind in ["message.delivered", "message.read"] {
+        assert_eq!(
+            daemon
+                .store
+                .claims_for("message/restart", Some(kind))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_preboot_mail_is_held_while_live_receipts_survive_outage() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let mut daemon = Daemon::new(root);
+    daemon.observe_running("agent/quartz", "previous");
+    daemon.send("message/startup", "agent/quartz", "QUARTZ STARTUP SIGNAL");
+    daemon
+        .store
+        .append_claim(&ClaimInput {
+            subject: "message/startup".into(),
+            kind: "message.staged".into(),
+            actor: Some("agent/quartz".into()),
+            fields: BTreeMap::from([
+                ("status".into(), json!("staged")),
+                ("recipient".into(), json!("agent/quartz")),
+                ("transport".into(), json!("claude-channel")),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+    daemon.observe_running("agent/quartz", "replacement");
+    daemon.start_with_binding(true).await;
+    let fixture = ClaudeChannelFixture::new(root, &daemon, "wrapper-replacement");
+    let (mut channel, _input, received) = fixture.open(root, &daemon, "wrapper-replacement").await;
+    assert!(received.recv_timeout(Duration::from_millis(1200)).is_err());
+    assert_eq!(daemon.store.message("message/startup").unwrap().unwrap().status, "staged");
+    daemon.send("message/live", "agent/quartz", "QUARTZ LIVE SIGNAL");
+    let frame = received.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(frame["params"]["meta"]["messageId"], "message/live");
+    // Consumption happens while receipt publication is unavailable. The channel
+    // must keep proof, retry only the receipt, and never repeat the notification.
+    daemon.stop().await;
+    fixture.append(
+        root,
+        json!({"type":"user","isMeta":true,
+        "message":{"role":"user","content":frame["params"]["content"]}}),
+    );
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_alive(&mut channel, "the Claude channel");
+    daemon.start_with_binding(true).await;
+    wait_until(
+        "startup receipts after daemon recovery",
+        Duration::from_secs(8),
+        || {
+            daemon
+                .store
+                .message("message/live")
+                .unwrap()
+                .unwrap()
+                .status
+                == "read"
+        },
+    )
+    .await;
+    assert!(received.recv_timeout(Duration::from_millis(1200)).is_err());
+    assert!(stop(channel).is_empty());
+    daemon.observe_running("agent/quartz", "second-restart");
+    std::fs::write(fixture.paths.agent_dir.join("claude-native-session"),
+        json!({"incarnation":"wrapper-second","native_session_id":"019fae17-c215-7882-a4d9-5f247168ffce"}).to_string()).unwrap();
+    let (channel, _input, received) = fixture.open(root, &daemon, "wrapper-second").await;
+    assert!(received.recv_timeout(Duration::from_millis(1200)).is_err());
+    assert!(stop(channel).is_empty());
+    for kind in ["message.delivered", "message.read"] {
+        assert_eq!(
+            daemon
+                .store
+                .claims_for("message/live", Some(kind))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    assert_eq!(daemon.store.message("message/startup").unwrap().unwrap().status, "staged");
+    assert!(daemon.store.claims_for("message/startup", Some("message.delivered")).unwrap().is_empty());
+    assert!(daemon.store.claims_for("message/startup", Some("message.read")).unwrap().is_empty());
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_delivered_unread_mail_from_an_old_ledger_is_held_in_a_fresh_session() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let mut daemon = Daemon::new(root);
+    daemon.observe_running("agent/quartz", "replacement");
+    daemon.send("message/unread", "agent/quartz", "QUARTZ UNREAD SIGNAL");
+    daemon
+        .store
+        .append_claim(&ClaimInput {
+            subject: "message/unread".into(),
+            kind: "message.delivered".into(),
+            actor: Some("agent/quartz".into()),
+            fields: BTreeMap::from([("status".into(), json!("delivered"))]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+    daemon.start_with_binding(true).await;
+    let fixture = ClaudeChannelFixture::new(root, &daemon, "wrapper-replacement");
+    fixture.append(
+        root,
+        json!({"type":"user","message":{"role":"user","content":"A fresh native session"}}),
+    );
+    // The old format lacks acceptance tracking. Its previous offer is neither
+    // consumption proof nor a reason to lose delivered-but-unread mail.
+    std::fs::write(
+        fixture.paths.agent_dir.join("native-channel-handoffs.json"),
+        json!({"incarnation":"previous","attempted":["message/unread"],"confirmed":[]}).to_string(),
+    )
+    .unwrap();
+    let (channel, _input, received) = fixture.open(root, &daemon, "wrapper-replacement").await;
+    assert!(received.recv_timeout(Duration::from_millis(1200)).is_err());
+    assert_eq!(daemon.store.message("message/unread").unwrap().unwrap().status, "delivered");
+    assert!(daemon.store.claims_for("message/unread", Some("message.read")).unwrap().is_empty());
+    daemon.send("message/fresh", "agent/quartz", "QUARTZ FRESH SIGNAL");
+    let frame = received.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(frame["params"]["meta"]["messageId"], "message/fresh");
+    fixture.append(
+        root,
+        json!({"type":"user","isMeta":true,
+        "message":{"role":"user","content":frame["params"]["content"]}}),
+    );
+    wait_until(
+        "the replacement session consumes unread mail",
+        Duration::from_secs(6),
+        || {
+            daemon
+                .store
+                .message("message/fresh")
+                .unwrap()
+                .unwrap()
+                .status
+                == "read"
+        },
+    )
+    .await;
+    for kind in ["message.delivered", "message.read"] {
+        assert_eq!(
+            daemon
+                .store
+                .claims_for("message/fresh", Some(kind))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    assert!(received.recv_timeout(Duration::from_millis(1200)).is_err());
+    assert!(stop(channel).is_empty());
+    assert_eq!(daemon.store.message("message/unread").unwrap().unwrap().status, "delivered");
+    assert!(daemon.store.claims_for("message/unread", Some("message.read")).unwrap().is_empty());
+    daemon.stop().await;
 }

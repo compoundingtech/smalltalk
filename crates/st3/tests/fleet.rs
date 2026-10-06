@@ -231,14 +231,26 @@ impl Node {
         let legacy = fs::read_to_string(self.root.join("config/st3/config.toml"))
             .is_ok_and(|config| config.contains("fleet_id"));
         if legacy || self.state_dir().join("fleet/fleet.toml").exists() {
-            let worker = self
-                .command(&["replication-worker"])
+            self.start_worker();
+        }
+    }
+
+    fn start_worker(&mut self) {
+        assert!(self.worker.is_none());
+        self.worker = Some(
+            self.command(&["replication-worker"])
                 .stdin(Stdio::null())
-                .stdout(log("worker.log"))
-                .stderr(log("worker.stderr.log"))
+                .stdout(fs::File::create(self.root.join("worker.log")).unwrap())
+                .stderr(fs::File::create(self.root.join("worker.stderr.log")).unwrap())
                 .spawn()
-                .unwrap();
-            self.worker = Some(worker);
+                .unwrap(),
+        );
+    }
+
+    fn stop_worker(&mut self) {
+        if let Some(mut child) = self.worker.take() {
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
 
@@ -523,6 +535,9 @@ async fn joined(root: &Path, sponsor: &Node, name: &str, extra: &[&str]) -> Node
 /// child finishes. Put the next real weekly tick close enough to exercise it in this daemon.
 #[tokio::test(flavor = "multi_thread")]
 async fn scheduled_occurrence_survives_parent_reapply_revision_and_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let mut node = Node::new(root.path(), "orchard");
     node.start().await;
@@ -673,16 +688,25 @@ mission "orchard/weekly" state="ready" {{
 /// A stopped origin's earlier running claims must not fence a seat placed on another host.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stopped_seat_is_reachable_after_a_cross_host_move() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     cross_host_seat_move(SeatMove::Stopped).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn placement_handoff_moves_a_running_seat_between_real_daemons() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     cross_host_seat_move(SeatMove::Running).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn placement_handoff_source_offline_retires_the_returning_real_daemon_runtime() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     cross_host_seat_move(SeatMove::SourceOffline).await;
 }
 
@@ -836,6 +860,9 @@ fn authority_digest(node: &Node) -> String {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_populated_standalone_daemon_founds_a_fleet_with_verified_person_and_agent_claims() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let mut a = Node::new(root.path(), "studio");
     a.start().await;
@@ -922,6 +949,9 @@ async fn a_populated_standalone_daemon_founds_a_fleet_with_verified_person_and_a
 
 #[tokio::test(flavor = "multi_thread")]
 async fn invite_and_join_sync_full_history() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let a = anchor(root.path(), "a").await;
     let mut expected = BTreeSet::new();
@@ -1004,6 +1034,9 @@ async fn invite_and_join_sync_full_history() {
 /// must say it has no route rather than that it is temporarily unavailable.
 #[tokio::test(flavor = "multi_thread")]
 async fn members_read_each_others_owner_state_and_unreachable_owners_say_why() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let a = anchor(root.path(), "a").await;
     let b = joined(root.path(), &a, "b", &[]).await;
@@ -1069,6 +1102,9 @@ fn peer_sync(node: &Node, peer: &str) -> Value {
 /// Then they heal: they find the claims one lacks and admit their envelopes again.
 #[tokio::test(flavor = "multi_thread")]
 async fn members_with_the_same_envelopes_but_different_claims_report_divergence_and_heal() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let mut a = anchor(root.path(), "a").await;
     let mut b = joined(root.path(), &a, "b", &[]).await;
@@ -1248,6 +1284,9 @@ async fn members_with_the_same_envelopes_but_different_claims_report_divergence_
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dial_out_member_is_caught_up_and_never_reported_down() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let a = anchor(root.path(), "a").await;
     let mut laptop = joined(root.path(), &a, "laptop", &["--dial-out"]).await;
@@ -1298,6 +1337,9 @@ async fn a_dial_out_member_is_caught_up_and_never_reported_down() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_interrupted_join_resumes_with_the_same_code() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let mut a = Node::new(root.path(), "a");
     let marker = root.path().join("drop-one-join-answer");
@@ -1380,6 +1422,9 @@ async fn an_interrupted_join_resumes_with_the_same_code() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn expired_revoked_and_used_codes_are_refused() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let a = anchor(root.path(), "a").await;
     let refusal = |output: Output| {
@@ -1425,6 +1470,9 @@ async fn expired_revoked_and_used_codes_are_refused() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_leaked_code_is_visible_and_can_be_revoked() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let a = anchor(root.path(), "a").await;
     let m = joined(root.path(), &a, "m", &[]).await;
@@ -1508,6 +1556,9 @@ async fn a_leaked_code_is_visible_and_can_be_revoked() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_secret_never_leaves_its_file() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let a = anchor(root.path(), "a").await;
     let b = joined(root.path(), &a, "b", &[]).await;
@@ -1584,11 +1635,131 @@ async fn the_secret_never_leaves_its_file() {
     let _ = json!({});
 }
 
+/// A rejoining member with tombstones from a different checkpoint lineage must still exchange
+/// later live claims in both directions (#1431). The tombstone rows model already-certified
+/// offline trims; this test does not manufacture certificates or transport tombstones.
+#[tokio::test(flavor = "multi_thread")]
+async fn rejoin_exchanges_live_claims_beyond_differing_checkpoint_tombstones() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    rejoin_tombstone_fixture(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rejoin_slow_exports_preserve_live_claims_and_show_overload_retry() {
+    if st3::test_support::supervise_test() { return; }
+    rejoin_tombstone_fixture(true).await;
+}
+
+async fn rejoin_tombstone_fixture(slow_export: bool) {
+    let root = tempfile::tempdir().unwrap();
+    let mut birch = anchor(root.path(), "birch").await;
+    let mut cedar = joined(root.path(), &birch, "cedar", &[]).await;
+    birch.note("birch-shared").await;
+    cedar.note("cedar-shared").await;
+    let shared = BTreeSet::from([
+        "custom/fleet-test/birch-shared".into(),
+        "custom/fleet-test/cedar-shared".into(),
+    ]);
+    for node in [&birch, &cedar] {
+        wait_for_notes(node, &shared, 30, &[&birch, &cedar]).await;
+    }
+    birch.stop();
+    cedar.stop();
+    for node in [&birch, &cedar] {
+        let mut connection =
+            rusqlite::Connection::open(node.state_dir().join("claims.sqlite3")).unwrap();
+        let transaction = connection.transaction().unwrap();
+        for id in smallclaims::store::test_envelope_ids("alder-retired", 0..768, &node.name) {
+            transaction
+                .execute(
+                    "INSERT INTO checkpoint_envelopes VALUES (?1, ?2, ?3, 0, ?4)",
+                    rusqlite::params![
+                        id.writer,
+                        id.sequence,
+                        id.hash,
+                        format!("checkpoint/{}", node.name)
+                    ],
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+    }
+    // Publish on both sides with no replication listener open, then rejoin their workers.
+    birch.start().await;
+    birch.stop_worker();
+    cedar.start().await;
+    cedar.stop_worker();
+    let mut expected = shared;
+    for node in [&birch, &cedar] {
+        for index in 0..4 {
+            let text = format!("{}-partition-{index}", node.name);
+            node.note(&text).await;
+            expected.insert(format!("custom/fleet-test/{text}"));
+        }
+    }
+    assert_eq!(birch.notes().await.len(), 6);
+    assert_eq!(cedar.notes().await.len(), 6);
+    let before = [&birch, &cedar].map(|node| {
+        node.st_json(&["replication", "status"])["timings"]["exchanges"]
+            .as_u64()
+            .unwrap()
+    });
+    if slow_export {
+        // Restart only the isolated daemon with the fixture-only injection. Each response
+        // export takes 25 seconds, beyond the old caller's entire 20-second HTTP deadline.
+        cedar.env.push(("ST3_TEST_REPLICATION_EXPORT_DELAY_MS".into(), "25000".into()));
+        cedar.stop();
+        cedar.start().await;
+        cedar.stop_worker();
+    }
+    birch.start_worker();
+    cedar.start_worker();
+    if slow_export {
+        wait_until("signed overload exposes polling phase and retry", 90, || async {
+            let status = birch.st_json(&["replication", "status"]);
+            status["peers"].as_array().unwrap().iter().any(|peer| {
+                peer["worker"]["phase"] == "overload"
+                    && peer["worker"]["last_attempt_at_unix_ms"].as_u64().is_some()
+                    && peer["worker"]["next_retry_at_unix_ms"].as_u64().is_some()
+            })
+        }).await;
+        let text = birch.st_ok(&["replication", "status"]);
+        assert!(text.contains("worker overload"), "{text}");
+        assert!(text.contains("next retry in"), "{text}");
+    }
+    for (node, before) in [&birch, &cedar].into_iter().zip(before) {
+        wait_until("both rejoined workers exchange successfully", if slow_export { 180 } else { 15 }, || async {
+            node.st_json(&["replication", "status"])["timings"]["exchanges"]
+                .as_u64()
+                .unwrap() >= before + 4
+        }).await;
+        let status = node.st_json(&["replication", "status"]);
+        eprintln!("{} rejoin exchanges={} envelopes_received={}",
+            node.name, status["timings"]["exchanges"], status["timings"]["envelopes_received"]);
+    }
+    for node in [&birch, &cedar] {
+        wait_for_notes(node, &expected, if slow_export { 180 } else { 30 }, &[&birch, &cedar]).await;
+        let connection =
+            rusqlite::Connection::open(node.state_dir().join("claims.sqlite3")).unwrap();
+        let count: u64 = connection
+            .query_row("SELECT COUNT(*) FROM checkpoint_envelopes", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 768, "no tombstone payloads replicate");
+    }
+}
+
 /// `st fleet wait` gates a restart (#1022). A first sync is verified once; after a restart
 /// far behind, the wait must also see an exchange since it began at which this node held
 /// everything its peer held, instead of returning at once with the old verdict.
 #[tokio::test(flavor = "multi_thread")]
 async fn fleet_wait_after_a_restart_waits_until_the_member_has_caught_up() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let a = anchor(root.path(), "a").await;
     let mut b = joined(root.path(), &a, "b", &[]).await;
@@ -1625,6 +1796,9 @@ async fn fleet_wait_after_a_restart_waits_until_the_member_has_caught_up() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_removed_member_is_refused() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let a = anchor(root.path(), "a").await;
     let b = joined(root.path(), &a, "b", &[]).await;
@@ -1739,6 +1913,9 @@ fn doctor_check(node: &Node, name: &str) -> Value {
 /// measurement stale with the envelopes written since it, and doctor warns.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_frozen_member_is_not_reported_up() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let a = anchor(root.path(), "a").await;
     let b = joined(root.path(), &a, "b", &[]).await;
@@ -1811,6 +1988,9 @@ async fn a_frozen_member_is_not_reported_up() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn leave_drains_everything_before_it_leaves() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let mut a = anchor(root.path(), "a").await;
     let b = joined(root.path(), &a, "b", &[]).await;
@@ -1851,6 +2031,9 @@ async fn leave_drains_everything_before_it_leaves() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn rejoining_under_a_new_name_reports_post_leave_history_as_divergent() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let a = anchor(root.path(), "orchard").await;
     let b = joined(root.path(), &a, "meadow", &[]).await;
@@ -1913,11 +2096,13 @@ async fn rejoining_under_a_new_name_reports_post_leave_history_as_divergent() {
     assert!(after.is_disjoint(&a.notes().await));
     assert!(after.is_disjoint(&b.notes().await));
     wait_until(
-        "rejoining node compares the common envelope inventory",
+        "rejoining node compares the common inventory and settled projections",
         90,
         || async {
             let diff = c.st_json(&["replication", "diff", "orchard"]);
-            diff["authority"]["equal"] == true && diff["status"] == "up"
+            diff["authority"]["equal"] == true
+                && diff["status"] == "up"
+                && diff["graph"]["equal"].is_boolean()
         },
     )
     .await;
@@ -1970,6 +2155,9 @@ async fn rejoining_under_a_new_name_reports_post_leave_history_as_divergent() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_leave_already_refused_as_left_finishes_when_run_again() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let a = anchor(root.path(), "a").await;
     let b = joined(root.path(), &a, "b", &[]).await;
@@ -2034,6 +2222,9 @@ async fn a_leave_already_refused_as_left_finishes_when_run_again() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn uninstall_leaves_nothing_behind() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let a = anchor(root.path(), "a").await;
     let mut b = joined(root.path(), &a, "b", &[]).await;
@@ -2115,6 +2306,9 @@ async fn uninstall_leaves_nothing_behind() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_flood_of_invalid_join_requests_does_not_block_a_valid_join() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let a = anchor(root.path(), "a").await;
     let code = a.invite("b", &[]);
@@ -2162,6 +2356,9 @@ async fn down_observations(node: &Node, host: &str) -> usize {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_config_peer_fleet_migrates_to_membership() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let fleet_id = "8f14e45f-ceea-467a-9a2b-5c3d6e7f8091";
     let secret = root.path().join("fleet.secret");
@@ -2288,6 +2485,9 @@ async fn a_config_peer_fleet_migrates_to_membership() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_leaving_member_writes_nothing_after_it_begins_to_leave() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let a = anchor(root.path(), "a").await;
     let b = joined(root.path(), &a, "b", &[]).await;
@@ -2356,6 +2556,9 @@ async fn a_leaving_member_writes_nothing_after_it_begins_to_leave() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_member_switches_between_listening_and_dial_out() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let a = anchor(root.path(), "a").await;
     let mut b = joined(root.path(), &a, "b", &[]).await;
@@ -2398,6 +2601,9 @@ async fn a_member_switches_between_listening_and_dial_out() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs ST3_COMPAT_BIN: the st3 of the pinned baseline release"]
 async fn an_old_build_config_peer_replicates_with_new_members() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let old = PathBuf::from(
         std::env::var("ST3_COMPAT_BIN").expect("ST3_COMPAT_BIN names the baseline st3"),
     );
@@ -2559,6 +2765,9 @@ fn backup_baseline_graph(old: &Node, directory: &Path) {
 
 #[test]
 fn fleet_workflows_have_no_path_filter() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let workflows = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows");
     let compat = fs::read_to_string(workflows.join("fleet.yml")).unwrap();
     // The Linux gate runs the fleet compatibility stage from this script.
@@ -2622,6 +2831,9 @@ esac
 /// Legacy helper ports must be unnecessary after membership advertises native Fabric routes.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_legacy_helper_fleet_migrates_to_native_fabric_without_losing_history() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let fleet_id = "8f14e45f-ceea-467a-9a2b-5c3d6e7f8091";
     let secret = root.path().join("fleet.secret");
@@ -2793,6 +3005,9 @@ async fn a_legacy_helper_fleet_migrates_to_native_fabric_without_losing_history(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_fabric_transport_works_through_the_worker_alone() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let registry = root.path().join("fabric-registry");
     let no_tailscale = root.path().join("no-tailscale");
@@ -2930,6 +3145,9 @@ async fn the_fabric_transport_works_through_the_worker_alone() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_removed_members_writes_relayed_by_an_uninformed_member_are_refused() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let mut a = anchor(root.path(), "a").await;
     let mut c = joined(root.path(), &a, "c", &[]).await;
@@ -3005,6 +3223,9 @@ async fn a_removed_members_writes_relayed_by_an_uninformed_member_are_refused() 
 /// but its network accepts no inbound connection. Two servers keep syncing while it sleeps.
 #[tokio::test(flavor = "multi_thread")]
 async fn outbound_only_member_returns_after_minutes_and_aged_hours_without_alerts() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
     let root = tempfile::tempdir().unwrap();
     let fleet_id = "8a7c55c0-e0d4-41cb-8e8c-6ab134611650";
@@ -3183,6 +3404,9 @@ async fn outbound_only_member_returns_after_minutes_and_aged_hours_without_alert
 /// leave the rest to the 30-second quiet window that follows the peer's last inbound exchange.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_backlog_of_several_pages_is_fetched_without_waiting_for_the_quiet_window() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     // Pages of 100 envelopes make a backlog of several pages cheap to write and to admit.
     const SETTINGS: [(&str, &str); 2] = [
         ("ST3_WORKER_INTERVAL_MS", "30000"),
@@ -3256,6 +3480,9 @@ async fn a_backlog_of_several_pages_is_fetched_without_waiting_for_the_quiet_win
 
 #[tokio::test(flavor = "multi_thread")]
 async fn action_coverage_fleet_controls_and_checkpoint_administration_survive_restarts() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let mut amber = anchor(root.path(), "fixture-amber").await;
     let mut cobalt = joined(root.path(), &amber, "fixture-cobalt", &[]).await;
@@ -3391,6 +3618,9 @@ async fn action_coverage_fleet_controls_and_checkpoint_administration_survive_re
 
 #[tokio::test(flavor = "multi_thread")]
 async fn action_coverage_github_watch_cli_uses_private_http_and_survives_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let http = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api = format!("http://{}", http.local_addr().unwrap());
@@ -3504,4 +3734,386 @@ async fn action_coverage_github_watch_cli_uses_private_http_and_survives_restart
     assert_eq!(ended["state"], "ended");
     assert_eq!(ended["ended"], "unwatched");
     server.abort();
+}
+
+/// Real native drivers on two private fleet daemons: the source never launches after suspend,
+/// and the target launches only after receiving the Git workspace and the same native transcript.
+#[tokio::test(flavor = "multi_thread")]
+async fn suspended_seat_moves_between_two_daemons_with_its_workspace_and_conversation() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    struct SeatCleanup {
+        pty: PathBuf,
+        roots: Vec<PathBuf>,
+    }
+    impl Drop for SeatCleanup {
+        fn drop(&mut self) {
+            for root in &self.roots {
+                let output = Command::new(&self.pty)
+                    .args(["list", "--json"])
+                    .env("PTY_ROOT", root)
+                    .output();
+                if let Ok(output) = output
+                    && let Ok(rows) = serde_json::from_slice::<Vec<Value>>(&output.stdout)
+                {
+                    for row in rows {
+                        if let Some(name) = row["name"].as_str() {
+                            let _ = Command::new(&self.pty)
+                                .args(["kill", name])
+                                .env("PTY_ROOT", root)
+                                .output();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let pty = st_runtime::resolve_executable("pty", &std::env::vars().collect()).unwrap();
+    let node_program = st_runtime::resolve_executable("node", &std::env::vars().collect()).unwrap();
+    let mut cleanup = SeatCleanup { pty: pty.clone(), roots: Vec::new() };
+    let mut amber = anchor(root.path(), "fixture-move-amber").await;
+    let mut jade = joined(root.path(), &amber, "fixture-move-jade", &[]).await;
+    cleanup.roots = vec![amber.state_dir().join("pty"), jade.state_dir().join("pty")];
+    for node in [&mut amber, &mut jade] {
+        node.stop();
+        fs::write(
+            node.root.join("bin/pty"),
+            format!("#!/bin/sh\nexec '{}' \"$@\"\n", pty.display()),
+        )
+        .unwrap();
+        let stub = node.root.join("bin/omp");
+        fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\nexec env STUB_HARNESS=omp '{}' '{}' \"$@\"\n",
+                node_program.display(),
+                repo.join("scripts/st3-boot-canaries/stub-pi-family.mjs")
+                    .display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+        node.start().await;
+    }
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "Canary")
+            .env("GIT_AUTHOR_EMAIL", "canary@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Canary")
+            .env("GIT_COMMITTER_EMAIL", "canary@example.invalid")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    git(&["init", "-q"]);
+    fs::write(workspace.join("tracked"), "original\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-qm", "Original"]);
+    let head = git(&["rev-parse", "HEAD"]);
+    fs::write(workspace.join("tracked"), "changed\n").unwrap();
+    fs::write(workspace.join("untracked"), "copper workspace\n").unwrap();
+    let seat = "agent/canary/portable";
+    let declaration = root.path().join("seat.kdl");
+    fs::write(&declaration, format!("version 2\nagent \"canary/portable\" {{ host \"fixture-move-amber\"; workspace \"{}\"; harness \"omp\" {{}} }}", workspace.display())).unwrap();
+    amber.st_ok(&[
+        "agents",
+        "apply",
+        declaration.to_str().unwrap(),
+        "--as",
+        PERSON,
+    ]);
+    let receipts = workspace.join("receipts-agent-canary-portable.jsonl");
+    wait_until("source native session becomes idle", 90, || async {
+        amber.st_json(&["agents", "show", seat])["value"]["harness_state"] == "idle"
+    })
+    .await;
+    amber.st_ok(&[
+        "conversations",
+        "send",
+        seat,
+        "--from",
+        PERSON,
+        "--subject",
+        "copper history",
+        "--body",
+        "Remember the copper orchard.",
+    ]);
+    wait_until("source reads the first message", 60, || async {
+        fs::read_to_string(&receipts)
+            .unwrap_or_default()
+            .contains("Remember the copper orchard")
+    })
+    .await;
+    let suspended = amber.st_json(&[
+        "agents",
+        "suspend",
+        seat,
+        "--as",
+        PERSON,
+        "--timeout",
+        "60s",
+    ]);
+    let native = suspended["suspension"]["native_session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let source_sessions =
+        st3::seat_snapshot::sessions(&amber.state_dir().join("drivers"), seat, "omp");
+    let transcript = st3::native_resume::pi_family_transcript(&source_sessions, &native).unwrap();
+    let before = fs::read(&transcript).unwrap();
+    assert!(String::from_utf8_lossy(&before).contains("Remember the copper orchard"));
+    wait_until("suspension replicates to target", 60, || async {
+        jade.st_json(&["agents", "show", seat])["value"]["suspension"]["phase"] == "suspended"
+    })
+    .await;
+    // Both daemons share this test's filesystem. An existing path represents an occupied target,
+    // and must refuse even when it happens to be the source's checkout.
+    let occupied = jade.st(&[
+        "agents",
+        "resume",
+        seat,
+        "--host",
+        "fixture-move-jade",
+        "--as",
+        PERSON,
+        "--timeout",
+        "60s",
+    ]);
+    assert!(!occupied.status.success());
+    assert!(
+        String::from_utf8_lossy(&occupied.stderr).contains("workspace-occupied"),
+        "{}\n{}",
+        String::from_utf8_lossy(&occupied.stderr),
+        jade.logs()
+    );
+    assert_eq!(git(&["rev-parse", "HEAD"]), head);
+    // Preserve the stopped source checkout elsewhere, modelling the target's independent disk
+    // with an unoccupied path at the exact same absolute cwd.
+    fs::rename(&workspace, root.path().join("preserved-source-workspace")).unwrap();
+    let resumed = jade.st_json(&[
+        "agents",
+        "resume",
+        seat,
+        "--host",
+        "fixture-move-jade",
+        "--as",
+        PERSON,
+        "--timeout",
+        "90s",
+    ]);
+    assert_eq!(resumed["id"], seat);
+    assert_eq!(resumed["suspension"]["phase"], "resumed");
+    assert_eq!(resumed["suspension"]["native_session_id"], native);
+    assert_eq!(
+        fs::read_to_string(workspace.join("tracked")).unwrap(),
+        "changed\n"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.join("untracked")).unwrap(),
+        "copper workspace\n"
+    );
+    assert_eq!(git(&["rev-parse", "HEAD"]), head);
+    let target_sessions =
+        st3::seat_snapshot::sessions(&jade.state_dir().join("drivers"), seat, "omp");
+    let target_transcript =
+        st3::native_resume::pi_family_transcript(&target_sessions, &native).unwrap();
+    assert!(fs::read(&target_transcript).unwrap().starts_with(&before));
+    jade.st_ok(&[
+        "conversations",
+        "send",
+        seat,
+        "--from",
+        PERSON,
+        "--subject",
+        "after move",
+        "--body",
+        "The copper orchard continued.",
+    ]);
+    wait_until(
+        "target reads mail in the resumed conversation",
+        60,
+        || async {
+            fs::read_to_string(&target_transcript)
+                .unwrap_or_default()
+                .contains("The copper orchard continued")
+        },
+    )
+    .await;
+    assert_eq!(
+        fs::read(&transcript).unwrap(),
+        before,
+        "source transcript changed after the move"
+    );
+    let source_ptys = Command::new(&pty).args(["list", "--json"])
+        .env("PTY_ROOT", amber.state_dir().join("pty")).output().unwrap();
+    let source_ptys: Vec<Value> = serde_json::from_slice(&source_ptys.stdout).unwrap();
+    assert!(source_ptys.iter().all(|row| row["status"] != "running"), "source still has a live PTY: {source_ptys:?}");
+    jade.st_ok(&[
+        "agents",
+        "suspend",
+        seat,
+        "--as",
+        PERSON,
+        "--timeout",
+        "60s",
+    ]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs ST3_TERMINALS_COMPAT_BIN: an st3 build before terminal owner filters"]
+async fn terminal_owner_filters_are_safe_across_mixed_builds() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let mut old = Node::new(root.path(), "terminal-legacy");
+    old.binary = PathBuf::from(std::env::var("ST3_TERMINALS_COMPAT_BIN").unwrap());
+    old.start().await;
+    let current_client = st3_client::Client::unix(old.socket());
+    current_client
+        .terminals_list(None, Some(50), false)
+        .await
+        .unwrap();
+    let error = current_client
+        .terminals_list_filtered(
+            None,
+            Some(1),
+            false,
+            Some("agent/lookup/unknown"),
+            Some("running"),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, st3_client::ClientError::Protocol(message) if message.contains("upgrade the server"))
+    );
+
+    let mut current = Node::new(root.path(), "terminal-current");
+    current.start().await;
+    let output = old
+        .command(&[
+            "--endpoint",
+            current.socket().to_str().unwrap(),
+            "--json",
+            "terminals",
+            "ls",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["value"]["collection"], "terminals");
+    assert_eq!(response["value"]["filters"], serde_json::json!({}));
+    assert_eq!(response["value"]["page"]["limit"], 50);
+}
+
+/// This narrower compatibility boundary needs a build that already knows today's mission
+/// format, but predates mission.provenance. The ancient fleet baseline is a different contract.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs ST3_PROVENANCE_COMPAT_BIN: a pre-provenance build with the current mission format"]
+async fn an_older_daemon_runs_a_provenance_revision_and_reads_its_sidecar_after_upgrade() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let old = PathBuf::from(
+        std::env::var("ST3_PROVENANCE_COMPAT_BIN").expect("pre-provenance st3 binary"),
+    );
+    let root = tempfile::tempdir().unwrap();
+    let current = anchor(root.path(), "current").await;
+    let mut older = joined(root.path(), &current, "older", &[]).await;
+    older.stop();
+    older.binary = old;
+    older.start().await;
+    let file = current.root.join("provenance.kdl");
+    fs::write(
+        &file,
+        r#"version 2
+mission "orchard/release" state="ready" {
+  provenance {
+    reason "Approved release source."
+    source {
+      repository "https://example.invalid/orchard/missions"
+      commit "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      path "missions/release.kdl"
+      renderer "orchard-renderer-v1"
+    }
+    decision "decision/opaque-approved-scope"
+    evidence "doc/orchard/proof@opaque-reference"
+  }
+  goal "Prepare the release."
+  step "prepare" { goal "Prepare the release." }
+}
+"#,
+    )
+    .unwrap();
+    current.st_ok(&[
+        "apply",
+        file.to_str().unwrap(),
+        "--no-gate-check",
+        "--as",
+        PERSON,
+    ]);
+    let path = "/v1/missions/orchard%2Frelease";
+    wait_until(
+        "older daemon projects the provenance-bearing revision",
+        60,
+        || async { older.client().get::<Value>(path).await.is_ok() },
+    )
+    .await;
+    let plain: Value = older.client().get(path).await.unwrap();
+    let with: Value = current.client().get(path).await.unwrap();
+    assert_eq!(plain["revision"], with["revision"]);
+    assert!(
+        plain.get("provenance").is_none(),
+        "the binary must predate provenance: {plain}"
+    );
+    assert_eq!(with["provenance"]["reason"], "Approved release source.");
+    let started = older.st_json(&[
+        "missions",
+        "start",
+        "orchard/release",
+        "--id",
+        "orchard/older-run",
+        "--as",
+        PERSON,
+    ]);
+    let run = &started["mission_run"];
+    assert_eq!(run["revision"], plain["revision"]);
+    assert!(!run["steps"].as_array().unwrap().is_empty());
+    let status = older.st_json(&["replication", "status"]);
+    assert_eq!(status["invalid_records"], 0, "{status}");
+    assert!(
+        status["waiting_claims"].as_u64().unwrap_or(0) >= 1,
+        "{status}"
+    );
+    older.stop();
+    older.binary = PathBuf::from(ST3);
+    older.start().await;
+    wait_until("upgraded daemon reads the retained sidecar", 60, || async {
+        older
+            .client()
+            .get::<Value>(path)
+            .await
+            .is_ok_and(|mission| mission["provenance"]["reason"] == "Approved release source.")
+    })
+    .await;
+    let shown = older.st_json(&["missions", "show", run["subject"].as_str().unwrap()]);
+    assert_eq!(shown["provenance"]["reason"], "Approved release source.");
 }

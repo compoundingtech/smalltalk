@@ -6,7 +6,7 @@ Status: current authoring and publication contract.
 
 Every KDL document starts with `version 2`. All declarations follow that line directly.
 
-Every purpose-specific route that applies KDL is an atomic upsert. The daemon first parses, resolves document references, validates, and checks the current subject heads. It then applies every change in one transaction. One failure rejects the full operation.
+`st apply FILE... --as ACTOR` and every route that applies KDL is an atomic upsert. The daemon first parses, resolves document references, validates, and checks the current subject heads. It then applies every change in one transaction. One failure rejects the full operation.
 
 Omission has no effect. Removing a declaration from a later file does not stop or delete its existing graph state. Retirement, cancellation, and refresh are explicit declarations.
 
@@ -16,10 +16,33 @@ with source and revision fences, and requires confirmation for mass retirement.
 
 The removed wrapper keyword is an error. There is no compatibility form.
 
-`st missions publish FILE --as ACTOR` previews and publishes exact authored mission KDL. A person
+`st apply FILE... --as ACTOR` previews and publishes exact authored KDL: seats, missions,
+schedules, and other supported root declarations. Multiple files are bundled into one atomic
+publication, with references resolved across the bundle. Every file starts with `version 2`;
+`-` reads standard input once. No source flags are needed for plain files. A person
 can instead use `st launch` to create, review, and approve a conversationally planned mission. An
 authorized agent uses `st work publish-mission` from the exact claimed producing step for generated
 nested work. Every route keeps intent, authority, and provenance on a typed operation.
+
+`st apply FILE --as ACTOR --dry-run` (alias `--preview`) stops after the publication
+preview. It prints the normalized and resolved intent, exact mission revisions, changes, predicted
+actions, blockers, warnings, and subject tokens; `--json` returns the full preview object.
+Blockers are printed before the command exits with failure. It does not apply the intent, publish
+or start a mission, launch helpers, or run exec gates. Add `--check` (alias `--check-gates`)
+to run exec gates during the dry run; gate answers
+appear on stderr while stdout retains the preview, including with `--json`. Pass `--workspace DIR`
+and repeated `--input NAME=VALUE` for the workspace and inputs a run would use.
+`st missions check FILE` remains available for gate checks alone. `--at-index INDEX` fences
+the plain-file preview snapshot as it does for publication.
+
+Publication checks exec gates by default and refuses broken commands (exit codes other than 0
+or 1). A gate that answers "not yet" (exit 1) does not block publication, just as with
+`st missions check`. Use `--no-gate-check` to skip this check. Dry runs without `--check`
+run no commands.
+
+`st agents apply` and `st missions publish` remain legacy commands. Each prints a one-line
+notice on stderr naming `st apply` as its replacement. Both accept `--dry-run` and `--preview`.
+The agent command keeps its previous behavior of publishing without gate checks.
 
 ## Definitions do not start work
 
@@ -164,7 +187,7 @@ A mission without a completion block uses the finite `all-steps-exhausted` defau
 long-lived conversation or worker harness as a top-level agent seat and assign finite mission work
 to that exact subject.
 
-Use `st agents apply`, or `st agents start ... --print-kdl` followed by the same command without
+Use `st apply`, or `st agents start ... --print-kdl` followed by the same command without
 the preview flag. Stop a seat explicitly with `st agents stop`. Mission revisions change mission
 work and generations without changing the seat's identity.
 
@@ -294,14 +317,14 @@ Free mode keeps three things:
   A harness with `ST_AGENT` can mutate only as its own seat. On Linux, the local Unix API also binds
   a connection from a harness process or its descendants to that seat and refuses a different
   actor, including `--as person/NAME`.
-- **Workflow.** Human review gates, lane approvers, steps assigned to a person (only that person
-  completes them with `st work done`), and attention for a person work as before.
+- **Workflow.** Human review gates, lane approvers, steps assigned to a person, and attention
+  keep their workflow fences. A person can enable [bounded delegation](person-delegation.md)
+  so an agent records a prior answer or instruction with `--for`, its own actor, and evidence.
 - **The fleet boundary.** Only members sync, and clients and paired apps keep their pairing.
 
 `mission-authority`, `queue-authority`, `seat-authority`, and `agent-authority` blocks still
 parse, so existing declarations stay valid, but st ignores them. The publication preview warns
-about each agent, declared directly or inside a mission, that carries one, and `st agents apply`
-and `st missions publish` print that warning.
+about each agent, declared directly or inside a mission, that carries one, and `st apply` prints that warning.
 
 Publishing a generated nested mission still needs a claimed producing step and an exact
 `produces-mission` match, because that is the step's lease rather than a grant. Use
@@ -556,3 +579,54 @@ An accepted operation can cause later runtime work. A later start, stop, observe
 This split keeps authored intent atomic and keeps real-world effects observable.
 
 The st eval suite proves these workflows with isolated state and bounded run time.
+
+## Mission revision provenance
+
+A top-level mission can record why its revision was produced and where it came from:
+
+```kdl
+version 2
+mission "orchard/release" state="ready" {
+  provenance {
+    reason "Apply the approved release plan."
+    source {
+      repository "https://example.invalid/orchard/missions"
+      commit "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      path "missions/release.kdl"
+      renderer "orchard-renderer-v1"
+    }
+    decision "decision/approved-release-scope"
+    evidence "doc/orchard/release-proof@opaque-reference"
+  }
+  goal "Prepare the release."
+  step "prepare" { goal "Prepare the release." }
+}
+```
+
+The block requires one reason and exactly one source with repository, full commit id, relative
+path and renderer. Decision and evidence strings can repeat; they are opaque references, and
+neither references nor renderer text are resolved or executed. Each list allows at most 32
+references of 1,024 UTF-8 bytes each; source text allows 1,024 bytes per field, reason allows
+2,048 bytes, and the complete JSON block allows 16 KiB. Empty strings, control characters,
+unknown or duplicate fixed fields, abbreviated/non-hexadecimal commits, and paths with absolute,
+empty, dot or parent components are refused. Commits accept full SHA-1 or SHA-256 ids.
+
+Provenance is fixed at the first publication of the exact mission revision. Republishing the
+same block is a no-op; omitting it preserves the existing block. Replacing it, or attaching one
+to an already published revision that had none, is refused. Change the mission definition to
+publish a new revision with new provenance. Earlier revisions keep their earlier blocks.
+`st missions show`, `st launch preview` and `st work revise` show the block. Launch approval
+also commits the displayed provenance. Querying revisions by source commit is deferred.
+
+The `mission.provenance` sidecar claim uses `mission/ID@REVISION` as its subject and has once
+cardinality and durable retention. `Once` is registry metadata; `validate_publication` enforces
+immutability on publication. Ingest validates the sidecar's shape and revision binding but does
+not enforce cardinality; reads choose the earliest claim in canonical order. It is written
+atomically with the ordinary `mission.published` claim. It stays outside `MissionSpec`, so
+existing mission and step hashes and revision bodies remain unchanged. Older daemons receive
+and project the ordinary revision and can start its work, retain the unknown sidecar for upgrade,
+and show no provenance. They cannot apply provenance-bearing KDL themselves; publish that KDL
+through an upgraded node. Older clients accept the added read fields.
+The sidecar reads directly from the claim log: no new projection table, checkpoint drop rule,
+retention window, or `RULES_VERSION` change is needed. Existing checkpoint rules preserve kinds
+without a drop slot and once claims; authenticated unknown records also remain retained.

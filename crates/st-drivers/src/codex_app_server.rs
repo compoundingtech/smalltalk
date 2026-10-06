@@ -141,6 +141,7 @@ struct WrapperDiagnostics {
     file: File,
     agent: String,
     runtime_id: String,
+    _log_guard: tracing::dispatcher::DefaultGuard,
 }
 
 impl WrapperDiagnostics {
@@ -155,6 +156,7 @@ impl WrapperDiagnostics {
             file,
             agent: agent.to_string(),
             runtime_id: runtime_id.to_string(),
+            _log_guard: log::install(state_dir),
         })
     }
 
@@ -460,7 +462,14 @@ impl CodexObservedState {
                 reason: CodexTerminalError::ProviderCapacity,
             } => Some(observation(Activity::Idle, BlockedOn::None).with_reason("providerCapacity")),
             CodexObservedState::TerminalError { reason } => Some(
-                observation(Activity::Ended, BlockedOn::None).with_reason(match reason {
+                {
+                    let mut o = observation(Activity::Ended, BlockedOn::None);
+                    if *reason == CodexTerminalError::ProviderAuthRejected {
+                        o.provider_auth = Some(false);
+                    }
+                    o
+                }
+                .with_reason(match reason {
                     CodexTerminalError::SystemError => "systemError",
                     CodexTerminalError::ProviderAuthRejected => "providerAuth",
                     CodexTerminalError::ProviderCapacity => unreachable!(),
@@ -565,8 +574,9 @@ impl CodexDeliveryConfig {
     }
 
     fn report_protocol_rejection(&self, codex: &str, error: &anyhow::Error) {
+        let _log_guard = log::install(&state_dir(&self.catalog_root, &self.identity));
         let Some(supervisor) = self.supervisor.as_deref() else {
-            eprintln!(
+            tracing::warn!(
                 "st codex: agent '{}' has no supervisor for a protocol rejection report",
                 self.identity
             );
@@ -599,7 +609,7 @@ impl CodexDeliveryConfig {
         let (sender, recipient) = match endpoints {
             Ok(endpoints) => endpoints,
             Err(resolve_error) => {
-                eprintln!(
+                tracing::warn!(
                     "st codex: failed to resolve the endpoints of agent '{}' protocol rejection report: {resolve_error:#}",
                     self.identity
                 );
@@ -618,7 +628,7 @@ impl CodexDeliveryConfig {
             Some(&idempotency_key),
             None,
         ) {
-            eprintln!(
+            tracing::warn!(
                 "st codex: failed to report agent '{}' protocol rejection to supervisor '{}': {report_error:#}",
                 self.identity, supervisor
             );
@@ -672,6 +682,7 @@ struct PendingCodexSnapshot {
 pub const CODEX_CONTEXT_VERIFIED_VERSION: &str = "0.151.0";
 
 mod context;
+mod log;
 use self::context::*;
 
 #[derive(Debug, Clone)]
@@ -728,6 +739,7 @@ struct CodexInboxDelivery {
     diagnostics: driver_diagnostic::Publisher,
     /// Failure reported for the turn, retained until observed recovery.
     turn_error: Option<CodexTurnError>,
+    provider_auth_edge: Option<bool>,
     safe_fallback_active: Arc<AtomicBool>,
     safe_fallback_diagnostic_published: bool,
 }
@@ -882,6 +894,7 @@ impl CodexInboxDelivery {
             account_read: AccountRead::Due,
             diagnostics,
             turn_error: None,
+            provider_auth_edge: None,
             safe_fallback_active,
             safe_fallback_diagnostic_published,
         })
@@ -945,7 +958,13 @@ impl CodexInboxDelivery {
     /// contradiction of the latest observation.
     fn observe_harness(&mut self, observed: &CodexObservedState) {
         match observed.harness_observation() {
-            Some(observation) => self.publish_observation(self.name_turn_error(observation)),
+            Some(mut observation) => {
+                if let Some(accepted) = self.provider_auth_edge.take() {
+                    observation.provider_auth = Some(accepted);
+                    self.harness_writer.interrupt();
+                }
+                self.publish_observation(self.name_turn_error(observation));
+            }
             None => {
                 // Evidence lost: stop heartbeating, drop anything pending (it predates the gap),
                 // and mark the stream discontinuous so a state restated after the gap opens a
@@ -1085,7 +1104,13 @@ impl CodexInboxDelivery {
         {
             return;
         }
-        match codex_turn_outcome(message.pointer("/params/turn")) {
+        let outcome = codex_turn_outcome(message.pointer("/params/turn"));
+        self.provider_auth_edge = match outcome {
+            CodexTurnOutcome::ProviderAuthRejected => Some(false),
+            CodexTurnOutcome::Accepted => Some(true),
+            _ => None,
+        };
+        match outcome {
             CodexTurnOutcome::ProviderAuthRejected => self.diagnostics.publish(
                 driver_diagnostic::Stage::ProviderAuth,
                 driver_diagnostic::Reason::ProviderAuthRejected,
@@ -1645,6 +1670,27 @@ impl CodexInboxDelivery {
         self.verified_snapshot = Some((head.filename.clone(), observed));
     }
 
+    fn retry_held_snapshot_after_live_recovery(&mut self, observed: &CodexObservedState) {
+        if matches!(
+            observed,
+            CodexObservedState::Idle
+                | CodexObservedState::Active { .. }
+                | CodexObservedState::TerminalError { .. }
+        ) && self.verified_snapshot.as_ref().is_some_and(|(_, snapshot)| {
+            matches!(
+                snapshot,
+                CodexObservedState::Held { .. } | CodexObservedState::AwaitingStatus
+            )
+        })
+        {
+            // A failed transcript lookup cannot be the only way out of an old held snapshot.
+            // Fresh positive live evidence permits another bounded thread/read, whose result
+            // still fences the delivery. It does not authorize blind input or settle a receipt.
+            self.verified_snapshot = None;
+            self.snapshot_attempts = 0;
+        }
+    }
+
     fn accept_response(&mut self, message: &Value, observed: &CodexObservedState) -> Result<bool> {
         let Some(pending) = self.pending.as_ref() else {
             return Ok(false);
@@ -1975,7 +2021,8 @@ impl CodexControlState {
         let thread_id = required_string(message, "/result/thread/id", "thread/resume response")?;
         anyhow::ensure!(
             thread_id == self.thread_id,
-            "Codex control thread/resume returned a different thread"
+            "Codex control thread/resume returned a different thread: expected {}, received {thread_id}",
+            self.thread_id
         );
         let status = required_string(
             message,
@@ -2179,14 +2226,7 @@ impl CodexControlState {
                 reason: CodexHoldReason::NotLoaded,
                 turn_id: None,
             },
-            "systemError"
-                if matches!(
-                    self.observed,
-                    CodexObservedState::TerminalError {
-                        reason: CodexTerminalError::SystemError
-                    }
-                ) =>
-            {
+            "systemError" if matches!(self.observed, CodexObservedState::TerminalError { .. }) => {
                 self.observed.clone()
             }
             "systemError" => CodexObservedState::Held {
@@ -2265,6 +2305,16 @@ impl CodexControlState {
                 reason: CodexTerminalError::ProviderCapacity,
             };
             return;
+        }
+        if outcome == CodexTurnOutcome::Accepted
+            && matches!(
+                self.observed,
+                CodexObservedState::TerminalError {
+                    reason: CodexTerminalError::ProviderAuthRejected
+                }
+            )
+        {
+            self.observed = CodexObservedState::Idle;
         }
         self.observed = match &self.observed {
             CodexObservedState::Idle => CodexObservedState::Idle,
@@ -2415,14 +2465,7 @@ fn observed_from_thread_snapshot(
                 reason: CodexHoldReason::NotLoaded,
                 turn_id: None,
             },
-            "systemError"
-                if matches!(
-                    previous,
-                    CodexObservedState::TerminalError {
-                        reason: CodexTerminalError::SystemError
-                    }
-                ) =>
-            {
+            "systemError" if matches!(previous, CodexObservedState::TerminalError { .. }) => {
                 previous.clone()
             }
             "systemError" => CodexObservedState::Held {
@@ -3828,7 +3871,7 @@ fn record_safe_fallback(
             "requestedPolicyApplied": false,
         }),
     )?;
-    eprintln!(
+    tracing::warn!(
         "st codex: declared launch arguments were rejected; booting once with known-safe flags (declared options: {})",
         if declared_options.is_empty() {
             "none".to_string()
@@ -4482,7 +4525,7 @@ fn wait_for_tui_loaded_thread(
 ) -> Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
-        eprintln!("codex control: requesting TUI-loaded thread list");
+        tracing::debug!("codex control: requesting TUI-loaded thread list");
         write_json_message(
             websocket,
             &json!({
@@ -4622,6 +4665,9 @@ fn pump_control(
     safe_fallback_active: Arc<AtomicBool>,
     events: Sender<ControlEvent>,
 ) {
+    // A spawned thread does not inherit its parent's tracing dispatcher. Install its own
+    // private, rate-limited log, including during adoption and isolated control tests.
+    let _log_guard = log::install(control_state_path.parent().unwrap_or(Path::new(".")));
     let result = (|| -> Result<()> {
         let (
             expected_resume,
@@ -4775,7 +4821,7 @@ fn pump_control(
                         && let Some(rejected) = resume_permissions.take()
                     {
                         safe_fallback_active.store(true, Ordering::SeqCst);
-                        eprintln!(
+                        tracing::warn!(
                             "st codex: app-server rejected the declared resume permission policy; continuing once with the provider-safe policy"
                         );
                         let _ = events.send(ControlEvent::SafeFallbackActivated {
@@ -4799,7 +4845,7 @@ fn pump_control(
                             ));
                         } else {
                             safe_fallback_active.store(true, Ordering::SeqCst);
-                            eprintln!(
+                            tracing::warn!(
                                 "st codex: resumed thread did not report the declared permission policy; continuing in degraded provider-safe mode"
                             );
                             let _ = events.send(ControlEvent::SafeFallbackActivated {
@@ -4963,10 +5009,17 @@ fn pump_control(
                 atomic_json(control_state_path, state)
                     .context("persisting Codex observed control state")?;
                 if let Some(delivery) = delivery.as_mut() {
+                    if !delivery_response {
+                        delivery.retry_held_snapshot_after_live_recovery(&state.observed);
+                    }
                     delivery.observe_harness(&state.observed);
                 }
                 let _ = events.send(ControlEvent::Observed);
-            } else if turn_error_changed {
+            } else if turn_error_changed
+                || delivery
+                    .as_ref()
+                    .is_some_and(|d| d.provider_auth_edge.is_some())
+            {
                 // The delivery-relevant state is unchanged and the reason is not. That is the
                 // exact shape of the overnight stall: Codex kept reporting a live turn while the
                 // provider refused every attempt, so nothing here changed and nothing was
@@ -5017,13 +5070,6 @@ fn pump_control(
     }
 }
 
-fn recover_active_codex_turn(thread_id: &str) -> Result<Option<String>> {
-    latest_codex_transcript(thread_id)?
-        .map(|path| active_turn_from_codex_transcript(&path))
-        .transpose()
-        .map(Option::flatten)
-}
-
 fn recover_transcript_turn_if_due(
     state: &mut CodexControlState,
     delivery: &mut Option<CodexInboxDelivery>,
@@ -5055,19 +5101,42 @@ fn recover_transcript_turn_if_due(
         return Ok(());
     }
     *last_recovery = Some(Instant::now());
-    if system_error {
-        let Some(path) = latest_codex_transcript(state.thread_id())? else {
-            return Ok(());
-        };
-        if failed_completed_turn_from_codex_frames(&codex_transcript_tail(&path)?).is_none() {
+    // Transcript discovery is auxiliary evidence. Propagating its read error here ends the
+    // control observer before it can send input or process live receipts and status updates.
+    let frames = match latest_codex_transcript(state.thread_id())
+        .and_then(|path| path.map(|path| codex_transcript_tail(&path)).transpose())
+    {
+        Ok(Some(frames)) => frames,
+        Ok(None) => return Ok(()),
+        Err(error) => {
+            tracing::warn!("st codex: bounded transcript turn recovery failed: {error:#}");
             return Ok(());
         }
+    };
+    recover_transcript_turn_from_frames(state, delivery, &frames, control_state_path, events)
+}
+
+fn recover_transcript_turn_from_frames(
+    state: &mut CodexControlState,
+    delivery: &mut Option<CodexInboxDelivery>,
+    frames: &[Value],
+    control_state_path: &Path,
+    events: &Sender<ControlEvent>,
+) -> Result<()> {
+    if matches!(
+        state.observed,
+        CodexObservedState::Held {
+            reason: CodexHoldReason::SystemError,
+            ..
+        }
+    ) {
+        let Some((_, reason)) = failed_completed_turn_from_codex_frames(frames) else {
+            return Ok(());
+        };
         // Some Codex app-server versions report the terminal thread status but
         // omit turn/completed. The saved task_complete with an error proves the
         // turn ended, so the next inbox delivery can safely start a new turn.
-        state.observed = CodexObservedState::TerminalError {
-            reason: CodexTerminalError::SystemError,
-        };
+        state.observed = CodexObservedState::TerminalError { reason };
         atomic_json(control_state_path, state)
             .context("persisting transcript-recovered Codex system error")?;
         if let Some(delivery) = delivery.as_mut() {
@@ -5077,7 +5146,7 @@ fn recover_transcript_turn_if_due(
         let _ = events.send(ControlEvent::Observed);
         return Ok(());
     }
-    let Some(turn_id) = recover_active_codex_turn(state.thread_id())? else {
+    let Some(turn_id) = active_turn_from_codex_frames(frames) else {
         return Ok(());
     };
     let before = state.observed.clone();
@@ -5177,6 +5246,7 @@ pub fn latest_codex_transcript_in(home: &Path, thread_id: &str) -> Result<Option
     Ok(selected.map(|(_, path)| path))
 }
 
+#[cfg(test)]
 fn active_turn_from_codex_transcript(path: &Path) -> Result<Option<String>> {
     let frames = codex_transcript_tail(path)?;
     Ok(active_turn_from_codex_frames(&frames))
@@ -5187,21 +5257,33 @@ fn codex_transcript_tail(path: &Path) -> Result<Vec<Value>> {
 }
 
 fn codex_transcript_tail_with_bytes(path: &Path) -> Result<(Vec<Value>, u64)> {
-    let mut file =
+    let file =
         File::open(path).with_context(|| format!("read Codex transcript {}", path.display()))?;
     let length = file.metadata()?.len();
+    codex_transcript_window(file, length)
+}
+
+fn codex_transcript_window(mut file: File, length: u64) -> Result<(Vec<Value>, u64)> {
     let start = length.saturating_sub(TRANSCRIPT_TURN_RECOVERY_BYTES);
     file.seek(SeekFrom::Start(start))?;
     // The rollout can grow while it is being read. Cap the stream itself so a busy writer
     // cannot make one recovery pass read past this fixed window.
     let mut reader = BufReader::new(file.take(TRANSCRIPT_TURN_RECOVERY_BYTES));
+    let mut line = Vec::new();
     if start != 0 {
-        let mut partial = String::new();
-        reader.read_line(&mut partial)?;
+        // Seek offsets are byte offsets, including inside a code point. Discard the first
+        // partial record as bytes, before attempting any UTF-8/JSON decoding.
+        reader.read_until(b'\n', &mut line)?;
     }
     let mut frames = Vec::new();
-    for line in (&mut reader).lines() {
-        if let Ok(value) = serde_json::from_str::<Value>(&line?) {
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        // A concurrent append or the byte cap can also split the final code point/record.
+        // Only complete JSON records provide evidence; malformed records are skipped.
+        if let Ok(value) = serde_json::from_slice::<Value>(&line) {
             frames.push(value);
         }
     }
@@ -5246,12 +5328,21 @@ fn active_turn_from_codex_frames(frames: &[Value]) -> Option<String> {
     active
 }
 
-fn failed_completed_turn_from_codex_frames(frames: &[Value]) -> Option<String> {
+fn failed_completed_turn_from_codex_frames(
+    frames: &[Value],
+) -> Option<(String, CodexTerminalError)> {
     let mut active = None;
+    // Codex can flush an item after task_complete; that does not reopen the closed turn.
+    let mut closed_turn = None;
     let mut failed = None;
     for value in frames {
         let event = value.pointer("/payload/type").and_then(Value::as_str);
-        let turn_id = value.pointer("/payload/turn_id").and_then(Value::as_str);
+        let turn_id = value
+            .pointer("/payload/turn_id")
+            .or_else(|| {
+                value.pointer("/payload/internal_chat_message_metadata_passthrough/turn_id")
+            })
+            .and_then(Value::as_str);
         match (event, turn_id) {
             (Some("task_started"), Some(turn_id)) => {
                 active = Some(turn_id);
@@ -5259,13 +5350,66 @@ fn failed_completed_turn_from_codex_frames(frames: &[Value]) -> Option<String> {
             }
             (Some("task_complete"), Some(turn_id)) if active == Some(turn_id) => {
                 active = None;
+                closed_turn = Some(turn_id);
                 failed = value
                     .pointer("/payload/error")
-                    .filter(|error| !error.is_null())
-                    .map(|_| turn_id.to_string());
+                    .filter(|error| error.is_object() || error.is_string())
+                    .map(|error| {
+                        // The native transcript uses snake_case; the control stream uses camelCase.
+                        let info = error
+                            .get("codex_error_info")
+                            .or_else(|| error.get("codexErrorInfo"))
+                            .map(|info| match info.as_str() {
+                                Some("usage_limit_exceeded") => json!("usageLimitExceeded"),
+                                _ => info.clone(),
+                            });
+                        let turn = json!({
+                            "status": "failed",
+                            "error": {
+                                "message": error.get("message"),
+                                "codexErrorInfo": info,
+                            }
+                        });
+                        let reason = match codex_turn_outcome(Some(&turn)) {
+                            CodexTurnOutcome::ProviderCapacity => {
+                                CodexTerminalError::ProviderCapacity
+                            }
+                            CodexTurnOutcome::ProviderAuthRejected => {
+                                CodexTerminalError::ProviderAuthRejected
+                            }
+                            _ => CodexTerminalError::SystemError,
+                        };
+                        (turn_id.to_string(), reason)
+                    });
+            }
+            (Some("task_complete"), turn_id) => {
+                closed_turn = turn_id;
+                failed = None;
             }
             (Some("turn_aborted"), Some(turn_id)) if active == Some(turn_id) => {
                 active = None;
+                closed_turn = Some(turn_id);
+                failed = None;
+            }
+            (Some("turn_aborted"), turn_id) => {
+                closed_turn = turn_id;
+                failed = None;
+            }
+            // A long turn can put task_started outside the bounded tail. Recent typed
+            // frames prove its identity just as they do for active-turn recovery. They
+            // also invalidate an older failure when a newer turn is now live.
+            (Some("item_completed"), Some(turn_id))
+                if active.is_none() && closed_turn != Some(turn_id) =>
+            {
+                active = Some(turn_id);
+                failed = None;
+            }
+            (_, Some(turn_id))
+                if active.is_none()
+                    && closed_turn != Some(turn_id)
+                    && value.get("type").and_then(Value::as_str) == Some("response_item") =>
+            {
+                active = Some(turn_id);
                 failed = None;
             }
             _ => {}

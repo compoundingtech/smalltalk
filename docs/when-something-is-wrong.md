@@ -66,3 +66,36 @@ The runtime watches process liveness, readiness, claim leases, and message deliv
 A watcher cannot fix a missing harness login, choose a product preference, or make an expired provider allowance return. Follow the recorded cause, and ask a person through a structured request when only that person can settle it.
 
 See [CLI tour](st3/cli-guided-tour.md), [operational state](st3/operational-state/README.md), and [replication](st3/replication.md) for deeper diagnosis.
+
+During daemon startup, `st doctor` reads a local readiness file without waiting for SQLite or
+an API listener. It reports `starting`, the current recovery phase, and committed frontier/target
+when projection has begun. Full replay also reports its stage and, during base claims, processed
+claims/total; those counts describe uncommitted work, not a newer committed frontier. Updates
+occur at stage boundaries and every 1,000 base claims. The record changes to `serving` only once
+both local API and paired gateway sockets have bound. Serving means the APIs accept requests;
+projection health remains a separate doctor check.
+
+`st service status` adds this readiness to the daemon service line, so a service manager's
+`active` or `running` state is not mistaken for API readiness. `st doctor --json` includes the
+local record as `startup`; if the API is unreachable during recovery it reports a failed
+startup check and exits nonzero. Once the API answers, `starting` is informational and the
+API's health checks determine the result, even before the gateway has bound.
+Command clients that normally announce outage retries return a full-replay phase promptly after
+an unsuccessful connection attempt. In ordinary startup phases, they print the phase and keep
+waiting under `--daemon-wait`, so a brief restart can finish normally. Long-lived drivers retain
+their connect-outage retry behavior. Existing clients still get the
+kernel's immediate missing-socket/connection-refused error during recovery and keep their own
+retry policy; no early listener accepts requests it cannot yet answer.
+
+The private, rebuildable record is `API_SOCKET.readiness.json`, beside the effective API socket,
+with a held `API_SOCKET.readiness.lock` establishing its lifetime. Readers ignore unlocked files,
+including a leftover `serving` record after SIGKILL; a restart overwrites the record with
+`starting`. These files are local observations, not replicated claims or a client API endpoint.
+No client HTTP response schema or API error code changes.
+
+Local startup observation is enabled on Linux. On macOS and other platforms, or when the
+observation files or OFD locks are unavailable, startup logs one warning and continues without
+a sidecar. Doctor and command clients then use their existing API checks and outage waits.
+Only lock-contention errors refuse a second observer; other observation failures never block
+startup. Writers and readers resolve socket discovery links and canonicalize the parent
+directory, including paths through symlinked directories.

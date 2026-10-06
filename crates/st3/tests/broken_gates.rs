@@ -83,17 +83,22 @@ impl Daemon {
     }
 
     fn run_cli(&self, args: &[&str]) -> std::process::Output {
-        st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
+        self.run_cli_format(args, true)
+    }
+
+    fn run_cli_format(&self, args: &[&str], json: bool) -> std::process::Output {
+        let mut command = st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"));
+        command
             .env_clear()
             .env("HOME", &self.root)
             .env("ST3_DAEMON_WAIT", "0")
             .current_dir(&self.root)
             .args(["--endpoint"])
-            .arg(self.root.join("daemon.sock"))
-            .arg("--json")
-            .args(args)
-            .output()
-            .unwrap()
+            .arg(self.root.join("daemon.sock"));
+        if json {
+            command.arg("--json");
+        }
+        command.args(args).output().unwrap()
     }
 
     fn run(&self) -> Value {
@@ -199,7 +204,365 @@ fn wait_for(label: &str, mut condition: impl FnMut() -> bool) {
 }
 
 #[test]
+fn mission_publish_dry_run_prints_the_preview_without_gates_or_publication() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(root.path());
+    let file = root.path().join("preview.kdl");
+    let source = r#"version 2
+agent "example/helper" {
+  workspace "."
+  command "touch helper-ran"
+  restart "never"
+  mission-authority { publish "example/*" }
+}
+mission "example/preview" state="ready" {
+  goal "Inspect publication without running commands."
+  step "work" {
+    agentless
+    gate "checked" {
+      exec "touch gate-ran; exit 2"
+      host "orchid"
+      workspace "."
+    }
+  }
+}
+"#;
+    std::fs::write(&file, source).unwrap();
+    let file = file.to_str().unwrap();
+    for (prefix, flag) in [
+        (vec!["apply"], "--dry-run"),
+        (vec!["apply"], "--preview"),
+        (vec!["agents", "apply"], "--dry-run"),
+        (vec!["missions", "publish"], "--dry-run"),
+        (vec!["missions", "publish"], "--preview"),
+    ] {
+        let mut args = prefix.clone();
+        args.extend([file, "--as", PUBLISHER, flag]);
+        let output = daemon.run_cli(&args);
+        assert!(output.status.success(), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            stderr.contains("is legacy; use st apply FILE"),
+            prefix.len() == 2
+        );
+        let preview = daemon.command(&args);
+        let resolved = preview["resolved_intent"]["kdl"].as_str().unwrap();
+        let intent = st3::graph::parse_intent(resolved, "orchid").unwrap();
+        assert!(resolved.contains("Inspect publication without running commands."));
+        assert!(preview["normalized"].is_object(), "{preview:#}");
+        let revision = preview["mission_revisions"]["mission/example/preview"]
+            .as_str()
+            .unwrap();
+        assert!(!revision.is_empty());
+        assert_eq!(intent.missions["example/preview"].revision, revision);
+        assert!(preview["changes"].as_array().unwrap().iter().any(|change| {
+            change["subject"] == "mission/example/preview" && change["new_revision"] == revision
+        }));
+        assert!(
+            preview["predicted_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|action| {
+                    action["subject"] == "mission/example/preview"
+                        && action["action"] == "publish-mission"
+                })
+        );
+        assert_eq!(preview["blockers"], serde_json::json!([]));
+        assert!(preview["warnings"].to_string().contains("free-mode"));
+        assert!(preview["subject_tokens"].is_object());
+
+        let human = daemon.run_cli_format(&args, false);
+        assert!(human.status.success(), "{human:?}");
+        let human = String::from_utf8_lossy(&human.stdout);
+        for expected in [
+            "RESOLVED INTENT",
+            "BLOCKERS",
+            "WARNINGS",
+            revision,
+            "Inspect publication without running commands.",
+        ] {
+            assert!(human.contains(expected), "{human}");
+        }
+        assert!(!root.path().join("gate-ran").exists());
+        assert!(!root.path().join("helper-ran").exists());
+        assert!(daemon.gate_results().is_empty());
+        let missions = daemon.command(&["missions", "ls", "--all"]);
+        assert!(
+            !missions.to_string().contains("example/preview"),
+            "{missions}"
+        );
+        let agents = daemon.command(&["agents", "ls", "--all"]);
+        assert!(!agents.to_string().contains("example/helper"), "{agents}");
+    }
+}
+
+#[test]
+fn mission_publish_dry_run_prints_blockers_before_refusing_publication() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(root.path());
+    let file = root.path().join("blocked.kdl");
+    std::fs::write(
+        &file,
+        "version 2\nmission \"example/blocked\" state=\"ready\" {\n  goal \"Find an unresolved seat.\"\n  step \"work\" { assigned-to \"agent/example/nobody\" }\n}\n",
+    )
+    .unwrap();
+    for prefix in [
+        vec!["apply"],
+        vec!["agents", "apply"],
+        vec!["missions", "publish"],
+    ] {
+        let mut args = prefix;
+        args.extend([file.to_str().unwrap(), "--as", PUBLISHER, "--dry-run"]);
+        let refused = daemon.run_cli(&args);
+        assert!(!refused.status.success(), "{refused:?}");
+        let preview: Value = serde_json::from_slice(&refused.stdout).unwrap();
+        let blocker = preview["blockers"][0].as_str().unwrap();
+        assert!(blocker.contains("missing eligible agent `agent/example/nobody`"));
+        assert!(
+            preview["resolved_intent"]["kdl"]
+                .as_str()
+                .unwrap()
+                .contains("example/blocked")
+        );
+        assert!(String::from_utf8_lossy(&refused.stderr).contains(blocker));
+        let human = daemon.run_cli_format(&args, false);
+        assert!(!human.status.success());
+        assert!(String::from_utf8_lossy(&human.stdout).contains(blocker));
+        let missions = daemon.command(&["missions", "ls", "--all"]);
+        assert!(
+            !missions.to_string().contains("example/blocked"),
+            "{missions}"
+        );
+    }
+}
+
+#[test]
+fn apply_bundles_seats_missions_and_schedules_and_refuses_partial_publication() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(root.path());
+    let seat = root.path().join("seat.kdl");
+    let mission = root.path().join("mission.kdl");
+    let schedule = root.path().join("schedule.kdl");
+    std::fs::write(&seat, "version 2\nagent \"example/helper\" { workspace \".\"; command \"true\"; restart \"never\"; }\n").unwrap();
+    std::fs::write(&mission, "version 2\nmission \"example/mixed\" state=\"ready\" { goal \"Resolve a seat from another file.\"; step \"work\" { assigned-to \"agent/example/helper\"; } }\n").unwrap();
+    std::fs::write(&schedule, "version 2\nschedule \"example/daily\" { every \"24h\"; anchor \"2099-01-01T00:00:00Z\"; work { mission \"example/mixed\"; workspace \".\"; } }\n").unwrap();
+    let seat = seat.to_str().unwrap();
+    let mission = mission.to_str().unwrap();
+    let schedule = schedule.to_str().unwrap();
+    let missing = root.path().join("missing.kdl");
+    for bad in [missing.to_str().unwrap(), mission] {
+        // Unreadable files and unresolved references both reject the entire bundle.
+        let args = if bad == mission {
+            vec!["apply", mission, schedule, "--as", PUBLISHER]
+        } else {
+            vec!["apply", seat, bad, "--as", PUBLISHER]
+        };
+        assert!(!daemon.run_cli(&args).status.success());
+        assert!(
+            !daemon
+                .command(&["agents", "ls", "--all"])
+                .to_string()
+                .contains("example/helper")
+        );
+        assert!(
+            !daemon
+                .command(&["missions", "ls", "--all"])
+                .to_string()
+                .contains("example/mixed")
+        );
+    }
+    let preview = daemon.command(&[
+        "apply",
+        seat,
+        mission,
+        schedule,
+        "--as",
+        PUBLISHER,
+        "--dry-run",
+    ]);
+    assert_eq!(preview["blockers"], serde_json::json!([]));
+    for subject in [
+        "agent/example/helper",
+        "mission/example/mixed",
+        "schedule/example/daily",
+    ] {
+        assert!(
+            preview["changes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|change| change["subject"] == subject),
+            "{preview:#}"
+        );
+    }
+    assert!(
+        !daemon
+            .command(&["agents", "ls", "--all"])
+            .to_string()
+            .contains("example/helper")
+    );
+    let applied = daemon.command(&["apply", seat, mission, schedule, "--as", PUBLISHER]);
+    assert!(
+        applied.to_string().contains("schedule/example/daily"),
+        "{applied}"
+    );
+    let revision = applied["published_missions"][0]["revision"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        preview["mission_revisions"]["mission/example/mixed"],
+        revision
+    );
+    assert!(
+        daemon
+            .command(&["agents", "ls", "--all"])
+            .to_string()
+            .contains("example/helper")
+    );
+    assert!(
+        daemon
+            .command(&["missions", "ls", "--all"])
+            .to_string()
+            .contains("example/mixed")
+    );
+    // Plain publication is an upsert; omitting the schedule does not retire it.
+    let repeated = daemon.command(&["apply", seat, "--as", PUBLISHER]);
+    assert!(!repeated.to_string().contains("schedule/example/daily"));
+    let status = daemon.command(&["subject", "show", "schedule/example/daily"]);
+    assert!(
+        status.to_string().contains("2099-01-01T00:00:00Z"),
+        "{status}"
+    );
+}
+
+#[test]
+fn apply_can_check_exec_gates_during_plain_and_owned_dry_runs() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    for owned in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let daemon = Daemon::start(root.path());
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let file = root.path().join("gates.kdl");
+        std::fs::write(
+            &file,
+            r#"version 2
+mission "example/check" state="ready" {
+  goal "Validate gates without publishing."
+  input "answer" kind="text"
+  step "work" {
+    agentless
+    gate "check" { exec "touch gate-ran; exit ${input.answer}"; host "orchid"; workspace "."; }
+  }
+}
+"#,
+        )
+        .unwrap();
+        let mut args = vec![
+            "apply",
+            file.to_str().unwrap(),
+            "--as",
+            PUBLISHER,
+            "--workspace",
+            workspace.to_str().unwrap(),
+        ];
+        if owned {
+            args.extend([
+                "--set",
+                "garden",
+                "--repository",
+                "acme/garden",
+                "--ref",
+                "refs/heads/main",
+                "--sha",
+                "0123456789abcdef0123456789abcdef01234567",
+                "--source-sequence",
+                "1",
+                "--expect-set",
+                "absent",
+            ]);
+        }
+        if owned {
+            // Retaining the owned-set route also retains intentional empty membership.
+            let mut empty = args.clone();
+            empty.remove(1);
+            let name = empty.iter().position(|arg| *arg == "garden").unwrap();
+            empty[name] = "empty-garden";
+            empty.extend(["--allow-empty", "--check"]);
+            let mut empty_dry = empty.clone();
+            empty_dry.push("--dry-run");
+            assert_eq!(daemon.command(&empty_dry)["empty"], true);
+            daemon.command(&empty);
+            assert!(
+                daemon
+                    .command(&["sets", "ls"])
+                    .to_string()
+                    .contains("empty-garden")
+            );
+        }
+        let mut dry = args.clone();
+        dry.push("--dry-run");
+        daemon.command(&dry);
+        assert!(!workspace.join("gate-ran").exists());
+        for answer in ["answer=0", "answer=1", "answer=2"] {
+            let mut checked = dry.clone();
+            checked.extend(["--check", "--input", answer]);
+            let output = daemon.run_cli(&checked);
+            assert_eq!(output.status.success(), answer != "answer=2", "{output:?}");
+            let preview: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(preview["blockers"], serde_json::json!([]));
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains(if answer == "answer=0" {
+                    "pass"
+                } else if answer == "answer=1" {
+                    "not yet"
+                } else {
+                    "broken"
+                })
+            );
+            assert!(workspace.join("gate-ran").exists());
+            std::fs::remove_file(workspace.join("gate-ran")).unwrap();
+            assert!(
+                !daemon
+                    .command(&["missions", "ls", "--all"])
+                    .to_string()
+                    .contains("example/check")
+            );
+        }
+        // A broken gate also refuses real publication; opting out publishes without execution.
+        let mut broken = args.clone();
+        broken.extend(["--input", "answer=2"]);
+        assert!(!daemon.run_cli(&broken).status.success());
+        std::fs::remove_file(workspace.join("gate-ran")).unwrap();
+        args.push("--no-gate-check");
+        daemon.command(&args);
+        assert!(!workspace.join("gate-ran").exists());
+        assert!(
+            daemon
+                .command(&["missions", "ls", "--all"])
+                .to_string()
+                .contains("example/check")
+        );
+    }
+}
+
+#[test]
 fn a_terminal_exec_fails_its_unsatisfied_field_gate() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let daemon = Daemon::start(root.path());
     let file = root.path().join("mission.kdl");
@@ -270,6 +633,9 @@ mission "orchid/replay" state="ready" {
 
 #[test]
 fn missions_and_doctor_surface_a_terminal_field_gate_behind_a_pending_gate() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let daemon = Daemon::start(root.path());
     let file = root.path().join("mission.kdl");
@@ -491,6 +857,9 @@ fn replay_host(root: &Path) -> Daemon {
 
 #[test]
 fn broken_gates_wait_for_a_revision_that_then_passes_their_steps() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let daemon = replay_host(root.path());
 
@@ -601,6 +970,9 @@ fn broken_gates_wait_for_a_revision_that_then_passes_their_steps() {
 
 #[test]
 fn a_check_answers_for_each_gate_and_publish_refuses_a_broken_one() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let daemon = replay_host(root.path());
     let workspace = root.path().to_str().unwrap();

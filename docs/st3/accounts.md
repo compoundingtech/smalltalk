@@ -10,7 +10,7 @@ harness's default login, exactly as before.
 
 ## Declare an account
 
-An `account` is a root declaration, applied like an agent: `st agents apply accounts.kdl --as person/ada`.
+An `account` is a root declaration, applied like an agent: `st apply accounts.kdl --as person/ada`.
 
 ```kdl
 version 2
@@ -102,9 +102,22 @@ Their spend and limits use a stable label derived from the declared name; unboun
 provider's label. Queued observations capture the account at their source, so replay after a
 switch still charges the account that produced them.
 
+Limits include `identified`: true when the source names a provider identity or a declared account,
+false when it names neither. Older servers omit this additive metadata. Identity and quota
+freshness are separate: a missing identity does not make a reading stale. Once a driver has
+identified evidence, its identity-less historical group is hidden if none of its latest reporting
+seats is still declared active. Unknown evidence from active seats remains visible, as does unknown
+evidence for a driver with no identified readings. Identified accounts keep their readings even
+without seats; unknown readings are never assigned to an identified account.
+
+A relaunch or a partial five-hour report cannot erase the last weekly observation or give it a
+new timestamp. Weekly selection uses only reports that actually contain a weekly percentage;
+providers with only a five-hour window still show that window. The original observation survives
+a member restart in the durable graph and remains available to other members through replication.
+
 ## At the limit
 
-`[limits]` in the node's config stops an account's seats at its weekly percentage (README). With
+`[limits]` in the node's config stops an account's seats at its weekly percentage ([configuration below](#usage-totals-and-automatic-stops)). With
 accounts:
 
 - A seat bound to one account stops, as before.
@@ -115,7 +128,36 @@ accounts:
 
 The selected account, fenced restart request and handled marker commit in one transaction. An
 interrupted switch can retry without losing its restart request. Enforcement checks the seat's
-current account binding and runtime incarnation before acting on a reading.
+current account binding before acting. A relaunch on the same declared account, including a
+persisted local pool choice, can use that account's fresh quota without waiting for its own quota
+report. A changed account binding cannot use the previous account's quota. Legacy pool seats with
+no persisted choice retain their source incarnation check. A person restarting a seat the policy
+already stopped still overrides the stop for the remainder of that weekly window.
+
+Missing, stale, future-dated, or already-reset weekly evidence is **unknown**, not below the limit.
+The policy leaves those seats running until fresh weekly evidence arrives, preserving `keep` and
+the once-per-window override. It reports the gap in the daemon log on each policy pass using
+`limits.fresh`; `st doctor` reports an `account-limits` warning for active accounts using a one-hour
+freshness bound, even when the policy is disabled. This avoids stopping an account on an old or
+missing number while making the gap visible to operations. An account that has never reported
+quota has no fabricated row in `st usage`; its missing evidence is reported by doctor.
+
+External backstops must read `st --json usage` (`limits`), or the client-v0 usage endpoint, rather
+than scanning driver directories, status-line files, or provider transcripts. Fresh harnesses
+commit observations through a SQLite outbox and need not produce those legacy files; a relaunch
+can remove every source a file collector sees. For each account:
+
+- Use `weekly_percent` alone; a missing `five_hour_percent` does not invalidate weekly evidence.
+- Check `measured_at_unix_ms` against the freshness bound and reject times over a minute ahead.
+  Check `weekly_resets_at_unix_ms` when provided; an elapsed reset needs a new observation.
+- Retain `account` and `account_ref`, the account's `seats`, and the configured exemptions. Evaluate
+  accounts separately and verify the seat's current binding before stopping it.
+- When the account row or weekly evidence is missing or stale, report an operations/attention
+  signal with the reason. Do not silently return an empty stop plan or substitute zero. A failed
+  read or offline peer is also unavailable evidence. Resume threshold evaluation on fresh data.
+
+The graph read preserves the selected source time. A collector must never replace it with the
+time it ran. A fresh real reading at exactly 95% meets a 95% stop rule.
 
 A switch is a fresh start: a harness cannot resume a native session from another account's
 directory, and a seat's work lives in the graph. For that reason a pooled seat cannot declare
@@ -130,3 +172,50 @@ seats on a particular account, under which namespace) still await smallclaims' c
 grants; its current rules match actor, kind and subject. Once those grants land, account use will
 use them in audit mode. Once sekrets holds model logins, an account will name the sekrets profile
 that holds its login instead of a directory.
+
+## Usage totals and automatic stops
+
+Token spend across the fleet is available by agent, mission, step, model, account, or host, with
+its API-equivalent cost: what the tokens would cost at the provider's list price, from a pricing
+table built into st. Tokens on a model the table does not price are counted as unpriced, and a
+cost that leaves them out ends in `+`. An account is a short digest of the harness's own login,
+never the login itself. The graph keeps hourly usage for about a week and each series' total
+after that; `[observations.otlp]` sends every response to OpenTelemetry for longer history. The
+period ends now:
+
+```sh
+st usage --hours 24
+st usage --hours 24 --by step
+st usage --hours 24 --by account
+```
+
+`st usage` also lists each account's 5-hour and weekly limits: the freshest reading any seat on
+that account reported, with when it was measured and when the weekly window resets.
+
+A node can stop an account's seats as the account nears its weekly limit. It is off until its
+config enables it:
+
+```toml
+person = "person/ada"
+
+[limits]
+enabled = true
+stop_at_weekly_percent = 95
+keep = ["agent/example/coordinator"]
+notify = "agent/example/operations"
+fresh = "1h"
+```
+
+When an account's freshest weekly reading, no older than `fresh`, reaches the percentage, each
+node stops the seats it hosts on that account, except those in `keep`, and the node that measured
+the reading sends one message to `notify`, naming the affected seats and the reset time. The
+operations agent groups alerts, acts on standing instructions, and asks a person through a
+structured request only when a decision is needed. Enabled policies require `notify` to name
+an agent; the legacy `ask` setting is accepted but never sends raw events to a person.
+Each seat is stopped once per weekly window: start it again and it stays up until the reset. Give
+every node that hosts seats the same `[limits]`.
+
+A person who owns more than one Claude or Codex account declares them and binds a seat to one or to
+a pool; a pooled seat at its limit restarts on another account instead of stopping, and `st usage`
+names each declared account. A seat that binds nothing runs on the
+harness's default login.

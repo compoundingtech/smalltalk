@@ -4463,21 +4463,27 @@ dependencies = [
 name = "st3-client"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "axum",
  "base64",
  "bytes",
+ "ciborium",
+ "crossterm",
  "futures-util",
  "hex",
  "http-body-util",
  "hyper",
  "hyper-util",
+ "libc",
  "reqwest",
  "ring",
  "serde",
  "serde_json",
  "sha2",
+ "signal-hook 0.3.18",
  "smallclaims",
  "st3",
+ "st3-schema",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
@@ -4492,6 +4498,21 @@ dependencies = [
  "anyhow",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "st3-client-tui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "crossterm",
+ "ratatui",
+ "serde_json",
+ "st3-client",
+ "st3-conversation-ui",
+ "st3-feed",
+ "tokio",
 ]
 
 [[package]]
@@ -4544,6 +4565,7 @@ name = "st3-schema"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "regex",
  "serde",
  "serde_json",
  "sha2",
@@ -4619,6 +4641,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "signal-hook 0.3.18",
+ "smallclaims",
  "st3",
  "st3-client",
  "st3-conversation-ui",

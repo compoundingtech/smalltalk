@@ -1,23 +1,26 @@
+import { buildSnapshotSave } from './build-snapshot.ts'
+import { auditCaches } from './cache-audit.ts'
+import { readFileSync } from 'node:fs'
 import {
   defaultActionlintConfig,
   githubWorkflow,
   nixDevelopStep,
-  plainFlakeJob,
-  plainFlakeSetupSteps,
 } from '../../repos/effect-utils/genie/external.ts'
 import {
   afterPickRunner,
   buildEnv,
   commonSetupSteps,
   linuxRunner,
-  linuxRunsOn,
   linuxStageJob as namespaceStageJob,
   linuxStageRunner,
   linuxStageRunsOn,
   perfStoresCache,
+  mailStageRunsOn,
   pickRunnerJob,
   pickRunnerJobId,
-  readOnlyBinaryCaches,
+  supportingLinuxRunsOn,
+  supportingStageRunsOn,
+  secondaryStageRunsOn,
   workspacePreparationSteps,
 } from './workspace-ci.ts'
 
@@ -47,33 +50,39 @@ const linuxStageJob = ({
   setup,
   description,
   env = {},
+  before = [],
   extraLogs = '',
+  runsOn = supportingStageRunsOn,
 }: {
   name: string
   stage: string
   setup: readonly unknown[]
   description?: string
   env?: Record<string, string>
+  before?: readonly unknown[]
   extraLogs?: string
+  runsOn?: unknown
 }) => ({
   name,
   ...afterPickRunner,
-  'runs-on': linuxStageRunsOn,
+  'runs-on': runsOn,
   'timeout-minutes': 120,
   defaults: { run: { shell: 'bash' } },
-  env: { ...buildEnv, ...env },
+  env: { ...buildEnv, ...env, CI_CACHE_DEV_SHELL: 'default' },
   steps: [
     ...setup,
     {
       name: 'Summarize tested revision',
       run: `printf 'Checked merge/commit: \\x60%s\\x60 on %s CPUs, %s\\n\\n| Stage | Result | Elapsed | Exit |\\n| --- | --- | --- | --- |\\n' "$(git rev-parse HEAD)" "$(nproc)" "$(free -h | awk '/^Mem:/ {print $2 " memory"}')" >> "$GITHUB_STEP_SUMMARY"`,
     },
+    ...before,
     nixDevelopStep({ name: description ?? 'Run nextest', command: ['bash', 'scripts/ci-linux', stage] }),
     {
       name: 'Save Nix outputs to the local Nix cache',
       if: "success() && env.CI_LOCAL_CACHES != '1'",
       run: 'bash scripts/ci-nix-cache save || echo "::warning::could not save the local Nix cache"',
     },
+    ...buildSnapshotSave,
     {
       name: 'Retain stage logs and timings',
       uses: 'actions/upload-artifact@v4',
@@ -88,7 +97,7 @@ const linuxStageJob = ({
 })
 
 // Required gate. Label events belong to macos.yml so they never restart or cancel this workflow.
-export default githubWorkflow({
+export default githubWorkflow(auditCaches({
   name: 'Workspace CI',
   on: {
     pull_request: {},
@@ -99,7 +108,7 @@ export default githubWorkflow({
     // preserves perf-cost and fills missing default-branch caches without repeating this gate.
     workflow_dispatch: {},
   },
-  permissions: { contents: 'read' },
+  permissions: { contents: 'read', actions: 'read' },
   concurrency: {
     // PR updates replace stale checks; every other run has its own group so pending pushes survive.
     group: 'workspace-${{ github.event.pull_request.number || github.run_id }}-${{ github.event_name }}',
@@ -108,21 +117,36 @@ export default githubWorkflow({
   // actionlint must know the Namespace shape label the stage jobs use.
   actionlint: {
     ...defaultActionlintConfig,
-    selfHostedRunnerLabels: [...(defaultActionlintConfig.selfHostedRunnerLabels ?? []), ...linuxStageRunner],
+    selfHostedRunnerLabels: [...(defaultActionlintConfig.selfHostedRunnerLabels ?? []), ...linuxRunner, ...linuxStageRunner],
   },
   jobs: {
     [pickRunnerJobId]: pickRunnerJob,
-    // Namespace runners are already authenticated. Manual runs record the platform resource limits
-    // alongside the CI workload so queue concurrency can be chosen from the actual account capacity.
+    // Watch queue refs on GitHub-hosted capacity, even when both workload pools are occupied.
+    // Manual runs retain the existing Namespace capacity report.
     'namespace-capacity': {
       name: 'namespace-capacity',
-      if: "github.event_name == 'workflow_dispatch'",
-      'runs-on': linuxRunner,
-      'timeout-minutes': 5,
+      if: "github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'",
+      'runs-on': `\${{ fromJSON(github.event_name == 'merge_group' && '["ubuntu-latest"]' || format('${JSON.stringify(linuxRunner).replaceAll('${{ github.run_id }}', '{0}')}', github.run_id)) }}`,
+      'timeout-minutes': 120,
+      permissions: { contents: 'read', actions: 'write' },
       defaults: { run: { shell: 'bash' } },
       steps: [
         {
+          name: 'Cancel superseded merge groups',
+          if: "github.event_name == 'merge_group'",
+          env: {
+            GH_TOKEN: '${{ github.token }}',
+            REPOSITORY: '${{ github.repository }}',
+            RUN_ID: '${{ github.run_id }}',
+            QUEUE_REF: '${{ github.event.merge_group.head_ref }}',
+            QUEUE_SHA: '${{ github.event.merge_group.head_sha }}',
+          },
+          // Embed trusted workflow source: this job never checks out or executes queued PR code.
+          run: `python3 - <<'QUEUE_WATCH_PY'\n${readFileSync(new URL('../../scripts/ci-queue-watch', import.meta.url), 'utf8')}\nQUEUE_WATCH_PY`,
+        },
+        {
           name: 'Record Namespace platform capacity',
+          if: "github.event_name == 'workflow_dispatch'",
           run: `nsc workspace concurrency --output json | jq '{concurrency: [.concurrency[] | {platforms, limits, activeConcurrency}]}' > "$RUNNER_TEMP/namespace-capacity.json"
 cat "$RUNNER_TEMP/namespace-capacity.json"
 printf 'Measured at %s\\n\\n' "$(date -u +%FT%TZ)" >> "$GITHUB_STEP_SUMMARY"
@@ -132,6 +156,7 @@ printf '\\n\\x60\\x60\\x60\\n' >> "$GITHUB_STEP_SUMMARY"`,
         },
         {
           name: 'Retain Namespace capacity evidence',
+          if: "github.event_name == 'workflow_dispatch'",
           uses: 'actions/upload-artifact@v4',
           with: {
             name: 'namespace-capacity',
@@ -141,21 +166,26 @@ printf '\\n\\x60\\x60\\x60\\n' >> "$GITHUB_STEP_SUMMARY"`,
         },
       ],
     },
-    'genie-freshness': plainFlakeJob({
+    'genie-freshness': {
       name: 'genie-freshness',
+      env: { CI_CACHE_DEV_SHELL: 'genie' },
       ...afterPickRunner,
-      runsOn: linuxRunsOn,
+      'runs-on': supportingLinuxRunsOn,
       'timeout-minutes': 20,
-      nix: { binaryCaches: readOnlyBinaryCaches },
-      step: nixDevelopStep({ name: 'Check runner selection and generated files', flake: '.#genie', command: ['bash', '-c', 'python3 scripts/check-ci-runner-test && python3 scripts/check-main-ci-test && python3 scripts/ci-perf-cache-test && genie --check'] }),
-    }),
+      steps: [
+        ...commonSetupSteps.filter((step) => !('id' in step && step.id === 'cargo-cache')),
+        nixDevelopStep({ name: 'Check runner selection and generated files', flake: '.#genie', command: ['bash', '-c', 'python3 scripts/check-ci-runner-test && python3 scripts/ci-mail-redelivery-canaries-test && python3 scripts/ci-test-partitions-test && python3 scripts/ci-queue-watch-test && python3 scripts/check-main-ci-test && python3 scripts/ci-perf-cache-test && python3 scripts/ci-cache-audit-test && genie --check'] }),
+        { name: 'Save Nix outputs', if: "success() && env.CI_LOCAL_CACHES != '1'", run: 'bash scripts/ci-nix-cache save' },
+        ...buildSnapshotSave,
+      ],
+    },
     // Check the shared client and its iOS consumer before merge.
     'typescript-client': {
       name: 'typescript-client',
-      // Reuse freshness's slot so the five general ci1 runners can cover the initial fan-out.
+      // Keep generated-file validation ahead of its consumers.
       needs: ['pick-runner', 'genie-freshness'],
       if: "${{ !cancelled() && needs.genie-freshness.result == 'success' }}",
-      'runs-on': linuxRunsOn,
+      'runs-on': supportingLinuxRunsOn,
       'timeout-minutes': 10,
       defaults: { run: { shell: 'bash' } },
       steps: [
@@ -200,15 +230,30 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
         { name: 'Check shared views, fixtures and iOS consumers', run: 'npm test --prefix clients/typescript/st3-views\nnpm run typecheck --prefix clients/typescript/st3-views\napps/ios/node_modules/.bin/tsc --noEmit -p apps/ios\nnpm test --prefix apps/ios' },
       ],
     },
-    // The Linux gate runs as three jobs on separate runners, each with its own caches.
+    // Two test partitions and the two supporting stages retain independent CPU capacity.
     // `linux-gate` below is the single required check that collects them.
     'linux-tests': linuxStageJob({
       name: 'linux-tests',
       stage: 'tests',
       setup: workspacePreparationSteps,
+      runsOn: linuxStageRunsOn,
       // CI_RUN_ID keeps the messaging-fault evidence under target/messaging-faults and a failed
       // boot canary's evidence under target/boot-canaries.
-      env: { CI_RUN_ID: '${{ github.run_id }}' },
+      env: { CI_RUN_ID: '${{ github.run_id }}', CI_TEST_PARTITION: 'hash:1/2', CI_TEST_THREADS: '8' },
+      extraLogs: 'target/messaging-faults/\ntarget/boot-canaries/',
+      before: [nixDevelopStep({ name: 'Prove both shards cover every selected test', command: ['python3', 'scripts/ci-test-partitions'] })],
+    }),
+    'linux-tests-shard-2': linuxStageJob({
+      name: 'linux-tests-shard-2',
+      stage: 'tests',
+      runsOn: secondaryStageRunsOn,
+      // Reuse the main-seeded test caches; each checkout keeps its own executable paths.
+      setup: workspacePreparationSteps.map((step: any) =>
+        step.id === 'cargo-cache' || step.id === 'nix-cache'
+          ? { ...step, with: { ...step.with, key: step.with.key.replace('${{ github.job }}', 'linux-tests'),
+              'restore-keys': step.with['restore-keys'].replaceAll('${{ github.job }}', 'linux-tests') } }
+          : step),
+      env: { CI_RUN_ID: '${{ github.run_id }}', CI_TEST_PARTITION: 'hash:2/2', CI_TEST_THREADS: '8' },
       extraLogs: 'target/messaging-faults/\ntarget/boot-canaries/',
     }),
     'linux-clippy': linuxStageJob({
@@ -225,18 +270,35 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
       setup: commonSetupSteps,
       description: 'Run fleet compatibility against the pinned older st3',
     }),
+    'mail-redelivery-canaries': {
+      ...namespaceStageJob({
+        name: 'mail-redelivery-canaries',
+        stage: 'mail-redelivery-canaries',
+        runsOn: mailStageRunsOn,
+        description: 'Require every harness to hold old mail across boot and reconnect',
+        setup: workspacePreparationSteps.map((step: any) =>
+          step.id === 'cargo-cache' || step.id === 'nix-cache'
+            ? { ...step, with: { ...step.with, key: step.with.key.replace('${{ github.job }}', 'linux-tests'),
+                'restore-keys': step.with['restore-keys'].replaceAll('${{ github.job }}', 'linux-tests') } }
+            : step),
+        env: { CI_RUN_ID: '${{ github.run_id }}', CI_TEST_THREADS: '8' },
+        extraLogs: 'target/messaging-faults/\ntarget/boot-canaries/',
+      }),
+      ...afterPickRunner,
+    },
     'linux-gate': {
       name: 'linux-gate',
-      needs: [pickRunnerJobId, 'linux-tests', 'linux-clippy', 'linux-fleet-compat'],
+      needs: [pickRunnerJobId, 'linux-tests', 'linux-tests-shard-2', 'linux-clippy', 'linux-fleet-compat', 'mail-redelivery-canaries'],
       // A skipped or cancelled stage must fail the gate, so it runs even when a stage failed.
       if: 'always()',
-      'runs-on': linuxRunsOn,
+      // Aggregation needs no build caches and must not queue behind the work it summarizes.
+      'runs-on': 'ubuntu-latest',
       'timeout-minutes': 5,
       steps: [
         {
           name: 'Require every Linux stage to pass',
           // The stages only: pick-runner is skipped whenever ci1 is off.
-          env: { RESULTS: '${{ needs.linux-tests.result }} ${{ needs.linux-clippy.result }} ${{ needs.linux-fleet-compat.result }}' },
+          env: { RESULTS: '${{ needs.linux-tests.result }} ${{ needs.linux-tests-shard-2.result }} ${{ needs.linux-clippy.result }} ${{ needs.linux-fleet-compat.result }} ${{ needs.mail-redelivery-canaries.result }}' },
           run: `echo "stage results: $RESULTS"
 for result in $RESULTS; do
   [ "$result" = success ] || exit 1
@@ -267,14 +329,14 @@ done`,
     'isolation-vm': {
       name: 'isolation-vm',
       ...afterPickRunner,
-      'runs-on': linuxRunsOn,
+      'runs-on': supportingLinuxRunsOn,
       'timeout-minutes': 60,
       defaults: { run: { shell: 'bash' } },
-      env: buildEnv,
+      env: { ...buildEnv, CI_CACHE_DEV_SHELL: 'default' },
       steps: [
-        { uses: 'actions/checkout@v4', with: { 'persist-credentials': false } },
+        commonSetupSteps[0],
         { name: 'Probe KVM', run: kvmProbe },
-        ...plainFlakeSetupSteps({ nix: { binaryCaches: readOnlyBinaryCaches } }),
+        ...commonSetupSteps.slice(1),
         {
           name: 'Archive the st2 integration test binary',
           run: `start=$SECONDS
@@ -300,7 +362,31 @@ mkdir -p "$RUNNER_TEMP/vm-out"
 jq -r '"| VM boot | \\(.boot_seconds)s |\\n| systemd-scope tests in VM (extract and run) | \\(.test_seconds)s |"' "$ST_ISOLATION_TIMINGS" >> "$GITHUB_STEP_SUMMARY"
 printf '| VM test driver total | %ss |\\n' "$((SECONDS - start))" >> "$GITHUB_STEP_SUMMARY"`,
         },
+        // The sekrets gateway needs real Unix users, a login session and a user manager: a second
+        // VM runs it with this st binary (nix/sekrets-vm.nix).
+        {
+          name: 'Build the st binary for the sekrets VM',
+          run: `start=$SECONDS
+nix develop -c cargo build --locked -p st3 --bin st3
+printf '| st build | %ss |\\n' "$((SECONDS - start))" >> "$GITHUB_STEP_SUMMARY"`,
+        },
+        {
+          name: 'Build the sekrets VM test driver',
+          run: `start=$SECONDS
+nix build --print-build-logs --out-link "$RUNNER_TEMP/sekrets-vm-driver" .#legacyPackages.x86_64-linux.sekrets-vm.driver
+printf '| sekrets VM driver build | %ss |\\n' "$((SECONDS - start))" >> "$GITHUB_STEP_SUMMARY"`,
+        },
+        {
+          name: 'Run the sekrets gateway test in the VM',
+          env: { ST_SEKRETS_BINARY: '${{ github.workspace }}/target/debug/st3' },
+          run: `start=$SECONDS
+mkdir -p "$RUNNER_TEMP/sekrets-vm-out"
+"$RUNNER_TEMP/sekrets-vm-driver/bin/nixos-test-driver" --output_directory "$RUNNER_TEMP/sekrets-vm-out"
+printf '| sekrets VM test | %ss |\\n' "$((SECONDS - start))" >> "$GITHUB_STEP_SUMMARY"`,
+        },
+        { name: 'Save Nix outputs', if: "success() && env.CI_LOCAL_CACHES != '1'", run: 'bash scripts/ci-nix-cache save' },
+        ...buildSnapshotSave,
       ],
     },
   },
-})
+}, {"pick-runner": "Runner selection uses live API state and builds nothing.", "namespace-capacity": "Capacity is live API state and builds nothing.", "linux-gate": "Collects completed checks and builds nothing."}))

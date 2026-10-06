@@ -10,6 +10,41 @@ A mission is an immutable definition in the claims graph. Publishing a mission d
 
 A mission run has one stable subject. Each immutable run generation binds that run to one exact mission revision.
 
+## First readiness under load
+
+The origin-local reconciler evaluates active mission runs with all-pending current generations
+first, newest first within each group. Each pass takes a finite snapshot and evaluates every
+needed run in it, including older runs and cleanup. New arrivals join the next snapshot. This
+protects a new run's first readiness from earlier runs' gate-result writes without changing
+dependencies, baselines, assignment eligibility, leases, or readiness epochs. It cannot preempt
+a writer operation or reconciliation stage already in progress, or bound the new run's own gates.
+If a pass admits K new runs before older work, that older work waits for those K evaluations;
+it remains in the same pass. Newer child runs are also visited before their parents. A parent
+and child may need another pass to observe each other's transitions, with the same fences.
+
+When the evaluator reaches satisfied first-readiness predicates after **120,000 ms (two minutes)**
+with every current step still pending at epoch zero, it records `reconcile.fault` on that run with
+scope `scheduler/first-readiness`. The reason names the run and the wait observed at detection.
+The clock starts at the latest creation time of the run and its current steps, so a new generation
+gets its own grace period. This diagnosis happens at the actual admission boundary, after mission
+and step baselines, dependency, backoff, and assignment checks; ordinary predicate blockers do
+not become scheduler faults. It reports late evaluation when the evaluator reaches the run,
+including after a stalled writer returns.
+Until the evaluator reaches that boundary, even a run delayed for twelve minutes can still
+appear as `waiting` without a scheduler blocker. This change adds no independent writer watchdog.
+
+The fault is recorded once while open, including across daemon restarts. Elapsed time alone does
+not replace it. The ready state is written before the diagnosis. Diagnostic and recovery errors
+are logged without failing admission or execution. The next evaluation records recovery when
+the run no longer waits for first readiness, and termination also closes the fault. Its durable
+fault and recovery history remain available. An open fault appears immediately in `st missions show
+mission-run/EXAMPLE`, `st doctor` (`mission-first-readiness`), and the mission blocker in stui.
+The leaf mission-run response adds optional `scheduler_fault`. Mission client views project
+`state: "blocked"` while the fault is open and set `run.blocker.scope` to
+`"scheduler/first-readiness"` with the fault reason. Pending steps also show that reason. These
+faults do not create operator attention items, so a restart diagnosing many late runs does not
+page the operator for each run. Ordinary reconciliation faults retain their existing attention behavior.
+
 ## Core rules
 
 - A mission has `draft`, `ready`, or `retired` state.
@@ -232,7 +267,9 @@ finite missions over their lifetime. A person's standalone shell is a top-level 
 `pty/person/NAME/UUID`, with no mission owner and no agent harness. Free-mode local agents
 can likewise create a plain shell at `pty/agent/PATH/UUID`. Only its exact creator may publish its
 `intent.desired` claims, including a stop; local admission and replication enforce this.
-Other top-level execution members still require a mission run.
+Top-level schedules are also valid authored declarations: `st apply schedules.kdl` previews
+and publishes them without creating a mission run. Each schedule names the mission it will
+request at its declared times. Other top-level execution members still require a mission run.
 
 The origin of the `mission-run.created` claim advances the mission run. It also materializes the run declarations.
 
@@ -826,11 +863,14 @@ each command for real, so a gate with side effects has them when it is checked, 
 st missions check release.kdl --workspace ~/src/app --input commit=4f2a9c1
 ```
 
-`st missions publish` runs the same check first and refuses a mission with a broken gate, printing
+`st apply` runs the same check first and refuses a mission with a broken gate, printing
 each gate's answer and the end of a broken check's output. Not yet does not stop a publication:
 before the work exists, most gates should say not yet. `--workspace` names the workspace for the
 check. `--no-gate-check` publishes without it, for a gate whose check cannot run before its run,
 such as one that waits on a lock the run takes.
+
+`--dry-run` (alias `--preview`) prints the publication preview and stops before any gate check or
+apply. Use `missions check` separately when gate commands should run during validation.
 
 Each check records its result on the gate's `gate.result` subject. The result's `verdict` is
 `pass`, `fail` for not yet, or `error` for broken, so every fleet build can read it; its
@@ -1459,7 +1499,7 @@ The default `work show` and `work claim` output gives a human-readable step view
 
 A worker completion report is not a correctness result. Products and gates still control final completion.
 
-The native driver renews active claims and transports messages. The reconciler creates one durable Small Talk message for each readiness epoch and runtime incarnation.
+The native driver renews active claims and transports messages. The reconciler creates one durable Smalltalk message for each readiness epoch and runtime incarnation.
 
 A pool message closes when another agent wins the claim. Release or expiry creates a new readiness epoch and a new message.
 
@@ -1485,10 +1525,12 @@ agent "example/cos/standing/cos" {
 The subject is exactly `agent/example/cos/standing/cos`; placement does not change its identity.
 The seat's bare `fresh-context` node starts a new harness session before each step it claims, even when the step has no `fresh-context` node. Omit it when the seat should retain context across ordinary steps.
 A seat's bare `handles-faults` node makes it the fleet's fault agent: it receives each fault that no step assignee or agent requester owns, such as a failed loop on a run a person requested. When several live seats carry it, the first by subject takes them. Faults never go to a person's attention.
+
+Two seat faults reach that owner so a seat that cannot start is never found by looking. A seat parked by the crash-loop guard is a fault that carries the driver's last `harness.diagnostic` (its code and reason). A seat that is declared to run but that no runtime observation has ever described for ten minutes, which `st agents ls` shows as `desired`, is a fault too ("An agent seat has not started", with the same diagnostic, or the note that the driver never ran). Both end when the seat's runtime is observed or its declaration changes. A mission's seat reaches the run's requester first, like any other fault.
 Typed harnesses always run their real interactive TUI in a PTY. Claude always loads the native st
 channel. Use `exec {}` for non-interactive provider commands.
 
-Use `st agents apply FILE --as person/NAME` for authored KDL or `st agents start ...` as a
+Use `st apply FILE --as person/NAME` for authored KDL or `st agents start ...` as a
 convenience. `st agents new NAME --host HOST --attach` declares a new seat with the fleet's
 harness defaults, waits until its harness is ready, and attaches from any fleet host.
 `--print-kdl` prints the exact declaration. `st agents stop SUBJECT` publishes an explicit root
@@ -1513,6 +1555,11 @@ mission-run "RUN_ID" {
 ```
 
 Cancellation revokes active claims and cancels normal work. It then runs the adjacent `finally` graph.
+
+Final work is evaluated normally during cancellation. An agentless final step that remains
+working with no live process is cancelled with a recorded reason, rather than waiting for its
+execution timeout. Nested steps and linked child runs settle before their parent step is
+cancelled. A missing remote runtime observation does not prove that its process stopped.
 
 A terminal normal step failure does the same when the mission has an explicit completion rule.
 
@@ -1756,7 +1803,7 @@ Store a summary, a redacted sample, or a hash when later work needs durable evid
 
 ## Review, approve, and start
 
-`st missions publish FILE --as ACTOR` previews and publishes exact authored KDL with authority and
+`st apply FILE --as ACTOR` previews and publishes exact authored KDL with authority and
 subject-head checks. `st launch preview SESSION` validates a planner candidate, resolves documents,
 displays changes, and returns the approval hash.
 `st launch approve SESSION HASH --as person/NAME` applies that exact candidate without starting it.
@@ -1765,7 +1812,7 @@ An authorized agent uses `st work publish-mission`, fenced to its claimed produc
 
 ### References that must resolve
 
-`missions publish`, `agents apply`, a run revision, and `work publish-mission` refuse, with the code
+`apply` (and its legacy `missions publish` and `agents apply` commands), a run revision, and `work publish-mission` refuse, with the code
 `unresolved-reference`, a publication that names something st cannot find:
 
 - a pinned mission revision that is not stored on this host, in `uses-mission`, a schedule's `work`,
@@ -1788,7 +1835,7 @@ that no longer resolve in its `graph-references` check.
 
 `st missions start MISSION --as ACTOR` publishes one mission-run declaration for the current ready revision. Add `--follow` to follow the run until it becomes terminal.
 
-`missions publish` prints each revision it created. Pass that value to `missions start --revision REVISION` to start exactly that revision. A mission published on another host reaches this host by replication. When the mission or the requested revision is not here yet, `start` waits up to 60 seconds with a plain message instead of failing. When a later revision already replaced the requested one, `start` names the replacement and stops. After a run starts, `start` names its revision on standard error and says whether other revisions share the mission name.
+`apply` prints each mission revision it created. Pass that value to `missions start --revision REVISION` to start exactly that revision. A mission published on another host reaches this host by replication. When the mission or the requested revision is not here yet, `start` waits up to 60 seconds with a plain message instead of failing. When a later revision already replaced the requested one, `start` names the replacement and stops. After a run starts, `start` names its revision on standard error and says whether other revisions share the mission name.
 
 `st missions show MISSION_RUN` reads one exact run. `st missions show MISSION` works only when that mission has exactly one nonterminal run.
 
@@ -1841,7 +1888,7 @@ The planner uses this command:
 st launch submit SESSION --variant compact --markdown MISSION.md --kdl mission.kdl
 ```
 
-The session stores the request, feedback, Markdown, and KDL as immutable documents. Small Talk carries document references, not mutable file paths.
+The session stores the request, feedback, Markdown, and KDL as immutable documents. Smalltalk carries document references, not mutable file paths.
 
 Each named candidate must contain exactly one ready mission with the requested ID.
 

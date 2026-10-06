@@ -587,6 +587,8 @@ mod tests {
             transition_sequence: None,
             evidence_incarnation: None,
             background_jobs: None,
+            provider_auth: None,
+            provider_auth_sequence: 0,
             exit: None,
             reason: None,
         });
@@ -613,6 +615,8 @@ mod tests {
             transition_sequence: None,
             evidence_incarnation: None,
             background_jobs: None,
+            provider_auth: None,
+            provider_auth_sequence: 0,
             exit: None,
             reason: Some("session-dead".to_string()),
         });
@@ -641,6 +645,8 @@ mod tests {
             transition_sequence: None,
             evidence_incarnation: None,
             background_jobs: None,
+            provider_auth: None,
+            provider_auth_sequence: 0,
             exit: None,
             reason: Some("session-dead".to_string()),
         });
@@ -748,6 +754,8 @@ mod tests {
             transition_sequence: None,
             evidence_incarnation: None,
             background_jobs: None,
+            provider_auth: None,
+            provider_auth_sequence: 0,
             exit: None,
             reason: None,
         });

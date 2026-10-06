@@ -1105,3 +1105,46 @@ fn a_node_that_left_the_fleet_is_not_waited_for() {
     let left = names(&["birch"]);
     assert_eq!(participants(&known, &left, &[]), names(&["alder"]));
 }
+
+#[test]
+fn v9_v10_seals_wait_for_matching_rules_before_verifying() {
+    let scratch = tempfile::tempdir().unwrap();
+    let context = context(scratch.path(), 0);
+    let cut = newest_due_cut(context.now_unix_ms);
+    let checkpoint = checkpoint_name(cut);
+    let [alder, birch] = ["alder", "birch"].map(|name| Store::open_memory(name).unwrap());
+    observe(&alder, 4);
+    observe(&birch, 3);
+    sync(&[&alder, &birch]);
+    assert_eq!(kinds(&step(&alder, &context)), ["sealed"]);
+    sync(&[&alder, &birch]);
+    let mut legacy =
+        newest_seals(&alder.checkpoint_claims().unwrap(), &checkpoint)["alder"].clone();
+    // Exact rules-v9 description/version from main 2e075af9, before native-auth retention.
+    legacy.rules_digest = "ba69471dde5e5a9d835a2576a55a9fe9b1c387095ee1dcabdd6abc8e03400780".into();
+    assert_ne!(legacy.rules_digest, rules_digest());
+    let sealed = birch.checkpoint_sealed_identities(cut, None).unwrap();
+    assert_eq!(sealed.digest, legacy.sealed_digest);
+    birch
+        .publish_seal(&checkpoint, &legacy, &sealed, None)
+        .unwrap();
+    sync(&[&alder, &birch]);
+    assert!(step(&alder, &context).is_empty());
+    let pending = alder
+        .checkpoint_status(context.now_unix_ms, &[])
+        .unwrap()
+        .pending
+        .unwrap();
+    assert_eq!(pending.disagreeing["birch"], "rules");
+    assert!(pending.verified.is_empty());
+    assert!(stable_cuts(&alder).is_empty());
+    assert!(stable_cuts(&birch).is_empty());
+    // The updated participant reseals under v10; only then can either side verify.
+    assert_eq!(kinds(&step(&birch, &context)), ["sealed"]);
+    sync(&[&alder, &birch]);
+    assert_eq!(kinds(&step(&alder, &context)), ["verified"]);
+    assert_eq!(kinds(&step(&birch, &context)), ["verified"]);
+    sync(&[&alder, &birch]);
+    assert_eq!(stable_cuts(&alder), [cut]);
+    assert_eq!(stable_cuts(&birch), [cut]);
+}

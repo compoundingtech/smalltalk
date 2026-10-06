@@ -1,10 +1,12 @@
-import { defaultActionlintConfig, githubWorkflow } from '../../repos/effect-utils/genie/external.ts'
+import { linuxActionlintConfig, linuxRunner } from './workspace-ci.ts'
+import { auditCaches } from './cache-audit.ts'
+import { githubWorkflow } from '../../repos/effect-utils/genie/external.ts'
 
 // Publishes once a day, only when main changed since the last release. It builds nothing: it
 // takes the archives that the newest successful main run of release-smalltalk.yml uploaded.
 // Tags made with this workflow's token do not start the tag workflow, so there is no second build.
-export default githubWorkflow({
-  actionlint: defaultActionlintConfig,
+export default githubWorkflow(auditCaches({
+  actionlint: linuxActionlintConfig,
   name: 'Smalltalk daily release',
   on: {
     schedule: [{ cron: '17 5 * * *' }],
@@ -23,7 +25,7 @@ export default githubWorkflow({
   jobs: {
     release: {
       name: 'daily-release',
-      'runs-on': 'namespace-profile-linux-x86-64',
+      'runs-on': linuxRunner,
       'timeout-minutes': 20,
       permissions: { contents: 'write', actions: 'read' },
       env: {
@@ -40,4 +42,4 @@ export default githubWorkflow({
       ],
     },
   },
-})
+}, {"release": "Reuses verified main release artifacts; builds nothing."}))

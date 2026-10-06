@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt as _;
 
 #[derive(Default, Deserialize, Serialize)]
@@ -16,6 +16,8 @@ struct State {
     fence: Fence,
     attempted: BTreeSet<String>,
     confirmed: BTreeSet<String>,
+    #[serde(default)]
+    accepted: BTreeSet<String>,
     lines: st_drivers::reexec::LineBuffer,
 }
 #[derive(Default, Deserialize, Serialize)]
@@ -23,6 +25,8 @@ struct Handoffs {
     incarnation: String,
     attempted: BTreeSet<String>,
     confirmed: BTreeSet<String>,
+    #[serde(default)]
+    accepted: BTreeSet<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -47,13 +51,15 @@ pub async fn run(
             .ok()
             .map(|bytes| serde_json::from_slice::<Handoffs>(&bytes))
             .transpose()?;
-        let ledger = ledger
-            .filter(|ledger| ledger.incarnation == incarnation)
-            .unwrap_or_default();
+        // Keep uncertain native handoffs across a seat restart. Proof is recovered
+        // before any new offer; absence of proof gets a typed diagnostic, never an
+        // unconditional replay of instructions whose consumption is uncertain.
+        let ledger = ledger.unwrap_or_default();
         State {
             fence: Fence::new(subject, incarnation, "delivery"),
             attempted: ledger.attempted,
             confirmed: ledger.confirmed,
+            accepted: ledger.accepted,
             ..State::default()
         }
     };
@@ -81,6 +87,9 @@ pub async fn run(
     let mut content = BTreeMap::<String, String>::new();
     let mut transcript = Transcript::default();
     let wrapper = std::env::var(st_drivers::claude_session::SESSION_ENV).unwrap_or_default();
+    let mut retries = BTreeMap::<String, Retry>::new();
+    let mut unconfirmed_since = BTreeMap::<String, Instant>::new();
+    let mut diagnostics = BTreeMap::<String, DiagnosticReport>::new();
     loop {
         tokio::select! {
             frame = subscription.receiver.recv() => match frame {
@@ -119,66 +128,151 @@ pub async fn run(
                     "channel":{"pid":std::process::id(),"image":st_drivers::reexec::running_identity().map(|i| i.token()),"age_ms":0},
                     "ready":state.initialized}));
                 if state.initialized && replayed {
-                    for message in &messages {
+                    // The stream grants eligibility only to live mail. Retained handoffs can
+                    // still acquire missing receipts from native proof, without another offer.
+                    let live: BTreeSet<_> = messages.iter().map(|message| message.subject.clone()).collect();
+                    let mut tracked = messages.clone();
+                    let mut dirty = false;
+                    let pending: BTreeSet<_> = state.attempted.iter().chain(&state.accepted).chain(&state.confirmed).cloned().collect();
+                    for message in pending {
+                        if live.contains(&message) { continue; }
+                        let key = format!("recovery:{message}");
+                        if !retry_ready(&retries, &key) { continue; }
+                        match client.get::<MessageView>(&format!("/v1/messages/read/{message}")).await {
+                            Ok(view) if view.to == subject && matches!(view.status.as_str(), "sent" | "staged" | "delivered") => {
+                                tracked.push(view);
+                                retries.remove(&key);
+                            },
+                            Ok(_) => {
+                                dirty |= state.attempted.remove(&message);
+                                dirty |= state.accepted.remove(&message);
+                                dirty |= state.confirmed.remove(&message);
+                                content.remove(&message);
+                                unconfirmed_since.remove(&message);
+                                retries.remove(&key);
+                            },
+                            Err(error) => {
+                                retry_failed(&mut retries, &key);
+                                diagnostic(client, &state.fence, &message, "claude-handoff-status-unavailable",
+                                    &format!("{message}: retained handoff status could not be read; receipt recovery retries with backoff up to 30s: {error:#}"),
+                                    &mut diagnostics).await;
+                            },
+                        }
+                    }
+                    for message in &tracked {
                         if !matches!(message.status.as_str(), "sent" | "staged" | "delivered") { continue; }
-                        if !state.attempted.contains(&message.subject)
-                            && !prepare_handoff(client, &state.fence, message).await.unwrap_or(false) { continue; }
-                        let envelope = if let Some(envelope) = content.get(&message.subject) { envelope.clone() } else {
-                            let Ok(body) = body(client, message).await else { continue; };
-                            // The image files come first: a message that names a file is delivered
-                            // once the file is here, never without it.
-                            let Ok(attachments) = crate::blobs::materialize_for_seat(client, subject, &agent_dir.join("attachments"), message).await else { continue; };
-                            let envelope = st_drivers::ding::with_dictation_notice(st_drivers::ding::st3_notification_with_attachments(&message.subject, &message.from, &message.to,
-                                message.title.as_deref(), &body, &st_drivers::ding::st3_body_sha256(&body), &attachments), &message.tags);
-                            // A body can become available after reexec has already scanned the native
-                            // transcript for other messages. Revisit retained proof once for this identity.
-                            transcript.body_available(state.attempted.contains(&message.subject));
-                            content.insert(message.subject.clone(), envelope.clone());
-                            envelope
-                        };
-                        if state.attempted.contains(&message.subject) { continue; }
-                        // Before the handoff, persist its stable identity. A broken stdout or channel
-                        // restart cannot authorize repeating an uncertain native notification.
+                        if content.contains_key(&message.subject) || !retry_ready(&retries, &message.subject) { continue; }
+                        let prepared = async {
+                            if !state.attempted.contains(&message.subject)
+                                && !prepare_handoff(client, &state.fence, message).await? {
+                                return Ok(None);
+                            }
+                            let body = body(client, message).await?;
+                            let attachments = crate::blobs::materialize_for_seat(client, subject, &agent_dir.join("attachments"), message).await?;
+                            Ok::<_, anyhow::Error>(Some(st_drivers::ding::with_dictation_notice(
+                                st_drivers::ding::st3_notification_with_attachments(&message.subject, &message.from, &message.to,
+                                    message.title.as_deref(), &body, &st_drivers::ding::st3_body_sha256(&body), &attachments), &message.tags)))
+                        }.await;
+                        match prepared {
+                            Ok(Some(envelope)) => {
+                                // Proof may predate this incarnation or arrive while a body is
+                                // unavailable. Inspect it before authorizing another notification.
+                                transcript.body_available(state.attempted.contains(&message.subject) || message.status != "sent");
+                                content.insert(message.subject.clone(), envelope);
+                                retries.remove(&message.subject);
+                            },
+                            Ok(None) => {},
+                            Err(error) => {
+                                retry_failed(&mut retries, &message.subject);
+                                diagnostic(client, &state.fence, &message.subject, "claude-message-unforwarded",
+                                    &format!("{message}: preparation failed; retrying with backoff up to 30s: {error:#}", message=message.subject),
+                                    &mut diagnostics).await;
+                            },
+                        }
+                    }
+                    // User meta records and explicit mid-turn absorption are native
+                    // consumption proof. An enqueue or writing stdout is not a receipt.
+                    if !content.is_empty() && retry_ready(&retries, "transcript") {
+                        let records = (|| {
+                            let path = st_drivers::claude_session::channel_transcript_recovering(paths, identity, runtime_id, &wrapper)?
+                                .context("Claude has not bound this wrapper to a native transcript")?;
+                            transcript.appended(&path)
+                        })();
+                        match records {
+                            Ok(records) => {
+                                retries.remove("transcript");
+                                for record in records {
+                                    for (message, envelope) in &content {
+                                        if native_receipt(&record, envelope) {
+                                            dirty |= state.confirmed.insert(message.clone());
+                                            dirty |= state.accepted.insert(message.clone());
+                                            dirty |= state.attempted.insert(message.clone());
+                                        } else if native_acceptance(&record, envelope) {
+                                            dirty |= state.accepted.insert(message.clone());
+                                            dirty |= state.attempted.insert(message.clone());
+                                        }
+                                    }
+                                }
+                            },
+                            Err(error) => {
+                                retry_failed(&mut retries, "transcript");
+                                diagnostic(client, &state.fence, "transcript", "claude-receipt-unavailable",
+                                    &format!("Native receipt lookup failed; retrying with backoff up to 30s: {error:#}"),
+                                    &mut diagnostics).await;
+                            },
+                        }
+                    }
+                    for message in &tracked {
+                        let Some(envelope) = content.get(&message.subject) else { continue; };
+                        if state.attempted.contains(&message.subject) {
+                            let since = unconfirmed_since.entry(message.subject.clone()).or_insert_with(Instant::now);
+                            if !state.confirmed.contains(&message.subject) && message.status != "delivered" && since.elapsed() >= Duration::from_secs(30) {
+                                diagnostic(client, &state.fence, &message.subject, "claude-handoff-unconfirmed",
+                                    &format!("{} was offered to Claude but has no native consumption proof after 30s; retaining staged mail and checking receipts with bounded backoff. Repeating an uncertain notification is held to avoid duplicate instructions.", message.subject),
+                                    &mut diagnostics).await;
+                            }
+                            continue;
+                        }
+                        if !live.contains(&message.subject) { continue; }
+                        // Persist the handoff before stdout. A broken pipe cannot authorize
+                        // repeating an uncertain notification. Restart first checks native proof.
                         state.attempted.insert(message.subject.clone());
                         save_handoffs(&ledger_path, &state)?;
+                        unconfirmed_since.insert(message.subject.clone(), Instant::now());
                         write(&mut stdout, &json!({"jsonrpc":"2.0","method":"notifications/claude/channel",
                             "params":{"content":envelope,"meta":{"from":message.from,"messageId":message.subject,
                             "threadId":message.in_reply_to.as_ref().unwrap_or(&message.subject),"identity":identity}}})).await?;
-                    }
-                    // The bound native transcript is the receipt. Writing notification bytes is
-                    // not delivery or read, and a daemon outage creates neither fact.
-                    let mut dirty = false;
-                    if !content.is_empty()
-                        && let Ok(Some(path)) = st_drivers::claude_session::channel_transcript_paths(&paths.session_dir, identity, runtime_id, &wrapper)
-                        && let Ok(records) = transcript.appended(&path) {
-                        for record in records {
-                            for (message, envelope) in &content {
-                                if state.attempted.contains(message) && native_receipt(&record, envelope) {
-                                    dirty |= state.confirmed.insert(message.clone());
-                                }
-                            }
-                        }
                     }
                     // Persist native proof before trying receipts: a lost daemon acknowledgement
                     // must retry the receipt, never the notification.
                     if dirty { save_handoffs(&ledger_path, &state)?; }
                     dirty = false;
-                    for message in state.confirmed.clone() {
-                        if receipt(client, &state.fence, &message, "delivered").await.is_ok()
-                            && receipt(client, &state.fence, &message, "read").await.is_ok() {
-                            state.confirmed.remove(&message);
-                            content.remove(&message);
-                            dirty = true;
+                    for message in state.accepted.union(&state.confirmed).cloned().collect::<Vec<_>>() {
+                        let key = format!("receipt:{message}");
+                        if !retry_ready(&retries, &key) { continue; }
+                        let result = async {
+                            receipt(client, &state.fence, &message, "delivered").await?;
+                            if state.confirmed.contains(&message) {
+                                receipt(client, &state.fence, &message, "read").await?;
+                            }
+                            Ok::<_, anyhow::Error>(())
+                        }.await;
+                        match result {
+                            Ok(()) => {
+                                state.accepted.remove(&message);
+                                if state.confirmed.remove(&message) { content.remove(&message); }
+                                retries.remove(&key);
+                                unconfirmed_since.remove(&message);
+                                dirty = true;
+                            },
+                            Err(error) => {
+                                retry_failed(&mut retries, &key);
+                                diagnostic(client, &state.fence, &message, "claude-receipt-unsettled",
+                                    &format!("{message} has durable native proof but publishing its receipt failed; retrying with backoff up to 30s: {error:#}"),
+                                    &mut diagnostics).await;
+                            },
                         }
                     }
-                    // Closed graph messages are also durable proof, including a receipt applied
-                    // before the HTTP response disappeared.
-                    let active: BTreeSet<_> = messages.iter().map(|message| message.subject.clone()).collect();
-                    let before = state.attempted.len();
-                    state.attempted.retain(|message| active.contains(message));
-                    state.confirmed.retain(|message| active.contains(message));
-                    content.retain(|message, _| active.contains(message));
-                    dirty |= before != state.attempted.len();
                     if dirty { save_handoffs(&ledger_path, &state)?; }
                 }
                 if let Some(binary) = watch.as_mut().and_then(|watch| tokio::task::block_in_place(|| watch.ready())) {
@@ -205,6 +299,71 @@ pub async fn run(
     }
 }
 
+#[derive(Default)]
+struct Retry {
+    failures: u32,
+    due: Option<Instant>,
+}
+fn retry_ready(retries: &BTreeMap<String, Retry>, key: &str) -> bool {
+    retries
+        .get(key)
+        .is_none_or(|retry| retry.due.is_none_or(|due| Instant::now() >= due))
+}
+fn retry_failed(retries: &mut BTreeMap<String, Retry>, key: &str) {
+    let retry = retries.entry(key.into()).or_default();
+    retry.failures = retry.failures.saturating_add(1);
+    let seconds = (1_u64 << retry.failures.saturating_sub(1).min(5)).min(30);
+    retry.due = Some(Instant::now() + Duration::from_secs(seconds));
+}
+struct DiagnosticReport {
+    reason: String,
+    recorded: bool,
+}
+async fn diagnostic(
+    client: &Client,
+    fence: &Fence,
+    message: &str,
+    code: &str,
+    reason: &str,
+    reports: &mut BTreeMap<String, DiagnosticReport>,
+) {
+    let key = format!("{code}:{}:{}:{message}", fence.subject, fence.incarnation);
+    // A lost acknowledgement retries the same diagnostic payload, even when a
+    // later attempt encounters a different transient failure.
+    let report = reports
+        .entry(key.clone())
+        .or_insert_with(|| DiagnosticReport {
+            reason: reason.into(),
+            recorded: false,
+        });
+    if report.recorded {
+        return;
+    }
+    let result: Result<ClaimRecord> = client
+        .post(
+            "/v1/claims",
+            &ClaimInput {
+                subject: fence.subject.clone(),
+                kind: "harness.diagnostic".into(),
+                actor: Some(fence.subject.clone()),
+                fields: BTreeMap::from([
+                    ("severity".into(), json!("warning")),
+                    ("status".into(), json!("waiting")),
+                    ("code".into(), json!(code)),
+                    ("reason".into(), json!(report.reason)),
+                    ("incarnation_id".into(), json!(fence.incarnation)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some(key.clone()),
+            },
+        )
+        .await;
+    if result.is_ok() {
+        report.recorded = true;
+    }
+}
+
 fn save_handoffs(path: &Path, state: &State) -> Result<()> {
     use std::io::Write as _;
     let mut file =
@@ -215,6 +374,7 @@ fn save_handoffs(path: &Path, state: &State) -> Result<()> {
             incarnation: state.fence.incarnation.clone(),
             attempted: state.attempted.clone(),
             confirmed: state.confirmed.clone(),
+            accepted: state.accepted.clone(),
         },
     )?;
     file.flush()?;
@@ -226,42 +386,96 @@ fn save_handoffs(path: &Path, state: &State) -> Result<()> {
 #[derive(Default)]
 struct Transcript {
     path: std::path::PathBuf,
+    identity: Option<(u64, u64)>,
     offset: u64,
     lines: st_drivers::reexec::LineBuffer,
+    recover: bool,
+    discard_line: bool,
 }
+// Restart and uncertain-body recovery inspect recent proof, not an unbounded
+// session history. Each poll has the same byte budget; an oversized/incomplete
+// native record cannot retain the rest of the transcript in memory.
+const TRANSCRIPT_WINDOW: usize = 4 * 1024 * 1024;
 impl Transcript {
     fn body_available(&mut self, uncertain: bool) {
-        if uncertain {
-            self.offset = 0;
-            self.lines = Default::default();
-        }
+        self.recover |= uncertain;
     }
     fn appended(&mut self, path: &Path) -> Result<Vec<Value>> {
         use std::io::{Read as _, Seek as _};
+        use std::os::unix::fs::MetadataExt as _;
         let mut file = std::fs::File::open(path)?;
-        if self.path != path || file.metadata()?.len() < self.offset {
+        let metadata = file.metadata()?;
+        let identity = (metadata.dev(), metadata.ino());
+        if self.recover
+            || self.path != path
+            || self.identity != Some(identity)
+            || metadata.len() < self.offset
+        {
             self.path = path.to_owned();
-            self.offset = 0;
+            self.identity = Some(identity);
+            self.offset = metadata.len().saturating_sub(TRANSCRIPT_WINDOW as u64);
             self.lines = Default::default();
+            self.discard_line = false;
+            if self.offset > 0 {
+                // A window may start inside a JSON record. Skip that fragment,
+                // but keep a complete record starting exactly at the boundary.
+                file.seek(std::io::SeekFrom::Start(self.offset - 1))?;
+                let mut previous = [0];
+                file.read_exact(&mut previous)?;
+                self.discard_line = previous[0] != b'\n';
+            }
+            self.recover = false;
         }
         file.seek(std::io::SeekFrom::Start(self.offset))?;
         let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
+        file.take(TRANSCRIPT_WINDOW as u64)
+            .read_to_end(&mut bytes)?;
         self.offset += bytes.len() as u64;
         self.lines.push(&bytes);
         let mut records = Vec::new();
         while let Some(line) = self.lines.next_line() {
+            if self.discard_line {
+                self.discard_line = false;
+                continue;
+            }
+            if line.len() > TRANSCRIPT_WINDOW {
+                continue;
+            }
             if let Ok(record) = serde_json::from_str(&line) {
                 records.push(record);
             }
         }
+        if self.lines.buffered_len() > TRANSCRIPT_WINDOW || self.discard_line {
+            self.lines = Default::default();
+            self.discard_line = true;
+        }
         Ok(records)
     }
 }
+fn native_acceptance(record: &Value, envelope: &str) -> bool {
+    record["type"] == "queue-operation"
+        && record["operation"] == "enqueue"
+        && record["content"]
+            .as_str()
+            .is_some_and(|text| text.contains(envelope))
+}
+
 fn native_receipt(record: &Value, envelope: &str) -> bool {
-    record["type"] == "user"
+    (record["type"] == "user"
         && record.pointer("/message/role").and_then(Value::as_str) == Some("user")
-        && user_text(record).iter().any(|text| text.contains(envelope))
+        && user_text(record).iter().any(|text| text.contains(envelope)))
+        || (record["type"] == "queue-operation"
+            && record["operation"] == "remove"
+            && record["reason"] == "absorbed_mid_turn"
+            && record["commandUuid"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())
+            && record["deliveryId"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())
+            && record["content"]
+                .as_str()
+                .is_some_and(|text| text.contains(envelope)))
 }
 
 fn user_text(record: &Value) -> Vec<&str> {
@@ -291,8 +505,8 @@ async fn body(client: &Client, message: &MessageView) -> Result<String> {
         Ok(message.content.clone())
     }
 }
-// Only read/closed settles graph mail. A new incarnation must reoffer delivered-unread mail;
-// the incarnation-scoped attempted ledger prevents repeating a handoff in the same channel.
+// Only read/closed settles graph mail. Stream eligibility authorizes new offers;
+// retained handoffs are prepared exclusively to recover their native receipts.
 async fn prepare_handoff(client: &Client, fence: &Fence, message: &MessageView) -> Result<bool> {
     match message.status.as_str() {
         "sent" => Ok(receipt(client, fence, &message.subject, "staged")
@@ -354,11 +568,29 @@ mod tests {
     use super::*;
     use std::io::Write as _;
 
+    #[test]
+    fn claude_receipt_state_accepts_ledgers_written_before_native_acceptance_tracking() {
+        let mut state = serde_json::to_value(State::default()).unwrap();
+        state.as_object_mut().unwrap().remove("accepted");
+        assert!(
+            serde_json::from_value::<State>(state)
+                .unwrap()
+                .accepted
+                .is_empty()
+        );
+        let handoffs: Handoffs = serde_json::from_value(json!({
+            "incarnation":"previous", "attempted":["message/quartz"], "confirmed":[],
+        }))
+        .unwrap();
+        assert!(handoffs.accepted.is_empty());
+        assert!(handoffs.attempted.contains("message/quartz"));
+    }
+
     #[tokio::test]
-    async fn claude_unread_replay_needs_no_backward_receipt_and_read_or_closed_mail_is_final() {
-        let client = Client::new(crate::client::Endpoint::Unix(
-            std::path::PathBuf::from("/absent-st889-daemon.sock"),
-        ));
+    async fn claude_receipt_preparation_needs_no_backward_transition_and_read_or_closed_mail_is_final() {
+        let client = Client::new(crate::client::Endpoint::Unix(std::path::PathBuf::from(
+            "/absent-st889-daemon.sock",
+        )));
         let fence = Fence::new("agent/eval.worker", "new-incarnation", "delivery");
         for (status, expected) in [
             ("staged", true),
@@ -408,6 +640,17 @@ mod tests {
             &json!({"type":"user","message":{"role":"user","content":[{"type":"text","text":envelope}]}}),
             &envelope
         ));
+        let enqueue = json!({"type":"queue-operation","operation":"enqueue","content":envelope});
+        assert!(native_acceptance(&enqueue, &envelope));
+        assert!(!native_receipt(&enqueue, &envelope));
+        let mut remove = json!({"type":"queue-operation","operation":"remove", "reason":"absorbed_mid_turn",
+            "content":envelope,"commandUuid":"native-command","deliveryId":"native-delivery"});
+        assert!(native_receipt(&remove, &envelope));
+        remove["reason"] = json!("cancelled");
+        assert!(!native_receipt(&remove, &envelope));
+        remove["reason"] = json!("absorbed_mid_turn");
+        remove["content"] = json!("QUARTZ SIGNAL");
+        assert!(!native_receipt(&remove, &envelope));
     }
 
     #[test]
@@ -458,6 +701,144 @@ mod tests {
         transcript.body_available(false);
         assert!(transcript.appended(&path).unwrap().is_empty());
         assert!(!root.path().join("resources").exists());
+    }
+
+    #[test]
+    fn claude_100_mb_transcript_bounds_startup_recovery_and_each_append() {
+        fn cpu_time() -> Duration {
+            let mut time = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            assert_eq!(
+                unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) },
+                0
+            );
+            Duration::new(time.tv_sec as u64, time.tv_nsec as u32)
+        }
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("native.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        // Dense, valid JSONL exercises splitting rather than a sparse-file seek.
+        // Build the history without allocating a transcript-sized test buffer.
+        let history = format!(
+            "{}\n",
+            json!({"type":"assistant","padding":"x".repeat(980)})
+        );
+        let batch = history.repeat(64);
+        while file.metadata().unwrap().len() < 100 * 1024 * 1024 {
+            file.write_all(batch.as_bytes()).unwrap();
+        }
+        let envelope = "QUARTZ SIGNAL";
+        let acceptance = json!({"type":"queue-operation","operation":"enqueue","content":envelope});
+        let user = json!({"type":"user","message":{"role":"user","content":envelope}});
+        let absorbed = json!({"type":"queue-operation","operation":"remove","reason":"absorbed_mid_turn",
+            "content":envelope,"commandUuid":"native-command","deliveryId":"native-delivery"});
+        writeln!(file, "{acceptance}").unwrap();
+        writeln!(file, "{user}").unwrap();
+        writeln!(file, "{absorbed}").unwrap();
+        let size = file.metadata().unwrap().len();
+        let mut transcript = Transcript::default();
+        let mut recovery_cpu = Duration::ZERO;
+        for _ in 0..3 {
+            let started = cpu_time();
+            let records = transcript.appended(&path).unwrap();
+            assert_eq!(transcript.offset, size);
+            assert!(records.len() <= TRANSCRIPT_WINDOW / history.len() + 3);
+            assert!(
+                records
+                    .iter()
+                    .any(|record| native_acceptance(record, envelope))
+            );
+            assert_eq!(
+                records
+                    .iter()
+                    .filter(|record| native_receipt(record, envelope))
+                    .count(),
+                2
+            );
+            assert_eq!(transcript.lines.buffered_len(), 0);
+            let elapsed = cpu_time() - started;
+            recovery_cpu = recovery_cpu.max(elapsed);
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "recovery CPU: {elapsed:?}"
+            );
+            assert!(transcript.appended(&path).unwrap().is_empty());
+            transcript.body_available(true);
+        }
+        // A fresh driver reads the same bounded tail, retaining both forms of
+        // consumption proof and the separate native acceptance evidence.
+        transcript = Transcript::default();
+        assert!(
+            transcript
+                .appended(&path)
+                .unwrap()
+                .iter()
+                .any(|record| native_receipt(record, envelope))
+        );
+        let mut append_cpu = Duration::ZERO;
+        for _ in 0..32 {
+            let started = cpu_time();
+            let before = transcript.offset;
+            writeln!(file, "{acceptance}").unwrap();
+            writeln!(file, "{user}").unwrap();
+            let records = transcript.appended(&path).unwrap();
+            assert_eq!(records, [acceptance.clone(), user.clone()]);
+            assert!(transcript.offset - before < 1024);
+            assert_eq!(transcript.lines.buffered_len(), 0);
+            let elapsed = cpu_time() - started;
+            append_cpu = append_cpu.max(elapsed);
+            assert!(elapsed < Duration::from_secs(1), "append CPU: {elapsed:?}");
+        }
+        eprintln!(
+            "100 MB transcript: maximum recovery CPU {recovery_cpu:?}, maximum append CPU {append_cpu:?}; recovery/read budget {TRANSCRIPT_WINDOW} bytes, append reads <1024 bytes, retained partial bytes 0"
+        );
+    }
+
+    #[test]
+    fn claude_transcript_bounds_backlogs_and_unterminated_records() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("native.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        let mut transcript = Transcript::default();
+        assert!(transcript.appended(&path).unwrap().is_empty());
+        let block = vec![b'x'; TRANSCRIPT_WINDOW];
+        for _ in 0..4 {
+            file.write_all(&block).unwrap();
+        }
+        for _ in 0..4 {
+            let before = transcript.offset;
+            assert!(transcript.appended(&path).unwrap().is_empty());
+            assert_eq!(transcript.offset - before, TRANSCRIPT_WINDOW as u64);
+            assert!(transcript.lines.buffered_len() <= TRANSCRIPT_WINDOW);
+        }
+        let record = json!({"type":"user","message":{"role":"user","content":"QUARTZ"}});
+        writeln!(file, "\n{record}").unwrap();
+        assert_eq!(transcript.appended(&path).unwrap(), [record.clone()]);
+        // Replacement at the same path can be longer than the old file; inode
+        // identity must still trigger a fresh tail rather than skipping proof.
+        let replacement = root.path().join("replacement.jsonl");
+        let mut replaced = std::fs::File::create(&replacement).unwrap();
+        for _ in 0..5 {
+            replaced.write_all(&block).unwrap();
+        }
+        writeln!(replaced, "\n{record}").unwrap();
+        std::fs::rename(replacement, &path).unwrap();
+        assert_eq!(transcript.appended(&path).unwrap(), [record]);
+    }
+
+    #[test]
+    fn claude_transcript_keeps_a_complete_record_at_the_tail_boundary() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("native.jsonl");
+        let record = json!({"type":"user","message":{"role":"user","content":"QUARTZ"}});
+        let line = format!("{record}\n");
+        let mut bytes = b"old\n".to_vec();
+        bytes.extend_from_slice(line.as_bytes());
+        bytes.resize(TRANSCRIPT_WINDOW + 4, b' ');
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(Transcript::default().appended(&path).unwrap(), [record]);
     }
 
     #[test]

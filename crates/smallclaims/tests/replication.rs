@@ -78,6 +78,46 @@ fn claims_replicate_between_members_and_their_logs_agree() {
 }
 
 #[test]
+fn full_inventory_fallback_requires_a_complete_digest_and_bounds_payloads() {
+    let source = node("birch");
+    for index in 0..6 {
+        note(&source, &format!("note/{index}"), "a live payload");
+    }
+    let mut remote = source.replication_inventory().unwrap();
+    remote.envelopes.truncate(4);
+    remote.digest = smallclaims::store::replication_inventory_digest(&remote.envelopes);
+    remote.accepts = Some(1);
+    let answer = source.export_replication_exchange(FLEET, &remote).unwrap();
+    assert_eq!(
+        answer.envelopes.len(),
+        1,
+        "the full path retains the peer's payload page limit"
+    );
+    assert_eq!(answer.inventory.envelopes.len(), 6);
+
+    remote.envelopes.truncate(3);
+    assert!(
+        source
+            .export_replication_exchange(FLEET, &remote)
+            .unwrap()
+            .envelopes
+            .is_empty(),
+        "a truncated listing cannot prove which identities the peer lacks"
+    );
+    remote.envelopes.clear();
+    let answer = source.export_replication_exchange(FLEET, &remote).unwrap();
+    assert!(
+        answer.envelopes.is_empty(),
+        "a bare, nonempty digest cannot prove an empty inventory"
+    );
+    assert_eq!(
+        answer.inventory.envelopes.len(),
+        6,
+        "the peer first receives the full identity proof"
+    );
+}
+
+#[test]
 fn a_claim_whose_content_does_not_match_its_id_is_never_admitted() {
     let ada = node("ada-laptop");
     let grace = node("grace-desktop");
@@ -87,7 +127,7 @@ fn a_claim_whose_content_does_not_match_its_id_is_never_admitted() {
         .unwrap();
     // Swap the envelope's payload for one that carries a different body under the same claim ID.
     let envelope = exchange.envelopes.first_mut().unwrap();
-    envelope.payload = envelope.payload.replace('A', "B");
+    envelope.payload = envelope.payload.base64().replace('A', "B").into();
     grace
         .receive_replication_exchange("ada-laptop", FLEET, &exchange)
         .unwrap();

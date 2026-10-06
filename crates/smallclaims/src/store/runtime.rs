@@ -23,6 +23,21 @@ pub type LegacyDigestTable = (
     &'static str,
 );
 
+/// Whether the healthy frontier can be extended, or why a canonical replay is required.
+#[derive(Debug, PartialEq, Eq)]
+pub enum IncrementalProjection {
+    Projected,
+    Replay(&'static str),
+}
+
+/// Work completed inside a replay transaction; it does not advance the committed frontier.
+#[derive(Clone, Copy, Debug)]
+pub struct ReplayProgress {
+    pub phase: &'static str,
+    pub processed: Option<u64>,
+    pub total: Option<u64>,
+}
+
 /// A runtime's claim kinds and projections.
 pub trait Runtime: Send + Sync {
     /// Migrate an older store's tables before any table is created. The graph has checked that
@@ -80,16 +95,30 @@ pub trait Runtime: Send + Sync {
 
     /// Project newly admitted replicated claims from a healthy frontier through `through`.
     /// The store commits that frontier before lending the writer to the next chunk. Aggregates
-    /// may rebuild from their complete history. `Ok(false)` asks for a replay from nothing.
+    /// may rebuild from their complete history. `Replay(reason)` asks for a replay from nothing.
     fn project_incremental(
         &self,
         transaction: &Transaction<'_>,
         origin: &str,
         through: u64,
-    ) -> Result<bool, Error>;
+    ) -> Result<IncrementalProjection, Error>;
 
     /// Clear every shared projection and fold the claims into it again in canonical order.
     fn replay_from_nothing(&self, transaction: &Transaction<'_>) -> Result<(), Error>;
+
+    /// Publish bounded stage progress without reading the database from the observer.
+    fn replay_from_nothing_with_progress(
+        &self,
+        transaction: &Transaction<'_>,
+        progress: &mut dyn FnMut(ReplayProgress),
+    ) -> Result<(), Error> {
+        progress(ReplayProgress {
+            phase: "full-replay",
+            processed: None,
+            total: None,
+        });
+        self.replay_from_nothing(transaction)
+    }
 
     /// Reapply this node's local state that a projection replaced, once a projection ends.
     fn after_projection(&self, transaction: &Transaction<'_>) -> Result<(), Error>;
@@ -220,8 +249,8 @@ impl Runtime for Plain {
         _transaction: &Transaction<'_>,
         _origin: &str,
         _through: u64,
-    ) -> Result<bool, Error> {
-        Ok(true)
+    ) -> Result<IncrementalProjection, Error> {
+        Ok(IncrementalProjection::Projected)
     }
 
     fn replay_from_nothing(&self, _transaction: &Transaction<'_>) -> Result<(), Error> {

@@ -511,6 +511,13 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
                 None => style,
             };
             let bar = run(bar.text, on(bar.style));
+            // Mail to the person leads with a bullet where their own mail has the bar's first
+            // row, so the two read apart at a glance (Nathan, 2026-10-05).
+            let lead = if to_you {
+                run("● ", on(fg(look.edge, theme)))
+            } else {
+                bar.clone()
+            };
             let mut from_style = fg(look.from, theme);
             if look.from_bold {
                 from_style = from_style.add_modifier(Modifier::BOLD);
@@ -546,7 +553,7 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
                     run(progress.text, on(progress.style)),
                 ],
                 inner,
-                std::slice::from_ref(&bar),
+                std::slice::from_ref(&lead),
                 std::slice::from_ref(&bar),
                 tint,
             ));
@@ -804,6 +811,35 @@ mod tests {
         // Opened, it reads in full.
         let opened = text(&HashSet::from(["message/others".to_owned()])).join("\n");
         assert_eq!(opened.matches("Three hosts").count(), 2, "{opened}");
+    }
+
+    #[test]
+    fn rows_as_the_person_sees_them_count_a_run_of_calls_once() {
+        let call = |id: &str| {
+            entry(
+                id,
+                Body::Tool {
+                    title: "$ ls".into(),
+                    state: ToolState::Ok,
+                    output: Vec::new(),
+                },
+            )
+        };
+        let entries = vec![
+            entry("a", Body::User("check".into())),
+            call("t1"),
+            call("t2"),
+            call("t3"),
+            entry("b", Body::Assistant("done".into())),
+            call("t4"),
+            entry("c", Body::Assistant("more".into())),
+            call("t5"),
+            call("t6"),
+        ];
+        // Two messages and a reply, and three runs of calls.
+        assert_eq!(crate::display_rows(&entries), 6);
+        assert_eq!(crate::display_rows(&[]), 0);
+        assert_eq!(crate::display_rows(&[call("only")]), 1);
     }
 
     #[test]

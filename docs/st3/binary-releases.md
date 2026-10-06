@@ -17,6 +17,11 @@ archives need neither Nix nor Rust installed. Harness CLIs and their logins rema
 
 ## Install or update
 
+If a populated v0.3.4 store may have unsigned delegation grants, follow the
+[founder signing audit](founder-signing-audit.md) before doctor or restart. Preserve raw state and
+keys first. A build containing prevention #1269 can sign preserved unsealed work; it retains
+signature warnings from already-sealed affected payloads.
+
 Choose a tag from the repository's Releases page, then download the archive for your machine
 and its `.sha256` file. For example, with GitHub CLI:
 
@@ -84,6 +89,13 @@ Nothing is rebuilt, and the tag is created at that exact commit with the workflo
 does not start a second tag build. There are no version-bump commits. Archives from these releases
 carry no tag in `BUILD.json`; `source` identifies the commit. `scripts/release-smalltalk-daily
 --dry-run` prints what would be published without publishing.
+
+Daily, manual dispatch, and tag publication use the same source-pinned **Upgrade impact**
+section before the change list, and attach `UPGRADE-IMPACT.json`. It describes replay,
+database changes, checkpoint rules/fleet coordination, client and harness compatibility,
+service interruption, manual steps, and recovery. Missing classifications stop publication;
+main builds and merges continue. See [release impact authoring](release-impact.md) for
+committed fragments, measurements, historical backfills, and a notes-only preview.
 
 Tag names are labels, not embedded package versions: use `BUILD.json`/`RELEASE.json` for exact
 source identity. Tag the tested commit (with this workflow in its tree); pushing a tag does not

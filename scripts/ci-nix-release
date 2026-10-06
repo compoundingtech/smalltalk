@@ -31,6 +31,28 @@ def main():
         if not checks:
             raise SystemExit('ci-nix-release: the flake has no native checks')
         targets = [f'.#packages.{system}.default', *[f'.#checks.{system}.{check}' for check in checks]]
+        # Probe the actual output paths before building. A post-build warm proof alone
+        # cannot reveal whether this run first downloaded or compiled a missing output.
+        derivations = json.loads(output('nix', 'derivation', 'show', '--no-update-lock-file', *targets))
+        derivations = derivations.get('derivations', derivations)
+        expected = {entry.get('path') for derivation in derivations.values()
+                    for entry in derivation['outputs'].values()}
+        unknown = None in expected
+        expected.discard(None)
+        store_dir = output('nix', 'eval', '--raw', '--expr', 'builtins.storeDir')
+        expected = {path if path.startswith('/') else str(Path(store_dir) / path) for path in expected}
+        probe = subprocess.run(['nix', 'path-info', '--offline', *sorted(expected)],
+                               capture_output=True, text=True) if expected else None
+        cached = set(probe.stdout.splitlines()) if probe else set()
+        missing = expected - cached
+        if missing or unknown:
+            coverage = f'P0: Nix store cache MISS before build: {len(missing)} missing outputs' + ('; unresolved outputs' if unknown else '')
+            print(f'::warning::{coverage}', flush=True)
+        else:
+            coverage = f'Nix store cache HIT before build: {len(expected)} outputs already present.'
+        if summary := os.environ.get('GITHUB_STEP_SUMMARY'):
+            with open(summary, 'a') as stream:
+                stream.write(('⚠️ **' + coverage + '**' if missing or unknown else coverage) + '\n\n')
         # The runner's persistent cache directory retains GC roots after its checkout and
         # temporary directory disappear. Each runner retains its latest successful outputs.
         roots = Path(cache_home) / 'smalltalk-nix-release'

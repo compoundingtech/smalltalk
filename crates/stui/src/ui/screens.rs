@@ -64,6 +64,7 @@ fn state_of<T>(load: &Load<Vec<T>>, loading: &'static str, empty: &'static str) 
 pub fn agent_glyph(state: AgentState, spinner: &'static str) -> (&'static str, Color) {
     match state {
         AgentState::NeedsYou => ("◆", theme::PERSON),
+        AgentState::NeedsLogin => ("⚿", theme::PERSON),
         AgentState::Fault => ("✕", theme::FAULT),
         AgentState::Working => (spinner, theme::WORKING),
         AgentState::Idle => ("●", theme::IDLE),
@@ -76,6 +77,7 @@ pub fn agent_glyph(state: AgentState, spinner: &'static str) -> (&'static str, C
 pub fn agent_word(state: AgentState) -> &'static str {
     match state {
         AgentState::NeedsYou => "needs you",
+        AgentState::NeedsLogin => "needs login",
         AgentState::Fault => "broken",
         AgentState::Working => "working",
         AgentState::Idle => "idle",
@@ -448,6 +450,22 @@ fn structured_request(
             ("↑↓", "Another", Hit::Key('a'), theme::OVERLAY1),
             ("esc", "Not now", Hit::Escape, theme::OVERLAY1),
         ]);
+    } else if request.answers.is_empty() {
+        // A feedback ask has no answers to choose: words are the answer, and it can be set
+        // aside, with word to its asker, when there is nothing to say (Nathan, 2026-10-05: a
+        // feedback card offered "Choose an answer" and no way to answer or dismiss it).
+        let label = format!("Close this: tell {from} there is nothing for you to do");
+        if !confirm_row(card, drafts, &label) {
+            card.buttons(&[
+                ("c", "Answer in words", Hit::Key('c'), theme::ACCENT),
+                (
+                    "x",
+                    "Dismiss: nothing to do",
+                    Hit::Key('x'),
+                    theme::OVERLAY1,
+                ),
+            ]);
+        }
     } else {
         let mut buttons = vec![("a", "Choose an answer", Hit::Key('a'), theme::ACCENT)];
         if request.custom {
@@ -651,6 +669,27 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
             .map(|candidate| candidate.title.clone())
             .unwrap_or_else(|| mission.trim_start_matches("mission/").to_owned());
         link(&mut card, "mission  ", &label, mission);
+    }
+    // The step that waits on this ask, and what it is for: what answering lets go on.
+    if let Some(blocked) = &item.blocked {
+        card.lines(text::wrap(
+            &[
+                text::run(blocked.step.clone(), theme::soft()),
+                text::run(
+                    if blocked.goal.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · {}", blocked.goal)
+                    },
+                    theme::dim(),
+                ),
+                text::run(" — it continues once you answer", theme::dim()),
+            ],
+            inner,
+            &[text::run("waits    ", theme::dim())],
+            &[text::run("         ", theme::dim())],
+            None,
+        ));
     }
     if let Some(agent) = &item.agent {
         let label = world
@@ -1003,6 +1042,7 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
             ..
         } => structured_request(&mut card, from, request, drafts, inner),
         AttentionKind::Request { from, question, .. } => {
+            let custom = item.actions.iter().any(|action| action == "custom.reply");
             card.line(Line::from(vec![
                 span("asks  ", theme::dim()),
                 span(from.clone(), theme::strong(theme::PERSON)),
@@ -1021,6 +1061,8 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
                     ("enter", "Send the answer", Hit::Enter, theme::ACCENT),
                     ("esc", "Cancel", Hit::Escape, theme::OVERLAY1),
                 ]);
+            } else if custom {
+                card.buttons(&[("c", "Reply with fields", Hit::Key('c'), theme::ACCENT)]);
             } else {
                 let label = match drafts.confirm {
                     Some('y') => format!("Answer {from} “Yes”"),
@@ -1056,9 +1098,11 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
             }
             card.wrap(
                 &text::inline(
-                    &format!(
-                        "{from} is waiting on you: answer it, or x to dismiss it when there is nothing for you to do. Either way the step it waits on continues."
-                    ),
+                    &if custom {
+                        "Reply using the choices and fields shown above.".to_owned()
+                    } else {
+                        format!("{from} is waiting on you: answer it, or x to dismiss it when there is nothing for you to do. Either way the step it waits on continues.")
+                    },
                     theme::dim(),
                 ),
                 inner,
@@ -1297,6 +1341,7 @@ fn agent_group(agent: &Agent) -> &'static str {
     }
     match agent.state {
         AgentState::NeedsYou => "waiting on you",
+        AgentState::NeedsLogin => "needs login",
         AgentState::Fault => "broken",
         AgentState::Working => "working",
         AgentState::Idle | AgentState::Starting => "idle",
@@ -1349,7 +1394,9 @@ pub fn agents_list(world: &World, spinner: &'static str, width: usize) -> Listin
             items.push(Item::Header {
                 title: group.into(),
                 count,
-                color: if agent.state == AgentState::NeedsYou && !agent.unmanaged {
+                color: if matches!(agent.state, AgentState::NeedsYou | AgentState::NeedsLogin)
+                    && !agent.unmanaged
+                {
                     theme::PERSON
                 } else {
                     theme::OVERLAY1
@@ -1371,10 +1418,17 @@ pub fn agents_list(world: &World, spinner: &'static str, width: usize) -> Listin
                 ),
                 span(format!(" {:>4}", agent.activity), theme::dim()),
             ],
-            second: vec![span(
-                format!("   {}", text::truncate(path, width.saturating_sub(4))),
-                theme::dim(),
-            )],
+            // What its step last reported leads; the path says who it is when nothing was said.
+            second: match &agent.details.progress {
+                Some(progress) => vec![span(
+                    format!("   {}", text::truncate(progress, width.saturating_sub(4))),
+                    theme::soft(),
+                )],
+                None => vec![span(
+                    format!("   {}", text::truncate(path, width.saturating_sub(4))),
+                    theme::dim(),
+                )],
+            },
             children: subagent_lines(agent, "   ", width),
         });
         ids.push(agent.id.clone());
@@ -1395,6 +1449,25 @@ pub fn agents_list(world: &World, spinner: &'static str, width: usize) -> Listin
 }
 
 /// The header strip above an agent's conversation.
+/// What a person does for an agent whose harness is signed out of its provider. st clears the
+/// state once the harness is signed in again, on the same run: no restart (Nathan, 2026-10-04).
+pub fn login_guidance(agent: &Agent) -> String {
+    let how = match agent.harness {
+        Harness::Claude => "open its terminal (ctrl+]) and run /login".to_owned(),
+        Harness::Codex => format!("run `codex login` on {} (or in its terminal)", agent.host),
+        _ => "open its terminal (ctrl+]) and log it in".to_owned(),
+    };
+    let provider = match agent.harness {
+        Harness::Claude => "Claude",
+        Harness::Codex => "Codex",
+        _ => "Its provider",
+    };
+    format!(
+        "{provider} login required on {}: {how}. Messages wait until it is signed in; it carries on without a restart.",
+        agent.host
+    )
+}
+
 pub fn agent_header(world: &World, agent: &Agent, width: usize, spinner: &'static str) -> Doc {
     let mut doc = Doc::new();
     let (glyph, color) = agent_glyph(agent.state, spinner);
@@ -1403,7 +1476,14 @@ pub fn agent_header(world: &World, agent: &Agent, width: usize, spinner: &'stati
         span(agent.name.clone(), theme::bold()),
         span(format!("  {}", agent_word(agent.state)), theme::fg(color)),
     ];
-    let right = format!("{} · {} ", agent.harness.name(), agent.host);
+    // The model rides beside the harness, as the harness reported it.
+    let model = agent
+        .details
+        .model
+        .as_deref()
+        .map(|model| format!(" · {model}"))
+        .unwrap_or_default();
+    let right = format!("{}{model} · {} ", agent.harness.name(), agent.host);
     let used = first.iter().map(Span::width).sum::<usize>();
     first.push(span(
         " ".repeat(width.saturating_sub(used + text::width(&right))),
@@ -1413,13 +1493,45 @@ pub fn agent_header(world: &World, agent: &Agent, width: usize, spinner: &'stati
         agent.harness.name(),
         theme::fg(harness_color(agent.harness)),
     ));
-    first.push(span(format!(" · {} ", agent.host), theme::dim()));
+    first.push(span(format!("{model} · {} ", agent.host), theme::dim()));
     doc.line(Line::from(first));
     let mut second = vec![span(format!("   {}", agent.id), theme::dim())];
     if let Some(tree) = &agent.worktree {
         second.push(span(format!("  ·  {tree}"), theme::dim()));
     }
+    // The agent's actions, discoverable from where it is shown (ctrl+a too).
+    let actions = "⋯ actions ";
+    let used = second.iter().map(Span::width).sum::<usize>();
+    if used + text::width(actions) + 2 <= width {
+        let column = width - text::width(actions);
+        second.push(span(" ".repeat(column - used), theme::dim()));
+        second.push(span(actions, theme::fg(theme::ACCENT)));
+        doc.targets.push(super::doc::Target {
+            line: doc.lines.len(),
+            column: column as u16,
+            width: text::width(actions) as u16,
+            hit: Hit::Actions(agent.id.clone()),
+        });
+    }
     doc.line(Line::from(second));
+    if agent.state == AgentState::NeedsLogin {
+        doc.lines(text::wrap(
+            &text::inline(&login_guidance(agent), theme::fg(theme::PERSON)),
+            width,
+            &[text::run("   ⚿ ", theme::fg(theme::PERSON))],
+            &[text::run("     ", theme::dim())],
+            None,
+        ));
+    }
+    if let Some(progress) = &agent.details.progress {
+        doc.lines(text::wrap(
+            &text::inline(progress, theme::text()),
+            width,
+            &[text::run("   ", theme::dim())],
+            &[text::run("   ", theme::dim())],
+            None,
+        ));
+    }
     if let (Some(mission), Some(step)) = (&agent.mission, &agent.step) {
         let title = world
             .missions
@@ -1466,7 +1578,18 @@ fn failed_before_today(mission: &Mission) -> bool {
         })
 }
 
-pub fn missions_list(world: &World, spinner: &'static str, system: bool) -> Listing {
+/// What a step in hand last reported, on one line: the status of a run in progress.
+fn mission_progress(mission: &Mission) -> Option<String> {
+    mission
+        .steps
+        .iter()
+        .filter(|step| step.state == StepState::Working)
+        .find_map(|step| mission.step_metadata.get(&step.id)?.last_progress.as_deref())
+        .map(|progress| progress.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|progress| !progress.is_empty())
+}
+
+pub fn missions_list(world: &World, width: usize, spinner: &'static str, system: bool) -> Listing {
     let mut items = Vec::new();
     let mut ids = Vec::new();
     let missions = mission_order(world, system);
@@ -1506,14 +1629,21 @@ pub fn missions_list(world: &World, spinner: &'static str, system: bool) -> List
                 span(mission.title.clone(), theme::bold()),
             ],
             right,
-            second: vec![span(
-                format!(
-                    "   {} · {}",
-                    mission.id.trim_start_matches("mission/"),
-                    mission.age
-                ),
-                theme::dim(),
-            )],
+            // A run in progress says what its step last reported before where it lives.
+            second: match mission_progress(mission) {
+                Some(progress) => vec![span(
+                    format!("   {}", text::truncate(&progress, width.saturating_sub(4))),
+                    theme::soft(),
+                )],
+                None => vec![span(
+                    format!(
+                        "   {} · {}",
+                        mission.id.trim_start_matches("mission/"),
+                        mission.age
+                    ),
+                    theme::dim(),
+                )],
+            },
             children: Vec::new(),
         });
         ids.push(mission.id.clone());
@@ -1708,6 +1838,21 @@ pub fn mission_detail(
         if let Some(note) = &step.note {
             steps.lines(text::wrap(
                 &text::inline(note, theme::dim()),
+                inner,
+                &[run("      ", theme::dim())],
+                &[run("      ", theme::dim())],
+                None,
+            ));
+        }
+        // A step in hand says what it last reported, the status a person reads first.
+        if step.state == StepState::Working
+            && let Some(progress) = mission
+                .step_metadata
+                .get(&step.id)
+                .and_then(|metadata| metadata.last_progress.as_deref())
+        {
+            steps.lines(text::wrap(
+                &text::inline(progress, theme::text()),
                 inner,
                 &[run("      ", theme::dim())],
                 &[run("      ", theme::dim())],
@@ -2096,8 +2241,72 @@ pub fn fleet_detail(world: &World, id: Option<&str>, width: usize, spinner: &'st
     }
     doc.card("agents here", theme::OVERLAY1, false, agents, width);
     if machine.you_are_here {
+        doc.append(clients_card(world, width), 0);
         doc.append(devices_card(world, width), 0);
     }
+    doc
+}
+
+// ------------------------------------------------------------------ clients
+
+/// Who is connected to this member: each client as it describes itself, who it acts for, how
+/// it came in, since when, and what it follows. A build older than the member's own carries a
+/// quiet note, nothing more.
+pub fn clients_card(world: &World, width: usize) -> Doc {
+    let mut inner = Doc::new();
+    match &world.clients {
+        Load::Loading => inner.line(Line::from(span("Loading connected clients…", theme::dim()))),
+        Load::Failed(error) => inner.wrap(
+            &[run(
+                format!("Could not read connected clients: {error}"),
+                theme::fg(theme::RED),
+            )],
+            width.saturating_sub(4),
+        ),
+        Load::Ready(clients) if clients.is_empty() => {
+            inner.line(Line::from(span("No clients connected.", theme::dim())))
+        }
+        Load::Ready(clients) => {
+            for item in clients {
+                let name = if item.client.is_empty() {
+                    "unnamed client"
+                } else {
+                    item.client.as_str()
+                };
+                let head = vec![
+                    span(
+                        if item.connected { "● " } else { "○ " },
+                        theme::fg(if item.connected {
+                            theme::GREEN
+                        } else {
+                            theme::QUIET
+                        }),
+                    ),
+                    span(name.to_owned(), theme::text()),
+                ];
+                inner.line(Line::from(head));
+                // Who, how it came in, what it follows and the quiet "older" note wrap under the
+                // name, so nothing clips at the card's edge.
+                let mut about = vec![match &item.device {
+                    Some(device) => format!("{} · {device}", item.who),
+                    None => item.who.clone(),
+                }];
+                about.extend([item.via.clone(), item.member.clone(), item.when.clone()]);
+                if !item.follows.is_empty() {
+                    about.push(format!("follows {}", item.follows.join(", ")));
+                }
+                if item.older {
+                    about.push("older than this member".to_owned());
+                }
+                inner.wrap(
+                    &[run(format!("  {}", about.join(" · ")), theme::dim())],
+                    width.saturating_sub(4),
+                );
+            }
+        }
+    }
+    let mut doc = Doc::new();
+    doc.card("connected clients", theme::OVERLAY1, false, inner, width);
     doc
 }
 
@@ -2285,6 +2494,74 @@ fn demo_banner(doc: &mut Doc, width: usize) {
 
 /// The small card a clicked reference opens: enough to recognise the subject, and a way
 /// to go to it.
+/// One row of the agent actions menu: its key, what it says, and what it does.
+pub struct AgentAction {
+    pub key: char,
+    pub label: &'static str,
+    pub what: &'static str,
+}
+
+/// What can be done to `agent` now, in the order the menu lists it (Nathan, 2026-10-04: make
+/// restart, retire and the rest discoverable). Ones that change the seat ask y first.
+pub fn agent_actions(agent: &Agent) -> Vec<AgentAction> {
+    let row = |key, label, what| AgentAction { key, label, what };
+    let mut rows = Vec::new();
+    let running = !matches!(agent.state, AgentState::Stopped | AgentState::Unknown);
+    if agent.state == AgentState::Working {
+        rows.push(row('i', "Interrupt", "stop its current turn, as Esc does in its own screen"));
+    }
+    if running {
+        rows.push(row('r', "Restart", "a new process for the same seat, on its declaration"));
+        rows.push(row('p', "Suspend", "stop at a quiet moment, keeping its session to resume"));
+        rows.push(row('x', "Retire", "stop it and take it off the lists; start brings it back"));
+    } else {
+        rows.push(row('s', "Start", "start it again on its declaration"));
+        rows.push(row('u', "Resume", "resume a suspended seat on the same session"));
+    }
+    if agent.terminal {
+        rows.push(row('t', "Terminal", "attach its terminal (ctrl+] too)"));
+    }
+    rows.push(row('d', "Details", "what it is doing and what is queued (ctrl+d too)"));
+    rows.push(row('f', "Find", "find in its conversation (ctrl+f too)"));
+    rows.push(row('c', "Copy id", "copy its id to the clipboard"));
+    rows
+}
+
+/// The agent actions menu's card.
+pub fn agent_actions_doc(agent: &Agent, width: usize, spinner: &'static str) -> Doc {
+    let mut doc = Doc::new();
+    doc.blank();
+    let (glyph, color) = agent_glyph(agent.state, spinner);
+    doc.line(Line::from(vec![
+        span(format!("{glyph} "), theme::strong(color)),
+        span(agent.name.clone(), theme::bold()),
+        span(format!("  {}", agent_word(agent.state)), theme::fg(color)),
+        span(format!("  {} · {}", agent.harness.name(), agent.host), theme::dim()),
+    ]));
+    doc.blank();
+    for action in agent_actions(agent) {
+        let line = doc.lines.len();
+        let label = format!("{:<10}", action.label);
+        doc.line(Line::from(vec![
+            span(format!(" {} ", action.key), theme::strong(theme::CRUST).bg(theme::ACCENT)),
+            span(format!(" {label}"), theme::bold()),
+            span(text::truncate(action.what, width.saturating_sub(16)), theme::dim()),
+        ]));
+        doc.targets.push(super::doc::Target {
+            line,
+            column: 0,
+            width: width.min(u16::MAX as usize) as u16,
+            hit: Hit::Key(action.key),
+        });
+    }
+    doc.blank();
+    doc.wrap(
+        &text::inline("Restart, suspend and retire ask y first. Esc closes.", theme::dim()),
+        width,
+    );
+    doc
+}
+
 pub fn peek(world: &World, subject: &str, width: usize, spinner: &'static str) -> Doc {
     let mut doc = Doc::new();
     doc.blank();
@@ -2311,6 +2588,9 @@ pub fn peek(world: &World, subject: &str, width: usize, spinner: &'static str) -
         doc.field("host", &agent.host, width, theme::soft());
         if let Some(tree) = &agent.worktree {
             doc.field("worktree", tree, width, theme::soft());
+        }
+        if let Some(progress) = &agent.details.progress {
+            doc.field("now", progress, width, theme::text());
         }
         if let (Some(mission), Some(step)) = (&agent.mission, &agent.step) {
             let title = world
@@ -2451,7 +2731,26 @@ pub fn agent_details(world: &World, agent: &Agent, width: usize, spinner: &'stat
         doc.card("broken", theme::FAULT, true, inner, width);
         doc.blank();
     }
+    if agent.state == AgentState::NeedsLogin {
+        let mut inner = Doc::new();
+        inner.wrap(
+            &text::inline(&login_guidance(agent), theme::text()),
+            width.saturating_sub(4),
+        );
+        doc.card("needs login", theme::PERSON, true, inner, width);
+        doc.blank();
+    }
     doc.section("now", None, width);
+    // What its step last reported is the status; the step and its goal say where it comes from.
+    if let Some(progress) = &details.progress {
+        doc.lines(text::wrap(
+            &text::inline(progress, theme::bold()),
+            width,
+            &[],
+            &[],
+            None,
+        ));
+    }
     match (&agent.mission, &agent.step) {
         (Some(mission), Some(step)) => {
             let title = world
@@ -2538,6 +2837,7 @@ pub fn agent_details(world: &World, agent: &Agent, width: usize, spinner: &'stat
         doc.line(Line::from(spans));
     };
     field(&mut doc, "harness", Some(agent.harness.name()));
+    field(&mut doc, "model", details.model.as_deref());
     field(&mut doc, "state", details.harness_state.as_deref());
     field(&mut doc, "runtime", details.runtime.as_deref());
     field(&mut doc, "host", Some(&agent.host));
@@ -2725,7 +3025,7 @@ pub fn missions_tree(world: &World, spinner: &'static str, system: bool) -> List
         state_of(&world.missions, "Loading missions…", "No missions yet."),
         vec![],
     );
-    listing.legend = missions_list(world, spinner, system).legend;
+    listing.legend = missions_list(world, 40, spinner, system).legend;
     listing
 }
 

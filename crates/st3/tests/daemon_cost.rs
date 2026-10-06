@@ -14,7 +14,9 @@
 //! statement. A foreign-key check or a trigger counts inside the statement that ran it.
 //!
 //! Each request runs once to warm caches, then three times; the least of the three counts, so a
-//! stray background statement cannot fail it. Its work at the larger scale may be at most
+//! stray background statement cannot fail it. Agent-list reads also run after a canonical
+//! harness observation between every sample, so their incremental rebuild is counted. Work at
+//! the larger scale may be at most
 //! [`GROWTH`] times its work at the smaller, after dividing by how much larger its answer grew: a
 //! list that answers ten times more rows may read ten times more, and a request that answers the
 //! same must read about the same. Small differences under [`SLACK`] steps pass.
@@ -23,6 +25,9 @@
 //! the reason, and a new route fails the check until it is one or the other. Beyond the routes it
 //! measures replication receive and export as the replication worker calls them, and the deletes
 //! of a checkpoint trim, per deleted row.
+//!
+//! Arrangement probes keep one live resource's register heads fixed while its edit history grows
+//! with the generated scale, so both the owner-selected list and detail must be history-independent.
 //!
 //! - `ST_COST_SCALES` sets the two generated scales, smaller first. The default is `0.01,0.1`.
 //! - `ST_BENCH_DIR` keeps generated stores for the next run, as for `daemon_bench`.
@@ -38,6 +43,7 @@ use serde_json::{Value, json};
 use smallclaims::sqlite::work::{self, SqliteWork};
 use st3::api::AppState;
 use st3::client::Client;
+use st3::model::ClaimInput;
 use st3::store::Store;
 use tokio::sync::{Notify, watch};
 
@@ -56,9 +62,8 @@ const SLACK: u64 = 5_000;
 /// much worse unnoticed. Each breaks the daemon's rule that no query's cost grows with the whole
 /// store and is owed a fix. A fixed one fails the check until it leaves this list.
 const KNOWN_GROWTH: &[(&str, f64)] = &[
-    // Attention and the mission detail read every person ask (11.8x full-scan steps).
+    // Attention reads every person ask (11.8x full-scan steps).
     ("GET /v1/attention", 18.0),
-    ("GET /v1/client/missions/{*id}", 18.0),
     // Checkpoint status walks the sealed set (9.8x).
     ("GET /v1/checkpoint/status", 15.0),
     // Runtimes read every runtime observation (3.8x for the list, 9.0x for one runtime).
@@ -87,10 +92,23 @@ const KNOWN_GROWTH: &[(&str, f64)] = &[
 /// Routes the check does not measure, and why. Keep this list short: a route here can grow with
 /// the store unnoticed.
 const NOT_MEASURED: &[(&str, &str)] = &[
+    // Sekrets: neither reads the claim store beyond one primary-key lookup.
+    (
+        "POST /v1/sekrets/attest",
+        "needs a calling process in a seat's cgroup scope; reads the terminal registry and one declaration by key",
+    ),
+    (
+        "GET /v1/sekrets/node",
+        "returns the node key held in memory",
+    ),
     // Streams and terminals: they stay open, or need a live `pty`.
     (
         "GET /v1/mailbox",
         "requires an authenticated native driver; the load test models seat waits with event long-polls",
+    ),
+    (
+        "GET /v1/mailbox/attachment",
+        "requires an authenticated native driver; uses indexed mailbox fence validation and an in-memory channel report",
     ),
     (
         "GET /v1/client/conversations/{id}/stream",
@@ -168,6 +186,10 @@ const NOT_MEASURED: &[(&str, &str)] = &[
         "POST /v1/internal/replication/peer-failure",
         "records a transport failure; no store read",
     ),
+    (
+        "POST /v1/internal/replication/worker-status",
+        "updates host-local worker memory; no store read or graph write",
+    ),
     // Checkpoints: the trim is measured directly, per deleted row.
     (
         "POST /v1/checkpoint/plan",
@@ -239,6 +261,10 @@ const NOT_MEASURED: &[(&str, &str)] = &[
     ("POST /v1/agents/start", "starts a seat"),
     ("POST /v1/agents/suspend", "suspends a live seat"),
     ("POST /v1/agents/resume", "resumes a live seat"),
+    (
+        "POST /v1/internal/seat-snapshot",
+        "requires a stopped source and a sealed portable snapshot; covered by the two-daemon move proof",
+    ),
     (
         "POST /v1/agents/native-session",
         "reports a live harness session",
@@ -381,6 +407,29 @@ const fn direct(route: &'static str, call: Direct) -> Probe {
 
 const PROBES: &[Probe] = &[
     post(
+        "POST /v1/schema/registrations",
+        "/v1/schema/registrations",
+        |_, attempt| json!({"manifest": custom_manifest(attempt as u32 + 2), "actor": "person/bench-operator"}),
+    ),
+    get("GET /v1/schema/registrations", "/v1/schema/registrations"),
+    get(
+        "GET /v1/client/custom-subjects",
+        "/v1/client/custom-subjects?kind=garden.review&version=1&limit=2",
+    ),
+    get(
+        "GET /v1/client/custom-subjects/{*id}",
+        "/v1/client/custom-subjects/custom/garden/review/v1/cost-read-000",
+    ),
+    get(
+        "GET /v1/custom/basis",
+        "/v1/custom/basis?subject=custom/garden/review/v1/cost-read-000&kinds=custom.garden.review.v1.requested",
+    ),
+    post(
+        "POST /v1/custom/reply",
+        "/v1/custom/reply",
+        |fixture, attempt| fixture.custom_replies[attempt].clone(),
+    ),
+    post(
         "POST /v1/agents/source-offline",
         "/v1/agents/source-offline",
         |fixture, attempt| {
@@ -397,6 +446,14 @@ const PROBES: &[Probe] = &[
     get(
         "GET /v1/client/sets/{*id}",
         "/v1/client/sets/bench/cost/fixture",
+    ),
+    get(
+        "GET /v1/client/arrangements",
+        "/v1/client/arrangements?person=person%2Fada",
+    ),
+    get(
+        "GET /v1/client/arrangements/{person_name}/{uuid}",
+        ARRANGEMENT_PATH,
     ),
     post("POST /v1/sets/preview", "/v1/sets/preview", |_, attempt| {
         owned_set_request(&format!("preview-{attempt}"))
@@ -490,6 +547,10 @@ const PROBES: &[Probe] = &[
         "GET /v1/client/subject-definition",
         "/v1/client/subject-definition?subject={seat}",
     ),
+    get(
+        "GET /v1/client/publication-definition",
+        "/v1/client/publication-definition?subject={seat}",
+    ),
     get("GET /v1/client/now", "/v1/client/now"),
     get("GET /v1/client/machines", "/v1/client/machines"),
     get("GET /v1/client/hosts/{*id}", "/v1/client/hosts/local/repositories"),
@@ -499,6 +560,10 @@ const PROBES: &[Probe] = &[
         "GET /v1/client/attention/{*id}",
         "/v1/client/attention/{attention}",
     ),
+    get("GET /v1/client/mail-backlog", "/v1/client/mail-backlog"),
+    post("POST /v1/messages/cleanup", "/v1/messages/cleanup", |_, _| {
+        json!({ "all": true, "older_than_ms": 1, "dry_run": true })
+    }),
     get("GET /v1/client/messages", "/v1/client/messages"),
     get(
         "GET /v1/client/messages/{*id}",
@@ -537,6 +602,14 @@ const PROBES: &[Probe] = &[
     get("GET /v1/client/work/{*id}", "/v1/client/work/{step}"),
     get("GET /v1/client/agents", "/v1/client/agents"),
     get("GET /v1/client/agents/{*id}", "/v1/client/agents/{agent}"),
+    get(
+        "GET /v1/client/agent-workspaces/{*id}",
+        "/v1/client/agent-workspaces/{agent}",
+    ),
+    get(
+        "GET /v1/client/status-history/{*id}",
+        "/v1/client/status-history/{agent}",
+    ),
     get(
         "GET /v1/client/agent-declarations/{*id}",
         "/v1/client/agent-declarations/{agent}",
@@ -759,6 +832,49 @@ const PROBES: &[Probe] = &[
                 .map_err(|error| error.message)
         },
     ),
+    post(
+        "POST /v1/work/start",
+        "/v1/work/start",
+        |fixture, attempt| {
+            json!({
+                "actor": fixture.items["asker"],
+                "title": format!("Invented spontaneous task {attempt}"),
+                "idempotency_key": format!("cost-start-{attempt}"),
+            })
+        },
+    ),
+    // Like renewal, handoff is fenced to a live harness at the HTTP boundary. Measure the
+    // same store write with a separate claimed step for each attempt, rather than cached retries.
+    direct(
+        "POST /v1/work/handoff/{*subject}",
+        |store, fixture, attempt| {
+            let (agent, step, incarnation) = &fixture.handoffs[attempt];
+            store
+                .handoff_work(
+                    step,
+                    &st3::model::WorkHandoffRequest {
+                        actor: agent.clone(),
+                        incarnation: Some(incarnation.clone()),
+                        to: "person/bench-operator".into(),
+                        note: "Review the invented fixture next.".into(),
+                        evidence: Vec::new(),
+                        idempotency_key: format!("cost-handoff-{attempt}"),
+                    },
+                )
+                .map(|view| serde_json::to_value(view).unwrap())
+                .map_err(|error| error.message)
+        },
+    ),
+    post(
+        "POST /v1/work/acknowledge/{*subject}",
+        "/v1/work/acknowledge/{acknowledge_step}",
+        |fixture, attempt| {
+            json!({
+                "actor": "person/bench-operator",
+                "message": fixture.acknowledgments[attempt].1,
+            })
+        },
+    ),
     post("POST /v1/work/ask", "/v1/work/ask", |fixture, attempt| {
         json!({
             "person": "person/bench-operator",
@@ -767,6 +883,15 @@ const PROBES: &[Probe] = &[
             "actor": fixture.items["asker"],
             "new_run": format!("cost-question-{attempt}"),
             "idempotency_key": format!("cost-ask-{attempt}"),
+        })
+    }),
+    post("POST /v1/work/delegation", "/v1/work/delegation", |fixture, attempt| {
+        json!({
+            "person": "person/bench-operator",
+            "actor": "person/bench-operator",
+            "actions": ["answer-ask"],
+            "evidence": [fixture.items["claim"]],
+            "idempotency_key": format!("cost-delegation-{attempt}"),
         })
     }),
     post("POST /v1/work/done", "/v1/work/done", |fixture, attempt| {
@@ -877,6 +1002,54 @@ fn owned_set_request(name: &str) -> Value {
 /// The running runtime of the first seat, whose driver publishes the harness events.
 const SEAT_RUNTIME: &str = "cost-seat-0-runtime";
 
+/// The same agent list, after one seat changes at each scale.
+const COLD_AGENTS: &str = "GET /v1/client/agents (after harness observation)";
+const ARRANGEMENT_OWNER: &str = "person/ada";
+const ARRANGEMENT_SUBJECT: &str = "arrangement/person/ada/019a0000-0000-7000-8000-000000000001";
+const ARRANGEMENT_PATH: &str = "/v1/client/arrangements/ada/019a0000-0000-7000-8000-000000000001";
+const ARRANGEMENT_FOLDER: &str = "019a0000-0000-7000-8000-000000000010";
+const ARRANGEMENT_PLACEMENT: &str = "agent/fleet/fixture-cost-arrangements/seat";
+
+/// Grow only durable history, not the live answer, to catch reads that fold old edits.
+fn seed_arrangement(store: &Store, scale: f64) -> String {
+    let append = |key: &str, operations: Value| {
+        store
+            .append_claim(&ClaimInput {
+                subject: ARRANGEMENT_SUBJECT.into(),
+                kind: "arrangement.edited".into(),
+                actor: Some(ARRANGEMENT_OWNER.into()),
+                fields: serde_json::from_value(json!({
+                    "owner": ARRANGEMENT_OWNER,
+                    "operations": operations,
+                }))
+                .unwrap(),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: Some(key.into()),
+            })
+            .expect("the arrangement cost fixture must publish")
+            .id
+    };
+    append(
+        "cost-arrangement-create",
+        json!([
+            {"op":"create","name":"Invented arrangement"},
+            {"op":"folder.create","id":ARRANGEMENT_FOLDER,"name":"Work","parent":null,"key":"a0"},
+            {"op":"subject.place","subject":ARRANGEMENT_PLACEMENT,"folder":ARRANGEMENT_FOLDER,"key":"a0"},
+        ]),
+    );
+    for edit in 0..((scale * 10_000.0).round() as usize).max(1) {
+        append(
+            &format!("cost-arrangement-history-{edit}"),
+            json!([{"op":"rename","name":format!("Invented revision {edit}")}]),
+        );
+    }
+    append(
+        "cost-arrangement-current",
+        json!([{"op":"rename","name":"Invented arrangement"}]),
+    )
+}
+
 /// The replication summary a peer asks for each exchange; a route of its own above would answer
 /// the same request.
 const SUMMARY: &str = "POST /v1/internal/replication/export (summary)";
@@ -925,16 +1098,21 @@ impl Cost {
 struct Fixture {
     subjects: Subjects,
     items: BTreeMap<&'static str, String>,
+    custom_replies: Vec<Value>,
     /// A message sent for the lifecycle writes.
     sent: String,
     /// Person asks the done probe answers, one per attempt.
     asks: Vec<String>,
+    /// Fresh claimed steps and incarnation fences, one per handoff measurement.
+    handoffs: Vec<(String, String, String)>,
+    /// Fresh pending handoffs and their recipient-visible notes, one per acknowledgment.
+    acknowledgments: Vec<(String, String)>,
     peer_inventory: Value,
     peer_exchange: Value,
 }
 
 impl Fixture {
-    fn fill(&self, path: &str) -> String {
+    fn fill(&self, path: &str, attempt: usize) -> String {
         let mut path = path
             .replace("{seat}", &urlencoding::encode(&self.subjects.seats[0]))
             .replace(
@@ -945,11 +1123,93 @@ impl Fixture {
                 "{held_step}",
                 self.subjects.held.first().map_or("", |(_, step, _)| step),
             );
+        if path.contains("{acknowledge_step}") {
+            path = path.replace("{acknowledge_step}", &self.acknowledgments[attempt].0);
+        }
         for (name, value) in &self.items {
             path = path.replace(&format!("{{{name}}}"), value);
         }
         path
     }
+}
+
+/// Historical runs may grow the answer, but must not repeat the assignee's message scan.
+#[tokio::test]
+async fn mission_detail_many_finished_runs_do_not_repeat_step_history() {
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(&root.path().join("claims.sqlite3"), NODE).unwrap());
+    let source = r#"version 2
+mission "cost/history" state="ready" {
+  goal "Bound enrichment of historical runs."
+  step "work" { assigned-to "agent/cost-worker" }
+}"#;
+    let intent = st3::graph::parse_intent(source, NODE).unwrap();
+    let planned = store.mission(&intent, st3::model::IntentInput {
+        kdl: source.into(), source_name: None,
+    }).unwrap();
+    store.apply(&intent, &planned.subject_tokens, "cost-history-definition").unwrap();
+    for message in 0..500 {
+        store.append_claim(&st3::model::ClaimInput {
+            subject: format!("message/cost-history-{message}"),
+            kind: "message.sent".into(),
+            actor: Some("person/bench-operator".into()),
+            fields: BTreeMap::from([
+                ("from".into(), json!("person/bench-operator")),
+                ("to".into(), json!("agent/cost-worker")),
+                ("content".into(), json!("Historical message")),
+                ("status".into(), json!("sent")),
+            ]),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+    }
+    let app = st3::api::router(AppState {
+        store: store.clone(),
+        notify: Arc::new(Notify::new()),
+        event_notify: watch::channel(0_u64).0,
+        node: NODE.into(),
+        state_dir: root.path().join("state"),
+        pty_root: root.path().join("pty"),
+        pty_binary: stub_pty(root.path()),
+        fleet_id: None, configured_peers: Vec::new(), client_relay: None,
+        native_session_home: Some(root.path().join("home")),
+        planner_default: st3::model::PlannerSpec::default(),
+    });
+    let mut measurements = Vec::new();
+    for run in 0..100 {
+        let view = store.create_mission_run(&st3::model::MissionRunRequest {
+            mission: "cost/history".into(), revision: None,
+            workspace: root.path().display().to_string(),
+            requester: Some("person/bench-operator".into()), mode: None,
+            inputs: BTreeMap::new(), idempotency_key: format!("cost-history-{run}"),
+        }).unwrap();
+        store.set_mission_run_state(&view.id, "cancelled", "terminal", None).unwrap();
+        if matches!(run, 9 | 99) {
+            let mut samples = Vec::new();
+            for _ in 0..4 {
+                let before = work::total();
+                let response = app.clone().oneshot(Request::builder()
+                    .uri("/v1/client/missions/mission%2Fcost%2Fhistory")
+                    .body(Body::empty()).unwrap()).await.unwrap();
+                assert_eq!(response.status(), axum::http::StatusCode::OK);
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                let value: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(value["value"]["run_details"].as_array().unwrap().len(), run + 1);
+                samples.push(work::total() - before);
+            }
+            measurements.push(samples.into_iter().skip(1).min_by_key(|work| work.fullscan_steps).unwrap());
+        }
+    }
+    let (small, large) = (measurements[0], measurements[1]);
+    println!("mission detail 10 -> 100 finished runs: {small:?} -> {large:?}");
+    // Allow 400 VM instructions per additional historical row, plus the standard slack.
+    // Current lightweight state/summary reads cost about 316; full enrichment costs about 891.
+    assert!(large.vm_steps <= small.vm_steps + 90 * 400 + SLACK,
+        "historical runs added full work-view enrichment: {small:?} -> {large:?}");
+    assert!(large.fullscan_steps <= small.fullscan_steps * 3 + SLACK,
+        "historical runs repeated the per-step history scans: {small:?} -> {large:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1002,7 +1262,12 @@ async fn no_request_does_work_that_grows_with_the_store() {
             continue;
         }
         // A list that answers more rows may read more; a request answering the same may not.
-        let answered = (after.answer.max(1) as f64 / before.answer.max(1) as f64).max(1.0);
+        // One seat changed at either scale: its rebuild must not grow with fleet size.
+        let answered = if name == COLD_AGENTS {
+            1.0
+        } else {
+            (after.answer.max(1) as f64 / before.answer.max(1) as f64).max(1.0)
+        };
         let grew = |field: fn(&Cost) -> u64| {
             let (before, after) = (field(before), field(after));
             let ratio = after as f64 / before.max(1) as f64 / answered;
@@ -1010,6 +1275,15 @@ async fn no_request_does_work_that_grows_with_the_store() {
         };
         let (steps, steps_grew) = grew(|cost| cost.vm_steps);
         let (scans, scans_grew) = grew(|cost| cost.fullscan_steps);
+        if name == COLD_AGENTS
+            && after.statements > before.statements + 20
+            && after.statements as f64 / before.statements.max(1) as f64 > GROWTH
+        {
+            failures.push(format!(
+                "{name}: statements grow with the fleet: {} -> {}",
+                before.statements, after.statements
+            ));
+        }
         let summary = format!(
             "{} -> {} VM steps, {} -> {} full-scan steps, answer {} -> {} bytes",
             before.vm_steps,
@@ -1246,6 +1520,12 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
         daemon.append_claim(&started).unwrap();
     }
     sync(&peer, PEER, &store);
+    let arrangement_revision = {
+        let store = store.clone();
+        tokio::task::spawn_blocking(move || seed_arrangement(&store, scale))
+            .await
+            .unwrap()
+    };
     let claims = store.index().unwrap();
 
     let socket = root.join("st3.sock");
@@ -1275,6 +1555,7 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
     let client = Client::unix(&socket);
     // Client reads come from a person, as stui and the app make them.
     let person = Client::unix_as(&socket, "person/bench-operator").unwrap();
+    let arrangement_person = Client::unix_as(&socket, ARRANGEMENT_OWNER).unwrap();
     let subjects = {
         let store = store.clone();
         tokio::task::spawn_blocking(move || fleet_subjects(&store, 3))
@@ -1336,9 +1617,37 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
         .await
         .expect("the owned-set detail probe must read a live fixture");
     assert_eq!(selected["receipt"]["source"]["sequence"], 1);
+    let selected: Value = arrangement_person
+        .get(ARRANGEMENT_PATH)
+        .await
+        .expect("the arrangement detail probe must read a live fixture");
+    assert_eq!(selected["id"], ARRANGEMENT_SUBJECT);
+    assert_eq!(selected["owner"], ARRANGEMENT_OWNER);
+    assert_eq!(selected["revision"], arrangement_revision);
+    assert_eq!(selected["body"]["name"]["value"], "Invented arrangement");
+    assert_eq!(
+        selected["body"]["folders"][ARRANGEMENT_FOLDER]["name"]["value"],
+        "Work"
+    );
+    assert_eq!(
+        selected["body"]["placements"][ARRANGEMENT_PLACEMENT]["value"],
+        json!({"folder":ARRANGEMENT_FOLDER,"key":"a0"})
+    );
+    let page: Value = arrangement_person
+        .get("/v1/client/arrangements?person=person%2Fada")
+        .await
+        .expect("the arrangement list probe must read the selected owner's fixture");
+    assert_eq!(page["items"], json!([selected]));
+
+    prepare_custom_fixture(&store, &mut fixture, scale);
 
     let mut costs = BTreeMap::new();
     for probe in PROBES {
+        // Prepare immediately before the work writes so the extra person steps do not change
+        // the generated read fixtures or their existing growth baselines.
+        if probe.route == "POST /v1/work/start" {
+            prepare_handoffs(&store, &mut fixture);
+        }
         let mut samples = Vec::new();
         // The first run warms statement caches and lazily built state; it is not counted.
         for attempt in 0..4 {
@@ -1352,9 +1661,11 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
                 })
                 .await
             } else {
-                let path = fixture.fill(probe.path);
+                let path = fixture.fill(probe.path, attempt);
                 let body = probe.body.map(|body| body(&fixture, attempt));
-                let client = if path.starts_with("/v1/client/") {
+                let client = if path.starts_with("/v1/client/arrangements") {
+                    arrangement_person.clone()
+                } else if path.starts_with("/v1/client/") {
                     person.clone()
                 } else {
                     client.clone()
@@ -1376,15 +1687,50 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
             println!("{}: {samples:?}", probe.route);
         }
         let cost = Cost::least(&samples);
-        // A missing item answers an error the same way at both scales; only a broken request fails.
+        // Other probes may select a missing generated item; the seeded arrangement must succeed.
         let cost = Cost {
-            error: cost
-                .error
-                .filter(|error| !error.contains("not-found") && !error.contains("404")),
+            error: cost.error.filter(|error| {
+                probe.route.starts_with("GET /v1/client/arrangements")
+                    || (!error.contains("not-found") && !error.contains("404"))
+            }),
             ..cost
         };
         costs.insert(probe.route.to_owned(), cost);
     }
+    // A real seat update invalidates its card between every read. Count only the read, using
+    // the same canonical claim path as a driver; the warm probe above remains unchanged.
+    let mut samples = Vec::new();
+    for attempt in 0..4 {
+        let mut observation = claim_input(
+            "harness.observed",
+            &format!("cost-cold-agents-{attempt}"),
+            attempt,
+            "",
+        );
+        observation.subject = fixture.subjects.seats[0].clone();
+        observation.actor = Some(observation.subject.clone());
+        observation
+            .fields
+            .insert("incarnation_id".into(), json!(SEAT_RUNTIME));
+        observation.fields.insert(
+            "state".into(),
+            json!(if attempt % 2 == 0 { "idle" } else { "working" }),
+        );
+        observation.fields.insert("driver".into(), json!("codex"));
+        store.append_claim(&observation).unwrap();
+        let cost = counted(|| async {
+            person
+                .get::<Value>("/v1/client/agents")
+                .await
+                .map_err(|error| error.to_string())
+        })
+        .await;
+        if attempt > 0 {
+            samples.push(cost);
+        }
+    }
+    costs.insert(COLD_AGENTS.to_owned(), Cost::least(&samples));
+
     // The summary a peer asks for before each exchange, after the daemon wrote a few claims.
     let mut samples = Vec::new();
     for attempt in 0..4 {
@@ -1423,6 +1769,63 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
         costs.len()
     );
     Measured { claims, costs }
+}
+
+fn custom_manifest(version: u32) -> st3_schema::custom::Manifest {
+    let mut manifest: st3_schema::custom::Manifest =
+        serde_json::from_str(include_str!("../../../examples/st3/custom-review.json")).unwrap();
+    manifest.version = version;
+    manifest.subject_prefix = format!("custom/garden/review/v{version}/");
+    manifest
+}
+
+fn prepare_custom_fixture(store: &Store, fixture: &mut Fixture, scale: f64) {
+    use st3::store::custom::{RegistrationRequest, ReplyRequest};
+    let manifest = custom_manifest(1);
+    store
+        .register_custom_kind(&RegistrationRequest {
+            manifest: manifest.clone(),
+            actor: "person/bench-operator".into(),
+        })
+        .unwrap();
+    let count = (scale * 200.0).round().max(2.0) as usize;
+    for name in (0..count)
+        .map(|i| format!("cost-read-{i:03}"))
+        .chain((0..4).map(|i| format!("cost-reply-{i}")))
+    {
+        let subject = format!("{}{}", manifest.subject_prefix, name);
+        store
+            .append_claim(&st3::model::ClaimInput {
+                subject: subject.clone(),
+                kind: manifest.creation_kind.clone(),
+                actor: Some("person/bench-operator".into()),
+                fields: serde_json::from_value(json!({"title":"Retain the seed history?",
+                "detail":"Choose Keep or Discard.","recipient":"person/bench-operator"}))
+                .unwrap(),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let view = store.custom_subject(&subject).unwrap().unwrap();
+        let reply = ReplyRequest {
+            subject,
+            registration: view["registration"].as_str().unwrap().into(),
+            revision: view["revision"].as_str().unwrap().into(),
+            episode: view["attention"]["episode"].as_str().unwrap().into(),
+            fields: serde_json::from_value(json!({"selection":"keep"})).unwrap(),
+            actor: "person/bench-operator".into(),
+            idempotency_key: format!("cost-seed-{name}"),
+        };
+        if name.starts_with("cost-reply-") {
+            fixture
+                .custom_replies
+                .push(serde_json::to_value(&reply).unwrap());
+        } else {
+            // Grow the source index without growing the native attention fixture.
+            store.reply_custom_subject(&reply).unwrap();
+        }
+    }
 }
 
 /// Ids from the store's own lists, a sent message, and a person ask per attempt.
@@ -1555,8 +1958,77 @@ async fn fixture(person: &Client, client: &Client, subjects: Subjects) -> Fixtur
         items,
         sent,
         asks,
+        handoffs: Vec::new(),
+        acknowledgments: Vec::new(),
+        custom_replies: Vec::new(),
         peer_inventory: Value::Null,
         peer_exchange: Value::Null,
+    }
+}
+
+/// Set up fresh writes outside the measured region. A handoff releases its sender before the
+/// next task starts, so each dedicated agent has exactly one worker lease during measurement.
+fn prepare_handoffs(store: &Store, fixture: &mut Fixture) {
+    let kdl = (0..4)
+        .map(|attempt| format!(
+            "agent \"bench/cost/handoff-{attempt}\" {{ workspace \"/tmp\"; command \"true\" }}\n"
+        ))
+        .collect::<String>();
+    let intent = st3::parse_intent(&format!("version 2\n{kdl}"), NODE).unwrap();
+    store.apply_internal(&intent, "cost-handoff-seats").unwrap();
+    for attempt in 0..4 {
+        let actor = format!("agent/bench/cost/handoff-{attempt}");
+        let incarnation = format!("cost-handoff-incarnation-{attempt}");
+        for purpose in ["acknowledge", "transfer"] {
+            let work = store
+                .start_work(&st3::model::WorkStartRequest {
+                    actor: actor.clone(),
+                    title: format!("Invented {purpose} task {attempt}"),
+                    idempotency_key: format!("cost-{purpose}-start-{attempt}"),
+                })
+                .unwrap();
+            store
+                .work_action(
+                    &work.subject,
+                    "claim",
+                    &st3::model::WorkRequest {
+                        actor: Some(actor.clone()),
+                        incarnation: Some(incarnation.clone()),
+                        summary: None,
+                        reason: None,
+                        evidence: Vec::new(),
+                        idempotency_key: format!("cost-{purpose}-claim-{attempt}"),
+                    },
+                )
+                .unwrap();
+            if purpose == "acknowledge" {
+                store
+                    .handoff_work(
+                        &work.subject,
+                        &st3::model::WorkHandoffRequest {
+                            actor: actor.clone(),
+                            incarnation: Some(incarnation.clone()),
+                            to: "person/bench-operator".into(),
+                            note: "Review the invented fixture next.".into(),
+                            evidence: Vec::new(),
+                            idempotency_key: format!("cost-prepare-handoff-{attempt}"),
+                        },
+                    )
+                    .unwrap();
+                let claims = store
+                    .claims_for(&work.subject, Some("work.released"))
+                    .unwrap();
+                let note = claims.last().unwrap().body["fields"]["handoff_message"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                fixture.acknowledgments.push((work.subject, note));
+            } else {
+                fixture
+                    .handoffs
+                    .push((actor.clone(), work.subject, incarnation.clone()));
+            }
+        }
     }
 }
 
@@ -1631,17 +2103,23 @@ fn write_claims(store: &Store, origin: &str, round: usize) {
 }
 
 fn sync(from: &Store, from_name: &str, to: &Store) {
-    let exchange = from
-        .export_replication_exchange(
-            FLEET,
-            &to.export_replication_summary(FLEET).unwrap().inventory,
-        )
-        .unwrap();
-    to.receive_replication_exchange(from_name, FLEET, &exchange)
-        .unwrap();
-    to.validate_replication_backlog().unwrap();
-    to.apply_replication_repairs().unwrap();
-    to.project_replication_backlog().unwrap();
+    // Fixture setup must drain every page before adding the measured deltas. A compact
+    // summary can require another listing round and leave an empty first response.
+    // Measured replication requests still use the production compact inventories.
+    for _ in 0..128 {
+        let exchange = from
+            .export_replication_exchange(FLEET, &to.replication_inventory().unwrap())
+            .unwrap();
+        if exchange.envelopes.is_empty() {
+            return;
+        }
+        to.receive_replication_exchange(from_name, FLEET, &exchange)
+            .unwrap();
+        to.validate_replication_backlog().unwrap();
+        to.apply_replication_repairs().unwrap();
+        to.project_replication_backlog().unwrap();
+    }
+    panic!("replication fixture did not drain within 128 pages");
 }
 
 /// A checkpoint trim of everything the checkpoint rules drop, counted per deleted row.

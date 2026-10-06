@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""Run the same mailbox fixture on any local Git ref, including unmodified main.
+
+Run inside the pinned devShell. The temporary checkout receives only the current
+cfg(test) fixture/module; production sources come from the requested ref.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+
+
+def run(*args, **kwargs):
+    return subprocess.run(args, check=True, **kwargs)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("ref", help="local Git ref or commit to measure")
+    parser.add_argument("output", type=Path, help="new directory outside this checkout")
+    parser.add_argument("--idle", type=int, metavar="MESSAGES_PER_SEAT",
+                        help="measure 60 seconds idle after seeding this many messages per seat")
+    args = parser.parse_args()
+    if args.idle is not None and args.idle <= 0:
+        parser.error("--idle must be positive")
+    repo = Path(run("git", "rev-parse", "--show-toplevel", capture_output=True, text=True).stdout.strip())
+    output = args.output.expanduser().resolve()
+    if output == repo or repo in output.parents:
+        parser.error("output must be outside this checkout")
+    if output.exists():
+        parser.error("output must be new; existing measurements are never overwritten")
+    commit = run("git", "rev-parse", "--verify", f"{args.ref}^{{commit}}", capture_output=True, text=True).stdout.strip()
+    fixture = (repo / "crates/st3/src/api/mailbox_profile.rs").read_bytes()
+    output.mkdir(parents=True)
+    checkout = output / "checkout"
+    run("git", "worktree", "add", "--detach", str(checkout), commit)
+    try:
+        (checkout / "crates/st3/src/api/mailbox_profile.rs").write_bytes(fixture)
+        mailbox = checkout / "crates/st3/src/api/mailbox.rs"
+        source = mailbox.read_text()
+        if '#[path = "mailbox_profile.rs"]' not in source:
+            mailbox.write_text(source + '\n#[cfg(test)]\n#[path = "mailbox_profile.rs"]\nmod profile;\n')
+        metadata = {"commit": commit, "fixture_sha256": hashlib.sha256(fixture).hexdigest(),
+                    "rustc": run("rustc", "--version", capture_output=True, text=True).stdout.strip(),
+                    "idle_messages_per_seat": args.idle}
+        (output / "build-metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+        with (output / "build.jsonl").open("w") as stdout, (output / "build.log").open("w") as stderr:
+            run("cargo", "test", "--release", "-p", "st3", "--lib",
+                "api::mailbox::profile::many_streams", "--no-run", "--message-format=json",
+                cwd=checkout, stdout=stdout, stderr=stderr)
+        executables = [item["executable"] for line in (output / "build.jsonl").read_text().splitlines()
+                       if (item := json.loads(line)).get("reason") == "compiler-artifact"
+                       and item.get("executable") and item["target"]["name"] == "st3"
+                       and item["profile"]["test"]]
+        if len(executables) != 1:
+            raise RuntimeError(f"expected one test executable, got {executables}")
+        env = os.environ.copy()
+        env.pop("ST_MAILBOX_PROFILE_DAEMON", None)
+        env.pop("ST_MAILBOX_PROFILE_IDLE", None)
+        env["ST_MAILBOX_PROFILE_DIR"] = str(output / "run")
+        if args.idle is not None:
+            env["ST_MAILBOX_PROFILE_IDLE"] = str(args.idle)
+        with (output / "run.log").open("w") as log:
+            run(executables[0], "--ignored", "--exact", "api::mailbox::profile::many_streams",
+                "--nocapture", cwd=checkout, env=env, stdout=log, stderr=log)
+        print(output)
+    finally:
+        # Remove only the disposable checkout this invocation created. Keep all evidence.
+        run("git", "worktree", "remove", "--force", str(checkout))
+
+
+if __name__ == "__main__":
+    main()

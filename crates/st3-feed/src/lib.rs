@@ -112,7 +112,8 @@ pub enum Update {
         /// The session the entries belong to: earlier pages are read from its timeline.
         session_id: String,
         replace: bool,
-        has_more: bool,
+        /// Availability before the live window; absent on deltas means unchanged.
+        has_more: Option<bool>,
         items: Vec<TimelineEntry>,
     },
     /// st could not show the open conversation; the feed asks again after a backoff, unless
@@ -1290,9 +1291,23 @@ mod tests {
         let app = st3::api::router(state.clone());
         let server = tokio::spawn(async move { st3::api::serve_unix(&server_socket, app).await });
 
-        for window in Window::ALL {
-            assert!(next_window(&rx, window).await.is_empty());
-        }
+        // Retain every initial window: independent server reads may finish in any order.
+        // Waiting for one ID at a time would discard an already-arrived later window.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut pending = std::collections::BTreeSet::from(Window::ALL);
+            while !pending.is_empty() {
+                match rx.try_recv() {
+                    Ok(Update::Window { window, items, .. }) if pending.remove(&window) => {
+                        assert!(items.is_empty(), "initial {window:?} window was not empty");
+                    }
+                    Ok(_) => {}
+                    Err(mpsc::TryRecvError::Empty) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => panic!("the feed stopped"),
+                }
+            }
+        }).await.expect("all initial windows arrive independently");
 
         let source =
             "version 2\nmission \"feed-test\" state=\"ready\" { goal \"Push changes to stui\" }\n";

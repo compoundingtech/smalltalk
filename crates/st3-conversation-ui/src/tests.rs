@@ -43,14 +43,14 @@ fn frame_updates_revise_by_id_and_replacements_remove_old_history() {
     let mut timeline = Timeline::default();
     timeline.apply(Frame {
         replace: true,
-        has_more: true,
+        has_more: Some(true),
         items: vec![item("a", 1, 1, "old")],
         ..Frame::default()
     });
     assert!(timeline.replace && timeline.has_more);
     timeline.apply(Frame {
         replace: false,
-        has_more: true,
+        has_more: Some(true),
         items: vec![item("b", 2, 1, "next"), item("a", 1, 2, "revised")],
         ..Frame::default()
     });
@@ -66,7 +66,7 @@ fn frame_updates_revise_by_id_and_replacements_remove_old_history() {
     assert!(matches!(&entries[0].body, Body::Assistant(text) if text == "revised"));
     timeline.apply(Frame {
         replace: true,
-        has_more: false,
+        has_more: Some(false),
         items: vec![],
         ..Frame::default()
     });
@@ -83,10 +83,73 @@ fn ids(timeline: &Timeline) -> Vec<&str> {
 }
 
 #[test]
+fn delta_preserves_older_history_until_an_older_page_reaches_the_start() {
+    let mut timeline = Timeline::default();
+    timeline.apply(Frame {
+        replace: true,
+        has_more: Some(true),
+        items: vec![item("c", 3, 1, "c")],
+        session_id: Some("session/a".into()),
+    });
+    timeline.apply(Frame {
+        items: vec![item("d", 4, 1, "d")],
+        session_id: Some("session/a".into()),
+        ..Frame::default()
+    });
+    assert!(timeline.more_before(), "a delta must not hide older history");
+    timeline.older_page("session/a", vec![item("b", 2, 1, "b")], true, Some("older".into()));
+    assert_eq!(ids(&timeline), ["b", "c", "d"]);
+    assert!(timeline.more_before());
+    timeline.apply(Frame {
+        items: vec![item("d", 4, 2, "revised")],
+        ..Frame::default()
+    });
+    timeline.older_page("session/a", vec![item("a", 1, 1, "a")], false, None);
+    assert_eq!(ids(&timeline), ["a", "b", "c", "d"]);
+    assert_eq!(timeline.items[3].revision, 2);
+    assert!(!timeline.more_before());
+}
+
+#[test]
+fn explicit_availability_updates_and_new_windows_do_not_inherit_old_history() {
+    let mut timeline = Timeline::default();
+    timeline.apply(Frame {
+        replace: true,
+        has_more: Some(true),
+        session_id: Some("session/a".into()),
+        ..Frame::default()
+    });
+    timeline.apply(Frame {
+        has_more: Some(false),
+        ..Frame::default()
+    });
+    assert!(!timeline.more_before());
+    timeline.apply(Frame {
+        has_more: Some(true),
+        ..Frame::default()
+    });
+    assert!(timeline.more_before());
+    timeline.apply(Frame {
+        replace: true,
+        ..Frame::default()
+    });
+    assert!(!timeline.more_before(), "a replacement without metadata starts fresh");
+    timeline.apply(Frame {
+        has_more: Some(true),
+        ..Frame::default()
+    });
+    timeline.apply(Frame {
+        session_id: Some("session/b".into()),
+        ..Frame::default()
+    });
+    assert!(!timeline.more_before(), "another session cannot inherit availability");
+}
+
+#[test]
 fn earlier_pages_go_above_the_window_and_survive_a_new_window_that_meets_them() {
     let window = |items: Vec<st3_client::TimelineEntry>, has_more: bool| Frame {
         replace: true,
-        has_more,
+        has_more: Some(has_more),
         items,
         session_id: Some("session/a".into()),
     };
@@ -123,11 +186,104 @@ fn earlier_pages_go_above_the_window_and_survive_a_new_window_that_meets_them() 
 }
 
 #[test]
+fn projection_notices_do_not_connect_disconnected_history_windows() {
+    let notice = |sequence: u64| -> st3_client::TimelineEntry {
+        serde_json::from_value(serde_json::json!({
+            "id": "timeline-entry/session/a/timeline-query-limited",
+            "sequence": sequence, "revision": 1,
+            "timestamp": "2026-09-30T10:00:00Z", "role": "system", "final": true,
+            "type": "error", "body": {
+                "code": "timeline-query-limited",
+                "message": "Older operations are outside this view",
+                "retryable": false, "details": {"operation_limit": 4096}
+            }
+        }))
+        .unwrap()
+    };
+    let window = |items| Frame {
+        replace: true,
+        has_more: Some(true),
+        items,
+        session_id: Some("session/a".into()),
+    };
+    let mut timeline = Timeline::default();
+    timeline.apply(window(vec![
+        item("c", 3, 1, "c"),
+        item("d", 4, 1, "d"),
+        notice(6),
+    ]));
+    timeline.older_page(
+        "session/a",
+        vec![item("a", 1, 1, "a"), item("b", 2, 1, "b")],
+        false,
+        None,
+    );
+    timeline.apply(window(vec![
+        item("d", 4, 1, "d"),
+        item("e", 5, 1, "e"),
+        notice(6),
+    ]));
+    assert_eq!(
+        ids(&timeline),
+        [
+            "a",
+            "b",
+            "c",
+            "d",
+            "e",
+            "timeline-entry/session/a/timeline-query-limited"
+        ]
+    );
+    assert!(timeline.older.paged);
+    timeline.apply(window(vec![item("x", 9, 1, "x"), notice(10)]));
+    assert_eq!(
+        ids(&timeline),
+        ["x", "timeline-entry/session/a/timeline-query-limited"]
+    );
+    assert!(!timeline.older.paged && timeline.more_before());
+}
+
+#[test]
+fn projection_notice_is_removed_from_preserved_older_prefix() {
+    let notice = |code: &str, timestamp: &str| serde_json::from_value(serde_json::json!({
+        "id": format!("timeline-entry/session/a/{code}"),
+        "sequence": 0, "revision": 1,
+        "timestamp": timestamp, "role": "system", "final": true,
+        "type": "error", "body": {
+            "code": code,
+            "message": "Projection availability changed", "retryable": false,
+            "details": {}
+        }
+    })).unwrap();
+    let window = |items| Frame {
+        replace: true, has_more: Some(true), items, session_id: Some("session/a".into()),
+    };
+    let mut timeline = Timeline::default();
+    timeline.apply(window(vec![
+        notice("timeline-history-incomplete", "2026-09-30T09:00:00Z"),
+        item("c", 3, 1, "c"), item("d", 4, 1, "d"),
+    ]));
+    timeline.older_page(
+        "session/a", vec![item("a", 1, 1, "a"), item("b", 2, 1, "b")], false, None,
+    );
+    timeline.apply(window(vec![item("d", 4, 1, "d"), item("e", 5, 1, "e")]));
+    assert_eq!(ids(&timeline), ["a", "b", "c", "d", "e"]);
+    assert!(timeline.older.paged);
+    timeline.apply(window(vec![
+        notice("timeline-query-limited", "2026-09-30T09:30:00Z"),
+        item("e", 5, 1, "e"), item("f", 6, 1, "f"),
+    ]));
+    assert_eq!(ids(&timeline), [
+        "a", "b", "c", "d", "timeline-entry/session/a/timeline-query-limited", "e", "f",
+    ]);
+}
+
+#[test]
 fn an_earlier_page_from_another_session_is_dropped_and_a_new_session_starts_over() {
     let mut timeline = Timeline::default();
     timeline.apply(Frame {
         replace: true,
-        has_more: true,
+        has_more: Some(true),
         items: vec![item("c", 3, 1, "c")],
         session_id: Some("session/a".into()),
     });
@@ -139,7 +295,7 @@ fn an_earlier_page_from_another_session_is_dropped_and_a_new_session_starts_over
     assert_eq!(timeline.older.failed.as_deref(), Some("st did not answer"));
     timeline.apply(Frame {
         replace: true,
-        has_more: false,
+        has_more: Some(false),
         items: vec![item("n", 1, 1, "n")],
         session_id: Some("session/b".into()),
     });
@@ -271,6 +427,45 @@ fn copying_wrapped_lines_gives_back_only_the_real_newlines() {
 }
 
 #[test]
+#[cfg(feature = "ratatui")]
+fn mail_to_the_person_leads_with_a_bullet_and_their_own_keeps_the_bar() {
+    // Nathan, 2026-10-05: mail to me and from me looked the same.
+    let mail = |from: &str, to: &str| Entry {
+        id: format!("message/{from}-{to}"),
+        at: "10:00".into(),
+        body: Body::Mail {
+            from: from.into(),
+            to: to.into(),
+            subject: String::new(),
+            body: "hello\nthere".into(),
+            delivered: false,
+            dictated: false,
+            images: Vec::new(),
+        },
+    };
+    let lines = |entry: Entry| {
+        let doc = Cache::default().render(&[entry], 60, &HashSet::new(), "", &theme());
+        doc.lines.iter().map(text::plain).collect::<Vec<_>>()
+    };
+    let to_you = lines(mail("agent", "you"));
+    assert!(to_you[0].starts_with("● agent → you"), "{to_you:?}");
+    assert!(to_you[1..].iter().all(|line| !line.starts_with('●')), "{to_you:?}");
+    assert!(to_you[1].starts_with("▎ "), "the body keeps the bar: {to_you:?}");
+    let from_you = lines(mail("you", "agent"));
+    assert!(from_you[0].starts_with("▎ you → agent"), "{from_you:?}");
+    // Copying from the bullet's row leaves the bullet out, as it does the bar.
+    let selection = Selection {
+        pane: "session/a".into(),
+        anchor: (0, 0),
+        head: (to_you.len() - 1, 200),
+    };
+    let doc = Cache::default().render(&[mail("agent", "you")], 60, &HashSet::new(), "", &theme());
+    let copied = selection.text(&doc.lines);
+    assert!(!copied.contains('●') && !copied.contains('▎'), "{copied}");
+    assert!(copied.contains("hello"), "{copied}");
+}
+
+#[test]
 fn pane_intents_keep_other_sessions_drafts_and_expansion_independent() {
     let mut state = State::default();
     state
@@ -371,4 +566,446 @@ fn shared_style_rules_are_available_without_a_renderer() {
         ))
         .unwrap()
     );
+}
+
+#[test]
+fn claude_skill_expansion_belongs_to_its_call_and_keeps_the_actual_body() {
+    let timeline: Vec<st3_client::TimelineEntry> = serde_json::from_str(include_str!(
+        "../../../fixtures/clients/transcripts/claude-skill.json"
+    ))
+    .unwrap();
+    let raw = match &timeline[2].body {
+        st3_client::TimelineBody::Content(content) => content.text.as_deref().unwrap(),
+        other => panic!("unexpected {other:?}"),
+    };
+    // A window starting after the call still preserves the entire skill as ordinary text.
+    let orphan = adapt::from_harness(true, raw, &Default::default());
+    assert!(
+        matches!(&orphan[..], [Body::User(body)] if body == raw.trim()),
+        "{orphan:?}"
+    );
+    let entries = adapt::conversation(&timeline, &Default::default());
+    assert_eq!(entries.len(), 2, "{entries:?}");
+    assert_eq!(entries[0].id, "skill-call");
+    assert!(
+        matches!(&entries[0].body, Body::Tool { title, state: ToolState::Ok, output }
+        if title == "Skill st" && output.join("\n") == raw.trim()),
+        "{entries:?}"
+    );
+}
+
+#[test]
+#[cfg(feature = "ratatui")]
+fn claude_skill_renders_folded_and_opens_with_its_newlines_and_quoted_tag() {
+    let timeline = serde_json::from_str::<Vec<st3_client::TimelineEntry>>(include_str!(
+        "../../../fixtures/clients/transcripts/claude-skill.json"
+    ))
+    .unwrap();
+    let entries = adapt::conversation(&timeline, &Default::default());
+    let cache = Cache::default();
+    let folded = cache.render(&entries, 100, &HashSet::new(), "", &theme());
+    assert!(
+        !folded
+            .lines
+            .iter()
+            .any(|line| text::plain(line).contains("## Messages"))
+    );
+    let opened = cache.render(
+        &entries,
+        100,
+        &HashSet::from(["skill-call".into()]),
+        "",
+        &theme(),
+    );
+    assert!(
+        opened
+            .lines
+            .iter()
+            .all(|line| !text::plain(line).contains('\n'))
+    );
+    let rendered = opened
+        .lines
+        .iter()
+        .map(text::plain)
+        .collect::<Vec<_>>()
+        .join("\n");
+    for kept in [
+        "# st",
+        "## Messages",
+        "`<smalltalk-message>`, followed by a bounded preview.",
+        "it prints nothing, st did not start the session and nothing here applies.",
+    ] {
+        assert!(rendered.contains(kept), "lost {kept:?}: {rendered}");
+    }
+}
+
+#[test]
+fn exposed_timeline_variants_and_media_are_visible_without_unknown_payloads() {
+    let bodies = [
+        (
+            "status",
+            serde_json::json!({"status":"waiting","detail":"approval"}),
+        ),
+        (
+            "usage",
+            serde_json::json!({"semantics":"response","driver":"omp","input_tokens":12,"cost":0.25,"attribution":{"agent_id":"agent/a","mission_run_id":null,"generation_id":null,"step_id":null}}),
+        ),
+        (
+            "redaction",
+            serde_json::json!({"reason":"credential","withheld_bytes":42,"withheld_items":2}),
+        ),
+        (
+            "truncation",
+            serde_json::json!({"reason":"window","omitted_from_sequence":1,"omitted_to_sequence":9}),
+        ),
+        (
+            "truncation",
+            serde_json::json!({"reason":"the native transcript prefix is outside the bounded read window","omitted_from_sequence":0,"omitted_to_sequence":0}),
+        ),
+        ("future-secret", serde_json::json!({"secret":"must-not-render"})),
+        (
+            "content",
+            serde_json::json!({"media_type":"image/png","attachment_id":"attachment/safe"}),
+        ),
+        (
+            "error",
+            serde_json::json!({"code":"transcript-not-bound","message":"transcript not bound: path unknown","retryable":true,"details":{"not_yet":true}}),
+        ),
+    ];
+    let timeline = bodies
+        .iter()
+        .enumerate()
+        .map(|(index, (kind, body))| {
+            serde_json::from_value(serde_json::json!({
+                "id":format!("entry/{index}"),"sequence":index,"revision":1,
+                "timestamp":"2026-10-05T10:00:00Z","role":"assistant","final":true,
+                "type":kind,"body":body
+            }))
+            .unwrap()
+        })
+        .collect::<Vec<st3_client::TimelineEntry>>();
+    let rendered = adapt::conversation(&timeline, &Default::default());
+    let display = serde_json::to_string(&rendered).unwrap();
+    for visible in [
+        "waiting",
+        "approval",
+        "credential",
+        "42",
+        "window",
+        "1–9",
+        "future-secret",
+        "attachment/safe",
+        "image/png",
+        "transcript unavailable",
+        "Earlier history is not shown: st reads only the newest part",
+    ] {
+        assert!(display.contains(visible), "missing {visible}: {display}");
+    }
+    assert!(!display.contains("must-not-render"));
+    assert!(!display.contains("bounded read window"), "{display}");
+    assert!(!display.contains("nothing in the harness"));
+    assert_eq!(rendered.len(), timeline.len());
+}
+
+#[test]
+fn attachment_only_content_survives_for_each_native_role() {
+    for role in ["user", "system", "assistant", "tool", "future-role"] {
+        let entry = serde_json::from_value(serde_json::json!({
+            "id":"image","sequence":1,"revision":1,"timestamp":"2026-10-05T10:00:00Z",
+            "role":role,"final":true,"type":"content",
+            "body":{"media_type":"image/png","attachment_id":"attachment/safe"}
+        }))
+        .unwrap();
+        let rendered = adapt::conversation(&[entry], &Default::default());
+        let display = serde_json::to_string(&rendered).unwrap();
+        assert!(display.contains("attachment/safe"), "{role}: {display}");
+    }
+}
+
+#[test]
+fn only_structural_delivery_envelopes_split_harness_content() {
+    let envelope = "<smalltalk-message id=\"a1\" from=\"person/example\" to=\"agent/example/quay\" subject=\"Keys &amp; locks\" sha256=\"00\" graph=\"message/a1\">\nRotate &lt;all&gt; keys.\n</smalltalk-message>";
+    for raw in [
+        "A quoted `<smalltalk-message>` stays here.".to_owned(),
+        "<smalltalk-message>\nordinary text\n</smalltalk-message>".to_owned(),
+        envelope.replace("graph=\"message/a1\"", "graph=\"message/other\""),
+        envelope.replace(" sha256=\"00\"", ""),
+        format!("An example: `{envelope}`"),
+        format!("```xml\n{envelope}\n```"),
+        format!("~~~xml\n{envelope}\n~~~"),
+        envelope
+            .lines()
+            .map(|line| format!("    {line}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        "Mention `<channel>` in prose.".to_owned(),
+    ] {
+        let bodies = adapt::from_harness(true, &raw, &Default::default());
+        assert!(
+            matches!(&bodies[..], [Body::User(text)] if text == raw.trim()),
+            "{bodies:?}"
+        );
+    }
+    // An invalid quoted head must not steal the attributes of a later real delivery.
+    let raw = format!("Mention `<smalltalk-message>` here.\n{envelope}");
+    let bodies = adapt::from_harness(true, &raw, &Default::default());
+    assert!(
+        matches!(&bodies[..], [Body::User(_), Body::Mail { from, subject, body, .. }]
+        if from == "person/example" && subject == "Keys & locks" && body == "Rotate <all> keys."),
+        "{bodies:?}"
+    );
+    let shown = std::collections::BTreeSet::from(["message/a1".into()]);
+    assert!(adapt::from_harness(true, envelope, &shown).is_empty());
+}
+
+#[test]
+fn skill_expansions_match_the_pending_name_in_this_turn() {
+    let timeline: Vec<st3_client::TimelineEntry> = serde_json::from_str(include_str!(
+        "../../../fixtures/clients/transcripts/claude-skill.json"
+    ))
+    .unwrap();
+    let mut other = timeline.clone();
+    if let st3_client::TimelineBody::ToolCall(call) = &mut other[0].body {
+        call.arguments = serde_json::json!({"skill": "another"});
+    }
+    let entries = adapt::conversation(&other, &Default::default());
+    assert!(
+        entries
+            .iter()
+            .any(|entry| matches!(&entry.body, Body::User(_)))
+    );
+    // A later turn's content must not attach to a stale call.
+    let mut later = timeline.clone();
+    later.insert(2, timeline[3].clone());
+    let entries = adapt::conversation(&later, &Default::default());
+    assert!(
+        entries
+            .iter()
+            .any(|entry| matches!(&entry.body, Body::User(_)))
+    );
+    // A later tool result must not overwrite the loaded body.
+    let mut reordered = timeline.clone();
+    reordered.swap(1, 2);
+    let entries = adapt::conversation(&reordered, &Default::default());
+    assert!(matches!(&entries[0].body, Body::Tool { output, .. }
+        if output.iter().any(|line| line == "## Messages")));
+    // Plugin names carry a namespace while the base directory uses the skill basename.
+    let mut plugin = timeline.clone();
+    if let st3_client::TimelineBody::ToolCall(call) = &mut plugin[0].body {
+        call.arguments = serde_json::json!({"skill": "example:st"});
+    }
+    let entries = adapt::conversation(&plugin, &Default::default());
+    assert_eq!(entries.len(), 2);
+}
+
+#[test]
+#[cfg(feature = "ratatui")]
+fn wrapping_multiline_runs_preserves_blank_rows_styles_and_copy_boundaries() {
+    let rows = text::wrap(
+        &[
+            text::run(
+                "When\nit prints nothing\n\n",
+                ratatui::style::Style::default(),
+            ),
+            text::run(
+                "## Messages\nlast",
+                ratatui::style::Style::default().fg(Color::Blue),
+            ),
+        ],
+        14,
+        &[],
+        &[],
+        None,
+    );
+    assert!(rows.iter().all(|line| !text::plain(line).contains('\n')));
+    let selection = Selection {
+        pane: "example".into(),
+        anchor: (0, 0),
+        head: (rows.len() - 1, 100),
+    };
+    assert_eq!(
+        selection.text(&rows),
+        "When\nit prints nothing\n\n## Messages\nlast"
+    );
+    assert!(
+        rows.iter().any(|line| text::plain(line) == "## Messages"
+            && line.spans[0].style.fg == Some(Color::Blue))
+    );
+}
+
+#[test]
+fn attachment_only_mail_and_non_image_refs_remain_visible() {
+    let message: st3_client::TimelineEntry = serde_json::from_value(serde_json::json!({
+        "id":"mail","sequence":1,"revision":1,"timestamp":"2026-10-05T10:00:00Z",
+        "role":"user","final":true,"type":"message",
+        "body":{"message_id":"message/media","role":"user","from":"person/ada","to":"agent/a",
+            "attachments":[{"blob":"blob/safe-hash","origin":"host/test","sha256":"safe-hash","media_type":"application/pdf","name":"document.pdf","size":12}]}
+    }))
+    .unwrap();
+    let standalone = adapt::conversation(std::slice::from_ref(&message), &Default::default());
+    let display = serde_json::to_string(&standalone).unwrap();
+    assert!(display.contains("safe-hash") && display.contains("application/pdf"));
+    let content = item("content", 2, 1, "");
+    let paired = adapt::conversation(&[message, content], &Default::default());
+    assert!(matches!(&paired[0].body, Body::Mail { body, .. } if body.contains("safe-hash")));
+}
+
+#[test]
+fn pending_binding_preserves_authorized_activity_without_claiming_an_empty_harness() {
+    let activity = item("activity", 1, 1, "Captured activity");
+    let mail = serde_json::from_value(serde_json::json!({
+        "id":"mail","sequence":2,"revision":1,"timestamp":"2026-10-05T10:00:00Z",
+        "role":"user","final":true,"type":"message",
+        "body":{"message_id":"message/status","from":"person/ada","to":"agent/a","title":"Status?"}
+    }))
+    .unwrap();
+    let text = item("mail-content", 3, 1, "How is the audit going?");
+    let notice = serde_json::from_value(serde_json::json!({
+        "id":"notice","sequence":4,"revision":1,"timestamp":"2026-10-05T10:00:01Z",
+        "role":"system","final":true,"type":"error",
+        "body":{"code":"transcript-not-bound","message":"transcript not bound: path unknown",
+            "retryable":true,"details":{"not_yet":true}}
+    }))
+    .unwrap();
+    let timeline = [activity, mail, text, notice];
+    assert!(adapt::unreadable_transcript(&timeline).is_none());
+    let rendered = adapt::conversation(&timeline, &Default::default());
+    assert!(matches!(&rendered[0].body, Body::Assistant(text) if text == "Captured activity"));
+    assert!(matches!(&rendered[1].body, Body::Mail { body, .. } if body == "How is the audit going?"));
+    let Body::Event(availability) = &rendered[2].body else {
+        panic!("{rendered:?}");
+    };
+    assert!(availability.contains("unavailable"));
+    assert!(!availability.contains("nothing"));
+}
+
+fn review_entry(kind: &str, role: &str, body: serde_json::Value) -> st3_client::TimelineEntry {
+    serde_json::from_value(serde_json::json!({
+        "id":kind,"sequence":1,"revision":1,"timestamp":"2026-10-05T10:00:00Z",
+        "role":role,"final":true,"type":kind,"body":body
+    }))
+    .unwrap()
+}
+
+#[test]
+fn review_usage_is_compact_and_preserves_supplied_tokens_cost_and_semantics() {
+    for (body, expected) in [
+        (serde_json::json!({"semantics":"response","driver":"omp","input_tokens":12,"output_tokens":5,"cached_tokens":3,"cache_write_tokens":2,"total_tokens":22,"cost":0.25,"currency":"USD"}),
+            "usage: response · input 12 · output 5 · cached 3 · cache write 2 · total 22 · cost USD 0.25"),
+        (serde_json::json!({"semantics":"context_occupancy","driver":"omp","context_used_tokens":0,"context_window_tokens":100}),
+            "usage: context occupancy · context used 0 · context window 100"),
+        (serde_json::json!({"semantics":"session_cumulative","driver":"omp","cost":0}),
+            "usage: session cumulative · cost 0 (currency unknown)"),
+        (serde_json::json!({"semantics":"future","driver":"omp"}),
+            "usage: unknown"),
+    ] {
+        let mut body = body;
+        body["attribution"] = serde_json::json!({"agent_id":"ATTRIBUTION_SENTINEL","mission_run_id":"MISSION_SENTINEL","generation_id":null,"step_id":null});
+        let rendered = adapt::conversation(&[review_entry("usage", "assistant", body)], &Default::default());
+        assert!(matches!(&rendered[..], [Entry { body: Body::Event(line), .. }] if line == expected), "{rendered:?}");
+    }
+}
+
+#[test]
+fn review_unknown_role_content_has_no_blank_event_or_unrecognized_payload() {
+    for text in [None, Some(""), Some(" \n\t")] {
+        let entry = review_entry("content", "future-role", serde_json::json!({
+            "media_type":"text/plain","text":text
+        }));
+        assert!(adapt::conversation(&[entry], &Default::default()).is_empty());
+    }
+    let entry = review_entry("content", "future-role", serde_json::json!({
+        "media_type":"image/png","text":"UNRECOGNIZED_PAYLOAD","attachment_id":"attachment/safe"
+    }));
+    let rendered = adapt::conversation(&[entry], &Default::default());
+    let display = serde_json::to_string(&rendered).unwrap();
+    assert!(display.contains("attachment/safe"));
+    assert!(!display.contains("UNRECOGNIZED_PAYLOAD"));
+    let entry = review_entry("content", "future-role", serde_json::json!({
+        "media_type":"text/plain","text":"UNRECOGNIZED_PAYLOAD"
+    }));
+    let rendered = adapt::conversation(&[entry], &Default::default());
+    let display = serde_json::to_string(&rendered).unwrap();
+    assert!(display.contains("content not displayed"));
+    assert!(!display.contains("UNRECOGNIZED_PAYLOAD"));
+}
+
+#[test]
+fn review_delayed_mail_content_contains_each_media_ref_once() {
+    let message = review_entry("message", "user", serde_json::json!({
+        "message_id":"message/media","from":"person/ada","to":"agent/a",
+        "attachments":[{"blob":"blob/hash","origin":"host/test","sha256":"hash","media_type":"application/pdf","size":12}]
+    }));
+    let status = review_entry("status", "system", serde_json::json!({"status":"running"}));
+    for attachment_id in [None, Some("blob/hash"), Some("hash")] {
+        let content = review_entry("content", "user", serde_json::json!({
+            "media_type":"application/pdf","text":"Document attached","attachment_id":attachment_id
+        }));
+        let rendered = adapt::conversation(
+            &[message.clone(), status.clone(), content],
+            &Default::default(),
+        );
+        let mail = rendered
+            .iter()
+            .find_map(|entry| match &entry.body {
+                Body::Mail { body, .. } => Some(body),
+                _ => None,
+            })
+            .expect("delayed content stays associated with its mail envelope");
+        assert!(mail.contains("Document attached") && mail.contains("application/pdf"));
+        assert_eq!(
+            serde_json::to_string(&rendered).unwrap().matches("hash").count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn review_unknown_type_and_diagnostics_are_bounded_on_unicode_boundaries() {
+    let unknown = review_entry(&"界".repeat(1000), "system", serde_json::json!({"secret":"SENTINEL"}));
+    let rendered = adapt::conversation(&[unknown], &Default::default());
+    assert!(matches!(&rendered[0].body, Body::Event(line)
+        if line.contains('…') && line.matches('界').count() == 64));
+    for (code, details) in [
+        ("transcript-not-bound", serde_json::json!({"not_yet":true})),
+        ("transcript-not-bound", serde_json::json!({})),
+        ("other", serde_json::json!({"severity":"warning"})),
+        ("other", serde_json::json!({})),
+    ] {
+        let entry = review_entry("error", "system", serde_json::json!({
+            "code":code,"message":"界".repeat(1000),"retryable":true,"details":details
+        }));
+        let rendered = adapt::conversation(std::slice::from_ref(&entry), &Default::default());
+        assert!(matches!(&rendered[0].body, Body::Event(line)
+            if line.contains('…') && line.matches('界').count() == 256));
+        if let Some(unavailable) = adapt::unreadable_transcript(&[entry]) {
+            assert!(unavailable.contains('…') && unavailable.chars().count() < 300);
+        }
+    }
+    for message in ["界".repeat(256), "line one\nline two".into()] {
+        let entry = review_entry("error", "system", serde_json::json!({
+            "code":"other","message":message,"retryable":true,"details":{"severity":"warning"}
+        }));
+        let rendered = adapt::conversation(&[entry], &Default::default());
+        assert!(matches!(&rendered[0].body, Body::Event(line) if line == &message));
+    }
+}
+
+#[test]
+fn review_unpaired_mail_refs_do_not_leak_into_the_next_envelope() {
+    let first = review_entry("message", "user", serde_json::json!({
+        "message_id":"message/first","from":"person/ada","to":"agent/a",
+        "attachments":[{"blob":"blob/old","origin":"host/test","sha256":"old","media_type":"application/pdf","size":12}]
+    }));
+    let second = review_entry("message", "user", serde_json::json!({
+        "message_id":"message/second","from":"person/ada","to":"agent/a"
+    }));
+    let content = review_entry("content", "user", serde_json::json!({
+        "media_type":"text/plain","text":"Second message"
+    }));
+    let rendered = adapt::conversation(&[first, second, content], &Default::default());
+    assert!(matches!(&rendered[..], [
+        Entry { id: first, body: Body::Event(refs), .. },
+        Entry { id: second, body: Body::Mail { body, .. }, .. }
+    ] if first == "message/first" && refs.contains("application/pdf") && second == "message/second" && body == "Second message"), "{rendered:?}");
 }

@@ -92,6 +92,42 @@ pub fn world() -> World {
         quiet_missions: 6,
         usage: Load::Ready(usage()),
         usage_limits: usage_limits(),
+        agent_messages: None,
+        clients: Load::Ready(vec![
+            Connected {
+                client: s("stui 0.1.0+1ecae71"),
+                who: s("person/robin"),
+                device: None,
+                member: s("lark"),
+                via: s("local"),
+                connected: true,
+                when: s("since 2h"),
+                follows: vec![s("glass:main"), s("conversation:agent/lark/planner")],
+                older: false,
+            },
+            Connected {
+                client: s("smalltalk-ios 1.0 (42)"),
+                who: s("person/robin"),
+                device: Some(s("Robin's phone")),
+                member: s("lark"),
+                via: s("gateway"),
+                connected: true,
+                when: s("since 12m"),
+                follows: vec![s("now"), s("terminal:terminal/agent/lark/planner")],
+                older: false,
+            },
+            Connected {
+                client: s("stui 0.0.9+77d0a13"),
+                who: s("person/robin"),
+                device: None,
+                member: s("lark"),
+                via: s("tailscale"),
+                connected: false,
+                when: s("seen 3m ago"),
+                follows: Vec::new(),
+                older: true,
+            },
+        ]),
     }
 }
 
@@ -112,6 +148,8 @@ pub fn loading() -> World {
         quiet_missions: 0,
         usage: Load::Loading,
         usage_limits: Vec::new(),
+        agent_messages: None,
+        clients: Load::Loading,
     }
 }
 
@@ -124,6 +162,7 @@ fn usage_limits() -> Vec<st3_client::UsageLimit> {
         st3_client::UsageLimit {
             account: s("anthropic"),
             account_ref: None,
+            identified: Some(true),
             driver: s("claude"),
             plan: Some(s("max")),
             five_hour_percent: Some(41.0),
@@ -138,6 +177,7 @@ fn usage_limits() -> Vec<st3_client::UsageLimit> {
         st3_client::UsageLimit {
             account: s("openai"),
             account_ref: None,
+            identified: Some(true),
             driver: s("codex"),
             plan: None,
             five_hour_percent: None,
@@ -173,6 +213,8 @@ fn usage() -> Vec<st3_client::UsageRow> {
         })),
         host: Some(s(host)),
         pricing: Some(s("list-2026-10-02")),
+        native_session_id: None,
+        pricing_provenance: None,
         total_tokens: tokens,
         input_tokens: tokens / 50,
         output_tokens: output,
@@ -262,6 +304,7 @@ fn attention() -> Vec<Attention> {
             actions: vec![],
             related: vec![],
             raised_by: None,
+            blocked: None,
             kind: AttentionKind::Review {
                 question: s(
                     "The row counts agree and the contract check passed. Cut over to the new store?",
@@ -295,6 +338,7 @@ fn attention() -> Vec<Attention> {
             actions: vec![],
             related: vec![],
             raised_by: None,
+            blocked: None,
             kind: AttentionKind::Feedback {
                 question: s(
                     "Here is the draft of the pricing page. What should change before it goes live?",
@@ -323,6 +367,7 @@ fn attention() -> Vec<Attention> {
             actions: vec![],
             related: vec![],
             raised_by: None,
+            blocked: None,
             kind: AttentionKind::Launch {
                 planner: s("Planner"),
                 name: s("harbor/nightly-audit"),
@@ -385,6 +430,7 @@ fn attention() -> Vec<Attention> {
             actions: vec![],
             related: vec![],
             raised_by: None,
+            blocked: None,
             kind: AttentionKind::Fault {
                 what: s(
                     "Release Captain exited 4 times in 10 minutes and st stopped restarting it.",
@@ -407,6 +453,7 @@ fn attention() -> Vec<Attention> {
             actions: vec![],
             related: vec![],
             raised_by: None,
+            blocked: None,
             kind: AttentionKind::Revision {
                 reason: s(
                     "A key rotated mid-run last week and nobody noticed. An audit step would catch it.",
@@ -434,6 +481,7 @@ fn attention() -> Vec<Attention> {
             actions: vec![],
             related: vec![],
             raised_by: None,
+            blocked: None,
             kind: AttentionKind::Message {
                 from: s("Chief of Staff"),
                 body: s(
@@ -609,6 +657,8 @@ fn agents() -> Vec<Agent> {
             runtime: Some(s("running · incarnation 3")),
             fault: None,
             under: None,
+            model: Some(s("claude-sonnet-5-5")),
+            progress: None,
         };
     list[0].details = detail(
         "Cut over to the new store once a person approves.",
@@ -634,6 +684,8 @@ fn agents() -> Vec<Agent> {
         runtime: Some(s("restarts paused")),
         fault: Some(s("401 Unauthorized: the API key expired at 08:40.")),
         under: None,
+        model: Some(s("gpt-5.5-codex")),
+        progress: None,
     };
     list[3].details = detail(
         "Keep Robin's fleet moving; answer questions.",
@@ -806,6 +858,7 @@ fn all_missions() -> Vec<Mission> {
             kdl: Some(s(ATLAS_KDL)),
             outcome: None,
             updated_at: String::new(),
+            step_metadata: Default::default(),
         },
         Mission {
             id: s("mission/fleet/site/pricing-page"),
@@ -840,6 +893,7 @@ fn all_missions() -> Vec<Mission> {
             kdl: None,
             outcome: None,
             updated_at: String::new(),
+            step_metadata: Default::default(),
         },
         Mission {
             id: s("mission/fleet/release/weekly"),
@@ -882,6 +936,7 @@ fn all_missions() -> Vec<Mission> {
             kdl: None,
             outcome: None,
             updated_at: String::new(),
+            step_metadata: Default::default(),
         },
         Mission {
             id: s("mission/fleet/harbor/pull-request-review"),
@@ -916,6 +971,7 @@ fn all_missions() -> Vec<Mission> {
             kdl: None,
             outcome: None,
             updated_at: String::new(),
+            step_metadata: Default::default(),
         },
         Mission {
             id: s("mission/fleet/rekey"),
@@ -960,6 +1016,7 @@ fn all_missions() -> Vec<Mission> {
             kdl: None,
             outcome: None,
             updated_at: String::new(),
+            step_metadata: Default::default(),
         },
         Mission {
             id: s("mission/fleet/docs/handbook"),
@@ -986,6 +1043,7 @@ fn all_missions() -> Vec<Mission> {
             kdl: None,
             outcome: None,
             updated_at: String::new(),
+            step_metadata: Default::default(),
         },
         Mission {
             id: s("mission/fleet/atlas/nightly"),
@@ -1020,6 +1078,7 @@ fn all_missions() -> Vec<Mission> {
             kdl: None,
             outcome: None,
             updated_at: String::new(),
+            step_metadata: Default::default(),
         },
     ]
 }

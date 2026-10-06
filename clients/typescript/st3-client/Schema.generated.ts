@@ -179,7 +179,7 @@ export const ActionCommon = /*#__PURE__*/ (() => Schema.Struct({
   "id": Id,
   "idempotency_key": Schema.String.check(Schema.isMinLength(16)).check(Schema.isMaxLength(256)).pipe(Schema.brand("st3/IdempotencyKey")),
   "parameters": Schema.Record(Schema.String, Schema.Unknown),
-  "type": Schema.Literals(["attention.resolve","review.approve","review.reject","review.request-changes","message.send","message.read","message.close","launch.create","launch.revise","launch.preview","launch.approve","launch.cancel","mission.start","mission.revise","mission.approve-revision","mission.cancel-revision","mission.cancel","session.import","work.ask","work.done","work.cancel-ask","work.claim","work.renew","work.progress","work.complete","work.fail","work.release","work.retry","work.publish-mission","agent.create","agent.stop","agent.start","agent.suspend","agent.resume","terminal.create","terminal.end","agent.queue-move","lane.join","lane.leave","lane.move","lane.mark","lane.approve","runtime.stop","runtime.restart","runtime.reset","runtime.context-clear","runtime.signal","terminal.input","terminal.resize","terminal.attach","terminal.detach","pairing.revoke"])
+  "type": Schema.Literals(["arrangement.edit","custom.reply","attention.resolve","review.approve","review.reject","review.request-changes","message.send","message.read","message.close","launch.create","launch.revise","launch.preview","launch.approve","launch.cancel","mission.start","mission.revise","mission.approve-revision","mission.cancel-revision","mission.cancel","session.import","work.ask","work.done","work.cancel-ask","work.claim","work.renew","work.progress","work.complete","work.fail","work.release","work.retry","work.publish-mission","agent.create","agent.stop","agent.start","agent.suspend","agent.resume","terminal.create","terminal.end","agent.queue-move","lane.join","lane.leave","lane.move","lane.mark","lane.approve","runtime.stop","runtime.restart","runtime.reset","runtime.context-clear","runtime.signal","terminal.input","terminal.resize","terminal.attach","terminal.detach","pairing.revoke"])
 }).annotate({ identifier: "ActionCommon" }))()
 export type ActionCommon = typeof ActionCommon.Type
 export type ActionCommonEncoded = typeof ActionCommon.Encoded
@@ -202,7 +202,8 @@ export type AgentCreateParameters = typeof AgentCreateParameters.Type
 export type AgentCreateParametersEncoded = typeof AgentCreateParameters.Encoded
 
 export const AgentResumeParameters = /*#__PURE__*/ (() => Schema.Struct({
-  "agent": Id
+  "agent": Id,
+  "host": optionalKey(Schema.String.check(Schema.isMinLength(1)))
 }).annotate({ identifier: "AgentResumeParameters" }))()
 export type AgentResumeParameters = typeof AgentResumeParameters.Type
 export type AgentResumeParametersEncoded = typeof AgentResumeParameters.Encoded
@@ -227,6 +228,54 @@ export const AgentSuspendParameters = /*#__PURE__*/ (() => Schema.Struct({
 export type AgentSuspendParameters = typeof AgentSuspendParameters.Type
 export type AgentSuspendParametersEncoded = typeof AgentSuspendParameters.Encoded
 
+export const ArrangementId = /*#__PURE__*/ (() => Schema.String.check(Schema.isPattern(new RegExp("^arrangement/person/[^/\\s]+/[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", "u"))).annotate({ identifier: "ArrangementId" }))()
+export type ArrangementId = typeof ArrangementId.Type
+export type ArrangementIdEncoded = typeof ArrangementId.Encoded
+
+export const ArrangementFolderId = /*#__PURE__*/ (() => Schema.String.check(Schema.isPattern(new RegExp("^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", "u"))).annotate({ identifier: "ArrangementFolderId" }))()
+export type ArrangementFolderId = typeof ArrangementFolderId.Type
+export type ArrangementFolderIdEncoded = typeof ArrangementFolderId.Encoded
+
+/** Canonical base-62 fractional-indexing key. Admission validates integer-part length and nonzero-ending fractional suffix, not merely this lexical envelope. */
+export const ArrangementKey = /*#__PURE__*/ (() => Schema.String.check(Schema.isPattern(new RegExp("^[A-Za-z][0-9A-Za-z]+$", "u"))).check(Schema.isMinLength(2)).check(Schema.isMaxLength(128)).annotate({ identifier: "ArrangementKey", description: "Canonical base-62 fractional-indexing key. Admission validates integer-part length and nonzero-ending fractional suffix, not merely this lexical envelope." }))()
+export type ArrangementKey = typeof ArrangementKey.Type
+export type ArrangementKeyEncoded = typeof ArrangementKey.Encoded
+
+/** Nonblank name; admission additionally enforces 256 UTF-8 bytes. */
+export const ArrangementName = /*#__PURE__*/ (() => Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(256)).annotate({ identifier: "ArrangementName", description: "Nonblank name; admission additionally enforces 256 UTF-8 bytes." }))()
+export type ArrangementName = typeof ArrangementName.Type
+export type ArrangementNameEncoded = typeof ArrangementName.Encoded
+
+/** Registered stable graph subject; pty and session subjects are not sidebar placement identities. */
+export const ArrangementSubject = /*#__PURE__*/ (() => Schema.String.check(Schema.isPattern(new RegExp("^(?!pty/|session/)[a-z][a-z0-9-]*/[^\\s]+$", "u"))).annotate({ identifier: "ArrangementSubject", description: "Registered stable graph subject; pty and session subjects are not sidebar placement identities." }))()
+export type ArrangementSubject = typeof ArrangementSubject.Type
+export type ArrangementSubjectEncoded = typeof ArrangementSubject.Encoded
+
+export const ArrangementOperation = /*#__PURE__*/ (() => Schema.Union([
+  Schema.Struct({ "name": ArrangementName, "op": Schema.Literal("create") }),
+  Schema.Struct({ "name": ArrangementName, "op": Schema.Literal("rename") }),
+  Schema.Struct({ "id": ArrangementFolderId, "key": ArrangementKey, "name": ArrangementName, "op": Schema.Literal("folder.create"), "parent": Schema.OptionFromNullOr(ArrangementFolderId) }),
+  Schema.Struct({ "id": ArrangementFolderId, "name": ArrangementName, "op": Schema.Literal("folder.rename") }),
+  Schema.Struct({ "id": ArrangementFolderId, "key": ArrangementKey, "op": Schema.Literal("folder.move"), "parent": Schema.OptionFromNullOr(ArrangementFolderId) }),
+  Schema.Struct({ "id": ArrangementFolderId, "op": Schema.Literal("folder.delete") }),
+  Schema.Struct({ "folder": Schema.OptionFromNullOr(ArrangementFolderId), "key": ArrangementKey, "op": Schema.Literal("subject.place"), "subject": ArrangementSubject }),
+  Schema.Struct({ "op": Schema.Literal("retire") })
+], { mode: "oneOf" }).pipe(Schema.toTaggedUnion("op")).annotate({ identifier: "ArrangementOperation" }))()
+export type ArrangementOperation = typeof ArrangementOperation.Type
+export type ArrangementOperationEncoded = typeof ArrangementOperation.Encoded
+
+export const ArrangementPerson = /*#__PURE__*/ (() => Schema.String.check(Schema.isPattern(new RegExp("^person/[^/\\s]+$", "u"))).annotate({ identifier: "ArrangementPerson" }))()
+export type ArrangementPerson = typeof ArrangementPerson.Type
+export type ArrangementPersonEncoded = typeof ArrangementPerson.Encoded
+
+export const ArrangementEditParameters = /*#__PURE__*/ (() => Schema.Struct({
+  "operations": Schema.Array(ArrangementOperation).check(Schema.isMinLength(1)).check(Schema.isMaxLength(1024)),
+  "owner": ArrangementPerson,
+  "subject": ArrangementId
+}).annotate({ identifier: "ArrangementEditParameters" }))()
+export type ArrangementEditParameters = typeof ArrangementEditParameters.Type
+export type ArrangementEditParametersEncoded = typeof ArrangementEditParameters.Encoded
+
 export const AttachmentInput = /*#__PURE__*/ (() => Schema.Struct({
   "blob": Schema.String.check(Schema.isPattern(new RegExp("^blob/[0-9a-f]{64}$", "u"))),
   "media_type": Schema.Literals(["image/png","image/jpeg","image/gif","image/webp"]),
@@ -234,6 +283,16 @@ export const AttachmentInput = /*#__PURE__*/ (() => Schema.Struct({
 }).annotate({ identifier: "AttachmentInput" }))()
 export type AttachmentInput = typeof AttachmentInput.Type
 export type AttachmentInputEncoded = typeof AttachmentInput.Encoded
+
+export const CustomReplyParameters = /*#__PURE__*/ (() => Schema.Struct({
+  "episode": Schema.String,
+  "fields": Schema.Record(Schema.String, Schema.Unknown),
+  "registration": Schema.String,
+  "revision": Schema.String,
+  "target_id": Id
+}).annotate({ identifier: "CustomReplyParameters" }))()
+export type CustomReplyParameters = typeof CustomReplyParameters.Type
+export type CustomReplyParametersEncoded = typeof CustomReplyParameters.Encoded
 
 export const DeviceSignature = /*#__PURE__*/ (() => Schema.Struct({
   "chain": Schema.Array(Schema.String),
@@ -338,6 +397,8 @@ export type TerminalCreateParameters = typeof TerminalCreateParameters.Type
 export type TerminalCreateParametersEncoded = typeof TerminalCreateParameters.Encoded
 
 export const ActionRequest = /*#__PURE__*/ (() => Schema.Union([
+  Schema.Struct({ "api_version": Schema.Literal("st3.client.v0"), "fence": Fence, "id": Id, "idempotency_key": Schema.String.check(Schema.isMinLength(16)).check(Schema.isMaxLength(256)).pipe(Schema.brand("st3/IdempotencyKey")), "parameters": ArrangementEditParameters, "type": Schema.Literal("arrangement.edit") }),
+  Schema.Struct({ "api_version": Schema.Literal("st3.client.v0"), "fence": Fence, "id": Id, "idempotency_key": Schema.String.check(Schema.isMinLength(16)).check(Schema.isMaxLength(256)).pipe(Schema.brand("st3/IdempotencyKey")), "parameters": CustomReplyParameters, "type": Schema.Literal("custom.reply") }),
   Schema.Struct({ "api_version": Schema.Literal("st3.client.v0"), "fence": Fence, "id": Id, "idempotency_key": Schema.String.check(Schema.isMinLength(16)).check(Schema.isMaxLength(256)).pipe(Schema.brand("st3/IdempotencyKey")), "parameters": AgentCreateParameters, "type": Schema.Literal("agent.create") }),
   Schema.Struct({ "api_version": Schema.Literal("st3.client.v0"), /** The snapshot and exact mutable identities the user acted on; echoed byte-identically in actions. */
 "fence": Schema.Struct({ "attempt": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "mission_generation": optionalKey(RunGenerationId), "preview_token": optionalKey(Schema.String.check(Schema.isPattern(new RegExp("^lpv0:[0-9a-f]{64}$", "u"))).pipe(Schema.brand("st3/PreviewToken"))), "readiness_epoch": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "runtime_desired_revision": Schema.String, "runtime_incarnation": optionalKey(Schema.String), "snapshot_id": SnapshotId, "step_definition": optionalKey(Revision), "subject_revisions": Schema.Record(Schema.String, Revision).check(Schema.makeFilter((o: object) => Object.keys(o).every(Schema.is(Schema.String.check(Schema.isPattern(new RegExp("^[a-z][a-z0-9-]*/", "u"))))), { expected: "property names matching the schema" })), "terminal_sequence": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))) }).annotate({ description: "The snapshot and exact mutable identities the user acted on; echoed byte-identically in actions." }), "id": Id, "idempotency_key": Schema.String.check(Schema.isMinLength(16)).check(Schema.isMaxLength(256)).pipe(Schema.brand("st3/IdempotencyKey")), "parameters": AgentStopParameters, "type": Schema.Literal("agent.stop") }),
@@ -421,6 +482,7 @@ export type TerminalAttachmentEncoded = typeof TerminalAttachment.Encoded
 export const ActionResult = /*#__PURE__*/ (() => Schema.Struct({
   "action_id": Id,
   "affected_ids": Schema.Array(Id).check(Schema.isUnique()),
+  "arrangement_revision": optionalKey(Revision),
   "kind": Schema.Literal("action-result"),
   "operation_id": Id,
   "snapshot_id": Id,
@@ -507,6 +569,7 @@ export const AgentSuspension = /*#__PURE__*/ (() => Schema.Struct({
   /** Stable reason the last suspend or resume failed, such as not-quiescent, native-session-mismatch or native-resume-unavailable. */
   "code": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE).annotate({ description: "Stable reason the last suspend or resume failed, such as not-quiescent, native-session-mismatch or native-resume-unavailable." }),
   "harness": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
+  "host": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
   /** The suspended incarnation, or the one a completed resume launched. */
   "incarnation_id": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE).annotate({ description: "The suspended incarnation, or the one a completed resume launched." }),
   /** The harness's own session the seat suspended on and resumes. */
@@ -514,8 +577,9 @@ export const AgentSuspension = /*#__PURE__*/ (() => Schema.Struct({
   /** The request claim; each phase change is a change of this agent. */
   "operation_id": Schema.String.annotate({ description: "The request claim; each phase change is a change of this agent." }),
   /** suspend: quiescing, snapshotting, suspended, or failed (refused; the seat keeps running). resume: restoring, verifying, resumed; a failed resume returns to suspended with code and reason. */
-  "phase": Schema.Literals(["quiescing","snapshotting","suspended","failed","restoring","verifying","resumed"]).annotate({ description: "suspend: quiescing, snapshotting, suspended, or failed (refused; the seat keeps running). resume: restoring, verifying, resumed; a failed resume returns to suspended with code and reason." }),
+  "phase": Schema.Literals(["quiescing","snapshotting","suspended","failed","fencing-source","transferring","restoring","verifying","resumed"]).annotate({ description: "suspend: quiescing, snapshotting, suspended, or failed (refused; the seat keeps running). resume: restoring, verifying, resumed; a failed resume returns to suspended with code and reason." }),
   "reason": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
+  "source_host": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
   "suspended_at": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE),
   "updated_at": Timestamp
 }).annotate({ identifier: "AgentSuspension" }))()
@@ -664,7 +728,10 @@ export const Agent = /*#__PURE__*/ (() => Schema.Struct({
   "fault": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE).annotate({ description: "Current member reconcile failure; cleared by a successful pass." }),
   /** Placement handoff phase; the destination waits for former hosts to acknowledge their stopped runtimes. */
   "handoff": Schema.OptionFromOptionalNullOr(AgentHandoff, NULL_NONE).annotate({ description: "Placement handoff phase; the destination waits for former hosts to acknowledge their stopped runtimes." }),
-  "harness_state": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
+  /** Known actionable harness error: needs-login. Login keeps the legacy unauthenticated harness_state for older clients; older daemons omit this optional detail. */
+  "harness_error_state": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE).annotate({ description: "Known actionable harness error: needs-login. Login keeps the legacy unauthenticated harness_state for older clients; older daemons omit this optional detail." }),
+  /** Observed harness state; stale idle is indeterminate. Desired state and declared work status remain separate. */
+  "harness_state": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE).annotate({ description: "Observed harness state; stale idle is indeterminate. Desired state and declared work status remain separate." }),
   "host_id": Schema.OptionFromOptionalNullOr(HostId, NULL_NONE),
   "id": AgentId,
   "incarnation_id": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
@@ -673,6 +740,8 @@ export const Agent = /*#__PURE__*/ (() => Schema.Struct({
   "name": Schema.String,
   "next_work": Schema.OptionFromOptionalNullOr(WorkLabel, NULL_NONE),
   "next_work_id": Schema.OptionFromOptionalNullOr(Id, NULL_NONE),
+  /** Stale after 90 seconds without a new observation; missing when this runtime has no observation. */
+  "observation": optionalKey(Schema.Literals(["current","stale","missing"])).annotate({ description: "Stale after 90 seconds without a new observation; missing when this runtime has no observation." }),
   "operational": optionalKey(Operational),
   "owner_run_id": Schema.OptionFromOptionalNullOr(MissionRunId, NULL_NONE),
   "queued_work_count": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
@@ -684,6 +753,8 @@ export const Agent = /*#__PURE__*/ (() => Schema.Struct({
   "rollout": Schema.OptionFromOptionalNullOr(Schema.Record(Schema.String, Schema.Unknown), NULL_NONE).annotate({ description: "Durable owned-seat cutover, incarnation and native-session fences, phase, deadline and blockers. Omitted by older daemons." }),
   "runtime_ids": Schema.Array(RuntimeId),
   "silent_since": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE),
+  /** When this observed state began in this runtime incarnation. Same-state observations never reset it. */
+  "since": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE).annotate({ description: "When this observed state began in this runtime incarnation. Same-state observations never reset it." }),
   "state": AgentState,
   /** The subagents this seat's harness runs now, oldest first: recorded, not ended, with a lease that runs past this read. An older daemon omits the field. */
   "subagents": optionalKey(Schema.Array(AgentSubagent)).annotate({ description: "The subagents this seat's harness runs now, oldest first: recorded, not ended, with a lease that runs past this read. An older daemon omits the field." }),
@@ -711,6 +782,33 @@ export const AgentDeclaration = /*#__PURE__*/ (() => Schema.Struct({
 }).annotate({ identifier: "AgentDeclaration" }))()
 export type AgentDeclaration = typeof AgentDeclaration.Type
 export type AgentDeclarationEncoded = typeof AgentDeclaration.Encoded
+
+export const AgentMessageDay = /*#__PURE__*/ (() => Schema.Struct({
+  "calibrated_messages": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "day_start_ms": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "high_microusd": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "high_percent": Schema.OptionFromOptionalNullOr(Schema.Number.check(Schema.isGreaterThanOrEqualTo(0)), NULL_NONE),
+  "low_microusd": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "low_percent": Schema.OptionFromOptionalNullOr(Schema.Number.check(Schema.isGreaterThanOrEqualTo(0)), NULL_NONE),
+  "messages": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "since_ms": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "unpriced_tokens": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "until_ms": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "usage_cost_microusd": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
+}).annotate({ identifier: "AgentMessageDay" }))()
+export type AgentMessageDay = typeof AgentMessageDay.Type
+export type AgentMessageDayEncoded = typeof AgentMessageDay.Encoded
+
+export const AgentMessageEstimate = /*#__PURE__*/ (() => Schema.Struct({
+  "calibration": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
+  "days": Schema.Array(AgentMessageDay),
+  "fallback_high_microusd": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "fallback_low_microusd": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "method": Schema.String,
+  "source": Schema.String
+}).annotate({ identifier: "AgentMessageEstimate" }))()
+export type AgentMessageEstimate = typeof AgentMessageEstimate.Type
+export type AgentMessageEstimateEncoded = typeof AgentMessageEstimate.Encoded
 
 export const AgentQueueMove = /*#__PURE__*/ (() => Schema.Struct({
   "actor_id": Schema.OptionFromNullOr(Id),
@@ -758,6 +856,149 @@ export const AgentRepository = /*#__PURE__*/ (() => Schema.Struct({
 export type AgentRepository = typeof AgentRepository.Type
 export type AgentRepositoryEncoded = typeof AgentRepository.Encoded
 
+export const AgentWorkspace = /*#__PURE__*/ (() => Schema.Struct({
+  "agent_id": AgentId,
+  /** Agent declaration supplying the workspace; reached through unambiguous stop predecessors. */
+  "declaration_token": Schema.String.annotate({ description: "Agent declaration supplying the workspace; reached through unambiguous stop predecessors." }),
+  /** Selected desired claim, including a stop when the seat is retired. */
+  "desired_token": Schema.String.annotate({ description: "Selected desired claim, including a stop when the seat is retired." }),
+  "host_id": HostId,
+  "kind": Schema.Literal("agent-workspace"),
+  /** Declared workspace directory on host_id, not the API gateway's filesystem or the harness's internal state directory. */
+  "workspace": Schema.String.annotate({ description: "Declared workspace directory on host_id, not the API gateway's filesystem or the harness's internal state directory." })
+}).annotate({ identifier: "AgentWorkspace" }))()
+export type AgentWorkspace = typeof AgentWorkspace.Type
+export type AgentWorkspaceEncoded = typeof AgentWorkspace.Encoded
+
+export const ArrangementNameRegister = /*#__PURE__*/ (() => Schema.Struct({
+  "revision": Revision,
+  "value": ArrangementName
+}).annotate({ identifier: "ArrangementNameRegister" }))()
+export type ArrangementNameRegister = typeof ArrangementNameRegister.Type
+export type ArrangementNameRegisterEncoded = typeof ArrangementNameRegister.Encoded
+
+export const ArrangementPosition = /*#__PURE__*/ (() => Schema.Struct({
+  "key": ArrangementKey,
+  "parent": Schema.OptionFromNullOr(ArrangementFolderId)
+}).annotate({ identifier: "ArrangementPosition" }))()
+export type ArrangementPosition = typeof ArrangementPosition.Type
+export type ArrangementPositionEncoded = typeof ArrangementPosition.Encoded
+
+export const ArrangementPositionRegister = /*#__PURE__*/ (() => Schema.Struct({
+  "revision": Revision,
+  "value": ArrangementPosition
+}).annotate({ identifier: "ArrangementPositionRegister" }))()
+export type ArrangementPositionRegister = typeof ArrangementPositionRegister.Type
+export type ArrangementPositionRegisterEncoded = typeof ArrangementPositionRegister.Encoded
+
+export const ArrangementTombstoneRegister = /*#__PURE__*/ (() => Schema.Struct({
+  "revision": Revision,
+  "value": Schema.Literal(true)
+}).annotate({ identifier: "ArrangementTombstoneRegister" }))()
+export type ArrangementTombstoneRegister = typeof ArrangementTombstoneRegister.Type
+export type ArrangementTombstoneRegisterEncoded = typeof ArrangementTombstoneRegister.Encoded
+
+export const ArrangementFolder = /*#__PURE__*/ (() => Schema.Struct({
+  "name": ArrangementNameRegister,
+  "position": ArrangementPositionRegister,
+  "tombstone": Schema.OptionFromNullOr(ArrangementTombstoneRegister)
+}).annotate({ identifier: "ArrangementFolder" }))()
+export type ArrangementFolder = typeof ArrangementFolder.Type
+export type ArrangementFolderEncoded = typeof ArrangementFolder.Encoded
+
+export const ArrangementPlacement = /*#__PURE__*/ (() => Schema.Struct({
+  "folder": Schema.OptionFromNullOr(ArrangementFolderId),
+  "key": ArrangementKey
+}).annotate({ identifier: "ArrangementPlacement" }))()
+export type ArrangementPlacement = typeof ArrangementPlacement.Type
+export type ArrangementPlacementEncoded = typeof ArrangementPlacement.Encoded
+
+export const ArrangementPlacementRegister = /*#__PURE__*/ (() => Schema.Struct({
+  "revision": Revision,
+  "value": ArrangementPlacement
+}).annotate({ identifier: "ArrangementPlacementRegister" }))()
+export type ArrangementPlacementRegister = typeof ArrangementPlacementRegister.Type
+export type ArrangementPlacementRegisterEncoded = typeof ArrangementPlacementRegister.Encoded
+
+export const ArrangementBody = /*#__PURE__*/ (() => Schema.Struct({
+  "folders": Schema.Record(Schema.String, ArrangementFolder).check(Schema.makeFilter((o: object) => Object.keys(o).every(Schema.is(ArrangementFolderId)), { expected: "property names matching the schema" })),
+  "name": ArrangementNameRegister,
+  "placements": Schema.Record(Schema.String, ArrangementPlacementRegister).check(Schema.makeFilter((o: object) => Object.keys(o).every(Schema.is(ArrangementSubject)), { expected: "property names matching the schema" })),
+  "version": Schema.Literal(1)
+}).annotate({ identifier: "ArrangementBody" }))()
+export type ArrangementBody = typeof ArrangementBody.Type
+export type ArrangementBodyEncoded = typeof ArrangementBody.Encoded
+
+export const ArrangementResolved = /*#__PURE__*/ (() => Schema.Struct({
+  "folders": Schema.Record(Schema.String, Schema.NullOr(ArrangementFolderId)),
+  "parents": Schema.Record(Schema.String, Schema.NullOr(ArrangementFolderId))
+}).annotate({ identifier: "ArrangementResolved" }))()
+export type ArrangementResolved = typeof ArrangementResolved.Type
+export type ArrangementResolvedEncoded = typeof ArrangementResolved.Encoded
+
+export const Arrangement = /*#__PURE__*/ (() => Schema.Struct({
+  "body": ArrangementBody,
+  "deleted": Schema.Literal(false),
+  "id": Id,
+  "kind": Schema.Literal("arrangement"),
+  "operational": optionalKey(Operational),
+  "owner": ArrangementPerson,
+  "resolved": optionalKey(ArrangementResolved),
+  "revision": Revision,
+  "updated_at": Timestamp
+}).annotate({ identifier: "Arrangement" }))()
+export type Arrangement = typeof Arrangement.Type
+export type ArrangementEncoded = typeof Arrangement.Encoded
+
+export const PageInfo = /*#__PURE__*/ (() => Schema.Struct({
+  "cursor_expires_at": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE),
+  "has_more": Schema.Boolean,
+  "limit": Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(Schema.isLessThanOrEqualTo(200)),
+  "next_cursor": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE)
+}).annotate({ identifier: "PageInfo" }))()
+export type PageInfo = typeof PageInfo.Type
+export type PageInfoEncoded = typeof PageInfo.Encoded
+
+export const ReplicatedNotice = /*#__PURE__*/ (() => Schema.Struct({
+  "complete": Schema.Boolean,
+  "owner_host_id": Id,
+  "reason": optionalKey(Schema.String),
+  "source": Schema.Literals(["owner","replica"]),
+  "state": Schema.Literals(["current","lagging","unverified"])
+}).annotate({ identifier: "ReplicatedNotice" }))()
+export type ReplicatedNotice = typeof ReplicatedNotice.Type
+export type ReplicatedNoticeEncoded = typeof ReplicatedNotice.Encoded
+
+export const SyncPeer = /*#__PURE__*/ (() => Schema.Struct({
+  "diverged_since": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE),
+  "estimated_catch_up_seconds": Schema.OptionFromOptionalNullOr(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)).pipe(Schema.decodeTo(Schema.Duration.check(durationSecondsRange), wholeUnits(1000))), NULL_NONE),
+  "host_id": Id,
+  "last_exchange_at": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE),
+  "local_only_envelopes": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "peer_only_envelopes": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
+}).annotate({ identifier: "SyncPeer" }))()
+export type SyncPeer = typeof SyncPeer.Type
+export type SyncPeerEncoded = typeof SyncPeer.Encoded
+
+export const SyncNotice = /*#__PURE__*/ (() => Schema.Struct({
+  "peers": Schema.Array(SyncPeer).check(Schema.isMinLength(1)),
+  "state": Schema.Literals(["catching-up","diverged"])
+}).annotate({ identifier: "SyncNotice" }))()
+export type SyncNotice = typeof SyncNotice.Type
+export type SyncNoticeEncoded = typeof SyncNotice.Encoded
+
+export const ArrangementPage = /*#__PURE__*/ (() => Schema.Struct({
+  "collection": Schema.Literal("arrangements"),
+  "filters": Schema.Record(Schema.String, Schema.String),
+  "items": Schema.Array(Arrangement),
+  "kind": Schema.Literal("page"),
+  "page": PageInfo,
+  "replicated": optionalKey(ReplicatedNotice),
+  "sync": optionalKey(SyncNotice)
+}).annotate({ identifier: "ArrangementPage" }))()
+export type ArrangementPage = typeof ArrangementPage.Type
+export type ArrangementPageEncoded = typeof ArrangementPage.Encoded
+
 export const Attachment = /*#__PURE__*/ (() => Schema.Struct({
   "blob": Schema.String.check(Schema.isPattern(new RegExp("^blob/[0-9a-f]{64}$", "u"))),
   "media_type": Schema.Literals(["image/png","image/jpeg","image/gif","image/webp"]),
@@ -768,6 +1009,18 @@ export const Attachment = /*#__PURE__*/ (() => Schema.Struct({
 }).annotate({ identifier: "Attachment" }))()
 export type Attachment = typeof Attachment.Type
 export type AttachmentEncoded = typeof Attachment.Encoded
+
+export const AttentionBlocked = /*#__PURE__*/ (() => Schema.Struct({
+  "attempt": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  /** What that step is for. */
+  "goal": Schema.String.annotate({ description: "What that step is for." }),
+  /** That step's name within its mission. */
+  "step": Schema.String.annotate({ description: "That step's name within its mission." }),
+  /** The step run that asked and waits for the answer. */
+  "step_run_id": Id
+}).annotate({ identifier: "AttentionBlocked" }))()
+export type AttentionBlocked = typeof AttentionBlocked.Type
+export type AttentionBlockedEncoded = typeof AttentionBlocked.Encoded
 
 export const AttentionTargetState = /*#__PURE__*/ (() => Schema.Struct({
   "id": Id,
@@ -802,9 +1055,13 @@ export type PersonUpdateEncoded = typeof PersonUpdate.Encoded
 
 export const Attention = /*#__PURE__*/ (() => Schema.Struct({
   "action_parameters": optionalKey(Schema.Record(Schema.String, Schema.Unknown)),
-  "actions": Schema.Array(Schema.Literals(["work.done","review.approve","review.reject","review.request-changes","launch.approve","launch.cancel","mission.approve-revision","mission.cancel-revision","message.read"])),
-  "attention_kind": Schema.Literals(["human-gate","launch-approval","revision-approval","unread-message","person-step","agent-request","fault"]),
+  "actions": Schema.Array(Schema.Literals(["custom.reply","work.done","review.approve","review.reject","review.request-changes","launch.approve","launch.cancel","mission.approve-revision","mission.cancel-revision","message.read"])),
+  "attention_kind": Schema.Union([Schema.Literals(["human-gate","launch-approval","revision-approval","unread-message","person-step","agent-request","fault"]), Schema.String.check(Schema.isPattern(new RegExp("^custom\\.[a-zA-Z0-9_.-]+$", "u")))]),
   "because": optionalKey(Schema.String),
+  /** The mission step waiting on this ask, on an ask a mission step made; absent on a standalone ask. */
+  "blocked": optionalKey(AttentionBlocked),
+  /** Data-only registered reply form; absent on native attention. */
+  "custom_form": optionalKey(Schema.Record(Schema.String, Schema.Unknown)).annotate({ description: "Data-only registered reply form; absent on native attention." }),
   "detail": Schema.String,
   "episode": optionalKey(Schema.String),
   "fix": optionalKey(Schema.Record(Schema.String, Schema.Unknown)),
@@ -881,7 +1138,7 @@ export const Capabilities = /*#__PURE__*/ (() => Schema.Struct({
   "capabilities": Schema.Array(Capability),
   "event_cursor": Cursor,
   "kind": Schema.Literal("capabilities"),
-  "limits": Schema.Struct({ "max_event_items": Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)), "max_glass_body_bytes": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))), "max_glass_depth": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))), "max_glass_nodes": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))), "max_glasses": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))), "max_page_items": Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)), "max_response_bytes": Schema.Int.check(Schema.isGreaterThanOrEqualTo(1024)), "max_wait_ms": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)) }),
+  "limits": Schema.Struct({ "max_arrangement_body_bytes": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))), "max_arrangement_folders": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))), "max_arrangement_key_bytes": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))), "max_arrangement_name_bytes": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))), "max_arrangement_operations": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))), "max_arrangement_placements": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))), "max_arrangement_resource_bytes": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))), "max_arrangements": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))), "max_event_items": Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)), "max_glass_body_bytes": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))), "max_glass_depth": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))), "max_glass_nodes": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))), "max_glasses": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))), "max_page_items": Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)), "max_response_bytes": Schema.Int.check(Schema.isGreaterThanOrEqualTo(1024)), "max_wait_ms": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)) }),
   /** Compile-time build identity of the responding daemon; absent on older servers. */
   "machine_version": optionalKey(Schema.String).annotate({ description: "Compile-time build identity of the responding daemon; absent on older servers." }),
   "oldest_event_cursor": Cursor,
@@ -917,18 +1174,20 @@ export const ClientConnections = /*#__PURE__*/ (() => Schema.Struct({
 export type ClientConnections = typeof ClientConnections.Type
 export type ClientConnectionsEncoded = typeof ClientConnections.Encoded
 
-export const CollectionName = /*#__PURE__*/ (() => Schema.Literals(["missions","attention","agents","work","glasses"]).annotate({ identifier: "CollectionName" }))()
-export type CollectionName = typeof CollectionName.Type
-export type CollectionNameEncoded = typeof CollectionName.Encoded
-
 export const CollectionCommand = /*#__PURE__*/ (() => Schema.Union([
-  Schema.Struct({ "actor": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "collection": CollectionName, "id": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(128)), "kind": Schema.Literal("subscribe"), "limit": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(Schema.isLessThanOrEqualTo(200))), "person": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "status": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE) }),
+  Schema.Struct({ "actor": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "collection": Schema.Literals(["missions","attention","agents","work","glasses"]), "id": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(128)), "kind": Schema.Literal("subscribe"), "limit": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(Schema.isLessThanOrEqualTo(200))), "person": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "status": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE) }),
+  Schema.Struct({ "collection": Schema.Literal("arrangements"), "id": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(128)), "kind": Schema.Literal("subscribe"), "limit": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(Schema.isLessThanOrEqualTo(200))), "person": ArrangementPerson, /** Follow only this arrangement; its owner must equal person. */
+"subject": optionalKey(ArrangementId) }),
   Schema.Struct({ "capability": Schema.String, "collection": Schema.Literal("terminal"), "id": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(128)), "incarnation": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "kind": Schema.Literal("subscribe"), "terminal": Id }),
   Schema.Struct({ "collection": Schema.Literal("conversation"), "conversation": Id, "id": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(128)), "kind": Schema.Literal("subscribe") }),
   Schema.Struct({ "id": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(128)), "kind": Schema.Literal("unsubscribe") })
 ], { mode: "oneOf" }).annotate({ identifier: "CollectionCommand" }))()
 export type CollectionCommand = typeof CollectionCommand.Type
 export type CollectionCommandEncoded = typeof CollectionCommand.Encoded
+
+export const CollectionName = /*#__PURE__*/ (() => Schema.Literals(["missions","attention","agents","work","glasses","arrangements"]).annotate({ identifier: "CollectionName" }))()
+export type CollectionName = typeof CollectionName.Type
+export type CollectionNameEncoded = typeof CollectionName.Encoded
 
 export const Device = /*#__PURE__*/ (() => Schema.Struct({
   "expires_at": Timestamp,
@@ -1296,21 +1555,43 @@ export const MissionRunOutcome = /*#__PURE__*/ (() => Schema.Struct({
 export type MissionRunOutcome = typeof MissionRunOutcome.Type
 export type MissionRunOutcomeEncoded = typeof MissionRunOutcome.Encoded
 
+export const MissionWake = /*#__PURE__*/ (() => Schema.Struct({
+  "acknowledged_by": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
+  "assignee": AgentId,
+  "assignee_state": Schema.String,
+  "attempts": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "failure": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
+  "incarnation_id": Schema.String,
+  "last_attempt_at": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE)
+}).annotate({ identifier: "MissionWake" }))()
+export type MissionWake = typeof MissionWake.Type
+export type MissionWakeEncoded = typeof MissionWake.Encoded
+
 export const MissionStep = /*#__PURE__*/ (() => Schema.Struct({
   "agentless": optionalKey(Schema.Boolean),
   "assignee": Schema.OptionFromOptionalNullOr(AgentId, NULL_NONE),
   "attempt": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   "blocked_reason": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
   "blockers": optionalKey(Schema.Array(Id)),
+  "claim_expires_at": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE),
   "claimant": Schema.OptionFromOptionalNullOr(AgentId, NULL_NONE),
   "constraints": optionalKey(Schema.Array(Schema.String)),
   "goals": optionalKey(Schema.Array(Schema.String)),
   "id": Id,
   "last_progress": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
+  "loop_max_rounds": Schema.OptionFromOptionalNullOr(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)), NULL_NONE),
+  "loop_reason": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
+  /** Current round of this step's loop, enriched on mission detail reads. */
+  "loop_round": Schema.OptionFromOptionalNullOr(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)), NULL_NONE).annotate({ description: "Current round of this step's loop, enriched on mission detail reads." }),
+  /** Observed not-before time: earliest work eligibility, not a promise of wake dispatch. */
+  "next_wake_at": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE).annotate({ description: "Observed not-before time: earliest work eligibility, not a promise of wake dispatch." }),
   "path": Schema.String,
   "since": Timestamp,
   "state": WorkState,
-  "title": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE)
+  "title": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
+  "wake": Schema.OptionFromOptionalNullOr(MissionWake, NULL_NONE),
+  /** The deferral's blocked reason, or the observed wake failure when no deferral reason exists. */
+  "wake_reason": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE).annotate({ description: "The deferral's blocked reason, or the observed wake failure when no deferral reason exists." })
 }).annotate({ identifier: "MissionStep" }))()
 export type MissionStep = typeof MissionStep.Type
 export type MissionStepEncoded = typeof MissionStep.Encoded
@@ -1498,7 +1779,7 @@ export type SubscriptionEncoded = typeof Subscription.Encoded
 
 export const UnknownResource = /*#__PURE__*/ (() => Schema.Struct({
   "id": Id,
-  "kind": unknownCase(["attention","message","launch","launch-variant","launch-decision","launch-approval","mission","work","agent","runtime","observer","subscription","lane","machine","device","operation","history","session","glass","owned-set"]),
+  "kind": unknownCase(["attention","message","launch","launch-variant","launch-decision","launch-approval","mission","work","agent","runtime","observer","subscription","lane","machine","device","operation","history","session","glass","arrangement","owned-set"]),
   "operational": optionalKey(Operational),
   "revision": Revision,
   "updated_at": Timestamp
@@ -1517,6 +1798,8 @@ export type PersonAnswer = typeof PersonAnswer.Type
 export type PersonAnswerEncoded = typeof PersonAnswer.Encoded
 
 export const PersonAnswerRecord = /*#__PURE__*/ (() => Schema.Struct({
+  /** The person whose prior instruction the agent respondent recorded. */
+  "acted_for": optionalKey(Id),
   "answer": optionalKey(PersonAnswer),
   "answered_at_unix_ms": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   "ask": Id,
@@ -1585,6 +1868,7 @@ export const Resource = /*#__PURE__*/ (() => Schema.Union([
   History,
   Session,
   Glass,
+  Arrangement,
   OwnedSet,
   UnknownResource
 ], { mode: "oneOf" }).annotate({ identifier: "Resource" }))()
@@ -1847,15 +2131,6 @@ export const ConversationSearchHit = /*#__PURE__*/ (() => Schema.Struct({
 export type ConversationSearchHit = typeof ConversationSearchHit.Type
 export type ConversationSearchHitEncoded = typeof ConversationSearchHit.Encoded
 
-export const PageInfo = /*#__PURE__*/ (() => Schema.Struct({
-  "cursor_expires_at": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE),
-  "has_more": Schema.Boolean,
-  "limit": Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(Schema.isLessThanOrEqualTo(200)),
-  "next_cursor": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE)
-}).annotate({ identifier: "PageInfo" }))()
-export type PageInfo = typeof PageInfo.Type
-export type PageInfoEncoded = typeof PageInfo.Encoded
-
 export const ConversationSearch = /*#__PURE__*/ (() => Schema.Struct({
   "host_id": Id,
   "incomplete_sources": Schema.Array(Schema.String),
@@ -1903,33 +2178,13 @@ export const EventPage = /*#__PURE__*/ (() => Schema.Struct({
 export type EventPage = typeof EventPage.Type
 export type EventPageEncoded = typeof EventPage.Encoded
 
-export const ReplicatedNotice = /*#__PURE__*/ (() => Schema.Struct({
-  "complete": Schema.Boolean,
-  "owner_host_id": Id,
-  "reason": optionalKey(Schema.String),
-  "source": Schema.Literals(["owner","replica"]),
-  "state": Schema.Literals(["current","lagging","unverified"])
-}).annotate({ identifier: "ReplicatedNotice" }))()
-export type ReplicatedNotice = typeof ReplicatedNotice.Type
-export type ReplicatedNoticeEncoded = typeof ReplicatedNotice.Encoded
-
-export const SyncPeer = /*#__PURE__*/ (() => Schema.Struct({
-  "diverged_since": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE),
-  "estimated_catch_up_seconds": Schema.OptionFromOptionalNullOr(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)).pipe(Schema.decodeTo(Schema.Duration.check(durationSecondsRange), wholeUnits(1000))), NULL_NONE),
-  "host_id": Id,
-  "last_exchange_at": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE),
-  "local_only_envelopes": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
-  "peer_only_envelopes": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
-}).annotate({ identifier: "SyncPeer" }))()
-export type SyncPeer = typeof SyncPeer.Type
-export type SyncPeerEncoded = typeof SyncPeer.Encoded
-
-export const SyncNotice = /*#__PURE__*/ (() => Schema.Struct({
-  "peers": Schema.Array(SyncPeer).check(Schema.isMinLength(1)),
-  "state": Schema.Literals(["catching-up","diverged"])
-}).annotate({ identifier: "SyncNotice" }))()
-export type SyncNotice = typeof SyncNotice.Type
-export type SyncNoticeEncoded = typeof SyncNotice.Encoded
+export const MailBacklog = /*#__PURE__*/ (() => Schema.Struct({
+  "cleanup_command": Schema.String,
+  "count": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "threshold_ms": Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))
+}).annotate({ identifier: "MailBacklog" }))()
+export type MailBacklog = typeof MailBacklog.Type
+export type MailBacklogEncoded = typeof MailBacklog.Encoded
 
 export const Page = /*#__PURE__*/ (() => Schema.Struct({
   "collection": Schema.String.check(Schema.makeFilter((value: string) => value !== "resources", { expected: "a string other than \"resources\"" })),
@@ -1947,9 +2202,11 @@ export const PairedSession = /*#__PURE__*/ (() => Schema.Struct({
   "credential": Schema.RedactedFromValue(Schema.String.check(Schema.isMinLength(32))),
   "device_id": Id,
   "device_key_chain": optionalKey(Schema.Array(Schema.String)),
+  "device_key_proofs": optionalKey(Schema.Array(Schema.Record(Schema.String, Schema.Unknown)).check(Schema.isMaxLength(2))),
   "expires_at": Timestamp,
   "kind": Schema.Literal("paired-session"),
   "person_id": Schema.String.check(Schema.isPattern(new RegExp("^person/[^/]+$", "u"))),
+  "person_root_key_proof": optionalKey(Schema.Record(Schema.String, Schema.Unknown)),
   "scopes": Schema.Array(Schema.String).check(Schema.isUnique()),
   "session_actor": Id
 }).annotate({ identifier: "PairedSession" }))()
@@ -1960,10 +2217,22 @@ export const PairingChallenge = /*#__PURE__*/ (() => Schema.Struct({
   "code": Schema.String.check(Schema.isPattern(new RegExp("^[A-Z2-9]{8}$", "u"))),
   "expires_at": Timestamp,
   "kind": Schema.Literal("pairing-challenge"),
-  "pairing_id": Id
+  "pairing_id": Id,
+  "person_root_fingerprint": optionalKey(Schema.String.check(Schema.isPattern(new RegExp("^sha256:[A-Za-z0-9_-]{43}$", "u"))))
 }).annotate({ identifier: "PairingChallenge" }))()
 export type PairingChallenge = typeof PairingChallenge.Type
 export type PairingChallengeEncoded = typeof PairingChallenge.Encoded
+
+/** Canonical publication values with resolved compiler defaults; requires read.declarations. */
+export const PublicationDefinition = /*#__PURE__*/ (() => Schema.Struct({
+  "declaration": Schema.Record(Schema.String, Schema.Unknown),
+  "kind": Schema.Literal("publication-definition"),
+  "revision": Revision,
+  "subject": Schema.String.check(Schema.isPattern(new RegExp("^(agent|mission|schedule)/[^\\s]+$", "u"))),
+  "token": Schema.String.check(Schema.isMinLength(1))
+}).annotate({ identifier: "PublicationDefinition", description: "Canonical publication values with resolved compiler defaults; requires read.declarations." }))()
+export type PublicationDefinition = typeof PublicationDefinition.Type
+export type PublicationDefinitionEncoded = typeof PublicationDefinition.Encoded
 
 export const RequestId = /*#__PURE__*/ (() => subjectRef(new RegExp("^(?:request)/[^\\s]+$", "u"), "request").annotate({ identifier: "RequestId" }))()
 export type RequestId = typeof RequestId.Type
@@ -1990,6 +2259,27 @@ export const ResourcesPage = /*#__PURE__*/ (() => Schema.Struct({
 }).annotate({ identifier: "ResourcesPage" }))()
 export type ResourcesPage = typeof ResourcesPage.Type
 export type ResourcesPageEncoded = typeof ResourcesPage.Encoded
+
+export const StatusTransition = /*#__PURE__*/ (() => Schema.Struct({
+  "observed_at": Timestamp,
+  /** An incarnation starts here. A runtime reset without a harness observation has a null state. */
+  "reset": Schema.Boolean.annotate({ description: "An incarnation starts here. A runtime reset without a harness observation has a null state." }),
+  "runtime_incarnation": Schema.String,
+  "seat": AgentId,
+  "state": Schema.OptionFromNullOr(Schema.String)
+}).annotate({ identifier: "StatusTransition" }))()
+export type StatusTransition = typeof StatusTransition.Type
+export type StatusTransitionEncoded = typeof StatusTransition.Encoded
+
+export const StatusHistory = /*#__PURE__*/ (() => Schema.Struct({
+  "complete": Schema.Boolean,
+  "items": Schema.Array(StatusTransition).check(Schema.isMaxLength(200)),
+  "kind": Schema.Literal("status-history"),
+  "retained_from": Timestamp,
+  "seat": AgentId
+}).annotate({ identifier: "StatusHistory" }))()
+export type StatusHistory = typeof StatusHistory.Type
+export type StatusHistoryEncoded = typeof StatusHistory.Encoded
 
 export const SubjectDefinition = /*#__PURE__*/ (() => Schema.Struct({
   "conflicts": Schema.Array(Schema.String),
@@ -2019,6 +2309,8 @@ export const UsageLimit = /*#__PURE__*/ (() => Schema.Struct({
   "five_hour_percent": optionalKey(Schema.Number.check(Schema.isGreaterThanOrEqualTo(0))),
   "five_hour_resets_at_unix_ms": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
   "host": Schema.String,
+  /** The source named a provider identity or declared account; independent of quota freshness. Absent on older servers. */
+  "identified": optionalKey(Schema.Boolean).annotate({ description: "The source named a provider identity or declared account; independent of quota freshness. Absent on older servers." }),
   "measured_at_unix_ms": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   "measured_by": Schema.String,
   "plan": optionalKey(Schema.String),
@@ -2028,6 +2320,35 @@ export const UsageLimit = /*#__PURE__*/ (() => Schema.Struct({
 }).annotate({ identifier: "UsageLimit" }))()
 export type UsageLimit = typeof UsageLimit.Type
 export type UsageLimitEncoded = typeof UsageLimit.Encoded
+
+export const UsagePricingRates = /*#__PURE__*/ (() => Schema.Struct({
+  "cache_read": Schema.Number.check(Schema.isGreaterThanOrEqualTo(0)),
+  "cache_write_1h": Schema.Number.check(Schema.isGreaterThanOrEqualTo(0)),
+  "cache_write_5m": Schema.Number.check(Schema.isGreaterThanOrEqualTo(0)),
+  "input": Schema.Number.check(Schema.isGreaterThanOrEqualTo(0)),
+  "output": Schema.Number.check(Schema.isGreaterThanOrEqualTo(0))
+}).annotate({ identifier: "UsagePricingRates" }))()
+export type UsagePricingRates = typeof UsagePricingRates.Type
+export type UsagePricingRatesEncoded = typeof UsagePricingRates.Encoded
+
+/** Cumulative contribution on claims; period contribution on usage reads. Provider-reported costs have no disclosed price table or rates. Missing provenance on historical claims is unknown. */
+export const UsagePricing = /*#__PURE__*/ (() => Schema.Struct({
+  "cache_write_1h_tokens": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "cache_write_tokens": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "cached_tokens": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "cost_microusd": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "cost_source": Schema.Literals(["provider_reported","computed","unpriced"]),
+  "input_tokens": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "output_tokens": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "price_table_id": optionalKey(Schema.String),
+  "price_table_version": optionalKey(Schema.String),
+  "rates_usd_per_million_tokens": optionalKey(UsagePricingRates),
+  "reported_cost_microusd": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "total_tokens": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "unpriced_tokens": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
+}).annotate({ identifier: "UsagePricing", description: "Cumulative contribution on claims; period contribution on usage reads. Provider-reported costs have no disclosed price table or rates. Missing provenance on historical claims is unknown." }))()
+export type UsagePricing = typeof UsagePricing.Type
+export type UsagePricingEncoded = typeof UsagePricing.Encoded
 
 export const UsageRow = /*#__PURE__*/ (() => Schema.Struct({
   "account": optionalKey(Schema.String),
@@ -2040,8 +2361,10 @@ export const UsageRow = /*#__PURE__*/ (() => Schema.Struct({
   "input_tokens": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   "mission_run": optionalKey(Id),
   "model": optionalKey(Schema.String),
+  "native_session_id": optionalKey(Schema.String),
   "output_tokens": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   "pricing": optionalKey(Schema.String),
+  "pricing_provenance": optionalKey(Schema.Array(UsagePricing)),
   "reported_cost_microusd": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   "step": optionalKey(Id),
   "total_tokens": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
@@ -2051,6 +2374,7 @@ export type UsageRow = typeof UsageRow.Type
 export type UsageRowEncoded = typeof UsageRow.Encoded
 
 export const UsagePeriod = /*#__PURE__*/ (() => Schema.Struct({
+  "agent_messages": optionalKey(AgentMessageEstimate),
   "limits": optionalKey(Schema.Array(UsageLimit)),
   "rows": Schema.Array(UsageRow),
   "since_ms": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
@@ -2063,13 +2387,13 @@ export const Envelope = /*#__PURE__*/ (() => Schema.Struct({
   "api_version": Schema.Literal("st3.client.v0"),
   "request_id": RequestId,
   "snapshot": Snapshot,
-  "value": Schema.Union([Capabilities, DocumentContent, SubjectDefinition, Page, ResourcesPage, Resource, TimelinePage, ConversationChanges, ConversationSearch, EventPage, ActionResult, PairingChallenge, PairedSession, TerminalScreen, AgentQueue, UsagePeriod], { mode: "oneOf" })
+  "value": Schema.Union([Capabilities, DocumentContent, SubjectDefinition, PublicationDefinition, AgentWorkspace, Page, ResourcesPage, Resource, TimelinePage, ConversationChanges, ConversationSearch, EventPage, ActionResult, PairingChallenge, PairedSession, TerminalScreen, StatusHistory, AgentQueue, UsagePeriod, MailBacklog], { mode: "oneOf" })
 }).annotate({ identifier: "Envelope" }))()
 export type Envelope = typeof Envelope.Type
 export type EnvelopeEncoded = typeof Envelope.Encoded
 
-/** Versioned safe error code; unknown codes fall back to `retryable`. */
-export const ErrorCode = /*#__PURE__*/ (() => openEnum(["attention-migrated","not-found","forbidden","unsupported-capability","validation-failed","idempotency-conflict","stale-fence","cursor-gap","page-cursor-expired","rate-limited","runtime-not-local","runtime-authority-indeterminate","remote-unavailable","terminal-unavailable","terminal-ended","timeline-history-incomplete","blob-too-large","unsupported-media-type","blob-content-mismatch","blob-quota-exceeded","blob-not-found","blob-expired","internal"]).annotate({ identifier: "ErrorCode", description: "Versioned safe error code; unknown codes fall back to `retryable`." }))()
+/** Versioned safe error code; unknown codes fall back to `retryable`. Arrangement admission and validation refusals are non-retryable. */
+export const ErrorCode = /*#__PURE__*/ (() => openEnum(["attention-migrated","arrangement-exists","arrangement-folder-exists","arrangement-retired","arrangement-limit","arrangement-folder-deleted","arrangement-cycle","arrangement-body-too-large","arrangement-owner-forbidden","invalid-arrangement-subject","invalid-arrangement-action","invalid-arrangement-operations","invalid-arrangement-folder","invalid-arrangement-name","invalid-arrangement-key","invalid-subject-reference","not-found","forbidden","unsupported-capability","validation-failed","idempotency-conflict","stale-fence","cursor-gap","page-cursor-expired","rate-limited","runtime-not-local","runtime-authority-indeterminate","remote-unavailable","terminal-unavailable","terminal-ended","timeline-history-incomplete","blob-too-large","unsupported-media-type","blob-content-mismatch","blob-quota-exceeded","blob-not-found","blob-expired","internal"]).annotate({ identifier: "ErrorCode", description: "Versioned safe error code; unknown codes fall back to `retryable`. Arrangement admission and validation refusals are non-retryable." }))()
 export type ErrorCode = typeof ErrorCode.Type
 export type ErrorCodeEncoded = typeof ErrorCode.Encoded
 
@@ -2110,6 +2434,14 @@ export const HostRepositories = /*#__PURE__*/ (() => Schema.Struct({
 export type HostRepositories = typeof HostRepositories.Type
 export type HostRepositoriesEncoded = typeof HostRepositories.Encoded
 
+/** Static unauthenticated pairing preflight; no envelope, presence update or graph information. */
+export const PairingAdvertisement = /*#__PURE__*/ (() => Schema.Struct({
+  "api_version": Schema.Literal("st3.client.v0"),
+  "capabilities": Schema.Array(Schema.Struct({ "id": Schema.Literal("device-key-proofs"), "state": Schema.Literal("granted"), "version": Schema.Literal(1) })).check(Schema.isMinLength(1)).check(Schema.isMaxLength(1))
+}).annotate({ identifier: "PairingAdvertisement", description: "Static unauthenticated pairing preflight; no envelope, presence update or graph information." }))()
+export type PairingAdvertisement = typeof PairingAdvertisement.Type
+export type PairingAdvertisementEncoded = typeof PairingAdvertisement.Encoded
+
 export const PairingBegin = /*#__PURE__*/ (() => Schema.Struct({
   "api_version": Schema.Literal("st3.client.v0"),
   "device_name": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(120)),
@@ -2133,7 +2465,7 @@ export type PairingCompleteEncoded = typeof PairingComplete.Encoded
 export const ResourceHeader = /*#__PURE__*/ (() => Schema.Struct({
   "id": Id,
   /** Resource family. */
-  "kind": openEnum(["attention","message","launch","launch-variant","launch-decision","launch-approval","mission","work","agent","runtime","observer","subscription","lane","machine","device","operation","history","session","glass"]).annotate({ description: "Resource family." }),
+  "kind": openEnum(["attention","message","launch","launch-variant","launch-decision","launch-approval","mission","work","agent","runtime","observer","subscription","lane","machine","device","operation","history","session","glass","arrangement"]).annotate({ description: "Resource family." }),
   "operational": optionalKey(Operational),
   "revision": Revision,
   "updated_at": Timestamp

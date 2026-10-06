@@ -89,7 +89,15 @@ pub fn change_keys(change: &Change) -> Vec<String> {
         "run-generation.created" => {
             keys.extend(field("run").map(|run| format!("generations:{run}")));
         }
+        "subscription.mission-started" => {
+            keys.extend(field("mission_run").map(|run| format!("subscription-run:{run}")));
+        }
         _ => {}
+    }
+    if matches!(change.kind.as_str(), "intent.desired" | "owned-set.revised")
+        && keys.iter().any(|key| key.starts_with("agent/"))
+    {
+        keys.push("desired-kind:agent".into());
     }
     keys
 }
@@ -456,6 +464,31 @@ pub fn step_due(step: &crate::model::StepRunView, now: u128) -> Option<u128> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn agent_collection_keys_ignore_message_declarations_and_cover_owned_set_members() {
+        assert!(
+            !super::change_keys(&change("message/m", "intent.desired", None, "{}"))
+                .contains(&"desired-kind:agent".to_owned())
+        );
+        assert!(
+            !super::change_keys(&change("agent/a", "harness.observed", None, "{}"))
+                .contains(&"desired-kind:agent".to_owned())
+        );
+        assert!(
+            super::change_keys(&change("agent/a", "intent.desired", None, "{}"))
+                .contains(&"desired-kind:agent".to_owned())
+        );
+        assert!(
+            super::change_keys(&change(
+                "owned-set/x",
+                "owned-set.revised",
+                None,
+                r#"{"fields":{"body":{"members":{"agent/a":{}}}}}"#
+            ))
+            .contains(&"desired-kind:agent".to_owned())
+        );
+    }
+
     use super::*;
 
     fn change(subject: &str, kind: &str, actor: Option<&str>, body: &str) -> Change {
@@ -529,5 +562,36 @@ mod tests {
         assert!(keys.contains(&"mailbox:agent/x".to_owned()));
         assert!(keys.contains(&"actor:person/example".to_owned()));
         assert!(keys.contains(&"kind:message.sent".to_owned()));
+    }
+
+    #[test]
+    fn a_subscription_start_wakes_only_its_run() {
+        let store = Store::open_memory("orchid").unwrap();
+        let incremental = Incremental::default();
+        incremental.observe(&store).unwrap();
+        for run in ["a", "b"] {
+            incremental.evaluated(
+                &format!("mission-run/{run}"),
+                BTreeSet::from([format!("subscription-run:mission-run/{run}")]),
+                None,
+            );
+        }
+        store
+            .append_claim(&crate::model::ClaimInput {
+                subject: "subscription/reviews".into(),
+                kind: "subscription.mission-started".into(),
+                actor: None,
+                fields: std::collections::BTreeMap::from([
+                    ("mission_run".into(), Value::String("mission-run/a".into())),
+                    ("request".into(), Value::String("a".repeat(64))),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        incremental.observe(&store).unwrap();
+        assert!(incremental.needs("mission-run/a", 0));
+        assert!(!incremental.needs("mission-run/b", 0));
     }
 }
