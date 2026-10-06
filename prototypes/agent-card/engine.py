@@ -376,6 +376,21 @@ class Engine:
         ).fetchone()
         if validity is None or (validity[0] is not None and cut > validity[0]):
             raise CursorGap(f"epoch {epoch} no longer covers source cut {cut}")
+        retained = self.sql(
+            "SELECT 1 FROM agent_card_presentation_roots "
+            "WHERE epoch=? AND store_index=? AND local_generation=? "
+            "AND history=0 AND time_root_id=?",
+            (epoch, cut, generation, root),
+        ).fetchone()
+        if retained is None:
+            raise CursorGap(f"presentation root {root} has expired")
+        point_retained = self.sql(
+            "SELECT 1 FROM agent_card_roots WHERE epoch=? AND store_index=? "
+            "AND history=0 AND status='*' AND point_root_id IS ?",
+            (epoch, cut, point_root),
+        ).fetchone()
+        if point_retained is None:
+            raise CursorGap(f"point root {point_root} has expired")
         return root, generation, point_root
 
     def _roots_at(self, root: int, at: int, status: str) -> list[int]:

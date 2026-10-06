@@ -41,6 +41,11 @@ combining selector updates and packing each time node's status roots. Those
 constants remain a design cost gap, not acceptance evidence. Packed roots
 need explicit reachability handling in garbage collection because SQLite
 cannot enforce foreign keys inside JSON.
+`packed_root_gc_oracle.py` follows those encoded roots through ordered nodes
+and immutable fact versions, retains an old cursor through a local update,
+rolls back an unpublished root, retires the old root, and checks reopen. Its
+whole-table mark/sweep is a tiny invented correctness fixture; bounded GC
+work, deletion order under a large DAG, and retained-byte limits remain open.
 
 A cursor binds its exact time-root ID, projection epoch, canonical store cut,
 local generation, frozen u128 read time, history/status filters, page size and
