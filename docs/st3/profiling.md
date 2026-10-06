@@ -86,6 +86,11 @@ Each reader keeps up to 128 prepared statements. Mailbox changed-since, owner/bi
 local watermark, and snapshot fence checks reuse those statements; caching removes repeated
 SQL preparation but does not change the graph-wide wake fan-out.
 
+Status reachability checks walk the sparse `operations_conflict_index` and seek matching
+claims through `claims_operation_index`. An unrelated idempotency conflict must not turn
+every subject's status read into a scan of its historical JSON bodies. The operation ID's
+TEXT affinity is removed in that join so SQLite can seek the JSON-expression index.
+
 `st doctor` reports open, idle and active reader counts, peak open readers, total connections
 opened since startup, the configured cache target, and summed current reader targets without
 requiring SQLite MEMSTATUS. These are targets, not measured allocations: SQLite schema,
