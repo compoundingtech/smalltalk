@@ -48755,6 +48755,46 @@ message "human-attention" {
         );
     }
     #[test]
+    fn claim_ids_stream_keeps_real_store_status_claims_at_current_and_historical_cuts() {
+        let store = Store::open_memory("claim-id-node").unwrap();
+        let subject = "resource/claim-id-order";
+        let mut historical = 0;
+        for i in 0..4 {
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "resource.observed".into(),
+                    actor: Some("person/avery".into()),
+                    fields: BTreeMap::from([
+                        ("kind".into(), json!("human.review")),
+                        ("reason".into(), json!(format!("change {i}"))),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+            if i == 1 {
+                historical = store.index().unwrap();
+            }
+        }
+        for cut in [historical, store.index().unwrap()] {
+            let status = store
+                .status_for_subject_names_at(BTreeSet::from([subject.into()]), cut, true)
+                .unwrap();
+            let actual = &status
+                .subjects
+                .iter()
+                .find(|row| row.subject == subject)
+                .unwrap()
+                .claims;
+            let expected = full_canonical_claim_id_oracle(&store.readers.get(), subject, Some(cut));
+            assert_eq!(actual, &expected);
+            assert_eq!(actual.last(), expected.last());
+        }
+    }
+
+    #[test]
     fn admission_failure_fences_ready_work_and_exit_until_a_new_incarnation() {
         let store = Store::open_memory("node").unwrap();
         let subject = "agent/node.fixture";
