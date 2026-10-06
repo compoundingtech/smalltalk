@@ -193,6 +193,10 @@ WHERE kind IN ('mission-run.state','step-run.state','work.failed')
 CREATE INDEX IF NOT EXISTS claims_terminal_capability_hash_index
 ON claims(json_extract(body, '$.fields.capability_hash'), store_index)
 WHERE kind='custom.client.terminal-attached';
+-- The period usage report reads response rollups only: 8,700 of the 90,000 harness.usage claims
+-- on a real store (the rest are context occupancy and session totals, written every few seconds).
+CREATE INDEX IF NOT EXISTS claims_usage_rollup_index ON claims(store_index)
+WHERE kind='harness.usage' AND json_extract(body,'$.fields.semantics')='response_rollup';
 CREATE INDEX IF NOT EXISTS claims_message_to_index
 ON claims(json_extract(body, '$.fields.to'), subject)
 WHERE kind='message.sent';
@@ -14195,7 +14199,8 @@ impl Store {
         }
         let connection = self.readers.get();
         let mut statement = connection.prepare(&canonical_sql(
-            "SELECT subject, store_index, body FROM claims WHERE kind='harness.usage'
+            "SELECT subject, store_index, body FROM claims INDEXED BY claims_usage_rollup_index
+             WHERE kind='harness.usage'
              AND json_extract(body, '$.fields.semantics')='response_rollup'
              ORDER BY CANONICAL_ASC(claims)",
         ))?;
