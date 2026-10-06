@@ -3704,11 +3704,6 @@ impl Ui {
         self.parked.iter_mut().find(|view| view.agent == agent)
     }
 
-    /// Every attached terminal, the focused one first.
-    pub(crate) fn terminals_mut(&mut self) -> impl Iterator<Item = &mut TerminalView> {
-        self.terminal.iter_mut().chain(self.parked.iter_mut())
-    }
-
     /// About to attach `agent`: in a glass another attached terminal stays attached behind its
     /// own tab (Nathan, 2026-10-06: two terminals in two splits); elsewhere it is let go.
     pub(crate) fn park_for(&mut self, agent: &str) {
