@@ -3494,6 +3494,9 @@ fn client_launch_variant_resources(
                     .get(&session.mission)
                     .ok_or_else(|| anyhow::anyhow!("preview mission is missing"))?;
                 let mut normalized = serde_json::to_value(mission)?;
+                if let Some(provenance) = preview.mission.mission_provenance.get(&session.mission) {
+                    normalized["provenance"] = serde_json::to_value(provenance)?;
+                }
                 client_safe_json(&mut normalized);
                 let diagnostics = client_launch_diagnostics(preview);
                 let compact_preview =
@@ -7826,9 +7829,16 @@ async fn preview_planning_variant(
     let kdl = planning_document_text(&state, &candidate.kdl)?;
     let (intent, mission_response) = mission_source(&state, &kdl, None)?;
     let mission = &intent.missions[&session.mission];
-    let graph = render_planning_graph(mission);
+    let mut graph = render_planning_graph(mission);
+    if let Some(provenance) = mission_response.mission_provenance.get(&session.mission) {
+        graph.push('\n');
+        graph.push_str(&crate::provenance::render(provenance));
+    }
     let diff = render_planning_diff(&mission_response);
     let mut normalized = serde_json::to_value(mission).map_err(ApiError::internal)?;
+    if let Some(provenance) = mission_response.mission_provenance.get(&session.mission) {
+        normalized["provenance"] = serde_json::to_value(provenance).map_err(ApiError::internal)?;
+    }
     client_safe_json(&mut normalized);
     let diagnostics = launch_diagnostics(&mission_response.blockers, &mission_response.warnings);
     let hash = launch_preview_token_values(
@@ -7985,6 +7995,10 @@ async fn propose_planning_variant(
     let result =
         if reviewers.is_empty() && matches!(old.revision_cutover, RevisionCutover::RestartActive) {
             RevisionSubmissionView {
+                provenance: state
+                    .store
+                    .mission_provenance(&session.mission, &mission.revision)
+                    .map_err(ApiError::internal)?,
                 status: "applied".into(),
                 mission_run: state
                     .store
@@ -8010,6 +8024,10 @@ async fn propose_planning_variant(
                 )
                 .map_err(ApiError::bad)?;
             RevisionSubmissionView {
+                provenance: state
+                    .store
+                    .mission_provenance(&session.mission, &mission.revision)
+                    .map_err(ApiError::internal)?,
                 status: proposal.status.clone(),
                 mission_run: state
                     .store
@@ -9806,14 +9824,24 @@ async fn apply(
 async fn get_mission(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
-) -> Result<Json<crate::model::MissionSpec>, ApiError> {
+) -> Result<Json<Value>, ApiError> {
     let id = id.strip_prefix("mission/").unwrap_or(&id).to_owned();
     let store = state.store.clone();
     let id_for_read = id.clone();
-    blocking_store(move || store.mission_spec(&id_for_read, None))
-        .await?
-        .map(Json)
-        .ok_or_else(|| ApiError::not_found(format!("mission `mission/{id}` does not exist")))
+    blocking_store(move || {
+        let Some(mission) = store.mission_spec(&id_for_read, None)? else {
+            return Ok(None);
+        };
+        let provenance = store.mission_provenance(&id_for_read, &mission.revision)?;
+        let mut value = serde_json::to_value(mission)?;
+        if let Some(provenance) = provenance {
+            value["provenance"] = serde_json::to_value(provenance)?;
+        }
+        Ok(Some(value))
+    })
+    .await?
+    .map(Json)
+    .ok_or_else(|| ApiError::not_found(format!("mission `mission/{id}` does not exist")))
 }
 
 async fn put_document(
@@ -12097,7 +12125,7 @@ async fn revise_mission_run(
         .map_err(ApiError::bad)?;
     // A failed run has no active work to drain, so it adopts an unreviewed revision now.
     let reopening = current.status == "failed" && current.phase == "terminal";
-    let revised = if reviewers.is_empty()
+    let mut revised = if reviewers.is_empty()
         && (reopening || matches!(old.revision_cutover, RevisionCutover::RestartActive))
     {
         let mission_run = state
@@ -12111,6 +12139,7 @@ async fn revise_mission_run(
             )
             .map_err(ApiError::bad)?;
         RevisionSubmissionView {
+            provenance: None,
             status: "applied".into(),
             mission_run,
             proposal: None,
@@ -12127,6 +12156,7 @@ async fn revise_mission_run(
             )
             .map_err(ApiError::bad)?;
         RevisionSubmissionView {
+            provenance: None,
             status: proposal.status.clone(),
             mission_run: state
                 .store
@@ -12136,6 +12166,10 @@ async fn revise_mission_run(
             proposal: Some(proposal),
         }
     };
+    revised.provenance = state
+        .store
+        .mission_provenance(mission_id, &replacement.revision)
+        .map_err(ApiError::internal)?;
     signal_changed(&state);
     Ok(Json(revised))
 }
@@ -12151,6 +12185,10 @@ fn cached_revision_submission(
         .map_err(ApiError::internal)?
     {
         return Ok(Some(RevisionSubmissionView {
+            provenance: state
+                .store
+                .mission_provenance(&mission_run.mission, &mission_run.revision)
+                .map_err(ApiError::internal)?,
             status: "applied".into(),
             mission_run,
             proposal: None,
@@ -12174,6 +12212,10 @@ fn cached_revision_submission(
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::internal("the proposal mission run is unavailable"))?;
     Ok(Some(RevisionSubmissionView {
+        provenance: state
+            .store
+            .mission_provenance(&mission_run.mission, &proposal.candidate_revision)
+            .map_err(ApiError::internal)?,
         status: proposal.status.clone(),
         mission_run,
         proposal: Some(proposal),
