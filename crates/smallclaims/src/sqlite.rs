@@ -803,6 +803,17 @@ thread_local! {
 mod tests {
     use super::*;
 
+    fn wal_payload_values(connection: &Connection) -> Vec<String> {
+        let mut statement = connection
+            .prepare("SELECT value FROM payload ORDER BY sequence")
+            .unwrap();
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
     #[test]
     fn idle_checkpoint_recycles_the_wal_after_a_reader_releases_its_snapshot() {
         let directory = tempfile::tempdir().unwrap();
@@ -841,6 +852,151 @@ mod tests {
             12288
         );
     }
+
+    #[test]
+    fn idle_checkpoint_defers_fully_backfilled_wal_until_current_reader_releases() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let writer = Connection::open(&path).unwrap();
+        writer.busy_timeout(std::time::Duration::ZERO).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+                 CREATE TABLE payload(sequence INTEGER PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO payload VALUES (0, 'original');",
+            )
+            .unwrap();
+        let reader = Connection::open(&path).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        assert_eq!(wal_payload_values(&reader), ["original"]);
+        let checkpoint = Connection::open(&path).unwrap();
+        let wal = path.with_extension("sqlite3-wal");
+
+        // This reader pins the current WAL end, not an older snapshot that limits PASSIVE.
+        let (busy, frames, backfilled): (i32, i32, i32) = checkpoint
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(busy, 0);
+        assert!(frames > 0);
+        assert_eq!(frames, backfilled);
+        assert!(!checkpoint_idle_wal(&checkpoint).unwrap());
+        assert!(std::fs::metadata(&wal).unwrap().len() > 0);
+        let (busy, frames, backfilled): (i32, i32, i32) = checkpoint
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(busy, 1, "the readmark prevents recycling, not backfilling");
+        assert!(frames > 0);
+        assert_eq!(frames, backfilled);
+
+        // A busy TRUNCATE neither blocks the next commit nor changes the pinned snapshot.
+        writer
+            .execute("INSERT INTO payload VALUES (1, 'committed while pinned')", [])
+            .unwrap();
+        assert_eq!(wal_payload_values(&reader), ["original"]);
+        assert_eq!(
+            wal_payload_values(&writer),
+            ["original", "committed while pinned"]
+        );
+        reader.execute_batch("COMMIT").unwrap();
+        assert!(checkpoint_idle_wal(&checkpoint).unwrap());
+        assert_eq!(std::fs::metadata(&wal).unwrap().len(), 0);
+        assert_eq!(
+            wal_payload_values(&reader),
+            ["original", "committed while pinned"]
+        );
+    }
+
+    #[test]
+    fn idle_checkpoint_defers_recycling_under_sustained_overlapping_readers_and_writes() {
+        use std::sync::mpsc::sync_channel;
+        use std::time::Duration;
+
+        const WAIT: Duration = Duration::from_secs(5);
+        const VALUES: [&str; 9] = [
+            "seed", "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+        ];
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let writer = Connection::open(&path).unwrap();
+        writer.busy_timeout(Duration::ZERO).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+                 CREATE TABLE payload(sequence INTEGER PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO payload VALUES (0, 'seed');",
+            )
+            .unwrap();
+        let checkpoint = Connection::open(&path).unwrap();
+        let wal = path.with_extension("sqlite3-wal");
+
+        std::thread::scope(|scope| {
+            let start_reader = |last: usize| {
+                let path = &path;
+                let (ready, pinned) = sync_channel(1);
+                let (release, released) = sync_channel(1);
+                let (done, finished) = sync_channel(1);
+                let thread = scope.spawn(move || {
+                    let reader = Connection::open(path).unwrap();
+                    reader.busy_timeout(Duration::ZERO).unwrap();
+                    reader.execute_batch("BEGIN").unwrap();
+                    assert_eq!(wal_payload_values(&reader), VALUES[..=last]);
+                    ready.send(()).unwrap();
+                    released.recv_timeout(WAIT).unwrap();
+                    assert_eq!(wal_payload_values(&reader), VALUES[..=last]);
+                    reader.execute_batch("COMMIT").unwrap();
+                    done.send(()).unwrap();
+                });
+                pinned.recv_timeout(WAIT).unwrap();
+                (release, finished, thread)
+            };
+
+            let mut active = start_reader(0);
+            for (sequence, value) in VALUES.iter().enumerate().skip(1) {
+                // Every commit completes while the previous snapshot is still pinned.
+                writer
+                    .execute(
+                        "INSERT INTO payload VALUES (?1, ?2)",
+                        rusqlite::params![sequence as i64, value],
+                    )
+                    .unwrap();
+                assert_eq!(wal_payload_values(&writer), VALUES[..=sequence]);
+                let next = start_reader(sequence);
+                assert!(!checkpoint_idle_wal(&checkpoint).unwrap());
+                assert!(std::fs::metadata(&wal).unwrap().len() > 0);
+
+                // Acquisition is acknowledged before releasing the previous reader:
+                // repeated handoffs deliberately provide no reader-free idle gap.
+                active.0.send(()).unwrap();
+                active.1.recv_timeout(WAIT).unwrap();
+                active.2.join().unwrap();
+                active = next;
+
+                let (busy, frames, backfilled): (i32, i32, i32) = checkpoint
+                    .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })
+                    .unwrap();
+                assert_eq!(busy, 0);
+                assert!(frames > 0);
+                assert_eq!(frames, backfilled);
+                assert!(!checkpoint_idle_wal(&checkpoint).unwrap());
+                assert!(std::fs::metadata(&wal).unwrap().len() > 0);
+            }
+
+            active.0.send(()).unwrap();
+            active.1.recv_timeout(WAIT).unwrap();
+            active.2.join().unwrap();
+            assert!(checkpoint_idle_wal(&checkpoint).unwrap());
+            assert_eq!(std::fs::metadata(&wal).unwrap().len(), 0);
+            assert_eq!(wal_payload_values(&writer), VALUES);
+        });
+    }
+
 
     #[test]
     fn repeated_bursts_of_reads_reuse_connections_instead_of_opening_new_ones() {

@@ -21,6 +21,23 @@ pub struct SmalltalkRuntime {
     pub(crate) message_cache: Mutex<HashMap<String, MessageCacheEntry>>,
     pub(crate) agent_status_cache: Mutex<VecDeque<AgentStatusEntry>>,
     pub(crate) agent_resources_cache: Mutex<VecDeque<(u64, bool, Arc<Vec<Value>>)>>,
+    pub(crate) agent_resource_flights: [AgentResourceFlight; 2],
+}
+
+/// Current and historical lists have independent builders. Waiters own no SQLite snapshot.
+#[derive(Default)]
+pub(crate) struct AgentResourceFlight {
+    pub state: parking_lot::Mutex<AgentResourceFlightState>,
+    pub changed: parking_lot::Condvar,
+}
+
+#[derive(Default)]
+pub(crate) struct AgentResourceFlightState {
+    pub building: bool,
+    pub generation: u64,
+    pub pending_index: u64,
+    pub participants: usize,
+    pub completed: Option<std::result::Result<(u64, Arc<Vec<Value>>), Arc<str>>>,
 }
 
 impl SmalltalkRuntime {

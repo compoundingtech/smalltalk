@@ -3850,27 +3850,29 @@ async fn client_agents(
     Extension(snapshot): Extension<ClientSnapshot>,
     Query(query): Query<ClientListQuery>,
 ) -> Result<ClientPageResponse, ApiError> {
+    if query.cursor.is_some() {
+        let page = client_page(&state, &snapshot, "agents", Vec::new(), &query)?;
+        return Ok((Extension(snapshot), Json(page)));
+    }
     let history = query.history;
-    let status = query.status.clone();
-    client_snapshot_page(
-        &state,
-        snapshot,
-        "agents",
-        &query,
-        move |state, snapshot| {
-            let mut items = client_agent_resources(
-                &state.store,
-                history,
-                &snapshot.created_at,
-                snapshot.store_index,
-            )?;
-            if let Some(status) = status.as_deref() {
-                items.retain(|item| item.get("state").and_then(Value::as_str) == Some(status));
-            }
-            Ok(items)
-        },
-    )
-    .await
+    let minimum_index = snapshot.store_index;
+    let reader = state.clone();
+    let (index, items) = blocking_store(move || {
+        reader.store.coalesced_agent_resources(history, minimum_index, |index| {
+            let snapshot = client_snapshot_at(&reader, index);
+            reader.store.with_owned_set_snapshot_reads(|| {
+                client_agent_resources(&reader.store, history, &snapshot.created_at, index)
+            })
+        })
+    })
+    .await?;
+    let snapshot = client_snapshot_at(&state, index);
+    let mut items = Arc::unwrap_or_clone(items);
+    if let Some(status) = query.status.as_deref() {
+        items.retain(|item| item.get("state").and_then(Value::as_str) == Some(status));
+    }
+    let page = client_page_read(&state, &snapshot, "agents", items, &query, true)?;
+    Ok((Extension(snapshot), Json(page)))
 }
 
 async fn client_agents_detail(

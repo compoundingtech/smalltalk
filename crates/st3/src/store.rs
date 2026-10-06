@@ -2466,6 +2466,90 @@ impl Store {
             .unwrap_or_default())
     }
 
+    /// Coalesce current list reads before opening a physical SQLite snapshot. A burst has one
+    /// in-flight build and one pending target, advanced to the newest requested arrival index.
+    /// Never answer before that arrival index: callers can read their own committed writes.
+    pub(crate) fn coalesced_agent_resources(
+        &self,
+        history: bool,
+        minimum_index: u64,
+        build: impl FnOnce(u64) -> Result<Vec<Value>>,
+    ) -> Result<(u64, Arc<Vec<Value>>)> {
+        debug_assert_no_pinned_read();
+        let flight = &self.smalltalk.agent_resource_flights[usize::from(history)];
+        struct Participant<'a>(&'a runtime::AgentResourceFlight);
+        impl Drop for Participant<'_> {
+            fn drop(&mut self) {
+                let mut state = self.0.state.lock();
+                state.participants -= 1;
+                if state.participants == 0 {
+                    state.completed = None;
+                    state.pending_index = 0;
+                }
+            }
+        }
+        struct Builder<'a> {
+            flight: &'a runtime::AgentResourceFlight,
+            completed: bool,
+        }
+        impl Drop for Builder<'_> {
+            fn drop(&mut self) {
+                if !self.completed {
+                    let mut state = self.flight.state.lock();
+                    state.building = false;
+                    state.generation += 1;
+                    state.completed = Some(Err(Arc::from("agent card builder panicked")));
+                    self.flight.changed.notify_all();
+                }
+            }
+        }
+        let mut state = flight.state.lock();
+        state.participants += 1;
+        state.pending_index = state.pending_index.max(minimum_index);
+        let generation = state.generation;
+        let _participant = Participant(flight);
+        let mut build = Some(build);
+        flight.changed.notify_all();
+        loop {
+            if state.generation > generation {
+                match state.completed.as_ref().expect("a completed flight has a result") {
+                    Ok((index, items)) if *index >= minimum_index => {
+                        let result = (*index, Arc::clone(items));
+                        drop(state);
+                        return Ok(result);
+                    }
+                    Err(error) => {
+                        let error = Arc::clone(error);
+                        drop(state);
+                        return Err(anyhow::anyhow!("{error}"));
+                    }
+                    _ => {}
+                }
+            }
+            if state.building {
+                flight.changed.wait(&mut state);
+                continue;
+            }
+            state.building = true;
+            let target = state.pending_index;
+            drop(state);
+            let mut builder = Builder { flight, completed: false };
+            let build = build.take().expect("a participant builds at most once");
+            let result = self
+                .read_snapshot(|index| {
+                    anyhow::ensure!(index >= target, "agent snapshot precedes a committed request");
+                    Ok((index, Arc::new(build(index)?)))
+                })
+                .map_err(|error| Arc::<str>::from(format!("{error:#}")));
+            state = flight.state.lock();
+            state.completed = Some(result);
+            state.generation += 1;
+            state.building = false;
+            builder.completed = true;
+            flight.changed.notify_all();
+        }
+    }
+
     /// Keep bounded immutable snapshots. Advance the nearest older snapshot by rebuilding
     /// only cards whose local observations changed; historical reads never advance backwards.
     pub(crate) fn cached_agent_resources(
@@ -29771,6 +29855,81 @@ mod tests {
     use proptest::prelude::*;
 
     const TEST_FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+
+    #[test]
+    fn agent_resource_bursts_coalesce_pending_writes_without_stale_replies() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(&directory.path().join("graph.db"), "node").unwrap());
+        let observe = |n: usize| {
+            store.append_claim(&ClaimInput {
+                subject: "resource/burst".into(),
+                kind: "resource.observed".into(),
+                actor: Some("person/avery".into()),
+                fields: BTreeMap::from([
+                    ("kind".into(), json!("human.review")),
+                    ("reason".into(), json!(format!("change {n}"))),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            }).unwrap().store_index
+        };
+        let initial = observe(0);
+        let builds = Arc::new(AtomicUsize::new(0));
+        let (entered, started) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let first_store = store.clone();
+        let first_builds = builds.clone();
+        let first = std::thread::spawn(move || {
+            first_store.coalesced_agent_resources(false, initial, |_| {
+                first_builds.fetch_add(1, Ordering::SeqCst);
+                let rows = first_store.claims_for("resource/burst", None)?.len();
+                entered.send(()).unwrap();
+                released.recv().unwrap();
+                Ok(vec![json!({"rows": rows})])
+            }).unwrap()
+        });
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut requests = Vec::new();
+        let mut latest = initial;
+        for n in 1..=8 {
+            latest = observe(n);
+            let minimum = latest;
+            let reader = store.clone();
+            let builds = builds.clone();
+            requests.push(std::thread::spawn(move || {
+                let reply = reader.coalesced_agent_resources(false, minimum, |_| {
+                    builds.fetch_add(1, Ordering::SeqCst);
+                    Ok(vec![json!({"rows": reader.claims_for("resource/burst", None)?.len()})])
+                }).unwrap();
+                (minimum, reply)
+            }));
+        }
+        let flight = &store.smalltalk.agent_resource_flights[0];
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut state = flight.state.lock();
+        while state.participants < 9 && std::time::Instant::now() < deadline {
+            flight.changed.wait_for(&mut state, deadline.saturating_duration_since(std::time::Instant::now()));
+        }
+        let all_joined = state.participants == 9;
+        let pending = state.pending_index;
+        drop(state);
+        release.send(()).unwrap();
+        let initial_reply = first.join().unwrap();
+        let replies = requests.into_iter().map(|request| request.join().unwrap()).collect::<Vec<_>>();
+        assert!(all_joined, "all burst requests must join before the first build ends");
+        assert_eq!(pending, latest);
+        assert_eq!(initial_reply.0, initial);
+        assert_eq!(initial_reply.1[0]["rows"], 1);
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
+        for (minimum, (index, items)) in replies {
+            assert!(index >= minimum, "read-your-writes requires the request's committed index");
+            assert_eq!(index, latest);
+            assert_eq!(items[0]["rows"], 9);
+        }
+    }
 
     #[test]
     fn an_agent_card_build_does_not_hold_other_read_snapshots_at_the_cache_lock() {
