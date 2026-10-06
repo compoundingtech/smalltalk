@@ -159,12 +159,16 @@ outbound operation.
 ## Verification required before live cutover
 
 Registering `external` changes the native schema registry and its compatibility
-digest. A previous registry rejects this sender as an unknown subject family; a
-single-host rollout is insufficient evidence that peers can validate and project
-these messages. Coordinate the native schema release across the relevant fleet
-members, or prove an explicit mixed-version compatibility path before importing
-new external senders. Restarting only the Discord program cannot install this API
-or update peer registries.
+digest on the replication wire. Older builds lack this account family and adapter
+API. Different registries can continue exchanging authority envelopes, but the
+replication engine suppresses projection-root comparison and healing while the
+registries differ. This does not change the database schema or checkpoint rules.
+
+Upgrade all members together in a coordinated window before enabling external
+imports. Confirm every member is reachable before starting, verify installed
+commits and matching replication schema digests afterward, and check that exchange
+has resumed without stalls. A single-host restart is insufficient verification.
+Restarting only the Discord program cannot install this API or update peer registries.
 
 Native tests must prove route refusal, actor separation, image upload ownership,
 import idempotency and unchanged ordinary-send protections. Adapter tests must
