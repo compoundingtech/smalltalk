@@ -100,6 +100,15 @@ writer-cost failure. Any real implementation must update leaves transactionally
 when either lane head or its canonical prefix changes and prove bounded
 storage/replay/retirement.
 
+`coupled_range_oracle.py` connects that tree to the existing SQLite model for
+one invented predecessor deletion and one direct replica-record position
+change. At 10/100 mixed children, the full canonical fold and selected rows
+agree after refreshing zero far-recorded children or all 10/100 crossing
+children. This is a small semantic check only: its tree is in Python memory,
+its setup is unbounded, and it does not cover canonical prefix changes,
+multiple lane heads, rollback, reopen, checkpoint or actual Store hooks. The
+SQL model's earlier measured mixed-batch writer row remains failed.
+
 Before production integration, use current-main `store.rs` schema near
 `message_reply_edges`, its open/backfill path and runtime projection hook;
 classify the new table as a rebuildable local cache in canonical audit.
