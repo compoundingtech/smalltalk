@@ -48689,6 +48689,20 @@ message "human-attention" {
         tx.rollback().unwrap();
         assert!(connection.is_autocommit());
         connection
+            .execute_batch("PRAGMA query_only=ON; BEGIN")
+            .unwrap();
+        assert_eq!(
+            claim_ids_at(&connection, "agent/target", None).unwrap(),
+            full_canonical_claim_id_oracle(&connection, "agent/target", None)
+        );
+        assert!(
+            !connection.is_autocommit(),
+            "the caller retains its read transaction"
+        );
+        connection
+            .execute_batch("ROLLBACK; PRAGMA query_only=OFF")
+            .unwrap();
+        connection
             .execute_batch("DROP TABLE replica_records")
             .unwrap();
         assert!(claim_ids_at(&connection, "agent/target", None).is_err());
@@ -48703,6 +48717,17 @@ message "human-attention" {
             "a failed nested read must not roll back its caller"
         );
         tx.rollback().unwrap();
+        connection
+            .execute_batch("PRAGMA query_only=ON; BEGIN")
+            .unwrap();
+        assert!(claim_ids_at(&connection, "agent/target", None).is_err());
+        assert!(
+            !connection.is_autocommit(),
+            "a failed read must not close its caller"
+        );
+        connection
+            .execute_batch("ROLLBACK; PRAGMA query_only=OFF")
+            .unwrap();
     }
 
     #[test]
