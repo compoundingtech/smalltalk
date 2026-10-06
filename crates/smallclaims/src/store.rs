@@ -3028,6 +3028,11 @@ pub const REPLICATION_SYNC_STALE_MS: u128 = 300_000;
 /// A peer counts as up for this long after its last exchange in either direction.
 pub const PEER_UP_MS: u128 = 90_000;
 
+/// Replicated up observations stop supporting routes after 90 seconds without a live exchange.
+pub const TRANSPORT_LINK_MAX_AGE_MS: u128 = 90_000;
+/// Successful exchanges refresh an unchanged up observation at most once every 30 seconds.
+pub const TRANSPORT_LINK_REFRESH_MS: u128 = 30_000;
+
 /// Healthy peers exchange at least once per 30-second quiet interval. Once this long has passed
 /// since the last exchange and an attempt since then failed, the peer is not up: it missed an
 /// exchange, and the one this node tried did not happen. A failure sooner than this can be a
@@ -6176,10 +6181,23 @@ impl Store {
     /// The transport links the fleet currently observes as up, as `(observer, observed)` node
     /// names: each observer's latest observation of each peer, from every replicated node.
     pub fn transport_links(&self) -> Result<Vec<(String, String)>> {
+        self.transport_links_at(now_ms())
+    }
+
+    /// Evaluate route evidence at an explicit time, using the observation's original timestamp,
+    /// never its local receipt time. Dial-out members cannot carry bidirectional owner routes.
+    pub fn transport_links_at(&self, now: u128) -> Result<Vec<(String, String)>> {
+        let membership = self.fleet_view_sealed()?;
+        let dial_out = |name: &str| {
+            membership.members.iter().any(|member| {
+                member.name == name && member.state == "current" && member.mode == "dial-out"
+            })
+        };
         let connection = self.readers.get();
         let mut statement = connection.prepare_cached(&canonical_sql(
-            "SELECT origin, subject, json_extract(body, '$.fields.status') FROM (
-                SELECT origin, subject, body,
+            "SELECT origin, subject, json_extract(body, '$.fields.status'),
+                    accepted_at_unix_ms, json_extract(body, '$.fields.last_success_at') FROM (
+                SELECT origin, subject, body, accepted_at_unix_ms,
                     ROW_NUMBER() OVER (PARTITION BY origin, subject ORDER BY CANONICAL_DESC(claims)) AS canonical_rank
                 FROM claims WHERE kind='transport.observed'
              ) WHERE canonical_rank=1 ORDER BY origin, subject",
@@ -6189,14 +6207,26 @@ impl Store {
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<u64>>(4)?,
             ))
         })?;
         let mut links = Vec::new();
         for row in rows {
-            let (observer, subject, status) = row?;
+            let (observer, subject, status, accepted_at, last_success_at) = row?;
             if let (Some(observed), Some("up")) = (subject.strip_prefix("host/"), status.as_deref())
             {
-                links.push((observer, observed.to_owned()));
+                // Older observations may lack last_success_at; their original claim time
+                // still bounds them. A newly replicated old success must not become fresh.
+                let observed_at = last_success_at
+                    .map(u128::from)
+                    .or_else(|| accepted_at.parse().ok());
+                if observed_at.is_some_and(|at| now.saturating_sub(at) < TRANSPORT_LINK_MAX_AGE_MS)
+                    && !dial_out(&observer)
+                    && !dial_out(observed)
+                {
+                    links.push((observer, observed.to_owned()));
+                }
             }
         }
         Ok(links)
@@ -6217,17 +6247,33 @@ impl Store {
         };
         let reason = if status == "unknown" { None } else { reason };
         let subject = format!("host/{peer}");
-        let already_current = self
-            .latest_claim(&subject, Some("transport.observed"))?
-            .and_then(|claim| {
-                claim
-                    .body
-                    .pointer("/fields/status")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
-            .as_deref()
-            == Some(status);
+        let now = now_ms();
+        // Another member's observation of this peer cannot renew this node's evidence.
+        let latest: Option<(String, String)> = self
+            .readers
+            .get()
+            .query_row(
+                &canonical_sql(
+                    "SELECT body, accepted_at_unix_ms FROM claims
+                WHERE subject=?1 AND kind='transport.observed' AND origin=?2
+                ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+                ),
+                params![subject, self.origin],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let already_current = latest.is_some_and(|(body, accepted_at)| {
+            let body: Value = serde_json::from_str(&body).unwrap_or_default();
+            let observed_at = body
+                .pointer("/fields/last_success_at")
+                .and_then(Value::as_u64)
+                .map(u128::from)
+                .or_else(|| accepted_at.parse().ok());
+            body.pointer("/fields/status").and_then(Value::as_str) == Some(status)
+                && (status != "up"
+                    || observed_at
+                        .is_some_and(|at| now.saturating_sub(at) < TRANSPORT_LINK_REFRESH_MS))
+        });
         if already_current {
             return Ok(());
         }
@@ -6273,7 +6319,7 @@ impl Store {
     }
 
     /// When this replica last exchanged records with `peer`. The peer row records every
-    /// success, while the `transport.observed` claim changes only with the peer's status.
+    /// success, while an unchanged up claim is refreshed only at its bounded interval.
     pub fn replication_peer_last_success(&self, peer: &str) -> Result<Option<u128>> {
         let connection = self.readers.get();
         Ok(connection

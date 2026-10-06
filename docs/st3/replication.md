@@ -24,6 +24,19 @@ its own digest so a mismatch names the source. Local receipt metadata, physical 
 lease overlays and live reachability are excluded explicitly. Retained history and checkpoint
 tombstones represent the same logical source identity.
 
+Owner-read relay routes use each observer's latest `transport.observed` claim for each peer.
+An `up` link expires 90 seconds after its `last_success_at` (or its original claim timestamp
+for older observations without that field). Receiving or replaying a claim does not renew it.
+Only a successful live exchange refreshes an unchanged `up` observation, at most once every
+30 seconds; a down or unknown observation does not renew an earlier success. Gateways cache
+these filtered links for at most five seconds, so expiry reaches a busy gateway within that
+additional interval. Links involving current dial-out members never support bidirectional
+owner routes, even while fresh. A dial-out owner has no reverse route: reads and raw PTY attach
+return `remote-unavailable` with `details.reason = "dial-out-owner"` and the diagnostic
+“dial-out owner has no inbound route,” without trying listening peers as relays. Listening owners
+retain direct routes, observed bidirectional paths and the existing fallback for an unseen owner. Reverse
+owner-RPC and PTY transport over a dial-out connection requires separate transport support.
+
 Uploaded bytes in `local_blobs` are staged locally until a durable claim references them.
 Claim admission promotes those bytes into `blobs` in the claim's transaction; every column of
 `blobs` remains in the shared digest. Unreferenced uploads never enter envelopes and cannot be

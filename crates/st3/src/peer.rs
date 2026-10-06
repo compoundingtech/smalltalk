@@ -183,7 +183,7 @@ impl ClientReadRejected {
     }
 
     /// A read that could not reach its owner for `reason`: `no-route`, `dial-failed`,
-    /// `timed-out`, `refused`, `hop-limit`, `transport-error` or `owner-error`.
+    /// `timed-out`, `refused`, `hop-limit`, `transport-error`, `owner-error` or `dial-out-owner`.
     pub fn unreachable(reason: &str, message: impl Into<String>) -> Self {
         let mut rejected = Self::new(
             "remote-unavailable",
@@ -197,6 +197,20 @@ impl ClientReadRejected {
     /// The reason a read could not reach its owner, if this says.
     pub fn reason(&self) -> Option<&str> {
         self.details.get("reason").and_then(Value::as_str)
+    }
+
+    pub(crate) fn dial_out_owner(host: &str) -> Self {
+        let mut rejected = Self::unreachable(
+            "dial-out-owner",
+            format!(
+                "unreachable: dial-out owner {host} has no inbound route; cached data remains usable"
+            ),
+        );
+        rejected.details.insert("owner_host_id".into(), host.into());
+        rejected
+            .details
+            .insert("attempts".into(), serde_json::json!([]));
+        rejected
     }
 }
 
@@ -255,6 +269,20 @@ pub struct ClientReadProvenance {
 }
 
 impl ClientRelay {
+    pub(crate) fn is_dial_out_owner(&self, host: &str) -> bool {
+        host.strip_prefix("host/").is_some_and(|name| {
+            self.links.as_ref().is_some_and(|store| {
+                store.fleet_view_sealed().is_ok_and(|view| {
+                    view.members.iter().any(|member| {
+                        member.name == name
+                            && member.state == "current"
+                            && member.mode == "dial-out"
+                    })
+                })
+            })
+        })
+    }
+
     /// Choose routes by the transport observations in this store.
     pub fn with_links(mut self, store: Arc<Store>) -> Self {
         self.links = Some(store);
@@ -266,6 +294,7 @@ impl ClientRelay {
     pub fn reaches(&self, host_id: &str) -> bool {
         host_id.strip_prefix("host/").is_some_and(|name| {
             name != self.node
+                && !self.is_dial_out_owner(host_id)
                 && (self
                     .peers
                     .iter()
@@ -302,6 +331,13 @@ impl ClientRelay {
             .as_ref()
             .and_then(|store| store.fleet_view_sealed().ok())
             .unwrap_or_default();
+        // Sync from a dial-out member supplies no reverse owner-RPC or PTY transport.
+        // In particular, dropping its old links must not enable the unseen-owner fallback.
+        if view.members.iter().any(|member| {
+            member.name == target && member.state == "current" && member.mode == "dial-out"
+        }) {
+            return Vec::new();
+        }
         let local = LocalTransports {
             fabric: self.fabric.is_some(),
             tailscale: local_addresses()
@@ -519,6 +555,10 @@ impl ClientRelay {
         path: Vec<String>,
         hops_left: u8,
     ) -> Result<(serde_json::Value, PeerConfig)> {
+        let host = format!("host/{target}");
+        if self.is_dial_out_owner(&host) {
+            return Err(ClientReadRejected::dial_out_owner(&host).into());
+        }
         let mut attempts = Vec::new();
         let mut last_reason = None;
         for peer in self.next_hops(target, &path) {
@@ -716,6 +756,9 @@ impl ClientRelay {
         mode: st3_client::RawTerminalMode,
     ) -> Result<tokio::net::UnixStream> {
         let target = host.strip_prefix("host/").context("invalid owner host")?;
+        if self.is_dial_out_owner(host) {
+            return Err(ClientReadRejected::dial_out_owner(host).into());
+        }
         let mode = match mode {
             st3_client::RawTerminalMode::Attach => "attach",
             st3_client::RawTerminalMode::Peek => "peek",
@@ -1558,6 +1601,7 @@ mod tests {
     }
 
     include!("peer/raw_terminal_tests.rs");
+    include!("peer/stale_link_tests.rs");
 
     #[tokio::test]
     async fn a_gateway_streams_a_remote_terminal_through_owner_long_polls() {

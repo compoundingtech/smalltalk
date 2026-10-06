@@ -23635,6 +23635,103 @@ mod fleet_admission_tests {
     }
 
     #[test]
+    fn transport_link_expiry_uses_original_success_and_latest_status() {
+        use smallclaims::store::TRANSPORT_LINK_MAX_AGE_MS;
+        let observer = node("cedar", None, None);
+        let receiver = node("birch", None, None);
+        let success = 1_000_000_u128;
+        observer
+            .record_transport_observation("elm", "up", None, Some(success))
+            .unwrap();
+        sync(&observer, &receiver);
+        let expected = vec![("cedar".into(), "elm".into())];
+        assert_eq!(
+            receiver
+                .transport_links_at(success + TRANSPORT_LINK_MAX_AGE_MS - 1)
+                .unwrap(),
+            expected
+        );
+        assert!(
+            receiver
+                .transport_links_at(success + TRANSPORT_LINK_MAX_AGE_MS)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            receiver.transport_links().unwrap().is_empty(),
+            "receiving an old success does not renew it"
+        );
+
+        // Only a fresh live success renews a stable up status, then it is deduplicated.
+        observer
+            .record_transport_observation("elm", "up", None, None)
+            .unwrap();
+        let count = observer
+            .claims_for("host/elm", Some("transport.observed"))
+            .unwrap()
+            .len();
+        assert_eq!(count, 2);
+        observer
+            .record_transport_observation("elm", "up", None, None)
+            .unwrap();
+        assert_eq!(
+            observer
+                .claims_for("host/elm", Some("transport.observed"))
+                .unwrap()
+                .len(),
+            count
+        );
+        sync(&observer, &receiver);
+        assert_eq!(receiver.transport_links().unwrap(), expected);
+
+        observer
+            .record_transport_observation("elm", "unknown", None, None)
+            .unwrap();
+        sync(&observer, &receiver);
+        assert!(
+            receiver.transport_links().unwrap().is_empty(),
+            "latest unknown never revives an earlier up"
+        );
+    }
+
+    #[test]
+    fn legacy_transport_links_expire_and_another_observer_cannot_suppress_refresh() {
+        use smallclaims::store::TRANSPORT_LINK_MAX_AGE_MS;
+        let observer = node("cedar", None, None);
+        let receiver = node("birch", None, None);
+        let claim = append(
+            &observer,
+            "transport.observed",
+            "host/elm",
+            json!({"status":"up"}),
+        );
+        let accepted = claim.accepted_at_unix_ms;
+        sync(&observer, &receiver);
+        assert_eq!(
+            receiver
+                .transport_links_at(accepted + TRANSPORT_LINK_MAX_AGE_MS - 1)
+                .unwrap(),
+            vec![("cedar".into(), "elm".into())]
+        );
+        assert!(
+            receiver
+                .transport_links_at(accepted + TRANSPORT_LINK_MAX_AGE_MS)
+                .unwrap()
+                .is_empty()
+        );
+        receiver
+            .record_transport_observation("elm", "up", None, None)
+            .unwrap();
+        assert_eq!(
+            receiver.transport_links().unwrap(),
+            vec![
+                ("birch".into(), "elm".into()),
+                ("cedar".into(), "elm".into())
+            ]
+        );
+    }
+
+    #[test]
     fn a_dial_out_member_is_never_observed_and_endpoints_are_announced_once() {
         let (d_key, s_key) = (key(), key());
         let anchor = key();

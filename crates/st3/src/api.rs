@@ -3943,7 +3943,7 @@ async fn client_sessions_detail(
                 let relay = state
                     .client_relay
                     .as_ref()
-                    .ok_or_else(|| remote_unavailable(&remote_host))?;
+                    .ok_or_else(|| remote_unavailable_for_owner(&state, &remote_host))?;
                 if !client_v0::acting_party(&session) {
                     return Err(ApiError::bad(St3Error::new(
                         "forbidden",
@@ -3998,7 +3998,7 @@ async fn forward_client_read(
     let relay = state
         .client_relay
         .as_ref()
-        .ok_or_else(|| remote_unavailable(&target))?;
+        .ok_or_else(|| remote_unavailable_for_owner(&state, &target))?;
     relay.forward(&request).await.map(Json).map_err(|error| {
         match error.downcast_ref::<crate::peer::ClientReadRejected>() {
             Some(rejected) => ApiError {
@@ -4007,7 +4007,7 @@ async fn forward_client_read(
                 message: rejected.message.clone(),
                 details: Box::new(rejected.details.clone()),
             },
-            None => remote_unavailable(&target),
+            None => remote_unavailable_for_owner(&state, &target),
         }
     })
 }
@@ -4025,6 +4025,25 @@ fn remote_unavailable(host: &str) -> ApiError {
             "no route to owner {host}: this node cannot dial it and no peer reaches it; cached data remains usable"
         ),
         details: Box::new(details),
+    }
+}
+
+/// A known dial-out owner syncs outward but has no inbound owner transport.
+fn remote_unavailable_for_owner(state: &AppState, host: &str) -> ApiError {
+    let dial_out = host.strip_prefix("host/").is_some_and(|name| {
+        state.store.fleet_view_sealed().is_ok_and(|view| {
+            view.members.iter().any(|member| {
+                member.name == name && member.state == "current" && member.mode == "dial-out"
+            })
+        })
+    });
+    if dial_out {
+        remote_read_error(
+            host,
+            crate::peer::ClientReadRejected::dial_out_owner(host).into(),
+        )
+    } else {
+        remote_unavailable(host)
     }
 }
 
@@ -4236,7 +4255,7 @@ async fn relayed_messages_page(
         .client_relay
         .as_ref()
         .filter(|relay| relay.reaches(owner))
-        .ok_or_else(|| remote_unavailable(owner))?;
+        .ok_or_else(|| remote_unavailable_for_owner(state, owner))?;
     let value = relay
         .read(
             owner,
@@ -13759,7 +13778,7 @@ async fn host_agent_workspace(
         .client_relay
         .as_ref()
         .filter(|relay| relay.reaches(&host_id))
-        .ok_or_else(|| remote_unavailable(&host_id))?;
+        .ok_or_else(|| remote_unavailable_for_owner(&state, &host_id))?;
     let value = relay
         .read(
             &host_id,
