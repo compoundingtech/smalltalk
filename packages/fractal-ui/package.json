@@ -1,0 +1,32 @@
+{
+  "name": "@smalltalk/fractal-ui",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/kit.tsx",
+    "./tokens.css": "./src/tokens.css"
+  },
+  "scripts": {
+    "storybook": "storybook dev -p 53705 --host 127.0.0.1 --no-open --disable-telemetry",
+    "build-storybook": "storybook build --disable-telemetry",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "react-aria-components": "1.17.0"
+  },
+  "devDependencies": {
+    "storybook": "10.6.1",
+    "@storybook/react-vite": "10.6.1",
+    "@storybook/addon-a11y": "10.6.1",
+    "@storybook/addon-docs": "10.6.1",
+    "@tailwindcss/vite": "4.2.2",
+    "tailwindcss": "4.2.2",
+    "typescript": "6.0.3",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "vite": "8.0.5"
+  }
+}
