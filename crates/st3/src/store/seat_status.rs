@@ -560,6 +560,44 @@ mod tests {
     }
 
     #[test]
+    fn unknown_provider_auth_does_not_clear_a_known_rejection() {
+        let store = Store::open_memory("cedar").unwrap();
+        runtime(&store, "one");
+        let at = now_ms();
+        let rejected = store
+            .append_latest_observation(
+                &input("harness.observed", json!({
+                    "state":"working", "incarnation_id":"one", "observed_at_ms":at as u64,
+                    "provider_auth":false, "reason":"providerAuth"
+                })),
+                at,
+            )
+            .unwrap()
+            .0;
+        let uncertain = store
+            .append_latest_observation(
+                &input("harness.observed", json!({
+                    "state":"working", "incarnation_id":"one", "observed_at_ms":(at + 1) as u64,
+                    "provider_auth":null, "reason":"authUnknown"
+                })),
+                at + 1,
+            )
+            .unwrap()
+            .0;
+        assert_eq!(uncertain.body["fields"]["provider_auth"], false);
+        assert_eq!(uncertain.body["fields"]["status_transition"], false);
+        assert_eq!(
+            uncertain.body["fields"]["observed_since_ms"],
+            rejected.body["fields"]["observed_since_ms"]
+        );
+        assert_eq!(store.current_harness("agent/cedar").unwrap().unwrap().state, "needs-login");
+        let history = store.seat_status_history("agent/cedar", at + 2).unwrap();
+        let states = history["items"].as_array().unwrap().iter()
+            .filter_map(|item| item["state"].as_str()).collect::<Vec<_>>();
+        assert_eq!(states, ["unauthenticated"]);
+    }
+
+    #[test]
     fn repeated_observations_and_detail_changes_preserve_since_and_refresh_freshness() {
         let store = Store::open_memory("cedar").unwrap();
         runtime(&store, "one");
@@ -802,7 +840,7 @@ mod tests {
         };
         publish(json!(false), 1, at);
         let successor = publish(Value::Null, 1, at + 1);
-        assert!(local_observation_position(&successor).is_none());
+        assert!(local_observation_position(&successor).is_some());
         let blocked = store.current_harness("agent/cedar").unwrap().unwrap();
         assert_eq!(blocked.state, "needs-login");
         assert_eq!(blocked.since_unix_ms, at);

@@ -18239,13 +18239,28 @@ fn publish_changed_harness_state_tx(
         &input.subject,
         input.fields.get("incarnation_id").and_then(Value::as_str),
     )?;
+    let mut fields = input.fields.clone();
+    if let Some(previous) = latest.as_ref().and_then(|claim| claim.body.get("fields")) {
+        for name in ["blocked_on", "ask"] {
+            if !fields.contains_key(name)
+                && let Some(value) = previous.get(name)
+            {
+                fields.insert(name.into(), value.clone());
+            }
+        }
+        if fields.get("provider_auth").is_none_or(Value::is_null)
+            && let Some(value) = previous.get("provider_auth").filter(|value| value.is_boolean())
+        {
+            fields.insert("provider_auth".into(), value.clone());
+        }
+    }
     let unchanged = latest.as_ref().is_some_and(|claim| {
         claim
             .body
             .get("fields")
             .and_then(Value::as_object)
             .is_some_and(|previous| {
-                input.fields.iter().all(|(name, value)| {
+                fields.iter().all(|(name, value)| {
                     matches!(name.as_str(), "observed_at_ms" | "observed_since_ms" | "status_transition")
                         || previous.get(name) == Some(value)
                 })
@@ -18254,16 +18269,6 @@ fn publish_changed_harness_state_tx(
     // Refresh remote freshness at most once a minute, without manufacturing transitions.
     if unchanged && latest.as_ref().is_some_and(|claim| now.saturating_sub(claim.accepted_at_unix_ms) < 60_000) {
         return Ok(None);
-    }
-    let mut fields = input.fields.clone();
-    if let Some(previous) = latest.as_ref().and_then(|claim| claim.body.get("fields")) {
-        for name in ["blocked_on", "ask", "provider_auth"] {
-            if !fields.contains_key(name)
-                && let Some(value) = previous.get(name)
-            {
-                fields.insert(name.into(), value.clone());
-            }
-        }
     }
     let observed_at = fields.get("observed_at_ms").and_then(Value::as_u64)
         .map_or(now, u128::from).min(now);
