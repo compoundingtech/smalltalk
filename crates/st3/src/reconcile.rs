@@ -1890,16 +1890,6 @@ impl<R: RuntimeControl> Reconciler<R> {
         let observe_span = crate::profile::span("pass/changes");
         self.incremental.observe(&self.store)?;
         drop(observe_span);
-        // Mission transitions use the reserved writer class and run before bulk host
-        // reconciliation. Mailbox/status traffic must not put first readiness behind
-        // every ordinary write, runtime snapshot, or observer on this host.
-        let daemon = format!("daemon/{}", self.host);
-        self.file_watchers_used
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
-        self.isolate("stage/missions", &daemon, || self.evaluate_mission_runs());
-        self.release_unused_file_watchers();
         let _runners_span = crate::profile::span("pass/gate-runners");
         for runner in self.gate_runners()? {
             if runner.retired && runner.host == self.host {
@@ -2631,9 +2621,10 @@ impl<R: RuntimeControl> Reconciler<R> {
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|subject, _| members.contains(&format!("member:{subject}")));
         // Each later stage runs on its own. A stage that fails records a fault on this daemon
-        // and the stages after it still run. Intake-created runs advance on the next pass.
+        // and the stages after it still run.
         // Intake left by a terminal owner or a superseded generation must not observe, deliver,
         // or start work. A stopped declaration still runs so it can settle its own state.
+        let daemon = format!("daemon/{}", self.host);
         let intake = self.isolate("stage/intake", &daemon, || {
             let retired_intake = self.store.retired_owned_intake_subjects()?;
             Ok(desired
@@ -2679,6 +2670,12 @@ impl<R: RuntimeControl> Reconciler<R> {
         self.isolate("stage/github-watches", &daemon, || {
             self.reconcile_github_watches(&desired)
         });
+        self.file_watchers_used
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        self.isolate("stage/missions", &daemon, || self.evaluate_mission_runs());
+        self.release_unused_file_watchers();
 
         // Mission state is the primary control-plane projection. Evaluate it before
         // wake-message bookkeeping so a large mailbox or work history cannot starve

@@ -142,7 +142,6 @@ mission "promotion-proof" state="ready" {{
             }
             std::thread::sleep(Duration::from_millis(1));
         }
-        std::fs::write(&finish, "finish").unwrap();
         stop.store(true, Ordering::Release);
         for reader in readers {
             reader.join().unwrap();
@@ -162,6 +161,7 @@ mission "promotion-proof" state="ready" {{
     let actual = store.latest_actual_value("agent/node.promotion-seat").unwrap().unwrap();
     assert_eq!(actual_field(&actual, "status").and_then(Value::as_str), Some("starting"));
     assert_eq!(epoch, 1, "promotion is one durable readiness transition");
+    std::fs::write(&finish, "finish").unwrap();
     eprintln!(
         "first readiness: {} ms; first incarnation: {} ms; mailbox checks: {}; ordinary backlog: 24 x 250ms; bound: 3000ms",
         elapsed.as_millis(),
