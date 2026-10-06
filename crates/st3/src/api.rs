@@ -2155,6 +2155,7 @@ fn add_agent_todos(store: &Store, items: &mut [Value], index: u64) -> anyhow::Re
 fn overlay_agent_resources(store: &Store, items: &mut [Value], at: &str) -> anyhow::Result<()> {
     let local_host = client_host_id(store.origin());
     for item in items.iter_mut() {
+        item.as_object_mut().unwrap().remove("_queue_valid_until");
         if item.get("updated_at").and_then(Value::as_str) == Some("") {
             item["updated_at"] = Value::String(at.to_owned());
         }
@@ -2575,6 +2576,7 @@ fn client_agent_resources_from_status(
                 "next_work_id": queue.next_work_id,
                 "upcoming_work_ids": queue.upcoming_work_ids,
                 "queued_work_count": queue.queued_work_count,
+                "_queue_valid_until": queue.valid_until_unix_ms,
                 "current_work": queue.current_work_ids.iter().filter_map(label).collect::<Vec<_>>(),
                 "next_work": queue.next_work_id.as_ref().and_then(label),
                 "upcoming_work": queue.upcoming_work_ids.iter().filter_map(label).collect::<Vec<_>>(),
@@ -2591,7 +2593,8 @@ fn client_agent_resources_from_status(
             if let Some(delta) = changed.filter(|_| retain_queues)
                 && let Some(old) = delta.previous.iter().find(|item| item["id"] == value["id"]) {
                 for field in ["current_work_ids", "active_work_count", "next_work_id",
-                    "upcoming_work_ids", "queued_work_count", "current_work", "next_work", "upcoming_work"] {
+                    "upcoming_work_ids", "queued_work_count", "current_work", "next_work", "upcoming_work",
+                    "_queue_valid_until"] {
                     value[field] = old[field].clone();
                 }
             }

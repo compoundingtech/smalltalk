@@ -24,7 +24,7 @@ struct AgentResourcesEntry {
     local_observation_index: u64,
     reducer_version: usize,
     history: bool,
-    valid_until_unix_ms: Option<u128>,
+    time_invalidations: BTreeSet<(u128, String)>,
     rows: BTreeMap<String, Arc<Value>>,
     order: BTreeSet<(String, String)>,
 }
@@ -39,12 +39,18 @@ impl AgentResourcesEntry {
         self.remove(&id);
         let name = value["name"].as_str().unwrap_or_default().to_owned();
         self.order.insert((name, id.clone()));
+        if let Some(instant) = value["_queue_valid_until"].as_u64() {
+            self.time_invalidations.insert((u128::from(instant), id.clone()));
+        }
         self.rows.insert(id, Arc::new(value));
     }
 
     fn remove(&mut self, id: &str) {
         if let Some(old) = self.rows.remove(id) {
             self.order.remove(&(old["name"].as_str().unwrap_or_default().to_owned(), id.to_owned()));
+            if let Some(instant) = old["_queue_valid_until"].as_u64() {
+                self.time_invalidations.remove(&(u128::from(instant), id.to_owned()));
+            }
         }
     }
 }
@@ -332,38 +338,37 @@ impl Store {
             let cache = self.smalltalk.agent_resources_cache.lock().expect("agent resources cache poisoned");
             (cache.entries.iter().filter(|entry|
                 entry.store_index <= index && entry.local_observation_index <= local_index
-                    && entry.history == history && entry.reducer_version == version
-                    && entry.valid_until_unix_ms.is_none_or(|expiry| reduced_at < expiry))
+                    && entry.history == history && entry.reducer_version == version)
                 .max_by_key(|entry| (entry.store_index, entry.local_observation_index)).cloned(), cache.epoch)
         };
+        let expired = previous.as_ref().map(|entry| entry.time_invalidations.iter()
+            .take_while(|(instant, _)| *instant <= reduced_at)
+            .map(|(_, subject)| subject.clone()).collect::<BTreeSet<_>>()).unwrap_or_default();
         if let Some(entry) = previous.as_ref().filter(|entry|
-            entry.store_index == index && entry.local_observation_index == local_index) {
+            entry.store_index == index && entry.local_observation_index == local_index
+                && expired.is_empty()) {
             return Ok(entry.values());
         }
         let status_index = self.agent_status_index(index)?;
         let changes = previous.as_ref().map(|previous| self.changed_agent_resources(previous, index, local_index))
-            .transpose()?.flatten().filter(|changes| !changes.subjects.is_empty()
+            .transpose()?.flatten().map(|mut changes| {
+                if !expired.is_empty() {
+                    changes.subjects.extend(expired);
+                    changes.queues = true;
+                    changes.activity_only = false;
+                }
+                changes
+            }).filter(|changes| !changes.subjects.is_empty()
                 || previous.as_ref().is_some_and(|previous| previous.agent_status_index == status_index));
-        // Queue fields depend on time even without a claim. Keep the earliest future
-        // transition for the entire snapshot so no activity-only patch (or cache hit)
-        // can carry a row across a lease/deadline boundary without a full reduction.
-        let valid_until_unix_ms = self.readers.get().query_row(
-            "SELECT MIN(instant) FROM (
-                SELECT CAST(lease_expires_at_unix_ms AS INTEGER) AS instant FROM step_runs
-                UNION ALL SELECT CAST(not_before_unix_ms AS INTEGER) FROM step_runs
-                UNION ALL SELECT CAST(deadline_at_unix_ms AS INTEGER) FROM mission_run_deadlines
-             ) WHERE instant>?1",
-            [u64::try_from(reduced_at)?], |row| row.get::<_, Option<u64>>(0),
-        )?.map(u128::from);
         let mut entry = AgentResourcesEntry {
             store_index: index, agent_status_index: status_index, local_observation_index: local_index,
             reducer_version: version, history,
-            valid_until_unix_ms,
-            rows: BTreeMap::new(), order: BTreeSet::new(),
+            rows: BTreeMap::new(), order: BTreeSet::new(), time_invalidations: BTreeSet::new(),
         };
         if let (Some(previous), Some(changes)) = (previous, changes) {
             entry.rows = previous.rows.clone();
             entry.order = previous.order.clone();
+            entry.time_invalidations = previous.time_invalidations.clone();
             if !changes.subjects.is_empty() {
                 let prior = if changes.queues { Vec::new() } else {
                     changes.subjects.iter().filter_map(|id| previous.rows.get(id))
