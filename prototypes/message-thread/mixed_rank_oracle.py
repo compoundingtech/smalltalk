@@ -293,17 +293,25 @@ def main() -> None:
     # Record identity and position updates select both old and new claim subjects.
     second = 'message/second'
     add(db, 'a-second', 4, batch, second, 'message/other')
+    other_batch = 'batch/example/2'
+    third = 'message/third'
+    add(db, 'a-third', 6, other_batch, third, 'message/elsewhere')
     def move_record(target: str, position: int) -> None:
         db.execute("UPDATE replica_records SET claim_id=?,position=? "
                    "WHERE record_ref='record/z-recorded'", (target, position))
         sync_assignment(db, 'z-recorded')
         sync_assignment(db, 'a-second')
+        sync_assignment(db, 'a-third')
 
     assert mutate(db, {batch}, {'message/child', second},
                   lambda: move_record('a-second', 0))[0] == 2
     assert mutate(db, {batch}, {'message/child', second},
                   lambda: move_record('z-recorded', 2))[0] == 2
-    check(db, ['message/child', second])
+    assert mutate(db, {batch, other_batch}, {'message/child', third},
+                  lambda: move_record('a-third', 0))[0] == 3
+    assert mutate(db, {batch, other_batch}, {'message/child', third},
+                  lambda: move_record('z-recorded', 2))[0] == 3
+    check(db, ['message/child', second, third])
 
     def move_index() -> None:
         rank_bump(db, batch, 4, -1)

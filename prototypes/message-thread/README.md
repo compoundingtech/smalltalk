@@ -59,7 +59,7 @@ COUNT rank using indexed point seeks, so the two heads can be compared by the
 same canonical tuple. The independent slow COUNT fold stays outside writer
 measurements. Its fixture first proves the preceding `store_index` shortcut
 returns the wrong parent, then checks the two-lane answer under record identity
-and position changes, repaired state, a claim store-index move, insertion of
+and position changes across two batches, repaired state, a claim store-index move, insertion of
 an earlier unrelated claim, and deletion. `--growth` builds 1,000/10,000
 mixed children and counts deletion VM steps with full-fold spot checks after
 measurement.
