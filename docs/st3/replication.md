@@ -308,6 +308,23 @@ The `replication-worker` process owns peer HTTP, authentication, exchange, and a
 
 The service installer creates a separate systemd user service or launchd agent for the worker. A worker crash cannot stop the main daemon.
 
+Deploy the same `machine_version` to the daemon and its **same-host worker**. Updating only
+the daemon does not upgrade the worker's exchange algorithm: an old initiating worker can
+still stall behind checkpoint-only ranges even when the daemon includes the recovery fix.
+Different fleet members may continue running different compatible builds.
+
+`/v1/health` exposes the daemon's full `machine_version`. At startup the worker compares that
+identity and logs a loud warning on mismatch, or when an older daemon cannot report it;
+replication continues rather than introducing an outage during a coordinated rollout.
+The worker atomically records its build, PID and runtime process-start token in
+`STATE/replication-worker-build.json`, outside the replicated store. A failure to write this
+diagnostic file logs a warning without stopping replication.
+`st doctor`'s `replication-worker-build` check warns on a mismatch, a stale process identity,
+or a missing/unreadable report. Older workers do not publish this report, so their build is
+explicitly **unknown**, never assumed to match. The runtime's existing start-token fencing
+detects PID reuse on Linux; other platforms retain the runtime's PID-based token limitation.
+The check also detects a daemon-only upgrade while the reporting worker keeps running.
+
 A local graph change writes `replication.wake`. The worker watches only this file, not the SQLite files.
 
 The worker coalesces wake bursts for one second, so new authority, such as a mission publish, reaches every peer within seconds. An exchange that stored new envelopes on either side runs again at once until a backlog drains. An exchange that stored nothing new waits for the next wake, even if it carried envelopes the other side already held.
