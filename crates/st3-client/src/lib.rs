@@ -624,6 +624,7 @@ pub fn plain_message(code: Option<&ErrorCode>, message: &str) -> String {
         }
         ErrorCode::ValidationFailed
         | ErrorCode::AttentionMigrated
+        | ErrorCode::IssuerRequired
         | ErrorCode::RuntimeNotLocal
         | ErrorCode::ArrangementExists
         | ErrorCode::ArrangementFolderExists
