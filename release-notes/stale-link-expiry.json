@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Expire stale relay links and report dial-out owners without inbound routes",
+  "replay": {
+    "status": "none",
+    "detail": "Existing stores containing transport.observed claims need no additional replay or recovery. Routing evaluates the original success or legacy claim timestamp when read; no projection replay trigger changes. Shuffle, restart and checkpoint replay regressions pass."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database tables, columns, indexes, triggers or schema version change. Refreshes use the existing transport.observed fields and claim kind."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules and digests are unchanged; no coordinated sealing transition is needed. Healthy unchanged links refresh at most every 15 minutes (96 claims per directed link/day, 30 times fewer than a 30-second refresh). Six fully connected listening nodes add at most 2,880 refresh claims/day, roughly 5,760-8,640 in the two-to-three-day D+2 pre-cut window; the existing retention rule keeps the newest per origin/subject. These are arithmetic bounds, not measured saturated-daemon costs. Links nominally expire after two hours, with bounded five-minute clock-skew tolerance and a five-second gateway cache. Old observers never refresh unchanged up claims, so upgraded readers eventually expire their path evidence; direct listening routes and unseen-owner fallback remain usable until those observers upgrade. Old readers retain prior routing behavior."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Conversation, terminal, raw attach, workspace and attachment reads for known dial-out owners use the existing remote-unavailable error with the additional details.reason value dial-out-owner and an explicit no-inbound-route message. Sealed membership and route evidence cache for at most five seconds. The error envelope, replication fields, authentication and harness contracts are unchanged. Current isolated daemon/client regressions cover these paths; mixed-version pairs were not exercised. Reverse owner-RPC and PTY transport is still unavailable."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional interruption beyond the ordinary daemon restart is introduced. Restart-to-API and restart-to-health durations were not measured for this change."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Existing fleets preserve identities and state. Upgrade each routing daemon and observer normally for consistent expiry, bounded refresh and diagnostics; no migration is required. A published dial-out mode overrides even a configured URL: if the mode is incorrect, run st fleet mode listening on that member. It restarts installed services; without services or with --no-service, restart st3 replication-worker as the command instructs. The restarted worker enables its listener and publishes updated mode/endpoints; remote readers follow after replication and at most five seconds of cache delay."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No additional database recovery or migration reversal is needed. Existing claims and layouts remain unchanged; an older routing binary restores the prior stale-link behavior."
+  }
+}

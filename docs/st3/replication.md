@@ -24,6 +24,41 @@ its own digest so a mismatch names the source. Local receipt metadata, physical 
 lease overlays and live reachability are excluded explicitly. Retained history and checkpoint
 tombstones represent the same logical source identity.
 
+Owner-read relay routes use each observer's latest `transport.observed` claim for each peer.
+The nominal lifetime of an `up` link is two hours after its `last_success_at` (or its original
+claim timestamp for legacy observations). Receiving or replaying a claim does not renew it.
+Readers tolerate at most five minutes of clock skew in either direction: observations more
+than five minutes ahead are discarded; those within the allowance expire after two hours plus
+five minutes of timestamp age. Thus even the most-ahead accepted clock cannot extend a link
+beyond two hours and ten minutes of real elapsed time, plus the five-second gateway cache.
+Only a successful live exchange refreshes a stable `up`, at most once every 15 minutes. The
+real refresh interval can be 15-16 minutes with the worker's 30-60-second exchange cadence;
+the two-hour window leaves room for quiet sync and propagation. A down or unknown observation
+never renews an earlier success. Old nodes publish status changes only: their observations
+expire on upgraded readers even while they keep exchanging. Direct listening routes and the
+existing unseen-owner fallback remain usable; relayed path ordering improves once that
+observer upgrades and supplies bounded live refreshes.
+
+This refresh cadence adds at most 96 claims per healthy directed link per day (30 times fewer
+than a 30-second refresh), excluding actual status changes. For six fully connected listening
+nodes, 30 directed links add at most 2,880 claims/day. The unchanged checkpoint retention rule
+keeps the newest observation per origin/subject after the D+2 cut; a two-to-three-day pre-cut
+window holds roughly 5,760-8,640 refresh claims, plus each retained newest claim. These are
+arithmetic bounds, not measured saturated-daemon costs.
+
+Gateways cache filtered links and sealed membership for at most five seconds, including
+per-item `reaches()` checks. Links involving current dial-out members never support
+bidirectional owner routes, even while fresh. Dial-out owners return `remote-unavailable`
+with `details.reason = "dial-out-owner"` and an explicit no-inbound-route message across
+conversation, terminal, raw attach, workspace and attachment reads, without trying listening
+peers as relays. The member's published mode overrides a configured direct URL. Correct an
+incorrect mode on the owning member with `st fleet mode listening`. This restarts installed
+services; without installed services (or with `--no-service`), restart `st3 replication-worker`
+as the command instructs. The restarted worker enables its listener and publishes the new
+mode/endpoints. Other nodes see it after replication and at most five seconds of membership
+caching. Reverse owner-RPC and PTY transport over a dial-out connection
+requires separate transport support.
+
 Uploaded bytes in `local_blobs` are staged locally until a durable claim references them.
 Claim admission promotes those bytes into `blobs` in the claim's transaction; every column of
 `blobs` remains in the shared digest. Unreferenced uploads never enter envelopes and cannot be

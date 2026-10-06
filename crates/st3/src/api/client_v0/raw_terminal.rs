@@ -52,7 +52,7 @@ pub(crate) async fn attachment(
             .as_ref()
             .is_none_or(|relay| !relay.reaches(&live.owner_host_id))
     {
-        return Err(remote_unavailable(&live.owner_host_id));
+        return Err(remote_unavailable_for_owner(&state, &live.owner_host_id));
     }
     let attachment_id = format!("terminal-attachment/{}", new_request_id());
     let capability =
@@ -160,7 +160,7 @@ pub(crate) async fn stream(
         state
             .client_relay
             .as_ref()
-            .ok_or_else(|| remote_unavailable(&live.owner_host_id))?
+            .ok_or_else(|| remote_unavailable_for_owner(&state, &live.owner_host_id))?
             .raw_terminal(
                 &live.owner_host_id,
                 &session.authority_actor,
