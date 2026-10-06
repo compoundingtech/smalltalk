@@ -1602,8 +1602,11 @@ exit 0
     #[test]
     fn removing_a_missing_restart_record_also_deletes_its_environment() {
         let root = tempfile::tempdir().unwrap();
+        use std::os::unix::fs::DirBuilderExt as _;
+        let runtime_directory = root.path().join("runtime");
+        fs::DirBuilder::new().mode(0o700).create(&runtime_directory).unwrap();
         let runtime = PtyRuntime::new(root.path().join("registry")).with_environment(BTreeMap::from([
-            ("XDG_RUNTIME_DIR".into(), root.path().display().to_string()),
+            ("XDG_RUNTIME_DIR".into(), runtime_directory.display().to_string()),
         ]));
         let path = runtime.prepare_restart_environment("work", &BTreeMap::from([
             ("VARIABLE_NAME".into(), "synthetic-sensitive-value".into()),
@@ -1616,9 +1619,12 @@ exit 0
     #[test]
     fn refusing_to_remove_a_live_restart_record_retains_its_environment() {
         let root = tempfile::tempdir().unwrap();
+        use std::os::unix::fs::DirBuilderExt as _;
+        let runtime_directory = root.path().join("runtime");
+        fs::DirBuilder::new().mode(0o700).create(&runtime_directory).unwrap();
         let registry = root.path().join("registry");
         let runtime = PtyRuntime::new(registry.clone()).with_environment(BTreeMap::from([
-            ("XDG_RUNTIME_DIR".into(), root.path().display().to_string()),
+            ("XDG_RUNTIME_DIR".into(), runtime_directory.display().to_string()),
         ]));
         let path = runtime.prepare_restart_environment("work", &BTreeMap::from([
             ("VARIABLE_NAME".into(), "synthetic-sensitive-value".into()),
@@ -2194,8 +2200,10 @@ exit 0
         session.runtime.end_leftovers_later(&session.id);
 
         assert_gone_soon(session.orphan, "the ended harness's background process");
-        // Running the same cleanup synchronously makes the overlay assertion deterministic.
-        session.runtime.end_leftovers(&session.id).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while environment_file.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
         assert!(!environment_file.exists());
     }
 
