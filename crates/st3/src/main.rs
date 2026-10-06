@@ -55,6 +55,7 @@ use completion::{Complete, Entity, WorkFilter};
 
 mod cli_help;
 mod completion;
+mod current_harness_publisher;
 mod presentation;
 
 use presentation::{
@@ -16920,6 +16921,9 @@ async fn drive_st2_native(
         runtime_id,
         ..
     } = paths.clone();
+    let _current_publisher = current_harness_publisher::Publisher::start(
+        client, subject, driver, &agent_dir, &incarnation,
+    )?;
     let mut mailbox =
         NativeMailbox::start(client, subject, &incarnation, driver, &mut loop_state).await?;
     let attach_started = Instant::now();
@@ -17555,6 +17559,36 @@ impl NativeObservations {
         // Bound a wake's work so a backlog does not hold back native delivery.
         let mut events = st_drivers::harness_events::pending(&self.dir, 64)?;
         for event in &mut events {
+            if event.kind == "harness-gap" {
+                let mut fields = BTreeMap::from([
+                    ("runtime_incarnation".into(), Value::from(event.runtime_incarnation.as_str())),
+                ]);
+                for name in ["history_gap_count", "history_gap_from_ms", "history_gap_to_ms", "history_gap_reason"] {
+                    fields.insert(name.into(), event.payload.get(name).cloned().context("incomplete history gap")?);
+                }
+                let claim = ClaimInput {
+                    subject: subject.into(),
+                    kind: "harness.history.gap".into(),
+                    actor: Some(subject.into()),
+                    fields,
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!(
+                        "harness-gap:{subject}:{}:{}", event.runtime_incarnation, event.sequence,
+                    )),
+                };
+                let claim: ClaimInput = serde_json::from_value(st_drivers::harness_events::prepare_publication(
+                    &self.dir,
+                    event.sequence,
+                    "harness.history.gap:",
+                    &serde_json::to_value(&claim)?,
+                )?)?;
+                // A historical gap may belong to a predecessor runtime. It must remain visible,
+                // rather than pass through the live-runtime-only native observation endpoint.
+                let _: ClaimRecord = client.post("/v1/claims", &claim).await?;
+                st_drivers::harness_events::acknowledge(&self.dir, event.sequence)?;
+                continue;
+            }
             // Account binding is outbox metadata, not part of the producer's observation.
             // Preserve it separately for the accounting claim builders below.
             let account_ref = event.payload.as_object_mut()
@@ -17849,6 +17883,7 @@ async fn publish_harness_activity(
         ),
         ("ask".into(), Value::String(observed.ask.as_str().into())),
         ("background_jobs".into(), observed.background_jobs.map(Value::from).unwrap_or(Value::Null)),
+        ("running_subagents".into(), observed.running_subagents.map(Value::from).unwrap_or(Value::Null)),
         (
             "input_buffer".into(),
             Value::String(observed.input_buffer.as_str().into()),
@@ -19215,6 +19250,7 @@ impl PiChannelResume {
                 self.frame_sequence = self.frame_sequence.saturating_add(1);
                 self.pending.state = Some((status.to_owned(), self.frame_sequence));
                 self.pending.background_jobs = frame.get("backgroundJobs").and_then(Value::as_u64);
+                self.pending.running_subagents = frame.get("runningSubagents").and_then(Value::as_u64);
                 self.pending.blocked_on = frame
                     .get("blockedOn")
                     .and_then(Value::as_str)
@@ -19326,6 +19362,8 @@ struct PiFamilyReports {
     #[serde(default)]
     background_jobs: Option<u64>,
     #[serde(default)]
+    running_subagents: Option<u64>,
+    #[serde(default)]
     ask: Option<String>,
     #[serde(default)]
     reason: Option<String>,
@@ -19383,6 +19421,7 @@ impl PiFamilyReports {
                                     .unwrap_or(Value::Null),
                             ),
                             ("background_jobs".into(), self.background_jobs.map(Value::from).unwrap_or(Value::Null)),
+                            ("running_subagents".into(), self.running_subagents.map(Value::from).unwrap_or(Value::Null)),
                             ("input_buffer".into(), Value::Null),
                             ("exit".into(), Value::Null),
                         ])),
@@ -19837,6 +19876,9 @@ async fn drive_codex_native(
     let prior_binding = std::fs::read(state_dir.join("binding.json")).ok();
     let inbox = st_drivers::message::inbox_dir(&agent_dir);
     let archive = st_drivers::message::archive_dir(&agent_dir);
+    let _current_publisher = current_harness_publisher::Publisher::start(
+        client, subject, "codex", &agent_dir, &incarnation,
+    )?;
     let mut mailbox =
         NativeMailbox::start(client, subject, &incarnation, "codex", &mut loop_state).await?;
     let mut observations = NativeObservations::start(&agent_dir, &incarnation)?;
@@ -27800,5 +27842,72 @@ mission "review" state="ready" {
             "totals":{"pending":0,"in_progress":0,"completed":0,"blocked":0}, "truncated":false,
         })).unwrap();
         tokio::time::timeout(Duration::from_secs(1), observations.recv()).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn historical_gap_survives_lost_ack_and_reexec_after_runtime_replacement() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use axum::{Json, Router, http::StatusCode, response::IntoResponse as _, routing::post};
+
+        let subject = "agent/example/history-gap";
+        let root = tempfile::tempdir().unwrap();
+        st_drivers::harness_events::enable(root.path(), "runtime-new").unwrap();
+        let connection = rusqlite::Connection::open(st_drivers::harness_events::database_path(root.path())).unwrap();
+        for (count, from, to) in [(2, 10, 20), (3, 21, 25)] {
+            let body = json!({
+                "incarnation":"provider-old",
+                "history_gap_count":count, "history_gap_from_ms":from,
+                "history_gap_to_ms":to, "history_gap_reason":"cap-full",
+            });
+            connection.execute(
+                "INSERT INTO events(runtime_incarnation,queued_at_ms,kind,body) VALUES (?1,?2,'harness-gap',?3)",
+                rusqlite::params!["runtime-old", to, serde_json::to_string(&body).unwrap()],
+            ).unwrap();
+        }
+        let store = Arc::new(st3::store::Store::open_memory("gap-proof").unwrap());
+        store.append_claim(&ClaimInput {
+            subject: subject.into(), kind: "runtime.observed".into(), actor: Some(subject.into()),
+            fields: BTreeMap::from([
+                ("status".into(), Value::from("running")),
+                ("incarnation_id".into(), Value::from("runtime-new")),
+            ]),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let lose_ack = Arc::new(AtomicBool::new(true));
+        let app = Router::new().route("/v1/claims", post({
+            let store = store.clone();
+            move |Json(input): Json<ClaimInput>| {
+                let (store, lose_ack) = (store.clone(), lose_ack.clone());
+                async move {
+                    let claim = store.append_claim(&input).unwrap();
+                    if lose_ack.swap(false, Ordering::SeqCst) {
+                        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"code":"lost-ack","message":"admitted before response failure"}))).into_response();
+                    }
+                    Json(json!({"api_version":"st3.v1", "value":claim})).into_response()
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = Client::new(st3::client::Endpoint::Http(format!("http://{}", listener.local_addr().unwrap())));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut observations = NativeObservations::start(root.path(), "runtime-new").unwrap();
+        let mut ready = false;
+        assert!(observations.drain(&client, subject, "omp", &mut ready).await.is_err());
+        let retained = st_drivers::harness_events::pending(root.path(), 4).unwrap();
+        assert_eq!(retained.iter().map(|event| event.sequence).collect::<Vec<_>>(), [1, 2]);
+        drop(observations);
+        let mut replacement = NativeObservations::start(root.path(), "runtime-new").unwrap();
+        replacement.drain(&client, subject, "omp", &mut ready).await.unwrap();
+        assert!(st_drivers::harness_events::pending(root.path(), 1).unwrap().is_empty());
+        let claims = store.claims_page(Some(subject), None, 0, None, false, 10).unwrap().claims;
+        let gaps: Vec<_> = claims.iter().filter(|claim| claim.kind == "harness.history.gap").collect();
+        assert_eq!(gaps.iter().map(|claim| claim.body["fields"]["history_gap_count"].as_u64().unwrap()).collect::<Vec<_>>(), [2, 3]);
+        assert!(gaps.iter().all(|claim| claim.body["fields"]["runtime_incarnation"] == "runtime-old"));
+        let pending_bytes: String = connection.query_row(
+            "SELECT value FROM metadata WHERE key='pending-bytes'", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(pending_bytes, "0");
+        server.abort();
     }
 }

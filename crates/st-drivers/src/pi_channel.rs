@@ -651,6 +651,7 @@ fn state_observation(frame: &Value) -> Option<harness_state::Observation> {
     let mut observation =
         harness_state::Observation::new(state, blocked_on, harness_state::InputBuffer::Unknown);
     observation.background_jobs = frame.get("backgroundJobs").and_then(Value::as_u64);
+    observation.running_subagents = frame.get("runningSubagents").and_then(Value::as_u64);
     if blocked_on == harness_state::BlockedOn::Human
         && let Some(ask) = frame.get("ask").and_then(Value::as_str)
     {
@@ -2072,5 +2073,23 @@ mod background_job_tests {
             let frame = json!({"type":"state","state":"idle","backgroundJobs":value});
             assert_eq!(state_observation(&frame).unwrap().background_jobs, expected);
         }
+    }
+
+    #[test]
+    fn subagent_wire_count_does_not_turn_missing_or_invalid_evidence_into_zero() {
+        for (value, expected) in [
+            (json!(3), Some(3)), (json!(0), Some(0)), (Value::Null, None),
+            (json!(-1), None), (json!("0"), None),
+        ] {
+            let frame = json!({
+                "type":"state", "state":"active", "blockedOn":"human", "ask":"question",
+                "backgroundJobs":2, "runningSubagents":value,
+            });
+            let observed = state_observation(&frame).unwrap();
+            assert_eq!(observed.running_subagents, expected);
+            assert_eq!(observed.background_jobs, Some(2));
+            assert_eq!(observed.blocked_on, harness_state::BlockedOn::Human);
+        }
+        assert_eq!(state_observation(&json!({"type":"state","state":"idle"})).unwrap().running_subagents, None);
     }
 }

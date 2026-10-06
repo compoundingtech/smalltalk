@@ -159,6 +159,8 @@ struct Record {
     ask: Ask,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     background_jobs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    running_subagents: Option<u64>,
     /// Diagnostic only. No consumer branches on it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
@@ -186,12 +188,11 @@ struct Record {
     /// while the successor's claim replaces the predecessor's.
     #[serde(default)]
     seq: u64,
-    /// When the current state was entered. Survives heartbeat re-stamps.
+    /// When the current category was entered. Survives heartbeat and metadata refreshes.
     since_ms: u64,
     /// The heartbeat: when the writer last held evidence for this state.
     written_at_ms: u64,
-    /// Monotonic transition counter. Keeps every write byte-distinct and leaves room for a
-    /// compatible transition history later.
+    /// Monotonic categorical transition counter; metadata refreshes preserve it.
     transitions: u64,
 }
 
@@ -213,6 +214,7 @@ pub struct Observation {
     pub input_buffer: InputBuffer,
     pub ask: Ask,
     pub background_jobs: Option<u64>,
+    pub running_subagents: Option<u64>,
     pub provider_auth: Option<bool>,
     pub reason: Option<String>,
     pub exit: Option<String>,
@@ -226,6 +228,7 @@ impl Observation {
             input_buffer,
             ask: Ask::None,
             background_jobs: None,
+            running_subagents: None,
             provider_auth: None,
             reason: None,
             exit: None,
@@ -454,17 +457,21 @@ impl Writer {
                     && (self.interrupted
                         || own_record.is_none_or(|r| r.provider_auth != observation.provider_auth)),
             ));
-        let unchanged = !self.interrupted
+        let same_category = !self.interrupted
             && own_record.is_some_and(|current| {
-                current.provider_auth_sequence == provider_auth_sequence
-                    && current.provider_auth == provider_auth
+                current.provider_auth == provider_auth
                     && current.state == observation.state
                     && current.blocked_on == observation.blocked_on
                     && current.input_buffer == observation.input_buffer
                     && current.ask == observation.ask
-                    && current.background_jobs == observation.background_jobs
-                    && current.reason == observation.reason
                     && current.exit == observation.exit
+            });
+        let unchanged = same_category
+            && own_record.is_some_and(|current| {
+                current.provider_auth_sequence == provider_auth_sequence
+                    && current.background_jobs == observation.background_jobs
+                    && current.running_subagents == observation.running_subagents
+                    && current.reason == observation.reason
             });
         if unchanged
             && let Some(current) = own_record
@@ -486,7 +493,7 @@ impl Writer {
         // garbage (or an overflow probe), and inheriting it would poison every later write —
         // the writer's own clock wins instead.
         let written_at_ms = next_stamp(on_disk.as_deref(), now_ms);
-        let (since_ms, transitions) = match (own_record, unchanged) {
+        let (since_ms, transitions) = match (own_record, same_category) {
             (Some(current), true) => (current.since_ms, current.transitions),
             (Some(current), false) => (written_at_ms, current.transitions.saturating_add(1)),
             (None, _) => (
@@ -505,6 +512,7 @@ impl Writer {
             input_buffer: observation.input_buffer,
             ask: observation.ask,
             background_jobs: observation.background_jobs,
+            running_subagents: observation.running_subagents,
             provider_auth,
             provider_auth_sequence,
             reason: observation.reason,
@@ -576,6 +584,7 @@ pub struct Observed {
     pub input_buffer: InputBuffer,
     pub ask: Ask,
     pub background_jobs: Option<u64>,
+    pub running_subagents: Option<u64>,
     pub harness: Option<String>,
     pub since_ms: Option<u64>,
     /// When the owning driver last refreshed this evidence.
@@ -602,6 +611,7 @@ impl Observed {
             input_buffer: InputBuffer::Unknown,
             ask: Ask::Unknown,
             background_jobs: None,
+            running_subagents: None,
             harness,
             since_ms: None,
             observed_at_ms: None,
@@ -707,6 +717,7 @@ pub fn read_raw_at(
         input_buffer: record.input_buffer,
         ask: record.ask,
         background_jobs: record.background_jobs,
+        running_subagents: record.running_subagents,
         harness,
         since_ms: Some(record.since_ms),
         observed_at_ms: Some(record.written_at_ms),
@@ -904,6 +915,7 @@ fn claim_locked(writer: &Writer, token: &str) -> anyhow::Result<u64> {
         input_buffer: InputBuffer::Unknown,
         ask: Ask::None,
         background_jobs: None,
+        running_subagents: None,
         provider_auth: None,
         provider_auth_sequence: 0,
         reason: Some("superseded".to_string()),
@@ -1362,6 +1374,7 @@ mod tests {
                 input_buffer: InputBuffer::Unknown,
                 ask: Ask::None,
                 background_jobs: None,
+                running_subagents: None,
                 provider_auth: None,
                 provider_auth_sequence: 0,
                 reason: None,
@@ -1571,6 +1584,7 @@ mod tests {
             input_buffer: InputBuffer::Unknown,
             ask: Ask::None,
             background_jobs: None,
+            running_subagents: None,
             provider_auth: None,
             provider_auth_sequence: 0,
             reason: None,
@@ -2372,5 +2386,56 @@ mod background_job_tests {
             writer.heartbeat().unwrap();
             assert_eq!(read(&harness_state_path(root.path()), None).unwrap().background_jobs, jobs);
         }
+    }
+
+    #[test]
+    fn running_subagents_change_without_reusing_an_unknown_or_previous_count() {
+        let root = tempfile::tempdir().unwrap();
+        let mut writer = Writer::new(root.path(), "example.worker", "omp", Some("fixture".into()));
+        for count in [Some(3), Some(0), None, Some(1)] {
+            let mut observation = Observation::new(Activity::Active, BlockedOn::Human, InputBuffer::Unknown)
+                .with_ask(Ask::Question);
+            observation.running_subagents = count;
+            writer.observe(observation).unwrap();
+            let observed = read(&harness_state_path(root.path()), None).unwrap();
+            assert_eq!(observed.running_subagents, count);
+            assert_eq!(observed.blocked_on, BlockedOn::Human);
+            assert_eq!(observed.ask, Ask::Question);
+        }
+    }
+
+    #[test]
+    fn counts_and_diagnostics_refresh_without_restarting_the_category() {
+        let root = tempfile::tempdir().unwrap();
+        let path = harness_state_path(root.path());
+        let mut writer = Writer::new(root.path(), "example.worker", "omp", Some("fixture".into()));
+        let mut first = Observation::new(Activity::Idle, BlockedOn::None, InputBuffer::Empty)
+            .with_reason("first diagnostic");
+        first.background_jobs = Some(0);
+        first.running_subagents = Some(2);
+        writer.observe(first).unwrap();
+        let baseline = read(&path, None).unwrap();
+        let mut previous_stamp = baseline.observed_at_ms.unwrap();
+        for (index, (jobs, subagents)) in [
+            (Some(0), Some(2)), (Some(1), Some(1)), (Some(0), Some(0)), (None, None),
+        ].into_iter().enumerate() {
+            let mut observation = Observation::new(Activity::Idle, BlockedOn::None, InputBuffer::Empty)
+                .with_reason(format!("diagnostic-{index}"));
+            observation.background_jobs = jobs;
+            observation.running_subagents = subagents;
+            writer.observe(observation).unwrap();
+            let updated = read(&path, None).unwrap();
+            assert_eq!(updated.since_ms, baseline.since_ms);
+            assert_eq!(updated.transition_sequence, baseline.transition_sequence);
+            assert!(updated.observed_at_ms.unwrap() > previous_stamp);
+            assert_eq!(updated.background_jobs, jobs);
+            assert_eq!(updated.running_subagents, subagents);
+            previous_stamp = updated.observed_at_ms.unwrap();
+        }
+        writer.observe(Observation::new(Activity::Active, BlockedOn::Human, InputBuffer::Unknown)
+            .with_ask(Ask::Question)).unwrap();
+        let changed = read(&path, None).unwrap();
+        assert!(changed.since_ms.unwrap() > baseline.since_ms.unwrap());
+        assert_eq!(changed.transition_sequence.unwrap(), baseline.transition_sequence.unwrap() + 1);
     }
 }
