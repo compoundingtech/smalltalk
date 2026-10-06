@@ -559,6 +559,7 @@ fn message_after_work_lease_expiry_matches_full_queue_reduction() {
     let source = r#"
 version 2
 agent "amber" { command "true" }
+agent "birch" { command "true" }
 mission "lease-expiry" state="ready" {
   goal "Exercise time-derived queue invalidation."
   step "build" { assigned-to "agent/node.amber" }
@@ -593,8 +594,58 @@ mission "lease-expiry" state="ready" {
         "from": "agent/node.amber", "to": "person/test", "status": "sent",
         "content": "The lease expired without a work claim."
     }));
+    let index = store.index().unwrap();
+    let mut reduced = BTreeSet::new();
+    let incrementally_updated = store.cached_agent_resources(index, false, |changed| {
+        let delta = changed.expect("lease expiry must not fill the entire roster");
+        reduced.extend(delta.subjects.iter().cloned());
+        assert!(delta.previous.is_empty(), "expired rows must not retain old queues");
+        project(store, false, index, changed)
+    }).unwrap();
+    assert_eq!(reduced, BTreeSet::from(["agent/node.amber".to_owned()]));
+    assert_eq!(card(&incrementally_updated, "agent/node.birch"), card(&before, "agent/node.birch"));
     let after = check_both_histories(store);
     assert_eq!(card(&after, "agent/node.amber")["current_work_ids"], json!([]));
     assert_eq!(card(&after, "agent/node.amber")["next_work_id"], *step);
-    assert_eq!(store.agent_resources_full_fills(), fills + 2);
+    assert_eq!(store.agent_resources_full_fills(), fills);
+}
+
+#[test]
+fn completed_mission_deadline_does_not_invalidate_warm_rows() {
+    let root = tempfile::tempdir().unwrap();
+    let state = state(root.path());
+    let store = &state.store;
+    let source = r#"
+version 2
+agent "amber" { command "true" }
+mission "finished-deadline" state="ready" timeout="1s" {
+  goal "Retain a deadline after completion without invalidating warm cards."
+  step "build" { assigned-to "agent/node.amber" }
+}
+"#;
+    let intent = crate::graph::parse_test_intent(source, "node").unwrap();
+    let planned = store.mission(&intent, crate::model::IntentInput {
+        kdl: source.into(), source_name: None,
+    }).unwrap();
+    store.apply(&intent, &planned.subject_tokens, "finished-deadline-source").unwrap();
+    let run = store.create_mission_run(&MissionRunRequest {
+        mission: "finished-deadline".into(), revision: None,
+        workspace: root.path().display().to_string(), requester: Some("person/test".into()),
+        mode: Some("run".into()), inputs: BTreeMap::new(), idempotency_key: "finished-deadline-run".into(),
+    }).unwrap();
+    let deadline = run.deadline_at_unix_ms.unwrap();
+    append(store, &run.subject, "mission-run.state", json!({
+        "status": "completed", "phase": "terminal"
+    }));
+    check_both_histories(store);
+    let fills = store.agent_resources_full_fills();
+    while client_now_ms() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    append(store, "daemon/node", "daemon.diagnostic", json!({
+        "code": "deadline-passed", "severity": "warning", "reason": "No live work changed."
+    }));
+    let cards = check_both_histories(store);
+    assert_eq!(card(&cards, "agent/node.amber")["queued_work_count"], 0);
+    assert_eq!(store.agent_resources_full_fills(), fills);
 }

@@ -177,6 +177,7 @@ pub struct AgentWorkQueue {
     pub next_work_id: Option<String>,
     pub upcoming_work_ids: Vec<String>,
     pub queued_work_count: u64,
+    pub(crate) valid_until_unix_ms: Option<u128>,
 }
 
 const AGENT_WORK_PREVIEW_LIMIT: usize = 5;
@@ -6157,6 +6158,7 @@ impl Store {
         let orders = seat_run_orders_tx(&connection, None)?;
         let rows = seat_step_rows_tx(&connection, None)?;
         let mut seats = BTreeMap::<&str, Vec<SeatStep<'_>>>::new();
+        let mut invalidations = BTreeMap::<&str, u128>::new();
         for row in &rows {
             let step = row.seat_step();
             for agent in [row.assignee.as_deref(), row.claimant.as_deref()]
@@ -6165,6 +6167,10 @@ impl Store {
                 .collect::<BTreeSet<_>>()
             {
                 seats.entry(agent).or_default().push(step);
+                if let Some(instant) = row.valid_until_unix_ms {
+                    invalidations.entry(agent).and_modify(|old| *old = (*old).min(instant))
+                        .or_insert(instant);
+                }
             }
         }
         let mut queues = BTreeMap::<String, AgentWorkQueue>::new();
@@ -6177,6 +6183,7 @@ impl Store {
             queues.insert(
                 agent.to_owned(),
                 AgentWorkQueue {
+                    valid_until_unix_ms: invalidations.get(agent).copied(),
                     current_work_ids: selection
                         .held
                         .iter()
@@ -27191,6 +27198,7 @@ struct RosterStepRow {
     available_to: Vec<String>,
     created_at_unix_ms: u128,
     carried_claimant: Option<String>,
+    valid_until_unix_ms: Option<u128>,
 }
 
 impl RosterStepRow {
@@ -27213,7 +27221,15 @@ impl RosterStepRow {
 /// predicate, word for word that of `step_runs_open_index`, reads the fleet's open steps rather
 /// than every step the store has run.
 const SEAT_STEP_ROWS: &str = "SELECT subject, run_id, step_path, status, assignee, lease_owner,
-            available_to, created_at_unix_ms, lease_expires_at_unix_ms
+            available_to, created_at_unix_ms, lease_expires_at_unix_ms, not_before_unix_ms,
+            (SELECT deadline_at_unix_ms FROM mission_run_deadlines deadline
+             JOIN mission_runs owner ON owner.id=deadline.run_id
+             WHERE deadline.run_id=step_runs.run_id
+               AND owner.status NOT IN ('completed','failed','cancelled')
+               AND owner.phase<>'terminal'),
+            EXISTS(SELECT 1 FROM mission_runs owner WHERE owner.id=step_runs.run_id
+                   AND owner.status NOT IN ('completed','failed','cancelled')
+                   AND owner.phase<>'terminal')
      FROM step_runs
      WHERE agentless=0
        AND status IN ('ready', 'claimed', 'working', 'verifying')
@@ -27234,11 +27250,18 @@ fn seat_step_rows_tx(connection: &Connection, agent: Option<&str>) -> Result<Vec
         .query_map(params![agent, snapshot_unix_ms.to_string()], |row| {
             let mut status: String = row.get(3)?;
             let mut claimant = row.get(5)?;
-            let expires: Option<String> = row.get(8)?;
+            let expires = row.get::<_, Option<String>>(8)?
+                .and_then(|value| value.parse::<u128>().ok());
+            let owner_live = row.get::<_, bool>(11)?;
+            let valid_until_unix_ms = [
+                expires.filter(|_| matches!(status.as_str(), "claimed" | "working" | "verifying")),
+                row.get::<_, Option<String>>(9)?.and_then(|value| value.parse::<u128>().ok()),
+                row.get::<_, Option<String>>(10)?.and_then(|value| value.parse::<u128>().ok()),
+            ].into_iter().flatten()
+                .filter(|instant| *instant > snapshot_unix_ms)
+                .min().filter(|_| owner_live);
             if matches!(status.as_str(), "claimed" | "working" | "verifying")
-                && expires
-                    .and_then(|value| value.parse::<u128>().ok())
-                    .is_some_and(|expiry| expiry <= snapshot_unix_ms)
+                && expires.is_some_and(|expiry| expiry <= snapshot_unix_ms)
             {
                 status = "ready".into();
                 claimant = None;
@@ -27253,6 +27276,7 @@ fn seat_step_rows_tx(connection: &Connection, agent: Option<&str>) -> Result<Vec
                 available_to: serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or_default(),
                 created_at_unix_ms: row.get::<_, String>(7)?.parse().unwrap_or_default(),
                 carried_claimant: None,
+                valid_until_unix_ms,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;

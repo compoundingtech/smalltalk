@@ -64,11 +64,12 @@ by agent ID and kept in `(name, id)` order. Known seat-local, message-activity, 
 generation, and work-queue changes reduce their affected seats. Step/work changes conservatively
 also refresh previously active/queued seats, covering revision-derived initial assignments
 beyond the bounded preview; unknown kinds or
-unclassifiable dependencies conservatively fill the full roster. Each snapshot also records
-the earliest future work-lease expiry, readiness time, or mission deadline. Crossing that
-boundary forces a full fill even without a claim, so cache hits and message-only patches do
-not preserve expired queue state. Repair and replay invalidate the cache. Card reduction
-happens outside the cache mutex.
+unclassifiable dependencies conservatively fill the full roster. Each row records its earliest
+future live-work lease expiry, readiness time, or non-terminal mission deadline during queue
+reduction. A maintained time index selects only expired rows for fresh reduction, even without
+a claim; cache advances do not scan historical timers or rebuild the roster for completed
+mission deadlines. Timer metadata stays internal and never changes card JSON. Repair and
+replay invalidate the cache. Card reduction happens outside the cache mutex.
 
 Observation freshness, delivery presence, and running-subagent leases remain request-time
 overlays. Unfiltered lists pin stable roster values and ordering before applying overlays to
