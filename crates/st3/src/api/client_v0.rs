@@ -7449,21 +7449,62 @@ fn validate_message_session(
     session_id: &str,
 ) -> Result<(), ApiError> {
     let recipient = normalize_message_party(recipient);
-    let current_session = client_agent_resources(
-        &state.store,
-        false,
-        &snapshot.created_at,
-        snapshot.store_index,
-    )
-    .map_err(ApiError::internal)?
-    .into_iter()
-    .find(|agent| agent["id"] == recipient)
-    .and_then(|agent| agent["current_session_id"].as_str().map(str::to_owned))
-    .ok_or_else(|| {
-        validation(format!(
-            "message recipient `{recipient}` has no current normalized session"
-        ))
-    })?;
+    // Match the card's current-session fence without building cards, work queues, usage,
+    // todo lists or delivery overlays for the fleet.
+    let status = state
+        .store
+        .status_for_subject_names_at(
+            BTreeSet::from([recipient.clone()]),
+            snapshot.store_index,
+            false,
+        )
+        .map_err(ApiError::internal)?;
+    let current_session = status
+        .subjects
+        .into_iter()
+        .find(|subject| {
+            subject.subject == recipient
+                && subject.subject.starts_with("agent/")
+                && subject.projection.layer == "current"
+        })
+        .map(|subject| -> anyhow::Result<Option<String>> {
+            let moving = subject
+                .desired_token
+                .as_deref()
+                .map(|token| {
+                    crate::placement::handoff(
+                        &state.store,
+                        &subject.subject,
+                        token,
+                        snapshot.store_index,
+                    )
+                })
+                .transpose()?
+                .flatten()
+                .is_some_and(|handoff| handoff.phase != "running");
+            let fields = subject
+                .actual
+                .as_ref()
+                .map(|actual| actual.get("fields").unwrap_or(actual));
+            let incarnation = fields
+                .filter(|_| !moving)
+                .and_then(|fields| fields.get("incarnation_id"))
+                .and_then(Value::as_str);
+            let runtime = fields
+                .and_then(|fields| fields.get("runtime_id"))
+                .and_then(Value::as_str);
+            Ok(incarnation
+                .or(runtime)
+                .map(|identity| managed_session_id(&subject.subject, identity)))
+        })
+        .transpose()
+        .map_err(ApiError::internal)?
+        .flatten()
+        .ok_or_else(|| {
+            validation(format!(
+                "message recipient `{recipient}` has no current normalized session"
+            ))
+        })?;
     if current_session != session_id {
         return Err(stale(format!(
             "session `{session_id}` is not the current session for `{recipient}`"
@@ -13305,6 +13346,78 @@ mission "example/zero-run" state="ready" {
         }
         let gap = conversation_read_now(&owner, &session, &session_id, Some(&cursor)).unwrap_err();
         assert_eq!(gap.code, "cursor-gap");
+    }
+
+    #[test]
+    fn message_session_validation_reads_only_the_recipient_and_preserves_session_fences() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "session-point-node");
+        for (subject, incarnation) in [
+            ("agent/session-point-owner", Some("point-runtime:i2")),
+            ("agent/session-point-legacy", None),
+            ("agent/session-point-empty", None),
+        ] {
+            let mut fields = BTreeMap::from([
+                ("status".into(), json!("running")),
+                ("terminal".into(), json!(false)),
+            ]);
+            if subject != "agent/session-point-empty" {
+                fields.insert("runtime_id".into(), json!("point-runtime"));
+            }
+            if let Some(incarnation) = incarnation {
+                fields.insert("incarnation_id".into(), json!(incarnation));
+            }
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "runtime.observed".into(),
+                    actor: Some(subject.into()),
+                    fields,
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(subject.into()),
+                })
+                .unwrap();
+        }
+        let snapshot = new_client_snapshot(&state);
+        // The old fleet-card path would decode this unrelated card's invalid harness overlay.
+        state
+            .store
+            .cached_agent_resources(snapshot.store_index, false, |_| {
+                Ok(vec![json!({"id":"agent/unrelated", "_status_source":true})])
+            })
+            .unwrap();
+        let owner_session = managed_session_id("agent/session-point-owner", "point-runtime:i2");
+        validate_message_session(&state, &snapshot, "session-point-owner", &owner_session).unwrap();
+        let legacy_session = managed_session_id("agent/session-point-legacy", "point-runtime");
+        validate_message_session(
+            &state,
+            &snapshot,
+            "agent/session-point-legacy",
+            &legacy_session,
+        )
+        .unwrap();
+        let wrong_runtime = managed_session_id("agent/session-point-owner", "point-runtime");
+        assert_eq!(
+            validate_message_session(
+                &state,
+                &snapshot,
+                "agent/session-point-owner",
+                &wrong_runtime
+            )
+            .unwrap_err()
+            .code,
+            "stale-fence"
+        );
+        for subject in ["agent/session-point-empty", "agent/missing", "person/alex"] {
+            assert_eq!(
+                validate_message_session(&state, &snapshot, subject, &owner_session)
+                    .unwrap_err()
+                    .code,
+                "validation-failed"
+            );
+        }
     }
 
     #[tokio::test]
