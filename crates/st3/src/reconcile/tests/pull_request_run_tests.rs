@@ -1,4 +1,5 @@
 use super::*;
+use crate::model::WorkRequest;
 
 const SOURCE: &str = r#"version 2
 mission "review" state="ready" {
@@ -142,6 +143,48 @@ fn completed_pull_request_snapshot_is_deduplicated_after_restart() {
 }
 
 #[test]
+fn completed_pull_request_snapshot_is_deduplicated_after_replication() {
+    let remote = Arc::new(Store::open_memory("remote").unwrap());
+    apply_source(&remote, SOURCE, "fixture");
+    let snapshot = observe(&remote, &"a".repeat(40), "open");
+    let mut run_request = MissionRunRequest {
+        mission: "review".into(),
+        revision: None,
+        workspace: "/tmp/example-reviews".into(),
+        requester: Some("person/operator".into()),
+        mode: None,
+        inputs: BTreeMap::from([("source".into(), format!("{PR}@{snapshot}"))]),
+        idempotency_key: "first".into(),
+    };
+    let completed = remote
+        .create_subscription_mission_run(&run_request, None, "subscription/reviews", PR, &snapshot)
+        .unwrap();
+    remote
+        .set_mission_run_state(&completed.id, "completed", "terminal", None)
+        .unwrap();
+
+    let local = Arc::new(Store::open_memory("node").unwrap());
+    local
+        .import_replication("remote", &remote.export_replication(0).unwrap())
+        .unwrap();
+    assert_eq!(
+        local.mission_run(&completed.id).unwrap().unwrap().status,
+        "completed"
+    );
+    run_request.idempotency_key = "local-duplicate".into();
+    let error = local
+        .create_subscription_mission_run(&run_request, None, "subscription/reviews", PR, &snapshot)
+        .unwrap_err();
+    assert_eq!(error.code, "completed-subscription-snapshot");
+    assert!(
+        local
+            .active_mission_runs_for_mission("review")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn failed_pull_request_snapshot_can_be_retried() {
     let store = Arc::new(Store::open_memory("node").unwrap());
     apply_source(&store, SOURCE, "fixture");
@@ -180,6 +223,8 @@ fn superseded_subscription_pull_request_runs_cancel_but_authored_runs_keep_their
         reads.contains(PR),
         "the next observation must wake the run evaluator"
     );
+    assert!(reads.contains(&format!("subscription-run:{}", run.subject)));
+    assert!(!reads.contains("kind:subscription.mission-started"));
 
     observe(&store, &"b".repeat(40), "open");
     for _ in 0..5 {
@@ -208,6 +253,97 @@ fn superseded_subscription_pull_request_runs_cancel_but_authored_runs_keep_their
         !outcomes
             .iter()
             .any(|c| c.body["fields"]["status"] == "failed")
+    );
+}
+
+#[test]
+fn supersession_revokes_a_claimed_worker_and_runs_final_cleanup() {
+    let store = Arc::new(Store::open_memory("node").unwrap());
+    let source = SOURCE.replace(
+        "step \"review\" { agentless; gate \"wait\" { document \"doc/review-ready\" } }",
+        "step \"review\" { assigned-to \"agent/node.worker\" }\n  finally { step \"cleanup\" { agentless } }",
+    ) + "\nagent \"worker\" { workspace \".\"; command \"true\" }\n";
+    apply_source(&store, &source, "fixture");
+    let snapshot = observe(&store, &"a".repeat(40), "open");
+    let run = start(&store, &snapshot, "first");
+    let step = run.steps.iter().find(|step| step.step == "review").unwrap();
+    store
+        .append_claim(&ClaimInput {
+            subject: "agent/node.worker".into(),
+            kind: "harness.observed".into(),
+            actor: None,
+            fields: BTreeMap::from([
+                ("state".into(), Value::String("ready".into())),
+                (
+                    "incarnation_id".into(),
+                    Value::String("worker-incarnation".into()),
+                ),
+            ]),
+            evidence: vec![],
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+    store.set_step_state(&step.subject, "ready", None).unwrap();
+    let work = |key: &str| WorkRequest {
+        actor: Some("agent/node.worker".into()),
+        incarnation: Some("worker-incarnation".into()),
+        summary: None,
+        reason: None,
+        evidence: vec![],
+        idempotency_key: key.into(),
+    };
+    store
+        .work_action(&step.subject, "claim", &work("claim"))
+        .unwrap();
+    observe(&store, &"b".repeat(40), "open");
+    let r = reconciler(&store);
+    r.evaluate_active_mission_run(&store.mission_run(&run.id).unwrap().unwrap())
+        .unwrap();
+    let cancelled = store.mission_run(&run.id).unwrap().unwrap();
+    assert_eq!(cancelled.phase, "final-cancelled");
+    let cancelled_step = cancelled
+        .steps
+        .iter()
+        .find(|step| step.step == "review")
+        .unwrap();
+    assert_eq!(cancelled_step.status, "cancelled");
+    assert!(cancelled_step.claimant.is_none());
+    assert!(cancelled_step.claim_incarnation.is_none());
+    assert!(cancelled_step.claim_expires_at_unix_ms.is_none());
+    assert_eq!(
+        cancelled
+            .steps
+            .iter()
+            .find(|step| step.step == "cleanup")
+            .unwrap()
+            .status,
+        "pending"
+    );
+    assert!(
+        store
+            .work_action(&step.subject, "complete", &work("late-complete"))
+            .is_err()
+    );
+    let notices = store.messages(None, true).unwrap();
+    assert!(
+        notices
+            .iter()
+            .any(|message| message.title.as_deref() == Some("Mission work cancelled"))
+    );
+    for _ in 0..5 {
+        r.evaluate_mission_runs().unwrap();
+    }
+    let ended = store.mission_run(&run.id).unwrap().unwrap();
+    assert_eq!(ended.status, "cancelled");
+    assert_eq!(
+        ended
+            .steps
+            .iter()
+            .find(|step| step.step == "cleanup")
+            .unwrap()
+            .status,
+        "completed"
     );
 }
 

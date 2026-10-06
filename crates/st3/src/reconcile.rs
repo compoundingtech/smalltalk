@@ -31864,8 +31864,9 @@ subscription "reviews" {
                 },
             )
             .unwrap();
-        // Occupy capacity so the migration must queue the valid hold rather than just start it.
-        let discovery = legacy[0].body["fields"]["discovery"].as_str().unwrap();
+        // Occupy capacity with another snapshot: completing the valid hold's own snapshot
+        // would correctly suppress its later delivery rather than test queue migration.
+        let discovery = legacy[1].body["fields"]["discovery"].as_str().unwrap();
         let occupied = store
             .create_mission_run(&MissionRunRequest {
                 mission: "review".into(),
@@ -31875,7 +31876,7 @@ subscription "reviews" {
                 mode: None,
                 inputs: BTreeMap::from([(
                     "source".into(),
-                    format!("resource/repo/pull-request/1@{discovery}"),
+                    format!("resource/repo/pull-request/2@{discovery}"),
                 )]),
                 idempotency_key: "occupied".into(),
             })

@@ -191,7 +191,25 @@ mission "review" state="ready" {
   goal "Review one immutable pull request snapshot."
   input "source" kind="resource"
   completion { when "all-steps-exhausted" }
-  step "inspect" { agentless; gate "wait" { document "doc/review-ready" } }
+  step "inspect" {
+    agentless
+    exec "writer" {
+      command "echo $$ > exec.pid; while :; do echo writing >> draft; sleep 0.05; done"
+      restart "never"
+    }
+    gate "wait" { document "doc/review-ready" }
+  }
+  finally {
+    step "cleanup" {
+      agentless
+      gate "the writer stopped before removing its draft" {
+        exec "while kill -0 $(cat exec.pid) 2>/dev/null; do sleep 0.05; done; rm -f draft; echo cleaned > cleanup"
+        host "orchid"
+        workspace "."
+        time-limit "1m"
+      }
+    }
+  }
 }
 resource "repo" { kind "vcs.repository" }
 observer "repo" { resource "resource/repo"; provider "github.repository"; locator "acme/garden"; field "pull_requests" }
@@ -298,6 +316,15 @@ subscription "reviews" { observer "observer/repo"; on "pull_requests"; delivery 
         daemon.command(&["missions", "show", &active.subject])["status"],
         "running"
     );
+    wait_for("the review writer to be writing its draft", || {
+        root.path().join("draft").exists()
+    });
+    let writer = std::fs::read_to_string(root.path().join("exec.pid"))
+        .unwrap()
+        .trim()
+        .parse::<i32>()
+        .unwrap();
+    assert!(live(writer));
     daemon.command(&[
         "claim",
         "resource/repo/pull-request/8",
@@ -313,6 +340,9 @@ subscription "reviews" { observer "observer/repo"; on "pull_requests"; delivery 
     wait_for("the superseded review to cancel", || {
         daemon.command(&["missions", "show", &active.subject])["status"] == "cancelled"
     });
+    assert!(!live(writer));
+    assert!(root.path().join("cleanup").exists());
+    assert!(!root.path().join("draft").exists());
     daemon.restart();
     assert_eq!(
         daemon.command(&["missions", "show", &active.subject])["status"],

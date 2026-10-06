@@ -234,6 +234,9 @@ WHERE kind IN (
 CREATE INDEX IF NOT EXISTS claims_subscription_delivery_key_index
 ON claims(json_extract(body, '$.fields.delivery_key'))
 WHERE kind='subscription.mission-requested';
+CREATE INDEX IF NOT EXISTS claims_subscription_started_run_index
+ON claims(json_extract(body, '$.fields.mission_run'))
+WHERE kind='subscription.mission-started';
 CREATE INDEX IF NOT EXISTS claims_subscription_mission_resource_index
 ON claims(json_extract(body, '$.fields.mission'), json_extract(body, '$.fields.resource'))
 WHERE kind='subscription.mission-requested';
@@ -1289,6 +1292,17 @@ fn stale_ref_request_tx(connection: &Connection, resource: &str, discovery: &str
     if let Some((requested, current)) = requested_head.zip(current.get("head").and_then(Value::as_str))
         && requested != current { return Ok(Some(format!("ref {resource} moved from head {requested} to {current}"))); }
     Ok(None)
+}
+
+const SUBSCRIPTION_STARTED_RUN_QUERY: &str =
+    "SELECT EXISTS(SELECT 1 FROM claims INDEXED BY claims_subscription_started_run_index
+     WHERE kind='subscription.mission-started'
+     AND json_extract(body, '$.fields.mission_run')=?1)";
+
+fn subscription_started_run_tx(connection: &Connection, run: &str) -> Result<bool> {
+    Ok(connection
+        .prepare_cached(SUBSCRIPTION_STARTED_RUN_QUERY)?
+        .query_row([run], |row| row.get(0))?)
 }
 
 fn stale_pull_request_request_tx(
@@ -13569,13 +13583,8 @@ impl Store {
             .as_deref()
             .is_some_and(|parent| parent.starts_with("step-run/subscription/"));
         if !from_subscription {
-            smallclaims::touched::note_read(|| "kind:subscription.mission-started".to_owned());
-            let started: bool = self.readers.get().query_row(
-                "SELECT EXISTS(SELECT 1 FROM claims WHERE kind='subscription.mission-started'
-                 AND json_extract(body, '$.fields.mission_run')=?1)",
-                [&run.subject],
-                |row| row.get(0),
-            )?;
+            smallclaims::touched::note_read(|| format!("subscription-run:{}", run.subject));
+            let started = subscription_started_run_tx(&self.readers.get(), &run.subject)?;
             if !started {
                 return Ok(None);
             }
@@ -39626,6 +39635,47 @@ version 2
                 "{kind}"
             );
         }
+    }
+
+    #[test]
+    fn subscription_run_lookup_cost_does_not_grow_with_unrelated_deliveries() {
+        let store = Store::open_memory("orchid").unwrap();
+        let mut connection = store.connection.write();
+        let transaction = connection.transaction().unwrap();
+        let mut costs = Vec::new();
+        for n in 1..=10_000 {
+            let id = format!("started-{n}");
+            transaction
+                .execute(
+                    "INSERT INTO batches(id,origin,replica_sequence,hash,accepted_at_unix_ms)
+                 VALUES(?1,'orchid',1,?1,'1')",
+                    [&id],
+                )
+                .unwrap();
+            transaction.execute(
+                "INSERT INTO claims(id,batch_id,subject,kind,origin,body,predecessors,accepted_at_unix_ms)
+                 VALUES(?1,?1,'subscription/reviews','subscription.mission-started','orchid',?2,'[]','1')",
+                params![id, json!({"fields":{"mission_run":format!("mission-run/{n}")}}).to_string()],
+            ).unwrap();
+            if n == 100 || n == 10_000 {
+                transaction
+                    .prepare_cached(SUBSCRIPTION_STARTED_RUN_QUERY)
+                    .unwrap()
+                    .reset_status(rusqlite::StatementStatus::VmStep);
+                assert!(subscription_started_run_tx(&transaction, "mission-run/1").unwrap());
+                assert!(!subscription_started_run_tx(&transaction, "mission-run/authored").unwrap());
+                costs.push(
+                    transaction
+                        .prepare_cached(SUBSCRIPTION_STARTED_RUN_QUERY)
+                        .unwrap()
+                        .get_status(rusqlite::StatementStatus::VmStep),
+                );
+            }
+        }
+        assert!(
+            costs[0] > 0 && costs[1] <= costs[0] * 2 && costs[1] < 100,
+            "positive and absent subscription lookups must seek, not scan history: {costs:?}"
+        );
     }
 
     #[test]
