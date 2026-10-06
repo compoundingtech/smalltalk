@@ -232,7 +232,9 @@ impl Heard {
     /// How long nothing has arrived.
     pub fn quiet_for(&self) -> Duration {
         let now = self.since.elapsed().as_millis() as u64;
-        Duration::from_millis(now.saturating_sub(self.at_ms.load(std::sync::atomic::Ordering::Relaxed)))
+        Duration::from_millis(
+            now.saturating_sub(self.at_ms.load(std::sync::atomic::Ordering::Relaxed)),
+        )
     }
 }
 
