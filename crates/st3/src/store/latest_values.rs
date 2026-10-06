@@ -327,7 +327,8 @@ pub(super) fn append(
                         .get("incarnation_id")
                         .cloned()
                         .unwrap_or(Value::Null)
-                && old["fields"].get("provider_auth") == input.fields.get("provider_auth")
+                && old["fields"].get("provider_auth").and_then(Value::as_bool)
+                    == input.fields.get("provider_auth").and_then(Value::as_bool)
                 && permission_blocked(&old["fields"])
                     == (input.fields.get("blocked_on") == Some(&json!("human"))
                         && input.fields.get("ask") == Some(&json!("permission")))
@@ -784,6 +785,32 @@ mod tests {
         assert!(relaunched.body["fields"].get("ask").is_none());
         assert_eq!(relaunched.body["fields"]["observed_since_ms"], 30);
         assert_eq!(relaunched.body["fields"]["status_transition"], true);
+    }
+
+    #[test]
+    fn unknown_auth_null_is_not_a_transition_or_an_auth_restoration() {
+        let store = Store::open_memory("owner").unwrap();
+        append(&store.graph, &state("working", "one", 10), 10, None).unwrap();
+        let publish = |at, auth| {
+            let mut input = state("working", "one", at);
+            input.fields.insert("provider_auth".into(), auth);
+            append(&store.graph, &input, u128::from(at), None)
+                .unwrap()
+                .0
+                .body
+        };
+        let unknown = publish(20, Value::Null);
+        assert_eq!(unknown["fields"]["status_transition"], false);
+        assert_eq!(unknown["fields"]["observed_since_ms"], 10);
+        let expired = publish(30, json!(false));
+        assert_eq!(expired["fields"]["status_transition"], true);
+        let still_expired = publish(40, Value::Null);
+        assert_eq!(still_expired["fields"]["provider_auth"], false);
+        assert_eq!(still_expired["fields"]["status_transition"], false);
+        assert_eq!(still_expired["fields"]["observed_since_ms"], 30);
+        let restored = publish(50, json!(true));
+        assert_eq!(restored["fields"]["status_transition"], true);
+        assert_eq!(restored["fields"]["observed_since_ms"], 50);
     }
 
     #[test]
