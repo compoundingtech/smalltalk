@@ -319,6 +319,7 @@ pub fn run(context: Context) -> Result<()> {
     let mut attached: Option<Following> = None;
     // The runtimes of the agent whose terminal view is open, to follow it again after a pause.
     let mut terminal_runtimes: Option<Vec<String>> = None;
+    let mut terminal_runtimes_by_agent: BTreeMap<String, Vec<String>> = BTreeMap::new();
     // Attaching a dropped terminal again: whether a try is out, and how many failed.
     let mut reattaching = false;
     // When a terminal was asked for, while it connects: the wait is shown, and a long one named.
@@ -628,9 +629,8 @@ pub fn run(context: Context) -> Result<()> {
                     }
                     let (rows, columns) = ui.terminal_size.get();
                     if let Some(view) = ui
-                        .terminal
-                        .as_mut()
-                        .filter(|view| view.agent == agent && view.native.is_none())
+                        .terminal_view_mut(&agent)
+                        .filter(|view| view.native.is_none())
                     {
                         view.native = Some(super::pty::NativeTerminal::spawn(
                             direct.stream,
@@ -645,9 +645,7 @@ pub fn run(context: Context) -> Result<()> {
                 Fetched::Reattached { agent, outcome } => {
                     reattaching = false;
                     if let Some(native) = ui
-                        .terminal
-                        .as_ref()
-                        .filter(|view| view.agent == agent)
+                        .terminal_view(&agent)
                         .and_then(|view| view.native.as_ref())
                     {
                         match outcome {
@@ -666,11 +664,10 @@ pub fn run(context: Context) -> Result<()> {
                     attach_started = None;
                     if agent.starts_with("terminal/") {
                         // A shell has no other view to fall back to.
-                        if let Some(view) = ui.terminal.as_mut().filter(|view| view.agent == agent)
-                        {
+                        if let Some(view) = ui.terminal_view_mut(&agent) {
                             view.ended = Some(format!("could not attach: {reason}"));
                         }
-                    } else if ui.terminal.as_ref().is_some_and(|view| view.agent == agent) {
+                    } else if ui.terminal_view(&agent).is_some() {
                         ui.flash(format!(
                             "No direct terminal ({reason}); showing st's view of it"
                         ));
@@ -964,6 +961,7 @@ pub fn run(context: Context) -> Result<()> {
                     });
                     attached = None;
                     terminal_runtimes = Some(runtime_ids.clone());
+                    terminal_runtimes_by_agent.insert(agent.clone(), runtime_ids.clone());
                     attach_started = Some(Instant::now());
                     let _ = commands.send(Command::Unfollow);
                     {
@@ -985,6 +983,7 @@ pub fn run(context: Context) -> Result<()> {
                         });
                     }
                     {
+                        ui.park_for(&agent);
                         ui.terminal = Some(super::TerminalView {
                             agent: agent.clone(),
                             title: name.clone(),
@@ -1262,17 +1261,26 @@ pub fn run(context: Context) -> Result<()> {
         // after a wait that grows with each try.
         if !reattaching
             && extras.live
-            && let Some(view) = ui.terminal.as_ref()
-            && let Some(native) = view.native.as_ref()
-            && let Some(at) = native.dropped()
-            && at.elapsed() >= Duration::from_secs(2_u64.pow(reattach_tries.min(5)))
+            && let Some((view, native)) = ui
+                .terminal
+                .iter()
+                .chain(ui.parked.iter())
+                .filter_map(|view| view.native.as_ref().map(|native| (view, native)))
+                .find(|(_, native)| {
+                    native.dropped().is_some_and(|at| {
+                        at.elapsed() >= Duration::from_secs(2_u64.pow(reattach_tries.min(5)))
+                    })
+                })
         {
             reattaching = true;
             let client = client.clone();
             let tx = fetched_tx.clone();
             let agent = view.agent.clone();
             let expected = native.incarnation.clone();
-            let runtime_ids = terminal_runtimes.clone().unwrap_or_default();
+            let runtime_ids = terminal_runtimes_by_agent
+                .get(&agent)
+                .cloned()
+                .unwrap_or_default();
             runtime.spawn(async move {
                 let outcome = attach_direct(&client, &agent, &runtime_ids, Some(&expected)).await;
                 let _ = tx.send(Fetched::Reattached { agent, outcome });
@@ -1280,9 +1288,9 @@ pub fn run(context: Context) -> Result<()> {
         }
         if ui
             .terminal
-            .as_ref()
-            .and_then(|view| view.native.as_ref())
-            .is_none()
+            .iter()
+            .chain(ui.parked.iter())
+            .all(|view| view.native.is_none())
         {
             reattach_tries = 0;
         }
@@ -1291,9 +1299,10 @@ pub fn run(context: Context) -> Result<()> {
         let flowing = ui.voice.is_some()
             || ui
                 .terminal
-                .as_ref()
-                .and_then(|view| view.native.as_ref())
-                .is_some_and(|native| native.flowing());
+                .iter()
+                .chain(ui.parked.iter())
+                .filter_map(|view| view.native.as_ref())
+                .any(|native| native.flowing());
         if event::poll(Duration::from_millis(if flowing { 16 } else { 80 }))? {
             // crossterm's read never returns on a closed terminal, so check for one before each.
             while !stopping.load(std::sync::atomic::Ordering::Relaxed) && !crate::stdin_hung_up() {
