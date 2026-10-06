@@ -1291,6 +1291,60 @@ fn stale_ref_request_tx(connection: &Connection, resource: &str, discovery: &str
     Ok(None)
 }
 
+fn stale_pull_request_request_tx(
+    connection: &Connection,
+    resource: &str,
+    discovery: &str,
+) -> Result<Option<String>> {
+    smallclaims::touched::note_read(|| resource.to_owned());
+    let Some(requested) = claim_by_id_tx(connection, discovery)?.filter(|claim| {
+        claim.subject == resource
+            && claim.body.pointer("/fields/kind").and_then(Value::as_str)
+                == Some("vcs.pull-request")
+    }) else {
+        return Ok(None);
+    };
+    let Some(current) =
+        latest_actual(connection, resource)?.and_then(|actual| actual.get("facts").cloned())
+    else {
+        return Ok(None);
+    };
+    let number = current
+        .get("number")
+        .and_then(Value::as_u64)
+        .map_or_else(|| resource.to_owned(), |number| format!("#{number}"));
+    if let Some(state) = current
+        .get("state")
+        .and_then(Value::as_str)
+        .filter(|state| *state != "open")
+    {
+        return Ok(Some(format!("pull request {number} is {state}")));
+    }
+    if current.get("draft").and_then(Value::as_bool) == Some(true) {
+        return Ok(Some(format!("pull request {number} is a draft again")));
+    }
+    let short = |head: &str| head.chars().take(12).collect::<String>();
+    let requested_head = match requested
+        .body
+        .pointer("/fields/facts/head_sha")
+        .and_then(Value::as_str)
+    {
+        Some(head) => Some(head.to_owned()),
+        None => listed_head_tx(connection, Some(&requested.body))?,
+    };
+    let current_head = current.get("head_sha").and_then(Value::as_str);
+    if let (Some(requested_head), Some(current_head)) = (requested_head.as_deref(), current_head)
+        && requested_head != current_head
+    {
+        return Ok(Some(format!(
+            "pull request {number} moved from head {} to {}",
+            short(requested_head),
+            short(current_head)
+        )));
+    }
+    Ok(None)
+}
+
 fn migrate_schema(connection: &Connection) -> Result<()> {
     let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version == 0 || version == 13 || version == 14 || version == 15 || version == 16 {
@@ -3424,6 +3478,40 @@ impl Store {
             return Err(St3Error::new("stale-ref-head", reason));
         }
         let inputs = resolve_mission_run_inputs(&transaction, &mission, &request.inputs)?;
+        if let Some((resource, discovery)) = latest_ref {
+            if let Some(reason) = stale_pull_request_request_tx(&transaction, resource, discovery)
+                .map_err(internal)?
+            {
+                return Err(St3Error::new("stale-pull-request", reason));
+            }
+            let is_pull_request = claim_by_id_tx(&transaction, discovery)
+                .map_err(internal)?
+                .is_some_and(|claim| {
+                    claim.subject == resource
+                        && claim.body.pointer("/fields/kind").and_then(Value::as_str)
+                            == Some("vcs.pull-request")
+                });
+            if is_pull_request {
+                let completed: Option<String> = transaction
+                    .query_row(
+                        "SELECT id FROM mission_runs WHERE mission_id=?1 AND status='completed'
+                     AND EXISTS(SELECT 1 FROM json_each(mission_runs.inputs) AS input
+                         WHERE json_extract(input.value, '$.subject')=?2
+                         AND json_extract(input.value, '$.claim_id')=?3)
+                     ORDER BY id LIMIT 1",
+                        params![mission_id, resource, discovery],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(internal)?;
+                if let Some(run) = completed {
+                    return Err(St3Error::new(
+                        "completed-subscription-snapshot",
+                        format!("mission-run/{run} already completed for {resource}@{discovery}"),
+                    ));
+                }
+            }
+        }
         enforce_mission_run_capacity(&transaction, &mission)?;
         let subject = occurrence_subject.map(str::to_owned).unwrap_or_else(|| {
             self.mission_run_subject_for_idempotency_key(&request.idempotency_key)
@@ -13462,48 +13550,46 @@ impl Store {
         resource: &str,
         discovery: &str,
     ) -> Result<Option<String>> {
-        let Some(requested) = self.claim_by_id(discovery)? else {
+        stale_pull_request_request_tx(&self.readers.get(), resource, discovery)
+    }
+
+    /// Only subscription deliveries follow the current PR head. Authored missions keep their
+    /// pinned inputs, including missions that opened or are changing a pull request themselves.
+    pub fn stale_subscription_pull_request_run(
+        &self,
+        run: &MissionRunView,
+    ) -> Result<Option<String>> {
+        if !run.inputs.values().any(|input| {
+            input.subject.as_deref().is_some_and(|subject| subject.contains("/pull-request/"))
+        }) {
             return Ok(None);
-        };
-        let Some(current) = self
-            .latest_actual_value(resource)?
-            .and_then(|actual| actual.get("facts").cloned())
-        else {
-            return Ok(None);
-        };
-        let number = current
-            .get("number")
-            .and_then(Value::as_u64)
-            .map_or_else(|| resource.to_owned(), |number| format!("#{number}"));
-        if let Some(state) = current
-            .get("state")
-            .and_then(Value::as_str)
-            .filter(|state| *state != "open")
-        {
-            return Ok(Some(format!("pull request {number} is {state}")));
         }
-        if current.get("draft").and_then(Value::as_bool) == Some(true) {
-            return Ok(Some(format!("pull request {number} is a draft again")));
+        let from_subscription = run
+            .parent_step_run
+            .as_deref()
+            .is_some_and(|parent| parent.starts_with("step-run/subscription/"));
+        if !from_subscription {
+            smallclaims::touched::note_read(|| "kind:subscription.mission-started".to_owned());
+            let started: bool = self.readers.get().query_row(
+                "SELECT EXISTS(SELECT 1 FROM claims WHERE kind='subscription.mission-started'
+                 AND json_extract(body, '$.fields.mission_run')=?1)",
+                [&run.subject],
+                |row| row.get(0),
+            )?;
+            if !started {
+                return Ok(None);
+            }
         }
-        let short = |head: &str| head.chars().take(12).collect::<String>();
-        let requested_head = match requested
-            .body
-            .pointer("/fields/facts/head_sha")
-            .and_then(Value::as_str)
+        for input in run
+            .inputs
+            .values()
+            .filter(|input| input.kind == MissionInputKind::Resource)
         {
-            Some(head) => Some(head.to_owned()),
-            None => listed_head_tx(&self.readers.get(), Some(&requested.body))?,
-        };
-        let current_head = current.get("head_sha").and_then(Value::as_str);
-        if let (Some(requested_head), Some(current_head)) =
-            (requested_head.as_deref(), current_head)
-            && requested_head != current_head
-        {
-            return Ok(Some(format!(
-                "pull request {number} moved from head {} to {}",
-                short(requested_head),
-                short(current_head)
-            )));
+            if let (Some(resource), Some(discovery)) = (&input.subject, &input.claim_id)
+                && let Some(reason) = self.stale_pull_request_request(resource, discovery)?
+            {
+                return Ok(Some(reason));
+            }
         }
         Ok(None)
     }

@@ -6690,6 +6690,14 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     fn evaluate_active_mission_run(&self, run: &MissionRunView) -> Result<bool> {
+        if run.phase == "normal"
+            && let Some(reason) = self.store.stale_subscription_pull_request_run(run)?
+        {
+            return self
+                .store
+                .request_mission_run_cancellation(&run.id, &reason)
+                .map_err(Into::into);
+        }
         if run
             .deadline_at_unix_ms
             .is_some_and(|deadline| deadline <= now_ms())
@@ -11863,7 +11871,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             let created = self.store.create_subscription_mission_run(&request_value, parent.as_ref(), &item.subject, resource, discovery);
             let run = match created {
                 Ok(run) => run,
-                Err(error) if error.code == "stale-ref-head" => {
+                Err(error) if matches!(error.code, "stale-ref-head" | "stale-pull-request" | "completed-subscription-snapshot") => {
                     self.store.append_claim(&ClaimInput {
                         subject: item.subject.clone(), kind: "subscription.mission-request-cancelled".into(), actor: None,
                         fields: BTreeMap::from([("request".into(), Value::String(request.id.clone())), ("reason".into(), Value::String(error.message))]),
@@ -15238,6 +15246,7 @@ mod tests {
     mod incremental_deadlines;
     mod rollout_tests;
     mod ref_watch_tests;
+    mod pull_request_run_tests;
     #[test]
     fn native_exec_and_gate_shell_resolve_the_declared_path() {
         use super::{NativeRuntime, RuntimeControl};
