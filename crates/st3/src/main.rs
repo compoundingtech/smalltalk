@@ -13720,6 +13720,11 @@ fn render_client_agent(
         agent.driver.as_deref().unwrap_or("none"),
         agent.harness_state.as_deref().unwrap_or("unobserved")
     );
+    if agent.blocked_on.as_deref() == Some("human")
+        && agent.ask.as_deref() == Some("permission")
+    {
+        let _ = writeln!(output, "AWAITING     approval");
+    }
     if let Some(todo) = &agent.todo {
         let snapshot = &todo.snapshot;
         let _ = write!(output, "Todo         ");
@@ -23576,6 +23581,20 @@ mod tests {
         assert!(card.contains(
             "FAULT        render refuses to change tracked file .claude/settings.local.json"
         ));
+    }
+
+    #[test]
+    fn agent_card_names_a_pending_codex_approval() {
+        let agent: st3_client::Agent = serde_json::from_value(serde_json::json!({
+            "kind": "agent", "id": "agent/approval", "revision": "one",
+            "updated_at": "2026-10-06T12:00:00Z", "name": "Approval",
+            "state": "running", "reachability": "local", "runtime_ids": [],
+            "driver": "codex", "harness_state": "blocked", "blocked_on": "human",
+            "ask": "permission", "reason": "waitingOnApproval"
+        })).unwrap();
+        let card = render_client_agent(&agent, &[], 0);
+        assert!(card.contains("HARNESS      codex · blocked\n"));
+        assert!(card.contains("AWAITING     approval\n"));
     }
 
     fn subagent_worker() -> serde_json::Value {

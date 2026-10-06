@@ -18289,37 +18289,63 @@ fn publish_changed_harness_state_tx(
     input: &ClaimInput,
     now: u128,
 ) -> Result<Option<ClaimRecord>, St3Error> {
-    fn state_fields<'a>(
-        fields: impl IntoIterator<Item = (&'a String, &'a Value)>,
-    ) -> BTreeMap<&'a str, &'a Value> {
-        fields
-            .into_iter()
-            .filter(|(name, _)| !matches!(name.as_str(), "observed_at_ms" | "observed_since_ms" | "status_transition"))
-            .map(|(name, value)| (name.as_str(), value))
-            .collect()
-    }
     let latest = latest_harness_of_incarnation_tx(
         transaction,
         &input.subject,
         input.fields.get("incarnation_id").and_then(Value::as_str),
     )?;
+    let mut fields = input.fields.clone();
+    if let Some(previous) = latest.as_ref().and_then(|claim| claim.body.get("fields")) {
+        for name in ["blocked_on", "ask"] {
+            if !fields.contains_key(name)
+                && let Some(value) = previous.get(name)
+            {
+                fields.insert(name.into(), value.clone());
+            }
+        }
+        if fields.get("provider_auth").is_none_or(Value::is_null)
+            && let Some(value) = previous.get("provider_auth").filter(|value| value.is_boolean())
+        {
+            fields.insert("provider_auth".into(), value.clone());
+        }
+    }
+    if matches!(fields.get("state").and_then(Value::as_str), Some("ended" | "indeterminate")) {
+        fields.insert("blocked_on".into(), Value::Null);
+        fields.insert("ask".into(), Value::Null);
+    }
     let unchanged = latest.as_ref().is_some_and(|claim| {
         claim
             .body
             .get("fields")
             .and_then(Value::as_object)
-            .is_some_and(|fields| state_fields(fields) == state_fields(&input.fields))
+            .is_some_and(|previous| {
+                fields.iter().all(|(name, value)| {
+                    matches!(name.as_str(), "observed_at_ms" | "observed_since_ms" | "status_transition")
+                        || previous.get(name) == Some(value)
+                })
+            })
     });
     // Refresh remote freshness at most once a minute, without manufacturing transitions.
     if unchanged && latest.as_ref().is_some_and(|claim| now.saturating_sub(claim.accepted_at_unix_ms) < 60_000) {
         return Ok(None);
     }
-    let mut fields = input.fields.clone();
     let observed_at = fields.get("observed_at_ms").and_then(Value::as_u64)
         .map_or(now, u128::from).min(now);
     let same_state = latest.as_ref().is_some_and(|claim| {
+        let previous = &claim.body["fields"];
+        let carried = |name: &str| fields.get(name).or_else(|| previous.get(name));
         claim.body["fields"]["state"] == fields["state"]
-            && claim.body["fields"].get("provider_auth") == fields.get("provider_auth")
+            && (seat_status::permission_blocked(
+                previous["state"].as_str(),
+                previous["blocked_on"].as_str(),
+                previous["ask"].as_str(),
+            ) == seat_status::permission_blocked(
+                fields["state"].as_str(),
+                carried("blocked_on").and_then(Value::as_str),
+                carried("ask").and_then(Value::as_str),
+            ))
+            && previous.get("provider_auth").and_then(Value::as_bool)
+                == carried("provider_auth").and_then(Value::as_bool)
             && claim.body["fields"].get("incarnation_id") == fields.get("incarnation_id")
     });
     let since = if same_state {
@@ -20480,6 +20506,10 @@ fn current_harness_fold_at(
         {
             current = Some((state.to_owned(), claim, observed_at_unix_ms, key));
         }
+        if matches!(fields.get("state").and_then(Value::as_str), Some("ended" | "indeterminate")) {
+            optional.entry("blocked_on").or_insert(None);
+            optional.entry("ask").or_insert(None);
+        }
         for name in [
             "driver",
             "transport",
@@ -20530,6 +20560,11 @@ fn current_harness_fold_at(
     if let Some((claim, _store_index, observed_at_unix_ms, key)) = work_activity
         && include_work_activity
         && key > runtime_key
+        && !seat_status::permission_blocked(
+            current.as_ref().map(|(state, _, _, _)| state.as_str()),
+            optional.get("blocked_on").and_then(|v| v.as_deref()),
+            optional.get("ask").and_then(|v| v.as_deref()),
+        )
         && current
             .as_ref()
             .is_none_or(|(_, _, _, harness_key)| key > *harness_key)
@@ -20552,6 +20587,16 @@ fn current_harness_fold_at(
     let Some((mut state, claim, observed_at_unix_ms, _)) = current else {
         return Ok(None);
     };
+    if seat_status::permission_blocked(
+        Some(state.as_str()),
+        optional.get("blocked_on").and_then(|v| v.as_deref()),
+        optional.get("ask").and_then(|v| v.as_deref()),
+    ) {
+        state = "blocked".into();
+    } else if matches!(state.as_str(), "ended" | "indeterminate") {
+        optional.insert("blocked_on", None);
+        optional.insert("ask", None);
+    }
     if optional.get("reason").and_then(|r| r.as_deref()) == Some("providerAuth") {
         if auth_restored {
             // Sparse successful reports must not inherit an older credential-refusal reason.

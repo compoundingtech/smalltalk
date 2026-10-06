@@ -20940,12 +20940,25 @@ mission "agent-human" state="ready" {
         // The harness schema's terminal activity keeps precedence over a stale ask.
         observe_harness("ended");
         assert_eq!(agent()["state"], "failed");
+        assert!(agent()["blocked_on"].is_null());
+        assert!(agent()["ask"].is_null());
         // Indeterminate activity keeps its existing waiting verdict; clients must not
         // present it as an answerable human ask.
         observe_harness("indeterminate");
         assert_eq!(agent()["state"], "waiting");
         assert_eq!(agent()["harness_state"], "indeterminate");
+        assert!(agent()["blocked_on"].is_null());
+        assert!(agent()["ask"].is_null());
+        // A sparse working successor in this incarnation must not revive the old ask.
+        append("harness.observed", json!({
+            "state": "working", "driver": "omp", "incarnation_id": "human-1",
+        }));
+        assert_eq!(agent()["state"], "running");
+        assert!(agent()["blocked_on"].is_null());
+        assert!(agent()["ask"].is_null());
+        // A fresh permission observation may block again.
         observe_harness("working");
+        assert_eq!(agent()["state"], "waiting");
         observe_runtime("stopped");
         assert_eq!(agent()["state"], "stopped");
         observe_runtime("starting");
