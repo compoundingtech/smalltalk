@@ -11,6 +11,17 @@ CREATE TABLE IF NOT EXISTS latest_values (
 );
 CREATE INDEX IF NOT EXISTS latest_values_local_index ON latest_values(local_id);
 CREATE UNIQUE INDEX IF NOT EXISTS latest_values_source_index ON latest_values(source_id);
+-- A register replacement retracts a cleared login candidate from this index immediately.
+-- Match the legacy positive-evidence predicate used by attention discovery.
+CREATE INDEX IF NOT EXISTS latest_values_harness_login_candidate_index ON latest_values(subject)
+WHERE (kind='harness.observed' AND (
+    json_type(body, '$.fields.provider_auth')='false'
+    OR json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
+        THEN '$.reason' ELSE '$.fields.reason' END)='providerAuth'
+    OR json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
+        THEN '$.state' ELSE '$.fields.state' END)='needs-login'))
+    OR (kind='harness.diagnostic'
+        AND json_extract(body, '$.fields.code')='provider-auth-expired');
 CREATE TABLE IF NOT EXISTS latest_readiness (
     subject TEXT PRIMARY KEY, incarnation TEXT NOT NULL, ready INTEGER NOT NULL
 );
@@ -36,6 +47,41 @@ CREATE VIEW IF NOT EXISTS registered_batches AS
 SELECT source_id AS id, origin, source_at AS replica_sequence, NULL AS actor,
     '' AS idempotency_key, CAST(source_at AS TEXT) AS accepted_at_unix_ms FROM latest_values;
 "#;
+
+/// Discover positive subjects before looking up their declaration. Do not correlate a
+/// whole-fleet declaration scan with the history/register UNION. Legacy observations use
+/// exactly the current_claims shadow rule; diagnostics remain durable auth evidence and
+/// the final harness fold still checks restoration, readiness, incarnation and ownership.
+pub(super) const LOGIN_CANDIDATES_SQL: &str = "
+WITH candidates AS (
+    SELECT subject FROM latest_values INDEXED BY latest_values_harness_login_candidate_index
+    WHERE (kind='harness.observed' AND (
+        json_type(body, '$.fields.provider_auth')='false'
+        OR json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
+            THEN '$.reason' ELSE '$.fields.reason' END)='providerAuth'
+        OR json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
+            THEN '$.state' ELSE '$.fields.state' END)='needs-login'))
+        OR (kind='harness.diagnostic'
+            AND json_extract(body, '$.fields.code')='provider-auth-expired')
+    UNION
+    SELECT subject FROM main.claims INDEXED BY claims_harness_login_candidate_index
+    WHERE ((kind='harness.observed' AND (
+        json_type(body, '$.fields.provider_auth')='false'
+        OR json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
+            THEN '$.reason' ELSE '$.fields.reason' END)='providerAuth'
+        OR json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
+            THEN '$.state' ELSE '$.fields.state' END)='needs-login'))
+        OR (kind='harness.diagnostic'
+            AND json_extract(body, '$.fields.code')='provider-auth-expired'))
+        AND (kind='harness.diagnostic' OR NOT EXISTS (
+            SELECT 1 FROM latest_values v
+            WHERE v.subject=claims.subject AND v.kind=claims.kind
+                AND v.source_at>=CAST(claims.accepted_at_unix_ms AS INTEGER)))
+)
+SELECT desired.subject, desired.kind, desired.body, desired.member,
+       desired.owner_run, desired.owner_generation, desired.owner_step
+FROM candidates CROSS JOIN desired
+WHERE desired.subject=candidates.subject AND desired.kind='agent' ORDER BY desired.subject";
 
 /// A database generation fences sequence numbers after a reset. Ordinary reopen retains it.
 /// Generation birth uses the owner clock; restore/reset requires that clock to move forward.

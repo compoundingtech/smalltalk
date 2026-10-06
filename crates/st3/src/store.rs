@@ -10555,21 +10555,7 @@ impl Store {
         smallclaims::touched::note_read(|| "kind:harness.observed".to_owned());
         smallclaims::touched::note_read(|| "kind:harness.diagnostic".to_owned());
         let connection = self.readers.get();
-        let mut statement = connection.prepare_cached(
-            "SELECT subject, kind, body, member, owner_run, owner_generation, owner_step
-             FROM desired WHERE kind='agent'
-               AND EXISTS (SELECT 1 FROM current_claims
-                 WHERE current_claims.subject=desired.subject AND (
-                   (kind='harness.observed' AND (
-                     json_type(body, '$.fields.provider_auth')='false'
-                     OR json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
-                         THEN '$.reason' ELSE '$.fields.reason' END)='providerAuth'
-                     OR json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
-                         THEN '$.state' ELSE '$.fields.state' END)='needs-login'))
-                   OR (kind='harness.diagnostic'
-                     AND json_extract(body, '$.fields.code')='provider-auth-expired')))
-             ORDER BY subject",
-        )?;
+        let mut statement = connection.prepare_cached(latest_values::LOGIN_CANDIDATES_SQL)?;
         statement
             .query_map([], desired_from_row)?
             .collect::<Result<Vec<_>, _>>()
@@ -49316,6 +49302,141 @@ message "human-attention" {
         assert_eq!(
             login_subjects(),
             BTreeSet::from(["agent/node.healthy".into()])
+        );
+    }
+
+    #[test]
+    fn login_candidates_follow_register_replacement_without_resurrecting_legacy_auth() {
+        let store = Store::open_memory("node").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let source = format!(
+            "version 2\nagent \"worker\" {{ workspace {:?}; harness \"claude\" {{}} }}\n",
+            workspace.path().display().to_string()
+        );
+        let intent = parse_intent(&source, "node").unwrap();
+        let preview = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source,
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &preview.subject_tokens, "register-login-candidate")
+            .unwrap();
+        let input = |auth: Value| ClaimInput {
+            subject: "agent/node.worker".into(),
+            kind: "harness.observed".into(),
+            actor: None,
+            fields: serde_json::from_value(json!({
+                "state":"idle", "incarnation_id":"current", "provider_auth":auth,
+            }))
+            .unwrap(),
+            evidence: vec![],
+            expected_subject: None,
+            idempotency_key: None,
+        };
+        store.append_legacy_claim(&input(json!(false))).unwrap();
+        assert_eq!(store.desired_harness_login_candidates().unwrap().len(), 1);
+        store.append_claim(&input(json!(false))).unwrap();
+        assert_eq!(store.desired_harness_login_candidates().unwrap().len(), 1);
+        store.append_claim(&input(Value::Null)).unwrap();
+        assert_eq!(
+            store.desired_harness_login_candidates().unwrap().len(),
+            1,
+            "an unknown sample must retain known credential rejection"
+        );
+        store.append_claim(&input(json!(true))).unwrap();
+        assert!(
+            store.desired_harness_login_candidates().unwrap().is_empty(),
+            "a healthy replacement retracts both its register and shadowed legacy candidate"
+        );
+        store.append_claim(&input(json!(false))).unwrap();
+        assert_eq!(
+            store.desired_harness_login_candidates().unwrap().len(),
+            1,
+            "a new rejection must enter the index again"
+        );
+    }
+
+    #[test]
+    fn login_candidate_sql_cost_does_not_grow_with_healthy_fleet_members() {
+        let store = Store::open_memory("node").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut costs = Vec::new();
+        for size in [32, 320] {
+            let source = format!(
+                "version 2\nagent \"login\" {{ workspace {:?}; harness \"claude\" {{}} }}\n{}",
+                workspace.path().display().to_string(),
+                (0..size)
+                    .map(|n| format!(
+                        "agent \"quiet-{n}\" {{ workspace {:?}; harness \"claude\" {{}} }}\n",
+                        workspace.path().display().to_string()
+                    ))
+                    .collect::<String>()
+            );
+            let intent = parse_intent(&source, "node").unwrap();
+            let preview = store
+                .mission(
+                    &intent,
+                    IntentInput {
+                        kdl: source,
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            store
+                .apply(
+                    &intent,
+                    &preview.subject_tokens,
+                    &format!("candidate-cost-{size}"),
+                )
+                .unwrap();
+            for name in
+                std::iter::once("login".to_owned()).chain((0..size).map(|n| format!("quiet-{n}")))
+            {
+                store
+                    .append_claim(&ClaimInput {
+                        subject: format!("agent/node.{name}"),
+                        kind: "harness.observed".into(),
+                        actor: None,
+                        fields: serde_json::from_value(json!({
+                            "state":"idle", "incarnation_id":"current", "provider_auth":name != "login",
+                        }))
+                        .unwrap(),
+                        evidence: vec![],
+                        expected_subject: None,
+                        idempotency_key: None,
+                    })
+                    .unwrap();
+            }
+            let connection = store.readers.get();
+            let mut statement = connection
+                .prepare_cached(latest_values::LOGIN_CANDIDATES_SQL)
+                .unwrap();
+            statement.reset_status(rusqlite::StatementStatus::VmStep);
+            statement.reset_status(rusqlite::StatementStatus::FullscanStep);
+            let candidates = statement
+                .query_map([], desired_from_row)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(candidates[0].subject, "agent/node.login");
+            costs.push((
+                statement.get_status(rusqlite::StatementStatus::VmStep),
+                statement.get_status(rusqlite::StatementStatus::FullscanStep),
+            ));
+        }
+        assert!(
+            costs[1].0 <= costs[0].0 + 100,
+            "same positive candidate must not scan healthy declarations or registers: {costs:?}"
+        );
+        assert_eq!(
+            costs[0].1, costs[1].1,
+            "unrelated declarations must not increase full-scan steps"
         );
     }
 
