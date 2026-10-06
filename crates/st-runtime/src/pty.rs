@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result};
 use pty_client::{PeekScreenOptions, SendOptions, StopError};
 use pty_core::registry::SessionInfo;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 const SPAWN_PUBLICATION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -52,6 +52,13 @@ impl std::error::Error for PtySpawnTimeout {}
 pub enum Launch {
     Shell(String),
     Argv(Vec<String>),
+}
+
+/// The rows and columns a PTY starts at. Without one, `pty run` picks its own default.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TerminalSize {
+    pub rows: u16,
+    pub columns: u16,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -176,6 +183,7 @@ impl PtyRuntime {
             .with_context(|| format!("PTY `{id}` is not present"))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         &self,
         id: &str,
@@ -184,8 +192,9 @@ impl PtyRuntime {
         env: &BTreeMap<String, String>,
         display_name: Option<&str>,
         tags: &BTreeMap<String, String>,
+        size: Option<TerminalSize>,
     ) -> Result<()> {
-        self.spawn_guarded(id, launch, cwd, env, display_name, tags, None, None)
+        self.spawn_guarded(id, launch, cwd, env, display_name, tags, size, None, None)
     }
 
     /// Start a cutover only after its predecessor exited. A replay can reuse only the exact
@@ -199,6 +208,7 @@ impl PtyRuntime {
         env: &BTreeMap<String, String>,
         display_name: Option<&str>,
         tags: &BTreeMap<String, String>,
+        size: Option<TerminalSize>,
         predecessor: &str,
         operation: &str,
     ) -> Result<()> {
@@ -209,6 +219,7 @@ impl PtyRuntime {
             env,
             display_name,
             tags,
+            size,
             Some((predecessor, operation)),
             None,
         )
@@ -222,6 +233,7 @@ impl PtyRuntime {
         env: &BTreeMap<String, String>,
         display_name: Option<&str>,
         tags: &BTreeMap<String, String>,
+        size: Option<TerminalSize>,
         predecessor: &str,
         operation: &str,
         guard: &dyn Fn() -> Result<()>,
@@ -233,6 +245,7 @@ impl PtyRuntime {
             env,
             display_name,
             tags,
+            size,
             Some((predecessor, operation)),
             Some(guard),
         )
@@ -246,6 +259,7 @@ impl PtyRuntime {
         env: &BTreeMap<String, String>,
         display_name: Option<&str>,
         tags: &BTreeMap<String, String>,
+        size: Option<TerminalSize>,
         cutover: Option<(&str, &str)>,
         guard: Option<&dyn Fn() -> Result<()>>,
     ) -> Result<()> {
@@ -352,6 +366,15 @@ impl PtyRuntime {
             arguments.extend([
                 OsString::from("--tag"),
                 OsString::from(format!("{key}={value}")),
+            ]);
+        }
+        // A live session keeps its size: this only reaches a launch.
+        if let Some(TerminalSize { rows, columns }) = size {
+            arguments.extend([
+                OsString::from("--rows"),
+                OsString::from(rows.to_string()),
+                OsString::from("--cols"),
+                OsString::from(columns.to_string()),
             ]);
         }
         arguments.push(OsString::from("--"));
@@ -1066,6 +1089,7 @@ exit 0
                 &BTreeMap::new(),
                 None,
                 &BTreeMap::new(),
+                None,
                 "42:original",
                 "cutover-one",
             );
@@ -1090,6 +1114,7 @@ exit 0
             &BTreeMap::new(),
             None,
             &BTreeMap::new(),
+            None,
             "42:original",
             "cutover-one",
             &|| anyhow::bail!("source superseded"),
@@ -1149,6 +1174,7 @@ exit 0
             env,
             None,
             &BTreeMap::new(),
+            None,
         )
     }
 
@@ -1404,6 +1430,7 @@ exit 0
                 &BTreeMap::new(),
                 None,
                 &BTreeMap::new(),
+                None,
             )
             .unwrap();
         let arguments = fs::read_to_string(binary.with_extension("args")).unwrap();
@@ -1432,6 +1459,65 @@ exit 0
         let arguments = fs::read_to_string(binary.with_extension("args")).unwrap();
         assert!(arguments.contains("TERM=screen-256color"));
         assert!(!arguments.contains("TERM=xterm-256color"));
+    }
+
+    #[test]
+    fn spawn_starts_the_session_at_the_requested_size_or_at_pty_default() {
+        let launched_arguments = |name: &str, size: Option<TerminalSize>| {
+            let root = tempfile::tempdir().unwrap();
+            let binary = fake_pty(root.path(), name, "  publish new");
+            PtyRuntime::new(root.path().join("registry"))
+                .with_binary(binary.to_string_lossy())
+                .spawn(
+                    "work",
+                    &Launch::Argv(vec!["harness".into(), "--rows".into(), "1".into()]),
+                    root.path(),
+                    &BTreeMap::new(),
+                    None,
+                    &BTreeMap::new(),
+                    size,
+                )
+                .unwrap();
+            fs::read_to_string(binary.with_extension("args"))
+                .unwrap()
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        let options = |arguments: &[String]| {
+            let separator = arguments
+                .iter()
+                .position(|argument| argument == "--")
+                .unwrap();
+            arguments[..separator].to_vec()
+        };
+
+        let sized = launched_arguments(
+            "fake-pty-sized",
+            Some(TerminalSize {
+                rows: 48,
+                columns: 160,
+            }),
+        );
+        let sized_options = options(&sized);
+        let rows = sized_options
+            .iter()
+            .position(|argument| argument == "--rows")
+            .unwrap();
+        assert_eq!(sized_options[rows + 1], "48");
+        let columns = sized_options
+            .iter()
+            .position(|argument| argument == "--cols")
+            .unwrap();
+        assert_eq!(sized_options[columns + 1], "160");
+        assert!(sized.ends_with(&["harness".into(), "--rows".into(), "1".into()]));
+
+        let unsized_options = options(&launched_arguments("fake-pty-unsized", None));
+        assert!(
+            !unsized_options
+                .iter()
+                .any(|argument| argument == "--rows" || argument == "--cols")
+        );
     }
 
     #[test]
@@ -1705,6 +1791,7 @@ exit 0
                 &environment,
                 None,
                 &BTreeMap::new(),
+                None,
             )
             .unwrap();
         let harness = read_pid(&pid_file);
@@ -1839,6 +1926,7 @@ exit 0
                     &environment,
                     None,
                     &tags,
+                    None,
                 )
                 .unwrap();
         }

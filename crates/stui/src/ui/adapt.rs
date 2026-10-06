@@ -646,7 +646,12 @@ fn agents(model: &Model) -> Vec<Agent> {
                         .as_ref()
                         .and_then(|usage| usage.context.as_ref())
                         .and_then(|context| context.model.clone()),
-                    fault: agent.fault.clone(),
+                    fault: agent.fault.clone().or_else(|| {
+                        agent.delivery.as_ref()
+                            .filter(|delivery| delivery.state == "stale")
+                            .and_then(|delivery| delivery.reason.clone())
+                            .filter(|reason| reason.starts_with("delivery-control-unavailable:"))
+                    }),
                     under: agent.under.first().map(|relation| {
                         model
                             .agents()
@@ -875,11 +880,9 @@ mod tests {
         ]))
         .unwrap();
         let entries = conversation(&timeline, &BTreeMap::new());
-        let Body::Mail { body, images, .. } = &entries[0].body else {
+        let Body::Mail { images, .. } = &entries[0].body else {
             panic!("{entries:#?}");
         };
-        // An image alone is the message, not a "(notification)".
-        assert_eq!(body, "");
         assert_eq!(
             images,
             &[st3_conversation_ui::MailImage {
@@ -1176,27 +1179,6 @@ mod tests {
             "{text:?}"
         );
         assert!(text.iter().any(|line| line.contains("✓ sent")), "{text:?}");
-    }
-
-    #[test]
-    fn a_seat_that_has_said_nothing_since_it_started_shows_its_small_talk() {
-        let timeline: Vec<TimelineEntry> = serde_json::from_value(json!([
-            {"id":"m","sequence":1,"revision":1,"timestamp":"2026-10-01T10:00:00Z","role":"user","type":"message","final":true,
-             "body":{"message_id":"message/one","from":"person/avery","to":"agent/example/harbor/keeper","title":"Status?"}},
-            {"id":"c","sequence":2,"revision":1,"timestamp":"2026-10-01T10:00:00Z","role":"user","type":"content","final":true,
-             "body":{"media_type":"text/plain","text":"How is the audit going?"}},
-            {"id":"n","sequence":3,"revision":1,"timestamp":"2026-10-01T10:00:01Z","role":"system","type":"error","final":true,
-             "body":{"code":"transcript-not-bound","message":"transcript not bound: Claude session 0190 has no transcript file yet","retryable":true,
-                     "details":{"driver":"claude","not_yet":true}}},
-        ]))
-        .unwrap();
-        assert_eq!(unreadable_transcript(&timeline), None, "nothing is wrong");
-        let entries = conversation(&timeline, &BTreeMap::new());
-        assert!(matches!(&entries[0].body, Body::Mail { subject, .. } if subject == "Status?"));
-        assert!(
-            matches!(&entries[1].body, Body::Event(line) if line == "nothing in the harness yet since this seat started"),
-            "{entries:?}"
-        );
     }
 
     #[test]

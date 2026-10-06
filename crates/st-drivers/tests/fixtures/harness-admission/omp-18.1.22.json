@@ -1,0 +1,709 @@
+{
+  "producerVersion": "18.1.22",
+  "probe": "installed omp RPC with shipped extension, loopback model, denied empty tool",
+  "nonce": "ADMISSION_NATIVE_FIXTURE",
+  "modelConsumed": true,
+  "events": [
+    {
+      "type": "extension_load",
+      "sendUserMessage": "function",
+      "sendMessage": "function",
+      "on": "function"
+    },
+    {
+      "type": "session_start",
+      "event": {
+        "type": "session_start"
+      },
+      "idle": true
+    },
+    {
+      "type": "agent_start",
+      "event": {
+        "type": "agent_start"
+      },
+      "idle": false
+    },
+    {
+      "type": "turn_start",
+      "event": {
+        "type": "turn_start",
+        "turnIndex": 0,
+        "timestamp": 1790970655980
+      },
+      "idle": false
+    },
+    {
+      "type": "message_start",
+      "event": {
+        "type": "message_start",
+        "message": {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "ADMISSION_NATIVE_FIXTURE"
+            }
+          ],
+          "attribution": "user",
+          "timestamp": 1790970655928
+        }
+      },
+      "idle": false
+    },
+    {
+      "type": "message_end",
+      "event": {
+        "type": "message_end",
+        "message": {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "ADMISSION_NATIVE_FIXTURE"
+            }
+          ],
+          "attribution": "user",
+          "timestamp": 1790970655928
+        }
+      },
+      "idle": false
+    },
+    {
+      "type": "message_start",
+      "event": {
+        "type": "message_start",
+        "message": {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "toolCall",
+              "id": "admission_call",
+              "name": "admission_fixture",
+              "arguments": {},
+              "partialArgs": "{}",
+              "streamIndex": 0
+            }
+          ],
+          "api": "openai-completions",
+          "provider": "admission",
+          "model": "fixture",
+          "usage": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 0,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
+          "stopReason": "toolUse",
+          "timestamp": 1790970655985,
+          "responseId": "admission"
+        }
+      },
+      "idle": false
+    },
+    {
+      "type": "message_end",
+      "event": {
+        "type": "message_end",
+        "message": {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "toolCall",
+              "id": "admission_call",
+              "name": "admission_fixture",
+              "arguments": {},
+              "partialArgs": "{}",
+              "streamIndex": 0
+            }
+          ],
+          "api": "openai-completions",
+          "provider": "admission",
+          "model": "fixture",
+          "usage": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 0,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
+          "stopReason": "toolUse",
+          "timestamp": 1790970655985,
+          "responseId": "admission",
+          "duration": 18.113460000000032,
+          "completedAt": 1790970656006
+        }
+      },
+      "idle": false
+    },
+    {
+      "type": "tool_approval_requested",
+      "event": {
+        "type": "tool_approval_requested",
+        "sessionId": "fixture-session",
+        "toolName": "admission_fixture",
+        "toolCallId": "admission_call",
+        "approvalMode": "always-ask"
+      },
+      "idle": false
+    },
+    {
+      "type": "tool_approval_resolved",
+      "event": {
+        "type": "tool_approval_resolved",
+        "sessionId": "fixture-session",
+        "toolName": "admission_fixture",
+        "toolCallId": "admission_call",
+        "approved": false,
+        "reason": "denied by user"
+      },
+      "idle": false
+    },
+    {
+      "type": "message_start",
+      "event": {
+        "type": "message_start",
+        "message": {
+          "role": "toolResult",
+          "toolCallId": "admission_call",
+          "toolName": "admission_fixture",
+          "content": [
+            {
+              "type": "text",
+              "text": "Tool call denied by user: admission_fixture"
+            }
+          ],
+          "details": {},
+          "isError": true,
+          "timestamp": 1790970656174
+        }
+      },
+      "idle": false
+    },
+    {
+      "type": "message_end",
+      "event": {
+        "type": "message_end",
+        "message": {
+          "role": "toolResult",
+          "toolCallId": "admission_call",
+          "toolName": "admission_fixture",
+          "content": [
+            {
+              "type": "text",
+              "text": "Tool call denied by user: admission_fixture"
+            }
+          ],
+          "details": {},
+          "isError": true,
+          "timestamp": 1790970656174
+        }
+      },
+      "idle": false
+    },
+    {
+      "type": "turn_end",
+      "event": {
+        "type": "turn_end",
+        "turnIndex": 0,
+        "message": {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "toolCall",
+              "id": "admission_call",
+              "name": "admission_fixture",
+              "arguments": {},
+              "partialArgs": "{}",
+              "streamIndex": 0
+            }
+          ],
+          "api": "openai-completions",
+          "provider": "admission",
+          "model": "fixture",
+          "usage": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 0,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
+          "stopReason": "toolUse",
+          "timestamp": 1790970655985,
+          "responseId": "admission",
+          "duration": 18.113460000000032
+        },
+        "toolResults": [
+          {
+            "role": "toolResult",
+            "toolCallId": "admission_call",
+            "toolName": "admission_fixture",
+            "content": [
+              {
+                "type": "text",
+                "text": "Tool call denied by user: admission_fixture"
+              }
+            ],
+            "details": {},
+            "isError": true,
+            "timestamp": 1790970656174
+          }
+        ]
+      },
+      "idle": false
+    },
+    {
+      "type": "turn_start",
+      "event": {
+        "type": "turn_start",
+        "turnIndex": 1,
+        "timestamp": 1790970656199
+      },
+      "idle": false
+    },
+    {
+      "type": "message_start",
+      "event": {
+        "type": "message_start",
+        "message": {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "CONSUMED:ADMISSION_NATIVE_FIXTURE"
+            }
+          ],
+          "api": "openai-completions",
+          "provider": "admission",
+          "model": "fixture",
+          "usage": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 0,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
+          "stopReason": "stop",
+          "timestamp": 1790970656199,
+          "responseId": "admission"
+        }
+      },
+      "idle": false
+    },
+    {
+      "type": "message_end",
+      "event": {
+        "type": "message_end",
+        "message": {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "CONSUMED:ADMISSION_NATIVE_FIXTURE"
+            }
+          ],
+          "api": "openai-completions",
+          "provider": "admission",
+          "model": "fixture",
+          "usage": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 0,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
+          "stopReason": "stop",
+          "timestamp": 1790970656199,
+          "responseId": "admission",
+          "duration": 12.040009999999938,
+          "ttft": 11.44920500000012,
+          "completedAt": 1790970656212
+        }
+      },
+      "idle": false
+    },
+    {
+      "type": "turn_end",
+      "event": {
+        "type": "turn_end",
+        "turnIndex": 1,
+        "message": {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "CONSUMED:ADMISSION_NATIVE_FIXTURE"
+            }
+          ],
+          "api": "openai-completions",
+          "provider": "admission",
+          "model": "fixture",
+          "usage": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 0,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
+          "stopReason": "stop",
+          "timestamp": 1790970656199,
+          "responseId": "admission",
+          "duration": 12.040009999999938,
+          "ttft": 11.44920500000012
+        },
+        "toolResults": []
+      },
+      "idle": false
+    },
+    {
+      "type": "agent_end",
+      "event": {
+        "type": "agent_end",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "ADMISSION_NATIVE_FIXTURE"
+              }
+            ],
+            "attribution": "user",
+            "timestamp": 1790970655928
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "toolCall",
+                "id": "admission_call",
+                "name": "admission_fixture",
+                "arguments": {},
+                "partialArgs": "{}",
+                "streamIndex": 0
+              }
+            ],
+            "api": "openai-completions",
+            "provider": "admission",
+            "model": "fixture",
+            "usage": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "totalTokens": 0,
+              "cost": {
+                "input": 0,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "total": 0
+              }
+            },
+            "stopReason": "toolUse",
+            "timestamp": 1790970655985,
+            "responseId": "admission",
+            "duration": 18.113460000000032,
+            "completedAt": 1790970656006,
+            "contextSnapshot": {
+              "promptTokens": 0,
+              "nonMessageTokens": 2391,
+              "compactionEpoch": 0
+            }
+          },
+          {
+            "role": "toolResult",
+            "toolCallId": "admission_call",
+            "toolName": "admission_fixture",
+            "content": [
+              {
+                "type": "text",
+                "text": "Tool call denied by user: admission_fixture"
+              }
+            ],
+            "details": {},
+            "isError": true,
+            "timestamp": 1790970656174
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "CONSUMED:ADMISSION_NATIVE_FIXTURE"
+              }
+            ],
+            "api": "openai-completions",
+            "provider": "admission",
+            "model": "fixture",
+            "usage": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "totalTokens": 0,
+              "cost": {
+                "input": 0,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "total": 0
+              }
+            },
+            "stopReason": "stop",
+            "timestamp": 1790970656199,
+            "responseId": "admission",
+            "duration": 12.040009999999938,
+            "ttft": 11.44920500000012,
+            "completedAt": 1790970656212,
+            "contextSnapshot": {
+              "promptTokens": 0,
+              "nonMessageTokens": 2391,
+              "compactionEpoch": 0
+            },
+            "errorId": 0
+          }
+        ]
+      },
+      "idle": false
+    },
+    {
+      "type": "idle_sample",
+      "idle": true
+    }
+  ],
+  "channel": [
+    {
+      "type": "session",
+      "sessionId": "fixture-session"
+    },
+    {
+      "type": "ready",
+      "sessionId": "fixture-session"
+    },
+    {
+      "type": "context",
+      "reading": {
+        "usedTokens": 2391,
+        "windowTokens": 100000,
+        "usedPercent": 2.391,
+        "model": "fixture",
+        "costUsd": null
+      }
+    },
+    {
+      "type": "delivered",
+      "meta": {
+        "id": "admission_fixture"
+      }
+    },
+    {
+      "type": "state",
+      "state": "active"
+    },
+    {
+      "type": "context",
+      "reading": {
+        "usedTokens": 2401,
+        "windowTokens": 100000,
+        "usedPercent": 2.401,
+        "model": "fixture",
+        "costUsd": null
+      }
+    },
+    {
+      "type": "timeline",
+      "event": "message_end",
+      "payload": {
+        "message": {
+          "role": "user",
+          "content": [
+            {
+              "text": "ADMISSION_NATIVE_FIXTURE"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "timeline",
+      "event": "tool_call",
+      "payload": {
+        "toolCallId": "admission_call",
+        "toolName": "admission_fixture",
+        "input": {
+          "redacted": true
+        }
+      }
+    },
+    {
+      "type": "context",
+      "reading": {
+        "usedTokens": 2407,
+        "windowTokens": 100000,
+        "usedPercent": 2.407,
+        "model": "fixture",
+        "costUsd": 0
+      }
+    },
+    {
+      "type": "timeline",
+      "event": "message_end",
+      "payload": {
+        "message": {
+          "role": "assistant",
+          "content": [
+            {}
+          ],
+          "usage": {
+            "input": 0,
+            "output": 0
+          }
+        }
+      }
+    },
+    {
+      "type": "state",
+      "state": "active",
+      "blockedOn": "human",
+      "ask": "permission",
+      "reason": "admission_fixture"
+    },
+    {
+      "type": "state",
+      "state": "active"
+    },
+    {
+      "type": "context",
+      "reading": {
+        "usedTokens": 2418,
+        "windowTokens": 100000,
+        "usedPercent": 2.418,
+        "model": "fixture",
+        "costUsd": 0
+      }
+    },
+    {
+      "type": "timeline",
+      "event": "message_end",
+      "payload": {
+        "message": {
+          "role": "toolResult",
+          "content": [
+            {
+              "text": "Tool call denied by user: admission_fixture"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "context",
+      "reading": {
+        "usedTokens": 2418,
+        "windowTokens": 100000,
+        "usedPercent": 2.418,
+        "model": "fixture",
+        "costUsd": 0
+      }
+    },
+    {
+      "type": "context",
+      "reading": {
+        "usedTokens": 2431,
+        "windowTokens": 100000,
+        "usedPercent": 2.431,
+        "model": "fixture",
+        "costUsd": 0
+      }
+    },
+    {
+      "type": "timeline",
+      "event": "message_end",
+      "payload": {
+        "message": {
+          "role": "assistant",
+          "content": [
+            {
+              "text": "CONSUMED:ADMISSION_NATIVE_FIXTURE"
+            }
+          ],
+          "usage": {
+            "input": 0,
+            "output": 0
+          }
+        }
+      }
+    },
+    {
+      "type": "context",
+      "reading": {
+        "usedTokens": 2431,
+        "windowTokens": 100000,
+        "usedPercent": 2.431,
+        "model": "fixture",
+        "costUsd": 0
+      }
+    },
+    {
+      "type": "context",
+      "reading": {
+        "usedTokens": 2431,
+        "windowTokens": 100000,
+        "usedPercent": 2.431,
+        "model": "fixture",
+        "costUsd": 0
+      }
+    },
+    {
+      "type": "turn"
+    },
+    {
+      "type": "state",
+      "state": "idle"
+    }
+  ]
+}

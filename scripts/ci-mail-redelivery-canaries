@@ -34,7 +34,9 @@ def main():
     if missing:
         raise SystemExit("missing, ignored or filtered required canaries: " + ", ".join(sorted(missing)))
     print(f"Running all {len(REQUIRED)} required mail redelivery canaries with zero retries", flush=True)
-    subprocess.run(["cargo", "nextest", "run", *common, "--retries", "0", "--no-tests", "fail"], check=True)
+    subprocess.run(["cargo", "nextest", "run", *common,
+                    "--test-threads", os.environ.get("CI_TEST_THREADS", "8"),
+                    "--retries", "0", "--no-tests", "fail"], check=True)
     if os.environ.get("GITHUB_STEP_SUMMARY"):
         with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as summary:
             summary.write(f"All {len(REQUIRED)} required mail redelivery canaries passed with zero retries.\n")
