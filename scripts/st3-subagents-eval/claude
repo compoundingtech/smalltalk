@@ -61,6 +61,14 @@ if argv[:1] in (["plugin"], ["mcp"]) or "--version" in argv:
 settings = json.loads(option(argv, "--settings") or "{}")
 mcp = json.loads(option(argv, "--mcp-config") or "{}")
 receipt("started", argv=argv)
+# An isolated model of a harness retaining launch settings without child lifecycle hooks.
+# Keep the actual launch argv receipt distinct from these intentionally reduced settings.
+if os.environ.get("ST3_SUBAGENTS_EVAL_OLD_SETTINGS") == "1":
+    for event in ("SubagentStart", "SubagentStop", "SessionEnd"):
+        settings.get("hooks", {}).pop(event, None)
+receipt("effective-settings", hooks=sorted(settings.get("hooks", {})),
+        agent_dir=os.environ.get("ST_DRIVER_AGENT_DIR"),
+        old_settings_model=os.environ.get("ST3_SUBAGENTS_EVAL_OLD_SETTINGS") == "1")
 
 cwd = str(WORKSPACE)
 projects = Path.home() / ".claude/projects" / re.sub(r"[^A-Za-z0-9]", "-", cwd)
@@ -176,6 +184,17 @@ def apply(op):
         hooks("SessionEnd", {"reason": op.get("reason", "other")})
     elif name == "session-start":
         start_session(op.get("source", "clear"))
+    elif name == "foreign-hooks":
+        foreign = str(uuid.uuid4())
+        for event, payload in [
+            ("SessionEnd", {"reason": "clear"}),
+            ("SubagentStart", {"agent_id": "foreign-child", "agent_type": "general-purpose"}),
+            ("SubagentStop", {"agent_id": op["id"], "agent_type": "general-purpose"}),
+            ("Stop", {"background_tasks": []}),
+            ("PreToolUse", {"tool_name": "Agent", "tool_use_id": "foreign-launch",
+                            "tool_input": {"description": "foreign launch"}}),
+        ]:
+            hooks(event, {**payload, "session_id": foreign})
     elif name == "claim-ready":
         listed = subprocess.run([os.environ["ST3_BIN"], "work", "ls", "--as", os.environ["ST_AGENT"], "--json"],
                                 capture_output=True, text=True, timeout=60)
@@ -234,7 +253,7 @@ while not stopping:
         op = json.loads(lines[offset])
         try:
             apply(op)
-            receipt("applied", op=op, session=session_id)
+            receipt("applied", op=op, session=session_id, running=sorted(running))
         except Exception as error:  # noqa: BLE001 - every failure is evidence
             receipt("failed", op=op, error=str(error))
         offset += 1
