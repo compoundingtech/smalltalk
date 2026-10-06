@@ -292,14 +292,7 @@ pub fn pi_family_link_transcript(argv: &[String], sessions: &Path) -> Result<boo
     pi_family_link_selected_transcript(Path::new(selected), sessions)
 }
 
-/// Make an exact transcript selected by the strict resume handshake visible to inventory.
-#[cfg(unix)]
-pub fn pi_family_link_selected_transcript(
-    transcript: &Path,
-    sessions: &Path,
-) -> Result<bool, Refusal> {
-    use std::os::unix::fs::{MetadataExt as _, symlink};
-
+fn pi_family_validate_transcript(transcript: &Path) -> Result<fs::Metadata, Refusal> {
     if !transcript.is_absolute() {
         return Err(Refusal::new(
             "resume-path-relative",
@@ -327,6 +320,18 @@ pub fn pi_family_link_selected_transcript(
             "filename and session header disagree",
         ));
     }
+    Ok(source)
+}
+
+/// Make an exact transcript selected by the strict resume handshake visible to inventory.
+#[cfg(unix)]
+pub fn pi_family_link_selected_transcript(
+    transcript: &Path,
+    sessions: &Path,
+) -> Result<bool, Refusal> {
+    use std::os::unix::fs::{MetadataExt as _, symlink};
+
+    let source = pi_family_validate_transcript(transcript)?;
     let parent = fs::canonicalize(transcript.parent().expect("absolute file has a parent"))
         .map_err(|error| Refusal::new("transcript-unreadable", error.to_string()))?;
     match fs::symlink_metadata(sessions) {
@@ -384,6 +389,30 @@ pub fn pi_family_argv(
     id: &str,
     resume_path: Option<&Path>,
 ) -> Result<Vec<String>, Refusal> {
+    pi_family_selected_argv(driver, argv, sessions, id, resume_path, true)
+}
+
+/// Continue a proven transcript without changing the seat's inventory directory.
+/// OMP reports the selected session file directly; the original inventory link need
+/// not follow a transcript relocated outside that directory.
+pub fn pi_family_continue_argv(
+    driver: &str,
+    argv: Vec<String>,
+    sessions: &Path,
+    id: &str,
+    resume_path: Option<&Path>,
+) -> Result<Vec<String>, Refusal> {
+    pi_family_selected_argv(driver, argv, sessions, id, resume_path, false)
+}
+
+fn pi_family_selected_argv(
+    driver: &str,
+    argv: Vec<String>,
+    sessions: &Path,
+    id: &str,
+    resume_path: Option<&Path>,
+    prepare_inventory: bool,
+) -> Result<Vec<String>, Refusal> {
     valid_id(id)?;
     refuse_authored(
         &argv,
@@ -407,8 +436,12 @@ pub fn pi_family_argv(
                 "the imported transcript does not name the required session",
             ));
         }
-        #[cfg(unix)]
-        pi_family_link_selected_transcript(path, sessions)?;
+        if prepare_inventory {
+            #[cfg(unix)]
+            pi_family_link_selected_transcript(path, sessions)?;
+        } else {
+            pi_family_validate_transcript(path)?;
+        }
         return Ok(insert_after_program(
             argv,
             &["--resume", &path.to_string_lossy()],

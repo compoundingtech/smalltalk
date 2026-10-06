@@ -16775,7 +16775,7 @@ async fn run_st2_native_driver(
         )
     })
     .await?;
-    let select = |argv: Vec<String>, session: &str, path: Option<&Path>| -> Result<_> {
+    let select = |argv: Vec<String>, session: &str, path: Option<&Path>, strict: bool| -> Result<_> {
         Ok(match driver {
             "claude" => st3::native_resume::claude_argv(
                 argv,
@@ -16783,13 +16783,20 @@ async fn run_st2_native_driver(
                 &std::env::current_dir()?,
                 st3::native_resume::claude_home().as_deref(),
             ),
-            "pi" | "omp" => st3::native_resume::pi_family_argv(
-                driver,
-                argv,
-                &paths.session_dir.join("provider-sessions"),
-                session,
-                path,
-            ),
+            "pi" | "omp" => {
+                let selector = if strict {
+                    st3::native_resume::pi_family_argv
+                } else {
+                    st3::native_resume::pi_family_continue_argv
+                };
+                selector(
+                    driver,
+                    argv,
+                    &paths.session_dir.join("provider-sessions"),
+                    session,
+                    path,
+                )
+            }
             "opencode" => st3::native_resume::opencode_argv(
                 argv,
                 session,
@@ -16823,7 +16830,7 @@ async fn run_st2_native_driver(
             }
         }
         let path = std::env::var_os(st3::rollout::RESUME_PATH_ENV).map(PathBuf::from);
-        match select(argv, &session, path.as_deref())? {
+        match select(argv, &session, path.as_deref(), true)? {
             Ok(argv) => {
                 // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
                 selected_session = Some(session);
@@ -16846,7 +16853,7 @@ async fn run_st2_native_driver(
                 path.as_deref(),
             );
         }
-        match select(argv.clone(), &session, path.as_deref())? {
+        match select(argv.clone(), &session, path.as_deref(), false)? {
             Ok(argv) => {
                 // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
                 selected_session = Some(session);

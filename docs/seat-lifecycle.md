@@ -169,6 +169,11 @@ session binding with an incarnation. Subsequent restarts ignore the original pai
 and continue the latest bound native ID and transcript path, including after OMP
 switches sessions or the original imported file moves. Explicit suspension resumes
 and rollouts retain their strict selectors.
+Continuation validates the latest bound transcript's absolute path, filename and
+session header, then resumes that exact file without replacing the original
+inventory link. A bound transcript may live in a different directory: OMP reports
+the active transcript path directly, so continuation does not require relinking
+the inventory.
 
 The daemon and native driver must both support strict OMP import paths. An older
 driver with a new import declaration rejects the strict path contract; upgrade

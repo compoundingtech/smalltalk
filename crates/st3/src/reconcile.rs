@@ -18489,7 +18489,9 @@ mission "feedback-review" state="ready" {
         let root = tempfile::tempdir().unwrap();
         let original_id = "5f9a6e16-5e30-4bce-b327-9a8241321bd6";
         let newer_id = "27a1a145-ed86-4e9d-80e7-071dace5e3d2";
-        let original = root.path().join(format!("2026-10-06_{original_id}.jsonl"));
+        let original_dir = root.path().join("original");
+        fs::create_dir(&original_dir).unwrap();
+        let original = original_dir.join(format!("2026-10-06_{original_id}.jsonl"));
         fs::write(
             &original,
             format!("{{\"type\":\"session\",\"id\":\"{original_id}\"}}\n"),
@@ -18573,8 +18575,18 @@ agent "import/omp/fixture" {{
             );
         }
         let managed = root.path().join("provider-sessions");
-        fs::create_dir(&managed).unwrap();
-        let newer = managed.join(format!("2026-10-06_{newer_id}.jsonl"));
+        crate::native_resume::pi_family_argv(
+            "omp",
+            vec!["omp".into()],
+            &managed,
+            original_id,
+            Some(&original),
+        )
+        .unwrap();
+        assert_eq!(fs::read_link(&managed).unwrap(), original_dir);
+        let newer_dir = root.path().join("newer");
+        fs::create_dir(&newer_dir).unwrap();
+        let newer = newer_dir.join(format!("2026-10-06_{newer_id}.jsonl"));
         fs::write(
             &newer,
             format!("{{\"type\":\"session\",\"id\":\"{newer_id}\"}}\n"),
@@ -18609,7 +18621,7 @@ agent "import/omp/fixture" {{
                 newer.to_str().unwrap()
             );
             assert_eq!(
-                crate::native_resume::pi_family_argv(
+                crate::native_resume::pi_family_continue_argv(
                     "omp",
                     vec!["omp".into()],
                     &managed,
@@ -18621,6 +18633,7 @@ agent "import/omp/fixture" {{
                 .unwrap(),
                 vec!["omp", "--resume", newer.to_str().unwrap()]
             );
+            assert_eq!(fs::read_link(&managed).unwrap(), original_dir);
         }
     }
 
