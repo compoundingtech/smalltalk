@@ -1,0 +1,728 @@
+#!/usr/bin/python3 -I
+"""One-channel Discord bridge. Hidden token prompt or explicit private token file."""
+
+import argparse
+import fcntl
+import getpass
+import hashlib
+import http.client
+import json
+import math
+import os
+from pathlib import Path
+import re
+import socket
+import sqlite3
+import stat
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import warnings
+import secrets
+
+API = 'https://discord.com/api/v10'
+ROOT = Path.home() / '.local/state/st3'
+LIMIT = 1024 * 1024
+MAX_PENDING = 100
+MAX_HISTORY = 1000
+MAX_RECORDS = 10000
+ID = re.compile(r'[1-9][0-9]{0,19}\Z')
+SUBJECT = re.compile(r'message/[a-f0-9]{16}\Z')
+IMAGE_LIMIT = 10 * 1024 * 1024
+IMAGE_TYPES = {'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp'}
+
+
+def image_type(data):
+    if data.startswith(b'\x89PNG\r\n\x1a\n'):
+        return 'image/png'
+    if data.startswith(b'\xff\xd8\xff'):
+        return 'image/jpeg'
+    if data.startswith((b'GIF87a', b'GIF89a')):
+        return 'image/gif'
+    if data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+        return 'image/webp'
+    raise Stop('The attachment bytes are not a supported image.')
+
+
+def multipart(body, files):
+    boundary = 'st-discord-' + secrets.token_hex(24)
+    parts = [('--' + boundary + '\r\nContent-Disposition: form-data; name="payload_json"\r\nContent-Type: application/json\r\n\r\n').encode() + json.dumps(body).encode() + b'\r\n']
+    for index, (name, media, data) in enumerate(files):
+        parts.append(('--' + boundary + '\r\nContent-Disposition: form-data; name="files[' + str(index) + ']"; filename="' + name + '"\r\nContent-Type: ' + media + '\r\n\r\n').encode() + data + b'\r\n')
+    parts.append(('--' + boundary + '--\r\n').encode())
+    return b''.join(parts), 'multipart/form-data; boundary=' + boundary
+
+
+class Stop(Exception):
+    """A sanitized permanent refusal. Do not log provider bodies or exceptions."""
+
+
+class Later(Exception):
+    def __init__(self, message, delay=5):
+        super().__init__(message)
+        self.delay = delay
+
+
+class Uncertain(Exception):
+    pass
+
+
+def private_file(path, max_size):
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077 or info.st_size > max_size:
+        raise Stop('Use a private regular file owned by your user (mode 0600).')
+
+
+def route_file(path):
+    private_file(path, 4096)
+    route = json.loads(path.read_text())
+    for key in ('application_id', 'guild_id', 'channel_id', 'user_id'):
+        if not isinstance(route.get(key), str) or not ID.fullmatch(route[key]):
+            raise Stop('The private route needs numeric application, server, channel and user IDs.')
+    return {key: route[key] for key in ('application_id', 'guild_id', 'channel_id', 'user_id')}
+
+
+def token_file(path):
+    """Read one dotenv entry without shell evaluation or exporting the credential."""
+    refusal = 'Use a private regular token file owned by your user (mode 0600), with only DISCORD_BOT_TOKEN=... .'
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        with os.fdopen(fd, 'rb') as stream:
+            info = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                    or info.st_mode & 0o077 or info.st_nlink != 1 or info.st_size > 4096):
+                raise Stop(refusal)
+            raw = stream.read(4097)
+        if len(raw) > 4096:
+            raise Stop(refusal)
+        entries = [line.strip() for line in raw.decode('utf-8').splitlines()
+                   if line.strip() and not line.lstrip().startswith('#')]
+        if len(entries) != 1 or not entries[0].startswith('DISCORD_BOT_TOKEN='):
+            raise Stop(refusal)
+        token = entries[0].split('=', 1)[1].strip()
+        if len(token) >= 2 and token[0] == token[-1] and token[0] in ('"', "'"):
+            token = token[1:-1]
+        if not re.fullmatch(r'[A-Za-z0-9._-]{20,1024}', token):
+            raise Stop(refusal)
+        return token
+    except (OSError, UnicodeError):
+        raise Stop(refusal) from None
+
+
+def delay_value(value, fallback=5):
+    try:
+        number = float(value)
+        return max(0.1, number) if math.isfinite(number) and number >= 0 else fallback
+    except (ValueError, TypeError):
+        return fallback
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+class Discord:
+    def __init__(self, token):
+        if not re.fullmatch(r'[A-Za-z0-9._-]{20,1024}', token):
+            raise Stop('The bot token is missing or malformed.')
+        self.token = token
+        self.ready_at = 0
+        self.bot_id = None
+        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+
+    def request(self, method, path, body=None, files=None):
+        if time.monotonic() < self.ready_at:
+            raise Later('Waiting for Discord rate limits.', self.ready_at - time.monotonic())
+        data, content_type = multipart(body, files) if files else (None if body is None else json.dumps(body).encode(), 'application/json')
+        request = urllib.request.Request(API + path, method=method,
+            data=data,
+            headers={'Authorization': 'Bot ' + self.token, 'Content-Type': content_type,
+                     'User-Agent': 'DiscordBot (https://github.com/compoundingtech/smalltalk, 0.1)'})
+        try:
+            with self.opener.open(request, timeout=15) as response:
+                if response.headers.get('X-RateLimit-Remaining') == '0':
+                    self.ready_at = time.monotonic() + delay_value(response.headers.get('X-RateLimit-Reset-After'))
+                raw = response.read(LIMIT + 1)
+                if len(raw) > LIMIT:
+                    raise ValueError()
+                return json.loads(raw)
+        except urllib.error.HTTPError as error:
+            if error.code == 429:
+                wait = delay_value(error.headers.get('Retry-After'))
+                try:
+                    raw = error.read(65537)
+                    if len(raw) <= 65536:
+                        wait = max(wait, delay_value(json.loads(raw).get('retry_after')))
+                except Exception:
+                    pass
+                self.ready_at = time.monotonic() + wait
+                raise Later('Discord rate limited the bridge; messages remain queued.', wait) from None
+            if error.code >= 500:
+                if method == 'POST':
+                    raise Uncertain('Discord did not confirm the send.') from None
+                raise Later('Discord is temporarily unavailable.') from None
+            raise Stop({401: 'Bot authentication failed.', 403: 'Bot permission was refused.',
+                        404: 'Discord cannot find the configured channel or message.'}.get(error.code, 'Discord refused the request.')) from None
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+            if method == 'POST':
+                raise Uncertain('Discord did not confirm the send.') from None
+            raise Later('Discord did not answer; messages remain queued.') from None
+
+    def image(self, attachment, channel):
+        url = attachment.get('url', '')
+        parsed = urllib.parse.urlsplit(url)
+        if (parsed.scheme != 'https' or parsed.hostname not in ('cdn.discordapp.com', 'media.discordapp.net')
+                or parsed.port not in (None, 443) or parsed.username or parsed.password
+                or not re.fullmatch('/attachments/' + channel + '/[0-9]+/[^/]+', parsed.path)
+                or self.token in url):
+            raise Stop('An image URL did not match the configured Discord attachment channel.')
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+        try:
+            # Anonymous CDN download: never send the bot credential to an attachment URL.
+            with opener.open(urllib.request.Request(url), timeout=15) as response:
+                data = response.read(IMAGE_LIMIT + 1)
+        except (OSError, urllib.error.URLError):
+            raise Later('Discord image download did not complete; import remains queued.') from None
+        if len(data) > IMAGE_LIMIT or self.token.encode() in data:
+            raise Stop('An image exceeded the size limit or contained the bot credential.')
+        media = image_type(data)
+        if len(data) != attachment['size'] or media != attachment['content_type']:
+            raise Stop('Discord image bytes did not match the retained type and size.')
+        return data
+
+    def validate(self, route):
+        def read(path):
+            while True:
+                try:
+                    return self.request('GET', path)
+                except Later as error:
+                    time.sleep(min(error.delay, 5))
+        app = read('/oauth2/applications/@me')
+        if not isinstance(app, dict) or app.get('id') != route['application_id']:
+            raise Stop('The token belongs to a different application.')
+        channel = read('/channels/' + route['channel_id'])
+        if not isinstance(channel, dict) or channel.get('id') != route['channel_id'] or channel.get('guild_id') != route['guild_id'] or channel.get('type') != 0:
+            raise Stop('The configured private-server text channel did not match.')
+        user = read('/users/@me')
+        if not isinstance(user, dict) or not isinstance(user.get('id'), str) or not ID.fullmatch(user['id']) or not user.get('bot'):
+            raise Stop('Discord did not identify a bot account.')
+        self.bot_id = user['id']
+
+
+class UnixConnection(http.client.HTTPConnection):
+    def __init__(self, path):
+        super().__init__('localhost', timeout=15)
+        self.path = path
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(str(self.path))
+
+
+class St:
+    """Same trusted-local message endpoints used by st conversations; never an HTTP listener."""
+    def __init__(self, path, actor=None):
+        self.path = path
+        self.actor = actor or os.environ.get('ST_AGENT')
+
+    def request(self, method, path, body=None, *, actor=None, media=None, binary=False):
+        connection = UnixConnection(self.path)
+        try:
+            info = self.path.lstat()
+            if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o007:
+                raise Stop('Use your own st Unix socket; it must not be accessible to other users.')
+            headers = {'Content-Type': media or 'application/json'}
+            if actor:
+                headers['X-St3-Person'] = actor
+            connection.request(method, path, body=body if media else None if body is None else json.dumps(body), headers=headers)
+            response = connection.getresponse()
+            bound = IMAGE_LIMIT if binary else LIMIT
+            raw = response.read(bound + 1)
+            if response.status >= 500:
+                raise Later('st is temporarily unavailable; messages remain queued.')
+            if response.status != 200:
+                raise Stop('st refused the operation (HTTP ' + str(response.status) + '). No response body was logged.')
+            if len(raw) > bound:
+                raise Stop('st response exceeded the bridge size limit.')
+            if binary:
+                return raw
+            value = json.loads(raw)
+            if isinstance(value, dict) and value.get('api_version') in ('st3.v1', 'st3.client.v0'):
+                return value.get('value')
+            return value
+        except (OSError, http.client.HTTPException, ValueError):
+            raise Later('st did not answer; the same delivery key will be retried.') from None
+        finally:
+            connection.close()
+
+    def send(self, body):
+        imported = body['from'].startswith('external/')
+        receipt = self.request('POST', '/v1/client/adapter/import' if imported else '/v1/messages', body, actor=self.actor if imported else None)
+        if not isinstance(receipt, dict) or receipt.get('from') != body['from'] or receipt.get('to') != body['to'] or receipt.get('content') != body['content'] or receipt.get('in_reply_to') != body['in_reply_to'] or not SUBJECT.fullmatch(receipt.get('subject', '')):
+            raise Stop('st send receipt did not match its sender, route, text and reply.')
+        return receipt['subject']
+
+    def upload(self, data, media, sender):
+        value = self.request('POST', '/v1/client/blobs', data, actor=sender, media=media)
+        digest = hashlib.sha256(data).hexdigest()
+        if not isinstance(value, dict) or value.get('blob') != 'blob/' + digest or value.get('size') != len(data) or value.get('media_type') != media:
+            raise Stop('st image upload receipt did not match the bytes.')
+        return {'blob': value['blob'], 'media_type': media, 'name': 'image-' + digest[:16] + '.' + IMAGE_TYPES[media]}
+
+    def image(self, attachment, message, actor):
+        digest = attachment.get('sha256', '')
+        if not re.fullmatch('[a-f0-9]{64}', digest) or attachment.get('media_type') not in IMAGE_TYPES or not isinstance(attachment.get('size'), int) or not 0 < attachment['size'] <= IMAGE_LIMIT:
+            raise Stop('st returned an invalid image reference.')
+        data = self.request('GET', '/v1/client/blobs/' + digest + '?' + urllib.parse.urlencode({'message': message}), actor=actor, binary=True)
+        if hashlib.sha256(data).hexdigest() != digest or len(data) != attachment['size'] or image_type(data) != attachment['media_type']:
+            raise Stop('st image bytes did not match the attachment reference.')
+        return ('image-' + digest[:16] + '.' + IMAGE_TYPES[attachment['media_type']], attachment['media_type'], data)
+
+    def replies(self, sender):
+        path = '/v1/messages/page?' + urllib.parse.urlencode({'to': sender, 'include_closed': 'true', 'limit': 100})
+        cursor = None
+        seen = set()
+        for _ in range(100):
+            query = path if cursor is None else path + '&cursor=' + urllib.parse.quote(cursor, safe='')
+            page = self.request('GET', query)
+            if not isinstance(page, dict) or not isinstance(page.get('items'), list):
+                raise Stop('st returned an invalid mailbox page.')
+            yield from page['items']
+            cursor = page.get('next_cursor')
+            if cursor is None:
+                return
+            if not isinstance(cursor, str) or cursor in seen:
+                raise Stop('st returned an invalid mailbox cursor.')
+            seen.add(cursor)
+        raise Stop('The bridge mailbox exceeded its retained history limit.')
+
+    def deliveries(self, after, wait_ms):
+        return self.request('GET', '/v1/client/adapter/deliveries?' + urllib.parse.urlencode({'after': after, 'wait_ms': wait_ms}), actor=self.actor)
+
+
+class State:
+    def __init__(self, path, route, agent):
+        os.umask(0o077)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        parent = path.parent.lstat()
+        if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != os.geteuid() or parent.st_mode & 0o077:
+            raise Stop('The bridge state directory must be private and owned by your user (mode 0700).')
+        lock_path = path.with_suffix(path.suffix + '.lock')
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        self.lock = os.fdopen(fd, 'w')
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            self.lock.close()
+            raise Stop('Another bridge already holds this state file.') from None
+        if path.exists() or path.is_symlink():
+            private_file(path, 64 * 1024 * 1024)
+        self.db = sqlite3.connect(path)
+        self.db.row_factory = sqlite3.Row
+        self.db.executescript('''
+            PRAGMA synchronous=FULL;
+            CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS inbox (
+                discord_id TEXT PRIMARY KEY, content TEXT NOT NULL, parent TEXT,
+                st_id TEXT UNIQUE, responded INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS outbox (
+                st_id TEXT NOT NULL, part INTEGER NOT NULL, content TEXT NOT NULL,
+                parent TEXT NOT NULL, nonce TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL DEFAULT 'pending', discord_id TEXT,
+                PRIMARY KEY(st_id, part));
+        ''')
+        # Additive migration keeps original cursors, reply links and send receipts.
+        for table in ('inbox', 'outbox'):
+            if 'images' not in {row[1] for row in self.db.execute('PRAGMA table_info(' + table + ')')}:
+                self.db.execute('ALTER TABLE ' + table + " ADD COLUMN images TEXT NOT NULL DEFAULT '[]'")
+        if 'sender' not in {row[1] for row in self.db.execute('PRAGMA table_info(inbox)')}:
+            self.db.execute('ALTER TABLE inbox ADD COLUMN sender TEXT')
+            self.db.execute('UPDATE inbox SET sender=?', ('person/discord-' + route['user_id'],))
+        if 'native_images' not in {row[1] for row in self.db.execute('PRAGMA table_info(inbox)')}:
+            self.db.execute('ALTER TABLE inbox ADD COLUMN native_images TEXT')
+        self.db.commit()
+        self.binding = json.dumps({**route, 'agent': agent}, sort_keys=True)
+        existing = self.get('binding')
+        if existing is not None and existing != self.binding:
+            self.close()
+            raise Stop('This state file belongs to a different route or agent. Do not reuse it.')
+        self.put('binding', self.binding)
+        # A crash between the durable checkpoint and the HTTP receipt is never a fresh send.
+        self.db.execute("UPDATE outbox SET status='uncertain' WHERE status='sending'")
+        self.db.commit()
+
+    def get(self, key):
+        row = self.db.execute('SELECT value FROM meta WHERE key=?', (key,)).fetchone()
+        return None if row is None else row[0]
+
+    def put(self, key, value):
+        self.db.execute('INSERT OR REPLACE INTO meta VALUES (?,?)', (key, str(value)))
+        self.db.commit()
+
+    def count_pending(self):
+        return self.db.execute('SELECT count(*) FROM inbox WHERE responded=0').fetchone()[0]
+
+    def close(self):
+        self.db.close()
+        self.lock.close()
+
+
+def chunks(text):
+    # Conservative UTF-16 accounting also accommodates supplementary-plane characters.
+    current = ''
+    length = 0
+    for char in text:
+        size = len(char.encode('utf-16-le')) // 2
+        if length + size > 1900:
+            yield current
+            current, length = '', 0
+        current += char
+        length += size
+    if current:
+        yield current
+
+
+class Bridge:
+    def __init__(self, route, agent, state, discord, st, log=print):
+        self.route, self.agent, self.state = route, agent, state
+        self.discord, self.st, self.log = discord, st, log
+        self.sender = 'external/discord/user/' + route['user_id']
+        self.legacy_sender = 'person/discord-' + route['user_id']
+        self.path = '/channels/' + route['channel_id'] + '/messages'
+        self.scope = hashlib.sha256(state.binding.encode()).hexdigest()[:24]
+        self.uncertain_notices = set()
+
+    def page(self, query):
+        page = self.discord.request('GET', self.path + '?' + urllib.parse.urlencode(query))
+        if not isinstance(page, list) or len(page) > 100 or any(
+            not isinstance(item, dict) or not isinstance(item.get('id'), str)
+            or not ID.fullmatch(item['id']) or item.get('channel_id') != self.route['channel_id'] for item in page):
+            raise Stop('Discord returned an invalid message page.')
+        return page
+
+    def incoming(self):
+        cursor = self.state.get('cursor')
+        if cursor is None:
+            latest = self.page({'limit': 1})
+            self.state.put('cursor', max((int(item['id']) for item in latest), default=0))
+            self.log('Bridge ready. Send a new text message in the Discord test channel.')
+            return
+        # Scan backwards to the retained boundary before accepting any of a full page.
+        # This avoids assuming which end Discord truncates when more than 100 messages arrived.
+        page = self.page({'after': cursor, 'limit': 100})
+        new = {item['id']: item for item in page if int(item['id']) > int(cursor)}
+        while len(page) == 100 and min(int(item['id']) for item in page) > int(cursor):
+            if len(new) >= MAX_HISTORY:
+                raise Stop('Discord catch-up exceeds 1000 messages. The cursor was preserved; no backlog was silently skipped.')
+            boundary = min(int(item['id']) for item in page)
+            page = self.page({'before': boundary, 'limit': 100})
+            new.update({item['id']: item for item in page if int(item['id']) > int(cursor)})
+        for item in sorted(new.values(), key=lambda value: int(value['id'])):
+            author = item.get('author')
+            allowed = isinstance(author, dict) and author.get('id') == self.route['user_id'] and not author.get('bot') and not item.get('webhook_id') and item.get('type', 0) in (0, 19)
+            if allowed and not self.state.db.execute('SELECT 1 FROM inbox WHERE discord_id=?', (item['id'],)).fetchone():
+                text = item.get('content')
+                images = []
+                omitted = False
+                attachments = item.get('attachments', [])
+                if not isinstance(attachments, list):
+                    raise Stop('Discord returned invalid attachment metadata.')
+                total = 0
+                for attachment in attachments:
+                    if (isinstance(attachment, dict) and attachment.get('content_type') in IMAGE_TYPES
+                            and isinstance(attachment.get('size'), int) and 0 < attachment['size'] <= IMAGE_LIMIT
+                            and len(images) < 4 and total + attachment['size'] <= IMAGE_LIMIT):
+                        images.append({key: attachment.get(key) for key in ('id', 'url', 'size', 'content_type')})
+                        total += attachment['size']
+                    else:
+                        omitted = True
+                if (not isinstance(text, str) or not text.strip()) and not images:
+                    if not any(item.get(field) for field in ('attachments', 'embeds', 'sticker_items')):
+                        raise Stop('A message from the configured user has no readable text or visible attachments. Check Message Content Intent; the cursor was preserved.')
+                    self.log('Skipped a message without text or supported images.')
+                elif self.discord.token in (text or ''):
+                    self.log('Skipped a message containing the bot credential; it was not saved or imported.')
+                elif len((text or '').encode()) > 3000:
+                    self.log('Skipped an oversized message; the text limit is 3000 UTF-8 bytes.')
+                else:
+                    if self.state.count_pending() >= MAX_PENDING:
+                        self.log('Agent reply queue is full. New messages remain in Discord; the cursor is held.')
+                        return
+                    if self.state.db.execute('SELECT count(*) FROM inbox').fetchone()[0] >= MAX_RECORDS:
+                        raise Stop('Retained state reached 10000 conversations. The cursor was preserved.')
+                    reference = item.get('message_reference') or {}
+                    parent = reference.get('message_id') if isinstance(reference, dict) and reference.get('channel_id', self.route['channel_id']) == self.route['channel_id'] else None
+                    if parent is not None and (not isinstance(parent, str) or not ID.fullmatch(parent)):
+                        parent = None
+                    text = text or ''
+                    if omitted:
+                        text += '\n\n[Unsupported or excess attachments omitted by the Discord bridge.]'
+                    self.state.db.execute('INSERT INTO inbox(discord_id,content,parent,images,sender) VALUES (?,?,?,?,?)', (item['id'], text, parent, json.dumps(images), self.sender))
+                    self.state.db.commit()
+            self.state.put('cursor', item['id'])
+
+    def native_parent(self, discord_id):
+        if discord_id is None:
+            return None
+        row = self.state.db.execute('SELECT st_id FROM inbox WHERE discord_id=? UNION ALL SELECT st_id FROM outbox WHERE discord_id=? LIMIT 1', (discord_id, discord_id)).fetchone()
+        return None if row is None else row[0]
+
+    def imports(self):
+        for row in self.state.db.execute('SELECT * FROM inbox WHERE st_id IS NULL ORDER BY length(discord_id),discord_id LIMIT 5').fetchall():
+            images = json.loads(row['images'])
+            native_images = json.loads(row['native_images']) if row['native_images'] is not None else []
+            if images and row['native_images'] is None:
+                # Refresh signed CDN URLs without changing retained image identity.
+                fresh = self.discord.request('GET', self.path + '/' + row['discord_id'])
+                if fresh.get('author', {}).get('id') != self.route['user_id'] or fresh.get('channel_id') != self.route['channel_id']:
+                    raise Stop('The source image message no longer matches the configured route.')
+                for attachment in images:
+                    current = next((item for item in fresh.get('attachments', []) if item.get('id') == attachment['id']), None)
+                    if current is None or current.get('size') != attachment['size'] or current.get('content_type') != attachment['content_type']:
+                        raise Stop('A queued source image was removed or changed; import was retained.')
+                    data = self.discord.image({**attachment, 'url': current.get('url')}, self.route['channel_id'])
+                    native_images.append(self.st.upload(data, attachment['content_type'], self.st.actor))
+                self.state.db.execute('UPDATE inbox SET native_images=? WHERE discord_id=?', (json.dumps(native_images), row['discord_id']))
+                self.state.db.commit()
+            # Retry exactly the same immutable payload after an unconfirmed native send.
+            body = {'idempotency_key': 'discord-bridge:' + self.scope + ':in:' + row['discord_id'],
+                    'from': row['sender'], 'to': self.agent, 'in_reply_to': self.native_parent(row['parent']),
+                    'content': '[Discord origin: server ' + self.route['guild_id'] + ', channel ' + self.route['channel_id'] + ', message ' + row['discord_id'] + '. Sender has no native-person link.]\n\n' + row['content'],
+                    'title': 'Discord message', 'tags': ['discord-bridge', 'discord-origin'], 'attachments': native_images}
+            st_id = self.st.send(body)
+            self.state.db.execute('UPDATE inbox SET st_id=? WHERE discord_id=?', (st_id, row['discord_id']))
+            self.state.db.commit()
+            self.log('Imported Discord ' + row['discord_id'] + ' as ' + self.sender + ' -> ' + st_id)
+
+    def queue_replies(self, messages=None):
+        import itertools
+        if messages is None:
+            messages = itertools.chain(self.st.replies(self.sender), self.st.replies(self.legacy_sender))
+        for message in messages:
+            if not isinstance(message, dict) or message.get('from') != self.agent or message.get('to') not in (self.sender, self.legacy_sender) or not isinstance(message.get('subject'), str) or not SUBJECT.fullmatch(message['subject']):
+                continue
+            if self.state.db.execute('SELECT 1 FROM outbox WHERE st_id=?', (message['subject'],)).fetchone():
+                continue
+            parent = self.state.db.execute('SELECT discord_id FROM inbox WHERE st_id=? UNION ALL SELECT discord_id FROM outbox WHERE st_id=? AND discord_id IS NOT NULL ORDER BY 1 LIMIT 1', (message.get('in_reply_to'), message.get('in_reply_to'))).fetchone()
+            if parent is None:
+                continue
+            text = message.get('content')
+            if not isinstance(text, str) or len(text.encode()) > 8192 or self.discord.token in text:
+                raise Stop('An agent reply is oversized or contains the bot credential; it was not queued for Discord.')
+            images = message.get('attachments') or []
+            if not isinstance(images, list) or len(images) > 4 or any(not isinstance(item, dict) or item.get('media_type') not in IMAGE_TYPES or not isinstance(item.get('size'), int) or not 0 < item['size'] <= IMAGE_LIMIT for item in images) or sum(item['size'] for item in images) > IMAGE_LIMIT:
+                raise Stop('An agent image reply exceeds supported attachment limits; delivery was retained.')
+            if not text.strip() and not images:
+                continue
+            parts = list(chunks(text)) or ['']
+            if self.state.db.execute('SELECT count(*) FROM outbox').fetchone()[0] + len(parts) > MAX_RECORDS:
+                raise Stop('Retained reply state reached its limit; no reply was discarded.')
+            for part, content in enumerate(parts):
+                nonce = hashlib.sha256((self.scope + ':' + message['subject'] + ':' + str(part)).encode()).hexdigest()[:24]
+                self.state.db.execute('INSERT OR IGNORE INTO outbox(st_id,part,content,parent,nonce,images) VALUES (?,?,?,?,?,?)', (message['subject'], part, content, parent[0], nonce, json.dumps(images if part == 0 else [])))
+            self.state.db.commit()
+
+    def watch_replies(self, wait_ms=5000):
+        after = int(self.state.get('outbound_cursor') or '0')
+        page = self.st.deliveries(after, wait_ms)
+        if (not isinstance(page, dict) or page.get('contract') != 'st3.adapter.delivery.v0'
+                or not isinstance(page.get('items'), list) or len(page['items']) > 200
+                or type(page.get('cursor')) is not int or page['cursor'] < after
+                or not isinstance(page.get('host'), str) or not page['host']):
+            raise Stop('st returned an invalid delivery watch response; the cursor was retained.')
+        host = self.state.get('outbound_host')
+        if host is not None and host != page['host']:
+            raise Stop('The delivery watch moved to another host; reconcile retained delivery state before resuming.')
+        # Queue durable parts before advancing the frontier. A crash replays stable IDs.
+        self.queue_replies(page['items'])
+        self.state.put('outbound_host', page['host'])
+        self.state.put('outbound_cursor', page['cursor'])
+
+    def receipt(self, row, message, require_nonce=False):
+        return (isinstance(message, dict) and isinstance(message.get('id'), str) and ID.fullmatch(message['id'])
+                and message.get('channel_id') == self.route['channel_id']
+                and isinstance(message.get('author'), dict) and message['author'].get('id') == self.discord.bot_id
+                and not message.get('webhook_id') and message.get('content') == row['content']
+                and (str(message.get('nonce', '')) == row['nonce']
+                     or not require_nonce and message.get('nonce') is None)
+                and isinstance(message.get('message_reference'), dict)
+                and message['message_reference'].get('message_id') == row['parent']
+                and self.image_receipt(row, message))
+
+    def image_receipt(self, row, message):
+        expected = json.loads(row['images'])
+        actual = message.get('attachments') or []
+        if not expected:
+            return not actual
+        if len(actual) != len(expected):
+            return False
+        for image, attachment in zip(expected, actual):
+            name = 'image-' + image['sha256'][:16] + '.' + IMAGE_TYPES[image['media_type']]
+            if attachment.get('filename') != name or attachment.get('size') != image['size'] or attachment.get('content_type') != image['media_type']:
+                return False
+            data = self.discord.image(attachment, self.route['channel_id'])
+            if hashlib.sha256(data).hexdigest() != image['sha256']:
+                return False
+        return True
+
+    def delivered(self, row, message):
+        self.state.db.execute("UPDATE outbox SET status='sent',discord_id=? WHERE st_id=? AND part=?", (message['id'], row['st_id'], row['part']))
+        # A reply relieves the bounded waiting queue only after all its chunks are delivered.
+        if not self.state.db.execute("SELECT 1 FROM outbox WHERE st_id=? AND status!='sent'", (row['st_id'],)).fetchone():
+            self.state.db.execute('UPDATE inbox SET responded=1 WHERE discord_id=?', (row['parent'],))
+        self.state.db.commit()
+        self.log('Delivered ' + row['st_id'] + ' -> Discord ' + message['id'])
+
+    def recover(self):
+        rows = self.state.db.execute("SELECT * FROM outbox WHERE status='uncertain'").fetchall()
+        if not rows:
+            return
+        page = self.page({'limit': 100})
+        for row in rows:
+            found = next((item for item in page if self.receipt(row, item, require_nonce=True)), None)
+            if found is not None:
+                self.delivered(row, found)
+            elif (row['st_id'], row['part']) not in self.uncertain_notices:
+                self.log('Unconfirmed send held without reposting: ' + row['st_id'] + ' part ' + str(row['part']) + '. Inspect Discord; use resolve with its Discord message ID.')
+                self.uncertain_notices.add((row['st_id'], row['part']))
+
+    def exports(self):
+        # Hold subsequent sends while an earlier outcome is unknown.
+        if self.state.db.execute("SELECT 1 FROM outbox WHERE status='uncertain'").fetchone():
+            return
+        for row in self.state.db.execute("SELECT * FROM outbox WHERE status='pending' ORDER BY rowid LIMIT 5").fetchall():
+            images = json.loads(row['images'])
+            files = [self.st.image(image, row['st_id'], self.st.actor) for image in images]
+            if any(self.discord.token.encode() in data for _, _, data in files):
+                raise Stop('An outgoing image contained the bot credential; it was not sent.')
+            self.state.db.execute("UPDATE outbox SET status='sending' WHERE st_id=? AND part=?", (row['st_id'], row['part']))
+            self.state.db.commit()
+            body = {'content': row['content'], 'allowed_mentions': {'parse': [], 'replied_user': False},
+                    'nonce': row['nonce'], 'enforce_nonce': True,
+                    'message_reference': {'message_id': row['parent'], 'channel_id': self.route['channel_id'], 'fail_if_not_exists': True}}
+            if files:
+                body['attachments'] = [{'id': index, 'filename': name} for index, (name, _, _) in enumerate(files)]
+            try:
+                message = self.discord.request('POST', self.path, body, files=files) if files else self.discord.request('POST', self.path, body)
+                if not self.receipt(row, message):
+                    raise Uncertain('Discord receipt did not match the reply.')
+            except (Uncertain, Later, Stop) as error:
+                if not isinstance(error, Uncertain) and not files:
+                    self.state.db.execute("UPDATE outbox SET status='pending' WHERE st_id=? AND part=?", (row['st_id'], row['part']))
+                    self.state.db.commit()
+                    raise
+                self.state.db.execute("UPDATE outbox SET status='uncertain' WHERE st_id=? AND part=?", (row['st_id'], row['part']))
+                self.state.db.commit()
+                self.log('Discord send outcome is unknown; held for reconciliation without automatic reposting.')
+                return
+            except (Later, Stop):
+                self.state.db.execute("UPDATE outbox SET status='pending' WHERE st_id=? AND part=?", (row['st_id'], row['part']))
+                self.state.db.commit()
+                raise
+            self.delivered(row, message)
+
+    def tick(self, wait_ms=None):
+        self.recover()
+        if wait_ms is None:
+            self.incoming()
+            self.imports()
+            self.queue_replies()
+        else:
+            now = time.monotonic()
+            if now >= getattr(self, 'next_intake', 0):
+                self.incoming()
+                self.imports()
+                self.next_intake = time.monotonic() + 5
+            remaining = max(0, int((self.next_intake - time.monotonic()) * 1000))
+            self.watch_replies(min(wait_ms, remaining))
+        self.exports()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('action', choices=('run', 'status', 'resolve'))
+    parser.add_argument('--agent', required=True, help='The one allowlisted st agent subject.')
+    parser.add_argument('--route', type=Path, default=ROOT / 'discord-probe/trial.json')
+    parser.add_argument('--state', type=Path)
+    parser.add_argument('--socket', type=Path, default=ROOT / 'st3.sock')
+    parser.add_argument('--token-file', type=Path, help='Private dotenv file with one DISCORD_BOT_TOKEN entry; never evaluated as shell code.')
+    parser.add_argument('--st-message')
+    parser.add_argument('--discord-message')
+    parser.add_argument('--part', type=int, default=0)
+    args = parser.parse_args()
+    state = None
+    try:
+        if not re.fullmatch(r'agent/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*', args.agent):
+            raise Stop('Name one explicit st agent subject.')
+        route = route_file(args.route)
+        state = State(args.state or ROOT / ('discord-bridge/' + route['channel_id'] + '.sqlite'), route, args.agent)
+        if args.action == 'status':
+            print(json.dumps({'sender': 'external/discord/user/' + route['user_id'], 'agent': args.agent,
+                              'waiting_for_reply': state.count_pending(),
+                              'outgoing': [dict(row) for row in state.db.execute('SELECT st_id,part,status,discord_id FROM outbox')]}))
+            return 0
+        if args.token_file is not None:
+            token = token_file(args.token_file)
+        else:
+            if not sys.stdin.isatty():
+                raise Stop('Run from your own interactive terminal for hidden token input, or provide --token-file.')
+            with warnings.catch_warnings():
+                warnings.simplefilter('error', getpass.GetPassWarning)
+                token = getpass.getpass('Paste the bot token from 1Password (input hidden): ')
+        discord = Discord(token)
+        token = None
+        print('Checking bot application and channel...', flush=True)
+        discord.validate(route)
+        bridge = Bridge(route, args.agent, state, discord, St(args.socket))
+        if args.action == 'resolve':
+            if not args.st_message or not SUBJECT.fullmatch(args.st_message) or not args.discord_message or not ID.fullmatch(args.discord_message):
+                raise Stop('resolve needs --st-message message/ID and --discord-message ID.')
+            row = state.db.execute("SELECT * FROM outbox WHERE st_id=? AND part=? AND status='uncertain'", (args.st_message, args.part)).fetchone()
+            if row is None:
+                raise Stop('No matching unconfirmed send was found.')
+            message = discord.request('GET', bridge.path + '/' + args.discord_message)
+            if not bridge.receipt(row, message):
+                raise Stop('That Discord message does not match the held reply, nonce, author and reference.')
+            bridge.delivered(row, message)
+            return 0
+        print('Text bridge running as ' + bridge.sender + '. Replies target ' + args.agent + '.', flush=True)
+        print('Images are forwarded both ways (up to 4, 10 MiB total); other files, edits and deletes are not. Restart retains delivery state.', flush=True)
+        failures = 0
+        retry_at = 0
+        last_notice = None
+        while True:
+            if time.monotonic() < retry_at:
+                time.sleep(min(5, retry_at - time.monotonic()))
+                continue
+            try:
+                bridge.tick(wait_ms=5000)
+                failures, last_notice = 0, None
+            except Later as error:
+                failures += 1
+                retry_at = time.monotonic() + max(error.delay, min(60, 2 ** min(failures, 6)))
+                if str(error) != last_notice:
+                    print(str(error), flush=True)
+                    last_notice = str(error)
+    except (EOFError, KeyboardInterrupt):
+        print('Bridge stopped. Queued delivery state was retained.')
+        return 0
+    except getpass.GetPassWarning:
+        print('Hidden token input is unavailable; no token was read.', file=sys.stderr)
+        return 1
+    except Stop as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    except Exception:
+        print('Bridge stopped while reading local state or a provider response. No exception or credentials were logged; state was retained.', file=sys.stderr)
+        return 1
+    finally:
+        if state is not None:
+            state.close()
+
+
+if __name__ == '__main__':
+    sys.exit(main())

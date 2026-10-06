@@ -67,6 +67,91 @@ fn blob_reply(value: Value) -> Json<Value> {
     Json(value)
 }
 
+#[derive(Deserialize)]
+pub(super) struct DeliveryQuery {
+    #[serde(default)]
+    after: u64,
+    #[serde(default)]
+    wait_ms: u64,
+}
+
+/// Interim bounded watch: a durable local graph frontier, not a provider receipt.
+/// Subscribe before reading so a reply between the read and wait is never lost.
+pub(super) async fn deliveries(
+    State(state): State<AppState>,
+    Extension(session): Extension<ClientSession>,
+    Query(query): Query<DeliveryQuery>,
+) -> Result<Json<Value>, ApiError> {
+    require_scope(&session, "control.messages")?;
+    let actor = &session.authority_actor;
+    let declaration = state.store.latest_claim(actor, Some("intent.desired")).map_err(ApiError::internal)?;
+    let member = declaration.as_ref().map(|claim| &claim.body["member"]);
+    let (source, target) = member.and_then(|member| {
+        (actor.starts_with("agent/") && member["kind"] == "agent" && member["driver"].is_null())
+            .then(|| (member["tags"]["st3.adapter.source"].as_str(), member["tags"]["st3.adapter.target"].as_str()))
+    }).and_then(|(source, target)| source.zip(target))
+        .ok_or_else(|| ApiError::bad(St3Error::new("adapter-route-refused", "delivery watch requires an enrolled program seat")))?;
+    let legacy = source.strip_prefix("external/discord/user/").map(|id| format!("person/discord-{id}"));
+    let mut changed = state.event_notify.subscribe();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(query.wait_ms.min(10_000));
+    loop {
+        let through = state.store.index().map_err(ApiError::internal)?;
+        if query.after > through {
+            return Err(ApiError::bad(St3Error::new("adapter-resync-required", "the local delivery frontier moved backwards; reload retained delivery state")));
+        }
+        let mut items = Vec::new();
+        let mut frontier = through;
+        for recipient in std::iter::once(source).chain(legacy.as_deref()) {
+            let (page, next) = state.store.messages_page(Some(recipient), true, Some(query.after), through, 100).map_err(ApiError::internal)?;
+            if let Some(next) = next { frontier = frontier.min(next); }
+            items.extend(page);
+        }
+        items.retain(|message| message.created_index <= frontier && message.from == target && message.in_reply_to.is_some());
+        items.sort_by_key(|message| message.created_index);
+        if items.len() > 100 {
+            frontier = frontier.min(items[99].created_index);
+            items.truncate(100);
+        }
+        if !items.is_empty() || frontier > query.after || tokio::time::Instant::now() >= deadline {
+            return Ok(blob_reply(json!({"contract":"st3.adapter.delivery.v0", "items":items, "cursor":frontier, "more":frontier < through, "host":state.node})));
+        }
+        if tokio::time::timeout_at(deadline, changed.changed()).await.is_err() {
+            return Ok(blob_reply(json!({"contract":"st3.adapter.delivery.v0", "items":[], "cursor":through, "more":false, "host":state.node})));
+        }
+    }
+}
+
+/// Import as an external sender while retaining the adapter's own upload authority.
+/// The selected program-seat declaration binds exactly one source and destination.
+pub(super) async fn import_message(
+    State(state): State<AppState>,
+    Extension(session): Extension<ClientSession>,
+    Json(mut request): Json<MessageSendRequest>,
+) -> Result<Json<Value>, ApiError> {
+    require_scope(&session, "control.messages")?;
+    let actor = &session.authority_actor;
+    let source = &request.from;
+    if !actor.starts_with("agent/") || !source.starts_with("external/") || source.len() > 512
+        || source.split('/').any(|part| part.is_empty() || !part.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)))
+        || source.split('/').count() != 4
+    {
+        return Err(ApiError::bad(St3Error::new("adapter-route-refused", "an adapter import needs its agent actor and an external provider account")));
+    }
+    let declaration = state.store.latest_claim(actor, Some("intent.desired")).map_err(ApiError::internal)?;
+    let permitted = declaration.as_ref().is_some_and(|claim| {
+        let member = &claim.body["member"];
+        member["kind"] == "agent" && member["driver"].is_null()
+            && member["tags"]["st3.adapter.source"] == *source
+            && member["tags"]["st3.adapter.target"] == request.to
+    });
+    if !permitted {
+        return Err(ApiError::bad(St3Error::new("adapter-route-refused", "the program-seat declaration does not authorize this exact external sender and destination")));
+    }
+    request.tags.push(format!("adapter:{actor}"));
+    let receipt = accept_message_receipt_with_upload_owner(&state, request, None, None, Some(actor))?;
+    Ok(blob_reply(json!(receipt.message)))
+}
+
 /// `POST /v1/client/blobs`: keep the bytes of one image on this member and answer their reference.
 pub(super) async fn upload(
     State(state): State<AppState>,
@@ -439,6 +524,63 @@ mod tests {
     use super::*;
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
+
+    #[tokio::test]
+    async fn adapter_import_keeps_external_sender_and_upload_owner_separate() {
+        let root = tempfile::tempdir().unwrap();
+        let state = crate::api::tests::state(root.path());
+        let actor = "agent/example/bridge";
+        let source = r#"version 2
+agent "example/bridge" {
+  workspace "/tmp"
+  argv "/usr/bin/true"
+  tags st3.adapter.source="external/discord/user/404" st3.adapter.target="agent/example/test"
+}"#.to_owned();
+        let intent = crate::graph::parse_test_intent(&source, "node").unwrap();
+        let planned = state.store.mission(&intent, crate::model::IntentInput { kdl: source, source_name: None }).unwrap();
+        state.store.apply(&intent, &planned.subject_tokens, "adapter-route").unwrap();
+        let app = router_for_transport(state.clone(), ClientTransportBoundary::Unix);
+        let image = png(32, 7);
+        let (status, _, bytes) = call(&app, "POST", "/v1/client/blobs", actor, Some("image/png"), image.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{}", json_of(&bytes));
+        let blob = json_of(&bytes)["value"]["blob"].as_str().unwrap().to_owned();
+        let payload = json!({"idempotency_key":"adapter-image-505", "from":"external/discord/user/404", "to":"agent/example/test", "content":"image from Discord", "attachments":[{"blob":blob,"media_type":"image/png"}]});
+        let (status, _, bytes) = call(&app, "POST", "/v1/client/adapter/import", actor, Some("application/json"), serde_json::to_vec(&payload).unwrap()).await;
+        assert_eq!(status, StatusCode::OK, "{}", json_of(&bytes));
+        let value = json_of(&bytes);
+        assert_eq!(value["value"]["from"], "external/discord/user/404");
+        assert_eq!(value["value"]["attachments"][0]["sha256"], hex::encode(Sha256::digest(&image)));
+        let id = value["value"]["subject"].clone();
+        let (_, _, repeated) = call(&app, "POST", "/v1/client/adapter/import", actor, Some("application/json"), serde_json::to_vec(&payload).unwrap()).await;
+        assert_eq!(json_of(&repeated)["value"]["subject"], id);
+        for (from, to, caller) in [("person/alex", "agent/example/test", actor), ("external/discord/user/999", "agent/example/test", actor), ("external/discord/user/404", "agent/example/other", actor), ("external/discord/user/404", "agent/example/test", "agent/example/other")] {
+            let changed = json!({"idempotency_key":"refused", "from":from,"to":to,"content":"do not import"});
+            let (status, _, _) = call(&app, "POST", "/v1/client/adapter/import", caller, Some("application/json"), serde_json::to_vec(&changed).unwrap()).await;
+            assert_ne!(status, StatusCode::OK);
+        }
+        let refused = format!("message/{}", &hex::encode(Sha256::digest(b"refused"))[..16]);
+        assert!(state.store.message(&refused).unwrap().is_none());
+        let after = state.store.index().unwrap();
+        let waiting_app = app.clone();
+        let waiting = tokio::spawn(async move {
+            call(&waiting_app, "GET", &format!("/v1/client/adapter/deliveries?after={after}&wait_ms=1000"), actor, None, Vec::new()).await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let reply = json!({"idempotency_key":"adapter-reply-606","from":"agent/example/test","to":"external/discord/user/404","content":"streamed reply","in_reply_to":id});
+        let (status, _, bytes) = call(&app, "POST", "/v1/messages", "agent/example/test", Some("application/json"), serde_json::to_vec(&reply).unwrap()).await;
+        assert_eq!(status, StatusCode::OK, "{}", json_of(&bytes));
+        let (status, _, bytes) = waiting.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", json_of(&bytes));
+        let page = json_of(&bytes);
+        assert_eq!(page["value"]["items"][0]["content"], "streamed reply");
+        let cursor = page["value"]["cursor"].as_u64().unwrap();
+        let (_, _, replay) = call(&app, "GET", &format!("/v1/client/adapter/deliveries?after={after}"), actor, None, Vec::new()).await;
+        assert_eq!(json_of(&replay)["value"]["items"], page["value"]["items"]);
+        let (_, _, quiet) = call(&app, "GET", &format!("/v1/client/adapter/deliveries?after={cursor}&wait_ms=1"), actor, None, Vec::new()).await;
+        assert_eq!(json_of(&quiet)["value"]["items"], json!([]));
+        let (status, _, _) = call(&app, "GET", "/v1/client/adapter/deliveries", "agent/example/other", None, Vec::new()).await;
+        assert_ne!(status, StatusCode::OK);
+    }
 
     /// The smallest bytes that sniff as a PNG, padded to `length`.
     fn png(length: usize, seed: u8) -> Vec<u8> {

@@ -760,6 +760,12 @@ fn build_registry() -> Registry {
         ),
         ("person", "person/IDENTITY", "A human actor.", false),
         (
+            "external",
+            "external/PROVIDER/KIND/IDENTITY",
+            "An external account or actor, distinct from a native person.",
+            false,
+        ),
+        (
             "arrangement",
             "arrangement/person/NAME/UUIDv7",
             "A permanently person-owned shared folder arrangement.",
