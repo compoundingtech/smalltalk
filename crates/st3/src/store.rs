@@ -49523,7 +49523,9 @@ message "human-attention" {
                 tx.commit().unwrap();
                 claim
             };
-            let after_work = store.index().unwrap();
+            // The synthetic direct transaction does not publish the process atomic.
+            let after_work = store.read_snapshot(Ok).unwrap();
+            assert!(after_work >= work.store_index);
             checked_raw_harness_pair(&store, subject, after_work);
             store
                 .read_snapshot(|_| {
