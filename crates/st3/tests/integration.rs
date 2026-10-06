@@ -30,6 +30,7 @@ mod delivery_probe;
 mod examples;
 mod fault_isolation;
 mod first_sync;
+mod follow_retry;
 mod fleet;
 mod gate_kinds;
 mod getting_started;
