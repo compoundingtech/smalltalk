@@ -39,8 +39,11 @@ def emit_failure_evidence(out, report):
     Run after native cleanup and judging, never in the delivery/timing path.
     Bound file reads and printed bytes; a truncated file is explicitly marked.
     """
+    import sys
+    sys.path.insert(0, str(HERE.parent))
+    from st3_failure_evidence import read_failure_file
+
     budget = 256 * 1024
-    half = 8 * 1024
     names = ["reader.json", "recovered-trace.json", "trace.json", "link-events.json",
              "before.json", "after.json"]
     for node in ("amber", "cobalt"):
@@ -53,20 +56,10 @@ def emit_failure_evidence(out, report):
         for name in names:
             path = out / case["case"] / name
             try:
-                with path.open("rb") as stream:
-                    size = os.fstat(stream.fileno()).st_size
-                    head = stream.read(min(size, half * 2, budget))
-                    tail = b""
-                    if size > len(head) and budget > len(head):
-                        head = head[:half]
-                        stream.seek(max(len(head), size - min(half, budget - len(head))))
-                        tail = stream.read(min(half, budget - len(head)))
-                budget -= len(head) + len(tail)
+                record = read_failure_file(path, budget)
+                budget -= record["retained_bytes"]
                 print(json.dumps({"native_failure_evidence": f"{case['case']}/{name}",
-                                  "file_bytes": size, "retained_bytes": len(head) + len(tail),
-                                  "omitted_bytes": size - len(head) - len(tail),
-                                  "head": head.decode(errors="replace"),
-                                  "tail": tail.decode(errors="replace")}), flush=True)
+                                  **record}), flush=True)
             except FileNotFoundError:
                 continue
             except OSError as error:

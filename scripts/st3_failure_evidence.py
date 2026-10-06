@@ -2,6 +2,7 @@
 import fnmatch
 import json
 import os
+import stat
 
 
 class SuspendCliEvidence:
@@ -31,6 +32,26 @@ class SuspendCliEvidence:
                  "results": rows}) + "\n")
 
 
+def read_failure_file(path, budget):
+    """Read a bounded regular file; a FIFO or symlink must not block capture."""
+    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    with os.fdopen(descriptor, "rb") as stream:
+        metadata = os.fstat(stream.fileno())
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError("failure evidence is not a regular file")
+        size = metadata.st_size
+        half = 8 * 1024
+        head = stream.read(min(size, half * 2, budget))
+        tail = b""
+        if size > len(head) and budget > len(head):
+            head = head[:half]
+            stream.seek(max(len(head), size - min(half, budget - len(head))))
+            tail = stream.read(min(half, budget - len(head)))
+    return {"file_bytes": size, "retained_bytes": len(head) + len(tail),
+            "omitted_bytes": size - len(head) - len(tail),
+            "head": head.decode(errors="replace"), "tail": tail.decode(errors="replace")}
+
+
 def emit_failure_files(evidence):
     """Bound reads and raw retained bytes; JSON escaping can expand the output.
 
@@ -42,7 +63,6 @@ def emit_failure_files(evidence):
                 "harness-state-*.json", "trace*.json*", "*.claims.json",
                 "driver-*.log", "daemon.log", "terminal*.txt")
     budget = 256 * 1024
-    half = 8 * 1024
     def priority(path):
         return (next((i for i, pattern in enumerate(patterns)
                       if fnmatch.fnmatchcase(path.name, pattern)), len(patterns)), path.name)
@@ -51,20 +71,9 @@ def emit_failure_files(evidence):
         if not any(fnmatch.fnmatchcase(path.name, pattern) for pattern in patterns):
             continue
         try:
-            with path.open("rb") as stream:
-                size = os.fstat(stream.fileno()).st_size
-                head = stream.read(min(size, half * 2, budget))
-                tail = b""
-                if size > len(head) and budget > len(head):
-                    head = head[:half]
-                    stream.seek(max(len(head), size - min(half, budget - len(head))))
-                    tail = stream.read(min(half, budget - len(head)))
-            budget -= len(head) + len(tail)
-            print(json.dumps({"native_failure_evidence": path.name, "file_bytes": size,
-                              "retained_bytes": len(head) + len(tail),
-                              "omitted_bytes": size - len(head) - len(tail),
-                              "head": head.decode(errors="replace"),
-                              "tail": tail.decode(errors="replace")}), flush=True)
+            record = read_failure_file(path, budget)
+            budget -= record["retained_bytes"]
+            print(json.dumps({"native_failure_evidence": path.name, **record}), flush=True)
         except OSError as error:
             print(json.dumps({"native_failure_evidence": path.name,
                               "capture_error": str(error)}), flush=True)

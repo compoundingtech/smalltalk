@@ -836,7 +836,7 @@
         checks.st2 = st2;
         checks.st3 = st3Check;
         checks.cargo-artifact-reuse = import ./nix/cargo-artifacts-test.nix {
-          inherit pkgs;
+          inherit pkgs st3 st3Check;
           craneLib = crane.mkLib pkgs;
         };
         checks.st3-help = st3Help;

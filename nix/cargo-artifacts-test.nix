@@ -1,4 +1,4 @@
-{ pkgs, craneLib }:
+{ pkgs, craneLib, st3, st3Check }:
 let
   manifest = pkgs.writeText "Cargo.toml" ''
     [package]
@@ -138,6 +138,13 @@ let
       '';
     });
 in
+# The dummy-only dependency exception must never remove shipped-hook assertions.
+assert builtins.all (package:
+  pkgs.lib.hasInfix "Missing embedded Claude hook:" package.postPatch
+  && pkgs.lib.hasInfix "Wrong embedded Claude hook interpreter" package.postPatch
+  && pkgs.lib.hasInfix (builtins.unsafeDiscardStringContext
+    ''[ "$shebang" != "#!${pkgs.bash}/bin/bash" ]'') package.postPatch
+) [ st3 st3Check ];
 assert artifacts first == artifacts changed;
 assert artifacts first == artifacts codeOnly;
 assert artifacts first == artifacts changedCheck;

@@ -4,6 +4,7 @@ import importlib.machinery
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import subprocess
@@ -83,6 +84,43 @@ class FailureEvidenceTests(unittest.TestCase):
             self.assertEqual(records[1]["file_bytes"] - 16384, records[1]["omitted_bytes"])
             self.assertIn('"exit":126', records[0]["head"])
             self.assertNotIn("must not appear", output.getvalue())
+
+    def test_fifo_and_symlink_are_rejected_without_reading_their_contents(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            os.mkfifo(root / "daemon.log")
+            (root / "secret.txt").write_text("must not appear")
+            (root / "driver-0.log").symlink_to(root / "secret.txt")
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                module.emit_failure_files(root)
+            rows = [json.loads(line) for line in output.getvalue().splitlines()]
+            self.assertEqual(2, len(rows))
+            self.assertTrue(all("capture_error" in row for row in rows))
+            self.assertNotIn("must not appear", output.getvalue())
+
+    def test_messaging_capture_uses_shared_reader_and_only_failed_cases(self):
+        loader = importlib.machinery.SourceFileLoader("messaging_failure_capture", str(
+            Path(__file__).resolve().parent / "run"))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        messaging = importlib.util.module_from_spec(spec)
+        loader.exec_module(messaging)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("passed", "failed"):
+                (root / name).mkdir()
+                (root / name / "trace.json").write_text(name)
+            os.mkfifo(root / "failed" / "amber-daemon.log")
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                messaging.emit_failure_evidence(root, {"cases": [
+                    {"case": "passed", "verdict": "pass"},
+                    {"case": "failed", "verdict": "fail"}]})
+            rows = [json.loads(line) for line in output.getvalue().splitlines()]
+            self.assertEqual(["failed/trace.json", "failed/amber-daemon.log"],
+                             [row["native_failure_evidence"] for row in rows])
+            self.assertEqual("failed", rows[0]["head"])
+            self.assertIn("capture_error", rows[1])
 
     def test_escaped_payloads_share_a_raw_byte_budget_across_files(self):
         with tempfile.TemporaryDirectory() as directory:
