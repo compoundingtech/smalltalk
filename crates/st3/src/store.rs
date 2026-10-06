@@ -20648,9 +20648,7 @@ fn observed_harness_from_fold_fields(
     auth_restored: bool,
     incarnation_id: &str,
 ) -> Option<crate::model::CurrentHarnessView> {
-    let Some((mut state, claim, observed_at_unix_ms, _)) = current else {
-        return None;
-    };
+    let (mut state, claim, observed_at_unix_ms, _) = current?;
     if optional.get("reason").and_then(|r| r.as_deref()) == Some("providerAuth") {
         if auth_restored {
             // Sparse successful reports must not inherit an older credential-refusal reason.
