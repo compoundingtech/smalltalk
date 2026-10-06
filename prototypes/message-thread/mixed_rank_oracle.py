@@ -43,6 +43,9 @@ CREATE INDEX reply_recorded_head ON reply_assignments(
   child,accepted_len DESC,accepted_at DESC,origin DESC,replica_sequence DESC,
   batch_id DESC,recorded_position DESC,claim_id DESC
 ) WHERE recorded_position IS NOT NULL;
+CREATE INDEX reply_legacy_batch_after ON reply_assignments(
+  batch_id,store_index,child
+) WHERE recorded_position IS NULL;
 CREATE TABLE selected_reply(child TEXT PRIMARY KEY, parent TEXT NOT NULL);
 """
 
@@ -159,8 +162,12 @@ def lane_parent(db: sqlite3.Connection, child: str) -> str | None:
 
 
 def refresh(db: sqlite3.Connection, child: str) -> None:
-    db.execute("DELETE FROM selected_reply WHERE child=?", (child,))
     parent = lane_parent(db, child)
+    previous = db.execute("SELECT parent FROM selected_reply WHERE child=?",
+                          (child,)).fetchone()
+    if (previous[0] if previous else None) == parent:
+        return
+    db.execute("DELETE FROM selected_reply WHERE child=?", (child,))
     if parent is not None:
         db.execute("INSERT INTO selected_reply VALUES(?,?)", (child, parent))
 
@@ -170,6 +177,15 @@ def all_children(db: sqlite3.Connection, batch: str) -> list[str]:
     return [row[0] for row in db.execute(
         "SELECT DISTINCT subject FROM claims INDEXED BY claims_batch_subject "
         "WHERE batch_id=? AND kind='message.sent' ORDER BY subject", (batch,),
+    )]
+
+
+def later_legacy_children(db: sqlite3.Connection, batch: str, index: int) -> list[str]:
+    """Only these existing legacy positions can change rank after a mutation."""
+    return [row[0] for row in db.execute(
+        "SELECT DISTINCT child FROM reply_assignments INDEXED BY reply_legacy_batch_after "
+        "WHERE batch_id=? AND recorded_position IS NULL AND store_index>? ORDER BY child",
+        (batch, index),
     )]
 
 
@@ -198,13 +214,21 @@ def add(db: sqlite3.Connection, claim_id: str, index: int, batch: str,
 
 
 def mutate(db: sqlite3.Connection, batches: set[str], subjects: set[str], change,
-           *, audit: bool = True) -> tuple[int, int]:
-    """Enumerate both sides of every changed batch; correct, but not bounded."""
-    old = sorted(subjects | {child for batch in batches for child in all_children(db, batch)})
+           *, audit: bool = True,
+           rank_shift: tuple[str, int] | None = None,
+           direct_only: bool = False) -> tuple[int, int]:
+    """Compare old/new candidate keys; rank shifts seek later legacy claims."""
+    def candidates() -> set[str]:
+        if direct_only:
+            return set()
+        if rank_shift is not None:
+            return set(later_legacy_children(db, *rank_shift))
+        return {child for batch in batches for child in all_children(db, batch)}
+
+    old = sorted(subjects | candidates())
     previous = {name: lane_parent(db, name) for name in old}
     change()
-    affected = sorted(set(old) | subjects |
-                      {child for batch in batches for child in all_children(db, batch)})
+    affected = sorted(set(old) | subjects | candidates())
     for name in affected:
         refresh(db, name)
     if audit:
@@ -225,7 +249,7 @@ def delete(db: sqlite3.Connection, claim_id: str, *, audit: bool = True) -> tupl
         rank_bump(db, batch, index, -1)
 
     return mutate(db, {batch}, {child} if kind == 'message.sent' else set(),
-                  change, audit=audit)
+                  change, audit=audit, rank_shift=(batch, index))
 
 
 def measured(db: sqlite3.Connection, work) -> tuple[object, dict[str, int]]:
@@ -329,7 +353,7 @@ def fixed_answer_unrelated(scale: int) -> dict:
 
 
 def unchanged_batch(scale: int) -> dict:
-    """A changed batch with many children whose selected parents stay put."""
+    """Recorded-only children need no candidate enumeration on rank shifts."""
     db = sqlite3.connect(':memory:')
     db.executescript(SCHEMA)
     batch = 'batch/unchanged/1'
@@ -343,7 +367,7 @@ def unchanged_batch(scale: int) -> dict:
     (enumerated, changed), metrics = measured(
         db, lambda: delete(db, 'predecessor', audit=False),
     )
-    assert (enumerated, changed) == (scale, 0)
+    assert (enumerated, changed) == (0, 0)
     assert db.execute("SELECT COUNT(*) FROM selected_reply "
                       "WHERE parent='message/root'").fetchone()[0] == scale
     for number in (0, scale // 2, scale - 1):
@@ -351,6 +375,35 @@ def unchanged_batch(scale: int) -> dict:
         assert lane_parent(db, child) == exact_parent(db, child)
     db.close()
     return {'case': 'same-answer-changed-batch', 'scale': scale,
+            'enumerated': enumerated, 'changed': changed, **metrics}
+
+
+def unchanged_mixed_batch(scale: int) -> dict:
+    """Mixed children are potential keys even when none actually changes."""
+    db = sqlite3.connect(':memory:')
+    db.executescript(SCHEMA)
+    batch = 'batch/mixed-unchanged/1'
+    db.execute("INSERT INTO batches VALUES(?,'host/example',1)", (batch,))
+    db.execute("INSERT INTO claims VALUES('predecessor',1,?,'resource/example',"
+               "'resource.observed',NULL,'100')", (batch,))
+    rank_bump(db, batch, 1, 1)
+    for number in range(scale):
+        child = f'message/mixed-unchanged-{number:05}'
+        add(db, f'z-{number:05}', 2 * number + 2, batch,
+            child, 'message/root', recorded=100_000)
+        add(db, f'a-{number:05}', 2 * number + 3, batch,
+            child, 'message/other')
+    (enumerated, changed), metrics = measured(
+        db, lambda: delete(db, 'predecessor', audit=False),
+    )
+    assert (enumerated, changed) == (scale, 0)
+    assert db.execute("SELECT COUNT(*) FROM selected_reply "
+                      "WHERE parent='message/root'").fetchone()[0] == scale
+    for number in (0, scale // 2, scale - 1):
+        child = f'message/mixed-unchanged-{number:05}'
+        assert lane_parent(db, child) == exact_parent(db, child)
+    db.close()
+    return {'case': 'same-answer-mixed-batch', 'scale': scale,
             'enumerated': enumerated, 'changed': changed, **metrics}
 
 
@@ -387,13 +440,13 @@ def main() -> None:
         sync_assignment(db, 'a-third')
 
     assert mutate(db, {batch}, {'message/child', second},
-                  lambda: move_record('a-second', 0))[0] == 2
+                  lambda: move_record('a-second', 0), direct_only=True)[0] == 2
     assert mutate(db, {batch}, {'message/child', second},
-                  lambda: move_record('z-recorded', 2))[0] == 2
+                  lambda: move_record('z-recorded', 2), direct_only=True)[0] == 2
     assert mutate(db, {batch, other_batch}, {'message/child', third},
-                  lambda: move_record('a-third', 0))[0] == 3
+                  lambda: move_record('a-third', 0), direct_only=True)[0] == 2
     assert mutate(db, {batch, other_batch}, {'message/child', third},
-                  lambda: move_record('z-recorded', 2))[0] == 3
+                  lambda: move_record('z-recorded', 2), direct_only=True)[0] == 2
     check(db, ['message/child', second, third])
 
     def move_index() -> None:
@@ -402,13 +455,15 @@ def main() -> None:
         rank_bump(db, batch, 5, 1)
         sync_assignment(db, 'a-second')
 
-    assert mutate(db, {batch}, {second}, move_index)[0] == 2
+    assert mutate(db, {batch}, {second}, move_index,
+                  rank_shift=(batch, 4))[0] == 1
     def insert_predecessor() -> None:
         db.execute("INSERT INTO claims VALUES('new-predecessor',4,?,'resource/example',"
                    "'resource.observed',NULL,'100')", (batch,))
         rank_bump(db, batch, 4, 1)
 
-    assert mutate(db, {batch}, set(), insert_predecessor)[0] == 2
+    assert mutate(db, {batch}, set(), insert_predecessor,
+                  rank_shift=(batch, 4))[0] == 1
     affected, changed = delete(db, 'a-first')
     assert affected == 2 and changed <= affected
     print('mixed lane heads, repaired record, exact rank and affected-child audit passed',
@@ -419,5 +474,6 @@ if __name__ == '__main__':
     main()
     if '--growth' in sys.argv or '--small-growth' in sys.argv:
         scales = (1000, 10000) if '--growth' in sys.argv else (10, 100)
-        for case in (growth, fixed_answer_unrelated, unchanged_batch):
+        for case in (growth, fixed_answer_unrelated, unchanged_batch,
+                     unchanged_mixed_batch):
             print([case(scale) for scale in scales])

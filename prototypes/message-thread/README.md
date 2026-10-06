@@ -61,21 +61,28 @@ measurements. Its fixture first proves the preceding `store_index` shortcut
 returns the wrong parent, then checks the two-lane answer under record identity
 and position changes across two batches, repaired state, a claim store-index
 move, insertion of an earlier unrelated claim, and deletion. `--growth` builds
-1,000/10,000 children in three cases: every parent changes; only two parents
-change while an unrelated batch grows; and a changed batch grows while no
-parent changes. It records enumerated and changed keys, VM steps, statement
+1,000/10,000 children in four cases: every parent changes; only two parents
+change while an unrelated batch grows; a recorded-only changed batch grows
+while no parent changes; and a mixed changed batch grows while no parent
+changes. It records enumerated and changed keys, VM steps, statement
 count, SQL trace text bytes, rank-node writes and seeks, row changes, and
 allocated page-byte delta. SQL text bytes and page allocation are proxies,
 not disk-write bytes. Full-fold spot checks run after each measured mutation.
 `--small-growth` exercises the same cases at 10/100.
 
-The current affected-key enumerator intentionally revisits **all** message
-children in a changed batch. It is complete but unbounded; one unrelated
-predecessor deletion can actually flip every child's selected parent in the
-invented cohort. This is a failing writer-cost design row, not a production
-solution. The rank trie also copies 63 count nodes per insert/delete and needs
-real-schema transaction, durability, replay, and byte-cost proof. No shared
-Store or API method uses this model.
+The first enumerator revisited **all** message children in a changed batch.
+Its frozen `b56368c3` receipt showed 1,000→10,000 unchanged recorded-only
+parents costing 180,662→1,773,662 VM steps. The later model seeks only legacy
+assignments after the changed store index, plus directly mutated subjects,
+and skips selected-row writes when the answer is unchanged. That removes
+recorded-only children from rank-shift work, but mixed children whose parents
+stay unchanged still require evaluation. An unrelated predecessor deletion can
+also actually flip every mixed child's selected parent; this is inherent
+affected-key fanout. Both the high original constants and the remaining
+mixed no-change scan are failing writer-cost rows, not production acceptance.
+The rank trie touches 63 count nodes per insert/delete and needs real-schema
+transaction, durability, replay and byte-cost proof. No shared Store or API
+method uses this model.
 
 Before production integration, use current-main `store.rs` schema near
 `message_reply_edges`, its open/backfill path and runtime projection hook;
