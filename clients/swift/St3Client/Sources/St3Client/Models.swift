@@ -705,8 +705,8 @@ public struct ArrangementCollectionFrame: Codable, Sendable {
 
 public struct TimelineBlock: Codable, Sendable {
     public let id: String; public let kind: String; public let sourceType: String
-    public let payload: JSONValue; public let continuation: ConversationContentRef?
-    enum CodingKeys: String, CodingKey { case id, kind, sourceType = "source_type", payload, continuation }
+    public let payload: JSONValue; public let visibility: String?; public let metadata: JSONValue?; public let continuation: ConversationContentRef?
+    enum CodingKeys: String, CodingKey { case id, kind, sourceType = "source_type", payload, visibility, metadata, continuation }
 }
 public struct ConversationContentRef: Codable, Sendable {
     public let ref: String; public let mediaType: String; public let size: UInt64?; public let reason: String?

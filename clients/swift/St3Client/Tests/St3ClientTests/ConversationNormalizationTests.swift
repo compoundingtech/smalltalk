@@ -27,12 +27,17 @@ final class ConversationNormalizationTests: XCTestCase {
     }
 
     func testBlocksRoundTripWithoutChangingTheOldEntryType() throws {
-        let data = Data(#"{"id":"timeline-entry/example","sequence":1,"revision":1,"timestamp":"2026-10-06T12:00:00Z","role":"system","type":"content","final":true,"body":{"media_type":"text/plain","text":"future JSON","blocks":[{"id":"block/example","kind":"unknown","source_type":"future","payload":{"raw":{"nested":{"token":"invented-token"}}}}]}}"#.utf8)
+        let data = Data(#"{"id":"timeline-entry/example","sequence":1,"revision":1,"timestamp":"2026-10-06T12:00:00Z","role":"system","type":"content","final":true,"body":{"media_type":"text/plain","text":"future JSON","blocks":[{"id":"block/example","kind":"raw_text","source_type":"future","visibility":"internal","metadata":{"wallTimeMs":12.75,"timeoutSeconds":0,"future":"untouched"},"payload":{"raw":{"nested":{"token":"invented-token"}}}}]}}"#.utf8)
         let legacy = try JSONDecoder().decode(LegacyTimelineEntry.self, from: data)
         XCTAssertEqual(legacy.type, .content)
         let current = try JSONDecoder().decode(TimelineEntry.self, from: data)
         guard case .content(let content) = current.body else { return XCTFail("wrong envelope") }
-        XCTAssertEqual(content.blocks?.first?.kind, "unknown")
+        XCTAssertEqual(content.blocks?.first?.kind, "raw_text")
+        XCTAssertEqual(content.blocks?.first?.visibility, "internal")
+        guard case .object(let metadata) = content.blocks?.first?.metadata else { return XCTFail("missing timing metadata") }
+        XCTAssertEqual(metadata["wallTimeMs"], .number(12.75))
+        XCTAssertEqual(metadata["timeoutSeconds"], .number(0))
+        XCTAssertEqual(metadata["future"], .string("untouched"))
         let roundTrip = try JSONEncoder().encode(current)
         let decoded = try JSONDecoder().decode(TimelineEntry.self, from: roundTrip)
         guard case .content(let copied) = decoded.body else { return XCTFail("wrong round trip") }

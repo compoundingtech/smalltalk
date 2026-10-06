@@ -1,4 +1,14 @@
+use crate::DisplayFilter;
+
 pub fn clean_message_text(raw: &str) -> String {
+    clean_message_text_with_filters(raw, crate::DEFAULT_FILTERS)
+}
+
+pub fn clean_message_text_with_filters(raw: &str, filters: &[DisplayFilter]) -> String {
+    if filters.is_empty() {
+        return raw.to_owned();
+    }
+    let markup = filters.contains(&DisplayFilter::HarnessMarkup);
     let normalized = raw.replace("\r\n", "\n");
     // st keeps 8 KB of a transcript value and says so in its own words.
     let (normalized, cut) =
@@ -12,7 +22,7 @@ pub fn clean_message_text(raw: &str) -> String {
     for line in normalized.split_inclusive('\n') {
         if line.trim_start().starts_with("```") {
             if !code {
-                output.push_str(&strip_internal_markup(&plain));
+                output.push_str(&strip_internal_markup(&plain, markup));
                 plain.clear();
             }
             output.push_str(line);
@@ -23,10 +33,15 @@ pub fn clean_message_text(raw: &str) -> String {
             plain.push_str(line);
         }
     }
-    output.push_str(&strip_internal_markup(&plain));
+    output.push_str(&strip_internal_markup(&plain, markup));
     let safe = output
         .chars()
-        .filter(|character| *character == '\n' || *character == '\t' || !character.is_control())
+        .filter(|character| {
+            !filters.contains(&DisplayFilter::ControlCharacters)
+                || *character == '\n'
+                || *character == '\t'
+                || !character.is_control()
+        })
         .collect::<String>();
     let text = safe
         .trim()
@@ -46,7 +61,10 @@ pub fn clean_message_text(raw: &str) -> String {
         text
     }
 }
-fn strip_internal_markup(input: &str) -> String {
+fn strip_internal_markup(input: &str, markup: bool) -> String {
+    if !markup {
+        return input.to_owned();
+    }
     let mut in_st3_channel = false;
     let mut text = input
         .lines()
@@ -77,5 +95,78 @@ fn strip_internal_markup(input: &str) -> String {
     if input.ends_with('\n') && !text.is_empty() {
         text.push('\n');
     }
+    for tag in [
+        "analysis",
+        "thinking",
+        "think",
+        "internal",
+        "system-reminder",
+        "function_calls",
+        "tool_result",
+    ] {
+        let open = format!("<{tag}");
+        let close = format!("</{tag}>");
+        let mut from = 0;
+        loop {
+            let lower = text.to_ascii_lowercase();
+            let Some(start) = lower[from..].find(&open).map(|offset| from + offset) else {
+                break;
+            };
+            // `<think` is not `<thinking`, and a tag named in `code` or mid-sentence is prose:
+            // people write about these tags, and a mention must not cut their message short.
+            let named = !lower[start + open.len()..].starts_with(['>', ' ', '/', '\n'])
+                || in_inline_code(&text, start);
+            let block = lower[..start]
+                .rsplit('\n')
+                .next()
+                .is_some_and(|before| before.trim().is_empty());
+            let open_end = lower[start..].find('>').map(|offset| start + offset + 1);
+            let close = open_end.and_then(|open_end| {
+                lower[open_end..]
+                    .find(&close)
+                    .map(|offset| open_end + offset + close.len())
+            });
+            match (named, close) {
+                (true, _) => from = start + open.len(),
+                (false, Some(end)) => text.replace_range(start..end, ""),
+                // Hidden reasoning that never closed hides the rest; a mention does not.
+                (false, None) if block => {
+                    text.truncate(start);
+                    break;
+                }
+                (false, None) => from = start + open.len(),
+            }
+        }
+    }
+    while let Some(start) = text.find("<|im_start|>") {
+        let Some(separator) = text[start..]
+            .find("<|im_sep|>")
+            .map(|offset| start + offset)
+        else {
+            text.truncate(start);
+            break;
+        };
+        let header = &text[start..separator];
+        let hidden =
+            header.contains("<|meta_sep|>analysis") || header.contains("<|meta_sep|>commentary");
+        let body_start = separator + "<|im_sep|>".len();
+        if hidden {
+            let end = text[body_start..]
+                .find("<|im_end|>")
+                .map(|offset| body_start + offset + "<|im_end|>".len())
+                .unwrap_or(text.len());
+            text.replace_range(start..end, "");
+        } else {
+            text.replace_range(start..body_start, "");
+        }
+    }
+    for token in ["<|im_end|>", "<|fim_suffix|>", "<|im_sep|>"] {
+        text = text.replace(token, "");
+    }
     text
+}
+/// Whether `at` falls inside a `code span` on its line.
+pub(crate) fn in_inline_code(text: &str, at: usize) -> bool {
+    let line_start = text[..at].rfind('\n').map_or(0, |index| index + 1);
+    text[line_start..at].matches('`').count() % 2 == 1
 }

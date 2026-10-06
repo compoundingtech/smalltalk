@@ -3784,6 +3784,10 @@ pub struct TimelineBlock {
     pub id: String,
     pub kind: String,
     pub source_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
     pub payload: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuation: Option<ConversationContentRef>,

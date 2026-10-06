@@ -1655,8 +1655,12 @@ export type TimelineBlock = {
   continuation?: ConversationContentRef;
   id: string;
   kind: string;
+  metadata?: {
+
+};
   payload: unknown;
   source_type: string;
+  visibility?: string;
 };
 
 export type TimelineContentBody = (unknown | unknown);

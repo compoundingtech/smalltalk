@@ -1092,7 +1092,36 @@ fn native_unknown_system_blocks_and_user_reasoning_tags_remain_visible() {
     let shown = crate::adapt::conversation(&[entry], &std::collections::BTreeMap::new());
     assert!(matches!(&shown[0].body, Body::Event(text) if text == raw));
     assert_eq!(
-        clean_message_text("<analysis>visible invented-token</analysis>"),
+        crate::clean_message_text_with_filters(
+            "<analysis>visible invented-token</analysis>",
+            crate::SHOW_EVERYTHING
+        ),
         "<analysis>visible invented-token</analysis>"
     );
+}
+
+#[test]
+fn display_filters_hide_context_but_raw_mode_keeps_every_entry_and_byte() {
+    let raw = "<system-reminder>invented-token</system-reminder>visible\u{1b}\n<thinking>private reasoning</thinking>";
+    let content: st3_client::TimelineEntry = serde_json::from_value(serde_json::json!({"id":"timeline-entry/filters","sequence":1,"revision":1,"timestamp":"2026-10-06T12:00:00Z","role":"user","type":"content","final":true,"body":{"media_type":"text/plain","text":raw,"blocks":[{"id":"source","kind":"source_record","source_type":"claude","visibility":"internal","payload":{"raw":{"text":raw}}}]}})).unwrap();
+    let original = serde_json::to_value(&content).unwrap();
+    let shown = adapt::conversation_with_filters(
+        std::slice::from_ref(&content),
+        &Default::default(),
+        crate::DEFAULT_FILTERS,
+    );
+    assert!(matches!(&shown[0].body, Body::User(text) if text == "visible"));
+    let everything = adapt::conversation_with_filters(
+        std::slice::from_ref(&content),
+        &Default::default(),
+        crate::SHOW_EVERYTHING,
+    );
+    let Body::User(text) = &everything[0].body else {
+        panic!("raw view")
+    };
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(text).unwrap(),
+        original
+    );
+    assert_eq!(serde_json::to_value(content).unwrap(), original);
 }

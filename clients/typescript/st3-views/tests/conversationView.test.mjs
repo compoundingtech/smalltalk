@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { unreadableTranscript, cleanMessageText, conversationEntries, entryMatches, foldDeliveryFlaps, fromHarness, shownToolLines, toolTitle } from '@smalltalk/st3-views/conversationView';
+import { unreadableTranscript, cleanMessageText, conversationEntries, entryMatches, foldDeliveryFlaps, fromHarness, shownToolLines, toolTitle, DEFAULT_FILTERS, SHOW_EVERYTHING } from '@smalltalk/st3-views/conversationView';
 
 let sequence = 0;
 const at = minute => `2026-09-30T12:${String(minute).padStart(2, '0')}:00Z`;
@@ -30,7 +30,7 @@ const describe = entry => entry.body.kind === 'event' ? `event(${entry.body.tone
   : `${entry.body.kind}: ${entry.body.text}`;
 const entries = conversationEntries(timeline, names);
 assert.deepEqual(entries.map(describe), [
-  'user: <system-reminder>ignore me</system-reminder>Please fix it',
+  'user: Please fix it',
   'assistant: **On it.**',
   'tool(ok): $ cargo test [ok 1|ok 2]',
   'mail: example/cos/standing/cos → Stui · Hello · Body text',
@@ -50,7 +50,7 @@ assert.deepEqual(fromHarness(true, '<command-name>/review</command-name><command
 assert.deepEqual(fromHarness(false, '<task-notification><status>completed</status><summary>Agent finished</summary></task-notification>'), [{ kind: 'event', tone: 'quiet', text: 'background task completed: Agent finished' }]);
 assert.equal(fromHarness(true, '<channel source="plugin:st3-channel:st3" from="agent/x">\nSubject: Hi\n</channel>')[0].text, 'delivered to the agent: Hi · from agent/x');
 assert.equal(cleanMessageText('[PING] ? hello [id:message/xyz]'), 'hello');
-assert.equal(cleanMessageText('keep\n```\n<thinking>code stays</thinking>\n```\n<thinking>gone</thinking>'), 'keep\n```\n<thinking>code stays</thinking>\n```\n<thinking>gone</thinking>');
+assert.equal(cleanMessageText('keep\n```\n<thinking>code stays</thinking>\n```\n<thinking>gone</thinking>'), 'keep\n```\n<thinking>code stays</thinking>\n```');
 
 // A tool result with no call still shows; a malformed argument still gets a title.
 assert.equal(conversationEntries([e('tool_result', 'tool', { call_id: 'nope', status: 'error', content: 'bad' })], names)[0].body.state, 'failed');
@@ -202,8 +202,18 @@ assert.equal(shownToolLines({ ...tool, state: 'failed' }, false).hidden, 14, 'fa
 }
 
 const exposed = '<analysis>invented-token</analysis><thinking>visible</thinking>';
-assert.equal(conversationEntries([{id:'raw',timestamp:'2026-10-06T12:00:00Z',role:'assistant',type:'content',body:{text:exposed}}], new Map())[0].body.text, exposed);
+assert.equal(JSON.parse(conversationEntries([{id:'raw',timestamp:'2026-10-06T12:00:00Z',role:'assistant',type:'content',body:{text:exposed}}], new Map(), SHOW_EVERYTHING)[0].body.text).body.text, exposed);
 
 const unknownNative = '[unrecognized future]\n{"raw":{"token":"invented-token"}}';
 assert.equal(conversationEntries([{id:'unknown',timestamp:'2026-10-06T12:00:00Z',role:'system',type:'content',body:{text:unknownNative,blocks:[{kind:'unknown'}]}}],new Map())[0].body.text,unknownNative);
-assert.equal(fromHarness(true,'<analysis>visible invented-token</analysis>')[0].text,'<analysis>visible invented-token</analysis>');
+assert.equal(cleanMessageText('<analysis>visible invented-token</analysis>', SHOW_EVERYTHING), '<analysis>visible invented-token</analysis>');
+assert.deepEqual(fromHarness(true,'<analysis>visible invented-token</analysis>'), []);
+
+// Display preferences do not mutate the normalized data; raw mode is reversible JSON.
+const rawText = '<system-reminder>invented-token</system-reminder>visible\u001b\n<thinking>private reasoning</thinking>';
+const rawEntry = e('content', 'user', {text:rawText, blocks:[{id:'source', kind:'source_record', source_type:'claude', visibility:'internal', payload:{raw:{text:rawText}}}]});
+const original = structuredClone(rawEntry);
+assert.equal(conversationEntries([rawEntry], names, DEFAULT_FILTERS)[0].body.text, 'visible');
+assert.deepEqual(JSON.parse(conversationEntries([rawEntry], names, SHOW_EVERYTHING)[0].body.text), original);
+assert.deepEqual(rawEntry, original);
+assert.equal(cleanMessageText(rawText, SHOW_EVERYTHING), rawText);

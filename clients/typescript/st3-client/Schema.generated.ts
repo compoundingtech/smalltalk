@@ -2005,11 +2005,15 @@ export type ConversationContentRefEncoded = typeof ConversationContentRef.Encode
 export const TimelineBlock = /*#__PURE__*/ (() => Schema.Struct({
   "continuation": optionalKey(ConversationContentRef),
   "id": Schema.String,
-  /** text, reasoning, tool_call, tool_output, image, image_link, job, subagent, ask, status, unknown; future kinds remain readable as JSON */
-  "kind": Schema.String.annotate({ description: "text, reasoning, tool_call, tool_output, image, image_link, job, subagent, ask, status, unknown; future kinds remain readable as JSON" }),
+  /** text, reasoning, tool_call, tool_output, image, image_link, job, subagent, ask, status, error, document, source_record, raw_text, unknown; future kinds remain readable as JSON */
+  "kind": Schema.String.annotate({ description: "text, reasoning, tool_call, tool_output, image, image_link, job, subagent, ask, status, error, document, source_record, raw_text, unknown; future kinds remain readable as JSON" }),
+  /** Source-supplied metadata including timing (wallTimeMs, timeoutSeconds); preserve names, units, values and future fields */
+  "metadata": optionalKey(Schema.Record(Schema.String, Schema.Unknown)).annotate({ description: "Source-supplied metadata including timing (wallTimeMs, timeoutSeconds); preserve names, units, values and future fields" }),
   /** Native JSON; {body_ref:true} refers to the containing known fallback body without duplication */
   "payload": Schema.Unknown.annotate({ description: "Native JSON; {body_ref:true} refers to the containing known fallback body without duplication" }),
-  "source_type": Schema.String
+  "source_type": Schema.String,
+  /** UI hint: visible (default), internal or hidden-by-harness; never an access restriction */
+  "visibility": optionalKey(Schema.String).annotate({ description: "UI hint: visible (default), internal or hidden-by-harness; never an access restriction" })
 }).annotate({ identifier: "TimelineBlock" }))()
 export type TimelineBlock = typeof TimelineBlock.Type
 export type TimelineBlockEncoded = typeof TimelineBlock.Encoded

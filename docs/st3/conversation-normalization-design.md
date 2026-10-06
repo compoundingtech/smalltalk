@@ -17,22 +17,42 @@ Keep the timeline envelope (`id`, source `sequence`, `revision`, `timestamp`, `r
 `type`, `final`, `body`) and use a negotiated `body.blocks` array. Each block has
 `id`, `kind`, `source_type` and `payload`; optional `continuation` describes an
 owner-fetched remainder. Kinds are text, reasoning, tool_call, tool_output, image,
-job, subagent, ask, status, image_link and unknown. For standard known bodies,
+job, subagent, ask, status, error, document, source_record, raw_text, image_link and unknown. For standard known bodies,
 `payload: {body_ref: true}` refers to the containing entry's fallback body, avoiding
 an identical second copy; a continuation still fetches the original full body. Preserve native identities, call/result
 correlation, revisions, supplied timing and failure state. Job/subagent payloads
 preserve supplied parent/activity links; an historical ask is never a live picker.
+Errors also have a known `error` block with `{body_ref:true}`, so native stop/exit
+notices from #1478 need no new kind. Optional `block.metadata` is an open JSON
+object for source-supplied timing (including `wallTimeMs` and `timeoutSeconds`),
+preserving original names, units, values and future fields. #1458 will populate
+that shape after rebasing; this PR does not duplicate its timing extraction.
 Unknown uses `payload: {raw: <original JSON>}` and retains the native type and role
 when supplied. Future fields and full structured tool arguments survive; unknown
-blocks have a readable JSON view. Rust and phone adapters preserve tagged text and
-raw system/unknown fallbacks; structural mail/command envelopes can still normalize
-into their existing display shapes. Setup-like XML context is not stripped from
-entries the API has already exposed. Unknown role means unknown attribution, not omission.
+blocks have a readable JSON view. A `source_record` block with the `internal`
+visibility hint retains the entire parsed native record, including fields unused by
+the typed projection. A `document` block carries the original Claude document,
+rather than only a placeholder. The optional open-string `visibility` field is a
+UI hint (`visible` by default, `internal`, or `hidden-by-harness`), never a read-scope
+restriction. Unknown role means unknown attribution, not omission.
+
+Malformed JSON, unfinished tail lines, blank lines and unknown encodings become
+`raw_text` blocks. Their payload has `encoding: "base64"`, `bytes` containing the
+exact original bytes (including newline and controls), and a lossy `text` preview.
+OpenCode message and part data are read as SQLite bytes, including BLOB/invalid
+UTF-8 values, and preserved by the same rule. Replacing/completing a partial record
+invalidates its old ref visibly; appending another record preserves previous refs.
+A torn prefix can produce both a raw block and a recovered typed record.
 
 ### Native record visibility audit
 
-Omit only established native setup metadata or an explicit harness-hidden marker.
-When visibility is unproven, retain the raw record instead of guessing it is internal.
+The sole omission table is `omission_reason` in
+`crates/st3/src/external_sessions.rs`: one named match arm per permitted type with
+an explicit reason. It omits only the four categories below. Nothing else may be
+dropped by a parser branch: an otherwise empty projection falls back to raw JSON.
+The coverage test exercises each harness/type/role/display combination and fails
+if an empty result has no table justification; fixtures also prove unknown and
+unparseable records and direct owner reads. When visibility is unproven, retain it.
 
 | Harness records | Decision and reason |
 | --- | --- |
@@ -45,17 +65,47 @@ When visibility is unproven, retain the raw record instead of guessing it is int
 | Pi/OMP `custom_message` with explicit `display: false` | Omit because the native extension explicitly marks it hidden from its terminal. |
 | Pi/OMP `custom`, `label`, `session_info`, `credential_pin`, `title`, model/thinking changes and summary records without text | Retain raw; summaries with text remain readable native notes. |
 | OpenCode `snapshot` | Retain raw; visibility is not established across releases. |
+| Claude documents | Retain the complete document payload, with a readable document fallback. |
+| Malformed/partial/unknown-encoding input | Retain exact bytes as a `raw_text` block; never silently skip a tail line. |
 | Any unknown record/block/role | Retain original JSON and original attribution with a visible unknown label. |
 
 These decisions avoid silent per-type exclusions. Bounded native input windows and
-undecodable records still produce visible size/read notices; they are transport
-limitations. Oversized OpenCode items receive bounded display stubs and full owner
+read failures still produce visible size/read notices; they are transport
+limitations. Unparseable records themselves remain accessible as raw bytes. Oversized OpenCode items receive bounded display stubs and full owner
 continuations, rather than being dropped before ref generation.
 
 Start in `crates/st3/src/external_sessions.rs`; use the same normalizer for owner
 side-input updates, reads and follow. Remove deliberate visible-reasoning exclusions, image
-withholding and the 512-byte unknown excerpt policy. No sanitized-text payload class
+withholding from the data. A 512-character unknown excerpt is a UI preference only. No sanitized-text payload class
 or second durable transcript is needed. Native transcript formats remain authoritative.
+
+## UI filters and show-everything mode
+
+Rust `conversation_with_filters` and TypeScript `conversationEntries` accept an
+explicit named filter set. `DEFAULT_FILTERS` selects harness-markup, context-block,
+control-character, internal-block and excerpt filters. This keeps stui and the
+phone's familiar delivery/task/command display shapes, folded tools/mail and
+heartbeat/usage suppression, while new reasoning, image/link, document,
+job/subagent/ask/status and unknown blocks have readable fallbacks. Default filters
+hide XML reasoning/internal/system-reminder/tool wrappers, setup context wrappers
+(permissions, environment, collaboration, skills, app/plugin and command metadata),
+control characters and `internal`/`hidden-by-harness` block payloads; unknown text
+has a visibly marked 512-character excerpt. Diagnostic and tool display bounds
+remain UI choices. These operations act only on a presentation copy.
+
+`SHOW_EVERYTHING` is the empty filter set: every entry, including message metadata,
+usage/status, original JSON blocks and raw byte payloads, is rendered as reversible
+JSON without folds, excerpting or markup removal. JSON escapes controls so a raw
+terminal view can expose them without interpreting them. Decoding that JSON yields
+the unchanged normalized entry. Transport size caps and owner continuations still
+apply; raw mode cannot conjure an unrequested chunk.
+
+This PR supplies the shared renderer APIs and verifies both defaults and raw mode.
+Interactive raw-mode controls, and **stui/phone image loading and clipped-value
+expansion wired to the chunk route, are the next implementation PR**. Current
+clients show load/truncation markers and references; they do not fetch native image
+pixels or expand clipped blocks yet. Existing graph-message image handling is
+separate. Generated Rust/Swift/TypeScript clients expose the chunk API now.
 
 ## Owner reads, images and limits
 
@@ -268,3 +318,11 @@ wakes but no conversation IVM engine; the first slice still uses the existing
 bounded native read path. It claims no cold-read or incremental-append performance
 proof. Integrate with #1487's owner before the subsequent read-model slice; do not
 add an independent cache or persist conversation bytes to meet that dependency.
+
+#1478 (native stop/retry/abort/process exit) and #1458 (native tool-result timing)
+will rebase onto this implementation's final head. The former currently proposes
+withholding free-form stop/provider prose; that policy must be removed or kept
+strictly as a UI presentation choice on rebase. Native source records here retain
+all those fields. The latter's optional timing extraction can use open block
+metadata; arbitrary native result details remain available in `source_record`,
+without copying its numeric whitelist into this normalizer.

@@ -840,6 +840,15 @@ mod tests {
             .filter_map(|item| item["body"]["blocks"].as_array())
             .flatten()
             .collect::<Vec<_>>();
+        assert!(
+            blocks
+                .iter()
+                .any(|block| block["kind"] == "source_record" && block["visibility"] == "internal")
+        );
+        let blocks = blocks
+            .into_iter()
+            .filter(|block| block["kind"] != "source_record")
+            .collect::<Vec<_>>();
         assert_eq!(
             blocks
                 .iter()
@@ -1170,6 +1179,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn raw_text_continuations_recover_exact_non_utf8_bytes_and_invalidate_on_edit() {
+        let root = tempfile::tempdir().unwrap();
+        let native = fixture(root.path(), json!([]));
+        let mut bytes = b"not JSON ".repeat(2000);
+        bytes.extend_from_slice(b"\xff\x00unfinished");
+        std::fs::write(&native.transcript, &bytes).unwrap();
+        let state = super::super::tests::test_state_named(root.path(), "raw-bytes-test");
+        let mut session = ClientSession::local(Some("person/example")).unwrap();
+        session.conversation_blocks = true;
+        let page = read(&native, &session, &native.id).unwrap();
+        let block = &page[0]["body"]["blocks"][0];
+        assert_eq!(block["kind"], "raw_text");
+        assert!(block["payload"].as_str().unwrap().contains("truncated"));
+        let token = block["continuation"]["ref"].as_str().unwrap();
+        let mut offset = 0;
+        let mut encoded = Vec::new();
+        loop {
+            let chunk = chunk_local(&state, &session, &native.id, token, offset)
+                .await
+                .unwrap();
+            encoded.extend(STANDARD.decode(chunk["data"].as_str().unwrap()).unwrap());
+            let Some(next) = chunk["next_offset"].as_u64() else {
+                break;
+            };
+            offset = next;
+        }
+        let payload: Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(
+            STANDARD.decode(payload["bytes"].as_str().unwrap()).unwrap(),
+            bytes
+        );
+        std::fs::write(&native.transcript, b"replacement").unwrap();
+        assert_eq!(
+            chunk_local(&state, &session, &native.id, token, 0)
+                .await
+                .unwrap_err()
+                .status,
+            StatusCode::GONE
+        );
+    }
+
+    #[tokio::test]
     async fn chunk_checks_read_scope_before_resolving_any_source() {
         let root = tempfile::tempdir().unwrap();
         let state = super::super::tests::test_state_named(root.path(), "owner-test");
@@ -1394,6 +1445,44 @@ mod tests {
         drop(held);
         assert!(read_slot(&slots).is_ok());
     }
+    #[test]
+    fn sqlite_ref_fences_native_message_and_part_identity_not_only_rowid() {
+        use rusqlite::{Connection, params};
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("opencode.db");
+        let db = Connection::open(&database).unwrap();
+        db.execute_batch("CREATE TABLE message(id TEXT PRIMARY KEY,session_id TEXT,time_created INTEGER,data TEXT); CREATE TABLE part(id TEXT PRIMARY KEY,session_id TEXT,message_id TEXT,time_created INTEGER,data TEXT); INSERT INTO message VALUES('message-one','native-test',1,'{\"role\":\"assistant\"}');").unwrap();
+        let raw = json!({"type":"future","content":"invented".repeat(2000)});
+        db.execute(
+            "INSERT INTO part VALUES('part-one','native-test','message-one',1,?1)",
+            params![raw.to_string()],
+        )
+        .unwrap();
+        let mut native = fixture(root.path(), json!([]));
+        native.driver = ExternalDriver::OpenCode;
+        native.transcript = database;
+        let mut session = ClientSession::local(Some("person/example")).unwrap();
+        session.conversation_blocks = true;
+        let page = read(&native, &session, &native.id).unwrap();
+        let block = page
+            .iter()
+            .flat_map(|item| item["body"]["blocks"].as_array().into_iter().flatten())
+            .find(|block| block["kind"] == "unknown")
+            .unwrap();
+        let token = block["continuation"]["ref"].as_str().unwrap();
+        let location = locator(token, &native.id).unwrap();
+        assert_eq!(located_value(&native, &location).unwrap()["raw"], raw);
+        db.execute("UPDATE part SET id='renamed-part'", []).unwrap();
+        assert!(located_value(&native, &location).is_err());
+        db.execute("UPDATE part SET id='part-one'", []).unwrap();
+        assert!(located_value(&native, &location).is_ok());
+        db.execute("UPDATE message SET id='renamed-message'", [])
+            .unwrap();
+        db.execute("UPDATE part SET message_id='renamed-message'", [])
+            .unwrap();
+        assert!(located_value(&native, &location).is_err());
+    }
+
     #[test]
     fn sqlite_large_rows_get_continuations_and_refs_survive_wal_appends() {
         use rusqlite::{Connection, params};
