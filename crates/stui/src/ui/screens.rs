@@ -1418,10 +1418,17 @@ pub fn agents_list(world: &World, spinner: &'static str, width: usize) -> Listin
                 ),
                 span(format!(" {:>4}", agent.activity), theme::dim()),
             ],
-            second: vec![span(
-                format!("   {}", text::truncate(path, width.saturating_sub(4))),
-                theme::dim(),
-            )],
+            // What its step last reported leads; the path says who it is when nothing was said.
+            second: match &agent.details.progress {
+                Some(progress) => vec![span(
+                    format!("   {}", text::truncate(progress, width.saturating_sub(4))),
+                    theme::soft(),
+                )],
+                None => vec![span(
+                    format!("   {}", text::truncate(path, width.saturating_sub(4))),
+                    theme::dim(),
+                )],
+            },
             children: subagent_lines(agent, "   ", width),
         });
         ids.push(agent.id.clone());
@@ -1804,6 +1811,21 @@ pub fn mission_detail(
         if let Some(note) = &step.note {
             steps.lines(text::wrap(
                 &text::inline(note, theme::dim()),
+                inner,
+                &[run("      ", theme::dim())],
+                &[run("      ", theme::dim())],
+                None,
+            ));
+        }
+        // A step in hand says what it last reported, the status a person reads first.
+        if step.state == StepState::Working
+            && let Some(progress) = mission
+                .step_metadata
+                .get(&step.id)
+                .and_then(|metadata| metadata.last_progress.as_deref())
+        {
+            steps.lines(text::wrap(
+                &text::inline(progress, theme::text()),
                 inner,
                 &[run("      ", theme::dim())],
                 &[run("      ", theme::dim())],
@@ -2540,6 +2562,9 @@ pub fn peek(world: &World, subject: &str, width: usize, spinner: &'static str) -
         if let Some(tree) = &agent.worktree {
             doc.field("worktree", tree, width, theme::soft());
         }
+        if let Some(progress) = &agent.details.progress {
+            doc.field("now", progress, width, theme::text());
+        }
         if let (Some(mission), Some(step)) = (&agent.mission, &agent.step) {
             let title = world
                 .missions
@@ -2689,6 +2714,16 @@ pub fn agent_details(world: &World, agent: &Agent, width: usize, spinner: &'stat
         doc.blank();
     }
     doc.section("now", None, width);
+    // What its step last reported is the status; the step and its goal say where it comes from.
+    if let Some(progress) = &details.progress {
+        doc.lines(text::wrap(
+            &text::inline(progress, theme::bold()),
+            width,
+            &[],
+            &[],
+            None,
+        ));
+    }
     match (&agent.mission, &agent.step) {
         (Some(mission), Some(step)) => {
             let title = world

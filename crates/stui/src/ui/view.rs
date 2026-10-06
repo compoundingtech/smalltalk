@@ -352,6 +352,9 @@ pub struct AgentDetails {
     pub under: Option<String>,
     /// The model its harness last reported using, as reported ("claude-sonnet-5-5").
     pub model: Option<String>,
+    /// What the step it holds last reported (`st work progress`): the status a person reads first.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<String>,
 }
 
 // ---------------------------------------------------------------- fleet, trees

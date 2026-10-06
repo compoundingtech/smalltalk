@@ -6625,6 +6625,21 @@ mod tests {
     }
 
     #[test]
+    fn what_a_seats_step_last_reported_leads_in_the_sidebar_and_on_its_card() {
+        let mut world = demo::world();
+        if let Load::Ready(agents) = &mut world.agents {
+            agents[0].details.progress = Some("Cut over 2 of 3 stores; waiting on the signer".into());
+        }
+        let mut ui = Ui::new(world);
+        ui.switch_tab(1);
+        let screen = frame(&ui, 150, 40).join("\n");
+        assert!(screen.contains("Cut over 2 of 3 stores"), "{screen}");
+        // The details pane says it whole, above the step it comes from.
+        let whole = frame(&ui, 150, 40).join(" ");
+        assert!(whole.contains("Cut over 2 of 3 stores; waiting on"), "{whole}");
+    }
+
+    #[test]
     fn remind_me_later_hides_a_message_and_the_badge_counts_what_is_left() {
         let mut ui = Ui::new(demo::world());
         let index = ui.ids().iter().position(|id| id == "attention/6").unwrap();
