@@ -1501,6 +1501,7 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
     // An offline source needs no live runtime: publish its exact departure before measuring
     // the operator's recorded exception, against both generated store sizes.
     let mut expected_publication = None;
+    let mut expected_publication_revision = None;
     for host in ["amber", "cobalt"] {
         let kdl = format!(
             "version 2\nagent \"bench/cost/mover\" {{\n host \"{host}\"\n workspace {:?}\n command \"sleep 1000\"\n restart always\n}}\n",
@@ -1522,6 +1523,17 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
                 },
             )
             .unwrap();
+        if host == "cobalt" {
+            expected_publication_revision = Some(
+                preview
+                    .changes
+                    .iter()
+                    .find(|change| change.subject == "agent/bench/cost/mover")
+                    .expect("the cobalt declaration must change the desired revision")
+                    .new_revision
+                    .clone(),
+            );
+        }
         store
             .apply_as(
                 &intent,
@@ -1549,7 +1561,10 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
         publication["token"].as_str(),
         Some(fixture.items["placement_token"].as_str())
     );
-    assert!(publication["revision"].as_str().is_some_and(|value| !value.is_empty()));
+    assert_eq!(
+        publication["revision"].as_str(),
+        Some(expected_publication_revision.as_deref().unwrap())
+    );
     client
         .post::<_, Value>("/v1/sets/apply", &owned_set_request("fixture"))
         .await
