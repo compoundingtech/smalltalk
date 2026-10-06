@@ -41,6 +41,30 @@ fn not_yet(error: &st3_client::TimelineErrorBody) -> bool {
 /// One conversation: the harness transcript and Small Talk messages, in time order.
 /// Draw one conversation as st joined it: the harness's turns and the agent's Small Talk, in
 /// the order st sent them.
+/// How a message's signature reads beside its sender: the device that signed it and whether
+/// that checks ("✓ thinboi (secure enclave)"). A message st holds no signature for is usually
+/// just old, so it says nothing and a conversation is not covered in "unsigned".
+pub fn signature_mark(provenance: &st3_client::MessageProvenance) -> Option<String> {
+    let who = provenance
+        .device
+        .clone()
+        .or_else(|| provenance.signer.clone())
+        .unwrap_or_default();
+    let reason = |text: &str| {
+        provenance
+            .reason
+            .as_deref()
+            .map(|reason| format!("{text}: {reason}"))
+            .unwrap_or_else(|| text.to_owned())
+    };
+    match provenance.verdict.as_str() {
+        "verified" => Some(format!("✓ {who}").trim_end().to_owned()),
+        "held" => Some(format!("⚠ {}", reason("signature held"))),
+        "invalid" => Some(format!("✕ {}", reason("signature invalid"))),
+        _ => None,
+    }
+}
+
 pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>) -> Vec<Entry> {
     let name = |id: &str| -> String {
         names.get(id).cloned().unwrap_or_else(|| match id {
@@ -142,6 +166,7 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
                     },
                     delivered: false,
                     dictated: message.tags.iter().any(|tag| tag == "dictated"),
+                    signed: message.provenance.as_ref().and_then(signature_mark),
                     images,
                 }
             };
@@ -792,6 +817,7 @@ fn harness_bodies(
             body: clean_message_text(&unescape(&block)),
             delivered: false,
             dictated: false,
+            signed: None,
             images: Vec::new(),
         });
     }

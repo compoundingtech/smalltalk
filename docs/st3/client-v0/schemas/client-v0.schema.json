@@ -1668,7 +1668,18 @@
     },
     "TimelineMessageBody": {
       "type": "object", "additionalProperties": false, "required": ["message_id"],
-      "properties": { "message_id": { "type": "string" }, "reply_to": { "type": ["string", "null"] }, "from": { "$ref": "#/$defs/ParticipantRef" }, "to": { "$ref": "#/$defs/ParticipantRef" }, "title": { "type": "string" }, "tags": { "type": "array", "items": { "type": "string" } }, "attachments": { "type": "array", "items": { "$ref": "#/$defs/Attachment" } } }
+      "properties": { "message_id": { "type": "string" }, "reply_to": { "type": ["string", "null"] }, "from": { "$ref": "#/$defs/ParticipantRef" }, "to": { "$ref": "#/$defs/ParticipantRef" }, "title": { "type": "string" }, "tags": { "type": "array", "items": { "type": "string" } }, "attachments": { "type": "array", "items": { "$ref": "#/$defs/Attachment" } }, "provenance": { "$ref": "#/$defs/MessageProvenance" } }
+    },
+    "MessageProvenance": {
+      "type": "object", "additionalProperties": false, "required": ["verdict"],
+      "description": "Who signed a message a person wrote, and whether the signature checks. Only messages whose sender is a person carry it; an agent's message does not.",
+      "properties": {
+        "verdict": { "enum": ["verified", "unsigned", "held", "invalid"], "description": "What every member concluded when the claim arrived: `verified` its chain reaches a trust root, `unsigned` it carries no signature (written before signing), `held` a delegation in its chain has not arrived yet, `invalid` it is not acceptable (see reason)." },
+        "reason": { "type": "string", "description": "Why a held or invalid signature is so." },
+        "signer": { "$ref": "#/$defs/ParticipantRef", "description": "The person who signed, which may be a device that speaks for them." },
+        "key": { "type": "string", "description": "The public key that signed (`p256:…` or a bare Ed25519 key)." },
+        "device": { "type": "string", "description": "The device the key was granted to, by the label it was given when it paired, such as `thinboi (secure enclave)`. Absent for a key with no label." }
+      }
     },
     "TimelineContentBody": {
       "type": "object", "additionalProperties": false, "required": ["media_type"],
