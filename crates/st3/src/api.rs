@@ -14989,7 +14989,7 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         .await
         .unwrap();
         assert_eq!(card["id"], "agent/node.amber");
-        assert_eq!(card["name"], "amber");
+        assert_eq!(card["name"], "node.amber");
         assert!(card.get("todo").is_some());
         assert!(card.get("_status_source").is_none());
     }
