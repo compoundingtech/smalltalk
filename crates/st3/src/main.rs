@@ -5599,6 +5599,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
             },
         ));
     }
+    tokio::spawn(recycle_idle_wal(config.state_dir.join("claims.sqlite3")));
     tokio::spawn(convert_envelope_payloads(store.clone()));
     tokio::spawn(trim_local_observations(
         store.clone(),
@@ -21675,6 +21676,35 @@ async fn enforce_account_limits(store: Arc<Store>, policy: st3::store::LimitsPol
             Err(error) => eprintln!("st3: limits policy stopped: {error}"),
         }
         tokio::time::sleep(LIMITS_INTERVAL).await;
+    }
+}
+
+/// Page copying runs off the writer queue; recycling never waits for a reader or writer lock.
+async fn recycle_idle_wal(path: PathBuf) {
+    let mut connection = match tokio::task::spawn_blocking(move || rusqlite::Connection::open(path)).await {
+        Ok(Ok(connection)) => connection,
+        result => {
+            eprintln!("st3: open WAL checkpoint connection: {result:?}");
+            return;
+        }
+    };
+    loop {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        match tokio::task::spawn_blocking(move || {
+            let result = smallclaims::sqlite::checkpoint_idle_wal(&connection);
+            (connection, result)
+        }).await {
+            Ok((returned, result)) => {
+                connection = returned;
+                if let Err(error) = result {
+                    eprintln!("st3: recycle idle WAL: {error:#}");
+                }
+            }
+            Err(error) => {
+                eprintln!("st3: WAL checkpoint task stopped: {error}");
+                return;
+            }
+        }
     }
 }
 

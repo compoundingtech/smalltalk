@@ -2474,7 +2474,7 @@ impl Store {
         history: bool,
         build: impl FnOnce(Option<(&BTreeSet<String>, &[Value])>) -> Result<Vec<Value>>,
     ) -> Result<Vec<Value>> {
-        let mut cache = self
+        let cache = self
             .smalltalk
             .agent_resources_cache
             .lock()
@@ -2488,12 +2488,16 @@ impl Store {
         let previous = cache
             .iter()
             .filter(|(at, all, _)| *at < index && *all == history)
-            .max_by_key(|(at, _, _)| *at);
-        let items = if let Some((at, _, previous)) = previous {
-            match self.changed_agent_resources(*at, index)? {
-                Some(changed) if changed.is_empty() => (**previous).clone(),
+            .max_by_key(|(at, _, _)| *at)
+            .map(|(at, _, items)| (*at, Arc::clone(items)));
+        // A caller already holds a SQLite snapshot. Waiting behind another card build here
+        // pins that old WAL read mark for the whole build, starving checkpoints.
+        drop(cache);
+        let items = if let Some((at, previous)) = previous {
+            match self.changed_agent_resources(at, index)? {
+                Some(changed) if changed.is_empty() => (*previous).clone(),
                 Some(changed) => {
-                    let fresh = build(Some((&changed, previous)))?;
+                    let fresh = build(Some((&changed, &previous)))?;
                     let mut items = previous
                         .iter()
                         .filter(|item| !changed.contains(item["id"].as_str().unwrap_or_default()))
@@ -2513,9 +2517,16 @@ impl Store {
         } else {
             build(None)?
         };
-        cache.push_back((index, history, Arc::new(items.clone())));
-        if cache.len() > 8 {
-            cache.pop_front();
+        let mut cache = self
+            .smalltalk
+            .agent_resources_cache
+            .lock()
+            .expect("agent resources cache poisoned");
+        if !cache.iter().any(|(at, all, _)| *at == index && *all == history) {
+            cache.push_back((index, history, Arc::new(items.clone())));
+            if cache.len() > 8 {
+                cache.pop_front();
+            }
         }
         Ok(items)
     }
@@ -29750,6 +29761,38 @@ mod tests {
     use proptest::prelude::*;
 
     const TEST_FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+
+    #[test]
+    fn an_agent_card_build_does_not_hold_other_read_snapshots_at_the_cache_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("graph.db"), "node").unwrap();
+        store.cached_agent_resources(0, true, |_| Ok(vec![json!({"id":"agent/cached"})])).unwrap();
+        let (entered, building) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let slow = store.clone();
+        let builder = std::thread::spawn(move || {
+            slow.read_snapshot(|_| {
+                slow.cached_agent_resources(1, false, |_| {
+                    entered.send(()).unwrap();
+                    released.recv().unwrap();
+                    Ok(Vec::new())
+                })
+            }).unwrap();
+        });
+        building.recv().unwrap();
+        let (finished, result) = std::sync::mpsc::channel();
+        let reader = store.clone();
+        let other = std::thread::spawn(move || {
+            finished.send(reader.read_snapshot(|_| {
+                reader.cached_agent_resources(0, true, |_| panic!("cached snapshot was lost"))
+            })).unwrap();
+        });
+        let completed = result.recv_timeout(std::time::Duration::from_secs(1));
+        release.send(()).unwrap();
+        builder.join().unwrap();
+        other.join().unwrap();
+        assert_eq!(completed.unwrap().unwrap()[0]["id"], "agent/cached");
+    }
 
     #[test]
     fn terminal_capability_lookup_fences_the_subject_head_after_reopen() {
