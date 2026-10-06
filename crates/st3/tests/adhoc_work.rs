@@ -578,3 +578,62 @@ async fn person_handoff_is_visible_acknowledged_and_closed_with_evidence() {
     );
     daemon.stop().await;
 }
+
+/// A person answering an ask an agent made from spontaneous work closes the ask, not the work, so
+/// it needs no evidence (Nathan, 2026-10-06: approving an attention item failed with "close
+/// spontaneous work with --evidence"). Closing a handed-off step still does.
+#[tokio::test]
+async fn a_person_answers_an_ask_from_spontaneous_work_without_evidence() {
+    let root = tempfile::tempdir().unwrap();
+    let mut daemon = Daemon::new(root.path());
+    daemon.declare();
+    daemon.start().await;
+    let opened = daemon
+        .ok(&["work", "start", "Rollout scope", "--as", ALDER])
+        .await;
+    let step = opened["subject"].as_str().unwrap();
+    daemon
+        .ok(&[
+            "work",
+            "claim",
+            step,
+            "--as",
+            ALDER,
+            "--incarnation",
+            "alder-one",
+        ])
+        .await;
+    let asked = daemon
+        .ok(&[
+            "work",
+            "ask",
+            "--for",
+            "person/avery",
+            "--title",
+            "Integrate or keep the pilot?",
+            "--reason",
+            "The rollout needs a scope decision",
+            "--step",
+            step,
+            "--as",
+            ALDER,
+            "--incarnation",
+            "alder-one",
+            "--idempotency-key",
+            "scope-ask",
+        ])
+        .await;
+    let ask = asked["subject"].as_str().unwrap();
+    daemon
+        .ok(&[
+            "work",
+            "done",
+            ask,
+            "--as",
+            "person/avery",
+            "--summary",
+            "Integrate it",
+        ])
+        .await;
+    daemon.stop().await;
+}

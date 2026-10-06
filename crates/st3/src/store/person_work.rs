@@ -612,7 +612,9 @@ impl Store {
             if !cancel && super::adhoc_work::pending_handoff(tx, &view)? {
                 return Err(St3Error::new("handoff-not-acknowledged", "read and acknowledge the current handoff note before closing this step"));
             }
-            if !cancel && super::adhoc_work::is_adhoc(tx, &view.run).map_err(internal)? && input.evidence.is_empty() {
+            // Closing a handed-off step closes the spontaneous work and needs evidence; answering an
+            // ask an agent made from that work closes only the ask, which is the person's answer.
+            if !cancel && ask.is_none() && super::adhoc_work::is_adhoc(tx, &view.run).map_err(internal)? && input.evidence.is_empty() {
                 return Err(St3Error::new("work-needs-evidence", "close spontaneous work with --evidence"));
             }
             let (answer, summary) = resolved?;
