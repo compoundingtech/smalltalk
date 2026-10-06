@@ -1365,10 +1365,14 @@ async fn a_cli_command_waits_out_a_daemon_restart() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
+    #[cfg(target_os = "linux")]
     assert!(stderr.contains("daemon starting · open-store"), "{stderr}");
+    #[cfg(not(target_os = "linux"))]
+    assert!(stderr.contains("retrying for up to 20s"), "{stderr}");
     let _: Value = serde_json::from_slice(&output.stdout).unwrap();
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cli_command_tries_a_bound_listener_before_refusing_startup() {
     if st3::test_support::supervise_test() {
@@ -1403,6 +1407,75 @@ async fn a_cli_command_tries_a_bound_listener_before_refusing_startup() {
         st3::startup::read(&daemon.socket).unwrap().status,
         "starting"
     );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn doctor_reports_starting_without_failing_an_answering_api() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let mut daemon = Daemon::new(root);
+    let startup = st3::startup::Startup::begin(&daemon.socket).unwrap();
+    startup.phase("bind");
+    daemon
+        .start_isolated_app(
+            axum::Router::new()
+                .route(
+                    "/v1/doctor",
+                    axum::routing::get(|| async {
+                        axum::Json(json!({"status":"pass", "checks":[], "performance":{}}))
+                    }),
+                )
+                .route(
+                    "/v1/performance",
+                    axum::routing::get(|| async { axum::Json(json!({"fixture":"performance"})) }),
+                ),
+        )
+        .await;
+    let output = seat_command(root, &daemon.socket)
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["status"], "pass");
+    assert_eq!(report["startup"]["status"], "starting");
+    assert_eq!(report["startup"]["phase"], "bind");
+    let output = seat_command(root, &daemon.socket)
+        .arg("doctor")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.contains("info\tstartup\tdaemon starting · bind"),
+        "{text}"
+    );
+    assert!(!text.contains("API is not ready"), "{text}");
+    let output = seat_command(root, &daemon.socket)
+        .args(["doctor", "--performance", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["fixture"], "performance");
+    assert_eq!(report["startup"]["status"], "starting");
+    daemon.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

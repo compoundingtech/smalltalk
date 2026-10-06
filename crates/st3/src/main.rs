@@ -9858,32 +9858,58 @@ fn render_performance(view: &Value) -> String {
     out
 }
 
+async fn doctor_request<T: serde::de::DeserializeOwned>(
+    client: &Client,
+    path: &str,
+    readiness: Option<&st3::startup::Readiness>,
+    json_output: bool,
+) -> Result<T> {
+    match client.get(path).await {
+        Err(error)
+            if st3::client::daemon_unreachable(&error).is_some()
+                && readiness.is_some_and(|startup| startup.status == "starting") =>
+        {
+            let startup = readiness.expect("starting observation was checked");
+            if json_output {
+                print_value(
+                    &serde_json::json!({"status":"fail", "startup":startup,
+                    "checks":[{"status":"fail", "name":"startup", "message":startup.summary()}]}),
+                    true,
+                )?;
+            } else {
+                println!("fail\tstartup\t{}", startup.summary());
+            }
+            anyhow::bail!("the daemon is starting; the API is not ready");
+        }
+        outcome => outcome,
+    }
+}
+
 async fn run_doctor(client: &Client, args: DoctorArgs, json_output: bool) -> Result<()> {
     let readiness = client.socket_path().and_then(st3::startup::read);
-    if let Some(startup) = &readiness
-        && startup.status == "starting"
-    {
-        if json_output {
-            print_value(
-                &serde_json::json!({"status":"fail", "startup":startup,
-                    "checks":[{"status":"fail", "name":"startup", "message":startup.summary()}]}),
-                true,
-            )?;
-        } else {
-            println!("fail\tstartup\t{}", startup.summary());
-        }
-        anyhow::bail!("the daemon is starting; the API is not ready");
-    }
 
     if args.performance {
-        let report: Value = client.get("/v1/performance").await?;
+        let mut report: Value =
+            doctor_request(client, "/v1/performance", readiness.as_ref(), json_output).await?;
         if json_output {
+            if let Some(startup) = &readiness {
+                report["startup"] = serde_json::to_value(startup)?;
+            }
             return print_value(&report, true);
+        }
+        if let Some(startup) = &readiness {
+            let status = if startup.status == "starting" {
+                "info"
+            } else {
+                "pass"
+            };
+            println!("{status}\tstartup\t{}", startup.summary());
         }
         print!("{}", render_performance(&report));
         return Ok(());
     }
-    let report: DoctorReport = client.get("/v1/doctor").await?;
+    let report: DoctorReport =
+        doctor_request(client, "/v1/doctor", readiness.as_ref(), json_output).await?;
     if json_output {
         let mut value = serde_json::to_value(&report)?;
         if let Some(startup) = &readiness {
@@ -9895,7 +9921,12 @@ async fn run_doctor(client: &Client, args: DoctorArgs, json_output: bool) -> Res
             println!("daemon\t{version}");
         }
         if let Some(startup) = &readiness {
-            println!("pass\tstartup\t{}", startup.summary());
+            let status = if startup.status == "starting" {
+                "info"
+            } else {
+                "pass"
+            };
+            println!("{status}\tstartup\t{}", startup.summary());
         }
         for check in &report.checks {
             println!("{}\t{}\t{}", check.status, check.name, check.message);

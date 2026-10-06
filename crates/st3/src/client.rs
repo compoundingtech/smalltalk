@@ -103,7 +103,10 @@ impl DaemonUnreachable {
         if startup.status != "starting" {
             return None;
         }
-        let mut outage = Self::connect(socket.display().to_string(), startup.summary());
+        let mut outage = Self::connect(
+            socket.display().to_string(),
+            format!("{}; the API is not ready", startup.summary()),
+        );
         outage.starting = true;
         outage.full_replay = startup.full_replay();
         Some(outage)
@@ -1370,6 +1373,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn interactive_startup_fails_promptly_but_drivers_keep_a_connect_outage() {
         let root = tempfile::tempdir().unwrap();

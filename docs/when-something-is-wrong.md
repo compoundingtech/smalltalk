@@ -77,7 +77,9 @@ projection health remains a separate doctor check.
 
 `st service status` adds this readiness to the daemon service line, so a service manager's
 `active` or `running` state is not mistaken for API readiness. `st doctor --json` includes the
-local record as `startup`; during recovery it reports a failed startup check and exits nonzero.
+local record as `startup`; if the API is unreachable during recovery it reports a failed
+startup check and exits nonzero. Once the API answers, `starting` is informational and the
+API's health checks determine the result, even before the gateway has bound.
 Command clients that normally announce outage retries return a full-replay phase promptly after
 an unsuccessful connection attempt. In ordinary startup phases, they print the phase and keep
 waiting under `--daemon-wait`, so a brief restart can finish normally. Long-lived drivers retain
@@ -90,3 +92,10 @@ with a held `API_SOCKET.readiness.lock` establishing its lifetime. Readers ignor
 including a leftover `serving` record after SIGKILL; a restart overwrites the record with
 `starting`. These files are local observations, not replicated claims or a client API endpoint.
 No client HTTP response schema or API error code changes.
+
+Local startup observation is enabled on Linux. On macOS and other platforms, or when the
+observation files or OFD locks are unavailable, startup logs one warning and continues without
+a sidecar. Doctor and command clients then use their existing API checks and outage waits.
+Only lock-contention errors refuse a second observer; other observation failures never block
+startup. Writers and readers resolve socket discovery links and canonicalize the parent
+directory, including paths through symlinked directories.
