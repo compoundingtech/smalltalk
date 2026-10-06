@@ -204,8 +204,17 @@ pub(super) fn create_limits_schema(connection: &Connection) -> Result<()> {
         .context("creating the account limits projection")
 }
 
-/// Catch the projection up when a store opens: all of history the first time, then only what
-/// arrived while the daemon was down.
+/// Claims an append or a projection pass folds at most: the new one, with slack for a few that
+/// arrived replicated and wait for projection.
+const LIMITS_APPEND_PAGE: usize = 64;
+/// Claims one catch-up page folds: about 25 ms of writer time, after which the writer serves what
+/// queued meanwhile.
+pub(crate) const LIMITS_CATCH_UP_PAGE: usize = 200;
+const LIMITS_READY: &str = "account_limits_ready";
+
+/// Check the projection's version when a store opens. Opening never folds history: a store that
+/// has `harness.limits` claims but no projection is filled by [`Store::catch_up_account_limits`],
+/// a page at a time, and reads say "not yet known" until it has finished.
 pub(super) fn open_limits(transaction: &Transaction<'_>) -> Result<()> {
     let version: Option<String> = transaction
         .query_row(
@@ -217,17 +226,47 @@ pub(super) fn open_limits(transaction: &Transaction<'_>) -> Result<()> {
     if version.as_deref() != Some(LIMITS_PROJECTION_VERSION) {
         transaction.execute("DELETE FROM account_limit_readings", [])?;
         transaction.execute("DELETE FROM account_limit_seats", [])?;
-        transaction.execute("DELETE FROM meta WHERE key=?1", [LIMITS_CURSOR])?;
+        transaction.execute(
+            "DELETE FROM meta WHERE key IN (?1, ?2)",
+            [LIMITS_CURSOR, LIMITS_READY],
+        )?;
         transaction.execute(
             "INSERT OR REPLACE INTO meta(key,value) VALUES('account_limits_version',?1)",
             [LIMITS_PROJECTION_VERSION],
         )?;
     }
-    flush_limits(transaction).map(|_| ())
+    // A store with nothing to catch up on is ready at once.
+    let ready: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM meta WHERE key=?1)",
+        [LIMITS_READY],
+        |row| row.get(0),
+    )?;
+    let has_history: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM claims WHERE kind='harness.limits')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !ready && !has_history {
+        mark_limits_ready(transaction)?;
+    }
+    Ok(())
 }
 
-/// Fold the `harness.limits` claims after the cursor into the tables, and return how many.
+fn mark_limits_ready(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute(
+        "INSERT OR REPLACE INTO meta(key,value) VALUES(?1, ?2)",
+        [LIMITS_READY, LIMITS_PROJECTION_VERSION],
+    )?;
+    Ok(())
+}
+
+/// Fold the next `limit` `harness.limits` claims after the cursor into the tables, and return how
+/// many. A page that finds fewer than `limit` has reached the end: the projection is ready.
 pub(super) fn flush_limits(transaction: &Transaction<'_>) -> Result<usize> {
+    flush_limits_page(transaction, LIMITS_APPEND_PAGE)
+}
+
+pub(crate) fn flush_limits_page(transaction: &Transaction<'_>, limit: usize) -> Result<usize> {
     let through: u64 = transaction
         .query_row("SELECT value FROM meta WHERE key=?1", [LIMITS_CURSOR], |row| {
             row.get::<_, String>(0)
@@ -238,9 +277,9 @@ pub(super) fn flush_limits(transaction: &Transaction<'_>) -> Result<usize> {
     let claims = transaction
         .prepare_cached(
             "SELECT subject, origin, body, accepted_at_unix_ms, store_index FROM claims
-             WHERE kind='harness.limits' AND store_index>?1 ORDER BY store_index",
+             WHERE kind='harness.limits' AND store_index>?1 ORDER BY store_index LIMIT ?2",
         )?
-        .query_map([through], |row| {
+        .query_map(params![through, limit as i64], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -323,6 +362,16 @@ pub(super) fn flush_limits(transaction: &Transaction<'_>) -> Result<usize> {
             "INSERT OR REPLACE INTO meta(key,value) VALUES(?1,?2)",
             params![LIMITS_CURSOR, newest_index.to_string()],
         )?;
+    }
+    if claims.len() < limit {
+        let ready: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM meta WHERE key=?1)",
+            [LIMITS_READY],
+            |row| row.get(0),
+        )?;
+        if !ready {
+            mark_limits_ready(transaction)?;
+        }
     }
     Ok(claims.len())
 }
@@ -427,13 +476,47 @@ fn utc(unix_ms: u64) -> String {
 
 impl Store {
     /// The highest recent weekly reading in each account's latest reset window, in account order.
+    /// While the projection is still being filled after an upgrade the answer is not yet known,
+    /// and this returns nothing: a half-filled projection must never read as an unused account.
     pub fn account_limits(&self) -> Result<Vec<AccountLimit>> {
+        if !self.account_limits_ready()? {
+            return Ok(Vec::new());
+        }
         account_limits_at(&self.readers.get())
+    }
+
+    /// Whether the account limits projection has caught up with the `harness.limits` claims at
+    /// least once. False only on the first start after an upgrade, until the catch-up finishes.
+    pub fn account_limits_ready(&self) -> Result<bool> {
+        Ok(self.readers.get().query_row(
+            "SELECT EXISTS(SELECT 1 FROM meta WHERE key=?1)",
+            [LIMITS_READY],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Fold one page of `harness.limits` claims into the projection, in its own short writer
+    /// transaction, and say whether more remain. The daemon calls this until it returns false;
+    /// the cursor is stored, so a restart resumes where it stopped.
+    pub fn catch_up_account_limits(&self, page: usize) -> Result<bool> {
+        let page = page.max(1);
+        let mut connection = self.connection.write();
+        let transaction = connection.transaction()?;
+        let folded = flush_limits_page(&transaction, page)?;
+        transaction.commit()?;
+        Ok(folded == page)
     }
 
     /// Missing quota evidence is unknown, never evidence that an account is below its limit.
     /// Keep the last reading visible and report unavailable weekly evidence for active seats.
     pub fn account_limits_check(&self, now: u128, fresh_ms: u64) -> Result<DoctorCheck> {
+        if !self.account_limits_ready()? {
+            return Ok(DoctorCheck {
+                name: "account-limits".into(),
+                status: "pass".into(),
+                message: "the account limits projection is catching up after an upgrade; no limits decision is made until it has".into(),
+            });
+        }
         let limits = self.account_limits()?;
         let connection = self.readers.get();
         let mut statement = connection.prepare_cached(
@@ -542,6 +625,10 @@ impl Store {
             ));
         }
         let mut outcome = LimitsOutcome::default();
+        // Not yet known is not "below the limit" nor "unused": decide nothing until it is.
+        if !self.account_limits_ready().map_err(internal)? {
+            return Ok(outcome);
+        }
         for limit in self.account_limits().map_err(internal)? {
             let Some(weekly) = limit.weekly_percent else {
                 continue;
@@ -961,19 +1048,72 @@ mod tests {
             assert_eq!(count(&store), 2);
             assert_eq!(store.account_limits().unwrap()[0].weekly_percent, Some(90.0));
         }
-        // A store opened again, and one whose projection is lost, answer the same.
+        // A store opened again answers the same, and opening folds nothing.
         let store = Store::open(&path, "alder").unwrap();
         assert_eq!(store.account_limits().unwrap()[0].weekly_percent, Some(90.0));
+        drop(store);
+        // A store from before the projection existed has the claims and no tables. Opening it
+        // does not fold them: the answer is not yet known, and the policy decides nothing, until a
+        // bounded, resumable catch-up has gone through every claim.
         {
             let connection = rusqlite::Connection::open(&path).unwrap();
             connection
-                .execute("UPDATE meta SET value='0' WHERE key='account_limits_version'", [])
+                .execute(
+                    "DELETE FROM meta WHERE key IN ('account_limits_version','account_limits_through_index','account_limits_ready')",
+                    [],
+                )
                 .unwrap();
+            connection.execute("DELETE FROM account_limit_readings", []).unwrap();
+            connection.execute("DELETE FROM account_limit_seats", []).unwrap();
         }
-        drop(store);
         let store = Store::open(&path, "alder").unwrap();
-        assert_eq!(store.account_limits().unwrap()[0].weekly_percent, Some(90.0));
-        assert_eq!(store.account_limits().unwrap()[0].seats, [seat]);
+        assert!(!store.account_limits_ready().unwrap());
+        assert!(store.account_limits().unwrap().is_empty());
+        assert!(store
+            .enforce_account_limits(&policy(), now + 168 * HOUR)
+            .unwrap()
+            .stopped
+            .is_empty());
+        assert_eq!(store.account_limits_check(now + 168 * HOUR, 3_600_000).unwrap().status, "pass");
+        // One page of ten of the 86 claims, then the daemon dies.
+        assert!(store.catch_up_account_limits(10).unwrap());
+        assert!(!store.account_limits_ready().unwrap());
+        drop(store);
+        // It resumes from the stored cursor and ends with the same answer and the same rows.
+        let store = Store::open(&path, "alder").unwrap();
+        assert!(!store.account_limits_ready().unwrap());
+        let mut pages = 1;
+        while store.catch_up_account_limits(10).unwrap() {
+            pages += 1;
+        }
+        assert_eq!(pages, 8, "86 claims, ten to a page, after the first page");
+        assert!(store.account_limits_ready().unwrap());
+        assert_eq!(count(&store), 2);
+        let limit = store.account_limits().unwrap().remove(0);
+        assert_eq!(limit.weekly_percent, Some(90.0));
+        assert_eq!(limit.seats, [seat]);
+    }
+
+    #[test]
+    fn the_catch_up_page_seeks_the_kind_index_past_the_cursor() {
+        let store = Store::open_memory("alder").unwrap();
+        let connection = store.readers.get();
+        let mut statement = connection
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT subject, origin, body, accepted_at_unix_ms, store_index
+                 FROM claims WHERE kind='harness.limits' AND store_index>?1
+                 ORDER BY store_index LIMIT ?2",
+            )
+            .unwrap();
+        let plan = statement
+            .query_map([0, 200], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            plan,
+            ["SEARCH claims USING INDEX claims_kind_index (kind=? AND store_index>?)"]
+        );
     }
 
     #[test]
