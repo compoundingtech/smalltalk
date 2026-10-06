@@ -21462,6 +21462,9 @@ fn report_claude_attachment(
     checked: &Result<st3::mailbox::Attachment>,
     terminal: Option<&ClaudeAttachmentTerminal>,
 ) -> Result<()> {
+    // A predecessor binding's parked state does not describe this new binding.
+    let terminal =
+        terminal.filter(|fault| same_claude_attachment_binding(&fault.fence, &mailbox.fence));
     let mut report: Value = serde_json::from_str(&native_delivery_report("claude-channel", None))?;
     report["ready"] = json!(checked.as_ref().is_ok_and(|attachment| attachment.attached));
     report["reason"] = json!(match terminal {
@@ -21531,6 +21534,9 @@ fn claude_attachment_diagnostic(
         expected_subject: None,
         // A new namespace avoids reusing a predecessor image's uncertain key with
         // a reason that may have changed since that image attempted publication.
+        // Abrupt process death loses the pending slot and episode. If a caller then
+        // reuses this epoch/episode/phase with a different reason, the same-key
+        // mismatch parks publication; this safeguard covers graceful re-exec only.
         idempotency_key: Some(format!(
             "claude-attachment-publication-v2:{code}:{subject}:{incarnation}:{}:{episode}:{phase}",
             fence.epoch

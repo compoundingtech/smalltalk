@@ -261,6 +261,31 @@ impl Fixture {
         .unwrap();
     }
 
+    async fn wait_unparked(&self, ready: bool) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let changed = self.control.report_changed.notified();
+                if self
+                    .control
+                    .reports
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .is_some_and(|v| {
+                        v["ready"] == ready && v["attachment_diagnostic_publication"].is_null()
+                    })
+                {
+                    return;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .unwrap();
+        let reports = self.control.reports.lock().unwrap();
+        assert!(reports.last().unwrap()["attachment_diagnostic_publication"].is_null());
+    }
+
     fn resume(&mut self) {
         let resume = DriverResume {
             driver: "claude".into(),
@@ -330,18 +355,21 @@ async fn claude_attachment_publication_committed_lost_response_then_positive_is_
         f.codes(),
         ["claude-channel-attached", "claude-channel-unattached"]
     );
+    f.wait_ready(false).await;
     f.control.attachment.store(1, Ordering::SeqCst);
     f.check().await.unwrap();
-    let requests = f.control.requests.lock().unwrap();
-    assert_eq!(
-        requests[1], requests[2],
-        "resolve the committed operation without changing its key or payload"
-    );
-    assert_ne!(
-        requests[2]["idempotency_key"],
-        requests[3]["idempotency_key"]
-    );
-    drop(requests);
+    f.wait_unparked(true).await;
+    {
+        let requests = f.control.requests.lock().unwrap();
+        assert_eq!(
+            requests[1], requests[2],
+            "resolve the committed operation without changing its key or payload"
+        );
+        assert_ne!(
+            requests[2]["idempotency_key"],
+            requests[3]["idempotency_key"]
+        );
+    }
     assert_eq!(
         f.codes(),
         [
@@ -447,10 +475,11 @@ async fn claude_attachment_publication_reason_change_cannot_mutate_uncertain_req
     );
     assert_eq!(f.state.claude_attachment_episode, 1);
     f.check().await.unwrap();
-    let requests = f.control.requests.lock().unwrap();
-    assert_eq!(requests[1], requests[2]);
-    assert_eq!(requests[2], requests[3]);
-    drop(requests);
+    {
+        let requests = f.control.requests.lock().unwrap();
+        assert_eq!(requests[1], requests[2]);
+        assert_eq!(requests[2], requests[3]);
+    }
     assert_eq!(
         f.codes(),
         ["claude-channel-attached", "claude-channel-unattached"]
@@ -655,7 +684,43 @@ async fn claude_attachment_publication_terminal_api_errors_are_capped_without_ac
 }
 
 #[tokio::test]
+async fn claude_attachment_publication_first_post_terminal_rejection_reports_and_stays_parked() {
+    let mut f = Fixture::new().await;
+    assert!(f.state.claude_attachment_pending.is_none());
+    *f.control.permanent.lock().unwrap() = Some((422, "invalid-claim-actor".into()));
+    assert!(
+        f.check()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("publication stopped")
+    );
+    f.wait_parked(true).await;
+    assert!(f.state.claude_attachment_pending.is_none());
+    assert!(f.state.claude_attachment_terminal.is_some());
+    assert_eq!(f.state.claude_attachment_phase, "");
+    assert_eq!(f.state.claude_attachment_episode, 0);
+    assert!(f.codes().is_empty());
+    f.resume();
+    for _ in 0..3 {
+        assert!(
+            f.check()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("is parked")
+        );
+    }
+    assert_eq!(f.control.requests.lock().unwrap().len(), 1);
+    assert_eq!(f.state.claude_attachment_episode, 0);
+    assert!(f.codes().is_empty());
+    f.unchanged_owner();
+}
+
+#[tokio::test]
 async fn claude_attachment_publication_transient_api_errors_retain_the_identical_operation() {
+    // Generic codes/statuses model response disposition; they are not asserted as
+    // codes emitted by /v1/claims. The two mailbox codes occur in the native API.
     for (status, code) in [
         (401, "unauthenticated"),
         (403, "read-only-member"),
@@ -745,6 +810,7 @@ async fn claude_attachment_publication_replacement_requires_current_ownership_an
     assert!(f.check().await.is_err());
     *f.control.permanent.lock().unwrap() = Some((422, "idempotency-mismatch".into()));
     assert!(f.check().await.is_err());
+    f.wait_parked(false).await;
     let rejected = f.control.requests.lock().unwrap()[2].clone();
     f.control.attachment.store(1, Ordering::SeqCst);
     let mut replacement = f.control.owner.clone();
@@ -761,6 +827,7 @@ async fn claude_attachment_publication_replacement_requires_current_ownership_an
     assert_eq!(f.state.claude_attachment_episode, 1);
     *f.control.replacement.lock().unwrap() = Some(replacement);
     f.check().await.unwrap();
+    f.wait_unparked(true).await;
     assert!(f.state.claude_attachment_terminal.is_none());
     assert!(f.state.claude_attachment_pending.is_none());
     assert_eq!(f.state.claude_attachment_episode, 2);
@@ -772,10 +839,11 @@ async fn claude_attachment_publication_replacement_requires_current_ownership_an
             "claude-channel-attached"
         ]
     );
-    let requests = f.control.requests.lock().unwrap();
-    assert_ne!(requests[3]["idempotency_key"], rejected["idempotency_key"]);
-    assert_eq!(requests[3]["fields"]["code"], "claude-channel-attached");
-    drop(requests);
+    {
+        let requests = f.control.requests.lock().unwrap();
+        assert_ne!(requests[3]["idempotency_key"], rejected["idempotency_key"]);
+        assert_eq!(requests[3]["fields"]["code"], "claude-channel-attached");
+    }
     f.check().await.unwrap();
     assert_eq!(f.control.requests.lock().unwrap().len(), 4);
 }
