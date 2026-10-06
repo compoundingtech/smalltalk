@@ -121,6 +121,11 @@ replayed, the newest page arrives again with `replace: true`. An `error` frame e
 subscription only, for example while the owning host is unreachable. After a dropped socket,
 subscribe again on the new one.
 
+Conversation routing resolves the runtime identity at the requested snapshot
+without building the fleet's agent cards. Message reads apply the conversation's
+party and store-index bounds before decoding message bodies, preserving the
+same global message window, session attribution, timeline order, and page size.
+
 `has_more` describes history before the replacement window, not whether a delta has more
 changes. Delta frames omit it: absence means preserve the last known availability, never
 `false`. Clients retain this distinction through decoding and UI updates; an explicitly

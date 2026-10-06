@@ -3711,16 +3711,10 @@ fn session_messages(
     }
     let mut messages = state
         .store
-        .claims_for_kind_at("message.sent", before, true, 10_000)
-        .map_err(ApiError::internal)?
-        .claims;
+        .conversation_messages_at(owner, before, 10_000)
+        .map_err(ApiError::internal)?;
     messages.retain(|claim| {
         let fields = claim.body.get("fields").unwrap_or(&claim.body);
-        let from = fields.get("from").and_then(Value::as_str);
-        let to = fields.get("to").and_then(Value::as_str);
-        if from != Some(owner) && to != Some(owner) {
-            return false;
-        }
         match fields.get("session_id").and_then(Value::as_str) {
             Some(message_session) => message_session == session_id,
             None => {
@@ -4828,22 +4822,19 @@ fn conversation_read_now(
                 }
             }
         }
-        for claim in state
-            .store
-            .claims_for_kind_at("message.sent", None, true, 10_000)
+        let messages = owner
+            .as_deref()
+            .map(|owner| state.store.conversation_messages_at(owner, None, 10_000))
+            .transpose()
             .map_err(ApiError::internal)?
-            .claims
-        {
+            .unwrap_or_default();
+        for claim in messages {
             let fields = claim.body.get("fields").unwrap_or(&claim.body);
             if claim.store_index > store_index
                 && fields
                     .get("session_id")
                     .and_then(Value::as_str)
                     .is_none_or(|message_session| message_session == session_id)
-                && owner.as_deref().is_some_and(|owner| {
-                    fields.get("from").and_then(Value::as_str) == Some(owner)
-                        || fields.get("to").and_then(Value::as_str) == Some(owner)
-                })
             {
                 changed_indexes.insert(claim.store_index);
                 message_indexes.insert(claim.store_index);
