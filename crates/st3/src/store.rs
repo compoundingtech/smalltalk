@@ -2479,11 +2479,13 @@ impl Store {
             .agent_resources_cache
             .lock()
             .expect("agent resources cache poisoned");
-        if let Some((_, _, items)) = cache
+        if let Some(items) = cache
             .iter()
             .find(|(at, all, _)| *at == index && *all == history)
+            .map(|(_, _, items)| Arc::clone(items))
         {
-            return Ok((**items).clone());
+            drop(cache);
+            return Ok((*items).clone());
         }
         let previous = cache
             .iter()
@@ -2522,13 +2524,21 @@ impl Store {
             .agent_resources_cache
             .lock()
             .expect("agent resources cache poisoned");
-        if !cache.iter().any(|(at, all, _)| *at == index && *all == history) {
-            cache.push_back((index, history, Arc::new(items.clone())));
-            if cache.len() > 8 {
-                cache.pop_front();
-            }
-        }
-        Ok(items)
+        let (items, evicted) = if let Some((_, _, published)) = cache
+            .iter()
+            .find(|(at, all, _)| *at == index && *all == history)
+        {
+            // Concurrent builds still return one immutable result for this snapshot.
+            (Arc::clone(published), None)
+        } else {
+            let items = Arc::new(items);
+            cache.push_back((index, history, Arc::clone(&items)));
+            let evicted = if cache.len() > 8 { cache.pop_front() } else { None };
+            (items, evicted)
+        };
+        drop(cache);
+        drop(evicted);
+        Ok((*items).clone())
     }
 
     /// Rebuild the operation projection when it no longer matches the claim log, and say
@@ -29777,10 +29787,10 @@ mod tests {
                 slow.cached_agent_resources(1, false, |_| {
                     entered.send(()).unwrap();
                     released.recv().unwrap();
-                    Ok(Vec::new())
+                    Ok(vec![json!({"id": "agent/slow"})])
                 })
             })
-            .unwrap();
+            .unwrap()
         });
         building.recv().unwrap();
         let (finished, result) = std::sync::mpsc::channel();
@@ -29793,10 +29803,16 @@ mod tests {
                 .unwrap();
         });
         let completed = result.recv_timeout(std::time::Duration::from_secs(1));
+        let published = completed.as_ref().ok().map(|_| {
+            store
+                .cached_agent_resources(1, false, |_| Ok(vec![json!({"id": "agent/published"})]))
+                .unwrap()
+        });
         release.send(()).unwrap();
-        builder.join().unwrap();
+        let resumed = builder.join().unwrap();
         other.join().unwrap();
         assert_eq!(completed.unwrap().unwrap()[0]["id"], "agent/cached");
+        assert_eq!(resumed, published.unwrap());
     }
 
     #[test]
