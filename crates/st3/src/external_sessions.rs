@@ -4626,7 +4626,7 @@ mod tests {
                         .unwrap()
                 )
                 .unwrap(),
-            complete[..complete.len() / 2].as_bytes()
+            &complete.as_bytes()[..complete.len() / 2]
         );
         let locator = serde_json::from_value(partial["_source"].clone()).unwrap();
         assert!(normalized_record(&session, &locator).is_ok());
