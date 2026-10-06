@@ -10,7 +10,7 @@ use axum::{
 };
 use std::sync::{
     Mutex,
-    atomic::{AtomicBool, AtomicU8, Ordering},
+    atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
 };
 
 struct Control {
@@ -19,6 +19,8 @@ struct Control {
     binding_live: AtomicBool,
     replacement: Mutex<Option<st3::mailbox::Fence>>,
     attachment_failure_once: AtomicBool,
+    attachment_checks: AtomicUsize,
+    after_post_attachment: AtomicU8,
     permanent: Mutex<Option<(u16, String)>>,
     reports: Mutex<Vec<Value>>,
     report_changed: Notify,
@@ -31,6 +33,7 @@ async fn attachment(
     State(control): State<Arc<Control>>,
     Query(fence): Query<st3::mailbox::Fence>,
 ) -> Response {
+    control.attachment_checks.fetch_add(1, Ordering::SeqCst);
     let mode = control.attachment.load(Ordering::SeqCst);
     if !control.binding_live.load(Ordering::SeqCst) {
         return (
@@ -80,6 +83,10 @@ async fn publication(
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     let record = control.store.append_claim(&input).unwrap();
+    let next = control.after_post_attachment.swap(255, Ordering::SeqCst);
+    if next != 255 {
+        control.attachment.store(next, Ordering::SeqCst);
+    }
     if mode == 2 {
         // Fail the HTTP body after commit: the caller cannot receive the operation's
         // acknowledgement, while the graph retains the canonical claim.
@@ -146,6 +153,8 @@ impl Fixture {
             binding_live: AtomicBool::new(true),
             replacement: Mutex::new(None),
             attachment_failure_once: AtomicBool::new(false),
+            attachment_checks: AtomicUsize::new(0),
+            after_post_attachment: AtomicU8::new(255),
             permanent: Mutex::new(None),
             reports: Mutex::new(vec![]),
             report_changed: Notify::new(),
@@ -218,6 +227,30 @@ impl Fixture {
                     .unwrap()
                     .last()
                     .is_some_and(|v| v["ready"] == ready)
+                {
+                    return;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn wait_parked(&self, ready: bool) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let changed = self.control.report_changed.notified();
+                if self
+                    .control
+                    .reports
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .is_some_and(|v| {
+                        v["ready"] == ready
+                            && v["attachment_diagnostic_publication"]["state"] == "parked"
+                    })
                 {
                     return;
                 }
@@ -528,7 +561,6 @@ async fn claude_attachment_publication_terminal_api_errors_are_capped_without_ac
         (422, "idempotency-mismatch"),
         (422, "claim-checkpointed"),
         (422, "foreign-mailbox"),
-        (422, "unbound-mailbox"),
         (422, "invalid-mailbox-token"),
         (422, "unknown-claim-kind"),
         (422, "invalid-claim-actor"),
@@ -541,6 +573,9 @@ async fn claude_attachment_publication_terminal_api_errors_are_capped_without_ac
         f.control.attachment.store(0, Ordering::SeqCst);
         f.control.publication.store(2, Ordering::SeqCst);
         assert!(f.check().await.is_err()); // The negative fence is durable, ACK is uncertain.
+        f.wait_ready(false).await;
+        f.control.attachment.store(1, Ordering::SeqCst);
+        let checks = f.control.attachment_checks.load(Ordering::SeqCst);
         *f.control.permanent.lock().unwrap() = Some((status, code.into()));
         let error = f.check().await.unwrap_err();
         assert!(error.to_string().contains("publication stopped"));
@@ -555,7 +590,34 @@ async fn claude_attachment_publication_terminal_api_errors_are_capped_without_ac
                 .reason
                 .contains(code)
         );
-        f.wait_ready(false).await;
+        // No later tick may be needed to expose this first terminal result.
+        f.wait_parked(true).await;
+        assert_eq!(
+            f.control.attachment_checks.load(Ordering::SeqCst) - checks,
+            2,
+            "reporting retirement must not add another admission query"
+        );
+        assert_eq!(f.control.requests.lock().unwrap().len(), 3);
+        assert_eq!(
+            f.codes(),
+            ["claude-channel-attached", "claude-channel-unattached"]
+        );
+        {
+            let reports = f.control.reports.lock().unwrap();
+            let report = reports.last().unwrap();
+            assert!(
+                report["reason"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("claude-channel-attached")
+            );
+            assert!(
+                report["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("graph fence has not been corrected")
+            );
+        }
         f.resume();
         assert!(f.state.claude_attachment_terminal.is_some());
         assert!(f.state.claude_attachment_pending.is_none());
@@ -595,11 +657,12 @@ async fn claude_attachment_publication_terminal_api_errors_are_capped_without_ac
 #[tokio::test]
 async fn claude_attachment_publication_transient_api_errors_retain_the_identical_operation() {
     for (status, code) in [
-        (401, "authentication-required"),
-        (403, "authentication-expired"),
-        (409, "conflict"),
+        (401, "unauthenticated"),
+        (403, "read-only-member"),
+        (409, "idempotency-conflict"),
         (429, "rate-limited"),
-        (422, "mailbox-session-starting"),
+        (422, "mailbox-session-starting"), // Actual store::check_mailbox_incarnation code.
+        (422, "unbound-mailbox"),
         (503, "internal"),
     ] {
         let mut f = Fixture::new().await;
@@ -624,6 +687,51 @@ async fn claude_attachment_publication_transient_api_errors_retain_the_identical
             ]
         );
         assert_eq!(f.state.claude_attachment_episode, 3);
+        f.unchanged_owner();
+    }
+}
+
+#[tokio::test]
+async fn claude_attachment_publication_attachment_flip_after_pending_post_uses_fresh_check() {
+    for next_attached in [false, true] {
+        let mut f = Fixture::new().await;
+        // Retain an uncertain operation whose phase is opposite the post-ACK result.
+        f.control
+            .attachment
+            .store(u8::from(!next_attached), Ordering::SeqCst);
+        f.control.publication.store(2, Ordering::SeqCst);
+        assert!(f.check().await.is_err());
+        let pending_phase = f
+            .state
+            .claude_attachment_pending
+            .as_ref()
+            .unwrap()
+            .phase
+            .clone();
+        f.control
+            .after_post_attachment
+            .store(u8::from(next_attached), Ordering::SeqCst);
+        f.check().await.unwrap();
+        let recovered_phase = if next_attached { "attached" } else { "blocked" };
+        assert_ne!(pending_phase, recovered_phase);
+        assert_eq!(f.state.claude_attachment_phase, recovered_phase);
+        assert_eq!(f.state.claude_attachment_episode, 2);
+        let codes = f.codes();
+        assert_eq!(codes.len(), 2);
+        assert_eq!(
+            codes[1],
+            if next_attached {
+                "claude-channel-attached"
+            } else {
+                "claude-channel-unattached"
+            }
+        );
+        let requests = f.control.requests.lock().unwrap();
+        assert_eq!(
+            requests[0], requests[1],
+            "the pending POST remains identical before phase flips"
+        );
+        drop(requests);
         f.unchanged_owner();
     }
 }

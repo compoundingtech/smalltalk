@@ -21361,7 +21361,9 @@ async fn check_claude_attachment(
     }
     if state.claude_attachment_pending.is_some() {
         // Resolve the identical operation before advancing the acknowledged episode.
-        publish_pending_claude_attachment(client, subject, incarnation, fence, state).await?;
+        let published =
+            publish_pending_claude_attachment(client, subject, incarnation, fence, state).await;
+        finish_claude_attachment_publication(published, mailbox, &checked, state)?;
         // Recovery publication needs an admission check AFTER the pending operation
         // resolved; the earlier check was only used to keep readiness reporting.
         checked = checked_claude_attachment(client, subject, incarnation, fence).await;
@@ -21393,7 +21395,32 @@ async fn check_claude_attachment(
         input_digest,
     });
     state.claude_attachment_reconciled = false;
-    publish_pending_claude_attachment(client, subject, incarnation, fence, state).await
+    let published =
+        publish_pending_claude_attachment(client, subject, incarnation, fence, state).await;
+    finish_claude_attachment_publication(published, mailbox, &checked, state)
+}
+
+fn finish_claude_attachment_publication(
+    published: Result<()>,
+    mailbox: &NativeMailbox,
+    checked: &Result<st3::mailbox::Attachment>,
+    state: &NativeLoopState,
+) -> Result<()> {
+    // Terminal retirement must be visible in THIS tick, using the already admitted
+    // readiness result. ACK also clears any old parked metadata immediately.
+    if published.is_ok() || state.claude_attachment_terminal.is_some() {
+        let reported =
+            report_claude_attachment(mailbox, checked, state.claude_attachment_terminal.as_ref());
+        if let Err(report_error) = reported {
+            return match published {
+                Err(error) => Err(error.context(format!(
+                    "reporting attachment publication outcome: {report_error:#}"
+                ))),
+                Ok(()) => Err(report_error),
+            };
+        }
+    }
+    published
 }
 
 fn same_claude_attachment_binding(a: &st3::mailbox::Fence, b: &st3::mailbox::Fence) -> bool {
@@ -21424,6 +21451,7 @@ async fn checked_claude_attachment(
 
 fn claude_attachment_reason(checked: &Result<st3::mailbox::Attachment>) -> String {
     match checked {
+        Ok(attachment) if attachment.attached => "claude-channel-attached: the current Claude channel is initialized and subscribed.".into(),
         Ok(_) => "claude-channel-unattached: the current Claude session has no live, initialized channel subscription; mail is held in the graph until attachment. The driver rechecks attachment and st will restart the harness with bounded retries if the channel stays missing.".into(),
         Err(error) => format!("claude-channel-unattached: attachment could not be verified; mail is held while the driver retries: {error:#}"),
     }
@@ -21583,6 +21611,8 @@ async fn publish_pending_claude_attachment(
     }
     .await;
     if let Err(error) = result {
+        // A mismatch of this SAME immutable request/key or a checkpointed claim cannot
+        // be resolved by reposting it; park visibly without assuming whether it committed.
         // Authentication renewal, generic conflicts and rate limits do not establish
         // a permanent outcome. Keep their uncertain operation unchanged.
         if matches!(
@@ -21592,7 +21622,6 @@ async fn publish_pending_claude_attachment(
                     | "claim-checkpointed"
                     | "stale-mailbox-session"
                     | "foreign-mailbox"
-                    | "unbound-mailbox"
                     | "invalid-mailbox-token"
                     | "unknown-claim-kind"
                     | "invalid-claim-actor"
