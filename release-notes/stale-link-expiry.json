@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Expire stale relay links and report dial-out owners without inbound routes",
+  "replay": {
+    "status": "none",
+    "detail": "Existing stores containing transport.observed claims need no additional replay or recovery. Routing evaluates the original success or legacy claim timestamp when read; no projection replay trigger changes. Shuffle, restart and checkpoint replay regressions pass."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database tables, columns, indexes, triggers or schema version change. Refreshes use the existing transport.observed fields and claim kind."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules and digests are unchanged; no coordinated sealing transition is needed. Existing up observations expire after 90 seconds on upgraded readers and live exchanges refresh them at most every 30 seconds. Older routing daemons retain their previous reachability behavior until upgraded."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Owner reads and raw PTY attach for known dial-out owners return the existing remote-unavailable error with the additional details.reason value dial-out-owner and an explicit no-inbound-route message. The error envelope, replication fields, authentication and harness contracts are unchanged. Current client and isolated daemon regressions pass; mixed-version client/daemon pairs were not exercised. Reverse owner-RPC and PTY transport is still unavailable."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional interruption beyond the ordinary daemon restart is introduced. Restart-to-API and restart-to-health durations were not measured for this change."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Existing fleets, including those with stale observations and dial-out members, preserve their identities and state. Upgrade each routing daemon normally for consistent expiry and diagnostics; no additional commands or configuration changes are required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No additional database recovery or migration reversal is needed. Existing claims and layouts remain unchanged; an older routing binary restores the prior stale-link behavior."
+  }
+}
