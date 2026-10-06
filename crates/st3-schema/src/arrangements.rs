@@ -14,6 +14,11 @@ pub const MAX_BODY_BYTES: usize = 1024 * 1024;
 pub const MAX_RESOURCE_BYTES: usize = 512 * 1024;
 pub const MAX_ARRANGEMENTS: usize = 100;
 
+pub const OPERATION_TAGS: &[&str] = &[
+    "create", "rename", "folder.create", "folder.rename", "folder.move",
+    "folder.delete", "subject.place", "retire",
+];
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "op", deny_unknown_fields)]
 pub enum Operation {
@@ -111,6 +116,15 @@ enum Touched<'a> {
 type OperationRegisters<'a> = (Option<&'a str>, Option<&'a str>, Option<&'a str>, Option<&'a str>, [Option<Touched<'a>>; 2]);
 
 pub fn operations(subject: &str, fields: &BTreeMap<String, Value>) -> Result<Vec<Operation>, ValidationError> {
+    operations_with_registry(subject, fields, super::registry(), false)
+}
+
+pub(crate) fn operations_with_registry(
+    subject: &str,
+    fields: &BTreeMap<String, Value>,
+    registry: &super::Registry,
+    replicated: bool,
+) -> Result<Vec<Operation>, ValidationError> {
     if fields.get("owner").and_then(Value::as_str) != Some(owner(subject)?) {
         return Err(error("arrangement-owner-forbidden", "owner must match the immutable person in the arrangement subject"));
     }
@@ -123,6 +137,15 @@ pub fn operations(subject: &str, fields: &BTreeMap<String, Value>) -> Result<Vec
     let value = fields.get("operations").ok_or_else(|| error("missing-claim-field", "arrangement edits require operations"))?;
     if serde_json::to_vec(value).map_err(|e| error("invalid-arrangement-operations", e.to_string()))?.len() > MAX_BODY_BYTES {
         return Err(error("arrangement-body-too-large", "arrangement operations exceed 1 MiB"));
+    }
+    if value.as_array().is_some_and(|ops| ops.iter().any(|op| {
+        op.get("op").and_then(Value::as_str)
+            .is_some_and(|tag| !registry.arrangement_operations.iter().any(|known| known == tag))
+    })) {
+        return Err(error(
+            if replicated { "unknown-claim-field" } else { "invalid-arrangement-operations" },
+            "arrangement edit contains an unknown operation tag",
+        ));
     }
     if value.as_array().is_some_and(|ops| ops.iter().any(|op| {
         match op.get("op").and_then(Value::as_str) {
@@ -146,7 +169,13 @@ pub fn operations(subject: &str, fields: &BTreeMap<String, Value>) -> Result<Vec
             Operation::FolderMove { id, parent, key } => (Some(id), None, parent.as_deref(), Some(key), [Some(Touched::FolderPosition(id)), None]),
             Operation::FolderDelete { id } => (Some(id), None, None, None, [Some(Touched::FolderTombstone(id)), None]),
             Operation::SubjectPlace { subject, folder, key } => {
-                super::registry().validate_subject(subject).map_err(|_| error("invalid-subject-reference", "placement requires a registered graph subject"))?;
+                registry.validate_subject(subject).map_err(|e| {
+                    if replicated && e.code == "unknown-subject-family" {
+                        error("unknown-claim-field", e.message)
+                    } else {
+                        error("invalid-subject-reference", "placement requires a registered graph subject")
+                    }
+                })?;
                 if subject.starts_with("pty/") || subject.starts_with("session/") {
                     return Err(error("invalid-subject-reference", "placements address stable graph subjects, never PTY or session IDs"));
                 }
@@ -207,5 +236,19 @@ mod tests {
         assert_eq!(operations(SUBJECT,&action).unwrap_err().code,"invalid-arrangement-action");
         action.insert("action_digest".into(),json!("0".repeat(64)));
         assert_eq!(operations(SUBJECT,&action).unwrap(),vec![Operation::Rename { name:"ok".into() }]);
+    }
+
+    #[test]
+    fn malformed_known_operations_and_references_do_not_wait_for_an_upgrade() {
+        for (operation, code) in [
+            (json!({"op":"rename","name":"ok","extra":true}), "invalid-arrangement-operations"),
+            (json!({"name":"missing tag"}), "invalid-arrangement-operations"),
+            (json!({"op":12}), "invalid-arrangement-operations"),
+            (json!({"op":"subject.place","subject":"mission/bad subject","folder":null,"key":"a0"}), "invalid-subject-reference"),
+            (json!({"op":"subject.place","subject":"pty/transient","folder":null,"key":"a0"}), "invalid-subject-reference"),
+        ] {
+            let fields = serde_json::from_value(json!({"owner":"person/ada","operations":[operation]})).unwrap();
+            assert_eq!(super::super::registry().validate_replicated_claim(SUBJECT, "arrangement.edited", &fields).unwrap_err().code, code);
+        }
     }
 }
