@@ -21346,11 +21346,16 @@ async fn check_claude_attachment(
     let mut checked = checked_claude_attachment(client, subject, incarnation, fence).await;
     // Readiness is independent of diagnostic publication. A rejected or uncertain
     // POST must not silence a current subscription's readiness report.
-    report_claude_attachment(mailbox, &checked)?;
+    report_claude_attachment(mailbox, &checked, state.claude_attachment_terminal.as_ref())?;
     if let Some(terminal) = &state.claude_attachment_terminal {
         if same_claude_attachment_binding(&terminal.fence, fence) {
-            return Ok(());
+            return Err(claude_attachment_parked_error(terminal));
         }
+        // A changed binding is not sufficient: the endpoint must admit its current
+        // ownership before this publisher leaves its parked state.
+        checked.as_ref().map_err(|error| {
+            anyhow::anyhow!("validating replacement Claude attachment ownership: {error:#}")
+        })?;
         state.claude_attachment_terminal = None;
         state.claude_attachment_reconciled = false;
     }
@@ -21360,7 +21365,7 @@ async fn check_claude_attachment(
         // Recovery publication needs an admission check AFTER the pending operation
         // resolved; the earlier check was only used to keep readiness reporting.
         checked = checked_claude_attachment(client, subject, incarnation, fence).await;
-        report_claude_attachment(mailbox, &checked)?;
+        report_claude_attachment(mailbox, &checked, state.claude_attachment_terminal.as_ref())?;
     }
     let attached = checked.as_ref().is_ok_and(|attachment| attachment.attached);
     let phase = if attached {
@@ -21427,10 +21432,24 @@ fn claude_attachment_reason(checked: &Result<st3::mailbox::Attachment>) -> Strin
 fn report_claude_attachment(
     mailbox: &NativeMailbox,
     checked: &Result<st3::mailbox::Attachment>,
+    terminal: Option<&ClaudeAttachmentTerminal>,
 ) -> Result<()> {
     let mut report: Value = serde_json::from_str(&native_delivery_report("claude-channel", None))?;
     report["ready"] = json!(checked.as_ref().is_ok_and(|attachment| attachment.attached));
-    report["reason"] = json!(claude_attachment_reason(checked));
+    report["reason"] = json!(match terminal {
+        Some(fault) => format!(
+            "{}; attachment diagnostic publication is parked: {}. The durable graph fence has not been corrected; recovery requires an authorized replacement binding.",
+            claude_attachment_reason(checked),
+            fault.reason
+        ),
+        None => claude_attachment_reason(checked),
+    });
+    report["attachment_diagnostic_publication"] = match terminal {
+        Some(fault) => {
+            json!({"state":"parked", "reason":fault.reason, "incarnation":fault.fence.incarnation, "epoch":fault.fence.epoch})
+        }
+        None => Value::Null,
+    };
     if let Some(subscription) = &mailbox.subscription {
         subscription.report(report);
     }
@@ -21564,12 +21583,22 @@ async fn publish_pending_claude_attachment(
     }
     .await;
     if let Err(error) = result {
-        if st3::client::http_status(&error).is_some_and(|status| (400..500).contains(&status))
-            || matches!(
-                st3::client::api_error_code(&error),
-                Some("idempotency-mismatch" | "claim-checkpointed")
+        // Authentication renewal, generic conflicts and rate limits do not establish
+        // a permanent outcome. Keep their uncertain operation unchanged.
+        if matches!(
+            st3::client::api_error_code(&error),
+            Some(
+                "idempotency-mismatch"
+                    | "claim-checkpointed"
+                    | "stale-mailbox-session"
+                    | "foreign-mailbox"
+                    | "unbound-mailbox"
+                    | "invalid-mailbox-token"
+                    | "unknown-claim-kind"
+                    | "invalid-claim-actor"
+                    | "unknown-claim-field"
             )
-        {
+        ) {
             return Err(retire_claude_attachment(
                 state,
                 fence,
@@ -21596,9 +21625,21 @@ fn retire_claude_attachment(
         fence: fence.clone(),
         reason: reason.clone(),
     });
-    // The driver records this error once. The retained inhibition caps terminal
-    // errors at one per binding; neither phase nor acknowledged episode advances.
-    anyhow::anyhow!("Claude attachment diagnostic publication stopped for this binding: {reason}")
+    // The fault remains visible on every tick under the driver's existing warning
+    // throttle, but network publication is capped at the one rejected operation.
+    // Neither phase nor acknowledged episode advances; graceful re-exec retains it.
+    anyhow::anyhow!(
+        "Claude attachment diagnostic publication stopped for this binding: {reason}; no further POSTs; recovery requires an authorized replacement binding"
+    )
+}
+
+fn claude_attachment_parked_error(fault: &ClaudeAttachmentTerminal) -> anyhow::Error {
+    anyhow::anyhow!(
+        "Claude attachment diagnostic publication is parked for incarnation {} epoch {}: {}; no further POSTs; the durable graph fence is unchanged; recovery requires an authorized replacement binding",
+        fault.fence.incarnation,
+        fault.fence.epoch,
+        fault.reason
+    )
 }
 
 fn claude_attachment_path(fence: &st3::mailbox::Fence) -> String {

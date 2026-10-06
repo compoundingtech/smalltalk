@@ -17,6 +17,7 @@ struct Control {
     store: Store,
     owner: st3::mailbox::Fence,
     binding_live: AtomicBool,
+    replacement: Mutex<Option<st3::mailbox::Fence>>,
     attachment_failure_once: AtomicBool,
     permanent: Mutex<Option<(u16, String)>>,
     reports: Mutex<Vec<Value>>,
@@ -32,7 +33,11 @@ async fn attachment(
 ) -> Response {
     let mode = control.attachment.load(Ordering::SeqCst);
     if !control.binding_live.load(Ordering::SeqCst) {
-        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"code":"stale-mailbox-session","message":"superseded owner","details":{}})),
+        )
+            .into_response();
     }
     if mode == 2
         || control
@@ -41,10 +46,15 @@ async fn attachment(
     {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
-    let owns =
-        serde_json::to_value(&fence).unwrap() == serde_json::to_value(&control.owner).unwrap();
+    let replacement = control.replacement.lock().unwrap();
+    let owner = replacement.as_ref().unwrap_or(&control.owner);
+    let owns = serde_json::to_value(&fence).unwrap() == serde_json::to_value(owner).unwrap();
     if !owns {
-        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"code":"stale-mailbox-session","message":"superseded owner","details":{}})),
+        )
+            .into_response();
     }
     Json(json!({"api_version":"st3.v1", "value":{"attached": mode == 1}})).into_response()
 }
@@ -134,6 +144,7 @@ impl Fixture {
             store,
             owner: owner.clone(),
             binding_live: AtomicBool::new(true),
+            replacement: Mutex::new(None),
             attachment_failure_once: AtomicBool::new(false),
             permanent: Mutex::new(None),
             reports: Mutex::new(vec![]),
@@ -215,6 +226,26 @@ impl Fixture {
         })
         .await
         .unwrap();
+    }
+
+    fn resume(&mut self) {
+        let resume = DriverResume {
+            driver: "claude".into(),
+            subject: self.control.owner.subject.clone(),
+            incarnation: self.control.owner.incarnation.clone(),
+            session: st_drivers::provider_session::DetachedSession::Provider {
+                pid: 42,
+                session: "quartz-session".into(),
+                seq: 3,
+            },
+            loop_state: std::mem::take(&mut self.state),
+        };
+        let path =
+            st_drivers::reexec::write_state(self._root.path(), "driver-resume", &resume).unwrap();
+        let restored: DriverResume = st_drivers::reexec::read_state(&path).unwrap();
+        assert_eq!(restored.incarnation, resume.incarnation);
+        assert_eq!(restored.session, resume.session);
+        self.state = restored.loop_state;
     }
 
     fn codes(&self) -> Vec<String> {
@@ -432,30 +463,42 @@ async fn claude_attachment_publication_legacy_uncertain_phase_requires_one_corre
 
 #[tokio::test]
 async fn claude_attachment_publication_acknowledged_resume_does_not_republish() {
-    let mut f = Fixture::new().await;
-    f.check().await.unwrap();
-    assert!(f.state.claude_attachment_reconciled);
-    let root = tempfile::tempdir().unwrap();
-    let resume = DriverResume {
-        driver: "claude".into(),
-        subject: f.control.owner.subject.clone(),
-        incarnation: f.control.owner.incarnation.clone(),
-        session: st_drivers::provider_session::DetachedSession::Provider {
-            pid: 42,
-            session: "quartz-session".into(),
-            seq: 3,
-        },
-        loop_state: std::mem::take(&mut f.state),
-    };
-    let path = st_drivers::reexec::write_state(root.path(), "driver-resume", &resume).unwrap();
-    let restored: DriverResume = st_drivers::reexec::read_state(&path).unwrap();
-    f.state = restored.loop_state;
-    assert!(f.state.claude_attachment_reconciled);
-    f.check().await.unwrap();
-    assert_eq!(f.codes(), ["claude-channel-attached"]);
-    assert_eq!(f.control.requests.lock().unwrap().len(), 1);
-    assert_eq!(f.state.claude_attachment_episode, 1);
-    f.unchanged_owner();
+    for attached in [false, true] {
+        let mut f = Fixture::new().await;
+        f.control
+            .attachment
+            .store(u8::from(attached), Ordering::SeqCst);
+        f.check().await.unwrap();
+        assert!(f.state.claude_attachment_reconciled);
+        let root = tempfile::tempdir().unwrap();
+        let resume = DriverResume {
+            driver: "claude".into(),
+            subject: f.control.owner.subject.clone(),
+            incarnation: f.control.owner.incarnation.clone(),
+            session: st_drivers::provider_session::DetachedSession::Provider {
+                pid: 42,
+                session: "quartz-session".into(),
+                seq: 3,
+            },
+            loop_state: std::mem::take(&mut f.state),
+        };
+        let path = st_drivers::reexec::write_state(root.path(), "driver-resume", &resume).unwrap();
+        let restored: DriverResume = st_drivers::reexec::read_state(&path).unwrap();
+        f.state = restored.loop_state;
+        assert!(f.state.claude_attachment_reconciled);
+        f.check().await.unwrap();
+        assert_eq!(
+            f.codes(),
+            [if attached {
+                "claude-channel-attached"
+            } else {
+                "claude-channel-unattached"
+            }]
+        );
+        assert_eq!(f.control.requests.lock().unwrap().len(), 1);
+        assert_eq!(f.state.claude_attachment_episode, 1);
+        f.unchanged_owner();
+    }
 }
 
 #[tokio::test]
@@ -483,18 +526,21 @@ async fn claude_attachment_publication_readiness_reports_despite_repeated_post_f
 async fn claude_attachment_publication_terminal_api_errors_are_capped_without_ack() {
     for (status, code) in [
         (422, "idempotency-mismatch"),
-        (409, "claim-checkpointed"),
-        (400, "bad-request"),
-        (401, "unauthorized"),
-        (403, "forbidden"),
-        (404, "not-found"),
-        (429, "rate-limited"),
+        (422, "claim-checkpointed"),
+        (422, "foreign-mailbox"),
+        (422, "unbound-mailbox"),
+        (422, "invalid-mailbox-token"),
+        (422, "unknown-claim-kind"),
+        (422, "invalid-claim-actor"),
+        (422, "unknown-claim-field"),
         (500, "idempotency-mismatch"),
         (500, "claim-checkpointed"),
     ] {
         let mut f = Fixture::new().await;
         f.check().await.unwrap();
         f.control.attachment.store(0, Ordering::SeqCst);
+        f.control.publication.store(2, Ordering::SeqCst);
+        assert!(f.check().await.is_err()); // The negative fence is durable, ACK is uncertain.
         *f.control.permanent.lock().unwrap() = Some((status, code.into()));
         let error = f.check().await.unwrap_err();
         assert!(error.to_string().contains("publication stopped"));
@@ -510,17 +556,120 @@ async fn claude_attachment_publication_terminal_api_errors_are_capped_without_ac
                 .contains(code)
         );
         f.wait_ready(false).await;
-        f.state = serde_json::from_value(serde_json::to_value(&f.state).unwrap()).unwrap();
+        f.resume();
+        assert!(f.state.claude_attachment_terminal.is_some());
+        assert!(f.state.claude_attachment_pending.is_none());
         f.control.attachment.store(1, Ordering::SeqCst);
         for _ in 0..3 {
-            f.check().await.unwrap();
+            assert!(
+                f.check()
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("is parked")
+            );
         }
         f.wait_ready(true).await;
-        assert_eq!(f.control.requests.lock().unwrap().len(), 2);
-        assert_eq!(f.codes(), ["claude-channel-attached"]);
+        assert_eq!(f.control.requests.lock().unwrap().len(), 3);
+        assert_eq!(
+            f.codes(),
+            ["claude-channel-attached", "claude-channel-unattached"]
+        );
+        let reports = f.control.reports.lock().unwrap();
+        let report = reports.last().unwrap();
+        assert_eq!(
+            report["attachment_diagnostic_publication"]["state"],
+            "parked"
+        );
+        assert!(
+            report["reason"]
+                .as_str()
+                .unwrap()
+                .contains("graph fence has not been corrected")
+        );
         assert_eq!(f.state.claude_attachment_episode, 1);
         f.unchanged_owner();
     }
+}
+
+#[tokio::test]
+async fn claude_attachment_publication_transient_api_errors_retain_the_identical_operation() {
+    for (status, code) in [
+        (401, "authentication-required"),
+        (403, "authentication-expired"),
+        (409, "conflict"),
+        (429, "rate-limited"),
+        (422, "mailbox-session-starting"),
+        (503, "internal"),
+    ] {
+        let mut f = Fixture::new().await;
+        f.check().await.unwrap();
+        f.control.attachment.store(0, Ordering::SeqCst);
+        *f.control.permanent.lock().unwrap() = Some((status, code.into()));
+        assert!(f.check().await.is_err());
+        assert!(f.state.claude_attachment_pending.is_some());
+        assert!(f.state.claude_attachment_terminal.is_none());
+        assert_eq!(f.state.claude_attachment_episode, 1);
+        f.control.attachment.store(1, Ordering::SeqCst);
+        f.check().await.unwrap();
+        let requests = f.control.requests.lock().unwrap();
+        assert_eq!(requests[1], requests[2], "{code}");
+        drop(requests);
+        assert_eq!(
+            f.codes(),
+            [
+                "claude-channel-attached",
+                "claude-channel-unattached",
+                "claude-channel-attached"
+            ]
+        );
+        assert_eq!(f.state.claude_attachment_episode, 3);
+        f.unchanged_owner();
+    }
+}
+
+#[tokio::test]
+async fn claude_attachment_publication_replacement_requires_current_ownership_and_new_input() {
+    let mut f = Fixture::new().await;
+    f.check().await.unwrap();
+    f.control.attachment.store(0, Ordering::SeqCst);
+    f.control.publication.store(2, Ordering::SeqCst);
+    assert!(f.check().await.is_err());
+    *f.control.permanent.lock().unwrap() = Some((422, "idempotency-mismatch".into()));
+    assert!(f.check().await.is_err());
+    let rejected = f.control.requests.lock().unwrap()[2].clone();
+    f.control.attachment.store(1, Ordering::SeqCst);
+    let mut replacement = f.control.owner.clone();
+    replacement.epoch += 1;
+    replacement.token = "replacement-owner".into();
+    f.mailbox.fence = replacement.clone();
+    f.state.mailbox_fence = Some(replacement.clone());
+    assert!(
+        f.check().await.is_err(),
+        "an unadmitted replacement cannot unpark publication"
+    );
+    assert_eq!(f.control.requests.lock().unwrap().len(), 3);
+    assert!(f.state.claude_attachment_terminal.is_some());
+    assert_eq!(f.state.claude_attachment_episode, 1);
+    *f.control.replacement.lock().unwrap() = Some(replacement);
+    f.check().await.unwrap();
+    assert!(f.state.claude_attachment_terminal.is_none());
+    assert!(f.state.claude_attachment_pending.is_none());
+    assert_eq!(f.state.claude_attachment_episode, 2);
+    assert_eq!(
+        f.codes(),
+        [
+            "claude-channel-attached",
+            "claude-channel-unattached",
+            "claude-channel-attached"
+        ]
+    );
+    let requests = f.control.requests.lock().unwrap();
+    assert_ne!(requests[3]["idempotency_key"], rejected["idempotency_key"]);
+    assert_eq!(requests[3]["fields"]["code"], "claude-channel-attached");
+    drop(requests);
+    f.check().await.unwrap();
+    assert_eq!(f.control.requests.lock().unwrap().len(), 4);
 }
 
 #[tokio::test]
@@ -590,7 +739,13 @@ async fn claude_attachment_publication_foreign_or_malformed_pending_never_posts(
         assert!(f.state.claude_attachment_pending.is_none());
         assert_eq!(f.state.claude_attachment_episode, 1);
         for _ in 0..3 {
-            f.check().await.unwrap();
+            assert!(
+                f.check()
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("is parked")
+            );
         }
         assert_eq!(f.control.requests.lock().unwrap().len(), 2, "{field}");
         assert_eq!(f.codes(), ["claude-channel-attached"]);
@@ -616,7 +771,13 @@ async fn claude_attachment_publication_superseded_server_binding_never_retries_p
     assert_eq!(f.state.claude_attachment_episode, 1);
     assert!(f.state.claude_attachment_pending.is_none());
     for _ in 0..3 {
-        f.check().await.unwrap();
+        assert!(
+            f.check()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("is parked")
+        );
     }
     assert_eq!(f.control.requests.lock().unwrap().len(), 2);
     f.wait_ready(false).await;
@@ -637,7 +798,13 @@ async fn claude_attachment_publication_overflow_refuses_before_post() {
     assert_eq!(f.state.claude_attachment_episode, u64::MAX);
     assert!(f.state.claude_attachment_pending.is_none());
     assert!(f.control.requests.lock().unwrap().is_empty());
-    f.check().await.unwrap();
+    assert!(
+        f.check()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("is parked")
+    );
     assert!(f.control.requests.lock().unwrap().is_empty());
     f.unchanged_owner();
 }
