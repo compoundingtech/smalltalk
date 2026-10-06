@@ -25,7 +25,7 @@ when supplied. Future fields and full structured tool arguments survive; unknown
 blocks have a readable JSON view. Unknown role means unknown attribution, not omission.
 
 Start in `crates/st3/src/external_sessions.rs`; use the same normalizer for owner
-reads and follow updates. Remove deliberate visible-reasoning exclusions, image
+side-input updates, reads and follow. Remove deliberate visible-reasoning exclusions, image
 withholding and the 512-byte unknown excerpt policy. No sanitized-text payload class
 or second durable transcript is needed. Native transcript formats remain authoritative.
 
@@ -54,8 +54,21 @@ remainder recovers full arguments/output/unknown JSON; do not cut JSON into an
 apparently complete object. Oversized entries must make progress through chunks.
 File/line scan bounds and missing native history also need explicit partial notices.
 Paging cursors fence source revisions; invalidation requests resync, never silently
-skips content. Prepared pages and search indexes may be bounded volatile memory;
-validate owner/source availability at request time, and persist no conversation bytes.
+skips content. Build on #1487's versioned per-subject incremental read models, with
+native transcripts as explicit owner-local side inputs. Maintain append/revision
+folds as the source changes, and read the normalized model at request time rather
+than re-normalizing the whole file for every page. Target wakes to affected sessions;
+merged #1512 provides mailbox dependency wakes, not a completed conversation IVM.
+
+The conversation model, prepared pages and search content remain bounded volatile
+memory: #1487's proposed SQLite-backed shape cannot persist conversation bytes under
+Nathan's decision. Rebuild after restart/eviction from the native source, without a
+durable ingestion queue or second transcript. Validate owner availability and file
+identity/revision on requests; bring the fold to the captured native high-water mark
+or report explicit partial progress. Replacement/truncation invalidates its old basis.
+A model is a derived accelerator, never authority or an offline fallback. Coordinate
+this boundary with #1487's owner, avoiding a second cache implementation; prove bounded
+cold rebuild, incremental append/replace work and unchanged-read costs separately.
 
 ## Managed seats currently store content
 
@@ -103,8 +116,9 @@ any implementation touching managed storage, admission, status or the outbox.
 Normalization needs these outcomes from cos's mission:
 
 1. An exact owner/session/incarnation/native-source binding for managed reads, with
-   authorized forwarding and a source revision usable by paging, follow and chunk
-   fetches. No dependence on stored timeline operations or an outbox sequence.
+   authorized forwarding and a versioned native side input usable by #1487's
+   incremental model, paging, follow and chunk fetches. No dependence on stored
+   timeline operations or an outbox sequence.
 2. Explicit owner-unavailable and transcript-unavailable results; stale prepared pages
    cannot masquerade as current owner reads. Source replacement invalidates refs and
    cursors visibly. Search uses the same owner availability and volatile-only content.
@@ -143,7 +157,9 @@ guarantee begins after writer cutover, not on a mixed fleet's first deploy.
 ## Existing work and proof
 
 Open conversation work was inventoried on 2026-10-06. Sequence after or integrate
-the owners' work: #1323/#1351 (native semantics and chronological windows/cursors),
+the owners' work: #1487 (incremental per-subject read models; coordinate its
+conversation-content persistence boundary), merged #1512 (targeted mailbox wakes),
+#1323/#1351 (native semantics and chronological windows/cursors),
 #1349/#1348 (exact binding/revisits), #1446 (cold runtime/message lookup, currently
 parked), #1471 (volatile prepared owner pages, stacked on #1446), #1458/#1478
 (timing/outcomes), #1496/#1442/#1342 (live ask identity/actions), #1444/#1441
