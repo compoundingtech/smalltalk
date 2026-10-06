@@ -17169,6 +17169,19 @@ struct NativeLoopState {
     claude_attachment_phase: String,
     #[serde(default)]
     claude_attachment_episode: u64,
+    #[serde(default)]
+    claude_attachment_pending: Option<PendingClaudeAttachment>,
+    // Reconcile once in each image, including an older image whose last POST committed
+    // without a reply and therefore never advanced its acknowledged local phase.
+    #[serde(skip)]
+    claude_attachment_reconciled: bool,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PendingClaudeAttachment {
+    fence: st3::mailbox::Fence,
+    phase: String,
+    input: ClaimInput,
 }
 
 /// What a native driver hands its next image across `execve`.
@@ -21319,6 +21332,9 @@ async fn check_claude_attachment(
     state: &mut NativeLoopState,
 ) -> Result<()> {
     let fence = &mailbox.fence;
+    // An error does not tell us whether the server committed. Resolve the identical
+    // operation before checking a newer phase or advancing its acknowledged episode.
+    publish_pending_claude_attachment(client, subject, incarnation, fence, state).await?;
     let path = format!(
         "/v1/mailbox/attachment?subject={}&incarnation={}&component={}&epoch={}&token={}",
         urlencoding::encode(&fence.subject),
@@ -21353,7 +21369,7 @@ async fn check_claude_attachment(
     if let Some(subscription) = &mailbox.subscription {
         subscription.report(report);
     }
-    if state.claude_attachment_phase == phase {
+    if state.claude_attachment_reconciled && state.claude_attachment_phase == phase {
         return Ok(());
     }
     let code = if attached {
@@ -21361,7 +21377,7 @@ async fn check_claude_attachment(
     } else {
         "claude-channel-unattached"
     };
-    let _: ClaimRecord = client.post("/v1/claims", &ClaimInput {
+    let input = ClaimInput {
         subject: subject.into(), kind: "harness.diagnostic".into(), actor: Some(subject.into()),
         fields: BTreeMap::from([
             ("severity".into(), json!(if phase == "blocked" { "error" } else { "warning" })),
@@ -21371,10 +21387,49 @@ async fn check_claude_attachment(
             ("driver".into(), json!("claude")),
             ("incarnation_id".into(), json!(incarnation)),
         ]), evidence: Vec::new(), expected_subject: None,
-        idempotency_key: Some(format!("{code}:{subject}:{incarnation}:{}:{}:{phase}", fence.epoch, state.claude_attachment_episode)),
-    }).await?;
-    state.claude_attachment_phase = phase.into();
-    state.claude_attachment_episode += 1;
+        // A new namespace avoids reusing a predecessor image's uncertain key with
+        // a reason that may have changed since that image attempted publication.
+        idempotency_key: Some(format!("claude-attachment-publication-v2:{code}:{subject}:{incarnation}:{}:{}:{phase}", fence.epoch, state.claude_attachment_episode)),
+    };
+    state.claude_attachment_pending = Some(PendingClaudeAttachment {
+        fence: fence.clone(),
+        phase: phase.into(),
+        input,
+    });
+    publish_pending_claude_attachment(client, subject, incarnation, fence, state).await
+}
+
+async fn publish_pending_claude_attachment(
+    client: &Client,
+    subject: &str,
+    incarnation: &str,
+    fence: &st3::mailbox::Fence,
+    state: &mut NativeLoopState,
+) -> Result<()> {
+    let Some(pending) = state.claude_attachment_pending.as_ref() else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        fence.subject == subject
+            && fence.incarnation == incarnation
+            && pending.fence.subject == fence.subject
+            && pending.fence.incarnation == fence.incarnation
+            && pending.fence.component == fence.component
+            && pending.fence.epoch == fence.epoch
+            && pending.fence.token == fence.token
+            && pending.input.subject == subject
+            && pending.input.actor.as_deref() == Some(subject)
+            && pending.input.fields.get("incarnation_id").and_then(Value::as_str) == Some(incarnation),
+        "the pending Claude attachment diagnostic belongs to another mailbox binding"
+    );
+    let next_episode = state.claude_attachment_episode
+        .checked_add(1)
+        .context("the Claude attachment diagnostic episode overflowed")?;
+    let _: ClaimRecord = client.post("/v1/claims", &pending.input).await?;
+    state.claude_attachment_phase = pending.phase.clone();
+    state.claude_attachment_episode = next_episode;
+    state.claude_attachment_reconciled = true;
+    state.claude_attachment_pending = None;
     Ok(())
 }
 
@@ -22326,6 +22381,9 @@ fn unique_pairs(values: Vec<(String, String)>, kind: &str) -> Result<BTreeMap<St
     }
     Ok(output)
 }
+
+#[cfg(test)]
+mod claude_attachment_tests;
 
 #[cfg(test)]
 mod tests {
@@ -23482,6 +23540,8 @@ mod tests {
                 delivery_episode: 2,
                 claude_attachment_phase: "blocked".into(),
                 claude_attachment_episode: 3,
+                claude_attachment_pending: None,
+                claude_attachment_reconciled: false,
             },
         };
         let back: DriverResume =
