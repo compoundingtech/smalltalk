@@ -18698,6 +18698,37 @@ agent "import/omp/fixture" {{
             diagnostics[0].body["fields"]["code"],
             crate::suspension::CONTINUE_UNAVAILABLE_CODE
         );
+        // Repair restores a strict launch of the previously refused native ID.
+        // Its successful binding supersedes the old refusal rather than leaving
+        // the repaired import permanently forced into fresh conversations.
+        let repaired = managed.join(relocated.file_name().unwrap());
+        fs::rename(&relocated, &repaired).unwrap();
+        assert_eq!(
+            crate::native_resume::pi_family_argv(
+                "omp",
+                vec!["omp".into()],
+                &managed,
+                newer_id,
+                Some(&repaired),
+            )
+            .unwrap(),
+            vec!["omp", "--resume", repaired.to_str().unwrap()]
+        );
+        binding(newer_id, &repaired, Some("driver-repaired"));
+        reconciler
+            .perform_start(&subject, member, "restart after successful strict repair")
+            .unwrap();
+        let starts = runtime
+            .started_members
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let launch = starts.last().unwrap();
+        assert_eq!(launch.environment[crate::suspension::CONTINUE_ENV], newer_id);
+        assert_eq!(
+            launch.environment[crate::suspension::CONTINUE_PATH_ENV],
+            repaired.to_str().unwrap()
+        );
+        assert!(!launch.environment.contains_key(crate::suspension::RESUME_ENV));
     }
 
     #[test]

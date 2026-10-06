@@ -173,10 +173,13 @@ rollouts retain their strict selectors.
 Moving the bound transcript outside the linked inventory directory is not
 supported. The driver reports a visible `native-continue-unavailable` warning with
 status `managed-directory-foreign-link` and starts a fresh session. The refusal is
-remembered for that native ID: subsequent launches do not retry the refused
-continuation or the original import bootstrap, so relocation does not cause a
-repeated refusal loop. Supporting relocation requires an owned-inventory relink
-shared by reporting, ask recovery, suspension and rollout consumers.
+remembered for that native ID until a newer successful binding supersedes it.
+Without a newer binding, subsequent launches do not retry the refused continuation
+or the original import bootstrap, so relocation does not cause a repeated refusal
+loop. A successful strict repair can bind the same native ID again; its later
+binding restores normal continuation. Supporting relocation requires an
+owned-inventory relink shared by reporting, ask recovery, suspension and rollout
+consumers.
 
 The daemon and native driver must both support strict OMP import paths. An older
 driver with a new import declaration rejects the strict path contract; upgrade

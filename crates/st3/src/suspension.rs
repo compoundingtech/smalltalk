@@ -325,7 +325,7 @@ pub fn continue_session(
         });
     let refused = store
         .operation_claim(&continue_unavailable_key(subject, &session))?
-        .is_some();
+        .is_some_and(|refusal| refusal.store_index > bound.store_index);
     if fresh_since || refused {
         return Ok(None);
     }
