@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Agent detail reads build only the requested card; unfiltered pages apply live overlays only to returned cards.",
+  "replay": {
+    "status": "none",
+    "detail": "No replay change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No schema change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rule change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Card freshness uses its cached observed timestamp rather than additional diagnostic and local-receipt history. Unfiltered page live overlays are applied to returned cards at request time; card fields and pagination membership/order remain unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional interruption."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual action."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No recovery change."
+  }
+}
