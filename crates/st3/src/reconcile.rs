@@ -24992,7 +24992,17 @@ mission "untimed-clock" state="ready" {
 
     #[test]
     fn an_unclaimed_timed_out_round_is_redispatched_without_spending_a_round() {
+        struct TestClock;
+        impl Drop for TestClock {
+            fn drop(&mut self) {
+                smallclaims::store::set_thread_clock(None);
+            }
+        }
+        let _clock = TestClock;
+        const START: u128 = 1_800_000_000_000;
+        smallclaims::store::set_thread_clock(Some(START));
         let store = Arc::new(Store::open_memory("node").unwrap());
+        store.set_write_clock_at(START).unwrap();
         let source = r#"
 version 2
 
@@ -25030,11 +25040,32 @@ mission "unclaimed-loop" state="ready" {
         for _ in 0..6 {
             reconciler.reconcile_once().unwrap();
         }
-        std::thread::sleep(Duration::from_millis(25));
         let loop_subject = format!(
             "loop-run/{}/improve",
             run.generation.strip_prefix("run-generation/").unwrap()
         );
+        assert!(
+            store
+                .claims_for(&loop_subject, Some("loop.round-dispatch"))
+                .unwrap()
+                .is_empty(),
+            "fixed-clock setup must not redispatch a round"
+        );
+        let child_subject = store.mission_run_subject_for_idempotency_key(&format!(
+            "loop-round:{}:1",
+            run.steps[0].subject
+        ));
+        let child = store.mission_run(&child_subject).unwrap().unwrap();
+        assert_eq!(
+            child.parent_step_run.as_deref(),
+            Some(run.steps[0].subject.as_str())
+        );
+        let deadline = child.deadline_at_unix_ms.expect("the round has a timeout");
+        assert_eq!(deadline, child.created_at_unix_ms + 20);
+        // Expire this child once, independently of setup speed or child/parent ordering.
+        let expired_at = deadline + 1;
+        smallclaims::store::set_thread_clock(Some(expired_at));
+        store.set_write_clock_at(expired_at).unwrap();
         for _ in 0..12 {
             reconciler.reconcile_once().unwrap();
             if !store
