@@ -19,7 +19,7 @@ PTY = os.environ.get("PTY_BIN") or shutil.which("pty")
 if not PTY:
     raise SystemExit("pty executable is required")
 
-FIRST_FRAME = "≡ st"  # spaces' top bar
+FIRST_FRAME = "working"  # spaces' top bar: "N working" is always on it
 PALETTE = "╭─ open"  # the palette's title: open in a new tab, in place of a tab...
 
 
