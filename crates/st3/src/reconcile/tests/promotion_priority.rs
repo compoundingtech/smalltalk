@@ -125,7 +125,7 @@ mission "promotion-proof" state="ready" {{
                 ready = Some((started.elapsed(), view.steps[0].readiness_epoch));
             }
             if launched.is_none()
-                && let Some(actual) = store.latest_actual_value("agent/promotion-seat").unwrap()
+                && let Some(actual) = store.latest_actual_value("agent/node.promotion-seat").unwrap()
                 && actual_field(&actual, "status").and_then(Value::as_str) == Some("running")
                 && let Some(incarnation) = actual_field(&actual, "incarnation_id").and_then(Value::as_str)
             {
@@ -150,7 +150,7 @@ mission "promotion-proof" state="ready" {{
     });
     let (elapsed, epoch) = result.0.expect("first readiness missed its 3s bound behind a 6s backlog");
     let (launch_elapsed, incarnation) = result.1.expect("first incarnation missed its 3s bound");
-    let observed = runtime.observe_exec("promotion-seat").unwrap().unwrap();
+    let observed = runtime.observe_exec("node.promotion-seat").unwrap().unwrap();
     assert_eq!(observed.incarnation_id.as_deref(), Some(incarnation.as_str()));
     assert_eq!(epoch, 1, "promotion is one durable readiness transition");
     eprintln!(
