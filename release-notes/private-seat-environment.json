@@ -15,7 +15,7 @@
   },
   "compatibility": {
     "status": "changed",
-    "detail": "New PTY sessions persist a shell wrapper and private environment file path instead of environment assignments in argv. Manual PTY restart restores the overlay from that file, including quoted and multiline values. PTY_SESSION remains owned by PTY. Environment files are replaced on the next st launch and remain available after a scope ends for manual restart."
+    "detail": "New PTY sessions persist a shell wrapper and private environment file path instead of environment assignments in argv. PTY_SESSION remains owned by PTY. Overlays require an owned mode-0700 XDG_RUNTIME_DIR; without private runtime storage, initial launches inherit their overlay but manual restart cannot restore it, and the warning lists variable names only. No persistent-state fallback is used. Files are replaced on the next st launch, retained after natural exit only while the restart record exists, and deleted after explicit stop/kill or record removal."
   },
   "downtime": {
     "status": "none",
@@ -27,6 +27,6 @@
   },
   "recovery": {
     "status": "none",
-    "detail": "No database migration or recovery changes. Private files use mode 0600 in a mode 0700 runtime directory; removing a file prevents manual PTY restart from restoring its overlay, but a new st launch recreates it."
+    "detail": "No database migration or recovery changes. Private files use mode 0600 in a mode 0700 runtime directory. After explicit stop/kill or record removal, a new st launch recreates the overlay; an old persisted command alone cannot restore it. Missing restart records are handled idempotently so retirement also cleans overlays for already-reaped sessions."
   }
 }

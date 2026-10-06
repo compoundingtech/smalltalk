@@ -345,20 +345,7 @@ impl PtyRuntime {
             .or_insert_with(|| "xterm-256color".into());
         // Scopes inherit the launcher's environment; EnvironmentFile is a service-only
         // property. The private file also restores the overlay on manual PTY restart.
-        let runtime_directory = self
-            .command_environment
-            .as_ref()
-            .and_then(|environment| environment.get("XDG_RUNTIME_DIR"))
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from))
-            .map(|directory| directory.join("st3/seat-env"))
-            .unwrap_or_else(|| self.spawn_state_directory().join("seat-env"));
-        let identity = Sha256::digest(format!("{}:{id}", self.root.display()).as_bytes());
-        let environment_file = crate::seat_environment::write_environment(
-            &runtime_directory,
-            &format!("{identity:x}"),
-            &terminal_env,
-        )?;
+        let environment_file = self.prepare_restart_environment(id, &terminal_env);
         std::fs::write(&fence, previous_incarnation.as_deref().unwrap_or_default())
             .with_context(|| format!("write PTY publication fence {}", fence.display()))?;
         let mut effective_tags = tags.clone();
@@ -388,13 +375,15 @@ impl PtyRuntime {
             ]);
         }
         arguments.push(OsString::from("--"));
-        arguments.extend([
-            OsString::from("sh"),
-            OsString::from("-c"),
-            OsString::from(crate::seat_environment::RESTORE_ENVIRONMENT),
-            OsString::from("st seat"),
-            environment_file.into_os_string(),
-        ]);
+        if let Some(environment_file) = environment_file {
+            arguments.extend([
+                OsString::from("sh"),
+                OsString::from("-c"),
+                OsString::from(crate::seat_environment::RESTORE_ENVIRONMENT),
+                OsString::from("st seat"),
+                environment_file.into_os_string(),
+            ]);
+        }
         arguments.extend(crate::work_prefix().into_iter().map(OsString::from));
         match launch {
             Launch::Shell(source) => {
@@ -544,11 +533,64 @@ impl PtyRuntime {
         }
     }
 
+    fn environment_directory(&self) -> Result<Option<PathBuf>> {
+        let runtime = match &self.command_environment {
+            Some(environment) => environment.get("XDG_RUNTIME_DIR").map(PathBuf::from),
+            None => std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
+        };
+        crate::seat_environment::runtime_directory(runtime.as_deref())
+    }
+
+    fn environment_identity(&self, id: &str) -> String {
+        let identity = Sha256::digest(format!("{}:{id}", self.root.display()).as_bytes());
+        format!("{identity:x}")
+    }
+
+    fn environment_path(&self, id: &str) -> Result<Option<PathBuf>> {
+        Ok(self.environment_directory()?.map(|directory| {
+            directory.join(format!("{}.env", self.environment_identity(id)))
+        }))
+    }
+
+    fn prepare_restart_environment(
+        &self,
+        id: &str,
+        environment: &BTreeMap<String, String>,
+    ) -> Option<PathBuf> {
+        if let Ok(Some(directory)) = self.environment_directory()
+            && let Ok(path) = crate::seat_environment::write_environment(
+                &directory,
+                &self.environment_identity(id),
+                environment,
+            )
+        {
+            return Some(path);
+        }
+        // Never include values or errors that could contain file contents in this warning.
+        eprintln!(
+            "st3: WARN {}",
+            crate::seat_environment::RestartOverlayUnavailable(environment)
+        );
+        None
+    }
+
+    fn remove_restart_environment(&self, id: &str) -> Result<()> {
+        let Some(path) = self.environment_path(id)? else {
+            return Ok(());
+        };
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).context("remove private seat environment"),
+        }
+    }
+
     pub fn stop(&self, id: &str) -> Result<()> {
         self.stop_if(id, None)
     }
 
     pub fn stop_if(&self, id: &str, expected_incarnation: Option<&str>) -> Result<()> {
+        let _spawn_lock = self.acquire_spawn_lock(id)?;
         let session = self.require_incarnation(id, expected_incarnation)?;
         // Fence the stop on the generation this read saw as well, so a replacement published
         // after the incarnation check is never stopped in its place.
@@ -571,7 +613,7 @@ impl PtyRuntime {
             crate::end_scope(unit, crate::SCOPE_GRACE)?;
         }
         if stopped.verified_empty() {
-            return Ok(());
+            return self.remove_restart_environment(id);
         }
         let running = |pids: &[i32]| {
             pids.iter()
@@ -587,7 +629,7 @@ impl PtyRuntime {
             "stop PTY failed: the daemon stopped, but processes {survived:?} survived, \
              {escalated:?} survived SIGKILL to their group, and {unknown:?} could not be checked",
         );
-        Ok(())
+        self.remove_restart_environment(id)
     }
 
     pub fn kill(&self, id: &str) -> Result<()> {
@@ -595,6 +637,7 @@ impl PtyRuntime {
     }
 
     pub fn kill_if(&self, id: &str, expected_incarnation: Option<&str>) -> Result<()> {
+        let _spawn_lock = self.acquire_spawn_lock(id)?;
         let session = self.require_incarnation(id, expected_incarnation)?;
         // Everything else the harness started ends with it, but the server leaves the work scope
         // first: it outlives the harness to record the exit.
@@ -609,7 +652,7 @@ impl PtyRuntime {
         if let Some(unit) = unit {
             crate::end_scope(unit, Duration::ZERO)?;
         }
-        Ok(())
+        self.remove_restart_environment(id)
     }
 
     pub fn signal_if(
@@ -707,13 +750,19 @@ impl PtyRuntime {
         {
             return Ok(());
         }
-        self.end_previous_scopes(id, session.as_ref())
+        self.end_previous_scopes(id, session.as_ref())?;
+        if session.is_none() {
+            self.remove_restart_environment(id)?;
+        }
+        Ok(())
     }
 
     /// [`Self::end_leftovers`] on a background worker, when the last launch of `id` left a scope
     /// to end. Otherwise it costs one file lookup.
     pub fn end_leftovers_later(&self, id: &str) {
-        if !self.spawn_state_path(id, "scope").is_file() {
+        if !self.spawn_state_path(id, "scope").is_file()
+            && !self.environment_path(id).ok().flatten().is_some_and(|path| path.is_file())
+        {
             return;
         }
         let (runtime, id) = (self.clone(), id.to_owned());
@@ -769,10 +818,20 @@ impl PtyRuntime {
     }
 
     pub fn remove(&self, id: &str) -> Result<()> {
+        let _spawn_lock = self.acquire_spawn_lock(id)?;
         // The record is the last place that names the session's work scope.
-        self.end_leftovers(id)?;
-        pty_client::remove_in(&self.root, id)
-            .map_err(|error| anyhow::anyhow!("remove PTY failed: {error}"))
+        let session = self.snapshot()?.into_iter().find(|session| session.name == id);
+        if !session.as_ref().is_some_and(|session| {
+            matches!(session.status.as_str(), "running" | "unknown")
+        }) {
+            self.end_previous_scopes(id, session.as_ref())?;
+        }
+        match pty_client::remove_in(&self.root, id) {
+            Ok(()) | Err(pty_client::RemoveError::NotFound { .. }) => {
+                self.remove_restart_environment(id)
+            }
+            Err(error) => Err(anyhow::anyhow!("remove PTY failed: {error}")),
+        }
     }
 
     pub fn attach(&self, id: &str) -> Result<()> {
@@ -1521,6 +1580,57 @@ exit 0
     }
 
     #[test]
+    fn unavailable_runtime_environment_never_uses_persistent_state_storage() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("persistent-state/registry");
+        let runtime = PtyRuntime::new(state).with_environment(BTreeMap::new());
+        let environment = BTreeMap::from([("VARIABLE_NAME".into(), "synthetic-sensitive-value".into())]);
+        assert!(runtime.prepare_restart_environment("work", &environment).is_none());
+        assert!(!runtime.spawn_state_directory().join("seat-env").exists());
+        assert!(!root.path().join("st3/seat-env").exists());
+
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let runtime = runtime.with_environment(BTreeMap::from([
+            ("XDG_RUNTIME_DIR".into(), root.path().display().to_string()),
+        ]));
+        assert!(runtime.prepare_restart_environment("work", &environment).is_none());
+        assert!(!runtime.spawn_state_directory().join("seat-env").exists());
+        assert!(!root.path().join("st3/seat-env").exists());
+    }
+
+    #[test]
+    fn removing_a_missing_restart_record_also_deletes_its_environment() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = PtyRuntime::new(root.path().join("registry")).with_environment(BTreeMap::from([
+            ("XDG_RUNTIME_DIR".into(), root.path().display().to_string()),
+        ]));
+        let path = runtime.prepare_restart_environment("work", &BTreeMap::from([
+            ("VARIABLE_NAME".into(), "synthetic-sensitive-value".into()),
+        ])).unwrap();
+        runtime.remove("work").unwrap();
+        assert!(!path.exists());
+        runtime.remove("work").unwrap();
+    }
+
+    #[test]
+    fn refusing_to_remove_a_live_restart_record_retains_its_environment() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = root.path().join("registry");
+        let runtime = PtyRuntime::new(registry.clone()).with_environment(BTreeMap::from([
+            ("XDG_RUNTIME_DIR".into(), root.path().display().to_string()),
+        ]));
+        let path = runtime.prepare_restart_environment("work", &BTreeMap::from([
+            ("VARIABLE_NAME".into(), "synthetic-sensitive-value".into()),
+        ])).unwrap();
+        write_record(&registry, "work", serde_json::json!({"createdAt":"now"}));
+        write_pid(&registry, "work", std::process::id());
+        fs::write(registry.join("work.sock"), "").unwrap();
+        assert!(runtime.remove("work").is_err());
+        assert!(path.is_file());
+    }
+
+    #[test]
     fn spawn_starts_the_session_at_the_requested_size_or_at_pty_default() {
         let launched_arguments = |name: &str, size: Option<TerminalSize>| {
             let root = tempfile::tempdir().unwrap();
@@ -2024,34 +2134,40 @@ exit 0
     }
 
     #[test]
-    fn stopping_a_session_ends_what_its_harness_left_running() {
+    fn stopping_a_session_clears_its_environment_and_ends_what_its_harness_left_running() {
         let Some(pty) = scoped_pty() else {
             eprintln!("skipped: no systemd user scopes or no pty binary");
             return;
         };
         let session = Started::orphaning(&pty, "tree-stop", "exec sleep 600", &[]);
+        let environment_file = session.runtime.environment_path(&session.id).unwrap().unwrap();
+        assert!(environment_file.is_file());
 
         session
             .runtime
             .stop_if(&session.id, Some(&session.incarnation()))
             .unwrap();
+        assert!(!environment_file.exists());
 
         assert_gone_soon(session.harness, "harness");
         assert_gone_soon(session.orphan, "the harness's background process");
     }
 
     #[test]
-    fn killing_a_session_ends_what_its_harness_left_running() {
+    fn killing_a_session_clears_its_environment_and_ends_what_its_harness_left_running() {
         let Some(pty) = scoped_pty() else {
             eprintln!("skipped: no systemd user scopes or no pty binary");
             return;
         };
         let session = Started::orphaning(&pty, "tree-kill", "exec sleep 600", &[]);
+        let environment_file = session.runtime.environment_path(&session.id).unwrap().unwrap();
+        assert!(environment_file.is_file());
 
         session
             .runtime
             .kill_if(&session.id, Some(&session.incarnation()))
             .unwrap();
+        assert!(!environment_file.exists());
 
         assert_gone_soon(session.harness, "harness");
         assert_gone_soon(session.orphan, "the harness's background process");
@@ -2059,30 +2175,43 @@ exit 0
     }
 
     #[test]
-    fn an_ended_session_ends_what_its_harness_left_running() {
+    fn an_ended_session_clears_its_environment_when_its_restart_record_is_gone() {
         let Some(pty) = scoped_pty() else {
             eprintln!("skipped: no systemd user scopes or no pty binary");
             return;
         };
         let session = Started::orphaning(&pty, "tree-ended", "exit 0", &[]);
         session.wait_until_ended();
+        let environment_file = session.runtime.environment_path(&session.id).unwrap().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while session.observe().is_some() {
+            assert!(Instant::now() < deadline, "the non-retained restart record did not disappear");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(environment_file.is_file());
 
         // The reconciler asks this on each pass in which a stopped runtime is not running.
         session.runtime.end_leftovers_later(&session.id);
 
         assert_gone_soon(session.orphan, "the ended harness's background process");
+        // Running the same cleanup synchronously makes the overlay assertion deterministic.
+        session.runtime.end_leftovers(&session.id).unwrap();
+        assert!(!environment_file.exists());
     }
 
     #[test]
-    fn removing_an_ended_session_ends_what_its_harness_left_running() {
+    fn removing_an_ended_session_clears_its_environment_and_ends_what_its_harness_left_running() {
         let Some(pty) = scoped_pty() else {
             eprintln!("skipped: no systemd user scopes or no pty binary");
             return;
         };
         let session = Started::orphaning(&pty, "tree-remove", "exit 0", &[("keep", "true")]);
         session.wait_until_ended();
+        let environment_file = session.runtime.environment_path(&session.id).unwrap().unwrap();
+        assert!(environment_file.is_file(), "restart overlay is retained with its restart record");
 
         session.runtime.remove(&session.id).unwrap();
+        assert!(!environment_file.exists());
 
         assert_gone_soon(session.orphan, "the ended harness's background process");
     }

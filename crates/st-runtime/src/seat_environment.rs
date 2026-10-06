@@ -14,6 +14,43 @@ static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 // The PTY persists this wrapper, not the environment values, for manual restart.
 pub(crate) const RESTORE_ENVIRONMENT: &str = ". \"$1\" || exit; shift; exec \"$@\"";
 
+pub(crate) struct RestartOverlayUnavailable<'a>(pub(crate) &'a BTreeMap<String, String>);
+
+impl std::fmt::Display for RestartOverlayUnavailable<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "private runtime environment storage unavailable; PTY restart overlay \
+             disabled for variable names {:?}",
+            self.0.keys()
+        )
+    }
+}
+
+/// Only user-private runtime storage may hold restart overlays. Never use state or cache.
+pub(crate) fn runtime_directory(runtime: Option<&Path>) -> Result<Option<PathBuf>> {
+    let Some(runtime) = runtime else {
+        return Ok(None);
+    };
+    let metadata = std::fs::symlink_metadata(runtime)
+        .context("read user runtime directory")?;
+    anyhow::ensure!(
+        metadata.is_dir() && metadata.mode() & 0o7777 == 0o700
+            && metadata.uid() == unsafe { libc::geteuid() },
+        "user runtime directory must be owned by this user with mode 0700"
+    );
+    let product = runtime.join("st3");
+    match std::fs::symlink_metadata(&product) {
+        Ok(metadata) => anyhow::ensure!(
+            metadata.is_dir() && metadata.uid() == unsafe { libc::geteuid() },
+            "runtime product directory must be a directory owned by this user"
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("read runtime product directory"),
+    }
+    Ok(Some(product.join("seat-env")))
+}
+
 /// Replace a seat's overlay on its next launch; retain it while PTY can restart the seat.
 /// `identity` is a digest, never a path supplied by the seat.
 pub(crate) fn write_environment(
@@ -126,5 +163,32 @@ mod tests {
             ("KEY; touch injected".into(), "unused".into()),
         ])).is_err());
         assert_eq!(std::fs::read_dir(directory).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn runtime_environment_requires_private_owned_storage_without_symlinks() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(runtime_directory(None).unwrap(), None);
+        assert!(runtime_directory(Some(&root.path().join("missing"))).is_err());
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(runtime_directory(Some(root.path())).is_err());
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(runtime_directory(Some(root.path())).unwrap(), Some(root.path().join("st3/seat-env")));
+        let link = root.path().join("linked-runtime");
+        symlink(root.path(), &link).unwrap();
+        assert!(runtime_directory(Some(&link)).is_err());
+        let persistent = tempfile::tempdir().unwrap();
+        symlink(persistent.path(), root.path().join("st3")).unwrap();
+        assert!(runtime_directory(Some(root.path())).is_err());
+        assert_eq!(std::fs::read_dir(persistent.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn unavailable_environment_warning_names_variables_without_values() {
+        let environment = BTreeMap::from([("VARIABLE_NAME".into(), "synthetic-sensitive-value".into())]);
+        let warning = RestartOverlayUnavailable(&environment).to_string();
+        assert!(warning.contains("VARIABLE_NAME"));
+        assert!(!warning.contains("synthetic-sensitive-value"));
     }
 }
