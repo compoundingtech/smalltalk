@@ -694,7 +694,7 @@ The v0 action discriminators are:
 | Lanes | `lane.join`, `lane.leave`, `lane.move`, `lane.mark`, `lane.approve` | snapshot; the lane must be open and a named entry or anchor must be in it |
 | Runtimes | `runtime.stop`, `runtime.restart`, `runtime.reset`, `runtime.context-clear`, `runtime.signal` | runtime incarnation; stop, restart, and reset also require `runtime_desired_revision` from the runtime resource |
 | Agent desired state | `agent.stop`, `agent.start` | snapshot and `runtime_desired_revision`, the agent's selected desired claim ID; no runtime incarnation required |
-| Terminals | `terminal.input`, `terminal.resize`, `terminal.attach`, `terminal.detach` | runtime incarnation; input and resize also require the screen sequence |
+| Terminals | `terminal.input`, `terminal.resize`, `terminal.attach`, `terminal.detach` | runtime incarnation; resize and a line of input (`mode` `line`) also require the screen sequence; raw and key input do not |
 | Pairing | `pairing.begin`, `pairing.complete`, `pairing.revoke` | pairing/device revision where applicable |
 
 `runtime.stop` publishes a stop for the selected member. `runtime.restart` terminates the current
@@ -927,7 +927,13 @@ client needs to encode keys and pastes (`alternate_screen`, `application_cursor`
 line per row, and `next_sequence`, an opaque numeric screen fence for input and resize. Compare
 it for equality; it is not a graph index or an ordered event counter. Unrelated graph writes do
 not change it. A terminal action may use an older snapshot from the same host, while incarnation
-and explicit revision fences still apply. Attach/detach do not require a screen sequence fence.
+and explicit revision fences still apply. Attach/detach do not require a screen sequence fence, and
+neither does `terminal.input` in `raw` or `key` mode: keys a person types cannot be made unsafe by a
+screen they did not see, and a program that redraws itself (a spinner) moves the sequence between
+any read and any send, so a client that must match it can never type. A client may send such input
+with no `terminal_sequence`; one that still sends it is not checked against it. A daemon older than
+this refuses such input with "terminal control requires a sequence fence", and the client then reads
+the screen and sends its sequence as before.
 `revision` digests the rest of
 the screen: equal revisions mean equal screens, and a stream never sends the same revision twice.
 The optional `kitty_keyboard` mode carries the active Kitty keyboard enhancement bitmask.

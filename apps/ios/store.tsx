@@ -11,7 +11,7 @@ import { REPAIR_WARNING, validatePairingTrust, verifyPairing } from './pairingPr
 import { emptyData, encodeProjectionCache, hydrateProjectionForPairedDevice, PROJECTION_CACHE_KEY, type Data } from './projectionCache';
 import { listCollectionPages } from './collectionPages';
 import { rememberBounded } from './boundedCache';
-import { withFreshTerminalFence } from './terminalControls';
+import { wantsScreenSequence, withFreshTerminalFence, type TerminalFence } from './terminalControls';
 import { Feed } from './feed';
 import { ForegroundGate } from './foreground';
 import type { FabricProfile } from './fabricProof';
@@ -79,6 +79,8 @@ function actionId() { return `action/ios-${Crypto.randomUUID()}`; }
 
 function useAppStore(proof?: FabricProfile) {
   const proofRef = useRef(proof); proofRef.current = proof;
+  /** The snapshot the windows last showed: a terminal key may be fenced by it, since any earlier one of this host is accepted. */
+  const lastSnapshot = useRef('');
   const [order, setOrder] = useState<Tab[]>(tabOrder(null));
   const [url, setUrl] = useState(proof?.url ?? ''), [urlDraft, setUrlDraft] = useState('');
   const [credential, setCredential] = useState<string | null>(proof?.credential ?? null);
@@ -167,6 +169,7 @@ function useAppStore(proof?: FabricProfile) {
     const opened = new Feed(client, {
       onWindow: (name, rows, hasMore, at) => {
         if (!current()) return;
+        if (at?.id) lastSnapshot.current = at.id;
         // Home decides what of attention to show, as stui does; agents drop only history.
         const shown = name === 'agents' ? (rows as Array<{ operational?: { layer?: string } }>).filter(currentAgent) : rows;
         setData(previous => ({ ...previous, [name]: shown }));
@@ -464,6 +467,18 @@ function useAppStore(proof?: FabricProfile) {
     /** Each input takes a fresh terminal fence and refuses a changed runtime incarnation. */
     async terminalInput(terminalId: string, incarnation: string, mode: 'line' | 'key' | 'raw', value: string) {
       if (!client) throw new Error('not connected');
+      // Typed keys need no screen fence, and an agent's spinner moves the screen faster than a read
+      // and a send can race it (Nathan, 2026-10-06: nothing typed ever arrived). So one request,
+      // on the snapshot the windows last showed (any earlier one of this host is accepted), fenced
+      // by the incarnation only. An st that still asks for the screen's sequence says so, and the
+      // old way is used.
+      if ((mode === 'raw' || mode === 'key') && lastSnapshot.current) {
+        const id = actionId();
+        try {
+          await client.terminalInput({ id, idempotency_key: id, fence: { snapshot_id: lastSnapshot.current, subject_revisions: {}, runtime_incarnation: incarnation } as TerminalFence, parameters: { terminal_id: terminalId, mode, value } });
+          return;
+        } catch (error) { if (!wantsScreenSequence(error)) throw error; }
+      }
       await withFreshTerminalFence(client, terminalId, incarnation, terminalFence => {
         const id = actionId();
         return client.terminalInput({ id, idempotency_key: id, fence: terminalFence, parameters: { terminal_id: terminalId, mode, value } });
