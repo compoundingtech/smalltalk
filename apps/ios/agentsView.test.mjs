@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { agentModel, compactFolders, agentName, agentRows, agentSections, agentState, agentTreeLines, filterAgentRows, UNMANAGED_GROUP } from './agentsView.ts';
+import { agentModel, compactFolders, agentName, agentRows, agentSections, agentState, agentTreeLines, filterAgentRows, stepProgress, UNMANAGED_GROUP } from './agentsView.ts';
 
 const now = Date.parse('2026-09-30T12:00:00Z');
 const agent = (id, extra = {}) => ({ id: `agent/${id}`, name: id, kind: 'agent', updated_at: '2026-09-30T11:00:00Z', state: 'running', harness_state: 'idle', driver: 'claude', runtime_ids: [], reachability: 'local', ...extra });
@@ -92,3 +92,15 @@ assert.equal(stateOf({ state: 'waiting', harness_state: 'indeterminate', observa
 // st's additive harness_error_state names a login outright, even when the harness state is stale.
 assert.equal(stateOf({ state: 'waiting', harness_state: 'indeterminate', observation: 'stale', reachability: 'reachable', harness_error_state: 'needs-login', fault: null, delivery: null }), 'needs-login');
 assert.equal(stateOf({ state: 'waiting', harness_state: 'indeterminate', observation: 'stale', reachability: 'reachable', harness_error_state: null, fault: null, delivery: null }), 'idle');
+
+// A seat's status is what the step it holds last reported, on one line (Nathan, 2026-10-06).
+const missions = [{ id: 'mission/example/build', run_details: [{ steps: [
+  { id: 'step-run/example/one', last_progress: '  Tests pass on\nmain; opening the PR \n' },
+  { id: 'step-run/example/quiet', last_progress: null },
+] }] }];
+assert.equal(stepProgress(missions, 'step-run/example/one'), 'Tests pass on main; opening the PR');
+assert.equal(stepProgress(missions, 'step-run/example/quiet'), undefined);
+assert.equal(stepProgress(missions, 'step-run/example/unknown'), undefined);
+const working = { ...agents[0], id: 'agent/example/doer', current_work: [{ id: 'step-run/example/one', mission_id: 'mission/example/build', path: 'build' }] };
+assert.equal(agentRows([working], [], 'example-linux', now, missions)[0].progress, 'Tests pass on main; opening the PR');
+assert.equal(agentRows([working], [], 'example-linux', now)[0].progress, undefined);

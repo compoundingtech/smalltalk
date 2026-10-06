@@ -1418,10 +1418,17 @@ pub fn agents_list(world: &World, spinner: &'static str, width: usize) -> Listin
                 ),
                 span(format!(" {:>4}", agent.activity), theme::dim()),
             ],
-            second: vec![span(
-                format!("   {}", text::truncate(path, width.saturating_sub(4))),
-                theme::dim(),
-            )],
+            // What its step last reported leads; the path says who it is when nothing was said.
+            second: match &agent.details.progress {
+                Some(progress) => vec![span(
+                    format!("   {}", text::truncate(progress, width.saturating_sub(4))),
+                    theme::soft(),
+                )],
+                None => vec![span(
+                    format!("   {}", text::truncate(path, width.saturating_sub(4))),
+                    theme::dim(),
+                )],
+            },
             children: subagent_lines(agent, "   ", width),
         });
         ids.push(agent.id.clone());
@@ -1516,6 +1523,15 @@ pub fn agent_header(world: &World, agent: &Agent, width: usize, spinner: &'stati
             None,
         ));
     }
+    if let Some(progress) = &agent.details.progress {
+        doc.lines(text::wrap(
+            &text::inline(progress, theme::text()),
+            width,
+            &[text::run("   ", theme::dim())],
+            &[text::run("   ", theme::dim())],
+            None,
+        ));
+    }
     if let (Some(mission), Some(step)) = (&agent.mission, &agent.step) {
         let title = world
             .missions
@@ -1562,7 +1578,18 @@ fn failed_before_today(mission: &Mission) -> bool {
         })
 }
 
-pub fn missions_list(world: &World, spinner: &'static str, system: bool) -> Listing {
+/// What a step in hand last reported, on one line: the status of a run in progress.
+fn mission_progress(mission: &Mission) -> Option<String> {
+    mission
+        .steps
+        .iter()
+        .filter(|step| step.state == StepState::Working)
+        .find_map(|step| mission.step_metadata.get(&step.id)?.last_progress.as_deref())
+        .map(|progress| progress.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|progress| !progress.is_empty())
+}
+
+pub fn missions_list(world: &World, width: usize, spinner: &'static str, system: bool) -> Listing {
     let mut items = Vec::new();
     let mut ids = Vec::new();
     let missions = mission_order(world, system);
@@ -1602,14 +1629,21 @@ pub fn missions_list(world: &World, spinner: &'static str, system: bool) -> List
                 span(mission.title.clone(), theme::bold()),
             ],
             right,
-            second: vec![span(
-                format!(
-                    "   {} · {}",
-                    mission.id.trim_start_matches("mission/"),
-                    mission.age
-                ),
-                theme::dim(),
-            )],
+            // A run in progress says what its step last reported before where it lives.
+            second: match mission_progress(mission) {
+                Some(progress) => vec![span(
+                    format!("   {}", text::truncate(&progress, width.saturating_sub(4))),
+                    theme::soft(),
+                )],
+                None => vec![span(
+                    format!(
+                        "   {} · {}",
+                        mission.id.trim_start_matches("mission/"),
+                        mission.age
+                    ),
+                    theme::dim(),
+                )],
+            },
             children: Vec::new(),
         });
         ids.push(mission.id.clone());
@@ -1804,6 +1838,21 @@ pub fn mission_detail(
         if let Some(note) = &step.note {
             steps.lines(text::wrap(
                 &text::inline(note, theme::dim()),
+                inner,
+                &[run("      ", theme::dim())],
+                &[run("      ", theme::dim())],
+                None,
+            ));
+        }
+        // A step in hand says what it last reported, the status a person reads first.
+        if step.state == StepState::Working
+            && let Some(progress) = mission
+                .step_metadata
+                .get(&step.id)
+                .and_then(|metadata| metadata.last_progress.as_deref())
+        {
+            steps.lines(text::wrap(
+                &text::inline(progress, theme::text()),
                 inner,
                 &[run("      ", theme::dim())],
                 &[run("      ", theme::dim())],
@@ -2540,6 +2589,9 @@ pub fn peek(world: &World, subject: &str, width: usize, spinner: &'static str) -
         if let Some(tree) = &agent.worktree {
             doc.field("worktree", tree, width, theme::soft());
         }
+        if let Some(progress) = &agent.details.progress {
+            doc.field("now", progress, width, theme::text());
+        }
         if let (Some(mission), Some(step)) = (&agent.mission, &agent.step) {
             let title = world
                 .missions
@@ -2689,6 +2741,16 @@ pub fn agent_details(world: &World, agent: &Agent, width: usize, spinner: &'stat
         doc.blank();
     }
     doc.section("now", None, width);
+    // What its step last reported is the status; the step and its goal say where it comes from.
+    if let Some(progress) = &details.progress {
+        doc.lines(text::wrap(
+            &text::inline(progress, theme::bold()),
+            width,
+            &[],
+            &[],
+            None,
+        ));
+    }
     match (&agent.mission, &agent.step) {
         (Some(mission), Some(step)) => {
             let title = world
@@ -2963,7 +3025,7 @@ pub fn missions_tree(world: &World, spinner: &'static str, system: bool) -> List
         state_of(&world.missions, "Loading missions…", "No missions yet."),
         vec![],
     );
-    listing.legend = missions_list(world, spinner, system).legend;
+    listing.legend = missions_list(world, 40, spinner, system).legend;
     listing
 }
 

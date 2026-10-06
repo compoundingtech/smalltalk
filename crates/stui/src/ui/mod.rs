@@ -974,7 +974,7 @@ impl Ui {
             1 if self.tree => screens::agents_tree(&self.world, self.spinner(), width),
             1 => screens::agents_list(&self.world, self.spinner(), width),
             2 if self.tree => screens::missions_tree(&self.world, self.spinner(), self.system),
-            2 => screens::missions_list(&self.world, self.spinner(), self.system),
+            2 => screens::missions_list(&self.world, width, self.spinner(), self.system),
             3 => screens::fleet_list(&self.world),
             4 => usage::list(&self.world, self.usage_by, self.usage_hours),
             _ => screens::worktrees_list(&self.world),
@@ -5611,7 +5611,7 @@ mod tests {
             missions.push(today);
             missions.push(failed);
         }
-        let shown = screens::missions_list(&world, "⠋", false);
+        let shown = screens::missions_list(&world, 40, "⠋", false);
         assert!(shown.ids.iter().any(|id| id == "mission/example/failed-today"));
         assert!(!shown.ids.iter().any(|id| id == "mission/example/failed-yesterday"));
         let note = shown
@@ -5624,7 +5624,7 @@ mod tests {
             .unwrap_or_default();
         assert!(note.contains("1 failed before today"), "{note}");
         // x shows it again.
-        let all = screens::missions_list(&world, "⠋", true);
+        let all = screens::missions_list(&world, 40, "⠋", true);
         assert!(all.ids.iter().any(|id| id == "mission/example/failed-yesterday"));
     }
 
@@ -6622,6 +6622,47 @@ mod tests {
         ui.set_world(world);
         let item = ui.world.attention.items()[3].clone();
         assert_eq!(ui.chat_target(&item).unwrap().0, "agent/example/cos");
+    }
+
+    #[test]
+    fn what_a_seats_step_last_reported_leads_in_the_sidebar_and_on_its_card() {
+        let mut world = demo::world();
+        if let Load::Ready(agents) = &mut world.agents {
+            agents[0].details.progress = Some("Cut over 2 of 3 stores; waiting on the signer".into());
+        }
+        let mut ui = Ui::new(world);
+        ui.switch_tab(1);
+        let screen = frame(&ui, 150, 40).join("\n");
+        assert!(screen.contains("Cut over 2 of 3 stores"), "{screen}");
+        // The details pane says it whole, above the step it comes from.
+        let whole = screen.replace('\n', " ");
+        assert!(whole.contains("Cut over 2 of 3 stores; waiting on"), "{whole}");
+        // A run in progress says what its step last reported on its row in Missions.
+        let mut world = demo::world();
+        if let Load::Ready(missions) = &mut world.missions {
+            let mission = missions
+                .iter_mut()
+                .find(|mission| mission.steps.iter().any(|step| step.state == StepState::Working))
+                .unwrap();
+            let id = mission
+                .steps
+                .iter()
+                .find(|step| step.state == StepState::Working)
+                .unwrap()
+                .id
+                .clone();
+            mission.step_metadata.insert(
+                id,
+                st3_ui_model::missions::StepMetadata {
+                    blocked_reason: None,
+                    last_progress: Some("Tests pass; opening the PR".into()),
+                },
+            );
+        }
+        let mut ui = Ui::new(world);
+        ui.switch_tab(2);
+        let listed = frame(&ui, 150, 40).join("\n");
+        assert!(listed.contains("Tests pass; opening the PR"), "{listed}");
     }
 
     #[test]

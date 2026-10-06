@@ -142,7 +142,7 @@ pub fn world(model: &Model, person: &str, extras: &Extras) -> World {
         link,
         diverged,
         attention: loaded(model.now.snapshot.is_some(), attention),
-        agents: loaded(model.agents.snapshot.is_some(), agents(model)),
+        agents: loaded(model.agents.snapshot.is_some(), agents(model, &missions)),
         missions: loaded(model.missions.snapshot.is_some(), missions),
         machines: loaded(model.machines.snapshot.is_some(), machines(model)),
         worktrees: Load::Ready(super::demo::world().worktrees.items().to_vec()),
@@ -553,7 +553,21 @@ fn harness(driver: Option<&str>) -> Harness {
     }
 }
 
-fn agents(model: &Model) -> Vec<Agent> {
+/// What a step last reported, on one line. A step run's ID names it in whichever mission holds it.
+fn step_progress(missions: &[Mission], step: &str) -> Option<String> {
+    let reported = missions
+        .iter()
+        .find_map(|mission| mission.step_metadata.get(step))?
+        .last_progress
+        .as_deref()?;
+    let line = clean_message_text(reported)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!line.is_empty()).then_some(line)
+}
+
+fn agents(model: &Model, missions: &[Mission]) -> Vec<Agent> {
     let mut agents = model
         .agents()
         .map(|agent| {
@@ -627,6 +641,7 @@ fn agents(model: &Model) -> Vec<Agent> {
                     .first()
                     .map(|relation| relation.agent_id.clone()),
                 details: AgentDetails {
+                    progress: work.and_then(|work| step_progress(missions, &work.id)),
                     goal: work.and_then(|work| work.goal.as_deref().map(clean_message_text)),
                     claimed: work.map(|work| format!("{} ago", age(&work.since))),
                     next: agent
@@ -1609,6 +1624,29 @@ mod tests {
     }
 
     #[test]
+    fn a_seats_status_is_what_its_step_last_reported_on_one_line() {
+        let mut mission = crate::ui::demo::world().missions.items()[0].clone();
+        mission.step_metadata.insert(
+            "step-run/example/build".into(),
+            st3_ui_model::missions::StepMetadata {
+                blocked_reason: None,
+                last_progress: Some("  Tests pass on\nmain; opening the PR \n".into()),
+            },
+        );
+        mission.step_metadata.insert(
+            "step-run/example/quiet".into(),
+            st3_ui_model::missions::StepMetadata::default(),
+        );
+        let missions = [mission];
+        assert_eq!(
+            step_progress(&missions, "step-run/example/build").as_deref(),
+            Some("Tests pass on main; opening the PR")
+        );
+        assert_eq!(step_progress(&missions, "step-run/example/quiet"), None);
+        assert_eq!(step_progress(&missions, "step-run/example/unknown"), None);
+    }
+
+    #[test]
     fn a_waiting_human_ask_needs_you_even_while_the_harness_activity_is_working() {
         let mut model = Model::default();
         let resource = |state: &str, activity: &str, blocked_on: Option<&str>| {
@@ -1620,13 +1658,13 @@ mod tests {
             })
         };
         model.agents = window(vec![resource("waiting", "working", Some("human"))]);
-        assert_eq!(agents(&model)[0].state, AgentState::NeedsYou);
+        assert_eq!(agents(&model, &[])[0].state, AgentState::NeedsYou);
         model.agents = window(vec![resource("running", "working", None)]);
-        assert_eq!(agents(&model)[0].state, AgentState::Working);
+        assert_eq!(agents(&model, &[])[0].state, AgentState::Working);
         model.agents = window(vec![resource("failed", "working", Some("human"))]);
-        assert_eq!(agents(&model)[0].state, AgentState::Fault);
+        assert_eq!(agents(&model, &[])[0].state, AgentState::Fault);
         model.agents = window(vec![resource("waiting", "indeterminate", Some("human"))]);
-        assert_eq!(agents(&model)[0].state, AgentState::Starting);
+        assert_eq!(agents(&model, &[])[0].state, AgentState::Starting);
     }
 
     #[test]
@@ -1642,17 +1680,17 @@ mod tests {
         };
         // Its idle claim went stale: st says waiting/indeterminate; the seat is just idle.
         model.agents = window(vec![resource("waiting", "indeterminate", Some("stale"))]);
-        assert_eq!(agents(&model)[0].state, AgentState::Idle);
+        assert_eq!(agents(&model, &[])[0].state, AgentState::Idle);
         // Without that staleness, an indeterminate waiting seat is still starting.
         model.agents = window(vec![resource("waiting", "indeterminate", Some("current"))]);
-        assert_eq!(agents(&model)[0].state, AgentState::Starting);
+        assert_eq!(agents(&model, &[])[0].state, AgentState::Starting);
         model.agents = window(vec![resource("waiting", "indeterminate", None)]);
-        assert_eq!(agents(&model)[0].state, AgentState::Starting);
+        assert_eq!(agents(&model, &[])[0].state, AgentState::Starting);
         // A stale observation on an unreachable seat is no news that it is idle.
         let mut gone = resource("waiting", "indeterminate", Some("stale"));
         gone["reachability"] = "unreachable".into();
         model.agents = window(vec![gone]);
-        assert_eq!(agents(&model)[0].state, AgentState::Starting);
+        assert_eq!(agents(&model, &[])[0].state, AgentState::Starting);
     }
 
     #[test]
@@ -1669,15 +1707,15 @@ mod tests {
         };
         // st's own word for it (st-drivers' needs-login) reads the same.
         model.agents = window(vec![resource("waiting", "needs-login", None)]);
-        assert_eq!(agents(&model)[0].state, AgentState::NeedsLogin);
+        assert_eq!(agents(&model, &[])[0].state, AgentState::NeedsLogin);
         // The additive field alone is enough, even when the harness state reads as stale.
         let mut detail = resource("waiting", "indeterminate", None);
         detail["harness_error_state"] = "needs-login".into();
         detail["observation"] = "stale".into();
         model.agents = window(vec![detail]);
-        assert_eq!(agents(&model)[0].state, AgentState::NeedsLogin);
+        assert_eq!(agents(&model, &[])[0].state, AgentState::NeedsLogin);
         model.agents = window(vec![resource("waiting", "unauthenticated", Some("providerAuth"))]);
-        let agent = &agents(&model)[0];
+        let agent = &agents(&model, &[])[0];
         assert_eq!(agent.state, AgentState::NeedsLogin);
         let guidance = super::super::screens::login_guidance(agent);
         assert!(guidance.contains("Claude login required on harbor"), "{guidance}");
@@ -1691,10 +1729,10 @@ mod tests {
         assert!(header.contains("needs login") && header.contains("run /login"), "{header}");
         // st's reason alone says so too.
         model.agents = window(vec![resource("waiting", "idle", Some("providerAuth"))]);
-        assert_eq!(agents(&model)[0].state, AgentState::NeedsLogin);
+        assert_eq!(agents(&model, &[])[0].state, AgentState::NeedsLogin);
         // Signed in again on the same run: it is simply idle, with nothing to restart.
         model.agents = window(vec![resource("running", "idle", None)]);
-        assert_eq!(agents(&model)[0].state, AgentState::Idle);
+        assert_eq!(agents(&model, &[])[0].state, AgentState::Idle);
     }
 
     #[test]
