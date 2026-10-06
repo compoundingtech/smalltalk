@@ -53,3 +53,4 @@ assert "actions/checkout" not in guard
 assert "github.event.merge_group.head_ref" in guard
 assert "github.event.merge_group.head_sha" in guard
 print("passed: generated guard uses hosted capacity and event identity without checkout")
+runpy.run_path(str(root / "scripts/ci-workflow-concurrency-test"))

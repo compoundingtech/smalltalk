@@ -32,6 +32,30 @@ The collections socket's `CollectionCommand` and `CollectionFrame` definitions l
 schema as HTTP resources. The operation manifest's `streams` section names its route, protocol,
 command/frame definitions, and subscription bound; see [collections](collections.md).
 
+### Mission run timing
+
+`GET /v1/client/missions/{id}` requires `read.projections`, like other projection reads.
+Its typed `run_details[].steps[]` includes `loop_round`, `loop_max_rounds`, `loop_reason`,
+`next_wake_at`, `wake_reason`, `wake`, and `claim_expires_at`. A mission detail already carries
+every run's steps, so these observations extend that contract rather than introduce a second
+run-detail endpoint. The detail uses the same enriched `Store::mission_run` read as the trusted
+`GET /v1/mission-runs/{run}` only for open runs and the latest finished run. Older finished
+runs keep lightweight effective-step summaries. Headers and enrichment share one reader
+snapshot; mission lists retain their lightweight summary reads.
+
+`loop_round` and `loop_max_rounds` belong to the loop attached to that exact step in the current
+generation; they are null for a non-loop step. `loop_reason` is the observed loop-state reason.
+`next_wake_at` is the observed not-before time (earliest work eligibility), not a delivery promise
+or a computed retry estimate. `wake_reason` is the deferral's blocked reason, otherwise the
+observed wake failure. `wake` carries the assignee and its current harness state/incarnation,
+attempt count, last attempt time, acknowledgement basis (`claim`, `consumed`, `delivery`, or
+`turn`), and failure, even when no next wake time is known. It is null for finished runs
+and finished steps. `claim_expires_at` is the effective claim lease expiry. All timestamps here are
+RFC 3339 UTC strings; unknown values are null. Older servers may omit these optional fields.
+Loop and wake enrichment is detail-only and bounded to open runs plus the latest finish;
+null timing fields on lists or older finished runs are not proof of no loop or wake.
+Clients can render `round N/M · wakes in …` without reading claim envelopes.
+
 ### Agent activity and human blocking
 
 An agent's `harness_state` describes activity independently of its optional `blocked_on`, `ask`,
@@ -212,7 +236,11 @@ projections can then show early history as current, such as a person step that a
 not-yet-received envelope completes. The notice lists each peer that holds more envelopes than one
 replication exchange carries, with `peer_only_envelopes` (held by the peer, missing here),
 `local_only_envelopes`, `last_exchange_at`, and `estimated_catch_up_seconds` (null until a rate is
-measured). Clients show the notice above the page. The page omits it once the host has caught up.
+measured or no finite forecast fits the safe-integer duration bound of 9,007,199,254,740,991
+whole seconds, `2^53 - 1`). Unavailable forecasts are null or absent; they are never clamped.
+The producer and API projection share `MAX_SAFE_DURATION_SECONDS`. A stalled peer keeps its
+sync notice even when its forecast is unavailable. Clients show the notice above the page.
+The page omits it once the host has caught up.
 
 The notice's `state` is `diverged` instead while the host's graph has diverged from a peer's: both
 hold the same envelopes but project different graphs from them, so the page can be wrong, not just
@@ -326,6 +354,17 @@ copy of the definition: re-publishing it would replace the environment values wi
 Unknown agents and agents with observations but no applied desired declaration return typed
 `not-found`. Other subject kinds return `validation-failed`: a mission is published as a compiled
 revision (read it through `/missions/{id}`) and keeps no canonical declaration AST to render.
+
+For canonical structured publication values, use
+`GET /v1/client/publication-definition?subject=mission%2Fexample%2Fdaily` (also accepts
+`agent/` and `schedule/` subjects). Rust `publication_definition(subject)`, Swift
+`publicationDefinition(subject:)`, and TypeScript `publicationDefinition(subject)` return
+`PublicationDefinition` in the same snapshot envelope. Its `declaration` is the compiled
+`MissionSpec` for missions, or normalized `DesiredSubject` for seats and schedules, with
+`revision` and immutable claim `token`. This read requires `read.projections` and
+`read.declarations`; environment values and embedded declarations are retained. Missing
+subjects return 404 and oversized definitions are rejected without truncation.
+These are the same values used by the [owned-set declaration diff](../owned-sets.md#declaration-diffs-and-readback).
 A definition is never truncated:
 when its serialized value exceeds `max_response_bytes - 4096` (reserving room for the envelope),
 the server returns `validation-failed` rather than an incomplete AST or KDL document.
@@ -370,7 +409,8 @@ cost: the harness's own figure when it reports one, else st's pricing table, nam
 could price, which a client shows as unknown cost, never as free). An identity st does not know,
 such as the mission run of a standing seat, is absent from the row. A period whose start is after
 its end is `validation-failed`. `limits` lists each account's selected limits reading: `account`
-(a label such as `claude/<digest>`, or `DRIVER/unknown`), `driver`, optional `plan`,
+(a label such as `claude/<digest>`, or `DRIVER/unknown`), `driver`, optional `account_ref`,
+`identified` (optional for older servers), and `plan`,
 `five_hour_percent`, `weekly_percent` and their `*_resets_at_unix_ms`, when and by which seat and
 host it was measured, and the seats whose newest reading names the account. A harness that does
 not report a value leaves it out. Selection uses quota observation time, independently of
@@ -381,11 +421,37 @@ outside the hour cannot override it. This same selection serves `st usage`, stui
 account pools and the limits policy. The policy tests freshness against the selected source
 time, so a recent low publication cannot freshen an old high observation. Claim kinds and
 client fields remain compatible with older clients.
+`identified` is true for a provider identity or declared account, false when both are missing;
+it does not describe quota freshness. Identity-less history with no active reporting seat is
+hidden once identified evidence exists for that driver. Active unknown evidence and every
+identified account, including exhausted accounts with no seats, remain visible. Bound readings
+use the same stable declared label as publishers, including older generic provider labels.
 Partial reports without a weekly percentage do not replace or refresh a prior weekly source.
 The durable reading survives member restarts. Consumers must check its original measurement time
 and reset window; missing or stale evidence is unknown, never zero. `st doctor` reports missing,
 stale, future-dated or already-reset weekly evidence for active accounts as `account-limits`.
 See [account limits](../accounts.md#at-the-limit) for the policy and external backstop behavior.
+Rows also carry optional `native_session_id` (the provider's session UUID, fenced by incarnation)
+and `pricing_provenance`. The legacy `pricing` label remains readable. Each provenance entry
+names `cost_source` (`provider_reported`, `computed`, or `unpriced`), disjoint token buckets,
+`cost_microusd`, `reported_cost_microusd` and `unpriced_tokens`. Computed entries name
+`price_table_id` (`st.api-list`), `price_table_version` (date plus SHA-256 of the complete table),
+and `rates_usd_per_million_tokens` (`input`, `output`, `cache_read`, `cache_write_5m`,
+`cache_write_1h`), with long-context multipliers already applied. Provider-reported entries
+omit undisclosed table identity and rates; unpriced entries name the attempted table and omit
+rates. Entries on rollups are cumulative; period reads subtract the matching baseline entry.
+Different versions, sources and effective rates remain separate within the same rollup slot.
+Historical claims without these fields remain readable; absent provenance or session binding
+is unknown. After an upgrade, provenance covers only responses priced by the upgraded writer;
+its bucket sums can therefore be smaller than the row's totals. Per-response rounding means
+recomputing a contribution from aggregate token counts can differ slightly from the recorded cost.
+
+The external per-request ledger remains canonical (#1419). These additions keep the existing
+five-minute/stop publication cadence and latest/hourly/baseline retention bounds. They do not
+change checkpoint selection or carriers, so they require no additional rules-version bump
+beyond version 10 introduced separately by #1322 for native credential evidence. Typed imports and a
+retention decision for native per-request records remain later work.
+
 The Rust method is `Client::usage_period(since_ms, until_ms)`;
 Swift has `usagePeriod(sinceMS:untilMS:)` and TypeScript `usagePeriod({ since_ms, until_ms })`.
 
@@ -935,6 +1001,18 @@ Read-only terminal scope permits screens but rejects input and resize. Screen pa
 negotiated byte limits: at most 200 lines and 4096 bytes of text per line, with explicit
 `redacted` and `truncated` markers.
 
+### Launch size
+
+A client that draws seats in a pane of fixed size publishes it as a claim on the person, so a seat
+st launches later starts at that size and the first attach needs no resize:
+`POST /v1/claims` with `{"subject":"person/NAME","kind":"terminal.launch-geometry",
+"actor":"person/NAME","fields":{"rows":ROWS,"columns":COLUMNS}}`. Only the person may write it,
+and `rows` and `columns` must each fit a positive u16. At every terminal launch the reconciler
+reads the newest such claim for its configured `person` and starts `pty run` with
+`--rows ROWS --cols COLUMNS`; without a configured person or a claim, pty picks its own size. The
+claim does not wake the reconciler, and a running seat keeps its size: resize it with
+`terminal.resize`.
+
 ### Raw PTY transport
 
 `POST /v1/client/terminals/{id}/raw-attachments` accepts
@@ -1077,8 +1155,7 @@ order, and each old tab’s title goes to its first pane. The original claims an
 and replay. A subsequent version-1 write stores the new body and records the old revision it
 replaced. New client writes require the version-1 shape and bounds. An empty legacy body at
 the old byte limit can project slightly above 64 KiB; the next write must fit the current limit.
-The response ceiling is
-8 MiB, allowing a complete 100-glass subscription window at these bounds.
+The negotiated client response ceiling is 1 MiB.
 
 Local creation is refused when the member already sees 100 live glasses. Concurrent creates
 on separate members are all retained as immutable claims. After synchronization, the earliest
@@ -1104,6 +1181,172 @@ Generated clients expose Rust `list_glasses`, `get_glass`, `put_glass`, `delete_
 `putGlass`, `deleteGlass`, and `glassesStream`. Each supplies typed bodies and recursive layouts.
 Mutation methods take an explicit idempotency key so a retry uses the original key and input.
 Member daemons replicate the claims; paired clients read them through a member gateway.
+
+## Person arrangements
+
+An arrangement is shared sidebar organization, not a private pane workspace. Discover
+`arrangements` capability version 1 and the `read.arrangements` / `control.arrangements`
+scopes. Glass identity, pane bodies, and privacy are unchanged. Authenticated persons and
+trusted fleet agents read and write in today's free mode as their **real actor**; an agent
+never impersonates the owner. Ownership is permanently the person in
+`arrangement/person/NAME/lowercase-UUIDv7`, independent of run or session lifetime.
+Restriction belongs to the upstream principals/grants system, not an arrangement-specific
+opt-in or ACL. Anonymous access is refused. A paired person selects only their own
+collection; a trusted local fleet agent explicitly selects a fleet person.
+
+Generic status views omit arrangements, like glasses; current arrangement reads use the dedicated client routes, and later arrangement edits do not invalidate historical status frontiers.
+
+Read `GET /v1/client/arrangements?person=person%2FNAME` (ordinary cursor/limit pagination)
+or `GET /v1/client/arrangements/{person_name}/{uuid}`. The owner selector is mandatory:
+an agent identity is not an implicit collection owner. Lists contain typed `Arrangement`
+resources in an ordinary page. Live details contain `id`, `kind: "arrangement"`, `owner`,
+`revision`, `updated_at`, `deleted: false`, and this versioned body:
+
+```ts
+type Register<T> = { value: T; revision: string }; // winning ClaimId
+type ArrangementBody = {
+  version: 1;
+  name: Register<string>;
+  folders: Record<string, {
+    name: Register<string>;
+    position: Register<{ parent: string | null; key: string }>;
+    tombstone: Register<true> | null;
+  }>;
+  placements: Record<string, Register<{ folder: string | null; key: string }>>;
+};
+```
+
+Existing phone pairings lack `read.arrangements` and must be re-paired to read arrangements.
+
+Folder IDs are stable lowercase UUIDv7. Placement keys are graph subjects, never PTY or
+session IDs. An optional `resolved: {parents, folders}` supplies effective folder parents
+and placement folders; null means root/unfiled. It does not rewrite raw registers.
+Names are nonblank, contain no control characters, and are bounded to 256 UTF-8 bytes; canonical base-62 fractional-indexing
+keys are bounded to 128 bytes (for example `a0`, `a1`, `Zz`). Integer-part lengths must
+be canonical and fractional suffixes cannot end in zero. Each edit has 1–1,024 operations
+and its compact UTF-8 JSON operations array is at most 1 MiB, locally and on replication.
+Local full projected resources (including headers, register revisions and resolved
+locations) are bounded to 512 KiB (`max_arrangement_resource_bytes`), 1,024 folders
+(including tombstones), and 4,096 placements. Local creation admits at most 100 live
+arrangements per person. These cumulative quotas apply only to local admission, not to
+a remotely replicated concurrent union. Heads retain that union without arrival-dependent
+dropping or canonical-cap truncation. Retirement bypasses cumulative overflow so an
+oversized remote union can still be retired. Per-operation shape, name, key, ID and claim
+bounds still apply on replication. Clients must not treat a lexical JSON Schema key
+pattern as the full fractional-key validator.
+
+Submit `POST /v1/client/actions` with `type: "arrangement.edit"` and typed parameters
+`{subject, owner, operations}`. `owner` is required on every edit and must equal the
+immutable person in the subject. Operations are tagged by `op`:
+
+| `op` | Required fields besides `op` |
+| --- | --- |
+| `create` | `name` |
+| `rename` | `name` |
+| `folder.create` | `id`, `name`, `parent: null \| folder ID`, `key` |
+| `folder.rename` | `id`, `name` |
+| `folder.move` | `id`, `parent: null \| folder ID`, `key` |
+| `folder.delete` | `id` |
+| `subject.place` | `subject`, `folder: null \| folder ID`, `key` |
+| `retire` | none |
+
+Each atomic edit may touch a register at most once; retirement must be its only operation.
+
+Creation declares the name and may atomically include folders and placements. Null
+placement folders unfile subjects; changing the key reorders them. Include any necessary
+rekeys in the same atomic edit. Only touched registers change: stale layout revisions
+merge rather than replace unrelated fields. For layout edits, the target arrangement's
+entry in `fence.subject_revisions` is a layout base, not a compare-and-swap precondition.
+For `retire`, that entry instead requires the current arrangement revision to match in
+the writer transaction: a mismatch returns `stale-fence` and appends nothing. An unfenced
+retire is unconditional. To fold a duplicate losslessly, read it, fold its contents into
+the winner, then retire it fenced on the revision read; on refusal, reread and refold.
+The existing action ID, snapshot fence, and session-scoped idempotency key remain required;
+stale graph identity/authority and launch revision fences for other subjects refuse the edit
+atomically in the writer transaction. Attention episodes and external native-session revisions
+retain the existing projected preflight checks; external filesystem state is not governed by
+SQLite admission and cannot be made transactionally atomic with graph writes.
+Retry of the same action identity, parameters and key returns the saved receipt, even
+after later edits or retirement. Fences are excluded from request identity: they may
+be refreshed after refusal, and accepted retries replay before fence validation.
+Changing other input with the same key returns `idempotency-conflict`. A completed
+result's `affected_ids` names only the arrangement and `arrangement_revision` identifies
+the accepted claim, not a promise that its registers will remain winners.
+A second `create` for an existing arrangement under a different idempotency key returns
+typed `arrangement-exists` with `retryable: false`; clients can distinguish a create
+race from an internal failure. Exact retries of the original create return its receipt.
+Folder creation reusing a live or tombstoned ID returns `arrangement-folder-exists`.
+Generated clients preserve the following admission/validation codes as typed,
+non-retryable refusals rather than `internal`; callers do not parse error wording:
+
+| Category | Codes |
+| --- | --- |
+| Create race | `arrangement-exists`, `arrangement-folder-exists` |
+| Lifecycle/structure | `arrangement-retired`, `arrangement-folder-deleted`, `arrangement-cycle` |
+| Bounds/authority | `arrangement-limit`, `arrangement-body-too-large`, `arrangement-owner-forbidden` |
+| Validation | `invalid-arrangement-subject`, `invalid-arrangement-action`, `invalid-arrangement-operations`, `invalid-arrangement-folder`, `invalid-arrangement-name`, `invalid-arrangement-key`, `invalid-subject-reference` |
+
+The ordinary `not-found`, `forbidden`, `stale-fence` and `idempotency-conflict` codes
+retain their existing meanings.
+
+`arrangement.edited` claims are durable. Each register uses canonical maximum
+`(accepted_at_unix_ms, batch origin, replica_sequence, batch_id, record position, claim_id)`,
+including the canonical legacy position fallback, rather than client HLC or arrival
+order. Offline writes therefore order by admission. Rename and move survive each other.
+Folder tombstones are remove-wins and final for that folder ID; they retain position
+and never delete subjects. Children and placements resolve through deleted folders to
+the nearest live ancestor, or root; unknown folders resolve root/unfiled. Missing roster
+subjects retain their placement for their return. Local self/descendant moves are refused.
+Concurrent cycles cut the greatest canonical position-register winner (folder ID
+tie-break) to root. Sort siblings by `(key, folder_id)` and members by `(key, subject)`.
+Retirement is permanent for an arrangement ID; it disappears from live reads and streams.
+Ending a reference never retires an arrangement or deletes a referenced subject.
+
+Admission transactions materialize register heads, tombstones and owner-indexed current
+rows. List/detail and write validation read these heads, never edit history. Replay may
+rebuild them once; projection digests and checkpoint proofs include the same read answers.
+There is **no new checkpoint drop rule**: agent-authored edits are durable too.
+
+Subscribe on `st3.client.collections.v0` with
+`{kind: "subscribe", id, collection: "arrangements", person: "person/NAME", limit: 100}`.
+Person is required and grants are checked on every read. Bounded authoritative snapshots,
+full resource upserts, removed IDs, complete order, and reconnect snapshots follow the
+ordinary collection contract.
+An optional `subject: ArrangementId` selects only that arrangement (zero or one items,
+`has_more: false`), so a selected Sidebar cannot fall outside a busy owner's byte/count
+window. Its owner must equal `person`; mismatches are refused. Snapshots, upserts and
+retirement removals retain the ordinary collection semantics. Omitting the filter
+keeps owner-wide prefix windows unchanged.
+Arrangement list and stream windows also fit a byte budget: the 1,048,576-byte response
+ceiling reserves 128,000 bytes for the envelope. A byte-shortened window sets `has_more`
+and retains full resources, not truncated registers or placements. A replicated full
+resource above the remaining 920,576-byte budget returns explicit `validation-failed`
+rather than silently omitting part of its layout. Detail reads enforce the same single
+resource bound. Reconnect takes a new authoritative bounded snapshot; paired-session
+revocation, grant changes and expiry are checked again on each read.
+
+Generated Rust exposes `arrangements_list`, `arrangements_get`, `arrangement_edit`, and
+`CollectionStream::subscribe_arrangements`; TypeScript exposes `arrangementsList`,
+`arrangementsGet`, `arrangementEdit`, and `CollectionStream.subscribeArrangements`;
+Swift exposes `arrangementsList`, `arrangementsGet`, `arrangementEdit`, and
+`arrangementsStream`. Detail methods take the person name and UUID separately.
+All three arrangements stream helpers accept an optional `subject`; Rust takes
+`subject: Option<&str>` after `limit`, TypeScript takes `subject?: ArrangementId`
+after `limit`, and Swift takes `subject: String? = nil`.
+Rust operations reuse `st3_schema::arrangements::Operation`; TypeScript and Swift have
+typed operation unions, not arbitrary JSON bodies. Regenerate all clients with
+`cargo run -p st3-client-codegen`; verify freshness with
+`cargo run -p st3-client-codegen -- --check`.
+
+Fractal migration is client-owned: discover capability, pause legacy writers, fold old
+`custom.fractal.sidebar` HLC history once, and durably stage the snapshot, target ID,
+exact typed operations and idempotency key. Preserve stable IDs, import order (keys are
+re-derived), tombstones and placements. Fractal sorts legacy siblings by `(key, ID)` and
+deterministically derives canonical fractional keys for each folder and placement list.
+Retry that exact staged request until acknowledged and readable, then switch
+exclusively to arrangements. Old stamps remain provenance, not live ordering. Keep staged
+state on failure, leave immutable custom history, and never dual-write. There is no
+upstream Fractal-specific importer.
 
 ## Agent and plain-shell creation
 

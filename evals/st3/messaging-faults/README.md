@@ -27,6 +27,16 @@ Both peer routes pass through a TCP proxy whose drop closes existing connections
 and refuses new traffic. Cleanup stops reconciliation before closing the private
 PTY registry. Shared daemons and seats are never stopped or changed.
 
+A dedicated Linux guardian watches the launcher and its caller through pidfds and
+reaps the eval's entire descendant tree, including detached PTY servers, before
+returning. It also owns the private runtime and executable-copy directories and
+removes them after reaping, including after SIGTERM, SIGKILL, timeout, setup failure,
+or evidence collection failure. `--keep` explicitly retains those directories and
+prints their paths; processes are still killed. Normalized evidence in `OUT` is
+retained independently. Daemons, workers, helper commands and provider channels
+have private process groups. Provider exit kills its channel groups, and provider
+shutdown has a one-second deadline.
+
 Every case starts fresh nodes and proves a cross-node warmup before injecting the
 fault. Provider readiness and that warmup both use the setup deadline (60 seconds by
 default): a peer exchange can already be in its 30-second long poll when the warmup
@@ -109,6 +119,12 @@ The oracle's negative controls run with:
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover \
   -s scripts/st3-messaging-faults-eval -p 'test_*.py'
 ```
+
+Set `ST3_MFE_TEST_BINARY=/path/to/st3` to include the cleanup regression. It starts
+real isolated nodes and a native OMP provider/channel, then kills the controller or
+launcher and checks that all recorded PIDs and private directories disappear within
+five seconds. It also checks SIGTERM and explicit `--keep`. Cargo runs this proof
+as `messaging_faults::controller_death_cleanup` using its fixture binary.
 
 The Linux Cargo integration suite exposes every case as its own `messaging_faults::*` test,
 so the Namespace Linux gate runs the complete matrix in parallel and retries individual cases.

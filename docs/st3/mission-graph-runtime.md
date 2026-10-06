@@ -232,7 +232,9 @@ finite missions over their lifetime. A person's standalone shell is a top-level 
 `pty/person/NAME/UUID`, with no mission owner and no agent harness. Free-mode local agents
 can likewise create a plain shell at `pty/agent/PATH/UUID`. Only its exact creator may publish its
 `intent.desired` claims, including a stop; local admission and replication enforce this.
-Other top-level execution members still require a mission run.
+Top-level schedules are also valid authored declarations: `st apply schedules.kdl` previews
+and publishes them without creating a mission run. Each schedule names the mission it will
+request at its declared times. Other top-level execution members still require a mission run.
 
 The origin of the `mission-run.created` claim advances the mission run. It also materializes the run declarations.
 
@@ -826,7 +828,7 @@ each command for real, so a gate with side effects has them when it is checked, 
 st missions check release.kdl --workspace ~/src/app --input commit=4f2a9c1
 ```
 
-`st missions publish` runs the same check first and refuses a mission with a broken gate, printing
+`st apply` runs the same check first and refuses a mission with a broken gate, printing
 each gate's answer and the end of a broken check's output. Not yet does not stop a publication:
 before the work exists, most gates should say not yet. `--workspace` names the workspace for the
 check. `--no-gate-check` publishes without it, for a gate whose check cannot run before its run,
@@ -1493,7 +1495,7 @@ Two seat faults reach that owner so a seat that cannot start is never found by l
 Typed harnesses always run their real interactive TUI in a PTY. Claude always loads the native st
 channel. Use `exec {}` for non-interactive provider commands.
 
-Use `st agents apply FILE --as person/NAME` for authored KDL or `st agents start ...` as a
+Use `st apply FILE --as person/NAME` for authored KDL or `st agents start ...` as a
 convenience. `st agents new NAME --host HOST --attach` declares a new seat with the fleet's
 harness defaults, waits until its harness is ready, and attaches from any fleet host.
 `--print-kdl` prints the exact declaration. `st agents stop SUBJECT` publishes an explicit root
@@ -1766,7 +1768,7 @@ Store a summary, a redacted sample, or a hash when later work needs durable evid
 
 ## Review, approve, and start
 
-`st missions publish FILE --as ACTOR` previews and publishes exact authored KDL with authority and
+`st apply FILE --as ACTOR` previews and publishes exact authored KDL with authority and
 subject-head checks. `st launch preview SESSION` validates a planner candidate, resolves documents,
 displays changes, and returns the approval hash.
 `st launch approve SESSION HASH --as person/NAME` applies that exact candidate without starting it.
@@ -1775,7 +1777,7 @@ An authorized agent uses `st work publish-mission`, fenced to its claimed produc
 
 ### References that must resolve
 
-`missions publish`, `agents apply`, a run revision, and `work publish-mission` refuse, with the code
+`apply` (and its legacy `missions publish` and `agents apply` commands), a run revision, and `work publish-mission` refuse, with the code
 `unresolved-reference`, a publication that names something st cannot find:
 
 - a pinned mission revision that is not stored on this host, in `uses-mission`, a schedule's `work`,
@@ -1798,7 +1800,7 @@ that no longer resolve in its `graph-references` check.
 
 `st missions start MISSION --as ACTOR` publishes one mission-run declaration for the current ready revision. Add `--follow` to follow the run until it becomes terminal.
 
-`missions publish` prints each revision it created. Pass that value to `missions start --revision REVISION` to start exactly that revision. A mission published on another host reaches this host by replication. When the mission or the requested revision is not here yet, `start` waits up to 60 seconds with a plain message instead of failing. When a later revision already replaced the requested one, `start` names the replacement and stops. After a run starts, `start` names its revision on standard error and says whether other revisions share the mission name.
+`apply` prints each mission revision it created. Pass that value to `missions start --revision REVISION` to start exactly that revision. A mission published on another host reaches this host by replication. When the mission or the requested revision is not here yet, `start` waits up to 60 seconds with a plain message instead of failing. When a later revision already replaced the requested one, `start` names the replacement and stops. After a run starts, `start` names its revision on standard error and says whether other revisions share the mission name.
 
 `st missions show MISSION_RUN` reads one exact run. `st missions show MISSION` works only when that mission has exactly one nonterminal run.
 

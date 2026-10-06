@@ -1,5 +1,9 @@
 pub mod custom;
+pub mod declarations;
 mod glass_heads;
+mod arrangements;
+#[cfg(test)]
+mod arrangements_tests;
 mod glasses;
 pub mod owned_sets;
 #[cfg(test)]
@@ -613,6 +617,13 @@ CREATE TABLE IF NOT EXISTS local_usage_spend (
     observed_at_unix_ms INTEGER NOT NULL,
     PRIMARY KEY(subject, incarnation_id, model, account, owner_run, owner_step, host)
 );
+-- Provenance shares the existing cumulative spend slot; individual responses remain local.
+CREATE TABLE IF NOT EXISTS local_usage_provenance (
+    subject TEXT NOT NULL,
+    slot TEXT NOT NULL,
+    pricing TEXT NOT NULL,
+    PRIMARY KEY(subject, slot)
+);
 -- The seats this node's limits policy stopped, once per account and weekly window, so a seat a
 -- person starts again stays up until the window resets.
 CREATE TABLE IF NOT EXISTS local_limit_stops (
@@ -846,6 +857,11 @@ struct ViewEntry {
 }
 
 fn subject_head_at(connection: &Connection, subject: &str, store_index: u64) -> Result<u64> {
+    if subject.starts_with("arrangement/") {
+        let index: u64 = connection.query_row("SELECT changed_index FROM arrangements WHERE subject=?1", [subject], |row| row.get(0)).optional()?.unwrap_or(0);
+        anyhow::ensure!(index <= store_index, "arrangement snapshot frontier is stale");
+        return Ok(index);
+    }
     connection
         .prepare_cached(
             "SELECT COALESCE(MAX(store_index), 0) FROM claims WHERE subject=?1 AND store_index<=?2",
@@ -942,6 +958,22 @@ fn subject_status_at(
 ) -> Result<Option<(SubjectStatus, Option<PlannedAction>)>> {
     #[cfg(test)]
     SUBJECT_REDUCTIONS.with(|reductions| reductions.set(reductions.get() + 1));
+    if subject.starts_with("arrangement/") {
+        if owner_filter.is_some() { return Ok(None); }
+        let actual = arrangements::arrangement_at(connection, subject, at_index.unwrap_or(i64::MAX as u64))?;
+        let revision = actual.as_ref().and_then(|v| v["revision"].as_str()).map(str::to_owned);
+        let live = actual.is_some();
+        return Ok(Some((SubjectStatus {
+            subject: subject.into(), kind: Some("arrangement".into()),
+            desired_token: None, desired_revision: None, desired: None,
+            actual, actual_claim: revision.clone(), actual_origin: None,
+            harness: None, conflicts: vec![], claims: revision.into_iter().collect(),
+            owner_run: None, gap: None, reachability: if live { "reachable" } else { "unknown" }.into(),
+            reason: None, under: vec![],
+            projection: OperationalAnnotation { layer: if live { "current" } else { "history" }.into(), actionable: false,
+                reasons: if live { vec![] } else { vec!["retired-or-uncreated".into()] }, owner_generation: None, runtime_incarnation: None },
+        }, None)));
+    }
     let desired = desired_row_at(connection, subject, at_index)?;
     let member = desired
         .as_ref()
@@ -2590,6 +2622,7 @@ impl Store {
         rebuild_planning_tx(&transaction)?;
         resources::rebuild(&transaction)?;
         glass_heads::rebuild(&transaction)?;
+        arrangements::rebuild(&transaction)?;
         transaction.commit()?;
         Ok(())
     }
@@ -8017,7 +8050,14 @@ impl Store {
         warnings.sort();
         warnings.dedup();
 
+        let declaration_diffs = declarations::diffs(
+            &connection,
+            intent,
+            changes.iter().map(|change| change.subject.as_str()),
+            Some(store_index),
+        )?;
         Ok(MissionResponse {
+            declaration_diffs,
             store_index,
             source_hash: intent.source_hash.clone(),
             normalized: intent.normalized.clone(),
@@ -9177,6 +9217,23 @@ impl Store {
         {
             fields.insert(name.into(), Value::from(value));
         }
+        let provenance: Option<String> = connection
+            .query_row(
+                "SELECT pricing FROM local_usage_provenance WHERE subject=?1 AND slot=?2",
+                params![observation.subject, usage_slot(&fields)],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(provenance) = provenance {
+            fields.insert(
+                "pricing_provenance".into(),
+                serde_json::from_str(&provenance)?,
+            );
+        }
+        // Never use the seat's current binding for a response from an older incarnation.
+        if let Some(binding) = usage_native_session(&connection, &observation.subject, &fields)? {
+            fields.insert("native_session_id".into(), Value::String(binding));
+        }
         let digest = hex::encode(Sha256::digest(serde_json::to_vec(&fields)?));
         Ok(Some(ClaimInput {
             subject: observation.subject.clone(),
@@ -9697,7 +9754,11 @@ impl Store {
         let connection = self.readers.get();
         let current = current_index(&connection)?;
         let store_index = selected_index(current, at_index).map_err(anyhow::Error::new)?;
-        let subjects = match prefix_upper_bound(prefix) {
+        let subjects = if prefix.starts_with("arrangement/") {
+            connection.prepare_cached("SELECT subject FROM arrangements WHERE subject>=?1 AND subject<?2 ORDER BY subject")?
+                .query_map(params![prefix, prefix_upper_bound(prefix).context("arrangement prefix bound")?], |row| row.get::<_,String>(0))?
+                .collect::<Result<BTreeSet<_>,_>>()?
+        } else { match prefix_upper_bound(prefix) {
             // One seek per subject instead of every claim of every subject in the range.
             Some(bound) => connection
                 .prepare_cached(RANGE_SUBJECTS)?
@@ -9714,7 +9775,7 @@ impl Store {
                     row.get::<_, String>(0)
                 })?
                 .collect::<Result<BTreeSet<_>, _>>()?,
-        };
+        }};
         drop(connection);
         self.status_for_subject_names_at(subjects, store_index, include_history)
     }
@@ -9764,7 +9825,10 @@ impl Store {
         let connection = self.readers.get();
         let current = current_index(&connection)?;
         let store_index = selected_index(current, at_index).map_err(anyhow::Error::new)?;
-        let subjects = if kind == "runtime.observed" {
+        let subjects = if kind == "arrangement.edited" {
+            connection.prepare_cached("SELECT subject FROM arrangements ORDER BY subject")?
+                .query_map([], |row| row.get::<_,String>(0))?.collect::<Result<BTreeSet<_>,_>>()?
+        } else if kind == "runtime.observed" {
             // One seek per runtime instead of every runtime observation.
             connection
                 .prepare_cached(RUNTIME_SUBJECTS)?
@@ -10068,7 +10132,7 @@ impl Store {
         let mut subjects = Vec::new();
         let mut pending_actions = Vec::new();
         for subject in subject_names {
-            if subject.starts_with("glass/") {
+            if subject.starts_with("glass/") || subject.starts_with("arrangement/") {
                 continue;
             }
             let reduced = match newest {
@@ -13966,21 +14030,18 @@ impl Store {
         since_ms: u64,
         until_ms: u64,
     ) -> Result<(Vec<Value>, Vec<agent_messages::DailyUsage>)> {
-        const BUCKETS: [&str; 9] = [
-            "total_tokens",
-            "input_tokens",
-            "output_tokens",
-            "cache_write_tokens",
-            "cache_write_1h_tokens",
-            "cached_tokens",
-            "cost_microusd",
-            "reported_cost_microusd",
-            "unpriced_tokens",
-        ];
-        #[derive(Clone, Copy, Default)]
+        #[derive(Clone, Default)]
         struct Snapshot {
             at: u64,
-            buckets: [u64; BUCKETS.len()],
+            buckets: [u64; USAGE_BUCKETS.len()],
+            pricing: String,
+            native_session_id: Option<String>,
+            provenance: Option<Vec<Value>>,
+        }
+        #[derive(Clone, Copy, Default)]
+        struct DailySnapshot {
+            at: u64,
+            buckets: [u64; USAGE_BUCKETS.len()],
         }
         let connection = self.readers.get();
         let mut statement = connection.prepare(&canonical_sql(
@@ -14009,8 +14070,7 @@ impl Store {
         struct Group {
             baseline: Option<Snapshot>,
             latest: Option<Snapshot>,
-            pricing: String,
-            days: Vec<(Option<Snapshot>, Option<Snapshot>)>,
+            days: Vec<(Option<DailySnapshot>, Option<DailySnapshot>)>,
         }
         let mut groups = BTreeMap::<Key, Group>::new();
         for row in rows {
@@ -14023,9 +14083,12 @@ impl Store {
             }
             let mut snapshot = Snapshot {
                 at,
+                pricing: fields["pricing"].as_str().unwrap_or("").to_owned(),
+                native_session_id: fields["native_session_id"].as_str().map(str::to_owned),
+                provenance: fields["pricing_provenance"].as_array().cloned(),
                 ..Snapshot::default()
             };
-            for (bucket, name) in snapshot.buckets.iter_mut().zip(BUCKETS) {
+            for (bucket, name) in snapshot.buckets.iter_mut().zip(USAGE_BUCKETS) {
                 *bucket = fields[name].as_u64().unwrap_or(0);
             }
             // A rollup from before costs were recorded priced nothing: its tokens are unpriced.
@@ -14052,7 +14115,10 @@ impl Store {
                 }
                 let target = if at <= day.since { baseline } else { latest };
                 if target.is_none_or(|previous| at >= previous.at) {
-                    *target = Some(snapshot);
+                    *target = Some(DailySnapshot {
+                        at,
+                        buckets: snapshot.buckets,
+                    });
                 }
             }
             let target = if at <= since_ms {
@@ -14060,11 +14126,8 @@ impl Store {
             } else {
                 &mut group.latest
             };
-            if target.is_none_or(|previous| at >= previous.at) {
+            if target.as_ref().is_none_or(|previous| at >= previous.at) {
                 *target = Some(snapshot);
-                if at > since_ms {
-                    group.pricing = text("pricing");
-                }
             }
         }
         let mut result = Vec::new();
@@ -14097,9 +14160,18 @@ impl Store {
             let mut row = json!({
                 "agent": agent, "mission_run": mission_run, "step": step,
                 "model": model, "account": account, "host": host,
-                "pricing": group.pricing,
+                "pricing": latest.pricing,
             });
-            for (index, name) in BUCKETS.iter().enumerate() {
+            if let Some(session) = latest.native_session_id {
+                row["native_session_id"] = json!(session);
+            }
+            if let Some(provenance) = latest.provenance {
+                row["pricing_provenance"] = json!(pricing_period_delta(
+                    provenance,
+                    baseline.provenance.as_deref().unwrap_or(&[]),
+                ));
+            }
+            for (index, name) in USAGE_BUCKETS.iter().enumerate() {
                 row[*name] =
                     Value::from(latest.buckets[index].saturating_sub(baseline.buckets[index]));
             }
@@ -14815,11 +14887,9 @@ impl Store {
         let index = self.index().map_err(internal)?;
         let connection = self.readers.get();
         let local = connection
-            .query_row(
-                "SELECT COALESCE(MAX(id), 0) FROM local_observations",
-                [],
-                |row| row.get(0),
-            )
+            .prepare_cached("SELECT COALESCE(MAX(id), 0) FROM local_observations")
+            .map_err(internal)?
+            .query_row([], |row| row.get(0))
             .map_err(internal)?;
         Ok(MailboxWatermark {
             index,
@@ -14846,7 +14916,7 @@ impl Store {
             .unwrap_or(&recipient)
             .to_owned();
         let changed: i64 = connection
-            .query_row(
+            .prepare_cached(
                 "SELECT EXISTS(SELECT 1 FROM claims WHERE subject=?1 AND store_index>?2)
                      OR EXISTS(SELECT 1 FROM claims INDEXED BY claims_message_to_order_index
                                WHERE kind='message.sent'
@@ -14859,6 +14929,9 @@ impl Store {
                                WHERE kind='intent.desired' AND store_index>?2
                                  AND subject GLOB 'message/*')
                      OR EXISTS(SELECT 1 FROM local_observations WHERE subject=?1 AND id>?6)",
+            )
+            .map_err(internal)?
+            .query_row(
                 params![
                     fence.subject,
                     mark.index,
@@ -15056,6 +15129,20 @@ impl Store {
         smallclaims::touched::note_read(|| format!("actor:{subject}"));
         let connection = self.readers.get();
         current_harness_at(&connection, subject, None)
+    }
+
+    /// Positive attachment proof under the indexed current-incarnation diagnostic fence.
+    pub(crate) fn claude_channel_attached(&self, subject: &str, incarnation: &str) -> Result<bool> {
+        smallclaims::touched::note_read(|| subject.to_owned());
+        let connection = self.readers.get();
+        let body: Option<String> = connection
+            .prepare_cached(&claude_attachment_query())?
+            .query_row(params![subject, i64::MAX, incarnation], |row| row.get(1))
+            .optional()?;
+        Ok(body
+            .map(|body| serde_json::from_str::<Value>(&body))
+            .transpose()?
+            .is_some_and(|body| body["fields"]["code"] == "claude-channel-attached"))
     }
 
     pub fn harness_was_ready(&self, subject: &str, incarnation: &str) -> Result<bool> {
@@ -15304,6 +15391,7 @@ impl Store {
         matches!(
             kind,
             "lane.approved"
+                | "arrangement.edited"
                 | "lane.joined"
                 | "lane.left"
                 | "lane.marked"
@@ -17860,6 +17948,87 @@ fn insert_local_observation_tx(
                     total_tokens, cost_microusd, reported_cost.unwrap_or(0), unpriced_tokens,
                     observed_at as i64],
             ).map_err(internal)?;
+            // Keep each distinct price/source/effective-rate combination cumulative. A later
+            // table revision or long-context response must not relabel earlier spend.
+            let mut key_fields = BTreeMap::from([
+                ("semantics".into(), json!("response_rollup")),
+                ("incarnation_id".into(), json!(incarnation)),
+                ("model".into(), json!(model)),
+                ("owner_run".into(), json!(owner_run)),
+                ("owner_step".into(), json!(owner_step)),
+                ("host".into(), json!(origin)),
+            ]);
+            if !account.is_empty() {
+                key_fields.insert("account".into(), json!(account));
+            }
+            let slot = usage_slot(&key_fields);
+            let previous: Option<String> = transaction
+                .query_row(
+                    "SELECT pricing FROM local_usage_provenance WHERE subject=?1 AND slot=?2",
+                    params![input.subject, slot],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(internal)?;
+            let mut provenance: Vec<Value> = previous
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .map_err(internal)?
+                .unwrap_or_default();
+            let tokens = crate::pricing::Tokens {
+                input: input_tokens,
+                output: output_tokens,
+                cache_read: cached_tokens,
+                cache_write: cache_write_tokens,
+                cache_write_1h: cache_write_1h_tokens,
+            };
+            let mut entry = json!({
+                "cost_source": if reported_cost.is_some() { "provider_reported" }
+                    else if estimated_cost.is_some() { "computed" } else { "unpriced" },
+            });
+            // A provider figure does not reveal the provider's own price table or rates.
+            if reported_cost.is_none() {
+                entry["price_table_id"] = json!(crate::pricing::PRICE_TABLE_ID);
+                entry["price_table_version"] = json!(crate::pricing::price_table_version());
+                if let Some(rates) = crate::pricing::applied_rates(model, tokens) {
+                    let mut rates = serde_json::to_value(rates).map_err(internal)?;
+                    rates.as_object_mut().unwrap().remove("long_context");
+                    entry["rates_usd_per_million_tokens"] = rates;
+                }
+            }
+            let index = provenance
+                .iter()
+                .position(|previous| pricing_identity(previous) == pricing_identity(&entry));
+            if let Some(index) = index {
+                entry = provenance.remove(index);
+            }
+            for (name, value) in USAGE_BUCKETS.into_iter().zip([
+                total_tokens,
+                input_tokens,
+                output_tokens,
+                cache_write_tokens,
+                cache_write_1h_tokens,
+                cached_tokens,
+                cost_microusd,
+                reported_cost.unwrap_or(0),
+                unpriced_tokens,
+            ]) {
+                entry[name] = json!(entry[name].as_u64().unwrap_or(0).saturating_add(value));
+            }
+            provenance.push(entry);
+            provenance.sort_by_key(pricing_identity);
+            transaction
+                .execute(
+                    "INSERT INTO local_usage_provenance(subject, slot, pricing) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(subject, slot) DO UPDATE SET pricing=excluded.pricing",
+                    params![
+                        input.subject,
+                        slot,
+                        serde_json::to_string(&provenance).map_err(internal)?
+                    ],
+                )
+                .map_err(internal)?;
         }
     }
     smallclaims::touched::note_wrote(|| format!("{} {}", input.kind, input.subject));
@@ -18040,9 +18209,95 @@ fn publish_changed_harness_state_tx(
         &json!(fields),
     )?;
     if input.fields.get("state").and_then(Value::as_str) != Some("working") {
-        publish_pending_usage_tx(transaction, origin, &input.subject, now)?;
+        publish_pending_usage_tx(
+            transaction, origin, &input.subject,
+            fields.get("incarnation_id").and_then(Value::as_str).unwrap_or(""), now,
+        )?;
     }
     Ok(Some(claim))
+}
+
+fn usage_native_session(
+    connection: &Connection,
+    subject: &str,
+    fields: &BTreeMap<String, Value>,
+) -> Result<Option<String>> {
+    if fields.get("semantics").and_then(Value::as_str) != Some("response_rollup") {
+        return Ok(None);
+    }
+    let text = |key| fields.get(key).and_then(Value::as_str).unwrap_or("");
+    let binding: Option<String> = connection
+        .query_row(
+            &canonical_sql(
+                "SELECT json_extract(body, '$.fields.session_id') FROM claims
+         WHERE subject=?1 AND kind='harness.session-file'
+           AND json_extract(body, '$.fields.incarnation_id')=?2
+           AND json_extract(body, '$.fields.harness')=?3
+         ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+            ),
+            params![subject, text("incarnation_id"), text("driver")],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(binding) = binding.filter(|id| !id.trim().is_empty()) {
+        return Ok(Some(binding));
+    }
+    // The native claim may have been trimmed after this slot first published. Its own
+    // published snapshot is still an exact-incarnation carrier, never a current-seat guess.
+    let previous: Option<Option<String>> = connection
+        .query_row(
+            "SELECT json_extract(published_fields, '$.native_session_id') FROM local_latest_slots
+         WHERE subject=?1 AND kind='harness.usage' AND slot=?2",
+            params![subject, usage_slot(fields)],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(previous.flatten().filter(|id| !id.trim().is_empty()))
+}
+
+const USAGE_BUCKETS: [&str; 9] = [
+    "total_tokens",
+    "input_tokens",
+    "output_tokens",
+    "cache_write_tokens",
+    "cache_write_1h_tokens",
+    "cached_tokens",
+    "cost_microusd",
+    "reported_cost_microusd",
+    "unpriced_tokens",
+];
+
+fn pricing_identity(entry: &Value) -> String {
+    json!([
+        entry.get("price_table_id"),
+        entry.get("price_table_version"),
+        entry.get("cost_source"),
+        entry.get("rates_usd_per_million_tokens")
+    ])
+    .to_string()
+}
+
+fn pricing_period_delta(latest: Vec<Value>, baseline: &[Value]) -> Vec<Value> {
+    latest
+        .into_iter()
+        .filter_map(|mut entry| {
+            if let Some(before) = baseline
+                .iter()
+                .find(|before| pricing_identity(before) == pricing_identity(&entry))
+            {
+                for name in USAGE_BUCKETS {
+                    entry[name] = json!(
+                        entry[name]
+                            .as_u64()
+                            .unwrap_or(0)
+                            .saturating_sub(before[name].as_u64().unwrap_or(0))
+                    );
+                }
+            }
+            // A zero-token response may still have a reported cost.
+            (entry["total_tokens"] != 0 || entry["cost_microusd"] != 0).then_some(entry)
+        })
+        .collect()
 }
 
 fn usage_slot(fields: &BTreeMap<String, Value>) -> String {
@@ -18132,6 +18387,15 @@ fn publish_usage_slot_tx(
     fields: &BTreeMap<String, Value>,
     now: u128,
 ) -> Result<ClaimRecord, St3Error> {
+    let mut fields = fields.clone();
+    // Native binding can arrive after the response was captured. Enrich at the scheduled
+    // publication (including stop), without adding a publication or changing the slot.
+    if !fields.contains_key("native_session_id")
+        && let Some(binding) =
+            usage_native_session(transaction, subject, &fields).map_err(internal)?
+    {
+        fields.insert("native_session_id".into(), json!(binding));
+    }
     let fields_text = canonical_json_text(&json!(fields)).map_err(internal)?;
     transaction
         .execute(
@@ -18144,7 +18408,7 @@ fn publish_usage_slot_tx(
                 pending_local_id=NULL",
             params![
                 subject,
-                usage_slot(fields),
+                usage_slot(&fields),
                 now.min(i64::MAX as u128) as i64,
                 fields_text
             ],
@@ -18165,6 +18429,7 @@ fn publish_pending_usage_tx(
     transaction: &Transaction<'_>,
     origin: &str,
     subject: &str,
+    incarnation: &str,
     now: u128,
 ) -> Result<Vec<ClaimRecord>, St3Error> {
     let pending = {
@@ -18189,7 +18454,7 @@ fn publish_pending_usage_tx(
             [subject],
         )
         .map_err(internal)?;
-    pending
+    let mut published = pending
         .into_iter()
         .map(|observation| {
             let fields =
@@ -18203,7 +18468,43 @@ fn publish_pending_usage_tx(
                 now,
             )
         })
-        .collect()
+        .collect::<Result<Vec<_>, St3Error>>()?;
+    // Even a single response can have published before its native binding arrived, leaving
+    // no pending token change. Capture that binding in the normal stop flush as well.
+    let unbound = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT published_fields FROM local_latest_slots
+             WHERE subject=?1 AND kind='harness.usage'
+               AND json_extract(published_fields, '$.semantics')='response_rollup'
+               AND json_extract(published_fields, '$.incarnation_id')=?2
+               AND json_extract(published_fields, '$.native_session_id') IS NULL",
+            )
+            .map_err(internal)?;
+        let rows = statement
+            .query_map(params![subject, incarnation], |row| row.get::<_, String>(0))
+            .map_err(internal)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(internal)?
+    };
+    for fields in unbound {
+        let mut fields: BTreeMap<String, Value> =
+            serde_json::from_str(&fields).map_err(internal)?;
+        if let Some(binding) =
+            usage_native_session(transaction, subject, &fields).map_err(internal)?
+        {
+            fields.insert("native_session_id".into(), json!(binding));
+            published.push(publish_usage_slot_tx(
+                transaction,
+                origin,
+                subject,
+                Some(subject),
+                &fields,
+                now,
+            )?);
+        }
+    }
+    Ok(published)
 }
 
 fn local_observation_id(origin: &str, id: i64) -> String {
@@ -18919,6 +19220,7 @@ fn append_claim_tx(
     st3_schema::owned_terminals::validate_declaration_owner(subject, kind, actor)
         .map_err(anyhow::Error::new)?;
     st3_schema::glasses::validate_owner(subject, actor).map_err(anyhow::Error::new)?;
+    st3_schema::arrangements::validate_actor(subject, actor).map_err(anyhow::Error::new)?;
     if kind == "owned-set.revised" { owned_sets::validate_receipt(subject, body).map_err(anyhow::Error::new)?; }
     let fields = schema_fields_for_body(kind, body)?;
     let claim_spec = st3_schema::registry()
@@ -18953,6 +19255,9 @@ fn append_claim_tx(
     }
     if kind == "message.sent" {
         agent_messages::flush(transaction)?;
+    }
+    if kind == "arrangement.edited" {
+        arrangements::project(transaction, &record)?;
     }
     normalize_local_projection_timestamps_tx(
         transaction,
@@ -19199,6 +19504,9 @@ fn selected_actual_source_at(
     desired_host: Option<&str>,
 ) -> Result<(Option<String>, Option<String>, bool)> {
     let at_index = at_index.unwrap_or(i64::MAX as u64);
+    if subject.starts_with("arrangement/") {
+        return Ok((arrangements::arrangement_at(connection, subject, at_index)?.and_then(|v| v["revision"].as_str().map(str::to_owned)), None, false));
+    }
     // Canonical order, not arrival order, so every node holding these claims selects the same
     // source. Only claims about the subject's actual state can be selected or conflict, so the
     // read leaves out its harness reports.
@@ -19347,6 +19655,9 @@ fn latest_actual_at(
     at_index: Option<u64>,
 ) -> Result<Option<Value>> {
     let at_index = at_index.unwrap_or(i64::MAX as u64);
+    if subject.starts_with("arrangement/") {
+        return arrangements::arrangement_at(connection, subject, at_index);
+    }
     // Folded in canonical order, so two nodes holding the same claims agree however they
     // received them. `NOT LIKE` also leaves out harness kinds in any letter case, as it always
     // has; the ranges let SQLite seek past the subject's harness reports.
@@ -19652,10 +19963,13 @@ fn mailbox_owner_key(
     fence: &crate::mailbox::Fence,
 ) -> Result<Option<(String, i64, bool)>, St3Error> {
     connection
-        .query_row(
+        .prepare_cached(
             "SELECT owner.incarnation, owner.epoch,
                     EXISTS(SELECT 1 FROM local_mailbox_bindings WHERE token=?3)
              FROM local_mailbox_owners owner WHERE owner.subject=?1 AND owner.component=?2",
+        )
+        .map_err(internal)?
+        .query_row(
             params![fence.subject, fence.component, fence.token],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
@@ -19669,12 +19983,15 @@ fn check_mailbox_fence(
 ) -> Result<(), St3Error> {
     check_mailbox_incarnation(connection, fence)?;
     let owner: Option<(String, u64)> = connection
-        .query_row(
+        .prepare_cached(
             "SELECT owner.incarnation, owner.epoch FROM local_mailbox_owners owner
              JOIN local_mailbox_bindings binding ON binding.token=?3
                AND binding.subject=owner.subject AND binding.component=owner.component
                AND binding.incarnation=owner.incarnation AND binding.epoch=owner.epoch
              WHERE owner.subject=?1 AND owner.component=?2",
+        )
+        .map_err(internal)?
+        .query_row(
             params![fence.subject, fence.component, fence.token],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
@@ -19811,12 +20128,47 @@ fn current_harness_fold_at(
     let runtime_key = canonical::claim_key(connection, &runtime_claim)?;
     let runtime_body: Value = serde_json::from_str(&runtime_body)?;
     let runtime_fields = runtime_body.get("fields").unwrap_or(&runtime_body);
-    if runtime_fields.get("status").and_then(Value::as_str) != Some("running") {
-        return Ok(None);
-    }
     let Some(incarnation_id) = runtime_fields.get("incarnation_id").and_then(Value::as_str) else {
         return Ok(None);
     };
+
+    // An admission refusal remains visible even after omp exits, and OpenCode's ready
+    // observations cannot claim healthy delivery while its exact build failed the probe.
+    let admission = connection
+        .prepare_cached(&canonical_sql(
+            "SELECT id, accepted_at_unix_ms, json_extract(body, '$.fields.reason') FROM claims
+         WHERE subject=?1 AND kind='harness.diagnostic' AND store_index<=?2
+           AND json_extract(body, '$.fields.code')='harness-admission-failed'
+           AND json_extract(body, '$.fields.incarnation_id')=?3
+         ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+        ))?
+        .query_row(params![subject, at_index, incarnation_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .optional()?;
+    if let Some((claim, observed_at, reason)) = admission {
+        return Ok(Some(crate::model::CurrentHarnessView {
+            state: "indeterminate".into(),
+            driver: None,
+            incarnation_id: incarnation_id.into(),
+            transport: None,
+            reason: Some(reason),
+            blocked_on: None,
+            ask: None,
+            input_buffer: None,
+            exit: None,
+            claim,
+            since_unix_ms: observed_at.parse()?,
+            observed_at_unix_ms: observed_at.parse()?,
+        }));
+    }
+    if runtime_fields.get("status").and_then(Value::as_str) != Some("running") {
+        return Ok(None);
+    }
 
     // A terminal modal holds even if a parallel native channel reports idle or work progress.
     // Only a successful subsequent screen observation or a new runtime lifts this fence.
@@ -20734,9 +21086,10 @@ fn pending_attention_requests_tx(
 
 fn sort_messages_canonically(connection: &Connection, messages: &mut [MessageView]) -> Result<()> {
     let mut keys = BTreeMap::new();
-    let mut statement = connection.prepare(&canonical_sql(
+    static QUERY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| canonical_sql(
         "SELECT id FROM claims WHERE subject=?1 AND kind IN ('message.sent','intent.desired') ORDER BY CANONICAL_ASC(claims) LIMIT 1"
-    ))?;
+    ));
+    let mut statement = connection.prepare_cached(&QUERY)?;
     for message in messages.iter() {
         let id: String = statement.query_row([&message.subject], |row| row.get(0))?;
         keys.insert(
@@ -22778,6 +23131,45 @@ mod fleet_admission_tests {
     }
 
     #[test]
+    fn arrangement_checkpoint_inputs_have_distinct_rules() {
+        use smallclaims::store::checkpoint_agreement::{SealTerms, seal_difference};
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(&temp.path().join("claims.sqlite3"), "alder").unwrap();
+        let connection = store.readers.get();
+        for table in ["arrangements", "arrangement_registers"] {
+            let count: u64 = connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 0);
+        }
+        let current = projection_digest::oracle(&connection).unwrap();
+        let legacy_tables = PROJECTION_DIGEST_TABLES
+            .iter()
+            .copied()
+            .filter(|(table, _)| !matches!(*table, "arrangements" | "arrangement_registers"))
+            .collect::<Vec<_>>();
+        let legacy = smallclaims::store::projection_digest::oracle(&connection, &legacy_tables)
+            .unwrap();
+        assert_ne!(
+            projection_digest::root(&current),
+            projection_digest::root(&legacy)
+        );
+        // Actual v10 identity immediately before #1267; its description stayed unchanged.
+        let legacy_rules = "d9a0e51ead09502fc373102832d96d530052735e53a75334b64906b149606fad";
+        let legacy_terms = SealTerms {
+            cut_unix_ms: 1,
+            participants: BTreeSet::from(["alder".into(), "birch".into()]),
+            sealed_digest: "same sealed claims".into(),
+            rules_digest: legacy_rules.into(),
+        };
+        let current_terms = SealTerms {
+            rules_digest: rules_digest(),
+            ..legacy_terms.clone()
+        };
+        assert_eq!(seal_difference(&current_terms, &legacy_terms), "rules");
+    }
+
+    #[test]
     fn a_store_without_an_anchor_admits_every_writer_as_before() {
         let b_key = key();
         let b = node("b", Some(&b_key), None);
@@ -23819,6 +24211,8 @@ fn classify_replicated_claim_with_registry(
     .map_err(|e| St3Error::new(e.code, e.message))?;
     st3_schema::glasses::validate_owner(&claim.subject, claim.actor.as_deref())
         .map_err(|e| St3Error::new(e.code, e.message))?;
+    st3_schema::arrangements::validate_actor(&claim.subject, claim.actor.as_deref())
+        .map_err(|e| St3Error::new(e.code, e.message))?;
     if claim.subject.starts_with("glass/")
         && (!fields.contains_key("base_revision") || !fields.contains_key("replaced_revision"))
     {
@@ -24683,6 +25077,11 @@ fn try_project_simple_replication_tx(
         )
         .map_err(internal)?;
     }
+    for claim in &claims {
+        if claim.kind == "arrangement.edited" {
+            arrangements::project(transaction, claim).map_err(internal)?;
+        }
+    }
     let mut aggregates = BTreeMap::<String, Option<Aggregate>>::new();
     // A claim is left to its aggregate's rebuild when that aggregate is dirty, and left waiting
     // when it is about a run tree that nothing has created yet.
@@ -24933,6 +25332,7 @@ fn replay_graph_from_nothing_tx(transaction: &Transaction<'_>) -> Result<(), St3
     resources::rebuild(transaction).map_err(internal)?;
     glass_heads::rebuild(transaction).map_err(internal)?;
     custom::rebuild(transaction).map_err(internal)?;
+    arrangements::rebuild(transaction).map_err(internal)?;
     Ok(())
 }
 
@@ -41790,6 +42190,237 @@ mission "nested-work" state="ready" {
     }
 
     #[test]
+    fn usage_provenance_survives_resume_replay_periods_and_reopen() {
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("usage.sqlite3");
+        let local = Store::open(&path, "host-one").unwrap();
+        let subject = "agent/example.provenance";
+        let binding = |incarnation: &str, session: &str| {
+            local
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "harness.session-file".into(),
+                    actor: Some(subject.into()),
+                    fields: BTreeMap::from([
+                        ("harness".into(), json!("codex")),
+                        ("session_id".into(), json!(session)),
+                        ("incarnation_id".into(), json!(incarnation)),
+                    ]),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: Some(format!("binding-{incarnation}")),
+                })
+                .unwrap();
+        };
+        let respond = |incarnation: &str, entry: &str, input: u64, reported: bool| {
+            let mut claim = timeline_observation(subject, incarnation, entry);
+            claim.fields.insert("driver".into(), json!("codex"));
+            claim.fields.insert("entry_type".into(), json!("usage"));
+            let mut body = json!({"semantics":"response", "model":"gpt-6.1-sol",
+                "input_tokens":input,"output_tokens":100,"total_tokens":input+100});
+            if reported {
+                body["cost"] = json!(0.001);
+            }
+            claim.fields.insert("body".into(), body);
+            let observation = local.append_claim(&claim).unwrap();
+            let rollup = local
+                .usage_rollup_for_timeline(&observation)
+                .unwrap()
+                .unwrap();
+            local.append_client_claim(&rollup).unwrap();
+            (claim, observation, rollup)
+        };
+        binding("inc-one", "native-example");
+        let (first, observation, baseline) = respond("inc-one", "price-short", 1000, false);
+        let provenance = &baseline.fields["pricing_provenance"][0];
+        assert_eq!(provenance["price_table_id"], crate::pricing::PRICE_TABLE_ID);
+        assert_eq!(
+            provenance["price_table_version"],
+            crate::pricing::price_table_version()
+        );
+        assert_eq!(provenance["cost_source"], "computed");
+        assert_eq!(provenance["rates_usd_per_million_tokens"]["input"], 2.0);
+        assert_eq!(baseline.fields["native_session_id"], "native-example");
+        let since = baseline.fields["observed_at_unix_ms"].as_u64().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        respond("inc-one", "price-long", 300000, false);
+        let (_, _, mixed) = respond("inc-one", "price-reported", 10, true);
+        assert_eq!(
+            mixed.fields["pricing_provenance"].as_array().unwrap().len(),
+            3
+        );
+        let computed = mixed.fields["pricing_provenance"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|p| p["cost_source"] == "computed")
+            .collect::<Vec<_>>();
+        assert!(
+            computed
+                .iter()
+                .any(|p| p["rates_usd_per_million_tokens"]["input"] == 4.0
+                    && p["rates_usd_per_million_tokens"]["output"] == 15.0)
+        );
+        let reported = mixed.fields["pricing_provenance"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["cost_source"] == "provider_reported")
+            .unwrap();
+        assert!(reported.get("rates_usd_per_million_tokens").is_none());
+        assert!(reported.get("price_table_id").is_none());
+        // Replaying the response never adds another provenance contribution.
+        local.append_claim(&first).unwrap();
+        assert_eq!(
+            local
+                .usage_rollup_for_timeline(&observation)
+                .unwrap()
+                .unwrap()
+                .fields,
+            mixed.fields
+        );
+        let period = local.usage_period_rows(since, u64::MAX).unwrap();
+        assert_eq!(period[0]["pricing_provenance"].as_array().unwrap().len(), 2);
+        assert_eq!(period[0]["total_tokens"], 300210);
+        assert_eq!(
+            period[0]["pricing_provenance"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p["total_tokens"].as_u64().unwrap())
+                .sum::<u64>(),
+            300210
+        );
+        let typed: st3_client::UsageRow = serde_json::from_value(period[0].clone()).unwrap();
+        assert_eq!(typed.native_session_id.as_deref(), Some("native-example"));
+        assert_eq!(typed.pricing_provenance.unwrap().len(), 2);
+        // Resume binds a new incarnation to the same conversation. A newer conversation on
+        // this seat must not steal the old incarnation's spend.
+        binding("inc-two", "native-example");
+        let (_, _, resumed) = respond("inc-two", "after-resume", 20, false);
+        assert_eq!(resumed.fields["native_session_id"], "native-example");
+        binding("inc-three", "native-other");
+        assert_eq!(
+            local
+                .usage_rollup_for_timeline(&observation)
+                .unwrap()
+                .unwrap()
+                .fields["native_session_id"],
+            "native-example"
+        );
+        let all = local.usage_period_rows(0, u64::MAX).unwrap();
+        let peer = Store::open_memory("host-two").unwrap();
+        receive_and_project(
+            &peer,
+            "host-one",
+            &exchange_from(&local, &ReplicationInventory::default()),
+        );
+        assert_eq!(peer.usage_period_rows(0, u64::MAX).unwrap(), all);
+        drop(local);
+        let reopened = Store::open(&path, "host-one").unwrap();
+        assert_eq!(reopened.usage_period_rows(0, u64::MAX).unwrap(), all);
+        assert_eq!(
+            reopened
+                .usage_rollup_for_timeline(&observation)
+                .unwrap()
+                .unwrap()
+                .fields,
+            mixed.fields
+        );
+    }
+
+    #[test]
+    fn usage_period_keeps_price_versions_separate_without_repricing_the_baseline() {
+        let local = Store::open_memory("host-one").unwrap();
+        let subject = "agent/example.price-change";
+        let contribution = |version: &str, tokens: u64, rate: u64| {
+            json!({
+                "price_table_id":"st.api-list", "price_table_version":version,
+                "cost_source":"computed",
+                "rates_usd_per_million_tokens":{"input":rate,"output":rate,"cache_read":rate,
+                    "cache_write_5m":rate,"cache_write_1h":rate},
+                "total_tokens":tokens,"input_tokens":tokens,"output_tokens":0,
+                "cache_write_tokens":0,"cache_write_1h_tokens":0,"cached_tokens":0,
+                "cost_microusd":tokens*rate,"reported_cost_microusd":0,"unpriced_tokens":0,
+            })
+        };
+        let old = contribution("example-v1", 10, 1);
+        let new = contribution("example-v2", 20, 2);
+        for (at, total, cost, provenance) in [
+            (10, 10, 10, json!([old.clone()])),
+            (20, 30, 50, json!([old, new])),
+        ] {
+            local
+                .append_client_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "harness.usage".into(),
+                    actor: Some(subject.into()),
+                    fields: serde_json::from_value(json!({
+                        "semantics":"response_rollup","driver":"codex","incarnation_id":"inc-one",
+                        "model":"example-model","native_session_id":"native-example",
+                        "observed_at_unix_ms":at,"total_tokens":total,"input_tokens":total,
+                        "cost_microusd":cost,"pricing_provenance":provenance,
+                    }))
+                    .unwrap(),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+        let rows = local.usage_period_rows(10, 20).unwrap();
+        let (reported_rows, estimate) = local.usage_period_report(10, 20).unwrap();
+        assert_eq!(reported_rows, rows);
+        assert_eq!(estimate["days"][0]["usage_cost_microusd"], 40);
+        assert_eq!(rows[0]["total_tokens"], 20);
+        assert_eq!(rows[0]["cost_microusd"], 40);
+        let provenance = rows[0]["pricing_provenance"].as_array().unwrap();
+        assert_eq!(provenance.len(), 1);
+        assert_eq!(provenance[0]["price_table_version"], "example-v2");
+        assert_eq!(provenance[0]["rates_usd_per_million_tokens"]["input"], 2);
+        assert_eq!(provenance[0]["total_tokens"], 20);
+        assert_eq!(provenance[0]["cost_microusd"], 40);
+        let lifetime = local.usage_period_rows(0, 20).unwrap();
+        assert_eq!(
+            lifetime[0]["pricing_provenance"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(lifetime[0]["cost_microusd"], 50);
+    }
+
+    #[test]
+    fn historical_usage_claims_leave_provenance_unknown() {
+        let local = Store::open_memory("host-one").unwrap();
+        let subject = "agent/example.legacy";
+        local
+            .append_client_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "harness.usage".into(),
+                actor: Some(subject.into()),
+                fields: BTreeMap::from([
+                    ("semantics".into(), json!("response_rollup")),
+                    ("driver".into(), json!("claude")),
+                    ("incarnation_id".into(), json!("legacy-inc")),
+                    ("total_tokens".into(), json!(99)),
+                    ("observed_at_unix_ms".into(), json!(10)),
+                    ("pricing".into(), json!("old-label")),
+                ]),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let rows = local.usage_period_rows(0, 100).unwrap();
+        assert_eq!(rows[0]["unpriced_tokens"], 99);
+        assert_eq!(rows[0]["pricing"], "old-label");
+        assert!(rows[0].get("pricing_provenance").is_none());
+        assert!(rows[0].get("native_session_id").is_none());
+        let typed: st3_client::UsageRow = serde_json::from_value(rows[0].clone()).unwrap();
+        assert!(typed.native_session_id.is_none());
+        assert!(typed.pricing_provenance.is_none());
+    }
+
+    #[test]
     fn response_spend_is_priced_and_kept_apart_by_account_and_step() {
         let local = Store::open_memory("host-one").unwrap();
         let subject = "agent/example.worker";
@@ -47723,6 +48354,91 @@ message "human-attention" {
     }
 
     #[test]
+    fn admission_failure_fences_ready_work_and_exit_until_a_new_incarnation() {
+        let store = Store::open_memory("node").unwrap();
+        let subject = "agent/node.fixture";
+        let append = |kind: &str, fields: BTreeMap<String, Value>| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: kind.into(),
+                    actor: Some(subject.into()),
+                    fields,
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap()
+        };
+        append(
+            "runtime.observed",
+            BTreeMap::from([
+                ("status".into(), json!("running")),
+                ("runtime_id".into(), json!("fixture")),
+                ("incarnation_id".into(), json!("first")),
+            ]),
+        );
+        append(
+            "harness.observed",
+            BTreeMap::from([
+                ("state".into(), json!("ready")),
+                ("incarnation_id".into(), json!("first")),
+            ]),
+        );
+        assert!(store.current_harness(subject).unwrap().unwrap().is_ready());
+        let refusal = append(
+            "harness.diagnostic",
+            BTreeMap::from([
+                ("code".into(), json!("harness-admission-failed")),
+                ("status".into(), json!("degraded")),
+                (
+                    "reason".into(),
+                    json!("opencode 99.42.7 admission failed at admissionLifecycle"),
+                ),
+                ("incarnation_id".into(), json!("first")),
+            ]),
+        );
+        append(
+            "harness.observed",
+            BTreeMap::from([
+                ("state".into(), json!("working")),
+                ("incarnation_id".into(), json!("first")),
+            ]),
+        );
+        let refused = store.current_harness(subject).unwrap().unwrap();
+        assert!(!refused.is_ready());
+        assert_eq!(refused.state, "indeterminate");
+        assert_eq!(refused.since_unix_ms, refusal.accepted_at_unix_ms);
+        assert!(refused.reason.unwrap().contains("admissionLifecycle"));
+        append(
+            "runtime.observed",
+            BTreeMap::from([
+                ("status".into(), json!("exited")),
+                ("incarnation_id".into(), json!("first")),
+            ]),
+        );
+        let exited = store.current_harness(subject).unwrap().unwrap();
+        assert!(exited.reason.unwrap().contains("admissionLifecycle"));
+        assert_eq!(exited.since_unix_ms, refusal.accepted_at_unix_ms);
+        append(
+            "runtime.observed",
+            BTreeMap::from([
+                ("status".into(), json!("running")),
+                ("runtime_id".into(), json!("fixture")),
+                ("incarnation_id".into(), json!("second")),
+            ]),
+        );
+        append(
+            "harness.observed",
+            BTreeMap::from([
+                ("state".into(), json!("ready")),
+                ("incarnation_id".into(), json!("second")),
+            ]),
+        );
+        assert!(store.current_harness(subject).unwrap().unwrap().is_ready());
+    }
+
+    #[test]
     fn expired_claude_login_fences_later_ready_and_work_claims_in_same_incarnation() {
         let store = Store::open_memory("node").unwrap();
         let subject = "agent/node.claude";
@@ -48166,6 +48882,16 @@ fn append_claim_with_fences(
     fence: Option<&crate::mailbox::Fence>,
     event_runtime: Option<&str>,
 ) -> Result<(ClaimRecord, bool), St3Error> {
+    append_claim_with_subject_fences(graph, input, fence, event_runtime, None)
+}
+
+fn append_claim_with_subject_fences(
+    graph: &GraphStore,
+    input: &ClaimInput,
+    fence: Option<&crate::mailbox::Fence>,
+    event_runtime: Option<&str>,
+    expected_subjects: Option<&BTreeMap<String, String>>,
+) -> Result<(ClaimRecord, bool), St3Error> {
     validate_claim_input(input)?;
     if local_retention(&input.kind)
         || (input.actor.is_none() && system_local_retention(&input.kind))
@@ -48227,6 +48953,36 @@ fn append_claim_with_fences(
             if let Some((operation_id, request_digest)) = &operation {
                 checkpointed_operation_outcome(transaction, operation_id, request_digest)?;
             }
+            if let Some(expected_subjects) = expected_subjects {
+                for (subject, expected) in expected_subjects {
+                    // Layout edits merge, but retiring a folded duplicate must not lose
+                    // an edit accepted after the client read it.
+                    if subject == &input.subject
+                        && !(input.kind == "arrangement.edited"
+                            && input.fields.get("operations").and_then(Value::as_array)
+                                .is_some_and(|operations| operations.iter().any(|operation| operation["op"] == "retire")))
+                    { continue; }
+                    let actual = if let Some(id) = subject.strip_prefix("launch/") {
+                        transaction.query_row(
+                            "SELECT updated_at_unix_ms FROM planning_sessions WHERE id=?1",
+                            [id], |row| row.get::<_, String>(0),
+                        ).optional().map_err(internal)?.map(|time| format!("launch/{time}"))
+                    } else if subject.starts_with("arrangement/") {
+                        transaction.query_row(
+                            "SELECT revision FROM arrangements WHERE subject=?1 AND created=1 AND retired=0",
+                            [subject], |row| row.get::<_, String>(0),
+                        ).optional().map_err(internal)?
+                    } else {
+                        latest_claim_id_tx(transaction, subject).map_err(internal)?
+                    };
+                    if actual.as_deref() != Some(expected.as_str()) {
+                        return Err(St3Error::new("stale-subject", format!("subject `{subject}` changed"))
+                            .with_detail("subject", subject.clone())
+                            .with_detail("expected_head", json!(expected))
+                            .with_detail("current_head", json!(actual)));
+                    }
+                }
+            }
             // A native adoption may import old DND only before any explicit graph decision.
             // Check inside the writer transaction so a concurrent release always wins.
             if input.kind == "delivery.hold"
@@ -48250,8 +49006,11 @@ fn append_claim_with_fences(
                 }
             }
             if let Some(expected) = &input.expected_subject {
-                let actual =
-                    latest_claim_id_tx(transaction, &input.subject).map_err(internal)?;
+                let actual = if input.kind == "arrangement.edited" {
+                    transaction.query_row("SELECT revision FROM arrangements WHERE subject=?1", [&input.subject], |row| row.get::<_,String>(0)).optional().map_err(internal)?
+                } else {
+                    latest_claim_id_tx(transaction, &input.subject).map_err(internal)?
+                };
                 if &actual != expected {
                     return Err(St3Error::new(
                         "stale-subject",
@@ -48291,6 +49050,7 @@ fn append_claim_with_fences(
             if let Some(fields) = glasses::prepare(transaction, input)? {
                 stored_fields = Some(fields);
             }
+            arrangements::prepare(transaction, input)?;
             // A leave names its own batch as the last sequence of its window. The sequence is only
             // known here, under the writer lock, so a zero high water stands for "this batch".
             if input.kind == "fleet.member-left"
@@ -48326,8 +49086,11 @@ fn append_claim_with_fences(
                     })?;
                 return Ok((latest, false));
             }
-            let predecessor =
-                latest_claim_id_tx(transaction, &input.subject).map_err(internal)?;
+            let predecessor = if input.kind == "arrangement.edited" {
+                transaction.query_row("SELECT revision FROM arrangements WHERE subject=?1", [&input.subject], |row| row.get::<_, String>(0)).optional().map_err(internal)?
+            } else {
+                latest_claim_id_tx(transaction, &input.subject).map_err(internal)?
+            };
             let mut predecessors = predecessor.into_iter().collect::<Vec<_>>();
             // A placement handoff explicitly cites its local runtime and peer stop proof.
             // Keep same-subject evidence as causal links even when a newer declaration
@@ -48403,6 +49166,8 @@ pub fn validate_claim_input(input: &ClaimInput) -> Result<(), St3Error> {
     )
     .map_err(|e| St3Error::new(e.code, e.message))?;
     st3_schema::glasses::validate_owner(&input.subject, input.actor.as_deref())
+        .map_err(|e| St3Error::new(e.code, e.message))?;
+    st3_schema::arrangements::validate_actor(&input.subject, input.actor.as_deref())
         .map_err(|e| St3Error::new(e.code, e.message))?;
     claim_operation(input)?;
     Ok(())
@@ -48534,6 +49299,8 @@ const PROJECTION_DIGEST_TABLES: &[(&str, &[&str])] = &[
     ("blobs", &[]),
     ("documents", &["created_index"]),
     ("desired", &[]),
+    ("arrangements", &["changed_index"]),
+    ("arrangement_registers", &[]),
     ("message_index", &["created_index"]),
     ("resource_observations", &[]),
     ("glass_heads", &[]),

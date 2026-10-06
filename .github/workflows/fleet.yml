@@ -26,8 +26,10 @@ jobs:
       pull-requests: read
     outputs:
       ci1: ${{ steps.pick.outputs.ci1 }}
+      ci1_secondary: ${{ steps.pick.outputs.ci1_secondary }}
+      ci1_mail: ${{ steps.pick.outputs.ci1_mail }}
     steps:
-      - name: Use reserved ci1 for priority PRs and the queue; available ci1 for PRs
+      - name: Keep reserved primary lanes and use idle general runners for tests and canaries
         id: pick
         env:
           GH_TOKEN: ${{ secrets.CI1_RUNNERS_READ_TOKEN }}
@@ -38,21 +40,26 @@ jobs:
           QUEUE_REF: ${{ github.event.merge_group.head_ref }}
           GH_REPO_TOKEN: ${{ github.token }}
           OWNER: ${{ github.repository_owner }}
-          NEED: ${{ vars.CI1_MIN_IDLE || '4' }}
+          NEED: ${{ vars.CI1_MIN_IDLE || '1' }}
         run: |
+          primary_label=
           namespace() {
             echo "$1: Namespace"
-            printf 'Runner: **Namespace** (%s)\n' "$1" >> "$GITHUB_STEP_SUMMARY"
+            printf 'Unpicked runners: **Namespace** (%s)\n' "$1" >> "$GITHUB_STEP_SUMMARY"
             exit 0
+          }
+          primary() {
+            primary_label=$1
+            printf 'ci1=["%s"]\n' "$primary_label" >> "$GITHUB_OUTPUT"
+            printf 'Primary runner: **ci1** (%s)\n' "$primary_label" >> "$GITHUB_STEP_SUMMARY"
           }
           if [ "$EVENT" = pull_request ] && [ "$HEAD_REPOSITORY" != "$REPOSITORY" ]; then
             namespace "a pull request from a fork never runs on ci1"
           fi
           if [ "$EVENT" = pull_request ] && jq -e 'index("ci-priority") != null' <<< "$PR_LABELS" >/dev/null 2>&1; then
-            printf 'ci1=["ci1-priority"]\n' >> "$GITHUB_OUTPUT"
+            primary ci1-priority
             echo "priority PR: reserved ci1-priority capacity"
             printf 'Runner: **ci1** (ci1-priority, ahead of ordinary PRs)\n' >> "$GITHUB_STEP_SUMMARY"
-            exit 0
           fi
           if [ "$EVENT" = merge_group ]; then
             label=ci1-merge
@@ -63,25 +70,42 @@ jobs:
                 label=ci1-priority
               fi
             fi
-            printf 'ci1=["%s"]\n' "$label" >> "$GITHUB_OUTPUT"
+            primary "$label"
             echo "merge queue: reserved $label runners"
             printf 'Runner: **ci1** (%s, reserved merge-queue capacity)\n' "$label" >> "$GITHUB_STEP_SUMMARY"
-            exit 0
           fi
-          label=ci1
           [ -n "$GH_TOKEN" ] || namespace "no runner status token"
           [[ "$NEED" =~ ^[1-9][0-9]*$ ]] || namespace "invalid minimum idle runner count"
           if ! runners=$(timeout 20s gh api --paginate --slurp "orgs/$OWNER/actions/runners?per_page=100" 2>&1); then
             echo "::warning::could not list ci1's runners: $runners"
             namespace "the runner list is unavailable"
           fi
-          if ! idle=$(jq -e --arg label "$label" '[.[].runners[] | select(.status == "online" and .busy == false and any(.labels[]; .name == $label))] | length' <<< "$runners"); then
+          if ! idle=$(jq -e '[.[].runners[] | select(.status == "online" and .busy == false and any(.labels[]; .name == "ci1"))] | length' <<< "$runners"); then
             namespace "the runner list is invalid"
           fi
-          [ "$idle" -ge "$NEED" ] || namespace "$idle $label runners idle, $NEED needed"
-          printf 'ci1=["%s"]\n' "$label" >> "$GITHUB_OUTPUT"
-          echo "$idle $label runners idle: ci1"
-          printf 'Runner: **ci1** (%s, %s idle)\n' "$label" "$idle" >> "$GITHUB_STEP_SUMMARY"
+          if [ -z "$primary_label" ]; then
+            if [ "$idle" -ge "$NEED" ]; then
+              primary ci1
+            else
+              printf 'Primary runner: **Namespace** (%s general runners idle, %s needed)\n' "$idle" "$NEED" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
+          # A primary on ci1 or ci1-merge may take a general worker. Account for that worker
+          # before offering separate slots to the second shard and canaries. A priority
+          # primary has its own reserved label; general workers temporarily lent to priority
+          # work no longer carry ci1 and therefore were excluded from the idle count above.
+          available=$idle
+          case "$primary_label" in ci1|ci1-merge) available=$((available - 1));; esac
+          echo "$idle general runners idle; primary minimum $NEED; extra slots $available"
+          for output in ci1_secondary ci1_mail; do
+            if [ "$available" -gt 0 ]; then
+              printf '%s=["ci1"]\n' "$output" >> "$GITHUB_OUTPUT"
+              printf '%s runner: **ci1** (idle general slot)\n' "$output" >> "$GITHUB_STEP_SUMMARY"
+              available=$((available - 1))
+            else
+              printf '%s runner: **Namespace** (no idle general slot)\n' "$output" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
       - name: Report job cache coverage
         if: always()
         shell: bash
@@ -91,7 +115,7 @@ jobs:
   namespace-capacity:
     name: namespace-capacity
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
-    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && '["ubuntu-latest"]' || format('["namespace-profile-linux-x86-64","namespace-features:github.run-id={0}"]', github.run_id)) }}
+    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && '["ubuntu-latest"]' || format('["namespace-profile-linux-x86-64;job.priority=1;github.run-id={0}"]', github.run_id)) }}
     timeout-minutes: 120
     permissions:
       contents: read
@@ -222,11 +246,7 @@ jobs:
       CI_CACHE_DEV_SHELL: genie
     needs: [pick-runner]
     if: ${{ !cancelled() }}
-    runs-on:
-      [
-        "namespace-profile-linux-x86-64;job.priority=${{ (github.event_name == 'merge_group' || contains(github.event.pull_request.labels.*.name, 'ci-priority')) && 1 || 10 }}",
-        "namespace-features:github.run-id=${{ github.run_id }}",
-      ]
+    runs-on: ["namespace-profile-linux-x86-64;job.priority=1;github.run-id=${{ github.run_id }}"]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -247,7 +267,7 @@ jobs:
       - name: Restore the local Nix cache
         id: nix-cache
         if: env.CI_LOCAL_CACHES != '1' && env.CI_BUILD_SNAPSHOT_HIT != '1'
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: "${{ runner.temp }}/st-ci-cache"
           key: "nix5-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
@@ -281,7 +301,7 @@ jobs:
         run: 'bash scripts/ci-nix-cache use || echo "::warning::the local Nix cache is unavailable; this run builds everything"'
       - name: Check runner selection and generated files
         shell: bash
-        run: "nix develop '.#genie' -c bash -c 'python3 scripts/check-ci-runner-test && python3 scripts/ci-test-partitions-test && python3 scripts/ci-queue-watch-test && python3 scripts/check-main-ci-test && python3 scripts/ci-perf-cache-test && python3 scripts/ci-cache-audit-test && genie --check'"
+        run: "nix develop '.#genie' -c bash -c 'python3 scripts/check-ci-runner-test && python3 scripts/ci-mail-redelivery-canaries-test && python3 scripts/ci-test-partitions-test && python3 scripts/ci-queue-watch-test && python3 scripts/check-main-ci-test && python3 scripts/ci-perf-cache-test && python3 scripts/ci-cache-audit-test && genie --check'"
       - name: Save Nix outputs
         if: success() && env.CI_LOCAL_CACHES != '1'
         run: bash scripts/ci-nix-cache save
@@ -305,17 +325,13 @@ jobs:
         if: always()
         shell: bash
         env:
-          CACHE_ENTRIES: '[{"name":"Restore the exact-source build snapshot","outcome":"${{ steps.build-snapshot.outcome }}","hit":"${{ steps.build-snapshot.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":true,"avoidable":"${{ steps.build-snapshot.outputs.avoidable-miss }}","lookup":false},{"name":"Restore the local Nix cache","outcome":"${{ steps.nix-cache.outcome }}","hit":"${{ steps.nix-cache.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":false,"avoidable":"","lookup":false}]'
+          CACHE_ENTRIES: '[{"name":"Restore the exact-source build snapshot","outcome":"${{ steps.build-snapshot.outcome }}","hit":"${{ steps.build-snapshot.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":true,"avoidable":"${{ steps.build-snapshot.outputs.avoidable-miss }}","lookup":false},{"name":"Restore the local Nix cache","outcome":"${{ steps.nix-cache.outcome }}","hit":"${{ steps.nix-cache.outputs.cache-hit }}","matched":"${{ steps.nix-cache.outputs.cache-matched-key }}","opaqueFallback":false,"sourceOnly":false,"avoidable":"","lookup":false}]'
         run: 'python3 "${CI_CACHE_AUDIT_SCRIPT:-scripts/ci-cache-audit}"'
   typescript-client:
     name: typescript-client
     needs: [pick-runner, genie-freshness]
     if: ${{ !cancelled() && needs.genie-freshness.result == 'success' }}
-    runs-on:
-      [
-        "namespace-profile-linux-x86-64;job.priority=${{ (github.event_name == 'merge_group' || contains(github.event.pull_request.labels.*.name, 'ci-priority')) && 1 || 10 }}",
-        "namespace-features:github.run-id=${{ github.run_id }}",
-      ]
+    runs-on: ["namespace-profile-linux-x86-64;job.priority=1;github.run-id=${{ github.run_id }}"]
     timeout-minutes: 10
     defaults:
       run:
@@ -370,7 +386,7 @@ jobs:
     name: linux-tests
     needs: [pick-runner]
     if: ${{ !cancelled() }}
-    runs-on: ${{ fromJSON(needs.pick-runner.outputs.ci1 || format('["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority={0}","namespace-features:github.run-id={1}"]', (github.event_name == 'merge_group' || contains(github.event.pull_request.labels.*.name, 'ci-priority')) && 1 || 10, github.run_id)) }}
+    runs-on: ${{ fromJSON(needs.pick-runner.outputs.ci1 || format('["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1","namespace-features:github.run-id={0}"]', github.run_id)) }}
     timeout-minutes: 120
     defaults:
       run:
@@ -402,7 +418,7 @@ jobs:
       - name: Restore the Cargo target and registry
         id: cargo-cache
         if: env.CI_LOCAL_CACHES != '1' && env.CI_BUILD_SNAPSHOT_HIT != '1'
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             ${{ github.workspace }}/target
@@ -413,7 +429,7 @@ jobs:
       - name: Restore the local Nix cache
         id: nix-cache
         if: env.CI_LOCAL_CACHES != '1' && env.CI_BUILD_SNAPSHOT_HIT != '1'
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: "${{ runner.temp }}/st-ci-cache"
           key: "nix5-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
@@ -469,10 +485,6 @@ jobs:
       - name: Prove both shards cover every selected test
         shell: bash
         run: nix develop -c python3 scripts/ci-test-partitions
-      - name: Require every harness to hold old mail across boot and reconnect
-        shell: bash
-        run: nix develop -c python3 scripts/ci-mail-redelivery-canaries
-        id: mail-redelivery-canaries
       - name: Run nextest
         shell: bash
         run: nix develop -c bash scripts/ci-linux tests
@@ -509,19 +521,13 @@ jobs:
         if: always()
         shell: bash
         env:
-          CACHE_ENTRIES: '[{"name":"Restore the exact-source build snapshot","outcome":"${{ steps.build-snapshot.outcome }}","hit":"${{ steps.build-snapshot.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":true,"avoidable":"${{ steps.build-snapshot.outputs.avoidable-miss }}","lookup":false},{"name":"Restore the Cargo target and registry","outcome":"${{ steps.cargo-cache.outcome }}","hit":"${{ steps.cargo-cache.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":false,"avoidable":"","lookup":false},{"name":"Restore the local Nix cache","outcome":"${{ steps.nix-cache.outcome }}","hit":"${{ steps.nix-cache.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":false,"avoidable":"","lookup":false}]'
+          CACHE_ENTRIES: '[{"name":"Restore the exact-source build snapshot","outcome":"${{ steps.build-snapshot.outcome }}","hit":"${{ steps.build-snapshot.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":true,"avoidable":"${{ steps.build-snapshot.outputs.avoidable-miss }}","lookup":false},{"name":"Restore the Cargo target and registry","outcome":"${{ steps.cargo-cache.outcome }}","hit":"${{ steps.cargo-cache.outputs.cache-hit }}","matched":"${{ steps.cargo-cache.outputs.cache-matched-key }}","opaqueFallback":false,"sourceOnly":false,"avoidable":"","lookup":false},{"name":"Restore the local Nix cache","outcome":"${{ steps.nix-cache.outcome }}","hit":"${{ steps.nix-cache.outputs.cache-hit }}","matched":"${{ steps.nix-cache.outputs.cache-matched-key }}","opaqueFallback":false,"sourceOnly":false,"avoidable":"","lookup":false}]'
         run: 'python3 "${CI_CACHE_AUDIT_SCRIPT:-scripts/ci-cache-audit}"'
-    outputs:
-      mail_redelivery: ${{ steps.mail-redelivery-canaries.outcome }}
   linux-tests-shard-2:
     name: linux-tests-shard-2
     needs: [pick-runner]
     if: ${{ !cancelled() }}
-    runs-on:
-      [
-        "nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=${{ (github.event_name == 'merge_group' || contains(github.event.pull_request.labels.*.name, 'ci-priority')) && 1 || 10 }}",
-        "namespace-features:github.run-id=${{ github.run_id }}",
-      ]
+    runs-on: ${{ fromJSON(needs.pick-runner.outputs.ci1_secondary || format('["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1","namespace-features:github.run-id={0}"]', github.run_id)) }}
     timeout-minutes: 120
     defaults:
       run:
@@ -553,7 +559,7 @@ jobs:
       - name: Restore the Cargo target and registry
         id: cargo-cache
         if: env.CI_LOCAL_CACHES != '1' && env.CI_BUILD_SNAPSHOT_HIT != '1'
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             ${{ github.workspace }}/target
@@ -564,7 +570,7 @@ jobs:
       - name: Restore the local Nix cache
         id: nix-cache
         if: env.CI_LOCAL_CACHES != '1' && env.CI_BUILD_SNAPSHOT_HIT != '1'
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: "${{ runner.temp }}/st-ci-cache"
           key: "nix5-linux-tests-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
@@ -653,7 +659,7 @@ jobs:
         if: always()
         shell: bash
         env:
-          CACHE_ENTRIES: '[{"name":"Restore the exact-source build snapshot","outcome":"${{ steps.build-snapshot.outcome }}","hit":"${{ steps.build-snapshot.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":true,"avoidable":"${{ steps.build-snapshot.outputs.avoidable-miss }}","lookup":false},{"name":"Restore the Cargo target and registry","outcome":"${{ steps.cargo-cache.outcome }}","hit":"${{ steps.cargo-cache.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":false,"avoidable":"","lookup":false},{"name":"Restore the local Nix cache","outcome":"${{ steps.nix-cache.outcome }}","hit":"${{ steps.nix-cache.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":false,"avoidable":"","lookup":false}]'
+          CACHE_ENTRIES: '[{"name":"Restore the exact-source build snapshot","outcome":"${{ steps.build-snapshot.outcome }}","hit":"${{ steps.build-snapshot.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":true,"avoidable":"${{ steps.build-snapshot.outputs.avoidable-miss }}","lookup":false},{"name":"Restore the Cargo target and registry","outcome":"${{ steps.cargo-cache.outcome }}","hit":"${{ steps.cargo-cache.outputs.cache-hit }}","matched":"${{ steps.cargo-cache.outputs.cache-matched-key }}","opaqueFallback":false,"sourceOnly":false,"avoidable":"","lookup":false},{"name":"Restore the local Nix cache","outcome":"${{ steps.nix-cache.outcome }}","hit":"${{ steps.nix-cache.outputs.cache-hit }}","matched":"${{ steps.nix-cache.outputs.cache-matched-key }}","opaqueFallback":false,"sourceOnly":false,"avoidable":"","lookup":false}]'
         run: 'python3 "${CI_CACHE_AUDIT_SCRIPT:-scripts/ci-cache-audit}"'
   linux-clippy:
     name: linux-clippy
@@ -661,7 +667,7 @@ jobs:
     if: ${{ !cancelled() }}
     runs-on:
       [
-        "nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=${{ (github.event_name == 'merge_group' || contains(github.event.pull_request.labels.*.name, 'ci-priority')) && 1 || 10 }}",
+        nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1,
         "namespace-features:github.run-id=${{ github.run_id }}",
       ]
     timeout-minutes: 120
@@ -693,7 +699,7 @@ jobs:
       - name: Restore the Cargo target and registry
         id: cargo-cache
         if: env.CI_LOCAL_CACHES != '1' && env.CI_BUILD_SNAPSHOT_HIT != '1'
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             ${{ github.workspace }}/target
@@ -704,7 +710,7 @@ jobs:
       - name: Restore the local Nix cache
         id: nix-cache
         if: env.CI_LOCAL_CACHES != '1' && env.CI_BUILD_SNAPSHOT_HIT != '1'
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: "${{ runner.temp }}/st-ci-cache"
           key: "nix5-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
@@ -773,7 +779,7 @@ jobs:
         if: always()
         shell: bash
         env:
-          CACHE_ENTRIES: '[{"name":"Restore the exact-source build snapshot","outcome":"${{ steps.build-snapshot.outcome }}","hit":"${{ steps.build-snapshot.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":true,"avoidable":"${{ steps.build-snapshot.outputs.avoidable-miss }}","lookup":false},{"name":"Restore the Cargo target and registry","outcome":"${{ steps.cargo-cache.outcome }}","hit":"${{ steps.cargo-cache.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":false,"avoidable":"","lookup":false},{"name":"Restore the local Nix cache","outcome":"${{ steps.nix-cache.outcome }}","hit":"${{ steps.nix-cache.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":false,"avoidable":"","lookup":false}]'
+          CACHE_ENTRIES: '[{"name":"Restore the exact-source build snapshot","outcome":"${{ steps.build-snapshot.outcome }}","hit":"${{ steps.build-snapshot.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":true,"avoidable":"${{ steps.build-snapshot.outputs.avoidable-miss }}","lookup":false},{"name":"Restore the Cargo target and registry","outcome":"${{ steps.cargo-cache.outcome }}","hit":"${{ steps.cargo-cache.outputs.cache-hit }}","matched":"${{ steps.cargo-cache.outputs.cache-matched-key }}","opaqueFallback":false,"sourceOnly":false,"avoidable":"","lookup":false},{"name":"Restore the local Nix cache","outcome":"${{ steps.nix-cache.outcome }}","hit":"${{ steps.nix-cache.outputs.cache-hit }}","matched":"${{ steps.nix-cache.outputs.cache-matched-key }}","opaqueFallback":false,"sourceOnly":false,"avoidable":"","lookup":false}]'
         run: 'python3 "${CI_CACHE_AUDIT_SCRIPT:-scripts/ci-cache-audit}"'
   linux-fleet-compat:
     name: linux-fleet-compat
@@ -781,7 +787,7 @@ jobs:
     if: ${{ !cancelled() }}
     runs-on:
       [
-        "nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=${{ (github.event_name == 'merge_group' || contains(github.event.pull_request.labels.*.name, 'ci-priority')) && 1 || 10 }}",
+        nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1,
         "namespace-features:github.run-id=${{ github.run_id }}",
       ]
     timeout-minutes: 120
@@ -812,7 +818,7 @@ jobs:
       - name: Restore the Cargo target and registry
         id: cargo-cache
         if: env.CI_LOCAL_CACHES != '1' && env.CI_BUILD_SNAPSHOT_HIT != '1'
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             ${{ github.workspace }}/target
@@ -823,7 +829,7 @@ jobs:
       - name: Restore the local Nix cache
         id: nix-cache
         if: env.CI_LOCAL_CACHES != '1' && env.CI_BUILD_SNAPSHOT_HIT != '1'
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: "${{ runner.temp }}/st-ci-cache"
           key: "nix5-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
@@ -892,25 +898,160 @@ jobs:
         if: always()
         shell: bash
         env:
-          CACHE_ENTRIES: '[{"name":"Restore the exact-source build snapshot","outcome":"${{ steps.build-snapshot.outcome }}","hit":"${{ steps.build-snapshot.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":true,"avoidable":"${{ steps.build-snapshot.outputs.avoidable-miss }}","lookup":false},{"name":"Restore the Cargo target and registry","outcome":"${{ steps.cargo-cache.outcome }}","hit":"${{ steps.cargo-cache.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":false,"avoidable":"","lookup":false},{"name":"Restore the local Nix cache","outcome":"${{ steps.nix-cache.outcome }}","hit":"${{ steps.nix-cache.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":false,"avoidable":"","lookup":false}]'
+          CACHE_ENTRIES: '[{"name":"Restore the exact-source build snapshot","outcome":"${{ steps.build-snapshot.outcome }}","hit":"${{ steps.build-snapshot.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":true,"avoidable":"${{ steps.build-snapshot.outputs.avoidable-miss }}","lookup":false},{"name":"Restore the Cargo target and registry","outcome":"${{ steps.cargo-cache.outcome }}","hit":"${{ steps.cargo-cache.outputs.cache-hit }}","matched":"${{ steps.cargo-cache.outputs.cache-matched-key }}","opaqueFallback":false,"sourceOnly":false,"avoidable":"","lookup":false},{"name":"Restore the local Nix cache","outcome":"${{ steps.nix-cache.outcome }}","hit":"${{ steps.nix-cache.outputs.cache-hit }}","matched":"${{ steps.nix-cache.outputs.cache-matched-key }}","opaqueFallback":false,"sourceOnly":false,"avoidable":"","lookup":false}]'
         run: 'python3 "${CI_CACHE_AUDIT_SCRIPT:-scripts/ci-cache-audit}"'
   mail-redelivery-canaries:
     name: mail-redelivery-canaries
-    needs: [linux-tests]
-    if: always()
-    runs-on: ubuntu-latest
-    timeout-minutes: 3
+    runs-on: ${{ fromJSON(needs.pick-runner.outputs.ci1_mail || format('["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1","namespace-features:github.run-id={0}"]', github.run_id)) }}
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+      CI_RUN_ID: ${{ github.run_id }}
+      CI_TEST_THREADS: "8"
+      CI_CACHE_DEV_SHELL: default
     steps:
-      - name: Require the explicit zero-redelivery canaries to pass
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Use the runner's own caches
+        run: |
+          if [ -n "${CI_LOCAL_CARGO_HOME:-}" ]; then echo CI_LOCAL_CACHES=1 >> "$GITHUB_ENV"; fi
+          printf 'CARGO_HOME=%s\nCI_CACHE_DIR=%s\n' "${CI_LOCAL_CARGO_HOME:-$RUNNER_TEMP/cargo-home}" "$RUNNER_TEMP/st-ci-cache" >> "$GITHUB_ENV"
+      - id: build-snapshot
+        name: Restore the exact-source build snapshot
+        if: env.CI_LOCAL_CACHES != '1'
         env:
-          RESULT: ${{ needs.linux-tests.outputs.mail_redelivery }}
-        run: '[ "$RESULT" = success ]'
+          GH_TOKEN: ${{ github.token }}
+          CI_SNAPSHOT_PIPELINE: ${{ github.workflow_sha }}
+        run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" restore'
+      - name: Restore the Cargo target and registry
+        id: cargo-cache
+        if: env.CI_LOCAL_CACHES != '1' && env.CI_BUILD_SNAPSHOT_HIT != '1'
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ${{ github.workspace }}/target
+            ${{ runner.temp }}/cargo-home/registry
+            ${{ runner.temp }}/cargo-home/git
+          key: "cargo-linux-tests-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '.cargo/config.toml') }}"
+          restore-keys: "cargo-linux-tests-${{ runner.os }}-"
+      - name: Restore the local Nix cache
+        id: nix-cache
+        if: env.CI_LOCAL_CACHES != '1' && env.CI_BUILD_SNAPSHOT_HIT != '1'
+        uses: actions/cache/restore@v4
+        with:
+          path: "${{ runner.temp }}/st-ci-cache"
+          key: "nix5-linux-tests-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
+          restore-keys: |
+            nix5-linux-tests-${{ runner.os }}-
+            nix4-linux-tests-${{ runner.os }}-
+      - name: Remember genuine source inputs before compiling
+        run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" prepare'
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@v3
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+            extra-substituters = https://overeng-effect-utils.cachix.org
+            extra-trusted-public-keys = overeng-effect-utils.cachix.org-1:KFmqYNF6Q7ZzVYPl2znpJYZGEolage9YNCA9res6vKc=
+            access-tokens = github.com=${{ github.token }}
+          summarize: true
+      - name: Isolate test home and XDG state
+        run: |
+          # Cargo's home and the CI cache directory live under RUNNER_TEMP, not HOME: tests get an isolated HOME,
+          # and actions/cache expands a leading tilde against the HOME of the step that runs it.
+          printf 'CARGO_HOME=%s\nCI_CACHE_DIR=%s\n' "${CI_LOCAL_CARGO_HOME:-$RUNNER_TEMP/cargo-home}" "$RUNNER_TEMP/st-ci-cache" >> "$GITHUB_ENV"
+          home="$RUNNER_TEMP/test-home"
+          mkdir -p "$home" "$home/.config" "$home/.cache" "$home/.local/state"
+          printf 'HOME=%s\nXDG_CONFIG_HOME=%s/.config\nXDG_CACHE_HOME=%s/.cache\nXDG_STATE_HOME=%s/.local/state\n' "$home" "$home" "$home" "$home" >> "$GITHUB_ENV"
+      - name: Use the cached Nix outputs
+        if: env.CI_LOCAL_CACHES != '1'
+        run: 'bash scripts/ci-nix-cache use || echo "::warning::the local Nix cache is unavailable; this run builds everything"'
+      - name: Prepare the historical messaging channel
+        if: runner.os == 'Linux'
+        run: |
+          binary=$(timeout 10m bash scripts/messaging-compat-binary)
+          printf 'ST3_MESSAGING_COMPAT_BIN=%s\n' "$binary" >> "$GITHUB_ENV"
+      - name: Prepare provider component fixtures
+        run: |
+          system=$(nix eval --impure --raw --expr builtins.currentSystem)
+          components=$(nix build ".#checks.$system.provider-components" --no-link --print-out-paths --print-build-logs)
+          for provider in GITHUB_ISSUE GITHUB_PR PTY_STATS VISTA; do
+            wasm=$(printf '%s' "$provider" | tr '[:upper:]' '[:lower:]')
+            printf 'ST2_%s_COMPONENT=%s/share/st2/providers/st2_%s_component.component.wasm\n' "$provider" "$components" "$wasm" >> "$GITHUB_ENV"
+          done
+      - name: Build selected test targets first (no debug info)
+        shell: bash
+        run: nix develop -c bash scripts/ci-nextest run --no-run
+      - name: Install matching rendered hooks
+        shell: bash
+        run: nix develop -c bash scripts/ci-install-built-hooks
+      - name: Summarize tested revision
+        run: "printf 'Checked merge/commit: \\x60%s\\x60 on %s CPUs, %s\\n\\n| Stage | Result | Elapsed | Exit |\\n| --- | --- | --- | --- |\\n' \"$(git rev-parse HEAD)\" \"$(nproc)\" \"$(free -h | awk '/^Mem:/ {print $2 \" memory\"}')\" >> \"$GITHUB_STEP_SUMMARY\""
+      - name: Require every harness to hold old mail across boot and reconnect
+        shell: bash
+        run: nix develop -c bash scripts/ci-linux mail-redelivery-canaries
+      - name: Save Nix outputs to the local Nix cache
+        if: success() && env.CI_LOCAL_CACHES != '1'
+        run: 'bash scripts/ci-nix-cache save || echo "::warning::could not save the local Nix cache"'
+      - name: Save main cargo-cache
+        if: success() && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && env.CI_LOCAL_CACHES != '1' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ${{ github.workspace }}/target
+            ${{ runner.temp }}/cargo-home/registry
+            ${{ runner.temp }}/cargo-home/git
+          key: "cargo-linux-tests-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '.cargo/config.toml') }}"
+      - name: Save main nix-cache
+        if: success() && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && env.CI_LOCAL_CACHES != '1' && steps.nix-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: "${{ runner.temp }}/st-ci-cache"
+          key: "nix5-linux-tests-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
+      - id: build-snapshot-save
+        name: Keep valid same-source build outputs
+        if: "!cancelled()"
+        env:
+          CI_SNAPSHOT_PIPELINE: ${{ github.workflow_sha }}
+        run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" pack'
+      - name: Retain the same-source build snapshot
+        if: "!cancelled() && steps.build-snapshot-save.outputs.publish == 'true'"
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.build-snapshot-save.outputs.name }}
+          path: "${{ runner.temp }}/ci-build-snapshot/build.tar.zst"
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: error
+          overwrite: true
+      - name: Retain stage logs and timings
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mail-redelivery-canaries-logs
+          path: |
+            ${{ runner.temp }}/ci-logs/
+            target/messaging-faults/
+            target/boot-canaries/
+          if-no-files-found: ignore
       - name: Report job cache coverage
         if: always()
         shell: bash
         env:
-          CACHE_REASON: Verifies the completed Linux canary outcome and builds nothing.
-        run: "printf 'Cache coverage: **not applicable** — %s\\n' \"$CACHE_REASON\" >> \"$GITHUB_STEP_SUMMARY\""
+          CACHE_ENTRIES: '[{"name":"Restore the exact-source build snapshot","outcome":"${{ steps.build-snapshot.outcome }}","hit":"${{ steps.build-snapshot.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":true,"avoidable":"${{ steps.build-snapshot.outputs.avoidable-miss }}","lookup":false},{"name":"Restore the Cargo target and registry","outcome":"${{ steps.cargo-cache.outcome }}","hit":"${{ steps.cargo-cache.outputs.cache-hit }}","matched":"${{ steps.cargo-cache.outputs.cache-matched-key }}","opaqueFallback":false,"sourceOnly":false,"avoidable":"","lookup":false},{"name":"Restore the local Nix cache","outcome":"${{ steps.nix-cache.outcome }}","hit":"${{ steps.nix-cache.outputs.cache-hit }}","matched":"${{ steps.nix-cache.outputs.cache-matched-key }}","opaqueFallback":false,"sourceOnly":false,"avoidable":"","lookup":false}]'
+        run: 'python3 "${CI_CACHE_AUDIT_SCRIPT:-scripts/ci-cache-audit}"'
+    needs: [pick-runner]
+    if: ${{ !cancelled() }}
   linux-gate:
     name: linux-gate
     needs:
@@ -941,7 +1082,11 @@ jobs:
   perf-cost:
     name: perf-cost
     if: github.event_name != 'merge_group'
-    runs-on: [nscloud-ubuntu-24.04-amd64-8x16]
+    runs-on:
+      [
+        nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1,
+        "namespace-features:github.run-id=${{ github.run_id }}",
+      ]
     timeout-minutes: 120
     defaults:
       run:
@@ -971,7 +1116,7 @@ jobs:
       - name: Restore the Cargo target and registry
         id: cargo-cache
         if: env.CI_LOCAL_CACHES != '1' && env.CI_BUILD_SNAPSHOT_HIT != '1'
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             ${{ github.workspace }}/target
@@ -982,7 +1127,7 @@ jobs:
       - name: Restore the local Nix cache
         id: nix-cache
         if: env.CI_LOCAL_CACHES != '1' && env.CI_BUILD_SNAPSHOT_HIT != '1'
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: "${{ runner.temp }}/st-ci-cache"
           key: "nix5-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
@@ -1029,6 +1174,21 @@ jobs:
       - name: Save Nix outputs to the local Nix cache
         if: success() && env.CI_LOCAL_CACHES != '1'
         run: 'bash scripts/ci-nix-cache save || echo "::warning::could not save the local Nix cache"'
+      - name: Save main cargo-cache
+        if: success() && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && env.CI_LOCAL_CACHES != '1' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ${{ github.workspace }}/target
+            ${{ runner.temp }}/cargo-home/registry
+            ${{ runner.temp }}/cargo-home/git
+          key: "cargo-${{ github.job }}-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '.cargo/config.toml') }}"
+      - name: Save main nix-cache
+        if: success() && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && env.CI_LOCAL_CACHES != '1' && steps.nix-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: "${{ runner.temp }}/st-ci-cache"
+          key: "nix5-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
       - id: build-snapshot-save
         name: Keep valid same-source build outputs
         if: "!cancelled()"
@@ -1058,17 +1218,13 @@ jobs:
         if: always()
         shell: bash
         env:
-          CACHE_ENTRIES: '[{"name":"Restore the exact-source build snapshot","outcome":"${{ steps.build-snapshot.outcome }}","hit":"${{ steps.build-snapshot.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":true,"avoidable":"${{ steps.build-snapshot.outputs.avoidable-miss }}","lookup":false},{"name":"Restore the Cargo target and registry","outcome":"${{ steps.cargo-cache.outcome }}","hit":"${{ steps.cargo-cache.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":false,"avoidable":"","lookup":false},{"name":"Restore the local Nix cache","outcome":"${{ steps.nix-cache.outcome }}","hit":"${{ steps.nix-cache.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":false,"avoidable":"","lookup":false},{"name":"Restore the generated stores","outcome":"${{ steps.cache-10.outcome }}","hit":"${{ steps.cache-10.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":false,"avoidable":"","lookup":false}]'
+          CACHE_ENTRIES: '[{"name":"Restore the exact-source build snapshot","outcome":"${{ steps.build-snapshot.outcome }}","hit":"${{ steps.build-snapshot.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":true,"avoidable":"${{ steps.build-snapshot.outputs.avoidable-miss }}","lookup":false},{"name":"Restore the Cargo target and registry","outcome":"${{ steps.cargo-cache.outcome }}","hit":"${{ steps.cargo-cache.outputs.cache-hit }}","matched":"${{ steps.cargo-cache.outputs.cache-matched-key }}","opaqueFallback":false,"sourceOnly":false,"avoidable":"","lookup":false},{"name":"Restore the local Nix cache","outcome":"${{ steps.nix-cache.outcome }}","hit":"${{ steps.nix-cache.outputs.cache-hit }}","matched":"${{ steps.nix-cache.outputs.cache-matched-key }}","opaqueFallback":false,"sourceOnly":false,"avoidable":"","lookup":false},{"name":"Restore the generated stores","outcome":"${{ steps.cache-10.outcome }}","hit":"${{ steps.cache-10.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":false,"avoidable":"","lookup":false}]'
         run: 'python3 "${CI_CACHE_AUDIT_SCRIPT:-scripts/ci-cache-audit}"'
   isolation-vm:
     name: isolation-vm
     needs: [pick-runner]
     if: ${{ !cancelled() }}
-    runs-on:
-      [
-        "namespace-profile-linux-x86-64;job.priority=${{ (github.event_name == 'merge_group' || contains(github.event.pull_request.labels.*.name, 'ci-priority')) && 1 || 10 }}",
-        "namespace-features:github.run-id=${{ github.run_id }}",
-      ]
+    runs-on: ["namespace-profile-linux-x86-64;job.priority=1;github.run-id=${{ github.run_id }}"]
     timeout-minutes: 60
     defaults:
       run:
@@ -1114,7 +1270,7 @@ jobs:
       - name: Restore the Cargo target and registry
         id: cargo-cache
         if: env.CI_LOCAL_CACHES != '1' && env.CI_BUILD_SNAPSHOT_HIT != '1'
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             ${{ github.workspace }}/target
@@ -1125,7 +1281,7 @@ jobs:
       - name: Restore the local Nix cache
         id: nix-cache
         if: env.CI_LOCAL_CACHES != '1' && env.CI_BUILD_SNAPSHOT_HIT != '1'
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: "${{ runner.temp }}/st-ci-cache"
           key: "nix5-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}"
@@ -1219,5 +1375,5 @@ jobs:
         if: always()
         shell: bash
         env:
-          CACHE_ENTRIES: '[{"name":"Restore the exact-source build snapshot","outcome":"${{ steps.build-snapshot.outcome }}","hit":"${{ steps.build-snapshot.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":true,"avoidable":"${{ steps.build-snapshot.outputs.avoidable-miss }}","lookup":false},{"name":"Restore the Cargo target and registry","outcome":"${{ steps.cargo-cache.outcome }}","hit":"${{ steps.cargo-cache.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":false,"avoidable":"","lookup":false},{"name":"Restore the local Nix cache","outcome":"${{ steps.nix-cache.outcome }}","hit":"${{ steps.nix-cache.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":false,"avoidable":"","lookup":false}]'
+          CACHE_ENTRIES: '[{"name":"Restore the exact-source build snapshot","outcome":"${{ steps.build-snapshot.outcome }}","hit":"${{ steps.build-snapshot.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":true,"avoidable":"${{ steps.build-snapshot.outputs.avoidable-miss }}","lookup":false},{"name":"Restore the Cargo target and registry","outcome":"${{ steps.cargo-cache.outcome }}","hit":"${{ steps.cargo-cache.outputs.cache-hit }}","matched":"${{ steps.cargo-cache.outputs.cache-matched-key }}","opaqueFallback":false,"sourceOnly":false,"avoidable":"","lookup":false},{"name":"Restore the local Nix cache","outcome":"${{ steps.nix-cache.outcome }}","hit":"${{ steps.nix-cache.outputs.cache-hit }}","matched":"${{ steps.nix-cache.outputs.cache-matched-key }}","opaqueFallback":false,"sourceOnly":false,"avoidable":"","lookup":false}]'
         run: 'python3 "${CI_CACHE_AUDIT_SCRIPT:-scripts/ci-cache-audit}"'

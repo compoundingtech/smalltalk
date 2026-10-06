@@ -49,13 +49,27 @@ async def until(predicate, timeout=30):
 
 
 async def stop(process):
-    if process and process.returncode is None:
-        process.terminate()
-        try:
-            await asyncio.wait_for(process.wait(), 10)
-        except asyncio.TimeoutError:
-            process.kill()
-            await process.wait()
+    if process:
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(process.pid, sig)
+            except ProcessLookupError:
+                pass
+            if sig == signal.SIGTERM:
+                try:
+                    await asyncio.wait_for(process.wait(), 1)
+                except asyncio.TimeoutError:
+                    pass
+        await process.wait()
+
+
+async def capture(*command, env):
+    process = await asyncio.create_subprocess_exec(*command, env=env, start_new_session=True,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    try:
+        return await asyncio.wait_for(process.communicate(), 5)
+    finally:
+        await stop(process)
 
 
 class Link:
@@ -181,13 +195,11 @@ class Node:
 
     async def cli(self, *args, check=True):
         process = await asyncio.create_subprocess_exec(str(self.binary), "--endpoint", str(self.endpoint),
-            *args, env=self.env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            *args, env=self.env, start_new_session=True, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         try:
             stdout, stderr = await asyncio.wait_for(process.communicate(), 5)
-        except asyncio.TimeoutError:
-            process.kill()
-            await process.wait()
-            raise
+        finally:
+            await stop(process)
         if check and process.returncode:
             raise RuntimeError(stderr.decode().strip())
         return stdout.decode()
@@ -262,30 +274,28 @@ class Node:
     async def cleanup(self):
         # Stop reconciliation before closing PTYs, otherwise restart=always can
         # launch a replacement while the registry is being drained.
-        await self.down()
-        # PTY servers are detached, so first close the exact private registry.
-        process = await asyncio.create_subprocess_exec("pty", "list", "--json", env={**self.env, "PTY_ROOT": str(self.root / "pty")},
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-        stdout, _ = await process.communicate()
         try:
+            await self.down()
+            # PTY servers are detached, so first close the exact private registry.
+            stdout, _ = await capture("pty", "list", "--json",
+                env={**self.env, "PTY_ROOT": str(self.root / "pty")})
             for row in json.loads(stdout):
-                child = await asyncio.create_subprocess_exec("pty", "kill", row["name"],
-                    env={**self.env, "PTY_ROOT": str(self.root / "pty")},
-                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
-                await child.wait()
+                await capture("pty", "kill", row["name"],
+                    env={**self.env, "PTY_ROOT": str(self.root / "pty")})
         except (ValueError, KeyError):
             pass
-        for process in reversed(self.processes):
-            await stop(process)
-        for sig in (signal.SIGTERM, signal.SIGKILL):
-            for row in self.seats():
-                try:
-                    os.kill(row["pid"], sig)
-                except ProcessLookupError:
-                    pass
-            await asyncio.sleep(0.2)
-        for stream in self.logs:
-            stream.close()
+        finally:
+            for process in reversed(self.processes):
+                await stop(process)
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                for row in self.seats():
+                    try:
+                        os.kill(row["pid"], sig)
+                    except ProcessLookupError:
+                        pass
+                await asyncio.sleep(0.2)
+            for stream in self.logs:
+                stream.close()
 
 
 def receipts(node):
@@ -377,7 +387,7 @@ def judge(proof):
 
 
 async def run_case(args, case, directory, candidate, old, replacement):
-    root = Path(tempfile.mkdtemp(prefix="mfe-"))
+    root = Path(tempfile.mkdtemp(prefix="mfe-", dir=os.environ["ST3_MESSAGING_ROOT"]))
     binary_root = Path(tempfile.mkdtemp(prefix="mfe-bin-", dir=args.scratch))
     nodes = []
     link = Link()
@@ -413,7 +423,14 @@ name = "{peer.name}"
 url = "http://127.0.0.1:{proxies[1 - i]}"
 ''')
             wrapper = node.root / "bin/omp"
-            wrapper.write_text(f"#!/bin/sh\nexec {shlex.quote(shutil.which('node'))} {shlex.quote(str(HERE / 'provider.mjs'))} \"$@\"\n")
+            # Admission already owns the child's process group. setsid would fork and
+            # return before --version/probe output, making the direct child look finished.
+            # Retain the separate session for the actual provider and its native faults.
+            provider = f"{shlex.quote(shutil.which('node'))} {shlex.quote(str(HERE / 'provider.mjs'))}"
+            wrapper.write_text(
+                f'#!/bin/sh\nif [ "$1" = "--version" ] || [ -n "$ST_ADMISSION_TRACE" ]; then\n'
+                f'  exec {provider} "$@"\nfi\nexec setsid {provider} "$@"\n'
+            )
             wrapper.chmod(0o755)
             await node.start()
         legacy_env = ""
@@ -641,32 +658,45 @@ agent "fault-probe" {{
             trace = await node.cli("trace", "show", "agent/eval/fault-probe", "--json", "--limit", "100", check=False)
             (directory / f"{node.name}-error-trace.jsonl").write_text(trace)
     finally:
-        write_json(directory / "link-events.json", link.events)
-        await link.close()
-        for node in reversed(nodes):
-            terminal = await asyncio.create_subprocess_exec("pty", "peek", "--plain", "--full", "eval.fault-probe",
-                env={**node.env, "PTY_ROOT": str(node.root / "pty")},
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-            stdout, stderr = await terminal.communicate()
-            (directory / f"{node.name}-terminal.txt").write_bytes(stdout + stderr)
-            await node.cleanup()
-            for log in ("daemon.log", "worker.log", "native.log", "ws/receipts.jsonl", "home/state/st3/driver-api-warnings.log"):
-                path = node.root / log
-                if path.exists():
-                    (directory / f"{node.name}-{Path(log).name}").write_text(path.read_text(errors="replace"))
-        # Public evidence contains invented names and portable paths only.
-        substitutions = [(str(root), "<eval-root>"), (str(binary_root), "<binary-root>"),
-                         (str(HERE.parent.parent), "<repo>"),
-                         (str(Path.home()), "<home>")]
-        for path in directory.iterdir():
-            text = path.read_text()
+        cleaned = set()
+        try:
+            write_json(directory / "link-events.json", link.events)
+            await link.close()
+            for node in reversed(nodes):
+                try:
+                    terminal = await asyncio.create_subprocess_exec("pty", "peek", "--plain", "--full", "eval.fault-probe",
+                        env={**node.env, "PTY_ROOT": str(node.root / "pty")}, start_new_session=True,
+                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                    try:
+                        stdout, stderr = await asyncio.wait_for(terminal.communicate(), 5)
+                    finally:
+                        await stop(terminal)
+                    (directory / f"{node.name}-terminal.txt").write_bytes(stdout + stderr)
+                finally:
+                    await node.cleanup()
+                    cleaned.add(id(node))
+                for log in ("daemon.log", "worker.log", "native.log", "ws/receipts.jsonl", "home/state/st3/driver-api-warnings.log"):
+                    path = node.root / log
+                    if path.exists():
+                        (directory / f"{node.name}-{Path(log).name}").write_text(path.read_text(errors="replace"))
+            # Public evidence contains invented names and portable paths only.
+            substitutions = [(str(root), "<eval-root>"), (str(binary_root), "<binary-root>"),
+                             (str(HERE.parent.parent), "<repo>"),
+                             (str(Path.home()), "<home>")]
+            for path in directory.iterdir():
+                text = path.read_text()
+                for actual, portable in substitutions:
+                    text = text.replace(actual, portable)
+                path.write_text(text)
             for actual, portable in substitutions:
-                text = text.replace(actual, portable)
-            path.write_text(text)
-        for actual, portable in substitutions:
-            result = json.loads(json.dumps(result).replace(actual, portable))
-        shutil.rmtree(root)
-        shutil.rmtree(binary_root)
+                result = json.loads(json.dumps(result).replace(actual, portable))
+        finally:
+            # Evidence failures must still stop BOTH nodes. The guardian is the
+            # final backstop for escaped PTYs, cancelled cleanup, and SIGKILL.
+            await asyncio.gather(*(node.cleanup() for node in nodes if id(node) not in cleaned), return_exceptions=True)
+            if not args.keep:
+                shutil.rmtree(root)
+                shutil.rmtree(binary_root)
     return result
 
 
@@ -675,15 +705,18 @@ async def main(args):
     args.scratch.mkdir(parents=True, exist_ok=True)
     started = datetime.datetime.now(datetime.timezone.utc)
     # Pin binaries once: a shared deploy during the eval cannot change its input.
-    with tempfile.TemporaryDirectory(prefix="mfi-", dir=args.scratch) as inputs:
-        inputs = Path(inputs)
+    inputs = Path(tempfile.mkdtemp(prefix="mfi-", dir=args.scratch))
+    try:
         candidate, old, replacement = [inputs / name for name in ("candidate", "old", "replacement")]
         shutil.copy2(args.binary, candidate)
         shutil.copy2(args.old_binary, old)
         shutil.copy2(args.swap_binary or args.binary, replacement)
         probe = await asyncio.create_subprocess_exec(str(old), "resume-probe",
-            env={"PATH": os.environ["PATH"]}, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        probe_stdout, _ = await asyncio.wait_for(probe.communicate(), 5)
+            env={"PATH": os.environ["PATH"]}, start_new_session=True, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        try:
+            probe_stdout, _ = await asyncio.wait_for(probe.communicate(), 5)
+        finally:
+            await stop(probe)
         if "old-channel" in args.cases and probe.returncode == 0:
             raise ValueError("--old-binary supports resume-probe; supply a pre-reexec channel build")
         if not args.swap_binary:
@@ -704,6 +737,9 @@ async def main(args):
             report["verdict"] = "pass" if all(row["verdict"] == "pass" for row in report["cases"]) else "fail"
             write_json(args.out / "result.json", report)
             print(f"{case}: {result['verdict']} read={result.get('read_after_clear_ms')} ms; " + "; ".join(result["failures"]), flush=True)
+    finally:
+        if not args.keep:
+            shutil.rmtree(inputs)
     ended = datetime.datetime.now(datetime.timezone.utc)
     report.update(ended=ended.isoformat(), duration_seconds=(ended - started).total_seconds())
     write_json(args.out / "result.json", report)
@@ -713,13 +749,14 @@ async def main(args):
 if __name__ == "__main__":
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from st3_test_process import supervised_main
+    from st3_test_process import run_supervised
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
     parser.add_argument("out", type=Path)
     parser.add_argument("--old-binary", type=Path, required=True, help="actual pre-reexec build; not a simulated old client")
     parser.add_argument("--swap-binary", type=Path)
     parser.add_argument("--scratch", type=Path, help="directory for large executable copies; defaults to out")
+    parser.add_argument("--keep", action="store_true", help="keep private state and executable copies, including on failure")
     parser.add_argument("--cases", nargs="+", choices=CASES, default=list(CASES))
     parser.add_argument("--short-seconds", type=float, default=3)
     parser.add_argument("--long-seconds", type=float, default=120)
@@ -733,4 +770,14 @@ if __name__ == "__main__":
         parser.error("run detached outside an st seat; see the eval README")
     if not shutil.which("node") or not shutil.which("pty"):
         parser.error("node (with native TypeScript support) and pty must be on PATH")
-    raise SystemExit(supervised_main(lambda: asyncio.run(main(args))))
+    if "ST3_MESSAGING_ROOT" not in os.environ:
+        # Use a dedicated guardian even inside a supervised Rust test: its roots
+        # must be removed after this controller dies, before the Rust test ends.
+        scratch_parent = args.scratch if args.scratch != args.out.resolve() else args.out.resolve().parent
+        scratch_parent.mkdir(parents=True, exist_ok=True)
+        raise SystemExit(run_supervised([sys.executable, *sys.orig_argv[1:]],
+            temporary_roots=[("ST3_MESSAGING_ROOT", "mfe-owner-", tempfile.gettempdir()),
+                             ("ST3_MESSAGING_SCRATCH", "mfi-owner-", str(scratch_parent))],
+            keep=args.keep))
+    args.scratch = Path(os.environ["ST3_MESSAGING_SCRATCH"])
+    raise SystemExit(asyncio.run(main(args)))

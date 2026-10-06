@@ -116,8 +116,10 @@ server = mcp.get("mcpServers", {}).get("st3")
 # Fault injection belongs to this private workspace, never to a shared provider setting.
 channel_mode = Path.cwd() / "claude-channel-mode"
 mode = channel_mode.read_text().strip() if channel_mode.exists() else ""
-if mode == "missing":
+if mode in ("missing", "missing-once"):
     server = None
+    if mode == "missing-once":
+        channel_mode.write_text("healthy")
 channel = None
 if server:
     channel = subprocess.Popen([server["command"], *server.get("args", [])], stdin=subprocess.PIPE,

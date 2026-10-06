@@ -419,7 +419,7 @@ fn parse_desired_node(
         && !owned_terminal
         && matches!(
             kind,
-            "exec" | "pty" | "lane" | "observer" | "subscription" | "schedule"
+            "exec" | "pty" | "lane" | "observer" | "subscription"
         )
     {
         return Err(St3Error::new(
@@ -1340,6 +1340,7 @@ fn parse_agent(
             restart_intensity: restart_intensity.clone(),
             shutdown_timeout_ms,
             driver: None,
+            terminal_size: None,
         });
     }
 
@@ -2508,6 +2509,7 @@ fn driver_member(
         restart_intensity,
         shutdown_timeout_ms,
         driver: Some(name),
+        terminal_size: None,
     })
 }
 
@@ -2598,6 +2600,7 @@ fn task_member(
         restart_intensity,
         shutdown_timeout_ms,
         driver: None,
+        terminal_size: None,
     })
 }
 
@@ -6552,14 +6555,15 @@ schedule "daily" {
     catch-up "latest"
     work { mission "work@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; workspace "/tmp/work" }
 }"#;
-        let intent = parse_test_intent(source, "node").unwrap();
+        let intent = parse_intent(source, "node").unwrap();
+        assert!(intent.subjects["schedule/daily"].owner_run.is_none());
         let spec = schedule_spec(&intent.subjects["schedule/daily"].desired, "node").unwrap();
         assert_eq!(spec.calendar.as_ref().unwrap().at_minute, 480);
         assert_eq!(spec.calendar.as_ref().unwrap().weekday, None);
         assert_eq!(spec.calendar.as_ref().unwrap().timezone, "Europe/Berlin");
         assert!(spec.at_unix_ms.is_none());
         assert!(spec.every_ms.is_none());
-        let weekly = parse_test_intent(&source.replace("08:00", "Mon 09:00"), "node").unwrap();
+        let weekly = parse_intent(&source.replace("08:00", "Mon 09:00"), "node").unwrap();
         let weekly = schedule_spec(&weekly.subjects["schedule/daily"].desired, "node").unwrap();
         assert_eq!(weekly.calendar.as_ref().unwrap().weekday, Some(1));
         assert_eq!(weekly.calendar.as_ref().unwrap().at_minute, 540);
@@ -6569,7 +6573,7 @@ schedule "daily" {
             (source.replace("08:00", "Funday 08:00"), "invalid-schedule-calendar"),
             (source.replace("calendar {", "every \"1d\"; anchor \"2026-01-01T00:00:00Z\"; calendar {"), "invalid-schedule-time"),
         ] {
-            assert_eq!(parse_test_intent(&changed, "node").unwrap_err().code, code);
+            assert_eq!(parse_intent(&changed, "node").unwrap_err().code, code);
         }
     }
 

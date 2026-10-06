@@ -710,6 +710,7 @@ async fn an_agents_conversation_rides_the_collection_socket_with_its_small_talk(
             id,
             session_id,
             replace: true,
+            has_more: Some(false),
             ..
         } if id == "chat" => session_id,
         other => panic!("expected the conversation page, got {other:?}"),
@@ -739,6 +740,7 @@ async fn an_agents_conversation_rides_the_collection_socket_with_its_small_talk(
         CollectionEvent::Conversation {
             id,
             replace: false,
+            has_more: None,
             items,
             ..
         } if id == "chat" => items,
@@ -1779,4 +1781,66 @@ async fn generated_client_conforms_over_paired_loopback_and_rejects_bad_credenti
     );
     restarted_gateway.abort();
     restarted_local.abort();
+}
+
+#[tokio::test]
+async fn canonical_publication_definition_requires_declaration_scope() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("st3.sock");
+    let server_socket = socket.clone();
+    let state = state(root.path(), "client-publication-definition");
+    let source = r#"version 2
+mission "example/readback" state="ready" {
+    goal "Read resolved defaults."
+    step "inspect" { agentless }
+}
+schedule "example/daily" {
+    host "client-publication-definition"
+    every "1h"
+    anchor "2026-01-01T00:00:00Z"
+    work { mission "example/readback"; workspace "/tmp"; }
+}
+"#;
+    let intent =
+        st3::graph::parse_owned_set_intent(source, "client-publication-definition").unwrap();
+    state
+        .store
+        .apply_internal(&intent, "readback-fixture")
+        .unwrap();
+    let app = st3::api::router(state.clone());
+    let server = tokio::spawn(async move { st3::api::serve_unix(&server_socket, app).await });
+    wait_for_socket(&socket).await;
+    let reader = Client::unix(&socket);
+    let publisher = Client::unix_as(&socket, "person/test");
+    for subject in ["mission/example/readback", "schedule/example/daily"] {
+        assert!(matches!(
+            reader.publication_definition(subject).await,
+            Err(ClientError::Api(ErrorCode::Forbidden, _, _))
+        ));
+        let response = publisher.publication_definition(subject).await.unwrap();
+        assert_eq!(response.value.subject, subject);
+        assert_eq!(response.snapshot.store_index, state.store.index().unwrap());
+        let expected = if subject.starts_with("mission/") {
+            serde_json::to_value(&intent.missions["example/readback"]).unwrap()
+        } else {
+            serde_json::to_value(&intent.subjects[subject]).unwrap()
+        };
+        assert_eq!(
+            serde_json::to_value(response.value.declaration).unwrap(),
+            expected
+        );
+    }
+    assert!(matches!(
+        publisher
+            .publication_definition("mission/example/absent")
+            .await,
+        Err(ClientError::Api(ErrorCode::NotFound, _, _))
+    ));
+    assert!(matches!(
+        publisher
+            .publication_definition("runtime/unsupported")
+            .await,
+        Err(ClientError::Api(ErrorCode::ValidationFailed, _, _))
+    ));
+    server.abort();
 }

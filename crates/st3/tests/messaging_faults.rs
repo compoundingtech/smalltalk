@@ -2,6 +2,26 @@
 //! The provider API stand-in consumes native handoffs without making model calls.
 #![cfg(target_os = "linux")]
 
+#[test]
+fn controller_death_cleanup() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let repo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let output = st3::test_support::command("python3")
+        .arg(repo.join("scripts/st3-messaging-faults-eval/test_cleanup.py"))
+        .env("ST3_MFE_TEST_BINARY", env!("CARGO_BIN_EXE_st3-fixture"))
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .expect("run isolated messaging cleanup regression");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn run_case(case: &str) {
     use std::path::PathBuf;
 

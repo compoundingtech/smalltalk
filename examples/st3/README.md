@@ -12,7 +12,7 @@ All names, repositories, paths, and people are invented. Replace them before you
 ## How the pieces fit
 
 - **A durable agent is a seat.** Declare it as a top-level `agent` in its own file and apply it with
-  `st agents apply FILE --as person/NAME`. A seat has no mission owner, so no mission's end stops
+  `st apply FILE --as person/NAME`. A seat has no mission owner, so no mission's end stops
   it. Stop it with `st agents stop`. Do not model a durable agent as a mission with no steps: that
   run completes at once and stops the agent it owns.
 - **Work reaches a seat as mission steps.** A step `assigned-to` the seat's exact subject waits in
@@ -26,7 +26,7 @@ All names, repositories, paths, and people are invented. Replace them before you
   starts a run. A mission that owns an observer, subscription, or schedule needs a step that keeps
   its run open, such as the `retire` gate in [`github-intake.kdl`](github-intake.kdl).
 
-Publish exact hand-authored missions with `st missions publish FILE --as ACTOR`. For
+Publish exact hand-authored missions with `st apply FILE --as ACTOR`. For
 conversational planning, use `st launch start`, review the candidate with `st launch preview`,
 and approve it with `st launch approve-and-launch`. An authorized agent uses
 `st work publish-mission` while it owns the declared producing step.

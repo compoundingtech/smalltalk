@@ -328,6 +328,43 @@ fn value(output: &Output) -> Value {
     })
 }
 
+#[test]
+fn person_admission_exception_is_local_reversible_and_never_spawns_the_producer() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let producer = root.path().join("omp");
+    let marker = root.path().join("producer-called");
+    std::fs::write(&producer, format!("#!/bin/sh\nprintf called > '{}'\nexit 1\n", marker.display())).unwrap();
+    std::fs::set_permissions(&producer, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let run = |action: &str, agent: bool| {
+        let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin!("st3"));
+        command.env_remove("ST_AGENT").env_remove("ST_MISSION_RUN")
+            .arg("--json").args(["admission", action, "omp", "--binary"])
+            .arg(&producer).arg("--state-dir").arg(root.path().join("state"));
+        if action == "override" { command.args(["--reason", "local offline probe exception"]); }
+        if agent { command.env("ST_AGENT", "agent/fixture/worker"); }
+        command.output().unwrap()
+    };
+    let refused = run("override", true);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("person's terminal"));
+    assert!(!root.path().join("state").exists());
+    let output = run("override", false);
+    let result = value(&output);
+    assert_eq!(result["overridden"], true);
+    let record = PathBuf::from(result["record"].as_str().unwrap());
+    assert!(record.starts_with(root.path().join("state/drivers/sessions/harness-admission")));
+    let bytes = std::fs::read(&record).unwrap();
+    let exception: Value = serde_json::from_slice(&bytes).unwrap();
+    let (_, extension) = st3::hooks::FILES.iter().find(|(name, _)| *name == "omp-channel.ts").unwrap();
+    assert_eq!(exception["identity"]["adapterDigest"], format!("{:x}", Sha256::digest(extension)));
+    assert!(exception.get("measurements").is_none());
+    assert_eq!(std::fs::metadata(&record).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(value(&run("revoke", false))["overridden"], false);
+    assert!(!record.exists());
+    assert!(!marker.exists(), "the exception commands run neither --version nor the native probe");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn agent_workspace_cli_and_client_read_the_same_declaration_even_after_retirement() {
     let root = tempfile::tempdir().unwrap();
@@ -414,6 +451,152 @@ async fn agent_workspace_cli_and_client_read_the_same_declaration_even_after_ret
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn usage_cli_and_client_keep_pricing_provenance_and_native_session_binding() {
+    use serde_json::json;
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("st3.sock");
+    let state = test_state(root.path());
+    let store = state.store.clone();
+    let subject = "agent/example.usage";
+    let append = |kind: &str, fields: Value| {
+        store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: kind.into(),
+                actor: Some(subject.into()),
+                fields: serde_json::from_value(fields).unwrap(),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap()
+    };
+    append(
+        "harness.observed",
+        json!({"state":"working","driver":"codex","incarnation_id":"inc-one"}),
+    );
+    let respond = |entry: &str| {
+        let observation = append(
+            "harness.timeline",
+            json!({
+                "operation":"append","entry_id":entry,"revision":1,"role":"system",
+                "entry_type":"usage","final":true,"driver":"codex",
+                "incarnation_id":"inc-one","sequence":1,
+                "body":{"semantics":"response","model":"gpt-6.1-sol",
+                    "input_tokens":1000,"output_tokens":100,"total_tokens":1100}
+            }),
+        );
+        let rollup = store
+            .usage_rollup_for_timeline(&observation)
+            .unwrap()
+            .unwrap();
+        store.append_client_claim(&rollup).unwrap();
+    };
+    respond("first-response");
+    assert_eq!(
+        store
+            .claims_for(subject, Some("harness.usage"))
+            .unwrap()
+            .len(),
+        1
+    );
+    // A single response already published has no pending token change. Its late native
+    // binding must still be captured at stop, without publishing at binding time.
+    append(
+        "harness.session-file",
+        json!({"harness":"codex","session_id":"native-example",
+        "incarnation_id":"inc-one"}),
+    );
+    assert_eq!(
+        store
+            .claims_for(subject, Some("harness.usage"))
+            .unwrap()
+            .len(),
+        1
+    );
+    append(
+        "harness.observed",
+        json!({"state":"idle","driver":"codex","incarnation_id":"inc-one"}),
+    );
+    assert_eq!(
+        store
+            .claims_for(subject, Some("harness.usage"))
+            .unwrap()
+            .len(),
+        2
+    );
+    append(
+        "harness.observed",
+        json!({"state":"working","driver":"codex","incarnation_id":"inc-one"}),
+    );
+    respond("second-response");
+    assert_eq!(
+        store
+            .claims_for(subject, Some("harness.usage"))
+            .unwrap()
+            .len(),
+        2,
+        "second response stays pending within five minutes"
+    );
+    append(
+        "harness.observed",
+        json!({"state":"idle","driver":"codex","incarnation_id":"inc-one"}),
+    );
+    assert_eq!(
+        store
+            .claims_for(subject, Some("harness.usage"))
+            .unwrap()
+            .len(),
+        3
+    );
+    let server_socket = socket.clone();
+    let server = tokio::spawn(async move {
+        st3::api::serve_unix(&server_socket, st3::api::router(state))
+            .await
+            .unwrap();
+    });
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let cli = value(&run_cli(&socket, &["usage"]).await);
+    let row = &cli["rows"][0];
+    assert_eq!(row["native_session_id"], "native-example");
+    assert_eq!(row["total_tokens"], 2200);
+    assert_eq!(
+        row["pricing_provenance"][0]["price_table_id"],
+        st3::pricing::PRICE_TABLE_ID
+    );
+    assert_eq!(
+        row["pricing_provenance"][0]["price_table_version"],
+        st3::pricing::price_table_version()
+    );
+    assert_eq!(row["pricing_provenance"][0]["cost_source"], "computed");
+    assert_eq!(
+        row["pricing_provenance"][0]["rates_usd_per_million_tokens"]["input"],
+        2.0
+    );
+    let client = st3_client::Client::unix_as(&socket, "person/avery");
+    let report = client.usage_period(None, None).await.unwrap();
+    let typed = &report.value.rows[0];
+    assert_eq!(typed.native_session_id.as_deref(), Some("native-example"));
+    let provenance = &typed.pricing_provenance.as_ref().unwrap()[0];
+    assert_eq!(provenance.total_tokens, 2200);
+    assert_eq!(provenance.cost_microusd, 6000);
+    assert_eq!(
+        provenance
+            .rates_usd_per_million_tokens
+            .as_ref()
+            .unwrap()
+            .output,
+        10.0
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stale_seat_publishing_last_cannot_lower_usage_or_disable_the_limits_policy() {
     let root = tempfile::tempdir().unwrap();
     let socket = root.path().join("st3.sock");
@@ -473,6 +656,115 @@ async fn a_stale_seat_publishing_last_cannot_lower_usage_or_disable_the_limits_p
         )
         .unwrap();
     assert_eq!(outcome.stopped, [fresh, stale]);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn usage_hides_legacy_unknowns_preserves_account_identity_and_stops_at_95_percent() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("st3.sock");
+    let state = test_state(root.path());
+    let store = state.store.clone();
+    let intent = st3::graph::parse_intent(
+        "version 2\nagent \"worker\" { workspace \"/tmp\"; command \"true\"; }\nagent \"unknown\" { workspace \"/tmp\"; command \"true\"; }",
+        store.origin(),
+    ).unwrap();
+    store.apply_internal(&intent, "usage-identities").unwrap();
+    let worker = "agent/client-v0-cli.worker";
+    let unknown = "agent/client-v0-cli.unknown";
+    let now = st_drivers::message::now_ms();
+    let append = |seat: &str, driver: &str, account: Option<&str>, weekly: f64, at: u64| {
+        let mut fields = serde_json::json!({
+            "driver": driver, "incarnation_id": "example-inc", "weekly_percent": weekly,
+            "weekly_resets_at_unix_ms": now + 3_600_000, "measured_at_unix_ms": at,
+        });
+        if let Some(account) = account {
+            fields["account"] = serde_json::json!(account);
+        }
+        store
+            .append_claim(&ClaimInput {
+                subject: seat.into(),
+                kind: "harness.limits".into(),
+                actor: Some(seat.into()),
+                fields: serde_json::from_value(fields).unwrap(),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+    };
+    // Both drivers have old identity-less evidence. Neither observation can be attributed
+    // to any of the real accounts, and an exhausted off-seat account must stay visible.
+    let legacy_at = now - 3 * 86_400_000;
+    append(worker, "claude", None, 100.0, legacy_at);
+    append(worker, "claude", Some("claude/exhausted"), 100.0, now);
+    append(worker, "claude", Some("claude/current"), 95.0, now);
+    append("agent/example/old", "codex", None, 100.0, legacy_at);
+    append("agent/example/old", "codex", Some("codex/one"), 25.0, now);
+    append("agent/example/other", "codex", Some("codex/two"), 15.0, now);
+    let server_socket = socket.clone();
+    let server = tokio::spawn(async move {
+        st3::api::serve_unix(&server_socket, st3::api::router(state))
+            .await
+            .unwrap();
+    });
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let client = st3_client::Client::unix_as(&socket, "person/avery");
+    let cli = value(&run_cli(&socket, &["usage"]).await);
+    assert_eq!(cli["limits"].as_array().unwrap().len(), 4);
+    assert!(
+        cli["limits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|limit| limit["identified"] == true)
+    );
+    let report = client
+        .usage_period(Some(now - 1000), Some(now + 1000))
+        .await
+        .unwrap();
+    assert_eq!(report.value.limits.len(), 4);
+    let exhausted = report
+        .value
+        .limits
+        .iter()
+        .find(|limit| limit.account == "claude/exhausted")
+        .unwrap();
+    assert_eq!(exhausted.weekly_percent, Some(100.0));
+    assert!(exhausted.seats.is_empty());
+    // Identity-less quota from an active seat remains unknown, independently of freshness.
+    append(unknown, "claude", None, 20.0, legacy_at);
+    let report = client.usage_period(None, None).await.unwrap();
+    assert_eq!(report.value.limits.len(), 5);
+    let limit = report
+        .value
+        .limits
+        .iter()
+        .find(|limit| limit.identified == Some(false))
+        .unwrap();
+    assert_eq!(limit.account, "claude/unknown");
+    assert_eq!(limit.seats, [unknown]);
+    assert_eq!(limit.measured_at_unix_ms, legacy_at);
+    let cli = value(&run_cli(&socket, &["usage"]).await);
+    assert_eq!(cli["limits"].as_array().unwrap().len(), 5);
+    // The same shared selection drives the policy, including an exact 95% boundary.
+    let outcome = store
+        .enforce_account_limits(
+            &st3::store::LimitsPolicy {
+                stop_at_weekly_percent: 95,
+                keep: Default::default(),
+                notify: "agent/example/operations".into(),
+                fresh_ms: 3_600_000,
+            },
+            u128::from(now),
+        )
+        .unwrap();
+    assert_eq!(outcome.stopped, [worker]);
     server.abort();
 }
 

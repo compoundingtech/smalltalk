@@ -1,24 +1,37 @@
 import { buildSnapshotPrepare, buildSnapshotRestore, buildSnapshotSave } from './build-snapshot.ts'
 import {
+  defaultActionlintConfig,
   effectUtilsBinaryCaches,
-  namespaceRunner,
   nixDevelopStep,
   plainFlakeSetupSteps,
 } from '../../repos/effect-utils/genie/external.ts'
 
-export const linuxRunner = namespaceRunner({ profile: 'namespace-profile-linux-x86-64', runId: '${{ github.run_id }}' })
+// Profiles require controls inline; namespace-features labels apply only to shape labels.
+export const linuxRunnerProfile = 'namespace-profile-linux-x86-64;job.priority=1'
+export const macosRunnerProfile = 'namespace-profile-macos-arm64'
+export const linuxRunner = [`${linuxRunnerProfile};github.run-id=\${{ github.run_id }}`] as const
 /**
  * The Linux gate's stage jobs. On 2026-10-03 the shape label `nscloud-ubuntu-24.04-amd64-16x32`
  * stopped getting runners at about 12:10Z, and the profile allows only about five runners at
  * once, so with every job on it Workspace CI runs went one at a time. The 8x16 shape label still
  * got runners at once.
  */
-export const linuxStageRunner = ['nscloud-ubuntu-24.04-amd64-8x16'] as const
-export const macosRunner = namespaceRunner({ profile: 'namespace-profile-macos-arm64', runId: '${{ github.run_id }}' })
+const linuxStageShape = 'nscloud-ubuntu-24.04-amd64-8x16-with-features'
+/** All Linux Namespace work shares one class: older benchmarks cannot be overtaken forever. */
+export const linuxStageRunner = [
+  `${linuxStageShape};job.priority=1`,
+  'namespace-features:github.run-id=${{ github.run_id }}',
+] as const
+export const macosRunner = [`${macosRunnerProfile};github.run-id=\${{ github.run_id }}`] as const
+export const linuxActionlintConfig = {
+  ...defaultActionlintConfig,
+  selfHostedRunnerLabels: [...(defaultActionlintConfig.selfHostedRunnerLabels ?? []), ...linuxRunner, ...linuxStageRunner],
+} as const
 
 /**
- * ci1 takes the primary Workspace CI test partition when enough general runners are idle;
- * Namespace takes the second partition and supporting jobs on independent CPUs. GitHub has no
+ * ci1 takes the primary Workspace CI test partition when enough general runners are idle.
+ * The second partition and mail canaries may each take an idle general runner; other supporting
+ * jobs stay on Namespace. GitHub has no
  * overflow between runner labels, so the `pick-runner` job asks the
  * GitHub API how many ci1 runners are idle before the other jobs start, and their `runs-on` reads its
  * output. Trusted PRs labelled `ci-priority` use the reserved `ci1-priority` lane.
@@ -31,8 +44,8 @@ export const macosRunner = namespaceRunner({ profile: 'namespace-profile-macos-a
  */
 export const pickRunnerJobId = 'pick-runner'
 
-/** Leave CPU capacity for the priority and merge lanes; only one shard uses ci1 per run. */
-const ci1MinIdle = 4
+/** One free general runner admits a primary; reserved labels stay out of that pool. */
+const ci1MinIdle = 1
 
 export const pickRunnerJob = {
   name: pickRunnerJobId,
@@ -41,10 +54,14 @@ export const pickRunnerJob = {
   'runs-on': 'ubuntu-latest',
   'timeout-minutes': 3,
   permissions: { 'pull-requests': 'read' },
-  outputs: { ci1: '${{ steps.pick.outputs.ci1 }}' },
+  outputs: {
+    ci1: '${{ steps.pick.outputs.ci1 }}',
+    ci1_secondary: '${{ steps.pick.outputs.ci1_secondary }}',
+    ci1_mail: '${{ steps.pick.outputs.ci1_mail }}',
+  },
   steps: [
     {
-      name: 'Use reserved ci1 for priority PRs and the queue; available ci1 for PRs',
+      name: 'Keep reserved primary lanes and use idle general runners for tests and canaries',
       id: 'pick',
       env: {
         // A token that may only read the organization's self-hosted runners. Forks never receive it.
@@ -58,19 +75,24 @@ export const pickRunnerJob = {
         OWNER: '${{ github.repository_owner }}',
         NEED: `\${{ vars.CI1_MIN_IDLE || '${ci1MinIdle}' }}`,
       },
-      run: `namespace() {
+      run: `primary_label=
+namespace() {
   echo "$1: Namespace"
-  printf 'Runner: **Namespace** (%s)\\n' "$1" >> "$GITHUB_STEP_SUMMARY"
+  printf 'Unpicked runners: **Namespace** (%s)\\n' "$1" >> "$GITHUB_STEP_SUMMARY"
   exit 0
+}
+primary() {
+  primary_label=$1
+  printf 'ci1=["%s"]\\n' "$primary_label" >> "$GITHUB_OUTPUT"
+  printf 'Primary runner: **ci1** (%s)\\n' "$primary_label" >> "$GITHUB_STEP_SUMMARY"
 }
 if [ "$EVENT" = pull_request ] && [ "$HEAD_REPOSITORY" != "$REPOSITORY" ]; then
   namespace "a pull request from a fork never runs on ci1"
 fi
 if [ "$EVENT" = pull_request ] && jq -e 'index("ci-priority") != null' <<< "$PR_LABELS" >/dev/null 2>&1; then
-  printf 'ci1=["ci1-priority"]\\n' >> "$GITHUB_OUTPUT"
+  primary ci1-priority
   echo "priority PR: reserved ci1-priority capacity"
   printf 'Runner: **ci1** (ci1-priority, ahead of ordinary PRs)\\n' >> "$GITHUB_STEP_SUMMARY"
-  exit 0
 fi
 if [ "$EVENT" = merge_group ]; then
   label=ci1-merge
@@ -81,57 +103,74 @@ if [ "$EVENT" = merge_group ]; then
       label=ci1-priority
     fi
   fi
-  printf 'ci1=["%s"]\\n' "$label" >> "$GITHUB_OUTPUT"
+  primary "$label"
   echo "merge queue: reserved $label runners"
   printf 'Runner: **ci1** (%s, reserved merge-queue capacity)\\n' "$label" >> "$GITHUB_STEP_SUMMARY"
-  exit 0
 fi
-label=ci1
 [ -n "$GH_TOKEN" ] || namespace "no runner status token"
 [[ "$NEED" =~ ^[1-9][0-9]*$ ]] || namespace "invalid minimum idle runner count"
 if ! runners=$(timeout 20s gh api --paginate --slurp "orgs/$OWNER/actions/runners?per_page=100" 2>&1); then
   echo "::warning::could not list ci1's runners: $runners"
   namespace "the runner list is unavailable"
 fi
-if ! idle=$(jq -e --arg label "$label" '[.[].runners[] | select(.status == "online" and .busy == false and any(.labels[]; .name == $label))] | length' <<< "$runners"); then
+if ! idle=$(jq -e '[.[].runners[] | select(.status == "online" and .busy == false and any(.labels[]; .name == "ci1"))] | length' <<< "$runners"); then
   namespace "the runner list is invalid"
 fi
-[ "$idle" -ge "$NEED" ] || namespace "$idle $label runners idle, $NEED needed"
-printf 'ci1=["%s"]\\n' "$label" >> "$GITHUB_OUTPUT"
-echo "$idle $label runners idle: ci1"
-printf 'Runner: **ci1** (%s, %s idle)\\n' "$label" "$idle" >> "$GITHUB_STEP_SUMMARY"`,
+if [ -z "$primary_label" ]; then
+  if [ "$idle" -ge "$NEED" ]; then
+    primary ci1
+  else
+    printf 'Primary runner: **Namespace** (%s general runners idle, %s needed)\\n' "$idle" "$NEED" >> "$GITHUB_STEP_SUMMARY"
+  fi
+fi
+# A primary on ci1 or ci1-merge may take a general worker. Account for that worker
+# before offering separate slots to the second shard and canaries. A priority
+# primary has its own reserved label; general workers temporarily lent to priority
+# work no longer carry ci1 and therefore were excluded from the idle count above.
+available=$idle
+case "$primary_label" in ci1|ci1-merge) available=$((available - 1));; esac
+echo "$idle general runners idle; primary minimum $NEED; extra slots $available"
+for output in ci1_secondary ci1_mail; do
+  if [ "$available" -gt 0 ]; then
+    printf '%s=["ci1"]\\n' "$output" >> "$GITHUB_OUTPUT"
+    printf '%s runner: **ci1** (idle general slot)\\n' "$output" >> "$GITHUB_STEP_SUMMARY"
+    available=$((available - 1))
+  else
+    printf '%s runner: **Namespace** (no idle general slot)\\n' "$output" >> "$GITHUB_STEP_SUMMARY"
+  fi
+done`,
     },
   ],
 } as const
 
-const pickedOr = (namespaceLabels: string) =>
-  `\${{ fromJSON(needs.${pickRunnerJobId}.outputs.ci1 || ${namespaceLabels}) }}`
+const pickedOr = (namespaceLabels: string, output = 'ci1') =>
+  `\${{ fromJSON(needs.${pickRunnerJobId}.outputs.${output} || ${namespaceLabels}) }}`
 
-// Required Workspace jobs precede optional benchmarks under Namespace contention.
-// Run affinity prevents another workflow with the same shape from taking their runner.
-const workspaceQueuePriority = "(github.event_name == 'merge_group' || contains(github.event.pull_request.labels.*.name, 'ci-priority')) && 1 || 10"
-const workspaceStageShape = `${linuxStageRunner[0]}-with-features`
-const workspaceStageLabels = (priority: string, runId: string) => [
-  `${workspaceStageShape};job.priority=${priority}`,
-  `namespace-features:github.run-id=${runId}`,
-] as const
-
-/** `runs-on` for a stage job: picked ci1, else prioritized Namespace with run affinity. */
+// Same priority for required, optional and manual jobs. Run affinity makes Namespace's
+// scheduled order deterministic; a newer required run cannot steal an older benchmark's runner.
+/** `runs-on` for a stage job: picked ci1, else the shared Namespace queue class. */
 export const linuxStageRunsOn = pickedOr(
-  `format('${JSON.stringify(workspaceStageLabels('{0}', '{1}'))}', ${workspaceQueuePriority}, github.run_id)`,
+  `format('${JSON.stringify(linuxStageRunner).replaceAll('${{ github.run_id }}', '{0}')}', github.run_id)`,
 )
 
-/** `runs-on` for the other Linux jobs: ci1 when picked, else the Namespace profile with run affinity. */
+/** Extra test jobs can consume only general ci1 slots, never the primary's reserved label. */
+export const secondaryStageRunsOn = pickedOr(
+  `format('${JSON.stringify(linuxStageRunner).replaceAll('${{ github.run_id }}', '{0}')}', github.run_id)`,
+  'ci1_secondary',
+)
+export const mailStageRunsOn = pickedOr(
+  `format('${JSON.stringify(linuxStageRunner).replaceAll('${{ github.run_id }}', '{0}')}', github.run_id)`,
+  'ci1_mail',
+)
+
+/** `runs-on` for a Linux profile job: picked ci1, else the shared Namespace queue class. */
 export const linuxRunsOn = pickedOr(
-  `format('${JSON.stringify(namespaceRunner({ profile: linuxRunner[0], runId: '{0}' }))}', github.run_id)`,
+  `format('${JSON.stringify(linuxRunner).replaceAll('${{ github.run_id }}', '{0}')}', github.run_id)`,
 )
 
-/** Supporting jobs use independent CPUs; only the primary test shard takes the picked lane. */
-export const supportingLinuxRunsOn = [
-  `${linuxRunner[0]};job.priority=\${{ ${workspaceQueuePriority} }}`,
-  linuxRunner[1],
-] as const
-export const supportingStageRunsOn = workspaceStageLabels(`\${{ ${workspaceQueuePriority} }}`, '${{ github.run_id }}')
+/** Other supporting jobs stay on Namespace rather than spending the test runners. */
+export const supportingLinuxRunsOn = linuxRunner
+export const supportingStageRunsOn = linuxStageRunner
 
 /** A job that needs `pick-runner` still runs when it was skipped (ci1 off). */
 export const afterPickRunner = { needs: [pickRunnerJobId], if: '${{ !cancelled() }}' } as const
@@ -146,7 +185,7 @@ export const cargoCacheStep = {
   name: 'Restore the Cargo target and registry',
   id: 'cargo-cache',
   if: "env.CI_LOCAL_CACHES != '1' && env.CI_BUILD_SNAPSHOT_HIT != '1'",
-  uses: 'actions/cache@v4',
+  uses: 'actions/cache/restore@v4',
   with: {
     path: '${{ github.workspace }}/target\n${{ runner.temp }}/cargo-home/registry\n${{ runner.temp }}/cargo-home/git',
     key: "cargo-${{ github.job }}-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '.cargo/config.toml') }}",
@@ -158,13 +197,23 @@ export const nixCacheStep = {
   name: 'Restore the local Nix cache',
   id: 'nix-cache',
   if: "env.CI_LOCAL_CACHES != '1' && env.CI_BUILD_SNAPSHOT_HIT != '1'",
-  uses: 'actions/cache@v4',
+  uses: 'actions/cache/restore@v4',
   with: {
     path: '${{ runner.temp }}/st-ci-cache',
     key: "nix5-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', '.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json') }}",
     'restore-keys': 'nix5-${{ github.job }}-${{ runner.os }}-\nnix4-${{ github.job }}-${{ runner.os }}-',
   },
 } as const
+
+/** Keep shared dependency entries on protected main; PR builds have exact-source artifacts. */
+export const saveMainDependencyCaches = (setup: readonly unknown[]) => setup
+  .filter((value: any) => value.id === 'cargo-cache' || value.id === 'nix-cache')
+  .map((value: any) => ({
+    name: `Save main ${value.id}`,
+    if: `success() && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && env.CI_LOCAL_CACHES != '1' && steps.${value.id}.outputs.cache-hit != 'true'`,
+    uses: 'actions/cache/save@v4',
+    with: { path: value.with.path, key: value.with.key },
+  }))
 
 /**
  * Checkout, the Namespace cache volume, Nix with the read-only effect-utils cache, and an isolated
@@ -278,6 +327,7 @@ export const linuxStageJob = ({
       if: "success() && env.CI_LOCAL_CACHES != '1'",
       run: 'bash scripts/ci-nix-cache save || echo "::warning::could not save the local Nix cache"',
     },
+    ...saveMainDependencyCaches(setup),
     ...buildSnapshotSave,
     {
       name: 'Retain stage logs and timings',

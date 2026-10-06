@@ -37,6 +37,9 @@ attaches the agent's terminal and `Ctrl+\` leaves it. A drag selects text in one
 it on release. Scrolling to the top of a conversation loads the page before it. Home cards show
 their own keys; `y` confirms what a card asks, and Enter never does.
 
+The [terminal tab input reference](../../docs/stui-terminal-tab.md) records the measured
+input modes, query replies, and remaining gaps, including the headless PTY probe.
+
 Verification:
 
 ```sh

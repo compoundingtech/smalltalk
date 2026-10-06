@@ -14,8 +14,12 @@ pub mod demo;
 pub mod doc;
 mod edit;
 mod glass;
+#[cfg(test)]
+#[path = "../../tests/support/terminal_tab.rs"]
+mod terminal_tab;
 pub use glass::set_glasses_version;
 mod glass_store;
+mod lastrun;
 pub mod layout;
 pub mod live;
 pub mod pane;
@@ -384,6 +388,17 @@ pub struct Ui {
     updated: HashMap<String, Instant>,
     /// Why a conversation could not be brought up to date, until st sends it again.
     stalled: HashMap<String, String>,
+}
+
+/// What clicking a link says it did: an address is pasted in a browser; a path names a file on the
+/// machine the writer works on, which stui cannot open.
+fn link_note(target: &str) -> String {
+    let shown = text::truncate(target, 60);
+    if target.starts_with('/') || target.starts_with("~/") {
+        format!("Copied {shown} · a file on the writer's machine")
+    } else {
+        format!("Copied {shown} · paste it in a browser")
+    }
 }
 
 /// Whether `c` can be part of a written-out web address.
@@ -2999,6 +3014,16 @@ impl Ui {
         }
     }
 
+    /// Dispatch the outer terminal's decoded input, shared by the live and demo loops.
+    fn input_event(&mut self, event: Event) {
+        match event {
+            Event::Key(key) => self.key(key),
+            Event::Paste(text) => self.paste(text),
+            Event::Mouse(mouse) => self.mouse(mouse),
+            _ => {}
+        }
+    }
+
     pub fn key(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Press {
             return;
@@ -3485,6 +3510,17 @@ impl Ui {
                     // x dismisses whatever can be dismissed, one key for every kind (Nathan,
                     // 2026-10-03): a request is closed with word to its asker that there is
                     // nothing for the person to do, after a y; an update or a message is read.
+                    // A decision or choice needs one of its named answers, which a dismissal
+                    // is not, so x says so rather than sending something st would refuse.
+                    ("request", 'x')
+                        if self
+                            .structured_request()
+                            .is_some_and(|(_, request)| !request.answers.is_empty()) =>
+                    {
+                        self.flash(
+                            "This asks you to choose, so x cannot dismiss it: a chooses one of its answers",
+                        )
+                    }
                     ("request", 'x') => self.confirm = Some('r'),
                     ("update", 'x') => self.read_update(),
                     ("message", 'x') => self.act('m'),
@@ -4636,10 +4672,7 @@ impl Ui {
             // clipboard is the person's, so the link lands where their browser is.
             Hit::Link(url) => {
                 copy(&url);
-                self.flash(format!(
-                    "Copied {} · paste it in a browser",
-                    text::truncate(&url, 60)
-                ));
+                self.flash(link_note(&url));
             }
             Hit::Split(right) => self.split(right),
             Hit::GlassTab(group, tab) => self.show_in(group, tab),
@@ -5213,12 +5246,7 @@ pub fn run_demo(args: &[String]) -> Result<()> {
             // Drain everything queued so a fast wheel does not lag behind. crossterm's read never
             // returns on a closed terminal, so check for one before each read.
             while !stopping.load(std::sync::atomic::Ordering::Relaxed) && !crate::stdin_hung_up() {
-                match event::read()? {
-                    Event::Key(key) => ui.key(key),
-                    Event::Paste(text) => ui.paste(text),
-                    Event::Mouse(mouse) => ui.mouse(mouse),
-                    _ => {}
-                }
+                ui.input_event(event::read()?);
                 if !event::poll(Duration::ZERO)? {
                     break;
                 }
@@ -5583,6 +5611,103 @@ mod tests {
         // x shows it again.
         let all = screens::missions_list(&world, "⠋", true);
         assert!(all.ids.iter().any(|id| id == "mission/example/failed-yesterday"));
+    }
+
+    #[test]
+    fn clicking_a_link_says_whether_it_copied_an_address_or_a_file_path() {
+        assert_eq!(
+            link_note("https://example.com/a"),
+            "Copied https://example.com/a · paste it in a browser"
+        );
+        assert_eq!(
+            link_note("/srv/repo/spec.md"),
+            "Copied /srv/repo/spec.md · a file on the writer's machine"
+        );
+        assert!(link_note("~/notes/a.md").contains("a file on the writer's machine"));
+    }
+
+    #[test]
+    fn a_feedback_request_offers_words_and_a_dismissal_not_an_answer_to_choose() {
+        // Nathan, 2026-10-05: "why can't I dismiss this attention item?"
+        let feedback = |kind: &str, answers: Vec<st3_client::RequestAnswerOption>| {
+            let mut world = demo::world();
+            let request = st3_client::StructuredRequest {
+                version: 1,
+                entry_type: kind.into(),
+                question: "What did you run and what did you see?".into(),
+                why_person: "Only you saw the failure.".into(),
+                summary: None,
+                reasons: Vec::new(),
+                subjects: Vec::new(),
+                recommendation: None,
+                answers,
+                custom: false,
+            };
+            let item = Attention {
+                id: "attention/feedback".into(),
+                tier: Tier::Stopped,
+                title: "What went wrong?".into(),
+                waiting: None,
+                age: "1h".into(),
+                mission: None,
+                agent: Some("agent/example/cos".into()),
+                kind: AttentionKind::Request {
+                    from: "Chief of Staff".into(),
+                    from_id: "agent/example/cos".into(),
+                    question: request.question.clone(),
+                    structured: Some(Box::new(request)),
+                },
+                actions: vec!["work.done".into()],
+                related: Vec::new(),
+                raised_by: None,
+                blocked: None,
+            };
+            if let Load::Ready(items) = &mut world.attention {
+                items.insert(0, item);
+            }
+            let mut ui = Ui::new(world);
+            ui.live = true;
+            ui.tab = 0;
+            let at = ui
+                .listing(60)
+                .ids
+                .iter()
+                .position(|id| id == "attention/feedback")
+                .unwrap();
+            ui.select(at);
+            ui
+        };
+        let mut ui = feedback("feedback", Vec::new());
+        let screen = frame(&ui, 140, 50).join("\n");
+        for shown in ["Answer in words", "Dismiss: nothing to do"] {
+            assert!(screen.contains(shown), "{shown}: {screen}");
+        }
+        assert!(!screen.contains("Choose an answer"), "{screen}");
+        // x then y closes it with word to its asker, as a plain request does.
+        ui.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(frame(&ui, 140, 50).join("\n").contains("tell Chief of Staff there is nothing"));
+        ui.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(
+            matches!(&ui.effects[..], [Effect::Attention { id, action, reason: Some(reason), .. }]
+                if id == "attention/feedback" && action == "work.done" && reason.contains("Nothing for me")),
+            "{:?}",
+            ui.effects
+        );
+        // A choice has named answers: it offers those, and x says why it cannot dismiss.
+        let answer = st3_client::RequestAnswerOption {
+            id: "yes".into(),
+            label: "Yes".into(),
+            consequence: "Goes ahead.".into(),
+            outcome: None,
+            conditions: Vec::new(),
+        };
+        let mut ui = feedback("choice", vec![answer]);
+        let screen = frame(&ui, 140, 50).join("\n");
+        assert!(screen.contains("Choose an answer"), "{screen}");
+        assert!(!screen.contains("Dismiss: nothing to do"), "{screen}");
+        ui.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(ui.confirm.is_none());
+        assert!(ui.effects.is_empty());
     }
 
     #[test]

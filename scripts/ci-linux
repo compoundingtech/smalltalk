@@ -2,7 +2,7 @@
 # Run one Linux gate stage inside the pinned devShell: tests, clippy, or fleet-compat.
 # Each stage is its own GitHub Actions job on its own runner; `linux-gate` requires all three.
 set -euo pipefail
-stage=${1:?usage: scripts/ci-linux tests|clippy|fleet-compat}
+stage=${1:?usage: scripts/ci-linux tests|clippy|fleet-compat|mail-redelivery-canaries}
 # Logs stay outside the checkout: the public-content test scans untracked files.
 logs="$RUNNER_TEMP/ci-logs"
 mkdir -p "$logs"
@@ -69,18 +69,17 @@ python3 scripts/check-st-boundary-test
 python3 scripts/check-st-boundary
 
 start=$SECONDS status=0
+# Both native test jobs and the standalone mail canaries use the existing runner
+# tmpfs, with short socket paths and evidence retained until job cleanup.
+if [[ ( "$stage" == tests || "$stage" == mail-redelivery-canaries ) && -n "${CI_LOCAL_CARGO_HOME:-}" ]]; then
+  export TMPDIR="$RUNNER_TEMP/t" TMP="$RUNNER_TEMP/t" TEMP="$RUNNER_TEMP/t"
+  mkdir -p "$TMPDIR"
+  printf 'Test scratch filesystem: '
+  stat -f -c %T "$TMPDIR"
+fi
 case "$stage" in
   # The nextest --no-run step already compiled the test executables.
   tests) {
-    if [[ -n "${CI_LOCAL_CARGO_HOME:-}" ]]; then
-      # The local runner's RUNNER_TEMP is on /run's tmpfs. nix develop otherwise
-      # puts tempfile stores on /tmp's disk, where each commit pays an fsync.
-      # Keep the path short for Unix sockets and retain evidence until job cleanup.
-      export TMPDIR="$RUNNER_TEMP/t" TMP="$RUNNER_TEMP/t" TEMP="$RUNNER_TEMP/t"
-      mkdir -p "$TMPDIR" || exit $?
-      printf 'Test scratch filesystem: '
-      stat -f -c %T "$TMPDIR" || exit $?
-    fi
     # The standalone feature check is independent of the workspace's unified test build.
     # Only shard 1 (or an unpartitioned local run) needs to perform it.
     if [[ "${CI_TEST_PARTITION:-}" != hash:2/2 ]]; then conversation_model || exit $?; fi
@@ -88,6 +87,7 @@ case "$stage" in
   } 2>&1 | tee "$logs/$stage.log" || status=$? ;;
   clippy) clippy_and_codegen 2>&1 | tee "$logs/$stage.log" || status=$? ;;
   fleet-compat) fleet_compat 2>&1 | tee "$logs/$stage.log" || status=$? ;;
+  mail-redelivery-canaries) python3 scripts/ci-mail-redelivery-canaries 2>&1 | tee "$logs/$stage.log" || status=$? ;;
   *) echo "unknown stage: $stage" >&2; exit 2 ;;
 esac
 # `tee` hides the stage's exit status behind a pipeline; pipefail restores it above.

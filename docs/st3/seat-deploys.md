@@ -5,6 +5,53 @@ new one such as a new Nix store path. The daemon adopts every running seat; it d
 This document explains how each seat's message path follows the new binary without ending the
 provider session, and how st reports a seat whose message path did not.
 
+## Harness admission at the next launch
+
+Before starting an unseen installed omp or OpenCode build, st measures its native delivery
+contract in a disposable session. Existing running providers and driver adoption across deploys
+are unaffected. On a new launch (including restart or residency resume), a failed omp measurement
+refuses to start the provider; OpenCode starts with native delivery disabled and mail stays queued.
+There is no rollback to a last-admitted executable. `st doctor` and the affected agent's state
+name the failed boundary and the remedy.
+
+The fixture uses loopback endpoints and dummy keys, without real credentials. It needs writable
+temporary/state directories and the installed harness's normal runtime; omp also needs POSIX `sh`.
+A producer that bootstraps missing packages in its empty scratch cache can fail offline even when
+its normal installation works. A person can explicitly allow the exact installed build, on the
+host and as the operating-system user owning the seats, outside an agent seat:
+
+```sh
+st admission override omp --binary /path/to/omp --reason 'The isolated probe cannot run in this offline installation'
+```
+
+Use `opencode` for OpenCode; `--binary` must name the executable used by the affected seat.
+For a daemon using a nondefault state directory, add `--state-dir /path/to/state`. Then restart
+only the affected seat. The override command runs no producer or probe child and needs no daemon.
+The recorded exception contains a reason and exact build/extension identity; it preserves failed
+measurements and expires when executable, interpreter, package manifest, lockfile or shipped-extension
+identity changes. Build identity hashes executable and runtime contents plus package metadata; it
+does not traverse package assets or refuse installations for their size. A dependency upgrade
+recorded in a manifest or lockfile changes identity; an arbitrary asset edit does not.
+The driver logs the active exception. `st admission revoke omp --binary /path/to/omp` (with the
+same state directory, if customized) restores normal admission on the next launch. An override
+cannot supply a runtime missing from the real harness installation or repair incompatible APIs.
+
+## Stopping during an API outage
+
+After its provider ends, a native driver retries the final `runtime.observed` exit claim until
+it is acknowledged, including across daemon restarts. SIGTERM or SIGHUP requests a stop instead:
+once the provider is gone, the driver checks for that request every 250 ms and allows two seconds
+for the final observation drain, subagent cleanup and exit claim together. Including stop polling,
+this reporting phase takes up to about 2.25 seconds. The deadline also cancels an in-flight API
+request. The provider's existing five-second stop grace precedes this reporting budget, so a
+stopped driver does not wait indefinitely for a daemon that is down. An ordinary API outage
+without a stop has no exit-report deadline.
+
+If the deadline expires, the driver records a private log note and exits. An abandoned exit claim
+is not persisted for later delivery. When the daemon returns, the reconciler records the runtime
+as `vanished` from PTY liveness, without an exit code. If only the driver was signalled, an
+`on-failure` restart policy can therefore restart a provider that exited cleanly after the stop.
+
 ## What runs in a seat
 
 Each seat runs in its own PTY. The daemon starts `st3 driver HARNESS` there, and the driver starts

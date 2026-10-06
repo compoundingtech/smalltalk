@@ -2,13 +2,13 @@
 
 The inventory covers every offered CLI command, every typed client action, every stui daemon effect, and the palette and local controls. It distinguishes real CLI/Unix transport tests, the live stui adapter, local reducer tests, and shared implementations. A test reference describes its actual layer; a shared implementation test alone is not a claim that the entire interactive UI was driven.
 
-`action-coverage.json` is the machine-readable source. Tests compare its 187 CLI rows with Clap's offered command tree, its 52 typed actions with the generated client contract and real dispatch builders, and its 19 stui effects and 13 palette actions with their declarations. Every row must reference an existing test. Hidden driver/replication worker commands and help aliases are internal or alternate spellings, rather than additional person or agent actions.
+`action-coverage.json` is the machine-readable source. Tests compare its 187 CLI rows with Clap's offered command tree, its 54 typed actions with the generated client contract and real dispatch builders, and its 19 stui effects and 13 palette actions with their declarations. Every row must reference an existing test. Hidden driver/replication worker commands and help aliases are internal or alternate spellings, rather than additional person or agent actions.
 
 ## Restart and stale-state model
 
 The new integration fixture owns a private disk store, Unix socket, configuration, HOME/XDG directories, native transcripts and PTYs. A restart ends the listener/router, reopens the store, and constructs fresh daemon state, notification channels and action gates. It never starts or changes the user's daemon. Readiness requires a successful public capabilities response; a socket path alone is insufficient. CI retries are disabled for these action coverage tests. Runtime restart tests acknowledge signal delivery, then wait with a bounded timeout for the PTY to publish process exit. The fleet fixture runs real `st up` and replication workers in private directories and uses `--no-service` for administrative operations. Service tests use a private manager shim which launches real daemon processes and records only fixture service changes.
 
-For each supported typed action, the test first submits a stale applicable fence and checks that the store index does not change. It then restarts, submits the original valid fence, checks the domain result, restarts again, and replays the exact request. The replay must return the original affected IDs without duplicate domain writes or receipts. Execution-specific cases also check old runtime incarnations, stale terminal sequences, old native discovery revisions, obsolete desired revisions, changed review cards, and replaced proposal preview tokens.
+For the restart-matrix typed actions, the test first submits a stale applicable fence and checks that the store index does not change. It then restarts, submits the original valid fence, checks the domain result, restarts again, and replays the exact request. The replay must return the original affected IDs without duplicate domain writes or receipts. Execution-specific cases also check old runtime incarnations, stale terminal sequences, old native discovery revisions, obsolete desired revisions, changed review cards, and replaced proposal preview tokens.
 
 The CLI drives real public command paths. Reads are compared before and after restart; writes are checked in the reopened graph. Messaging checks explicit idempotency keys, replies, attachments and lifecycle receipts. Review tests use current source cards and inspect the single attributed verdict. Launch tests ask and answer questions, submit/compare variants, preview, approve, request revision, cancel, start approved definitions, and propose a variant against one run generation. Terminal tests send real input, keys and signals to a private PTY, inspect its screen, and reject revoked attachments. Fleet tests cover creation/join/history, mode changes, revoke/remove/leave, migrations, checkpoints and repairs. The GitHub watch/unwatch/list/comment/own test drives real CLI and daemon processes against a private HTTP fixture, including restart, repeated unwatch, comment and review posting, foreign-author refusal and idempotent ownership registration.
 
@@ -40,7 +40,19 @@ Real-process fleet tests require a process ancestry without an inherited st agen
 
 ## Typed client actions
 
-The accepted/refused result and replay invariants above apply to these rows.
+The accepted/refused result and replay invariants above apply to the restart-matrix rows. `arrangement.edit` instead references focused real API-handler and store regression tests: stale layout fences intentionally merge; fenced retirement compares the current revision and refuses concurrent edits without writes, while unfenced retirement remains unconditional; stale authority and launch fences refuse without edits; receipts replay and recover a dispatch gap without accepting changed action identity, including fenced retirement; agent attribution retains person ownership; and projected heads survive store reopen, upgrade backfill and replication. These tests do not claim full CLI/Unix transport restart coverage.
+
+Conditional-retirement evidence: `arrangement_retire_fences_refuse_concurrent_edits_and_replay_receipts`
+and `arrangement_fenced_retire_recovers_receipt_gap` in
+[`crates/st3/src/api/client_v0/arrangements.rs`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/src/api/client_v0/arrangements.rs).
+
+Create/folder races return typed non-retryable refusals rather than internal errors:
+`arrangement_create_race_returns_typed_exists_and_exact_retry_receipt` and
+`arrangement_folder_race_and_validation_refusals_stay_typed` exercise the actual
+HTTP error envelope, rejected-write atomicity and receipt replay.
+`selected_arrangement_survives_byte_window_edits_and_retirement` verifies the selected
+stream window stays outside owner-prefix truncation, rejects wrong owners, follows
+edits and removes retired subjects without changing unfiltered reads.
 
 | Action | Test evidence |
 | --- | --- |
@@ -50,6 +62,7 @@ The accepted/refused result and replay invariants above apply to these rows.
 | `agent.start` | [`creation_and_declaration_actions_survive_stale_fences_and_restarts`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/action_coverage.rs) |
 | `agent.stop` | [`creation_and_declaration_actions_survive_stale_fences_and_restarts`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/action_coverage.rs) |
 | `agent.suspend` | [`suspension_requests_survive_stale_incarnations_and_restarts`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/action_coverage.rs) |
+| `arrangement.edit` | [`arrangement_actions_merge_layout_fences_replay_receipts_and_preserve_owner`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/src/api/client_v0/arrangements.rs); [`arrangement_edit_recovers_receipt_gap_without_accepting_a_changed_action_id`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/src/api/client_v0/arrangements.rs); [`arrangement_actions_accept_current_projected_launch_fences_and_refuse_stale_ones`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/src/api/client_v0/arrangements.rs); [`owner_admission_real_agent_and_atomic_identity_fences`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/src/store/arrangements_tests.rs); [`heads_survive_reopen_and_an_upgrade_backfills_once`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/src/store/arrangements_tests.rs) |
 | `attention.resolve` | [`unavailable_actions_refuse_before_and_after_restart_without_writes`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/action_coverage.rs) |
 | `lane.approve` | [`lane_actions_survive_stale_fences_and_restarts`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/action_coverage.rs) |
 | `lane.join` | [`lane_actions_survive_stale_fences_and_restarts`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/action_coverage.rs) |
@@ -102,6 +115,8 @@ The accepted/refused result and replay invariants above apply to these rows.
 | Command | Verification | Test evidence |
 | --- | --- | --- |
 | `st activity` | real CLI over private Unix socket; disk store reopened between actions | [`cli_reads_preserve_operational_views_after_restart`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/action_coverage.rs) |
+| `st admission override` | real local CLI; environment guard, exact-build record, revoke, and no daemon or producer child | [`person_admission_exception_is_local_reversible_and_never_spawns_the_producer`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/client_v0_cli.rs) |
+| `st admission revoke` | real local CLI; environment guard, exact-build record, revoke, and no daemon or producer child | [`person_admission_exception_is_local_reversible_and_never_spawns_the_producer`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/client_v0_cli.rs) |
 | `st agents apply` | real CLI over private Unix socket; disk store reopened between actions | [`cli_agent_and_shell_declarations_survive_restart`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/action_coverage.rs) |
 | `st agents hold` | real CLI over private Unix socket; disk store reopened between actions | [`cli_local_skill_completions_holds_and_repairs_use_private_files`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/action_coverage.rs) |
 | `st agents ls` | real CLI over private Unix socket; disk store reopened between actions | [`cli_reads_preserve_operational_views_after_restart`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/action_coverage.rs) |
@@ -118,7 +133,7 @@ The accepted/refused result and replay invariants above apply to these rows.
 | `st agents stop` | real CLI over private Unix socket; disk store reopened between actions | [`cli_agent_and_shell_declarations_survive_restart`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/action_coverage.rs) |
 | `st agents suspend` | real CLI request/wait across restart; fixture runtime-owner acknowledgements | [`cli_seat_suspension_and_resume_wait_for_durable_owner_acknowledgements`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/action_coverage.rs) |
 | `st agents tree` | real CLI over private Unix socket; disk store reopened between actions | [`cli_reads_preserve_operational_views_after_restart`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/action_coverage.rs) |
-| `st apply` | real CLI over isolated disk-backed Unix daemons; source fences, partition/heal and retirement confirmation | [`disconnected_daemons_heal_to_newest_source_and_pruning_requires_confirmation`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/owned_sets.rs) |
+| `st apply` | real CLI; mixed-file atomic publication, dry-run side effects, gate checks, source fences and retirement | [`apply_bundles_seats_missions_and_schedules_and_refuses_partial_publication`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/broken_gates.rs), [`apply_can_check_exec_gates_during_plain_and_owned_dry_runs`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/broken_gates.rs), [`disconnected_daemons_heal_to_newest_source_and_pruning_requires_confirmation`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/owned_sets.rs) |
 | `st attention approve` | real CLI over private Unix socket; current source review and durable verdict | [`cli_human_reviews_act_on_the_current_card_after_restart`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/action_coverage.rs) |
 | `st attention ls` | real CLI over private Unix socket; disk store reopened between actions | [`cli_reads_preserve_operational_views_after_restart`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/action_coverage.rs) |
 | `st attention reject` | real CLI over private Unix socket; current source review and durable verdict | [`cli_human_reviews_act_on_the_current_card_after_restart`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/action_coverage.rs) |

@@ -263,6 +263,11 @@ fn claude_uninitialized_channel_blocks_until_native_attachment() {
 }
 
 #[test]
+fn claude_permanent_channel_failure_parks_after_three_attempts_without_a_restart_loop() {
+    canary("claude", "channel-parked");
+}
+
+#[test]
 fn omp_when_idle_replacement_binds_its_original_native_session() {
     if st3::test_support::supervise_test() {
         return;
@@ -276,4 +281,12 @@ fn codex_transcript_utf8_and_discovery_failures_preserve_delivery_and_private_wa
         return;
     }
     canary("codex", "utf8");
+}
+
+#[test]
+fn an_imported_codex_session_binds_exactly_on_first_launch_and_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    canary("codex", "import");
 }

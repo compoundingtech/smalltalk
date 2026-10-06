@@ -58,6 +58,11 @@ reaches a live store. If they match, the node publishes one `checkpoint.verified
 digests of the drops, the kept claims, the graph and the readers' answers. A node verifies a
 checkpoint once.
 
+The rules identity covers projection inputs and replay as well as retention. Version 11 includes
+`arrangements` and `arrangement_registers`, even when empty, and rebuilds them from sealed claims.
+Different builds' rules digests must match exactly, not by version ordering: a mixed-version
+fleet waits at sealing until its participants use compatible rules, including during rollback.
+
 **Stable.** A checkpoint is stable when every participant has published a verification that names
 the same participants and carries identical digests. Stability is a pure function of claims, like
 the membership fold: no clock, no order, so every node that holds the same claims reaches the same

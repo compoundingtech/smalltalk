@@ -108,11 +108,11 @@ agent "probe/delivery/amber" {
 ```
 
 ```sh
-st agents apply probe.kdl --as person/operator
+st apply probe.kdl --as person/operator
 st doctor --json
 ```
 
-`agents apply` previews the intent and refuses unresolved references before
+`apply` previews the intent and refuses unresolved references before
 publishing it. Create the corresponding configuration and seat for every node, with its other
 two nodes as peers. Host and agent identities must agree across configurations.
 An offline node remains configured so its missing source heartbeat and unread
@@ -141,6 +141,17 @@ Shorter test intervals make the outage proof bounded; production uses the
 60-second deadline. The operations recipient fixture uses a token-free omp provider
 stand-in, requiring Node.js; probe recipients remain dedicated Python consumers.
 The native proof runs in the normal Linux Cargo test suite.
+
+The probe's private `events.jsonl` pairs every channel start and exit by channel ID
+and PID. Exit records include whether the native hello arrived, the inherited runtime
+incarnation and ownership sequence, and separately timed observations of the agent's
+current owner at launch and exit. Those observations are context, not proof of the channel's accepted binding.
+Stderr is drained concurrently with native stdout. Only a 4 KiB tail is retained;
+diagnostics keep CLI error lines with credentials redacted and omit structured or native
+message payloads. An inherited pipe cannot hold up restart indefinitely. These records
+have mode 0600 and stay local; they never enter replicated probe reports. Native test
+failures print the private event tail so a startup refusal can be distinguished from a
+later recovery failure without manufacturing a consumed or read receipt.
 
 A member shown as last seen pauses its route: the probe queues no new sends, withdraws
 route attention, and retains any pending message. After a new replication exchange,

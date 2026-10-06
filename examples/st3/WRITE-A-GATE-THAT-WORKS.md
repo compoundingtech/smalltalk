@@ -40,7 +40,7 @@ step "verify-index" timeout="1m" {
 It gives the step no time beyond its own gate and says nothing about whether the shell file
 parses. The owning step can time out while its gate is still legitimately using its full minute.
 A syntax error waits until runtime if nobody checks it before publication; `st missions check`
-runs the gate once, now, the way a run would, and `st missions publish` refuses a gate that check
+runs the gate once, now, the way a run would, and `st apply` refuses a gate that check
 finds broken.
 
 Gates use the same captured interactive login-shell environment as agents and daemon commands.
@@ -64,7 +64,7 @@ printf '%s\n' 'catalog version 1' >"$gate_workspace/catalog-index.txt"
 
 /bin/bash -n examples/st3/verify-catalog-index.sh
 st missions check examples/st3/gate-recovery.kdl --workspace "$gate_workspace"
-st missions publish examples/st3/gate-recovery.kdl --workspace "$gate_workspace" \
+st apply examples/st3/gate-recovery.kdl --workspace "$gate_workspace" \
   --as person/operator
 st missions start example/catalog-gate \
   --id example/catalog-gate/first \
