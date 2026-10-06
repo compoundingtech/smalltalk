@@ -21,7 +21,9 @@ pub struct SmalltalkRuntime {
     pub(crate) subject_cache: Mutex<SubjectCache>,
     pub(crate) message_cache: Mutex<HashMap<String, MessageCacheEntry>>,
     pub(crate) agent_status_cache: Mutex<VecDeque<AgentStatusEntry>>,
-    pub(crate) agent_resources_cache: Mutex<VecDeque<(u64, bool, Arc<Vec<Value>>)>>,
+    pub(crate) agent_resources_cache: Mutex<agent_resources::AgentResourcesCache>,
+    pub(crate) agent_resources_full_fills: std::sync::atomic::AtomicUsize,
+    pub(crate) agent_resources_reducer_version: std::sync::atomic::AtomicUsize,
 }
 
 impl SmalltalkRuntime {
