@@ -9,11 +9,13 @@ fn controller_death_cleanup() {
     }
     let repo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let output = st3::test_support::command("python3")
-        .arg(repo.join("scripts/st3-messaging-faults-eval/test_cleanup.py"))
+        .args(["-m", "unittest", "discover", "-s"])
+        .arg(repo.join("scripts/st3-messaging-faults-eval"))
+        .args(["-p", "test_*.py"])
         .env("ST3_MFE_TEST_BINARY", env!("CARGO_BIN_EXE_st3-fixture"))
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .output()
-        .expect("run isolated messaging cleanup regression");
+        .expect("run messaging cleanup, oracle, readiness and timing regressions");
     assert!(
         output.status.success(),
         "{}\n{}",
