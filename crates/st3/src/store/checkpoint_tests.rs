@@ -1807,23 +1807,24 @@ fn categorical_current_source_and_auth_winners_survive_checkpoint_proof_and_trim
         }).unwrap()
     };
     append("runtime.observed", json!({"status":"running", "runtime_id":"native", "incarnation_id":"one"}));
-    let at = now_ms() as u64 - 1_000;
+    let at = now_ms() as u64 - 8 * 24 * 60 * 60 * 1_000;
+    let gap_at = now_ms() as u64 - 1_000;
     let current = append("harness.current", json!({
         "state":"idle", "incarnation_id":"one", "observed_at_ms":at + 5,
         "observed_since_ms":at, "provider_auth":false, "running_subagents":3,
-        "history_gap_count":1, "history_gap_from_ms":at, "history_gap_to_ms":at + 5,
+        "history_gap_count":1, "history_gap_from_ms":gap_at, "history_gap_to_ms":gap_at + 5,
         "history_gap_reason":"cap-full"
     }));
     append("harness.history.gap", json!({
         "runtime_incarnation":"one", "history_gap_count":2,
-        "history_gap_from_ms":at, "history_gap_to_ms":at + 6, "history_gap_reason":"cap-full"
+        "history_gap_from_ms":gap_at, "history_gap_to_ms":gap_at + 6, "history_gap_reason":"cap-full"
     }));
     for index in 0..220 {
         append("harness.observed", json!({
             "state":"idle", "incarnation_id":"one", "observed_since_ms":at,
             "observed_at_ms":at + if index == 2 {20} else if index == 3 {10} else {1},
             "provider_auth": if index == 2 {Value::Null} else {json!(index == 3)},
-            "status_transition":false
+            "status_transition":false, "input_buffer": if index % 2 == 0 {"empty"} else {"nonempty"}
         }));
     }
     let cut = now_ms() + 1_000;

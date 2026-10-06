@@ -53,6 +53,14 @@ It reads durable runtime/provider-bound latest state at startup and before retry
 15-second request deadline and source-time expiry timer. A full or stalled history queue cannot
 delay that task. Ordered sequence acknowledgement, retained history and normalized operations
 remain unchanged; current captures never add status-history transitions.
+The current producer preserves categorical `since` and transition identity on count-only or
+diagnostic-only refreshes; their capture time still advances freshness. Activity, blocking,
+composer input, ask, native authentication and exit evidence remain separate categorical axes.
+`background_jobs` counts all native running asynchronous jobs, including task jobs.
+`running_subagents` is the parent task-lifecycle subset, not an additional disjoint job count.
+Consumers must not sum the two measures or infer either from leased subagent metadata.
+After a terminal-authored parent error, count refreshes cannot replay cached working evidence;
+the producer waits for new parent activity before reusing activity state.
 
 A node can also send every local observation to an OpenTelemetry collector. The exporter is off
 unless the config names a collector:

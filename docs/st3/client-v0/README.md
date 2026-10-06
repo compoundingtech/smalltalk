@@ -87,11 +87,15 @@ subagent is part of its agent, not a resource of its own, and has no actions. Th
 per request, so a lease that runs out leaves it at the next read without a new claim. A daemon
 older than the field omits it; clients read a missing list as empty.
 
-`running_subagents` and `background_jobs` are independent optional nullable native counts for
+`running_subagents` and `background_jobs` are two optional nullable native measures for
 the current runtime incarnation. Missing or null means unknown; zero means a producer explicitly
-observed none running. They are not inferred from `subagents`: that existing leased metadata list
-keeps its own lifecycle and can differ from the native running count. A runtime replacement does
-not inherit either count from its predecessor.
+observed none running. `background_jobs` counts **all** running jobs from the native asynchronous
+job snapshot, including task jobs. `running_subagents` counts the parent task-lifecycle subset:
+the measures overlap, so clients must not add them together. Neither is inferred from `subagents`:
+that existing leased metadata list keeps its own lifecycle and can differ from the native count.
+A runtime replacement does not inherit either count from its predecessor.
+Count refreshes preserve the parent categorical state. After a terminal-authored parent error,
+job/task count updates do not replay its cached working frame; new parent activity is required.
 
 The model-free native count probe is
 `python3 crates/st3/fixtures/omp-resume/native-task-count-probe.py --omp "$OMP_BIN"`.
@@ -1431,8 +1435,11 @@ contain mistakes. The stored text and body digest stay unchanged. Timeline messa
 the message's optional `tags` array so clients can mark dictation without inspecting its text.
 
 The agent resource exposes observed harness status as `harness_state`, `since` (RFC 3339),
-and `observation: current | stale | missing`. `since` is the start of that state in that
-runtime incarnation; repeated observations and changes to display details preserve it.
+and `observation: current | stale | missing`. The current lane preserves its producer's `since`,
+the start of that categorical state in the runtime incarnation. Repeated captures, changes to
+`running_subagents` / `background_jobs`, and diagnostic-only details do not restart it. Activity,
+human blocking, input, ask, authentication or terminal-exit edges can start a new categorical state.
+Old writers retain their observed activity/authentication state-run fallback.
 `observation` becomes stale after 90 seconds without fresh evidence, and is missing when
 this runtime has no observation. Stale idle is exposed as indeterminate, never proven idle.
 Desired runtime state and agent-declared work progress remain separate from harness evidence.

@@ -625,6 +625,16 @@ export const AgentTodo = /*#__PURE__*/ (() => Schema.Struct({
 export type AgentTodo = typeof AgentTodo.Type
 export type AgentTodoEncoded = typeof AgentTodo.Encoded
 
+export const HarnessHistoryGap = /*#__PURE__*/ (() => Schema.Struct({
+  "count": Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(Schema.isLessThanOrEqualTo(9223372036854775807)),
+  "from_ms": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)).check(Schema.isLessThanOrEqualTo(9223372036854775807)),
+  "reason": Schema.Literal("cap-full"),
+  "runtime_incarnation": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(256)),
+  "to_ms": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)).check(Schema.isLessThanOrEqualTo(9223372036854775807))
+}).annotate({ identifier: "HarnessHistoryGap" }))()
+export type HarnessHistoryGap = typeof HarnessHistoryGap.Type
+export type HarnessHistoryGapEncoded = typeof HarnessHistoryGap.Encoded
+
 export const HostId = /*#__PURE__*/ (() => subjectRef(new RegExp("^(?:host)/[^\\s]+$", "u"), "host").annotate({ identifier: "HostId" }))()
 export type HostId = typeof HostId.Type
 export type HostIdEncoded = typeof HostId.Encoded
@@ -705,6 +715,8 @@ export const Agent = /*#__PURE__*/ (() => Schema.Struct({
   "active_work_count": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
   /** Structured human ask kind (question, permission, or review); meaningful only while blocked_on is human. */
   "ask": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE).annotate({ description: "Structured human ask kind (question, permission, or review); meaningful only while blocked_on is human." }),
+  /** Native count of currently running background jobs in this runtime incarnation. Missing or null means unknown; zero is an explicit observed count. */
+  "background_jobs": Schema.OptionFromOptionalNullOr(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)), NULL_NONE).annotate({ description: "Native count of currently running background jobs in this runtime incarnation. Missing or null means unknown; zero is an explicit observed count." }),
   /** Current incarnation's harness blocking axis; human means a person must answer before it continues. */
   "blocked_on": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE).annotate({ description: "Current incarnation's harness blocking axis; human means a person must answer before it continues." }),
   "current_session_id": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
@@ -722,6 +734,8 @@ export const Agent = /*#__PURE__*/ (() => Schema.Struct({
   "harness_error_state": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE).annotate({ description: "Known actionable harness error: needs-login. Login keeps the legacy unauthenticated harness_state for older clients; older daemons omit this optional detail." }),
   /** Observed harness state; stale idle is indeterminate. Desired state and declared work status remain separate. */
   "harness_state": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE).annotate({ description: "Observed harness state; stale idle is indeterminate. Desired state and declared work status remain separate." }),
+  /** Explicit aggregate native history loss for this runtime incarnation. Read independently of the current activity winner; missing/null does not prove complete history. */
+  "history_gap": Schema.OptionFromOptionalNullOr(HarnessHistoryGap, NULL_NONE).annotate({ description: "Explicit aggregate native history loss for this runtime incarnation. Read independently of the current activity winner; missing/null does not prove complete history." }),
   "host_id": Schema.OptionFromOptionalNullOr(HostId, NULL_NONE),
   "id": AgentId,
   "incarnation_id": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
@@ -741,6 +755,8 @@ export const Agent = /*#__PURE__*/ (() => Schema.Struct({
   "revision": Revision,
   /** Durable owned-seat cutover, incarnation and native-session fences, phase, deadline and blockers. Omitted by older daemons. */
   "rollout": Schema.OptionFromOptionalNullOr(Schema.Record(Schema.String, Schema.Unknown), NULL_NONE).annotate({ description: "Durable owned-seat cutover, incarnation and native-session fences, phase, deadline and blockers. Omitted by older daemons." }),
+  /** Native count of currently running subagents in this runtime incarnation, independent of the leased subagents metadata list. Missing or null means unknown; zero is an explicit observed count. */
+  "running_subagents": Schema.OptionFromOptionalNullOr(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)), NULL_NONE).annotate({ description: "Native count of currently running subagents in this runtime incarnation, independent of the leased subagents metadata list. Missing or null means unknown; zero is an explicit observed count." }),
   "runtime_ids": Schema.Array(RuntimeId),
   "silent_since": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE),
   /** When this observed state began in this runtime incarnation. Same-state observations never reset it. */
@@ -2257,6 +2273,8 @@ export type StatusTransitionEncoded = typeof StatusTransition.Encoded
 
 export const StatusHistory = /*#__PURE__*/ (() => Schema.Struct({
   "complete": Schema.Boolean,
+  /** Explicit aggregate loss intervals intersecting the retained time window, including prior runtime incarnations. Any such interval makes complete false; current captures never fabricate missing transitions. */
+  "history_gaps": optionalKey(Schema.Array(HarnessHistoryGap)).annotate({ description: "Explicit aggregate loss intervals intersecting the retained time window, including prior runtime incarnations. Any such interval makes complete false; current captures never fabricate missing transitions." }),
   "items": Schema.Array(StatusTransition).check(Schema.isMaxLength(200)),
   "kind": Schema.Literal("status-history"),
   "retained_from": Timestamp,

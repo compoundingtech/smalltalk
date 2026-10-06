@@ -1034,9 +1034,9 @@ mod tests {
         let recovered = publication(json!(true), at + 2);
         let (claim, first) = store.append_harness_current(&recovered).unwrap();
         assert!(first);
-        let (retry, appended) = store.append_harness_current(&recovered).unwrap();
+        let (_retry, appended) = store.append_harness_current(&recovered).unwrap();
         assert!(!appended);
-        assert_eq!(retry.id, claim.id);
+        assert_eq!(store.current_harness("agent/cedar").unwrap().unwrap().claim, claim.id);
         store.append_claim(&input("harness.observed", json!({
             "incarnation_id":"one", "state":"working", "observed_at_ms":at,
             "provider_auth":false

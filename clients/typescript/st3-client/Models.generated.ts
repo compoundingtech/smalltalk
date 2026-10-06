@@ -30,6 +30,7 @@ export type ActorRef = string;
 export type Agent = ResourceHeader & {
   active_work_count?: number;
   ask?: string | null;
+  background_jobs?: number | null;
   blocked_on?: string | null;
   current_session_id?: string | null;
   current_work?: Array<WorkLabel>;
@@ -40,6 +41,7 @@ export type Agent = ResourceHeader & {
   handoff?: (AgentHandoff | null);
   harness_error_state?: string | null;
   harness_state?: string | null;
+  history_gap?: (HarnessHistoryGap | null);
   host_id?: (HostId | null);
   id?: AgentId;
   incarnation_id?: string | null;
@@ -56,6 +58,7 @@ export type Agent = ResourceHeader & {
   rollout?: {
 
 } | null;
+  running_subagents?: number | null;
   runtime_ids: Array<RuntimeId>;
   silent_since?: (Timestamp | null);
   since?: (Timestamp | null);
@@ -773,6 +776,14 @@ export type GlassTab = {
 
 export type GoldenResourceSet = Array<Resource>;
 
+export type HarnessHistoryGap = {
+  count: number;
+  from_ms: number;
+  reason: "cap-full";
+  runtime_incarnation: string;
+  to_ms: number;
+};
+
 export type HarnessPhase = {
   name: string;
   tasks: Array<HarnessTask>;
@@ -1403,6 +1414,7 @@ export type SnapshotId = string;
 
 export type StatusHistory = {
   complete: boolean;
+  history_gaps?: Array<HarnessHistoryGap>;
   items: Array<StatusTransition>;
   kind: "status-history";
   retained_from: Timestamp;

@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `a7f6681a92983e89c320ea6cdd9931897a558b8631bd197c2b43f0de59a50927`
+Digest: `f63999faa08f00a9f5503522361450f7ddadcbe8a51253ecdf22bde2dff3cc33`
 
 ## Subject families
 
@@ -97,7 +97,9 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `glass.upserted` | `glass` | `authorized-requester` | `append` | `durable` | `base_revision:string`, `body:object`, `replaced_revision:string` |  |
 | `harness.context-clear.requested` | `agent` | `authorized-requester` | `append` | `durable` | `context_epoch:string`, `incarnation_id:string`, `operation_status:string`, `runtime_id:string` |  |
 | `harness.context-clear.result` | `agent` | `system-only` | `once` | `durable` | `context_epoch:string`, `incarnation_id:string`, `reason:string`, `result!:string`, `runtime_id:string` |  |
+| `harness.current` | `agent` | `same-subject-actor` | `append` | `latest` | `active_ask:string`, `ask:string`, `background_jobs:integer`, `blocked_on:string`, `blocking:array`, `driver:string`, `evidence_incarnation:string`, `history_gap_count:integer`, `history_gap_from_ms:integer`, `history_gap_reason:string`, `history_gap_to_ms:integer`, `incarnation_id!:string`, `input_buffer:string`, `observed_at_ms!:integer`, `observed_since_ms:integer`, `ownership_sequence:integer`, `provider_auth:boolean`, `provider_auth_sequence:integer`, `quiescent:boolean`, `running_subagents:integer`, `state!:string`, `transition_sequence:integer`, `transport:string` |  |
 | `harness.diagnostic` | `agent` | `same-subject-actor` | `append` | `durable` | `attempt:integer`, `auth_attention_key:string`, `code:string`, `driver:string`, `incarnation_id:string`, `matched_line:string`, `observed_since_ms:integer`, `ownership_sequence:integer`, `provider_auth_sequence:integer`, `readiness_epoch:integer`, `reason:string`, `retry_after_unix_ms:integer`, `retry_attempt:integer`, `severity:string`, `status:string`, `step_run:subject-reference(step-run)`, `wake_attempts:integer` |  |
+| `harness.history.gap` | `agent` | `same-subject-actor` | `append` | `durable` | `history_gap_count!:integer`, `history_gap_from_ms!:integer`, `history_gap_reason!:string`, `history_gap_to_ms!:integer`, `runtime_incarnation!:string` |  |
 | `harness.limits` | `agent` | `same-subject-actor` | `append` | `durable` | `account:string`, `account_ref:string`, `driver!:string`, `five_hour_percent:number`, `five_hour_resets_at_unix_ms:integer`, `incarnation_id:string`, `measured_at_unix_ms!:integer`, `plan:string`, `weekly_percent:number`, `weekly_resets_at_unix_ms:integer` |  |
 | `harness.observed` | `agent` | `same-subject-actor` | `append` | `latest` | `ask:string`, `background_jobs:integer`, `blocked_on:string`, `blocking:array`, `driver:string`, `evidence_incarnation:string`, `exit:string`, `incarnation_id:string`, `input_buffer:string`, `observed_at_ms:integer`, `observed_since_ms:integer`, `ownership_sequence:integer`, `provider_auth:boolean`, `provider_auth_sequence:integer`, `quiescent:boolean`, `reason:string`, `rollout_operation:string`, `state!:string`, `status_transition:boolean`, `transition_sequence:integer`, `transport:string` |  |
 | `harness.session-file` | `agent` | `authorized-requester` | `append` | `durable` | `account_ref:string`, `agent:subject-reference(agent)`, `discovery_revision:string`, `harness!:string`, `incarnation_id:string`, `modified_at:string`, `path:string`, `session_id!:string`, `source_session:string`, `status:string` |  |
@@ -206,7 +208,7 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 
 `resource.observed` validates facts against the resource kind. Custom resource facts remain open.
 
-A `durable` claim is a fact in the replicated claim log. A `local` claim is an observation kept only in the local observation log of the node that made it, trimmed after that node's retention window. A `latest` claim is an observation kept in that log whose replicated claims are written only when its state changes; each one replaces the previous one for its subject. A `system-local` claim is `local` when the system records it without an actor and replicates when a person or agent writes it as its actor.
+A `durable` claim is a fact in the replicated claim log. A `local` claim is an observation kept only in the local observation log of the node that made it, trimmed after that node's retention window. A `latest` claim is current-state evidence read by peers; publication can coalesce unchanged evidence, except `harness.current` admits each unique categorical source capture independently of ordered history. A checkpoint may drop replaced evidence only under a reader-equivalence rule; current captures are not immediately droppable. A `system-local` claim is `local` when the system records it without an actor and replicates when a person or agent writes it as its actor.
 
 ## Harness todo snapshots
 
