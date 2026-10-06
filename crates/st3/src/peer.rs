@@ -302,7 +302,7 @@ impl ClientRelay {
                 // The worker briefly leaves backoff while checking a still-offline route.
                 // Its existing, indexed connectivity evidence remains down until a successful
                 // exchange. Current samples must not create their own probes during that check.
-                !matches!(store.replication_peer_up(peer), Ok((false, Some(_))) | Err(_))
+                !store.replication_peer_failed(peer).unwrap_or(true)
             })
             .filter_map(|(_, routes)| routes.into_iter().next())
             .map(|route| {
@@ -1810,6 +1810,10 @@ mod tests {
         source.record_replication_worker("peer", smallclaims::replication::ReplicationWorkerStatus {
             phase: "idle".into(), ..Default::default()
         });
+        source.record_peer_failure("peer", "unknown", "offline route").unwrap();
+        relay.publish_current_value(record.clone()).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 4, "checking an offline route does not open current probes");
+        source.connection.write().execute("UPDATE replication_peers SET last_error=NULL WHERE peer='peer'", []).unwrap();
         tokio::task::yield_now().await;
         assert_eq!(calls.load(Ordering::SeqCst), 4, "recovery does not replay a dropped hint");
         relay.publish_current_value(record).await;

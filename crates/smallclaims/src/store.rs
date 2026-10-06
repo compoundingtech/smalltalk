@@ -6288,6 +6288,15 @@ impl Store {
             .and_then(|value| value.parse().ok()))
     }
 
+    /// Whether the existing route evidence records a failure not cleared by an exchange.
+    /// Current-value fanout uses this to avoid probing around the worker's retry schedule.
+    pub fn replication_peer_failed(&self, peer: &str) -> Result<bool> {
+        Ok(self.readers.get().query_row(
+            "SELECT last_error IS NOT NULL FROM replication_peers WHERE peer=?1",
+            [peer], |row| row.get(0),
+        ).optional()?.unwrap_or(false))
+    }
+
     /// Whether `peer` counts as up now (see [`peer_up`]), and when it last exchanged.
     pub fn replication_peer_up(&self, peer: &str) -> Result<(bool, Option<u128>)> {
         let connection = self.readers.get();
