@@ -13,6 +13,16 @@ reconciliation. Discord intake still polls every five seconds. This interim wait
 uses existing graph notifications; the planned graph-watch engine can replace that
 notification source without changing reply correlation or provider receipts.
 
+While the native update is pending, `--legacy-text` runs the text pilot using its
+existing provisional identities and mailbox observation. Repeated `--allow-user`
+flags explicitly enroll additional numeric accounts in that mode. Each account
+gets its own `person/discord-<id>` sender and reply correlation; enrollment does
+not change the primary route binding or erase delivery checkpoints. Bots and
+webhooks remain excluded. Enrollment applies to new channel messages, without
+replaying messages already skipped. Example: `--legacy-text --allow-user 606`.
+Additional accounts in external-identity mode require native multi-route enrollment
+and are refused by the current command. Images remain disabled in legacy mode.
+
 The bridge is a normal-user Python process, run in a terminal or an st-supervised
 program seat. It polls one private
 Discord text channel every five seconds and routes one allowlisted Discord user

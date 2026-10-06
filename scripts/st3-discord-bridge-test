@@ -151,6 +151,18 @@ class BridgeScenarios(unittest.TestCase):
         self.assertIn('no native-person link', sent['content'])
         self.assertEqual(self.state.get('cursor'), '105')
 
+    def test_two_enrolled_legacy_accounts_keep_distinct_senders_and_reply_routes(self):
+        self.link = bridge.Bridge(ROUTE, AGENT, self.state, self.discord, self.st, self.logs.append, allowed_users=['606'], legacy_text=True)
+        self.discord.messages = [source(101), source(102, author={'id': '606'}), source(103, author={'id': '999'})]
+        self.link.tick()
+        sent = list(self.st.sent.values())
+        self.assertEqual({item['from'] for item in sent}, {'person/discord-404', 'person/discord-606'})
+        for item in sent:
+            parent = 'message/' + hashlib.sha256(item['idempotency_key'].encode()).hexdigest()[:16]
+            self.answer(parent, 'hello ' + item['from'], to=item['from'])
+        self.link.tick()
+        self.assertEqual({item['message_reference']['message_id'] for item in self.discord.posts}, {'101', '102'})
+
     def test_legacy_database_migration_preserves_sender_cursor_and_uncertain_receipt(self):
         self.state.close()
         self.path.unlink()

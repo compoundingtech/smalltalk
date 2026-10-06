@@ -387,14 +387,22 @@ def chunks(text):
 
 
 class Bridge:
-    def __init__(self, route, agent, state, discord, st, log=print):
+    def __init__(self, route, agent, state, discord, st, log=print, allowed_users=(), legacy_text=False):
         self.route, self.agent, self.state = route, agent, state
         self.discord, self.st, self.log = discord, st, log
-        self.sender = 'external/discord/user/' + route['user_id']
+        self.legacy_text = legacy_text
+        self.allowed_users = {route['user_id'], *allowed_users}
+        self.sender = self.account_sender(route['user_id'])
         self.legacy_sender = 'person/discord-' + route['user_id']
+        self.senders = {'person/discord-' + user for user in self.allowed_users}
+        if not legacy_text:
+            self.senders.update('external/discord/user/' + user for user in self.allowed_users)
         self.path = '/channels/' + route['channel_id'] + '/messages'
         self.scope = hashlib.sha256(state.binding.encode()).hexdigest()[:24]
         self.uncertain_notices = set()
+
+    def account_sender(self, user):
+        return ('person/discord-' if self.legacy_text else 'external/discord/user/') + user
 
     def page(self, query):
         page = self.discord.request('GET', self.path + '?' + urllib.parse.urlencode(query))
@@ -423,7 +431,7 @@ class Bridge:
             new.update({item['id']: item for item in page if int(item['id']) > int(cursor)})
         for item in sorted(new.values(), key=lambda value: int(value['id'])):
             author = item.get('author')
-            allowed = isinstance(author, dict) and author.get('id') == self.route['user_id'] and not author.get('bot') and not item.get('webhook_id') and item.get('type', 0) in (0, 19)
+            allowed = isinstance(author, dict) and author.get('id') in self.allowed_users and not author.get('bot') and not item.get('webhook_id') and item.get('type', 0) in (0, 19)
             if allowed and not self.state.db.execute('SELECT 1 FROM inbox WHERE discord_id=?', (item['id'],)).fetchone():
                 text = item.get('content')
                 images = []
@@ -433,7 +441,7 @@ class Bridge:
                     raise Stop('Discord returned invalid attachment metadata.')
                 total = 0
                 for attachment in attachments:
-                    if (isinstance(attachment, dict) and attachment.get('content_type') in IMAGE_TYPES
+                    if (not self.legacy_text and isinstance(attachment, dict) and attachment.get('content_type') in IMAGE_TYPES
                             and isinstance(attachment.get('size'), int) and 0 < attachment['size'] <= IMAGE_LIMIT
                             and len(images) < 4 and total + attachment['size'] <= IMAGE_LIMIT):
                         images.append({key: attachment.get(key) for key in ('id', 'url', 'size', 'content_type')})
@@ -461,7 +469,7 @@ class Bridge:
                     text = text or ''
                     if omitted:
                         text += '\n\n[Unsupported or excess attachments omitted by the Discord bridge.]'
-                    self.state.db.execute('INSERT INTO inbox(discord_id,content,parent,images,sender) VALUES (?,?,?,?,?)', (item['id'], text, parent, json.dumps(images), self.sender))
+                    self.state.db.execute('INSERT INTO inbox(discord_id,content,parent,images,sender) VALUES (?,?,?,?,?)', (item['id'], text, parent, json.dumps(images), self.account_sender(author['id'])))
                     self.state.db.commit()
             self.state.put('cursor', item['id'])
 
@@ -478,7 +486,7 @@ class Bridge:
             if images and row['native_images'] is None:
                 # Refresh signed CDN URLs without changing retained image identity.
                 fresh = self.discord.request('GET', self.path + '/' + row['discord_id'])
-                if fresh.get('author', {}).get('id') != self.route['user_id'] or fresh.get('channel_id') != self.route['channel_id']:
+                if fresh.get('author', {}).get('id') not in self.allowed_users or self.account_sender(fresh.get('author', {}).get('id', '')) != row['sender'] or fresh.get('channel_id') != self.route['channel_id']:
                     raise Stop('The source image message no longer matches the configured route.')
                 for attachment in images:
                     current = next((item for item in fresh.get('attachments', []) if item.get('id') == attachment['id']), None)
@@ -496,14 +504,14 @@ class Bridge:
             st_id = self.st.send(body)
             self.state.db.execute('UPDATE inbox SET st_id=? WHERE discord_id=?', (st_id, row['discord_id']))
             self.state.db.commit()
-            self.log('Imported Discord ' + row['discord_id'] + ' as ' + self.sender + ' -> ' + st_id)
+            self.log('Imported Discord ' + row['discord_id'] + ' as ' + row['sender'] + ' -> ' + st_id)
 
     def queue_replies(self, messages=None):
         import itertools
         if messages is None:
-            messages = itertools.chain(self.st.replies(self.sender), self.st.replies(self.legacy_sender))
+            messages = itertools.chain.from_iterable(self.st.replies(sender) for sender in sorted(self.senders))
         for message in messages:
-            if not isinstance(message, dict) or message.get('from') != self.agent or message.get('to') not in (self.sender, self.legacy_sender) or not isinstance(message.get('subject'), str) or not SUBJECT.fullmatch(message['subject']):
+            if not isinstance(message, dict) or message.get('from') != self.agent or message.get('to') not in self.senders or not isinstance(message.get('subject'), str) or not SUBJECT.fullmatch(message['subject']):
                 continue
             if self.state.db.execute('SELECT 1 FROM outbox WHERE st_id=?', (message['subject'],)).fetchone():
                 continue
@@ -514,6 +522,8 @@ class Bridge:
             if not isinstance(text, str) or len(text.encode()) > 8192 or self.discord.token in text:
                 raise Stop('An agent reply is oversized or contains the bot credential; it was not queued for Discord.')
             images = message.get('attachments') or []
+            if self.legacy_text and images:
+                raise Stop('Native image delivery requires the enrolled adapter update; the reply was retained.')
             if not isinstance(images, list) or len(images) > 4 or any(not isinstance(item, dict) or item.get('media_type') not in IMAGE_TYPES or not isinstance(item.get('size'), int) or not 0 < item['size'] <= IMAGE_LIMIT for item in images) or sum(item['size'] for item in images) > IMAGE_LIMIT:
                 raise Stop('An agent image reply exceeds supported attachment limits; delivery was retained.')
             if not text.strip() and not images:
@@ -650,6 +660,8 @@ def main():
     parser.add_argument('--state', type=Path)
     parser.add_argument('--socket', type=Path, default=ROOT / 'st3.sock')
     parser.add_argument('--token-file', type=Path, help='Private dotenv file with one DISCORD_BOT_TOKEN entry; never evaluated as shell code.')
+    parser.add_argument('--legacy-text', action='store_true', help='Keep provisional sender identities and text-only delivery on the current native daemon.')
+    parser.add_argument('--allow-user', action='append', default=[], help='Enroll another numeric Discord account in legacy text mode.')
     parser.add_argument('--st-message')
     parser.add_argument('--discord-message')
     parser.add_argument('--part', type=int, default=0)
@@ -659,6 +671,8 @@ def main():
         if not re.fullmatch(r'agent/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*', args.agent):
             raise Stop('Name one explicit st agent subject.')
         route = route_file(args.route)
+        if any(not ID.fullmatch(user) for user in args.allow_user) or args.allow_user and not args.legacy_text:
+            raise Stop('Additional accounts need numeric IDs and legacy text mode until native multi-route enrollment is supported.')
         state = State(args.state or ROOT / ('discord-bridge/' + route['channel_id'] + '.sqlite'), route, args.agent)
         if args.action == 'status':
             print(json.dumps({'sender': 'external/discord/user/' + route['user_id'], 'agent': args.agent,
@@ -677,7 +691,7 @@ def main():
         token = None
         print('Checking bot application and channel...', flush=True)
         discord.validate(route)
-        bridge = Bridge(route, args.agent, state, discord, St(args.socket))
+        bridge = Bridge(route, args.agent, state, discord, St(args.socket), allowed_users=args.allow_user, legacy_text=args.legacy_text)
         if args.action == 'resolve':
             if not args.st_message or not SUBJECT.fullmatch(args.st_message) or not args.discord_message or not ID.fullmatch(args.discord_message):
                 raise Stop('resolve needs --st-message message/ID and --discord-message ID.')
@@ -690,7 +704,7 @@ def main():
             bridge.delivered(row, message)
             return 0
         print('Text bridge running as ' + bridge.sender + '. Replies target ' + args.agent + '.', flush=True)
-        print('Images are forwarded both ways (up to 4, 10 MiB total); other files, edits and deletes are not. Restart retains delivery state.', flush=True)
+        print('Allowlisted accounts: ' + str(len(bridge.allowed_users)) + '. ' + ('Text only; native adapter rollout pending.' if args.legacy_text else 'Images both ways (up to 4, 10 MiB total).') + ' Restart retains delivery state.', flush=True)
         failures = 0
         retry_at = 0
         last_notice = None
@@ -699,8 +713,10 @@ def main():
                 time.sleep(min(5, retry_at - time.monotonic()))
                 continue
             try:
-                bridge.tick(wait_ms=5000)
+                bridge.tick(wait_ms=None if args.legacy_text else 5000)
                 failures, last_notice = 0, None
+                if args.legacy_text:
+                    time.sleep(5)
             except Later as error:
                 failures += 1
                 retry_at = time.monotonic() + max(error.delay, min(60, 2 ** min(failures, 6)))
