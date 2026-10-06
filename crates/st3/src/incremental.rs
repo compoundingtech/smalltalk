@@ -581,10 +581,10 @@ mod tests {
                 subject: "subscription/reviews".into(),
                 kind: "subscription.mission-started".into(),
                 actor: None,
-                fields: std::collections::BTreeMap::from([(
-                    "mission_run".into(),
-                    Value::String("mission-run/a".into()),
-                )]),
+                fields: std::collections::BTreeMap::from([
+                    ("mission_run".into(), Value::String("mission-run/a".into())),
+                    ("request".into(), Value::String("a".repeat(64))),
+                ]),
                 evidence: Vec::new(),
                 expected_subject: None,
                 idempotency_key: None,
