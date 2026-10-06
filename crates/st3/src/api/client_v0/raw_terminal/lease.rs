@@ -117,22 +117,26 @@ fn principal_epoch(connection: &Connection, person: &str) -> anyhow::Result<Valu
     Ok(json!({"daemon_epoch":epoch(), "person":person, "revision":revision, "keys":keys}))
 }
 
-fn authority(connection: &Connection, session: &ClientSession) -> anyhow::Result<Value> {
-    let person = session.authority_actor.as_str();
+fn authority(
+    connection: &Connection,
+    actor: &str,
+    person: &str,
+    pairing_grant: Option<&str>,
+) -> anyhow::Result<Value> {
     let principal = principal_epoch(connection, person)?;
-    if session.actor == person {
+    if actor == person {
         return Ok(json!({"local_principal_epoch":principal}));
     }
     // Two pairings of one person and device key derive the same session actor, so the
     // authenticated session carries the exact grant subject instead of searching by actor.
-    let subject = session.pairing_grant.as_deref()
+    let subject = pairing_grant
         .ok_or_else(|| anyhow::anyhow!("the paired client session has no exact grant"))?;
     let Some((issuer, paired)) = latest(connection, subject, "custom.client.pairing-completed")?
     else {
         anyhow::bail!("the paired session grant is absent");
     };
     anyhow::ensure!(
-        paired.pointer("/fields/session_actor").and_then(Value::as_str) == Some(session.actor.as_str()),
+        paired.pointer("/fields/session_actor").and_then(Value::as_str) == Some(actor),
         "session actor changed"
     );
     anyhow::ensure!(
@@ -171,8 +175,13 @@ pub(super) fn authorization_epoch(
     session: &ClientSession,
 ) -> Result<String, ApiError> {
     let connection = state.store.readers.get();
-    let authority = authority(&connection, session)
-        .map_err(|error| forbidden(error.to_string()))?;
+    let authority = authority(
+        &connection,
+        &session.actor,
+        &session.authority_actor,
+        session.pairing_grant.as_deref(),
+    )
+    .map_err(|error| forbidden(error.to_string()))?;
     if authority
         .get("issuer")
         .and_then(Value::as_str)
@@ -256,6 +265,7 @@ fn snapshot(
             &binding.actor
         },
         &binding.person,
+        binding.grant_subject.as_deref(),
     )?;
     let current_epoch = credential_digest(&serde_json::to_string(&authority)?);
     anyhow::ensure!(
@@ -343,8 +353,13 @@ impl Lease {
             binding
         } else {
             let connection = state.store.readers.get();
-            let authority = authority(&connection, &session.actor, &session.authority_actor)
-                .map_err(|error| forbidden(error.to_string()))?;
+            let authority = authority(
+                &connection,
+                &session.actor,
+                &session.authority_actor,
+                session.pairing_grant.as_deref(),
+            )
+            .map_err(|error| forbidden(error.to_string()))?;
             let authorization_epoch = acquisition_epoch.to_owned();
             let absolute_deadline_unix_ms = authority
                 .pointer("/grant/fields/expires_at_unix_ms")
