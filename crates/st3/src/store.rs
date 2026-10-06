@@ -945,6 +945,14 @@ fn runtime_view_entry(
     })
 }
 
+#[derive(Clone, Copy)]
+enum SubjectStatusMode {
+    Full,
+    /// Agent cards replace the harness with observed evidence and never expose desired
+    /// conflicts. Provenance is only the last canonical claim, and only without a declaration.
+    AgentCard,
+}
+
 /// One subject's status at `at_index`, and the action it asks of its host when it is current and
 /// differs from what is declared. With `owner_filter`, a subject another run owns is skipped.
 fn subject_status_at(
@@ -952,6 +960,16 @@ fn subject_status_at(
     subject: &str,
     at_index: Option<u64>,
     owner_filter: Option<&str>,
+) -> Result<Option<(SubjectStatus, Option<PlannedAction>)>> {
+    subject_status_at_with_mode(connection, subject, at_index, owner_filter, SubjectStatusMode::Full)
+}
+
+fn subject_status_at_with_mode(
+    connection: &Connection,
+    subject: &str,
+    at_index: Option<u64>,
+    owner_filter: Option<&str>,
+    mode: SubjectStatusMode,
 ) -> Result<Option<(SubjectStatus, Option<PlannedAction>)>> {
     #[cfg(test)]
     SUBJECT_REDUCTIONS.with(|reductions| reductions.set(reductions.get() + 1));
@@ -983,14 +1001,25 @@ fn subject_status_at(
         at_index,
         member.as_ref().map(|member| member.host.as_str()),
     )?;
-    let harness = current_harness_at(connection, subject, at_index)?;
-    let claims = claim_ids_at(connection, subject, at_index)?;
-    let conflicts = desired_conflicts_at(
-        connection,
-        subject,
-        desired.as_ref().map(|row| row.claim_id.as_str()),
-        at_index,
-    )?;
+    let (harness, claims, conflicts) = match mode {
+        SubjectStatusMode::Full => (
+            current_harness_at(connection, subject, at_index)?,
+            claim_ids_at(connection, subject, at_index)?,
+            desired_conflicts_at(connection, subject, desired.as_ref().map(|row| row.claim_id.as_str()), at_index)?,
+        ),
+        SubjectStatusMode::AgentCard => {
+            let claims = if desired.is_some() {
+                Vec::new()
+            } else {
+                connection.prepare_cached(&canonical_sql(
+                    "SELECT id FROM claims WHERE subject=?1 AND store_index<=?2
+                     ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+                ))?.query_row(params![subject, at_index.unwrap_or(i64::MAX as u64)], |row| row.get::<_, String>(0))
+                    .optional()?.into_iter().collect()
+            };
+            (None, claims, Vec::new())
+        }
+    };
     let kind = desired.as_ref().map(|row| row.kind.clone());
     let owner_run = desired.as_ref().and_then(|row| row.owner_run.clone());
     let owner_generation = desired
@@ -2536,6 +2565,110 @@ impl Store {
             .unwrap_or_default())
     }
 
+    /// Coalesce current list reads before opening a physical SQLite snapshot. A burst has one
+    /// in-flight build and one pending target, advanced to the newest requested arrival index.
+    /// Never answer before that arrival index: callers can read their own committed writes.
+    pub(crate) fn coalesced_agent_resources(
+        &self,
+        history: bool,
+        minimum_index: u64,
+        build: impl FnOnce(u64) -> Result<Vec<Value>>,
+    ) -> Result<(u64, Arc<Vec<Value>>)> {
+        let participant = self.join_agent_resource_flight(history, minimum_index);
+        self.finish_agent_resource_flight(participant, build)
+    }
+
+    fn join_agent_resource_flight(
+        &self,
+        history: bool,
+        minimum_index: u64,
+    ) -> runtime::AgentResourceParticipant<'_> {
+        debug_assert_no_pinned_read();
+        let flight = &self.smalltalk.agent_resource_flights[usize::from(history)];
+        let mut state = flight.state.lock();
+        // Once a snapshot has opened, requests requiring later commits join the single
+        // pending generation immediately, not whichever outcome happens to finish next.
+        let pending = state.building_index.is_some_and(|index| minimum_index > index);
+        let generation = state.generation + 1 + u64::from(pending);
+        state.outcomes.entry(generation).or_default().participants += 1;
+        state.participants += 1;
+        state.pending_index = state.pending_index.max(minimum_index);
+        flight.changed.notify_all();
+        runtime::AgentResourceParticipant { flight, generation, minimum_index }
+    }
+
+    fn finish_agent_resource_flight(
+        &self,
+        participant: runtime::AgentResourceParticipant<'_>,
+        build: impl FnOnce(u64) -> Result<Vec<Value>>,
+    ) -> Result<(u64, Arc<Vec<Value>>)> {
+        let flight = participant.flight;
+        struct Builder<'a> {
+            flight: &'a runtime::AgentResourceFlight,
+            generation: u64,
+            completed: bool,
+        }
+        impl Drop for Builder<'_> {
+            fn drop(&mut self) {
+                if !self.completed {
+                    let mut state = self.flight.state.lock();
+                    state.building = false;
+                    state.building_index = None;
+                    state.generation = self.generation;
+                    state.outcomes.get_mut(&self.generation).expect("registered generation").result =
+                        Some(Err(Arc::from("agent card builder panicked")));
+                    self.flight.changed.notify_all();
+                }
+            }
+        }
+        let mut build = Some(build);
+        loop {
+            let mut state = flight.state.lock();
+            let outcome = &state.outcomes[&participant.generation];
+            if let Some(result) = &outcome.result {
+                let result = result.clone();
+                drop(state);
+                let (index, items) = result.map_err(|error| anyhow::anyhow!("{error}"))?;
+                anyhow::ensure!(index >= participant.minimum_index, "agent reply precedes its request");
+                return Ok((index, items));
+            }
+            if state.building || participant.generation != state.generation + 1 {
+                flight.changed.wait(&mut state);
+                continue;
+            }
+            state.building = true;
+            let target = state.pending_index;
+            let mut builder = Builder {
+                flight,
+                generation: participant.generation,
+                completed: false,
+            };
+            // Hold admission only until the snapshot index is known. Arrivals cannot attach
+            // to this generation in the gap between opening its read mark and recording it.
+            // `opening` drops before `builder` on an opening error or panic.
+            let mut opening = Some(state);
+            let build = build.take().expect("a participant builds at most once");
+            let result = self
+                .read_snapshot(|index| {
+                    let mut state = opening.take().expect("snapshot admission is held");
+                    state.building_index = Some(index);
+                    drop(state);
+                    anyhow::ensure!(index >= target, "agent snapshot precedes a committed request");
+                    Ok((index, Arc::new(build(index)?)))
+                })
+                .map_err(|error| Arc::<str>::from(format!("{error:#}")));
+            drop(opening);
+            let mut state = flight.state.lock();
+            state.outcomes.get_mut(&participant.generation).expect("registered generation").result =
+                Some(result);
+            state.generation = participant.generation;
+            state.building = false;
+            state.building_index = None;
+            builder.completed = true;
+            flight.changed.notify_all();
+        }
+    }
+
     /// Keep bounded immutable snapshots. Advance the nearest older snapshot by rebuilding
     /// only cards whose local observations changed; historical reads never advance backwards.
     pub(crate) fn cached_agent_resources(
@@ -2544,26 +2677,32 @@ impl Store {
         history: bool,
         build: impl FnOnce(Option<(&BTreeSet<String>, &[Value])>) -> Result<Vec<Value>>,
     ) -> Result<Vec<Value>> {
-        let mut cache = self
+        let cache = self
             .smalltalk
             .agent_resources_cache
             .lock()
             .expect("agent resources cache poisoned");
-        if let Some((_, _, items)) = cache
+        if let Some(items) = cache
             .iter()
             .find(|(at, all, _)| *at == index && *all == history)
+            .map(|(_, _, items)| Arc::clone(items))
         {
-            return Ok((**items).clone());
+            drop(cache);
+            return Ok((*items).clone());
         }
         let previous = cache
             .iter()
             .filter(|(at, all, _)| *at < index && *all == history)
-            .max_by_key(|(at, _, _)| *at);
-        let items = if let Some((at, _, previous)) = previous {
-            match self.changed_agent_resources(*at, index)? {
-                Some(changed) if changed.is_empty() => (**previous).clone(),
+            .max_by_key(|(at, _, _)| *at)
+            .map(|(at, _, items)| (*at, Arc::clone(items)));
+        // A caller already holds a SQLite snapshot. Waiting behind another card build here
+        // pins that old WAL read mark for the whole build, starving checkpoints.
+        drop(cache);
+        let items = if let Some((at, previous)) = previous {
+            match self.changed_agent_resources(at, index)? {
+                Some(changed) if changed.is_empty() => (*previous).clone(),
                 Some(changed) => {
-                    let fresh = build(Some((&changed, previous)))?;
+                    let fresh = build(Some((&changed, &previous)))?;
                     let mut items = previous
                         .iter()
                         .filter(|item| !changed.contains(item["id"].as_str().unwrap_or_default()))
@@ -2583,11 +2722,26 @@ impl Store {
         } else {
             build(None)?
         };
-        cache.push_back((index, history, Arc::new(items.clone())));
-        if cache.len() > 8 {
-            cache.pop_front();
-        }
-        Ok(items)
+        let mut cache = self
+            .smalltalk
+            .agent_resources_cache
+            .lock()
+            .expect("agent resources cache poisoned");
+        let (items, evicted) = if let Some((_, _, published)) = cache
+            .iter()
+            .find(|(at, all, _)| *at == index && *all == history)
+        {
+            // Concurrent builds still return one immutable result for this snapshot.
+            (Arc::clone(published), None)
+        } else {
+            let items = Arc::new(items);
+            cache.push_back((index, history, Arc::clone(&items)));
+            let evicted = if cache.len() > 8 { cache.pop_front() } else { None };
+            (items, evicted)
+        };
+        drop(cache);
+        drop(evicted);
+        Ok((*items).clone())
     }
 
     /// Rebuild the operation projection when it no longer matches the claim log, and say
@@ -10072,6 +10226,36 @@ impl Store {
     #[cfg(test)]
     pub(crate) fn forget_current_views(&self) {
         self.smalltalk.forget_views();
+    }
+
+    /// Only fields consumed by agent cards, retaining the full reducer's membership,
+    /// reachability and operational annotation. Never use this for a public status response.
+    pub(crate) fn agent_card_status_at(
+        &self,
+        names: Option<&BTreeSet<String>>,
+        index: u64,
+        history: bool,
+    ) -> Result<StatusResponse> {
+        let connection = self.readers.get();
+        let index = selected_index(current_index(&connection)?, Some(index)).map_err(anyhow::Error::new)?;
+        let names = match names {
+            Some(names) => names.clone(),
+            None => connection.prepare_cached(RANGE_SUBJECTS)?
+                .query_map(params![index, "agent/", "agent0"], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<BTreeSet<_>>>()?,
+        };
+        let names = if history { names } else {
+            self.current_view_candidates(&connection, names, index, true)?
+        };
+        let mut subjects = Vec::with_capacity(names.len());
+        for name in names {
+            if let Some((status, _)) = subject_status_at_with_mode(
+                &connection, &name, Some(index), None, SubjectStatusMode::AgentCard,
+            )? && (history || status.projection.layer == "current") {
+                subjects.push(status);
+            }
+        }
+        Ok(StatusResponse { store_index: index, subjects, pending_actions: Vec::new() })
     }
 
     pub(crate) fn status_for_subject_names_at(
@@ -30066,6 +30250,179 @@ mod tests {
     use proptest::prelude::*;
 
     const TEST_FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+
+    fn assert_agent_resource_outcome_survives_later_flight(first_succeeds: bool) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(&directory.path().join("graph.db"), "node").unwrap());
+        let minimum = store.index().unwrap();
+        let (entered, started) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let first_store = store.clone();
+        let first = std::thread::spawn(move || {
+            first_store.coalesced_agent_resources(false, minimum, |_| {
+                entered.send(()).unwrap();
+                released.recv().unwrap();
+                if first_succeeds {
+                    Ok(vec![json!({"id": "agent/original", "state": "waiting"})])
+                } else {
+                    anyhow::bail!("first flight failed")
+                }
+            })
+        });
+        started.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        // Registration and scheduling are separate: this real participant joins flight one,
+        // but does not consume its receipt until an opposite second outcome has published.
+        let delayed = store.join_agent_resource_flight(false, minimum);
+        release.send(()).unwrap();
+        let first_result = first.join().unwrap();
+        let later = store.coalesced_agent_resources(false, minimum, |_| {
+            if first_succeeds {
+                anyhow::bail!("later flight failed")
+            } else {
+                Ok(vec![json!({"id": "agent/replacement", "state": "running"})])
+            }
+        });
+        let delayed_result = store.finish_agent_resource_flight(delayed, |_| {
+            panic!("an attached caller must consume its own generation, not rebuild")
+        });
+        if first_succeeds {
+            assert_eq!(later.unwrap_err().to_string(), "later flight failed");
+            assert_eq!(first_result.unwrap().1[0]["id"], "agent/original");
+            assert_eq!(delayed_result.unwrap().1[0]["id"], "agent/original");
+        } else {
+            assert_eq!(later.unwrap().1[0]["id"], "agent/replacement");
+            assert_eq!(first_result.unwrap_err().to_string(), "first flight failed");
+            assert_eq!(delayed_result.unwrap_err().to_string(), "first flight failed");
+        }
+    }
+
+    #[test]
+    fn agent_resource_failed_receipt_survives_a_later_success() {
+        assert_agent_resource_outcome_survives_later_flight(false);
+    }
+
+    #[test]
+    fn agent_resource_successful_receipt_survives_a_later_failure() {
+        assert_agent_resource_outcome_survives_later_flight(true);
+    }
+
+    #[test]
+    fn agent_resource_bursts_coalesce_pending_writes_without_stale_replies() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(&directory.path().join("graph.db"), "node").unwrap());
+        let observe = |n: usize| {
+            store.append_claim(&ClaimInput {
+                subject: "resource/burst".into(),
+                kind: "resource.observed".into(),
+                actor: Some("person/avery".into()),
+                fields: BTreeMap::from([
+                    ("kind".into(), json!("human.review")),
+                    ("reason".into(), json!(format!("change {n}"))),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            }).unwrap().store_index
+        };
+        let initial = observe(0);
+        let builds = Arc::new(AtomicUsize::new(0));
+        let (entered, started) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let first_store = store.clone();
+        let first_builds = builds.clone();
+        let first = std::thread::spawn(move || {
+            first_store.coalesced_agent_resources(false, initial, |_| {
+                first_builds.fetch_add(1, Ordering::SeqCst);
+                let rows = first_store.claims_for("resource/burst", None)?.len();
+                entered.send(()).unwrap();
+                released.recv().unwrap();
+                Ok(vec![json!({"rows": rows})])
+            }).unwrap()
+        });
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut requests = Vec::new();
+        let mut latest = initial;
+        for n in 1..=8 {
+            latest = observe(n);
+            let minimum = latest;
+            let reader = store.clone();
+            let builds = builds.clone();
+            requests.push(std::thread::spawn(move || {
+                let reply = reader.coalesced_agent_resources(false, minimum, |_| {
+                    builds.fetch_add(1, Ordering::SeqCst);
+                    Ok(vec![json!({"rows": reader.claims_for("resource/burst", None)?.len()})])
+                }).unwrap();
+                (minimum, reply)
+            }));
+        }
+        let flight = &store.smalltalk.agent_resource_flights[0];
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut state = flight.state.lock();
+        while state.participants < 9 && std::time::Instant::now() < deadline {
+            flight.changed.wait_for(&mut state, deadline.saturating_duration_since(std::time::Instant::now()));
+        }
+        let all_joined = state.participants == 9;
+        let pending = state.pending_index;
+        drop(state);
+        release.send(()).unwrap();
+        let initial_reply = first.join().unwrap();
+        let replies = requests.into_iter().map(|request| request.join().unwrap()).collect::<Vec<_>>();
+        assert!(all_joined, "all burst requests must join before the first build ends");
+        assert_eq!(pending, latest);
+        assert_eq!(initial_reply.0, initial);
+        assert_eq!(initial_reply.1[0]["rows"], 1);
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
+        for (minimum, (index, items)) in replies {
+            assert!(index >= minimum, "read-your-writes requires the request's committed index");
+            assert_eq!(index, latest);
+            assert_eq!(items[0]["rows"], 9);
+        }
+    }
+
+    #[test]
+    fn an_agent_card_build_does_not_hold_other_read_snapshots_at_the_cache_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(&directory.path().join("graph.db"), "node").unwrap());
+        store
+            .cached_agent_resources(0, true, |_| Ok(vec![json!({"id": "agent/cached"})]))
+            .unwrap();
+        let (entered, building) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let slow = store.clone();
+        let builder = std::thread::spawn(move || {
+            slow.read_snapshot(|_| {
+                slow.cached_agent_resources(1, false, |_| {
+                    entered.send(()).unwrap();
+                    released.recv().unwrap();
+                    Ok(vec![json!({"id": "agent/slow"})])
+                })
+            })
+            .unwrap()
+        });
+        building.recv().unwrap();
+        let (finished, result) = std::sync::mpsc::channel();
+        let reader = store.clone();
+        let other = std::thread::spawn(move || {
+            finished
+                .send(reader.read_snapshot(|_| {
+                    reader.cached_agent_resources(0, true, |_| panic!("cached snapshot was lost"))
+                }))
+                .unwrap();
+        });
+        let completed = result.recv_timeout(std::time::Duration::from_secs(1));
+        let published = completed.as_ref().ok().map(|_| {
+            store
+                .cached_agent_resources(1, false, |_| Ok(vec![json!({"id": "agent/published"})]))
+                .unwrap()
+        });
+        release.send(()).unwrap();
+        let resumed = builder.join().unwrap();
+        other.join().unwrap();
+        assert_eq!(completed.unwrap().unwrap()[0]["id"], "agent/cached");
+        assert_eq!(resumed, published.unwrap());
+    }
 
     #[test]
     fn terminal_capability_lookup_fences_the_subject_head_after_reopen() {
