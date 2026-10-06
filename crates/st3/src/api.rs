@@ -8763,7 +8763,7 @@ fn record_planning_event(
         .map_err(ApiError::bad)?;
     state
         .store
-        .rebuild_claim_projections()
+        .rebuild_planning_projection()
         .map_err(ApiError::internal)?;
     Ok(())
 }

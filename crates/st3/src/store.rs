@@ -2677,6 +2677,18 @@ impl Store {
         Ok(drift)
     }
 
+    /// Rebuild only the planning tables. A planning claim written through the generic claim path
+    /// is projected by this rebuild alone; the other projections already took it at the append,
+    /// and rebuilding all of them re-derived every operation (about 240,000 rows) under the
+    /// writer for each planning write.
+    pub fn rebuild_planning_projection(&self) -> Result<()> {
+        let mut connection = self.connection.write();
+        let transaction = connection.transaction()?;
+        rebuild_planning_tx(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn rebuild_claim_projections(&self) -> Result<()> {
         let mut connection = self.connection.write();
         let transaction = connection.transaction()?;
