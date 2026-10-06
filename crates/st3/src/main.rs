@@ -21062,7 +21062,7 @@ fn update_native_title(seat: &st3::model::DesiredSubject, runtime_id: &str) -> R
     let session = std::env::var("PTY_SESSION")
         .ok()
         .filter(|session| !session.is_empty())
-        .unwrap_or_else(|| runtime_id.to_owned());
+        .unwrap_or_else(|| runtime_id.replace('/', "."));
     let result = std::process::Command::new("pty")
         .args(["rename", &session, &label])
         .output()?;
