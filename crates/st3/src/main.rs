@@ -2029,6 +2029,12 @@ enum PtyCommand {
     End(PtyScreenArgs),
     /// List current terminal sessions; use --all for stopped history.
     Ls {
+        /// Match the exact owner subject before pagination (for example agent/example/worker).
+        #[arg(long, add = ArgValueCompleter::new(Complete(Entity::Actor)))]
+        owner: Option<String>,
+        /// Match the exact projected runtime state, such as running.
+        #[arg(long)]
+        state: Option<String>,
         #[arg(long)]
         all: bool,
         /// Resume the next bounded page returned by an earlier list.
@@ -7093,21 +7099,35 @@ async fn run_pty(
                 .await?;
             print_client_value(&result, json_output)
         }
-        PtyCommand::Ls { all, cursor, limit } => {
+        PtyCommand::Ls {
+            all,
+            cursor,
+            limit,
+            owner,
+            state,
+        } => {
             anyhow::ensure!(
                 limit > 0 && limit <= 200,
                 "the terminal limit must be 1 through 200"
             );
             let response = generated_client(endpoint, None)?
-                .terminals_list(cursor.as_deref(), Some(limit), all)
+                .terminals_list_filtered(
+                    cursor.as_deref(),
+                    Some(limit),
+                    all,
+                    owner.as_deref(),
+                    state.as_deref(),
+                )
                 .await?;
             let history = if all { " --all" } else { "" };
-            print_product_page(
-                "TERMINALS",
-                &response,
-                json_output,
-                &format!("st terminals ls{history}"),
-            )
+            let mut command = format!("st terminals ls{history}");
+            for (name, value) in [("owner", owner.as_deref()), ("state", state.as_deref())] {
+                if let Some(value) = value {
+                    let quoted = value.replace('\'', "'\"'\"'");
+                    command.push_str(&format!(" --{name} '{quoted}'"));
+                }
+            }
+            print_product_page("TERMINALS", &response, json_output, &command)
         }
         PtyCommand::Attach(args) => {
             let budget = (!args.subject.contains('/'))

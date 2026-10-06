@@ -54,7 +54,7 @@
     { "id": "subscriptions.get", "method": "GET", "path": "/v1/client/subscriptions/{id}", "response": "Resource" },
     { "id": "lanes.list", "method": "GET", "path": "/v1/client/lanes", "response": "Page" },
     { "id": "lanes.get", "method": "GET", "path": "/v1/client/lanes/{id}", "response": "Resource" },
-    { "id": "terminals.list", "method": "GET", "path": "/v1/client/terminals", "response": "Page" },
+    { "id": "terminals.list", "method": "GET", "path": "/v1/client/terminals", "response": "Page", "query": { "owner": "optional exact owner subject", "state": "optional exact projected runtime state" } },
     { "id": "operations.list", "method": "GET", "path": "/v1/client/operations", "response": "Page" },
     { "id": "operations.get", "method": "GET", "path": "/v1/client/operations/{id}", "response": "Resource" },
     { "id": "history.list", "method": "GET", "path": "/v1/client/history", "response": "Page" },

@@ -10,6 +10,7 @@ import type {
 } from './Models.generated.ts';
 
 export type PageOptions = { cursor?: string; limit?: number };
+export type TerminalListOptions = PageOptions & { history?: boolean; owner?: string; state?: string };
 export type ListOptions = PageOptions & { history?: boolean; owner_run?: string; actor?: string; status?: string; native_only?: boolean };
 export type EventOptions = { after?: string; limit?: number; wait_ms?: number };
 export type ClientOptions = {
@@ -335,6 +336,17 @@ export class St3Client {
     getGlass(id: string): Promise<EnvelopeOf<Glass>> { return this.get(`/v1/client/glasses/${encodeURIComponent(id.split('/').pop()!)}`); }
     putGlass(id: string, request: GlassPut, idempotencyKey: string): Promise<EnvelopeOf<Glass>> { return this.request('PUT', `/v1/client/glasses/${encodeURIComponent(id.split('/').pop()!)}`, request, idempotencyKey); }
     deleteGlass(id: string, request: GlassDelete, idempotencyKey: string): Promise<EnvelopeOf<Glass>> { return this.request('DELETE', `/v1/client/glasses/${encodeURIComponent(id.split('/').pop()!)}`, request, idempotencyKey); }
+    /** Exact server-side filters; refuses older servers that ignore them. */
+    async terminalsListFiltered(options: TerminalListOptions = {}): Promise<EnvelopeOf<Page>> {
+        const response: EnvelopeOf<Page> = await this.get('/v1/client/terminals' + query(options));
+        for (const name of ['owner', 'state'] as const) {
+            if (options[name] !== undefined && response.value.filters[name] !== options[name]) {
+                throw new Error(`The server does not support the terminal ${name} filter; upgrade the server`);
+            }
+        }
+        return response;
+    }
+
     async customSubjectsList(options: PageOptions & { kind?: string; version?: number } = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/custom-subjects' + query(options)); }
     async customSubjectsGet(id: string): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/custom-subjects/${encodeURIComponent(routedId(id))}`); }
     async hostRepositories(id: string): Promise<EnvelopeOf<HostRepositories>> { return this.get(`/v1/client/hosts/${encodeURIComponent(routedId(id))}/repositories`); }

@@ -880,6 +880,33 @@ impl Client {
         self.get(&format!("/v1/client/{collection}{suffix}")).await
     }
 
+    /// Exact terminal filters, applied by the server before pagination.
+    /// Older servers that ignore these filters are refused, never scanned client-side.
+    pub async fn terminals_list_filtered(
+        &self,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+        history: bool,
+        owner: Option<&str>,
+        state: Option<&str>,
+    ) -> Result<Envelope<Page>, ClientError> {
+        let filters = [("owner", owner), ("state", state)]
+            .into_iter()
+            .filter_map(|(name, value)| value.map(|value| (name, value)))
+            .collect::<Vec<_>>();
+        let response: Envelope<Page> = self
+            .list_internal_with_filters("terminals", cursor, limit, history, &filters)
+            .await?;
+        for (name, value) in filters {
+            if response.value.filters.get(name).map(String::as_str) != Some(value) {
+                return Err(ClientError::Protocol(format!(
+                    "the server does not support the terminal {name} filter; upgrade the server"
+                )));
+            }
+        }
+        Ok(response)
+    }
+
     pub async fn messages_list_for_recipient(
         &self,
         recipient: &str,
@@ -3494,6 +3521,45 @@ mod tests {
         assert_eq!(body, b"12345678");
         assert!(append_bounded(&mut body, b"9", 8).is_err());
         assert_eq!(body, b"12345678");
+    }
+
+    #[test]
+    fn terminal_filters_refuse_legacy_servers_and_preserve_unfiltered_reads() {
+        runtime().block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let socket = directory.path().join("legacy.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let server = tokio::spawn(async move {
+                let mut requests = Vec::new();
+                for _ in 0..3 {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut request = Vec::new();
+                    let mut chunk = [0_u8; 1024];
+                    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        let read = stream.read(&mut chunk).await.unwrap();
+                        assert_ne!(read, 0);
+                        request.extend_from_slice(&chunk[..read]);
+                    }
+                    requests.push(String::from_utf8(request).unwrap().lines().next().unwrap().to_owned());
+                    // The old server's response has no owner/state filter acknowledgment.
+                    let body = EMPTY_PAGE.replace("launch-children", "terminals").replace("resource-page", "page");
+                    let response = format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}", body.len(), body);
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                }
+                requests
+            });
+            let client = Client::unix(&socket);
+            for (owner, state) in [(Some("agent/lookup/seat+064"), None), (None, Some("running"))] {
+                let error = client.terminals_list_filtered(None, Some(1), false, owner, state).await.unwrap_err();
+                assert!(matches!(error, ClientError::Protocol(message) if message.contains("upgrade the server")));
+            }
+            client.terminals_list(None, None, false).await.unwrap();
+            assert_eq!(server.await.unwrap(), [
+                "GET /v1/client/terminals?limit=1&owner=agent/lookup/seat%2B064 HTTP/1.1",
+                "GET /v1/client/terminals?limit=1&state=running HTTP/1.1",
+                "GET /v1/client/terminals HTTP/1.1",
+            ]);
+        });
     }
 
     #[test]
