@@ -131,18 +131,68 @@ fn discover_impl(root: &Path, strict: bool) -> Discovered {
 ///
 /// A nested file can itself declare an agent through agent-shaped content. Its generic filename
 /// alone does not reserve a second declaration below the first agent's bundle.
+/// Ancestor inspection stays strictly below the lexically normalized discovery root.
 fn is_nested_in_declaration_bundle(root: &Path, path: &Path) -> bool {
+    let root = normalize_discovery_path(root);
+    let path = normalize_discovery_path(path);
     let mut ancestor = path.parent().and_then(Path::parent);
     while let Some(dir) = ancestor {
-        if dir == root {
+        if dir == root.as_ref() || !dir.starts_with(root.as_ref()) {
             break;
         }
-        if is_declaration_parent(root, dir) {
+        if is_declaration_parent(root.as_ref(), dir) {
             return true;
         }
         ancestor = dir.parent();
     }
     false
+}
+
+fn normalize_discovery_path(path: &Path) -> std::borrow::Cow<'_, Path> {
+    if !path.components().any(|part| part == Component::ParentDir) {
+        return std::borrow::Cow::Borrowed(path);
+    }
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir if out.file_name().is_some_and(|name| name != "..") => {
+                out.pop();
+            }
+            Component::ParentDir if path.is_absolute() => {}
+            _ => out.push(component.as_os_str()),
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+#[cfg(test)]
+mod ancestor_tests {
+    use super::*;
+
+    #[test]
+    fn declaration_ancestors_stay_inside_normalized_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("catalog");
+        fs::create_dir(&root).unwrap();
+        let sentinel = temp.path().join("sentinel.kdl");
+        fs::write(&sentinel, "agent \"outside\" { command \"true\" }").unwrap();
+        let file = fs::File::open(&sentinel).unwrap();
+        let times = fs::FileTimes::new().set_accessed(std::time::UNIX_EPOCH);
+        file.set_times(times).unwrap();
+        let accessed = fs::metadata(&sentinel).unwrap().accessed().unwrap();
+        let path = root.join("catalog.kdl");
+        fs::write(&path, "agent \"inside\" { command \"true\" }").unwrap();
+        assert!(!is_nested_in_declaration_bundle(&root, &path));
+        assert!(discover(&root).errors.is_empty());
+        let after = fs::metadata(&sentinel).unwrap().accessed().unwrap();
+        assert_eq!(after, accessed);
+        fs::create_dir(root.join("bundle")).unwrap();
+        fs::write(root.join("bundle/agent.kdl"), "invalid sentinel").unwrap();
+        let nested = root.join("bundle/docs/agent.kdl");
+        let normalized_root = root.join("unused/..");
+        assert!(is_nested_in_declaration_bundle(&normalized_root, &nested));
+    }
 }
 
 /// Whether `path` is in catalog declaration space rather than a known control/runtime namespace.
