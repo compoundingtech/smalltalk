@@ -1095,6 +1095,56 @@ mod tests {
     }
 
     #[test]
+    fn a_pool_start_and_a_pool_move_wait_for_a_half_filled_projection() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claims.sqlite3");
+        let now = now_ms();
+        let seat = "agent/alder.pooled";
+        {
+            let store = Store::open(&path, "alder").unwrap();
+            declare_accounts(&store);
+            read_account(&store, seat, "ada/one", "codex/aaaa", 97.0, now);
+            read_account(&store, seat, "ada/two", "codex/bbbb", 20.0, now + 1);
+        }
+        // The claims exist; the projection does not yet (the first start after an upgrade).
+        {
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            connection
+                .execute(
+                    "DELETE FROM meta WHERE key IN ('account_limits_version','account_limits_through_index','account_limits_ready')",
+                    [],
+                )
+                .unwrap();
+            connection.execute("DELETE FROM account_limit_readings", []).unwrap();
+            connection.execute("DELETE FROM account_limit_seats", []).unwrap();
+        }
+        let store = Store::open(&path, "alder").unwrap();
+        assert!(!store.account_limits_ready().unwrap());
+        let binding = store.seat_binding(seat).unwrap().unwrap();
+        // Every account would read as unused, so a pool start chooses nothing and stores nothing.
+        let error = store.account_for_start(seat, &binding, "alder", now + 2).unwrap_err();
+        assert!(error.contains("catching up"), "{error}");
+        assert_eq!(store.seat_account_choice(seat).unwrap(), None);
+        assert!(store
+            .pool_alternatives(&binding, "alder", "ada/one", 95.0, now + 2)
+            .unwrap()
+            .is_empty());
+        // A single named account does not depend on the readings.
+        let single = store.seat_binding("agent/alder.single").unwrap().unwrap();
+        assert_eq!(
+            store.account_for_start("agent/alder.single", &single, "alder", now + 2).unwrap().account.name,
+            "ada/one"
+        );
+        // Once the projection has caught up the pool start picks the account with usage left.
+        while store.catch_up_account_limits(1).unwrap() {}
+        assert_eq!(
+            store.account_for_start(seat, &binding, "alder", now + 2).unwrap().account.name,
+            "ada/two"
+        );
+        assert_eq!(store.seat_account_choice(seat).unwrap().as_deref(), Some("ada/two"));
+    }
+
+    #[test]
     fn the_catch_up_page_seeks_the_kind_index_past_the_cursor() {
         let store = Store::open_memory("alder").unwrap();
         let connection = store.readers.get();
