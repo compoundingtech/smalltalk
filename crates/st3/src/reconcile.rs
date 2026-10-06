@@ -18489,9 +18489,7 @@ mission "feedback-review" state="ready" {
         let root = tempfile::tempdir().unwrap();
         let original_id = "5f9a6e16-5e30-4bce-b327-9a8241321bd6";
         let newer_id = "27a1a145-ed86-4e9d-80e7-071dace5e3d2";
-        let original_dir = root.path().join("original");
-        fs::create_dir(&original_dir).unwrap();
-        let original = original_dir.join(format!("2026-10-06_{original_id}.jsonl"));
+        let original = root.path().join(format!("2026-10-06_{original_id}.jsonl"));
         fs::write(
             &original,
             format!("{{\"type\":\"session\",\"id\":\"{original_id}\"}}\n"),
@@ -18575,18 +18573,8 @@ agent "import/omp/fixture" {{
             );
         }
         let managed = root.path().join("provider-sessions");
-        crate::native_resume::pi_family_argv(
-            "omp",
-            vec!["omp".into()],
-            &managed,
-            original_id,
-            Some(&original),
-        )
-        .unwrap();
-        assert_eq!(fs::read_link(&managed).unwrap(), original_dir);
-        let newer_dir = root.path().join("newer");
-        fs::create_dir(&newer_dir).unwrap();
-        let newer = newer_dir.join(format!("2026-10-06_{newer_id}.jsonl"));
+        fs::create_dir(&managed).unwrap();
+        let newer = managed.join(format!("2026-10-06_{newer_id}.jsonl"));
         fs::write(
             &newer,
             format!("{{\"type\":\"session\",\"id\":\"{newer_id}\"}}\n"),
@@ -18621,7 +18609,7 @@ agent "import/omp/fixture" {{
                 newer.to_str().unwrap()
             );
             assert_eq!(
-                crate::native_resume::pi_family_continue_argv(
+                crate::native_resume::pi_family_argv(
                     "omp",
                     vec!["omp".into()],
                     &managed,
@@ -18633,8 +18621,83 @@ agent "import/omp/fixture" {{
                 .unwrap(),
                 vec!["omp", "--resume", newer.to_str().unwrap()]
             );
-            assert_eq!(fs::read_link(&managed).unwrap(), original_dir);
         }
+        // Relocation outside the linked inventory is intentionally unsupported.
+        // Record the driver's visible refusal once; later launches must neither
+        // retry that continuation nor resurrect the original import selector.
+        let inventory = root.path().join("owned-inventory");
+        fs::rename(&managed, &inventory).unwrap();
+        std::os::unix::fs::symlink(&inventory, &managed).unwrap();
+        let relocated_dir = root.path().join("relocated");
+        fs::create_dir(&relocated_dir).unwrap();
+        let relocated = relocated_dir.join(newer.file_name().unwrap());
+        fs::rename(managed.join(newer.file_name().unwrap()), &relocated).unwrap();
+        binding(newer_id, &relocated, Some("driver-relocated"));
+        let refusal = crate::native_resume::pi_family_argv(
+            "omp",
+            vec!["omp".into()],
+            &managed,
+            newer_id,
+            Some(&relocated),
+        )
+        .unwrap_err();
+        assert_eq!(refusal.code, "managed-directory-foreign-link");
+        store
+            .append_claim(&ClaimInput {
+                subject: subject.subject.clone(),
+                kind: "harness.diagnostic".into(),
+                actor: Some(subject.subject.clone()),
+                fields: BTreeMap::from([
+                    ("severity".into(), Value::String("warning".into())),
+                    ("status".into(), Value::String(refusal.code.into())),
+                    (
+                        "code".into(),
+                        Value::String(crate::suspension::CONTINUE_UNAVAILABLE_CODE.into()),
+                    ),
+                    (
+                        "reason".into(),
+                        Value::String(format!(
+                            "omp started a new session instead of continuing {newer_id}: {}",
+                            refusal.reason
+                        )),
+                    ),
+                    ("incarnation_id".into(), Value::String("driver-relocated".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some(crate::suspension::continue_unavailable_key(
+                    &subject.subject,
+                    newer_id,
+                )),
+            })
+            .unwrap();
+        for _ in 0..3 {
+            reconciler
+                .perform_start(&subject, member, "restart after continuation refusal")
+                .unwrap();
+            let starts = runtime
+                .started_members
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let launch = starts.last().unwrap();
+            for variable in [
+                crate::suspension::RESUME_ENV,
+                crate::rollout::RESUME_PATH_ENV,
+                crate::suspension::CONTINUE_ENV,
+                crate::suspension::CONTINUE_PATH_ENV,
+            ] {
+                assert!(!launch.environment.contains_key(variable), "{variable}");
+            }
+        }
+        assert_eq!(fs::read_link(&managed).unwrap(), inventory);
+        let diagnostics = store
+            .claims_for(&subject.subject, Some("harness.diagnostic"))
+            .unwrap();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].body["fields"]["code"],
+            crate::suspension::CONTINUE_UNAVAILABLE_CODE
+        );
     }
 
     #[test]

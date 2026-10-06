@@ -166,14 +166,17 @@ into the managed inventory without copying it, and launches OMP with that exact
 path. Missing or mismatched transcripts fail the launch rather than starting anew.
 The pair bootstraps the imported seat only until its driver publishes a native
 session binding with an incarnation. Subsequent restarts ignore the original pair
-and continue the latest bound native ID and transcript path, including after OMP
-switches sessions or the original imported file moves. Explicit suspension resumes
-and rollouts retain their strict selectors.
-Continuation validates the latest bound transcript's absolute path, filename and
-session header, then resumes that exact file without replacing the original
-inventory link. A bound transcript may live in a different directory: OMP reports
-the active transcript path directly, so continuation does not require relinking
-the inventory.
+and continue the latest bound native ID and transcript path within the linked
+inventory, including after OMP switches sessions. Explicit suspension resumes and
+rollouts retain their strict selectors.
+
+Moving the bound transcript outside the linked inventory directory is not
+supported. The driver reports a visible `native-continue-unavailable` warning with
+status `managed-directory-foreign-link` and starts a fresh session. The refusal is
+remembered for that native ID: subsequent launches do not retry the refused
+continuation or the original import bootstrap, so relocation does not cause a
+repeated refusal loop. Supporting relocation requires an owned-inventory relink
+shared by reporting, ask recovery, suspension and rollout consumers.
 
 The daemon and native driver must both support strict OMP import paths. An older
 driver with a new import declaration rejects the strict path contract; upgrade
