@@ -4979,6 +4979,8 @@ fn harness_ancestor(_pid: u32) -> Option<String> {
 
 #[derive(Clone)]
 struct NativeDeliveryPeer {
+    /// Kernel process birth captured with the authenticated Unix peer.
+    start_token: Option<u64>,
     agent: String,
     transport: &'static str,
     pid: u32,
@@ -4986,8 +4988,15 @@ struct NativeDeliveryPeer {
 }
 
 fn native_delivery_peer(pid: u32) -> Option<NativeDeliveryPeer> {
+    let start_token = st_runtime::process_start_token(pid).ok()?;
     let (args, env) = local_process_arguments(pid)?;
-    native_delivery_identity(pid, &args, &env)
+    let mut peer = native_delivery_identity(pid, &args, &env)?;
+    // Do not authenticate argv/environment from one process as a reused PID's caller.
+    if st_runtime::process_start_token(pid).ok()? != start_token {
+        return None;
+    }
+    peer.start_token = Some(start_token);
+    Some(peer)
 }
 
 fn native_delivery_identity(
@@ -5019,6 +5028,7 @@ fn native_delivery_identity(
         transport,
         pid,
         archives_inbox,
+        start_token: None,
     })
 }
 
@@ -15245,6 +15255,7 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
             transport: "omp-channel",
             pid: 37,
             archives_inbox: false,
+            start_token: None,
         };
         record_legacy_poll(Some(&peer), Some("agent/eval/other-mailbox"), false);
         record_legacy_poll(Some(&peer), Some(recipient), true);
@@ -15706,6 +15717,7 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
                 transport: "app-server",
                 pid: 1,
                 archives_inbox: true,
+                start_token: None,
             }))
         };
         assert!(
@@ -15812,6 +15824,7 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
                     transport: "app-server",
                     pid: 1,
                     archives_inbox: true,
+                    start_token: None,
                 })),
                 Json(input),
             )
@@ -22873,6 +22886,7 @@ agent "seat" { workspace "/tmp"; command "true" }
             transport: "claude-channel",
             pid: 7,
             archives_inbox: true,
+            start_token: None,
         };
         let (status, _) = json_request(
             app.clone().layer(Extension(peer)),
@@ -22886,6 +22900,7 @@ agent "seat" { workspace "/tmp"; command "true" }
             transport: "claude-channel",
             pid: 7,
             archives_inbox: true,
+            start_token: None,
         };
         let app = app.layer(Extension(peer));
         let (status, first) =

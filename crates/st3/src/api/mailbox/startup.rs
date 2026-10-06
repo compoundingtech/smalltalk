@@ -6,15 +6,24 @@ pub(super) fn live_native_incarnation(
     peer: &NativeDeliveryPeer,
     fence: &Fence,
 ) -> bool {
+    if !same_caller_birth(peer) {
+        return false;
+    }
     let Ok(observations) = st_runtime::PtyRuntime::new(pty_root.to_path_buf()).snapshot() else {
         return false;
     };
-    observations.iter().any(|observation| {
-        matches_incarnation(observation, peer, fence)
-            && observation
-                .pid
-                .is_some_and(|pid| is_descendant(peer.pid, pid))
-    })
+    same_caller_birth(peer)
+        && observations.iter().any(|observation| {
+            matches_incarnation(observation, peer, fence)
+                && observation
+                    .pid
+                    .is_some_and(|pid| is_descendant(peer.pid, pid))
+        })
+}
+
+fn same_caller_birth(peer: &NativeDeliveryPeer) -> bool {
+    peer.start_token
+        .is_some_and(|start| st_runtime::process_start_token(peer.pid).ok() == Some(start))
 }
 
 fn matches_incarnation(
@@ -76,6 +85,7 @@ mod tests {
             transport: "omp-channel",
             pid: 43,
             archives_inbox: false,
+            start_token: None,
         };
         let fence = Fence::new("agent/cedar", "42:launch-time", "delivery");
         assert!(matches_incarnation(&observation, &peer, &fence));
@@ -115,5 +125,22 @@ mod tests {
         assert!(is_descendant(child.0.id(), pid));
         assert!(is_descendant(pid, pid));
         assert!(!is_descendant(child.0.id(), u32::MAX));
+    }
+    #[test]
+    fn bootstrap_refuses_missing_or_reused_authenticated_process_identity() {
+        let pid = std::process::id();
+        let mut peer = NativeDeliveryPeer {
+            agent: "agent/cedar".into(),
+            transport: "omp-channel",
+            pid,
+            archives_inbox: false,
+            start_token: None,
+        };
+        assert!(!same_caller_birth(&peer));
+        let start = st_runtime::process_start_token(pid).unwrap();
+        peer.start_token = Some(start);
+        assert!(same_caller_birth(&peer));
+        peer.start_token = Some(start.wrapping_add(1));
+        assert!(!same_caller_birth(&peer));
     }
 }

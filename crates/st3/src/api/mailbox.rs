@@ -561,7 +561,7 @@ mod tests {
         }
         let title = state.store.bind_mailbox(&Fence::new(subject, "current", "title")).unwrap();
         let delivery = state.store.bind_mailbox(&Fence::new(subject, "current", "delivery")).unwrap();
-        let peer = NativeDeliveryPeer { agent: subject.into(), transport: "claude-channel", pid: 7, archives_inbox: true };
+        let peer = NativeDeliveryPeer { start_token: None, agent: subject.into(), transport: "claude-channel", pid: 7, archives_inbox: true };
         let ready = json!({"transport":"claude-channel","ready":true,"channel":{"pid":8,"age_ms":0}}).to_string();
         delivery_presence::record_fenced(&delivery, &ready);
         assert!(attachment(State(state.clone()), Query(title.clone()), Some(Extension(peer.clone()))).await.unwrap().0.attached);
@@ -673,6 +673,7 @@ mod tests {
             transport,
             pid: 37,
             archives_inbox: true,
+            start_token: None,
         };
         let app = router(state.clone()).layer(Extension(peer));
         let path = root.path().join("daemon.sock");
@@ -805,6 +806,7 @@ mod tests {
                 transport,
                 pid: 37,
                 archives_inbox: true,
+                start_token: None,
             };
             for (id, phase) in [
                 ("fresh", "sent"),
@@ -1005,6 +1007,7 @@ mod tests {
             transport,
             pid: 37,
             archives_inbox: true,
+            start_token: None,
         };
         let app = router(state.clone()).layer(Extension(peer));
         let path = root.path().join("daemon.sock");
@@ -1242,6 +1245,7 @@ mod tests {
             transport: "claude-channel",
             pid: 37,
             archives_inbox: false,
+            start_token: None,
         };
         let app = router(state.clone()).layer(Extension(peer));
         let path = root.path().join("daemon.sock");
@@ -1310,6 +1314,7 @@ mod tests {
                 transport,
                 pid: 37,
                 archives_inbox: false,
+                start_token: None,
             };
             let lose_response = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let injection = lose_response.clone();
@@ -2039,6 +2044,7 @@ mod tests {
             transport: "omp-channel",
             pid: 37,
             archives_inbox: false,
+            start_token: None,
         };
         assert!(authorize(&fence, Some(&peer)).is_err());
     }
