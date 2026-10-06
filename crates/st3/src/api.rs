@@ -2014,25 +2014,43 @@ fn client_agent_resources(
     at: &str,
     snapshot_index: u64,
 ) -> anyhow::Result<Vec<Value>> {
-    let mut items = store.cached_agent_resources(snapshot_index, history, |changed| {
+    let mut items = client_agent_resources_cached(store, history, snapshot_index)?;
+    overlay_agent_resources(store, &mut items, at)?;
+    Ok(items)
+}
+
+fn client_agent_resources_cached(
+    store: &Store,
+    history: bool,
+    snapshot_index: u64,
+) -> anyhow::Result<Vec<Value>> {
+    store.cached_agent_resources(snapshot_index, history, |changed| {
         let mut items = client_agent_resources_selected(store, history, snapshot_index, changed)?;
-        let subjects = items
-            .iter()
-            .filter_map(|item| item["id"].as_str().map(str::to_owned))
-            .collect::<Vec<_>>();
-        let observations = store.agent_todo_observations_for(&subjects, snapshot_index)?;
-        for item in &mut items {
-            let claims = observations.get(item["id"].as_str().unwrap_or_default());
-            item["todo"] = client_v0::agent_todo_value(
-                claims.and_then(|claims| claims.get("harness.todo.observed")),
-                claims.and_then(|claims| claims.get("harness.session-file")),
-                item["incarnation_id"].as_str(),
-            );
-        }
+        add_agent_todos(store, &mut items, snapshot_index)?;
         Ok(items)
-    })?;
+    })
+}
+
+fn add_agent_todos(store: &Store, items: &mut [Value], index: u64) -> anyhow::Result<()> {
+    let subjects = items
+        .iter()
+        .filter_map(|item| item["id"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    let observations = store.agent_todo_observations_for(&subjects, index)?;
+    for item in items {
+        let claims = observations.get(item["id"].as_str().unwrap_or_default());
+        item["todo"] = client_v0::agent_todo_value(
+            claims.and_then(|claims| claims.get("harness.todo.observed")),
+            claims.and_then(|claims| claims.get("harness.session-file")),
+            item["incarnation_id"].as_str(),
+        );
+    }
+    Ok(())
+}
+
+fn overlay_agent_resources(store: &Store, items: &mut [Value], at: &str) -> anyhow::Result<()> {
     let local_host = client_host_id(store.origin());
-    for item in &mut items {
+    for item in items.iter_mut() {
         if item.get("updated_at").and_then(Value::as_str) == Some("") {
             item["updated_at"] = Value::String(at.to_owned());
         }
@@ -2042,12 +2060,17 @@ fn client_agent_resources(
             .remove("_status_source")
             .unwrap_or(Value::Null);
         let harness: Option<crate::model::CurrentHarnessView> = serde_json::from_value(source)?;
-        let observation = store.seat_observation_at(
-            item["id"].as_str().unwrap_or_default(),
-            harness.as_ref(),
-            snapshot_index,
-            client_now_ms(),
-        )?;
+        // Freshness is approximate presentation. Use the card's already reduced observation;
+        // querying diagnostic and local-observation history here made every read grow with it.
+        let observation = match harness {
+            None => "missing",
+            Some(harness)
+                if client_now_ms().saturating_sub(harness.observed_at_unix_ms) > 90_000 =>
+            {
+                "stale"
+            }
+            Some(_) => "current",
+        };
         item["observation"] = json!(observation);
         if observation == "stale" && item["harness_state"] == "idle" {
             item["harness_state"] = json!("indeterminate");
@@ -2057,8 +2080,8 @@ fn client_agent_resources(
         }
         overlay_delivery_presence(item, &local_host);
     }
-    overlay_subagents(store, &mut items)?;
-    Ok(items)
+    overlay_subagents(store, items)?;
+    Ok(())
 }
 
 /// A seat's latest suspend or resume as client-v0 shows it.
@@ -3860,24 +3883,39 @@ async fn client_agents(
 ) -> Result<ClientPageResponse, ApiError> {
     let history = query.history;
     let status = query.status.clone();
-    client_snapshot_page(
+    let page = client_snapshot_page(
         &state,
         snapshot,
         "agents",
         &query,
         move |state, snapshot| {
-            let mut items = client_agent_resources(
-                &state.store,
-                history,
-                &snapshot.created_at,
-                snapshot.store_index,
-            )?;
+            let mut items = if status.is_some() {
+                client_agent_resources(
+                    &state.store,
+                    history,
+                    &snapshot.created_at,
+                    snapshot.store_index,
+                )?
+            } else {
+                client_agent_resources_cached(&state.store, history, snapshot.store_index)?
+            };
             if let Some(status) = status.as_deref() {
                 items.retain(|item| item.get("state").and_then(Value::as_str) == Some(status));
             }
             Ok(items)
         },
     )
+    .await?;
+    if query.status.is_some() {
+        return Ok(page);
+    }
+    // Name/id ordering is independent of the live overlays. Only the returned page needs them.
+    let store = state.store.clone();
+    blocking_store(move || {
+        let (Extension(snapshot), Json(mut page)) = page;
+        overlay_agent_resources(&store, &mut page.items, &snapshot.created_at)?;
+        Ok((Extension(snapshot), Json(page)))
+    })
     .await
 }
 
@@ -3891,8 +3929,18 @@ async fn client_agents_detail(
     let history = query.history;
     let created_at = snapshot.created_at.clone();
     let snapshot_index = snapshot.store_index;
+    let subject = client_detail_id("agent", &id);
     let items = blocking_store(move || {
-        client_agent_resources(&store, history, &created_at, snapshot_index)
+        let selected = BTreeSet::from([subject]);
+        let mut items = client_agent_resources_selected(
+            &store,
+            history,
+            snapshot_index,
+            Some((&selected, &[])),
+        )?;
+        add_agent_todos(&store, &mut items, snapshot_index)?;
+        overlay_agent_resources(&store, &mut items, &created_at)?;
+        Ok(items)
     })
     .await?;
     client_detail(items, "agent", &id)
@@ -14923,6 +14971,94 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         held.join().unwrap();
         read.join().unwrap();
         assert!(result.unwrap().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn agent_detail_does_not_materialize_unrelated_cached_cards() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let source = "version 2\nagent \"amber\" { command \"true\" }\nagent \"cobalt\" { command \"true\" }\n";
+        let intent = crate::graph::parse_test_intent(source, "node").unwrap();
+        let plan = state
+            .store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(&intent, &plan.subject_tokens, "point-card")
+            .unwrap();
+        let snapshot = new_client_snapshot(&state);
+        // An unrelated cached card cannot be decoded as a harness. A point read must not touch it.
+        state
+            .store
+            .cached_agent_resources(snapshot.store_index, false, |_| {
+                Ok(vec![
+                    json!({"id":"agent/node.cobalt", "_status_source":true}),
+                ])
+            })
+            .unwrap();
+        let Json(card) = client_agents_detail(
+            State(state),
+            Extension(snapshot),
+            AxumPath("node.amber".into()),
+            Query(ClientListQuery::default()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(card["id"], "agent/node.amber");
+        assert_eq!(card["name"], "node.amber");
+        assert!(card.get("todo").is_some());
+        assert!(card.get("_status_source").is_none());
+    }
+
+    #[tokio::test]
+    async fn agent_page_overlays_only_returned_cards_and_retains_continuation() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let snapshot = new_client_snapshot(&state);
+        state.store.cached_agent_resources(snapshot.store_index, false, |_| {
+            Ok(vec![
+                json!({"id":"agent/amber", "name":"amber", "updated_at":"", "_status_source":null}),
+                json!({"id":"agent/cobalt", "name":"cobalt", "updated_at":"", "_status_source":null}),
+                // This third card is deliberately undecodable and must remain off the first pages.
+                json!({"id":"agent/indigo", "name":"indigo", "_status_source":true}),
+            ])
+        }).unwrap();
+        let (_, Json(first)) = client_agents(
+            State(state.clone()),
+            Extension(snapshot.clone()),
+            Query(ClientListQuery {
+                limit: Some(1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.items.len(), 1);
+        assert_eq!(first.items[0]["id"], "agent/amber");
+        assert_eq!(first.items[0]["observation"], "missing");
+        assert!(first.items[0].get("_status_source").is_none());
+        assert!(first.page.has_more);
+        let (_, Json(second)) = client_agents(
+            State(state),
+            Extension(snapshot),
+            Query(ClientListQuery {
+                limit: Some(1),
+                cursor: first.page.next_cursor,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.items.len(), 1);
+        assert_eq!(second.items[0]["id"], "agent/cobalt");
+        assert!(second.page.has_more);
     }
 
     #[test]
