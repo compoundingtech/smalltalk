@@ -6,8 +6,11 @@ Workspace CI runs on pull requests, merge groups and manual dispatch. The merge 
 exact commit that lands on `main`; its successful checks stay attached to that SHA, so a main push
 does not repeat the workspace gate. `Main upkeep` verifies those five checks, runs `perf-cost`
 (which the queue skips), and fills missing main-scope caches on Namespace. macOS CI is currently
-disabled. Each non-PR run uses its own `github.run_id` in the concurrency group, so
-successive pushes do not cancel checks or cache saves. PR updates still cancel stale checks.
+disabled. PR updates cancel obsolete runs for that PR in Workspace CI, Performance and the
+public-content guard. Main upkeep, Performance and public checks keep only the latest main push;
+older pushes must not keep consuming runners after their source is superseded. Manual dispatch,
+scheduled Performance controls and merge-group runs retain independent `github.run_id` groups.
+The required queue checks and their runner reservations are unchanged.
 
 The generated `Workspace CI` workflow (`.github/workflows/fleet.yml`) replaces the fleet's
 former Linux `st/ci` execution. The retained macOS workflow (`.github/workflows/macos.yml`) is
@@ -70,7 +73,7 @@ fixtures and budgets; retain completed failures as evidence. See Namespace's
   are timing-sensitive, so the build is retried up to three times.
 
 The primary test job proves that the two actual nextest inventories are disjoint and their union
-equals the full selected suite before running the explicit zero-retry mail canaries. It also
+equals the full selected suite. The explicit zero-retry mail canaries run in a parallel job. The primary also
 runs the standalone conversation model feature check. The second shard runs the remaining
 workspace and st2 tests on independent Namespace CPUs. `linux-gate` requires both shards;
 failure, cancellation or skipping either shard fails the gate. Each shard retains passing test
@@ -553,7 +556,7 @@ accepted-source verification remain in place.
 
 ## Required mail redelivery canaries
 
-Before the full Linux suite, `scripts/ci-mail-redelivery-canaries` requires twenty named,
+Alongside the two Linux test shards, `scripts/ci-mail-redelivery-canaries` requires twenty named,
 unignored regressions: boot/reconnect mailbox suppression and recent unoffered recovery for
 Claude, Codex, OpenCode, Pi, and OMP; each harness's native suspend/resume canary with hour-old
 mail held and recent unoffered mail consumed exactly once; legacy polling recovery through the
@@ -565,9 +568,12 @@ mail, prove zero historical offers, preserve explicit mailbox access, and recove
 send after a daemon restart with exactly one receipt pair. Every selected test runs with zero retries.
 
 The script fails if any required test is missing, ignored, or filtered out. The named
-`mail-redelivery-canaries` check reads that step's actual outcome; a skipped step cannot pass.
+`mail-redelivery-canaries` check executes the script on its own Namespace 8x16 runner; a skipped
+or failed job cannot pass.
 `linux-gate` requires it, so this protection applies to pull requests and merge groups. It
-reuses the compiled Linux test runner instead of allocating another native-test runner.
+restores the main-seeded Linux test Cargo and Nix caches, prepares the same fixtures and rendered
+hooks, and retains its own logs, timing and failure evidence. It never uses the native priority
+or merge lanes, and neither test shard waits for it before starting its own suite.
 Apply the fifth live ruleset check after this workflow has passed on main.
 
 ## Generated files and existing workflows
@@ -689,6 +695,14 @@ for the scheduler's limits, and GitHub's [merge queue settings](https://docs.git
 for the distinction between build concurrency and merge batch size.
 
 ## Superseded merge groups
+
+Push concurrency in Main upkeep, Performance and the public guard is scoped to protected main.
+A new main push cancels obsolete automatic work; its upkeep still probes and fills the current
+main's exact cache entries. PR groups use the PR number, rather than its head SHA, so a new head
+replaces the old one. Manual pinned validations are never grouped with PR or push runs. Old
+immutable workflow revisions can remain queued: before cancelling a backlog entry, compare its
+event, source and PR state with current main or the PR's latest head, retain its original timing
+and cancellation, and leave manual controls and merge groups to their owners.
 
 The `namespace-capacity` job also watches `merge_group` events on a GitHub-hosted runner,
 independent of ci1 and Namespace availability. It polls the group's ref and required check statuses

@@ -69,6 +69,8 @@ pub struct Preview {
     pub previous: Option<String>,
     pub source: Source,
     pub changes: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub declaration_diffs: BTreeMap<String, declarations::DeclarationDiff>,
     pub effects: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub rollouts: BTreeMap<String, Value>,
@@ -318,7 +320,7 @@ fn reference(view: &View) -> String {
     format!("{}@{}", view.id, view.revision)
 }
 
-fn claim(
+pub(super) fn claim(
     connection: &Connection,
     id: &str,
     at: Option<u64>,
@@ -900,7 +902,15 @@ pub(super) fn plan_tx(
         &options.rollout,
     ))
     .map_err(internal)?;
+    let declaration_diffs = declarations::diffs(
+        transaction,
+        &intent,
+        changes.iter().filter(|(_, change)| change.as_str() != "unchanged")
+            .map(|(subject, _)| subject.as_str()),
+        Some(current_index(transaction).map_err(internal)?),
+    )?;
     let preview = Preview {
+        declaration_diffs,
         rollout: options.rollout.clone(),
         set,
         previous,

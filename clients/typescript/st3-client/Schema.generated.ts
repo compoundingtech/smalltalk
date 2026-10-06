@@ -2133,6 +2133,17 @@ export const PrivateNotesSubject = /*#__PURE__*/ (() => Schema.Struct({
 export type PrivateNotesSubject = typeof PrivateNotesSubject.Type
 export type PrivateNotesSubjectEncoded = typeof PrivateNotesSubject.Encoded
 
+/** Canonical publication values with resolved compiler defaults; requires read.declarations. */
+export const PublicationDefinition = /*#__PURE__*/ (() => Schema.Struct({
+  "declaration": Schema.Record(Schema.String, Schema.Unknown),
+  "kind": Schema.Literal("publication-definition"),
+  "revision": Revision,
+  "subject": Schema.String.check(Schema.isPattern(new RegExp("^(agent|mission|schedule)/[^\\s]+$", "u"))),
+  "token": Schema.String.check(Schema.isMinLength(1))
+}).annotate({ identifier: "PublicationDefinition", description: "Canonical publication values with resolved compiler defaults; requires read.declarations." }))()
+export type PublicationDefinition = typeof PublicationDefinition.Type
+export type PublicationDefinitionEncoded = typeof PublicationDefinition.Encoded
+
 export const RequestId = /*#__PURE__*/ (() => subjectRef(new RegExp("^(?:request)/[^\\s]+$", "u"), "request").annotate({ identifier: "RequestId" }))()
 export type RequestId = typeof RequestId.Type
 export type RequestIdEncoded = typeof RequestId.Encoded
@@ -2208,6 +2219,8 @@ export const UsageLimit = /*#__PURE__*/ (() => Schema.Struct({
   "five_hour_percent": optionalKey(Schema.Number.check(Schema.isGreaterThanOrEqualTo(0))),
   "five_hour_resets_at_unix_ms": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
   "host": Schema.String,
+  /** The source named a provider identity or declared account; independent of quota freshness. Absent on older servers. */
+  "identified": optionalKey(Schema.Boolean).annotate({ description: "The source named a provider identity or declared account; independent of quota freshness. Absent on older servers." }),
   "measured_at_unix_ms": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   "measured_by": Schema.String,
   "plan": optionalKey(Schema.String),
@@ -2284,7 +2297,7 @@ export const Envelope = /*#__PURE__*/ (() => Schema.Struct({
   "api_version": Schema.Literal("st3.client.v0"),
   "request_id": RequestId,
   "snapshot": Snapshot,
-  "value": Schema.Union([Capabilities, PrivateNotesSubject, DocumentContent, SubjectDefinition, AgentWorkspace, Page, ResourcesPage, Resource, TimelinePage, ConversationChanges, ConversationSearch, EventPage, ActionResult, PairingChallenge, PairedSession, TerminalScreen, StatusHistory, AgentQueue, UsagePeriod, MailBacklog], { mode: "oneOf" })
+  "value": Schema.Union([Capabilities, PrivateNotesSubject, DocumentContent, SubjectDefinition, PublicationDefinition, AgentWorkspace, Page, ResourcesPage, Resource, TimelinePage, ConversationChanges, ConversationSearch, EventPage, ActionResult, PairingChallenge, PairedSession, TerminalScreen, StatusHistory, AgentQueue, UsagePeriod, MailBacklog], { mode: "oneOf" })
 }).annotate({ identifier: "Envelope" }))()
 export type Envelope = typeof Envelope.Type
 export type EnvelopeEncoded = typeof Envelope.Encoded

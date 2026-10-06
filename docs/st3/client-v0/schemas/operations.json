@@ -19,6 +19,7 @@
     { "id": "sets.get", "method": "GET", "path": "/v1/client/sets/{id}", "response": "Resource" },
     { "id": "capabilities.get", "method": "GET", "path": "/v1/client/capabilities", "response": "Capabilities", "anonymous_response": "PairingAdvertisement" },
     { "id": "document.get", "method": "GET", "path": "/v1/client/documents/content", "response": "DocumentContent" },
+    { "id": "publication.definition", "method": "GET", "path": "/v1/client/publication-definition", "response": "PublicationDefinition", "scope": "read.declarations" },
     { "id": "subject.definition", "method": "GET", "path": "/v1/client/subject-definition", "response": "SubjectDefinition" },
     { "id": "mail-backlog.summary", "method": "GET", "path": "/v1/client/mail-backlog", "response": "MailBacklog", "scope": "read.projections" },
     { "id": "usage.period", "method": "GET", "path": "/v1/client/usage", "response": "UsagePeriod" },

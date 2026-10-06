@@ -881,3 +881,212 @@ async fn manual_rollout_publishes_with_automatic_member_and_only_moves_on_explic
     reconciler.reconcile_once().unwrap();
     assert_eq!(runtime.starts.lock().unwrap().len(), 2);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn canonical_declaration_diffs_match_publication_reads_and_mission_previews() {
+    use st3::model::{MissionRequest, MissionResponse};
+    let root = tempfile::tempdir().unwrap();
+    let key = Arc::new(MemberKey::generate().unwrap().0);
+    let d = daemon(root.path(), "amber", key.clone(), &key).await;
+    let source = |note: &str, interval: &str| {
+        format!(
+            r#"version 2
+agent "garden/orchard" {{ command "true"; description "{note}"; env {{ TOKEN "fixture-value"; }} }}
+mission "garden/harvest" state="ready" timeout="1m" {{
+    goal "{note}"
+    step "inspect" {{ agentless }}
+}}
+schedule "garden/daily" {{
+    host "amber"
+    every "{interval}"
+    anchor "2026-01-01T00:00:00Z"
+    work {{ mission "garden/harvest"; workspace "/tmp"; }}
+}}
+"#
+        )
+    };
+    let mut schema: Value = serde_json::from_str(include_str!(
+        "../../../docs/st3/client-v0/schemas/client-v0.schema.json"
+    ))
+    .unwrap();
+    schema["oneOf"] = json!([{ "$ref": "#/$defs/PublicationDefinition" }]);
+    let validator = jsonschema::options().build(&schema).unwrap();
+    let mut first = request(&d, 1, source("first", "6h")).await;
+    let p = preview(&d, &mut first).await;
+    assert_eq!(p.declaration_diffs.len(), 3);
+    assert!(
+        p.declaration_diffs
+            .values()
+            .all(|diff| diff.before.is_none())
+    );
+    assert_eq!(
+        p.declaration_diffs["mission/garden/harvest"].after["max_active_runs"],
+        1
+    );
+    assert_eq!(
+        p.declaration_diffs["mission/garden/harvest"].after["revision_cutover"],
+        "restart-active"
+    );
+    let mission = &p.declaration_diffs["mission/garden/harvest"].after;
+    assert_eq!(mission["timeout_ms"], 60_000);
+    assert_eq!(
+        mission["steps"]["inspect"]["retry"],
+        json!({"attempts": 1, "backoff_ms": 0})
+    );
+    d.client
+        .post::<_, Value>("/v1/sets/apply", &first)
+        .await
+        .unwrap();
+    let read = |subject: &str| {
+        format!(
+            "/v1/client/publication-definition?subject={}",
+            urlencoding::encode(subject)
+        )
+    };
+    for (subject, diff) in &p.declaration_diffs {
+        let response: Value = d.client.get(&read(subject)).await.unwrap();
+        assert!(
+            validator.is_valid(&response),
+            "{:?}",
+            validator
+                .iter_errors(&response)
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(response["declaration"], diff.after);
+        assert_eq!(response["subject"], *subject);
+    }
+    let mut updated = request(&d, 2, source("second", "12h")).await;
+    let changed = preview(&d, &mut updated).await;
+    let ordinary: MissionResponse = d
+        .client
+        .post(
+            "/v1/intent/mission",
+            &MissionRequest {
+                intent: IntentInput {
+                    kdl: updated
+                        .intent
+                        .kdl
+                        .split("\nschedule ")
+                        .next()
+                        .unwrap()
+                        .into(),
+                    source_name: None,
+                },
+                at_index: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(ordinary.declaration_diffs.len(), 2);
+    for (subject, diff) in &ordinary.declaration_diffs {
+        assert_eq!(
+            serde_json::to_value(diff).unwrap(),
+            serde_json::to_value(&changed.declaration_diffs[subject]).unwrap()
+        );
+    }
+    assert!(
+        changed.declaration_diffs["mission/garden/harvest"]
+            .fields
+            .contains("/goals")
+    );
+    for (subject, diff) in &changed.declaration_diffs {
+        assert_eq!(
+            diff.before.as_ref(),
+            Some(&p.declaration_diffs[subject].after)
+        );
+        assert!(!diff.fields.is_empty());
+    }
+    d.client
+        .post::<_, Value>("/v1/sets/apply", &updated)
+        .await
+        .unwrap();
+    for (subject, diff) in &changed.declaration_diffs {
+        let response: Value = d.client.get(&read(subject)).await.unwrap();
+        assert!(
+            validator.is_valid(&response),
+            "{:?}",
+            validator
+                .iter_errors(&response)
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(response["declaration"], diff.after);
+    }
+    let mut same = request(&d, 3, source("second", "12h")).await;
+    assert!(preview(&d, &mut same).await.declaration_diffs.is_empty());
+    let mut empty = request(&d, 3, "version 2\n".into()).await;
+    empty.options.allow_empty = true;
+    let retire = preview(&d, &mut empty).await;
+    assert_eq!(retire.declaration_diffs.len(), 3);
+    assert_eq!(
+        retire.declaration_diffs["mission/garden/harvest"].after["state"],
+        "retired"
+    );
+    empty.options.confirm_retire = Some(retire.digest.clone());
+    d.client
+        .post::<_, Value>("/v1/sets/apply", &empty)
+        .await
+        .unwrap();
+    for (subject, diff) in &retire.declaration_diffs {
+        let response: Value = d.client.get(&read(subject)).await.unwrap();
+        assert!(
+            validator.is_valid(&response),
+            "{:?}",
+            validator
+                .iter_errors(&response)
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(response["declaration"], diff.after);
+        assert_eq!(
+            diff.before.as_ref(),
+            Some(&changed.declaration_diffs[subject].after)
+        );
+    }
+    let mut restored = request(&d, 4, source("second", "12h")).await;
+    let restore = preview(&d, &mut restored).await;
+    for (subject, diff) in &restore.declaration_diffs {
+        assert_eq!(restore.changes[subject], "added");
+        assert_eq!(
+            diff.before.as_ref(),
+            Some(&retire.declaration_diffs[subject].after)
+        );
+        assert_eq!(diff.after, changed.declaration_diffs[subject].after);
+    }
+    // Old serialized previews still deserialize with an empty additive diff map.
+    let mut legacy = serde_json::to_value(retire).unwrap();
+    legacy.as_object_mut().unwrap().remove("declaration_diffs");
+    assert!(
+        serde_json::from_value::<Preview>(legacy)
+            .unwrap()
+            .declaration_diffs
+            .is_empty()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adoption_diff_reads_existing_unmanaged_definition_and_invalid_actors_are_refused() {
+    let root = tempfile::tempdir().unwrap();
+    let key = Arc::new(MemberKey::generate().unwrap().0);
+    let d = daemon(root.path(), "amber", key.clone(), &key).await;
+    let initial = st3::graph::parse_intent(&bundle("unmanaged", false), "amber").unwrap();
+    d.store
+        .apply_internal(&initial, "unmanaged-fixture")
+        .unwrap();
+    let mut adopt = request(&d, 1, bundle("managed", false)).await;
+    adopt.options.adopt.insert("agent/garden/orchard".into());
+    let p = preview(&d, &mut adopt).await;
+    let before = &p.declaration_diffs["agent/garden/orchard"].before;
+    assert_eq!(
+        before.as_ref().unwrap(),
+        &serde_json::to_value(&initial.subjects["agent/garden/orchard"]).unwrap()
+    );
+    adopt.actor = "daemon/not-an-actor".into();
+    assert!(
+        d.client
+            .post::<_, Value>("/v1/sets/preview", &adopt)
+            .await
+            .is_err()
+    );
+}

@@ -35,9 +35,20 @@ async fn authored_omp_resume_publishes_binding_from_an_empty_managed_directory()
         .join("sessions/omp/provider-sessions");
     std::fs::create_dir_all(&managed).unwrap();
     let provider = root.path().join("omp");
+    let fixture_node = std::env::split_paths(&std::ffi::OsString::from(env!("ST3_FIXTURE_PATH")))
+        .map(|directory| directory.join("node"))
+        .find(|candidate| candidate.is_file())
+        .expect("the OMP admission stand-in needs Node on the fixture PATH");
+    let admission_host = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../scripts/st3-boot-canaries/stub-pi-family.mjs");
     // The fake provider uses the actual spawned channel, not a direct API binding request.
+    // Its admission mode loads the actual adapter against the loopback model fixture.
     std::fs::write(&provider, format!(r#"#!{bash}
 if [ "$1" = "--version" ]; then echo '18.4.4'; exit 0; fi
+if [ -n "$ST_ADMISSION_TRACE" ]; then
+  export STUB_HARNESS=omp
+  exec "{node}" "{admission_host}" "$@"
+fi
 while [ "$#" -gt 0 ]; do
   if [ "$1" = "--resume" ]; then shift; resume="$1"; fi
   shift
@@ -46,7 +57,7 @@ done
   printf '%s\n' '{{"type":"session","sessionId":"{id}","sessionFile":"'"$resume"'"}}'
   while [ -d "${{RESUME_TEST_STOP%/*}}" ] && [ ! -f "$RESUME_TEST_STOP" ]; do sleep 0.01; done
 }} | "$ST_OMP_CHANNEL_BIN" --endpoint "$ST3_ENDPOINT" driver omp-channel --identity "$ST_OMP_CHANNEL_IDENTITY" --catalog "$ST_DRIVER_ROOT"
-"#, bash=env!("ST3_FIXTURE_BASH"))).unwrap();
+"#, bash=env!("ST3_FIXTURE_BASH"), node=fixture_node.display(), admission_host=admission_host.display())).unwrap();
     std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
     let source = format!(
         r#"version 2
@@ -121,7 +132,11 @@ agent "garden/worker" {{
     let hooks = root.path().join("hooks");
     std::fs::create_dir(&hooks).unwrap();
     std::fs::write(hooks.join(st_drivers::hooks::ST3_SET_MARKER), "fixture").unwrap();
-    std::fs::write(hooks.join("omp-channel.ts"), "").unwrap();
+    std::fs::write(
+        hooks.join("omp-channel.ts"),
+        include_bytes!("../hooks/omp-channel.ts"),
+    )
+    .unwrap();
     let mut command = st3::test_support::async_command(env!("CARGO_BIN_EXE_st3-fixture"));
     let stop = root.path().join("provider-stop");
     command
@@ -159,6 +174,26 @@ agent "garden/worker" {{
     let binding = store
         .latest_claim(subject, Some("harness.session-file"))
         .unwrap();
+    let admission_records = std::fs::read_dir(drivers.join("sessions/harness-admission"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(admission_records.len(), 1);
+    let admitted: Value =
+        serde_json::from_slice(&std::fs::read(&admission_records[0]).unwrap()).unwrap();
+    assert_eq!(admitted["identity"]["version"], "18.4.4");
+    let measurements = admitted["measurements"].as_array().unwrap();
+    assert_eq!(measurements.len(), 5);
+    assert!(
+        measurements
+            .iter()
+            .all(|measurement| measurement["passed"] == true)
+    );
     let client = st3::client::Client::unix(socket.clone());
     let sessions: Value = client.get("/v1/client/sessions").await.unwrap();
     let session_id = sessions["items"]

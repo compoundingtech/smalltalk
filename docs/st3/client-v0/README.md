@@ -314,7 +314,11 @@ projections can then show early history as current, such as a person step that a
 not-yet-received envelope completes. The notice lists each peer that holds more envelopes than one
 replication exchange carries, with `peer_only_envelopes` (held by the peer, missing here),
 `local_only_envelopes`, `last_exchange_at`, and `estimated_catch_up_seconds` (null until a rate is
-measured). Clients show the notice above the page. The page omits it once the host has caught up.
+measured or no finite forecast fits the safe-integer duration bound of 9,007,199,254,740,991
+whole seconds, `2^53 - 1`). Unavailable forecasts are null or absent; they are never clamped.
+The producer and API projection share `MAX_SAFE_DURATION_SECONDS`. A stalled peer keeps its
+sync notice even when its forecast is unavailable. Clients show the notice above the page.
+The page omits it once the host has caught up.
 
 The notice's `state` is `diverged` instead while the host's graph has diverged from a peer's: both
 hold the same envelopes but project different graphs from them, so the page can be wrong, not just
@@ -428,6 +432,17 @@ copy of the definition: re-publishing it would replace the environment values wi
 Unknown agents and agents with observations but no applied desired declaration return typed
 `not-found`. Other subject kinds return `validation-failed`: a mission is published as a compiled
 revision (read it through `/missions/{id}`) and keeps no canonical declaration AST to render.
+
+For canonical structured publication values, use
+`GET /v1/client/publication-definition?subject=mission%2Fexample%2Fdaily` (also accepts
+`agent/` and `schedule/` subjects). Rust `publication_definition(subject)`, Swift
+`publicationDefinition(subject:)`, and TypeScript `publicationDefinition(subject)` return
+`PublicationDefinition` in the same snapshot envelope. Its `declaration` is the compiled
+`MissionSpec` for missions, or normalized `DesiredSubject` for seats and schedules, with
+`revision` and immutable claim `token`. This read requires `read.projections` and
+`read.declarations`; environment values and embedded declarations are retained. Missing
+subjects return 404 and oversized definitions are rejected without truncation.
+These are the same values used by the [owned-set declaration diff](../owned-sets.md#declaration-diffs-and-readback).
 A definition is never truncated:
 when its serialized value exceeds `max_response_bytes - 4096` (reserving room for the envelope),
 the server returns `validation-failed` rather than an incomplete AST or KDL document.
@@ -472,7 +487,8 @@ cost: the harness's own figure when it reports one, else st's pricing table, nam
 could price, which a client shows as unknown cost, never as free). An identity st does not know,
 such as the mission run of a standing seat, is absent from the row. A period whose start is after
 its end is `validation-failed`. `limits` lists each account's selected limits reading: `account`
-(a label such as `claude/<digest>`, or `DRIVER/unknown`), `driver`, optional `plan`,
+(a label such as `claude/<digest>`, or `DRIVER/unknown`), `driver`, optional `account_ref`,
+`identified` (optional for older servers), and `plan`,
 `five_hour_percent`, `weekly_percent` and their `*_resets_at_unix_ms`, when and by which seat and
 host it was measured, and the seats whose newest reading names the account. A harness that does
 not report a value leaves it out. Selection uses quota observation time, independently of
@@ -483,6 +499,11 @@ outside the hour cannot override it. This same selection serves `st usage`, stui
 account pools and the limits policy. The policy tests freshness against the selected source
 time, so a recent low publication cannot freshen an old high observation. Claim kinds and
 client fields remain compatible with older clients.
+`identified` is true for a provider identity or declared account, false when both are missing;
+it does not describe quota freshness. Identity-less history with no active reporting seat is
+hidden once identified evidence exists for that driver. Active unknown evidence and every
+identified account, including exhausted accounts with no seats, remain visible. Bound readings
+use the same stable declared label as publishers, including older generic provider labels.
 Partial reports without a weekly percentage do not replace or refresh a prior weekly source.
 The durable reading survives member restarts. Consumers must check its original measurement time
 and reset window; missing or stale evidence is unknown, never zero. `st doctor` reports missing,

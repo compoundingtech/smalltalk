@@ -262,6 +262,10 @@ const PROBES: &[Probe] = &[
         "GET /v1/client/subject-definition",
         "/v1/client/subject-definition?subject={seat}",
     ),
+    get(
+        "GET /v1/client/publication-definition",
+        "/v1/client/publication-definition?subject={seat}",
+    ),
     get("GET /v1/client/now", "/v1/client/now"),
     get("GET /v1/client/machines", "/v1/client/machines"),
     get("GET /v1/client/hosts/{*id}", "/v1/client/hosts/local/repositories"),

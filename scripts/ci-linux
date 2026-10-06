@@ -2,7 +2,7 @@
 # Run one Linux gate stage inside the pinned devShell: tests, clippy, or fleet-compat.
 # Each stage is its own GitHub Actions job on its own runner; `linux-gate` requires all three.
 set -euo pipefail
-stage=${1:?usage: scripts/ci-linux tests|clippy|fleet-compat}
+stage=${1:?usage: scripts/ci-linux tests|clippy|fleet-compat|mail-redelivery-canaries}
 # Logs stay outside the checkout: the public-content test scans untracked files.
 logs="$RUNNER_TEMP/ci-logs"
 mkdir -p "$logs"
@@ -88,6 +88,7 @@ case "$stage" in
   } 2>&1 | tee "$logs/$stage.log" || status=$? ;;
   clippy) clippy_and_codegen 2>&1 | tee "$logs/$stage.log" || status=$? ;;
   fleet-compat) fleet_compat 2>&1 | tee "$logs/$stage.log" || status=$? ;;
+  mail-redelivery-canaries) python3 scripts/ci-mail-redelivery-canaries 2>&1 | tee "$logs/$stage.log" || status=$? ;;
   *) echo "unknown stage: $stage" >&2; exit 2 ;;
 esac
 # `tee` hides the stage's exit status behind a pipeline; pipefail restores it above.

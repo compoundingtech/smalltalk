@@ -714,10 +714,11 @@ impl PeerSyncProgress {
             Some(0)
         } else {
             sync.catch_up_rate_per_second
-                .filter(|rate| *rate > 0.0)
+                .filter(|rate| rate.is_finite() && *rate > 0.0)
                 .map(|rate| (peer_only as f64 / rate).ceil())
-                // JSON duration consumers require exact JavaScript-safe integer seconds.
-                .filter(|seconds| *seconds <= ((1_u64 << 53) - 1) as f64)
+                .filter(|seconds| {
+                    seconds.is_finite() && *seconds <= MAX_SAFE_DURATION_SECONDS as f64
+                })
                 .map(|seconds| seconds as u64)
         };
         self.measured = Some(sync);
@@ -3694,6 +3695,24 @@ pub fn replication_difference_counts_what_each_side_lacks() {
 
 #[cfg(test)]
 #[test]
+pub fn sync_progress_infinite_rate_does_not_claim_caught_up() {
+    let mut progress = PeerSyncProgress {
+        measured: Some(ReplicationPeerSync {
+            catch_up_rate_per_second: Some(f64::INFINITY),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    progress.observe(0, Some((9_000, 3)), 1_000);
+    let sync = progress.view(1_000).unwrap();
+    assert_eq!(sync.estimated_catch_up_seconds, None);
+    assert_eq!(sync.peer_only_envelopes, 9_000);
+    assert_eq!(sync.local_only_envelopes, 3);
+    assert!(sync.catching_up);
+}
+
+#[cfg(test)]
+#[test]
 pub fn sync_progress_estimates_catch_up_from_net_progress() {
     let mut progress = PeerSyncProgress::default();
     progress.observe(0, Some((10_000, 0)), 1_000);
@@ -3748,7 +3767,6 @@ pub fn sync_progress_estimates_catch_up_from_net_progress() {
 #[cfg(test)]
 #[test]
 pub fn sync_progress_omits_forecasts_outside_safe_integer_seconds() {
-    const MAX_SAFE_SECONDS: u64 = (1_u64 << 53) - 1;
     let mut progress = PeerSyncProgress {
         measured: Some(ReplicationPeerSync {
             catch_up_rate_per_second: Some(1.0),
@@ -3756,15 +3774,15 @@ pub fn sync_progress_omits_forecasts_outside_safe_integer_seconds() {
         }),
         ..Default::default()
     };
-    progress.observe(0, Some((MAX_SAFE_SECONDS, 7)), 1_000);
+    progress.observe(0, Some((MAX_SAFE_DURATION_SECONDS, 7)), 1_000);
     assert_eq!(
         progress.view(1_000).unwrap().estimated_catch_up_seconds,
-        Some(MAX_SAFE_SECONDS)
+        Some(MAX_SAFE_DURATION_SECONDS)
     );
-    progress.observe(0, Some((MAX_SAFE_SECONDS + 1, 7)), 2_000);
+    progress.observe(0, Some((MAX_SAFE_DURATION_SECONDS + 1, 7)), 2_000);
     let sync = progress.view(2_000).unwrap();
     assert_eq!(sync.estimated_catch_up_seconds, None);
-    assert_eq!(sync.peer_only_envelopes, MAX_SAFE_SECONDS + 1);
+    assert_eq!(sync.peer_only_envelopes, MAX_SAFE_DURATION_SECONDS + 1);
     assert_eq!(sync.local_only_envelopes, 7);
     assert!(sync.catching_up);
 }

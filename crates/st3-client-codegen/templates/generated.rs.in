@@ -433,6 +433,10 @@ pub struct UsageLimit {
     /// The declared account the measuring seat ran on, when it was bound to one.
     #[serde(default)]
     pub account_ref: Option<String>,
+    /// Whether the source named a provider identity or declared account, independent of freshness.
+    /// Older servers omit this metadata.
+    #[serde(default)]
+    pub identified: Option<bool>,
     pub driver: String,
     #[serde(default)]
     pub plan: Option<String>,
@@ -521,6 +525,16 @@ pub struct CanonicalNode {
     pub properties: BTreeMap<String, Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<CanonicalNode>,
+}
+
+/// Canonical compiler values of an applied seat, mission, or schedule publication.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct PublicationDefinition {
+    pub kind: String,
+    pub subject: String,
+    pub declaration: BTreeMap<String, Value>,
+    pub revision: String,
+    pub token: String,
 }
 
 /// Applied desired state, not the original declaration file or a proposed mission revision.
