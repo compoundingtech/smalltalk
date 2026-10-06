@@ -79,9 +79,28 @@ impl Store {
             }
             previews.push(items);
         }
-        Ok(json!({"mission": format!("mission/{mission}"),
+        let revision: Option<String> = connection
+            .query_row(
+                "SELECT revision FROM mission_definitions WHERE mission_id=?1",
+                [mission],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let provenance = revision
+            .as_deref()
+            .map(|revision| crate::provenance::read(&connection, mission, revision))
+            .transpose()?
+            .flatten();
+        let mut overview = json!({"mission": format!("mission/{mission}"),
             "total_runs": counts.values().sum::<u64>(), "counts": counts,
-            "newest": previews[0], "failed": previews[1], "preview_limit": limit.clamp(1,20)}))
+            "newest": previews[0], "failed": previews[1], "preview_limit": limit.clamp(1,20)});
+        if let Some(revision) = revision {
+            overview["revision"] = json!(revision);
+        }
+        if let Some(provenance) = provenance {
+            overview["provenance"] = serde_json::to_value(provenance)?;
+        }
+        Ok(overview)
     }
 
     /// A run card's progress counts cover every step; only its first twenty steps are hydrated.

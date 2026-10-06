@@ -9986,6 +9986,14 @@ fn render_mission_overview(view: &Value) -> String {
             let _ = writeln!(out, "  {state}: {count}");
         }
     }
+    if let Some(revision) = view["revision"].as_str() {
+        let _ = writeln!(out, "REVISION {revision}");
+    }
+    if let Some(value) = view.get("provenance")
+        && let Ok(provenance) = serde_json::from_value(value.clone())
+    {
+        out.push_str(&st3::provenance::render(&provenance));
+    }
     for (key, title) in [("newest", "NEWEST"), ("failed", "FAILED")] {
         let _ = writeln!(out, "{title} (up to {} runs)", view["preview_limit"]);
         if let Some(runs) = view[key].as_array() {
