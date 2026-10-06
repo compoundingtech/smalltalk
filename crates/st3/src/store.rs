@@ -1247,6 +1247,16 @@ impl Store {
         hold();
     }
 
+    pub(crate) fn pending_writer_jobs_for_test(&self) -> (usize, usize) {
+        self.connection
+            .jobs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .unwrap()
+            .pending_counts()
+    }
+
     /// Record local observations as `append_claim` does, in one transaction: one commit, and
     /// so one sync to disk, instead of one for each observation.
     pub(crate) fn append_local_observations_for_test(&self, inputs: &[ClaimInput]) {

@@ -1,7 +1,8 @@
 //! The store's SQLite connections: one writer thread that batches writes, and a pool of read
 //! connections that a thread can pin to one snapshot.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -56,13 +57,34 @@ pub fn max_idle_read_connections() -> usize {
 /// for every subject.
 pub const STATEMENT_CACHE_CAPACITY: usize = 128;
 
-/// The store's only write connection, owned by one writer thread. Writes queue in front of it in
-/// arrival order: a batched write runs on the writer thread with the others queued behind it, each
-/// in a savepoint of one transaction that commits once for all of them, and its caller hears back
-/// after that commit. `write` lends the connection itself to its caller until the guard drops,
-/// for writes that manage their own transactions. Nothing else ever takes SQLite's write lock.
+thread_local! {
+    static CONTROL_WRITES: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Give writes enqueued by `f` on this thread control-plane admission priority.
+///
+/// The scope nests and restores its previous priority even when `f` panics; spawned threads do
+/// not inherit it. Priority never interrupts an active transaction or a lent connection. Control
+/// writes run before queued ordinary work, except that one ordinary turn is reserved after eight
+/// control turns. Each control batched write commits without batching ordinary work behind it.
+pub fn with_control_writes<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CONTROL_WRITES.with(|priority| priority.set(self.0));
+        }
+    }
+    let _restore = Restore(CONTROL_WRITES.with(|priority| priority.replace(true)));
+    f()
+}
+
+/// The store's only write connection, owned by one writer thread. Ordinary writes queue in
+/// arrival order; [`with_control_writes`] reserves fair priority admission at transaction
+/// boundaries. Batched writes run in savepoints of one transaction and hear back after commit.
+/// `write` lends the connection until the guard drops, for callers managing their own
+/// transactions. Nothing else ever takes SQLite's write lock.
 pub struct WriterConnection {
-    pub jobs: Mutex<Option<std::sync::mpsc::Sender<WriterJob>>>,
+    pub jobs: Mutex<Option<WriterSender>>,
     pub thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     pub committed_index: Arc<AtomicU64>,
     /// Transactions the writer committed for batched writes, and the batched writes in them.
@@ -88,6 +110,128 @@ pub enum WriterJob {
     },
 }
 
+const CONTROL_TURN_LIMIT: usize = 8;
+
+#[derive(Default)]
+struct WriterQueueState {
+    ordinary: VecDeque<WriterJob>,
+    control: VecDeque<WriterJob>,
+    control_turns: usize,
+    senders: usize,
+    stopped: bool,
+}
+
+struct WriterQueue {
+    state: Mutex<WriterQueueState>,
+    ready: Condvar,
+}
+
+/// An enqueue handle to the writer. Clones keep the queue open, like a channel sender.
+pub struct WriterSender {
+    queue: Arc<WriterQueue>,
+}
+
+impl WriterSender {
+    pub fn send(&self, job: WriterJob) -> Result<(), std::sync::mpsc::SendError<WriterJob>> {
+        let control = CONTROL_WRITES.with(Cell::get);
+        let mut state = self.queue.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.stopped {
+            return Err(std::sync::mpsc::SendError(job));
+        }
+        if control {
+            state.control.push_back(job);
+        } else {
+            state.ordinary.push_back(job);
+        }
+        drop(state);
+        self.queue.ready.notify_one();
+        Ok(())
+    }
+
+    /// Queued control and ordinary jobs, excluding the active transaction or connection loan.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn pending_counts(&self) -> (usize, usize) {
+        let state = self.queue.state.lock().unwrap_or_else(PoisonError::into_inner);
+        (state.control.len(), state.ordinary.len())
+    }
+}
+
+impl Clone for WriterSender {
+    fn clone(&self) -> Self {
+        self.queue
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .senders += 1;
+        Self {
+            queue: self.queue.clone(),
+        }
+    }
+}
+
+impl Drop for WriterSender {
+    fn drop(&mut self) {
+        let mut state = self.queue.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.senders -= 1;
+        drop(state);
+        self.queue.ready.notify_one();
+    }
+}
+
+struct WriterReceiver {
+    queue: Arc<WriterQueue>,
+}
+
+impl WriterReceiver {
+    fn recv(&self) -> Option<(WriterJob, bool)> {
+        let mut state = self.queue.state.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            if !state.control.is_empty()
+                && (state.control_turns < CONTROL_TURN_LIMIT || state.ordinary.is_empty())
+            {
+                state.control_turns = (state.control_turns + 1).min(CONTROL_TURN_LIMIT);
+                return state.control.pop_front().map(|job| (job, true));
+            }
+            if let Some(job) = state.ordinary.pop_front() {
+                state.control_turns = 0;
+                return Some((job, false));
+            }
+            if state.senders == 0 {
+                return None;
+            }
+            state.control_turns = 0;
+            state = self.queue.ready.wait(state).unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    /// Do not consume a loan or a control job before committing the current ordinary batch:
+    /// either must compete for admission again at that transaction boundary.
+    fn next_in_batch(&self) -> Option<WriterJob> {
+        let mut state = self.queue.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.control.is_empty()
+            && matches!(state.ordinary.front(), Some(WriterJob::Batched { .. }))
+        {
+            state.ordinary.pop_front()
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for WriterReceiver {
+    fn drop(&mut self) {
+        let mut state = self.queue.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.stopped = true;
+        // On writer failure, drop every borrowed closure before its completion sender. No
+        // caller can return with a closure still queued, even while sender clones survive.
+        let ordinary = std::mem::take(&mut state.ordinary);
+        let control = std::mem::take(&mut state.control);
+        drop(state);
+        drop(ordinary);
+        drop(control);
+    }
+}
+
 /// At most this many batched writes share one transaction.
 pub const WRITE_BATCH_LIMIT: usize = 256;
 
@@ -108,7 +252,17 @@ pub struct WriterGuard<'a> {
 
 impl WriterConnection {
     pub fn new(connection: Connection, committed_index: Arc<AtomicU64>) -> Self {
-        let (jobs, queue) = std::sync::mpsc::channel::<WriterJob>();
+        let queue = Arc::new(WriterQueue {
+            state: Mutex::new(WriterQueueState {
+                senders: 1,
+                ..WriterQueueState::default()
+            }),
+            ready: Condvar::new(),
+        });
+        let jobs = WriterSender {
+            queue: queue.clone(),
+        };
+        let queue = WriterReceiver { queue };
         let index = committed_index.clone();
         let batches = Arc::new((AtomicU64::new(0), AtomicU64::new(0)));
         let counted = batches.clone();
@@ -134,9 +288,9 @@ impl WriterConnection {
             .expect("the writer thread runs while the store is open");
     }
 
-    /// The writer connection itself, lent until the guard drops, after every write queued before
-    /// this one. A panic while it is lent rolls back the open transaction as it unwinds and still
-    /// gives the connection back, so it cannot disable the store.
+    /// The writer connection itself, lent until the guard drops, in FIFO order within this
+    /// thread's admission class. A panic while it is lent rolls back the open transaction as it
+    /// unwinds and still gives the connection back, so it cannot disable the store.
     pub fn write(&self) -> WriterGuard<'_> {
         debug_assert_no_pinned_read();
         let wait = crate::profile::writer_waiting();
@@ -251,24 +405,14 @@ impl Drop for WriterConnection {
     }
 }
 
-/// The writer thread: run each batched write with the others queued behind it in one
-/// transaction, and lend the connection to each lending write in its turn.
-pub fn write_queue(
+/// The writer thread: admit control and ordinary turns fairly at transaction boundaries.
+fn write_queue(
     mut connection: Connection,
-    queue: std::sync::mpsc::Receiver<WriterJob>,
+    queue: WriterReceiver,
     committed_index: &AtomicU64,
     batches: &(AtomicU64, AtomicU64),
 ) {
-    let mut next = None;
-    loop {
-        let job = match next.take() {
-            Some(job) => job,
-            None => match queue.recv() {
-                Ok(job) => job,
-                // The store closed its queue.
-                Err(_) => return,
-            },
-        };
+    while let Some((job, control)) = queue.recv() {
         match job {
             WriterJob::Lend { lent, returned } => {
                 if let Err(std::sync::mpsc::SendError(back)) = lent.send(connection) {
@@ -281,26 +425,25 @@ pub fn write_queue(
                 }
             }
             batched => {
-                next = run_write_batch(&mut connection, batched, &queue, committed_index, batches);
+                run_write_batch(&mut connection, batched, control, &queue, committed_index, batches);
             }
         }
     }
 }
 
-/// Run `first` and the batched writes queued behind it in one transaction, each in its own
-/// savepoint, then commit once and answer every caller. The batch stops taking writes when it
-/// reaches `WRITE_BATCH_LIMIT`, has run for `WRITE_BATCH_WINDOW`, fails, or meets a lending write,
-/// which it returns to run next.
-pub fn run_write_batch(
+/// Run an ordinary batch in savepoints, or one control write alone, then commit and answer.
+/// A queued control write or loan ends an ordinary batch without being dequeued; admission is
+/// decided after commit, not before. Size, time and failure boundaries still apply.
+fn run_write_batch(
     connection: &mut Connection,
     first: WriterJob,
-    queue: &std::sync::mpsc::Receiver<WriterJob>,
+    control: bool,
+    queue: &WriterReceiver,
     committed_index: &AtomicU64,
     batches: &(AtomicU64, AtomicU64),
-) -> Option<WriterJob> {
+) {
     let started = std::time::Instant::now();
     let mut answers = Vec::new();
-    let mut lend = None;
     let (transaction, mut failure) =
         match connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate) {
             Ok(transaction) => (Some(transaction), None),
@@ -315,8 +458,7 @@ pub fn run_write_batch(
             done,
         } = current
         else {
-            lend = Some(current);
-            break;
+            unreachable!("only batched jobs enter a write batch");
         };
         match (&transaction, &failure) {
             (Some(transaction), None) => {
@@ -340,11 +482,12 @@ pub fn run_write_batch(
             _ => drop(run),
         }
         answers.push(done);
-        if failure.is_none()
+        if !control
+            && failure.is_none()
             && answers.len() < WRITE_BATCH_LIMIT
             && started.elapsed() < WRITE_BATCH_WINDOW
         {
-            job = queue.try_recv().ok();
+            job = queue.next_in_batch();
         }
     }
     batches.0.fetch_add(1, Ordering::Relaxed);
@@ -362,7 +505,6 @@ pub fn run_write_batch(
     for done in answers {
         let _ = done.send(committed.clone());
     }
-    lend
 }
 
 impl Deref for WriterGuard<'_> {
@@ -786,6 +928,272 @@ thread_local! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_writer() -> WriterConnection {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("CREATE TABLE events (position INTEGER PRIMARY KEY, label TEXT)")
+            .unwrap();
+        WriterConnection::new(connection, Arc::new(AtomicU64::new(0)))
+    }
+
+    fn enqueue_insert(
+        writer: &WriterConnection,
+        label: String,
+        succeeded: bool,
+    ) -> std::sync::mpsc::Receiver<Result<(), String>> {
+        let (done, answer) = std::sync::mpsc::sync_channel(1);
+        writer.send(WriterJob::Batched {
+            run: Box::new(move |tx| {
+                tx.execute("INSERT INTO events(label) VALUES (?1)", [&label]).unwrap();
+                succeeded
+            }),
+            profile: None,
+            wait: None,
+            done,
+        });
+        answer
+    }
+
+    fn await_commit(answer: std::sync::mpsc::Receiver<Result<(), String>>) {
+        answer.recv_timeout(std::time::Duration::from_secs(5)).unwrap().unwrap();
+    }
+
+    fn events(writer: &WriterConnection) -> Vec<String> {
+        let connection = writer.write();
+        let mut statement = connection.prepare("SELECT label FROM events ORDER BY position").unwrap();
+        statement.query_map([], |row| row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap()
+    }
+
+    #[test]
+    fn stopped_writer_drops_queued_captures_before_disconnecting_their_callers() {
+        struct Capture(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Capture {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let writer = test_writer();
+        let (lent, loan) = std::sync::mpsc::sync_channel(1);
+        let (give_back, returned) = std::sync::mpsc::sync_channel(1);
+        writer.send(WriterJob::Lend { lent, returned });
+        let connection = loan.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let enqueue = || {
+            let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let capture = Capture(dropped.clone());
+            let (done, answer) = std::sync::mpsc::sync_channel(1);
+            writer.send(WriterJob::Batched {
+                run: Box::new(move |_| {
+                    drop(capture);
+                    panic!("a stopped writer must not run queued jobs");
+                }),
+                profile: None,
+                wait: None,
+                done,
+            });
+            (dropped, answer)
+        };
+        let ordinary = enqueue();
+        let control = with_control_writes(enqueue);
+        // Losing a borrowed connection ends the writer, while its enqueue handle stays alive.
+        drop(give_back);
+        drop(connection);
+        for (dropped, answer) in [ordinary, control] {
+            assert!(matches!(
+                answer.recv_timeout(std::time::Duration::from_secs(5)),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+            ));
+            assert!(dropped.load(Ordering::Acquire));
+        }
+    }
+
+    #[test]
+    fn control_arriving_during_an_ordinary_batch_precedes_the_next_connection_loan() {
+        let writer = test_writer();
+        let (started, running) = std::sync::mpsc::sync_channel(1);
+        let (release, wait) = std::sync::mpsc::sync_channel(1);
+        let (done, first) = std::sync::mpsc::sync_channel(1);
+        writer.send(WriterJob::Batched {
+            run: Box::new(move |tx| {
+                tx.execute("INSERT INTO events(label) VALUES ('active ordinary')", []).unwrap();
+                started.send(()).unwrap();
+                wait.recv().unwrap();
+                true
+            }),
+            profile: None,
+            wait: None,
+            done,
+        });
+        running.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let (lent, loan) = std::sync::mpsc::sync_channel(1);
+        let (give_back, returned) = std::sync::mpsc::sync_channel(1);
+        writer.send(WriterJob::Lend { lent, returned });
+        let control = with_control_writes(|| enqueue_insert(&writer, "control".into(), true));
+        release.send(()).unwrap();
+        await_commit(first);
+        let connection = loan.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM events WHERE label='control'", [], |row| row.get(0))
+            .unwrap();
+        give_back.send(connection).unwrap();
+        await_commit(control);
+        assert_eq!(count, 1, "control must commit before the queued ordinary loan");
+        assert_eq!(events(&writer), ["active ordinary", "control"]);
+    }
+
+    #[test]
+    fn control_write_commits_ahead_of_backlog_without_waiting_for_next_ordinary_write() {
+        let writer = test_writer();
+        let holder = writer.write();
+        let (release, wait) = std::sync::mpsc::sync_channel(1);
+        let (done, first) = std::sync::mpsc::sync_channel(1);
+        writer.send(WriterJob::Batched {
+            run: Box::new(move |tx| {
+                tx.execute("INSERT INTO events(label) VALUES ('ordinary0')", []).unwrap();
+                // The first ordinary job holds its transaction until the test releases it.
+                wait.recv().unwrap();
+                true
+            }),
+            profile: None,
+            wait: None,
+            done,
+        });
+        let ordinary: Vec<_> = (1..6)
+            .map(|index| enqueue_insert(&writer, format!("ordinary{index}"), true))
+            .collect();
+        let control = with_control_writes(|| enqueue_insert(&writer, "control".into(), true));
+        drop(holder);
+        let committed = control.recv_timeout(std::time::Duration::from_secs(5));
+        // Always release the ordinary writer, even when the priority assertion will fail.
+        release.send(()).unwrap();
+        await_commit(first);
+        for answer in ordinary {
+            await_commit(answer);
+        }
+        committed.unwrap().unwrap();
+        assert_eq!(
+            events(&writer),
+            ["control", "ordinary0", "ordinary1", "ordinary2", "ordinary3", "ordinary4", "ordinary5"]
+        );
+    }
+
+    #[test]
+    fn ordinary_writes_get_a_turn_every_eight_control_turns() {
+        let writer = test_writer();
+        let holder = writer.write();
+        let control: Vec<_> = with_control_writes(|| {
+            (0..24)
+                .map(|index| enqueue_insert(&writer, format!("control{index}"), true))
+                .collect()
+        });
+        let ordinary0 = enqueue_insert(&writer, "ordinary0".into(), true);
+        let ordinary1 = enqueue_insert(&writer, "ordinary1".into(), true);
+        drop(holder);
+        for answer in control {
+            await_commit(answer);
+        }
+        await_commit(ordinary0);
+        await_commit(ordinary1);
+        let mut expected = Vec::new();
+        for index in 0..24 {
+            expected.push(format!("control{index}"));
+            if index == 7 {
+                expected.push("ordinary0".into());
+            } else if index == 15 {
+                expected.push("ordinary1".into());
+            }
+        }
+        assert_eq!(events(&writer), expected);
+    }
+
+    #[test]
+    fn control_connection_loan_passes_ordinary_backlog() {
+        let writer = test_writer();
+        let holder = writer.write();
+        let ordinary = enqueue_insert(&writer, "ordinary".into(), true);
+        let (lent, loan) = std::sync::mpsc::sync_channel(1);
+        let (give_back, returned) = std::sync::mpsc::sync_channel(1);
+        with_control_writes(|| writer.send(WriterJob::Lend { lent, returned }));
+        drop(holder);
+        let connection = loan.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let count: i64 = connection.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0)).unwrap();
+        connection.execute("INSERT INTO events(label) VALUES ('control loan')", []).unwrap();
+        give_back.send(connection).unwrap();
+        await_commit(ordinary);
+        assert_eq!(count, 0);
+        assert_eq!(events(&writer), ["control loan", "ordinary"]);
+    }
+
+    #[test]
+    fn control_scope_restores_priority_after_nested_and_outer_panics() {
+        let writer = test_writer();
+        let holder = writer.write();
+        let ordinary0 = enqueue_insert(&writer, "ordinary0".into(), true);
+        let mut answers = Vec::new();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_control_writes(|| {
+                let nested = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    with_control_writes(|| {
+                        answers.push(enqueue_insert(&writer, "control0".into(), true));
+                        panic!("nested scope");
+                    });
+                }));
+                assert!(nested.is_err());
+                answers.push(enqueue_insert(&writer, "control1".into(), true));
+                panic!("outer scope");
+            });
+        }));
+        assert!(panic.is_err());
+        let ordinary1 = enqueue_insert(&writer, "ordinary1".into(), true);
+        drop(holder);
+        for answer in answers {
+            await_commit(answer);
+        }
+        await_commit(ordinary0);
+        await_commit(ordinary1);
+        assert_eq!(events(&writer), ["control0", "control1", "ordinary0", "ordinary1"]);
+    }
+
+    #[test]
+    fn default_writes_remain_fifo_and_rollback_only_the_failed_savepoint() {
+        let writer = test_writer();
+        let holder = writer.write();
+        let first = enqueue_insert(&writer, "first".into(), true);
+        let failed = enqueue_insert(&writer, "rolled back".into(), false);
+        let last = enqueue_insert(&writer, "last".into(), true);
+        drop(holder);
+        await_commit(first);
+        await_commit(failed);
+        await_commit(last);
+        assert_eq!(events(&writer), ["first", "last"]);
+    }
+
+    #[test]
+    fn control_batched_writes_finish_borrows_and_roll_back_errors_and_panics() {
+        let writer = test_writer();
+        let label = String::from("borrowed");
+        let mut ran = false;
+        let result = with_control_writes(|| writer.batched(|tx| -> rusqlite::Result<()> {
+            tx.execute("INSERT INTO events(label) VALUES (?1)", [&label])?;
+            ran = true;
+            Ok(())
+        }));
+        result.unwrap().unwrap();
+        assert!(ran);
+        let failed = with_control_writes(|| writer.batched(|tx| -> rusqlite::Result<()> {
+            tx.execute("INSERT INTO events(label) VALUES ('error')", [])?;
+            Err(rusqlite::Error::InvalidQuery)
+        }));
+        assert!(matches!(failed, Ok(Err(rusqlite::Error::InvalidQuery))));
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_control_writes(|| writer.batched(|tx| -> rusqlite::Result<()> {
+                tx.execute("INSERT INTO events(label) VALUES ('panic')", [])?;
+                panic!("borrowed job");
+            }))
+        }));
+        assert!(panic.is_err());
+        assert_eq!(events(&writer), ["borrowed"]);
+    }
 
     #[test]
     fn repeated_bursts_of_reads_reuse_connections_instead_of_opening_new_ones() {

@@ -1589,7 +1589,7 @@ fn a_write_queued_during_sealing_runs_before_the_backlog_finishes() {
     let (done, committed) = std::sync::mpsc::sync_channel(1);
     // Queue a real write after SQLite bounds the first chunk, while that writer loan is
     // still held. FIFO order makes the observation deterministic, without sleeping.
-    static QUEUED_WRITE: std::sync::Mutex<Option<(std::sync::mpsc::Sender<WriterJob>, WriterJob)>> =
+    static QUEUED_WRITE: std::sync::Mutex<Option<(smallclaims::sqlite::WriterSender, WriterJob)>> =
         std::sync::Mutex::new(None);
     fn after_chunk_bound(sql: &str, _: std::time::Duration) {
         if (sql.contains("ORDER BY rowid LIMIT")

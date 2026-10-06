@@ -1890,6 +1890,16 @@ impl<R: RuntimeControl> Reconciler<R> {
         let observe_span = crate::profile::span("pass/changes");
         self.incremental.observe(&self.store)?;
         drop(observe_span);
+        // Mission transitions use the reserved writer class and run before bulk host
+        // reconciliation. Mailbox/status traffic must not put first readiness behind
+        // every ordinary write, runtime snapshot, or observer on this host.
+        let daemon = format!("daemon/{}", self.host);
+        self.file_watchers_used
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        self.isolate("stage/missions", &daemon, || self.evaluate_mission_runs());
+        self.release_unused_file_watchers();
         let _runners_span = crate::profile::span("pass/gate-runners");
         for runner in self.gate_runners()? {
             if runner.retired && runner.host == self.host {
@@ -1970,6 +1980,32 @@ impl<R: RuntimeControl> Reconciler<R> {
         }));
 
         let active = desired.iter().collect::<Vec<_>>();
+        // Only launch-needing members reserve admission for their prerequisite
+        // receipts. Routine workspace/render observations remain ordinary writes.
+        let mut launch_members = BTreeSet::new();
+        for subject in &active {
+            if subject.kind == "stop" || self.store.owned_desired_guard(subject).is_err() {
+                continue;
+            }
+            let Some(member) = subject.member.as_ref().filter(|member| member.host == self.host)
+            else {
+                continue;
+            };
+            let observation = if member.terminal {
+                let Some(ptys) = &ptys else { continue };
+                ptys.get(&member.runtime_id).cloned()
+            } else {
+                self.runtime.observe_exec(&member.runtime_id).ok().flatten()
+            };
+            if observation.as_ref().is_none_or(|observed| observed.status != "running")
+                || observation.as_ref().is_some_and(|observed| {
+                    self.declared_launch_changes(subject, member, observed)
+                        .map_or(true, |changes| changes.is_some())
+                })
+            {
+                launch_members.insert(subject.subject.as_str());
+            }
+        }
         let mut member_errors = BTreeMap::new();
         for subject in &active {
             if self.store.owned_desired_guard(subject).is_err() {
@@ -1985,40 +2021,14 @@ impl<R: RuntimeControl> Reconciler<R> {
             else {
                 continue;
             };
-            let workspace = Path::new(&member.workspace);
-            let checkout = (subject.kind == "agent")
-                .then(|| Checkout::from_desired(&subject.desired))
-                .flatten();
-            if workspace.is_dir() {
-                if let Some(checkout) = &checkout
-                    && let Err(error) = checkout.validate_workspace(workspace)
-                {
-                    member_errors.insert(subject.subject.clone(), error);
-                    continue;
-                }
-                if subject.kind == "agent" {
-                    self.observe_agent_workspace(&subject.subject, member)?;
-                }
-                continue;
-            }
-            let result = if let Some(checkout) = checkout {
-                self.create_checkout(&subject.subject, &checkout, workspace)
-                    .and_then(|failure| match failure {
-                        Some(reason) => Err(anyhow::anyhow!(reason)),
-                        None => Ok(()),
-                    })
-            } else if member.workspace_create {
-                fs::create_dir_all(workspace).map_err(anyhow::Error::from)
+            let prepare = || self.prepare_member_workspace(subject, member);
+            let result = if launch_members.contains(subject.subject.as_str()) {
+                smallclaims::sqlite::with_control_writes(prepare)
             } else {
-                Err(anyhow::anyhow!(
-                    "the workspace does not exist and create was not requested"
-                ))
+                prepare()
             };
-            if let Err(error) = result.with_context(|| format!("workspace {}", workspace.display()))
-            {
+            if let Err(error) = result {
                 member_errors.insert(subject.subject.clone(), error);
-            } else if subject.kind == "agent" {
-                self.observe_agent_workspace(&subject.subject, member)?;
             }
         }
         let renderable = active
@@ -2107,7 +2117,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             .collect::<BTreeSet<_>>();
         let mut render_failed = BTreeMap::new();
         for (subject, result) in rendered {
-            let result = result.and_then(|result| {
+            let record = || result.and_then(|result| {
                 let mut applied = BTreeMap::new();
                 // Only an agent has a harness to report a diagnostic on. Another member keeps its
                 // warnings on its render receipt, so a warning never faults it.
@@ -2133,6 +2143,11 @@ impl<R: RuntimeControl> Reconciler<R> {
                 }
                 Ok(())
             });
+            let result = if launch_members.contains(subject.as_str()) {
+                smallclaims::sqlite::with_control_writes(record)
+            } else {
+                record()
+            };
             if let Err(error) = result {
                 render_failed.insert(subject.clone(), format!("{error:#}"));
                 member_errors.insert(subject, error);
@@ -2264,7 +2279,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             let wrote_mark = smallclaims::touched::wrote_len();
             let ((result, due), reads) = smallclaims::touched::record(|| {
                 smallclaims::touched::record_due(|| {
-                    caught(|| -> Result<()> {
+                    smallclaims::sqlite::with_control_writes(|| caught(|| -> Result<()> {
                         // A workspace or render failure blocks only a start or restart. A running member
                         // is still observed, checked, and given its work.
                         let mut blocked = member_errors.remove(&subject.subject);
@@ -2565,7 +2580,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                             }
                         }
                         blocked.map_or(Ok(()), Err)
-                    })
+                    }))
                 })
             });
             crate::performance::record_evaluation(
@@ -2615,10 +2630,8 @@ impl<R: RuntimeControl> Reconciler<R> {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|subject, _| members.contains(&format!("member:{subject}")));
-        // Each later stage runs on its own. A stage that fails records a fault on this daemon and
-        // the stages after it still run, so no intake item can hold back mission evaluation, run
-        // cleanup, or work delivery on this host.
-        let daemon = format!("daemon/{}", self.host);
+        // Each later stage runs on its own. A stage that fails records a fault on this daemon
+        // and the stages after it still run. Intake-created runs advance on the next pass.
         // Intake left by a terminal owner or a superseded generation must not observe, deliver,
         // or start work. A stopped declaration still runs so it can settle its own state.
         let intake = self.isolate("stage/intake", &daemon, || {
@@ -2666,12 +2679,6 @@ impl<R: RuntimeControl> Reconciler<R> {
         self.isolate("stage/github-watches", &daemon, || {
             self.reconcile_github_watches(&desired)
         });
-        self.file_watchers_used
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
-        self.isolate("stage/missions", &daemon, || self.evaluate_mission_runs());
-        self.release_unused_file_watchers();
 
         // Mission state is the primary control-plane projection. Evaluate it before
         // wake-message bookkeeping so a large mailbox or work history cannot starve
@@ -4373,6 +4380,37 @@ impl<R: RuntimeControl> Reconciler<R> {
             timeout,
             observation.as_ref(),
         )?;
+        Ok(())
+    }
+
+    fn prepare_member_workspace(&self, subject: &DesiredSubject, member: &MemberSpec) -> Result<()> {
+        let workspace = Path::new(&member.workspace);
+        let checkout = (subject.kind == "agent")
+            .then(|| Checkout::from_desired(&subject.desired))
+            .flatten();
+        if workspace.is_dir() {
+            if let Some(checkout) = &checkout {
+                checkout.validate_workspace(workspace)?;
+            }
+        } else {
+            let result = if let Some(checkout) = checkout {
+                self.create_checkout(&subject.subject, &checkout, workspace)
+                    .and_then(|failure| match failure {
+                        Some(reason) => Err(anyhow::anyhow!(reason)),
+                        None => Ok(()),
+                    })
+            } else if member.workspace_create {
+                fs::create_dir_all(workspace).map_err(anyhow::Error::from)
+            } else {
+                Err(anyhow::anyhow!(
+                    "the workspace does not exist and create was not requested"
+                ))
+            };
+            result.with_context(|| format!("workspace {}", workspace.display()))?;
+        }
+        if subject.kind == "agent" {
+            self.observe_agent_workspace(&subject.subject, member)?;
+        }
         Ok(())
     }
 
@@ -6557,7 +6595,9 @@ impl<R: RuntimeControl> Reconciler<R> {
     /// Evaluate each active run on its own. A run that fails records a fault on that run, and
     /// every other run, including runs in cleanup, is still evaluated in the same pass.
     fn evaluate_mission_runs(&self) -> Result<()> {
-        self.recording_writes(|| self.evaluate_mission_runs_pass())
+        smallclaims::sqlite::with_control_writes(|| {
+            self.recording_writes(|| self.evaluate_mission_runs_pass())
+        })
     }
 
     fn evaluate_mission_runs_pass(&self) -> Result<()> {
@@ -15247,6 +15287,7 @@ mod tests {
     mod rollout_tests;
     mod ref_watch_tests;
     mod pull_request_run_tests;
+    mod promotion_priority;
     #[test]
     fn native_exec_and_gate_shell_resolve_the_declared_path() {
         use super::{NativeRuntime, RuntimeControl};
