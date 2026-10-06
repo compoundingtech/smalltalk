@@ -1786,6 +1786,8 @@ export type PersonAnswer = typeof PersonAnswer.Type
 export type PersonAnswerEncoded = typeof PersonAnswer.Encoded
 
 export const PersonAnswerRecord = /*#__PURE__*/ (() => Schema.Struct({
+  /** The person whose prior instruction the agent respondent recorded. */
+  "acted_for": optionalKey(Id),
   "answer": optionalKey(PersonAnswer),
   "answered_at_unix_ms": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   "ask": Id,

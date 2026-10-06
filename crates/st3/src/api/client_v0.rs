@@ -8074,6 +8074,7 @@ async fn dispatch_action(
                 State(state.clone()),
                 AxumPath(target),
                 Json(ReviewRequest {
+                    delegation: None,
                     decision: match decision {
                         "review.approve" => "approved",
                         "review.request-changes" => "changes-requested",
@@ -8148,6 +8149,7 @@ async fn dispatch_action(
                 .store
                 .finish_person_step(
                     &PersonStepResponse {
+                        delegation: None,
                         subject: target,
                         actor: authority_actor.clone(),
                         summary: parameter_string(p, "summary")?,
@@ -8256,6 +8258,7 @@ async fn dispatch_action(
                 State(state.clone()),
                 AxumPath(target),
                 Json(MessageLifecycleRequest {
+                    delegation: None,
                     lifecycle: lifecycle.into(),
                     actor: Some(authority_actor.clone()),
                     transport: None,

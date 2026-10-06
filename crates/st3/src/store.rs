@@ -92,12 +92,13 @@ pub use smallclaims::store::{
 };
 
 mod accounts;
+mod adhoc_work;
 mod attention_snapshot;
 mod backup;
 mod checkpoint_rules;
+pub(crate) mod delegation;
 mod limits;
 mod person_work;
-mod adhoc_work;
 mod subagents;
 mod watches;
 pub use checkpoint_rules::{RULES_VERSION, plan_drops, rules_digest};
@@ -19029,6 +19030,12 @@ fn validate_message_transition(
             .map(|_| "sent")
     };
     if requested != "sent" && current == Some(requested) {
+        if input.fields.contains_key("delegation") {
+            return Err(St3Error::new(
+                "delegation-refused",
+                "this message is already closed; only an identical operation may replay",
+            ));
+        }
         return Ok(true);
     }
     if matches!(
@@ -19093,7 +19100,8 @@ fn validate_message_transition(
     let daemon_withdrawal = matches!(current, Some("sent" | "staged"))
         && requested == "closed"
         && input.actor.as_deref() == Some("daemon/runtime");
-    if !valid && !person_read && !daemon_withdrawal {
+    let delegated_close = requested == "closed" && input.fields.contains_key("delegation");
+    if !valid && !person_read && !daemon_withdrawal && !delegated_close {
         return Err(St3Error::new(
             "invalid-message-transition",
             format!(
@@ -19124,8 +19132,21 @@ fn append_claim_tx(
         .map_err(anyhow::Error::new)?;
     st3_schema::glasses::validate_owner(subject, actor).map_err(anyhow::Error::new)?;
     st3_schema::arrangements::validate_actor(subject, actor).map_err(anyhow::Error::new)?;
-    if kind == "owned-set.revised" { owned_sets::validate_receipt(subject, body).map_err(anyhow::Error::new)?; }
+    if kind == "owned-set.revised" {
+        owned_sets::validate_receipt(subject, body).map_err(anyhow::Error::new)?;
+    }
     let fields = schema_fields_for_body(kind, body)?;
+    if kind == "person.delegation-set"
+        || fields.contains_key("delegation")
+        || fields.contains_key("acted_for")
+        || (kind == "work.person-done" && actor.is_some_and(|actor| actor.starts_with("agent/")))
+    {
+        let evidence = serde_json::from_value::<Vec<String>>(
+            body.get("evidence").cloned().unwrap_or_else(|| json!([])),
+        )?;
+        delegation::validate_write(transaction, subject, kind, actor, &fields, &evidence)
+            .map_err(anyhow::Error::new)?;
+    }
     let claim_spec = st3_schema::registry()
         .validate_claim(subject, kind, &fields)
         .map_err(|error| anyhow::anyhow!("{}: {}", error.code, error.message))?;
@@ -20745,7 +20766,10 @@ fn reviewer_answer_sql(result: &str) -> String {
         "{result}.subject=request.subject
          AND {result}.kind='gate.result'
          AND json_extract({result}.body, '$.fields.request')=request.id
-         AND {result}.actor=json_extract(request.body, '$.fields.reviewer')
+         AND ({result}.actor=json_extract(request.body, '$.fields.reviewer')
+              OR ({result}.actor LIKE 'agent/%'
+                  AND json_extract({result}.body, '$.fields.acted_for')=json_extract(request.body, '$.fields.reviewer')
+                  AND json_extract({result}.body, '$.fields.delegation.episode')=request.id))
          AND json_extract({result}.body, '$.fields.verdict') IN ('pass','fail','feedback')"
     )
 }
@@ -40878,6 +40902,7 @@ mission "external-blocker" state="ready" {
             .resolve_attention(
                 &attention.subject,
                 &AttentionResolveRequest {
+                    delegation: None,
                     outcome: "resolved".into(),
                     reason: Some("Xcode first-launch setup now succeeds.".into()),
                     actor: "person/alex".into(),
@@ -47724,6 +47749,7 @@ mission "typecase" state="ready" {
         );
 
         let unknown = AttentionResolveRequest {
+            delegation: None,
             outcome: "resolved".into(),
             reason: None,
             actor: "client/unknown".into(),
@@ -47738,6 +47764,7 @@ mission "typecase" state="ready" {
         );
         // Any agent can close an item routed to a person, and is recorded as the resolver.
         let resolution = AttentionResolveRequest {
+            delegation: None,
             outcome: "dismissed".into(),
             reason: Some("The fault is expected during maintenance.".into()),
             actor: "agent/fabric/other".into(),

@@ -34836,6 +34836,7 @@ mission "ios-proof-blocked" state="ready" {
         store
             .finish_person_step(
                 &crate::model::PersonStepResponse {
+                    delegation: None,
                     subject: ask.subject,
                     actor: "person/alex".into(),
                     summary: "Simulator components repaired.".into(),

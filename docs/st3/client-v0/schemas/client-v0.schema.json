@@ -1920,6 +1920,7 @@
         "status": {"enum": ["completed", "cancelled"]},
         "summary": {"type": "string"},
         "respondent": {"$ref": "#/$defs/Id"},
+        "acted_for": {"$ref": "#/$defs/Id", "description": "The person whose prior instruction the agent respondent recorded."},
         "answered_at_unix_ms": {"type": "integer", "minimum": 0},
         "answer": {"$ref": "#/$defs/PersonAnswer"},
         "evidence": {"type": "array", "items": {"$ref": "#/$defs/Id"}}

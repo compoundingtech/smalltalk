@@ -1230,6 +1230,7 @@ export type PersonAnswerInput = {
 };
 
 export type PersonAnswerRecord = {
+  acted_for?: Id;
   answer?: PersonAnswer;
   answered_at_unix_ms: number;
   ask: Id;

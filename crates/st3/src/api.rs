@@ -553,6 +553,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/claims/by-id/{id}", get(get_claim))
         .route("/v1/reviews", get(list_reviews))
         .route("/v1/reviews/{*subject}", post(post_review))
+        .route("/v1/work/delegation", post(set_delegation_policy))
         .route("/v1/attention", get(list_attention).post(request_attention))
         .route("/v1/attention/resolve/{*subject}", post(resolve_attention))
         .route("/v1/subscription-requests", get(list_subscription_requests))
@@ -5123,6 +5124,7 @@ async fn guard_bound_request(
         "/v1/subscription-requests/",
         "/v1/reviews/",
         "/v1/claims",
+        "/v1/messages/",
         "/v1/schema/registrations",
         "/v1/custom/reply",
         "/v1/diagnostic",
@@ -10295,6 +10297,18 @@ async fn done_person_step(
     Ok(Json(result))
 }
 
+async fn set_delegation_policy(
+    State(state): State<AppState>,
+    Json(request): Json<crate::model::DelegationPolicyRequest>,
+) -> Result<Json<ClaimRecord>, ApiError> {
+    let result = state
+        .store
+        .set_delegation_policy(&request)
+        .map_err(ApiError::bad)?;
+    signal_changed(&state);
+    Ok(Json(result))
+}
+
 async fn cancel_person_ask(
     State(state): State<AppState>,
     Json(request): Json<PersonStepResponse>,
@@ -10344,10 +10358,85 @@ async fn request_attention(
 }
 
 async fn resolve_attention(
-    State(_state): State<AppState>,
-    AxumPath(_subject): AxumPath<String>,
-    Json(_request): Json<AttentionResolveRequest>,
+    State(state): State<AppState>,
+    AxumPath(subject): AxumPath<String>,
+    Json(request): Json<AttentionResolveRequest>,
 ) -> Result<Json<AttentionRequestView>, ApiError> {
+    if let Some(proof) = request.delegation {
+        let subject = if subject.starts_with("attention/") {
+            subject
+        } else {
+            format!("attention/{subject}")
+        };
+        let actor = request.actor.clone();
+        let summary = request.reason.clone().unwrap_or_else(|| "Read".into());
+        if !matches!(request.outcome.as_str(), "resolved" | "dismissed") {
+            return Err(ApiError::bad(St3Error::new(
+                "invalid-attention-outcome",
+                "an attention outcome must be resolved or dismissed",
+            )));
+        }
+        // Resolve the exact original update, including a completed one on an identical retry.
+        // Attention snapshots contain only open cards; they cannot identify closed episodes.
+        let update = state
+            .store
+            .delegated_update_request(&proof)
+            .map_err(ApiError::bad)?;
+        if client_attention_id(&update.subject, &proof.person, &proof.episode)
+            .map_err(ApiError::internal)?
+            != subject
+        {
+            return Err(ApiError::bad(St3Error::new(
+                "delegation-refused",
+                "the attention card does not match the update episode",
+            )));
+        }
+        let card = json!({
+            "episode": proof.episode, "person_id": proof.person,
+            "title": update.body["fields"]["title"], "detail": update.body["fields"]["reason"]
+        });
+        let target = update.subject;
+        let response = state
+            .store
+            .finish_person_step(
+                &PersonStepResponse {
+                    subject: target.clone(),
+                    actor: request.actor,
+                    summary: summary.clone(),
+                    evidence: vec![],
+                    episode: Some(proof.episode.clone()),
+                    delegation: Some(proof),
+                    answer: Some(crate::person_request::AnswerInput {
+                        id: Some("read".into()),
+                        text: None,
+                    }),
+                    idempotency_key: request.idempotency_key,
+                },
+                false,
+            )
+            .map_err(ApiError::bad)?;
+        signal_changed(&state);
+        // Preserve the legacy response shape for callers of this compatibility endpoint.
+        return Ok(Json(AttentionRequestView {
+            subject,
+            request: card["episode"].as_str().unwrap_or_default().into(),
+            reviewer: card["person_id"].as_str().unwrap_or_default().into(),
+            title: card["title"].as_str().unwrap_or_default().into(),
+            reason: card["detail"].as_str().unwrap_or_default().into(),
+            severity: "warning".into(),
+            targets: vec![target],
+            actor,
+            requested_at_unix_ms: response.created_at_unix_ms,
+            status: "resolved".into(),
+            resolved_at_unix_ms: Some(response.updated_at_unix_ms),
+            outcome: Some(request.outcome),
+            resolution_reason: Some(summary),
+            until: None,
+            step: None,
+            step_attempt: None,
+            closed_by: None,
+        }));
+    }
     Err(ApiError::bad(St3Error::new(
         "attention-migrated",
         "attention is a derived view; use work ask/done/cancel-ask or act on its source",
@@ -10553,7 +10642,14 @@ async fn post_review(
             .pointer("/fields/reviewer")
             .and_then(Value::as_str)
             .ok_or_else(|| ApiError::internal("a human review request has no reviewer"))?;
-        if actor.as_deref() != Some(reviewer) {
+        if actor.as_deref() != Some(reviewer)
+            && !request.delegation.as_ref().is_some_and(|proof| {
+                proof.person == reviewer
+                    && actor
+                        .as_deref()
+                        .is_some_and(|actor| actor.starts_with("agent/"))
+            })
+        {
             return Err(ApiError::bad(St3Error::new(
                 "wrong-reviewer",
                 format!("the pending review requires `{reviewer}`"),
@@ -10602,6 +10698,14 @@ async fn post_review(
     if let Some(review_request) = &review_request {
         fields.insert("request".into(), Value::String(review_request.id.clone()));
     }
+    let mut evidence: Vec<String> = review_request
+        .iter()
+        .map(|request| request.id.clone())
+        .collect();
+    if let Some(proof) = &request.delegation {
+        crate::store::delegation::add_fields(&mut fields, proof);
+        state.store.delegation_evidence(&mut evidence, proof).map_err(ApiError::bad)?;
+    }
     let response = state
         .store
         .append_claim(&ClaimInput {
@@ -10612,10 +10716,7 @@ async fn post_review(
             kind: "gate.result".into(),
             actor,
             fields,
-            evidence: review_request
-                .iter()
-                .map(|request| request.id.clone())
-                .collect(),
+            evidence,
             expected_subject: request.expected_subject,
             idempotency_key: None,
         })
@@ -11169,7 +11270,12 @@ async fn post_message_claim(
             ))
         })?;
         let actor = normalize_message_party(&actor);
-        if actor != message.to {
+        if actor != message.to
+            && !request
+                .delegation
+                .as_ref()
+                .is_some_and(|proof| proof.person == message.to && actor.starts_with("agent/"))
+        {
             return Err(ApiError::bad(St3Error::new(
                 "wrong-message-recipient",
                 format!(
@@ -11180,6 +11286,11 @@ async fn post_message_claim(
         }
         let mut fields =
             BTreeMap::from([("status".into(), Value::String(request.lifecycle.clone()))]);
+        let mut evidence = request.evidence;
+        if let Some(proof) = &request.delegation {
+            crate::store::delegation::add_fields(&mut fields, proof);
+            store.delegation_evidence(&mut evidence, proof).map_err(ApiError::bad)?;
+        }
         if kind == "message.staged" {
             fields.insert("recipient".into(), Value::String(actor.clone()));
             if let Some(transport) = request.transport {
@@ -11195,7 +11306,7 @@ async fn post_message_claim(
                 kind: kind.into(),
                 actor: Some(actor),
                 fields,
-                evidence: request.evidence,
+                evidence,
                 expected_subject: request.expected_subject,
                 idempotency_key: Some(request.idempotency_key),
             })
@@ -14176,6 +14287,8 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
             "/v1/agents/resume",
             "/v1/agents/native-session",
             "/v1/work/revision/approve/proposal",
+            "/v1/work/delegation",
+            "/v1/messages/example/claims",
             "/v1/mission-runs/example%2Fdemo%2F1/outcome",
             "/v1/mission-runs/example%2Fdemo%2F1/revision",
             "/v1/missions/example%2Fdemo/retire",
@@ -19046,6 +19159,7 @@ version 2
                     app.clone(),
                     &path,
                     serde_json::to_value(MessageLifecycleRequest {
+                        delegation: None,
                         lifecycle: lifecycle.into(),
                         actor: Some("agent/receiver".into()),
                         transport: Some(transport.into()),
@@ -19172,6 +19286,7 @@ version 2
             app.clone(),
             &path,
             serde_json::to_value(MessageLifecycleRequest {
+                delegation: None,
                 lifecycle: "read".into(),
                 actor: None,
                 transport: None,
@@ -19190,6 +19305,7 @@ version 2
             app.clone(),
             &path,
             serde_json::to_value(MessageLifecycleRequest {
+                delegation: None,
                 lifecycle: "read".into(),
                 actor: Some("person/intruder".into()),
                 transport: None,
@@ -19208,6 +19324,7 @@ version 2
             app.clone(),
             &path,
             serde_json::to_value(MessageLifecycleRequest {
+                delegation: None,
                 lifecycle: "staged".into(),
                 actor: Some("person/receiver".into()),
                 transport: Some("codex-app-server".into()),
@@ -19229,6 +19346,7 @@ version 2
             app.clone(),
             &path,
             serde_json::to_value(MessageLifecycleRequest {
+                delegation: None,
                 lifecycle: "delivered".into(),
                 actor: Some("person/receiver".into()),
                 transport: None,
@@ -21568,6 +21686,7 @@ version 2
 
         let body = |actor: &str| {
             serde_json::to_value(ReviewRequest {
+                delegation: None,
                 decision: "approved".into(),
                 reason: None,
                 actor: Some(actor.into()),
@@ -21599,6 +21718,7 @@ version 2
         assert_eq!(accepted_mission["body"]["fields"]["verdict"], "pass");
 
         let missing_reason = serde_json::to_value(ReviewRequest {
+            delegation: None,
             decision: "rejected".into(),
             reason: None,
             actor: Some("person/alex".into()),
@@ -21615,6 +21735,7 @@ version 2
         assert_eq!(invalid["code"], "missing-review-reason");
 
         let reject = serde_json::to_value(ReviewRequest {
+            delegation: None,
             decision: "rejected".into(),
             reason: Some("the evidence is incomplete".into()),
             actor: Some("person/alex".into()),
@@ -21909,6 +22030,129 @@ agent "seat" { workspace "/tmp"; command "true" }
                     .is_empty()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn delegated_person_work_api_preserves_identity_and_closes_person_message() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let intent = crate::graph::parse_internal_intent(
+            "version 2\nagent \"asker\" { workspace \"/tmp\"; command \"true\" }",
+            state.store.origin(),
+        )
+        .unwrap();
+        state
+            .store
+            .apply_internal(&intent, "delegation-api-agent")
+            .unwrap();
+        let actor = format!("agent/{}.asker", state.store.origin());
+        let app = router(state.clone());
+        for (subject, from, to, content) in [
+            (
+                "message/instruction",
+                "person/avery",
+                actor.as_str(),
+                "Friday; archive the notice; read the update",
+            ),
+            ("message/notice", actor.as_str(), "person/avery", "Notice"),
+        ] {
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "message.sent".into(),
+                    actor: Some(from.into()),
+                    fields: BTreeMap::from([
+                        ("from".into(), json!(from)),
+                        ("to".into(), json!(to)),
+                        ("content".into(), json!(content)),
+                        ("status".into(), json!("sent")),
+                    ]),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: Some(subject.into()),
+                })
+                .unwrap();
+        }
+        let (status,policy)=json_request(app.clone(),"/v1/work/delegation",json!({"person":"person/avery","actor":"person/avery","actions":["answer-ask","close-item","record-go-stop"],"evidence":[state.store.claims_for("message/instruction",Some("message.sent")).unwrap()[0].id],"idempotency_key":"allow"})).await;
+        assert_eq!(status, StatusCode::OK, "{policy}");
+        let (_,ask)=json_request(app.clone(),"/v1/work/ask",json!({"person":"person/avery","title":"Choose a date","reason":"A date","actor":actor,"new_run":"date","idempotency_key":"ask"})).await;
+        let episode = state
+            .store
+            .claims_for(ask["subject"].as_str().unwrap(), Some("work.person-asked"))
+            .unwrap()[0]
+            .id
+            .clone();
+        let proof = json!({"person":"person/avery","policy":policy["id"],"message":"message/instruction","quote":"Friday","episode":episode});
+        let body = json!({"subject":ask["subject"],"actor":actor,"summary":"Friday","episode":episode,"delegation":proof,"evidence":[],"idempotency_key":"answer"});
+        let (status, done) = json_request(app.clone(), "/v1/work/done", body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{done}");
+        let projection = state
+            .store
+            .step_run(ask["subject"].as_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(projection.person_answers[0].respondent, actor);
+        assert_eq!(
+            projection.person_answers[0].acted_for.as_deref(),
+            Some("person/avery")
+        );
+        let (_, again) = json_request(app.clone(), "/v1/work/done", body).await;
+        assert_eq!(again["status"], "completed");
+        let mut close_proof = proof;
+        close_proof["quote"] = json!("archive the notice");
+        close_proof["episode"] = json!(
+            state
+                .store
+                .claims_for("message/notice", Some("message.sent"))
+                .unwrap()[0]
+                .id
+        );
+        let (status,closed)=json_request(app.clone(),"/v1/messages/message%2Fnotice/claims",json!({"lifecycle":"closed","actor":actor,"delegation":close_proof,"evidence":[],"idempotency_key":"close"})).await;
+        assert_eq!(status, StatusCode::OK, "{closed}");
+        assert_eq!(closed["actor"], actor);
+        assert_eq!(closed["body"]["fields"]["acted_for"], "person/avery");
+        assert_eq!(
+            state
+                .store
+                .message("message/notice")
+                .unwrap()
+                .unwrap()
+                .status,
+            "closed"
+        );
+        let (status, update) = json_request(app.clone(), "/v1/work/ask", json!({
+            "person":"person/avery","title":"Release status","reason":"The release is ready","actor":actor,
+            "request":{"version":1,"type":"update","about":"message/instruction"},"idempotency_key":"update"
+        })).await;
+        assert_eq!(status, StatusCode::OK, "{update}");
+        let card = client_attention_resources(&state.store, Some("person/avery"), false)
+            .unwrap()
+            .into_iter()
+            .find(|card| card["source_id"] == update["subject"])
+            .unwrap();
+        let mut read_proof = close_proof;
+        read_proof["quote"] = json!("read the update");
+        read_proof["episode"] = json!(
+            state
+                .store
+                .claims_for(
+                    update["subject"].as_str().unwrap(),
+                    Some("work.person-asked")
+                )
+                .unwrap()[0]
+                .id
+        );
+        let read_body = json!({"outcome":"resolved","actor":actor,"delegation":read_proof,"idempotency_key":"read-update"});
+        let path = format!(
+            "/v1/attention/resolve/{}",
+            urlencoding::encode(card["id"].as_str().unwrap())
+        );
+        let (status, read) = json_request(app.clone(), &path, read_body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{read}");
+        assert_eq!(read["actor"], actor);
+        let (status, repeated) = json_request(app, &path, read_body).await;
+        assert_eq!(status, StatusCode::OK, "{repeated}");
     }
 
     #[tokio::test]

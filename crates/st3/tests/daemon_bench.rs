@@ -1365,6 +1365,7 @@ fn generate(store: &Store, prefix: &str, scale: f64) {
         {
             let _ = store.finish_person_step(
                 &PersonStepResponse {
+                    delegation: None,
                     subject: posted.subject,
                     actor: "person/bench-operator".into(),
                     summary: "The invented decision is made".into(),

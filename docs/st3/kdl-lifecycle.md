@@ -317,8 +317,9 @@ Free mode keeps three things:
   A harness with `ST_AGENT` can mutate only as its own seat. On Linux, the local Unix API also binds
   a connection from a harness process or its descendants to that seat and refuses a different
   actor, including `--as person/NAME`.
-- **Workflow.** Human review gates, lane approvers, steps assigned to a person (only that person
-  completes them with `st work done`), and attention for a person work as before.
+- **Workflow.** Human review gates, lane approvers, steps assigned to a person, and attention
+  keep their workflow fences. A person can enable [bounded delegation](person-delegation.md)
+  so an agent records a prior answer or instruction with `--for`, its own actor, and evidence.
 - **The fleet boundary.** Only members sync, and clients and paired apps keep their pairing.
 
 `mission-authority`, `queue-authority`, `seat-authority`, and `agent-authority` blocks still

@@ -85,6 +85,50 @@ fn resolve_answer(
     Ok((Some(answer), summary))
 }
 
+pub(super) fn validate_delegated_answer(
+    ask: &ClaimRecord,
+    fields: &BTreeMap<String, Value>,
+) -> Result<(), St3Error> {
+    if fields.get("status").and_then(Value::as_str) != Some("completed")
+        || fields
+            .get("summary")
+            .and_then(Value::as_str)
+            .is_none_or(|summary| summary.trim().is_empty())
+    {
+        return Err(St3Error::new(
+            "delegation-refused",
+            "a completion needs completed status and a summary",
+        ));
+    }
+    if let Some(request) = structured_request(ask)? {
+        let submitted = fields.get("answer").ok_or_else(|| {
+            St3Error::new("delegation-refused", "the structured answer is missing")
+        })?;
+        let input = crate::person_request::AnswerInput {
+            id: submitted
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            text: submitted
+                .get("text")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        };
+        if request.answer(Some(&input), fields["summary"].as_str().unwrap())? != *submitted {
+            return Err(St3Error::new(
+                "delegation-refused",
+                "the answer does not match the offered structured answer",
+            ));
+        }
+    } else if fields.contains_key("answer") {
+        return Err(St3Error::new(
+            "delegation-refused",
+            "a free-text ask has no named answer",
+        ));
+    }
+    Ok(())
+}
+
 const STEP_QUERY: &str = "SELECT subject, run_id, step_path, definition_hash, status, attempt,
  assignee, available_to, agentless, title, goals, worker_reported, lease_owner,
  lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms,
@@ -327,7 +371,7 @@ pub(super) fn current(connection: &Connection, ask: &ClaimRecord, as_of: u128) -
     Ok(true)
 }
 
-fn is_update(ask: &ClaimRecord) -> bool {
+pub(super) fn is_update(ask: &ClaimRecord) -> bool {
     ask.body["fields"]["request"]["type"] == "update"
 }
 
@@ -406,6 +450,10 @@ pub(super) fn enrich_responses(
             view.constraints.push(format!("Person response: {summary}"));
         }
         view.person_answers.push(crate::model::PersonAnswerView {
+            acted_for: fields
+                .get("acted_for")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
             ask,
             status: fields["status"].as_str().unwrap_or("completed").into(),
             summary: summary.into(),
@@ -529,7 +577,10 @@ impl Store {
                     let Ok((answer, summary)) = &resolved else {
                         return Err(St3Error::new("idempotency-conflict", "this response key already has another answer"));
                     };
-                    if existing.body["fields"]["summary"] != *summary || existing.body["evidence"] != json!(input.evidence)
+                    let mut response_evidence = input.evidence.clone();
+                    if let Some(proof) = &input.delegation { super::delegation::add_evidence(tx, &mut response_evidence, proof)?; }
+                    if existing.body["fields"]["summary"] != *summary || existing.body["evidence"] != json!(response_evidence)
+                        || existing.body["fields"].get("delegation") != input.delegation.as_ref().map(|proof| serde_json::to_value(proof).expect("serializable proof")).as_ref()
                         || existing.body["fields"]["answer"] != answer.clone().unwrap_or_default()
                         || existing.body["fields"]["attempt"].as_u64() != Some(view.attempt as u64)
                         || input.episode.as_ref().is_some_and(|episode| existing.body["fields"]["episode"] != *episode) {
@@ -541,6 +592,10 @@ impl Store {
             if cancel {
                 if ask.as_ref().and_then(|a| a.actor.as_deref()) != Some(input.actor.as_str()) {
                     return Err(St3Error::new("forbidden", "only the requester can cancel its ask"));
+                }
+            } else if let Some(proof) = &input.delegation {
+                if !input.actor.starts_with("agent/") || view.assigned_to.as_deref() != Some(&proof.person) || input.episode.as_deref() != Some(&proof.episode) {
+                    return Err(St3Error::new("delegation-refused", "delegation needs the assigned person and exact asking episode"));
                 }
             } else if !input.actor.starts_with("person/") || view.assigned_to.as_deref() != Some(input.actor.as_str()) {
                 return Err(St3Error::new("forbidden", "only the assigned person can complete this step"));
@@ -569,6 +624,14 @@ impl Store {
                 "summary": summary, "key": input.idempotency_key, "episode": ask.as_ref().map(|a| a.id.clone()).unwrap_or_else(|| format!("{}:{}:{}", view.generation, view.attempt, view.readiness_epoch))}, "evidence": input.evidence});
             if let Some(answer) = &answer {
                 body["fields"]["answer"] = answer.clone();
+            }
+            if let Some(proof) = &input.delegation {
+                if cancel { return Err(St3Error::new("delegation-refused", "cancelling another agent's ask is outside the delegation list")); }
+                body["fields"]["acted_for"] = json!(proof.person);
+                body["fields"]["delegation"] = json!(proof);
+                let mut response_evidence = input.evidence.clone();
+                super::delegation::add_evidence(tx, &mut response_evidence, proof)?;
+                body["evidence"] = json!(response_evidence);
             }
             let claim = append_claim_tx(tx, &self.origin, &subject, kind, Some(&input.actor), &body, &evidence, None).map_err(claim_append_error)?;
             project(tx, &claim)?;
@@ -783,8 +846,16 @@ fn send_answer_tx(
     };
     let fields = &ask.body["fields"];
     let title = fields["title"].as_str().unwrap_or_default();
-    let person = response.actor.as_deref().unwrap_or("the person");
+    let person = response.body["fields"]["acted_for"]
+        .as_str()
+        .unwrap_or_else(|| response.actor.as_deref().unwrap_or("the person"));
     let mut content = format!("{person} answered `{}`: {title}\n\n", ask.subject);
+    if response.body["fields"].get("acted_for").is_some() {
+        content.push_str(&format!(
+            "Recorded by {} for {person}.\n\n",
+            response.actor.as_deref().unwrap_or("the agent")
+        ));
+    }
     match answer.filter(|answer| answer["id"].is_string()) {
         Some(answer) => {
             content.push_str(&format!(
@@ -916,10 +987,10 @@ pub(super) fn project(tx: &Transaction<'_>, claim: &ClaimRecord) -> Result<bool,
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
-    fn fixture() -> (Store, StepRunView, PersonAskRequest) {
+    pub(in crate::store) fn fixture() -> (Store, StepRunView, PersonAskRequest) {
         let store = Store::open_memory("alder").unwrap();
         let intent = crate::graph::parse_internal_intent(
             r#"version 2
@@ -1053,6 +1124,7 @@ schedule "intake" {
                 );
             }
             let response = PersonStepResponse {
+                delegation: None,
                 subject: ask.subject,
                 actor: "person/avery".into(),
                 summary: "Friday".into(),
@@ -1172,6 +1244,7 @@ schedule "intake" {
                 .is_empty()
         );
         let mut response = PersonStepResponse {
+            delegation: None,
             subject: ask.subject.clone(),
             actor: "person/robin".into(),
             summary: "Friday".into(),
@@ -1335,6 +1408,7 @@ mission "person-work" state="ready" {{
                 .all(|item| item.subject != ask.subject)
         );
         let response = PersonStepResponse {
+            delegation: None,
             subject: ask.subject.clone(),
             actor: "person/avery".into(),
             summary: "Friday".into(),
@@ -1373,6 +1447,7 @@ mission "person-work" state="ready" {{
                 .any(|item| item.subject == ask.subject)
         );
         let response = PersonStepResponse {
+            delegation: None,
             subject: ask.subject.clone(),
             actor: input.actor,
             summary: "No longer needed".into(),
@@ -1445,6 +1520,7 @@ mission "person-work" state="ready" {{
         assert_eq!(request["subjects"][0]["revision"], "abc123");
         assert!(item.actions[0].argv.iter().any(|arg| arg == "--answer"));
         let mut response = PersonStepResponse {
+            delegation: None,
             subject: ask.subject.clone(),
             actor: "person/avery".into(),
             summary: "yes".into(),
@@ -1533,6 +1609,7 @@ mission "person-work" state="ready" {{
         store
             .finish_person_step(
                 &PersonStepResponse {
+                    delegation: None,
                     subject: ask.subject.clone(),
                     actor: "person/avery".into(),
                     summary: String::new(),
@@ -1636,6 +1713,7 @@ mission "person-work" state="ready" {{
         let read = |subject: &str, answer: Option<&str>, text: Option<&str>| {
             store.finish_person_step(
                 &PersonStepResponse {
+                    delegation: None,
                     subject: subject.into(),
                     actor: "person/avery".into(),
                     summary: String::new(),
@@ -1698,6 +1776,7 @@ mission "person-work" state="ready" {{
             .unwrap();
         assert!(item.request.is_none());
         let mut response = PersonStepResponse {
+            delegation: None,
             subject: ask.subject.clone(),
             actor: "person/avery".into(),
             summary: String::new(),
@@ -1751,6 +1830,7 @@ mission "person-work" state="ready" {{
         store
             .finish_person_step(
                 &PersonStepResponse {
+                    delegation: None,
                     subject: ask.subject.clone(),
                     actor: "person/avery".into(),
                     summary: "Lead with the phone.".into(),
@@ -1787,6 +1867,7 @@ mission "person-work" state="ready" {{
         store
             .finish_person_step(
                 &PersonStepResponse {
+                    delegation: None,
                     subject: ask.subject.clone(),
                     actor: "person/avery".into(),
                     summary: "Lead with the phone.".into(),
@@ -1810,7 +1891,7 @@ mission "person-work" state="ready" {{
 
     const TEST_FLEET: &str = "7c9e6679-7425-40de-944b-e07fc1f90ae7";
 
-    fn receive(source: &Store, target: &Store) {
+    pub(in crate::store) fn receive(source: &Store, target: &Store) {
         let exchange = source
             .export_replication_exchange_answering(
                 TEST_FLEET,
@@ -1889,6 +1970,7 @@ agent "alder.asker" { workspace "/tmp"; command "true"; restart always; }
                 source
                     .finish_person_step(
                         &PersonStepResponse {
+                            delegation: None,
                             subject: ask.subject.clone(),
                             actor: if cancel { input.actor } else { input.person },
                             summary: "Release reviewed".into(),
@@ -1951,6 +2033,7 @@ agent "alder.asker" { workspace "/tmp"; command "true"; restart always; }
         source
             .finish_person_step(
                 &PersonStepResponse {
+                    delegation: None,
                     subject: ask.subject.clone(),
                     actor: input.actor,
                     summary: "No longer needed".into(),
@@ -2035,6 +2118,7 @@ mission "writer-load" state="ready" {
         source
             .finish_person_step(
                 &PersonStepResponse {
+                    delegation: None,
                     subject: ask.subject.clone(),
                     actor: input.actor,
                     summary: "No longer needed".into(),
@@ -2151,6 +2235,7 @@ mission "writer-load" state="ready" {
             .unwrap();
         assert_eq!(item.subject, review.subject);
         let mut response = PersonStepResponse {
+            delegation: None,
             subject: review.subject.clone(),
             actor: "person/robin".into(),
             summary: "Reviewed the release".into(),
@@ -2202,6 +2287,7 @@ mission "writer-load" state="ready" {
                     .all(|item| item.subject != ask.subject)
             );
             let response = PersonStepResponse {
+                delegation: None,
                 subject: ask.subject.clone(),
                 actor: "person/avery".into(),
                 summary: "Friday".into(),
@@ -2370,6 +2456,7 @@ mission "writer-load" state="ready" {
                 .all(|item| item.subject != ask.subject)
         );
         let response = PersonStepResponse {
+            delegation: None,
             subject: ask.subject,
             actor: "person/avery".into(),
             summary: "Friday".into(),
