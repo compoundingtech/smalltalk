@@ -145,6 +145,8 @@ enum Fetched {
         target: String,
         session_id: String,
         page: Result<OlderPage, String>,
+        /// How long st took to answer, so a slow st is not asked for more than the person scrolled to.
+        took: Duration,
     },
     Preview(String, Load<MissionPreview>),
     /// The message behind an unread-message item: sender, title and text.
@@ -317,6 +319,7 @@ pub fn run(context: Context) -> Result<()> {
     let mut attached: Option<Following> = None;
     // The runtimes of the agent whose terminal view is open, to follow it again after a pause.
     let mut terminal_runtimes: Option<Vec<String>> = None;
+    let mut terminal_runtimes_by_agent: BTreeMap<String, Vec<String>> = BTreeMap::new();
     // Attaching a dropped terminal again: whether a try is out, and how many failed.
     let mut reattaching = false;
     // When a terminal was asked for, while it connects: the wait is shown, and a long one named.
@@ -569,7 +572,12 @@ pub fn run(context: Context) -> Result<()> {
                     target,
                     session_id,
                     page,
+                    took,
                 } => {
+                    // A slow st is not asked to fill the first screen any further.
+                    if slow_page(took) {
+                        filled.insert(target.clone(), FILL_PAGES);
+                    }
                     if let Some(timeline) = timelines.get_mut(&target) {
                         match page {
                             Ok(page) => timeline.older_page(
@@ -621,9 +629,8 @@ pub fn run(context: Context) -> Result<()> {
                     }
                     let (rows, columns) = ui.terminal_size.get();
                     if let Some(view) = ui
-                        .terminal
-                        .as_mut()
-                        .filter(|view| view.agent == agent && view.native.is_none())
+                        .terminal_view_mut(&agent)
+                        .filter(|view| view.native.is_none())
                     {
                         view.native = Some(super::pty::NativeTerminal::spawn(
                             direct.stream,
@@ -638,9 +645,7 @@ pub fn run(context: Context) -> Result<()> {
                 Fetched::Reattached { agent, outcome } => {
                     reattaching = false;
                     if let Some(native) = ui
-                        .terminal
-                        .as_ref()
-                        .filter(|view| view.agent == agent)
+                        .terminal_view(&agent)
                         .and_then(|view| view.native.as_ref())
                     {
                         match outcome {
@@ -659,11 +664,10 @@ pub fn run(context: Context) -> Result<()> {
                     attach_started = None;
                     if agent.starts_with("terminal/") {
                         // A shell has no other view to fall back to.
-                        if let Some(view) = ui.terminal.as_mut().filter(|view| view.agent == agent)
-                        {
+                        if let Some(view) = ui.terminal_view_mut(&agent) {
                             view.ended = Some(format!("could not attach: {reason}"));
                         }
-                    } else if ui.terminal.as_ref().is_some_and(|view| view.agent == agent) {
+                    } else if ui.terminal_view(&agent).is_some() {
                         ui.flash(format!(
                             "No direct terminal ({reason}); showing st's view of it"
                         ));
@@ -957,6 +961,7 @@ pub fn run(context: Context) -> Result<()> {
                     });
                     attached = None;
                     terminal_runtimes = Some(runtime_ids.clone());
+                    terminal_runtimes_by_agent.insert(agent.clone(), runtime_ids.clone());
                     attach_started = Some(Instant::now());
                     let _ = commands.send(Command::Unfollow);
                     {
@@ -978,6 +983,7 @@ pub fn run(context: Context) -> Result<()> {
                         });
                     }
                     {
+                        ui.park_for(&agent);
                         ui.terminal = Some(super::TerminalView {
                             agent: agent.clone(),
                             title: name.clone(),
@@ -1026,7 +1032,13 @@ pub fn run(context: Context) -> Result<()> {
         // a few pages at most, until about a screenful of rows is there.
         let mut wanted = ui.take_older_wanted();
         let mut names = None;
+        // One page is asked for at a time across every conversation, so opening several at
+        // once is not a burst of reads on a daemon that may already be busy.
+        let reading = timelines.values().any(|timeline| timeline.older.loading);
         for (target, timeline) in &timelines {
+            if reading || !wanted.is_empty() {
+                break;
+            }
             let pages = filled.get(target).copied().unwrap_or(0);
             if !extras.live || !wants_fill(timeline, pages) {
                 continue;
@@ -1063,11 +1075,13 @@ pub fn run(context: Context) -> Result<()> {
             let client = client.clone();
             let tx = fetched_tx.clone();
             runtime.spawn(async move {
+                let started = Instant::now();
                 let page = older_page(&client, &session_id, cursor, oldest).await;
                 let _ = tx.send(Fetched::Older {
                     target,
                     session_id,
                     page,
+                    took: started.elapsed(),
                 });
             });
         }
@@ -1247,17 +1261,26 @@ pub fn run(context: Context) -> Result<()> {
         // after a wait that grows with each try.
         if !reattaching
             && extras.live
-            && let Some(view) = ui.terminal.as_ref()
-            && let Some(native) = view.native.as_ref()
-            && let Some(at) = native.dropped()
-            && at.elapsed() >= Duration::from_secs(2_u64.pow(reattach_tries.min(5)))
+            && let Some((view, native)) = ui
+                .terminal
+                .iter()
+                .chain(ui.parked.iter())
+                .filter_map(|view| view.native.as_ref().map(|native| (view, native)))
+                .find(|(_, native)| {
+                    native.dropped().is_some_and(|at| {
+                        at.elapsed() >= Duration::from_secs(2_u64.pow(reattach_tries.min(5)))
+                    })
+                })
         {
             reattaching = true;
             let client = client.clone();
             let tx = fetched_tx.clone();
             let agent = view.agent.clone();
             let expected = native.incarnation.clone();
-            let runtime_ids = terminal_runtimes.clone().unwrap_or_default();
+            let runtime_ids = terminal_runtimes_by_agent
+                .get(&agent)
+                .cloned()
+                .unwrap_or_default();
             runtime.spawn(async move {
                 let outcome = attach_direct(&client, &agent, &runtime_ids, Some(&expected)).await;
                 let _ = tx.send(Fetched::Reattached { agent, outcome });
@@ -1265,9 +1288,9 @@ pub fn run(context: Context) -> Result<()> {
         }
         if ui
             .terminal
-            .as_ref()
-            .and_then(|view| view.native.as_ref())
-            .is_none()
+            .iter()
+            .chain(ui.parked.iter())
+            .all(|view| view.native.is_none())
         {
             reattach_tries = 0;
         }
@@ -1276,9 +1299,10 @@ pub fn run(context: Context) -> Result<()> {
         let flowing = ui.voice.is_some()
             || ui
                 .terminal
-                .as_ref()
-                .and_then(|view| view.native.as_ref())
-                .is_some_and(|native| native.flowing());
+                .iter()
+                .chain(ui.parked.iter())
+                .filter_map(|view| view.native.as_ref())
+                .any(|native| native.flowing());
         if event::poll(Duration::from_millis(if flowing { 16 } else { 80 }))? {
             // crossterm's read never returns on a closed terminal, so check for one before each.
             while !stopping.load(std::sync::atomic::Ordering::Relaxed) && !crate::stdin_hung_up() {
@@ -1404,6 +1428,13 @@ const FILL_ROWS: usize = 200;
 
 /// The most earlier pages one conversation reads on its own to get there.
 const FILL_PAGES: usize = 7;
+
+/// A page st took this long to give is a sign it is busy: no more pages are read on their own.
+const FILL_SLOW: Duration = Duration::from_millis(1500);
+
+fn slow_page(took: Duration) -> bool {
+    took > FILL_SLOW
+}
 
 /// Whether a conversation may read one more earlier page on its own: there is more before it,
 /// no page is in flight or has just failed, and it has not used up its pages.
@@ -2160,6 +2191,12 @@ async fn send_message(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_slow_page_stops_the_first_screen_reading_on() {
+        assert!(!super::slow_page(Duration::from_millis(400)));
+        assert!(super::slow_page(Duration::from_secs(2)));
+    }
+
     #[test]
     fn a_first_screen_reads_earlier_pages_only_while_it_may() {
         let mut timeline = st3_conversation_ui::Timeline {

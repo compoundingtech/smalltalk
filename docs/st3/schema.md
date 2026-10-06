@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `c391a83d7a01d391e7c5afae57e14ce23d9b9cf8a6c7907eec4d392ac1c0374f`
+Digest: `0ae56dbbffe32b240808b7c64ffaa25b09128f6301e1e99859d6314a7eba76f3`
 
 ## Subject families
 
@@ -122,6 +122,7 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `mission-run.created` | `mission-run` | `system-only` | `once` | `durable` | `ad_hoc_title:string`, `after:subject-reference`, `current_generation:subject-reference`, `deadline_at_unix_ms:integer`, `default_selector:object`, `generation:subject-reference`, `initial_revision:string`, `inputs:object`, `mission:subject-reference`, `mission_spec:object`, `mode:string`, `parent_step_run:subject-reference`, `requester:subject-reference`, `revision:string`, `root_mission_run:subject-reference`, `root_revision:string`, `status:string`, `timeout_ms:integer`, `workspace:string` | `mission-run` |
 | `mission-run.state` | `mission-run` | `system-only` | `state-transition` | `durable` | `completion:string`, `finally:string`, `phase:string`, `previous_phase:string`, `reason:string`, `status:string` | `mission-run`, `completion`, `finally`, `cancellation` |
 | `mission.produced` | `mission`, `step-run` | `capability-holder` | `append` | `durable` | `attempt:integer`, `mission:subject-reference`, `name:string`, `revision:string`, `step_definition:string` | `produces` |
+| `mission.provenance` | `mission` | `system-only` | `once` | `durable` | `mission!:subject-reference(mission)`, `provenance!:object`, `revision!:string` | `provenance` |
 | `mission.published` | `mission` | `authorized-requester` | `append` | `durable` | `body:object`, `revision:string`, `state:string` | `mission` |
 | `observer.observed` | `observer` | `system-only` | `append` | `durable` | `attempt:string`, `changed:boolean`, `changed_fields:array`, `cursor:string`, `locator:string`, `next_check_unix_ms:string`, `observation:subject-reference`, `provider:string`, `resource:subject-reference`, `revision:string`, `status:string` | `observer` |
 | `observer.refresh-requested` | `observer` | `system-only` | `append` | `durable` | `attempt!:string`, `revision!:string` | `refresh` |

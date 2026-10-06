@@ -132,6 +132,7 @@ const fullCtx = {
   getContextUsage: () => ({ tokens: 22500, contextWindow: 4000, percent: 562.5 }),
   sessionManager: {
     getSessionId: () => "session-smoke",
+    getSessionFile: () => path.join(dir, "session-smoke.jsonl"),
     getEntries: () => [{ type: "message" }, { type: "compaction" }],
   },
 };
@@ -162,8 +163,16 @@ const messageEvent = {
 
 for (const ctx of [bareCtx, fullCtx, throwingCtx]) {
   // Two session starts in a row: the second exercises the predecessor close-and-await path.
+  const bindingStart = readFrames().length;
   await handlers.get("session_start")({}, ctx);
   await handlers.get("session_start")({}, ctx);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  for (const type of ["session", "ready"]) {
+    const binding = readFrames().slice(bindingStart).find((frame) => frame.type === type);
+    assert.deepStrictEqual(binding, { type, sessionId: "session-smoke",
+      ...(ctx === fullCtx ? { sessionFile: path.join(dir, "session-smoke.jsonl") } : {}),
+    }, `${type} binds the native transcript when available and tolerates an absent getter`);
+  }
   await handlers.get("tool_approval_requested")({ toolName: "bash" }, ctx);
   await handlers.get("tool_approval_resolved")({ approved: true }, ctx);
   await handlers.get("agent_start")({}, ctx);
@@ -586,6 +595,7 @@ if (process.argv[2]?.includes("st-omp-channel") || process.argv.includes("--todo
     ...bareCtx,
     sessionManager: {
       getSessionId: () => nativeSession,
+      getSessionFile: () => path.join(dir, `${nativeSession}.jsonl`),
       getLeafId: () => branch.at(-1)?.id ?? null,
       getBranch: () => { branchReads++; return branch; },
       // A newer result on a different branch MUST NOT seed this binding.
@@ -670,6 +680,7 @@ if (process.argv[2]?.includes("st-omp-channel") || process.argv.includes("--todo
   const newSessionFrames = readFrames().slice(beforeNewSession);
   assert.strictEqual(newSessionFrames[0].type, "session");
   assert.strictEqual(newSessionFrames[0].sessionId, nativeSession);
+  assert.strictEqual(newSessionFrames[0].sessionFile, path.join(dir, `${nativeSession}.jsonl`));
   assert.strictEqual(todos().at(-1).session, nativeSession);
   assert.deepStrictEqual(todos().at(-1).totals, totals());
   assert.strictEqual(fs.readFileSync(pidPath, "utf8"), pidsBeforeBranch, "branch hydration does not reopen delivery");

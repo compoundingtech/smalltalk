@@ -378,8 +378,10 @@ fn compare_shared(expected: &Store, actual: &Store, phase: &str, mismatches: &mu
     if expected.usage_period_rows(0, 3000).unwrap() != actual.usage_period_rows(0, 3000).unwrap() {
         mismatches.push(format!("{phase}: period usage"));
     }
-    if expected.transport_links().unwrap() != actual.transport_links().unwrap() {
-        mismatches.push(format!("{phase}: replicated transport observations"));
+    for as_of in [2_000_000_000_000_u128, 2_000_000_600_000_u128] {
+        if expected.transport_links_at(as_of).unwrap() != actual.transport_links_at(as_of).unwrap() {
+            mismatches.push(format!("{phase}: replicated transport observations at {as_of}"));
+        }
     }
     let lane = |store: &Store| {
         crate::lane::replay(

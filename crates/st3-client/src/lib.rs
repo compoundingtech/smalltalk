@@ -204,6 +204,38 @@ pub struct ConversationStream {
 pub struct CollectionStream {
     socket: TerminalSocket,
     limit: usize,
+    heard: Heard,
+}
+
+/// When anything last arrived on a stream, a frame or a WebSocket pong alike. A clone of it
+/// outlives borrows of the stream, so a task waiting on the stream can tell how long it has been
+/// quiet without asking st anything.
+#[derive(Clone, Debug)]
+pub struct Heard {
+    since: std::time::Instant,
+    at_ms: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Heard {
+    fn new() -> Self {
+        Self {
+            since: std::time::Instant::now(),
+            at_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+    fn note(&self) {
+        self.at_ms.store(
+            self.since.elapsed().as_millis() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    /// How long nothing has arrived.
+    pub fn quiet_for(&self) -> Duration {
+        let now = self.since.elapsed().as_millis() as u64;
+        Duration::from_millis(
+            now.saturating_sub(self.at_ms.load(std::sync::atomic::Ordering::Relaxed)),
+        )
+    }
 }
 
 impl CollectionStream {
@@ -276,9 +308,14 @@ impl CollectionStream {
         .map_err(|error| ClientError::Transport(error.to_string()))
     }
     pub async fn next(&mut self) -> Result<Option<serde_json::Value>, ClientError> {
+        let heard = self.heard.clone();
         let payload = match &mut self.socket {
-            TerminalSocket::Unix(socket) => next_websocket_payload(socket, self.limit).await?,
-            TerminalSocket::Remote(socket) => next_websocket_payload(socket, self.limit).await?,
+            TerminalSocket::Unix(socket) => {
+                next_websocket_payload_noting(socket, self.limit, &heard).await?
+            }
+            TerminalSocket::Remote(socket) => {
+                next_websocket_payload_noting(socket, self.limit, &heard).await?
+            }
         };
         payload
             .map(|bytes| {
@@ -286,6 +323,19 @@ impl CollectionStream {
                     .map_err(|error| ClientError::Protocol(error.to_string()))
             })
             .transpose()
+    }
+    /// Where the stream last heard anything: a clone to read while the stream is being waited on.
+    pub fn heard(&self) -> Heard {
+        self.heard.clone()
+    }
+    /// A WebSocket ping. st answers it without running a request, so a quiet stream can be told
+    /// from a dead one at the cost of one small frame; the pong counts as [`Heard`].
+    pub async fn ping(&mut self) -> Result<(), ClientError> {
+        match &mut self.socket {
+            TerminalSocket::Unix(socket) => socket.send(WsMessage::Ping(Bytes::new())).await,
+            TerminalSocket::Remote(socket) => socket.send(WsMessage::Ping(Bytes::new())).await,
+        }
+        .map_err(|error| ClientError::Transport(error.to_string()))
     }
     pub async fn close(mut self) {
         let _ = match &mut self.socket {
@@ -2608,9 +2658,12 @@ impl Client {
                 TerminalSocket::Remote(socket)
             }
         };
+        let heard = Heard::new();
+        heard.note();
         Ok(CollectionStream {
             socket,
             limit: self.response_limit(),
+            heard,
         })
     }
 
@@ -3278,6 +3331,37 @@ where
         if bytes.len() > limit {
             return Err(ClientError::Protocol(format!(
                 "terminal WebSocket message exceeds the negotiated {limit}-byte limit"
+            )));
+        }
+        return Ok(Some(bytes));
+    }
+}
+
+/// [`next_websocket_payload`], noting that something was heard on every message, pings and pongs
+/// included.
+async fn next_websocket_payload_noting<S>(
+    websocket: &mut WebSocketStream<S>,
+    limit: usize,
+    heard: &Heard,
+) -> Result<Option<Vec<u8>>, ClientError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    loop {
+        let Some(message) = websocket.next().await else {
+            return Ok(None);
+        };
+        let message = message.map_err(|error| ClientError::Transport(error.to_string()))?;
+        heard.note();
+        let bytes = match message {
+            WsMessage::Text(text) => text.as_bytes().to_vec(),
+            WsMessage::Binary(bytes) => bytes.to_vec(),
+            WsMessage::Close(_) => return Ok(None),
+            WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Frame(_) => continue,
+        };
+        if bytes.len() > limit {
+            return Err(ClientError::Protocol(format!(
+                "WebSocket message exceeds the negotiated {limit}-byte limit"
             )));
         }
         return Ok(Some(bytes));

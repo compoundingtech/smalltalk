@@ -151,6 +151,10 @@ proves the new wrapper incarnation, exact native session, exact generation, and 
 two-way channel handshake; a binding from before the checkpoint remains starting rather than
 becoming a false positive.
 
+The extension includes OMP's `sessionManager.getSessionFile()` path, when available, in
+`session` and `ready` frames (including in-process branch bindings). This binds web and TUI
+transcript reads to the native JSONL file; an absent getter does not prevent channel readiness.
+
 On `pre_compact`, Rust resolves `<agent>/resources/context/now.md` through the canonical context
 API. The blank predicate and atomic replacement execute under the same lock used by every
 `now.md` writer, so an authored write cannot land between them. Only `NotFound` or successfully

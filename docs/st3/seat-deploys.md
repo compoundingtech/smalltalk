@@ -16,6 +16,14 @@ name the failed boundary and the remedy.
 
 The fixture uses loopback endpoints and dummy keys, without real credentials. It needs writable
 temporary/state directories and the installed harness's normal runtime; omp also needs POSIX `sh`.
+The omp fixture supplies a scratch `--session-dir` and a synthetic `ST_AGENT` identity so a
+seat-guarded launcher can validate its normal launch contract without opening a live seat.
+Its loopback model configuration is also present in the scratch HOME's default OMP profile,
+because managed launchers can clear profile environment overrides.
+Failed measurement records include the failed phase, elapsed time, exit versus timeout,
+exit code when available, stderr tail, and error detail; these diagnostics are also logged
+when the probe runs or a failed record is reused. A changed probe implementation has a new
+cache identity, so deploying a repaired probe does not reuse its predecessor's failed record.
 A producer that bootstraps missing packages in its empty scratch cache can fail offline even when
 its normal installation works. A person can explicitly allow the exact installed build, on the
 host and as the operating-system user owning the seats, outside an agent seat:

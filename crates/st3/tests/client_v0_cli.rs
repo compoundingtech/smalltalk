@@ -4252,3 +4252,184 @@ async fn terminal_owner_lookup_finds_a_seat_beyond_the_default_page() {
     );
     server.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provenance_is_visible_in_show_preview_and_revise() {
+    use st3::model::{PlanningCandidateSubmitRequest, PlanningSessionStartRequest};
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("st3.sock");
+    let state = test_state(root.path());
+    let store = state.store.clone();
+    let block = |reason: &str| {
+        format!(
+            r#"provenance {{
+      reason {reason:?}
+      source {{
+        repository "https://example.invalid/orchard/missions"
+        commit "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        path "missions/release.kdl"
+        renderer "orchard-renderer-v1"
+      }}
+      decision "decision/opaque-release-scope"
+      evidence "doc/orchard/proof@opaque-reference"
+    }}"#
+        )
+    };
+    let source = |goal: &str, reason: &str| {
+        format!(
+            "version 2\nmission \"orchard/release\" state=\"ready\" {{ {}\n goal {goal:?}; step \"build\" {{ goal {goal:?}; }} }}",
+            block(reason)
+        )
+    };
+    let first = source("Build.", "First source.");
+    let intent = st3::parse_intent(&first, "client-v0-cli").unwrap();
+    store.apply_internal(&intent, "first-provenance").unwrap();
+    let server_socket = socket.clone();
+    let server =
+        tokio::spawn(
+            async move { st3::api::serve_unix(&server_socket, st3::api::router(state)).await },
+        );
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let unstarted = run_cli(&socket, &["missions", "show", "mission/orchard/release"]).await;
+    assert_eq!(value(&unstarted)["provenance"]["reason"], "First source.");
+    let shown = run_cli_human(&socket, &["missions", "show", "mission/orchard/release"]).await;
+    assert!(
+        String::from_utf8_lossy(&shown.stdout).contains("PROVENANCE"),
+        "{shown:?}"
+    );
+    let run = store
+        .create_mission_run(&MissionRunRequest {
+            mission: "orchard/release".into(),
+            revision: None,
+            workspace: root.path().display().to_string(),
+            requester: Some("person/avery".into()),
+            mode: None,
+            inputs: BTreeMap::new(),
+            idempotency_key: "provenance-run".into(),
+        })
+        .unwrap();
+    let shown = run_cli(&socket, &["missions", "show", &run.subject]).await;
+    assert_eq!(value(&shown)["provenance"]["reason"], "First source.");
+    let shown = run_cli_human(&socket, &["missions", "show", &run.subject]).await;
+    let text = String::from_utf8_lossy(&shown.stdout);
+    for expected in [
+        "PROVENANCE",
+        "First source.",
+        "orchard-renderer-v1",
+        "decision/opaque-release-scope",
+        "doc/orchard/proof@opaque-reference",
+    ] {
+        assert!(text.contains(expected), "{text}");
+    }
+    let revision_file = root.path().join("revision.kdl");
+    std::fs::write(&revision_file, source("Build again.", "Revised source.")).unwrap();
+    let revised = run_cli(
+        &socket,
+        &[
+            "work",
+            "revise",
+            &run.subject,
+            revision_file.to_str().unwrap(),
+            "--as",
+            "person/avery",
+            "--reason",
+            "Use the revised plan.",
+        ],
+    )
+    .await;
+    let revised = value(&revised);
+    assert_eq!(revised["provenance"]["reason"], "Revised source.");
+    let updated = store.mission_run(&run.subject).unwrap().unwrap();
+    assert_ne!(updated.revision, run.revision);
+    assert_eq!(
+        store
+            .mission_provenance("orchard/release", &run.revision)
+            .unwrap()
+            .unwrap()
+            .reason,
+        "First source."
+    );
+    std::fs::write(
+        &revision_file,
+        source("Build a third time.", "Third source."),
+    )
+    .unwrap();
+    let revised = run_cli_human(
+        &socket,
+        &[
+            "work",
+            "revise",
+            &run.subject,
+            revision_file.to_str().unwrap(),
+            "--as",
+            "person/avery",
+            "--reason",
+            "Use the third plan.",
+        ],
+    )
+    .await;
+    assert!(revised.status.success(), "{revised:?}");
+    assert!(
+        String::from_utf8_lossy(&revised.stdout).contains("Third source."),
+        "{revised:?}"
+    );
+
+    // Planner-backed previews use an isolated API only; no harness or live daemon is started.
+    let client = st3::client::Client::unix(socket.clone());
+    let launch: Value = client
+        .post(
+            "/v1/launches",
+            &PlanningSessionStartRequest {
+                mission: "orchard/planned".into(),
+                run: None,
+                request: b"Plan the release.".to_vec(),
+                workspace: root.path().display().to_string(),
+                requester: Some("person/avery".into()),
+                provider: None,
+                model: None,
+                effort: None,
+                idempotency_key: "provenance-launch".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let launch_id = launch["id"].as_str().unwrap();
+    let candidate = source("Prepare the planned release.", "Preview source.")
+        .replace("orchard/release", "orchard/planned");
+    let _: Value = client
+        .post(
+            &format!("/v1/launches/{launch_id}/submit"),
+            &PlanningCandidateSubmitRequest {
+                actor: launch["planner"].as_str().unwrap().into(),
+                markdown: b"# Release plan".to_vec(),
+                kdl: candidate.as_bytes().to_vec(),
+                idempotency_key: "provenance-candidate".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let previewed = run_cli(&socket, &["launch", "preview", launch_id]).await;
+    let previewed = value(&previewed);
+    assert_eq!(
+        previewed["preview"]["mission"]["mission_provenance"]["orchard/planned"]["reason"],
+        "Preview source."
+    );
+    let shown = run_cli_human(&socket, &["launch", "preview", launch_id]).await;
+    let text = String::from_utf8_lossy(&shown.stdout);
+    assert!(
+        text.contains("PROVENANCE") && text.contains("Preview source."),
+        "{text}"
+    );
+    assert!(
+        store
+            .mission_spec("orchard/planned", None)
+            .unwrap()
+            .is_none()
+    );
+    server.abort();
+}

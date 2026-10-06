@@ -77,11 +77,12 @@ pub const HARNESS_CONTEXT_BUCKET_PERCENT: f64 = 1.0;
 /// attention" number, explicitly **not** a prediction of where a harness will compact — that
 /// point is harness-, model-, and setting-specific.
 pub const HARNESS_CONTEXT_WARN_PERCENT: f64 = 80.0;
-/// The maximum interval between writes *while a reading is available* (HC-R09). Equal to
-/// [`crate::harness_state::HARNESS_STATE_REFRESH`] on purpose, so this record never re-stamps more
-/// often than the state record beside it. A producer holding no fresh reading writes nothing and
-/// the record ages visibly instead.
-pub const HARNESS_CONTEXT_HEARTBEAT: Duration = crate::harness_state::HARNESS_STATE_REFRESH;
+/// The maximum interval between writes *while a reading is available* (HC-R09). Numeric context
+/// uses a five-minute heartbeat independently of categorical state freshness: re-stamping an
+/// unchanged reading also produces durable usage and account-limit claims. Bucket, account/reset,
+/// rate-limit and compaction changes still land immediately. A producer holding no fresh reading
+/// writes nothing and the record ages visibly instead.
+pub const HARNESS_CONTEXT_HEARTBEAT: Duration = Duration::from_secs(5 * 60);
 
 /// The record file: `<agent_dir>/harness-context`.
 pub fn harness_context_path(agent_dir: &Path) -> PathBuf {

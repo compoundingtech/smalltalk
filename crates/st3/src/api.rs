@@ -2014,25 +2014,147 @@ fn client_agent_resources(
     at: &str,
     snapshot_index: u64,
 ) -> anyhow::Result<Vec<Value>> {
-    let mut items = store.cached_agent_resources(snapshot_index, history, |changed| {
+    let mut items = client_agent_resources_cached(store, history, snapshot_index)?;
+    overlay_agent_resources(store, &mut items, at)?;
+    Ok(items)
+}
+
+fn client_agent_resources_cached(
+    store: &Store,
+    history: bool,
+    snapshot_index: u64,
+) -> anyhow::Result<Vec<Value>> {
+    store.cached_agent_resources(snapshot_index, history, |changed| {
         let mut items = client_agent_resources_selected(store, history, snapshot_index, changed)?;
-        let subjects = items
-            .iter()
-            .filter_map(|item| item["id"].as_str().map(str::to_owned))
-            .collect::<Vec<_>>();
-        let observations = store.agent_todo_observations_for(&subjects, snapshot_index)?;
-        for item in &mut items {
-            let claims = observations.get(item["id"].as_str().unwrap_or_default());
-            item["todo"] = client_v0::agent_todo_value(
-                claims.and_then(|claims| claims.get("harness.todo.observed")),
-                claims.and_then(|claims| claims.get("harness.session-file")),
-                item["incarnation_id"].as_str(),
-            );
-        }
+        add_agent_todos(store, &mut items, snapshot_index)?;
         Ok(items)
-    })?;
+    })
+}
+
+// Freeze membership, ordering and the inexpensive declaration/queue metadata. The expensive
+// status, usage, fault and activity reductions are needed only for the returned page.
+fn client_agent_page_refs(store: &Store, history: bool, index: u64) -> anyhow::Result<Vec<Value>> {
+    let connection = store.readers.get();
+    let mut subjects = connection
+        .prepare_cached(crate::store::RANGE_SUBJECTS)?
+        .query_map(rusqlite::params![index, "agent/", "agent0"], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if !history {
+        subjects = store.current_view_candidates(&connection, subjects, index, true)?;
+    }
+    let names = subjects.iter().cloned().collect::<Vec<_>>();
+    let desired = store
+        .desired_subjects_named(&names)?
+        .into_iter()
+        .map(|desired| (desired.subject.clone(), desired))
+        .collect::<BTreeMap<_, _>>();
+    let queues = store.agent_work_queues()?;
+    let steps = queues
+        .values()
+        .flat_map(|queue| {
+            queue
+                .current_work_ids
+                .iter()
+                .chain(queue.next_work_id.iter())
+                .chain(queue.upcoming_work_ids.iter())
+                .cloned()
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let labels = store.step_labels(&steps)?;
+    let label = |id: &String| {
+        labels.get(id).map(|step| json!({
+        "id":id, "mission_id":step.mission, "mission_run_id":step.run,
+        "path":step.path, "title":step.title, "goal":step.goal,
+        "state":client_work_state(&step.status), "since":client_timestamp(step.updated_at_unix_ms),
+    }))
+    };
+    let mut refs = subjects.into_iter().map(|id| {
+        let declaration = desired.get(&id);
+        let name = crate::model::effective_agent_name(&id, declaration.map(|d| &d.desired));
+        let queue = queues.get(&id).cloned().unwrap_or_default();
+        json!({
+            "id":id, "name":name,
+            "host_id":declaration.and_then(|d| d.member.as_ref()).map(|m| client_host_id(&m.host)),
+            "current_work_ids":queue.current_work_ids, "active_work_count":queue.active_work_count,
+            "next_work_id":queue.next_work_id, "upcoming_work_ids":queue.upcoming_work_ids,
+            "queued_work_count":queue.queued_work_count,
+            "current_work":queue.current_work_ids.iter().filter_map(label).collect::<Vec<_>>(),
+            "next_work":queue.next_work_id.as_ref().and_then(label),
+            "upcoming_work":queue.upcoming_work_ids.iter().filter_map(label).collect::<Vec<_>>(),
+        })
+    }).collect::<Vec<_>>();
+    refs.sort_by(|a, b| {
+        a["name"]
+            .as_str()
+            .cmp(&b["name"].as_str())
+            .then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
+    });
+    Ok(refs)
+}
+
+fn client_agent_cards_for_page(
+    store: &Store,
+    history: bool,
+    index: u64,
+    refs: &[Value],
+    at: &str,
+) -> Result<Vec<Value>, ApiError> {
+    let selected = refs
+        .iter()
+        .filter_map(|r| r["id"].as_str().map(str::to_owned))
+        .collect::<BTreeSet<_>>();
+    let mut cards = client_agent_resources_selected(store, history, index, Some((&selected, refs)))
+        .map_err(ApiError::internal)?;
+    if cards.len() != refs.len() {
+        return Err(client_page_expired(
+            "agent page membership is no longer available; restart pagination",
+        ));
+    }
+    let mut ordered = Vec::with_capacity(refs.len());
+    for reference in refs {
+        let position = cards
+            .iter()
+            .position(|card| card["id"] == reference["id"])
+            .ok_or_else(|| {
+                client_page_expired(
+                    "agent page membership is no longer available; restart pagination",
+                )
+            })?;
+        let mut card = cards.swap_remove(position);
+        // The original cut's ordering and host metadata must survive later declaration changes.
+        card["name"] = reference["name"].clone();
+        card["host_id"] = reference["host_id"].clone();
+        ordered.push(card);
+    }
+    add_agent_todos(store, &mut ordered, index).map_err(ApiError::internal)?;
+    overlay_agent_resources(store, &mut ordered, at).map_err(ApiError::internal)?;
+    Ok(ordered)
+}
+
+fn add_agent_todos(store: &Store, items: &mut [Value], index: u64) -> anyhow::Result<()> {
+    let subjects = items
+        .iter()
+        .filter_map(|item| item["id"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    let observations = store.agent_todo_observations_for(&subjects, index)?;
+    for item in items {
+        let claims = observations.get(item["id"].as_str().unwrap_or_default());
+        item["todo"] = client_v0::agent_todo_value(
+            claims.and_then(|claims| claims.get("harness.todo.observed")),
+            claims.and_then(|claims| claims.get("harness.session-file")),
+            item["incarnation_id"].as_str(),
+        );
+    }
+    Ok(())
+}
+
+fn overlay_agent_resources(store: &Store, items: &mut [Value], at: &str) -> anyhow::Result<()> {
     let local_host = client_host_id(store.origin());
-    for item in &mut items {
+    for item in items.iter_mut() {
         if item.get("updated_at").and_then(Value::as_str) == Some("") {
             item["updated_at"] = Value::String(at.to_owned());
         }
@@ -2042,12 +2164,17 @@ fn client_agent_resources(
             .remove("_status_source")
             .unwrap_or(Value::Null);
         let harness: Option<crate::model::CurrentHarnessView> = serde_json::from_value(source)?;
-        let observation = store.seat_observation_at(
-            item["id"].as_str().unwrap_or_default(),
-            harness.as_ref(),
-            snapshot_index,
-            client_now_ms(),
-        )?;
+        // Freshness is approximate presentation. Use the card's already reduced observation;
+        // querying diagnostic and local-observation history here made every read grow with it.
+        let observation = match harness {
+            None => "missing",
+            Some(harness)
+                if client_now_ms().saturating_sub(harness.observed_at_unix_ms) > 90_000 =>
+            {
+                "stale"
+            }
+            Some(_) => "current",
+        };
         item["observation"] = json!(observation);
         if observation == "stale" && item["harness_state"] == "idle" {
             item["harness_state"] = json!("indeterminate");
@@ -2057,8 +2184,8 @@ fn client_agent_resources(
         }
         overlay_delivery_presence(item, &local_host);
     }
-    overlay_subagents(store, &mut items)?;
-    Ok(items)
+    overlay_subagents(store, items)?;
+    Ok(())
 }
 
 /// A seat's latest suspend or resume as client-v0 shows it.
@@ -3494,6 +3621,9 @@ fn client_launch_variant_resources(
                     .get(&session.mission)
                     .ok_or_else(|| anyhow::anyhow!("preview mission is missing"))?;
                 let mut normalized = serde_json::to_value(mission)?;
+                if let Some(provenance) = preview.mission.mission_provenance.get(&session.mission) {
+                    normalized["provenance"] = serde_json::to_value(provenance)?;
+                }
                 client_safe_json(&mut normalized);
                 let diagnostics = client_launch_diagnostics(preview);
                 let compact_preview =
@@ -3857,25 +3987,53 @@ async fn client_agents(
 ) -> Result<ClientPageResponse, ApiError> {
     let history = query.history;
     let status = query.status.clone();
-    client_snapshot_page(
+    let page = client_snapshot_page(
         &state,
         snapshot,
         "agents",
         &query,
         move |state, snapshot| {
-            let mut items = client_agent_resources(
-                &state.store,
-                history,
-                &snapshot.created_at,
-                snapshot.store_index,
-            )?;
+            let mut items = if status.is_some() {
+                client_agent_resources(
+                    &state.store,
+                    history,
+                    &snapshot.created_at,
+                    snapshot.store_index,
+                )?
+            } else {
+                client_agent_page_refs(&state.store, history, snapshot.store_index)?
+            };
             if let Some(status) = status.as_deref() {
                 items.retain(|item| item.get("state").and_then(Value::as_str) == Some(status));
             }
             Ok(items)
         },
     )
-    .await
+    .await?;
+    if query.status.is_some() {
+        return Ok(page);
+    }
+    // Name/id ordering is independent of the live overlays. Only the returned page needs them.
+    let store = state.store.clone();
+    blocking_store(move || {
+        let (Extension(snapshot), Json(mut page)) = page;
+        let items = store.read_snapshot(|_| {
+            Ok(store.with_owned_set_snapshot_reads(|| {
+                client_agent_cards_for_page(
+                    &store,
+                    history,
+                    snapshot.store_index,
+                    &page.items,
+                    &snapshot.created_at,
+                )
+            }))
+        })?;
+        Ok(items.map(|items| {
+            page.items = items;
+            (Extension(snapshot), Json(page))
+        }))
+    })
+    .await?
 }
 
 async fn client_agents_detail(
@@ -3888,8 +4046,18 @@ async fn client_agents_detail(
     let history = query.history;
     let created_at = snapshot.created_at.clone();
     let snapshot_index = snapshot.store_index;
+    let subject = client_detail_id("agent", &id);
     let items = blocking_store(move || {
-        client_agent_resources(&store, history, &created_at, snapshot_index)
+        let selected = BTreeSet::from([subject]);
+        let mut items = client_agent_resources_selected(
+            &store,
+            history,
+            snapshot_index,
+            Some((&selected, &[])),
+        )?;
+        add_agent_todos(&store, &mut items, snapshot_index)?;
+        overlay_agent_resources(&store, &mut items, &created_at)?;
+        Ok(items)
     })
     .await?;
     client_detail(items, "agent", &id)
@@ -3947,7 +4115,7 @@ async fn client_sessions_detail(
                 let relay = state
                     .client_relay
                     .as_ref()
-                    .ok_or_else(|| remote_unavailable(&remote_host))?;
+                    .ok_or_else(|| remote_unavailable_for_owner(&state, &remote_host))?;
                 if !client_v0::acting_party(&session) {
                     return Err(ApiError::bad(St3Error::new(
                         "forbidden",
@@ -4002,7 +4170,7 @@ async fn forward_client_read(
     let relay = state
         .client_relay
         .as_ref()
-        .ok_or_else(|| remote_unavailable(&target))?;
+        .ok_or_else(|| remote_unavailable_for_owner(&state, &target))?;
     relay.forward(&request).await.map(Json).map_err(|error| {
         match error.downcast_ref::<crate::peer::ClientReadRejected>() {
             Some(rejected) => ApiError {
@@ -4011,7 +4179,7 @@ async fn forward_client_read(
                 message: rejected.message.clone(),
                 details: Box::new(rejected.details.clone()),
             },
-            None => remote_unavailable(&target),
+            None => remote_unavailable_for_owner(&state, &target),
         }
     })
 }
@@ -4029,6 +4197,29 @@ fn remote_unavailable(host: &str) -> ApiError {
             "no route to owner {host}: this node cannot dial it and no peer reaches it; cached data remains usable"
         ),
         details: Box::new(details),
+    }
+}
+
+/// A known dial-out owner syncs outward but has no inbound owner transport.
+fn remote_unavailable_for_owner(state: &AppState, host: &str) -> ApiError {
+    let dial_out = if let Some(relay) = &state.client_relay {
+        relay.is_dial_out_owner(host)
+    } else {
+        host.strip_prefix("host/").is_some_and(|name| {
+            state.store.fleet_view_sealed().is_ok_and(|view| {
+                view.members.iter().any(|member| {
+                    member.name == name && member.state == "current" && member.mode == "dial-out"
+                })
+            })
+        })
+    };
+    if dial_out {
+        remote_read_error(
+            host,
+            crate::peer::ClientReadRejected::dial_out_owner(host).into(),
+        )
+    } else {
+        remote_unavailable(host)
     }
 }
 
@@ -4240,7 +4431,7 @@ async fn relayed_messages_page(
         .client_relay
         .as_ref()
         .filter(|relay| relay.reaches(owner))
-        .ok_or_else(|| remote_unavailable(owner))?;
+        .ok_or_else(|| remote_unavailable_for_owner(state, owner))?;
     let value = relay
         .read(
             owner,
@@ -7826,9 +8017,16 @@ async fn preview_planning_variant(
     let kdl = planning_document_text(&state, &candidate.kdl)?;
     let (intent, mission_response) = mission_source(&state, &kdl, None)?;
     let mission = &intent.missions[&session.mission];
-    let graph = render_planning_graph(mission);
+    let mut graph = render_planning_graph(mission);
+    if let Some(provenance) = mission_response.mission_provenance.get(&session.mission) {
+        graph.push('\n');
+        graph.push_str(&crate::provenance::render(provenance));
+    }
     let diff = render_planning_diff(&mission_response);
     let mut normalized = serde_json::to_value(mission).map_err(ApiError::internal)?;
+    if let Some(provenance) = mission_response.mission_provenance.get(&session.mission) {
+        normalized["provenance"] = serde_json::to_value(provenance).map_err(ApiError::internal)?;
+    }
     client_safe_json(&mut normalized);
     let diagnostics = launch_diagnostics(&mission_response.blockers, &mission_response.warnings);
     let hash = launch_preview_token_values(
@@ -7985,6 +8183,10 @@ async fn propose_planning_variant(
     let result =
         if reviewers.is_empty() && matches!(old.revision_cutover, RevisionCutover::RestartActive) {
             RevisionSubmissionView {
+                provenance: state
+                    .store
+                    .mission_provenance(&session.mission, &mission.revision)
+                    .map_err(ApiError::internal)?,
                 status: "applied".into(),
                 mission_run: state
                     .store
@@ -8010,6 +8212,10 @@ async fn propose_planning_variant(
                 )
                 .map_err(ApiError::bad)?;
             RevisionSubmissionView {
+                provenance: state
+                    .store
+                    .mission_provenance(&session.mission, &mission.revision)
+                    .map_err(ApiError::internal)?,
                 status: proposal.status.clone(),
                 mission_run: state
                     .store
@@ -9806,14 +10012,24 @@ async fn apply(
 async fn get_mission(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
-) -> Result<Json<crate::model::MissionSpec>, ApiError> {
+) -> Result<Json<Value>, ApiError> {
     let id = id.strip_prefix("mission/").unwrap_or(&id).to_owned();
     let store = state.store.clone();
     let id_for_read = id.clone();
-    blocking_store(move || store.mission_spec(&id_for_read, None))
-        .await?
-        .map(Json)
-        .ok_or_else(|| ApiError::not_found(format!("mission `mission/{id}` does not exist")))
+    blocking_store(move || {
+        let Some(mission) = store.mission_spec(&id_for_read, None)? else {
+            return Ok(None);
+        };
+        let provenance = store.mission_provenance(&id_for_read, &mission.revision)?;
+        let mut value = serde_json::to_value(mission)?;
+        if let Some(provenance) = provenance {
+            value["provenance"] = serde_json::to_value(provenance)?;
+        }
+        Ok(Some(value))
+    })
+    .await?
+    .map(Json)
+    .ok_or_else(|| ApiError::not_found(format!("mission `mission/{id}` does not exist")))
 }
 
 async fn put_document(
@@ -12097,7 +12313,7 @@ async fn revise_mission_run(
         .map_err(ApiError::bad)?;
     // A failed run has no active work to drain, so it adopts an unreviewed revision now.
     let reopening = current.status == "failed" && current.phase == "terminal";
-    let revised = if reviewers.is_empty()
+    let mut revised = if reviewers.is_empty()
         && (reopening || matches!(old.revision_cutover, RevisionCutover::RestartActive))
     {
         let mission_run = state
@@ -12111,6 +12327,7 @@ async fn revise_mission_run(
             )
             .map_err(ApiError::bad)?;
         RevisionSubmissionView {
+            provenance: None,
             status: "applied".into(),
             mission_run,
             proposal: None,
@@ -12127,6 +12344,7 @@ async fn revise_mission_run(
             )
             .map_err(ApiError::bad)?;
         RevisionSubmissionView {
+            provenance: None,
             status: proposal.status.clone(),
             mission_run: state
                 .store
@@ -12136,6 +12354,10 @@ async fn revise_mission_run(
             proposal: Some(proposal),
         }
     };
+    revised.provenance = state
+        .store
+        .mission_provenance(mission_id, &replacement.revision)
+        .map_err(ApiError::internal)?;
     signal_changed(&state);
     Ok(Json(revised))
 }
@@ -12151,6 +12373,10 @@ fn cached_revision_submission(
         .map_err(ApiError::internal)?
     {
         return Ok(Some(RevisionSubmissionView {
+            provenance: state
+                .store
+                .mission_provenance(&mission_run.mission, &mission_run.revision)
+                .map_err(ApiError::internal)?,
             status: "applied".into(),
             mission_run,
             proposal: None,
@@ -12174,6 +12400,10 @@ fn cached_revision_submission(
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::internal("the proposal mission run is unavailable"))?;
     Ok(Some(RevisionSubmissionView {
+        provenance: state
+            .store
+            .mission_provenance(&mission_run.mission, &proposal.candidate_revision)
+            .map_err(ApiError::internal)?,
         status: proposal.status.clone(),
         mission_run,
         proposal: Some(proposal),
@@ -13808,7 +14038,7 @@ async fn host_agent_workspace(
         .client_relay
         .as_ref()
         .filter(|relay| relay.reaches(&host_id))
-        .ok_or_else(|| remote_unavailable(&host_id))?;
+        .ok_or_else(|| remote_unavailable_for_owner(&state, &host_id))?;
     let value = relay
         .read(
             &host_id,
@@ -14858,6 +15088,166 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         held.join().unwrap();
         read.join().unwrap();
         assert!(result.unwrap().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn agent_detail_does_not_materialize_unrelated_cached_cards() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let source = "version 2\nagent \"amber\" { command \"true\" }\nagent \"cobalt\" { command \"true\" }\n";
+        let intent = crate::graph::parse_test_intent(source, "node").unwrap();
+        let plan = state
+            .store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(&intent, &plan.subject_tokens, "point-card")
+            .unwrap();
+        let snapshot = new_client_snapshot(&state);
+        // An unrelated cached card cannot be decoded as a harness. A point read must not touch it.
+        state
+            .store
+            .cached_agent_resources(snapshot.store_index, false, |_| {
+                Ok(vec![
+                    json!({"id":"agent/node.cobalt", "_status_source":true}),
+                ])
+            })
+            .unwrap();
+        let Json(card) = client_agents_detail(
+            State(state),
+            Extension(snapshot),
+            AxumPath("node.amber".into()),
+            Query(ClientListQuery::default()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(card["id"], "agent/node.amber");
+        assert_eq!(card["name"], "node.amber");
+        assert!(card.get("todo").is_some());
+        assert!(card.get("_status_source").is_none());
+    }
+
+    #[tokio::test]
+    async fn agent_page_overlays_only_returned_cards_and_retains_continuation() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let source = "version 2\nagent \"amber\" { command \"true\" }\nagent \"cobalt\" { command \"true\" }\nagent \"indigo\" { command \"true\" }\n";
+        let intent = crate::graph::parse_test_intent(source, "node").unwrap();
+        let plan = state
+            .store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(&intent, &plan.subject_tokens, "page-cards")
+            .unwrap();
+        let snapshot = new_client_snapshot(&state);
+        let oracle = client_agent_resources(
+            &state.store,
+            false,
+            &snapshot.created_at,
+            snapshot.store_index,
+        )
+        .unwrap();
+        let (_, Json(first)) = client_agents(
+            State(state.clone()),
+            Extension(snapshot.clone()),
+            Query(ClientListQuery {
+                limit: Some(1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.items, oracle[..1]);
+        assert!(first.page.has_more);
+        // A later runtime observation must not enter the second card's original cut.
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: "agent/node.cobalt".into(),
+                kind: "runtime.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("status".into(), json!("running")),
+                    ("runtime_id".into(), json!("node.cobalt")),
+                    ("incarnation_id".into(), json!("cobalt-new")),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let (_, Json(second)) = client_agents(
+            State(state),
+            Extension(snapshot),
+            Query(ClientListQuery {
+                limit: Some(1),
+                cursor: first.page.next_cursor,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.items, oracle[1..2]);
+        assert!(second.page.has_more);
+    }
+
+    #[test]
+    fn agent_page_constructs_only_its_selected_subject_and_matches_full_projection() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let source = format!(
+            "version 2\n{}",
+            (0..16)
+                .map(|n| format!("agent \"card-{n:02}\" {{ command \"true\" }}\n"))
+                .collect::<String>()
+        );
+        let intent = crate::graph::parse_test_intent(&source, "node").unwrap();
+        let plan = state
+            .store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.clone(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(&intent, &plan.subject_tokens, "page-reduction-work")
+            .unwrap();
+        let index = state.store.index().unwrap();
+        let oracle = client_agent_resources(&state.store, false, "cut", index).unwrap();
+        state.store.forget_current_views();
+        crate::store::SUBJECT_REDUCTIONS.with(|count| count.set(0));
+        let refs = client_agent_page_refs(&state.store, false, index).unwrap();
+        assert_eq!(refs.len(), 16);
+        assert_eq!(
+            crate::store::SUBJECT_REDUCTIONS.with(std::cell::Cell::get),
+            0
+        );
+        let cards =
+            client_agent_cards_for_page(&state.store, false, index, &refs[..1], "cut").unwrap();
+        assert_eq!(
+            crate::store::SUBJECT_REDUCTIONS.with(std::cell::Cell::get),
+            1
+        );
+        assert_eq!(cards, oracle[..1]);
     }
 
     #[test]

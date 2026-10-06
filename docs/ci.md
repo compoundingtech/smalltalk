@@ -117,6 +117,13 @@ The messaging fault matrix runs as eleven independent `messaging_faults::*` test
 Each case keeps its own evidence directory under `target/messaging-faults/`. The fixture uses
 a systemd user runtime only when its bus exists, so runners without a user manager use the
 existing detached process path instead of trying to create scopes through a synthetic runtime.
+Recovery cases include `recovery_timing` in the result printed by a failed test: partition
+restoration, the observed current channel and its incarnation, the first peer exchange request,
+staging acceptance, native consumption, and read acceptance. Staging precedes writing the
+native frame and does not prove an accepted offer. These timestamps and offsets use
+the recovery restoration time, independently of the later fresh send. `recovered-trace.json`
+retains the recovered message's graph claims. A peer request proves transport activity, not
+the recipient's local message arrival; channel readiness records an observation, not its first transition.
 
 `.config/nextest.toml` gives the messaging fault matrix and the fleet reconnect test, both with
 real multi-minute outages, first priority so their retries fit the CI test window. Failed tests

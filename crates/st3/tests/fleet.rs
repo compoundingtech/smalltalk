@@ -4023,3 +4023,97 @@ async fn terminal_owner_filters_are_safe_across_mixed_builds() {
     assert_eq!(response["value"]["filters"], serde_json::json!({}));
     assert_eq!(response["value"]["page"]["limit"], 50);
 }
+
+/// This narrower compatibility boundary needs a build that already knows today's mission
+/// format, but predates mission.provenance. The ancient fleet baseline is a different contract.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs ST3_PROVENANCE_COMPAT_BIN: a pre-provenance build with the current mission format"]
+async fn an_older_daemon_runs_a_provenance_revision_and_reads_its_sidecar_after_upgrade() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let old = PathBuf::from(
+        std::env::var("ST3_PROVENANCE_COMPAT_BIN").expect("pre-provenance st3 binary"),
+    );
+    let root = tempfile::tempdir().unwrap();
+    let current = anchor(root.path(), "current").await;
+    let mut older = joined(root.path(), &current, "older", &[]).await;
+    older.stop();
+    older.binary = old;
+    older.start().await;
+    let file = current.root.join("provenance.kdl");
+    fs::write(
+        &file,
+        r#"version 2
+mission "orchard/release" state="ready" {
+  provenance {
+    reason "Approved release source."
+    source {
+      repository "https://example.invalid/orchard/missions"
+      commit "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      path "missions/release.kdl"
+      renderer "orchard-renderer-v1"
+    }
+    decision "decision/opaque-approved-scope"
+    evidence "doc/orchard/proof@opaque-reference"
+  }
+  goal "Prepare the release."
+  step "prepare" { goal "Prepare the release." }
+}
+"#,
+    )
+    .unwrap();
+    current.st_ok(&[
+        "apply",
+        file.to_str().unwrap(),
+        "--no-gate-check",
+        "--as",
+        PERSON,
+    ]);
+    let path = "/v1/missions/orchard%2Frelease";
+    wait_until(
+        "older daemon projects the provenance-bearing revision",
+        60,
+        || async { older.client().get::<Value>(path).await.is_ok() },
+    )
+    .await;
+    let plain: Value = older.client().get(path).await.unwrap();
+    let with: Value = current.client().get(path).await.unwrap();
+    assert_eq!(plain["revision"], with["revision"]);
+    assert!(
+        plain.get("provenance").is_none(),
+        "the binary must predate provenance: {plain}"
+    );
+    assert_eq!(with["provenance"]["reason"], "Approved release source.");
+    let started = older.st_json(&[
+        "missions",
+        "start",
+        "orchard/release",
+        "--id",
+        "orchard/older-run",
+        "--as",
+        PERSON,
+    ]);
+    let run = &started["mission_run"];
+    assert_eq!(run["revision"], plain["revision"]);
+    assert!(!run["steps"].as_array().unwrap().is_empty());
+    let status = older.st_json(&["replication", "status"]);
+    assert_eq!(status["invalid_records"], 0, "{status}");
+    assert!(
+        status["waiting_claims"].as_u64().unwrap_or(0) >= 1,
+        "{status}"
+    );
+    older.stop();
+    older.binary = PathBuf::from(ST3);
+    older.start().await;
+    wait_until("upgraded daemon reads the retained sidecar", 60, || async {
+        older
+            .client()
+            .get::<Value>(path)
+            .await
+            .is_ok_and(|mission| mission["provenance"]["reason"] == "Approved release source.")
+    })
+    .await;
+    let shown = older.st_json(&["missions", "show", run["subject"].as_str().unwrap()]);
+    assert_eq!(shown["provenance"]["reason"], "Approved release source.");
+}
