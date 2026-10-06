@@ -4069,6 +4069,12 @@ fn read_codex_config_approval(
         .pointer("/result/origins/approval_policy/name/type")
         .and_then(Value::as_str)
         .map(str::to_owned);
+    if policy.is_some() {
+        anyhow::ensure!(
+            origin.is_some(),
+            "Codex config/read response has a policy without its origin"
+        );
+    }
     Ok((policy, origin))
 }
 

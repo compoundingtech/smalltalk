@@ -6878,6 +6878,7 @@ fn config_read_uses_the_selected_cwd_and_reports_provider_policy_origin() {
         (Some("on-request"), Some("project")),
         (Some("never"), Some("system")),
         (Some("on-request"), Some("managed")),
+        (Some("on-request"), None),
     ] {
         let temp = tempfile::tempdir().unwrap();
         let socket = temp.path().join("server.sock");
@@ -6923,9 +6924,14 @@ fn config_read_uses_the_selected_cwd_and_reports_provider_policy_origin() {
         });
         let stream = UnixStream::connect(&socket).unwrap();
         let mut websocket = initialize_control(stream).unwrap().unwrap();
-        let found = read_codex_config_approval(&mut websocket, &cwd).unwrap();
-        assert_eq!(found.0.as_deref(), policy);
-        assert_eq!(found.1.as_deref(), origin);
+        let found = read_codex_config_approval(&mut websocket, &cwd);
+        if policy.is_some() && origin.is_none() {
+            assert!(found.unwrap_err().to_string().contains("without its origin"));
+        } else {
+            let found = found.unwrap();
+            assert_eq!(found.0.as_deref(), policy);
+            assert_eq!(found.1.as_deref(), origin);
+        }
         server.join().unwrap();
     }
 }
