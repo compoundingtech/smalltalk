@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useFocusEffect } from '@react-navigation/native';
 import { plainError, type ClientConnections } from '../../../clients/typescript/st3-client';
 import { ActionSheetIOS, Alert, ScrollView, View } from 'react-native';
@@ -134,6 +134,9 @@ export function PairScreen() {
   const { url, urlDraft, setUrlDraft, pairDraft, busy, actions } = useStore();
   const [id, setId] = useState(pairDraft?.id ?? ''), [code, setCode] = useState(pairDraft?.code ?? '');
   const [fingerprint, setFingerprint] = useState(''), [unpinned, setUnpinned] = useState(false);
+  useEffect(() => {
+    if (pairDraft) { setId(pairDraft.id); setCode(pairDraft.code); setFingerprint(''); setUnpinned(false); }
+  }, [pairDraft]);
   const submit = () => void actions.pair(id, code, fingerprint, unpinned).then(done => { if (done) { setId(''); setCode(''); setFingerprint(''); } });
   return <Screen>
     <Banners />

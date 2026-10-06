@@ -12,8 +12,8 @@ public class StDeviceKeyModule: Module {
     Name("StDeviceKey")
 
     // The key this phone has, or null: {key: "p256:…", storage}.
-    AsyncFunction("current") { () -> [String: String]? in
-      try DeviceKey.load().map { $0.described }
+    AsyncFunction("current") { (handle: String?) -> [String: String]? in
+      try DeviceKey.load(handle: handle).map { $0.described }
     }
 
     // A new key, replacing any earlier one: each pairing enrolls its own key.
