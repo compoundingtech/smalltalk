@@ -5506,26 +5506,9 @@ impl Store {
                 )
                 .optional()?
                 .is_none();
-            let mut statement = connection.prepare(
-                "WITH retry_ids AS (
-                     SELECT writer, sequence, envelope_hash FROM replica_envelopes
-                     WHERE receipt_state='pending'
-                     UNION
-                     SELECT writer, sequence, envelope_hash FROM replica_records
-                     WHERE state='unknown'
-                        OR (state='invalid' AND error_code='invalid-replicated-claim'
-                            AND error_message LIKE '%violates unknown-claim-field:%')
-                        OR (?1 AND state='invalid' AND error_code='claim-hash-mismatch')
-                 )
-                 SELECT envelopes.writer, envelopes.sequence, envelopes.envelope_hash,
-                        envelopes.previous_hash, envelopes.accepted_at_unix_ms, envelopes.payload
-                 FROM retry_ids JOIN replica_envelopes AS envelopes
-                   ON envelopes.writer=retry_ids.writer AND envelopes.sequence=retry_ids.sequence
-                  AND envelopes.envelope_hash=retry_ids.envelope_hash
-                 ORDER BY envelopes.writer, envelopes.sequence, envelopes.envelope_hash",
-            )?;
+            let mut statement = connection.prepare(&admission_retry_query(retry_hash_mismatches))?;
             let envelopes = statement
-                .query_map([retry_hash_mismatches], |row| {
+                .query_map([], |row| {
                     Ok(ReplicaEnvelope {
                         writer: row.get(0)?,
                         sequence: row.get(1)?,
@@ -5541,7 +5524,12 @@ impl Store {
             (retry_hash_mismatches, envelopes)
         };
         let mut outcome = ReplicationAdmission::default();
-        let mut membership = fleet_membership_tx(&self.connection.write())?;
+        // Membership is a few hundred statements on the writer; with nothing to admit, skip it.
+        let mut membership = if envelopes.is_empty() {
+            Default::default()
+        } else {
+            fleet_membership_tx(&self.connection.write())?
+        };
         let mut pending = envelopes;
         // Admitting one envelope can admit a membership claim that decides another envelope,
         // so held envelopes get another pass whenever membership changes.
@@ -6796,6 +6784,41 @@ pub fn normalize_actor(value: &str, default_kind: &str) -> String {
     } else {
         format!("{default_kind}/{value}")
     }
+}
+
+/// The envelopes admission looks at again: pending ones, and records that wait for a newer build
+/// or failed for a reason a newer build may fix. One index seek per branch. A single
+/// `WHERE state='unknown' OR (state='invalid' ...)` made SQLite scan every replica record, and the
+/// join then scanned every envelope: seconds on the writer, on every receive, with nothing
+/// pending. The hash-mismatch branch exists only until its one-time retry has run.
+pub fn admission_retry_query(retry_hash_mismatches: bool) -> String {
+    let hash_mismatches = if retry_hash_mismatches {
+        "UNION
+             SELECT writer, sequence, envelope_hash FROM replica_records
+             WHERE state='invalid' AND error_code='claim-hash-mismatch'"
+    } else {
+        ""
+    };
+    format!(
+        "WITH retry_ids AS (
+             SELECT writer, sequence, envelope_hash FROM replica_envelopes
+             WHERE receipt_state='pending'
+             UNION
+             SELECT writer, sequence, envelope_hash FROM replica_records
+             WHERE state='unknown'
+             UNION
+             SELECT writer, sequence, envelope_hash FROM replica_records
+             WHERE state='invalid' AND error_code='invalid-replicated-claim'
+               AND error_message LIKE '%violates unknown-claim-field:%'
+             {hash_mismatches}
+         )
+         SELECT envelopes.writer, envelopes.sequence, envelopes.envelope_hash,
+                envelopes.previous_hash, envelopes.accepted_at_unix_ms, envelopes.payload
+         FROM retry_ids CROSS JOIN replica_envelopes AS envelopes
+           ON envelopes.writer=retry_ids.writer AND envelopes.sequence=retry_ids.sequence
+          AND envelopes.envelope_hash=retry_ids.envelope_hash
+         ORDER BY envelopes.writer, envelopes.sequence, envelopes.envelope_hash"
+    )
 }
 
 /// Subject `?1`'s newest claim of kind `?2` in canonical order. See [`Store::latest_claim`].

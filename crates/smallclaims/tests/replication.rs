@@ -159,3 +159,32 @@ fn a_documents_bytes_and_binding_replicate_by_content() {
         Some(b"# Plan\n".as_slice())
     );
 }
+
+/// Admission looks for envelopes to retry on every receive. With nothing pending that must be a
+/// handful of index seeks: scanning the replica records and envelopes held the only writer for
+/// seconds on a store of 660,000 records.
+#[test]
+fn the_admission_retry_query_seeks_by_index_and_never_scans_a_replica_table() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("claims.sqlite3");
+    drop(Store::open(&path, "ada-laptop", Arc::new(Plain)).unwrap());
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    for retry_hash_mismatches in [false, true] {
+        let sql = format!(
+            "EXPLAIN QUERY PLAN {}",
+            smallclaims::store::admission_retry_query(retry_hash_mismatches)
+        );
+        let mut statement = connection.prepare(&sql).unwrap();
+        let plan = statement
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for line in &plan {
+            assert!(
+                !line.starts_with("SCAN replica_") && !line.starts_with("SCAN envelopes"),
+                "the retry query scans a replica table: {plan:#?}"
+            );
+        }
+    }
+}
