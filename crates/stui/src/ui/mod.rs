@@ -100,6 +100,8 @@ struct FrameInfo {
     agent_narrow: bool,
     /// The first palette row drawn.
     palette_top: usize,
+    /// Glasses: where the right-click menu was drawn, while it is open.
+    menu: Option<Rect>,
 }
 
 struct Demo {
@@ -337,6 +339,8 @@ pub struct Ui {
     pub(crate) simple: bool,
     /// An attached terminal shown in place of the conversation.
     pub(crate) terminal: Option<TerminalView>,
+    /// Glasses: the right-click menu, while it is open.
+    pub(crate) context: Option<glass::ContextMenu>,
     /// A Ctrl-C or Ctrl-D pressed once in a terminal, waiting for its confirming second press.
     terminal_confirm: Option<(KeyCode, Instant)>,
     /// The New mission form: title, request, mission id, workspace; and the focused field.
@@ -448,6 +452,7 @@ impl Ui {
             older_wanted: RefCell::default(),
             popover: None,
             chat: None,
+            context: None,
             said: None,
             voice: None,
             answering: None,
@@ -875,6 +880,41 @@ impl Ui {
     }
 
     /// Attach the image on this machine's clipboard to the message being written.
+    /// The top bar's connection word, clicked: live opens this machine, where its clients and
+    /// links show; anything else says why it is not reached (Nathan, 2026-10-06).
+    fn show_connection(&mut self) {
+        match self.world.link.clone() {
+            Link::Live => {
+                let machine = format!("machine/{}", self.world.host);
+                let known = self
+                    .world
+                    .machines
+                    .items()
+                    .iter()
+                    .any(|candidate| format!("machine/{}", candidate.name) == machine);
+                if !self.world.diverged.is_empty() {
+                    self.flash(format!(
+                        "Diverged from {}: what shows here can be wrong until that host is repaired",
+                        self.world.diverged.join(", ")
+                    ));
+                }
+                if known {
+                    self.open(&machine);
+                } else if self.world.diverged.is_empty() {
+                    self.flash(format!(
+                        "Connected to {} as {}",
+                        self.world.host, self.world.person
+                    ));
+                }
+            }
+            Link::Connecting => self.flash(format!(
+                "Connecting to {}: st has not answered yet",
+                self.world.host
+            )),
+            Link::Offline(reason) => self.flash(reason),
+        }
+    }
+
     fn attach_clipboard(&mut self) {
         let Some(key) = self.draft_key() else { return };
         // kitty hands over the person's own clipboard through the terminal, wherever stui
@@ -4477,7 +4517,23 @@ impl Ui {
             }
             return;
         }
+        // The right-click menu takes the next press: a row acts, anywhere else only closes it.
+        if self.context.is_some() && matches!(mouse.kind, MouseEventKind::Down(_)) {
+            let inside = self
+                .frame
+                .borrow()
+                .menu
+                .is_some_and(|rect| contains(rect, mouse.column, mouse.row));
+            if !inside || !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                self.context = None;
+                return;
+            }
+        }
         if self.terminal_mouse(mouse) {
+            return;
+        }
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) && self.glasses.is_some() {
+            self.open_context_menu(mouse.column, mouse.row);
             return;
         }
         // A tab dragged to another place or a split's edge.
@@ -4729,6 +4785,8 @@ impl Ui {
                 self.open_from_sidebar();
             }
             Hit::Usage => self.toggle_usage(),
+            Hit::Connection => self.show_connection(),
+            Hit::Menu(action) => self.run_menu_action(action),
             Hit::SidebarSection(section) => {
                 if let Some(glasses) = self.glasses.as_mut() {
                     glasses.sidebar.section = section;

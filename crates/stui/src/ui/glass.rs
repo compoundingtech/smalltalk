@@ -98,6 +98,27 @@ enum Drop {
     },
 }
 
+/// What a row of the right-click menu does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MenuAction {
+    CloseTab(usize, usize),
+    SplitTab { group: usize, tab: usize, right: bool },
+    MoveTab { group: usize, tab: usize, to: usize },
+    CopyPath(String),
+    SplitGroup { group: usize, right: bool },
+    NewTab(usize),
+    NewTerminal(usize),
+}
+
+/// A menu opened by a right click, at the place of the click.
+#[derive(Clone, Debug)]
+pub(crate) struct ContextMenu {
+    column: u16,
+    row: u16,
+    title: String,
+    items: Vec<(String, MenuAction)>,
+}
+
 /// The old stui's Usage tab, which now floats over the glass as Now does.
 const USAGE_TAB: usize = 4;
 /// The sidebar's sections, by the tab whose list each shows. Now and Usage are not ones: they
@@ -534,6 +555,33 @@ struct Choice {
     action: Action,
 }
 
+/// The graph path a row stands for, without its kind: `example/atlas/builder` for an agent.
+fn choice_path(action: &Action) -> Option<String> {
+    match action {
+        Action::Open(Pane::Agent(Some(id)) | Pane::Terminal(id)) => {
+            Some(id.trim_start_matches("agent/").to_owned())
+        }
+        Action::Open(Pane::Mission(Some(id))) => Some(id.trim_start_matches("mission/").to_owned()),
+        _ => None,
+    }
+}
+
+/// `query` against `text`, or, when it holds several words, every word against it: "atlas builder"
+/// finds `agent/example/atlas/builder`, which no one-run match reaches across the slashes.
+fn fuzzy_words(query: &str, text: &str) -> Option<i64> {
+    if let Some(score) = fuzzy(query, text) {
+        return Some(score);
+    }
+    let words = query.split_whitespace().collect::<Vec<_>>();
+    if words.len() < 2 {
+        return None;
+    }
+    words
+        .iter()
+        .map(|word| fuzzy(word, text))
+        .sum::<Option<i64>>()
+}
+
 /// How well `query` matches `text`: higher is better, `None` is no match. A query matches as a
 /// substring, or letter by letter where each letter either follows the last one or starts a
 /// word ("ab" finds "Atlas Builder"); letters scattered inside words do not match.
@@ -920,7 +968,7 @@ impl Ui {
                 let score = if choice.search.is_empty() {
                     Some(0)
                 } else {
-                    fuzzy(&palette.query, &choice.search)
+                    fuzzy_words(&palette.query, &choice.search)
                 };
                 score.map(|score| (choice, score))
             })
@@ -931,10 +979,14 @@ impl Ui {
             // "close glass" closes the glass rather than starting an agent named that.
             // What is typed exactly as a choice begins ("new mission", "atlas") is first.
             let typed = palette.query.trim().to_lowercase();
+            // A command typed as it begins ("new mission") is first. Among what can be opened,
+            // agents come first, then missions, whatever a mission's title starts with
+            // (Nathan, 2026-10-06); within a section, what begins as typed comes first.
             scored.sort_by_key(|(choice, score)| {
                 let catch_all = matches!(choice.action, Action::NewAgent(Some(_)));
                 let named = choice.label.to_lowercase().starts_with(&typed);
-                (catch_all, !named, RANK[choice.section], -score)
+                let command = named && choice.section > 3;
+                (catch_all, !command, RANK[choice.section], !named, -score)
             });
         }
         scored.into_iter().map(|(choice, _)| choice).collect()
@@ -1025,6 +1077,7 @@ impl Ui {
         if let Some(palette) = &glasses.palette {
             self.draw_palette(buf, area, palette);
         }
+        self.draw_context_menu(buf, area);
         self.draw_drag(buf);
     }
 
@@ -1851,17 +1904,25 @@ impl Ui {
     fn status_line(&self, buf: &mut Buffer, area: Rect, glass: &Glass) {
         buf.set_style(area, Style::default().bg(theme::CRUST));
         let bar = |style: Style| style.bg(theme::CRUST);
-        let mut spans = vec![Span::styled(" ≡ st  ", bar(theme::strong(theme::ACCENT)))];
+        // No label at the left: the bar starts at what is live (Nathan, 2026-10-06).
+        let mut spans = vec![Span::styled(" ", bar(theme::strong(theme::ACCENT)))];
         let (glyph, word, color) = match &self.world.link {
             Link::Live if !self.world.diverged.is_empty() => ("⚠", "diverged", theme::RED),
             Link::Live => ("●", "live", theme::GREEN),
             Link::Connecting => (self.spinner(), "connecting", theme::YELLOW),
             Link::Offline(_) => ("○", "offline", theme::RED),
         };
-        spans.push(Span::styled(
-            format!("{glyph} {word}"),
-            bar(theme::fg(color)),
-        ));
+        let link_text = format!("{glyph} {word}");
+        // The connection opens what is known of it: this machine, or why it is not reached.
+        self.hit(
+            Rect {
+                x: area.x + Line::from(spans.clone()).width() as u16,
+                width: text::width(&link_text) as u16,
+                ..area
+            },
+            Hit::Connection,
+        );
+        spans.push(Span::styled(link_text, bar(theme::fg(color))));
         // Now opens over the glass from its count, "need you" (Nathan, 2026-10-04: one way in,
         // named as `st now` is).
         let need = self
@@ -2242,7 +2303,14 @@ impl Ui {
             };
             let detail_width = text::width(&choice.detail).min(inner / 3);
             let label = text::truncate(&choice.label, inner.saturating_sub(detail_width + 6));
-            let fill = inner.saturating_sub(text::width(&label) + detail_width + 4);
+            // The whole path after the name, so two agents with one name are told apart and
+            // what was typed against the path is seen to match (Nathan, 2026-10-06).
+            let room = inner.saturating_sub(text::width(&label) + detail_width + 6);
+            let path = choice_path(&choice.action)
+                .filter(|path| room > 6 && !path.eq_ignore_ascii_case(&choice.label))
+                .map(|path| format!("  {}", text::truncate(&path, room - 2)))
+                .unwrap_or_default();
+            let fill = inner.saturating_sub(text::width(&label) + text::width(&path) + detail_width + 4);
             rows.push((
                 Some(index),
                 Line::from(vec![
@@ -2255,6 +2323,7 @@ impl Ui {
                         theme::fg(choice.glyph.1).bg(bg),
                     ),
                     Span::styled(label, theme::text().bg(bg)),
+                    Span::styled(path, theme::dim().bg(bg)),
                     Span::styled(" ".repeat(fill), Style::default().bg(bg)),
                     Span::styled(
                         text::truncate(&choice.detail, detail_width),
@@ -2315,6 +2384,13 @@ impl Ui {
         // Esc lets a dragged tab go back where it was.
         if key.code == KeyCode::Esc && self.cancel_drag() {
             return true;
+        }
+        // Esc closes the right-click menu; it is the only key the menu takes.
+        if self.context.is_some() {
+            self.context = None;
+            if key.code == KeyCode::Esc {
+                return true;
+            }
         }
         let terminal_focused = self.terminal_focused();
         let mission_form = self.mission_form_focused();
@@ -3195,6 +3271,187 @@ impl Ui {
 
     /// Close the focused group's shown tab; an empty group other than the first goes with it.
     /// Home stays.
+    /// Open the right-click menu for what is under the pointer: a tab, or a split's strip or
+    /// non-terminal body (a terminal body keeps the click for its program).
+    pub(crate) fn open_context_menu(&mut self, column: u16, row: u16) {
+        let Some(glasses) = self.glasses.as_ref() else {
+            return;
+        };
+        if glasses.palette.is_some() {
+            return;
+        }
+        let glass = glasses.glass();
+        let groups = glass.layout.groups();
+        let tab_under = {
+            let info = self.frame.borrow();
+            info.hits.iter().rev().find_map(|(rect, hit)| match hit {
+                Hit::GlassTab(group, tab) if contains(*rect, column, row) => Some((*group, *tab)),
+                _ => None,
+            })
+        };
+        let menu = if let Some((group, tab)) = tab_under {
+            let Some(pane) = groups
+                .get(group)
+                .and_then(|members| members.tabs.get(tab.saturating_sub(offset(group))))
+                .map(|tab| tab.pane.clone())
+            else {
+                return;
+            };
+            let subject = pane.split_once(':').map(|(_, subject)| subject.to_owned()).filter(|s| !s.is_empty());
+            let mut items = vec![("Close tab".to_owned(), MenuAction::CloseTab(group, tab))];
+            if groups.get(group).is_some_and(|group| group.tabs.len() > 1) {
+                items.push(("Split right with this tab".into(), MenuAction::SplitTab { group, tab, right: true }));
+                items.push(("Split below with this tab".into(), MenuAction::SplitTab { group, tab, right: false }));
+            }
+            if groups.len() > 1 {
+                let to = (group + 1) % groups.len();
+                items.push((
+                    format!("Move to split {}", to + 1),
+                    MenuAction::MoveTab { group, tab, to },
+                ));
+            }
+            if let Some(subject) = subject {
+                items.push(("Copy its path".into(), MenuAction::CopyPath(subject.clone())));
+            }
+            ContextMenu {
+                column,
+                row,
+                title: "tab".into(),
+                items,
+            }
+        } else {
+            let leaf = {
+                let info = self.frame.borrow();
+                info.glass_leaves.iter().position(|rect| {
+                    contains(
+                        Rect {
+                            y: rect.y.saturating_sub(1),
+                            height: rect.height + 1,
+                            ..*rect
+                        },
+                        column,
+                        row,
+                    )
+                })
+            };
+            let Some(group) = leaf else { return };
+            let strip = self
+                .frame
+                .borrow()
+                .glass_leaves
+                .get(group)
+                .is_some_and(|rect| row + 1 == rect.y);
+            let on_terminal = groups
+                .get(group)
+                .and_then(|members| members.tabs.get(members.current.saturating_sub(offset(group))))
+                .is_some_and(|tab| matches!(Pane::parse(&tab.pane), Some(Pane::Terminal(_))));
+            if on_terminal && !strip {
+                return;
+            }
+            ContextMenu {
+                column,
+                row,
+                title: "split".into(),
+                items: vec![
+                    ("Split right".into(), MenuAction::SplitGroup { group, right: true }),
+                    ("Split below".into(), MenuAction::SplitGroup { group, right: false }),
+                    ("New tab…".into(), MenuAction::NewTab(group)),
+                    ("New terminal".into(), MenuAction::NewTerminal(group)),
+                ],
+            }
+        };
+        self.context = Some(menu);
+    }
+
+    /// The right-click menu, drawn at the click and kept inside the glass; each row is a target.
+    fn draw_context_menu(&self, buf: &mut Buffer, area: Rect) {
+        let Some(menu) = &self.context else { return };
+        let width = menu
+            .items
+            .iter()
+            .map(|(label, _)| text::width(label))
+            .chain([text::width(&menu.title)])
+            .max()
+            .unwrap_or(8) as u16
+            + 4;
+        let height = menu.items.len() as u16 + 1;
+        let x = menu.column.min((area.x + area.width).saturating_sub(width));
+        let y = (menu.row + 1).min((area.y + area.height).saturating_sub(height));
+        let rect = Rect {
+            x,
+            y,
+            width: width.min(area.width),
+            height: height.min(area.height),
+        };
+        self.frame.borrow_mut().menu = Some(rect);
+        buf.set_style(rect, Style::default().bg(theme::MANTLE));
+        buf.set_stringn(
+            rect.x + 1,
+            rect.y,
+            &menu.title,
+            rect.width.saturating_sub(2) as usize,
+            theme::dim().bg(theme::MANTLE),
+        );
+        for (index, (label, action)) in menu.items.iter().enumerate() {
+            let line = Rect {
+                y: rect.y + 1 + index as u16,
+                height: 1,
+                ..rect
+            };
+            buf.set_stringn(
+                line.x + 2,
+                line.y,
+                label,
+                line.width.saturating_sub(3) as usize,
+                theme::text().bg(theme::MANTLE),
+            );
+            self.hit(line, Hit::Menu(action.clone()));
+        }
+    }
+
+    /// A row of the right-click menu was chosen.
+    pub(crate) fn run_menu_action(&mut self, action: MenuAction) {
+        self.context = None;
+        match action {
+            MenuAction::CloseTab(group, tab) => {
+                self.show_in(group, tab);
+                self.close_tab();
+            }
+            MenuAction::SplitTab { group, tab, right } => self.drop_tab(
+                (group, tab),
+                Drop::Edge {
+                    group,
+                    side: if right { Side::Right } else { Side::Below },
+                    first: false,
+                },
+            ),
+            MenuAction::MoveTab { group, tab, to } => {
+                let end = self
+                    .glasses
+                    .as_ref()
+                    .and_then(|glasses| glasses.glass().layout.groups().get(to).map(|group| group.tabs.len()))
+                    .unwrap_or(0);
+                self.drop_tab((group, tab), Drop::Strip { group: to, index: end });
+            }
+            MenuAction::CopyPath(path) => {
+                copy(&path);
+                self.flash(format!("Copied {path}"));
+            }
+            MenuAction::SplitGroup { group, right } => {
+                self.focus_group(group);
+                self.split(right);
+            }
+            MenuAction::NewTab(group) => {
+                self.focus_group(group);
+                self.open_palette(None, Open::Tab);
+            }
+            MenuAction::NewTerminal(group) => {
+                self.focus_group(group);
+                self.open_new_terminal();
+            }
+        }
+    }
+
     fn close_tab(&mut self) {
         let Some(glasses) = self.glasses.as_mut() else {
             return;
@@ -5141,6 +5398,112 @@ mod tests {
         assert_eq!((tabs(&ui).0, ui.tab), (0, 1));
     }
 
+    fn mouse(ui: &mut Ui, kind: MouseEventKind, column: u16, row: u16) {
+        ui.mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+
+    #[test]
+    fn a_right_click_on_a_tab_offers_its_actions_and_a_split_offers_a_new_split() {
+        let mut ui = glass();
+        ui.open_in_glass(
+            Pane::Agent(Some("agent/example/atlas/builder".into())),
+            Open::Tab,
+        );
+        ui.open_in_glass(
+            Pane::Mission(Some("mission/fleet/release/weekly".into())),
+            Open::Tab,
+        );
+        screen(&ui);
+        let (group, tab, rect) = {
+            let info = ui.frame.borrow();
+            info.hits
+                .iter()
+                .find_map(|(rect, hit)| match hit {
+                    Hit::GlassTab(group, tab) if *tab == 0 => Some((*group, *tab, *rect)),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_eq!(group, 0);
+        let before = tabs(&ui).2[0].len();
+        mouse(&mut ui, MouseEventKind::Down(MouseButton::Right), rect.x, rect.y);
+        assert!(ui.context.is_some());
+        let shown = screen(&ui);
+        assert!(shown.contains("Close tab") && shown.contains("Copy its path"), "{shown}");
+        // A click elsewhere only closes the menu.
+        mouse(&mut ui, MouseEventKind::Down(MouseButton::Left), 1, 20);
+        assert!(ui.context.is_none());
+        assert_eq!(tabs(&ui).2[0].len(), before);
+        // A row acts: Close tab.
+        mouse(&mut ui, MouseEventKind::Down(MouseButton::Right), rect.x, rect.y);
+        screen(&ui);
+        let close = {
+            let info = ui.frame.borrow();
+            info.hits
+                .iter()
+                .find_map(|(rect, hit)| {
+                    (*hit == Hit::Menu(MenuAction::CloseTab(group, tab))).then_some(*rect)
+                })
+                .unwrap()
+        };
+        mouse(&mut ui, MouseEventKind::Down(MouseButton::Left), close.x + 2, close.y);
+        assert!(ui.context.is_none());
+        assert_eq!(tabs(&ui).2[0].len(), before - 1);
+        // The empty end of a strip offers a new split.
+        screen(&ui);
+        let leaf = ui.frame.borrow().glass_leaves[0];
+        mouse(
+            &mut ui,
+            MouseEventKind::Down(MouseButton::Right),
+            leaf.x + leaf.width - 2,
+            leaf.y - 1,
+        );
+        let shown = screen(&ui);
+        assert!(shown.contains("Split right") && shown.contains("New terminal"), "{shown}");
+        ui.run_menu_action(MenuAction::SplitGroup { group: 0, right: true });
+        assert_eq!(tabs(&ui).2.len(), 2, "a second split exists");
+    }
+
+    #[test]
+    fn the_connection_word_is_clickable_and_says_what_is_known() {
+        let mut ui = glass();
+        ui.world.link = Link::Offline("Last connected at 10:02 · reconnecting · r retry now".into());
+        screen(&ui);
+        let rect = {
+            let info = ui.frame.borrow();
+            info.hits
+                .iter()
+                .find_map(|(rect, hit)| (*hit == Hit::Connection).then_some(*rect))
+                .unwrap()
+        };
+        mouse(&mut ui, MouseEventKind::Down(MouseButton::Left), rect.x, rect.y);
+        assert!(
+            ui.flash
+                .as_ref()
+                .is_some_and(|(text, _)| text.contains("Last connected at 10:02")),
+            "{:?}",
+            ui.flash
+        );
+        // Live opens this machine.
+        ui.world.link = Link::Live;
+        screen(&ui);
+        mouse(&mut ui, MouseEventKind::Down(MouseButton::Left), rect.x, rect.y);
+        assert!(
+            tabs(&ui)
+                .2
+                .iter()
+                .flatten()
+                .any(|pane| pane.starts_with("machine:machine/")),
+            "{:?}",
+            tabs(&ui)
+        );
+    }
+
     #[test]
     fn clicking_another_split_only_moves_focus_away_from_an_attached_terminal() {
         let mut ui = glass();
@@ -5282,6 +5645,39 @@ mod tests {
         ctrl(&mut ui, 'k');
         typed(&mut ui, "atlas");
         assert!(!screen(&ui).contains("said in conversations"));
+    }
+
+    #[test]
+    fn find_ranks_agents_before_missions_and_matches_words_across_the_path() {
+        // A mission whose title starts with what is typed does not outrank an agent that
+        // matches it (Nathan, 2026-10-06).
+        let mut ui = glass();
+        let agent = ui.world.agents.items()[0].clone();
+        let title = agent.name.clone();
+        if let Load::Ready(missions) = &mut ui.world.missions {
+            missions[0].title = format!("{title} rollout");
+        }
+        ctrl(&mut ui, 'k');
+        typed(&mut ui, &title.to_lowercase());
+        let found = ui.matches(ui.glasses.as_ref().unwrap().palette.as_ref().unwrap());
+        let first_mission = found.iter().position(|choice| choice.section == 2);
+        let first_agent = found.iter().position(|choice| choice.section == 1);
+        assert!(first_agent < first_mission, "agents lead: {first_agent:?} {first_mission:?}");
+        // Words typed against the path find the agent across its slashes, and the row shows
+        // the whole path.
+        let path = agent.id.trim_start_matches("agent/").to_owned();
+        let words = path.split('/').take(2).collect::<Vec<_>>().join(" ");
+        ctrl(&mut ui, 'k');
+        ctrl(&mut ui, 'k');
+        typed(&mut ui, &words);
+        let found = ui.matches(ui.glasses.as_ref().unwrap().palette.as_ref().unwrap());
+        assert!(
+            found
+                .iter()
+                .any(|choice| choice_path(&choice.action).as_deref() == Some(path.as_str())),
+            "{words:?} finds {path}"
+        );
+        assert!(screen(&ui).contains(&path), "{}", screen(&ui));
     }
 
     #[test]
