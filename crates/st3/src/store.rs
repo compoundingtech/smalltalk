@@ -25233,6 +25233,8 @@ fn claims_in_replay_order_tx(
 /// claims: forget its runs, generations, steps and proposals, then project its claims again in
 /// the replay's order and passes.
 fn rebuild_run_tree_tx(transaction: &Transaction<'_>, root: &str) -> Result<(), St3Error> {
+    #[cfg(test)]
+    RUN_TREE_REBUILDS.with(|rebuilds| rebuilds.set(rebuilds.get() + 1));
     let _span = crate::profile::span("projection/run-tree");
     crate::profile::note("projection: run tree rebuilt");
     let strings = |sql: &str, value: &str| -> Result<Vec<String>, St3Error> {
@@ -25380,6 +25382,12 @@ fn rebuild_run_tree_tx(transaction: &Transaction<'_>, root: &str) -> Result<(), 
         }
     }
     reapply_local_work_lease_renewals_tx(transaction)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Run trees this thread rebuilt from their own claims.
+    static RUN_TREE_REBUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -25532,12 +25540,34 @@ fn try_project_simple_replication_tx(
     // rebuilt from its own claims; everything else extends the graph as it arrives.
     let mut dirty = BTreeSet::<Aggregate>::new();
     let mut rebuild_planning = false;
-    for claim in claims
-        .iter()
-        .filter(|claim| claim.origin == origin && run_tree_kind(&claim.kind))
-    {
-        if let Some(root) = run_tree_of_tx(transaction, &claim.subject)? {
-            dirty.insert(Aggregate::RunTree(root));
+    // A run tree needs rebuilding for this node's own claims only when another writer's claims
+    // about the same tree arrived in the same range, since only then can the two be out of the
+    // replay's order. A tree that holds this node's claims alone already has them: they were
+    // applied when written, and projecting them again, or rebuilding the tree to do so, changes
+    // nothing. Rebuilding every such tree on every pass cost 15 s of writer time, 130,000
+    // statements, for one large tree on a busy node.
+    let foreign_roots = {
+        let mut roots = BTreeSet::new();
+        for claim in claims
+            .iter()
+            .filter(|claim| claim.origin != origin && run_tree_kind(&claim.kind))
+        {
+            if let Some(root) = run_tree_of_tx(transaction, &claim.subject)? {
+                roots.insert(root);
+            }
+        }
+        roots
+    };
+    if !foreign_roots.is_empty() {
+        for claim in claims
+            .iter()
+            .filter(|claim| claim.origin == origin && run_tree_kind(&claim.kind))
+        {
+            if let Some(root) = run_tree_of_tx(transaction, &claim.subject)?
+                && foreign_roots.contains(&root)
+            {
+                dirty.insert(Aggregate::RunTree(root));
+            }
         }
     }
     for claim in &claims {
@@ -25821,7 +25851,8 @@ fn try_project_simple_replication_tx(
         .collect::<Vec<_>>();
     run_updates.sort_by_key(|claim| &order_keys[&claim.id]);
     for claim in run_updates {
-        if in_dirty(claim)? {
+        // This node's own claims are in the graph already, whether or not their tree is rebuilt.
+        if claim.origin == origin || in_dirty(claim)? {
             continue;
         }
         project_mission_run_update(transaction, claim)?;
@@ -25830,7 +25861,7 @@ fn try_project_simple_replication_tx(
         .iter()
         .filter(|claim| claim.kind == "step-run.carried")
     {
-        if in_dirty(claim)? {
+        if claim.origin == origin || in_dirty(claim)? {
             continue;
         }
         reconcile_carried_step_tx(transaction, claim)?;
@@ -37089,6 +37120,29 @@ version 2
             "normal work updates need turns between projection chunks"
         );
         worker.project_replication_backlog().unwrap();
+        assert_eq!(FULL_REPLAYS.with(std::cell::Cell::get), 0);
+        let incremental = graph_digest_of(&worker);
+        let before = worker.step_run(&step).unwrap().unwrap();
+        worker.replay_replication_graph().unwrap();
+        let after = worker.step_run(&step).unwrap().unwrap();
+        assert_eq!(
+            (&before.status, &before.claimant, &before.blocked_reason),
+            (&after.status, &after.claimant, &after.blocked_reason)
+        );
+        assert_eq!(incremental, graph_digest_of(&worker));
+    }
+
+    #[test]
+    fn a_run_tree_with_only_this_nodes_new_claims_is_not_rebuilt_by_a_projection_pass() {
+        let (_controller, worker, step) = replicated_step_pair();
+        worker_work(&worker, &step, "claim", None, "local-only-claim");
+        worker_work(&worker, &step, "progress", Some("working"), "local-only-progress");
+        RUN_TREE_REBUILDS.with(|rebuilds| rebuilds.set(0));
+        FULL_REPLAYS.with(|replays| replays.set(0));
+        worker.project_replication_backlog().unwrap();
+        // The claims were applied when written; a pass that sees nothing from another writer for
+        // the tree has nothing to reconcile, and must not re-derive the whole tree for them.
+        assert_eq!(RUN_TREE_REBUILDS.with(std::cell::Cell::get), 0);
         assert_eq!(FULL_REPLAYS.with(std::cell::Cell::get), 0);
         let incremental = graph_digest_of(&worker);
         let before = worker.step_run(&step).unwrap().unwrap();
