@@ -165,10 +165,14 @@ transcript path. The driver validates the transcript header, links its directory
 into the managed inventory without copying it, and launches OMP with that exact
 path. Missing or mismatched transcripts fail the launch rather than starting anew.
 The pair bootstraps an imported or repaired seat until an incarnation-bearing
-driver binding follows the declaration revision that introduced or last changed
-that pair, and the incarnation's existing successful-start receipt proves it was
-launched under that revision or a later revision carrying the same pair. An
-incumbent launched before repair cannot consume bootstrap by reporting late.
+durable `harness.session-file` binding records a `desired_token` naming the
+declaration that introduced or last changed the pair, or a canonically later
+declaration carrying the same pair. The launcher stamps this token into
+`ST3_LAUNCH_DESIRED_TOKEN`, and the native-session report persists it in the binding.
+An incumbent's late binding carrying a pre-repair token cannot consume bootstrap.
+Local start-observation trimming and replication to another node cannot rearm it.
+Bindings from older drivers without this optional field never expire bootstrap;
+they remain strict until an upgraded driver publishes a proven binding.
 Unrelated declaration edits do not reset it. Subsequent restarts ignore the pair
 and continue the latest bound native ID and transcript path within the linked
 inventory. Explicit suspension resumes and rollouts retain strict selectors.

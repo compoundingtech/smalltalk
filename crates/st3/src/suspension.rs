@@ -28,6 +28,8 @@ use serde_json::Value;
 
 /// The environment variable that names the native session a resumed driver must relaunch.
 pub const RESUME_ENV: &str = "ST3_NATIVE_RESUME_SESSION";
+/// Launcher-owned declaration identity forwarded into the durable native binding.
+pub const LAUNCH_DESIRED_TOKEN_ENV: &str = "ST3_LAUNCH_DESIRED_TOKEN";
 /// The diagnostic code a driver records when it cannot relaunch the named native session.
 pub const RESUME_UNAVAILABLE_CODE: &str = "native-resume-unavailable";
 /// The environment variable that names the native session a relaunched driver continues when
@@ -292,9 +294,9 @@ pub fn continue_unavailable_key(subject: &str, session: &str) -> String {
     format!("{CONTINUE_UNAVAILABLE_CODE}:{subject}:{session}")
 }
 
-/// Whether a driver has bound after the declaration that last changed the import pair.
-/// Unrelated declaration edits do not reset bootstrap, and pre-repair bindings cannot
-/// consume a repaired declaration's strict selector.
+/// Whether a durable driver binding proves a launch under the current import pair.
+/// Launch provenance survives observation trimming and replication; unrelated declaration
+/// edits do not reset bootstrap, and a late pre-repair binding cannot consume it.
 pub fn omp_import_bootstrap_bound(
     store: &Store,
     subject: &str,
@@ -320,7 +322,6 @@ pub fn omp_import_bootstrap_bound(
         }
         introduced = prior;
     }
-    let launches = store.observations_for(subject, "runtime.action.succeeded")?;
     for bound in store
         .claims_for(subject, Some("harness.session-file"))?
         .iter()
@@ -331,21 +332,10 @@ pub fn omp_import_bootstrap_bound(
         {
             continue;
         }
-        let Some(incarnation) = field(bound, "incarnation_id").filter(|id| !id.is_empty()) else {
+        if !field(bound, "incarnation_id").is_some_and(|id| !id.is_empty()) {
             continue;
-        };
-        if !store.claim_is_after(&bound.id, &introduced.id)? {
-            return Ok(false);
         }
-        let Some(token) = launches
-            .iter()
-            .rev()
-            .find(|launch| {
-                field(launch, "action") == Some("start")
-                    && field(launch, "incarnation_id") == Some(incarnation)
-            })
-            .and_then(|launch| field(launch, "desired_token"))
-        else {
+        let Some(token) = field(bound, "desired_token").filter(|token| !token.is_empty()) else {
             continue;
         };
         let Some(declaration) = declarations.iter().find(|claim| claim.id == token) else {

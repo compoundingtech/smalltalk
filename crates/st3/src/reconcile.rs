@@ -5084,6 +5084,10 @@ impl<R: RuntimeControl> Reconciler<R> {
         }
         // Capture the token before starting; a publication during start must not relabel the launch.
         let desired_token = self.launch_token(&subject.subject)?;
+        launch_member.environment.insert(
+            crate::suspension::LAUNCH_DESIRED_TOKEN_ENV.into(),
+            desired_token.clone(),
+        );
         let guard = || -> Result<()> {
             self.store.owned_desired_guard(subject)?;
             if let Some(request) = request {
@@ -18507,6 +18511,10 @@ agent "import/omp/repair-order" {{
                         ("session_id".into(), Value::String(native.into())),
                         ("incarnation_id".into(), Value::String(incarnation.into())),
                         (
+                            "desired_token".into(),
+                            Value::String(store.launch_lineage(seat).unwrap().pop().unwrap()),
+                        ),
+                        (
                             "path".into(),
                             Value::String(transcript.to_string_lossy().into_owned()),
                         ),
@@ -18623,26 +18631,6 @@ agent "import/omp/repair-order" {{
         let first = Arc::new(Store::open_memory("node").unwrap());
         first.import_replication("author", &declaration_claims).unwrap();
         first.import_replication("old-driver", &old_claims).unwrap();
-        // Start receipts are system-local observations; preserve the incumbent's
-        // captured token locally, rather than pretending they replicate.
-        first
-            .append_claim(&ClaimInput {
-                subject: seat.into(),
-                kind: "runtime.action.succeeded".into(),
-                actor: None,
-                fields: BTreeMap::from([
-                    ("action".into(), Value::String("start".into())),
-                    ("incarnation_id".into(), Value::String("before-repair".into())),
-                    (
-                        "desired_token".into(),
-                        Value::String(old.launch_lineage(seat).unwrap().pop().unwrap()),
-                    ),
-                ]),
-                evidence: Vec::new(),
-                expected_subject: None,
-                idempotency_key: None,
-            })
-            .unwrap();
         launch(first.clone(), true);
         first.import_replication("new-driver", &repaired_claims).unwrap();
         declaration.set_write_clock_at(base + 50).unwrap();
@@ -18667,11 +18655,30 @@ agent "import/omp/repair-order" {{
         first
             .import_replication("author", &declaration.export_replication(0).unwrap())
             .unwrap();
+        launch(first.clone(), false);
+        first
+            .append_claim(&ClaimInput {
+                subject: seat.into(),
+                kind: "runtime.action.succeeded".into(),
+                actor: None,
+                fields: BTreeMap::from([("action".into(), Value::String("stop".into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        first.trim_local_observations(u128::MAX, 1, 100).unwrap();
+        assert!(
+            first
+                .observations_for(seat, "runtime.action.succeeded")
+                .unwrap()
+                .iter()
+                .all(|claim| claim.body["fields"]["action"] != "start")
+        );
         launch(first, false);
         for reverse in [false, true] {
             let replica = Arc::new(Store::open_memory("node").unwrap());
             replica.import_replication("author", &declaration_claims).unwrap();
-            launch(replica.clone(), true);
             if reverse {
                 replica.import_replication("new-driver", &repaired_claims).unwrap();
                 replica.import_replication("old-driver", &old_claims).unwrap();
@@ -18679,8 +18686,36 @@ agent "import/omp/repair-order" {{
                 replica.import_replication("old-driver", &old_claims).unwrap();
                 replica.import_replication("new-driver", &repaired_claims).unwrap();
             }
+            assert!(
+                replica
+                    .observations_for(seat, "runtime.action.succeeded")
+                    .unwrap()
+                    .is_empty()
+            );
             launch(replica, false);
         }
+        let old_build = Arc::new(Store::open_memory("node").unwrap());
+        old_build.import_replication("author", &declaration_claims).unwrap();
+        old_build
+            .append_claim(&ClaimInput {
+                subject: seat.into(),
+                kind: "harness.session-file".into(),
+                actor: Some(seat.into()),
+                fields: BTreeMap::from([
+                    ("harness".into(), Value::String("omp".into())),
+                    ("session_id".into(), Value::String(native.into())),
+                    ("incarnation_id".into(), Value::String("old-build".into())),
+                    (
+                        "path".into(),
+                        Value::String(transcript.to_string_lossy().into_owned()),
+                    ),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        launch(old_build, true);
     }
 
     #[cfg(unix)]
@@ -18732,26 +18767,10 @@ agent "import/omp/fixture" {{
             ]);
             if let Some(incarnation) = incarnation {
                 fields.insert("incarnation_id".into(), Value::String(incarnation.into()));
-                store
-                    .append_claim(&ClaimInput {
-                        subject: subject.subject.clone(),
-                        kind: "runtime.action.succeeded".into(),
-                        actor: None,
-                        fields: BTreeMap::from([
-                            ("action".into(), Value::String("start".into())),
-                            ("incarnation_id".into(), Value::String(incarnation.into())),
-                            (
-                                "desired_token".into(),
-                                Value::String(
-                                    store.launch_lineage(&subject.subject).unwrap().pop().unwrap(),
-                                ),
-                            ),
-                        ]),
-                        evidence: Vec::new(),
-                        expected_subject: None,
-                        idempotency_key: None,
-                    })
-                    .unwrap();
+                fields.insert(
+                    "desired_token".into(),
+                    Value::String(store.launch_lineage(&subject.subject).unwrap().pop().unwrap()),
+                );
             }
             store
                 .append_claim(&ClaimInput {

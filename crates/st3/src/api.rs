@@ -9753,6 +9753,8 @@ struct NativeSessionReport {
     session_id: String,
     #[serde(default)]
     path: Option<String>,
+    #[serde(default)]
+    desired_token: Option<String>,
 }
 
 /// A seat's driver reports the native session its harness bound for one incarnation. Only the
@@ -9792,6 +9794,9 @@ async fn report_native_session(
     }
     if let Some(account) = request.account_ref.filter(|name| !name.is_empty()) {
         fields.insert("account_ref".into(), Value::String(account));
+    }
+    if let Some(token) = request.desired_token.filter(|token| !token.is_empty()) {
+        fields.insert("desired_token".into(), Value::String(token));
     }
     let claim = state
         .store

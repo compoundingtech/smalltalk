@@ -18822,6 +18822,8 @@ async fn report_native_session(
                 "session_id": session,
                 "path": path.map(|path| path.to_string_lossy().into_owned()),
                 "account_ref": std::env::var("ST3_ACCOUNT").ok(),
+                "desired_token": std::env::var(st3::suspension::LAUNCH_DESIRED_TOKEN_ENV)
+                    .ok().filter(|token| !token.is_empty()),
             }),
         )
         .await?;
@@ -19908,6 +19910,8 @@ impl PiFamilyReports {
                         "session_id": native,
                         "path": path,
                         "account_ref": std::env::var("ST3_ACCOUNT").ok(),
+                        "desired_token": std::env::var(st3::suspension::LAUNCH_DESIRED_TOKEN_ENV)
+                            .ok().filter(|token| !token.is_empty()),
                     }),
                 )
                 .await;
