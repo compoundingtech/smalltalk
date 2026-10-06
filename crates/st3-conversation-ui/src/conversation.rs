@@ -814,6 +814,35 @@ mod tests {
     }
 
     #[test]
+    fn rows_as_the_person_sees_them_count_a_run_of_calls_once() {
+        let call = |id: &str| {
+            entry(
+                id,
+                Body::Tool {
+                    title: "$ ls".into(),
+                    state: ToolState::Ok,
+                    output: Vec::new(),
+                },
+            )
+        };
+        let entries = vec![
+            entry("a", Body::User("check".into())),
+            call("t1"),
+            call("t2"),
+            call("t3"),
+            entry("b", Body::Assistant("done".into())),
+            call("t4"),
+            entry("c", Body::Assistant("more".into())),
+            call("t5"),
+            call("t6"),
+        ];
+        // Two messages and a reply, and three runs of calls.
+        assert_eq!(crate::display_rows(&entries), 6);
+        assert_eq!(crate::display_rows(&[]), 0);
+        assert_eq!(crate::display_rows(&[call("only")]), 1);
+    }
+
+    #[test]
     fn simplified_a_run_of_calls_is_one_line_and_one_call_never_wraps() {
         let call = |id: &str, title: &str, state: ToolState| {
             entry(
