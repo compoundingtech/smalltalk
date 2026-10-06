@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Reduce unchanged numeric seat-context heartbeat writes while preserving immediate meaningful changes.",
+  "replay": {
+    "status": "none",
+    "detail": "No replay change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint or claim-retention rule change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Numeric harness-context heartbeat returns to five minutes. Categorical harness state remains at twenty seconds; context bucket, account/reset, proven rate-limit and compaction changes retain immediate publication. Durable numeric claim publication and retries are unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No added interruption."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual action."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No recovery change."
+  }
+}
