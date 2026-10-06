@@ -1086,7 +1086,7 @@ export type CanonicalNodeEncoded = { readonly "arguments"?: (ReadonlyArray<strin
 export const CanonicalNode: Schema.Codec<CanonicalNode, CanonicalNodeEncoded> = /*#__PURE__*/ (() => Schema.Struct({ "arguments": optionalKey(Schema.Array(Schema.Union([Schema.String, Schema.Number, Schema.Boolean, Schema.Null]))), "children": optionalKey(Schema.Array(Schema.suspend(() => CanonicalNode))), "name": Schema.String, "properties": optionalKey(Schema.Record(Schema.String, Schema.Union([Schema.String, Schema.Number, Schema.Boolean, Schema.Null]))) }).annotate({ identifier: "CanonicalNode" }))()
 
 export const Capability = /*#__PURE__*/ (() => Schema.Struct({
-  "id": Schema.String.check(Schema.isPattern(new RegExp("^[a-z][a-z0-9.-]+$", "u"))),
+  "id": Schema.String.check(Schema.isPattern(new RegExp("^[a-z][a-z0-9._-]+$", "u"))),
   "state": Schema.Literals(["granted","ungranted","unavailable","unsupported"]),
   "version": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
 }).annotate({ identifier: "Capability" }))()
