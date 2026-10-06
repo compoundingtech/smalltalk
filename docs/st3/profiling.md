@@ -98,6 +98,10 @@ runs while a single pending target advances to the newest requested index; overl
 requests share its immutable result. No request receives a snapshot older than its arrival
 index, so a caller can read its own committed writes. Later independent reads recompute local
 freshness overlays rather than retaining the coalesced result indefinitely.
+Each caller is attached to a specific build generation, whose success or error remains
+available until its callers drain; later outcomes cannot overwrite that receipt. A canceled
+HTTP await leaves its started blocking participant alive until it returns, without holding
+a read mark while waiting.
 
 A builder still pins one physical snapshot for its entire card build. Breaking that snapshot
 into independent reads would tear mutable local projections. Coalescing removes waiting

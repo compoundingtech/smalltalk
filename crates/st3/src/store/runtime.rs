@@ -34,10 +34,38 @@ pub(crate) struct AgentResourceFlight {
 #[derive(Default)]
 pub(crate) struct AgentResourceFlightState {
     pub building: bool,
+    pub building_index: Option<u64>,
     pub generation: u64,
     pub pending_index: u64,
     pub participants: usize,
-    pub completed: Option<std::result::Result<(u64, Arc<Vec<Value>>), Arc<str>>>,
+    pub outcomes: BTreeMap<u64, AgentResourceOutcome>,
+}
+
+#[derive(Default)]
+pub(crate) struct AgentResourceOutcome {
+    pub participants: usize,
+    pub result: Option<std::result::Result<(u64, Arc<Vec<Value>>), Arc<str>>>,
+}
+
+pub(crate) struct AgentResourceParticipant<'a> {
+    pub flight: &'a AgentResourceFlight,
+    pub generation: u64,
+    pub minimum_index: u64,
+}
+
+impl Drop for AgentResourceParticipant<'_> {
+    fn drop(&mut self) {
+        let mut state = self.flight.state.lock();
+        let outcome = state.outcomes.get_mut(&self.generation).expect("registered generation");
+        outcome.participants -= 1;
+        if outcome.participants == 0 {
+            state.outcomes.remove(&self.generation);
+        }
+        state.participants -= 1;
+        if state.participants == 0 {
+            state.pending_index = 0;
+        }
+    }
 }
 
 impl SmalltalkRuntime {

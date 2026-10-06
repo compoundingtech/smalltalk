@@ -2475,21 +2475,38 @@ impl Store {
         minimum_index: u64,
         build: impl FnOnce(u64) -> Result<Vec<Value>>,
     ) -> Result<(u64, Arc<Vec<Value>>)> {
+        let participant = self.join_agent_resource_flight(history, minimum_index);
+        self.finish_agent_resource_flight(participant, build)
+    }
+
+    fn join_agent_resource_flight(
+        &self,
+        history: bool,
+        minimum_index: u64,
+    ) -> runtime::AgentResourceParticipant<'_> {
         debug_assert_no_pinned_read();
         let flight = &self.smalltalk.agent_resource_flights[usize::from(history)];
-        struct Participant<'a>(&'a runtime::AgentResourceFlight);
-        impl Drop for Participant<'_> {
-            fn drop(&mut self) {
-                let mut state = self.0.state.lock();
-                state.participants -= 1;
-                if state.participants == 0 {
-                    state.completed = None;
-                    state.pending_index = 0;
-                }
-            }
-        }
+        let mut state = flight.state.lock();
+        // Once a snapshot has opened, requests requiring later commits join the single
+        // pending generation immediately, not whichever outcome happens to finish next.
+        let pending = state.building_index.is_some_and(|index| minimum_index > index);
+        let generation = state.generation + 1 + u64::from(pending);
+        state.outcomes.entry(generation).or_default().participants += 1;
+        state.participants += 1;
+        state.pending_index = state.pending_index.max(minimum_index);
+        flight.changed.notify_all();
+        runtime::AgentResourceParticipant { flight, generation, minimum_index }
+    }
+
+    fn finish_agent_resource_flight(
+        &self,
+        participant: runtime::AgentResourceParticipant<'_>,
+        build: impl FnOnce(u64) -> Result<Vec<Value>>,
+    ) -> Result<(u64, Arc<Vec<Value>>)> {
+        let flight = participant.flight;
         struct Builder<'a> {
             flight: &'a runtime::AgentResourceFlight,
+            generation: u64,
             completed: bool,
         }
         impl Drop for Builder<'_> {
@@ -2497,54 +2514,57 @@ impl Store {
                 if !self.completed {
                     let mut state = self.flight.state.lock();
                     state.building = false;
-                    state.generation += 1;
-                    state.completed = Some(Err(Arc::from("agent card builder panicked")));
+                    state.building_index = None;
+                    state.generation = self.generation;
+                    state.outcomes.get_mut(&self.generation).expect("registered generation").result =
+                        Some(Err(Arc::from("agent card builder panicked")));
                     self.flight.changed.notify_all();
                 }
             }
         }
-        let mut state = flight.state.lock();
-        state.participants += 1;
-        state.pending_index = state.pending_index.max(minimum_index);
-        let generation = state.generation;
-        let _participant = Participant(flight);
         let mut build = Some(build);
-        flight.changed.notify_all();
         loop {
-            if state.generation > generation {
-                match state.completed.as_ref().expect("a completed flight has a result") {
-                    Ok((index, items)) if *index >= minimum_index => {
-                        let result = (*index, Arc::clone(items));
-                        drop(state);
-                        return Ok(result);
-                    }
-                    Err(error) => {
-                        let error = Arc::clone(error);
-                        drop(state);
-                        return Err(anyhow::anyhow!("{error}"));
-                    }
-                    _ => {}
-                }
+            let mut state = flight.state.lock();
+            let outcome = &state.outcomes[&participant.generation];
+            if let Some(result) = &outcome.result {
+                let result = result.clone();
+                drop(state);
+                let (index, items) = result.map_err(|error| anyhow::anyhow!("{error}"))?;
+                anyhow::ensure!(index >= participant.minimum_index, "agent reply precedes its request");
+                return Ok((index, items));
             }
-            if state.building {
+            if state.building || participant.generation != state.generation + 1 {
                 flight.changed.wait(&mut state);
                 continue;
             }
             state.building = true;
             let target = state.pending_index;
-            drop(state);
-            let mut builder = Builder { flight, completed: false };
+            let mut builder = Builder {
+                flight,
+                generation: participant.generation,
+                completed: false,
+            };
+            // Hold admission only until the snapshot index is known. Arrivals cannot attach
+            // to this generation in the gap between opening its read mark and recording it.
+            // `opening` drops before `builder` on an opening error or panic.
+            let mut opening = Some(state);
             let build = build.take().expect("a participant builds at most once");
             let result = self
                 .read_snapshot(|index| {
+                    let mut state = opening.take().expect("snapshot admission is held");
+                    state.building_index = Some(index);
+                    drop(state);
                     anyhow::ensure!(index >= target, "agent snapshot precedes a committed request");
                     Ok((index, Arc::new(build(index)?)))
                 })
                 .map_err(|error| Arc::<str>::from(format!("{error:#}")));
-            state = flight.state.lock();
-            state.completed = Some(result);
-            state.generation += 1;
+            drop(opening);
+            let mut state = flight.state.lock();
+            state.outcomes.get_mut(&participant.generation).expect("registered generation").result =
+                Some(result);
+            state.generation = participant.generation;
             state.building = false;
+            state.building_index = None;
             builder.completed = true;
             flight.changed.notify_all();
         }
@@ -29855,6 +29875,61 @@ mod tests {
     use proptest::prelude::*;
 
     const TEST_FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+
+    fn assert_agent_resource_outcome_survives_later_flight(first_succeeds: bool) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(&directory.path().join("graph.db"), "node").unwrap());
+        let minimum = store.index().unwrap();
+        let (entered, started) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let first_store = store.clone();
+        let first = std::thread::spawn(move || {
+            first_store.coalesced_agent_resources(false, minimum, |_| {
+                entered.send(()).unwrap();
+                released.recv().unwrap();
+                if first_succeeds {
+                    Ok(vec![json!({"id": "agent/original", "state": "waiting"})])
+                } else {
+                    anyhow::bail!("first flight failed")
+                }
+            })
+        });
+        started.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        // Registration and scheduling are separate: this real participant joins flight one,
+        // but does not consume its receipt until an opposite second outcome has published.
+        let delayed = store.join_agent_resource_flight(false, minimum);
+        release.send(()).unwrap();
+        let first_result = first.join().unwrap();
+        let later = store.coalesced_agent_resources(false, minimum, |_| {
+            if first_succeeds {
+                anyhow::bail!("later flight failed")
+            } else {
+                Ok(vec![json!({"id": "agent/replacement", "state": "running"})])
+            }
+        });
+        let delayed_result = store.finish_agent_resource_flight(delayed, |_| {
+            panic!("an attached caller must consume its own generation, not rebuild")
+        });
+        if first_succeeds {
+            assert_eq!(later.unwrap_err().to_string(), "later flight failed");
+            assert_eq!(first_result.unwrap().1[0]["id"], "agent/original");
+            assert_eq!(delayed_result.unwrap().1[0]["id"], "agent/original");
+        } else {
+            assert_eq!(later.unwrap().1[0]["id"], "agent/replacement");
+            assert_eq!(first_result.unwrap_err().to_string(), "first flight failed");
+            assert_eq!(delayed_result.unwrap_err().to_string(), "first flight failed");
+        }
+    }
+
+    #[test]
+    fn agent_resource_failed_receipt_survives_a_later_success() {
+        assert_agent_resource_outcome_survives_later_flight(false);
+    }
+
+    #[test]
+    fn agent_resource_successful_receipt_survives_a_later_failure() {
+        assert_agent_resource_outcome_survives_later_flight(true);
+    }
 
     #[test]
     fn agent_resource_bursts_coalesce_pending_writes_without_stale_replies() {
