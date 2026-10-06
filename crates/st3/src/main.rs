@@ -17171,10 +17171,12 @@ struct NativeLoopState {
     claude_attachment_episode: u64,
     #[serde(default)]
     claude_attachment_pending: Option<PendingClaudeAttachment>,
-    // Reconcile once in each image, including an older image whose last POST committed
-    // without a reply and therefore never advanced its acknowledged local phase.
-    #[serde(skip)]
+    // An acknowledged phase survives graceful re-exec. Legacy resume files lack this
+    // flag and require one corrective publication because their last POST was uncertain.
+    #[serde(default)]
     claude_attachment_reconciled: bool,
+    #[serde(default)]
+    claude_attachment_terminal: Option<ClaudeAttachmentTerminal>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -17182,6 +17184,15 @@ struct PendingClaudeAttachment {
     fence: st3::mailbox::Fence,
     phase: String,
     input: ClaimInput,
+    input_digest: String,
+}
+
+// One terminal rejection inhibits publication for this binding, including re-exec.
+// Readiness still reports; a replacement binding starts a new publication lifecycle.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ClaudeAttachmentTerminal {
+    fence: st3::mailbox::Fence,
+    reason: String,
 }
 
 /// What a native driver hands its next image across `execve`.
@@ -21332,23 +21343,25 @@ async fn check_claude_attachment(
     state: &mut NativeLoopState,
 ) -> Result<()> {
     let fence = &mailbox.fence;
-    // An error does not tell us whether the server committed. Resolve the identical
-    // operation before checking a newer phase or advancing its acknowledged episode.
-    publish_pending_claude_attachment(client, subject, incarnation, fence, state).await?;
-    let path = format!(
-        "/v1/mailbox/attachment?subject={}&incarnation={}&component={}&epoch={}&token={}",
-        urlencoding::encode(&fence.subject),
-        urlencoding::encode(&fence.incarnation),
-        fence.component,
-        fence.epoch,
-        fence.token,
-    );
-    let checked: Result<st3::mailbox::Attachment> = match tokio::time::timeout(
-        Duration::from_secs(2), client.get(&path),
-    ).await {
-        Ok(checked) => checked,
-        Err(_) => Err(anyhow::anyhow!("the channel attachment check exceeded two seconds")),
-    };
+    let mut checked = checked_claude_attachment(client, subject, incarnation, fence).await;
+    // Readiness is independent of diagnostic publication. A rejected or uncertain
+    // POST must not silence a current subscription's readiness report.
+    report_claude_attachment(mailbox, &checked)?;
+    if let Some(terminal) = &state.claude_attachment_terminal {
+        if same_claude_attachment_binding(&terminal.fence, fence) {
+            return Ok(());
+        }
+        state.claude_attachment_terminal = None;
+        state.claude_attachment_reconciled = false;
+    }
+    if state.claude_attachment_pending.is_some() {
+        // Resolve the identical operation before advancing the acknowledged episode.
+        publish_pending_claude_attachment(client, subject, incarnation, fence, state).await?;
+        // Recovery publication needs an admission check AFTER the pending operation
+        // resolved; the earlier check was only used to keep readiness reporting.
+        checked = checked_claude_attachment(client, subject, incarnation, fence).await;
+        report_claude_attachment(mailbox, &checked)?;
+    }
     let attached = checked.as_ref().is_ok_and(|attachment| attachment.attached);
     let phase = if attached {
         "attached"
@@ -21359,44 +21372,127 @@ async fn check_claude_attachment(
     } else {
         "starting"
     };
-    let reason = match checked {
-        Ok(_) => "claude-channel-unattached: the current Claude session has no live, initialized channel subscription; mail is held in the graph until attachment. The driver rechecks attachment and st will restart the harness with bounded retries if the channel stays missing.".into(),
-        Err(error) => format!("claude-channel-unattached: attachment could not be verified; mail is held while the driver retries: {error:#}"),
-    };
-    let mut report: Value = serde_json::from_str(&native_delivery_report("claude-channel", None))?;
-    report["ready"] = json!(attached);
-    report["reason"] = json!(&reason);
-    if let Some(subscription) = &mailbox.subscription {
-        subscription.report(report);
-    }
     if state.claude_attachment_reconciled && state.claude_attachment_phase == phase {
         return Ok(());
     }
+    let reason = claude_attachment_reason(&checked);
+    let input =
+        claude_attachment_diagnostic(fence, state.claude_attachment_episode, phase, &reason);
+    let input_digest = claude_attachment_input_digest(&input)?;
+    // Retained in memory before POST; only the existing graceful re-exec write_state
+    // serializes it to disk. This does not promise recovery from abrupt process death.
+    state.claude_attachment_pending = Some(PendingClaudeAttachment {
+        fence: fence.clone(),
+        phase: phase.into(),
+        input,
+        input_digest,
+    });
+    state.claude_attachment_reconciled = false;
+    publish_pending_claude_attachment(client, subject, incarnation, fence, state).await
+}
+
+fn same_claude_attachment_binding(a: &st3::mailbox::Fence, b: &st3::mailbox::Fence) -> bool {
+    a.subject == b.subject
+        && a.incarnation == b.incarnation
+        && a.component == b.component
+        && a.epoch == b.epoch
+        && a.token == b.token
+}
+
+async fn checked_claude_attachment(
+    client: &Client,
+    subject: &str,
+    incarnation: &str,
+    fence: &st3::mailbox::Fence,
+) -> Result<st3::mailbox::Attachment> {
+    anyhow::ensure!(
+        fence.subject == subject && fence.incarnation == incarnation,
+        "the Claude attachment check belongs to another mailbox binding"
+    );
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        client.get(&claude_attachment_path(fence)),
+    )
+    .await
+    .context("the channel attachment check exceeded two seconds")?
+}
+
+fn claude_attachment_reason(checked: &Result<st3::mailbox::Attachment>) -> String {
+    match checked {
+        Ok(_) => "claude-channel-unattached: the current Claude session has no live, initialized channel subscription; mail is held in the graph until attachment. The driver rechecks attachment and st will restart the harness with bounded retries if the channel stays missing.".into(),
+        Err(error) => format!("claude-channel-unattached: attachment could not be verified; mail is held while the driver retries: {error:#}"),
+    }
+}
+
+fn report_claude_attachment(
+    mailbox: &NativeMailbox,
+    checked: &Result<st3::mailbox::Attachment>,
+) -> Result<()> {
+    let mut report: Value = serde_json::from_str(&native_delivery_report("claude-channel", None))?;
+    report["ready"] = json!(checked.as_ref().is_ok_and(|attachment| attachment.attached));
+    report["reason"] = json!(claude_attachment_reason(checked));
+    if let Some(subscription) = &mailbox.subscription {
+        subscription.report(report);
+    }
+    Ok(())
+}
+
+fn claude_attachment_diagnostic(
+    fence: &st3::mailbox::Fence,
+    episode: u64,
+    phase: &str,
+    reason: &str,
+) -> ClaimInput {
+    let subject = &fence.subject;
+    let incarnation = &fence.incarnation;
+    let attached = phase == "attached";
     let code = if attached {
         "claude-channel-attached"
     } else {
         "claude-channel-unattached"
     };
-    let input = ClaimInput {
-        subject: subject.into(), kind: "harness.diagnostic".into(), actor: Some(subject.into()),
+    ClaimInput {
+        subject: subject.into(),
+        kind: "harness.diagnostic".into(),
+        actor: Some(subject.into()),
         fields: BTreeMap::from([
-            ("severity".into(), json!(if phase == "blocked" { "error" } else { "warning" })),
-            ("status".into(), json!(if attached { "recovered" } else { phase })),
+            (
+                "severity".into(),
+                json!(if phase == "blocked" {
+                    "error"
+                } else {
+                    "warning"
+                }),
+            ),
+            (
+                "status".into(),
+                json!(if attached { "recovered" } else { phase }),
+            ),
             ("code".into(), json!(code)),
-            ("reason".into(), json!(if attached { "The current Claude channel is initialized and subscribed; durable mail delivery resumes." } else { &reason })),
+            (
+                "reason".into(),
+                json!(if attached {
+                    "The current Claude channel is initialized and subscribed; durable mail delivery resumes."
+                } else {
+                    reason
+                }),
+            ),
             ("driver".into(), json!("claude")),
             ("incarnation_id".into(), json!(incarnation)),
-        ]), evidence: Vec::new(), expected_subject: None,
+        ]),
+        evidence: Vec::new(),
+        expected_subject: None,
         // A new namespace avoids reusing a predecessor image's uncertain key with
         // a reason that may have changed since that image attempted publication.
-        idempotency_key: Some(format!("claude-attachment-publication-v2:{code}:{subject}:{incarnation}:{}:{}:{phase}", fence.epoch, state.claude_attachment_episode)),
-    };
-    state.claude_attachment_pending = Some(PendingClaudeAttachment {
-        fence: fence.clone(),
-        phase: phase.into(),
-        input,
-    });
-    publish_pending_claude_attachment(client, subject, incarnation, fence, state).await
+        idempotency_key: Some(format!(
+            "claude-attachment-publication-v2:{code}:{subject}:{incarnation}:{}:{episode}:{phase}",
+            fence.epoch
+        )),
+    }
+}
+
+fn claude_attachment_input_digest(input: &ClaimInput) -> Result<String> {
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(input)?)))
 }
 
 async fn publish_pending_claude_attachment(
@@ -21409,28 +21505,111 @@ async fn publish_pending_claude_attachment(
     let Some(pending) = state.claude_attachment_pending.as_ref() else {
         return Ok(());
     };
-    anyhow::ensure!(
-        fence.subject == subject
-            && fence.incarnation == incarnation
-            && pending.fence.subject == fence.subject
-            && pending.fence.incarnation == fence.incarnation
-            && pending.fence.component == fence.component
-            && pending.fence.epoch == fence.epoch
-            && pending.fence.token == fence.token
-            && pending.input.subject == subject
-            && pending.input.actor.as_deref() == Some(subject)
-            && pending.input.fields.get("incarnation_id").and_then(Value::as_str) == Some(incarnation),
-        "the pending Claude attachment diagnostic belongs to another mailbox binding"
-    );
-    let next_episode = state.claude_attachment_episode
-        .checked_add(1)
-        .context("the Claude attachment diagnostic episode overflowed")?;
-    let _: ClaimRecord = client.post("/v1/claims", &pending.input).await?;
+    let valid_binding = fence.subject == subject
+        && fence.incarnation == incarnation
+        && same_claude_attachment_binding(&pending.fence, fence)
+        && pending.input.subject == subject
+        && pending.input.actor.as_deref() == Some(subject)
+        && pending
+            .input
+            .fields
+            .get("incarnation_id")
+            .and_then(Value::as_str)
+            == Some(incarnation);
+    if !valid_binding {
+        return Err(retire_claude_attachment(
+            state,
+            fence,
+            "the pending Claude attachment diagnostic belongs to another mailbox binding",
+        ));
+    }
+    let valid_input = (|| -> Result<bool> {
+        let reason = pending
+            .input
+            .fields
+            .get("reason")
+            .and_then(Value::as_str)
+            .context("the pending Claude attachment diagnostic has no reason")?;
+        Ok(
+            matches!(pending.phase.as_str(), "starting" | "blocked" | "attached")
+                && pending.input_digest == claude_attachment_input_digest(&pending.input)?
+                && serde_json::to_value(&pending.input)?
+                    == serde_json::to_value(claude_attachment_diagnostic(
+                        fence,
+                        state.claude_attachment_episode,
+                        &pending.phase,
+                        reason,
+                    ))?,
+        )
+    })();
+    if !matches!(valid_input, Ok(true)) {
+        return Err(retire_claude_attachment(
+            state,
+            fence,
+            "the pending Claude attachment diagnostic request was changed or malformed",
+        ));
+    }
+    let Some(next_episode) = state.claude_attachment_episode.checked_add(1) else {
+        return Err(retire_claude_attachment(
+            state,
+            fence,
+            "the Claude attachment diagnostic episode overflowed",
+        ));
+    };
+    // Validate the current title binding before retrying a retained operation.
+    // This result is not reused as recovery proof.
+    let result: Result<ClaimRecord> = async {
+        let _ = checked_claude_attachment(client, subject, incarnation, fence).await?;
+        client.post("/v1/claims", &pending.input).await
+    }
+    .await;
+    if let Err(error) = result {
+        if st3::client::http_status(&error).is_some_and(|status| (400..500).contains(&status))
+            || matches!(
+                st3::client::api_error_code(&error),
+                Some("idempotency-mismatch" | "claim-checkpointed")
+            )
+        {
+            return Err(retire_claude_attachment(
+                state,
+                fence,
+                &format!("{error:#}"),
+            ));
+        }
+        return Err(error);
+    }
     state.claude_attachment_phase = pending.phase.clone();
     state.claude_attachment_episode = next_episode;
     state.claude_attachment_reconciled = true;
     state.claude_attachment_pending = None;
     Ok(())
+}
+
+fn retire_claude_attachment(
+    state: &mut NativeLoopState,
+    fence: &st3::mailbox::Fence,
+    reason: &str,
+) -> anyhow::Error {
+    let reason: String = reason.chars().take(2_000).collect();
+    state.claude_attachment_pending = None;
+    state.claude_attachment_terminal = Some(ClaudeAttachmentTerminal {
+        fence: fence.clone(),
+        reason: reason.clone(),
+    });
+    // The driver records this error once. The retained inhibition caps terminal
+    // errors at one per binding; neither phase nor acknowledged episode advances.
+    anyhow::anyhow!("Claude attachment diagnostic publication stopped for this binding: {reason}")
+}
+
+fn claude_attachment_path(fence: &st3::mailbox::Fence) -> String {
+    format!(
+        "/v1/mailbox/attachment?subject={}&incarnation={}&component={}&epoch={}&token={}",
+        urlencoding::encode(&fence.subject),
+        urlencoding::encode(&fence.incarnation),
+        fence.component,
+        fence.epoch,
+        fence.token,
+    )
 }
 
 struct NativeMailbox {
@@ -23542,6 +23721,7 @@ mod tests {
                 claude_attachment_episode: 3,
                 claude_attachment_pending: None,
                 claude_attachment_reconciled: false,
+                claude_attachment_terminal: None,
             },
         };
         let back: DriverResume =
