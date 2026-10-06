@@ -10,6 +10,7 @@ from pathlib import Path
 import sys
 import tempfile
 import threading
+from unittest.mock import patch
 
 sys.dont_write_bytecode = True
 root = Path(__file__).resolve().parent.parent
@@ -17,6 +18,47 @@ loader = importlib.machinery.SourceFileLoader('ci_perf_cache', str(root / 'scrip
 spec = importlib.util.spec_from_loader(loader.name, loader)
 module = importlib.util.module_from_spec(spec)
 loader.exec_module(module)
+
+with tempfile.TemporaryDirectory() as tmp:
+    temp = Path(tmp)
+    calls, sleeps = [], []
+    replies = [(1, 'HTTP 503: Egress is over the account limit. '
+                   '(https://example.invalid/artifact?sig=private)'),
+               (1, 'HTTP 504: gateway timeout'), (0, '')]
+    def transfer(cmd, capture_output, text):
+        assert capture_output and text
+        calls.append(cmd)
+        stage = Path(cmd[-1])
+        stage.mkdir()
+        code, error = replies.pop(0)
+        (stage / 'load.json').write_text('partial' if code else 'complete baseline')
+        return module.subprocess.CompletedProcess(cmd, code, '', error)
+    output = io.StringIO()
+    with patch.object(module.subprocess, 'run', transfer), patch.object(module.time, 'sleep', sleeps.append):
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+            module.download('example/project', {'id': 123}, 'perf-load-logs', temp / 'report')
+    assert sleeps == [5, 15] and len(calls) == 3
+    assert all(cmd[:-1] == calls[0][:-1] for cmd in calls), 'retry exactly the selected artifact'
+    assert (temp / 'report/load.json').read_text() == 'complete baseline'
+    assert len({cmd[-1] for cmd in calls}) == 3, 'partial downloads must never be reused'
+    assert [path.name for path in temp.iterdir()] == ['report']
+    assert 'sig=private' not in output.getvalue() and 'https://' not in output.getvalue()
+    assert 'P0:' in output.getvalue() and 'attempt 3' in output.getvalue()
+    for error, attempts in [('HTTP 503: busy', 3), ('HTTP 403: forbidden', 1),
+                            ('HTTP 404: missing', 1), ('invalid archive', 1)]:
+        calls.clear()
+        sleeps.clear()
+        replies[:] = [(1, error)] * attempts
+        with patch.object(module.subprocess, 'run', transfer), patch.object(module.time, 'sleep', sleeps.append):
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    module.download('example/project', {'id': 123}, 'perf-load-logs', temp / 'failed')
+                except module.subprocess.CalledProcessError:
+                    pass
+                else:
+                    raise AssertionError('failed restoration must remain fatal')
+        assert len(calls) == attempts and not (temp / 'failed').exists()
+        assert [path.name for path in temp.iterdir()] == ['report']
 
 run = dict(id=1, head_branch='main', conclusion='success', event='schedule', path='.github/workflows/perf.yml')
 report = dict(scale=1, claims=1000, seconds=135, daemon_cores=1, long_poll_seats=30,

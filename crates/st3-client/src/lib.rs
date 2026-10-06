@@ -210,6 +210,20 @@ impl CollectionStream {
     pub async fn subscribe_glasses(&mut self, id: &str) -> Result<(), ClientError> {
         self.subscribe(id, "glasses", 100, None, None).await
     }
+    /// Select the owner's fleet explicitly; agent identity is not an owner selector.
+    pub async fn subscribe_arrangements(
+        &mut self,
+        id: &str,
+        person: &str,
+        limit: usize,
+        subject: Option<&str>,
+    ) -> Result<(), ClientError> {
+        let mut command = serde_json::json!({"kind":"subscribe", "id":id, "collection":"arrangements", "person":person, "limit":limit});
+        if let Some(subject) = subject {
+            command["subject"] = serde_json::json!(subject);
+        }
+        self.send(&command).await
+    }
     pub async fn subscribe(
         &mut self,
         id: &str,
@@ -331,7 +345,8 @@ pub enum CollectionEvent {
         session_id: String,
         replace: bool,
         items: Vec<TimelineEntry>,
-        has_more: bool,
+        /// Availability before the live window; absent on deltas means unchanged.
+        has_more: Option<bool>,
     },
     /// Subscribe again: the server could not bring this subscription up to date.
     /// `code` and `message` say why when a temporary failure caused it, such as a conversation
@@ -390,7 +405,7 @@ impl CollectionEvent {
                 session_id: field(&frame, "session_id")?,
                 replace: field(&frame, "replace")?,
                 items: field(&frame, "items")?,
-                has_more: field::<Option<bool>>(&frame, "has_more")?.unwrap_or(false),
+                has_more: field(&frame, "has_more")?,
                 id,
             }),
             Some("resync") => Ok(Self::Resync {
@@ -560,6 +575,21 @@ pub fn plain_message(code: Option<&ErrorCode>, message: &str) -> String {
         ErrorCode::ValidationFailed
         | ErrorCode::AttentionMigrated
         | ErrorCode::RuntimeNotLocal
+        | ErrorCode::ArrangementExists
+        | ErrorCode::ArrangementFolderExists
+        | ErrorCode::ArrangementRetired
+        | ErrorCode::ArrangementLimit
+        | ErrorCode::ArrangementFolderDeleted
+        | ErrorCode::ArrangementCycle
+        | ErrorCode::ArrangementBodyTooLarge
+        | ErrorCode::ArrangementOwnerForbidden
+        | ErrorCode::InvalidArrangementSubject
+        | ErrorCode::InvalidArrangementAction
+        | ErrorCode::InvalidArrangementOperations
+        | ErrorCode::InvalidArrangementFolder
+        | ErrorCode::InvalidArrangementName
+        | ErrorCode::InvalidArrangementKey
+        | ErrorCode::InvalidSubjectReference
         | ErrorCode::Unknown => message.to_owned(),
     }
 }
@@ -1594,6 +1624,33 @@ impl Client {
     ) -> Result<Envelope<TerminalScreen>, ClientError> {
         self.terminal_screen_internal(terminal_id).await
     }
+    pub async fn arrangements_list(
+        &self,
+        person: &str,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Envelope<ArrangementPage>, ClientError> {
+        let mut path = format!("/v1/client/arrangements?person={}", percent_encode(person));
+        if let Some(cursor) = cursor {
+            path.push_str(&format!("&cursor={}", percent_encode(cursor)));
+        }
+        if let Some(limit) = limit {
+            path.push_str(&format!("&limit={limit}"));
+        }
+        self.get(&path).await
+    }
+    pub async fn arrangements_get(
+        &self,
+        person_name: &str,
+        uuid: &str,
+    ) -> Result<Envelope<Arrangement>, ClientError> {
+        self.get(&format!(
+            "/v1/client/arrangements/{}/{}",
+            percent_encode(person_name),
+            percent_encode(uuid)
+        ))
+        .await
+    }
     pub async fn glasses_list(
         &self,
         cursor: Option<&str>,
@@ -1668,6 +1725,17 @@ impl Client {
         parameters: AgentSuspendParameters,
     ) -> Result<Envelope<ActionResult>, ClientError> {
         let request = ActionRequest::agent_suspend(id, idempotency_key, fence, parameters)
+            .map_err(|error| ClientError::Protocol(error.to_string()))?;
+        self.action_internal(&request).await
+    }
+    pub async fn arrangement_edit(
+        &self,
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: ArrangementEditParameters,
+    ) -> Result<Envelope<ActionResult>, ClientError> {
+        let request = ActionRequest::arrangement_edit(id, idempotency_key, fence, parameters)
             .map_err(|error| ClientError::Protocol(error.to_string()))?;
         self.action_internal(&request).await
     }

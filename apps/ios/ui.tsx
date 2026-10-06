@@ -1,5 +1,6 @@
 import type { ReactNode, Ref } from 'react';
-import { Linking, Pressable, StyleSheet, Text, TextInput, View, type StyleProp, type TextInputProps, type TextStyle, type ViewStyle } from 'react-native';
+import * as Clipboard from 'expo-clipboard';
+import { ActionSheetIOS, Linking, Pressable, StyleSheet, Text, TextInput, View, type StyleProp, type TextInputProps, type TextStyle, type ViewStyle } from 'react-native';
 import { fonts, theme } from './theme';
 import type { Run } from './markdown';
 import { markdown } from './markdown';
@@ -74,8 +75,15 @@ function runStyle(run: Run, base: TextStyle): StyleProp<TextStyle> {
     default: return base;
   }
 }
+// A path in a message names a file on the writer's machine: say so, and offer to copy it.
+function showPath(path: string) {
+  ActionSheetIOS.showActionSheetWithOptions(
+    { title: 'A file on the writer’s machine', message: path, options: ['Copy path', 'Cancel'], cancelButtonIndex: 1 },
+    index => { if (index === 0) void Clipboard.setStringAsync(path); },
+  );
+}
 function Runs({ runs, base }: { runs: Run[]; base: TextStyle }) {
-  return <>{runs.map((run, index) => <Text key={index} style={runStyle(run, base)} onPress={run.url ? () => void Linking.openURL(run.url!) : undefined}>{run.text}</Text>)}</>;
+  return <>{runs.map((run, index) => <Text key={index} style={runStyle(run, base)} onPress={run.url ? () => void Linking.openURL(run.url!) : run.path ? () => showPath(run.path!) : undefined}>{run.text}</Text>)}</>;
 }
 
 /** Markdown as stui renders a reply: peach headings, lavender bullets, code in a gutter. */

@@ -37,6 +37,7 @@ use crate::sqlite::{
 };
 
 mod binary_payloads;
+mod inventory_generation;
 pub use binary_payloads::PayloadConversion;
 pub mod canonical;
 pub mod checkpoint;
@@ -48,7 +49,7 @@ pub mod principals;
 pub mod projection_digest;
 pub mod runtime;
 
-pub use runtime::Runtime;
+pub use runtime::{IncrementalProjection, Runtime};
 
 pub use canonical::{CANONICAL_ORDER, CANONICAL_ORDER_DESC, canonical_sql};
 pub use checkpoint::{
@@ -67,6 +68,22 @@ pub use checkpoint_agreement::{
     first_verifications, newest_seals, participants as checkpoint_participants, stable_checkpoints,
 };
 pub use checkpoint_trim::{CheckpointManifestNeed, TRIM_CHUNK_ENVELOPES, TrimFault};
+
+/// Keep diagnostics on one bounded line even when an error code or caller phase is untrusted.
+fn full_replay_log_line(phase: &str, reason: &str, frontier: u64, target: u64) -> String {
+    fn bounded(value: &str) -> String {
+        value
+            .chars()
+            .take(128)
+            .map(|c| if c.is_control() { '?' } else { c })
+            .collect()
+    }
+    format!(
+        "st: projection full replay phase={} reason={} frontier={frontier} target={target}",
+        bounded(phase),
+        bounded(reason)
+    )
+}
 
 /// The graph's tables: the claim log and its batches, operations, documents and blobs, replica
 /// envelopes and records, peers, fleet invites and checkpoints. A runtime adds its own.
@@ -492,6 +509,7 @@ impl Store {
         reject_old_schema(connection)?;
         runtime.migrate_schema(connection)?;
         connection.execute_batch(SCHEMA)?;
+        inventory_generation::initialize(connection)?;
         connection.execute_batch(principals::PRINCIPAL_SCHEMA)?;
         runtime.create_schema(connection)?;
         // Reassigning user_version dirties the database header even when it is unchanged.
@@ -589,10 +607,10 @@ pub struct ReplicationSnapshot {
     pub store_index: u64,
     pub replica_generation: u64,
     pub max_envelope_rowid: i64,
-    /// Rows in `replica_envelopes` and `checkpoint_envelopes` when this snapshot was built. A
-    /// snapshot extends its predecessor only when both moved exactly by the new envelopes.
+    /// Held envelope rows at this snapshot, counted while loading or extending its inventory.
     pub envelope_rows: usize,
-    pub tombstone_rows: usize,
+    /// Changes to an existing inventory prefix or its checkpoint tombstones.
+    pub inventory_generation: i64,
     pub inventory: CompactReplicationInventory,
     pub buckets: Vec<ReplicationInventoryBucket>,
     /// The inventory digest state before each range in `buckets`.
@@ -714,10 +732,11 @@ impl PeerSyncProgress {
             Some(0)
         } else {
             sync.catch_up_rate_per_second
-                .filter(|rate| *rate > 0.0)
+                .filter(|rate| rate.is_finite() && *rate > 0.0)
                 .map(|rate| (peer_only as f64 / rate).ceil())
-                // JSON duration consumers require exact JavaScript-safe integer seconds.
-                .filter(|seconds| *seconds <= ((1_u64 << 53) - 1) as f64)
+                .filter(|seconds| {
+                    seconds.is_finite() && *seconds <= MAX_SAFE_DURATION_SECONDS as f64
+                })
                 .map(|seconds| seconds as u64)
         };
         self.measured = Some(sync);
@@ -2904,7 +2923,7 @@ pub fn full_replication_inventory_rows(
 pub fn full_compact_replication_inventory(
     connection: &Connection,
 ) -> Result<(CompactReplicationInventory, i64)> {
-    let (mut inventory, max_rowid) = load_compact_replication_inventory(connection)?;
+    let (mut inventory, max_rowid, _) = load_compact_replication_inventory(connection)?;
     inventory.refresh_digest();
     Ok((inventory, max_rowid))
 }
@@ -2913,7 +2932,7 @@ pub fn full_compact_replication_inventory(
 // Leave the digest unset here so that path does not hash the full log twice.
 fn load_compact_replication_inventory(
     connection: &Connection,
-) -> Result<(CompactReplicationInventory, i64)> {
+) -> Result<(CompactReplicationInventory, i64, usize)> {
     let mut statement = connection.prepare(
         "SELECT rowid, writer, sequence, envelope_hash, 1 FROM replica_envelopes
          UNION ALL
@@ -2928,6 +2947,7 @@ fn load_compact_replication_inventory(
     let mut rows = statement.query([])?;
     let mut inventory = CompactReplicationInventory::default();
     let mut max_rowid = 0;
+    let mut envelope_rows = 0;
     while let Some(row) = rows.next()? {
         max_rowid = max_rowid.max(row.get::<_, i64>(0)?);
         inventory.push_sorted(ReplicaEnvelopeId {
@@ -2937,9 +2957,11 @@ fn load_compact_replication_inventory(
         });
         if row.get::<_, i64>(4)? == 0 {
             inventory.mark_last_payloadless();
+        } else {
+            envelope_rows += 1;
         }
     }
-    Ok((inventory, max_rowid))
+    Ok((inventory, max_rowid, envelope_rows))
 }
 
 /// The most envelopes one exchange carries to a peer that does not say how many it takes, and
@@ -3694,6 +3716,24 @@ pub fn replication_difference_counts_what_each_side_lacks() {
 
 #[cfg(test)]
 #[test]
+pub fn sync_progress_infinite_rate_does_not_claim_caught_up() {
+    let mut progress = PeerSyncProgress {
+        measured: Some(ReplicationPeerSync {
+            catch_up_rate_per_second: Some(f64::INFINITY),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    progress.observe(0, Some((9_000, 3)), 1_000);
+    let sync = progress.view(1_000).unwrap();
+    assert_eq!(sync.estimated_catch_up_seconds, None);
+    assert_eq!(sync.peer_only_envelopes, 9_000);
+    assert_eq!(sync.local_only_envelopes, 3);
+    assert!(sync.catching_up);
+}
+
+#[cfg(test)]
+#[test]
 pub fn sync_progress_estimates_catch_up_from_net_progress() {
     let mut progress = PeerSyncProgress::default();
     progress.observe(0, Some((10_000, 0)), 1_000);
@@ -3748,7 +3788,6 @@ pub fn sync_progress_estimates_catch_up_from_net_progress() {
 #[cfg(test)]
 #[test]
 pub fn sync_progress_omits_forecasts_outside_safe_integer_seconds() {
-    const MAX_SAFE_SECONDS: u64 = (1_u64 << 53) - 1;
     let mut progress = PeerSyncProgress {
         measured: Some(ReplicationPeerSync {
             catch_up_rate_per_second: Some(1.0),
@@ -3756,15 +3795,15 @@ pub fn sync_progress_omits_forecasts_outside_safe_integer_seconds() {
         }),
         ..Default::default()
     };
-    progress.observe(0, Some((MAX_SAFE_SECONDS, 7)), 1_000);
+    progress.observe(0, Some((MAX_SAFE_DURATION_SECONDS, 7)), 1_000);
     assert_eq!(
         progress.view(1_000).unwrap().estimated_catch_up_seconds,
-        Some(MAX_SAFE_SECONDS)
+        Some(MAX_SAFE_DURATION_SECONDS)
     );
-    progress.observe(0, Some((MAX_SAFE_SECONDS + 1, 7)), 2_000);
+    progress.observe(0, Some((MAX_SAFE_DURATION_SECONDS + 1, 7)), 2_000);
     let sync = progress.view(2_000).unwrap();
     assert_eq!(sync.estimated_catch_up_seconds, None);
-    assert_eq!(sync.peer_only_envelopes, MAX_SAFE_SECONDS + 1);
+    assert_eq!(sync.peer_only_envelopes, MAX_SAFE_DURATION_SECONDS + 1);
     assert_eq!(sync.local_only_envelopes, 7);
     assert!(sync.catching_up);
 }
@@ -4780,6 +4819,7 @@ impl Store {
             let current_graph_generation = graph_generation(&reader)?;
             let current_projection_generation = projection_digest::generation(&reader)?;
             let envelope_rowid = max_envelope_rowid(&reader)?;
+            let inventory_generation = inventory_generation::current(&reader)?;
             Ok(store
                 .replication_snapshot
                 .lock()
@@ -4791,6 +4831,7 @@ impl Store {
                         && snapshot.graph_generation == current_graph_generation
                         && snapshot.projection_generation == current_projection_generation
                         && snapshot.max_envelope_rowid == envelope_rowid
+                        && snapshot.inventory_generation == inventory_generation
                 })
                 .cloned())
         };
@@ -4827,97 +4868,101 @@ impl Store {
             .as_ref()
             .filter(|previous| previous.graph_generation == graph_generation)
             .map(|previous| previous.legacy_graph_digest.clone());
-        let envelope_count: usize =
-            connection.query_row("SELECT COUNT(*) FROM replica_envelopes", [], |row| {
-                row.get(0)
-            })?;
-        let tombstone_count: usize =
-            connection.query_row("SELECT COUNT(*) FROM checkpoint_envelopes", [], |row| {
-                row.get(0)
-            })?;
+        let inventory_generation = inventory_generation::current(connection)?;
         let full = |connection: &Connection| -> Result<_> {
-            let (inventory, max_rowid) = load_compact_replication_inventory(connection)?;
+            let (inventory, max_rowid, envelope_rows) =
+                load_compact_replication_inventory(connection)?;
             let buckets = inventory.buckets();
-            Ok((inventory, max_rowid, buckets, Vec::new(), 0))
+            Ok((inventory, max_rowid, buckets, Vec::new(), 0, envelope_rows))
         };
-        let (mut inventory, max_envelope_rowid, buckets, mut digest_prefixes, resume_from) =
-            if let Some(previous) = previous {
-                let mut statement = connection.prepare(
-                    "SELECT rowid, writer, sequence, envelope_hash FROM replica_envelopes
+        let (
+            mut inventory,
+            max_envelope_rowid,
+            buckets,
+            mut digest_prefixes,
+            resume_from,
+            envelope_count,
+        ) = if let Some(previous) = previous {
+            let mut statement = connection.prepare(
+                "SELECT rowid, writer, sequence, envelope_hash FROM replica_envelopes
                      WHERE rowid>?1 ORDER BY rowid",
-                )?;
-                let additions = statement
-                    .query_map([previous.max_envelope_rowid], |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            ReplicaEnvelopeId {
-                                writer: row.get(1)?,
-                                sequence: row.get(2)?,
-                                hash: row.get(3)?,
-                            },
-                        ))
-                    })?
-                    .collect::<Result<Vec<_>, _>>()?;
-                if envelope_count == previous.envelope_rows + additions.len()
-                    && tombstone_count == previous.tombstone_rows
+            )?;
+            let additions = statement
+                .query_map([previous.max_envelope_rowid], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        ReplicaEnvelopeId {
+                            writer: row.get(1)?,
+                            sequence: row.get(2)?,
+                            hash: row.get(3)?,
+                        },
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            if inventory_generation == previous.inventory_generation {
+                let envelope_rows = previous.envelope_rows + additions.len();
+                let mut max_rowid = previous.max_envelope_rowid;
+                // Most snapshots are owned only by this cache. Move their inventory
+                // into the successor so a graph write does not allocate and free
+                // every envelope ID. Keep the old snapshot intact for concurrent
+                // callers that still hold it.
+                let (mut inventory, mut buckets, digest_prefixes) = match Arc::try_unwrap(previous)
                 {
-                    let mut max_rowid = previous.max_envelope_rowid;
-                    // Most snapshots are owned only by this cache. Move their inventory
-                    // into the successor so a graph write does not allocate and free
-                    // every envelope ID. Keep the old snapshot intact for concurrent
-                    // callers that still hold it.
-                    let (mut inventory, mut buckets, digest_prefixes) =
-                        match Arc::try_unwrap(previous) {
-                            Ok(snapshot) => (
-                                snapshot.inventory,
-                                snapshot.buckets,
-                                snapshot.digest_prefixes,
-                            ),
-                            Err(shared) => (
-                                shared.inventory.clone(),
-                                shared.buckets.clone(),
-                                shared.digest_prefixes.clone(),
-                            ),
-                        };
-                    let mut touched = BTreeSet::new();
-                    for (rowid, identity) in additions {
-                        max_rowid = max_rowid.max(rowid);
-                        touched.insert((
-                            identity.writer.clone(),
-                            replication_bucket_start(identity.sequence),
-                        ));
-                        inventory.insert(identity);
-                    }
-                    // Only the ranges that gained an envelope need a new digest.
-                    for (writer, start) in &touched {
-                        let bucket = inventory.bucket(inventory.range(writer, *start));
-                        match buckets.binary_search_by(|existing| {
-                            (existing.writer.as_str(), existing.start)
-                                .cmp(&(writer.as_str(), *start))
-                        }) {
-                            Ok(position) => buckets[position] = bucket,
-                            Err(position) => buckets.insert(position, bucket),
-                        }
-                    }
-                    // Every range before the first one that gained an envelope is unchanged, so
-                    // the inventory digest resumes there instead of hashing every identity again.
-                    let resume_from = touched
-                        .iter()
-                        .map(|(writer, start)| {
-                            buckets.partition_point(|existing| {
-                                (existing.writer.as_str(), existing.start)
-                                    < (writer.as_str(), *start)
-                            })
-                        })
-                        .min()
-                        .unwrap_or(buckets.len());
-                    (inventory, max_rowid, buckets, digest_prefixes, resume_from)
-                } else {
-                    full(connection)?
+                    Ok(snapshot) => (
+                        snapshot.inventory,
+                        snapshot.buckets,
+                        snapshot.digest_prefixes,
+                    ),
+                    Err(shared) => (
+                        shared.inventory.clone(),
+                        shared.buckets.clone(),
+                        shared.digest_prefixes.clone(),
+                    ),
+                };
+                let mut touched = BTreeSet::new();
+                for (rowid, identity) in additions {
+                    max_rowid = max_rowid.max(rowid);
+                    touched.insert((
+                        identity.writer.clone(),
+                        replication_bucket_start(identity.sequence),
+                    ));
+                    inventory.insert(identity);
                 }
+                // Only the ranges that gained an envelope need a new digest.
+                for (writer, start) in &touched {
+                    let bucket = inventory.bucket(inventory.range(writer, *start));
+                    match buckets.binary_search_by(|existing| {
+                        (existing.writer.as_str(), existing.start).cmp(&(writer.as_str(), *start))
+                    }) {
+                        Ok(position) => buckets[position] = bucket,
+                        Err(position) => buckets.insert(position, bucket),
+                    }
+                }
+                // Every range before the first one that gained an envelope is unchanged, so
+                // the inventory digest resumes there instead of hashing every identity again.
+                let resume_from = touched
+                    .iter()
+                    .map(|(writer, start)| {
+                        buckets.partition_point(|existing| {
+                            (existing.writer.as_str(), existing.start) < (writer.as_str(), *start)
+                        })
+                    })
+                    .min()
+                    .unwrap_or(buckets.len());
+                (
+                    inventory,
+                    max_rowid,
+                    buckets,
+                    digest_prefixes,
+                    resume_from,
+                    envelope_rows,
+                )
             } else {
                 full(connection)?
-            };
+            }
+        } else {
+            full(connection)?
+        };
         inventory.resume_digest(&buckets, &mut digest_prefixes, resume_from);
         // Envelope hashes already commit the complete payload (and chain metadata). The
         // inventory digest therefore commits the authority log without hex-encoding and hashing
@@ -4935,7 +4980,7 @@ impl Store {
             replica_generation: self.replica_generation.load(Ordering::Acquire),
             max_envelope_rowid,
             envelope_rows: envelope_count,
-            tombstone_rows: tombstone_count,
+            inventory_generation,
             inventory,
             buckets,
             digest_prefixes,
@@ -5626,25 +5671,54 @@ impl Store {
     }
 
     pub fn project_replication_backlog(&self) -> Result<bool> {
-        self.project_replication_backlog_chunks(|| {}, || {})
+        self.project_replication_backlog_in_phase("replication")
+    }
+
+    /// Identify the caller's phase in the always-on full-replay diagnostic.
+    pub fn project_replication_backlog_in_phase(&self, phase: &str) -> Result<bool> {
+        self.project_replication_backlog_chunks(|| {}, || {}, phase, |line| eprintln!("{line}"))
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn project_replication_backlog_with_log(
+        &self,
+        phase: &str,
+        log: impl FnMut(&str),
+    ) -> Result<bool> {
+        self.project_replication_backlog_chunks(|| {}, || {}, phase, log)
     }
 
     /// Exercise reads and queued writes between committed projection chunks.
     #[cfg(any(test, feature = "test-support"))]
     pub fn project_replication_backlog_with_yield(&self, between: impl FnMut()) -> Result<bool> {
-        self.project_replication_backlog_chunks(between, || {})
+        self.project_replication_backlog_chunks(
+            between,
+            || {},
+            "replication",
+            |line| eprintln!("{line}"),
+        )
     }
 
     /// Force an admission or deferral after the final index read, before clearing its state.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn project_replication_backlog_before_clear(&self, before_clear: impl FnMut()) -> Result<bool> {
-        self.project_replication_backlog_chunks(|| {}, before_clear)
+    pub fn project_replication_backlog_before_clear(
+        &self,
+        before_clear: impl FnMut(),
+    ) -> Result<bool> {
+        self.project_replication_backlog_chunks(
+            || {},
+            before_clear,
+            "replication",
+            |line| eprintln!("{line}"),
+        )
     }
 
     fn project_replication_backlog_chunks(
         &self,
         mut between: impl FnMut(),
         mut before_clear: impl FnMut(),
+        phase: &str,
+        mut log: impl FnMut(&str),
     ) -> Result<bool> {
         let _projecting = self
             .projection
@@ -5686,7 +5760,7 @@ impl Store {
                     .execute_batch("SAVEPOINT project_incremental")
                     .map_err(internal)?;
                 let incremental = crate::profile::span("projection/incremental");
-                let projected =
+                let fallback_reason =
                     match self
                         .runtime
                         .project_incremental(&transaction, &self.origin, through)
@@ -5695,7 +5769,10 @@ impl Store {
                             transaction
                                 .execute_batch("RELEASE project_incremental")
                                 .map_err(internal)?;
-                            projected
+                            match projected {
+                                IncrementalProjection::Projected => None,
+                                IncrementalProjection::Replay(reason) => Some(reason.to_owned()),
+                            }
                         }
                         Err(error) => {
                             crate::profile::note(&format!(
@@ -5707,11 +5784,13 @@ impl Store {
                                     "ROLLBACK TO project_incremental; RELEASE project_incremental",
                                 )
                                 .map_err(internal)?;
-                            false
+                            Some(format!("incremental-error:{}", error.code))
                         }
                     };
                 drop(incremental);
-                if !projected {
+                let projected = fallback_reason.is_none();
+                if let Some(reason) = fallback_reason {
+                    log(&full_replay_log_line(phase, &reason, frontier, target));
                     #[cfg(any(test, feature = "test-support"))]
                     FULL_REPLAYS.with(|replays| replays.set(replays.get() + 1));
                     let _replay = crate::profile::span("projection/full-replay");
@@ -6445,11 +6524,7 @@ impl Store {
             authority_digest: snapshot.authority_digest.clone(),
             graph_digest: snapshot.graph_digest.clone(),
             projection_digests: snapshot.projection_digests.clone(),
-            received_envelopes: connection.query_row(
-                "SELECT COUNT(*) FROM replica_envelopes",
-                [],
-                |row| row.get(0),
-            )?,
+            received_envelopes: snapshot.envelope_rows as u64,
             pending_records: count("pending")?,
             valid_records: count("valid")?,
             unknown_records: waiting_claims,
@@ -7260,4 +7335,15 @@ pub fn append_claim_record_tx(
         predecessors: predecessors.to_vec(),
         accepted_at_unix_ms: now,
     })
+}
+
+#[cfg(test)]
+mod replay_log_tests {
+    #[test]
+    fn replay_log_is_bounded_and_single_line() {
+        let line = super::full_replay_log_line(&"phase\n".repeat(200), &"reason\r\t".repeat(200), u64::MAX, u64::MAX);
+        assert!(!line.contains(['\n', '\r', '\t']));
+        assert!(line.len() < 1200);
+        assert!(line.contains(&format!("frontier={} target={}", u64::MAX, u64::MAX)));
+    }
 }

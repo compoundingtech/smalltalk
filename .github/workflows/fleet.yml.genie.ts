@@ -15,10 +15,12 @@ import {
   linuxStageRunner,
   linuxStageRunsOn,
   perfStoresCache,
+  mailStageRunsOn,
   pickRunnerJob,
   pickRunnerJobId,
   supportingLinuxRunsOn,
   supportingStageRunsOn,
+  secondaryStageRunsOn,
   workspacePreparationSteps,
 } from './workspace-ci.ts'
 
@@ -244,6 +246,7 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
     'linux-tests-shard-2': linuxStageJob({
       name: 'linux-tests-shard-2',
       stage: 'tests',
+      runsOn: secondaryStageRunsOn,
       // Reuse the main-seeded test caches; each checkout keeps its own executable paths.
       setup: workspacePreparationSteps.map((step: any) =>
         step.id === 'cargo-cache' || step.id === 'nix-cache'
@@ -271,6 +274,7 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
       ...namespaceStageJob({
         name: 'mail-redelivery-canaries',
         stage: 'mail-redelivery-canaries',
+        runsOn: mailStageRunsOn,
         description: 'Require every harness to hold old mail across boot and reconnect',
         setup: workspacePreparationSteps.map((step: any) =>
           step.id === 'cargo-cache' || step.id === 'nix-cache'
