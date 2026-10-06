@@ -145,6 +145,8 @@ enum Fetched {
         target: String,
         session_id: String,
         page: Result<OlderPage, String>,
+        /// How long st took to answer, so a slow st is not asked for more than the person scrolled to.
+        took: Duration,
     },
     Preview(String, Load<MissionPreview>),
     /// The message behind an unread-message item: sender, title and text.
@@ -569,7 +571,12 @@ pub fn run(context: Context) -> Result<()> {
                     target,
                     session_id,
                     page,
+                    took,
                 } => {
+                    // A slow st is not asked to fill the first screen any further.
+                    if slow_page(took) {
+                        filled.insert(target.clone(), FILL_PAGES);
+                    }
                     if let Some(timeline) = timelines.get_mut(&target) {
                         match page {
                             Ok(page) => timeline.older_page(
@@ -1026,7 +1033,13 @@ pub fn run(context: Context) -> Result<()> {
         // a few pages at most, until about a screenful of rows is there.
         let mut wanted = ui.take_older_wanted();
         let mut names = None;
+        // One page is asked for at a time across every conversation, so opening several at
+        // once is not a burst of reads on a daemon that may already be busy.
+        let reading = timelines.values().any(|timeline| timeline.older.loading);
         for (target, timeline) in &timelines {
+            if reading || wanted.len() > 0 {
+                break;
+            }
             let pages = filled.get(target).copied().unwrap_or(0);
             if !extras.live || !wants_fill(timeline, pages) {
                 continue;
@@ -1063,11 +1076,13 @@ pub fn run(context: Context) -> Result<()> {
             let client = client.clone();
             let tx = fetched_tx.clone();
             runtime.spawn(async move {
+                let started = Instant::now();
                 let page = older_page(&client, &session_id, cursor, oldest).await;
                 let _ = tx.send(Fetched::Older {
                     target,
                     session_id,
                     page,
+                    took: started.elapsed(),
                 });
             });
         }
@@ -1404,6 +1419,13 @@ const FILL_ROWS: usize = 200;
 
 /// The most earlier pages one conversation reads on its own to get there.
 const FILL_PAGES: usize = 7;
+
+/// A page st took this long to give is a sign it is busy: no more pages are read on their own.
+const FILL_SLOW: Duration = Duration::from_millis(1500);
+
+fn slow_page(took: Duration) -> bool {
+    took > FILL_SLOW
+}
 
 /// Whether a conversation may read one more earlier page on its own: there is more before it,
 /// no page is in flight or has just failed, and it has not used up its pages.
@@ -2160,6 +2182,12 @@ async fn send_message(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_slow_page_stops_the_first_screen_reading_on() {
+        assert!(!super::slow_page(Duration::from_millis(400)));
+        assert!(super::slow_page(Duration::from_secs(2)));
+    }
+
     #[test]
     fn a_first_screen_reads_earlier_pages_only_while_it_may() {
         let mut timeline = st3_conversation_ui::Timeline {
