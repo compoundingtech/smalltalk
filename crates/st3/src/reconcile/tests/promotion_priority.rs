@@ -12,8 +12,8 @@ impl Drop for FinishProcessOnDrop {
 
 #[test]
 fn first_readiness_and_first_incarnation_beat_writer_backlog_under_mailbox_check_flood() {
-    let store = Arc::new(Store::open_memory("node").unwrap());
     let root = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(&root.path().join("claims.sqlite3"), "node").unwrap());
     let finish = root.path().join("finish");
     let _finish_on_drop = FinishProcessOnDrop(finish.clone());
     let runtime = Arc::new(NativeRuntime::new(root.path(), None, Path::new("unused-pty")));
