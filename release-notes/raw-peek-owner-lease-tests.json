@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Exercise owner-local PEEK expiry rotation and revocation boundaries",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay behavior changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Tests only; no database schema changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "RULES_VERSION remains11; no checkpoint rule changes."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No runtime or protocol changes beyond the preceding owner lease split."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional service interruption beyond a normal daemon upgrade."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No additional steps beyond the preceding lease split."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No data rewrite or destructive migration; existing binary swap-back behavior is unchanged. Older builds retain their older observation enforcement."
+  }
+}
