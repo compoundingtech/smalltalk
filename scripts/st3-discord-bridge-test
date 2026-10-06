@@ -413,6 +413,24 @@ class BridgeScenarios(unittest.TestCase):
             self.link.watch_replies()
         self.assertIsNone(self.state.get('outbound_cursor'))
 
+    def test_nested_reply_waits_for_parent_receipt_across_restart(self):
+        incoming = self.imported()
+        parent = self.answer(incoming, 'first reply')
+        self.answer(parent, 'nested reply')
+        page = {'contract': 'st3.adapter.delivery.v0', 'items': self.st.mailbox, 'cursor': 707, 'host': 'orchid'}
+        with patch.object(self.st, 'deliveries', return_value=page, create=True):
+            self.link.watch_replies()
+            self.assertIsNone(self.state.get('outbound_cursor'))
+            self.restart()
+            self.link.exports()
+            self.link.watch_replies()
+            self.assertEqual(self.state.get('outbound_cursor'), '707')
+            self.link.exports()
+        self.assertEqual(len(self.discord.posts), 2)
+        self.assertEqual(self.discord.posts[0]['message_reference']['message_id'], '101')
+        self.assertEqual(self.discord.posts[1]['message_reference']['message_id'],
+                         self.state.db.execute('SELECT discord_id FROM outbox WHERE st_id=?', (parent,)).fetchone()[0])
+
     def test_delivery_watch_refuses_another_hosts_frontier(self):
         self.state.put('outbound_host', 'orchid')
         self.state.put('outbound_cursor', '606')

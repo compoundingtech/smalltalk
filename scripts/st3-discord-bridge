@@ -517,6 +517,10 @@ class Bridge:
                 continue
             parent = self.state.db.execute('SELECT discord_id FROM inbox WHERE st_id=? UNION ALL SELECT discord_id FROM outbox WHERE st_id=? AND discord_id IS NOT NULL ORDER BY 1 LIMIT 1', (message.get('in_reply_to'), message.get('in_reply_to'))).fetchone()
             if parent is None:
+                if self.state.db.execute('SELECT 1 FROM outbox WHERE st_id=? AND discord_id IS NULL', (message.get('in_reply_to'),)).fetchone():
+                    # The parent was queued earlier in this page but is not yet
+                    # delivered. Export it, then replay this unchanged frontier.
+                    return False
                 continue
             text = message.get('content')
             if not isinstance(text, str) or len(text.encode()) > 8192 or self.discord.token in text:
@@ -535,6 +539,7 @@ class Bridge:
                 nonce = hashlib.sha256((self.scope + ':' + message['subject'] + ':' + str(part)).encode()).hexdigest()[:24]
                 self.state.db.execute('INSERT OR IGNORE INTO outbox(st_id,part,content,parent,nonce,images) VALUES (?,?,?,?,?,?)', (message['subject'], part, content, parent[0], nonce, json.dumps(images if part == 0 else [])))
             self.state.db.commit()
+        return True
 
     def watch_replies(self, wait_ms=5000):
         after = int(self.state.get('outbound_cursor') or '0')
@@ -548,7 +553,8 @@ class Bridge:
         if host is not None and host != page['host']:
             raise Stop('The delivery watch moved to another host; reconcile retained delivery state before resuming.')
         # Queue durable parts before advancing the frontier. A crash replays stable IDs.
-        self.queue_replies(page['items'])
+        if not self.queue_replies(page['items']):
+            return
         self.state.put('outbound_host', page['host'])
         self.state.put('outbound_cursor', page['cursor'])
 
