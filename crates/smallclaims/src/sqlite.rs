@@ -72,8 +72,10 @@ struct CommitObserverCallback {
     completed: Condvar,
 }
 
+type CommitCallback = Arc<dyn Fn(&Connection) + Send + Sync>;
+
 struct CommitObserverState {
-    run: Option<Arc<dyn Fn(&Connection) + Send + Sync>>,
+    run: Option<CommitCallback>,
     running: Option<std::thread::ThreadId>,
 }
 
