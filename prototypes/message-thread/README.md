@@ -84,6 +84,22 @@ The rank trie touches 63 count nodes per insert/delete and needs real-schema
 transaction, durability, replay and byte-cost proof. No shared Store or API
 method uses this model.
 
+`rank_gap_tree_oracle.py` is an isolated follow-up to the mixed no-change
+case. It keeps one legacy-head leaf per child only when its canonical prefix
+ties a recorded-lane head in the same batch. The leaf stores the dynamic
+legacy COUNT rank minus recorded position. A sparse range-add tree applies a
+predecessor insertion/deletion to later leaves and prunes subtrees whose gaps
+are too far from a possible winner crossing. Invented 10/100-child fixtures
+visit 19/22 nodes with zero candidates when the recorded position is far
+ahead, versus 43/312 nodes and 10/100 changed parents when every comparison
+crosses; 500 seeded set/delete/shift operations match a full dictionary
+oracle. These are Python node visits, not SQLite VM steps. The tree is not
+connected to `mixed_rank_oracle.py`, does not handle cross-batch prefix changes
+or persistent rollback/reopen, and does not cure the preceding measured mixed
+writer-cost failure. Any real implementation must update leaves transactionally
+when either lane head or its canonical prefix changes and prove bounded
+storage/replay/retirement.
+
 Before production integration, use current-main `store.rs` schema near
 `message_reply_edges`, its open/backfill path and runtime projection hook;
 classify the new table as a rebuildable local cache in canonical audit.
