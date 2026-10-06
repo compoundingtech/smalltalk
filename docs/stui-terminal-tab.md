@@ -15,6 +15,10 @@ The [original matrix](../crates/stui/tests/fixtures/terminal-tab-baseline.json) 
 [program receipts](../crates/stui/tests/fixtures/terminal-tab-program-baseline.json)
 retain the reproduction before fixes.
 
+The top bar's bottom border occupies one row in both layouts. Terminal panes begin
+below it and have one fewer content row at the same window size; the current
+fixtures record that geometry.
+
 ## Wheel and mouse
 
 The original wheel failure occurred before the encoder: `draw_terminal` did not
