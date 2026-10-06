@@ -186,6 +186,10 @@ const NOT_MEASURED: &[(&str, &str)] = &[
         "POST /v1/internal/replication/peer-failure",
         "records a transport failure; no store read",
     ),
+    (
+        "POST /v1/internal/replication/worker-status",
+        "updates host-local worker memory; no store read or graph write",
+    ),
     // Checkpoints: the trim is measured directly, per deleted row.
     (
         "POST /v1/checkpoint/plan",

@@ -10568,6 +10568,21 @@ fn render_replication_peers(
                 .or(peer.last_error.as_deref())
                 .unwrap_or("")
         );
+        if let Some(worker) = &peer.worker {
+            let _ = writeln!(
+                output,
+                "  worker {}: last attempt {}",
+                worker.phase,
+                relative_time(worker.last_attempt_at_unix_ms, now)
+            );
+            if let Some(at) = worker.next_retry_at_unix_ms {
+                let _ = writeln!(
+                    output,
+                    "  next retry in {}s (unix ms {at})",
+                    at.saturating_sub(now).div_ceil(1000)
+                );
+            }
+        }
         if !peer.differing_tables.is_empty() {
             let _ = writeln!(
                 output,
@@ -22578,6 +22593,7 @@ mod tests {
 
     fn peer_status(peer: &str, digest: Option<&str>) -> st3::model::ReplicationPeerStatus {
         st3::model::ReplicationPeerStatus {
+            worker: None,
             projection_digests: Default::default(),
             differing_tables: Vec::new(),
             projection_comparison_waiting: false,
@@ -24299,6 +24315,7 @@ mod tests {
         let peer =
             |name: &str, graph: Option<&str>, sync: Option<st3::model::ReplicationPeerSync>| {
                 ReplicationPeerStatus {
+                    worker: None,
                     projection_digests: BTreeMap::from([("claim_sources".into(), "sample".into())]),
                     differing_tables: Vec::new(),
                     projection_comparison_waiting: false,
