@@ -109,6 +109,20 @@ its setup is unbounded, and it does not cover canonical prefix changes,
 multiple lane heads, rollback, reopen, checkpoint or actual Store hooks. The
 SQL model's earlier measured mixed-batch writer row remains failed.
 
+`persistent_gap_tree.py` is a source-only SQLite persistence sketch for this
+range summary. It stores per-child lane-head identity and parent fields, plus
+per-batch sparse count/min/max/lazy nodes. The gap uses decimal TEXT to avoid
+silently narrowing the canonical u64 replica-record position; positive claim
+store indexes remain within SQLite's signed INTEGER domain. `replace_head`
+removes an OLD leaf and inserts a NEW leaf, including cross-batch moves;
+`shift_after` applies one predecessor rank change and returns only possible
+crossings. Both operations must share the claim, record, rank and selected-edge
+writer transaction. `persistent_gap_tree_fixture.py` is a queued invented
+rollback/reopen/move/removal check, not yet executed. The code is not wired to
+Store or the SQLite rank model, has no migration, GC or startup/backfill plan,
+and has no measured node/statement/byte or production lifecycle result. It
+cannot clear the frozen b563 or later a8 writer-cost failures.
+
 Before production integration, use current-main `store.rs` schema near
 `message_reply_edges`, its open/backfill path and runtime projection hook;
 classify the new table as a rebuildable local cache in canonical audit.
