@@ -579,3 +579,50 @@ An accepted operation can cause later runtime work. A later start, stop, observe
 This split keeps authored intent atomic and keeps real-world effects observable.
 
 The st eval suite proves these workflows with isolated state and bounded run time.
+
+## Mission revision provenance
+
+A top-level mission can record why its revision was produced and where it came from:
+
+```kdl
+version 2
+mission "orchard/release" state="ready" {
+  provenance {
+    reason "Apply the approved release plan."
+    source {
+      repository "https://example.invalid/orchard/missions"
+      commit "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      path "missions/release.kdl"
+      renderer "orchard-renderer-v1"
+    }
+    decision "decision/approved-release-scope"
+    evidence "doc/orchard/release-proof@opaque-reference"
+  }
+  goal "Prepare the release."
+  step "prepare" { goal "Prepare the release." }
+}
+```
+
+The block requires one reason and exactly one source with repository, full commit id, relative
+path and renderer. Decision and evidence strings can repeat; they are opaque references, and
+neither references nor renderer text are resolved or executed. Each list allows at most 32
+references of 1,024 UTF-8 bytes each; source text allows 1,024 bytes per field, reason allows
+2,048 bytes, and the complete JSON block allows 16 KiB. Empty strings, control characters,
+unknown or duplicate fixed fields, abbreviated/non-hexadecimal commits, and paths with absolute,
+empty, dot or parent components are refused. Commits accept full SHA-1 or SHA-256 ids.
+
+Provenance is fixed at the first publication of the exact mission revision. Republishing the
+same block is a no-op; omitting it preserves the existing block. Replacing it, or attaching one
+to an already published revision that had none, is refused. Change the mission definition to
+publish a new revision with new provenance. Earlier revisions keep their earlier blocks.
+`st missions show`, `st launch preview` and `st work revise` show the block. Launch approval
+also commits the displayed provenance. Querying revisions by source commit is deferred.
+
+The `mission.provenance` sidecar claim uses `mission/ID@REVISION` as its subject and has once
+cardinality and durable retention. It is written atomically with the ordinary `mission.published`
+claim. It stays outside `MissionSpec`, so existing mission and step hashes and revision bodies
+remain unchanged. Older daemons project the ordinary revision and can start its work, retain the
+unknown sidecar for upgrade, and show no provenance. Older clients ignore the added read fields.
+The sidecar reads directly from the claim log: no new projection table, checkpoint drop rule,
+retention window, or `RULES_VERSION` change is needed. Existing checkpoint rules preserve kinds
+without a drop slot and once claims; authenticated unknown records also remain retained.

@@ -760,6 +760,8 @@ pub struct NormalizedIntent {
     pub subjects: BTreeMap<String, DesiredSubject>,
     #[serde(default)]
     pub missions: BTreeMap<String, MissionSpec>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mission_provenance: BTreeMap<String, st3_schema::provenance::Provenance>,
     #[serde(default)]
     pub mission_runs: BTreeMap<String, MissionRunDeclaration>,
     #[serde(default)]
@@ -1086,6 +1088,8 @@ pub struct MissionResponse {
     pub warnings: Vec<String>,
     pub subject_tokens: BTreeMap<String, Vec<String>>,
     pub mission_revisions: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mission_provenance: BTreeMap<String, st3_schema::provenance::Provenance>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2173,6 +2177,8 @@ pub struct MissionDefinitionView {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MissionRunView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<st3_schema::provenance::Provenance>,
     pub subject: String,
     pub id: String,
     pub mission: String,
@@ -2690,6 +2696,8 @@ pub struct RevisionProposalView {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RevisionSubmissionView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<st3_schema::provenance::Provenance>,
     pub status: String,
     pub mission_run: MissionRunView,
     #[serde(default, skip_serializing_if = "Option::is_none")]
