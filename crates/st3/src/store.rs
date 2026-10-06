@@ -44100,6 +44100,72 @@ mission "nested-work" state="ready" {
         );
     }
 
+    #[test]
+    fn the_per_subject_cap_trims_every_subject_over_it_and_only_those() {
+        let store = Store::open_memory("node").unwrap();
+        for (subject, entries) in [("agent/node.a", 7), ("agent/node.b", 5), ("agent/node.c", 2)] {
+            for entry in 0..entries {
+                store
+                    .append_claim(&timeline_observation(subject, "inc", &format!("entry-{entry}")))
+                    .unwrap();
+            }
+        }
+        let remaining = |store: &Store| {
+            store
+                .local_observations_after(0, 100)
+                .unwrap()
+                .iter()
+                .map(|record| (record.subject.clone(), local_observation_position(record).unwrap()))
+                .collect::<Vec<_>>()
+        };
+        // Nothing is old; the cap alone applies, two rows to a chunk, to a and b but not c.
+        assert_eq!(store.trim_local_observations(0, 3, 2).unwrap(), 4 + 2);
+        let kept = remaining(&store);
+        let of = |name: &str| {
+            kept.iter()
+                .filter(|(subject, _)| subject == name)
+                .map(|(_, position)| *position)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(of("agent/node.a"), [5, 6, 7], "the three newest of seven");
+        assert_eq!(of("agent/node.b"), [10, 11, 12], "the three newest of five");
+        assert_eq!(of("agent/node.c"), [13, 14], "a subject under the cap is untouched");
+        assert_eq!(store.trim_local_observations(0, 3, 2).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_planning_rebuild_leaves_the_operations_alone() {
+        let store = Store::open_memory("alder").unwrap();
+        let intent = crate::graph::parse_internal_intent(
+            "version 2\nagent \"worker\" { workspace \"/tmp\"; harness \"codex\" { }; }\n",
+            "alder",
+        )
+        .unwrap();
+        store.apply_internal(&intent, "operations-pin").unwrap();
+        let count = |store: &Store| -> i64 {
+            store
+                .readers
+                .get()
+                .query_row("SELECT COUNT(*) FROM operations", [], |row| row.get(0))
+                .unwrap()
+        };
+        let rows = count(&store);
+        assert!(rows > 0, "applying a declaration registers an operation");
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM operations", [])
+            .unwrap();
+        // A planning write rebuilds the planning tables only: it must not re-derive operations
+        // (241,000 rows, 19 s on a real store).
+        store.rebuild_planning_projection().unwrap();
+        assert_eq!(count(&store), 0);
+        // The full rebuild does, which is what the planning path used to run on every write.
+        store.rebuild_claim_projections().unwrap();
+        assert_eq!(count(&store), rows);
+    }
+
     fn harness_state(subject: &str, state: &str, observed_at_ms: u64) -> ClaimInput {
         ClaimInput {
             subject: subject.into(),
