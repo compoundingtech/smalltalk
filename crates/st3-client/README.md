@@ -61,6 +61,8 @@ PEEK streams expire after 60 seconds without selected foreground observation and
 `activity.selected_use().await` only while the terminal is selected in the foreground
 (approximately every 20 seconds). Stop sending controls on deselection or backgrounding.
 The byte-only connector has no automatic renewal and remains idle-expiring.
+ATTACH streams do not have observation leases: calling `selected_use()` on their activity
+handle returns a local protocol error without sending a control or closing the PTY stream.
 
 Rotate before the absolute deadline by acquiring a fresh capability and connector. Send the
 existing PEEK initialization frame and receive fresh GEOMETRY and SCREEN before replacing

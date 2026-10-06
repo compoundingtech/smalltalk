@@ -109,3 +109,57 @@ async fn selected_use_is_sequenced_out_of_band_and_server_text_becomes_eof() {
     .await
     .expect("raw terminal controls and closure must complete without retaining the bridge");
 }
+
+#[allow(clippy::result_large_err)]
+#[tokio::test]
+async fn attach_selected_use_is_rejected_without_closing_pty() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("raw-attach.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_hdr_async(
+                stream,
+                |_: &Request, mut response: Response| {
+                    response.headers_mut().insert(
+                        "sec-websocket-protocol",
+                        "st3.client.pty.v0".parse().unwrap(),
+                    );
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
+            match websocket.next().await.unwrap().unwrap() {
+                Message::Binary(bytes) => assert_eq!(bytes.as_ref(), b"foreground-input"),
+                message => panic!("ATTACH must not send a renewal control: {message:?}"),
+            }
+            websocket.send(Message::Binary(b"terminal-output".as_slice().into())).await.unwrap();
+            while websocket.next().await.is_some() {}
+        });
+        let controlled = Client::unix(&socket)
+            .raw_terminal_stream_controlled(&RawTerminalAttachment {
+                terminal_id: "terminal/attach-test".into(),
+                runtime_incarnation: "incarnation-test".into(),
+                owner_host_id: "owner-test".into(),
+                mode: RawTerminalMode::Attach,
+                stream_capability: "attach-test".into(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            controlled.activity.selected_use().await,
+            Err(st3_client::ClientError::Protocol(_)),
+        ));
+        let mut stream = controlled.stream;
+        stream.write_all(b"foreground-input").await.unwrap();
+        let mut output = [0_u8; 15];
+        stream.read_exact(&mut output).await.unwrap();
+        assert_eq!(&output, b"terminal-output");
+        drop(stream);
+        server.await.unwrap();
+    })
+    .await
+    .expect("rejecting ATTACH renewal must preserve its PTY stream");
+}

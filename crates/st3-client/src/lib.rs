@@ -206,6 +206,7 @@ pub struct RawTerminalStream {
 #[derive(Clone)]
 pub struct RawTerminalActivity {
     controls: tokio::sync::mpsc::Sender<RawTerminalActivityRequest>,
+    selected_use_supported: bool,
 }
 
 impl RawTerminalActivity {
@@ -213,7 +214,13 @@ impl RawTerminalActivity {
     ///
     /// The bounded queue applies backpressure. Success means the socket send completed,
     /// not that the server acknowledged renewal. Closed bridges fail rather than renew locally.
+    /// ATTACH streams reject renewal locally without changing their PTY connection.
     pub async fn selected_use(&self) -> Result<(), ClientError> {
+        if !self.selected_use_supported {
+            return Err(ClientError::Protocol(
+                "selected-use renewal is only supported for PEEK streams".into(),
+            ));
+        }
         let (sent, receipt) = tokio::sync::oneshot::channel();
         self.controls
             .send(RawTerminalActivityRequest { sent })
@@ -2556,7 +2563,7 @@ impl Client {
                 })?
                 .map_err(|error| ClientError::Transport(error.to_string()))?;
                 validate_raw_terminal_subprotocol(&response)?;
-                raw_terminal_connector(websocket)
+                raw_terminal_connector(websocket, attachment.mode == RawTerminalMode::Peek)
             }
             Endpoint::FabricLoopback(base) => {
                 let websocket_base = if let Some(base) = base.strip_prefix("https://") {
@@ -2578,7 +2585,7 @@ impl Client {
                 })?
                 .map_err(|error| ClientError::Transport(error.to_string()))?;
                 validate_raw_terminal_subprotocol(&response)?;
-                raw_terminal_connector(websocket)
+                raw_terminal_connector(websocket, attachment.mode == RawTerminalMode::Peek)
             }
         }
     }
@@ -3198,6 +3205,7 @@ fn validate_raw_terminal_subprotocol(
 
 fn raw_terminal_connector<S>(
     websocket: WebSocketStream<S>,
+    selected_use_supported: bool,
 ) -> Result<RawTerminalStream, ClientError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -3306,7 +3314,10 @@ where
     });
     Ok(RawTerminalStream {
         stream: consumer,
-        activity: RawTerminalActivity { controls },
+        activity: RawTerminalActivity {
+            controls,
+            selected_use_supported,
+        },
     })
 }
 
