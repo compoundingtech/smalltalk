@@ -16,7 +16,7 @@ public class StDeviceKeyModule: Module {
       try DeviceKey.load(handle: handle).map { $0.described }
     }
 
-    // A new key, replacing any earlier one: each pairing enrolls its own key.
+    // A separate candidate key: committing the pairing selects its handle.
     AsyncFunction("create") { () -> [String: String] in
       let handle = UUID().uuidString
       var info = try DeviceKey.create(handle: handle).described

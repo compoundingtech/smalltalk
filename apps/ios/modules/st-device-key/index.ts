@@ -5,10 +5,10 @@ import { requireOptionalNativeModule } from 'expo';
 export type DeviceKeyInfo = { key: string; storage: 'secure-enclave' | 'software'; handle: string };
 
 type Native = {
-  current(handle: string | null): Promise<Omit<DeviceKeyInfo, 'handle'> | null>;
+  current(handle?: string): Promise<Omit<DeviceKeyInfo, 'handle'> | null>;
   create(): Promise<DeviceKeyInfo>;
-  sign(text: string, handle: string | null): Promise<string>;
-  remove(handle: string | null): Promise<void>;
+  sign(text: string, handle?: string): Promise<string>;
+  remove(handle?: string): Promise<void>;
   verify(key: string, text: string, signature: string): Promise<boolean>;
 };
 
@@ -21,17 +21,17 @@ export async function createDeviceKey(): Promise<DeviceKeyInfo | null> {
 
 /** Inspect a saved profile's key by handle, or the legacy default key. */
 export async function currentDeviceKey(handle?: string): Promise<Omit<DeviceKeyInfo, 'handle'> | null> {
-  return native ? native.current(handle ?? null) : null;
+  return native ? (handle === undefined ? native.current() : native.current(handle)) : null;
 }
 
 /** The base64url r||s signature over `text`'s UTF-8 bytes. */
 export async function signWithDeviceKey(text: string, handle?: string): Promise<string> {
   if (!native) throw new Error('This build cannot sign');
-  return native.sign(text, handle ?? null);
+  return handle === undefined ? native.sign(text) : native.sign(text, handle);
 }
 
 export async function removeDeviceKey(handle?: string): Promise<void> {
-  await native?.remove(handle ?? null);
+  if (native) await (handle === undefined ? native.remove() : native.remove(handle));
 }
 
 export function canVerifyPairing(): boolean { return typeof native?.verify === 'function'; }
