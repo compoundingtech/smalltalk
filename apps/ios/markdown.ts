@@ -2,7 +2,7 @@
 // and inline): headings, bullets with a hanging marker, fenced code, quotes, rules, and tables
 // kept as monospace rows. Anything else is a plain line.
 
-export type Run = { text: string; style: 'plain' | 'bold' | 'code' | 'link'; url?: string };
+export type Run = { text: string; style: 'plain' | 'bold' | 'code' | 'link'; url?: string; path?: string };
 export type Block =
   | { kind: 'blank' }
   | { kind: 'text'; runs: Run[] }
@@ -30,6 +30,12 @@ function address(rest: string): string | null {
   return url.length > 'https://'.length - 1 ? url : null;
 }
 
+/** The file a markdown link's target names, when it is an absolute or home path (or a file: URL). */
+export function filePath(target: string): string | undefined {
+  const value = target.trim().replace(/^file:\/\//, '');
+  return /^(\/|~\/)[^\s]/.test(value) ? value : undefined;
+}
+
 export function inline(text: string): Run[] {
   const runs: Run[] = [];
   let plain = '';
@@ -44,7 +50,9 @@ export function inline(text: string): Run[] {
       const end = rest.indexOf('`', 1);
       flush(); runs.push({ text: rest.slice(1, end), style: 'code' }); rest = rest.slice(end + 1);
     } else if ((match = /^\[([^\]]*)\]\(([^)]*)\)/.exec(rest))) {
-      flush(); runs.push({ text: match[1], style: 'link', url: /^https?:\/\//.test(match[2]) ? match[2] : undefined }); rest = rest.slice(match[0].length);
+      // An address opens; a path names a file on the machine the writer works on (an agent's
+      // `[spec](/home/…/spec.md)`), which this phone cannot read but can copy.
+      flush(); runs.push({ text: match[1], style: 'link', url: /^https?:\/\//.test(match[2]) ? match[2] : undefined, ...(filePath(match[2]) ? { path: filePath(match[2]) } : {}) }); rest = rest.slice(match[0].length);
     } else if ((match = /^https?:\/\//.exec(rest)) && (plain === '' || /[\s(\["'*]$/.test(plain)) && address(rest)) {
       const url = address(rest)!;
       flush(); runs.push({ text: url, style: 'link', url }); rest = rest.slice(url.length);

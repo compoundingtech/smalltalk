@@ -44,6 +44,22 @@
       "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
     },
     {
+      "action": "arrangement.edit",
+      "tests": [
+        "crates/st3/src/api/client_v0/arrangements.rs::arrangement_actions_merge_layout_fences_replay_receipts_and_preserve_owner",
+        "crates/st3/src/api/client_v0/arrangements.rs::arrangement_edit_recovers_receipt_gap_without_accepting_a_changed_action_id",
+        "crates/st3/src/api/client_v0/arrangements.rs::arrangement_actions_accept_current_projected_launch_fences_and_refuse_stale_ones",
+        "crates/st3/src/api/client_v0/arrangements.rs::arrangement_retire_fences_refuse_concurrent_edits_and_replay_receipts",
+        "crates/st3/src/api/client_v0/arrangements.rs::arrangement_fenced_retire_recovers_receipt_gap",
+        "crates/st3/src/api/client_v0/arrangements.rs::arrangement_create_race_returns_typed_exists_and_exact_retry_receipt",
+        "crates/st3/src/api/client_v0/arrangements.rs::arrangement_folder_race_and_validation_refusals_stay_typed",
+        "crates/st3/src/api/client_v0/arrangements.rs::selected_arrangement_survives_byte_window_edits_and_retirement",
+        "crates/st3/src/store/arrangements_tests.rs::owner_admission_real_agent_and_atomic_identity_fences",
+        "crates/st3/src/store/arrangements_tests.rs::heads_survive_reopen_and_an_upgrade_backfills_once"
+      ],
+      "behavior": "real API handler and store tests: stale layout fences merge; fenced retirement compares the current revision and refuses concurrent edits without writes; unfenced retirement remains unconditional; stale authority and launch fences refuse without edits; replay preserves receipts and rejects changed action identity; fenced retirement recovers receipt gaps; agent attribution preserves person ownership; projected heads survive reopen, upgrade backfill and replication"
+    },
+    {
       "action": "attention.resolve",
       "tests": [
         "crates/st3/tests/action_coverage.rs::unavailable_actions_refuse_before_and_after_restart_without_writes"
@@ -382,6 +398,22 @@
         "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
       ],
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
+      "command": "st admission override",
+      "description": "Explicitly allow an installed exact harness build with a recorded reason",
+      "tests": [
+        "crates/st3/tests/client_v0_cli.rs::person_admission_exception_is_local_reversible_and_never_spawns_the_producer"
+      ],
+      "verification": "real local CLI; environment guard, exact-build record, revoke, and no daemon or producer child"
+    },
+    {
+      "command": "st admission revoke",
+      "description": "Remove the installed exact harness build exception",
+      "tests": [
+        "crates/st3/tests/client_v0_cli.rs::person_admission_exception_is_local_reversible_and_never_spawns_the_producer"
+      ],
+      "verification": "real local CLI; environment guard, exact-build record, revoke, and no daemon or producer child"
     },
     {
       "command": "st agents apply",

@@ -32,8 +32,9 @@ export default githubWorkflow({
   },
   permissions: { contents: 'read', actions: 'read', 'pull-requests': 'read' },
   concurrency: {
-    group: 'perf-${{ github.event.pull_request.number || github.run_id }}',
-    'cancel-in-progress': "${{ github.event_name == 'pull_request' }}",
+    // Preserve the existing PR group; replace obsolete main pushes, never pinned controls.
+    group: "perf-${{ github.event.pull_request.number || (github.event_name == 'push' && github.ref == 'refs/heads/main' && 'main') || github.run_id }}",
+    'cancel-in-progress': "${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}",
   },
   actionlint: {
     ...defaultActionlintConfig,

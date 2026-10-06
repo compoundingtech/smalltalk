@@ -23,4 +23,6 @@ pub use priority::{
     server_unit, work_prefix,
 };
 pub use process::{ExecGeneration, ExecObservation, ExecRuntime, process_start_token};
-pub use pty::{Launch, PtyObservation, PtyRuntime, PtySpawnTimeout, PtySpawnTimeoutPhase};
+pub use pty::{
+    Launch, PtyObservation, PtyRuntime, PtySpawnTimeout, PtySpawnTimeoutPhase, TerminalSize,
+};

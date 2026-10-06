@@ -10,7 +10,8 @@ fn is_projection_notice(entry: &TimelineEntry) -> bool {
 #[derive(Clone, Debug, Default)]
 pub struct Frame {
     pub replace: bool,
-    pub has_more: bool,
+    /// Availability before the live window; absent on deltas means unchanged.
+    pub has_more: Option<bool>,
     pub items: Vec<TimelineEntry>,
     /// The session the entries belong to, when the stream says.
     pub session_id: Option<String>,
@@ -44,10 +45,14 @@ pub struct Older {
 impl Timeline {
     pub fn apply(&mut self, frame: Frame) {
         self.replace = frame.replace;
-        self.has_more = frame.has_more;
         let other_session = frame.session_id.is_some()
             && self.session_id.is_some()
             && frame.session_id != self.session_id;
+        if frame.replace || other_session {
+            self.has_more = frame.has_more.unwrap_or(false);
+        } else if let Some(has_more) = frame.has_more {
+            self.has_more = has_more;
+        }
         if frame.session_id.is_some() {
             self.session_id = frame.session_id;
         }
@@ -69,7 +74,7 @@ impl Timeline {
                 .iter()
                 .find(|item| !is_projection_notice(item))
                 .map(|first| (first.timestamp.as_str(), first.sequence));
-            if self.older.paged && !other_session && (meets || !frame.has_more) {
+            if self.older.paged && !other_session && (meets || !self.has_more) {
                 let mut items = std::mem::take(&mut self.items);
                 items.retain(|held| {
                     !is_projection_notice(held)

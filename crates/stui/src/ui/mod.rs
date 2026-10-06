@@ -390,6 +390,17 @@ pub struct Ui {
     stalled: HashMap<String, String>,
 }
 
+/// What clicking a link says it did: an address is pasted in a browser; a path names a file on the
+/// machine the writer works on, which stui cannot open.
+fn link_note(target: &str) -> String {
+    let shown = text::truncate(target, 60);
+    if target.starts_with('/') || target.starts_with("~/") {
+        format!("Copied {shown} · a file on the writer's machine")
+    } else {
+        format!("Copied {shown} · paste it in a browser")
+    }
+}
+
 /// Whether `c` can be part of a written-out web address.
 fn is_address_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || "-._~:/?#[]@!$&'()*+,;=%".contains(c)
@@ -4661,10 +4672,7 @@ impl Ui {
             // clipboard is the person's, so the link lands where their browser is.
             Hit::Link(url) => {
                 copy(&url);
-                self.flash(format!(
-                    "Copied {} · paste it in a browser",
-                    text::truncate(&url, 60)
-                ));
+                self.flash(link_note(&url));
             }
             Hit::Split(right) => self.split(right),
             Hit::GlassTab(group, tab) => self.show_in(group, tab),
@@ -5603,6 +5611,19 @@ mod tests {
         // x shows it again.
         let all = screens::missions_list(&world, "⠋", true);
         assert!(all.ids.iter().any(|id| id == "mission/example/failed-yesterday"));
+    }
+
+    #[test]
+    fn clicking_a_link_says_whether_it_copied_an_address_or_a_file_path() {
+        assert_eq!(
+            link_note("https://example.com/a"),
+            "Copied https://example.com/a · paste it in a browser"
+        );
+        assert_eq!(
+            link_note("/srv/repo/spec.md"),
+            "Copied /srv/repo/spec.md · a file on the writer's machine"
+        );
+        assert!(link_note("~/notes/a.md").contains("a file on the writer's machine"));
     }
 
     #[test]

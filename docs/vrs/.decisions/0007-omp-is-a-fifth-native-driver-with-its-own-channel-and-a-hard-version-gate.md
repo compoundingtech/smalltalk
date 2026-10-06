@@ -1,6 +1,6 @@
 # omp is a fifth native driver with its own channel and a hard version gate
 
-Status: accepted
+Status: accepted; admission policy revised 2026-10-02, explicit operator exception added 2026-10-03 for [#819](https://github.com/compoundingtech/smalltalk/issues/819)
 
 ## Context
 
@@ -15,7 +15,7 @@ pattern.
 ## Options
 | Option | Result | Reason |
 | --- | --- | --- |
-| Full native driver (fifth expansion arm, own wrapper, own channel) | Selected | The 2026-08-25 capture shows the pi mechanism ports and omp's approval events add an axis pi lacks. Cost: ~pi-driver scale code and a per-minor admission checklist. |
+| Full native driver (fifth expansion arm, own wrapper, own channel) | Selected | The 2026-08-25 capture shows the pi mechanism ports and omp's approval events add an axis pi lacks. Cost: ~pi-driver scale code and measured exact-build admission. |
 | Alias onto the pi driver | Rejected | Cheapest, but measured divergence makes it wrong: no `agent_settled` means the observed idle edge never fires or blips at `agent_end`, and version gates would pin the wrong harness. Rejected on evidence, not effort. |
 | Docs-only hand-authored pattern | Rejected | No presence lease, observed state, or native delivery; inconsistent with all four existing drivers — not "first-class". |
 | Blocked axis deferred out of v1 | Rejected | Smaller diff, but omp seats would read busy while actually waiting on a human — exactly what st2's wedged-agent signal exists to catch; both events verified firing (q2). |
@@ -48,10 +48,29 @@ are exactly why the channel forks rather than shares a file.
    and approval logic differ per harness (OMP-R04).
 3. **Publish the blocked-on-human axis in v1** from the two approval events (OMP-R02) —
    verified firing, not speculative.
-4. **Hard version gate on the minor** (18.x initially) under the codex/opencode admission
-   convention, because the delivery-critical surface is versioned behavior, not API contract
-   (OMP-R05). Chosen over warn-only despite omp's near-daily releases: a silently degraded
-   fleet reads as healthy; a refused launch reads as what it is.
+4. **Hard measured admission of the exact installed build** (OMP-R05). Before taking
+   ownership of a live seat, automatically measure the installed executable with the shipped
+   channel extension in a disposable RPC session. All five checks must pass: extension load,
+   lifecycle event names, a positive idle sample after terminal `agent_end`, a correlated
+   requested/resolved approval pair for a harmless isolated tool, and one native message consumed
+   in a completed model turn. The channel's `delivered` acknowledgement alone cannot prove
+   consumption. A failed or indeterminate check refuses omp launch; it names the boundary in
+   the durable driver diagnostic, the Agent API state and `st doctor`.
+   Persist results under exact release, executable/installation/interpreter identity, extension
+   contents, and probe/adapter implementation identity. A same-version build or extension
+   replacement requires fresh evidence. Concurrent launches share a bounded cache lock.
+   Scratch HOME, XDG, credential, workspace and PTY roots contain no managed declarations or
+   history; the model endpoint is loopback and the empty fixture approval is denied automatically.
+   OpenCode uses the same cache discipline and its own API/SSE/permission/completed-consumption
+   measurements; failure retains its explicit native-delivery-disabled policy.
+   A person may explicitly allow the exact installed executable/interpreter/installation and
+   shipped extension with `st admission override omp --binary <path> --reason <reason>` (or
+   `opencode`). This exception is a separate local audit record, never a forged pass. It bypasses
+   scratch probes, including version probing, for that build; failed measurements remain intact,
+   replacement builds/extensions need a new exception, and `st admission revoke` restores the
+   normal gate. The named failure diagnostic points to this remedy. This addition follows
+   the 2026-10-03 requirement to preserve a person's ability to start their seats when a probe
+   cannot run on their machine. It does not automatically downgrade the gate to a warning.
 5. **No DING screen adapter for omp** in v1 (OMP-T03), matching the other native-channel
    drivers.
 
@@ -62,7 +81,19 @@ hard gate; VRS lives in [`06-omp-driver/`](../06-omp-driver/).
 
 - A fifth expansion arm, wrapper module, channel process, hook asset, and ding launch
   classification follow the existing per-harness pattern.
-- Every omp minor bump costs one capture run before admission; the required checklist is in
-  the subsystem spec.
+- Every unseen exact producer/adapter build runs the isolated probe once. Successful new
+  versions require no st release or manual allowlist change. Refusals persist too; repairing
+  the named producer/adapter boundary and removing its cache record permits a new measurement.
+- Existing measured captures remain fixtures for the builds they measured. Admission proves
+  the narrow delivery contract, not model/provider matrices, context/token arithmetic, prices,
+  every interactive UI mode, or all steer/modal behavior. Those still require their own captures.
+- The original per-minor policy is superseded by automatic measurement, as agreed with
+  @schickling-assistant on #819. The default loud refusal and all five OMP-R05 checks are preserved;
+  a person's deliberate exception is distinguishable from measured admission.
+- Admission only gates a new provider launch, including restart and residency resume. Existing
+  running providers and driver adoption are unaffected; there is no rollback to an older binary.
+  Loopback fixture calls need no real model credentials or Internet, but a producer bootstrapping
+  a missing dependency in its empty scratch cache can still fail offline. The explicit exception
+  is available in that case; it cannot repair a missing runtime needed by the real producer.
 - The deny path, ask-axis discrimination, steer/modal interactions, and update-banner
   suppression remain open (`DQ-OMP-1..5`) and bound v1's claims.

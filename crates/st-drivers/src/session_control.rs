@@ -7,21 +7,73 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// Why new native input cannot be handed off, independently of mailbox liveness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeliveryBlockReason {
+    ControlUnavailable,
+    HoldActive,
+}
+
+impl DeliveryBlockReason {
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::ControlUnavailable => {
+                "delivery-control-unavailable: new native handoffs are held until graph delivery control can be verified; the driver retries automatically"
+            }
+            Self::HoldActive => {
+                "delivery-hold-active: new native handoffs are held by graph delivery control"
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct Permit {
+    expires: Option<Instant>,
+    blocked: Option<DeliveryBlockReason>,
+}
+
 #[derive(Clone, Debug, Default)]
-pub struct DeliveryGate(Arc<Mutex<Option<Instant>>>);
+pub struct DeliveryGate(Arc<Mutex<Permit>>);
 
 impl DeliveryGate {
     /// Update from a successful graph read. A hold closes the gate immediately.
     pub fn update(&self, held: bool, lease: Duration) {
         if let Ok(mut permit) = self.0.lock() {
-            *permit = (!held).then(|| Instant::now() + lease);
+            permit.expires = (!held).then(|| Instant::now() + lease);
+            permit.blocked = held.then_some(DeliveryBlockReason::HoldActive);
         }
     }
 
+    /// A failed read immediately withdraws any previous permission.
+    pub fn unavailable(&self) {
+        if let Ok(mut permit) = self.0.lock() {
+            permit.expires = None;
+            permit.blocked = Some(DeliveryBlockReason::ControlUnavailable);
+        }
+    }
+
+    pub fn blocked_reason(&self) -> Option<DeliveryBlockReason> {
+        self.0
+            .lock()
+            .map_or(Some(DeliveryBlockReason::ControlUnavailable), |permit| {
+                if permit
+                    .expires
+                    .is_some_and(|expires| Instant::now() < expires)
+                {
+                    None
+                } else {
+                    Some(
+                        permit
+                            .blocked
+                            .unwrap_or(DeliveryBlockReason::ControlUnavailable),
+                    )
+                }
+            })
+    }
+
     pub fn held(&self) -> bool {
-        self.0.lock().map_or(true, |permit| {
-            permit.is_none_or(|expires| Instant::now() >= expires)
-        })
+        self.blocked_reason().is_some()
     }
 }
 
@@ -59,6 +111,10 @@ mod tests {
         let gate = DeliveryGate::default();
         let control = SessionControl::Graph(gate.clone());
         assert!(control.held(&status));
+        assert_eq!(
+            gate.blocked_reason(),
+            Some(DeliveryBlockReason::ControlUnavailable)
+        );
         control.refresh(&status);
         assert!(!status.exists());
         crate::status::set_state(&status, crate::status::State::Dnd).unwrap();
@@ -69,6 +125,12 @@ mod tests {
         assert_eq!(std::fs::read(&status).unwrap(), before);
         gate.update(true, Duration::from_secs(10));
         assert!(control.held(&status));
+        assert_eq!(gate.blocked_reason(), Some(DeliveryBlockReason::HoldActive));
+        gate.unavailable();
+        assert_eq!(
+            gate.blocked_reason(),
+            Some(DeliveryBlockReason::ControlUnavailable)
+        );
         gate.update(false, Duration::ZERO);
         assert!(control.held(&status));
     }

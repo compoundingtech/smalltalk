@@ -154,6 +154,49 @@ resuming the same native session. The seat has no mission owner, so st keeps it 
 seat you declare, and it appears in `agents`, `terminals`, and `conversations`.
 `st subject show agent/import/HARNESS/ID` shows the declaration import wrote.
 
+Codex imports select the exact thread through st's strict resume handshake and pin the
+originating `CODEX_HOME`. Discovery currently reads `$HOME/.codex/sessions`, including a
+symlink to another home; sessions stored only in another home are not discovered yet
+([#1495](https://github.com/compoundingtech/smalltalk/issues/1495)).
+
+### Repair a Codex import created before strict resume
+
+Upgrading st does not rewrite an existing imported seat's stored declaration. A Codex import
+that still declares `args "resume" "NATIVE_SESSION_ID"` can continue failing with the
+30-second typed thread-ownership timeout. Re-importing it does not repair the declaration:
+the durable seat already exists.
+
+Stop the affected seat and export its declaration for editing:
+
+```sh
+st agents stop agent/import/codex/ID --as person/ada
+st subject show agent/import/codex/ID --kdl --show-env-values > imported.kdl
+```
+
+Keep the same seat identity, workspace and other settings. Remove the harness's `resume`
+argument and its session ID, and add the strict selector and the home that owns the selected
+rollout. `CODEX_HOME` names the home directory, not its `sessions` directory or rollout file:
+
+```kdl
+version 2
+agent "import/codex/ID" {
+  workspace "/work/garden"
+  harness "codex" {}
+  env {
+    ST3_NATIVE_RESUME_SESSION "NATIVE_SESSION_ID"
+    CODEX_HOME "/work/codex-origin"
+  }
+  restart "always"
+}
+```
+
+Apply the repaired declaration and check the resulting seat:
+
+```sh
+st apply imported.kdl --as person/ada
+st agents show agent/import/codex/ID
+```
+
 The resumed session keeps the settings it was saved with, such as its permission mode. To choose
 them, declare the seat yourself with the same identity, workspace, and resume arguments, and keep
 that file with your other seats. For a Claude Code session:
