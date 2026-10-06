@@ -3955,6 +3955,7 @@ impl Store {
     ) -> Result<MissionRunView> {
         let connection = self.readers.get();
         apply_step_states_tx(&connection, &mut run.steps, summaries)?;
+        run.scheduler_fault = first_readiness_fault_tx(&connection, &run.subject)?;
         Ok(run)
     }
 
@@ -5694,9 +5695,6 @@ impl Store {
             .collect()
     }
 
-    /// The IDs of the active runs that `origin` created, oldest first. The reconciler builds each
-    /// run's view on its own with [`Store::mission_run_for_reconcile`], so one run whose view
-    /// cannot be built does not hide the others.
     /// Live work that `seat` holds or is assigned in a run outside the root of `owner_run`.
     pub fn seat_work_in_other_runs(&self, seat: &str, owner_run: &str) -> Result<Vec<String>> {
         // Any step or run can come to hold or release this seat's work.
@@ -5724,6 +5722,10 @@ impl Store {
         Ok(subjects)
     }
 
+    /// All-pending current generations first, newest first within each group. This puts first
+    /// readiness before older runs' gate writes. Every active run remains in the finite snapshot;
+    /// arrivals during a pass wait for the next pass and cannot displace its remaining work.
+    /// Build views separately so a malformed run cannot hide other runs.
     pub fn active_mission_run_ids_for_origin(&self, origin: &str) -> Result<Vec<String>> {
         let connection = self.readers.get();
         let mut statement = connection.prepare(
@@ -5736,7 +5738,11 @@ impl Store {
                    AND claims.kind='mission-run.created'
                    AND claims.origin=?1
                )
-             ORDER BY mission_runs.created_at_unix_ms",
+             ORDER BY EXISTS (
+                 SELECT 1 FROM step_runs
+                 WHERE step_runs.generation_id=mission_runs.current_generation_id
+                   AND step_runs.status<>'pending'
+             ), CAST(mission_runs.created_at_unix_ms AS INTEGER) DESC, mission_runs.id DESC",
         )?;
         statement
             .query_map([origin], |row| row.get::<_, String>(0))?
@@ -29610,7 +29616,32 @@ fn mission_run_steps_view_tx(
         )?
         .collect::<Result<Vec<_>, _>>()?;
     apply_step_states_tx(connection, &mut view.steps, summaries)?;
+    view.scheduler_fault = first_readiness_fault_tx(connection, &view.subject)?;
     Ok(view)
+}
+
+fn first_readiness_fault_tx(
+    connection: &Connection,
+    subject: &str,
+) -> rusqlite::Result<Option<String>> {
+    let body: Option<String> = connection
+        .query_row(
+            &canonical_sql(
+                "SELECT body FROM claims WHERE subject=?1 AND kind='reconcile.fault'
+            AND json_extract(body, '$.fields.scope')='scheduler/first-readiness'
+            ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+            ),
+            [subject],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(body
+        .and_then(|body| serde_json::from_str::<Value>(&body).ok())
+        .and_then(|body| {
+            (body["fields"]["status"] == "faulted")
+                .then(|| body["fields"]["reason"].as_str().map(str::to_owned))
+                .flatten()
+        }))
 }
 
 /// Each step's effective state, and with `summaries` its latest progress and completion
@@ -29667,6 +29698,9 @@ fn mission_run_view_with_enrichment_tx(
     }
     view.loops = loop_run_views_tx(connection, &view)?;
     view.outcome = mission_run_outcome_tx(connection, &view)?;
+    if presentation {
+        view.scheduler_fault = first_readiness_fault_tx(connection, &view.subject)?;
+    }
     Ok(view)
 }
 
@@ -29788,6 +29822,7 @@ fn mission_run_header_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Miss
         steps: Vec::new(),
         loops: Vec::new(),
         stuck_gates: Vec::new(),
+        scheduler_fault: None,
     })
 }
 
@@ -32398,6 +32433,32 @@ mission "clock-automatic" state="ready" {
                 .unwrap(),
             Some(50)
         );
+    }
+
+    #[test]
+    fn first_readiness_order_prioritizes_current_pending_generations_then_newest() {
+        let store = Store::open_memory("node").unwrap();
+        let first = start_agentless_run(&store, "first");
+        let second = start_agentless_run(&store, "second");
+        let third = start_agentless_run(&store, "third");
+        // Fixed timestamps prove both the priority class and numeric newest-first ordering.
+        for (run, at) in [(&first, "9"), (&second, "10"), (&third, "11")] {
+            store.connection.write().execute(
+                "UPDATE mission_runs SET created_at_unix_ms=?1 WHERE id=?2",
+                params![at, run.id],
+            ).unwrap();
+        }
+        store.set_step_state(&third.steps[0].subject, "ready", None).unwrap();
+        assert_eq!(store.active_mission_run_ids_for_origin("node").unwrap(),
+            [second.id.clone(), first.id.clone(), third.id.clone()]);
+        store.set_step_state(&second.steps[0].subject, "ready", None).unwrap();
+        assert_eq!(store.active_mission_run_ids_for_origin("node").unwrap(),
+            [first.id.clone(), third.id.clone(), second.id.clone()]);
+        // The order is deterministic even when two creations share the same millisecond.
+        store.connection.write().execute("UPDATE mission_runs SET created_at_unix_ms='12'", []).unwrap();
+        let ids = store.active_mission_run_ids_for_origin("node").unwrap();
+        assert_eq!(ids[0], first.id);
+        assert!(ids[1] > ids[2]);
     }
 
     #[test]

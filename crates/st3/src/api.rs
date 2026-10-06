@@ -5444,6 +5444,32 @@ fn descriptor_usage_check(soft: u64, hard: u64, usage: Option<u64>) -> DoctorChe
     }
 }
 
+fn first_readiness_scheduler_check(store: &Store, node: &str) -> DoctorCheck {
+    let (status, message) = match store.open_reconcile_faults(node) {
+        Ok(faults) => {
+            let reasons = faults
+                .into_iter()
+                .filter(|((_, scope), _)| scope == crate::reconcile::FIRST_READINESS_FAULT_SCOPE)
+                .map(|(_, reason)| reason)
+                .collect::<Vec<_>>();
+            if reasons.is_empty() {
+                (
+                    "pass",
+                    "no unresolved first-readiness scheduler faults".into(),
+                )
+            } else {
+                ("warn", reasons.join("; "))
+            }
+        }
+        Err(error) => ("warn", format!("cannot read scheduler faults: {error:#}")),
+    };
+    DoctorCheck {
+        name: "mission-first-readiness".into(),
+        status: status.into(),
+        message,
+    }
+}
+
 /// Show what spends the GitHub budget that every observer on every host shares: the budget
 /// GitHub last reported, how much of its window this host's observers spent, and each observer's
 /// requests.
@@ -6404,6 +6430,7 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
             message: error.to_string(),
         }),
     }
+    checks.push(first_readiness_scheduler_check(&state.store, &state.node));
     match state.store.idempotency_conflicts(5) {
         Ok((0, _)) => checks.push(DoctorCheck {
             name: "idempotency-keys".into(),
@@ -16908,6 +16935,47 @@ agent "good" {{ workspace {:?}; command "true" }}
         );
         let retry = state.store.append_claim(&note("written here")).unwrap_err();
         assert_eq!(retry.code, "idempotency-conflict", "{retry:?}");
+    }
+
+    #[tokio::test]
+    async fn first_readiness_fault_is_visible_in_doctor_and_mission_clients() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let intent = parse_intent(r#"version 2
+mission "orchid" state="ready" { goal "Expose a scheduler wait."; step "work" { agentless } }
+"#, "node").unwrap();
+        state.store.apply_internal(&intent, "scheduler-visibility").unwrap();
+        let run = state.store.create_mission_run(&MissionRunRequest {
+            mission: "orchid".into(), revision: None, workspace: root.path().display().to_string(),
+            requester: None, mode: None, inputs: BTreeMap::new(), idempotency_key: "orchid-run".into(),
+        }).unwrap();
+        let reason = format!("{} waited 180000ms with satisfied readiness predicates", run.subject);
+        let fault = |status: &str| ClaimInput {
+            subject: run.subject.clone(), kind: "reconcile.fault".into(), actor: None,
+            fields: BTreeMap::from([
+                ("scope".into(), json!(crate::reconcile::FIRST_READINESS_FAULT_SCOPE)),
+                ("status".into(), json!(status)), ("reason".into(), json!(reason)),
+            ]), evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        };
+        state.store.append_claim(&fault("faulted")).unwrap();
+        let check = first_readiness_scheduler_check(&state.store, "node");
+        assert_eq!(check.status, "warn");
+        assert!(check.message.contains(&run.subject) && check.message.contains("180000ms"));
+        let detail = client_v0::mission_resources(&state.store, state.store.index().unwrap(), false, Some("mission/orchid")).unwrap();
+        assert_eq!(detail[0]["state"], "blocked");
+        assert_eq!(detail[0]["run_details"][0]["blocker"]["reason"], reason);
+        assert_eq!(detail[0]["run_details"][0]["blocker"]["scope"], crate::reconcile::FIRST_READINESS_FAULT_SCOPE);
+        assert_eq!(detail[0]["run_details"][0]["steps"][0]["blocked_reason"], reason);
+        let (_, cards) = get_request(router(state.clone()), "/v1/client/missions").await;
+        assert_eq!(cards["items"][0]["state"], "blocked", "{cards}");
+        assert_eq!(cards["items"][0]["run_details"][0]["blocker"]["reason"], reason);
+        assert_eq!(cards["items"][0]["run_details"][0]["blocker"]["scope"], crate::reconcile::FIRST_READINESS_FAULT_SCOPE);
+        assert_eq!(cards["items"][0]["run_details"][0]["steps"][0]["blocked_reason"], reason);
+        state.store.append_claim(&fault("recovered")).unwrap();
+        assert_eq!(first_readiness_scheduler_check(&state.store, "node").status, "pass");
+        let detail = client_v0::mission_resources(&state.store, state.store.index().unwrap(), false, Some("mission/orchid")).unwrap();
+        assert_ne!(detail[0]["state"], "blocked");
+        assert!(detail[0]["run_details"][0]["blocker"].is_null());
     }
 
     #[test]
