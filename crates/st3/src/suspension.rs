@@ -292,6 +292,45 @@ pub fn continue_unavailable_key(subject: &str, session: &str) -> String {
     format!("{CONTINUE_UNAVAILABLE_CODE}:{subject}:{session}")
 }
 
+/// Whether a driver has bound after the declaration that last changed the import pair.
+/// Unrelated declaration edits do not reset bootstrap, and pre-repair bindings cannot
+/// consume a repaired declaration's strict selector.
+pub fn omp_import_bootstrap_bound(
+    store: &Store,
+    subject: &str,
+    session: &str,
+    path: &str,
+) -> Result<bool> {
+    let Some(selected) = store.selected_desired_token(subject)? else {
+        return Ok(false);
+    };
+    let declarations = store.claims_for(subject, Some("intent.desired"))?;
+    let Some(position) = declarations.iter().position(|claim| claim.id == selected) else {
+        anyhow::bail!("the selected import declaration {selected} is missing");
+    };
+    let carries_pair = |claim: &ClaimRecord| {
+        let environment = &claim.body["member"]["environment"];
+        environment[RESUME_ENV].as_str() == Some(session)
+            && environment[crate::rollout::RESUME_PATH_ENV].as_str() == Some(path)
+    };
+    let mut introduced = &declarations[position];
+    for prior in declarations[..position].iter().rev() {
+        if !carries_pair(prior) {
+            break;
+        }
+        introduced = prior;
+    }
+    for bound in store.claims_for(subject, Some("harness.session-file"))?.iter().rev() {
+        if field(bound, "harness") == Some("omp")
+            && field(bound, "incarnation_id").is_some_and(|id| !id.is_empty())
+            && field(bound, "session_id").is_some_and(|id| !id.is_empty())
+        {
+            return store.claim_is_after(&bound.id, &introduced.id);
+        }
+    }
+    Ok(false)
+}
+
 /// The native session a relaunch of `subject` on `harness` continues, with its path: the last
 /// one the seat's driver bound for that harness. A seat relaunched for a fresh context since,
 /// or whose driver could not continue that session before, starts a new one.
@@ -317,15 +356,19 @@ pub fn continue_session(
     let Some(session) = field(&bound, "session_id").map(str::to_owned) else {
         return Ok(None);
     };
-    let fresh_since = store
-        .claims_for(subject, Some("runtime.action.requested"))?
-        .iter()
-        .any(|claim| {
-            claim.store_index > bound.store_index && field(claim, "action") == Some("fresh-context")
-        });
-    let refused = store
-        .operation_claim(&continue_unavailable_key(subject, &session))?
-        .is_some_and(|refusal| refusal.store_index > bound.store_index);
+    let mut fresh_since = false;
+    for claim in store.claims_for(subject, Some("runtime.action.requested"))? {
+        if field(&claim, "action") == Some("fresh-context")
+            && store.claim_is_after(&claim.id, &bound.id)?
+        {
+            fresh_since = true;
+            break;
+        }
+    }
+    let refused = match store.operation_claim(&continue_unavailable_key(subject, &session))? {
+        Some(refusal) => store.claim_is_after(&refusal.id, &bound.id)?,
+        None => false,
+    };
     if fresh_since || refused {
         return Ok(None);
     }

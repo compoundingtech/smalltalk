@@ -164,16 +164,19 @@ holding the native session ID and `ST3_NATIVE_RESUME_PATH` pinning the absolute
 transcript path. The driver validates the transcript header, links its directory
 into the managed inventory without copying it, and launches OMP with that exact
 path. Missing or mismatched transcripts fail the launch rather than starting anew.
-The pair bootstraps the imported seat only until its driver publishes a native
-session binding with an incarnation. Subsequent restarts ignore the original pair
+The pair bootstraps an imported or repaired seat until an incarnation-bearing
+driver binding follows the declaration revision that introduced or last changed
+that pair. Historical bindings before a repair cannot consume its strict selector;
+unrelated declaration edits do not reset it. Subsequent restarts ignore the pair
 and continue the latest bound native ID and transcript path within the linked
-inventory, including after OMP switches sessions. Explicit suspension resumes and
-rollouts retain their strict selectors.
+inventory. Explicit suspension resumes and rollouts retain strict selectors.
+Declaration/binding and refusal/binding precedence use canonical claim order,
+so replication arrival order does not change which native session launches.
 
 Moving the bound transcript outside the linked inventory directory is not
 supported. The driver reports a visible `native-continue-unavailable` warning with
 status `managed-directory-foreign-link` and starts a fresh session. The refusal is
-remembered for that native ID until a newer successful binding supersedes it.
+remembered for that native ID until a canonically newer successful binding supersedes it.
 Without a newer binding, subsequent launches do not retry the refused continuation
 or the original import bootstrap, so relocation does not cause a repeated refusal
 loop. A successful strict repair can bind the same native ID again; its later

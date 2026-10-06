@@ -4958,31 +4958,19 @@ impl<R: RuntimeControl> Reconciler<R> {
         // continuation must follow its latest transcript rather than the import.
         let import_bound = subject.subject.starts_with("agent/import/omp/")
             && member.driver.as_deref() == Some("omp")
-            && member
-                .environment
-                .contains_key(crate::rollout::RESUME_PATH_ENV)
+            && member.environment.contains_key(crate::suspension::RESUME_ENV)
+            && member.environment.contains_key(crate::rollout::RESUME_PATH_ENV)
             && !member
                 .environment
                 .contains_key(crate::rollout::OPERATION_ENV)
             && !crate::suspension::current(&self.store, &subject.subject)?
                 .is_some_and(|state| state.action == "resume" && state.phase != "resumed")
-            && self
-                .store
-                .claims_for(&subject.subject, Some("harness.session-file"))?
-                .iter()
-                .any(|claim| {
-                    claim.body.get("fields").is_some_and(|fields| {
-                        fields.get("harness").and_then(Value::as_str) == Some("omp")
-                            && fields
-                                .get("incarnation_id")
-                                .and_then(Value::as_str)
-                                .is_some_and(|id| !id.is_empty())
-                            && fields
-                                .get("session_id")
-                                .and_then(Value::as_str)
-                                .is_some_and(|id| !id.is_empty())
-                    })
-                });
+            && crate::suspension::omp_import_bootstrap_bound(
+                &self.store,
+                &subject.subject,
+                &member.environment[crate::suspension::RESUME_ENV],
+                &member.environment[crate::rollout::RESUME_PATH_ENV],
+            )?;
         if import_bound {
             launch_member
                 .environment
@@ -18480,6 +18468,182 @@ mission "feedback-review" state="ready" {
             .account_for_start("agent/node.worker", &binding, "node", now_ms())
             .unwrap();
         assert_eq!(kept.account.name, "ada/two");
+    }
+
+    #[test]
+    fn omp_import_repair_and_refusal_precedence_converge_across_replica_arrival() {
+        let root = tempfile::tempdir().unwrap();
+        let native = "5f9a6e16-5e30-4bce-b327-9a8241321bd6";
+        let transcript = root.path().join(format!("2026-10-06_{native}.jsonl"));
+        let seat = "agent/import/omp/repair-order";
+        let declaration = Store::open_memory("author").unwrap();
+        let base = 1_900_000_000_000;
+        declaration.set_write_clock_at(base).unwrap();
+        apply_source(
+            &declaration,
+            &format!(
+                r#"version 2
+agent "import/omp/repair-order" {{
+  workspace {:?}
+  harness "omp" {{ args "--resume={}" }}
+  restart "always"
+}}"#,
+                root.path().to_str().unwrap(),
+                transcript.display()
+            ),
+            "legacy-import",
+        );
+        let old = Store::open_memory("old-driver").unwrap();
+        old.import_replication("author", &declaration.export_replication(0).unwrap())
+            .unwrap();
+        let append_binding = |store: &Store, incarnation: &str| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: seat.into(),
+                    kind: "harness.session-file".into(),
+                    actor: Some(seat.into()),
+                    fields: BTreeMap::from([
+                        ("harness".into(), Value::String("omp".into())),
+                        ("session_id".into(), Value::String(native.into())),
+                        ("incarnation_id".into(), Value::String(incarnation.into())),
+                        (
+                            "path".into(),
+                            Value::String(transcript.to_string_lossy().into_owned()),
+                        ),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        };
+        old.set_write_clock_at(base + 10).unwrap();
+        append_binding(&old, "before-repair");
+        old.set_write_clock_at(base + 20).unwrap();
+        old.append_claim(&ClaimInput {
+            subject: seat.into(),
+            kind: "harness.diagnostic".into(),
+            actor: Some(seat.into()),
+            fields: BTreeMap::from([
+                (
+                    "code".into(),
+                    Value::String(crate::suspension::CONTINUE_UNAVAILABLE_CODE.into()),
+                ),
+                ("status".into(), Value::String("authored-session-selection".into())),
+                ("incarnation_id".into(), Value::String("before-repair".into())),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(crate::suspension::continue_unavailable_key(seat, native)),
+        })
+        .unwrap();
+        declaration.set_write_clock_at(base + 30).unwrap();
+        apply_source(
+            &declaration,
+            &format!(
+                r#"version 2
+agent "import/omp/repair-order" {{
+  workspace {:?}
+  harness "omp" {{}}
+  env {{
+    ST3_NATIVE_RESUME_SESSION "{native}"
+    ST3_NATIVE_RESUME_PATH {:?}
+  }}
+  restart "always"
+}}"#,
+                root.path().to_str().unwrap(),
+                transcript.to_str().unwrap()
+            ),
+            "repair-import",
+        );
+        let repaired = Store::open_memory("new-driver").unwrap();
+        repaired
+            .import_replication("author", &declaration.export_replication(0).unwrap())
+            .unwrap();
+        repaired.set_write_clock_at(base + 40).unwrap();
+        append_binding(&repaired, "after-repair");
+        let declaration_claims = declaration.export_replication(0).unwrap();
+        let old_claims = old.export_replication(0).unwrap();
+        let repaired_claims = repaired.export_replication(0).unwrap();
+        let launch = |store: Arc<Store>, strict: bool| {
+            let runtime = Arc::new(FakeRuntime::default());
+            let reconciler = Reconciler::new(
+                store.clone(),
+                runtime.clone(),
+                "node".into(),
+                Arc::new(Notify::new()),
+            );
+            let subject = store
+                .desired_subjects()
+                .unwrap()
+                .into_iter()
+                .find(|subject| subject.subject == seat)
+                .unwrap();
+            reconciler
+                .perform_start(&subject, subject.member.as_ref().unwrap(), "repair-order proof")
+                .unwrap();
+            let starts = runtime
+                .started_members
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let member = starts.last().unwrap();
+            if strict {
+                assert_eq!(member.environment[crate::suspension::RESUME_ENV], native);
+                assert_eq!(
+                    member.environment[crate::rollout::RESUME_PATH_ENV],
+                    transcript.to_str().unwrap()
+                );
+                assert!(!member.environment.contains_key(crate::suspension::CONTINUE_ENV));
+            } else {
+                assert!(!member.environment.contains_key(crate::suspension::RESUME_ENV));
+                assert!(!member.environment.contains_key(crate::rollout::RESUME_PATH_ENV));
+                assert_eq!(member.environment[crate::suspension::CONTINUE_ENV], native);
+                assert_eq!(
+                    member.environment[crate::suspension::CONTINUE_PATH_ENV],
+                    transcript.to_str().unwrap()
+                );
+            }
+        };
+        let first = Arc::new(Store::open_memory("node").unwrap());
+        first.import_replication("author", &declaration_claims).unwrap();
+        first.import_replication("old-driver", &old_claims).unwrap();
+        launch(first.clone(), true);
+        first.import_replication("new-driver", &repaired_claims).unwrap();
+        declaration.set_write_clock_at(base + 50).unwrap();
+        apply_source(
+            &declaration,
+            &format!(
+                r#"version 2
+agent "import/omp/repair-order" {{
+  workspace {:?}
+  harness "omp" {{}}
+  env {{
+    ST3_NATIVE_RESUME_SESSION "{native}"
+    ST3_NATIVE_RESUME_PATH {:?}
+  }}
+  restart "never"
+}}"#,
+                root.path().to_str().unwrap(),
+                transcript.to_str().unwrap()
+            ),
+            "unrelated-restart-policy-edit",
+        );
+        first
+            .import_replication("author", &declaration.export_replication(0).unwrap())
+            .unwrap();
+        launch(first, false);
+        for reverse in [false, true] {
+            let replica = Arc::new(Store::open_memory("node").unwrap());
+            replica.import_replication("author", &declaration_claims).unwrap();
+            if reverse {
+                replica.import_replication("new-driver", &repaired_claims).unwrap();
+                replica.import_replication("old-driver", &old_claims).unwrap();
+            } else {
+                replica.import_replication("old-driver", &old_claims).unwrap();
+                replica.import_replication("new-driver", &repaired_claims).unwrap();
+            }
+            launch(replica, false);
+        }
     }
 
     #[cfg(unix)]

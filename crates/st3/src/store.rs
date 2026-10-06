@@ -10489,6 +10489,12 @@ impl Store {
         .transpose()
     }
 
+    /// Compare shared claims by canonical order, independent of replica arrival.
+    pub(crate) fn claim_is_after(&self, left: &str, right: &str) -> Result<bool> {
+        let connection = self.readers.get();
+        Ok(canonical::claim_key(&connection, left)? > canonical::claim_key(&connection, right)?)
+    }
+
     pub fn agent_declaration_revisions(&self, subject: &str) -> Result<Vec<String>> {
         let connection = self.readers.get();
         let mut statement = connection.prepare(&format!(
