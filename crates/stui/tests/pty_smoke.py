@@ -25,7 +25,7 @@ import threading
 import time
 
 
-FIRST_FRAME = "\u2261 st".encode()  # spaces' top bar
+FIRST_FRAME = b"working"  # spaces' top bar: "N working" is always on it (the bar no longer starts with a label)
 
 
 def plain(output: bytes) -> bytes:
