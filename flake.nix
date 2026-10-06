@@ -345,6 +345,16 @@
           pname = "st3";
           inherit version;
           src = self;
+          # Embedded hooks are published into immutable runtime hook sets. The
+          # sandbox has no /usr/bin/env; patch before compilation for package/check.
+          postPatch = ''
+            for hook in crates/st3/hooks/claude-observe.sh crates/st3/hooks/claude-statusline.sh; do
+              if [ -f "$hook" ]; then
+                # --host uses HOST_PATH, which omits native Bash under strictDeps.
+                HOST_PATH=${pkgs.bash}/bin:$HOST_PATH patchShebangs --host "$hook"
+              fi
+            done
+          '';
           # Stamp st3, its shared driver library, and stui from this declared flake source.
           CLI_BUILD_STAMP = buildStamp;
           cargoLock = {
