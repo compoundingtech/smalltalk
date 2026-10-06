@@ -4591,6 +4591,14 @@ impl AcceptFailures {
     }
 }
 
+pub async fn serve_unix_with_ready(
+    socket: &Path,
+    app: Router,
+    ready: impl FnOnce(),
+) -> anyhow::Result<()> {
+    serve_unix_with_ancestor_ready(socket, None, app, false, harness_ancestor, ready).await
+}
+
 pub async fn serve_unix(socket: &Path, app: Router) -> anyhow::Result<()> {
     serve_unix_inner(socket, app, false).await
 }
@@ -4617,7 +4625,25 @@ pub async fn serve_unix_bound(
     state_socket: &Path,
     app: Router,
 ) -> anyhow::Result<()> {
-    serve_unix_with_ancestor(socket, Some(state_socket), app, true, harness_ancestor).await
+    serve_unix_bound_with_ready(socket, state_socket, app, || {}).await
+}
+
+/// Readiness is published only once the local API is bound and discoverable.
+pub async fn serve_unix_bound_with_ready(
+    socket: &Path,
+    state_socket: &Path,
+    app: Router,
+    ready: impl FnOnce(),
+) -> anyhow::Result<()> {
+    serve_unix_with_ancestor_ready(
+        socket,
+        Some(state_socket),
+        app,
+        true,
+        harness_ancestor,
+        ready,
+    )
+    .await
 }
 
 async fn serve_unix_inner(socket: &Path, app: Router, bind_harness: bool) -> anyhow::Result<()> {
@@ -4630,6 +4656,17 @@ async fn serve_unix_with_ancestor(
     app: Router,
     bind_harness: bool,
     ancestor: fn(u32) -> Option<String>,
+) -> anyhow::Result<()> {
+    serve_unix_with_ancestor_ready(socket, state_socket, app, bind_harness, ancestor, || {}).await
+}
+
+async fn serve_unix_with_ancestor_ready(
+    socket: &Path,
+    state_socket: Option<&Path>,
+    app: Router,
+    bind_harness: bool,
+    ancestor: fn(u32) -> Option<String>,
+    ready: impl FnOnce(),
 ) -> anyhow::Result<()> {
     // Only st3-fixture initializes this process-local state. Disable host ancestry while
     // retaining native-driver identification, which mailbox subscriptions require.
@@ -4658,6 +4695,7 @@ async fn serve_unix_with_ancestor(
     if let Some(state_socket) = state_socket {
         publish_state_socket(socket, state_socket)?;
     }
+    ready();
     let mut accept_failures = AcceptFailures::default();
     loop {
         let stream = match listener.accept().await {
