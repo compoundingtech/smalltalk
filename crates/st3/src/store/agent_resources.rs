@@ -155,6 +155,16 @@ impl Store {
                 || kind.starts_with("work.")) {
                 changes.queues = true;
                 changes.activity_only = false;
+                // Initial assignments can come from an interpolated revision selector rather
+                // than a step claim. A bounded preview cannot prove an old participant absent.
+                // Conservatively refresh seats with prior queue activity as well.
+                for (id, card) in &previous.rows {
+                    if card["queued_work_count"].as_u64().unwrap_or_default() > 0
+                        || card["active_work_count"].as_u64().unwrap_or_default() > 0
+                    {
+                        changes.subjects.insert(id.clone());
+                    }
+                }
                 let body: Value = serde_json::from_str(row.get_ref(2)?.as_str()?)?;
                 let actor: Option<String> = row.get(3)?;
                 agent_references(&body, &mut changes.subjects);
@@ -186,8 +196,8 @@ impl Store {
                         changes.subjects.insert(actor);
                     }
                 }
-                // Initial assignments are embedded in run/generation creation, not in
-                // step-specific history. Recover them even beyond the bounded card preview.
+                // Creation claims can also name participants absent from step-specific history.
+                // Revision-derived selectors are covered by prior queue activity above.
                 let mut initial = connection.prepare_cached(
                     "SELECT claims.body FROM claims JOIN step_runs step
                      ON claims.subject IN ('mission-run/' || step.run_id,

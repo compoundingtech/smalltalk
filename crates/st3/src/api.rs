@@ -2008,6 +2008,17 @@ fn aggregate_usage_for_runs(
     )
 }
 
+fn client_agent_resources(
+    store: &Store,
+    history: bool,
+    at: &str,
+    snapshot_index: u64,
+) -> anyhow::Result<Vec<Value>> {
+    let mut items = client_agent_resources_cached(store, history, snapshot_index)?;
+    overlay_agent_resources(store, &mut items, at)?;
+    Ok(items)
+}
+
 fn client_agent_resources_cached(
     store: &Store,
     history: bool,
@@ -3941,7 +3952,11 @@ async fn client_agents_detail(
             &store,
             history,
             snapshot_index,
-            Some((&selected, &[])),
+            Some(crate::store::AgentResourceDelta {
+                subjects: &selected,
+                previous: &[],
+                activity_only: false,
+            }),
         )?;
         add_agent_todos(&store, &mut items, snapshot_index)?;
         overlay_agent_resources(&store, &mut items, &created_at)?;

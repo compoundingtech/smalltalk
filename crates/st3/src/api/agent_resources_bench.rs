@@ -33,11 +33,12 @@ async fn first_page(client: &reqwest::Client, store: &Store) -> (Value, [f64; 3]
     let index = envelope["snapshot"]["store_index"].as_u64().unwrap();
     let at = envelope["snapshot"]["created_at"].as_str().unwrap();
     let started = Instant::now();
-    let stable = client_agent_resources_stable(store, false, index).unwrap();
+    let stable = client_agent_resources_cached(store, false, index).unwrap();
     let stable_ms = started.elapsed().as_secs_f64() * 1_000.0;
     drop(stable);
     let started = Instant::now();
-    let projection = client_agent_resources(store, false, at, index).unwrap();
+    let mut projection = client_agent_resources_cached(store, false, index).unwrap();
+    overlay_agent_resources(store, &mut projection, at).unwrap();
     let projection_ms = started.elapsed().as_secs_f64() * 1_000.0;
     drop(projection);
     (envelope, [elapsed_ms, stable_ms, projection_ms])
@@ -146,11 +147,16 @@ async fn copied_store_agent_resources_benchmark() {
     report("cold_first_page", &mut [cold_ms], 0, 0.0, &store);
     assert_eq!(store.agent_resources_full_fills(), 1, "cold request fills the projection once");
 
-    let projected = client_agent_resources(
+    let mut projected = client_agent_resources_cached(
         &store,
         false,
-        cold_page["snapshot"]["created_at"].as_str().unwrap(),
         cold_page["snapshot"]["store_index"].as_u64().unwrap(),
+    )
+    .unwrap();
+    overlay_agent_resources(
+        &store,
+        &mut projected,
+        cold_page["snapshot"]["created_at"].as_str().unwrap(),
     )
     .unwrap();
     let first = &cold_page["value"]["items"][0];
