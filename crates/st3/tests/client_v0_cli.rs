@@ -1718,6 +1718,102 @@ async fn cli_person_ask_is_completed_by_its_assigned_person() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attention_discuss_sends_the_message_stui_chat_about_this_sends() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("st3.sock");
+    let state = test_state(root.path());
+    let store = state.store.clone();
+    let intent = st3::graph::parse_intent(
+        "version 2\nagent \"asker\" { workspace \"/tmp\"; command \"true\" }",
+        store.origin(),
+    )
+    .unwrap();
+    store.apply_internal(&intent, "cli-discuss-asker").unwrap();
+    let actor = format!("agent/{}.asker", store.origin());
+    let server_socket = socket.clone();
+    let server =
+        tokio::spawn(
+            async move { st3::api::serve_unix(&server_socket, st3::api::router(state)).await },
+        );
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    value(
+        &run_cli(
+            &socket,
+            &[
+                "work",
+                "ask",
+                "--for",
+                "person/avery",
+                "--title",
+                "Choose release date",
+                "--reason",
+                "The release needs a date",
+                "--new-run",
+                "release-date",
+                "--as",
+                &actor,
+                "--idempotency-key",
+                "cli-discuss-ask",
+            ],
+        )
+        .await,
+    );
+    let listed = value(&run_cli(&socket, &["attention", "ls", "--as", "person/avery"]).await);
+    let attention_id = listed["value"]["items"][0]["id"].as_str().unwrap();
+    let sent = run_cli(
+        &socket,
+        &[
+            "attention",
+            "discuss",
+            attention_id,
+            "--as",
+            "person/avery",
+            "--body",
+            "Why does it need a date?",
+        ],
+    )
+    .await;
+    assert!(sent.status.success(), "{}", failure(&sent));
+    let inbox = value(&run_cli(&socket, &["conversations", "ls", &actor]).await);
+    let message = inbox
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["from"] == "person/avery")
+        .unwrap_or_else(|| panic!("no message reached the asker: {inbox}"));
+    assert_eq!(message["title"], "About: Choose release date");
+    let id = message["subject"].as_str().unwrap();
+    let read = value(&run_cli(&socket, &["conversations", "read", id, "--as", &actor]).await);
+    let body = read["content"].as_str().unwrap_or_default();
+    assert!(body.starts_with("Why does it need a date?"), "{read}");
+    assert!(
+        body.contains(&format!("This is about Choose release date ({attention_id}")),
+        "{body}"
+    );
+    let nobody = run_cli(
+        &socket,
+        &[
+            "attention",
+            "discuss",
+            attention_id,
+            "--as",
+            "person/robin",
+            "--body",
+            "hello",
+        ],
+    )
+    .await;
+    assert!(!nobody.status.success());
+    assert!(String::from_utf8_lossy(&nobody.stderr).contains("not currently actionable"));
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_structured_choice_returns_the_selected_option_as_data() {
     let root = tempfile::tempdir().unwrap();
     let socket = root.path().join("st3.sock");

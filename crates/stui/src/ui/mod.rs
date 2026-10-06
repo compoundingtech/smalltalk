@@ -4006,11 +4006,13 @@ impl Ui {
             }
             context.push(')');
             self.effects.push(Effect::Discuss {
-                to: chat.to,
+                to: chat.to.clone(),
                 title,
                 text: context,
             });
             self.flash("Sending…");
+            // Go where the reply will appear (Nathan, 2026-10-06).
+            self.open(&chat.to);
             return;
         }
         let at = chrono::Local::now().format("%H:%M").to_string();
@@ -4043,6 +4045,7 @@ impl Ui {
             });
         }
         self.flash("Sent · demo: nothing left this machine");
+        self.open(&chat.to);
     }
 
     fn submit(&mut self) {
@@ -6568,12 +6571,11 @@ mod tests {
             press(&mut ui, KeyCode::Char(character));
         }
         press(&mut ui, KeyCode::Enter);
+        // Sending goes to the agent's conversation, where the reply will appear.
+        assert_eq!(ui.tab, 1);
+        assert_eq!(ui.selected_id().as_deref(), Some("agent/example/atlas/builder"));
+        assert!(ui.chat.is_none());
         let screen = frame(&ui, 150, 70).join("\n");
-        assert!(
-            screen.contains("CHAT WITH ATLAS BUILDER")
-                || screen.contains("chat with Atlas Builder"),
-            "{screen}"
-        );
         assert!(screen.contains("why now?"), "{screen}");
     }
 
