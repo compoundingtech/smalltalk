@@ -619,10 +619,14 @@ publish a new revision with new provenance. Earlier revisions keep their earlier
 also commits the displayed provenance. Querying revisions by source commit is deferred.
 
 The `mission.provenance` sidecar claim uses `mission/ID@REVISION` as its subject and has once
-cardinality and durable retention. It is written atomically with the ordinary `mission.published`
-claim. It stays outside `MissionSpec`, so existing mission and step hashes and revision bodies
-remain unchanged. Older daemons project the ordinary revision and can start its work, retain the
-unknown sidecar for upgrade, and show no provenance. Older clients ignore the added read fields.
+cardinality and durable retention. `Once` is registry metadata; `validate_publication` enforces
+immutability on publication. Ingest validates the sidecar's shape and revision binding but does
+not enforce cardinality; reads choose the earliest claim in canonical order. It is written
+atomically with the ordinary `mission.published` claim. It stays outside `MissionSpec`, so
+existing mission and step hashes and revision bodies remain unchanged. Older daemons receive
+and project the ordinary revision and can start its work, retain the unknown sidecar for upgrade,
+and show no provenance. They cannot apply provenance-bearing KDL themselves; publish that KDL
+through an upgraded node. Older clients accept the added read fields.
 The sidecar reads directly from the claim log: no new projection table, checkpoint drop rule,
 retention window, or `RULES_VERSION` change is needed. Existing checkpoint rules preserve kinds
 without a drop slot and once claims; authenticated unknown records also remain retained.
