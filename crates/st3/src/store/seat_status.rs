@@ -6,15 +6,6 @@ pub(crate) const WINDOW_MS: u128 = 7 * 24 * 60 * 60 * 1000;
 pub(crate) const MAX_TRANSITIONS: usize = 200;
 pub(crate) const STALE_MS: u128 = 90_000;
 
-pub(super) fn projected_harness_state(fields: &Value) -> Option<&str> {
-    let state = fields.get("state")?.as_str()?;
-    Some(if fields.get("blocked_on").and_then(Value::as_str) == Some("human") {
-        "blocked"
-    } else {
-        state
-    })
-}
-
 pub(super) fn observation_time(claim: &ClaimRecord) -> u128 {
     claim
         .body
@@ -63,7 +54,7 @@ fn transitions(claims: &[&ClaimRecord]) -> Vec<(usize, Option<String>, bool)> {
         let reset = runtime.is_none() && !statuses.contains_key(incarnation);
         match claim.kind.as_str() {
             "harness.observed" => {
-                let Some(state) = projected_harness_state(fields) else {
+                let Some(state) = fields.get("state").and_then(Value::as_str) else {
                     continue;
                 };
                 let status = statuses.entry(incarnation).or_default();
@@ -96,8 +87,7 @@ fn transitions(claims: &[&ClaimRecord]) -> Vec<(usize, Option<String>, bool)> {
         // Heartbeats never become transitions when a retained prefix disappears. A recorded
         // transition remains one even if trimming removes an intervening state.
         let heartbeat = claim.kind == "harness.observed"
-            && fields.get("status_transition").and_then(Value::as_bool) == Some(false)
-            && status.state == next.as_deref();
+            && fields.get("status_transition").and_then(Value::as_bool) == Some(false);
         let recorded = claim.kind == "harness.observed"
             && status.prompt.is_none()
             && status.provider_auth != Some(false)
@@ -124,7 +114,7 @@ pub(super) fn state_run_since(
     while let Some(row) = rows.next()? {
         let body: Value = serde_json::from_str(&row.get::<_, String>(1)?)?;
         let fields = body.get("fields").unwrap_or(&body);
-        if projected_harness_state(fields) != Some(state) {
+        if fields.get("state").and_then(Value::as_str) != Some(state) {
             break;
         }
         let accepted: u128 = row.get::<_, String>(2)?.parse()?;
@@ -462,27 +452,41 @@ mod tests {
     }
 
     #[test]
-    fn approval_observation_is_blocked_in_current_and_history_then_clears() {
+    fn approval_observation_is_blocked_in_current_then_clears() {
         let store = Store::open_memory("cedar").unwrap();
         runtime(&store, "one");
         let at = now_ms();
         observe(&store, "one", "working", at, "working");
-        store.append_latest_observation(&input("harness.observed", json!({
-            "state":"working", "incarnation_id":"one", "observed_at_ms":(at + 1) as u64,
-            "blocked_on":"human", "ask":"permission", "reason":"waitingOnApproval"
-        })), at + 1).unwrap();
+        store
+            .append_latest_observation(
+                &input(
+                    "harness.observed",
+                    json!({
+                        "state":"working", "incarnation_id":"one", "observed_at_ms":(at + 1) as u64,
+                        "blocked_on":"human", "ask":"permission", "reason":"waitingOnApproval"
+                    }),
+                ),
+                at + 1,
+            )
+            .unwrap();
         let blocked = store.current_harness("agent/cedar").unwrap().unwrap();
         assert_eq!(blocked.state, "blocked");
         assert_eq!(blocked.blocked_on.as_deref(), Some("human"));
         assert_eq!(blocked.ask.as_deref(), Some("permission"));
         assert_eq!(blocked.reason.as_deref(), Some("waitingOnApproval"));
-        let history = store.seat_status_history("agent/cedar", at + 1).unwrap();
-        assert_eq!(history["items"].as_array().unwrap().last().unwrap()["state"], "blocked");
 
-        store.append_latest_observation(&input("harness.observed", json!({
-            "state":"working", "incarnation_id":"one", "observed_at_ms":(at + 2) as u64,
-            "blocked_on":null, "ask":null, "reason":null
-        })), at + 2).unwrap();
+        store
+            .append_latest_observation(
+                &input(
+                    "harness.observed",
+                    json!({
+                        "state":"working", "incarnation_id":"one", "observed_at_ms":(at + 2) as u64,
+                        "blocked_on":null, "ask":null, "reason":null
+                    }),
+                ),
+                at + 2,
+            )
+            .unwrap();
         let resumed = store.current_harness("agent/cedar").unwrap().unwrap();
         assert_eq!(resumed.state, "working");
         assert!(resumed.blocked_on.is_none());

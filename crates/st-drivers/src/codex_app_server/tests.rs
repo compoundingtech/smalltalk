@@ -3448,7 +3448,11 @@ fn rejected_declared_resume_settings_fail_without_downgrading_the_policy() {
 
 #[test]
 fn successful_resume_with_wrong_model_or_effort_fails_before_binding() {
-    for (reported_model, reported_effort) in [("gpt-6-sol", "high"), ("gpt-6.1-sol", "medium")] {
+    for (reported_model, reported_effort) in [
+        (Some("gpt-6-sol"), Some("high")),
+        (Some("gpt-6.1-sol"), Some("medium")),
+        (None, Some("high")),
+    ] {
         let tmp = tempfile::tempdir().unwrap();
         let _stop_exclusive = stop_flag_tests();
         let socket = tmp.path().join("server.sock");
@@ -3493,20 +3497,21 @@ fn successful_resume_with_wrong_model_or_effort_fails_before_binding() {
                 declared["params"]["config"]["model_reasoning_effort"],
                 "high"
             );
-            write_json_message(
-                &mut websocket,
-                &json!({
-                    "id": CONTROL_SUBSCRIBE_REQUEST_ID,
-                    "result": {
-                        "thread": { "id": "thread-prior", "status": { "type": "idle" } },
-                        "approvalPolicy": "never",
-                        "sandbox": { "type": "dangerFullAccess" },
-                        "model": reported_model,
-                        "reasoningEffort": reported_effort
-                    }
-                }),
-            )
-            .unwrap();
+            let mut response = json!({
+                "id": CONTROL_SUBSCRIBE_REQUEST_ID,
+                "result": {
+                    "thread": { "id": "thread-prior", "status": { "type": "idle" } },
+                    "approvalPolicy": "never",
+                    "sandbox": { "type": "dangerFullAccess" }
+                }
+            });
+            if let Some(model) = reported_model {
+                response["result"]["model"] = json!(model);
+            }
+            if let Some(effort) = reported_effort {
+                response["result"]["reasoningEffort"] = json!(effort);
+            }
+            write_json_message(&mut websocket, &response).unwrap();
 
             assert!(matches!(
                 poll_json_message(&mut websocket).unwrap(),
@@ -4396,7 +4401,8 @@ fn a_native_seat_restart_retires_the_old_thread_binding() {
         "the old binding must not make this seat ready"
     );
     let prepared =
-        prepare_controlled_launch_args("unix:///server.sock", &[], selected.as_deref()).unwrap();
+        prepare_controlled_launch_args("unix:///server.sock", &[], selected.as_deref(), true, None)
+            .unwrap();
     assert!(!prepared.tui_args.iter().any(|arg| arg == "resume"));
     assert!(prepared.expected_resume.is_none());
 }
@@ -5508,6 +5514,19 @@ fn approval_request_blocks_until_matching_thread_reports_resolution() {
         }))
         .unwrap();
 
+    for request in [
+        json!({"id": 40, "method": "item/commandExecution/requestApproval", "params": {"threadId": "thread-other"}}),
+        json!({"id": 41, "method": "item/commandExecution/requestApproval", "params": {}}),
+    ] {
+        assert!(!state.observe(&request).unwrap());
+        assert_eq!(
+            state.observed(),
+            &CodexObservedState::Active {
+                turn_id: "turn-1".into()
+            }
+        );
+    }
+
     assert!(
         state
             .observe(&json!({
@@ -5532,6 +5551,15 @@ fn approval_request_blocks_until_matching_thread_reports_resolution() {
     assert_eq!(observation.ask, crate::harness_state::Ask::Permission);
     state = serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
     assert!(state.approval_request_pending);
+    assert!(
+        !state
+            .observe(&json!({
+                "id": 1,
+                "method": "item/commandExecution/requestApproval",
+                "params": {"threadId": "thread-main", "turnId": "turn-1"}
+            }))
+            .unwrap()
+    );
 
     assert!(
         !state
@@ -6466,9 +6494,14 @@ fn automatic_remote_resume_omits_permission_overrides_but_fresh_launch_is_exact(
         "remote resume must not send provider-rejected permission overrides"
     );
 
-    let prepared =
-        prepare_controlled_launch_args("unix:///server.sock", &authored, Some("thread-prior"))
-            .unwrap();
+    let prepared = prepare_controlled_launch_args(
+        "unix:///server.sock",
+        &authored,
+        Some("thread-prior"),
+        true,
+        None,
+    )
+    .unwrap();
     assert!(
         prepared
             .server_args
@@ -6539,9 +6572,14 @@ fn automatic_remote_resume_omits_permission_overrides_but_fresh_launch_is_exact(
         "--dangerously-bypass-hook-trust".into(),
         "boot".into(),
     ];
-    let prepared =
-        prepare_controlled_launch_args("unix:///server.sock", &standing_seat, Some("thread-prior"))
-            .unwrap();
+    let prepared = prepare_controlled_launch_args(
+        "unix:///server.sock",
+        &standing_seat,
+        Some("thread-prior"),
+        true,
+        None,
+    )
+    .unwrap();
     assert!(
         prepared
             .server_args
@@ -6600,7 +6638,7 @@ fn automatic_remote_resume_omits_permission_overrides_but_fresh_launch_is_exact(
 fn unattended_codex_defaults_approval_policy_without_overriding_a_declaration() {
     let endpoint = "unix:///server.sock";
     let plain = vec!["--model".into(), "gpt-6.1-sol".into(), "boot".into()];
-    let fresh = prepare_controlled_launch_args(endpoint, &plain, None).unwrap();
+    let fresh = prepare_controlled_launch_args(endpoint, &plain, None, true, None).unwrap();
     assert!(
         fresh
             .server_args
@@ -6618,7 +6656,8 @@ fn unattended_codex_defaults_approval_policy_without_overriding_a_declaration() 
             "gpt-6.1-sol"
         ]
     );
-    let resumed = prepare_controlled_launch_args(endpoint, &plain, Some("saved-thread")).unwrap();
+    let resumed =
+        prepare_controlled_launch_args(endpoint, &plain, Some("saved-thread"), true, None).unwrap();
     assert_eq!(
         resumed
             .resume_permissions
@@ -6649,7 +6688,7 @@ fn unattended_codex_defaults_approval_policy_without_overriding_a_declaration() 
             "boot".into(),
         ],
     ] {
-        let fresh = prepare_controlled_launch_args(endpoint, &explicit, None).unwrap();
+        let fresh = prepare_controlled_launch_args(endpoint, &explicit, None, true, None).unwrap();
         assert!(
             !fresh
                 .server_args
@@ -6663,7 +6702,8 @@ fn unattended_codex_defaults_approval_policy_without_overriding_a_declaration() 
                 .any(|v| v == ["--ask-for-approval", "never"])
         );
         let resumed =
-            prepare_controlled_launch_args(endpoint, &explicit, Some("saved-thread")).unwrap();
+            prepare_controlled_launch_args(endpoint, &explicit, Some("saved-thread"), true, None)
+                .unwrap();
         assert!(
             !resumed
                 .server_args
@@ -6692,7 +6732,8 @@ fn compact_model_and_ordered_config_overrides_reach_the_typed_resume() {
         "-aon-request".into(),
         "boot".into(),
     ];
-    let prepared = prepare_controlled_launch_args(endpoint, &args, Some("thread-prior")).unwrap();
+    let prepared =
+        prepare_controlled_launch_args(endpoint, &args, Some("thread-prior"), true, None).unwrap();
     let permissions = prepared.resume_permissions.unwrap();
     assert_eq!(permissions.model.as_deref(), Some("gpt-6.1-sol"));
     assert_eq!(permissions.effort.as_deref(), Some("high"));
@@ -6709,6 +6750,103 @@ fn compact_model_and_ordered_config_overrides_reach_the_typed_resume() {
         &json!({"result": {"model": "older", "reasoningEffort": "medium", "approvalPolicy": "never"}}),
         &permissions,
     ));
+
+    let reversed = vec![
+        "-aon-request".into(),
+        "-capproval_policy=never".into(),
+        "-mgpt-6.1-sol".into(),
+        "-cmodel=older".into(),
+        "boot".into(),
+    ];
+    let prepared =
+        prepare_controlled_launch_args(endpoint, &reversed, Some("thread-prior"), true, None)
+            .unwrap();
+    let permissions = prepared.resume_permissions.unwrap();
+    assert_eq!(permissions.approval_policy.as_deref(), Some("on-request"));
+    assert_eq!(permissions.model.as_deref(), Some("gpt-6.1-sol"));
+    assert_eq!(
+        declared_codex_model(&reversed).as_deref(),
+        Some("gpt-6.1-sol")
+    );
+}
+
+#[test]
+fn attended_codex_and_configured_mission_policy_do_not_get_an_implicit_never() {
+    let endpoint = "unix:///server.sock";
+    let plain = vec!["boot".into()];
+    let attended = prepare_controlled_launch_args(endpoint, &plain, None, false, None).unwrap();
+    assert!(
+        !attended
+            .server_args
+            .iter()
+            .any(|value| value == "approval_policy=\"never\"")
+    );
+    assert!(
+        !attended
+            .tui_args
+            .iter()
+            .any(|value| value == "--ask-for-approval")
+    );
+    let resumed =
+        prepare_controlled_launch_args(endpoint, &plain, Some("thread-prior"), false, None)
+            .unwrap();
+    assert!(resumed.resume_permissions.is_none());
+
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("config.toml"),
+        "approval_policy = 'on-request'\n",
+    )
+    .unwrap();
+    let configured =
+        prepare_controlled_launch_args(endpoint, &plain, None, true, Some(temp.path())).unwrap();
+    assert!(
+        !configured
+            .server_args
+            .iter()
+            .any(|value| value == "approval_policy=\"never\"")
+    );
+    let configured_resume = prepare_controlled_launch_args(
+        endpoint,
+        &plain,
+        Some("thread-prior"),
+        true,
+        Some(temp.path()),
+    )
+    .unwrap();
+    assert!(configured_resume.resume_permissions.is_none());
+
+    std::fs::write(temp.path().join("config.toml"), "model = 'gpt-6.1-sol'\n").unwrap();
+    std::fs::write(
+        temp.path().join("review.config.toml"),
+        "approval_policy = 'on-request'\n",
+    )
+    .unwrap();
+    let profile = vec!["--profile".into(), "review".into(), "boot".into()];
+    let profiled =
+        prepare_controlled_launch_args(endpoint, &profile, None, true, Some(temp.path())).unwrap();
+    assert!(
+        !profiled
+            .server_args
+            .iter()
+            .any(|value| value == "approval_policy=\"never\"")
+    );
+}
+
+#[test]
+fn explicit_resume_and_fork_do_not_receive_a_policy_splice() {
+    for command in ["resume", "fork"] {
+        let authored = vec![command.into(), "thread-prior".into()];
+        let prepared =
+            prepare_controlled_launch_args("unix:///server.sock", &authored, None, true, None)
+                .unwrap();
+        assert!(
+            !prepared
+                .tui_args
+                .iter()
+                .any(|value| value == "--ask-for-approval")
+        );
+    }
 }
 
 #[test]
@@ -6724,7 +6862,8 @@ fn rejected_declared_options_fail_before_launch_without_leaking_values() {
         ),
     ] {
         let error =
-            prepare_controlled_launch_args("unix:///server.sock", &args, resume).unwrap_err();
+            prepare_controlled_launch_args("unix:///server.sock", &args, resume, true, None)
+                .unwrap_err();
         assert!(error.to_string().contains("--future-token"));
         assert!(!error.to_string().contains("secret"));
         assert!(!error.to_string().contains("do-not-log-this"));

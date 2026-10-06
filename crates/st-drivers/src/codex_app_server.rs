@@ -3047,8 +3047,14 @@ fn run_controlled_owned(
     prepare_socket_for_launch(&socket_path)?;
 
     let endpoint = format!("unix://{}", socket_path.display());
-    let prepared =
-        prepare_controlled_launch_args(&endpoint, &codex_argv[1..], resume_thread.as_deref())?;
+    let config_home = codex_home();
+    let prepared = prepare_controlled_launch_args(
+        &endpoint,
+        &codex_argv[1..],
+        resume_thread.as_deref(),
+        std::env::var_os("ST_MISSION_RUN").is_some(),
+        config_home.as_deref(),
+    )?;
     let safe_fallback_active = Arc::new(AtomicBool::new(false));
 
     // Publish the host-owned incarnation for a residency attempt only after this process holds
@@ -3132,24 +3138,42 @@ fn run_controlled_owned(
 }
 
 fn declared_codex_model(args: &[String]) -> Option<String> {
-    let mut selected = None;
+    let mut selected_config = None;
+    let mut selected_direct = None;
     let mut index = 0;
     while index < args.len() && args[index] != "--" {
         if matches!(args[index].as_str(), "-m" | "--model") {
-            selected = args.get(index + 1).cloned();
+            selected_direct = args.get(index + 1).cloned();
             index += 2;
             continue;
         }
         if let Some(value) = args[index].strip_prefix("--model=") {
-            selected = Some(value.to_owned());
+            selected_direct = Some(value.to_owned());
         } else if let Some(value) = args[index].strip_prefix("-m")
             && !value.is_empty()
         {
-            selected = Some(value.to_owned());
+            selected_direct = Some(value.to_owned());
+        } else {
+            let config = if matches!(args[index].as_str(), "-c" | "--config") {
+                let value = args.get(index + 1).map(String::as_str);
+                index += 1;
+                value
+            } else {
+                args[index]
+                    .strip_prefix("--config=")
+                    .or_else(|| args[index].strip_prefix("-c"))
+            };
+            if let Some((key, value)) = config.and_then(|value| value.split_once('='))
+                && key.trim() == "model"
+            {
+                selected_config = Some(value.trim().trim_matches(['"', '\'']).to_owned());
+            }
         }
         index += 1;
     }
-    selected.filter(|model| !model.is_empty())
+    selected_direct
+        .or(selected_config)
+        .filter(|model| !model.is_empty())
 }
 
 fn prepare_socket_for_launch(socket_path: &Path) -> Result<()> {
@@ -3583,11 +3607,13 @@ fn prepare_controlled_launch_args(
     endpoint: &str,
     authored_args: &[String],
     resume_thread: Option<&str>,
+    unattended: bool,
+    config_home: Option<&Path>,
 ) -> Result<PreparedControlledLaunch> {
     let exact = controlled_app_server_args(endpoint, authored_args).and_then(|mut server_args| {
+        let default_approval = unattended && !authored_approval_policy(authored_args, config_home)?;
         let resume_permissions =
-            automatic_resume_permission_overrides(authored_args, resume_thread)?;
-        let default_approval = !authored_approval_policy(authored_args)?;
+            automatic_resume_permission_overrides(authored_args, resume_thread, default_approval)?;
         if default_approval && resume_permissions.is_none() {
             insert_app_server_config_override(
                 &mut server_args,
@@ -3603,7 +3629,10 @@ fn prepare_controlled_launch_args(
             }
         }
         let mut tui_args = controlled_tui_args(endpoint, authored_args, resume_thread)?;
-        if default_approval && resume_thread.is_none() {
+        if default_approval
+            && resume_thread.is_none()
+            && resume_insertion_index(authored_args)?.is_some()
+        {
             tui_args.splice(2..2, ["--ask-for-approval".into(), "never".into()]);
         }
         Ok((
@@ -3633,6 +3662,7 @@ fn prepare_controlled_launch_args(
 fn automatic_resume_permission_overrides(
     authored_args: &[String],
     resume_thread: Option<&str>,
+    default_approval: bool,
 ) -> Result<Option<ResumePermissionOverrides>> {
     if resume_thread.is_none() {
         return Ok(None);
@@ -3641,7 +3671,14 @@ fn automatic_resume_permission_overrides(
         return Ok(None);
     };
     let mut overrides = ResumePermissionOverrides {
-        approval_policy: (!authored_approval_policy(authored_args)?).then(|| "never".into()),
+        approval_policy: default_approval.then(|| "never".into()),
+        approvals_reviewer: None,
+        sandbox: None,
+        model: None,
+        effort: None,
+    };
+    let mut direct = ResumePermissionOverrides {
+        approval_policy: None,
         approvals_reviewer: None,
         sandbox: None,
         model: None,
@@ -3652,14 +3689,14 @@ fn automatic_resume_permission_overrides(
         let argument = authored_args[index].as_str();
         match argument {
             "--dangerously-bypass-approvals-and-sandbox" => {
-                overrides.approval_policy = Some("never".into());
-                overrides.sandbox = Some("danger-full-access".into());
+                direct.approval_policy = Some("never".into());
+                direct.sandbox = Some("danger-full-access".into());
                 index += 1;
             }
             "--approve-for-me" => {
-                overrides.approval_policy = Some("on-request".into());
-                overrides.approvals_reviewer = Some("auto_review".into());
-                overrides.sandbox = Some("workspace-write".into());
+                direct.approval_policy = Some("on-request".into());
+                direct.approvals_reviewer = Some("auto_review".into());
+                direct.sandbox = Some("workspace-write".into());
                 index += 1;
             }
             "-s" | "--sandbox" => {
@@ -3667,7 +3704,7 @@ fn automatic_resume_permission_overrides(
                     .get(index + 1)
                     .context("Codex sandbox option has no value")?;
                 validate_resume_sandbox(value)?;
-                overrides.sandbox = Some(value.clone());
+                direct.sandbox = Some(value.clone());
                 index += 2;
             }
             "-a" | "--ask-for-approval" => {
@@ -3675,11 +3712,11 @@ fn automatic_resume_permission_overrides(
                     .get(index + 1)
                     .context("Codex approval option has no value")?;
                 validate_resume_approval_policy(value)?;
-                overrides.approval_policy = Some(value.clone());
+                direct.approval_policy = Some(value.clone());
                 index += 2;
             }
             "-m" | "--model" => {
-                overrides.model = Some(
+                direct.model = Some(
                     authored_args
                         .get(index + 1)
                         .context("Codex model option has no value")?
@@ -3706,35 +3743,35 @@ fn automatic_resume_permission_overrides(
                 index += 1;
             }
             _ if argument.starts_with("--model=") => {
-                overrides.model = Some(argument.trim_start_matches("--model=").into());
+                direct.model = Some(argument.trim_start_matches("--model=").into());
                 index += 1;
             }
             _ if argument.starts_with("-m") && argument.len() > 2 => {
-                overrides.model = Some(argument[2..].into());
+                direct.model = Some(argument[2..].into());
                 index += 1;
             }
             _ if argument.starts_with("--sandbox=") => {
                 let value = argument.trim_start_matches("--sandbox=");
                 validate_resume_sandbox(value)?;
-                overrides.sandbox = Some(value.into());
+                direct.sandbox = Some(value.into());
                 index += 1;
             }
             _ if argument.starts_with("--ask-for-approval=") => {
                 let value = argument.trim_start_matches("--ask-for-approval=");
                 validate_resume_approval_policy(value)?;
-                overrides.approval_policy = Some(value.into());
+                direct.approval_policy = Some(value.into());
                 index += 1;
             }
             _ if argument.starts_with("-s") && argument.len() > 2 => {
                 let value = &argument[2..];
                 validate_resume_sandbox(value)?;
-                overrides.sandbox = Some(value.into());
+                direct.sandbox = Some(value.into());
                 index += 1;
             }
             _ if argument.starts_with("-a") && argument.len() > 2 => {
                 let value = &argument[2..];
                 validate_resume_approval_policy(value)?;
-                overrides.approval_policy = Some(value.into());
+                direct.approval_policy = Some(value.into());
                 index += 1;
             }
             _ => {
@@ -3759,6 +3796,18 @@ fn automatic_resume_permission_overrides(
                 };
             }
         }
+    }
+    if direct.approval_policy.is_some() {
+        overrides.approval_policy = direct.approval_policy;
+    }
+    if direct.approvals_reviewer.is_some() {
+        overrides.approvals_reviewer = direct.approvals_reviewer;
+    }
+    if direct.sandbox.is_some() {
+        overrides.sandbox = direct.sandbox;
+    }
+    if direct.model.is_some() {
+        overrides.model = direct.model;
     }
     Ok((overrides.approval_policy.is_some()
         || overrides.approvals_reviewer.is_some()
@@ -3801,11 +3850,21 @@ fn apply_resume_config_override(
 
 /// A declaration can select approvals either with the CLI option or a direct config override.
 /// The latter must take precedence over the unattended default on both fresh and resumed seats.
-fn authored_approval_policy(authored_args: &[String]) -> Result<bool> {
+fn authored_approval_policy(authored_args: &[String], config_home: Option<&Path>) -> Result<bool> {
     let boundary = interactive_root_prefix_end(authored_args)?;
     let mut index = 0;
+    let mut selected_profile = None;
     while index < boundary {
         let arg = authored_args[index].as_str();
+        if matches!(arg, "-p" | "--profile") {
+            selected_profile = authored_args.get(index + 1).map(String::as_str);
+        } else if let Some(profile) = arg.strip_prefix("--profile=") {
+            selected_profile = Some(profile);
+        } else if let Some(profile) = arg.strip_prefix("-p")
+            && !profile.is_empty()
+        {
+            selected_profile = Some(profile);
+        }
         if matches!(
             arg,
             "--dangerously-bypass-approvals-and-sandbox"
@@ -3854,7 +3913,47 @@ fn authored_approval_policy(authored_args: &[String]) -> Result<bool> {
             1
         };
     }
-    Ok(false)
+    let Some(home) = config_home else {
+        return Ok(false);
+    };
+    let base = codex_config_file(&home.join("config.toml"))?;
+    if base
+        .as_ref()
+        .is_some_and(|config| config.get("approval_policy").is_some())
+    {
+        return Ok(true);
+    }
+    let profile = selected_profile.or_else(|| {
+        base.as_ref()
+            .and_then(|config| config.get("profile"))
+            .and_then(toml::Value::as_str)
+    });
+    let Some(profile) = profile else {
+        return Ok(false);
+    };
+    anyhow::ensure!(
+        std::path::Path::new(profile)
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+            && std::path::Path::new(profile).components().count() == 1,
+        "Codex profile name is not a single path component"
+    );
+    Ok(
+        codex_config_file(&home.join(format!("{profile}.config.toml")))?
+            .as_ref()
+            .is_some_and(|config| config.get("approval_policy").is_some()),
+    )
+}
+
+fn codex_config_file(path: &Path) -> Result<Option<toml::Value>> {
+    let source = match fs::read_to_string(path) {
+        Ok(source) => source,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    };
+    Ok(Some(
+        toml::from_str(&source).with_context(|| format!("parsing {}", path.display()))?,
+    ))
 }
 
 fn validate_resume_sandbox(value: &str) -> Result<()> {
