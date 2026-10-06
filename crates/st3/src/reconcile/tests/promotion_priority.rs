@@ -130,6 +130,8 @@ mission "promotion-proof" state="ready" {{
                 && let Some(incarnation) = store
                     .claims_for("agent/node.promotion-seat", Some("runtime.action.succeeded")).unwrap()
                     .iter()
+                    .filter(|claim| claim.body.pointer("/fields/action").and_then(Value::as_str)
+                        == Some("start"))
                     .find_map(|claim| claim.body.pointer("/fields/incarnation_id")
                         .and_then(Value::as_str).map(str::to_owned))
             {
@@ -157,6 +159,8 @@ mission "promotion-proof" state="ready" {{
     let observed = runtime.snapshot_ptys().unwrap().into_iter()
         .find(|observation| observation.runtime_id == "node.promotion-seat").unwrap();
     assert_eq!(observed.incarnation_id.as_deref(), Some(incarnation.as_str()));
+    let actual = store.latest_actual_value("agent/node.promotion-seat").unwrap().unwrap();
+    assert_eq!(actual_field(&actual, "status").and_then(Value::as_str), Some("starting"));
     assert_eq!(epoch, 1, "promotion is one durable readiness transition");
     eprintln!(
         "first readiness: {} ms; first incarnation: {} ms; mailbox checks: {}; ordinary backlog: 24 x 250ms; bound: 3000ms",
