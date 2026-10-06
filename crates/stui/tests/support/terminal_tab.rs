@@ -119,6 +119,8 @@ fn terminal_tab_probe_worker() -> Result<()> {
             })
             .collect();
         let status = serde_json::json!({
+            "attached": native.attached(),
+            "grid": native.grid_size(),
             "title": native.title(), "mode": format!("{:?}", native.mode()),
             "mode_bits": native.mode().bits(),
             "body": [body.x, body.y, body.width, body.height],

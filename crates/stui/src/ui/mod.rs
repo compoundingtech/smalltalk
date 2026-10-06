@@ -1101,16 +1101,17 @@ impl Ui {
         if self.help {
             self.draw_help(buf, area);
         }
-        if let Some(view) = &self.terminal
-            && let Some(native) = &view.native
-            && (!self
+        for view in self.terminal.iter().chain(self.parked.iter()) {
+            if let Some(native) = &view.native
+                && (!self
                 .frame
                 .borrow()
                 .panes
                 .iter()
                 .any(|pane| pane.key == Pane::Terminal(view.agent.clone()).key()))
-        {
-            native.hide_graphics();
+            {
+                native.hide_graphics();
+            }
         }
         if let Some(cursor) = self.terminal_cursor.get() {
             frame.set_cursor_position((cursor.x, cursor.y));
@@ -2504,10 +2505,15 @@ impl Ui {
         if let Some(native) = view.native.as_ref() {
             // One line for where this is and how to leave; the PTY gets the rest of the pane.
             let scrolled = native.scrolled();
+            let selection_here = self.terminal_selection_mode
+                && self
+                    .terminal
+                    .as_ref()
+                    .is_some_and(|view| view.agent == agent);
             let status = match (native.ended(), native.attached(), scrolled) {
                 (Some(reason), _, _) => format!("ended: {reason}"),
                 (None, false, _) => "attaching…".into(),
-                (None, true, 0) if self.terminal_selection_mode => {
+                (None, true, 0) if selection_here => {
                     "selection on · drag copies · ctrl+alt+s resumes program mouse".into()
                 }
                 (None, true, 0)
@@ -2566,7 +2572,10 @@ impl Ui {
                 && !self.help
                 && self.popover.is_none()
                 && !self.palette_open();
-            self.terminal_cursor.set(native.draw(buf, body, real));
+            let cursor = native.draw(buf, body, real);
+            if real {
+                self.terminal_cursor.set(cursor);
+            }
             if let Some(picker) = &self.picker {
                 native.draw_graphics(buf, body, picker);
             }
@@ -3149,7 +3158,7 @@ impl Ui {
 
     /// Dispatch the outer terminal's decoded input, shared by the live and demo loops.
     fn input_event(&mut self, event: Event) {
-        let focused = self.terminal_focused() && !self.palette_open() && !self.help;
+        let focused = self.input_terminal();
         match event {
             Event::Key(key) => self.key(key),
             Event::Paste(text) => {
@@ -3157,19 +3166,40 @@ impl Ui {
                 self.paste(text)
             }
             Event::Mouse(mouse) => self.mouse(mouse),
-            Event::FocusGained | Event::FocusLost if focused => {
+            Event::FocusGained | Event::FocusLost if focused.is_some() => {
                 if let Some(native) = self.native_terminal() {
                     native.focus(matches!(event, Event::FocusGained));
                 }
             }
             _ => {}
         }
-        let now = self.terminal_focused() && !self.palette_open() && !self.help;
-        if focused != now
-            && let Some(native) = self.native_terminal()
-        {
-            native.focus(now);
+        self.sync_terminal_slot();
+        let now = self.input_terminal();
+        if focused != now {
+            for (agent, gained) in [(focused, false), (now, true)] {
+                if let Some(agent) = agent
+                    && let Some(native) = self
+                        .terminal_view(&agent)
+                        .and_then(|view| view.native.as_ref())
+                {
+                    native.focus(gained);
+                }
+            }
         }
+    }
+
+    fn input_terminal(&self) -> Option<String> {
+        (self.terminal_focused()
+            && !self.palette_open()
+            && !self.help
+            && self.popover.is_none()
+            && self.voice.is_none()
+            && self.context.is_none())
+        .then(|| match self.focused_pane() {
+            Some(Pane::Terminal(agent)) => Some(agent),
+            _ => self.terminal.as_ref().map(|view| view.agent.clone()),
+        })
+        .flatten()
     }
 
     pub fn key(&mut self, key: KeyEvent) {
@@ -3180,6 +3210,7 @@ impl Ui {
                 && !self.help
                 && self.popover.is_none()
                 && self.voice.is_none()
+                && self.context.is_none()
                 && !terminal_space_key(key)
                 && !matches!(key.code, KeyCode::Char('\\' | '4') if key.modifiers.contains(KeyModifiers::CONTROL))
                 && !matches!(key.code, KeyCode::Char('s' | 'S' | 'r' | 'R') if key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::ALT))
@@ -3910,6 +3941,21 @@ impl Ui {
             let wanted = self.parked.remove(index);
             if let Some(old) = self.terminal.replace(wanted) {
                 self.parked.push(old);
+            }
+            self.terminal_selection_mode = false;
+            self.terminal_selecting = false;
+            self.terminal_press = None;
+            if let Some(body) = self
+                .frame
+                .borrow()
+                .panes
+                .iter()
+                .find(|pane| pane.key == Pane::Terminal(agent.clone()).key())
+                .map(|pane| pane.rect)
+            {
+                self.terminal_body.set(Some(body));
+                self.terminal_size
+                    .set((body.height.max(1), body.width.max(1)));
             }
         }
     }
@@ -4862,19 +4908,30 @@ impl Ui {
                         as usize;
                 } else if let Some(key) = pane {
                     // An attached terminal scrolls its own history (or tells its program).
-                    match self.native_terminal() {
-                        Some(native)
-                            if self.terminal.as_ref().is_some_and(|view| {
-                                key == Pane::Terminal(view.agent.clone()).key()
-                            }) =>
-                        {
-                            if let Some(body) = self.terminal_body.get() {
+                    let target = self
+                        .terminal
+                        .iter()
+                        .chain(self.parked.iter())
+                        .find(|view| key == Pane::Terminal(view.agent.clone()).key());
+                    match target.and_then(|view| view.native.as_ref()) {
+                        Some(native) => {
+                            if let Some(body) = self
+                                .frame
+                                .borrow()
+                                .panes
+                                .iter()
+                                .find(|pane| pane.key == key)
+                                .map(|pane| pane.rect)
+                            {
                                 native.wheel(
                                     -(delta as i32),
                                     mouse,
                                     mouse.column.saturating_sub(body.x),
                                     mouse.row.saturating_sub(body.y),
-                                    self.terminal_selection_mode
+                                    (self.terminal_selection_mode
+                                        && self.terminal.as_ref().is_some_and(|view| {
+                                            key == Pane::Terminal(view.agent.clone()).key()
+                                        }))
                                         || mouse
                                             .modifiers
                                             .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT),

@@ -434,6 +434,8 @@
             pkgs.which
             pkgs.cargo-nextest
             pkgs.python3
+            # Boot cleanup fixtures query their isolated daemon with curl.
+            pkgs.curl
             pkgs.nodejs
             ptyPackage
           ]

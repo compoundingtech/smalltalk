@@ -119,7 +119,11 @@ class Tab:
         )
         self.reader_thread = threading.Thread(target=self.drain, daemon=True)
         self.reader_thread.start()
-        wait_for(self.status, lambda value: value and value.get("body"), "terminal tab")
+        # A body can be drawn before the daemon's initial screen cut. Starting output
+        # then lets attach replay and the first resize move fixture text during a drag.
+        wait_for(self.status, lambda value: value and value.get("attached") and value.get("body")
+                 and value.get("grid") == [value["body"][3], value["body"][2]],
+                 "attached terminal tab at pane geometry")
 
     def drain(self):
         pending = b""

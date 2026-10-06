@@ -478,6 +478,12 @@ impl NativeTerminal {
         self.lock().attached
     }
 
+    #[cfg(test)]
+    pub(super) fn grid_size(&self) -> (usize, usize) {
+        let screen = self.lock();
+        (screen.term.screen_lines(), screen.term.columns())
+    }
+
     /// Whether output arrived in the last moment, so stui draws more often.
     pub(crate) fn flowing(&self) -> bool {
         self.lock()

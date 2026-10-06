@@ -23,6 +23,12 @@ registered. Mouse reporting now works on either screen with actual pane-relative
 coordinates and modifiers. Mode 1003 button/wheel codes also correct the underlying
 PTY encoder's inappropriate motion bit.
 
+With several attached terminals in splits, the wheel reaches the pane under the
+pointer without moving keyboard focus. Focus reports and the cursor follow the
+focused terminal; selection overrides reset when another terminal gets focus.
+Hidden terminals release their own image resources even while their sessions stay
+attached behind other tabs.
+
 | Request or input | Terminal tab behavior | Limit or ownership |
 | --- | --- | --- |
 | Wheel with mouse 1000/1002/1003 | Three wheel reports, on main or alternate screen | Alt/Option, Shift and selection mode hold it locally |
