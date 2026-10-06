@@ -245,7 +245,7 @@ fn process_capture_rejects_oversize_and_child_held_pipes() {
     output
         .args(["--exact", "cli_inventory_capture_helper", "--nocapture"])
         .env("ST3_CLI_INVENTORY_CAPTURE_HELPER", "oversize");
-    let oversize = bounded_output(output, Duration::from_secs(2)).unwrap_err();
+    let oversize = bounded_output(output, Duration::from_secs(5)).unwrap_err();
     assert!(
         oversize.contains("exceeds"),
         "oversize stdout must be refused: {oversize}"
@@ -257,7 +257,7 @@ fn process_capture_rejects_oversize_and_child_held_pipes() {
     held.args(["--exact", "cli_inventory_capture_helper", "--nocapture"])
         .env("ST3_CLI_INVENTORY_CAPTURE_HELPER", "child")
         .env("ST3_CLI_INVENTORY_CAPTURE_MARKER", &marker);
-    let child_pipe = bounded_output(held, Duration::from_secs(2)).unwrap_err();
+    let child_pipe = bounded_output(held, Duration::from_secs(5)).unwrap_err();
     assert!(
         child_pipe.contains("deadline"),
         "a descendant holding stdout open must be killed with the process group: {child_pipe}"

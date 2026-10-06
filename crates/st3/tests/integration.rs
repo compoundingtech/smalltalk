@@ -26,7 +26,8 @@ fn cli_inventory_capture_helper() {
 
     match std::env::var("ST3_CLI_INVENTORY_CAPTURE_HELPER").as_deref() {
         Ok("oversize") => {
-            std::io::stdout().write_all(&vec![b'x'; 1_048_577]).unwrap();
+            let bytes = vec![b'x'; 1_048_577];
+            std::io::stdout().write_all(&bytes).unwrap();
         }
         Ok("child") => {
             std::process::Command::new(std::env::current_exe().unwrap())
