@@ -1,7 +1,7 @@
 //! st-owned observation outbox. Opt-in is per directory, never process-global: an adopted
 //! provider keeps its transport while a fresh st seat initializes this database before spawn.
-//! A snapshot and its event commit together. The driver removes only acknowledged events;
-//! readers of provider-local evidence do not depend on the daemon being reachable.
+//! Current state has separate storage and is not subject to historical admission. The bounded
+//! history FIFO records cap-full loss explicitly; only acknowledged events are removed.
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -17,6 +17,119 @@ pub const WAKE_PIPE: &str = ".st-harness-events-wake";
 pub const DATABASE: &str = "st-harness-events.sqlite";
 pub const STATE_WAKE_PIPE: &str = ".st-harness-state-wake";
 const MAX_PENDING_BYTES: u64 = 64 * 1024 * 1024;
+const CURRENT_SNAPSHOT: &str = "harness-current";
+
+#[derive(Serialize, Deserialize)]
+struct HistoryGap {
+    count: u64,
+    from_ms: u64,
+    to_ms: u64,
+}
+
+fn gap_key(runtime: &str) -> String {
+    format!("history-gap:{runtime}")
+}
+
+fn enrich_gap(connection: &Connection, runtime: &str, state: &mut Value) -> Result<()> {
+    let gap: Option<String> = connection.query_row(
+        "SELECT value FROM metadata WHERE key=?1", [gap_key(runtime)], |row| row.get(0),
+    ).optional()?;
+    let gap = gap.map(|raw| serde_json::from_str::<HistoryGap>(&raw)).transpose()?;
+    state["history_gap_count"] = gap.as_ref().map(|gap| Value::from(gap.count)).unwrap_or(Value::Null);
+    state["history_gap_from_ms"] = gap.as_ref().map(|gap| Value::from(gap.from_ms)).unwrap_or(Value::Null);
+    state["history_gap_to_ms"] = gap.as_ref().map(|gap| Value::from(gap.to_ms)).unwrap_or(Value::Null);
+    state["history_gap_reason"] = if gap.is_some() { Value::from("cap-full") } else { Value::Null };
+    Ok(())
+}
+
+fn write_current_snapshot(connection: &Connection, runtime: &str, state: &Value) -> Result<()> {
+    let mut current = serde_json::Map::new();
+    for key in ["schema", "agent", "harness", "state", "blockedOn", "inputBuffer", "ask",
+        "active_ask", "backgroundJobs", "runningSubagents", "providerAuth", "providerAuthSequence",
+        "ptySession", "incarnation", "seq", "sinceMs", "writtenAtMs", "transitions", "exit"] {
+        if let Some(value) = state.get(key) { current.insert(key.into(), value.clone()); }
+    }
+    // This internal sentinel distinguishes a claimed-but-not-started provider from an exit.
+    // Normal diagnostic reasons do not belong in the categorical snapshot or graph lane.
+    if state["state"] == "ended" && state["exit"].is_null() && state["reason"] == "superseded" {
+        current.insert("reason".into(), Value::from("superseded"));
+    }
+    let mut current = Value::Object(current);
+    enrich_gap(connection, runtime, &mut current)?;
+    connection.execute(
+        "INSERT INTO snapshots VALUES (?1,?2) ON CONFLICT(kind) DO UPDATE SET body=excluded.body",
+        params![CURRENT_SNAPSHOT, serde_json::to_vec(&current)?],
+    )?;
+    Ok(())
+}
+
+fn record_history_gap(connection: &Connection, runtime: &str, body: &Value) -> Result<()> {
+    let now = crate::message::now_ms();
+    let existing: Option<String> = connection.query_row(
+        "SELECT value FROM metadata WHERE key=?1", [gap_key(runtime)], |row| row.get(0),
+    ).optional()?;
+    let mut aggregate = existing.map(|raw| serde_json::from_str::<HistoryGap>(&raw)).transpose()?
+        .unwrap_or(HistoryGap { count: 0, from_ms: now, to_ms: now });
+    aggregate.count = aggregate.count.checked_add(1)
+        .filter(|count| *count <= i64::MAX as u64)
+        .ok_or_else(|| anyhow::anyhow!("history gap count overflow"))?;
+    aggregate.from_ms = aggregate.from_ms.min(now);
+    aggregate.to_ms = aggregate.to_ms.max(now);
+    connection.execute(
+        "INSERT INTO metadata VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        params![gap_key(runtime), serde_json::to_string(&aggregate)?],
+    )?;
+    let segment_key = format!("history-gap-segment:{runtime}");
+    let sequence: Option<u64> = connection.query_row(
+        "SELECT CAST(value AS INTEGER) FROM metadata WHERE key=?1", [&segment_key], |row| row.get(0),
+    ).optional()?;
+    let previous: Option<(u64, String)> = if let Some(sequence) = sequence {
+        connection.query_row(
+            "SELECT sequence,body FROM events WHERE sequence=?1 AND kind='harness-gap'
+             AND NOT EXISTS(SELECT 1 FROM prepared WHERE prepared.sequence=events.sequence)",
+            [sequence], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?
+    } else { None };
+    if let Some((sequence, raw)) = previous {
+        let mut segment: Value = serde_json::from_str(&raw)?;
+        segment["history_gap_count"] = Value::from(segment["history_gap_count"].as_u64()
+            .and_then(|count| count.checked_add(1)).ok_or_else(|| anyhow::anyhow!("gap segment count overflow"))?);
+        segment["history_gap_from_ms"] = Value::from(segment["history_gap_from_ms"].as_u64().unwrap().min(now));
+        segment["history_gap_to_ms"] = Value::from(segment["history_gap_to_ms"].as_u64().unwrap().max(now));
+        connection.execute("UPDATE events SET body=?1 WHERE sequence=?2",
+            params![serde_json::to_string(&segment)?, sequence])?;
+    } else {
+        let segment = serde_json::json!({
+            "incarnation": body["incarnation"].as_str().or_else(|| body["incarnationId"].as_str()),
+            "account_ref": body["account_ref"],
+            "history_gap_count": 1, "history_gap_from_ms": now, "history_gap_to_ms": now,
+            "history_gap_reason": "cap-full"
+        });
+        // Gap control metadata is outside the normal payload budget. It has no dropped body,
+        // and at most one unprepared segment per runtime; preparation seals each segment.
+        connection.execute(
+            "INSERT INTO events(runtime_incarnation,queued_at_ms,kind,body) VALUES (?1,?2,'harness-gap',?3)",
+            params![runtime, now, serde_json::to_string(&segment)?],
+        )?;
+        connection.execute(
+            "INSERT INTO metadata VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![segment_key, connection.last_insert_rowid()],
+        )?;
+    }
+    let current: Option<Vec<u8>> = connection.query_row(
+        "SELECT body FROM snapshots WHERE kind='harness-state'", [], |row| row.get(0),
+    ).optional()?;
+    if let Some(raw) = current {
+        let state: Value = serde_json::from_slice(&raw)?;
+        let owner: Option<String> = connection.query_row(
+            "SELECT value FROM metadata WHERE key=?1",
+            [format!("provider-runtime:{}", state["incarnation"].as_str().unwrap_or(""))],
+            |row| row.get(0),
+        ).optional()?;
+        if owner.as_deref() == Some(runtime) { write_current_snapshot(connection, runtime, &state)?; }
+    }
+    Ok(())
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Event {
@@ -180,7 +293,11 @@ pub fn enable(agent_dir: &Path, runtime_incarnation: &str) -> Result<()> {
     Ok(())
 }
 
-fn append_event(tx: &Connection, kind: &str, body: &Value) -> Result<()> {
+fn append_event(tx: &Connection, kind: &str, body: &Value) -> Result<bool> {
+    append_event_with_limit(tx, kind, body, MAX_PENDING_BYTES)
+}
+
+fn append_event_with_limit(tx: &Connection, kind: &str, body: &Value, limit: u64) -> Result<bool> {
     let bytes: u64 = tx.query_row(
         "SELECT CAST(value AS INTEGER) FROM metadata WHERE key='pending-bytes'",
         [],
@@ -203,20 +320,20 @@ fn append_event(tx: &Connection, kind: &str, body: &Value) -> Result<()> {
         .filter(|name| !name.is_empty())
         .map(Value::String)
         .unwrap_or(Value::Null);
-    let body = serde_json::to_string(&body)?;
-    anyhow::ensure!(
-        bytes.saturating_add(body.len() as u64) <= MAX_PENDING_BYTES,
-        "harness event spool is full; observation was not committed"
-    );
+    let encoded = serde_json::to_string(&body)?;
+    if bytes.saturating_add(encoded.len() as u64) > limit {
+        record_history_gap(tx, &runtime, &body)?;
+        return Ok(false);
+    }
     tx.execute(
         "INSERT INTO events(runtime_incarnation,queued_at_ms,kind,body) VALUES (?1,?2,?3,?4)",
-        params![runtime, crate::message::now_ms(), kind, body],
+        params![runtime, crate::message::now_ms(), kind, encoded],
     )?;
     tx.execute(
         "UPDATE metadata SET value=?1 WHERE key='pending-bytes'",
-        [bytes + body.len() as u64],
+        [bytes + encoded.len() as u64],
     )?;
-    Ok(())
+    Ok(true)
 }
 
 pub fn read_snapshot(agent_dir: &Path, kind: &str) -> Result<Option<Vec<u8>>> {
@@ -235,13 +352,15 @@ pub fn read_runtime_state(agent_dir: &Path, runtime: &str) -> Result<Option<Vec<
     let tx = connection.transaction()?;
     let raw: Option<Vec<u8>> = tx
         .query_row(
-            "SELECT body FROM snapshots WHERE kind='harness-state'",
+            "SELECT body FROM snapshots WHERE kind IN ('harness-state','harness-current')
+             ORDER BY CAST(json_extract(body,'$.writtenAtMs') AS INTEGER) DESC,
+                      kind='harness-current' DESC LIMIT 1",
             [],
             |row| row.get(0),
         )
         .optional()?;
     let Some(raw) = raw else { return Ok(None) };
-    let state: Value = serde_json::from_slice(&raw)?;
+    let mut state: Value = serde_json::from_slice(&raw)?;
     let Some(token) = state["incarnation"].as_str() else {
         return Ok(None);
     };
@@ -252,7 +371,9 @@ pub fn read_runtime_state(agent_dir: &Path, runtime: &str) -> Result<Option<Vec<
             |row| row.get(0),
         )
         .optional()?;
-    Ok((owner.as_deref() == Some(runtime)).then_some(raw))
+    if owner.as_deref() != Some(runtime) { return Ok(None); }
+    enrich_gap(&tx, runtime, &mut state)?;
+    Ok(Some(serde_json::to_vec(&state)?))
 }
 
 fn current_token(connection: &Connection) -> Result<Option<String>> {
@@ -269,6 +390,10 @@ fn current_token(connection: &Connection) -> Result<Option<String>> {
 }
 
 pub fn write_snapshot(agent_dir: &Path, kind: &str, body: &[u8]) -> Result<()> {
+    write_snapshot_with_limit(agent_dir, kind, body, MAX_PENDING_BYTES)
+}
+
+fn write_snapshot_with_limit(agent_dir: &Path, kind: &str, body: &[u8], limit: u64) -> Result<()> {
     anyhow::ensure!(
         matches!(kind, "harness-state" | "harness-context" | "harness-todo"),
         "unsupported observation kind"
@@ -305,10 +430,20 @@ pub fn write_snapshot(agent_dir: &Path, kind: &str, body: &[u8]) -> Result<()> {
         ON CONFLICT(kind) DO UPDATE SET body=excluded.body",
         params![kind, body],
     )?;
-    append_event(&tx, kind, &value)?;
+    if kind == "harness-state" {
+        let runtime: String = tx.query_row(
+            "SELECT value FROM metadata WHERE key=?1",
+            [format!("provider-runtime:{}", value["incarnation"].as_str().unwrap())],
+            |row| row.get(0),
+        )?;
+        // Separate latest storage has no history quota. Keep capture and the explicit gap
+        // marker atomic so a crash cannot leave a committed observation with silent loss.
+        write_current_snapshot(&tx, &runtime, &value)?;
+    }
+    let admitted = append_event_with_limit(&tx, kind, &value, limit)?;
     tx.commit()?;
     signal_wake(agent_dir);
-    if kind == "harness-state" {
+    if kind == "harness-state" || !admitted {
         signal_named_wake(agent_dir, STATE_WAKE_PIPE);
     }
     Ok(())
@@ -347,16 +482,17 @@ pub fn expire_state(agent_dir: &Path, expected: &Value) -> Result<()> {
     let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let current: Option<Vec<u8>> = tx
         .query_row(
-            "SELECT body FROM snapshots WHERE kind='harness-state'",
+            "SELECT body FROM snapshots WHERE kind IN ('harness-state','harness-current')
+             ORDER BY CAST(json_extract(body,'$.writtenAtMs') AS INTEGER) DESC,
+                      kind='harness-current' DESC LIMIT 1",
             [],
             |r| r.get(0),
         )
         .optional()?;
-    if current
-        .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
-        .as_ref()
-        != Some(expected)
-    {
+    let current = current.and_then(|raw| serde_json::from_slice::<Value>(&raw).ok());
+    if !current.as_ref().is_some_and(|current| {
+        ["incarnation", "seq", "writtenAtMs"].iter().all(|key| current[*key] == expected[*key])
+    }) {
         return Ok(());
     }
     let expired: Option<String> = tx
@@ -445,9 +581,23 @@ pub fn prepare_publication(
         |r| r.get(0),
     )?;
     anyhow::ensure!(pending, "event has already been acknowledged");
+    // A gap may grow after pending() reads it but before preparation. Freeze the current
+    // segment, not that earlier copy, under the same transaction that seals its claim.
+    let gap: Option<String> = tx.query_row(
+        "SELECT body FROM events WHERE sequence=?1 AND kind='harness-gap'",
+        [sequence], |row| row.get(0),
+    ).optional()?;
+    let encoded = if let Some(raw) = gap {
+        let gap: Value = serde_json::from_str(&raw)?;
+        let mut refreshed = claim.clone();
+        for key in ["history_gap_count", "history_gap_from_ms", "history_gap_to_ms", "history_gap_reason"] {
+            refreshed["fields"][key] = gap[key].clone();
+        }
+        serde_json::to_string(&refreshed)?
+    } else { serde_json::to_string(claim)? };
     tx.execute(
         "INSERT OR IGNORE INTO prepared VALUES (?1,?2,?3)",
-        params![sequence, slot, serde_json::to_string(claim)?],
+        params![sequence, slot, encoded],
     )?;
     // Rebuild rejected todo claims from their retained event without keeping the malformed
     // pre-normalization slot as a retry target. Preparation and retirement commit together.
@@ -470,7 +620,7 @@ pub fn acknowledge(agent_dir: &Path, sequence: u64) -> Result<()> {
     let mut connection = open(agent_dir)?;
     let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let removed: u64 = tx.query_row(
-        "SELECT COALESCE(SUM(length(CAST(body AS BLOB))),0) FROM events WHERE sequence<=?1",
+        "SELECT COALESCE(SUM(length(CAST(body AS BLOB))),0) FROM events WHERE sequence<=?1 AND kind<>'harness-gap'",
         [sequence],
         |r| r.get(0),
     )?;
@@ -809,37 +959,124 @@ mod protocol_tests {
             Some("new")
         );
     }
-    #[test]
-    fn full_spool_rolls_back_snapshot_and_timeline_changes() {
+    fn cap_fixture() -> (tempfile::TempDir, Value) {
         let root = tempfile::tempdir().unwrap();
         enable(root.path(), "runtime").unwrap();
-        let seq = claim(root.path(), "example/seat", "claude", "provider").unwrap();
-        let before = read_snapshot(root.path(), "harness-state").unwrap();
-        open(root.path())
-            .unwrap()
-            .execute(
-                "UPDATE metadata SET value=?1 WHERE key='pending-bytes'",
-                [MAX_PENDING_BYTES],
-            )
-            .unwrap();
-        let mut writer = Writer::new(root.path(), "example/seat", "claude", Some("pty".into()))
-            .with_ownership("provider", seq);
-        assert!(writer.observe(active()).is_err());
-        assert_eq!(read_snapshot(root.path(), "harness-state").unwrap(), before);
-        let mut timeline = crate::harness_timeline::Writer::new(root.path(), "claude", "provider");
-        assert!(
-            timeline
-                .append(
-                    "source",
-                    Role::User,
-                    EntryType::Content,
-                    json!({"text":"hello"}),
-                    true
-                )
-                .is_err()
-        );
-        assert!(read_timeline(root.path()).unwrap().is_none());
-        assert_eq!(pending(root.path(), 100).unwrap().len(), 1);
+        claim(root.path(), "example/seat", "omp", "provider").unwrap();
+        let mut state: Value = serde_json::from_slice(
+            &read_snapshot(root.path(), "harness-state").unwrap().unwrap(),
+        ).unwrap();
+        let queued = pending(root.path(), 100).unwrap();
+        acknowledge(root.path(), queued.last().unwrap().sequence).unwrap();
+        state["state"] = json!("active");
+        state["blockedOn"] = json!("human");
+        state["ask"] = json!("question");
+        state["reason"] = json!("private native question");
+        state["writtenAtMs"] = json!(state["writtenAtMs"].as_u64().unwrap() + 1);
+        (root, state)
+    }
+
+    #[test]
+    fn cap_full_keeps_current_ask_and_records_visible_loss() {
+        let (root, mut state) = cap_fixture();
+        // Exercise the production quota path with a small budget, not a corrupt counter
+        // or a 64 MiB allocation. A state must still advance when no history body fits.
+        write_snapshot_with_limit(root.path(), "harness-state", &serde_json::to_vec(&state).unwrap(), 0).unwrap();
+        let current: Value = serde_json::from_slice(
+            &read_runtime_state(root.path(), "runtime").unwrap().unwrap(),
+        ).unwrap();
+        assert_eq!(current["state"], "active");
+        assert_eq!(current["blockedOn"], "human");
+        assert_eq!(current["ask"], "question");
+        assert!(current.get("reason").is_none());
+        assert_eq!(current["history_gap_count"], 1);
+        assert_eq!(current["history_gap_reason"], "cap-full");
+        let first = pending(root.path(), 100).unwrap();
+        assert_eq!(first[0].kind, "harness-gap");
+        let first_sequence = first[0].sequence;
+        let stale_candidate = json!({"fields": {
+            "history_gap_count": first[0].payload["history_gap_count"],
+            "history_gap_from_ms": first[0].payload["history_gap_from_ms"],
+            "history_gap_to_ms": first[0].payload["history_gap_to_ms"],
+            "history_gap_reason": "cap-full"
+        }});
+        state["blockedOn"] = json!("none");
+        state["ask"] = json!("none");
+        state["runningSubagents"] = json!(2);
+        state["writtenAtMs"] = json!(state["writtenAtMs"].as_u64().unwrap() + 1);
+        write_snapshot_with_limit(root.path(), "harness-state", &serde_json::to_vec(&state).unwrap(), 0).unwrap();
+        let current: Value = serde_json::from_slice(
+            &read_runtime_state(root.path(), "runtime").unwrap().unwrap(),
+        ).unwrap();
+        assert_eq!(current["blockedOn"], "none", "a full FIFO cannot retain an answered ask");
+        assert_eq!(current["ask"], "none");
+        assert_eq!(current["runningSubagents"], 2);
+        assert_eq!(current["history_gap_count"], 2);
+        let prepared = prepare_publication(root.path(), first_sequence, "harness.history.gap:", &stale_candidate).unwrap();
+        assert_eq!(prepared["fields"]["history_gap_count"], 2,
+            "preparation must seal losses that occurred after the pending read");
+        state["writtenAtMs"] = json!(state["writtenAtMs"].as_u64().unwrap() + 1);
+        write_snapshot_with_limit(root.path(), "harness-state", &serde_json::to_vec(&state).unwrap(), 0).unwrap();
+        assert_eq!(prepare_publication(root.path(), first_sequence, "harness.history.gap:", &stale_candidate).unwrap(),
+            prepared, "a prepared gap must remain immutable through retry");
+        let segments = pending(root.path(), 100).unwrap();
+        assert_eq!(segments.iter().map(|event| event.payload["history_gap_count"].as_u64().unwrap())
+            .collect::<Vec<_>>(), [2, 1]);
+        acknowledge(root.path(), first_sequence).unwrap();
+        let retained = pending(root.path(), 100).unwrap();
+        assert_eq!(retained[0].payload["history_gap_count"], 1, "prefix ACK cannot discard later losses");
+        acknowledge(root.path(), retained[0].sequence).unwrap();
+        let bytes: u64 = open(root.path()).unwrap().query_row(
+            "SELECT CAST(value AS INTEGER) FROM metadata WHERE key='pending-bytes'", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(bytes, 0, "gap metadata must not underflow the normal history budget");
+        let aggregate: Value = serde_json::from_slice(
+            &read_runtime_state(root.path(), "runtime").unwrap().unwrap(),
+        ).unwrap();
+        assert_eq!(aggregate["history_gap_count"], 3, "delivery does not erase the coverage gap");
+        assert!(aggregate["history_gap_from_ms"].as_u64().unwrap() <= aggregate["history_gap_to_ms"].as_u64().unwrap());
+    }
+
+    #[test]
+    fn exact_history_budget_admits_prefix_and_gaps_the_next_observation() {
+        let (root, mut state) = cap_fixture();
+        let mut captured = state.clone();
+        captured["account_ref"] = std::env::var("ST3_ACCOUNT").ok()
+            .filter(|name| !name.is_empty()).map(Value::String).unwrap_or(Value::Null);
+        let budget = serde_json::to_vec(&captured).unwrap().len() as u64;
+        write_snapshot_with_limit(root.path(), "harness-state", &serde_json::to_vec(&state).unwrap(), budget).unwrap();
+        state["blockedOn"] = json!("none");
+        state["ask"] = json!("none");
+        state["writtenAtMs"] = json!(state["writtenAtMs"].as_u64().unwrap() + 1);
+        write_snapshot_with_limit(root.path(), "harness-state", &serde_json::to_vec(&state).unwrap(), budget).unwrap();
+        let events = pending(root.path(), 100).unwrap();
+        assert_eq!(events.iter().map(|event| event.kind.as_str()).collect::<Vec<_>>(), ["harness-state", "harness-gap"]);
+        assert_eq!(events[0].payload["blockedOn"], "human", "admitted history remains intact and ordered");
+        let latest: Value = serde_json::from_slice(&read_runtime_state(root.path(), "runtime").unwrap().unwrap()).unwrap();
+        assert_eq!(latest["blockedOn"], "none");
+        assert_eq!(latest["history_gap_count"], 1);
+        acknowledge(root.path(), events.last().unwrap().sequence).unwrap();
+        let bytes: u64 = open(root.path()).unwrap().query_row(
+            "SELECT CAST(value AS INTEGER) FROM metadata WHERE key='pending-bytes'", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(bytes, 0);
+    }
+
+    #[test]
+    fn cap_gap_remains_historical_without_crossing_runtime_fence() {
+        let (root, state) = cap_fixture();
+        write_snapshot_with_limit(root.path(), "harness-state", &serde_json::to_vec(&state).unwrap(), 0).unwrap();
+        enable(root.path(), "runtime-next").unwrap();
+        assert!(read_runtime_state(root.path(), "runtime-next").unwrap().is_none());
+        claim(root.path(), "example/seat", "omp", "provider-next").unwrap();
+        let current: Value = serde_json::from_slice(
+            &read_runtime_state(root.path(), "runtime-next").unwrap().unwrap(),
+        ).unwrap();
+        assert!(current["history_gap_count"].is_null(), "a successor must not inherit the previous runtime's gap");
+        assert!(read_runtime_state(root.path(), "runtime").unwrap().is_none());
+        let gap = pending(root.path(), 100).unwrap().into_iter().find(|event| event.kind == "harness-gap").unwrap();
+        assert_eq!(gap.runtime_incarnation, "runtime");
+        assert_eq!(gap.payload["history_gap_count"], 1, "old coverage loss remains publishable after replacement");
     }
     #[test]
     fn deadlines_are_once_only_and_cannot_expire_concurrent_evidence() {
