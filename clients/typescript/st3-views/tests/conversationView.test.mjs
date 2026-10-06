@@ -30,7 +30,7 @@ const describe = entry => entry.body.kind === 'event' ? `event(${entry.body.tone
   : `${entry.body.kind}: ${entry.body.text}`;
 const entries = conversationEntries(timeline, names);
 assert.deepEqual(entries.map(describe), [
-  'user: Please fix it',
+  'user: <system-reminder>ignore me</system-reminder>Please fix it',
   'assistant: **On it.**',
   'tool(ok): $ cargo test [ok 1|ok 2]',
   'mail: example/cos/standing/cos → Stui · Hello · Body text',
