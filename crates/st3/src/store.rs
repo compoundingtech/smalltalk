@@ -46707,6 +46707,69 @@ subscription "green" {
         );
     }
 
+    /// The selected reply edge must eventually agree with this real Store
+    /// fold, including concurrent Once claims admitted in either order.
+    #[test]
+    fn concurrent_message_sends_keep_the_canonical_reply_parent() {
+        const CHILD: &str = "message/shared-reply";
+        let left = Store::open_memory("left").unwrap();
+        let right = Store::open_memory("right").unwrap();
+        for (store, parent) in [
+            (&left, "message/parent-left"),
+            (&right, "message/parent-right"),
+        ] {
+            store
+                .append_claim(&ClaimInput {
+                    subject: CHILD.into(),
+                    kind: "message.sent".into(),
+                    actor: Some("person/test".into()),
+                    fields: BTreeMap::from([
+                        ("from".into(), json!("person/test")),
+                        ("to".into(), json!("agent/test")),
+                        ("content".into(), json!("reply")),
+                        ("status".into(), json!("sent")),
+                        ("in_reply_to".into(), json!(parent)),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+
+        for (first, second) in [(&left, &right), (&right, &left)] {
+            let target = Store::open_memory("target").unwrap();
+            for source in [first, second] {
+                let label = source.origin();
+                target
+                    .import_replication(&label, &source.export_replication(0).unwrap())
+                    .unwrap();
+            }
+            let expected = {
+                let connection = target.readers.get();
+                let mut statement = connection
+                    .prepare(&format!(
+                        "SELECT claims.body FROM claims JOIN batches ON batches.id=claims.batch_id \
+                         WHERE claims.subject=?1 AND claims.kind='message.sent' \
+                         ORDER BY {CANONICAL_ORDER}"
+                    ))
+                    .unwrap();
+                let bodies = statement
+                    .query_map([CHILD], |row| row.get::<_, String>(0))
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                assert_eq!(bodies.len(), 2);
+                bodies
+                    .iter()
+                    .map(|body| serde_json::from_str::<Value>(body).unwrap())
+                    .filter_map(|body| body["fields"]["in_reply_to"].as_str().map(str::to_owned))
+                    .last()
+            };
+            assert_eq!(target.message(CHILD).unwrap().unwrap().in_reply_to, expected);
+        }
+    }
+
     #[test]
     fn issue_openers_survive_publishers_and_direct_and_collection_observers() {
         for attribution in [
