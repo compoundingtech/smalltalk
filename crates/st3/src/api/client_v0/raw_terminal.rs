@@ -3,7 +3,7 @@ use super::*;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::UnixStream;
 mod lease;
-use lease::{Binding as LeaseBinding, Lease, ORIGIN_HEADER};
+pub(crate) use lease::{Binding as LeaseBinding, Lease, ORIGIN_HEADER};
 
 const SUBPROTOCOL: &str = "st3.client.pty.v0";
 const CHUNK: usize = 16 * 1024;
@@ -171,9 +171,7 @@ pub(crate) async fn stream(
             serde_json::from_slice::<LeaseBinding>(header.as_bytes()).map_err(ApiError::internal)
         })
         .transpose()?;
-    // Gateway-to-owner lease routing lands separately; until then only owner-local PEEK leases.
-    let local = live.owner_host_id == client_host_id(&state.node);
-    let lease = (query.mode == st3_client::RawTerminalMode::Peek && local)
+    let lease = (query.mode == st3_client::RawTerminalMode::Peek)
         .then(|| {
             Lease::register(
                 &state,
@@ -189,7 +187,7 @@ pub(crate) async fn stream(
         })
         .transpose()?;
     // Open and fence before HTTP upgrade: a stale owner incarnation is a refusal, not a blank pane.
-    let (transport, control) = if local {
+    let (transport, control) = if live.owner_host_id == client_host_id(&state.node) {
         let terminal = crate::model::LocalTerminal {
             subject: terminal_subject(&id),
             runtime_id: live.runtime_id,
@@ -205,7 +203,7 @@ pub(crate) async fn stream(
             None,
         )
     } else {
-        let transport = state
+        let (transport, control) = state
             .client_relay
             .as_ref()
             .ok_or_else(|| remote_unavailable(&live.owner_host_id))?
@@ -215,10 +213,11 @@ pub(crate) async fn stream(
                 &client_detail_id("terminal", &id),
                 &query.incarnation,
                 query.mode,
+                lease.clone(),
             )
             .await
             .map_err(|error| remote_read_error(&live.owner_host_id, error))?;
-        (transport, None)
+        (transport, Some(control))
     };
     if let Some(lease) = &lease {
         lease
