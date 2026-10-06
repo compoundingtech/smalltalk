@@ -44136,12 +44136,19 @@ mission "nested-work" state="ready" {
     #[test]
     fn a_planning_rebuild_leaves_the_operations_alone() {
         let store = Store::open_memory("alder").unwrap();
-        let intent = crate::graph::parse_internal_intent(
-            "version 2\nagent \"worker\" { workspace \"/tmp\"; harness \"codex\" { }; }\n",
-            "alder",
-        )
-        .unwrap();
-        store.apply_internal(&intent, "operations-pin").unwrap();
+        for index in 0..5 {
+            store
+                .append_claim(&ClaimInput {
+                    subject: format!("custom/pin/{index}"),
+                    kind: "custom.drift.note".into(),
+                    actor: Some("person/tester".into()),
+                    fields: BTreeMap::new(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("pin-{index}")),
+                })
+                .unwrap();
+        }
         let count = |store: &Store| -> i64 {
             store
                 .readers
@@ -44150,7 +44157,7 @@ mission "nested-work" state="ready" {
                 .unwrap()
         };
         let rows = count(&store);
-        assert!(rows > 0, "applying a declaration registers an operation");
+        assert!(rows >= 5, "each claim with an idempotency key registers an operation");
         store
             .connection
             .lock()
