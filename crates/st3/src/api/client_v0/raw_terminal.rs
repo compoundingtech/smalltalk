@@ -3,6 +3,7 @@ use super::*;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::UnixStream;
 mod lease;
+use lease::{Binding as LeaseBinding, Lease, ORIGIN_HEADER};
 
 const SUBPROTOCOL: &str = "st3.client.pty.v0";
 const CHUNK: usize = 16 * 1024;
@@ -151,7 +152,7 @@ pub(crate) async fn stream(
     if !live.terminal {
         return Err(validation("raw attachment requires a terminal runtime"));
     }
-    consume_terminal_attachment_mode(
+    let acquisition_epoch = consume_terminal_attachment_mode(
         &state,
         &session,
         &client_detail_id("terminal", &id),
@@ -159,8 +160,36 @@ pub(crate) async fn stream(
         Some(capabilities[0]),
         Some(mode_name(query.mode)),
     )?;
+    let origin = headers
+        .get(ORIGIN_HEADER)
+        .map(|header| {
+            if session.transport != "unix" || query.mode != st3_client::RawTerminalMode::Peek {
+                return Err(forbidden(
+                    "raw origin bindings require a trusted Unix PEEK route",
+                ));
+            }
+            serde_json::from_slice::<LeaseBinding>(header.as_bytes()).map_err(ApiError::internal)
+        })
+        .transpose()?;
+    // Gateway-to-owner lease routing lands separately; until then only owner-local PEEK leases.
+    let local = live.owner_host_id == client_host_id(&state.node);
+    let lease = (query.mode == st3_client::RawTerminalMode::Peek && local)
+        .then(|| {
+            Lease::register(
+                &state,
+                &session,
+                &client_detail_id("terminal", &id),
+                &live.owner_host_id,
+                &query.incarnation,
+                origin,
+                acquisition_epoch
+                    .as_deref()
+                    .ok_or_else(|| forbidden("raw PEEK capability has no authorization epoch"))?,
+            )
+        })
+        .transpose()?;
     // Open and fence before HTTP upgrade: a stale owner incarnation is a refusal, not a blank pane.
-    let transport = if live.owner_host_id == client_host_id(&state.node) {
+    let (transport, control) = if local {
         let terminal = crate::model::LocalTerminal {
             subject: terminal_subject(&id),
             runtime_id: live.runtime_id,
@@ -171,9 +200,12 @@ pub(crate) async fn stream(
             .await
             .map_err(|error| stale(error.to_string()))?;
         stream.set_nonblocking(true).map_err(ApiError::internal)?;
-        UnixStream::from_std(stream).map_err(ApiError::internal)?
+        (
+            UnixStream::from_std(stream).map_err(ApiError::internal)?,
+            None,
+        )
     } else {
-        state
+        let transport = state
             .client_relay
             .as_ref()
             .ok_or_else(|| remote_unavailable(&live.owner_host_id))?
@@ -185,13 +217,19 @@ pub(crate) async fn stream(
                 query.mode,
             )
             .await
-            .map_err(|error| remote_read_error(&live.owner_host_id, error))?
+            .map_err(|error| remote_read_error(&live.owner_host_id, error))?;
+        (transport, None)
     };
+    if let Some(lease) = &lease {
+        lease
+            .revalidate()
+            .map_err(|error| stale(error.to_string()))?;
+    }
     Ok(websocket
         .protocols([SUBPROTOCOL])
         .max_message_size(CHUNK * 4)
         .max_frame_size(CHUNK * 4)
-        .on_upgrade(move |socket| splice(socket, transport, Some(query.mode))))
+        .on_upgrade(move |socket| splice(socket, transport, Some(query.mode), lease, control)))
 }
 
 /// One bounded byte splice; closing either direction drops the persistent owner connection.
@@ -200,6 +238,8 @@ pub(crate) async fn splice(
     socket: WebSocket,
     transport: UnixStream,
     mode: Option<st3_client::RawTerminalMode>,
+    lease: Option<Arc<Lease>>,
+    control: Option<tokio::sync::mpsc::Sender<Value>>,
 ) {
     let (mut sink, mut source) = socket.split();
     let (mut reader, mut writer) = transport.into_split();
@@ -207,7 +247,46 @@ pub(crate) async fn splice(
         let mut gate = FrameGate::new(mode);
         while let Some(Ok(message)) = source.next().await {
             match message {
+                axum::extract::ws::Message::Text(text) => {
+                    let Some(lease) = &lease else {
+                        break;
+                    };
+                    let Ok(message) = serde_json::from_str::<lease::Control>(&text) else {
+                        break;
+                    };
+                    let result = match message {
+                        lease::Control::SelectedUse { sequence } => {
+                            let result = lease.selected_use(sequence);
+                            if result.is_ok()
+                                && let Some(control) = &control
+                                && control
+                                    .send(json!({"type":"selected-use","sequence":sequence}))
+                                    .await
+                                    .is_err()
+                            {
+                                break;
+                            }
+                            result
+                        }
+                        lease::Control::AuthorityProof {
+                            lease_id,
+                            watcher_epoch,
+                            sequence,
+                        } if lease.owner_side() && lease_id == lease.binding.lease_id => {
+                            lease.proof(&watcher_epoch, sequence)
+                        }
+                        _ => break,
+                    };
+                    if result.is_err() {
+                        break;
+                    }
+                }
                 axum::extract::ws::Message::Binary(bytes) => {
+                    if lease.as_ref().is_some_and(|lease| {
+                        lease.check().is_err() || lease.owner_side() && !lease.has_proof()
+                    }) {
+                        break;
+                    }
                     if gate.write(&mut writer, &bytes).await.is_err() {
                         break;
                     }
@@ -219,23 +298,38 @@ pub(crate) async fn splice(
     };
     let download = async {
         let mut bytes = [0_u8; CHUNK];
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut sequence = 0_u64;
         loop {
-            let Ok(count) = reader.read(&mut bytes).await else {
-                break;
-            };
-            if count == 0
-                || sink
-                    .send(axum::extract::ws::Message::Binary(
-                        bytes[..count].to_vec().into(),
-                    ))
-                    .await
-                    .is_err()
-            {
-                break;
+            tokio::select! {
+                biased;
+                _ = heartbeat.tick(), if lease.is_some() => {
+                    let lease = lease.as_ref().expect("heartbeat requires lease");
+                    if lease.revalidate().is_err() { break; }
+                    sequence += 1;
+                    if lease.owner_side() {
+                        if sink.send(axum::extract::ws::Message::Text(json!({"type":"owner-proof","lease_id":lease.binding.lease_id,"watcher_epoch":lease.binding.gateway_epoch,"sequence":sequence,"issued_at_unix_ms":client_now_ms()}).to_string().into())).await.is_err() { break; }
+                    } else if lease.binding.gateway == lease.binding.owner && lease.proof(&lease.binding.gateway_epoch, sequence).is_err() {
+                        break;
+                    }
+                }
+                read = reader.read(&mut bytes), if lease.as_ref().is_none_or(|lease| !lease.owner_side() || lease.has_proof()) => {
+                    let Ok(count) = read else { break; };
+                    if count == 0 || lease.as_ref().is_some_and(|lease| lease.check().is_err()) { break; }
+                    if sink.send(axum::extract::ws::Message::Binary(bytes[..count].to_vec().into())).await.is_err() { break; }
+                }
             }
         }
     };
-    tokio::select! { () = upload => {}, () = download => {} }
+    let expired = async {
+        if let Some(lease) = &lease {
+            lease.expired().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::select! { biased; () = expired => {}, () = upload => {}, () = download => {} }
 }
 
 /// Validate frame headers before forwarding them, without copying or buffering payloads.

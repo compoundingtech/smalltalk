@@ -261,6 +261,10 @@ impl ClientRelay {
         self
     }
 
+    pub(crate) fn legacy_authority(&self) -> bool {
+        self.legacy
+    }
+
     /// Whether a read for this host has somewhere to go: the host itself, or a peer that can
     /// carry it on.
     pub fn reaches(&self, host_id: &str) -> bool {
@@ -948,7 +952,7 @@ async fn receive_raw_terminal(
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "raw terminal signature failed").into_response(),
     };
     let mut response = websocket.max_message_size(64 * 1024).max_frame_size(64 * 1024)
-        .on_upgrade(move |socket| crate::api::raw_terminal_splice(socket, transport, None));
+        .on_upgrade(move |socket| crate::api::raw_terminal_splice(socket, transport, None, None, None));
     response.headers_mut().extend(signed);
     response
 }
