@@ -161,9 +161,21 @@ async fn collection_items(
         // Keep the physical read slot even if its awaiting subscription is canceled.
         let _read_permit = read_permit;
         let store = state.store.clone();
+        if collection == "agents" {
+            let (index, items) = store.coalesced_agent_resources(false, store.index()?, |index| {
+                let snapshot = client_snapshot_at(&state, index);
+                client_agent_resources(&store, false, &snapshot.created_at, index)
+            })?;
+            let snapshot = client_snapshot_at(&state, index);
+            let mut items = Arc::unwrap_or_clone(items);
+            if let Some(status) = status.as_deref() {
+                items.retain(|item| item["state"].as_str() == Some(status));
+            }
+            let has_more = items.len() > limit;
+            return Ok((snapshot, items, has_more));
+        }
         store.read_snapshot(|index| {
             let snapshot = client_snapshot_at(&state, index);
-            let at = snapshot.created_at.clone();
             let mut items = match collection.as_str() {
                 "missions" => {
                     let mut ids =
@@ -185,7 +197,6 @@ async fn collection_items(
                     }
                 }
                 "attention" => client_attention_resources(&store, person.as_deref(), false)?,
-                "agents" => client_agent_resources(&store, false, &at, index)?,
                 "work" => client_work_resources(
                     &store,
                     actor.as_deref(),
