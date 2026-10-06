@@ -4,6 +4,7 @@ pub mod arrangements;
 pub mod custom;
 pub mod glasses;
 pub mod owned_terminals;
+pub mod provenance;
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
@@ -432,6 +433,9 @@ impl Registry {
                 validate_value(kind, name, value, field)?;
                 self.validate_reference(kind, name, value, field)?;
             }
+        }
+        if kind == "mission.provenance" {
+            provenance::validate_claim(subject, fields)?;
         }
         if kind == "harness.todo.observed" {
             validate_harness_todo(fields)?;
@@ -1230,6 +1234,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             Some("missions"),
             true,
             &["mission"],
+        ),
+        (
+            "mission.provenance",
+            &["mission"],
+            WritePolicy::SystemOnly,
+            Cardinality::Once,
+            Some("missions"),
+            true,
+            &["provenance"],
         ),
         (
             "mission.produced",
@@ -2516,6 +2529,11 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("revision", string()),
             ("state", string()),
             ("body", object()),
+        ],
+        "mission.provenance" => &[
+            ("mission", required_reference_to(&["mission"])),
+            ("revision", required_string()),
+            ("provenance", required_object()),
         ],
         "mission.produced" => &[
             ("name", string()),
@@ -4061,6 +4079,7 @@ mod tests {
                 "mission-run.created",
                 "mission-run.state",
                 "mission.produced",
+                "mission.provenance",
                 "mission.published",
                 "observer.observed",
                 "observer.refresh-requested",

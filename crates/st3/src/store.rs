@@ -2723,6 +2723,14 @@ impl Store {
         Ok(())
     }
 
+    pub fn mission_provenance(
+        &self,
+        mission: &str,
+        revision: &str,
+    ) -> Result<Option<crate::provenance::Provenance>> {
+        crate::provenance::read(&self.readers.get(), mission, revision)
+    }
+
     pub fn mission_spec(
         &self,
         mission_id: &str,
@@ -4289,6 +4297,12 @@ impl Store {
             )
             .map_err(internal)?;
             let response = RevisionSubmissionView {
+                provenance: crate::provenance::read(
+                    &transaction,
+                    &run.mission,
+                    &proposal.candidate_revision,
+                )
+                .map_err(internal)?,
                 status: "applied".into(),
                 mission_run: run,
                 proposal: Some(proposal),
@@ -4408,6 +4422,9 @@ impl Store {
                 .map_err(internal)?
                 .expect("the applied proposal exists");
             let response = RevisionSubmissionView {
+                provenance: self
+                    .mission_provenance(&run.mission, &applied.candidate_revision)
+                    .map_err(internal)?,
                 status: "applied".into(),
                 mission_run: run,
                 proposal: Some(applied),
@@ -4434,6 +4451,9 @@ impl Store {
             .map_err(internal)?
             .expect("the proposal mission run exists");
         let response = RevisionSubmissionView {
+            provenance: self
+                .mission_provenance(&run.mission, &proposal.candidate_revision)
+                .map_err(internal)?,
             status: proposal.status.clone(),
             mission_run: run,
             proposal: Some(proposal),
@@ -4630,6 +4650,9 @@ impl Store {
             .map_err(internal)?
             .expect("the applied proposal exists");
         Ok(Some(RevisionSubmissionView {
+            provenance: self
+                .mission_provenance(&run.mission, &proposal.candidate_revision)
+                .map_err(internal)?,
             status: "applied".into(),
             mission_run: run,
             proposal: Some(proposal),
@@ -7724,6 +7747,9 @@ impl Store {
         let mut actions = Vec::new();
         let mut blockers = Vec::new();
         let mut warnings = Vec::new();
+        if let Err(error) = crate::provenance::validate_publication(&connection, intent) {
+            blockers.push(format!("{}: {}", error.code, error.message));
+        }
 
         if intent.deprecated_syntax.contains("pty") {
             warnings.push(
@@ -8158,6 +8184,15 @@ impl Store {
             changes.iter().map(|change| change.subject.as_str()),
             Some(store_index),
         )?;
+        let mut mission_provenance = intent.mission_provenance.clone();
+        for (id, mission) in &intent.missions {
+            if !mission_provenance.contains_key(id)
+                && let Some(provenance) =
+                    crate::provenance::read(&connection, id, &mission.revision).map_err(internal)?
+            {
+                mission_provenance.insert(id.clone(), provenance);
+            }
+        }
         Ok(MissionResponse {
             declaration_diffs,
             store_index,
@@ -8169,6 +8204,7 @@ impl Store {
             blockers,
             warnings,
             subject_tokens: tokens,
+            mission_provenance,
             mission_revisions: intent
                 .missions
                 .values()
@@ -8249,6 +8285,7 @@ impl Store {
                 {
                     return serde_json::from_str(&response).map_err(internal);
                 }
+                crate::provenance::validate_publication(transaction, intent)?;
                 let owned_plan = owned.map(|options| owned_sets::plan_tx(transaction, intent, options)).transpose()?;
                 let mut one_shot_sets = BTreeMap::new();
                 if let (Some(plan), Some(options)) = (&owned_plan, owned) {
@@ -8729,6 +8766,10 @@ impl Store {
                         mission_definition_token_tx(transaction, &mission.id).map_err(internal)?;
                     let mut body = serde_json::to_value(mission).map_err(internal)?;
                     if let Some(plan) = &owned_plan { body["owned_set"] = json!(plan.preview.set); }
+                    if let Some(provenance) = intent.mission_provenance.get(&mission.id)
+                        && let Some(claim) = crate::provenance::record(transaction, &self.origin, mission, provenance, actor, &batch_id)? {
+                        claim_ids.push(claim.id);
+                    }
                     // The publication records its publisher, as a declaration records its writer.
                     let claim_id = claim_hash(
                         &batch_id,
@@ -10492,6 +10533,7 @@ impl Store {
             source_hash: canonical_hash(&normalized).map_err(internal)?,
             subjects: BTreeMap::from([(subject.to_owned(), desired)]),
             missions: BTreeMap::new(),
+            mission_provenance: BTreeMap::new(),
             mission_runs: BTreeMap::new(),
             planning_sessions: BTreeMap::new(),
             resource_refreshes: Vec::new(),
@@ -10676,6 +10718,7 @@ impl Store {
             source_hash: canonical_hash(&normalized).map_err(internal)?,
             subjects: BTreeMap::from([(subject.to_owned(), declaration)]),
             missions: BTreeMap::new(),
+            mission_provenance: BTreeMap::new(),
             mission_runs: BTreeMap::new(),
             planning_sessions: BTreeMap::new(),
             resource_refreshes: Vec::new(),
@@ -19235,7 +19278,7 @@ fn validate_message_transition(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn append_claim_tx(
+pub(crate) fn append_claim_tx(
     transaction: &Transaction<'_>,
     origin: &str,
     subject: &str,
@@ -23038,8 +23081,90 @@ mod fleet_admission_tests {
             ("unknown", None, true),
             ("invalid", Some("harness.limits"), true),
         ] {
-            assert_eq!(replica_record_bears_authority(state, kind), bears, "{state} {kind:?}");
+            assert_eq!(
+                replica_record_bears_authority(state, kind),
+                bears,
+                "{state} {kind:?}"
+            );
         }
+    }
+
+    #[test]
+    fn older_registry_projects_missions_while_provenance_waits_for_upgrade() {
+        let anchor_key = key();
+        let older_key = key();
+        let current = node("current", Some(&anchor_key), Some(&anchor_key));
+        admit(&current, "current", &anchor_key, "anchor", None);
+        admit(&current, "older", &older_key, "invite", None);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("older.sqlite3");
+        let older = Store::open(&path, "older").unwrap();
+        older.bind_fleet(FLEET).unwrap();
+        older.pin_fleet_anchor(anchor_key.public()).unwrap();
+        older.set_member_key(Some(older_key.clone())).unwrap();
+        let mut registry = st3_schema::registry().clone();
+        registry.claims.remove("mission.provenance").unwrap();
+        older.set_claim_registry(registry);
+        sync(&current, &older);
+        let source = crate::provenance::tests::source("Build.", Some("Approved source."));
+        let intent = crate::parse_intent(&source, "current").unwrap();
+        current
+            .apply_internal(&intent, "provenance-publication")
+            .unwrap();
+        let sidecar = current
+            .latest_claim(
+                &format!("mission/orchard@{}", intent.missions["orchard"].revision),
+                Some("mission.provenance"),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(checkpoint_rules::slot_of(&sidecar).is_none());
+        let admission = sync(&current, &older);
+        assert_eq!(admission.invalid, 0);
+        assert_eq!(admission.unknown, 1);
+        let mission = older.mission_spec("orchard", None).unwrap().unwrap();
+        assert_eq!(mission, intent.missions["orchard"]);
+        assert!(
+            older
+                .mission_provenance("orchard", &mission.revision)
+                .unwrap()
+                .is_none()
+        );
+        let run = older
+            .create_mission_run(&MissionRunRequest {
+                mission: "orchard".into(),
+                revision: None,
+                workspace: directory.path().display().to_string(),
+                requester: Some("person/avery".into()),
+                mode: None,
+                inputs: BTreeMap::new(),
+                idempotency_key: "old-build-run".into(),
+            })
+            .unwrap();
+        assert_eq!(run.revision, mission.revision);
+        assert!(!run.steps.is_empty());
+        let before = older.replication_status(true, Some(FLEET), &[]).unwrap();
+        assert_eq!(before.invalid_records, 0);
+        assert_eq!(before.unhealthy_projections, 0);
+        drop(older);
+        let upgraded = Store::open(&path, "older").unwrap();
+        upgraded.set_member_key(Some(older_key)).unwrap();
+        upgraded.validate_replication_backlog().unwrap();
+        upgraded.project_replication_backlog().unwrap();
+        assert_eq!(
+            upgraded
+                .mission_provenance("orchard", &mission.revision)
+                .unwrap(),
+            Some(intent.mission_provenance["orchard"].clone())
+        );
+        assert_eq!(
+            upgraded
+                .mission_run(&run.subject)
+                .unwrap()
+                .unwrap()
+                .revision,
+            run.revision
+        );
     }
 
     #[test]
@@ -29696,6 +29821,8 @@ fn mission_run_view_with_enrichment_tx(
                 step_timeout_extension_at(connection, &step.subject, step.attempt, now_ms())?;
         }
     }
+    view.provenance = crate::provenance::read(connection, &view.mission, &view.revision)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(error.into()))?;
     view.loops = loop_run_views_tx(connection, &view)?;
     view.outcome = mission_run_outcome_tx(connection, &view)?;
     if presentation {
@@ -29798,6 +29925,7 @@ fn mission_run_header_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Miss
     let created: String = row.get(16)?;
     let updated: String = row.get(17)?;
     Ok(MissionRunView {
+        provenance: None,
         subject: format!("mission-run/{id}"),
         id,
         mission: format!("mission/{}", row.get::<_, String>(1)?),
