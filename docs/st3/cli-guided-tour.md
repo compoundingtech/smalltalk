@@ -432,6 +432,14 @@ st trace wait --help
 We do not leave a wait running. Check the boundary between product detail (`agents show`) and expert
 history (`subject`/`trace`).
 
+`st trace show SUBJECT --follow`, `st missions show RUN --follow`, and the viewer started by
+`st missions start --follow` keep retrying request timeouts and daemon outages until stopped.
+Retries use exponential backoff from 100 ms up to 5 s with jitter and print one `follow gap`
+line on stderr per interrupted request. Trace resumes after the last delivered index;
+mission viewers retain their last displayed snapshot and resume polling the same run.
+These follow reads wait indefinitely even with `--daemon-wait 0`. Authentication, not-found,
+validation, and other non-transient errors still stop the viewer immediately with a nonzero exit.
+
 ### 16. `schema` and `claim` — discover and use the graph vocabulary
 
 Why: registered types and write policy must be inspectable; low-level observation remains explicit

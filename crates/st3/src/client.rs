@@ -48,6 +48,7 @@ pub struct Client {
     person: Option<String>,
     outage_wait: Duration,
     announce_outage_wait: bool,
+    follow_reads: bool,
 }
 
 /// Where a request stood when the daemon went away.
@@ -196,6 +197,7 @@ impl Client {
             person: None,
             outage_wait: Duration::ZERO,
             announce_outage_wait: false,
+            follow_reads: false,
         }
     }
 
@@ -205,6 +207,14 @@ impl Client {
     pub fn with_outage_wait(mut self, wait: Duration, announce: bool) -> Self {
         self.outage_wait = wait;
         self.announce_outage_wait = announce;
+        self
+    }
+
+    /// Follow reads wait through typed outages and request deadlines until stopped. The caller
+    /// retains its last delivered cursor; each request retries with the same path. This takes
+    /// precedence over `outage_wait` for GETs and announces one gap per interrupted request.
+    pub fn with_follow_retry(mut self) -> Self {
+        self.follow_reads = true;
         self
     }
 
@@ -330,6 +340,27 @@ impl Client {
                 Ok(response) => return decode_api_response(&response),
                 Err(error) => error,
             };
+            if self.follow_reads && method == "GET" && daemon_did_not_answer(&error) {
+                if !announced {
+                    let reason = daemon_unreachable(&error)
+                        .map(|outage| outage.summary())
+                        .or_else(|| {
+                            error.chain().find_map(|cause| {
+                                cause
+                                    .downcast_ref::<DaemonDeadline>()
+                                    .map(|deadline| deadline.summary())
+                            })
+                        })
+                        .expect("a retryable follow error has a typed reason");
+                    eprintln!(
+                        "st: follow gap: {reason}; retrying from the last delivered position until stopped"
+                    );
+                    announced = true;
+                }
+                tokio::time::sleep(jittered(pause).min(Duration::from_secs(5))).await;
+                pause = (pause * 2).min(Duration::from_secs(5));
+                continue;
+            }
             let Some(outage) = daemon_unreachable(&error) else {
                 return Err(error);
             };
@@ -1090,14 +1121,21 @@ struct DaemonDeadline {
     deadline: Duration,
 }
 
+impl DaemonDeadline {
+    fn summary(&self) -> String {
+        format!(
+            "st API endpoint `{}` exceeded the {} limit of {} ms",
+            self.endpoint, self.phase, self.deadline.as_millis()
+        )
+    }
+}
+
 impl fmt::Display for DaemonDeadline {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "st API endpoint `{}` exceeded the {} limit of {} ms; the service may be busy or unavailable, retry the command",
-            self.endpoint,
-            self.phase,
-            self.deadline.as_millis()
+            "{}; the service may be busy or unavailable, retry the command",
+            self.summary()
         )
     }
 }
@@ -1335,6 +1373,7 @@ mod tests {
             person: None,
             outage_wait: Duration::ZERO,
             announce_outage_wait: false,
+            follow_reads: false,
         }
     }
 
@@ -1517,6 +1556,48 @@ mod tests {
         assert!(message.contains("st daemon"), "{message}");
         assert!(message.contains("restarting"), "{message}");
         assert!(!message.contains("st up"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn follow_reads_wait_for_a_typed_connect_outage_with_daemon_wait_zero() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("st3.sock");
+        let client = fast_client(Endpoint::Unix(socket.clone())).with_follow_retry();
+        let read = tokio::spawn(async move { client.get::<Value>("/v1/test").await });
+        // Leave the socket absent through several backoff attempts, then bring it up.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !read.is_finished(),
+            "the follow read exited during the outage"
+        );
+        let server = tokio::spawn(async move {
+            crate::api::serve_unix(&socket, test_router()).await.unwrap();
+        });
+        let value = tokio::time::timeout(Duration::from_secs(10), read)
+            .await.unwrap().unwrap().unwrap();
+        assert_eq!(value, json!({"method": "get"}));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn follow_retry_does_not_repeat_a_write_that_times_out() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("st3.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+        let client = fast_client(Endpoint::Unix(socket)).with_follow_retry();
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            client.post::<_, Value>("/v1/test", &json!({"mutation": true})),
+        )
+        .await
+        .expect("follow retry repeated a write")
+        .unwrap_err();
+        assert!(daemon_did_not_answer(&error));
+        server.abort();
     }
 
     #[tokio::test]

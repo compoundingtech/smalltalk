@@ -1699,6 +1699,7 @@ enum MissionViewCommand {
 struct MissionShowArgs {
     #[arg(add = ArgValueCompleter::new(Complete(Entity::MissionOrRun)))]
     mission_or_run: String,
+    /// Follow until finished or stopped; retry daemon outages and request timeouts indefinitely.
     #[arg(long)]
     follow: bool,
 }
@@ -1801,6 +1802,7 @@ struct MissionRunStartArgs {
     #[arg(long, value_name = "RUN")]
     #[arg(add = ArgValueCompleter::new(Complete(Entity::MissionRun { unfinished_only: true })))]
     after: Option<String>,
+    /// Follow until finished or stopped; retry daemon outages and request timeouts indefinitely.
     #[arg(long)]
     follow: bool,
     #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
@@ -2216,6 +2218,7 @@ struct TraceArgs {
     limit: usize,
     #[arg(long)]
     after_index: Option<u64>,
+    /// Follow until stopped; retry daemon outages and request timeouts from the last index.
     #[arg(short = 'f', long)]
     follow: bool,
 }
@@ -6150,6 +6153,12 @@ async fn run_mission_view(
             )
         }
         MissionViewCommand::Show(args) => {
+            let client = if args.follow {
+                client.clone().with_follow_retry()
+            } else {
+                client.clone()
+            };
+            let client = &client;
             let mut selected = args.mission_or_run;
             if !selected.starts_with("mission-run/") {
                 let overview: Value = client
@@ -6808,6 +6817,8 @@ async fn follow_mission_run(
     _cursor: u64,
     json_output: bool,
 ) -> Result<()> {
+    let client = client.clone().with_follow_retry();
+    let client = &client;
     let mut prior = String::new();
     let interactive = std::io::stdout().is_terminal();
     let _screen = if !json_output && interactive {
@@ -7688,6 +7699,12 @@ async fn run_trace(client: &Client, args: TraceArgs, json_output: bool) -> Resul
         args.limit > 0 && args.limit <= 500,
         "the trace limit must be 1 through 500"
     );
+    let client = if args.follow {
+        client.clone().with_follow_retry()
+    } else {
+        client.clone()
+    };
+    let client = &client;
     let claims = trace_claims(client, &args).await?;
     let mut cursor = args.after_index.unwrap_or_default();
     for claim in claims {
@@ -7713,7 +7730,6 @@ async fn run_trace(client: &Client, args: TraceArgs, json_output: bool) -> Resul
             .get(&format!("/v1/events?{}", event_query.join("&")))
             .await?;
         for event in events {
-            cursor = cursor.max(event.store_index);
             if json_output {
                 println!("{}", serde_json::to_string(&event)?);
             } else {
@@ -7737,6 +7753,7 @@ async fn run_trace(client: &Client, args: TraceArgs, json_output: bool) -> Resul
                     );
                 }
             }
+            cursor = cursor.max(event.store_index);
         }
     }
 }
