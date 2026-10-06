@@ -658,6 +658,10 @@ fn exposed_timeline_variants_and_media_are_visible_without_unknown_payloads() {
             "truncation",
             serde_json::json!({"reason":"window","omitted_from_sequence":1,"omitted_to_sequence":9}),
         ),
+        (
+            "truncation",
+            serde_json::json!({"reason":"the native transcript prefix is outside the bounded read window","omitted_from_sequence":0,"omitted_to_sequence":0}),
+        ),
         ("future-secret", serde_json::json!({"secret":"must-not-render"})),
         (
             "content",
@@ -693,10 +697,12 @@ fn exposed_timeline_variants_and_media_are_visible_without_unknown_payloads() {
         "attachment/safe",
         "image/png",
         "transcript unavailable",
+        "Earlier history is not shown: st reads only the newest part",
     ] {
         assert!(display.contains(visible), "missing {visible}: {display}");
     }
     assert!(!display.contains("must-not-render"));
+    assert!(!display.contains("bounded read window"), "{display}");
     assert!(!display.contains("nothing in the harness"));
     assert_eq!(rendered.len(), timeline.len());
 }

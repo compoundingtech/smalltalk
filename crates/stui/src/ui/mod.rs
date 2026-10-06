@@ -3517,9 +3517,21 @@ impl Ui {
                             .structured_request()
                             .is_some_and(|(_, request)| !request.answers.is_empty()) =>
                     {
-                        self.flash(
-                            "This asks you to choose, so x cannot dismiss it: a chooses one of its answers",
-                        )
+                        // A decision usually has an answer that declines; name it, since that
+                        // is the way to close it without agreeing (Nathan, 2026-10-06).
+                        let decline = self.structured_request().and_then(|(_, request)| {
+                            request
+                                .answers
+                                .iter()
+                                .find(|answer| answer.outcome.as_deref() == Some("decline"))
+                                .map(|answer| answer.label.clone())
+                        });
+                        self.flash(match decline {
+                            Some(label) => format!(
+                                "x cannot dismiss a question that needs an answer; a opens its answers, and \"{label}\" declines it"
+                            ),
+                            None => "This asks you to choose, so x cannot dismiss it: a chooses one of its answers".to_owned(),
+                        })
                     }
                     ("request", 'x') => self.confirm = Some('r'),
                     ("update", 'x') => self.read_update(),
@@ -5708,6 +5720,25 @@ mod tests {
         ui.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
         assert!(ui.confirm.is_none());
         assert!(ui.effects.is_empty());
+        // A decision with an answer that declines names it: that is the way to close it
+        // without agreeing (Nathan, 2026-10-06).
+        let hold = st3_client::RequestAnswerOption {
+            id: "hold".into(),
+            label: "Hold".into(),
+            consequence: "Nothing is approved.".into(),
+            outcome: Some("decline".into()),
+            conditions: Vec::new(),
+        };
+        let mut ui = feedback("decision", vec![hold]);
+        ui.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(ui.confirm.is_none());
+        assert!(
+            ui.flash
+                .as_ref()
+                .is_some_and(|(text, _)| text.contains("\"Hold\" declines it")),
+            "{:?}",
+            ui.flash
+        );
     }
 
     #[test]
