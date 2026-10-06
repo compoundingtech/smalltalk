@@ -337,6 +337,9 @@ pub struct Ui {
     pub(crate) simple: bool,
     /// An attached terminal shown in place of the conversation.
     pub(crate) terminal: Option<TerminalView>,
+    /// Glasses: the other terminals still attached, each behind its own tab or split. The one
+    /// whose tab has focus is `terminal`; they swap places as focus moves.
+    pub(crate) parked: Vec<TerminalView>,
     /// A Ctrl-C or Ctrl-D pressed once in a terminal, waiting for its confirming second press.
     terminal_confirm: Option<(KeyCode, Instant)>,
     /// The New mission form: title, request, mission id, workspace; and the focused field.
@@ -448,6 +451,7 @@ impl Ui {
             older_wanted: RefCell::default(),
             popover: None,
             chat: None,
+            parked: Vec::new(),
             said: None,
             voice: None,
             answering: None,
@@ -2384,7 +2388,7 @@ impl Ui {
     }
 
     fn draw_terminal(&self, buf: &mut Buffer, area: Rect, agent: &str) {
-        let Some(view) = self.terminal.as_ref().filter(|view| view.agent == agent) else {
+        let Some(view) = self.terminal_view(agent) else {
             buf.set_stringn(
                 area.x,
                 area.y + 1,
@@ -2425,12 +2429,19 @@ impl Ui {
                 height: area.height.saturating_sub(1),
                 ..area
             };
-            self.terminal_size
-                .set((body.height.max(1), body.width.max(1)));
-            self.terminal_body.set(Some(body));
+            // Where the mouse maps and where a new attach starts is the focused terminal's body;
+            // every attached terminal fits its own.
+            let focused = self.terminal.as_ref().is_some_and(|view| view.agent == agent)
+                || self.parked.is_empty();
+            if focused {
+                self.terminal_size
+                    .set((body.height.max(1), body.width.max(1)));
+                self.terminal_body.set(Some(body));
+            }
             native.fit(body.height, body.width);
             // The person's own cursor only where nothing is drawn over the terminal.
             let real = self.terminal_focused()
+                && self.focused_pane() == Some(Pane::Terminal(agent.to_owned()))
                 && !self.help
                 && self.popover.is_none()
                 && !self.palette_open();
@@ -3018,7 +3029,10 @@ impl Ui {
     fn input_event(&mut self, event: Event) {
         match event {
             Event::Key(key) => self.key(key),
-            Event::Paste(text) => self.paste(text),
+            Event::Paste(text) => {
+                self.sync_terminal_slot();
+                self.paste(text)
+            }
             Event::Mouse(mouse) => self.mouse(mouse),
             _ => {}
         }
@@ -3028,6 +3042,7 @@ impl Ui {
         if key.kind != KeyEventKind::Press {
             return;
         }
+        self.sync_terminal_slot();
         // Listening takes every key until the words are sent, kept or dropped.
         if self.voice_key(key) {
             return;
@@ -3674,6 +3689,68 @@ impl Ui {
         self.attach_terminal(&agent.id);
     }
 
+    /// The view of the terminal attached for `agent`, the focused one or one behind another tab.
+    pub(crate) fn terminal_view(&self, agent: &str) -> Option<&TerminalView> {
+        self.terminal
+            .as_ref()
+            .filter(|view| view.agent == agent)
+            .or_else(|| self.parked.iter().find(|view| view.agent == agent))
+    }
+
+    pub(crate) fn terminal_view_mut(&mut self, agent: &str) -> Option<&mut TerminalView> {
+        if self.terminal.as_ref().is_some_and(|view| view.agent == agent) {
+            return self.terminal.as_mut();
+        }
+        self.parked.iter_mut().find(|view| view.agent == agent)
+    }
+
+    /// Every attached terminal, the focused one first.
+    pub(crate) fn terminals_mut(&mut self) -> impl Iterator<Item = &mut TerminalView> {
+        self.terminal.iter_mut().chain(self.parked.iter_mut())
+    }
+
+    /// About to attach `agent`: in a glass another attached terminal stays attached behind its
+    /// own tab (Nathan, 2026-10-06: two terminals in two splits); elsewhere it is let go.
+    pub(crate) fn park_for(&mut self, agent: &str) {
+        self.parked.retain(|view| view.agent != agent);
+        if let Some(old) = self.terminal.take()
+            && old.agent != agent
+            && self.glasses.is_some()
+        {
+            self.parked.push(old);
+        }
+    }
+
+    /// Put the terminal whose tab has focus in `terminal`, where keys and the mouse find it.
+    pub(crate) fn sync_terminal_slot(&mut self) {
+        if self.glasses.is_none() || self.parked.is_empty() {
+            return;
+        }
+        let Some(Pane::Terminal(agent)) = self.focused_pane() else {
+            return;
+        };
+        if self.terminal.as_ref().is_some_and(|view| view.agent == agent) {
+            return;
+        }
+        if let Some(index) = self.parked.iter().position(|view| view.agent == agent) {
+            let wanted = self.parked.remove(index);
+            if let Some(old) = self.terminal.replace(wanted) {
+                self.parked.push(old);
+            }
+        }
+    }
+
+    /// Let go of `agent`'s terminal wherever it is attached; whether there was one.
+    pub(crate) fn drop_terminal(&mut self, agent: &str) -> bool {
+        let before = self.parked.len();
+        self.parked.retain(|view| view.agent != agent);
+        let focused = self.terminal.as_ref().is_some_and(|view| view.agent == agent);
+        if focused {
+            self.terminal = None;
+        }
+        focused || self.parked.len() != before
+    }
+
     /// Attach `agent`'s terminal: followed live, or the demo's in demo mode.
     pub(crate) fn attach_terminal(&mut self, agent: &str) {
         // A plain shell is a terminal of its own, not an agent's.
@@ -3684,6 +3761,7 @@ impl Ui {
                 });
                 self.flash("Opening the terminal…");
             } else {
+                self.park_for(agent);
                 self.terminal = Some(TerminalView {
                     agent: agent.to_owned(),
                     title: "shell · demo terminal".into(),
@@ -3711,6 +3789,7 @@ impl Ui {
             self.effects.push(Effect::OpenTerminal { agent: agent.id });
             self.flash("Opening the terminal…");
         } else {
+            self.park_for(&agent.id);
             self.terminal = Some(TerminalView {
                 agent: agent.id.clone(),
                 title: format!("{} · demo terminal", agent.name),
@@ -4449,6 +4528,7 @@ impl Ui {
     }
 
     pub fn mouse(&mut self, mouse: MouseEvent) {
+        self.sync_terminal_slot();
         if self.help {
             if matches!(mouse.kind, MouseEventKind::Down(_)) {
                 self.help = false;

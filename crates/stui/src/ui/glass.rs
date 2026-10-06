@@ -3209,13 +3209,14 @@ impl Ui {
         let Some(group) = glass.layout.group_mut(focus) else {
             return;
         };
-        let mut detach = false;
+        let mut released: Option<String> = None;
         match group.current.checked_sub(offset(focus)) {
             Some(index) if index < group.tabs.len() => {
                 let closed = group.tabs.remove(index);
-                // Closing the attached terminal's tab lets it go.
-                detach = matches!(Pane::parse(&closed.pane), Some(Pane::Terminal(agent))
-                    if self.terminal.as_ref().is_some_and(|view| view.agent == agent));
+                // Closing an attached terminal's tab lets it go.
+                if let Some(Pane::Terminal(agent)) = Pane::parse(&closed.pane) {
+                    released = Some(agent);
+                }
                 let shown = group.tabs.len() + offset(focus);
                 group.current = group.current.min(shown.saturating_sub(1));
             }
@@ -3227,9 +3228,12 @@ impl Ui {
             glass.focus = focus.saturating_sub(1);
         }
         let id = glass.id.clone();
-        if detach {
-            self.terminal = None;
-            self.effects.push(Effect::CloseTerminal);
+        if let Some(agent) = released {
+            // The one that had the keys also stops being followed through st.
+            let focused = self.terminal.as_ref().is_some_and(|view| view.agent == agent);
+            if self.drop_terminal(&agent) && focused {
+                self.effects.push(Effect::CloseTerminal);
+            }
         }
         self.glass_changed(&id);
         self.show_focused();
@@ -3955,6 +3959,50 @@ mod tests {
             Some(shell)
         );
         assert_eq!(tabs(&ui).2, vec![vec![format!("terminal:{shell}")]]);
+    }
+
+    #[test]
+    fn two_terminals_in_two_splits_stay_attached_and_keys_follow_focus() {
+        // Nathan, 2026-10-06: attaching one terminal detached the other.
+        let mut ui = glass();
+        let ids = ui
+            .world
+            .agents
+            .items()
+            .iter()
+            .filter(|agent| agent.terminal)
+            .map(|agent| (agent.id.clone(), agent.name.clone()))
+            .take(2)
+            .collect::<Vec<_>>();
+        let [(first, first_name), (second, second_name)] = &ids[..] else {
+            panic!("the demo has two agents with terminals");
+        };
+        ui.open_in_glass(Pane::Agent(Some(first.clone())), Open::Tab);
+        ctrl(&mut ui, ']');
+        ui.open_in_glass(Pane::Agent(Some(second.clone())), Open::Right);
+        ctrl(&mut ui, ']');
+        assert_eq!(ui.terminal.as_ref().map(|view| view.agent.as_str()), Some(second.as_str()));
+        assert_eq!(ui.parked.len(), 1, "the first is still attached");
+        let shown = screen(&ui);
+        assert!(
+            shown.contains(first_name) && shown.contains(second_name),
+            "both terminals draw: {shown}"
+        );
+        // Focus moves to the left split; the next key finds its terminal.
+        let left = ui.frame.borrow().glass_leaves[0];
+        ui.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: left.x + 2,
+            row: left.y + 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        press(&mut ui, KeyCode::Char('a'), KeyModifiers::NONE);
+        assert_eq!(ui.terminal.as_ref().map(|view| view.agent.as_str()), Some(first.as_str()));
+        assert_eq!(ui.parked.first().map(|view| view.agent.as_str()), Some(second.as_str()));
+        // Closing a tab lets only its own terminal go (Ctrl+W goes to a focused terminal).
+        ui.close_tab();
+        assert!(ui.terminal_view(first).is_none());
+        assert!(ui.terminal_view(second).is_some(), "the other stays attached");
     }
 
     #[test]
