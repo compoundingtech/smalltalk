@@ -93,6 +93,10 @@ pub fn is_current_input(input: &ClaimInput) -> bool {
             || input.fields.get("semantics").and_then(Value::as_str) == Some("context_occupancy"))
 }
 
+fn permission_blocked(fields: &Value) -> bool {
+    fields["blocked_on"] == "human" && fields["ask"] == "permission"
+}
+
 /// Current folds use the historical column contract and canonical tie breakers, without
 /// putting mutable values into signed graph envelopes.
 pub(super) fn current_sql(sql: &str) -> String {
@@ -324,9 +328,19 @@ pub(super) fn append(
                         .cloned()
                         .unwrap_or(Value::Null)
                 && old["fields"].get("provider_auth") == input.fields.get("provider_auth")
+                && permission_blocked(&old["fields"])
+                    == (input.fields.get("blocked_on") == Some(&json!("human"))
+                        && input.fields.get("ask") == Some(&json!("permission")))
+                && (old["fields"]["reason"] == "providerAuth")
+                    == (input.fields.get("reason") == Some(&json!("providerAuth")))
             {
                 since = old["fields"]["observed_since_ms"].clone();
                 transition = false;
+            } else {
+                // Native activity may retain its raw working episode's start while an
+                // approval prompt changes the effective state. Date that transition from
+                // its own source observation, including an explicit clearing snapshot.
+                since = json!(source_at);
             }
         }
         input.fields.insert("observed_since_ms".into(), since);
@@ -720,6 +734,56 @@ mod tests {
             expected_subject: None,
             idempotency_key: None,
         }
+    }
+
+    #[test]
+    fn permission_blocking_and_explicit_clears_start_distinct_status_episodes() {
+        let store = Store::open_memory("owner").unwrap();
+        let publish = |at, blocked_on: Value, ask: Value| {
+            let mut input = state("working", "one", at);
+            input.fields.insert("observed_since_ms".into(), json!(10));
+            input.fields.insert("blocked_on".into(), blocked_on);
+            input.fields.insert("ask".into(), ask);
+            append(&store.graph, &input, u128::from(at), None)
+                .unwrap()
+                .0
+                .body
+        };
+        let running = publish(10, Value::Null, Value::Null);
+        assert_eq!(running["fields"]["observed_since_ms"], 10);
+        let permission = publish(20, json!("human"), json!("permission"));
+        assert_eq!(permission["fields"]["observed_since_ms"], 20);
+        assert_eq!(permission["fields"]["status_transition"], true);
+        let heartbeat = publish(30, json!("human"), json!("permission"));
+        assert_eq!(heartbeat["fields"]["observed_since_ms"], 20);
+        assert_eq!(heartbeat["fields"]["status_transition"], false);
+        let resumed = publish(40, Value::Null, Value::Null);
+        assert_eq!(resumed["fields"]["observed_since_ms"], 40);
+        assert_eq!(resumed["fields"]["status_transition"], true);
+        let question = publish(50, json!("human"), json!("question"));
+        assert_eq!(question["fields"]["observed_since_ms"], 40);
+        assert_eq!(question["fields"]["status_transition"], false);
+    }
+
+    #[test]
+    fn sparse_permission_updates_carry_axes_only_within_the_same_incarnation() {
+        let store = Store::open_memory("owner").unwrap();
+        let mut blocked = state("working", "one", 10);
+        blocked.fields.insert("blocked_on".into(), json!("human"));
+        blocked.fields.insert("ask".into(), json!("permission"));
+        append(&store.graph, &blocked, 10, None).unwrap();
+        let heartbeat = append(&store.graph, &state("working", "one", 20), 20, None)
+            .unwrap()
+            .0;
+        assert_eq!(heartbeat.body["fields"]["ask"], "permission");
+        assert_eq!(heartbeat.body["fields"]["observed_since_ms"], 10);
+        assert_eq!(heartbeat.body["fields"]["status_transition"], false);
+        let relaunched = append(&store.graph, &state("working", "two", 30), 30, None)
+            .unwrap()
+            .0;
+        assert!(relaunched.body["fields"].get("ask").is_none());
+        assert_eq!(relaunched.body["fields"]["observed_since_ms"], 30);
+        assert_eq!(relaunched.body["fields"]["status_transition"], true);
     }
 
     #[test]
