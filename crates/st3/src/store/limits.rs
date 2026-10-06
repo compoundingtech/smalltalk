@@ -163,45 +163,117 @@ fn reading(origin: &str, body: &Value) -> Option<(AccountLimit, String)> {
     ))
 }
 
-pub(super) fn account_limits_at(connection: &Connection) -> Result<Vec<AccountLimit>> {
-    let mut statement = connection.prepare_cached(&canonical_sql(
-        "SELECT subject, origin, body FROM claims WHERE kind='harness.limits'
-         ORDER BY CANONICAL_ASC(claims)",
-    ))?;
-    let mut newest = BTreeMap::<String, (String, String, Option<String>)>::new();
-    let mut readings = BTreeMap::<(String, String, Option<String>), Vec<AccountLimit>>::new();
-    for row in statement.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-        ))
-    })? {
-        let (subject, origin, body) = row?;
-        let body: Value = serde_json::from_str(&body)?;
-        if let Some((mut limit, _)) = reading(&origin, &body) {
+/// One account's readings that can still decide its answer. Weekly and partial (five-hour only)
+/// readings are kept apart because a weekly reading anywhere in history hides every partial one,
+/// and each kind only needs what lies within the window of its own newest reading.
+#[derive(Default)]
+struct KeyReadings {
+    weekly: Vec<AccountLimit>,
+    weekly_newest: u64,
+    partial: Vec<AccountLimit>,
+    partial_newest: u64,
+}
+
+/// The `harness.limits` claims read so far, reduced to what `account_limits_at` answers from.
+/// Seats publish a limits claim every few seconds and the kind is never trimmed (101,000 claims on
+/// one real store), so replaying all of them on every call, twice every two minutes, cost seconds
+/// of reading and parsing. A claim's store index only grows, so each call reads the claims after
+/// the last index it saw and folds them in.
+#[derive(Default)]
+pub(crate) struct LimitsCache {
+    through_index: u64,
+    /// Claims folded in so far, so a test can see that a call reads only what is new.
+    #[cfg(test)]
+    folded: u64,
+    /// Each seat's newest reading by acceptance time, and the account it names.
+    newest: BTreeMap<String, ((u64, u64), (String, String, Option<String>))>,
+    readings: BTreeMap<(String, String, Option<String>), KeyReadings>,
+}
+
+impl LimitsCache {
+    fn advance(&mut self, connection: &Connection) -> Result<()> {
+        let mut statement = connection.prepare_cached(
+            "SELECT subject, origin, body, accepted_at_unix_ms, store_index FROM claims
+             WHERE kind='harness.limits' AND store_index>?1 ORDER BY store_index",
+        )?;
+        let rows = statement
+            .query_map([self.through_index], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, u64>(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (subject, origin, body, accepted_at, store_index) in rows {
+            self.through_index = self.through_index.max(store_index);
+            #[cfg(test)]
+            {
+                self.folded += 1;
+            }
+            let body: Value = serde_json::from_str(&body)?;
+            let Some((mut limit, _)) = reading(&origin, &body) else {
+                continue;
+            };
             limit.measured_by = subject.clone();
             let key = (
                 limit.driver.clone(),
                 limit.account.clone(),
                 limit.account_ref.clone(),
             );
-            newest.insert(subject, key.clone());
+            let position = (accepted_at.parse().unwrap_or(0), store_index);
+            if self
+                .newest
+                .get(&subject)
+                .is_none_or(|(newest, _)| position >= *newest)
+            {
+                self.newest.insert(subject, (position, key.clone()));
+            }
             // Keep the last reading even after the account's last seat switches away. Otherwise
             // the exhausted account would immediately look unused to the next pool choice.
-            readings.entry(key).or_default().push(limit);
+            let entry = self.readings.entry(key).or_default();
+            let (list, newest) = if limit.weekly_percent.is_some() {
+                (&mut entry.weekly, &mut entry.weekly_newest)
+            } else {
+                (&mut entry.partial, &mut entry.partial_newest)
+            };
+            *newest = (*newest).max(limit.measured_at_unix_ms);
+            list.push(limit);
+            let since = newest.saturating_sub(ACCOUNT_READING_WINDOW_MS);
+            list.retain(|reading| reading.measured_at_unix_ms >= since);
         }
+        Ok(())
     }
-    let mut accounts = readings
-        .into_iter()
-        .map(|(key, readings)| (key, select_account_reading(readings)))
+}
+
+pub(super) fn account_limits_at(
+    connection: &Connection,
+    cache: &Mutex<LimitsCache>,
+) -> Result<Vec<AccountLimit>> {
+    let mut cache = cache.lock().unwrap_or_else(PoisonError::into_inner);
+    cache.advance(connection)?;
+    let mut accounts = cache
+        .readings
+        .iter()
+        .map(|(key, readings)| {
+            // A partial snapshot after a relaunch can know only the five-hour window. It is not
+            // a weekly observation and must neither erase nor freshen the last weekly evidence.
+            let selected = if readings.weekly.is_empty() {
+                &readings.partial
+            } else {
+                &readings.weekly
+            };
+            (key.clone(), select_account_reading(selected.clone()))
+        })
         .collect::<BTreeMap<_, _>>();
-    for (seat, key) in newest {
+    for (seat, (_, key)) in &cache.newest {
         accounts
-            .get_mut(&key)
+            .get_mut(key)
             .expect("the seat reported an account")
             .seats
-            .push(seat);
+            .push(seat.clone());
     }
     let identified_drivers = accounts
         .values()
@@ -242,7 +314,7 @@ fn utc(unix_ms: u64) -> String {
 impl Store {
     /// The highest recent weekly reading in each account's latest reset window, in account order.
     pub fn account_limits(&self) -> Result<Vec<AccountLimit>> {
-        account_limits_at(&self.readers.get())
+        account_limits_at(&self.readers.get(), &self.smalltalk.limits_cache)
     }
 
     /// Missing quota evidence is unknown, never evidence that an account is below its limit.
@@ -743,6 +815,25 @@ mod tests {
         let limit = &store.account_limits().unwrap()[0];
         assert_eq!(limit.weekly_percent, Some(2.0));
         assert_eq!(limit.measured_by, busy);
+    }
+
+    #[test]
+    fn account_limits_read_only_the_claims_published_since_the_last_call() {
+        let store = Store::open_memory("alder").unwrap();
+        let now = now_ms();
+        let seat = "agent/alder.busy";
+        for beat in 0..300 {
+            read(&store, seat, Some("claude/aaaa"), 40.0, now + beat);
+        }
+        assert_eq!(store.account_limits().unwrap()[0].weekly_percent, Some(40.0));
+        let folded = |store: &Store| store.smalltalk.limits_cache.lock().unwrap().folded;
+        assert_eq!(folded(&store), 300);
+        // Nothing new: nothing read. One new claim: one read, and the answer follows it.
+        store.account_limits().unwrap();
+        assert_eq!(folded(&store), 300);
+        read(&store, seat, Some("claude/aaaa"), 41.0, now + 300);
+        assert_eq!(store.account_limits().unwrap()[0].weekly_percent, Some(41.0));
+        assert_eq!(folded(&store), 301);
     }
 
     #[test]

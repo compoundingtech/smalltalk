@@ -22,6 +22,8 @@ pub struct SmalltalkRuntime {
     pub(crate) message_cache: Mutex<HashMap<String, MessageCacheEntry>>,
     pub(crate) agent_status_cache: Mutex<VecDeque<AgentStatusEntry>>,
     pub(crate) agent_resources_cache: Mutex<VecDeque<(u64, bool, Arc<Vec<Value>>)>>,
+    /// What the `harness.limits` claims up to some store index say; see `limits::LimitsCache`.
+    pub(crate) limits_cache: Mutex<limits::LimitsCache>,
 }
 
 impl SmalltalkRuntime {
