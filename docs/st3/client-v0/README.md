@@ -380,6 +380,8 @@ startup. That first request can take longer; it never returns partially backfill
 Until then, changed subjects accumulate in the local pending queue. Once initialized, counts
 are maintained in each writer transaction. Full UTC days use daily recipient counters; the
 first and last partial days use an indexed send-time range.
+An estimate inside an already-pinned read snapshot with an uninitialized cache folds that
+snapshot's retained sends directly instead of writing or observing a later commit.
 
 `AgentMessageEstimate.days` contains at most the latest 31 UTC calendar days intersecting the
 period, including zero-message days. Each row names `day_start_ms`, the clipped `since_ms` and

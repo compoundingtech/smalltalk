@@ -228,6 +228,29 @@ pub(super) fn windows(since: u64, until: u64) -> Vec<(u64, u64)> {
         .collect()
 }
 
+// A caller's pinned snapshot cannot be initialized by a later writer commit. Fold that
+// snapshot's retained sends instead, with the same earliest-send arbitration and eligibility.
+fn snapshot_sends(connection: &Connection) -> Result<Vec<(u64, String)>> {
+    let mut statement = connection.prepare_cached(
+        "SELECT sent_ms,body FROM (
+             SELECT CAST(accepted_at_unix_ms AS INTEGER) AS sent_ms,body,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY subject ORDER BY CAST(accepted_at_unix_ms AS INTEGER),id
+                    ) AS rank
+             FROM claims WHERE kind='message.sent'
+         ) WHERE rank=1"
+    )?;
+    let mut rows = statement.query([])?;
+    let mut sends = Vec::new();
+    while let Some(row) = rows.next()? {
+        let body: Value = serde_json::from_str(&row.get::<_, String>(1)?)?;
+        if eligible(&body["fields"]) {
+            sends.push((row.get(0)?, body["fields"]["to"].as_str().unwrap().to_owned()));
+        }
+    }
+    Ok(sends)
+}
+
 impl Store {
     pub(super) fn agent_message_estimate(&self, days: &[DailyUsage]) -> Result<Value> {
         // Complete the migration atomically on the first estimate request, never return
@@ -237,10 +260,14 @@ impl Store {
             [],
             |row| row.get(0),
         )?;
-        if !ready {
+        let pinned = PINNED_READER.with(|slot| {
+            slot.borrow().as_ref().is_some_and(|(pool, _)| *pool == self.readers.key())
+        });
+        if !ready && !pinned {
             self.connection.batched(ensure_ready).map_err(anyhow::Error::msg)??;
         }
         let connection = self.readers.get();
+        let snapshot_sends = (!ready && pinned).then(|| snapshot_sends(&connection)).transpose()?;
         let calibration: Option<(String, Vec<u8>)> = connection
             .query_row(
                 "SELECT d.hash,b.bytes FROM documents d JOIN blobs b ON b.hash=d.hash
@@ -276,7 +303,15 @@ impl Store {
         } in days
         {
             let day = since / DAY_MS * DAY_MS;
-            let counts = if since == day && until == day.saturating_add(DAY_MS) {
+            let counts = if let Some(sends) = &snapshot_sends {
+                let mut counts = BTreeMap::<String, u64>::new();
+                for (sent_ms, recipient) in sends {
+                    if since <= *sent_ms && *sent_ms < until {
+                        *counts.entry(recipient.clone()).or_default() += 1;
+                    }
+                }
+                counts.into_iter().collect()
+            } else if since == day && until == day.saturating_add(DAY_MS) {
                 connection
                     .prepare_cached(
                         "SELECT recipient,count FROM agent_message_days WHERE day_ms=?1",
@@ -404,6 +439,28 @@ mod tests {
         println!("eager_open={eager:?} lazy_open={lazy_open:?} first_estimate={lazy_first_estimate:?} messages={}",
             actual.iter().map(|(_, _, count)| count).sum::<u64>());
         transaction.rollback().unwrap();
+    }
+
+    #[test]
+    fn first_estimate_in_pinned_snapshot_does_not_write_or_see_later_sends() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("pinned.sqlite3"), "node").unwrap();
+        let fields = json!({"from":"agent/alder","to":"agent/birch","status":"sent"});
+        send(&store, "message/old", DAY_MS + 1, fields.clone());
+        let day = [(DAY_MS, 2 * DAY_MS, 1_000_000, 0)];
+        let pinned = store.read_snapshot(|_| {
+            std::thread::scope(|scope| {
+                scope.spawn(|| send(&store, "message/new", DAY_MS + 2, fields));
+            });
+            estimate_days(&store, &day)
+        }).unwrap();
+        assert_eq!(pinned["days"][0]["messages"], 1);
+        let ready: bool = store.readers.get().query_row(
+            "SELECT EXISTS(SELECT 1 FROM meta WHERE key='agent_message_days_v1')",
+            [], |row| row.get(0)
+        ).unwrap();
+        assert!(!ready);
+        assert_eq!(estimate_days(&store, &day).unwrap()["days"][0]["messages"], 2);
     }
 
     #[test]
