@@ -1312,7 +1312,6 @@ async fn wait_peer_retry<B: Backend>(
     let started = tokio::time::Instant::now();
     let mut deadline = started + delay;
     let mut next_probe = started + PEER_PROBE_INTERVAL;
-    let mut probed_at = None;
     loop {
         // Check before sleeping as well as after notification: watch channels coalesce
         // events, and an accepted request can predate entry to this retry wait.
@@ -1333,7 +1332,7 @@ async fn wait_peer_retry<B: Backend>(
                 .read()
                 .expect("activity lock poisoned")
                 .get(name)
-                .is_some_and(|at| *at >= attempt_started && Some(*at) != probed_at)
+                .is_some_and(|at| *at >= attempt_started)
         {
             return true;
         }
@@ -1376,10 +1375,8 @@ async fn wait_peer_retry<B: Backend>(
                 if alive {
                     // Transport is alive, but another expensive exchange has just failed.
                     // Retain backoff and allow at most one attempt every 30 seconds at the cap.
-                    let at = tokio::time::Instant::now();
-                    probed_at = Some(at);
-                    fleet.activity.write().expect("activity lock poisoned")
-                        .insert(name.to_owned(), at);
+                    // A cheap probe is not authenticated activity. It must not refresh
+                    // its own eligibility window and keep a failing peer hot indefinitely.
                     let capped = started + Duration::from_secs(30);
                     if capped < deadline {
                         deadline = capped;

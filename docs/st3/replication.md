@@ -334,10 +334,10 @@ after a successful outbound exchange, a failed dialer's retry wait probes that s
 every three seconds, with a one-second timeout. The probe uses `HEAD` on the existing exchange
 route: any HTTP response, including an older build's `405`, caps that retry wait at 30 seconds
 without resetting its failure count. It neither exports an inventory nor records a failure.
-Successful probes extend the five-minute window while the endpoint keeps answering, so an
-alive overloaded peer cannot drift into an hour-long wait. A route that has never worked, a
-replaced route, or a peer with no sign of life for five minutes keeps the long retry schedule.
-Authenticated overload answers also cap subsequent failure waits at 30 seconds. Graph wakes
+Probes do not extend their own eligibility window. Only authenticated activity, including an
+overload answer, keeps the 30-second cap active; a peer that answers probes but keeps failing
+signed exchanges returns to the long retry schedule after five minutes. A route that has never
+worked or a replaced route keeps the long retry schedule. Graph wakes
 still leave intentionally absent peers alone. Transport life only schedules an exchange;
 the exchange still authenticates every claim and peer.
 
@@ -378,6 +378,12 @@ starting more work. The job survives a cancelled response and completes receive 
 A completed answer is retained until delivered or evicted when other peers need the bounded
 cache. Receipt remains idempotent if a lost or evicted answer must be recomputed. Once delivered,
 a later identical inventory starts a fresh export, so quiet peers still discover new envelopes.
+An undelivered completed answer has no time expiry; a later identical request can consume it
+before the following exchange obtains a fresh inventory. Failed jobs return a signed 500 and
+are removed so a retry can recompute them. Invalid request JSON still returns signed 422.
+Backend failures no longer synchronously record a responder-side failure before sending headers;
+the initiating worker records its failed exchange. Worker status reporting is best effort with
+a one-second timeout per phase or poll. Reported round-trip time includes overload polling.
 Local store operations run on blocking threads so their disk waits cannot block the response timer.
 
 New callers poll the identical signed body after authenticated overload, for at most 60 HTTP
