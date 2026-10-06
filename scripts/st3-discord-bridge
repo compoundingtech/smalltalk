@@ -554,9 +554,10 @@ class Bridge:
             raise Stop('The delivery watch moved to another host; reconcile retained delivery state before resuming.')
         # Queue durable parts before advancing the frontier. A crash replays stable IDs.
         if not self.queue_replies(page['items']):
-            return
+            return False
         self.state.put('outbound_host', page['host'])
         self.state.put('outbound_cursor', page['cursor'])
+        return True
 
     def receipt(self, row, message, require_nonce=False):
         return (isinstance(message, dict) and isinstance(message.get('id'), str) and ID.fullmatch(message['id'])
@@ -646,7 +647,7 @@ class Bridge:
         if wait_ms is None:
             self.incoming()
             self.imports()
-            self.queue_replies()
+            queued = self.queue_replies()
         else:
             now = time.monotonic()
             if now >= getattr(self, 'next_intake', 0):
@@ -654,8 +655,9 @@ class Bridge:
                 self.imports()
                 self.next_intake = time.monotonic() + 5
             remaining = max(0, int((self.next_intake - time.monotonic()) * 1000))
-            self.watch_replies(min(wait_ms, remaining))
+            queued = self.watch_replies(min(wait_ms, remaining))
         self.exports()
+        return queued
 
 
 def main():
@@ -719,9 +721,11 @@ def main():
                 time.sleep(min(5, retry_at - time.monotonic()))
                 continue
             try:
-                bridge.tick(wait_ms=None if args.legacy_text else 5000)
+                queued = bridge.tick(wait_ms=None if args.legacy_text else 5000)
                 failures, last_notice = 0, None
-                if args.legacy_text:
+                if args.legacy_text or not queued:
+                    # A retained parent frontier can return immediately while an
+                    # uncertain Discord send is held. Keep recovery bounded.
                     time.sleep(5)
             except Later as error:
                 failures += 1
