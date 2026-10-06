@@ -48491,7 +48491,7 @@ message "human-attention" {
                         ("total_tokens".into(), json!(100)),
                         ("cost".into(), json!(i as f64)),
                         ("context_used_tokens".into(), json!(i)),
-                        ("padding".into(), json!("x".repeat(4096))),
+                        ("model".into(), json!("fixture-model-".repeat(320))),
                     ]),
                     evidence: Vec::new(),
                     expected_subject: None,
