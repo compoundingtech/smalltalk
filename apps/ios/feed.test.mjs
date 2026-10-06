@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { Feed } from './feed.ts';
+import { Feed, shouldProbe } from './feed.ts';
 import { ForegroundGate } from './foreground.ts';
 import { fakeClient } from './fakeFeed.mjs';
 
@@ -234,3 +234,8 @@ const subscribed = socket => socket.sent.filter(command => command.kind === 'sub
   feed.close();
 }
 
+
+// st is asked nothing while the stream speaks; only a quiet stream is probed (Nathan, 2026-10-06).
+assert.equal(shouldProbe(1_000, 5_000), false);
+assert.equal(shouldProbe(1_000, 20_999), false);
+assert.equal(shouldProbe(1_000, 21_000), true);
