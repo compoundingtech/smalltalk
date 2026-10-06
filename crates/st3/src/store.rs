@@ -234,6 +234,9 @@ WHERE kind IN (
 CREATE INDEX IF NOT EXISTS claims_subscription_delivery_key_index
 ON claims(json_extract(body, '$.fields.delivery_key'))
 WHERE kind='subscription.mission-requested';
+CREATE INDEX IF NOT EXISTS claims_subscription_started_run_index
+ON claims(json_extract(body, '$.fields.mission_run'))
+WHERE kind='subscription.mission-started';
 CREATE INDEX IF NOT EXISTS claims_subscription_mission_resource_index
 ON claims(json_extract(body, '$.fields.mission'), json_extract(body, '$.fields.resource'))
 WHERE kind='subscription.mission-requested';
@@ -1288,6 +1291,71 @@ fn stale_ref_request_tx(connection: &Connection, resource: &str, discovery: &str
     let requested_head = requested.body.pointer("/fields/facts/head").and_then(Value::as_str);
     if let Some((requested, current)) = requested_head.zip(current.get("head").and_then(Value::as_str))
         && requested != current { return Ok(Some(format!("ref {resource} moved from head {requested} to {current}"))); }
+    Ok(None)
+}
+
+const SUBSCRIPTION_STARTED_RUN_QUERY: &str =
+    "SELECT EXISTS(SELECT 1 FROM claims INDEXED BY claims_subscription_started_run_index
+     WHERE kind='subscription.mission-started'
+     AND json_extract(body, '$.fields.mission_run')=?1)";
+
+fn subscription_started_run_tx(connection: &Connection, run: &str) -> Result<bool> {
+    Ok(connection
+        .prepare_cached(SUBSCRIPTION_STARTED_RUN_QUERY)?
+        .query_row([run], |row| row.get(0))?)
+}
+
+fn stale_pull_request_request_tx(
+    connection: &Connection,
+    resource: &str,
+    discovery: &str,
+) -> Result<Option<String>> {
+    smallclaims::touched::note_read(|| resource.to_owned());
+    let Some(requested) = claim_by_id_tx(connection, discovery)?.filter(|claim| {
+        claim.subject == resource
+            && claim.body.pointer("/fields/kind").and_then(Value::as_str)
+                == Some("vcs.pull-request")
+    }) else {
+        return Ok(None);
+    };
+    let Some(current) =
+        latest_actual(connection, resource)?.and_then(|actual| actual.get("facts").cloned())
+    else {
+        return Ok(None);
+    };
+    let number = current
+        .get("number")
+        .and_then(Value::as_u64)
+        .map_or_else(|| resource.to_owned(), |number| format!("#{number}"));
+    if let Some(state) = current
+        .get("state")
+        .and_then(Value::as_str)
+        .filter(|state| *state != "open")
+    {
+        return Ok(Some(format!("pull request {number} is {state}")));
+    }
+    if current.get("draft").and_then(Value::as_bool) == Some(true) {
+        return Ok(Some(format!("pull request {number} is a draft again")));
+    }
+    let short = |head: &str| head.chars().take(12).collect::<String>();
+    let requested_head = match requested
+        .body
+        .pointer("/fields/facts/head_sha")
+        .and_then(Value::as_str)
+    {
+        Some(head) => Some(head.to_owned()),
+        None => listed_head_tx(connection, Some(&requested.body))?,
+    };
+    let current_head = current.get("head_sha").and_then(Value::as_str);
+    if let (Some(requested_head), Some(current_head)) = (requested_head.as_deref(), current_head)
+        && requested_head != current_head
+    {
+        return Ok(Some(format!(
+            "pull request {number} moved from head {} to {}",
+            short(requested_head),
+            short(current_head)
+        )));
+    }
     Ok(None)
 }
 
@@ -3424,6 +3492,40 @@ impl Store {
             return Err(St3Error::new("stale-ref-head", reason));
         }
         let inputs = resolve_mission_run_inputs(&transaction, &mission, &request.inputs)?;
+        if let Some((resource, discovery)) = latest_ref {
+            if let Some(reason) = stale_pull_request_request_tx(&transaction, resource, discovery)
+                .map_err(internal)?
+            {
+                return Err(St3Error::new("stale-pull-request", reason));
+            }
+            let is_pull_request = claim_by_id_tx(&transaction, discovery)
+                .map_err(internal)?
+                .is_some_and(|claim| {
+                    claim.subject == resource
+                        && claim.body.pointer("/fields/kind").and_then(Value::as_str)
+                            == Some("vcs.pull-request")
+                });
+            if is_pull_request {
+                let completed: Option<String> = transaction
+                    .query_row(
+                        "SELECT id FROM mission_runs WHERE mission_id=?1 AND status='completed'
+                     AND EXISTS(SELECT 1 FROM json_each(mission_runs.inputs) AS input
+                         WHERE json_extract(input.value, '$.subject')=?2
+                         AND json_extract(input.value, '$.claim_id')=?3)
+                     ORDER BY id LIMIT 1",
+                        params![mission_id, resource, discovery],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(internal)?;
+                if let Some(run) = completed {
+                    return Err(St3Error::new(
+                        "completed-subscription-snapshot",
+                        format!("mission-run/{run} already completed for {resource}@{discovery}"),
+                    ));
+                }
+            }
+        }
         enforce_mission_run_capacity(&transaction, &mission)?;
         let subject = occurrence_subject.map(str::to_owned).unwrap_or_else(|| {
             self.mission_run_subject_for_idempotency_key(&request.idempotency_key)
@@ -13462,48 +13564,41 @@ impl Store {
         resource: &str,
         discovery: &str,
     ) -> Result<Option<String>> {
-        let Some(requested) = self.claim_by_id(discovery)? else {
+        stale_pull_request_request_tx(&self.readers.get(), resource, discovery)
+    }
+
+    /// Only subscription deliveries follow the current PR head. Authored missions keep their
+    /// pinned inputs, including missions that opened or are changing a pull request themselves.
+    pub fn stale_subscription_pull_request_run(
+        &self,
+        run: &MissionRunView,
+    ) -> Result<Option<String>> {
+        if !run.inputs.values().any(|input| {
+            input.subject.as_deref().is_some_and(|subject| subject.contains("/pull-request/"))
+        }) {
             return Ok(None);
-        };
-        let Some(current) = self
-            .latest_actual_value(resource)?
-            .and_then(|actual| actual.get("facts").cloned())
-        else {
-            return Ok(None);
-        };
-        let number = current
-            .get("number")
-            .and_then(Value::as_u64)
-            .map_or_else(|| resource.to_owned(), |number| format!("#{number}"));
-        if let Some(state) = current
-            .get("state")
-            .and_then(Value::as_str)
-            .filter(|state| *state != "open")
-        {
-            return Ok(Some(format!("pull request {number} is {state}")));
         }
-        if current.get("draft").and_then(Value::as_bool) == Some(true) {
-            return Ok(Some(format!("pull request {number} is a draft again")));
+        let from_subscription = run
+            .parent_step_run
+            .as_deref()
+            .is_some_and(|parent| parent.starts_with("step-run/subscription/"));
+        if !from_subscription {
+            smallclaims::touched::note_read(|| format!("subscription-run:{}", run.subject));
+            let started = subscription_started_run_tx(&self.readers.get(), &run.subject)?;
+            if !started {
+                return Ok(None);
+            }
         }
-        let short = |head: &str| head.chars().take(12).collect::<String>();
-        let requested_head = match requested
-            .body
-            .pointer("/fields/facts/head_sha")
-            .and_then(Value::as_str)
+        for input in run
+            .inputs
+            .values()
+            .filter(|input| input.kind == MissionInputKind::Resource)
         {
-            Some(head) => Some(head.to_owned()),
-            None => listed_head_tx(&self.readers.get(), Some(&requested.body))?,
-        };
-        let current_head = current.get("head_sha").and_then(Value::as_str);
-        if let (Some(requested_head), Some(current_head)) =
-            (requested_head.as_deref(), current_head)
-            && requested_head != current_head
-        {
-            return Ok(Some(format!(
-                "pull request {number} moved from head {} to {}",
-                short(requested_head),
-                short(current_head)
-            )));
+            if let (Some(resource), Some(discovery)) = (&input.subject, &input.claim_id)
+                && let Some(reason) = self.stale_pull_request_request(resource, discovery)?
+            {
+                return Ok(Some(reason));
+            }
         }
         Ok(None)
     }
@@ -39540,6 +39635,47 @@ version 2
                 "{kind}"
             );
         }
+    }
+
+    #[test]
+    fn subscription_run_lookup_cost_does_not_grow_with_unrelated_deliveries() {
+        let store = Store::open_memory("orchid").unwrap();
+        let mut connection = store.connection.write();
+        let transaction = connection.transaction().unwrap();
+        let mut costs = Vec::new();
+        for n in 1..=10_000 {
+            let id = format!("started-{n}");
+            transaction
+                .execute(
+                    "INSERT INTO batches(id,origin,replica_sequence,hash,accepted_at_unix_ms)
+                 VALUES(?1,'orchid',1,?1,'1')",
+                    [&id],
+                )
+                .unwrap();
+            transaction.execute(
+                "INSERT INTO claims(id,batch_id,subject,kind,origin,body,predecessors,accepted_at_unix_ms)
+                 VALUES(?1,?1,'subscription/reviews','subscription.mission-started','orchid',?2,'[]','1')",
+                params![id, json!({"fields":{"mission_run":format!("mission-run/{n}")}}).to_string()],
+            ).unwrap();
+            if n == 100 || n == 10_000 {
+                transaction
+                    .prepare_cached(SUBSCRIPTION_STARTED_RUN_QUERY)
+                    .unwrap()
+                    .reset_status(rusqlite::StatementStatus::VmStep);
+                assert!(subscription_started_run_tx(&transaction, "mission-run/1").unwrap());
+                assert!(!subscription_started_run_tx(&transaction, "mission-run/authored").unwrap());
+                costs.push(
+                    transaction
+                        .prepare_cached(SUBSCRIPTION_STARTED_RUN_QUERY)
+                        .unwrap()
+                        .get_status(rusqlite::StatementStatus::VmStep),
+                );
+            }
+        }
+        assert!(
+            costs[0] > 0 && costs[1] <= costs[0] * 2 && costs[1] < 100,
+            "positive and absent subscription lookups must seek, not scan history: {costs:?}"
+        );
     }
 
     #[test]

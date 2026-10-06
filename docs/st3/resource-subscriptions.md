@@ -83,6 +83,18 @@ A live subscription to a `github.ref` observer now checks at least every thirty 
 
 For mission deliveries from a `vcs.ref`, only the newest observed head remains queued. Older unstarted deliveries are cancelled before capacity retries and stay cancelled across daemon restart. Run creation rechecks that head in its writer transaction. A running mission retains its original pinned resource claim and its exact-commit `ci-passed` gate. Keep the applier mission at `concurrent-runs max=1` and on its existing host; no push receiver or additional applier is introduced.
 
+For pull request mission deliveries, a snapshot already completed by the same mission does not
+start another run, including after restart, a definition revision, or replication of that
+completed run. The match uses the exact
+resource subject and observation claim, so a new snapshot remains eligible and failed reviews
+can be retried. Run creation checks completion and the current head in its writer transaction.
+An active subscription run is cancelled with its reason and normal cleanup when its pinned pull
+request moves to another head, closes, or becomes a draft. The next resource observation wakes
+that evaluation. Identifying a subscription run uses its parent or an indexed start-claim lookup;
+another subscription's start claim does not wake it. Missions started explicitly retain their
+pinned inputs. Completion suppression uses the graph already received by the local store; it
+does not reserve snapshots across disconnected replicas.
+
 Every item the observer sees becomes its resource, including a draft pull request and every open
 item at the baseline. Only a change records an observation: an unchanged item records nothing, and
 an observation that read only some facts, such as a new comment, keeps the others.
