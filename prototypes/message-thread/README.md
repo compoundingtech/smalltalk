@@ -59,10 +59,15 @@ COUNT rank using indexed point seeks, so the two heads can be compared by the
 same canonical tuple. The independent slow COUNT fold stays outside writer
 measurements. Its fixture first proves the preceding `store_index` shortcut
 returns the wrong parent, then checks the two-lane answer under record identity
-and position changes across two batches, repaired state, a claim store-index move, insertion of
-an earlier unrelated claim, and deletion. `--growth` builds 1,000/10,000
-mixed children and counts deletion VM steps with full-fold spot checks after
-measurement.
+and position changes across two batches, repaired state, a claim store-index
+move, insertion of an earlier unrelated claim, and deletion. `--growth` builds
+1,000/10,000 children in three cases: every parent changes; only two parents
+change while an unrelated batch grows; and a changed batch grows while no
+parent changes. It records enumerated and changed keys, VM steps, statement
+count, SQL trace text bytes, rank-node writes and seeks, row changes, and
+allocated page-byte delta. SQL text bytes and page allocation are proxies,
+not disk-write bytes. Full-fold spot checks run after each measured mutation.
+`--small-growth` exercises the same cases at 10/100.
 
 The current affected-key enumerator intentionally revisits **all** message
 children in a changed batch. It is complete but unbounded; one unrelated
