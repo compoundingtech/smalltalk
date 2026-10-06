@@ -1943,7 +1943,7 @@ fn aggregate_usage_values<'a>(
     let mut aggregate = None::<crate::model::UsageSummary>;
     for usage in usages {
         let total = aggregate.get_or_insert_with(|| crate::model::UsageSummary {
-            aggregation: "cumulative-per-incarnation-else-response-deltas".into(),
+            aggregation: "rollup-per-slot-else-cumulative-per-incarnation-else-response-deltas".into(),
             ..crate::model::UsageSummary::default()
         });
         total.total_tokens = total.total_tokens.saturating_add(usage.total_tokens);

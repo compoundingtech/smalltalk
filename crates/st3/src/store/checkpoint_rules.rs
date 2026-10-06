@@ -25,7 +25,8 @@ use smallclaims::store::checkpoint_agreement::*;
 /// bounded observed status history and the beginning of the current state.
 /// Version 10 retains native credential edges and their bounded status transitions.
 /// Version 11 includes arrangement tables in the graph proof and rebuilds them during replay.
-pub const RULES_VERSION: u32 = 11;
+/// Version 12 includes selected rollup costs and complete, single-currency legacy costs in usage proofs.
+pub const RULES_VERSION: u32 = 12;
 
 /// Kinds that are now local observations are dropped only when they are dated at least five days
 /// before the cut, so they are seven days old when the checkpoint is due. That matches the local
@@ -86,6 +87,7 @@ sealed=every-admitted-claim-of-an-envelope-before-the-cut-but-repaired-originals
 proof=the-sealed-claims-and-the-blobs-they-reference
 graph=shared-projection-tables-including-arrangements-and-arrangement_registers-even-when-empty
 replay=clear-arrangements-and-arrangement_registers,rebuild-from-sealed-arrangement-claims
+reader-usage=rollup-per-slot-else-cumulative-per-incarnation-else-response-deltas,cost-complete-single-currency
 guards=person-actor,once-cardinality,record-not-valid,repair-replacement,projection-reference,claim-in-two-envelopes,cited-as-evidence,mission-run-input,shared-operation,writer-newest-envelope,whole-envelope
 witness=every-field-set-again-by-a-later-kept-claim-of-the-slot
 carriers=every-rule-but-loop.state-keeps-the-newest-carrier-of-each-field";

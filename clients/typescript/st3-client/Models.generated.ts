@@ -1809,7 +1809,7 @@ export type UsageRow = {
 };
 
 export type UsageSummary = {
-  aggregation: "cumulative-per-incarnation-else-response-deltas";
+  aggregation: "rollup-per-slot-else-cumulative-per-incarnation-else-response-deltas";
   cache_write_tokens?: number;
   cached_tokens: number;
   context?: UsageContext;

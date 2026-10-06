@@ -607,7 +607,7 @@
         "cost": { "type": "number", "minimum": 0 },
         "currency": { "type": "string" },
         "incarnation_count": { "type": "integer", "minimum": 0 },
-        "aggregation": { "const": "cumulative-per-incarnation-else-response-deltas" },
+        "aggregation": { "const": "rollup-per-slot-else-cumulative-per-incarnation-else-response-deltas" },
         "context": { "$ref": "#/$defs/UsageContext" }
       }
     },

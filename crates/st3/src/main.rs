@@ -24204,7 +24204,7 @@ mod tests {
                 "output_tokens": 0,
                 "cached_tokens": 0,
                 "incarnation_count": 0,
-                "aggregation": "cumulative-per-incarnation-else-response-deltas",
+                "aggregation": "rollup-per-slot-else-cumulative-per-incarnation-else-response-deltas",
                 "context": { "used_tokens": 319465, "observed_at_unix_ms": 1 }
             }))
             .unwrap(),
