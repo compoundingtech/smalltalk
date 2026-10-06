@@ -62,7 +62,14 @@ pub(crate) fn write_environment(
             // Single quotes are the only shell metacharacter inside a single-quoted value.
             // Closing the quote, quoting one apostrophe, then reopening is lossless even
             // for substitutions, backticks, newlines and trailing whitespace.
-            writeln!(file, "export {key}='{}'", value.replace('\'', "'\\''"))?;
+            write!(file, "export {key}='")?;
+            for (index, fragment) in value.split('\'').enumerate() {
+                if index > 0 {
+                    file.write_all(b"'\\''")?;
+                }
+                file.write_all(fragment.as_bytes())?;
+            }
+            file.write_all(b"'\n")?;
         }
         file.flush()?;
         std::fs::rename(&temporary, &path).context("publish private seat environment file")?;
