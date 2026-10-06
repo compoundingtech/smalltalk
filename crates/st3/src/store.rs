@@ -36814,6 +36814,152 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
         assert_eq!(right_status.unknown_records, 1);
     }
 
+    /// A retained Once claim protects its own envelope. A different fork of
+    /// the same batch can have a different envelope key, which the checkpoint
+    /// planner must judge on its own before a live trim touches either row.
+    #[test]
+    fn same_batch_fork_trim_brackets_a_warm_message_view() {
+        const CHILD: &str = "message/fork-trim-child";
+        let source = Store::open_memory("source").unwrap();
+        let sent = source
+            .append_claim(&ClaimInput {
+                subject: CHILD.into(),
+                kind: "message.sent".into(),
+                actor: Some("person/test".into()),
+                fields: BTreeMap::from([
+                    ("from".into(), json!("person/test")),
+                    ("to".into(), json!("agent/test")),
+                    ("content".into(), json!("fork fixture")),
+                    ("status".into(), json!("sent")),
+                    ("in_reply_to".into(), json!("message/root")),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        for status in ["down", "up"] {
+            source
+                .append_claim(&ClaimInput {
+                    subject: "host/source".into(),
+                    kind: "transport.observed".into(),
+                    actor: None,
+                    fields: BTreeMap::from([("status".into(), json!(status))]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+        let mut envelopes = exchange_from(&source, &ReplicationInventory::default()).envelopes;
+        envelopes.sort_by_key(|envelope| envelope.sequence);
+        assert_eq!(envelopes.len(), 3);
+        let original = envelopes[0].clone();
+        let fork = rewrite_envelope(&original, |payload| {
+            let claim = &mut payload.batch.claims[0];
+            claim.subject = "host/source".into();
+            claim.kind = "transport.observed".into();
+            claim.actor = None;
+            claim.body = json!({"fields": {"status": "down"}});
+            claim.id = claim_hash(
+                &claim.batch_id,
+                &claim.subject,
+                &claim.kind,
+                &claim.origin,
+                claim.actor.as_deref(),
+                &claim.body,
+                &claim.predecessors,
+            )
+            .unwrap();
+        });
+        let fork_payload: ReplicaEnvelopePayload =
+            ciborium::from_reader(fork.payload.bytes().unwrap()).unwrap();
+        let fork_claim = fork_payload.batch.claims[0].id.clone();
+        assert_eq!(fork_payload.batch.id, sent.batch_id);
+        assert_ne!(original.hash, fork.hash);
+
+        let target = Store::open_memory("target").unwrap();
+        let exchange = exchange_of(
+            "source",
+            vec![original.clone(), fork.clone(), envelopes[1].clone(), envelopes[2].clone()],
+        );
+        let admission = receive_and_project(&target, "source", &exchange);
+        assert!(admission.valid >= 4, "{admission:?}");
+        let association = |claim: &str, envelope: &ReplicaEnvelope| {
+            let connection = target.readers.get();
+            connection
+                .query_row(
+                    "SELECT records.writer,records.sequence,records.envelope_hash,claims.batch_id \
+                     FROM replica_records AS records JOIN claims ON claims.id=records.claim_id \
+                     WHERE records.claim_id=?1 AND records.envelope_hash=?2",
+                    params![claim, envelope.hash],
+                    |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?,
+                            row.get::<_, String>(2)?, row.get::<_, String>(3)?))
+                    },
+                )
+                .unwrap()
+        };
+        let sent_key = association(&sent.id, &original);
+        let candidate_key = association(&fork_claim, &fork);
+        assert_eq!(sent_key.0, candidate_key.0);
+        assert_eq!(sent_key.1, candidate_key.1);
+        assert_eq!(sent_key.3, candidate_key.3);
+        assert_ne!(sent_key.2, candidate_key.2);
+
+        let snapshot = |store: &Store| {
+            let through = store.index().unwrap();
+            let warm = store.message(CHILD).unwrap().unwrap();
+            let connection = store.readers.get();
+            let signature = connection
+                .query_row(
+                    "SELECT (SELECT MAX(store_index) FROM claims WHERE subject=?1), \
+                            (SELECT claim_id FROM desired WHERE subject=?1), \
+                            (SELECT MIN(store_index) FROM claims WHERE subject=?1)",
+                    [CHILD],
+                    |row| {
+                        Ok((row.get::<_, u64>(0)?, row.get::<_, Option<String>>(1)?,
+                            row.get::<_, u64>(2)?))
+                    },
+                )
+                .unwrap();
+            let uncached = message_view_tx(&connection, CHILD, signature.2).unwrap();
+            assert_eq!(serde_json::to_value(&warm).unwrap(),
+                       serde_json::to_value(&uncached).unwrap());
+            assert_eq!(store.index().unwrap(), through);
+            (signature, serde_json::to_value(warm).unwrap())
+        };
+        let before = snapshot(&target);
+        let cut = now_ms() + 1_000;
+        let scratch = tempfile::tempdir().unwrap();
+        let (plan, proof) = target.plan_checkpoint(cut, scratch.path()).unwrap();
+        assert!(proof.passed, "{proof:?}");
+        assert!(plan.claims.iter().any(|claim| claim.id == fork_claim));
+        assert!(!plan.claims.iter().any(|claim| claim.id == sent.id));
+        assert!(plan.envelopes.iter().any(|envelope| {
+            envelope.writer == candidate_key.0
+                && envelope.sequence == candidate_key.1
+                && envelope.envelope_hash == candidate_key.2
+        }));
+        assert!(!plan.envelopes.iter().any(|envelope| {
+            envelope.writer == sent_key.0
+                && envelope.sequence == sent_key.1
+                && envelope.envelope_hash == sent_key.2
+        }));
+        let mut actions = Vec::new();
+        target
+            .trim_checkpoint(&checkpoint_name(cut), cut, &plan.drop_digest,
+                             &plan.envelopes, &plan.claims, false, &mut actions)
+            .unwrap();
+        assert!(!actions.iter().any(|action| {
+            matches!(action, CheckpointAction::TrimGraphChanged { .. })
+        }), "{actions:?}");
+        assert!(target.claim_by_id(&fork_claim).unwrap().is_none());
+        assert!(target.claim_by_id(&sent.id).unwrap().is_some());
+        let after = snapshot(&target);
+        assert_eq!(before, after);
+    }
+
     /// One exchange carrying exactly `envelopes`, as a peer that holds only those would send it.
     pub(super) fn exchange_of(peer: &str, envelopes: Vec<ReplicaEnvelope>) -> ReplicationExchange {
         ReplicationExchange {
