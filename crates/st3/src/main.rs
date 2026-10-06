@@ -20922,7 +20922,7 @@ fn work_incarnation_key(incarnation: Option<&str>) -> String {
 async fn renew_claimed_work(client: &Client, subject: &str, minute: u64) -> Result<()> {
     let status: StatusResponse = client
         .get(&format!(
-            "/v1/status?subject={}",
+            "/v1/status?subject={}&harness_only=true",
             urlencoding::encode(subject)
         ))
         .await?;
