@@ -122,6 +122,16 @@ rollback/reopen/move/removal check, not yet executed. The code is not wired to
 Store or the SQLite rank model, has no migration, GC or startup/backfill plan,
 and has no measured node/statement/byte or production lifecycle result. It
 cannot clear the frozen b563 or later a8 writer-cost failures.
+`refresh_child_leaf` now derives the two indexed lane heads, checks equality
+of all five canonical prefix fields, and keeps a leaf only when their parents
+differ. It avoids rewriting an identical persisted leaf. The source-only
+`persistent_pair_fixture.py` couples that derivation to the SQLite claim and
+record model, with a queued rollback/reopen assertion. The source-only
+`persistent_pair_growth.py` measures a future writer transaction including
+rank-index changes, persisted tree SQL, selected-parent writes, SQL VM steps,
+statements, row changes and page allocation for far unchanged, all changed,
+and fixed two-child output under unrelated 1k/10k history growth. Neither
+fixture has executed, so none of those correctness or cost rows are green.
 
 Before production integration, use current-main `store.rs` schema near
 `message_reply_edges`, its open/backfill path and runtime projection hook;

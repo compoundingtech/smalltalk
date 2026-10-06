@@ -205,3 +205,63 @@ class PersistentGapTree:
             carried += node.lazy
             prefix = prefix * 2 + ((index >> (DEPTH - level - 1)) & 1)
         raise AssertionError('unreachable')
+
+
+def refresh_child_leaf(db: sqlite3.Connection, child: str) -> None:
+    """Re-derive one OLD/NEW gap leaf from indexed selected lane heads.
+
+    Call only after reply_assignments and the batch rank index reflect the
+    claim/record mutation in this transaction. A rank shift must first adjust
+    existing leaves and report its possible changed children. The caller then
+    refreshes those selected parents and any directly changed OLD/NEW child.
+    """
+    # The two heads share the same exact canonical prefix columns. If those
+    # prefixes differ, one dominates regardless of a COUNT-rank shift. Equal
+    # parents also cannot change the selected_reply answer by swapping heads.
+    columns = ("claim_id,store_index,batch_id,accepted_at,origin,"
+               "replica_sequence,recorded_position,parent,accepted_len")
+    order = ("accepted_len DESC,accepted_at DESC,origin DESC,"
+             "replica_sequence DESC,batch_id DESC,")
+
+    def head(predicate: str, index: str, tail: str) -> tuple | None:
+        return db.execute(
+            f"SELECT {columns} FROM reply_assignments INDEXED BY {index} "
+            f"WHERE child=? AND recorded_position {predicate} "
+            f"ORDER BY {order}{tail} LIMIT 1",
+            (child,),
+        ).fetchone()
+
+    legacy = head('IS NULL', 'reply_legacy_head',
+                  'store_index DESC,claim_id DESC')
+    recorded = head('IS NOT NULL', 'reply_recorded_head',
+                    'recorded_position DESC,claim_id DESC')
+    old = db.execute(
+        "SELECT batch_id,store_index,legacy_claim_id,recorded_claim_id,"
+        "legacy_parent,recorded_parent FROM reply_gap_leaves WHERE child=?",
+        (child,),
+    ).fetchone()
+    old_batch = old[0] if old else ''
+    if legacy is None or recorded is None:
+        PersistentGapTree(db, old_batch).replace_head(child=child,
+                                                       store_index=None)
+        return
+    prefix = lambda row: (row[8], row[3], row[4], row[5], row[2])
+    if prefix(legacy) != prefix(recorded) or legacy[7] == recorded[7]:
+        PersistentGapTree(db, old_batch).replace_head(child=child,
+                                                       store_index=None)
+        return
+    batch = legacy[2]
+    store_index = legacy[1]
+    # Import locally: the exact indexed rank source lives in the sibling
+    # model and is already maintained for all claims, including non-messages.
+    from mixed_rank_oracle import prefix_rank
+    gap = prefix_rank(db, batch, store_index) - recorded[6]
+    if old == (batch, store_index, legacy[0], recorded[0],
+               legacy[7], recorded[7]):
+        if PersistentGapTree(db, batch).gap_at(store_index) == gap:
+            return
+    PersistentGapTree(db, batch).replace_head(
+        child=child, store_index=store_index, gap=gap,
+        legacy_claim_id=legacy[0], recorded_claim_id=recorded[0],
+        legacy_parent=legacy[7], recorded_parent=recorded[7],
+    )
