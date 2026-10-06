@@ -320,12 +320,41 @@ pub fn omp_import_bootstrap_bound(
         }
         introduced = prior;
     }
-    for bound in store.claims_for(subject, Some("harness.session-file"))?.iter().rev() {
-        if field(bound, "harness") == Some("omp")
-            && field(bound, "incarnation_id").is_some_and(|id| !id.is_empty())
-            && field(bound, "session_id").is_some_and(|id| !id.is_empty())
+    let launches = store.observations_for(subject, "runtime.action.succeeded")?;
+    for bound in store
+        .claims_for(subject, Some("harness.session-file"))?
+        .iter()
+        .rev()
+    {
+        if field(bound, "harness") != Some("omp")
+            || !field(bound, "session_id").is_some_and(|id| !id.is_empty())
         {
-            return store.claim_is_after(&bound.id, &introduced.id);
+            continue;
+        }
+        let Some(incarnation) = field(bound, "incarnation_id").filter(|id| !id.is_empty()) else {
+            continue;
+        };
+        if !store.claim_is_after(&bound.id, &introduced.id)? {
+            return Ok(false);
+        }
+        let Some(token) = launches
+            .iter()
+            .rev()
+            .find(|launch| {
+                field(launch, "action") == Some("start")
+                    && field(launch, "incarnation_id") == Some(incarnation)
+            })
+            .and_then(|launch| field(launch, "desired_token"))
+        else {
+            continue;
+        };
+        let Some(declaration) = declarations.iter().find(|claim| claim.id == token) else {
+            continue;
+        };
+        if carries_pair(declaration)
+            && (token == introduced.id || store.claim_is_after(token, &introduced.id)?)
+        {
+            return Ok(true);
         }
     }
     Ok(false)

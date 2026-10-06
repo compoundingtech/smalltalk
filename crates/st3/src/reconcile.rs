@@ -18556,6 +18556,10 @@ agent "import/omp/repair-order" {{
             ),
             "repair-import",
         );
+        // The incumbent reports again after repair publication, but was launched
+        // under the old declaration: this late binding must not consume bootstrap.
+        old.set_write_clock_at(base + 35).unwrap();
+        append_binding(&old, "before-repair");
         let repaired = Store::open_memory("new-driver").unwrap();
         repaired
             .import_replication("author", &declaration.export_replication(0).unwrap())
@@ -18566,19 +18570,31 @@ agent "import/omp/repair-order" {{
         let old_claims = old.export_replication(0).unwrap();
         let repaired_claims = repaired.export_replication(0).unwrap();
         let launch = |store: Arc<Store>, strict: bool| {
-            let runtime = Arc::new(FakeRuntime::default());
-            let reconciler = Reconciler::new(
-                store.clone(),
-                runtime.clone(),
-                "node".into(),
-                Arc::new(Notify::new()),
-            );
             let subject = store
                 .desired_subjects()
                 .unwrap()
                 .into_iter()
                 .find(|subject| subject.subject == seat)
                 .unwrap();
+            let mut runtime = FakeRuntime::default();
+            runtime
+                .ptys
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(RuntimeObservation {
+                    runtime_id: subject.member.as_ref().unwrap().runtime_id.clone(),
+                    terminal: true,
+                    status: "running".into(),
+                    exit_code: None,
+                    incarnation_id: Some("after-repair".into()),
+                });
+            let runtime = Arc::new(runtime);
+            let reconciler = Reconciler::new(
+                store.clone(),
+                runtime.clone(),
+                "node".into(),
+                Arc::new(Notify::new()),
+            );
             reconciler
                 .perform_start(&subject, subject.member.as_ref().unwrap(), "repair-order proof")
                 .unwrap();
@@ -18607,6 +18623,26 @@ agent "import/omp/repair-order" {{
         let first = Arc::new(Store::open_memory("node").unwrap());
         first.import_replication("author", &declaration_claims).unwrap();
         first.import_replication("old-driver", &old_claims).unwrap();
+        // Start receipts are system-local observations; preserve the incumbent's
+        // captured token locally, rather than pretending they replicate.
+        first
+            .append_claim(&ClaimInput {
+                subject: seat.into(),
+                kind: "runtime.action.succeeded".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("action".into(), Value::String("start".into())),
+                    ("incarnation_id".into(), Value::String("before-repair".into())),
+                    (
+                        "desired_token".into(),
+                        Value::String(old.launch_lineage(seat).unwrap().pop().unwrap()),
+                    ),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
         launch(first.clone(), true);
         first.import_replication("new-driver", &repaired_claims).unwrap();
         declaration.set_write_clock_at(base + 50).unwrap();
@@ -18635,6 +18671,7 @@ agent "import/omp/repair-order" {{
         for reverse in [false, true] {
             let replica = Arc::new(Store::open_memory("node").unwrap());
             replica.import_replication("author", &declaration_claims).unwrap();
+            launch(replica.clone(), true);
             if reverse {
                 replica.import_replication("new-driver", &repaired_claims).unwrap();
                 replica.import_replication("old-driver", &old_claims).unwrap();
@@ -18695,6 +18732,26 @@ agent "import/omp/fixture" {{
             ]);
             if let Some(incarnation) = incarnation {
                 fields.insert("incarnation_id".into(), Value::String(incarnation.into()));
+                store
+                    .append_claim(&ClaimInput {
+                        subject: subject.subject.clone(),
+                        kind: "runtime.action.succeeded".into(),
+                        actor: None,
+                        fields: BTreeMap::from([
+                            ("action".into(), Value::String("start".into())),
+                            ("incarnation_id".into(), Value::String(incarnation.into())),
+                            (
+                                "desired_token".into(),
+                                Value::String(
+                                    store.launch_lineage(&subject.subject).unwrap().pop().unwrap(),
+                                ),
+                            ),
+                        ]),
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: None,
+                    })
+                    .unwrap();
             }
             store
                 .append_claim(&ClaimInput {

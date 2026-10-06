@@ -166,8 +166,10 @@ into the managed inventory without copying it, and launches OMP with that exact
 path. Missing or mismatched transcripts fail the launch rather than starting anew.
 The pair bootstraps an imported or repaired seat until an incarnation-bearing
 driver binding follows the declaration revision that introduced or last changed
-that pair. Historical bindings before a repair cannot consume its strict selector;
-unrelated declaration edits do not reset it. Subsequent restarts ignore the pair
+that pair, and the incarnation's existing successful-start receipt proves it was
+launched under that revision or a later revision carrying the same pair. An
+incumbent launched before repair cannot consume bootstrap by reporting late.
+Unrelated declaration edits do not reset it. Subsequent restarts ignore the pair
 and continue the latest bound native ID and transcript path within the linked
 inventory. Explicit suspension resumes and rollouts retain strict selectors.
 Declaration/binding and refusal/binding precedence use canonical claim order,
