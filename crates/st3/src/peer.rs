@@ -109,6 +109,10 @@ pub enum ClientReadOperation {
     AgentWorkspace {
         identity: String,
     },
+    HarnessInventory {
+        agent_id: String,
+        query: st3_client::HarnessInventoryQuery,
+    },
     /// Up to 512 KiB of an attachment from `offset`, from the member that took the upload. The
     /// answer is base64 in JSON with the file's size; the reader asks again until it has it all.
     Blob {
@@ -1157,6 +1161,10 @@ async fn receive_client_read(
                     StatusCode::CONFLICT, format!("{error:#}")
                 ).into())
             }
+            ClientReadOperation::HarnessInventory { agent_id, query } => {
+                let value = client.harness_inventory_get(&agent_id, &query).await?.value;
+                Ok(serde_json::to_value(value)?)
+            }
             ClientReadOperation::AgentWorkspace { identity } => {
                 let workspace =
                     crate::config::default_agent_workspace(&identity).map_err(|error| {
@@ -1219,6 +1227,7 @@ async fn receive_client_read(
                                 st3_client::ErrorCode::NotFound
                                 | st3_client::ErrorCode::BlobNotFound => StatusCode::NOT_FOUND,
                                 st3_client::ErrorCode::StaleFence => StatusCode::CONFLICT,
+                                st3_client::ErrorCode::InventoryUnavailable => StatusCode::SERVICE_UNAVAILABLE,
                                 _ => StatusCode::UNPROCESSABLE_ENTITY,
                             };
                             (
@@ -3232,6 +3241,71 @@ mod tests {
         let response = peer_router(peer, smalltalk_routes()).oneshot(rejected).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn signed_inventory_read_preserves_owner_unavailable_http_status() {
+        let root = tempfile::tempdir().unwrap();
+        let subject = "agent/proof/inventory";
+        let store = Arc::new(Store::open_memory("owner").unwrap());
+        store.apply_internal(
+            &crate::graph::parse_intent("version 2\nagent \"proof/inventory\" { harness \"omp\" {} }\n", "owner").unwrap(),
+            "inventory-proof",
+        ).unwrap();
+        store.append_claim(&ClaimInput {
+            subject: subject.into(), kind: "runtime.observed".into(), actor: Some(subject.into()),
+            fields: serde_json::from_value(serde_json::json!({"status":"running",
+                "runtime_id":"proof/inventory", "incarnation_id":"inventory:one", "terminal":false})).unwrap(),
+            evidence: vec![], expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        // Genuine owner failure: the local native observation spool is unreadable SQLite.
+        // No mocked handler or transport supplies the error being asserted.
+        let observations = root.path().join("drivers")
+            .join(&hex::encode(Sha256::digest(subject.as_bytes()))[..24]).join("observations");
+        fs::create_dir_all(&observations).unwrap();
+        fs::write(observations.join(st_drivers::harness_events::DATABASE), "invalid native spool").unwrap();
+        let socket = root.path().join("st3.sock");
+        let main = crate::api::AppState {
+            store, notify: Arc::new(tokio::sync::Notify::new()), event_notify: watch::channel(0_u64).0,
+            node: "owner".into(), state_dir: root.path().to_path_buf(),
+            pty_root: root.path().join("pty"), pty_binary: PathBuf::from("pty"),
+            fleet_id: None, configured_peers: vec!["source".into()], client_relay: None,
+            native_session_home: None, planner_default: crate::model::PlannerSpec::default(),
+        };
+        let serving = socket.clone();
+        let server = tokio::spawn(async move {
+            crate::api::serve_unix(&serving, crate::api::router(main)).await.unwrap();
+        });
+        for _ in 0..100 {
+            if socket.exists() { break }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let auth = FleetAuth::test("fleet-test", &[4; 32]);
+        let peer = PeerState::new(MainBackend::new(socket), "owner".into(), auth.clone(),
+            FleetContext::legacy(BTreeSet::from(["source".into()])));
+        let digest = hex::encode(Sha256::digest(format!("{subject}:inventory:one").as_bytes()));
+        let body = serde_json::to_vec(&ClientReadRequest {
+            authority_actor: "person/test".into(), relay: None,
+            request: ClientReadOperation::HarnessInventory { agent_id: subject.into(),
+                query: st3_client::HarnessInventoryQuery {
+                    owner_host_id: "host/owner".into(), session_id: format!("session/{}", &digest[..24]),
+                    native_session_id: "native-one".into(), runtime_incarnation: "inventory:one".into(),
+                    collection: "files".into(), directory: String::new(), prefix: String::new(),
+                    limit: Some(1), cursor: None,
+                } },
+        }).unwrap();
+        let mut request = Request::builder().method("POST").uri(CLIENT_READ_PATH)
+            .body(Body::from(body.clone())).unwrap();
+        *request.headers_mut() = auth.request_headers_for(CLIENT_READ_PATH, "source", &body).unwrap();
+        let response = peer_router(peer, smalltalk_routes()).oneshot(request).await.unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = to_bytes(response.into_body(), MAX_CLIENT_READ_BYTES).await.unwrap();
+        server.abort();
+        auth.verify(&headers, "RESPONSE", CLIENT_READ_PATH, &bytes, Some("owner"),
+            Some(&FleetAuth::body_digest(&body))).unwrap();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap()["value"]["code"], "inventory-unavailable");
     }
 
     #[tokio::test]

@@ -43,6 +43,7 @@ pub mod fsatomic;
 pub mod harness_admission;
 pub mod harness_context;
 pub mod harness_events;
+pub mod harness_inventory;
 pub mod blocking_screen;
 pub mod harness_state;
 pub mod harness_timeline;

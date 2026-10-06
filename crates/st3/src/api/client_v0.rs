@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 
 pub(super) mod raw_terminal;
 pub(super) mod resources;
+pub(super) mod inventory;
 pub(super) mod search;
 
 const TERMINAL_SUBPROTOCOL: &str = "st3.client.terminal.v0";

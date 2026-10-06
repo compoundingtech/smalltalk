@@ -3,6 +3,7 @@ import { API_VERSION } from './Models.generated.ts';
 import type {
     AgentDeclaration, Glass, GlassPut, GlassDelete, ActionOf, ActionRequest, ActionResult, AgentQueue, StatusHistory, BlobChunk, BlobUpload, Capabilities, DocumentContent, EnvelopeOf,
     ResourcesFilter, ResourcesPage,
+    HarnessInventory, HarnessInventoryQuery,
     PublicationDefinition, SubjectDefinition, AgentWorkspace, UsagePeriod, MailBacklog, ClientConnections, CollectionName, CollectionFrame, HostRepositories,
     ConversationChanges, ConversationSearch, ErrorEnvelope, EventPage, Page, PairingBegin, PairingChallenge,
     PairingComplete, PairedSession, Resource, Snapshot, TerminalScreen, TimelinePage,
@@ -366,6 +367,7 @@ export class St3Client {
     async agentDeclarationGet(id: string, revision?: string, showEnvValues = false): Promise<EnvelopeOf<AgentDeclaration>> { return this.get(`/v1/client/agent-declarations/${encodeURIComponent(routedId(id))}` + query({ revision, show_env_values: showEnvValues })); }
     async statusHistoryGet(id: string): Promise<EnvelopeOf<StatusHistory>> { return this.get(`/v1/client/status-history/${encodeURIComponent(routedId(id))}`); }
     async agentQueueGet(id: string): Promise<EnvelopeOf<AgentQueue>> { return this.get(`/v1/client/agent-queues/${encodeURIComponent(routedId(id))}`); }
+    async harnessInventoryGet(id: string, options: HarnessInventoryQuery): Promise<EnvelopeOf<HarnessInventory>> { return this.get(`/v1/client/harness-inventory/${encodeURIComponent(routedId(id))}` + query({ ...options, limit: options.limit ?? undefined, cursor: options.cursor ?? undefined })); }
     async runtimesList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/runtimes' + query(options)); }
     async runtimesGet(id: string): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/runtimes/${encodeURIComponent(routedId(id))}`); }
     async observersList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/observers' + query(options)); }

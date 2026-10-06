@@ -39,6 +39,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
     case staleFence, cursorGap, pageCursorExpired, rateLimited
     case runtimeNotLocal, runtimeAuthorityIndeterminate, remoteUnavailable, `internal`
     case terminalUnavailable, terminalEnded, timelineHistoryIncomplete
+    case inventoryUnavailable
     case blobTooLarge, unsupportedMediaType, blobContentMismatch, blobQuotaExceeded, blobNotFound, blobExpired
     case unknown(String)
 
@@ -52,6 +53,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
         case "rate-limited": .rateLimited; case "runtime-not-local": .runtimeNotLocal
         case "timeline-history-incomplete": .timelineHistoryIncomplete
         case "terminal-unavailable": .terminalUnavailable; case "terminal-ended": .terminalEnded
+        case "inventory-unavailable": .inventoryUnavailable
         case "blob-too-large": .blobTooLarge; case "unsupported-media-type": .unsupportedMediaType; case "blob-content-mismatch": .blobContentMismatch
         case "blob-quota-exceeded": .blobQuotaExceeded; case "blob-not-found": .blobNotFound; case "blob-expired": .blobExpired
         case "runtime-authority-indeterminate": .runtimeAuthorityIndeterminate; case "remote-unavailable": .remoteUnavailable; case "internal": .internal
@@ -67,6 +69,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
         case .rateLimited: "rate-limited"; case .runtimeNotLocal: "runtime-not-local"
         case .timelineHistoryIncomplete: "timeline-history-incomplete"
         case .terminalUnavailable: "terminal-unavailable"; case .terminalEnded: "terminal-ended"
+        case .inventoryUnavailable: "inventory-unavailable"
         case .blobTooLarge: "blob-too-large"; case .unsupportedMediaType: "unsupported-media-type"; case .blobContentMismatch: "blob-content-mismatch"
         case .blobQuotaExceeded: "blob-quota-exceeded"; case .blobNotFound: "blob-not-found"; case .blobExpired: "blob-expired"
         case .runtimeAuthorityIndeterminate: "runtime-authority-indeterminate"; case .remoteUnavailable: "remote-unavailable"; case .internal: "internal"
@@ -574,4 +577,48 @@ public struct CustomReplyParameters: Codable, Sendable {
     public var fields: [String: JSONValue]
     public init(targetID: String, registration: String, revision: String, episode: String, fields: [String: JSONValue]) { self.targetID = targetID; self.registration = registration; self.revision = revision; self.episode = episode; self.fields = fields }
     enum CodingKeys: String, CodingKey { case targetID = "target_id", registration, revision, episode, fields }
+}
+
+public struct HarnessInventoryQuery: Codable, Sendable {
+    public var ownerHostID: String
+    public var sessionID: String
+    public var nativeSessionID: String
+    public var runtimeIncarnation: String
+    public var collection: String
+    public var directory: String?
+    public var prefix: String?
+    public var limit: Int?
+    public var cursor: String?
+    public init(ownerHostID: String, sessionID: String, nativeSessionID: String, runtimeIncarnation: String, collection: String, directory: String? = nil, prefix: String? = nil, limit: Int? = nil, cursor: String? = nil) {
+        self.ownerHostID = ownerHostID; self.sessionID = sessionID; self.nativeSessionID = nativeSessionID
+        self.runtimeIncarnation = runtimeIncarnation; self.collection = collection
+        self.directory = directory; self.prefix = prefix; self.limit = limit; self.cursor = cursor
+    }
+    enum CodingKeys: String, CodingKey {
+        case ownerHostID = "owner_host_id", sessionID = "session_id", nativeSessionID = "native_session_id", runtimeIncarnation = "runtime_incarnation", collection, directory, prefix, limit, cursor
+    }
+}
+public struct HarnessInventoryItem: Codable, Sendable {
+    public let name: String
+    public let kind: String
+    public let source: String?
+}
+public struct HarnessInventory: Codable, Sendable {
+    public let kind: String
+    public let agentID: String
+    public let ownerHostID: String
+    public let sessionID: String
+    public let nativeSessionID: String?
+    public let runtimeIncarnation: String
+    public let collection: String
+    public let status: String
+    public let coverage: String
+    public let fullInventory: Bool
+    public let reason: String?
+    public let observedAt: String?
+    public let items: [HarnessInventoryItem]
+    public let page: PageInfo
+    enum CodingKeys: String, CodingKey {
+        case kind, agentID = "agent_id", ownerHostID = "owner_host_id", sessionID = "session_id", nativeSessionID = "native_session_id", runtimeIncarnation = "runtime_incarnation", collection, status, coverage, fullInventory = "full_inventory", reason, observedAt = "observed_at", items, page
+    }
 }

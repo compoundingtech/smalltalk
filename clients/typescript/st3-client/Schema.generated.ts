@@ -2232,7 +2232,7 @@ export type Envelope = typeof Envelope.Type
 export type EnvelopeEncoded = typeof Envelope.Encoded
 
 /** Versioned safe error code; unknown codes fall back to `retryable`. */
-export const ErrorCode = /*#__PURE__*/ (() => openEnum(["attention-migrated","not-found","forbidden","unsupported-capability","validation-failed","idempotency-conflict","stale-fence","cursor-gap","page-cursor-expired","rate-limited","runtime-not-local","runtime-authority-indeterminate","remote-unavailable","terminal-unavailable","terminal-ended","timeline-history-incomplete","blob-too-large","unsupported-media-type","blob-content-mismatch","blob-quota-exceeded","blob-not-found","blob-expired","internal"]).annotate({ identifier: "ErrorCode", description: "Versioned safe error code; unknown codes fall back to `retryable`." }))()
+export const ErrorCode = /*#__PURE__*/ (() => openEnum(["attention-migrated","not-found","forbidden","unsupported-capability","validation-failed","idempotency-conflict","stale-fence","cursor-gap","page-cursor-expired","rate-limited","runtime-not-local","runtime-authority-indeterminate","remote-unavailable","terminal-unavailable","inventory-unavailable","terminal-ended","timeline-history-incomplete","blob-too-large","unsupported-media-type","blob-content-mismatch","blob-quota-exceeded","blob-not-found","blob-expired","internal"]).annotate({ identifier: "ErrorCode", description: "Versioned safe error code; unknown codes fall back to `retryable`." }))()
 export type ErrorCode = typeof ErrorCode.Type
 export type ErrorCodeEncoded = typeof ErrorCode.Encoded
 
@@ -2265,6 +2265,47 @@ export type GlassPutEncoded = typeof GlassPut.Encoded
 export const GoldenResourceSet = /*#__PURE__*/ (() => Schema.Array(Resource).check(Schema.isMinLength(15)).check(Schema.makeFilter((items: ReadonlyArray<unknown>) => items.some(Schema.is(Schema.Struct({ "kind": Schema.Literal("session") }))), { expected: "an array containing a match" })).annotate({ identifier: "GoldenResourceSet" }))()
 export type GoldenResourceSet = typeof GoldenResourceSet.Type
 export type GoldenResourceSetEncoded = typeof GoldenResourceSet.Encoded
+
+export const HarnessInventoryItem = /*#__PURE__*/ (() => Schema.Struct({
+  "kind": Schema.Literals(["file","directory","skill-command","slash-command"]),
+  "name": Schema.String,
+  "source": Schema.OptionFromNullOr(Schema.Literals(["extension","prompt","skill"]))
+}).annotate({ identifier: "HarnessInventoryItem" }))()
+export type HarnessInventoryItem = typeof HarnessInventoryItem.Type
+export type HarnessInventoryItemEncoded = typeof HarnessInventoryItem.Encoded
+
+export const HarnessInventory = /*#__PURE__*/ (() => Schema.Struct({
+  "agent_id": Schema.String,
+  "collection": Schema.Literals(["files","skills","skill-commands","slash-commands"]),
+  "coverage": Schema.Literals(["none","native-workspace","enabled-skill-commands","dynamic-commands"]),
+  "full_inventory": Schema.Boolean,
+  "items": Schema.Array(HarnessInventoryItem).check(Schema.isMaxLength(200)),
+  "kind": Schema.Literal("harness-inventory"),
+  "native_session_id": Schema.OptionFromNullOr(Schema.String),
+  "observed_at": Schema.OptionFromNullOr(Schema.String),
+  "owner_host_id": Schema.String,
+  "page": PageInfo,
+  "reason": Schema.OptionFromNullOr(Schema.String),
+  "runtime_incarnation": Schema.String,
+  "session_id": Schema.String,
+  "status": Schema.Literals(["supported","unsupported","unavailable"])
+}).annotate({ identifier: "HarnessInventory" }))()
+export type HarnessInventory = typeof HarnessInventory.Type
+export type HarnessInventoryEncoded = typeof HarnessInventory.Encoded
+
+export const HarnessInventoryQuery = /*#__PURE__*/ (() => Schema.Struct({
+  "collection": Schema.Literals(["files","skills","skill-commands","slash-commands"]),
+  "cursor": Schema.OptionFromOptionalNullOr(Schema.String.check(Schema.isMaxLength(8192)), NULL_NONE),
+  "directory": optionalKey(Schema.String.check(Schema.isMaxLength(1024))),
+  "limit": Schema.OptionFromOptionalNullOr(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(Schema.isLessThanOrEqualTo(200)), NULL_NONE),
+  "native_session_id": Schema.String,
+  "owner_host_id": Schema.String,
+  "prefix": optionalKey(Schema.String.check(Schema.isMaxLength(160))),
+  "runtime_incarnation": Schema.String,
+  "session_id": Schema.String
+}).annotate({ identifier: "HarnessInventoryQuery" }))()
+export type HarnessInventoryQuery = typeof HarnessInventoryQuery.Type
+export type HarnessInventoryQueryEncoded = typeof HarnessInventoryQuery.Encoded
 
 export const HostRepositories = /*#__PURE__*/ (() => Schema.Struct({
   "host_id": Schema.String,

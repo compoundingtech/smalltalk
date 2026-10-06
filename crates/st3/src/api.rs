@@ -397,6 +397,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         )
         .route("/v1/client/agent-queues/{*id}", get(client_v0::agent_queue))
         .route("/v1/client/status-history/{*id}", get(client_v0::status_history))
+        .route("/v1/client/harness-inventory/{*id}", get(client_v0::inventory::read))
         .route("/v1/client/lanes", get(client_v0::lanes))
         .route("/v1/client/lanes/{*id}", get(client_v0::lane_detail))
         .route("/v1/client/history", get(client_history))
@@ -1150,6 +1151,7 @@ fn client_error_code(code: Option<&str>) -> String {
         | "runtime-authority-indeterminate"
         | "remote-unavailable"
         | "terminal-unavailable"
+        | "inventory-unavailable"
         | "terminal-ended"
         | "blob-too-large"
         | "unsupported-media-type"
@@ -4012,6 +4014,7 @@ fn remote_read_error(host: &str, error: anyhow::Error) -> ApiError {
         "page-cursor-expired"
             | "timeline-history-incomplete"
             | "cursor-gap"
+            | "inventory-unavailable"
             | "not-found"
             | "stale-fence"
             | "validation-failed"

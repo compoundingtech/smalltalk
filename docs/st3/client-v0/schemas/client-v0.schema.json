@@ -47,7 +47,7 @@
     "AgentState": {"anyOf": [{"enum": ["desired", "starting", "running", "waiting", "stopped", "failed", "suspended"]}, {"type": "string"}], "description": "Desired/observed agent seat state. `suspended`: the seat was stopped at a quiet boundary and resumes its own native session; see `suspension`."},
     "AgentReachability": {"anyOf": [{"enum": ["local", "remote", "unreachable", "unknown", "reachable", "indeterminate"]}, {"type": "string"}], "description": "Whether the daemon can currently reach the agent runtime."},
     "TimelineStatus": {"anyOf": [{"enum": ["queued", "running", "waiting", "completed", "failed", "cancelled"]}, {"type": "string"}], "description": "Run status reported in a timeline `status` entry."},
-    "ErrorCode": {"anyOf": [{"enum": ["attention-migrated", "not-found", "forbidden", "unsupported-capability", "validation-failed", "idempotency-conflict", "stale-fence", "cursor-gap", "page-cursor-expired", "rate-limited", "runtime-not-local", "runtime-authority-indeterminate", "remote-unavailable", "terminal-unavailable", "terminal-ended", "timeline-history-incomplete", "blob-too-large", "unsupported-media-type", "blob-content-mismatch", "blob-quota-exceeded", "blob-not-found", "blob-expired", "internal"]}, {"type": "string"}], "description": "Versioned safe error code; unknown codes fall back to `retryable`."},
+    "ErrorCode": {"anyOf": [{"enum": ["attention-migrated", "not-found", "forbidden", "unsupported-capability", "validation-failed", "idempotency-conflict", "stale-fence", "cursor-gap", "page-cursor-expired", "rate-limited", "runtime-not-local", "runtime-authority-indeterminate", "remote-unavailable", "terminal-unavailable", "inventory-unavailable", "terminal-ended", "timeline-history-incomplete", "blob-too-large", "unsupported-media-type", "blob-content-mismatch", "blob-quota-exceeded", "blob-not-found", "blob-expired", "internal"]}, {"type": "string"}], "description": "Versioned safe error code; unknown codes fall back to `retryable`."},
     "UnknownResource": {"allOf": [{"$ref": "#/$defs/ResourceHeader"}, {"type": "object", "properties": {"kind": {"type": "string", "not": {"enum": ["attention", "message", "launch", "launch-variant", "launch-decision", "launch-approval", "mission", "work", "agent", "runtime", "observer", "subscription", "lane", "machine", "device", "operation", "history", "session", "glass", "owned-set"]}}}}]},
     "OwnedSet": {"allOf": [{"$ref": "#/$defs/ResourceHeader"}, {"type": "object", "required": ["kind", "claim", "receipt", "blockers", "members_status", "visibility"], "properties": {"kind": {"const": "owned-set"}, "claim": {"type": "string"}, "receipt": {"type": "object"}, "blockers": {"type": "array", "items": {"type": "string"}}, "members_status": {"type": "array", "items": {"type": "object"}}, "visibility": {"type": "object"}, "commit_status": {"type": ["object", "null"]}}}]},
     "GlassLayout": {"oneOf": [{"type": "object", "additionalProperties": false, "required": ["tabs"], "properties": {"tabs": {"type": "array", "maxItems": 1024, "items": {"$ref": "#/$defs/GlassTab"}}}}, {"type": "object", "additionalProperties": false, "required": ["split", "children"], "properties": {"split": {"enum": ["right", "below"]}, "ratio": {"type": "number", "minimum": 0.1, "maximum": 0.9, "description": "First child share; absent means 0.5. Requires glasses capability version 2."}, "children": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"$ref": "#/$defs/GlassLayout"}}}}]},
@@ -2425,6 +2425,50 @@
           "properties": { "kind": { "const": "unsubscribe" }, "id": { "type": "string", "minLength": 1, "maxLength": 128 } }
         }
       ]
+    },
+    "HarnessInventoryQuery": {
+      "type": "object", "additionalProperties": false,
+      "required": ["owner_host_id", "session_id", "native_session_id", "runtime_incarnation", "collection"],
+      "properties": {
+        "owner_host_id": {"type": "string"},
+        "session_id": {"type": "string"},
+        "native_session_id": {"type": "string"},
+        "runtime_incarnation": {"type": "string"},
+        "collection": {"enum": ["files", "skills", "skill-commands", "slash-commands"]},
+        "directory": {"type": "string", "maxLength": 1024},
+        "prefix": {"type": "string", "maxLength": 160},
+        "limit": {"type": ["integer", "null"], "minimum": 1, "maximum": 200},
+        "cursor": {"type": ["string", "null"], "maxLength": 8192}
+      }
+    },
+    "HarnessInventoryItem": {
+      "type": "object", "additionalProperties": false,
+      "required": ["name", "kind", "source"],
+      "properties": {
+        "name": {"type": "string"},
+        "kind": {"enum": ["file", "directory", "skill-command", "slash-command"]},
+        "source": {"enum": ["extension", "prompt", "skill", null]}
+      }
+    },
+    "HarnessInventory": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "agent_id", "owner_host_id", "session_id", "native_session_id", "runtime_incarnation", "collection", "status", "coverage", "full_inventory", "reason", "observed_at", "items", "page"],
+      "properties": {
+        "kind": {"const": "harness-inventory"},
+        "agent_id": {"type": "string"},
+        "owner_host_id": {"type": "string"},
+        "session_id": {"type": "string"},
+        "native_session_id": {"type": ["string", "null"]},
+        "runtime_incarnation": {"type": "string"},
+        "collection": {"enum": ["files", "skills", "skill-commands", "slash-commands"]},
+        "status": {"enum": ["supported", "unsupported", "unavailable"]},
+        "coverage": {"enum": ["none", "native-workspace", "enabled-skill-commands", "dynamic-commands"]},
+        "full_inventory": {"type": "boolean"},
+        "reason": {"type": ["string", "null"]},
+        "observed_at": {"type": ["string", "null"]},
+        "items": {"type": "array", "maxItems": 200, "items": {"$ref": "#/$defs/HarnessInventoryItem"}},
+        "page": {"$ref": "#/$defs/PageInfo"}
+      }
     },
     "CollectionFrame": {
       "oneOf": [
