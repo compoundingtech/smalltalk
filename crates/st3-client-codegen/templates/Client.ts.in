@@ -6,7 +6,7 @@ import type {
     Arrangement, ArrangementId, ArrangementPage,
     PublicationDefinition, SubjectDefinition, AgentWorkspace, UsagePeriod, MailBacklog, ClientConnections, CollectionName, CollectionFrame, HostRepositories,
     ConversationChanges, ConversationSearch, ErrorEnvelope, EventPage, Page, PairingBegin, PairingChallenge,
-    PairingComplete, PairedSession, Resource, Snapshot, TerminalScreen, TimelinePage,
+    PairingComplete, PairedSession, Resource, Snapshot, TerminalScreen, TerminalHistory, TimelinePage,
 } from './Models.generated.ts';
 
 export type PageOptions = { cursor?: string; limit?: number };

@@ -80,6 +80,12 @@ pub enum ClientReadOperation {
         limit: usize,
         cursor: Option<String>,
     },
+    TerminalHistory {
+        terminal_id: String,
+        runtime_incarnation: String,
+        before: Option<String>,
+        limit: u16,
+    },
     TerminalScreen {
         terminal_id: String,
         /// Ask the owner for its best-effort session facts too.
@@ -1044,6 +1050,11 @@ async fn receive_client_read(
                     .value;
                 Ok(serde_json::to_value(value)?)
             }
+            ClientReadOperation::TerminalHistory { terminal_id, runtime_incarnation, before, limit } => {
+                anyhow::ensure!((1..=200).contains(&limit), "the history limit is invalid");
+                let value = client.terminal_history(&terminal_id, &runtime_incarnation, before.as_deref(), limit).await?.value;
+                Ok(serde_json::to_value(value)?)
+            }
             ClientReadOperation::TerminalScreen { terminal_id, facts } => {
                 let value = if facts {
                     client.terminal_screen_with_facts(&terminal_id).await?.value
@@ -1215,10 +1226,15 @@ async fn receive_client_read(
                             let status = match code {
                                 st3_client::ErrorCode::PageCursorExpired
                                 | st3_client::ErrorCode::CursorGap
-                                | st3_client::ErrorCode::BlobExpired => StatusCode::GONE,
+                                | st3_client::ErrorCode::BlobExpired
+                                | st3_client::ErrorCode::TerminalEnded => StatusCode::GONE,
                                 st3_client::ErrorCode::NotFound
                                 | st3_client::ErrorCode::BlobNotFound => StatusCode::NOT_FOUND,
-                                st3_client::ErrorCode::StaleFence => StatusCode::CONFLICT,
+                                st3_client::ErrorCode::StaleFence
+                                | st3_client::ErrorCode::HistoryCursorGap
+                                | st3_client::ErrorCode::HistoryAlternateScreen => StatusCode::CONFLICT,
+                                st3_client::ErrorCode::HistoryTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+                                st3_client::ErrorCode::TerminalUnavailable => StatusCode::SERVICE_UNAVAILABLE,
                                 _ => StatusCode::UNPROCESSABLE_ENTITY,
                             };
                             (
@@ -1558,6 +1574,7 @@ mod tests {
     }
 
     include!("peer/raw_terminal_tests.rs");
+    include!("peer/history_tests.rs");
 
     #[tokio::test]
     async fn a_gateway_streams_a_remote_terminal_through_owner_long_polls() {

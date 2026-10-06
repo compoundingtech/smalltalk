@@ -17,6 +17,7 @@ use libghostty_vt::style::{Style as GhosttyStyle, StyleColor, Underline};
 use libghostty_vt::terminal::{Mode, Point, PointCoordinate};
 use pty_terminal::{TerminalActor, TerminalEvent};
 use pty_core::protocol::{MessageType, PacketReader, decode_geometry, encode_peek};
+use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -468,38 +469,14 @@ impl Emulator {
                     y: row as u32,
                 })
             };
-            let mut line = ScreenLine::default();
-            for column in 0..columns {
-                let Ok(cell_ref) = term.grid_ref(point(column)) else {
-                    continue;
-                };
-                let cell = cell_ref.cell().ok();
-                let cells = match cell.and_then(|cell| cell.wide().ok()) {
-                    Some(CellWide::Wide) => 2,
-                    Some(CellWide::SpacerTail | CellWide::SpacerHead) => continue,
-                    _ => 1,
-                };
-                let pen = cell_ref.style().unwrap_or_default();
-                let link = cell
-                    .and_then(|cell| cell.has_hyperlink().ok())
-                    .unwrap_or(false)
-                    .then(|| read_link(&cell_ref, &mut uri))
-                    .flatten();
-                let style = Style::of(&pen, cell, link);
-                if pen.invisible {
-                    line.push(style, if cells == 2 { "  " } else { " " }, cells);
-                } else {
-                    read_text(&cell_ref, &mut graphemes, &mut text);
-                    line.push(style, &text, cells);
-                }
-            }
+            let line = project_row(term, columns, &point, &mut graphemes, &mut uri, &mut text, None);
             let wrapped = term
                 .grid_ref(point(0))
                 .ok()
                 .and_then(|cell| cell.row().ok())
                 .and_then(|row| row.is_wrap_continuation().ok())
                 .unwrap_or(false);
-            lines.push(line.finish().value(row, wrapped));
+            lines.push(line.value(row, wrapped));
         }
         let (style, blinking) = self.cursor_style();
         let mode = |mode| term.mode(mode).unwrap_or(false);
@@ -551,6 +528,191 @@ impl Emulator {
         );
         Screen { body, revision }
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct HistoryTooLarge;
+
+/// The existing client response budget, spent before retaining projected runs.
+pub(super) struct HistoryByteBudget {
+    remaining: usize,
+}
+
+impl HistoryByteBudget {
+    pub(super) const fn new(remaining: usize) -> Self {
+        Self { remaining }
+    }
+
+    pub(super) fn take(&mut self, bytes: usize) -> Result<(), HistoryTooLarge> {
+        self.remaining = self.remaining.checked_sub(bytes).ok_or(HistoryTooLarge)?;
+        Ok(())
+    }
+
+    pub(super) fn charge_json<T: Serialize + ?Sized>(
+        &mut self,
+        value: &T,
+    ) -> Result<(), HistoryTooLarge> {
+        serde_json::to_writer(self, value).map_err(|_| HistoryTooLarge)
+    }
+}
+
+impl std::io::Write for HistoryByteBudget {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.take(bytes.len())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::WriteZero))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Serialize)]
+struct HistoryLineHeader {
+    row: usize,
+    text: &'static str,
+    runs: &'static [Value],
+    wrapped: bool,
+    redacted: bool,
+    truncated: bool,
+}
+
+#[derive(Serialize)]
+struct RunValue<'a> {
+    text: &'a str,
+    cells: usize,
+    #[serde(flatten)]
+    style: &'a Style,
+}
+
+fn json_text_bytes(text: &str) -> usize {
+    text.bytes().map(|byte| match byte {
+        b'"' | b'\\' | b'\n' | b'\r' | b'\t' | 0x08 | 0x0c => 2,
+        0..=0x1f => 6,
+        _ => 1,
+    }).sum()
+}
+
+fn decimal_bytes(value: usize) -> usize {
+    value.checked_ilog10().unwrap_or(0) as usize + 1
+}
+
+/// Project bounded owner history rows using the screen's exact styled-cell contract.
+pub(super) fn history_lines(
+    columns: u16,
+    rows: &[pty_core::protocol::HistoryRow],
+    budget: &mut HistoryByteBudget,
+) -> Result<Vec<Value>, HistoryTooLarge> {
+    if rows.len() > TERMINAL_MAX_LINES {
+        return Err(HistoryTooLarge);
+    }
+    budget.take(2)?; // The enclosing lines array.
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut actor = TerminalActor::new(2, columns.max(1), 0);
+    let mut graphemes = vec![char::default(); 16];
+    let mut uri = vec![0_u8; 256];
+    let mut text = String::new();
+    let mut lines = Vec::with_capacity(rows.len());
+    for (row, retained) in rows.iter().enumerate() {
+        if row != 0 {
+            budget.take(1)?;
+        }
+        budget.charge_json(&HistoryLineHeader {
+            row, text: "", runs: &[], wrapped: retained.wrapped,
+            redacted: false, truncated: false,
+        })?;
+        actor.reset();
+        actor.write(retained.ansi.as_bytes());
+        let point = |column: usize| Point::Active(PointCoordinate { x: column as u16, y: 0 });
+        let line = project_row(
+            actor.terminal(), usize::from(columns), &point, &mut graphemes, &mut uri, &mut text,
+            Some(&mut *budget),
+        );
+        if line.truncated {
+            return Err(HistoryTooLarge);
+        }
+        lines.push(line.value(row, retained.wrapped));
+    }
+    Ok(lines)
+}
+
+fn cell_width(cell: Option<Cell>) -> Option<usize> {
+    match cell.and_then(|cell| cell.wide().ok()) {
+        Some(CellWide::Wide) => Some(2),
+        Some(CellWide::SpacerTail | CellWide::SpacerHead) => None,
+        _ => Some(1),
+    }
+}
+
+/// Do not charge or retain invisible trailing cells. Visible styled blanks remain
+/// in runs, but plain text stops at its last non-space cell, as in `finish`.
+fn history_column_bounds(
+    term: &libghostty_vt::terminal::Terminal<'_, '_>,
+    columns: usize,
+    point: &impl Fn(usize) -> Point,
+    graphemes: &mut Vec<char>,
+    text: &mut String,
+) -> (usize, usize) {
+    let mut runs_end = 0;
+    let mut text_end = 0;
+    for column in (0..columns).rev() {
+        let Ok(cell_ref) = term.grid_ref(point(column)) else { continue };
+        let cell = cell_ref.cell().ok();
+        let Some(cells) = cell_width(cell) else { continue };
+        let pen = cell_ref.style().unwrap_or_default();
+        if runs_end == 0 && !Style::of(&pen, cell, None).blank_is_invisible() {
+            runs_end = column + cells;
+        }
+        if !pen.invisible {
+            read_text(&cell_ref, graphemes, text);
+            if text.chars().any(|character| character != ' ') {
+                text_end = column + cells;
+                runs_end = runs_end.max(text_end);
+                break;
+            }
+        }
+    }
+    (runs_end.min(columns), text_end.min(columns))
+}
+
+fn project_row(
+    term: &libghostty_vt::terminal::Terminal<'_, '_>,
+    columns: usize,
+    point: &impl Fn(usize) -> Point,
+    graphemes: &mut Vec<char>,
+    uri: &mut Vec<u8>,
+    text: &mut String,
+    mut budget: Option<&mut HistoryByteBudget>,
+) -> ScreenLine {
+    let (columns, text_columns) = if budget.is_some() {
+        history_column_bounds(term, columns, point, graphemes, text)
+    } else {
+        (columns, columns)
+    };
+    let mut line = ScreenLine::default();
+    for column in 0..columns {
+        if line.truncated {
+            break;
+        }
+        let Ok(cell_ref) = term.grid_ref(point(column)) else { continue };
+        let cell = cell_ref.cell().ok();
+        let Some(cells) = cell_width(cell) else { continue };
+        let pen = cell_ref.style().unwrap_or_default();
+        let link = cell.and_then(|cell| cell.has_hyperlink().ok()).unwrap_or(false)
+            .then(|| read_link(&cell_ref, uri)).flatten();
+        let style = Style::of(&pen, cell, link);
+        let plain = column < text_columns;
+        if pen.invisible {
+            line.push(style, if cells == 2 { "  " } else { " " }, cells, plain, budget.as_deref_mut());
+        } else {
+            read_text(&cell_ref, graphemes, text);
+            line.push(style, text, cells, plain, budget.as_deref_mut());
+        }
+    }
+    line.finish()
 }
 
 fn read_text(cell: &GridRef<'_>, buffer: &mut Vec<char>, text: &mut String) {
@@ -617,16 +779,39 @@ impl Paint {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+impl Serialize for Paint {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match *self {
+            Self::Palette(index) => serializer.serialize_u8(index),
+            Self::Rgb(red, green, blue) => {
+                serializer.collect_str(&format_args!("#{red:02x}{green:02x}{blue:02x}"))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 struct Style {
+    #[serde(skip_serializing_if = "Option::is_none")]
     fg: Option<Paint>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     bg: Option<Paint>,
+    #[serde(skip_serializing_if = "style_flag_is_false")]
     bold: bool,
+    #[serde(skip_serializing_if = "style_flag_is_false")]
     dim: bool,
+    #[serde(skip_serializing_if = "style_flag_is_false")]
     italic: bool,
+    #[serde(skip_serializing_if = "style_flag_is_false")]
     underline: bool,
+    #[serde(skip_serializing_if = "style_flag_is_false")]
     inverse: bool,
+    #[serde(skip_serializing_if = "style_flag_is_false")]
     strikethrough: bool,
+    #[serde(skip_serializing_if = "Option::is_none", serialize_with = "serialize_style_link")]
     link: Option<String>,
 }
 
@@ -661,6 +846,24 @@ impl Style {
     }
 }
 
+fn style_flag_is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn serialize_style_link<S>(link: &Option<String>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    #[derive(Serialize)]
+    struct Link<'a> {
+        uri: &'a str,
+    }
+    match link {
+        Some(uri) => Link { uri }.serialize(serializer),
+        None => serializer.serialize_none(),
+    }
+}
+
 struct Run {
     text: String,
     cells: usize,
@@ -668,9 +871,9 @@ struct Run {
 }
 
 impl Run {
-    fn value(&self) -> Value {
+    fn value(self) -> Value {
         let mut value = serde_json::Map::new();
-        value.insert("text".into(), self.text.clone().into());
+        value.insert("text".into(), self.text.into());
         value.insert("cells".into(), self.cells.into());
         if let Some(fg) = self.style.fg {
             value.insert("fg".into(), fg.value());
@@ -690,8 +893,10 @@ impl Run {
                 value.insert(name.into(), true.into());
             }
         }
-        if let Some(uri) = &self.style.link {
-            value.insert("link".into(), json!({ "uri": uri }));
+        if let Some(uri) = self.style.link {
+            value.insert("link".into(), Value::Object(serde_json::Map::from_iter([
+                ("uri".into(), uri.into()),
+            ])));
         }
         Value::Object(value)
     }
@@ -708,7 +913,14 @@ struct ScreenLine {
 }
 
 impl ScreenLine {
-    fn push(&mut self, style: Style, text: &str, cells: usize) {
+    fn push(
+        &mut self,
+        style: Style,
+        text: &str,
+        cells: usize,
+        plain: bool,
+        budget: Option<&mut HistoryByteBudget>,
+    ) {
         if self.truncated {
             return;
         }
@@ -716,17 +928,36 @@ impl ScreenLine {
             self.truncated = true;
             return;
         }
-        self.bytes += text.len();
-        match self.runs.last_mut() {
-            Some(run) if run.style == style => {
-                run.text.push_str(text);
-                run.cells += cells;
+        let previous = self.runs.last().filter(|run| run.style == style);
+        let merge = previous.is_some();
+        if let Some(budget) = budget {
+            let text_bytes = json_text_bytes(text);
+            let charged = (|| {
+                if plain {
+                    budget.take(text_bytes)?;
+                }
+                match previous {
+                    Some(run) => budget.take(text_bytes + decimal_bytes(run.cells + cells) - decimal_bytes(run.cells)),
+                    None => {
+                        if !self.runs.is_empty() {
+                            budget.take(1)?;
+                        }
+                        budget.charge_json(&RunValue { text, cells, style: &style })
+                    }
+                }
+            })();
+            if charged.is_err() {
+                self.truncated = true;
+                return;
             }
-            _ => self.runs.push(Run {
-                text: text.to_owned(),
-                cells,
-                style,
-            }),
+        }
+        self.bytes += text.len();
+        if merge {
+            let run = self.runs.last_mut().expect("a matching last run exists");
+            run.text.push_str(text);
+            run.cells += cells;
+        } else {
+            self.runs.push(Run { text: text.to_owned(), cells, style });
         }
     }
 
@@ -752,15 +983,15 @@ impl ScreenLine {
         self
     }
 
-    fn value(&self, row: usize, wrapped: bool) -> Value {
-        json!({
-            "row": row,
-            "text": self.text,
-            "runs": self.runs.iter().map(Run::value).collect::<Vec<_>>(),
-            "wrapped": wrapped,
-            "redacted": false,
-            "truncated": self.truncated,
-        })
+    fn value(self, row: usize, wrapped: bool) -> Value {
+        Value::Object(serde_json::Map::from_iter([
+            ("row".into(), row.into()),
+            ("text".into(), self.text.into()),
+            ("runs".into(), Value::Array(self.runs.into_iter().map(Run::value).collect())),
+            ("wrapped".into(), wrapped.into()),
+            ("redacted".into(), false.into()),
+            ("truncated".into(), self.truncated.into()),
+        ]))
     }
 }
 
@@ -772,6 +1003,71 @@ mod tests {
         let mut emulator = Emulator::new(rows, columns, Title::default());
         emulator.feed(bytes);
         emulator.screen("fallback").value("terminal/demo", "1:now")
+    }
+
+    #[test]
+    fn retained_history_preserves_links_wide_cells_backgrounds_and_wraps() {
+        use pty_core::protocol::{HistoryRequest, HistoryResponse};
+        let mut owner = TerminalActor::new(2, 8, 100);
+        owner.write("\x1b[1;9;31m\x1b]8;;https://example.test/history\x1b\\A界\x1b]8;;\x1b\\\x1b[0m\r\n\x1b[44m\x1b[2K\x1b[0m\r\n123456789\r\nDONE\r\nLAST".as_bytes());
+        let HistoryResponse::Page { columns, rows, .. } =
+            owner.history("owner", &HistoryRequest { expected_generation: "owner".into(), limit: 200, before: None })
+        else { panic!("expected retained main-buffer page") };
+        let lines = history_lines(columns, &rows, &mut HistoryByteBudget::new(crate::api::CLIENT_MAX_RESPONSE_BYTES)).unwrap();
+        assert_eq!(lines[0]["text"], "A界");
+        assert_eq!(lines[0]["runs"], json!([{
+            "text": "A界", "cells": 3, "fg": 1, "bold": true,
+            "strikethrough": true, "link": { "uri": "https://example.test/history" },
+        }]));
+        assert_eq!(lines[1]["text"], "");
+        assert_eq!(lines[1]["runs"], json!([{ "text": "        ", "cells": 8, "bg": 4 }]));
+        assert_eq!(lines[2]["text"], "12345678");
+        assert_eq!(lines[2]["wrapped"], false);
+        assert_eq!(lines[3]["text"], "9");
+        assert_eq!(lines[3]["wrapped"], true);
+    }
+
+    #[test]
+    fn history_projection_preserves_exact_budget_prefix_and_visible_blanks() {
+        use pty_core::protocol::HistoryRow;
+        let rows = [
+            HistoryRow { ansi: "A\"\\\x1b[31mB\x1b[0m".into(), wrapped: false },
+            HistoryRow { ansi: " \x1b[44m \x1b[0m".into(), wrapped: true },
+        ];
+        let expected = json!([
+            {"row": 0, "text": "A\"\\B", "runs": [
+                {"text": "A\"\\", "cells": 3},
+                {"text": "B", "cells": 1, "fg": 1}
+            ], "wrapped": false, "redacted": false, "truncated": false},
+            {"row": 1, "text": "", "runs": [
+                {"text": " ", "cells": 1},
+                {"text": " ", "cells": 1, "bg": 4}
+            ], "wrapped": true, "redacted": false, "truncated": false}
+        ]);
+        let bytes = serde_json::to_vec(&expected).unwrap().len();
+        let lines = history_lines(8, &rows, &mut HistoryByteBudget::new(bytes)).unwrap();
+        assert_eq!(Value::Array(lines), expected);
+        assert_eq!(
+            history_lines(8, &rows, &mut HistoryByteBudget::new(bytes - 1)).unwrap_err(),
+            HistoryTooLarge,
+        );
+    }
+
+    #[test]
+    fn history_projection_rejects_repeated_long_link_amplification() {
+        use pty_core::protocol::HistoryRow;
+        let link = format!("https://example.test/{}", "x".repeat(1979));
+        let cells = "\x1b[0m\x1b[38;5;1mA\x1b[0m\x1b[38;5;2mB".repeat(2048);
+        let ansi = format!("\x1b]8;;{link}\x1b\\{cells}\x1b]8;;\x1b\\\x1b[0m");
+        // 35 rows fit the producer's 64 KiB row and 2 MiB ANSI-page bounds,
+        // but copying this admitted 2,000-byte link into every run does not.
+        let rows = vec![HistoryRow { ansi, wrapped: false }; 35];
+        assert_eq!(
+            history_lines(4096, &rows, &mut HistoryByteBudget::new(
+                crate::api::CLIENT_MAX_RESPONSE_BYTES.saturating_sub(128_000),
+            )).unwrap_err(),
+            HistoryTooLarge,
+        );
     }
 
     #[test]

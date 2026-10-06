@@ -32,8 +32,8 @@ ratatui-image = { version = "11", default-features = false, features = ["crosste
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 # Agent terminals attached through their PTY session (the gateway's raw stream), drawn here.
 alacritty_terminal = { version = "0.26", default-features = false }
-pty-client = { git = "https://github.com/compoundingtech/pty", rev = "ef0aaf96ede0ee5873ac7c659188a4cb45d1a18f" }
-pty-core = { git = "https://github.com/compoundingtech/pty", rev = "ef0aaf96ede0ee5873ac7c659188a4cb45d1a18f" }
+pty-client = { git = "https://github.com/compoundingtech/pty", rev = "e86580686a2a36e99cd439a8ddef6527e3a0b84c" }
+pty-core = { git = "https://github.com/compoundingtech/pty", rev = "e86580686a2a36e99cd439a8ddef6527e3a0b84c" }
 
 [[bin]]
 name = "stui"

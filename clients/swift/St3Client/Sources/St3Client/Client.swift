@@ -198,6 +198,7 @@ public actor St3Client {
     public func conversationSearch(text: String, agent: String? = nil, since: String? = nil, cursor: String? = nil, limit: Int? = nil) async throws -> Envelope<ConversationSearch> { var query: [URLQueryItem] = [.init(name: "text", value: text)]; for (name, value) in [("agent", agent), ("since", since), ("cursor", cursor)] { if let value { query.append(.init(name: name, value: value)) } }; if let limit { query.append(.init(name: "limit", value: String(limit))) }; return try await get("v1/client/conversations/search", query: query) }
     public func arrangementsList(person: String, cursor: String? = nil, limit: Int? = nil) async throws -> Envelope<ArrangementPage> { var query: [URLQueryItem] = [.init(name: "person", value: person)]; if let cursor { query.append(.init(name: "cursor", value: cursor)) }; if let limit { query.append(.init(name: "limit", value: String(limit))) }; return try await get("v1/client/arrangements", query: query) }
     public func arrangementsGet(personName: String, uuid: String) async throws -> Envelope<Arrangement> { try await get("v1/client/arrangements/\(Self.routedSessionID(personName))/\(Self.routedSessionID(uuid))") }
+    public func terminalHistory(_ id: String, runtimeIncarnation: String, before: String? = nil, limit: Int = 100) async throws -> Envelope<TerminalHistory> { let routedID = id.hasPrefix("terminal/") ? String(id.dropFirst("terminal/".count)) : id; var query: [URLQueryItem] = [.init(name: "runtime_incarnation", value: runtimeIncarnation), .init(name: "limit", value: String(limit))]; if let before { query.append(.init(name: "before", value: before)) }; return try await get("v1/client/terminals/\(Self.encodedPathSegment(routedID))/history", query: query) }
     public func glassesList(cursor: String? = nil, limit: Int? = nil, history: Bool = false) async throws -> Envelope<ResourcePage> { try await list("glasses", cursor: cursor, limit: limit, history: history) }
     public func glassesGet(id: String) async throws -> Envelope<Resource> { try await resource("glasses", id: id) }
     public func agentCreate(id: String, idempotencyKey: String, fence: Fence, parameters: AgentCreateParameters) async throws -> Envelope<ActionResult> { try await submit(try .agentCreate(id: id, idempotencyKey: idempotencyKey, fence: fence, parameters: parameters)) }
@@ -306,7 +307,11 @@ public actor St3Client {
 
     static func routedSessionID(_ value: String) -> String {
         let innerID = value.hasPrefix("session/") ? String(value.dropFirst("session/".count)) : value
+        return encodedPathSegment(innerID)
+    }
+
+    private static func encodedPathSegment(_ value: String) -> String {
         let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_.~"))
-        return innerID.addingPercentEncoding(withAllowedCharacters: allowed) ?? ""
+        return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? ""
     }
 }

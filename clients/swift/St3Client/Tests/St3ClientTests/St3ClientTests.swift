@@ -1,5 +1,8 @@
 import XCTest
 @testable import St3Client
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 final class St3ClientTests: XCTestCase {
     func testCreationActionFixtures() throws {
@@ -57,6 +60,28 @@ final class St3ClientTests: XCTestCase {
     func testTimelineRouteIDStripsPrefixAndEncodesOneSegment() {
         XCTAssertEqual(St3Client.routedSessionID("session/release-agent/9"), "release-agent%2F9")
         XCTAssertEqual(St3Client.routedSessionID("release agent/9"), "release%20agent%2F9")
+    }
+    func testTerminalHistorySubjectIsOnePathSegmentAndCursorRemainsQueryData() async {
+        let cases: [(String, URLProtocol.Type)] = [
+            ("terminal/agent/team/history #+%", HistoryRouteProtocol.self),
+            ("terminal/session/team/history #+%", SessionHistoryRouteProtocol.self),
+        ]
+        for (subject, probe) in cases {
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.protocolClasses = [probe]
+            let session = URLSession(configuration: configuration)
+            defer { session.invalidateAndCancel() }
+            let client = St3Client(fabricLoopbackURL: URL(string: "https://history.invalid/api")!, session: session)
+            do {
+                _ = try await client.terminalHistory(subject,
+                    runtimeIncarnation: "42:created+at", before: "generation:cursor+one", limit: 2)
+                XCTFail("The route probe intentionally cancels the request")
+            } catch let error as URLError {
+                XCTAssertEqual(error.code, .cancelled)
+            } catch {
+                XCTFail("Unexpected transport error: \(error)")
+            }
+        }
     }
 
     func testCapabilitiesFixtureDecodes() throws {
@@ -191,5 +216,30 @@ final class St3ClientTests: XCTestCase {
         XCTAssertEqual(unknown.fields["name"], .string("Pinned"))
         let again = try JSONDecoder().decode(Resource.self, from: JSONEncoder().encode(resource))
         XCTAssertEqual(again.id, resource.id)
+    }
+}
+
+private class HistoryRouteProtocol: URLProtocol {
+    var expectedPath: String {
+        "/api/v1/client/terminals/agent%2Fteam%2Fhistory%20%23%2B%25/history"
+    }
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        let components = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)!
+        XCTAssertEqual(components.percentEncodedPath, expectedPath)
+        let query = Dictionary(uniqueKeysWithValues: components.queryItems!.map { ($0.name, $0.value!) })
+        XCTAssertEqual(query["runtime_incarnation"], "42:created+at")
+        XCTAssertEqual(query["before"], "generation:cursor+one")
+        XCTAssertEqual(query["limit"], "2")
+        XCTAssertFalse(components.percentEncodedQuery!.contains("+"))
+        self.client?.urlProtocol(self, didFailWithError: URLError(.cancelled))
+    }
+    override func stopLoading() {}
+}
+
+private final class SessionHistoryRouteProtocol: HistoryRouteProtocol {
+    override var expectedPath: String {
+        "/api/v1/client/terminals/session%2Fteam%2Fhistory%20%23%2B%25/history"
     }
 }

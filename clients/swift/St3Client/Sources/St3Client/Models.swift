@@ -44,6 +44,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
     case staleFence, cursorGap, pageCursorExpired, rateLimited
     case runtimeNotLocal, runtimeAuthorityIndeterminate, remoteUnavailable, `internal`
     case terminalUnavailable, terminalEnded, timelineHistoryIncomplete
+    case historyCursorGap, historyAlternateScreen, historyTooLarge
     case blobTooLarge, unsupportedMediaType, blobContentMismatch, blobQuotaExceeded, blobNotFound, blobExpired
     case unknown(String)
 
@@ -66,6 +67,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
         case "rate-limited": .rateLimited; case "runtime-not-local": .runtimeNotLocal
         case "timeline-history-incomplete": .timelineHistoryIncomplete
         case "terminal-unavailable": .terminalUnavailable; case "terminal-ended": .terminalEnded
+        case "history-cursor-gap": .historyCursorGap; case "history-alternate-screen": .historyAlternateScreen; case "history-too-large": .historyTooLarge
         case "blob-too-large": .blobTooLarge; case "unsupported-media-type": .unsupportedMediaType; case "blob-content-mismatch": .blobContentMismatch
         case "blob-quota-exceeded": .blobQuotaExceeded; case "blob-not-found": .blobNotFound; case "blob-expired": .blobExpired
         case "runtime-authority-indeterminate": .runtimeAuthorityIndeterminate; case "remote-unavailable": .remoteUnavailable; case "internal": .internal
@@ -90,6 +92,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
         case .rateLimited: "rate-limited"; case .runtimeNotLocal: "runtime-not-local"
         case .timelineHistoryIncomplete: "timeline-history-incomplete"
         case .terminalUnavailable: "terminal-unavailable"; case .terminalEnded: "terminal-ended"
+        case .historyCursorGap: "history-cursor-gap"; case .historyAlternateScreen: "history-alternate-screen"; case .historyTooLarge: "history-too-large"
         case .blobTooLarge: "blob-too-large"; case .unsupportedMediaType: "unsupported-media-type"; case .blobContentMismatch: "blob-content-mismatch"
         case .blobQuotaExceeded: "blob-quota-exceeded"; case .blobNotFound: "blob-not-found"; case .blobExpired: "blob-expired"
         case .runtimeAuthorityIndeterminate: "runtime-authority-indeterminate"; case .remoteUnavailable: "remote-unavailable"; case .internal: "internal"
@@ -561,6 +564,7 @@ public enum TerminalColor: Codable, Sendable, Equatable {
 }
 public struct TerminalCursor: Codable, Sendable { public let row: Int; public let column: Int; public let visible: Bool; public let style: String; public let blinking: Bool }
 public struct TerminalModes: Codable, Sendable { public let alternateScreen: Bool; public let applicationCursor: Bool; public let applicationKeypad: Bool; public let bracketedPaste: Bool; public let focusEvents: Bool; public let mouseTracking: String; public let mouseEncoding: String; public let kittyKeyboard: UInt32?; enum CodingKeys: String, CodingKey { case alternateScreen = "alternate_screen", applicationCursor = "application_cursor", applicationKeypad = "application_keypad", bracketedPaste = "bracketed_paste", focusEvents = "focus_events", mouseTracking = "mouse_tracking", mouseEncoding = "mouse_encoding", kittyKeyboard = "kitty_keyboard" } }
+public struct TerminalHistory: Codable, Sendable { public let kind: String; public let terminalID: String; public let runtimeIncarnation: String; public let columns: Int; public let retainedRows: Int; public let lines: [TerminalLine]; public let nextBefore: String?; public let retention: String; enum CodingKeys: String, CodingKey { case kind, terminalID = "terminal_id", runtimeIncarnation = "runtime_incarnation", columns, retainedRows = "retained_rows", lines, nextBefore = "next_before", retention } }
 public struct TerminalScreen: Codable, Sendable { public let kind: String; public let terminalID: String; public let runtimeIncarnation: String; public let revision: String; public let rows: Int; public let columns: Int; public let cursor: TerminalCursor; public let title: String; public let modes: TerminalModes; public let lines: [TerminalLine]; public let nextSequence: UInt64; public let truncated: Bool; public let facts: TerminalFacts?; public let relay: TerminalRelay?; enum CodingKeys: String, CodingKey { case kind, terminalID = "terminal_id", runtimeIncarnation = "runtime_incarnation", revision, rows, columns, cursor, title, modes, lines, nextSequence = "next_sequence", truncated, facts, relay } }
 public struct TerminalFacts: Codable, Sendable { public let rows: Int?; public let columns: Int?; public let clients: TerminalClients?; public let process: TerminalProcess?; public let uptimeS: UInt64?; public let tags: [String: String]?; enum CodingKeys: String, CodingKey { case rows, columns, clients, process, uptimeS = "uptime_s", tags } }
 public struct TerminalClients: Codable, Sendable { public let total: Int; public let attached: Int; public let readOnly: Int; enum CodingKeys: String, CodingKey { case total, attached, readOnly = "read_only" } }

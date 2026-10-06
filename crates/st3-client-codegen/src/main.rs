@@ -265,6 +265,11 @@ fn rust_operation_methods(
             )?;
         } else if id == "status-history.get" {
             writeln!(out, "    pub async fn status_history_get(&self, id: &str) -> Result<Envelope<StatusHistory>, ClientError> {{ self.get(&format!(\"/v1/client/status-history/{{}}\", percent_encode(id))).await }}")?;
+        } else if id == "terminal.history" {
+            writeln!(
+                out,
+                "    pub async fn terminal_history(&self, terminal_id: &str, runtime_incarnation: &str, before: Option<&str>, limit: u16) -> Result<Envelope<TerminalHistory>, ClientError> {{ self.terminal_history_internal(terminal_id, runtime_incarnation, before, limit).await }}"
+            )?;
         } else if id == "agent-queue.get" {
             writeln!(
                 out,
@@ -365,6 +370,11 @@ fn swift_operation_methods(
                 | "agent-queue.get"
         ) {
             continue;
+        } else if id == "terminal.history" {
+            writeln!(
+                out,
+                "    public func terminalHistory(_ id: String, runtimeIncarnation: String, before: String? = nil, limit: Int = 100) async throws -> Envelope<TerminalHistory> {{ let routedID = id.hasPrefix(\"terminal/\") ? String(id.dropFirst(\"terminal/\".count)) : id; var query: [URLQueryItem] = [.init(name: \"runtime_incarnation\", value: runtimeIncarnation), .init(name: \"limit\", value: String(limit))]; if let before {{ query.append(.init(name: \"before\", value: before)) }}; return try await get(\"v1/client/terminals/\\(Self.encodedPathSegment(routedID))/history\", query: query) }}"
+            )?;
         } else if id == "conversation.search" {
             writeln!(
                 out,
@@ -664,6 +674,7 @@ fn validate_surfaces(
         "PairedSession",
         "TerminalAttachment",
         "TerminalScreen",
+        "TerminalHistory",
         "TerminalLine",
         "TerminalRun",
         "TerminalModes",
@@ -1226,6 +1237,11 @@ fn typescript_operation_methods(
             writeln!(
                 out,
                 "    async {method}(id: string, options: {{ after?: string; wait_ms?: number }} = {{}}): Promise<EnvelopeOf<{response}>> {{ return this.get(`{route}` + query(options)); }}"
+            )?;
+        } else if id == "terminal.history" {
+            writeln!(
+                out,
+                "    async {method}(id: string, runtimeIncarnation: string, options: {{ before?: string; limit?: number }} = {{}}): Promise<EnvelopeOf<{response}>> {{ bounded(options.limit, 200, 'limit'); return this.get(`{route}` + query({{ runtime_incarnation: runtimeIncarnation, ...options }})); }}"
             )?;
         } else if id == "timeline.list" || id == "terminal.screen" || id.ends_with(".get") {
             let query_suffix = if id == "timeline.list" {

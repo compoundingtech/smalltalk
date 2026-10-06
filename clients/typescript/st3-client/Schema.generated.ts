@@ -2277,6 +2277,19 @@ export const SubjectDefinition = /*#__PURE__*/ (() => Schema.Struct({
 export type SubjectDefinition = typeof SubjectDefinition.Type
 export type SubjectDefinitionEncoded = typeof SubjectDefinition.Encoded
 
+export const TerminalHistory = /*#__PURE__*/ (() => Schema.Struct({
+  "columns": Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)),
+  "kind": Schema.Literal("terminal-history"),
+  "lines": Schema.Array(TerminalLine).check(Schema.isMaxLength(200)),
+  "next_before": Schema.OptionFromNullOr(Schema.String.check(Schema.isMaxLength(128))),
+  "retained_rows": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "retention": Schema.Literal("owner-memory"),
+  "runtime_incarnation": Schema.String.check(Schema.isMinLength(1)),
+  "terminal_id": TerminalId
+}).annotate({ identifier: "TerminalHistory" }))()
+export type TerminalHistory = typeof TerminalHistory.Type
+export type TerminalHistoryEncoded = typeof TerminalHistory.Encoded
+
 export const TimelinePage = /*#__PURE__*/ (() => Schema.Struct({
   "items": Schema.Array(TimelineEntry),
   "kind": Schema.Literal("timeline-page"),
@@ -2371,13 +2384,13 @@ export const Envelope = /*#__PURE__*/ (() => Schema.Struct({
   "api_version": Schema.Literal("st3.client.v0"),
   "request_id": RequestId,
   "snapshot": Snapshot,
-  "value": Schema.Union([Capabilities, DocumentContent, SubjectDefinition, PublicationDefinition, AgentWorkspace, Page, ResourcesPage, Resource, TimelinePage, ConversationChanges, ConversationSearch, EventPage, ActionResult, PairingChallenge, PairedSession, TerminalScreen, StatusHistory, AgentQueue, UsagePeriod, MailBacklog], { mode: "oneOf" })
+  "value": Schema.Union([Capabilities, DocumentContent, SubjectDefinition, PublicationDefinition, AgentWorkspace, Page, ResourcesPage, Resource, TimelinePage, ConversationChanges, ConversationSearch, EventPage, ActionResult, PairingChallenge, PairedSession, TerminalScreen, StatusHistory, TerminalHistory, AgentQueue, UsagePeriod, MailBacklog], { mode: "oneOf" })
 }).annotate({ identifier: "Envelope" }))()
 export type Envelope = typeof Envelope.Type
 export type EnvelopeEncoded = typeof Envelope.Encoded
 
 /** Versioned safe error code; unknown codes fall back to `retryable`. Arrangement admission and validation refusals are non-retryable. */
-export const ErrorCode = /*#__PURE__*/ (() => openEnum(["attention-migrated","arrangement-exists","arrangement-folder-exists","arrangement-retired","arrangement-limit","arrangement-folder-deleted","arrangement-cycle","arrangement-body-too-large","arrangement-owner-forbidden","invalid-arrangement-subject","invalid-arrangement-action","invalid-arrangement-operations","invalid-arrangement-folder","invalid-arrangement-name","invalid-arrangement-key","invalid-subject-reference","not-found","forbidden","unsupported-capability","validation-failed","idempotency-conflict","stale-fence","cursor-gap","page-cursor-expired","rate-limited","runtime-not-local","runtime-authority-indeterminate","remote-unavailable","terminal-unavailable","terminal-ended","timeline-history-incomplete","blob-too-large","unsupported-media-type","blob-content-mismatch","blob-quota-exceeded","blob-not-found","blob-expired","internal"]).annotate({ identifier: "ErrorCode", description: "Versioned safe error code; unknown codes fall back to `retryable`. Arrangement admission and validation refusals are non-retryable." }))()
+export const ErrorCode = /*#__PURE__*/ (() => openEnum(["attention-migrated","arrangement-exists","arrangement-folder-exists","arrangement-retired","arrangement-limit","arrangement-folder-deleted","arrangement-cycle","arrangement-body-too-large","arrangement-owner-forbidden","invalid-arrangement-subject","invalid-arrangement-action","invalid-arrangement-operations","invalid-arrangement-folder","invalid-arrangement-name","invalid-arrangement-key","invalid-subject-reference","not-found","forbidden","unsupported-capability","validation-failed","idempotency-conflict","stale-fence","cursor-gap","history-cursor-gap","history-alternate-screen","history-too-large","page-cursor-expired","rate-limited","runtime-not-local","runtime-authority-indeterminate","remote-unavailable","terminal-unavailable","terminal-ended","timeline-history-incomplete","blob-too-large","unsupported-media-type","blob-content-mismatch","blob-quota-exceeded","blob-not-found","blob-expired","internal"]).annotate({ identifier: "ErrorCode", description: "Versioned safe error code; unknown codes fall back to `retryable`. Arrangement admission and validation refusals are non-retryable." }))()
 export type ErrorCode = typeof ErrorCode.Type
 export type ErrorCodeEncoded = typeof ErrorCode.Encoded
 

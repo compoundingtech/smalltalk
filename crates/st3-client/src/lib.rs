@@ -557,7 +557,10 @@ pub fn plain_message(code: Option<&ErrorCode>, message: &str) -> String {
         ErrorCode::NotFound => format!("it is gone: {message}"),
         ErrorCode::Forbidden => format!("not allowed: {message}"),
         ErrorCode::Internal => format!("st hit a problem: {message}"),
-        ErrorCode::TimelineHistoryIncomplete => message.to_owned(),
+        ErrorCode::TimelineHistoryIncomplete
+        | ErrorCode::HistoryCursorGap
+        | ErrorCode::HistoryAlternateScreen
+        | ErrorCode::HistoryTooLarge => message.to_owned(),
         ErrorCode::TerminalEnded => "the terminal ended: its process exited".into(),
         ErrorCode::TerminalUnavailable => "the terminal cannot be reached right now".into(),
         ErrorCode::BlobTooLarge => "the image is too large; the limit is 10 MiB".into(),
@@ -1624,6 +1627,16 @@ impl Client {
         ))
         .await
     }
+    pub async fn terminal_history(
+        &self,
+        terminal_id: &str,
+        runtime_incarnation: &str,
+        before: Option<&str>,
+        limit: u16,
+    ) -> Result<Envelope<TerminalHistory>, ClientError> {
+        self.terminal_history_internal(terminal_id, runtime_incarnation, before, limit)
+            .await
+    }
     pub async fn glasses_list(
         &self,
         cursor: Option<&str>,
@@ -2267,6 +2280,30 @@ impl Client {
     ) -> Result<Envelope<AgentQueue>, ClientError> {
         self.get(&format!("/v1/client/agent-queues/{agent_id}"))
             .await
+    }
+    async fn terminal_history_internal(
+        &self,
+        terminal_id: &str,
+        runtime_incarnation: &str,
+        before: Option<&str>,
+        limit: u16,
+    ) -> Result<Envelope<TerminalHistory>, ClientError> {
+        let mut query = vec![
+            format!(
+                "runtime_incarnation={}",
+                percent_encode(runtime_incarnation)
+            ),
+            format!("limit={limit}"),
+        ];
+        if let Some(before) = before {
+            query.push(format!("before={}", percent_encode(before)));
+        }
+        self.get(&format!(
+            "/v1/client/terminals/{}/history?{}",
+            percent_encode_segment(terminal_id.trim_start_matches("terminal/")),
+            query.join("&"),
+        ))
+        .await
     }
     async fn terminal_screen_internal(
         &self,
