@@ -490,6 +490,23 @@ mod tests {
         let resumed = store.current_harness("agent/cedar").unwrap().unwrap();
         assert_eq!(resumed.state, "working");
         assert!(resumed.blocked_on.is_none());
+
+        store
+            .append_latest_observation(
+                &input(
+                    "harness.observed",
+                    json!({
+                        "state":"working", "incarnation_id":"one", "observed_at_ms":(at + 3) as u64,
+                        "blocked_on":"human", "ask":"question", "reason":"waitingOnUserInput"
+                    }),
+                ),
+                at + 3,
+            )
+            .unwrap();
+        assert_eq!(
+            store.current_harness("agent/cedar").unwrap().unwrap().state,
+            "working"
+        );
     }
 
     #[test]

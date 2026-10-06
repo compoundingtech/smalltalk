@@ -18264,8 +18264,10 @@ fn publish_changed_harness_state_tx(
         .map_or(now, u128::from).min(now);
     let same_state = latest.as_ref().is_some_and(|claim| {
         claim.body["fields"]["state"] == fields["state"]
-            && (claim.body["fields"]["blocked_on"] == "human")
-                == (fields.get("blocked_on").and_then(Value::as_str) == Some("human"))
+            && ((claim.body["fields"]["blocked_on"] == "human"
+                && claim.body["fields"]["ask"] == "permission")
+                == (fields.get("blocked_on").and_then(Value::as_str) == Some("human")
+                    && fields.get("ask").and_then(Value::as_str) == Some("permission")))
             && claim.body["fields"].get("provider_auth") == fields.get("provider_auth")
             && claim.body["fields"].get("incarnation_id") == fields.get("incarnation_id")
     });
@@ -20477,7 +20479,8 @@ fn current_harness_fold_at(
     if let Some((claim, _store_index, observed_at_unix_ms, key)) = work_activity
         && include_work_activity
         && key > runtime_key
-        && optional.get("blocked_on").and_then(|v| v.as_deref()) != Some("human")
+        && !(optional.get("blocked_on").and_then(|v| v.as_deref()) == Some("human")
+            && optional.get("ask").and_then(|v| v.as_deref()) == Some("permission"))
         && current
             .as_ref()
             .is_none_or(|(_, _, _, harness_key)| key > *harness_key)
@@ -20500,7 +20503,9 @@ fn current_harness_fold_at(
     let Some((mut state, claim, observed_at_unix_ms, _)) = current else {
         return Ok(None);
     };
-    if optional.get("blocked_on").and_then(|v| v.as_deref()) == Some("human") {
+    if optional.get("blocked_on").and_then(|v| v.as_deref()) == Some("human")
+        && optional.get("ask").and_then(|v| v.as_deref()) == Some("permission")
+    {
         state = "blocked".into();
     }
     if optional.get("reason").and_then(|r| r.as_deref()) == Some("providerAuth") {

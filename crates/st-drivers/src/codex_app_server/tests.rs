@@ -3452,6 +3452,7 @@ fn successful_resume_with_wrong_model_or_effort_fails_before_binding() {
         (Some("gpt-6-sol"), Some("high")),
         (Some("gpt-6.1-sol"), Some("medium")),
         (None, Some("high")),
+        (Some("gpt-6.1-sol-2026-10-06"), Some("high")),
     ] {
         let tmp = tempfile::tempdir().unwrap();
         let _stop_exclusive = stop_flag_tests();
@@ -4401,8 +4402,7 @@ fn a_native_seat_restart_retires_the_old_thread_binding() {
         "the old binding must not make this seat ready"
     );
     let prepared =
-        prepare_controlled_launch_args("unix:///server.sock", &[], selected.as_deref(), true, None)
-            .unwrap();
+        prepare_controlled_launch_args("unix:///server.sock", &[], selected.as_deref()).unwrap();
     assert!(!prepared.tui_args.iter().any(|arg| arg == "resume"));
     assert!(prepared.expected_resume.is_none());
 }
@@ -6494,14 +6494,9 @@ fn automatic_remote_resume_omits_permission_overrides_but_fresh_launch_is_exact(
         "remote resume must not send provider-rejected permission overrides"
     );
 
-    let prepared = prepare_controlled_launch_args(
-        "unix:///server.sock",
-        &authored,
-        Some("thread-prior"),
-        true,
-        None,
-    )
-    .unwrap();
+    let prepared =
+        prepare_controlled_launch_args("unix:///server.sock", &authored, Some("thread-prior"))
+            .unwrap();
     assert!(
         prepared
             .server_args
@@ -6572,14 +6567,9 @@ fn automatic_remote_resume_omits_permission_overrides_but_fresh_launch_is_exact(
         "--dangerously-bypass-hook-trust".into(),
         "boot".into(),
     ];
-    let prepared = prepare_controlled_launch_args(
-        "unix:///server.sock",
-        &standing_seat,
-        Some("thread-prior"),
-        true,
-        None,
-    )
-    .unwrap();
+    let prepared =
+        prepare_controlled_launch_args("unix:///server.sock", &standing_seat, Some("thread-prior"))
+            .unwrap();
     assert!(
         prepared
             .server_args
@@ -6635,29 +6625,45 @@ fn automatic_remote_resume_omits_permission_overrides_but_fresh_launch_is_exact(
 }
 
 #[test]
-fn unattended_codex_defaults_approval_policy_without_overriding_a_declaration() {
+fn unattended_codex_defaults_only_after_provider_reports_no_policy() {
     let endpoint = "unix:///server.sock";
     let plain = vec!["--model".into(), "gpt-6.1-sol".into(), "boot".into()];
-    let fresh = prepare_controlled_launch_args(endpoint, &plain, None, true, None).unwrap();
+    let mut fresh = prepare_controlled_launch_args(endpoint, &plain, None).unwrap();
     assert!(
-        fresh
+        !fresh
             .server_args
-            .windows(2)
-            .any(|v| v == ["-c", "approval_policy=\"never\""])
+            .iter()
+            .any(|v| v == "approval_policy=\"never\"")
     );
+    project_effective_approval(
+        &mut fresh.tui_args,
+        &mut fresh.resume_permissions,
+        &plain,
+        None,
+        true,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
     assert_eq!(
-        &fresh.tui_args[..6],
-        [
-            "--remote",
-            endpoint,
-            "--ask-for-approval",
-            "never",
-            "--model",
-            "gpt-6.1-sol"
-        ]
+        &fresh.tui_args[..4],
+        ["--remote", endpoint, "--ask-for-approval", "never"]
     );
-    let resumed =
-        prepare_controlled_launch_args(endpoint, &plain, Some("saved-thread"), true, None).unwrap();
+
+    let mut resumed =
+        prepare_controlled_launch_args(endpoint, &plain, Some("saved-thread")).unwrap();
+    project_effective_approval(
+        &mut resumed.tui_args,
+        &mut resumed.resume_permissions,
+        &plain,
+        Some("saved-thread"),
+        true,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
     assert_eq!(
         resumed
             .resume_permissions
@@ -6667,18 +6673,13 @@ fn unattended_codex_defaults_approval_policy_without_overriding_a_declaration() 
             .as_deref(),
         Some("never")
     );
-    assert_eq!(
-        resumed.tui_args,
-        [
-            "--remote",
-            endpoint,
-            "resume",
-            "--model",
-            "gpt-6.1-sol",
-            "saved-thread",
-            "boot"
-        ]
+    assert!(
+        !resumed
+            .tui_args
+            .iter()
+            .any(|value| value == "--ask-for-approval")
     );
+    assert_eq!(resumed.tui_args[2], "resume");
 
     for explicit in [
         vec!["--ask-for-approval=on-request".into(), "boot".into()],
@@ -6688,30 +6689,11 @@ fn unattended_codex_defaults_approval_policy_without_overriding_a_declaration() 
             "boot".into(),
         ],
     ] {
-        let fresh = prepare_controlled_launch_args(endpoint, &explicit, None, true, None).unwrap();
-        assert!(
-            !fresh
-                .server_args
-                .iter()
-                .any(|v| v == "approval_policy=\"never\"")
-        );
-        assert!(
-            !fresh
-                .tui_args
-                .windows(2)
-                .any(|v| v == ["--ask-for-approval", "never"])
-        );
-        let resumed =
-            prepare_controlled_launch_args(endpoint, &explicit, Some("saved-thread"), true, None)
-                .unwrap();
-        assert!(
-            !resumed
-                .server_args
-                .iter()
-                .any(|v| v == "approval_policy=\"never\"")
-        );
+        assert!(authored_approval_policy(&explicit).unwrap());
+        let prepared =
+            prepare_controlled_launch_args(endpoint, &explicit, Some("saved-thread")).unwrap();
         assert_eq!(
-            resumed
+            prepared
                 .resume_permissions
                 .as_ref()
                 .and_then(|v| v.approval_policy.as_deref()),
@@ -6732,8 +6714,7 @@ fn compact_model_and_ordered_config_overrides_reach_the_typed_resume() {
         "-aon-request".into(),
         "boot".into(),
     ];
-    let prepared =
-        prepare_controlled_launch_args(endpoint, &args, Some("thread-prior"), true, None).unwrap();
+    let prepared = prepare_controlled_launch_args(endpoint, &args, Some("thread-prior")).unwrap();
     let permissions = prepared.resume_permissions.unwrap();
     assert_eq!(permissions.model.as_deref(), Some("gpt-6.1-sol"));
     assert_eq!(permissions.effort.as_deref(), Some("high"));
@@ -6759,8 +6740,7 @@ fn compact_model_and_ordered_config_overrides_reach_the_typed_resume() {
         "boot".into(),
     ];
     let prepared =
-        prepare_controlled_launch_args(endpoint, &reversed, Some("thread-prior"), true, None)
-            .unwrap();
+        prepare_controlled_launch_args(endpoint, &reversed, Some("thread-prior")).unwrap();
     let permissions = prepared.resume_permissions.unwrap();
     assert_eq!(permissions.approval_policy.as_deref(), Some("on-request"));
     assert_eq!(permissions.model.as_deref(), Some("gpt-6.1-sol"));
@@ -6771,66 +6751,183 @@ fn compact_model_and_ordered_config_overrides_reach_the_typed_resume() {
 }
 
 #[test]
-fn attended_codex_and_configured_mission_policy_do_not_get_an_implicit_never() {
+fn attended_and_provider_configured_policies_do_not_get_an_implicit_never() {
     let endpoint = "unix:///server.sock";
     let plain = vec!["boot".into()];
-    let attended = prepare_controlled_launch_args(endpoint, &plain, None, false, None).unwrap();
-    assert!(
-        !attended
-            .server_args
-            .iter()
-            .any(|value| value == "approval_policy=\"never\"")
-    );
-    assert!(
-        !attended
-            .tui_args
-            .iter()
-            .any(|value| value == "--ask-for-approval")
-    );
-    let resumed =
-        prepare_controlled_launch_args(endpoint, &plain, Some("thread-prior"), false, None)
-            .unwrap();
-    assert!(resumed.resume_permissions.is_none());
+    let mut attended = prepare_controlled_launch_args(endpoint, &plain, None).unwrap();
+    project_effective_approval(
+        &mut attended.tui_args,
+        &mut attended.resume_permissions,
+        &plain,
+        None,
+        false,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    assert!(!attended.tui_args.iter().any(|v| v == "--ask-for-approval"));
+    assert!(attended.resume_permissions.is_none());
+
+    for origin in ["project", "system", "managed", "user"] {
+        let mut fresh = prepare_controlled_launch_args(endpoint, &plain, None).unwrap();
+        project_effective_approval(
+            &mut fresh.tui_args,
+            &mut fresh.resume_permissions,
+            &plain,
+            None,
+            true,
+            Some("on-request".into()),
+            Some(origin),
+            None,
+        )
+        .unwrap();
+        assert!(!fresh.tui_args.iter().any(|v| v == "--ask-for-approval"));
+        let mut resumed =
+            prepare_controlled_launch_args(endpoint, &plain, Some("thread-prior")).unwrap();
+        project_effective_approval(
+            &mut resumed.tui_args,
+            &mut resumed.resume_permissions,
+            &plain,
+            Some("thread-prior"),
+            true,
+            Some("on-request".into()),
+            Some(origin),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            resumed
+                .resume_permissions
+                .as_ref()
+                .unwrap()
+                .approval_policy
+                .as_deref(),
+            Some("on-request")
+        );
+    }
 
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(
-        temp.path().join("config.toml"),
-        "approval_policy = 'on-request'\n",
-    )
-    .unwrap();
-    let configured =
-        prepare_controlled_launch_args(endpoint, &plain, None, true, Some(temp.path())).unwrap();
-    assert!(
-        !configured
-            .server_args
-            .iter()
-            .any(|value| value == "approval_policy=\"never\"")
-    );
-    let configured_resume = prepare_controlled_launch_args(
-        endpoint,
-        &plain,
-        Some("thread-prior"),
-        true,
-        Some(temp.path()),
-    )
-    .unwrap();
-    assert!(configured_resume.resume_permissions.is_none());
-
-    std::fs::write(temp.path().join("config.toml"), "model = 'gpt-6.1-sol'\n").unwrap();
-    std::fs::write(
         temp.path().join("review.config.toml"),
-        "approval_policy = 'on-request'\n",
+        "approval_policy = 'never'\n",
     )
     .unwrap();
     let profile = vec!["--profile".into(), "review".into(), "boot".into()];
-    let profiled =
-        prepare_controlled_launch_args(endpoint, &profile, None, true, Some(temp.path())).unwrap();
-    assert!(
-        !profiled
-            .server_args
-            .iter()
-            .any(|value| value == "approval_policy=\"never\"")
+    let profile_policy = selected_codex_profile_policy_in(&profile, Some(temp.path())).unwrap();
+    assert_eq!(profile_policy.as_deref(), Some("never"));
+    let mut resumed =
+        prepare_controlled_launch_args(endpoint, &profile, Some("thread-prior")).unwrap();
+    project_effective_approval(
+        &mut resumed.tui_args,
+        &mut resumed.resume_permissions,
+        &profile,
+        Some("thread-prior"),
+        true,
+        Some("on-request".into()),
+        Some("user"),
+        profile_policy.clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        resumed
+            .resume_permissions
+            .as_ref()
+            .unwrap()
+            .approval_policy
+            .as_deref(),
+        Some("never")
     );
+    project_effective_approval(
+        &mut resumed.tui_args,
+        &mut resumed.resume_permissions,
+        &profile,
+        Some("thread-prior"),
+        true,
+        Some("on-request".into()),
+        Some("project"),
+        profile_policy,
+    )
+    .unwrap();
+    assert_eq!(
+        resumed
+            .resume_permissions
+            .as_ref()
+            .unwrap()
+            .approval_policy
+            .as_deref(),
+        Some("on-request")
+    );
+
+    let profile_path = temp.path().join("review.config.toml");
+    std::fs::write(&profile_path, "approval_policy = [\n").unwrap();
+    let invalid = selected_codex_profile_policy_in(&profile, Some(temp.path())).unwrap_err();
+    assert!(invalid.to_string().contains("review.config.toml"));
+    std::fs::write(&profile_path, "x".repeat(64 * 1024 + 1)).unwrap();
+    assert!(selected_codex_profile_policy_in(&profile, Some(temp.path())).is_err());
+    std::fs::remove_file(&profile_path).unwrap();
+    std::os::unix::fs::symlink(temp.path().join("elsewhere.toml"), &profile_path).unwrap();
+    assert!(selected_codex_profile_policy_in(&profile, Some(temp.path())).is_err());
+}
+
+#[test]
+fn config_read_uses_the_selected_cwd_and_reports_provider_policy_origin() {
+    let _stop_exclusive = stop_flag_tests();
+    for (policy, origin) in [
+        (None, None),
+        (Some("on-request"), Some("project")),
+        (Some("never"), Some("system")),
+        (Some("on-request"), Some("managed")),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("server.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let cwd = temp.path().join("workspace");
+        fs::create_dir(&cwd).unwrap();
+        let expected_cwd = cwd.clone();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut websocket = tungstenite::accept(stream).unwrap();
+            assert_eq!(
+                read_json_message(&mut websocket).unwrap().unwrap()["method"],
+                "initialize"
+            );
+            write_json_message(
+                &mut websocket,
+                &json!({"id": 0, "result": {"userAgent": "fake"}}),
+            )
+            .unwrap();
+            assert_eq!(
+                read_json_message(&mut websocket).unwrap().unwrap()["method"],
+                "initialized"
+            );
+            let request = read_json_message(&mut websocket).unwrap().unwrap();
+            assert_eq!(request["id"], CONTROL_CONFIG_READ_REQUEST_ID);
+            assert_eq!(request["method"], "config/read");
+            assert_eq!(
+                request["params"]["cwd"],
+                expected_cwd.to_string_lossy().as_ref()
+            );
+            assert_eq!(request["params"]["includeLayers"], true);
+            write_json_message(
+                &mut websocket,
+                &json!({
+                    "id": CONTROL_CONFIG_READ_REQUEST_ID,
+                    "result": {
+                        "config": {"approval_policy": policy},
+                        "origins": {"approval_policy": {"name": {"type": origin}}}
+                    }
+                }),
+            )
+            .unwrap();
+        });
+        let stream = UnixStream::connect(&socket).unwrap();
+        let mut websocket = initialize_control(stream).unwrap().unwrap();
+        let found = read_codex_config_approval(&mut websocket, &cwd).unwrap();
+        assert_eq!(found.0.as_deref(), policy);
+        assert_eq!(found.1.as_deref(), origin);
+        server.join().unwrap();
+    }
 }
 
 #[test]
@@ -6838,8 +6935,7 @@ fn explicit_resume_and_fork_do_not_receive_a_policy_splice() {
     for command in ["resume", "fork"] {
         let authored = vec![command.into(), "thread-prior".into()];
         let prepared =
-            prepare_controlled_launch_args("unix:///server.sock", &authored, None, true, None)
-                .unwrap();
+            prepare_controlled_launch_args("unix:///server.sock", &authored, None).unwrap();
         assert!(
             !prepared
                 .tui_args
@@ -6862,8 +6958,7 @@ fn rejected_declared_options_fail_before_launch_without_leaking_values() {
         ),
     ] {
         let error =
-            prepare_controlled_launch_args("unix:///server.sock", &args, resume, true, None)
-                .unwrap_err();
+            prepare_controlled_launch_args("unix:///server.sock", &args, resume).unwrap_err();
         assert!(error.to_string().contains("--future-token"));
         assert!(!error.to_string().contains("secret"));
         assert!(!error.to_string().contains("do-not-log-this"));

@@ -40,6 +40,7 @@ use crate::{
 };
 
 const REQUIRED_CODEX_CLIENT_REQUESTS: &[&str] = &[
+    "config/read",
     "hooks/list",
     "initialize",
     "thread/loaded/list",
@@ -103,6 +104,7 @@ const RESIDENCY_CHECKPOINT_FILE: &str = "residency-checkpoint.json";
 const WRAPPER_DIAGNOSTIC_SCHEMA: &str = "st.codex-wrapper-diagnostic.v1";
 const CONTROL_TUI_LOADED_REQUEST_ID: u64 = 0;
 const CONTROL_SUBSCRIBE_REQUEST_ID: u64 = 1;
+const CONTROL_CONFIG_READ_REQUEST_ID: u64 = 2;
 const FIRST_DELIVERY_REQUEST_ID: u64 = 2;
 /// A string ID can never collide with the numeric subscription and delivery requests.
 const ACCOUNT_READ_REQUEST_ID: &str = "st-account-read";
@@ -3047,14 +3049,10 @@ fn run_controlled_owned(
     prepare_socket_for_launch(&socket_path)?;
 
     let endpoint = format!("unix://{}", socket_path.display());
-    let config_home = codex_home();
-    let prepared = prepare_controlled_launch_args(
-        &endpoint,
-        &codex_argv[1..],
-        resume_thread.as_deref(),
-        std::env::var_os("ST_MISSION_RUN").is_some(),
-        config_home.as_deref(),
-    )?;
+    let unattended = std::env::var("ST_MISSION_RUN").is_ok_and(|run| !run.trim().is_empty());
+    let explicit_approval = authored_approval_policy(&codex_argv[1..])?;
+    let prepared =
+        prepare_controlled_launch_args(&endpoint, &codex_argv[1..], resume_thread.as_deref())?;
     let safe_fallback_active = Arc::new(AtomicBool::new(false));
 
     // Publish the host-owned incarnation for a residency attempt only after this process holds
@@ -3107,6 +3105,8 @@ fn run_controlled_owned(
                 prepared.resume_permissions,
                 safe_fallback_active.clone(),
                 delivery,
+                unattended,
+                explicit_approval,
                 diagnostics,
             )
         });
@@ -3259,11 +3259,13 @@ fn run_connected(
     state_dir: &Path,
     runtime: &CodexRuntime,
     codex_argv: &[String],
-    tui_args: Vec<String>,
+    mut tui_args: Vec<String>,
     expected_resume: Option<String>,
-    resume_permissions: Option<ResumePermissionOverrides>,
+    mut resume_permissions: Option<ResumePermissionOverrides>,
     safe_fallback_active: Arc<AtomicBool>,
     delivery: CodexDeliveryConfig,
+    unattended: bool,
+    explicit_approval: bool,
     diagnostics: &mut WrapperDiagnostics,
 ) -> Result<()> {
     // The stop handler is installed by the launch entry point before any spawn (the preflight's
@@ -3286,7 +3288,7 @@ fn run_connected(
     }
     // The initialize wait itself polls the stop flag between short socket timeouts and returns
     // None on a stop; the recheck below covers a stop raised in the remaining gaps.
-    let Some(websocket) = initialize_control(control)? else {
+    let Some(mut websocket) = initialize_control(control)? else {
         diagnostics.record("stoppedDuringStartup", json!({ "phase": "initialize" }))?;
         let _ = shutdown.shutdown(Shutdown::Both);
         return Ok(());
@@ -3297,6 +3299,21 @@ fn run_connected(
         return Ok(());
     }
     diagnostics.record("controlInitialized", json!({}))?;
+    if !explicit_approval && (unattended || expected_resume.is_some()) {
+        let cwd = controlled_hook_cwd(&codex_argv[1..])?;
+        let (provider_policy, provider_origin) = read_codex_config_approval(&mut websocket, &cwd)?;
+        let profile_policy = selected_codex_profile_policy(&codex_argv[1..])?;
+        project_effective_approval(
+            &mut tui_args,
+            &mut resume_permissions,
+            &codex_argv[1..],
+            expected_resume.as_deref(),
+            unattended,
+            provider_policy,
+            provider_origin.as_deref(),
+            profile_policy,
+        )?;
+    }
     let (events_tx, events_rx) = mpsc::channel();
     let binding_path = state_dir.join("binding.json");
     let control_state_path = state_dir.join("control-state.json");
@@ -3441,6 +3458,36 @@ fn run_connected(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+fn project_effective_approval(
+    tui_args: &mut Vec<String>,
+    resume_permissions: &mut Option<ResumePermissionOverrides>,
+    authored_args: &[String],
+    expected_resume: Option<&str>,
+    unattended: bool,
+    provider_policy: Option<String>,
+    provider_origin: Option<&str>,
+    profile_policy: Option<String>,
+) -> Result<()> {
+    let policy = if provider_origin == Some("project") {
+        provider_policy
+    } else {
+        profile_policy.or(provider_policy)
+    };
+    let implicit_default = policy.is_none() && unattended;
+    let selected = policy.or_else(|| implicit_default.then(|| "never".into()));
+    if let Some(selected) = selected {
+        if expected_resume.is_some() {
+            resume_permissions
+                .get_or_insert_with(ResumePermissionOverrides::empty)
+                .approval_policy = Some(selected);
+        } else if implicit_default && resume_insertion_index(authored_args)?.is_some() {
+            tui_args.splice(2..2, ["--ask-for-approval".into(), "never".into()]);
+        }
+    }
+    Ok(())
+}
+
 /// End one controlled TUI session after its monitor returned: stop the control pump, then publish
 /// the terminal observation. A detached session skips the terminal record, because its TUI and
 /// app-server keep running under the driver's next image.
@@ -3557,6 +3604,16 @@ struct ResumePermissionOverrides {
 }
 
 impl ResumePermissionOverrides {
+    fn empty() -> Self {
+        Self {
+            approval_policy: None,
+            approvals_reviewer: None,
+            sandbox: None,
+            model: None,
+            effort: None,
+        }
+    }
+
     fn app_server_config_overrides(&self) -> Vec<String> {
         let mut overrides = Vec::new();
         for (key, value) in [
@@ -3607,19 +3664,10 @@ fn prepare_controlled_launch_args(
     endpoint: &str,
     authored_args: &[String],
     resume_thread: Option<&str>,
-    unattended: bool,
-    config_home: Option<&Path>,
 ) -> Result<PreparedControlledLaunch> {
     let exact = controlled_app_server_args(endpoint, authored_args).and_then(|mut server_args| {
-        let default_approval = unattended && !authored_approval_policy(authored_args, config_home)?;
         let resume_permissions =
-            automatic_resume_permission_overrides(authored_args, resume_thread, default_approval)?;
-        if default_approval && resume_permissions.is_none() {
-            insert_app_server_config_override(
-                &mut server_args,
-                "approval_policy=\"never\"".into(),
-            )?;
-        }
+            automatic_resume_permission_overrides(authored_args, resume_thread)?;
         if let Some(permissions) = &resume_permissions {
             // The remote TUI's resume argv cannot contain CLI permission flags. Project the
             // declaration into app-server defaults before either client loads the saved thread;
@@ -3628,13 +3676,7 @@ fn prepare_controlled_launch_args(
                 insert_app_server_config_override(&mut server_args, override_value)?;
             }
         }
-        let mut tui_args = controlled_tui_args(endpoint, authored_args, resume_thread)?;
-        if default_approval
-            && resume_thread.is_none()
-            && resume_insertion_index(authored_args)?.is_some()
-        {
-            tui_args.splice(2..2, ["--ask-for-approval".into(), "never".into()]);
-        }
+        let tui_args = controlled_tui_args(endpoint, authored_args, resume_thread)?;
         Ok((
             server_args,
             tui_args,
@@ -3662,7 +3704,6 @@ fn prepare_controlled_launch_args(
 fn automatic_resume_permission_overrides(
     authored_args: &[String],
     resume_thread: Option<&str>,
-    default_approval: bool,
 ) -> Result<Option<ResumePermissionOverrides>> {
     if resume_thread.is_none() {
         return Ok(None);
@@ -3671,7 +3712,7 @@ fn automatic_resume_permission_overrides(
         return Ok(None);
     };
     let mut overrides = ResumePermissionOverrides {
-        approval_policy: default_approval.then(|| "never".into()),
+        approval_policy: None,
         approvals_reviewer: None,
         sandbox: None,
         model: None,
@@ -3850,21 +3891,11 @@ fn apply_resume_config_override(
 
 /// A declaration can select approvals either with the CLI option or a direct config override.
 /// The latter must take precedence over the unattended default on both fresh and resumed seats.
-fn authored_approval_policy(authored_args: &[String], config_home: Option<&Path>) -> Result<bool> {
+fn authored_approval_policy(authored_args: &[String]) -> Result<bool> {
     let boundary = interactive_root_prefix_end(authored_args)?;
     let mut index = 0;
-    let mut selected_profile = None;
     while index < boundary {
         let arg = authored_args[index].as_str();
-        if matches!(arg, "-p" | "--profile") {
-            selected_profile = authored_args.get(index + 1).map(String::as_str);
-        } else if let Some(profile) = arg.strip_prefix("--profile=") {
-            selected_profile = Some(profile);
-        } else if let Some(profile) = arg.strip_prefix("-p")
-            && !profile.is_empty()
-        {
-            selected_profile = Some(profile);
-        }
         if matches!(
             arg,
             "--dangerously-bypass-approvals-and-sandbox"
@@ -3913,47 +3944,132 @@ fn authored_approval_policy(authored_args: &[String], config_home: Option<&Path>
             1
         };
     }
-    let Some(home) = config_home else {
-        return Ok(false);
-    };
-    let base = codex_config_file(&home.join("config.toml"))?;
-    if base
-        .as_ref()
-        .is_some_and(|config| config.get("approval_policy").is_some())
-    {
-        return Ok(true);
-    }
-    let profile = selected_profile.or_else(|| {
-        base.as_ref()
-            .and_then(|config| config.get("profile"))
-            .and_then(toml::Value::as_str)
-    });
-    let Some(profile) = profile else {
-        return Ok(false);
-    };
-    anyhow::ensure!(
-        std::path::Path::new(profile)
-            .components()
-            .all(|component| matches!(component, std::path::Component::Normal(_)))
-            && std::path::Path::new(profile).components().count() == 1,
-        "Codex profile name is not a single path component"
-    );
-    Ok(
-        codex_config_file(&home.join(format!("{profile}.config.toml")))?
-            .as_ref()
-            .is_some_and(|config| config.get("approval_policy").is_some()),
-    )
+    Ok(false)
 }
 
-fn codex_config_file(path: &Path) -> Result<Option<toml::Value>> {
-    let source = match fs::read_to_string(path) {
-        Ok(source) => source,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+fn selected_codex_profile_policy(authored_args: &[String]) -> Result<Option<String>> {
+    let home = codex_home();
+    selected_codex_profile_policy_in(authored_args, home.as_deref())
+}
+
+fn selected_codex_profile_policy_in(
+    authored_args: &[String],
+    config_home: Option<&Path>,
+) -> Result<Option<String>> {
+    let boundary = interactive_root_prefix_end(authored_args)?;
+    let mut selected_profile = None;
+    let mut index = 0;
+    while index < boundary {
+        let arg = authored_args[index].as_str();
+        if matches!(arg, "-p" | "--profile") {
+            selected_profile = authored_args.get(index + 1).map(String::as_str);
+        } else if let Some(profile) = arg.strip_prefix("--profile=") {
+            selected_profile = Some(profile);
+        } else if let Some(profile) = arg.strip_prefix("-p")
+            && !profile.is_empty()
+        {
+            selected_profile = Some(profile);
+        }
+        index += if matches!(arg, "-p" | "--profile") {
+            2
+        } else {
+            1
+        };
+    }
+    let Some(profile) = selected_profile else {
+        return Ok(None);
     };
-    Ok(Some(
-        toml::from_str(&source).with_context(|| format!("parsing {}", path.display()))?,
-    ))
+    anyhow::ensure!(
+        std::path::Path::new(profile).components().count() == 1
+            && std::path::Path::new(profile)
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_))),
+        "Codex profile name is not a single path component"
+    );
+    let home = config_home.context("Codex has no configuration home for selected profile")?;
+    let path = home.join(format!("{profile}.config.toml"));
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .with_context(|| format!("opening Codex profile {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("reading Codex profile {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.len() <= 64 * 1024,
+        "Codex profile {} must be a regular file of at most 64 KiB",
+        path.display()
+    );
+    let mut source = String::new();
+    file.take(64 * 1024 + 1)
+        .read_to_string(&mut source)
+        .with_context(|| format!("reading Codex profile {}", path.display()))?;
+    anyhow::ensure!(
+        source.len() <= 64 * 1024,
+        "Codex profile {} exceeds 64 KiB",
+        path.display()
+    );
+    let config: toml::Value = toml::from_str(&source)
+        .with_context(|| format!("parsing Codex profile {}", path.display()))?;
+    config
+        .get("approval_policy")
+        .map(|value| {
+            let policy = value
+                .as_str()
+                .context("Codex profile approval_policy is not a string")?;
+            validate_resume_approval_policy(policy)?;
+            Ok(policy.to_owned())
+        })
+        .transpose()
+}
+
+fn read_codex_config_approval(
+    websocket: &mut WebSocket<UnixStream>,
+    cwd: &Path,
+) -> Result<(Option<String>, Option<String>)> {
+    write_json_message(
+        websocket,
+        &json!({
+            "id": CONTROL_CONFIG_READ_REQUEST_ID,
+            "method": "config/read",
+            "params": {"cwd": cwd.to_string_lossy(), "includeLayers": true},
+        }),
+    )?;
+    websocket.get_ref().set_read_timeout(Some(CONTROL_POLL))?;
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    let response = loop {
+        match read_startup_message(websocket, deadline)? {
+            StartupRead::Message(message)
+                if message.get("id") == Some(&Value::from(CONTROL_CONFIG_READ_REQUEST_ID)) =>
+            {
+                break message;
+            }
+            StartupRead::Message(_) => continue,
+            StartupRead::Stopped => anyhow::bail!("Codex config/read stopped before launch"),
+            StartupRead::Closed => anyhow::bail!("Codex app-server closed during config/read"),
+        }
+    };
+    if let Some(error) = response.get("error") {
+        anyhow::bail!("Codex app-server rejected config/read: {error}");
+    }
+    let value = response
+        .pointer("/result/config/approval_policy")
+        .context("Codex config/read response has no approval_policy field")?;
+    let policy = if value.is_null() {
+        None
+    } else {
+        let policy = value
+            .as_str()
+            .context("Codex config/read approval_policy is not a string")?;
+        validate_resume_approval_policy(policy)?;
+        Some(policy.to_owned())
+    };
+    let origin = response
+        .pointer("/result/origins/approval_policy/name/type")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    Ok((policy, origin))
 }
 
 fn validate_resume_sandbox(value: &str) -> Result<()> {
