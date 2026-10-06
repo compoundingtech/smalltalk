@@ -65,8 +65,7 @@ evaluated mission gates or introducing a second evaluator. Large gate workloads 
 filesystem can still delay host work; the three-second regression is an admission bound
 for this controlled backlog, not an end-to-end production latency guarantee.
 
-
-The saturation regression drives the production mission evaluator, native exec launcher,
+The saturation regression drives the production mission evaluator, native command-seat launcher,
 and durable mailbox changed-since query with eight reader threads and a deterministic
 six-second ordinary writer backlog. After warming the incremental section, it declares
 a new seat and a new run. Both the seat's first durable incarnation and the original
