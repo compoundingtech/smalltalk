@@ -4380,14 +4380,14 @@ pub(super) fn timeline_value(
     if let Some(incarnation) = incarnation
         && let Some(managed) = managed_transcript(state, owner, incarnation)?
     {
-        let read = managed
-            .transcript
-            .as_ref()
-            .map_err(|missing| missing.reason.clone())
-            .and_then(|external| {
-                conversation_blocks::read(external, session, &session_id)
-                    .map_err(|error| format!("the transcript could not be read: {}", error.message))
-            });
+        let read = match managed.transcript.as_ref() {
+            Ok(external) => match conversation_blocks::read(external, session, &session_id) {
+                Ok(items) => Ok(items),
+                Err(error) if error.status == StatusCode::TOO_MANY_REQUESTS => return Err(error),
+                Err(error) => Err(format!("the transcript could not be read: {}", error.message)),
+            },
+            Err(missing) => Err(missing.reason.clone()),
+        };
         match read {
             Ok(items) => return native_timeline_page(state, snapshot, &session_id, query, items),
             Err(reason) => {

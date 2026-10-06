@@ -28,7 +28,7 @@ const DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(2);
 /// with the last complete inventory.
 const HISTORY_WAIT: Duration = Duration::from_secs(2);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum ExternalDriver {
     Codex,

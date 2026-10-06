@@ -1503,15 +1503,18 @@ write or message-attachment scopes are not required. A local read-only Unix clie
 already has this scope; a paired client needs it in its active delegated grant.
 
 Image pixels stay off timeline pages. Blocks and nested native images carry opaque
-owner references. Every fetch rebinds the authorized session, entry/revision and
-native source identity; no client-supplied file path or image URL is accepted. A
+owner references. Every fetch verifies the authorized session, entry/revision and
+native source identity; no client-supplied file path or image URL is accepted. The
+ref encrypts the owner-located source descriptor, so native chunks do not inventory
+other sessions and the path is not exposed. Managed chunks also recheck the current
+owner binding. A
 chunk contains base64 `data`, `media_type`, `offset`, total `size` and nullable
 `next_offset`. Chunks hold at most 256 KiB of decoded bytes; native image reads are
 limited to 32 MiB, with explicit errors. Transcript URLs are never fetched by the owner. Oversized JSON
 payloads show an 8 KiB UTF-8 prefix labelled as truncated JSON text, and a reference
 recovers the full valid JSON. The existing 1 MB page bound still applies.
 
-Edited records, replacement, binding changes and owner restarts invalidate references;
+Edited records, replacement, managed binding changes and owner restarts invalidate references;
 append-only growth preserves existing refs:
 HTTP 410 `conversation-content-invalidated`, `retryable: true`, and
 `details.full_resync: true` tell the client to reload before fetching again. A
@@ -1522,9 +1525,13 @@ labels `transcript-unavailable`; retiring its stored-history fallback is owned b
 the separate no-agent-history mission. This contract adds no durable content class,
 claim kind, retention rule, spool, or image blob copy.
 
-Native conversation `read.projections` grants full transcript access, including
-secrets in exposed reasoning, tool arguments/output and unknown JSON. Projection-only
-paired displays and anonymous local Unix readers have this access. No content is scrubbed.
+Native conversation `read.projections` grants full transcript, chunk and image access,
+including secrets in exposed reasoning, tool arguments/output and unknown JSON.
+Local people and agents, anonymous local read-only Unix readers, and default paired
+phones and wall displays have this access. No content is scrubbed. Refs die on a
+daemon restart; clients must reload the timeline. Four expensive owner timeline/chunk
+reads can run concurrently; busy reads return HTTP 429 `rate-limited`, including
+managed timeline reads. Clients must back off and retry.
 Known blocks can use `payload: {body_ref: true}` to refer to the containing fallback
 body without duplicating its bytes. Content refs authenticate one native record;
 chunk reads do not rebuild the session. The owner never requests transcript HTTP(S)

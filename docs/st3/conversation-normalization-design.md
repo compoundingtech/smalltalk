@@ -92,16 +92,24 @@ chunk request, including owner-forwarded requests.
 The present 8 KiB/value and 1 MB/page bounds protect memory and transport only.
 The initial chunk contract returns up to 256 KiB decoded bytes; image reads have
 a visible 32 MiB decoded limit. Four expensive owner timeline/chunk reads can run
-concurrently; excess reads return `rate-limited`, without a queued backlog.
+concurrently; excess reads, including managed timeline reads, return HTTP 429
+`rate-limited`, without a queued backlog. Clients must back off and retry.
 An authenticated ref contains a JSONL offset/length/digest or SQLite part/message
 identity/digest (message role/time, independent of streaming usage updates),
-entry/revision, session and stable native file identity. It contains
-no path or content. Each chunk directly normalizes only that record and checks it
-again after fetching bytes, rather than rebuilding the entire timeline or hashing
-every JSON node. Appends, including SQLite WAL growth, preserve existing refs;
-record edits, file replacement, binding changes or an owner process restart return
+entry/revision, session and stable native file identity. Its encrypted source
+descriptor carries the owner-located driver, native ID and transcript path; the
+client cannot see or choose that path. No conversation bytes are carried in the
+ref. Native chunks use this descriptor directly, without inventorying other
+sessions. Managed chunks retain current owner binding checks. Each chunk reads and
+normalizes its identified record once, then rechecks source identity after fetching
+bytes. It returns the validated record snapshot; content-addressed blob hashes bind
+external pixels to that snapshot. A concurrent edit after capture is detected on
+the next fetch. No whole timeline rebuild or second record decode occurs.
+Appends, including SQLite WAL growth, preserve existing refs;
+record edits, file replacement, managed binding changes or an owner process restart return
 `conversation-content-invalidated` with `full_resync: true`. The ephemeral owner
-HMAC key is neither stored nor replicated. Timeline reads capture a finite native
+authenticated-encryption key is neither stored nor replicated. Clients must reload
+the timeline after a daemon restart to obtain new refs. Timeline reads capture a finite native
 high-water mark; concurrent appends belong to the following read.
 Count encoded response bytes, preserve valid JSON/UTF-8, and mark every clipped
 value with its reason, original size when known and continuation. Fetching the

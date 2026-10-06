@@ -1,9 +1,9 @@
-//! Owner-local wire normalization. References contain no path or payload and hold no durable
+//! Owner-local wire normalization. References encrypt source metadata and hold no durable
 //! state: a fetch reads one authenticated native record and refuses edited/replaced content.
 use super::*;
 use crate::external_sessions::{ExternalConversation, ExternalSession};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
-use hmac::{Hmac, Mac as _};
+use ring::aead;
 use std::io::Read as _;
 use std::sync::LazyLock;
 
@@ -117,7 +117,41 @@ fn basis(source: &ExternalSession) -> Result<String, ApiError> {
 }
 
 #[derive(Deserialize, Serialize)]
+struct LocatedSource {
+    driver: crate::external_sessions::ExternalDriver,
+    native_id: String,
+    transcript: std::path::PathBuf,
+}
+
+impl LocatedSource {
+    fn from_session(source: &ExternalSession) -> Self {
+        Self {
+            driver: source.driver,
+            native_id: source.native_id.clone(),
+            transcript: source.transcript.clone(),
+        }
+    }
+
+    fn session(&self, id: &str) -> ExternalSession {
+        ExternalSession {
+            id: id.into(),
+            revision: String::new(),
+            driver: self.driver,
+            native_id: self.native_id.clone(),
+            transcript: self.transcript.clone(),
+            codex_home: None,
+            cwd: None,
+            title: None,
+            started_at_unix_ms: 0,
+            updated_at_unix_ms: 0,
+            process: None,
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize)]
 struct ContentLocator {
+    source: LocatedSource,
     basis: String,
     session: String,
     entry: Value,
@@ -127,8 +161,15 @@ struct ContentLocator {
     native: Value,
 }
 
-fn reference(basis: &str, session: &str, item: &Value, pointer: &str) -> String {
+fn reference(
+    source: &ExternalSession,
+    basis: &str,
+    session: &str,
+    item: &Value,
+    pointer: &str,
+) -> String {
     let locator = ContentLocator {
+        source: LocatedSource::from_session(source),
         basis: basis.into(),
         session: session.into(),
         entry: item["id"].clone(),
@@ -139,12 +180,21 @@ fn reference(basis: &str, session: &str, item: &Value, pointer: &str) -> String 
             .is_some_and(|value| image(value) && !external_image(value)),
         native: item["_source"].clone(),
     };
-    let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&locator).expect("JSON value encodes"));
-    let mut mac = Hmac::<Sha256>::new_from_slice(&*REF_KEY).expect("HMAC key");
-    mac.update(encoded.as_bytes());
+    let key = aead::LessSafeKey::new(
+        aead::UnboundKey::new(&aead::CHACHA20_POLY1305, &*REF_KEY).expect("owner reference key"),
+    );
+    let mut nonce = [0; aead::NONCE_LEN];
+    getrandom::fill(&mut nonce).expect("owner reference nonce entropy");
+    let mut encrypted = serde_json::to_vec(&locator).expect("JSON value encodes");
+    key.seal_in_place_append_tag(
+        aead::Nonce::assume_unique_for_key(nonce),
+        aead::Aad::from(b"st-conversation-ref-v2"),
+        &mut encrypted,
+    )
+    .expect("owner reference encryption");
     format!(
-        "v1.{encoded}.{}",
-        URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+        "v2.{}",
+        URL_SAFE_NO_PAD.encode([nonce.as_slice(), &encrypted].concat())
     )
 }
 
@@ -152,23 +202,24 @@ fn locator(wanted: &str, session: &str) -> Result<ContentLocator, ApiError> {
     if wanted.len() > 4096 {
         return Err(invalidated());
     }
-    let mut parts = wanted.split('.');
-    if parts.next() != Some("v1") {
+    let encoded = wanted.strip_prefix("v2.").ok_or_else(invalidated)?;
+    let mut encrypted = URL_SAFE_NO_PAD.decode(encoded).map_err(|_| invalidated())?;
+    if encrypted.len() < aead::NONCE_LEN + aead::CHACHA20_POLY1305.tag_len() {
         return Err(invalidated());
     }
-    let encoded = parts.next().ok_or_else(invalidated)?;
-    let tag = URL_SAFE_NO_PAD
-        .decode(parts.next().ok_or_else(invalidated)?)
+    let (nonce, payload) = encrypted.split_at_mut(aead::NONCE_LEN);
+    let nonce: [u8; aead::NONCE_LEN] = nonce.try_into().map_err(|_| invalidated())?;
+    let key = aead::LessSafeKey::new(
+        aead::UnboundKey::new(&aead::CHACHA20_POLY1305, &*REF_KEY).expect("owner reference key"),
+    );
+    let plaintext = key
+        .open_in_place(
+            aead::Nonce::assume_unique_for_key(nonce),
+            aead::Aad::from(b"st-conversation-ref-v2"),
+            payload,
+        )
         .map_err(|_| invalidated())?;
-    if parts.next().is_some() {
-        return Err(invalidated());
-    }
-    let mut mac = Hmac::<Sha256>::new_from_slice(&*REF_KEY).expect("HMAC key");
-    mac.update(encoded.as_bytes());
-    mac.verify_slice(&tag).map_err(|_| invalidated())?;
-    let locator: ContentLocator =
-        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded).map_err(|_| invalidated())?)
-            .map_err(|_| invalidated())?;
+    let locator: ContentLocator = serde_json::from_slice(plaintext).map_err(|_| invalidated())?;
     if locator.session != session
         || locator.pointer.len() > 512
         || !(locator.pointer == "/body" || locator.pointer.starts_with("/body/"))
@@ -254,18 +305,32 @@ fn continuation(reference: String, media: &str, size: Option<usize>, reason: &st
     result
 }
 
-fn image_refs(value: &mut Value, pointer: &str, basis: &str, session: &str, item: &Value) {
+fn image_refs(
+    value: &mut Value,
+    pointer: &str,
+    source: &ExternalSession,
+    basis: &str,
+    session: &str,
+    item: &Value,
+) {
     if image(value) {
         if external_image(value) {
             return;
         }
-        *value = json!({"type":"image","content":continuation(reference(basis,session,item,pointer),image_media(value),None,"on-demand")});
+        *value = json!({"type":"image","content":continuation(reference(source,basis,session,item,pointer),image_media(value),None,"on-demand")});
         return;
     }
     match value {
         Value::Array(values) => {
             for (index, value) in values.iter_mut().enumerate() {
-                image_refs(value, &format!("{pointer}/{index}"), basis, session, item);
+                image_refs(
+                    value,
+                    &format!("{pointer}/{index}"),
+                    source,
+                    basis,
+                    session,
+                    item,
+                );
             }
         }
         Value::Object(values) => {
@@ -273,6 +338,7 @@ fn image_refs(value: &mut Value, pointer: &str, basis: &str, session: &str, item
                 image_refs(
                     value,
                     &format!("{pointer}/{}", key.replace('~', "~0").replace('/', "~1")),
+                    source,
                     basis,
                     session,
                     item,
@@ -335,7 +401,7 @@ pub(super) fn prepare(
                     block["kind"] = json!("image_link");
                 } else if block["kind"] == "image" {
                     block["continuation"] = continuation(
-                        reference(&basis, session_id, &original, &pointer),
+                        reference(source, &basis, session_id, &original, &pointer),
                         image_media(&block["payload"]),
                         None,
                         "on-demand",
@@ -345,6 +411,7 @@ pub(super) fn prepare(
                     image_refs(
                         &mut block["payload"],
                         &pointer,
+                        source,
                         &basis,
                         session_id,
                         &original,
@@ -353,7 +420,7 @@ pub(super) fn prepare(
                         serde_json::to_vec(&block["payload"]).map_err(ApiError::internal)?;
                     if encoded.len() > VALUE_BYTES || original["_oversized_bytes"].is_number() {
                         block["continuation"] = continuation(
-                            reference(&basis, session_id, &original, &pointer),
+                            reference(source, &basis, session_id, &original, &pointer),
                             "application/json",
                             Some(
                                 original["_oversized_payload_bytes"][index]
@@ -397,6 +464,7 @@ pub(super) fn prepare(
                 image_refs(
                     value,
                     &format!("/body/{key}"),
+                    source,
                     &basis,
                     session_id,
                     &original,
@@ -511,7 +579,12 @@ pub(super) async fn chunk_local(
     let request_state = state.clone();
     let request_session = session_id.to_owned();
     let (bytes, media) = tokio::task::spawn_blocking(move || -> Result<_, ApiError> {
-        let source = source(&request_state, &request_session)?;
+        let native = request_session.starts_with("session/external-");
+        let source = if native {
+            locator.source.session(&request_session)
+        } else {
+            source(&request_state, &request_session)?
+        };
         let value = located_value(&source, &locator)?;
         let result = if locator.image {
             image_bytes(&source, &value)?
@@ -521,9 +594,15 @@ pub(super) async fn chunk_local(
                 "application/json".to_owned(),
             )
         };
-        // Recheck this record after fetching bytes; an append does not affect its digest.
-        let rebound = self::source(&request_state, &request_session)?;
-        if located_value(&rebound, &locator)? != value {
+        // Bytes belong to the validated record snapshot. Blob hashes bind external
+        // pixels to that snapshot. Recheck source identity/binding, without decoding
+        // the same record twice. An edit after capture is observed by the next fetch.
+        let rebound = if native {
+            source
+        } else {
+            self::source(&request_state, &request_session)?
+        };
+        if basis(&rebound)? != locator.basis {
             return Err(invalidated());
         }
         Ok(result)
@@ -971,16 +1050,28 @@ mod tests {
         let original = crate::external_sessions::normalized_timeline(&source).unwrap();
         let item = original.last().unwrap();
         let before = basis(&source).unwrap();
-        let token = reference(&before, &source.id, item, "/body/blocks/0/payload");
+        let token = reference(&source, &before, &source.id, item, "/body/blocks/0/payload");
         assert_ne!(
             token,
-            reference(&before, "session/other", item, "/body/blocks/0/payload")
+            reference(
+                &source,
+                &before,
+                "session/other",
+                item,
+                "/body/blocks/0/payload"
+            )
         );
         let mut revised = item.clone();
         revised["revision"] = json!(2);
         assert_ne!(
             token,
-            reference(&before, &source.id, &revised, "/body/blocks/0/payload")
+            reference(
+                &source,
+                &before,
+                &source.id,
+                &revised,
+                "/body/blocks/0/payload"
+            )
         );
         let location = locator(&token, &source.id).unwrap();
         assert!(locator(&token, "session/other").is_err());
@@ -1024,6 +1115,58 @@ mod tests {
                 Some(&json!("owner-unavailable"))
             );
         }
+    }
+
+    #[tokio::test]
+    async fn native_chunks_use_encrypted_source_without_session_discovery() {
+        let root = tempfile::tempdir().unwrap();
+        let raw = json!({"type":"future","content":"invented-token".repeat(1000)});
+        let native = fixture(root.path(), json!([raw.clone()]));
+        let state = super::super::tests::test_state_named(root.path(), "direct-owner-test");
+        // With discovery disabled, source() cannot find even this session. An issued ref
+        // must still fetch the pinned record directly, independent of other sessions.
+        assert!(state.native_session_home.is_none());
+        assert!(source(&state, &native.id).is_err());
+        let mut session = ClientSession::local(Some("person/example")).unwrap();
+        session.conversation_blocks = true;
+        let page = read(&native, &session, &native.id).unwrap();
+        let token = page.last().unwrap()["body"]["blocks"][0]["continuation"]["ref"]
+            .as_str()
+            .unwrap();
+        let encrypted = URL_SAFE_NO_PAD
+            .decode(token.strip_prefix("v2.").unwrap())
+            .unwrap();
+        assert!(
+            !encrypted
+                .windows(native.transcript.as_os_str().len())
+                .any(|bytes| bytes == native.transcript.to_string_lossy().as_bytes())
+        );
+        let location = locator(token, &native.id).unwrap();
+        assert_eq!(location.source.transcript, native.transcript);
+        let response = chunk_local(&state, &session, &native.id, token, 0)
+            .await
+            .unwrap();
+        let decoded = STANDARD.decode(response["data"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&decoded).unwrap(),
+            json!({"raw":raw})
+        );
+        let mut forged = encrypted;
+        *forged.last_mut().unwrap() ^= 1;
+        assert!(
+            locator(
+                &format!("v2.{}", URL_SAFE_NO_PAD.encode(forged)),
+                &native.id
+            )
+            .is_err()
+        );
+        assert!(
+            locator(
+                &format!("v1.{}", token.strip_prefix("v2.").unwrap()),
+                &native.id
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]
