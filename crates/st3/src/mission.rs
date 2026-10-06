@@ -284,7 +284,7 @@ fn parse_mission(
     let mut revision_owners = Vec::new();
     for child in children.nodes() {
         match child.name().value() {
-            "provenance" if require_state => {
+            "provenance" if top_level => {
                 // Validated here, carried separately by NormalizedIntent: never hash metadata
                 // into MissionSpec, which older daemons must still project.
                 crate::provenance::parse_block(child)?;
