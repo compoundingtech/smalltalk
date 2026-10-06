@@ -20367,12 +20367,63 @@ fn claim_ids_at(
     subject: &str,
     at_index: Option<u64>,
 ) -> Result<Vec<String>> {
+    claim_ids_at_after_first_row(connection, subject, at_index, || {})
+}
+
+fn claim_ids_at_after_first_row(
+    connection: &Connection,
+    subject: &str,
+    at_index: Option<u64>,
+    after_first_row: impl FnOnce(),
+) -> Result<Vec<String>> {
+    // The old single statement held one cut. Tie lookups must retain that cut too,
+    // while writer and pinned-read callers keep ownership of their transaction.
+    let snapshot = if connection.is_autocommit() {
+        Some(connection.unchecked_transaction()?)
+    } else {
+        None
+    };
     let at_index = at_index.unwrap_or(i64::MAX as u64);
-    let mut statement = connection.prepare_cached(&canonical_sql(
-        "SELECT id FROM claims WHERE subject=?1 AND store_index<=?2 ORDER BY CANONICAL_ASC(claims)",
-    ))?;
-    let rows = statement.query_map(params![subject, at_index], |row| row.get(0))?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    let mut ids = Vec::new();
+    {
+        let mut statement = connection.prepare_cached(
+            "SELECT id, accepted_at_unix_ms FROM claims INDEXED BY claims_subject_accepted_index
+             WHERE subject=?1 AND store_index<=?2
+             ORDER BY length(accepted_at_unix_ms), accepted_at_unix_ms",
+        )?;
+        let mut rows = statement.query_map(params![subject, at_index], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let first = rows.next().transpose()?;
+        if first.is_some() {
+            after_first_row();
+        }
+        let mut ties = Vec::<(String, String)>::new();
+        let mut flush = |ties: &mut Vec<(String, String)>| -> Result<()> {
+            if ties.len() > 1 {
+                let mut keyed = ties
+                    .drain(..)
+                    .map(|row| Ok((canonical::claim_key(connection, &row.0)?, row)))
+                    .collect::<Result<Vec<_>>>()?;
+                keyed.sort_by(|a, b| a.0.cmp(&b.0));
+                ties.extend(keyed.into_iter().map(|(_, row)| row));
+            }
+            ids.extend(ties.drain(..).map(|(id, _)| id));
+            Ok(())
+        };
+        for row in first.into_iter().map(Ok).chain(rows) {
+            let row = row?;
+            if ties.last().is_some_and(|previous| previous.1 != row.1) {
+                flush(&mut ties)?;
+            }
+            ties.push(row);
+        }
+        flush(&mut ties)?;
+    }
+    if let Some(snapshot) = snapshot {
+        snapshot.commit()?;
+    }
+    Ok(ids)
 }
 
 fn desired_conflicts_at(
@@ -48544,6 +48595,165 @@ message "human-attention" {
         }
     }
 
+    fn claim_id_order_fixture(connection: &Connection) {
+        connection
+            .execute_batch(
+                "CREATE TABLE batches(id TEXT PRIMARY KEY, origin TEXT, replica_sequence INTEGER);
+             CREATE TABLE claims(id TEXT PRIMARY KEY, subject TEXT, kind TEXT, batch_id TEXT,
+                                 store_index INTEGER, accepted_at_unix_ms TEXT);
+             CREATE INDEX claims_subject_accepted_index ON claims
+                 (subject, length(accepted_at_unix_ms), accepted_at_unix_ms);
+             CREATE TABLE replica_records(claim_id TEXT, position INTEGER);
+             INSERT INTO batches VALUES ('x','writer-a',4),('y','writer-a',3),('z','writer-b',1);
+             INSERT INTO claims VALUES
+               ('early','agent/target','runtime.observed','x',1,'9'),
+               ('legacy','agent/target','harness.usage','x',2,'10'),
+               ('record-a','agent/target','work.renewed','x',3,'10'),
+               ('other-subject','agent/other','daemon.diagnostic','x',4,'10'),
+               ('record-b','agent/target','intent.desired','x',5,'10'),
+               ('cross-batch','agent/target','harness.observed','y',6,'10'),
+               ('other-writer','agent/target','runtime.observed','z',7,'10'),
+               ('u128-time','agent/target','harness.usage','z',8,
+                '340282366920938463463374607431768211455');
+             INSERT INTO replica_records VALUES ('record-a',7),('record-a',3),('record-b',0);",
+            )
+            .unwrap();
+    }
+
+    fn full_canonical_claim_id_oracle(
+        connection: &Connection,
+        subject: &str,
+        at: Option<u64>,
+    ) -> Vec<String> {
+        connection
+            .prepare(&canonical_sql(
+                "SELECT id FROM claims WHERE subject=?1 AND store_index<=?2
+             ORDER BY CANONICAL_ASC(claims)",
+            ))
+            .unwrap()
+            .query_map(params![subject, at.unwrap_or(i64::MAX as u64)], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn claim_ids_stream_preserves_full_order_historical_bounds_and_transaction_ownership() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        claim_id_order_fixture(&connection);
+        assert_eq!(
+            full_canonical_claim_id_oracle(&connection, "agent/target", None),
+            [
+                "early",
+                "cross-batch",
+                "record-b",
+                "legacy",
+                "record-a",
+                "other-writer",
+                "u128-time"
+            ]
+        );
+        for at in [None, Some(2), Some(5), Some(6)] {
+            let expected = full_canonical_claim_id_oracle(&connection, "agent/target", at);
+            let actual = claim_ids_at(&connection, "agent/target", at).unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(
+                actual.last(),
+                expected.last(),
+                "the planning revision stays exact"
+            );
+            assert!(connection.is_autocommit());
+        }
+        assert!(
+            claim_ids_at(&connection, "agent/missing", None)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(connection.is_autocommit());
+        let tx = connection.transaction().unwrap();
+        tx.execute(
+            "UPDATE replica_records SET position=0 WHERE claim_id='record-a'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            claim_ids_at(&tx, "agent/target", None).unwrap(),
+            full_canonical_claim_id_oracle(&tx, "agent/target", None)
+        );
+        assert!(
+            !tx.is_autocommit(),
+            "the caller retains its in-flight writer transaction"
+        );
+        tx.rollback().unwrap();
+        assert!(connection.is_autocommit());
+        connection
+            .execute_batch("DROP TABLE replica_records")
+            .unwrap();
+        assert!(claim_ids_at(&connection, "agent/target", None).is_err());
+        assert!(
+            connection.is_autocommit(),
+            "a failed owned read must roll back"
+        );
+        let tx = connection.transaction().unwrap();
+        assert!(claim_ids_at(&tx, "agent/target", None).is_err());
+        assert!(
+            !tx.is_autocommit(),
+            "a failed nested read must not roll back its caller"
+        );
+        tx.rollback().unwrap();
+    }
+
+    #[test]
+    fn claim_ids_stream_pins_tie_lookups_across_a_wal_writer_and_unwind() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claims.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+        claim_id_order_fixture(&connection);
+        let old = full_canonical_claim_id_oracle(&connection, "agent/target", None);
+        let actual = claim_ids_at_after_first_row(&connection, "agent/target", None, || {
+            let writer = Connection::open(&path).unwrap();
+            writer
+                .execute_batch(
+                    "BEGIN IMMEDIATE;
+                 UPDATE replica_records SET position=0 WHERE claim_id='record-a';
+                 UPDATE replica_records SET position=99 WHERE claim_id='record-b';
+                 COMMIT;",
+                )
+                .unwrap();
+        })
+        .unwrap();
+        assert_eq!(
+            actual, old,
+            "the first stream row and later tie keys share one cut"
+        );
+        assert!(connection.is_autocommit());
+        let new = full_canonical_claim_id_oracle(&connection, "agent/target", None);
+        assert_ne!(
+            new, old,
+            "the concurrent commit really changed the canonical order"
+        );
+        assert_eq!(
+            claim_ids_at(&connection, "agent/target", None).unwrap(),
+            new
+        );
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            claim_ids_at_after_first_row(&connection, "agent/target", None, || {
+                panic!("injected after stream pin")
+            })
+        }));
+        assert!(unwind.is_err());
+        assert!(
+            connection.is_autocommit(),
+            "unwind must release the locally owned read"
+        );
+        assert_eq!(
+            claim_ids_at(&connection, "agent/target", None).unwrap(),
+            new
+        );
+    }
     #[test]
     fn admission_failure_fences_ready_work_and_exit_until_a_new_incarnation() {
         let store = Store::open_memory("node").unwrap();
