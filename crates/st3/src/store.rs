@@ -19430,6 +19430,9 @@ pub(crate) fn append_claim_tx(
     if kind == "message.sent" {
         agent_messages::flush(transaction)?;
     }
+    if kind == "harness.limits" {
+        limits::flush_limits(transaction)?;
+    }
     if kind == "arrangement.edited" {
         arrangements::project(transaction, &record)?;
     }
@@ -23654,6 +23657,29 @@ mod fleet_admission_tests {
         assert!(admitted(&receiver, &signed));
         assert!(admitted(&receiver, &unsigned));
         assert_eq!(receiver.fleet_membership().unwrap(), Default::default());
+    }
+
+    #[test]
+    fn fleet_membership_is_read_again_only_after_a_fleet_claim_or_signature_changes() {
+        let b_key = key();
+        let (_, a, stores) = fleet(&[("b", &b_key)]);
+        let b = &stores[0];
+        let ask = |store: &Store| {
+            let before = STATEMENTS_RUN.with(std::cell::Cell::get);
+            let membership = store.fleet_membership().unwrap();
+            (membership, STATEMENTS_RUN.with(std::cell::Cell::get) - before)
+        };
+        let (first, _) = ask(&a);
+        let (again, spent) = ask(&a);
+        assert_eq!(again, first);
+        assert_eq!(spent, 1, "an unchanged fleet costs the generation read alone");
+        // Ordinary claims, replicated or local, leave the generation where it was.
+        note(b, "plain");
+        sync(b, &a);
+        note(&a, "local");
+        let (after, spent) = ask(&a);
+        assert_eq!(after, first);
+        assert_eq!(spent, 1);
     }
 
     #[test]

@@ -393,9 +393,8 @@ pub struct Store {
     pub replication_sync: Mutex<BTreeMap<String, PeerSyncProgress>>,
     /// Held while replicated envelopes are admitted; see `validate_replication_backlog`.
     pub admission: Mutex<()>,
-    /// The membership last folded and the fleet claims, signatures and anchor it was folded from,
-    /// so reading it again costs one statement unless one of them changed.
-    pub membership_cache: Mutex<Option<(String, crate::fleet::Membership)>>,
+    /// The membership last folded, and the `fleet_generation` it was folded at.
+    pub membership_cache: Mutex<Option<(i64, crate::fleet::Membership)>>,
     /// Serializes projection passes while they lend the writer back between chunks.
     pub projection: Mutex<()>,
     pub replication_timers: ReplicationTimers,
@@ -522,6 +521,7 @@ impl Store {
         reject_old_schema(connection)?;
         runtime.migrate_schema(connection)?;
         connection.execute_batch(SCHEMA)?;
+        connection.execute_batch(&fleet_generation_schema())?;
         inventory_generation::initialize(connection)?;
         connection.execute_batch(principals::PRINCIPAL_SCHEMA)?;
         runtime.create_schema(connection)?;
@@ -1430,48 +1430,38 @@ impl Store {
 
     /// The current fleet membership, folded from admitted `fleet.*` claims.
     pub fn fleet_membership(&self) -> Result<crate::fleet::Membership> {
+        // Membership is a function of the fleet claims, their envelopes' signatures and the
+        // anchor, and triggers advance `fleet_generation` whenever any of them changes. Fold it
+        // when the generation moved, not on every call: folding is hundreds of statements, and
+        // callers ask on every graph change, a few times a second.
+        let generation = |connection: &Connection| -> Result<i64> {
+            Ok(connection.query_row(
+                "SELECT value FROM fleet_generation WHERE id=1",
+                [],
+                |row| row.get(0),
+            )?)
+        };
+        {
+            let current = generation(&self.readers.get())?;
+            let cache = self
+                .membership_cache
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some((folded_at, membership)) = cache.as_ref()
+                && *folded_at == current
+            {
+                return Ok(membership.clone());
+            }
+        }
         // A local claim counts only once its batch is an envelope with this node's signature.
         self.replication_snapshot()?;
         let connection = self.readers.get();
-        // The fold reads every fleet claim, with its envelope's signatures: hundreds of
-        // statements, and callers ask on every graph change. It is a function of those claims,
-        // their signatures and the anchor, so one statement says whether any of them changed.
-        let version = connection.query_row(
-            &format!(
-                "SELECT COUNT(*), COALESCE(MAX(claims.store_index),0), COUNT(envelopes.envelope_hash),
-                        COUNT(signatures.member_key), COALESCE(MAX(signatures.rowid),0),
-                        (SELECT COALESCE(value,'') FROM meta WHERE key='fleet_anchor_key')
-                 FROM claims
-                 LEFT JOIN replica_envelopes AS envelopes ON envelopes.batch_id=claims.batch_id
-                 LEFT JOIN replica_envelope_signatures AS signatures
-                   ON signatures.writer=envelopes.writer AND signatures.sequence=envelopes.sequence
-                  AND signatures.envelope_hash=envelopes.envelope_hash
-                 WHERE claims.kind IN ({FLEET_CLAIM_KINDS})"
-            ),
-            [],
-            |row| {
-                Ok(format!(
-                    "{}|{}|{}|{}|{}|{}",
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, i64>(4)?,
-                    row.get::<_, String>(5)?
-                ))
-            },
-        )?;
-        let mut cache = self
+        let folded_at = generation(&connection)?;
+        let membership = fleet_membership_tx(&connection)?;
+        *self
             .membership_cache
             .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if let Some((cached, membership)) = cache.as_ref()
-            && *cached == version
-        {
-            return Ok(membership.clone());
-        }
-        let membership = fleet_membership_tx(&connection)?;
-        *cache = Some((version, membership.clone()));
+            .unwrap_or_else(PoisonError::into_inner) = Some((folded_at, membership.clone()));
         Ok(membership)
     }
 
@@ -1806,6 +1796,61 @@ pub fn max_envelope_rowid(connection: &Connection) -> Result<i64> {
 
 /// Fold the admitted `fleet.*` claims from the pinned anchor. A store without an anchor has an
 /// empty membership, in which every writer is legacy.
+/// A counter that moves whenever fleet membership could: a fleet claim, the envelope that carries
+/// it, a signature on that envelope, or the anchor. `fleet_membership` re-folds only when it moved.
+fn fleet_generation_schema() -> String {
+    let bump = "UPDATE fleet_generation SET value=value+1 WHERE id=1;";
+    let carries_fleet_claims = |envelope: &str| {
+        format!(
+            "EXISTS (SELECT 1 FROM claims WHERE batch_id={envelope}.batch_id \
+             AND kind IN ({FLEET_CLAIM_KINDS}))"
+        )
+    };
+    let signs_fleet_claims = |signature: &str| {
+        format!(
+            "EXISTS (SELECT 1 FROM replica_envelopes AS envelopes \
+             JOIN claims ON claims.batch_id=envelopes.batch_id \
+             WHERE envelopes.writer={signature}.writer AND envelopes.sequence={signature}.sequence \
+             AND envelopes.envelope_hash={signature}.envelope_hash \
+             AND claims.kind IN ({FLEET_CLAIM_KINDS}))"
+        )
+    };
+    format!(
+        "CREATE TABLE IF NOT EXISTS fleet_generation (
+             id INTEGER PRIMARY KEY CHECK(id=1), value INTEGER NOT NULL);
+         INSERT OR IGNORE INTO fleet_generation(id, value) VALUES (1, 0);
+         CREATE TRIGGER IF NOT EXISTS fleet_generation_claim_insert AFTER INSERT ON claims
+         WHEN NEW.kind IN ({FLEET_CLAIM_KINDS}) BEGIN {bump} END;
+         CREATE TRIGGER IF NOT EXISTS fleet_generation_claim_delete AFTER DELETE ON claims
+         WHEN OLD.kind IN ({FLEET_CLAIM_KINDS}) BEGIN {bump} END;
+         CREATE TRIGGER IF NOT EXISTS fleet_generation_claim_update
+         AFTER UPDATE OF kind, batch_id, body ON claims
+         WHEN NEW.kind IN ({FLEET_CLAIM_KINDS}) OR OLD.kind IN ({FLEET_CLAIM_KINDS})
+         BEGIN {bump} END;
+         CREATE TRIGGER IF NOT EXISTS fleet_generation_envelope_insert AFTER INSERT ON replica_envelopes
+         WHEN NEW.batch_id IS NOT NULL AND {insert_envelope} BEGIN {bump} END;
+         CREATE TRIGGER IF NOT EXISTS fleet_generation_envelope_update
+         AFTER UPDATE OF batch_id ON replica_envelopes
+         WHEN NEW.batch_id IS NOT NULL AND {update_envelope} BEGIN {bump} END;
+         CREATE TRIGGER IF NOT EXISTS fleet_generation_signature_insert
+         AFTER INSERT ON replica_envelope_signatures
+         WHEN {insert_signature} BEGIN {bump} END;
+         CREATE TRIGGER IF NOT EXISTS fleet_generation_signature_delete
+         AFTER DELETE ON replica_envelope_signatures
+         WHEN {delete_signature} BEGIN {bump} END;
+         CREATE TRIGGER IF NOT EXISTS fleet_generation_anchor_insert AFTER INSERT ON meta
+         WHEN NEW.key='fleet_anchor_key' BEGIN {bump} END;
+         CREATE TRIGGER IF NOT EXISTS fleet_generation_anchor_update AFTER UPDATE ON meta
+         WHEN NEW.key='fleet_anchor_key' OR OLD.key='fleet_anchor_key' BEGIN {bump} END;
+         CREATE TRIGGER IF NOT EXISTS fleet_generation_anchor_delete AFTER DELETE ON meta
+         WHEN OLD.key='fleet_anchor_key' BEGIN {bump} END;",
+        insert_envelope = carries_fleet_claims("NEW"),
+        update_envelope = carries_fleet_claims("NEW"),
+        insert_signature = signs_fleet_claims("NEW"),
+        delete_signature = signs_fleet_claims("OLD"),
+    )
+}
+
 pub fn fleet_membership_tx(connection: &Connection) -> Result<crate::fleet::Membership> {
     fleet_membership_tx_with_local_signer(connection, None)
 }
