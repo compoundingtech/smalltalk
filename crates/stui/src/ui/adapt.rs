@@ -601,6 +601,12 @@ fn agents(model: &Model, missions: &[Mission]) -> Vec<Agent> {
                 {
                     AgentState::NeedsYou
                 }
+                // Blocked on its st channel is the seat's to fix (its mail is held), not the
+                // person's: answering it cannot unblock it (Nathan, 2026-10-06: "why does Stui
+                // show up as needs you?").
+                ("waiting", Some("blocked")) if agent.blocked_on.as_deref() == Some("channel") => {
+                    AgentState::Fault
+                }
                 ("waiting", Some("blocked")) => AgentState::NeedsYou,
                 // st withdraws an idle claim it has not heard renewed lately: the harness reads
                 // "indeterminate" and the seat "waiting", though it is up and reachable. That is an
@@ -666,6 +672,20 @@ fn agents(model: &Model, missions: &[Mission]) -> Vec<Agent> {
                             .filter(|delivery| delivery.state == "stale")
                             .and_then(|delivery| delivery.reason.clone())
                             .filter(|reason| reason.starts_with("delivery-control-unavailable:"))
+                    }).or_else(|| {
+                        (agent.state == "waiting"
+                            && agent.harness_state.as_deref() == Some("blocked")
+                            && agent.blocked_on.as_deref() == Some("channel"))
+                        .then(|| {
+                            format!(
+                                "Its st channel is not attached, so its mail is held{}",
+                                agent
+                                    .reason
+                                    .as_deref()
+                                    .map(|reason| format!(" ({reason})"))
+                                    .unwrap_or_default()
+                            )
+                        })
                     }),
                     under: agent.under.first().map(|relation| {
                         model
@@ -1665,6 +1685,35 @@ mod tests {
         assert_eq!(agents(&model, &[])[0].state, AgentState::Fault);
         model.agents = window(vec![resource("waiting", "indeterminate", Some("human"))]);
         assert_eq!(agents(&model, &[])[0].state, AgentState::Starting);
+    }
+
+    #[test]
+    fn a_seat_blocked_on_its_channel_is_broken_not_waiting_on_the_person() {
+        // Nathan, 2026-10-06: "why does Stui show up as needs you?" It was blocked on its st
+        // channel (mail held), which an answer cannot unblock.
+        let mut model = Model::default();
+        let resource = |blocked_on: &str| {
+            serde_json::json!({
+                "id": "agent/example/seat", "kind": "agent", "revision": "r1",
+                "updated_at": "2026-10-06T12:00:00Z", "name": "example/seat",
+                "state": "waiting", "reachability": "reachable", "harness_state": "blocked",
+                "blocked_on": blocked_on, "reason": "claude-channel-unattached",
+                "runtime_ids": [], "under": [],
+            })
+        };
+        model.agents = window(vec![resource("channel")]);
+        let seat = &agents(&model, &[])[0];
+        assert_eq!(seat.state, AgentState::Fault);
+        assert!(
+            seat.details.fault.as_deref().is_some_and(|text| {
+                text.contains("st channel is not attached") && text.contains("claude-channel-unattached")
+            }),
+            "{:?}",
+            seat.details.fault
+        );
+        // Blocked on a person is still theirs.
+        model.agents = window(vec![resource("human")]);
+        assert_eq!(agents(&model, &[])[0].state, AgentState::NeedsYou);
     }
 
     #[test]
