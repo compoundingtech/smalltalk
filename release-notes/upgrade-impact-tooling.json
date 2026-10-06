@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Source-pinned release upgrade-impact notes",
+  "replay": {"status": "none", "detail": "No runtime replay change."},
+  "schema": {"status": "none", "detail": "No database schema change."},
+  "rules": {"status": "none", "detail": "No checkpoint rules change."},
+  "compatibility": {"status": "none", "detail": "No client, wire or harness contract change."},
+  "downtime": {"status": "none", "detail": "No additional service interruption introduced."},
+  "manual": {"status": "changed", "detail": "Release authors must commit explicit upgrade-impact classifications. Before the first automated publication, operations must backfill any unclassified commits since the previous release with reviewed fragments listing their exact hashes. Daily/manual/tag publication all stop before creating a release when classification is missing."},
+  "recovery": {"status": "none", "detail": "No database or runtime recovery change."}
+}
