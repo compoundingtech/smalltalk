@@ -4,9 +4,9 @@
 One isolated daemon (private HOME, XDG dirs, PATH and sockets) runs one Claude seat whose
 `claude` is ./claude, a stand-in that drives the real hook, status-line and channel contracts.
 The eval checks, from outside the seat, that st3 alone:
-- publishes harness.observed working and idle from the seat's hooks;
+- exposes current working and idle through the client card from the seat's hooks;
 - binds Claude's native session, so the client API timeline shows the native transcript;
-- records the status line (harness.usage carries the stand-in's model and context);
+- exposes the current status-line context and model through the client card;
 - delivers a message through the channel and sees it read;
 - reports claude-hooks pass in `st doctor`;
 - launches nothing whose argv or environment names an `st2` program or an `/st2/` path, and
@@ -199,11 +199,14 @@ agent "native-seat" {{
 ''')
         node.cli("agents", "apply", str(seats), "--as", "person/eval")
 
-        def turned():
-            states = {fields(claim).get("state") for claim in claims(node, "harness.observed")}
-            return {"working", "idle"} <= states and states
-        checks["observed_states"] = sorted(until(turned, args.ready_seconds,
-                                                 "harness.observed never showed working and idle"))
+        observed_states = set()
+        def current_card():
+            card = node.api("/v1/client/agents/" + urllib.parse.quote(SUBJECT, safe="/")) or {}
+            if card.get("observation") == "current":
+                observed_states.add(card.get("harness_state"))
+            return card
+        until(lambda: current_card().get("harness_state") == "idle", args.ready_seconds,
+              "the current client card never showed idle")
 
         hooks = [row for row in receipts(node) if row["event"] == "hook"]
         checks["hook_runs"] = len(hooks)
@@ -222,9 +225,9 @@ agent "native-seat" {{
         checks["timeline_items"] = len(page.get("items", []))
 
         def status_recorded():
-            usage = claims(node, "harness.usage")
-            return [fields(claim) for claim in usage if fields(claim).get("model") == "claude-stub-model"]
-        checks["usage"] = until(status_recorded, 60, "the status line was never recorded")[-1]
+            context = ((current_card().get("usage") or {}).get("context") or {})
+            return context if context.get("model") == "claude-stub-model" else None
+        checks["usage"] = until(status_recorded, 60, "the current status-line context was never visible")
         lines = [row for row in receipts(node) if row["event"] == "statusline"]
         if not lines or any(row.get("exit") != 0 or "missing" in row.get("stdout", "") for row in lines):
             fail(f"the status line failed: {lines[-3:]}")
@@ -235,9 +238,16 @@ agent "native-seat" {{
         checks["message"] = message
 
         def read():
+            current_card()
             view = node.api("/v1/messages/read/" + message)
             return view if (view or {}).get("status") in ("read", "closed") else None
         checks["message_status"] = until(read, 90, f"{message} was never read")["status"]
+        until(lambda: current_card().get("harness_state") == "idle" and {"working", "idle"} <= observed_states,
+              10, "current client cards never showed both working and idle during delivery")
+        checks["observed_states"] = sorted(state for state in observed_states if state)
+        checks["durable_status_claims"] = len(claims(node, "harness.observed"))
+        if checks["durable_status_claims"]:
+            fail("current status entered durable history")
         channel = [row for row in receipts(node) if row["event"] == "channel"]
         if not any(message in row["content"] for row in channel):
             fail("the message never reached the channel")

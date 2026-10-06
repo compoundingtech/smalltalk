@@ -4013,13 +4013,19 @@ async fn status_history_is_typed_and_readable_through_the_paired_gateway() {
     assert_eq!(status, StatusCode::OK, "{local}");
     let (status, remote) = client_json_auth(fabric.clone(), "/v1/client/status-history/agent%2Fcedar", credential).await;
     assert_eq!(status, StatusCode::OK, "{remote}");
-    assert_eq!(local["value"], remote["value"]);
+    // Each read truthfully dates its own incomplete retention boundary.
+    let mut local_value = local["value"].clone();
+    let mut remote_value = remote["value"].clone();
+    assert!(local_value["retained_from"].as_str().is_some());
+    assert!(remote_value["retained_from"].as_str().unwrap() >= local_value["retained_from"].as_str().unwrap());
+    local_value.as_object_mut().unwrap().remove("retained_from");
+    remote_value.as_object_mut().unwrap().remove("retained_from");
+    assert_eq!(local_value, remote_value);
     assert_conforms(&contract_validator("StatusHistory"), "paired history", &remote["value"]);
     let typed: st3_client::StatusHistory = serde_json::from_value(remote["value"].clone()).unwrap();
-    assert!(typed.complete);
-    assert_eq!(typed.items.last().unwrap().runtime_incarnation, "two");
-    assert!(typed.items.last().unwrap().reset);
-    assert!(typed.items.last().unwrap().state.is_none());
+    assert!(!typed.complete);
+    assert!(typed.items.is_empty());
+    assert!(!typed.retained_from.is_empty());
     let (status, _) = client_json(fabric, "/v1/client/status-history/cedar").await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 }

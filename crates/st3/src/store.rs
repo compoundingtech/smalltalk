@@ -15370,7 +15370,14 @@ impl Store {
         let connection = self.readers.get();
         let pending: bool = connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM local_latest_slots WHERE subject=?1 AND kind='harness.usage'
-             AND pending_local_id IS NOT NULL)", [subject], |r| r.get(0)).map_err(internal)?;
+             AND (pending_local_id IS NOT NULL OR (
+                json_extract(published_fields,'$.semantics')='response_rollup'
+                AND json_extract(published_fields,'$.incarnation_id')=?2
+                AND json_extract(published_fields,'$.native_session_id') IS NULL
+                AND EXISTS(SELECT 1 FROM claims WHERE subject=?1 AND kind='harness.session-file'
+                    AND json_extract(body,'$.fields.incarnation_id')=?2
+                    AND json_extract(body,'$.fields.harness')=json_extract(published_fields,'$.driver')))))",
+            params![subject, incarnation], |r| r.get(0)).map_err(internal)?;
         drop(connection);
         if !pending {
             return Ok(false);

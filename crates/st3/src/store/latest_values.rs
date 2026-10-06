@@ -639,25 +639,9 @@ impl Store {
     }
 
     pub fn transport_links(&self) -> Result<Vec<(String, String)>> {
-        let connection = self.readers.get();
-        let query = current_sql(&smallclaims::store::canonical::canonical_sql(
-            "SELECT origin,subject FROM (
-                SELECT origin,subject,body,
-                    ROW_NUMBER() OVER (PARTITION BY origin,subject ORDER BY CANONICAL_DESC(claims)) AS rank
-                FROM claims WHERE kind='transport.observed')
-             WHERE rank=1 AND json_extract(body,'$.fields.status')='up'
-             AND CAST(coalesce(json_extract(body,'$.fields.last_success_unix_ms'),json_extract(body,'$.fields.observed_at_ms'),0) AS INTEGER)>=?1 ORDER BY origin,subject"));
-        connection
-            .prepare_cached(&query)?
-            .query_map([now_ms().saturating_sub(90_000) as u64], |row| {
-                let subject: String = row.get(1)?;
-                Ok((
-                    row.get(0)?,
-                    subject.strip_prefix("host/").unwrap_or(&subject).to_owned(),
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+        // The graph's source-clock, skew, refresh and dial-out fences also apply to
+        // registers through Runtime::current_observation_sql. Keep one route reducer.
+        self.graph.transport_links()
     }
 
     pub(crate) fn own_transport_value(&self, peer: &str) -> Result<Option<ClaimRecord>> {

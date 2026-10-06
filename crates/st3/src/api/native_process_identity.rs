@@ -9,14 +9,14 @@ pub(super) fn birth(pid: u32) -> Option<u64> {
     identity(pid).map(|identity| identity.birth)
 }
 
-pub(super) fn is_descendant(mut pid: u32, root: u32) -> bool {
+pub(super) fn is_descendant(mut pid: u32, root: u32, root_birth: u64) -> bool {
     let mut seen = std::collections::BTreeSet::new();
     while pid > 1 && seen.len() < 64 && seen.insert(pid) {
         let Some(identity) = identity(pid) else {
             return false;
         };
         if pid == root {
-            return true;
+            return identity.birth == root_birth;
         }
         pid = identity.parent;
     }
@@ -89,8 +89,9 @@ mod tests {
     use super::*;
     #[test]
     fn process_stat_identity_uses_birth_and_refuses_zombies_or_truncation() {
-        let stat = "42 (fixture ) name) S 7 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1234 0";
-        let id = parse_linux_stat(stat).unwrap();
+        // Kernel fields 5..21 precede starttime at field 22.
+        let stat = format!("42 (fixture ) name) S 7 {} 1234 0", vec!["0"; 17].join(" "));
+        let id = parse_linux_stat(&stat).unwrap();
         assert_eq!((id.parent, id.birth), (7, 1234));
         assert!(parse_linux_stat(&stat.replace(") S ", ") Z ")).is_none());
         assert!(parse_linux_stat("42 (fixture) S 7").is_none());

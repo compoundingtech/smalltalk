@@ -409,7 +409,8 @@ mod tests {
         let store = Store::open_memory("owner").unwrap();
         let publish = |semantics, step, total| {
             store.append_claim(&ClaimInput {
-            subject:"agent/cedar".into(), kind:"harness.usage".into(),actor:Some("agent/cedar".into()),
+            subject:if semantics == "session_cumulative" {"agent/birch"} else {"agent/cedar"}.into(),
+            kind:"harness.usage".into(),actor:Some(if semantics == "session_cumulative" {"agent/birch"} else {"agent/cedar"}.into()),
             fields:serde_json::from_value(json!({"driver":"codex","incarnation_id":"one","semantics":semantics,
                 "model":"model","account":"provider/account","owner_step":step,"total_tokens":total})).unwrap(),
             evidence:vec![],expected_subject:None,idempotency_key:None,
@@ -430,11 +431,20 @@ mod tests {
         assert_eq!(connection.query_row("SELECT json_extract(body,'$.fields.total_tokens') FROM numeric_values WHERE json_extract(body,'$.fields.semantics')='session_cumulative'",[],|r|r.get::<_,u64>(0)).unwrap(),40);
         assert_eq!(
             store
-                .usage_summary_at("agent/cedar", None, None)
+                .usage_summary_at("agent/birch", None, None)
                 .unwrap()
                 .unwrap()
                 .total_tokens,
             40
+        );
+        // Attributed response rollups remain distinct from provider cumulative totals.
+        assert_eq!(
+            store
+                .usage_summary_at("agent/cedar", None, None)
+                .unwrap()
+                .unwrap()
+                .total_tokens,
+            30
         );
     }
     #[test]

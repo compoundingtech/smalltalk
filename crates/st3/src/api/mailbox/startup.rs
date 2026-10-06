@@ -44,17 +44,45 @@ pub(super) fn live_native_incarnation(
     else {
         return false;
     };
-    let Some(observation) = point_launch(pty_root, &member.runtime_id) else {
-        return false;
-    };
-    same_caller_birth(peer)
-        && matches_incarnation(&observation, peer, fence)
-        && observation
-            .pid
-            .is_some_and(|pid| is_descendant(peer.pid, pid))
+    verify_point_launch(pty_root, &member.runtime_id, peer, fence, is_descendant)
 }
 
-fn point_launch(root: &std::path::Path, id: &str) -> Option<st_runtime::PtyObservation> {
+struct LaunchEvidence {
+    observation: st_runtime::PtyObservation,
+    metadata: pty_core::registry::SessionMetadata,
+    kernel_birth: u64,
+}
+
+impl LaunchEvidence {
+    fn same_identity(&self, other: &Self) -> bool {
+        self.kernel_birth == other.kernel_birth
+            && self.metadata.generation == other.metadata.generation
+            && self.metadata.daemon_pid == other.metadata.daemon_pid
+            && self.metadata.daemon_start_token() == other.metadata.daemon_start_token()
+            && self.metadata.created_at == other.metadata.created_at
+            && self.observation.tags.get("st3.subject") == other.observation.tags.get("st3.subject")
+    }
+}
+
+fn verify_point_launch(
+    root: &std::path::Path,
+    id: &str,
+    peer: &NativeDeliveryPeer,
+    fence: &Fence,
+    walk: impl FnOnce(u32, u32, u64) -> bool,
+) -> bool {
+    let Some(launch) = point_launch(root, id) else {
+        return false;
+    };
+    matches_incarnation(&launch.observation, peer, fence)
+        && launch.observation.pid.is_some_and(|pid| walk(peer.pid, pid, launch.kernel_birth))
+        // Re-read only this launch after ancestry, retaining the private generation and
+        // opaque supervisor token. Root and caller replacements both fail closed.
+        && point_launch(root, id).is_some_and(|current| launch.same_identity(&current))
+        && same_caller_birth(peer)
+}
+
+fn point_launch(root: &std::path::Path, id: &str) -> Option<LaunchEvidence> {
     use pty_core::registry;
     registry::with_root(root, || {
         registry::validate_name(id).ok()?;
@@ -78,7 +106,14 @@ fn point_launch(root: &std::path::Path, id: &str) -> Option<st_runtime::PtyObser
         // Retain the supervisor's published birth fence, not an unchecked PID sidecar.
         // Its Darwin token is the existing opaque registry contract; do not reinterpret
         // the separate microsecond Unix-caller token as that supervisor identity.
+        let root_pid = u32::try_from(metadata.daemon_pid?).ok()?;
+        // Capture before verifying the published token and carry this exact kernel
+        // identity through ancestry. A root PID recycled after lookup cannot match.
+        let root_birth = birth(root_pid)?;
         let pid = registry::read_signal_target_with(id, Some(&metadata))?;
+        if u32::try_from(pid).ok()? != root_pid || birth(root_pid) != Some(root_birth) {
+            return None;
+        }
         let current = read()?;
         if current.has_exited()
             || current.generation != metadata.generation
@@ -88,14 +123,18 @@ fn point_launch(root: &std::path::Path, id: &str) -> Option<st_runtime::PtyObser
         {
             return None;
         }
-        Some(st_runtime::PtyObservation {
-            name: id.into(),
-            status: "running".into(),
-            exit_code: None,
-            pid: Some(u32::try_from(pid).ok()?),
-            created_at: Some(metadata.created_at),
-            display_name: metadata.display_name,
-            tags: metadata.tags?.into_iter().collect(),
+        Some(LaunchEvidence {
+            observation: st_runtime::PtyObservation {
+                name: id.into(),
+                status: "running".into(),
+                exit_code: None,
+                pid: Some(u32::try_from(pid).ok()?),
+                created_at: Some(metadata.created_at.clone()),
+                display_name: metadata.display_name.clone(),
+                tags: metadata.tags.clone()?.into_iter().collect(),
+            },
+            metadata,
+            kernel_birth: root_birth,
         })
     })
 }
@@ -175,9 +214,16 @@ mod tests {
                 .spawn()
                 .unwrap(),
         );
-        assert!(is_descendant(child.0.id(), pid));
-        assert!(is_descendant(pid, pid));
-        assert!(!is_descendant(child.0.id(), u32::MAX));
+        let root_birth = birth(pid).unwrap();
+        assert!(is_descendant(child.0.id(), pid, root_birth));
+        assert!(is_descendant(pid, pid, root_birth));
+        assert!(!is_descendant(
+            child.0.id(),
+            pid,
+            root_birth.wrapping_add(1)
+        ));
+        assert!(!is_descendant(pid, pid, root_birth.wrapping_add(1)));
+        assert!(!is_descendant(child.0.id(), u32::MAX, root_birth));
     }
     #[test]
     fn bootstrap_refuses_missing_or_reused_authenticated_process_identity() {
@@ -304,6 +350,44 @@ mod tests {
                 .code,
             "stale-mailbox-session"
         );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn launch_replacement_between_lookup_and_ancestry_is_not_starting_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let (state, peer, fence, metadata) = bootstrap_fixture(root.path());
+        let path = state.pty_root.join("eval.worker.json");
+        for field in ["generation", "daemonStartToken"] {
+            fs::write(&path, metadata.to_string()).unwrap();
+            let result = bind_with_native_startup(&state.store, &fence, || {
+                verify_point_launch(
+                    &state.pty_root,
+                    "eval.worker",
+                    &peer,
+                    &fence,
+                    |pid, root, root_birth| {
+                        let mut replacement = metadata.clone();
+                        replacement[field] = json!("replacement");
+                        fs::write(&path, replacement.to_string()).unwrap();
+                        is_descendant(pid, root, root_birth)
+                    },
+                )
+            });
+            assert_eq!(result.err().unwrap().code, "stale-mailbox-session");
+            assert_eq!(
+                state
+                    .store
+                    .readers
+                    .get()
+                    .query_row("SELECT count(*) FROM local_mailbox_owners", [], |row| row
+                        .get::<_, u64>(
+                        0
+                    ))
+                    .unwrap(),
+                0
+            );
+        }
     }
 
     #[test]

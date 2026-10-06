@@ -15819,10 +15819,10 @@ mission "example/zero-run" state="ready" {
         let index = state.store.index().unwrap();
         let before = client_agent_resources(&state.store, false, "", index).unwrap();
         let before = before.iter().find(|item| item["id"] == subject).unwrap();
-        // The quick read uses the cached card's receipt time. The backdated payload time is
-        // deliberately no longer recovered by a separate per-request history query.
-        assert_eq!(before["observation"], "current");
-        assert_eq!(before["harness_state"], "idle");
+        // The cached current register keeps the actual source time. Receipt cannot
+        // freshen a backdated provider reading, and no history query is needed.
+        assert_eq!(before["observation"], "stale");
+        assert_eq!(before["harness_state"], "indeterminate");
         assert!(before.get("_status_source").is_none());
         let mut aged = vec![before.clone()];
         let mut cached_harness = state.store.observed_harness_at(subject, index).unwrap().unwrap();
