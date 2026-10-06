@@ -1890,6 +1890,16 @@ impl<R: RuntimeControl> Reconciler<R> {
         let observe_span = crate::profile::span("pass/changes");
         self.incremental.observe(&self.store)?;
         drop(observe_span);
+        // Mission transitions use the reserved writer class and run before bulk host
+        // reconciliation. Mailbox/status traffic must not put first readiness behind
+        // every ordinary write, runtime snapshot, or observer on this host.
+        let daemon = format!("daemon/{}", self.host);
+        self.file_watchers_used
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        self.isolate("stage/missions", &daemon, || self.evaluate_mission_runs());
+        self.release_unused_file_watchers();
         let _runners_span = crate::profile::span("pass/gate-runners");
         for runner in self.gate_runners()? {
             if runner.retired && runner.host == self.host {
@@ -2264,7 +2274,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             let wrote_mark = smallclaims::touched::wrote_len();
             let ((result, due), reads) = smallclaims::touched::record(|| {
                 smallclaims::touched::record_due(|| {
-                    caught(|| -> Result<()> {
+                    smallclaims::sqlite::with_control_writes(|| caught(|| -> Result<()> {
                         // A workspace or render failure blocks only a start or restart. A running member
                         // is still observed, checked, and given its work.
                         let mut blocked = member_errors.remove(&subject.subject);
@@ -2565,7 +2575,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                             }
                         }
                         blocked.map_or(Ok(()), Err)
-                    })
+                    }))
                 })
             });
             crate::performance::record_evaluation(
@@ -2615,10 +2625,8 @@ impl<R: RuntimeControl> Reconciler<R> {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|subject, _| members.contains(&format!("member:{subject}")));
-        // Each later stage runs on its own. A stage that fails records a fault on this daemon and
-        // the stages after it still run, so no intake item can hold back mission evaluation, run
-        // cleanup, or work delivery on this host.
-        let daemon = format!("daemon/{}", self.host);
+        // Each later stage runs on its own. A stage that fails records a fault on this daemon
+        // and the stages after it still run. Intake-created runs advance on the next pass.
         // Intake left by a terminal owner or a superseded generation must not observe, deliver,
         // or start work. A stopped declaration still runs so it can settle its own state.
         let intake = self.isolate("stage/intake", &daemon, || {
@@ -2666,12 +2674,6 @@ impl<R: RuntimeControl> Reconciler<R> {
         self.isolate("stage/github-watches", &daemon, || {
             self.reconcile_github_watches(&desired)
         });
-        self.file_watchers_used
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
-        self.isolate("stage/missions", &daemon, || self.evaluate_mission_runs());
-        self.release_unused_file_watchers();
 
         // Mission state is the primary control-plane projection. Evaluate it before
         // wake-message bookkeeping so a large mailbox or work history cannot starve
@@ -6557,7 +6559,9 @@ impl<R: RuntimeControl> Reconciler<R> {
     /// Evaluate each active run on its own. A run that fails records a fault on that run, and
     /// every other run, including runs in cleanup, is still evaluated in the same pass.
     fn evaluate_mission_runs(&self) -> Result<()> {
-        self.recording_writes(|| self.evaluate_mission_runs_pass())
+        smallclaims::sqlite::with_control_writes(|| {
+            self.recording_writes(|| self.evaluate_mission_runs_pass())
+        })
     }
 
     fn evaluate_mission_runs_pass(&self) -> Result<()> {
@@ -15247,6 +15251,7 @@ mod tests {
     mod rollout_tests;
     mod ref_watch_tests;
     mod pull_request_run_tests;
+    mod promotion_priority;
     #[test]
     fn native_exec_and_gate_shell_resolve_the_declared_path() {
         use super::{NativeRuntime, RuntimeControl};
