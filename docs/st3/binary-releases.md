@@ -90,6 +90,13 @@ does not start a second tag build. There are no version-bump commits. Archives f
 carry no tag in `BUILD.json`; `source` identifies the commit. `scripts/release-smalltalk-daily
 --dry-run` prints what would be published without publishing.
 
+Daily, manual dispatch, and tag publication use the same source-pinned **Upgrade impact**
+section before the change list, and attach `UPGRADE-IMPACT.json`. It describes replay,
+database changes, checkpoint rules/fleet coordination, client and harness compatibility,
+service interruption, manual steps, and recovery. Missing classifications stop publication;
+main builds and merges continue. See [release impact authoring](release-impact.md) for
+committed fragments, measurements, historical backfills, and a notes-only preview.
+
 Tag names are labels, not embedded package versions: use `BUILD.json`/`RELEASE.json` for exact
 source identity. Tag the tested commit (with this workflow in its tree); pushing a tag does not
 wait for unrelated CI runs. Tags made with another workflow's default `GITHUB_TOKEN` do not

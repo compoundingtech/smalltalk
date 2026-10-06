@@ -16,6 +16,7 @@ on:
       - build.rs
       - crates/st-drivers/src/version.rs
       - scripts/release-smalltalk*
+      - scripts/release_notes*
       - scripts/ci-build-snapshot*
       - scripts/ci-cache-audit*
       - scripts/ci-perf-cache
@@ -51,6 +52,7 @@ jobs:
           scripts/install-test
           scripts/install-release-test
           python3 scripts/install-macos-test
+          python3 scripts/release_notes_test.py
 
       - name: Report job cache coverage
         if: always()
@@ -113,6 +115,7 @@ jobs:
           scripts/install-release-test
           python3 scripts/install-macos-test
           python3 scripts/release-smalltalk-test
+          python3 scripts/release_notes_test.py
 
       - name: Build, package, and test extracted tools
         run: "scripts/release-smalltalk '${{ matrix.target }}' dist"
@@ -206,13 +209,14 @@ jobs:
           set -euo pipefail
           git fetch origin "refs/tags/$TAG"
           test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$SOURCE_SHA"
+          python3 scripts/release_notes.py --source "$SOURCE_SHA" --tag "$TAG" --output dist/RELEASE-NOTES.md --manifest dist/UPGRADE-IMPACT.json
           cd dist
           sha256sum --check SHA256SUMS
           python3 ../scripts/release-smalltalk-manifest.py "$SOURCE_SHA"
           # Refuse to replace any existing release or its assets. A partial draft stays private
           # for inspection; delete that draft before retrying, never move the tag.
           gh release create "$TAG" --verify-tag --draft --title "Smalltalk $TAG" \
-            --notes-file RELEASE-NOTES.md ./*.tar.gz ./*.sha256 SHA256SUMS RELEASE.json
+            --notes-file RELEASE-NOTES.md ./*.tar.gz ./*.sha256 SHA256SUMS RELEASE.json UPGRADE-IMPACT.json
           gh release edit "$TAG" --draft=false
 
       - name: Report job cache coverage
