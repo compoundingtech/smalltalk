@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Keep terminal and runtime list reads within their latency budget without relying on an earlier agent list to warm full status history.",
+  "replay": {
+    "status": "none",
+    "detail": "Read-side reduction only; no replay or durable claim changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database tables, indexes, triggers or schema version changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint, retention, replication or coordination rule changes."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Runtime and terminal resources retain the shared canonical authority and membership reducer and the same serialized fields. Full public status responses and claim fences are unchanged; internal runtime caches omit only harness state, claim provenance and desired conflicts that these resources never expose."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional service interruption beyond the normal binary restart."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual action is required after upgrading."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No migration or recovery changes; the previous binary can read the unchanged store."
+  }
+}

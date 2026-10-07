@@ -847,8 +847,9 @@ pub(crate) struct SubjectCache {
     conflicts: u64,
     views: HashMap<String, ViewEntry>,
     statuses: HashMap<String, StatusEntry>,
-    // Summary and full statuses never share entries: their provenance/harness fields differ.
+    // Reduction modes never share entries: their provenance/harness/actual fields differ.
     card_statuses: HashMap<String, StatusEntry>,
+    runtime_statuses: HashMap<String, StatusEntry>,
 }
 
 const AGENT_CARD_STATUS_LIMIT: usize = 4096;
@@ -1036,6 +1037,8 @@ enum SubjectStatusMode {
     /// Agent cards replace the harness with observed evidence and never expose desired
     /// conflicts. Provenance is only the last canonical claim, and only without a declaration.
     AgentCard,
+    /// Runtime resources do not serialize harness state, claim provenance or desired conflicts.
+    RuntimeProjection,
 }
 
 /// One subject's status at `at_index`, and the action it asks of its host when it is current and
@@ -1092,6 +1095,7 @@ fn subject_status_at_with_mode(
             claim_ids_at(connection, subject, at_index)?,
             desired_conflicts_at(connection, subject, desired.as_ref().map(|row| row.claim_id.as_str()), at_index)?,
         ),
+        SubjectStatusMode::RuntimeProjection => (None, Vec::new(), Vec::new()),
         SubjectStatusMode::AgentCard => {
             let claims = if desired.is_some() {
                 Vec::new()
@@ -10270,8 +10274,10 @@ impl Store {
                 cache.views.clear();
                 cache.statuses.clear();
                 cache.card_statuses.clear();
+                cache.runtime_statuses.clear();
                 cache.conflicts = conflicts;
-            } else if !cache.views.is_empty() || !cache.statuses.is_empty() || !cache.card_statuses.is_empty() {
+            } else if !cache.views.is_empty() || !cache.statuses.is_empty()
+                || !cache.card_statuses.is_empty() || !cache.runtime_statuses.is_empty() {
                 // The subjects and actors of the claims that arrived.
                 let mut statement = connection.prepare_cached(
                     "SELECT subject, actor FROM claims WHERE store_index>?1 AND store_index<=?2",
@@ -10295,6 +10301,7 @@ impl Store {
                     .statuses
                     .retain(|subject, entry| !stale(subject, &entry.owners));
                 cache.card_statuses.retain(|subject, entry| !stale(subject, &entry.owners));
+                cache.runtime_statuses.retain(|subject, entry| !stale(subject, &entry.owners));
             }
             cache.through = store_index;
         }
@@ -10326,6 +10333,7 @@ impl Store {
             let entries = match mode {
                 SubjectStatusMode::Full => &cache.statuses,
                 SubjectStatusMode::AgentCard => &cache.card_statuses,
+                SubjectStatusMode::RuntimeProjection => &cache.runtime_statuses,
             };
             if let Some(entry) = entries.get(subject)
                 .filter(|entry| entry.read_at <= store_index && store_index <= cache.through)
@@ -10352,6 +10360,7 @@ impl Store {
                 let entries = match mode {
                     SubjectStatusMode::Full => &mut cache.statuses,
                     SubjectStatusMode::AgentCard => &mut cache.card_statuses,
+                    SubjectStatusMode::RuntimeProjection => &mut cache.runtime_statuses,
                 };
                 // At capacity, a cold summary remains correct and uncached. Invalidation
                 // frees slots; no growing history map or full-status cache warming is needed.
@@ -10459,6 +10468,38 @@ impl Store {
         for name in names {
             let (status, _) = self.cached_subject_status_with_mode(
                 &connection, &name, index, newest, SubjectStatusMode::AgentCard,
+            )?;
+            if history || status.projection.layer == "current" {
+                subjects.push(status);
+            }
+        }
+        Ok(StatusResponse { store_index: index, subjects, pending_actions: Vec::new() })
+    }
+
+    /// Only fields consumed by runtime/terminal resources, using the shared authority and
+    /// membership reducer without materializing discarded harness or claim history.
+    pub(crate) fn runtime_projection_status_at(
+        &self,
+        owner: Option<&str>,
+        index: u64,
+        history: bool,
+    ) -> Result<StatusResponse> {
+        let connection = self.readers.get();
+        let index = selected_index(current_index(&connection)?, Some(index)).map_err(anyhow::Error::new)?;
+        let names = match owner {
+            Some(owner) => BTreeSet::from([owner.to_owned()]),
+            None => connection.prepare_cached(RUNTIME_SUBJECTS)?
+                .query_map([index], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<BTreeSet<_>>>()?,
+        };
+        let names = if history { names } else {
+            self.current_view_candidates(&connection, names, index, true)?
+        };
+        let newest = self.advance_subject_cache(&connection, index)?;
+        let mut subjects = Vec::with_capacity(names.len());
+        for name in names {
+            let (status, _) = self.cached_subject_status_with_mode(
+                &connection, &name, index, newest, SubjectStatusMode::RuntimeProjection,
             )?;
             if history || status.projection.layer == "current" {
                 subjects.push(status);
@@ -35037,6 +35078,39 @@ mission "card-owner" state="ready" {
                 continue;
             }
             for history in [false, true] {
+                let index = store.index().unwrap();
+                // Runtime lists must be correct cold, without an agent/full-status read
+                // warming their cache, and must not poison full public status answers.
+                let runtime = store.runtime_projection_status_at(None, index, history).unwrap();
+                let mut full = store.status_for_claim_kind_at("runtime.observed", Some(index), history).unwrap();
+                for subject in &mut full.subjects {
+                    assert!(!subject.claims.is_empty());
+                    subject.harness = None;
+                    subject.claims.clear();
+                    subject.conflicts.clear();
+                }
+                assert_eq!(serde_json::to_value(&runtime.subjects).unwrap(),
+                    serde_json::to_value(&full.subjects).unwrap(), "runtime step {step}, history {history}");
+                for subject in &runtime.subjects {
+                    let owner = store.runtime_projection_status_at(Some(&subject.subject), index, history).unwrap();
+                    assert_eq!(serde_json::to_value(&owner.subjects).unwrap(),
+                        serde_json::to_value([subject]).unwrap());
+                }
+                let older_index = index.saturating_sub(3);
+                let older = store.runtime_projection_status_at(None, older_index, history).unwrap();
+                let mut older_full = store.status_for_claim_kind_at("runtime.observed", Some(older_index), history).unwrap();
+                for subject in &mut older_full.subjects {
+                    subject.harness = None;
+                    subject.claims.clear();
+                    subject.conflicts.clear();
+                }
+                assert_eq!(serde_json::to_value(&older.subjects).unwrap(),
+                    serde_json::to_value(&older_full.subjects).unwrap(), "older runtime step {step}, history {history}");
+                let warm = store.runtime_projection_status_at(None, index, history).unwrap();
+                store.forget_current_views();
+                let cold = store.runtime_projection_status_at(None, index, history).unwrap();
+                assert_eq!(serde_json::to_value(&warm.subjects).unwrap(),
+                    serde_json::to_value(&cold.subjects).unwrap(), "runtime cache step {step}, history {history}");
                 let view = |store: &Store| {
                     serde_json::to_value(
                         store

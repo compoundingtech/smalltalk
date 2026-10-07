@@ -115,6 +115,13 @@ The agent-card cache holds its mutex only while selecting or publishing immutabl
 rows, not while building cards. A request's SQLite snapshot therefore does not wait at that
 mutex behind another request's disk reads.
 
+Runtime and terminal resources use the shared status authority and membership reducer but
+do not materialize the harness state, full claim-id history or desired conflicts that their
+responses omit. Their per-subject cache is separate from full status answers and follows the
+same subject/actor and owner-generation invalidation. Cold terminal reads therefore do not
+depend on an agent listing warming full status first. Public status responses still carry
+their complete provenance.
+
 Every five seconds a dedicated native thread attempts a passive WAL checkpoint outside the
 writer queue. Once every frame is backfilled, it attempts `TRUNCATE` with zero busy timeout.
 Active readers or writers defer recycling; the daemon never waits for them while holding the

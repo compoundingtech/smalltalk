@@ -2179,19 +2179,11 @@ fn runtime_resources_for_owner(
     // other control path. A raw claim ordered last by this replica's ingest
     // index is not necessarily the causally current runtime observation.
     // Exact owner reads reduce just that subject at this snapshot.
-    let status = if let Some(owner) = owner {
-        state.store.status_for_subject_names_at(
-            BTreeSet::from([owner.to_owned()]),
-            snapshot.store_index,
-            history,
-        )?
-    } else {
-        state.store.status_for_claim_kind_at(
-            "runtime.observed",
-            Some(snapshot.store_index),
-            history,
-        )?
-    };
+    let status = state.store.runtime_projection_status_at(
+        owner,
+        snapshot.store_index,
+        history,
+    )?;
     // Each runtime's declaration and observation time, in one statement apiece for the list.
     let desired_tokens = state.store.selected_desired_tokens(
         &status
