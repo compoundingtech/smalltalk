@@ -215,6 +215,7 @@ async fn stale_dial_out_links_never_offer_reverse_routes() {
                 "terminal/fixture-seat",
                 "fixture:i1",
                 st3_client::RawTerminalMode::Attach,
+                None,
             )
             .await
             .unwrap_err();
