@@ -241,6 +241,19 @@ fn signal_visible_change(state: &AppState) {
     );
 }
 
+#[cfg(test)]
+mod storage_contention_response_tests {
+    #[test]
+    fn typed_sqlite_contention_is_a_service_failure_not_input_validation() {
+        for code in ["database-busy", "database-locked"] {
+            let response = super::ApiError::bad(super::St3Error::new(code, "storage contention"));
+            assert_eq!(response.status, super::StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.code, code);
+        }
+        assert_eq!(super::ApiError::bad(super::St3Error::new("internal", "other fault")).status, super::StatusCode::INTERNAL_SERVER_ERROR);
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ApiError {
     status: StatusCode,
@@ -267,6 +280,7 @@ impl ApiError {
             | "lane-approval-denied"
             | "glass-owner-forbidden" => StatusCode::FORBIDDEN,
             "lane-not-found" | "not-found" => StatusCode::NOT_FOUND,
+            "database-busy" | "database-locked" => StatusCode::SERVICE_UNAVAILABLE,
             "internal" => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::UNPROCESSABLE_ENTITY,
         };

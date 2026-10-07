@@ -60,14 +60,46 @@ pub const STATEMENT_CACHE_CAPACITY: usize = 128;
 /// PASSIVE does page copying without taking the writer lock. TRUNCATE is attempted only after
 /// that copy completes, with no busy wait: an active reader or writer defers recycling.
 pub fn checkpoint_idle_wal(connection: &Connection) -> Result<bool> {
+    if !checkpoint_wal_backfilled(connection)? {
+        return Ok(false);
+    }
+    truncate_idle_wal(connection)
+}
+
+/// Copy pages without taking SQLite's writer lock. A live Store must serialize the later
+/// TRUNCATE with its writer queue; a zero busy timeout alone does not exclude a checkpoint.
+pub fn checkpoint_wal_backfilled(connection: &Connection) -> Result<bool> {
+    let report = checkpoint_wal_report(connection)?;
+    Ok(report.frames >= 0 && report.frames == report.backfilled)
+}
+
+#[derive(Debug)]
+pub struct WalCheckpointReport {
+    pub frames: i32,
+    pub backfilled: i32,
+    pub passive_ms: u128,
+    pub writer_wait_ms: u128,
+    pub truncate_ms: Option<u128>,
+    pub recycled: bool,
+}
+
+pub fn checkpoint_wal_report(connection: &Connection) -> Result<WalCheckpointReport> {
     connection.busy_timeout(std::time::Duration::ZERO)?;
+    let started = std::time::Instant::now();
     let (_, frames, backfilled): (i32, i32, i32) =
         connection.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?;
-    if frames < 0 || frames != backfilled {
-        return Ok(false);
-    }
+    Ok(WalCheckpointReport {
+        frames, backfilled, passive_ms: started.elapsed().as_millis(),
+        writer_wait_ms: 0, truncate_ms: None, recycled: false,
+    })
+}
+
+/// Attempt recycling without waiting for readers. TRUNCATE takes SQLite's writer lock;
+/// the daemon calls this only while it has borrowed the Store's sole writer from its queue.
+pub fn truncate_idle_wal(connection: &Connection) -> Result<bool> {
+    connection.busy_timeout(std::time::Duration::ZERO)?;
     let busy: i32 = connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
     Ok(busy == 0)
 }

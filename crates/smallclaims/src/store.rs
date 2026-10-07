@@ -36,6 +36,8 @@ use crate::sqlite::{
     STATEMENT_CACHE_CAPACITY, WriterConnection,
 };
 
+#[cfg(test)]
+mod projection_busy_tests;
 mod binary_payloads;
 mod inventory_generation;
 pub use binary_payloads::PayloadConversion;
@@ -708,7 +710,10 @@ pub struct Store {
     replication_projection_state: AtomicU64,
     /// Only limits new error detail lines; it never caches projection results or decisions.
     projection_diagnostics: Mutex<ProjectionDiagnosticState>,
-    /// When this process last projected replicated claims, in Unix milliseconds.
+    /// Advances only for numeric SQLite contention, so the daemon can coalesce a bounded
+    /// retry episode without treating arbitrary deferred work as contention.
+    projection_contention_generation: AtomicU64,
+    /// When this process last attempted projection of replicated claims, in Unix milliseconds.
     pub last_replication_projection_unix_ms: AtomicU64,
     /// The heals this node asks its peers, and when it last replayed its graph for one.
     pub heal: Mutex<heal::HealState>,
@@ -917,6 +922,7 @@ impl Store {
             replication_timers: ReplicationTimers::default(),
             replication_projection_state: AtomicU64::new(0),
             projection_diagnostics: Mutex::new(ProjectionDiagnosticState::default()),
+            projection_contention_generation: AtomicU64::new(0),
             last_replication_projection_unix_ms: AtomicU64::new(0),
             heal: Mutex::default(),
             member_key: std::sync::RwLock::new(None),
@@ -5243,7 +5249,8 @@ impl Store {
                 params![seeded_through, target, SEAL_CHUNK_BATCHES],
                 |row| row.get(0),
             )?;
-            let transaction = connection.transaction()?;
+            let transaction = connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             seed_replica_envelopes_signed_tx(
                 &transaction,
                 &self.origin,
@@ -5984,7 +5991,8 @@ impl Store {
             // one is rolled back and recorded alone.
             for chunk in pending.chunks(ADMISSION_CHUNK_ENVELOPES) {
                 let mut connection = self.connection.write();
-                let mut pass = connection.transaction()?;
+                let mut pass = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 for envelope in chunk {
                     let started = std::time::Instant::now();
                     let hold = fleet_admission_hold(&pass, &membership, envelope)?;
@@ -6086,12 +6094,42 @@ impl Store {
         self.replication_projection_state.load(Ordering::Acquire) & 1 != 0
     }
 
+    pub fn projection_contention_generation(&self) -> u64 {
+        self.projection_contention_generation.load(Ordering::Acquire)
+    }
+
+    fn note_projection_contention(&self) {
+        self.projection_contention_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
     fn defer_replication_projection(&self) {
         let _ = self.replication_projection_state.fetch_update(
             Ordering::AcqRel,
             Ordering::Acquire,
             |state| Some(state.wrapping_add(2) | 1),
         );
+    }
+
+    /// Copy WAL pages off the writer queue, then serialize the writer-lock-taking TRUNCATE.
+    /// The checkpoint connection has no busy wait; readers can still defer recycling.
+    pub fn checkpoint_idle_wal(&self, checkpoint: &Connection) -> Result<bool> {
+        Ok(self.checkpoint_idle_wal_report(checkpoint)?.recycled)
+    }
+
+    pub fn checkpoint_idle_wal_report(&self, checkpoint: &Connection) -> Result<crate::sqlite::WalCheckpointReport> {
+        let mut report = crate::sqlite::checkpoint_wal_report(checkpoint)?;
+        if report.frames <= 0 || report.frames != report.backfilled {
+            return Ok(report);
+        }
+        let waiting = std::time::Instant::now();
+        {
+            let _writer = self.connection.write();
+            report.writer_wait_ms = waiting.elapsed().as_millis();
+            let truncating = std::time::Instant::now();
+            report.recycled = crate::sqlite::truncate_idle_wal(checkpoint)?;
+            report.truncate_ms = Some(truncating.elapsed().as_millis());
+        }
+        Ok(report)
     }
 
     /// Replay the graph from nothing now, as a heal does when two nodes project different graphs
@@ -6240,7 +6278,17 @@ impl Store {
         let mut chunked = false;
         loop {
             let mut connection = self.connection.write();
-            let transaction = connection.transaction()?;
+            // Acquire SQLite's write lock before reading a snapshot. A deferred upgrade can
+            // fail immediately when the independent WAL checkpoint connection holds that lock.
+            let transaction = connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|error| {
+                    let error = internal(error);
+                    if error.is_sqlite_contention() { self.note_projection_contention(); }
+                    // No transaction began: surface the typed error, preserving the entry
+                    // deferred generation and attempt time. The daemon also schedules retry.
+                    error
+                })?;
             let frontier: u64 = transaction
                 .query_row(
                     "SELECT last_good_store_index FROM projection_health WHERE aggregate='graph'",
@@ -6267,8 +6315,8 @@ impl Store {
                 total: None,
             });
             let result = (|| -> Result<bool, St3Error> {
-                // An incremental projection that fails is rolled back and replaced by a full replay,
-                // which quarantines the claim it cannot project instead of failing the graph.
+                // Non-contention incremental failures retain the full replay fallback,
+                // which quarantines claims it cannot project. SQLite contention defers below.
                 transaction
                     .execute_batch("SAVEPOINT project_incremental")
                     .map_err(internal)?;
@@ -6305,6 +6353,11 @@ impl Store {
                         }
                         Err(error) => {
                             self.log_projection_failure(&error, phase, frontier, target, &mut log);
+                            if error.is_sqlite_contention() {
+                                // Roll back the whole chunk below. Replaying the same claims
+                                // cannot repair a connection lock and would lengthen its hold.
+                                return Err(error);
+                            }
                             crate::profile::note(&format!(
                                 "replay: incremental failed: {}",
                                 error.code
@@ -6334,6 +6387,10 @@ impl Store {
                                 processed: stage.processed,
                                 total: stage.total,
                             });
+                        }).map_err(|error| {
+                            let error = error.with_detail("projection_stage", "full-replay");
+                            self.log_projection_failure(&error, phase, frontier, target, &mut log);
+                            error
                         })?;
                 } else {
                     crate::profile::note("projection: incremental");
@@ -6406,6 +6463,14 @@ impl Store {
                 }
                 Err(error) => {
                     transaction.rollback()?;
+                    if error.is_sqlite_contention() {
+                        // Preserve committed health/frontier, not all process state: entry
+                        // advances the deferred generation by two and updates the last attempt
+                        // time, so the existing catch-up throttle applies. A daemon retry is
+                        // scheduled separately; receive/wake passes can also recover sooner.
+                        self.note_projection_contention();
+                        return Ok(false);
+                    }
                     connection.execute(
                     "INSERT INTO projection_health(aggregate, status, error_code, error_message, updated_at_unix_ms)
                      VALUES ('graph', 'stale', ?1, ?2, ?3)

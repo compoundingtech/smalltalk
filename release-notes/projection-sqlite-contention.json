@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Defer SQLite contention without replay and serialize WAL truncation with the writer queue",
+  "replay": {
+    "status": "changed",
+    "detail": "SQLite BUSY/LOCKED during incremental or post-projection rolls the chunk back and leaves it deferred without full replay or marking healthy projections stale. Other projection failures retain existing fallback and quarantine behavior."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, indexes, user_version or stored claim shape changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No authority, admission, checkpoint retention or proof rules change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Typed storage contention uses database-busy/database-locked with sqlite_extended_code; API errors preserving these codes return HTTP 503 instead of an internal/validation error. Replication envelopes and claim semantics are unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Normal forward deployment; no extra restart or migration is required."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No setting or operator action needed. Existing busy timeout and worker interval stay unchanged."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "Contended chunks preserve committed frontier/health, but entry advances the deferred generation by two and updates last-attempt time, retaining the existing 30 s catch-up throttle. The daemon coalesces contention generations into at most three scheduled calls after 30/60/120 s backoff; a throttled call also consumes budget. Success cancels retry and notifies clients/reconciler; non-contention failure or exhausted budget stops automatic retry until new external contention. Four receive-path transaction starts acquire IMMEDIATE and may wait up to the existing 5 s busy timeout. A busy projection begin surfaces typed Err before a transaction exists and schedules retry; later chunk contention rolls back and returns false. API503 occurs only where callers preserve typed code; some maps retain internal500. PASSIVE stays off queue; nonempty backfilled WAL TRUNCATE borrows FIFO writer, empty WAL skips it. New idle outcome stderr samples and abnormal reports use independent first-immediate/60 s buckets; suppressed counts and maximum durations appear on the next allowed same-bucket outcome, with no final flush or complete trace. Errors have no partial phase durations."
+  }
+}
