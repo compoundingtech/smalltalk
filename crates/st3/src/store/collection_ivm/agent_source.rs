@@ -1,13 +1,16 @@
 //! Exact SQL capture descriptors for the agent card source manifest.
 //! This list alone does not attest complete producer/authority/deadline coverage or Ready.
+pub mod boundary;
 pub mod canonical;
+pub mod clock;
 pub mod extract;
+pub mod shadow;
 
 use super::Table;
 use anyhow::Result;
 use rusqlite::Transaction;
 
-pub const CAPTURE_FINGERPRINT: &str = "st3.agent-card.capture.v2;recursive-delete-v1;declared-sql-inputs-v1;delivery-producer-v1;unfiltered-verdict-admission-v1";
+pub const CAPTURE_FINGERPRINT: &str = "st3.agent-card.capture.v3;recursive-delete-v1;declared-sql-inputs-v1;delivery-producer-global-v1;namespace-canonical-v1;clock-v1;unfiltered-verdict-admission-v1";
 pub const SOURCE: &str = "st3.agent-card-source.v1";
 
 /// Additional lifecycle/local producers must expand this manifest before source attestation.
@@ -211,6 +214,11 @@ pub const TABLES: &[Table] = &[
         key: &["subject", "component"],
     },
     Table {
+        name: "local_agent_card_clock",
+        columns: &["singleton", "at_ms", "revision", "reason"],
+        key: &["singleton"],
+    },
+    Table {
         name: "local_agent_delivery_presence",
         columns: &[
             "recipient",
@@ -246,6 +254,7 @@ pub fn capture_fingerprint() -> String {
 /// Install input capture only; paired hooks must be attached before explicit source registration.
 pub fn install_capture(tx: &Transaction<'_>, epoch: u64) -> Result<()> {
     super::delivery::create_schema(tx)?;
+    clock::create_schema(tx)?;
     let fingerprint = capture_fingerprint();
     super::install_recursive(tx, TABLES, &fingerprint, epoch)
 }

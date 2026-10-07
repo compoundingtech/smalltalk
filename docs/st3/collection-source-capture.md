@@ -98,3 +98,11 @@ verify the complete namespace producer boundary and selected certificates before
 the snapshot. A SQL notice can precede producer acknowledgement; the existing dirty
 collection retry must observe the later acknowledgement without another Publisher.
 These integration helpers are not a complete-card activation certificate.
+
+Namespace source shadow and captured maintenance clock
+
+The agent capture manifest now includes sixteen physical tables, adding the singleton `local_agent_card_clock` input. Its unsigned text clock cannot move backward, its revision increases monotonically, and its reason is one of deadline, kernel, or producer-ack. Live nonclock replacements only enqueue work; one captured clock per managed transaction drains a shared 128-item budget. Backfill/catch-up pages share the same budget.
+
+`agent_source::shadow` stores full physical replacements under each Installer namespace. Claims retain their original body SQL text. Canonical reads use only captured namespace batches, replica records, and a bounded indexed legacy prefix. Batch corrections and legacy membership changes enqueue indexed fanout work instead of scanning a batch in a source callback. Identity dirtiness includes foreign claims, checkpoint parents, and removals. Missing facts or parents remain provisional until independently complete extraction and journal coverage establishes absence. The operator retains old normalized facts, acknowledges only processed IDs, and deducts fanout plus normalization from its aggregate budget.
+
+Private producer boundary storage binds the whole namespace certificate to root epoch/revision/generation/status revision and the independently certified graph/local cut. It must be captured and acknowledged outside Writer, and reads must use the live producer guard as well as same-snapshot SQL checks. No source clock, shadow, or SQL certificate alone installs a production provider or establishes Ready.

@@ -205,6 +205,63 @@ pub(crate) fn row(
     }))
 }
 
+/// Decode the complete captured namespace physical row. This never reads the live producer
+/// or current SQL, and cannot replace the whole-namespace boundary certificate/guard.
+pub(crate) fn decode_sql_row(physical: &Value, at_ms: u64) -> Result<Option<CapturedAssessment>> {
+    let state = physical["state"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("invalid delivery source state"))?;
+    ensure!(
+        matches!(state, "pending" | "ready" | "fenced"),
+        "unsupported delivery source state"
+    );
+    if state != "ready" {
+        return Ok(None);
+    }
+    let text = |key: &str| -> Result<&str> {
+        physical[key]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("invalid delivery {key} SQL cell"))
+    };
+    let recipient = text("recipient")?;
+    let driver = text("driver")?;
+    ensure!(
+        !recipient.is_empty() && recipient.len() <= 1024 && DRIVERS.contains(&driver),
+        "invalid delivery source identity"
+    );
+    let assessment = text("assessment")?;
+    let encoded = text("certificate")?;
+    ensure!(
+        assessment.len() <= 16 * 1024 && encoded.len() <= 16 * 1024,
+        "delivery SQL payload budget exceeded"
+    );
+    let integer = |key: &str| -> Result<u64> {
+        physical[key]
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("invalid delivery {key} SQL integer"))
+    };
+    let evaluated = integer("evaluation_time_ms")?;
+    let deadline = integer("next_deadline_ms")?;
+    ensure!(
+        evaluated <= at_ms && at_ms < deadline,
+        "delivery namespace clock pending"
+    );
+    let certificate: Certificate = serde_json::from_str(encoded)?;
+    ensure!(
+        certificate.recipient == recipient
+            && certificate.driver == driver
+            && certificate.epoch == text("producer_epoch")?
+            && certificate.revision == integer("producer_revision")?
+            && certificate.evaluation_time_ms == evaluated
+            && certificate.next_deadline_ms == deadline,
+        "delivery namespace certificate binding mismatch"
+    );
+    Ok(Some(CapturedAssessment {
+        assessment: serde_json::from_str(assessment)?,
+        certificate,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,5 +360,25 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+}
+
+#[cfg(test)]
+mod namespace_decode_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn delivery_namespace_decoder_refuses_pending_expired_and_mismatched_evidence() {
+        let mut row = json!({"recipient":"agent/namespace-delivery","driver":"codex","producer_epoch":"fixture-epoch","producer_revision":7,
+            "state":"ready","assessment":"{\"state\":\"current\"}","evaluation_time_ms":100,"next_deadline_ms":200,
+            "certificate":serde_json::to_string(&json!({"epoch":"fixture-epoch","recipient":"agent/namespace-delivery","driver":"codex","revision":7,"evaluation_time_ms":100,"watermark_ns":10,"deadline_ns":1000,"next_deadline_ms":200,"follows":null})).unwrap(),"error":null});
+        let decoded = decode_sql_row(&row, 150).unwrap().unwrap();
+        assert_eq!(decoded.assessment, json!({"state":"current"}));
+        assert_eq!(decoded.certificate.revision, 7);
+        assert!(decode_sql_row(&row, 200).is_err());
+        row["producer_revision"] = json!(8);
+        assert!(decode_sql_row(&row, 150).is_err());
+        row["state"] = json!("pending");
+        assert!(decode_sql_row(&row, 150).unwrap().is_none());
     }
 }

@@ -1,11 +1,32 @@
 {
   "version": 1,
   "summary": "Compose bounded native agent SQL capture, primary-key extraction, canonical input and private delivery-source storage for the agent collection integration.",
-  "replay": {"status": "changed", "detail": "Explicit installation can page existing source tables at up to128 rows/1MiB per snapshot. No startup scan, automatic replay, gap recovery or source-cut promotion is installed."},
-  "schema": {"status": "changed", "detail": "Explicit source installation persists exact recursive-source descriptors and creates local_agent_delivery_presence with private certificate JSON and deadline/pending indexes. Normal Store opens remain unchanged; no numeric database version change."},
-  "rules": {"status": "none", "detail": "Public card admission and mutable-verdict policy are unchanged. The explicit capture fingerprint binds the default st3 registry/projection digest and current unfiltered-verdict domain."},
-  "compatibility": {"status": "none", "detail": "Existing v0 frames and generated clients are unchanged. Empty-key full refresh invalidates retained rows; pending independent source evidence retries without acknowledging the cursor. Paired grant expiry is rechecked on its deadline."},
-  "downtime": {"status": "none", "detail": "No default reader activation or startup work. Complete card composition, real daemon parity and callback-cost qualification remain required before serving this source."},
-  "manual": {"status": "none", "detail": "No deployment action activates these local integration helpers. Explicit source installation requires managed hooks, complete family/authority/deadline proof, a retained producer registration and one shared Store Publisher."},
-  "recovery": {"status": "unknown", "detail": "Raw capture gaps, descriptor changes and unsupported source closure remain fenced. Temporary producer acknowledgement/dirty output gaps use bounded collection retries. Restore or changed source epoch needs a separately qualified namespace-binding lifecycle."}
+  "replay": {
+    "status": "changed",
+    "detail": "Explicit installation pages existing source tables at up to128 rows/1MiB per snapshot; namespace canonical metadata repairs and finite captured clocks share a bounded maintenance budget. No startup scan, automatic replay, gap recovery or source-cut promotion is installed."
+  },
+  "schema": {
+    "status": "changed",
+    "detail": "Explicit installation persists exact recursive-source descriptors and creates private delivery, namespace physical/canonical shadow, producer-boundary and singleton captured-clock tables. Normal Store opens remain unchanged; no numeric database version change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Public card admission and mutable-verdict policy are unchanged. The explicit capture fingerprint binds the default st3 registry/projection digest and current unfiltered-verdict domain."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Existing v0 frames and generated clients are unchanged. Empty-key full refresh invalidates retained rows; pending independent source evidence retries without acknowledging the cursor. Paired grant expiry is rechecked on its deadline."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No default reader activation or startup work. Complete card composition, real daemon parity and callback-cost qualification remain required before serving this source."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No deployment action activates these local integration helpers. Explicit source installation requires managed hooks, complete family/authority/deadline proof, a retained producer registration and one shared Store Publisher."
+  },
+  "recovery": {
+    "status": "unknown",
+    "detail": "Raw capture gaps, descriptor changes and unsupported source closure remain fenced. Temporary producer acknowledgement/dirty output gaps use bounded collection retries. Restore or changed source epoch needs a separately qualified namespace-binding lifecycle."
+  }
 }

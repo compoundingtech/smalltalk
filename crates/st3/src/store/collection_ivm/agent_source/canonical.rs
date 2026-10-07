@@ -22,12 +22,116 @@ pub struct Fact {
 }
 
 impl Fact {
+    /// Retained OLD namespace fact; no SQL lookup and original body text parsed exactly once.
+    pub fn decode(encoded: &Value) -> Result<Self> {
+        let physical = encoded
+            .get("sql")
+            .context("retained fact is missing physical SQL")?
+            .clone();
+        let claim = decode_sql(&physical)?;
+        let metadata = encoded
+            .get("canonical")
+            .context("retained fact is missing canonical metadata")?;
+        let accepted: u128 = metadata["accepted_at_unix_ms"]
+            .as_str()
+            .context("invalid retained canonical time")?
+            .parse()?;
+        let writer = metadata["writer"]
+            .as_str()
+            .context("invalid retained canonical writer")?
+            .to_owned();
+        ensure!(
+            !writer.is_empty() && writer.len() <= 1024,
+            "unbounded retained canonical writer"
+        );
+        let sequence = metadata["sequence"]
+            .as_u64()
+            .context("invalid retained canonical sequence")?;
+        let position = metadata["position"]
+            .as_u64()
+            .context("invalid retained canonical position")?;
+        ensure!(
+            metadata["batch_id"].as_str() == Some(claim.batch_id.as_str())
+                && metadata["claim_id"].as_str() == Some(claim.id.as_str())
+                && accepted == claim.accepted_at_unix_ms,
+            "retained canonical identity mismatch"
+        );
+        let key = canonical::key_from_record(&claim, writer, sequence, position);
+        let rank: Vec<u8> = serde_json::from_value(encoded["rank"].clone())?;
+        ensure!(
+            rank == canonical::sortable_key(&key),
+            "retained canonical rank mismatch"
+        );
+        let repaired = encoded["repaired"]
+            .as_bool()
+            .context("invalid retained repair evidence")?;
+        Ok(Self {
+            claim,
+            key,
+            repaired,
+            physical,
+        })
+    }
     pub fn encoded(&self) -> Value {
         json!({"sql":self.physical,"canonical":{
             "accepted_at_unix_ms":self.key.0.to_string(),"writer":self.key.1,
             "sequence":self.key.2,"batch_id":self.key.3,"position":self.key.4,"claim_id":self.key.5},
             "rank":canonical::sortable_key(&self.key),"repaired":self.repaired})
     }
+}
+
+/// Strict SQL-cell decoder shared by retained facts and namespace NEW input.
+pub(super) fn decode_sql(physical: &Value) -> Result<ClaimRecord> {
+    let columns = super::TABLES[0].columns;
+    ensure!(
+        physical
+            .as_object()
+            .is_some_and(|row| row.len() == columns.len()
+                && columns.iter().all(|key| row.contains_key(*key))),
+        "retained claim SQL column mismatch"
+    );
+    ensure!(
+        serde_json::to_vec(physical)?.len() <= MAX_BYTES as usize,
+        "oversized retained physical claim"
+    );
+    let text = |field: &str| -> Result<&str> {
+        physical[field]
+            .as_str()
+            .with_context(|| format!("invalid claim {field} cell"))
+    };
+    let id = text("id")?.to_owned();
+    ensure!(
+        !id.is_empty() && id.len() <= 1024,
+        "invalid retained claim ID"
+    );
+    let store_index = physical["store_index"]
+        .as_u64()
+        .context("invalid claim source index")?;
+    ensure!(
+        store_index <= i64::MAX as u64,
+        "claim source index exceeds SQLite range"
+    );
+    ensure!(
+        physical["actor"].is_null() || physical["actor"].is_string(),
+        "invalid retained claim actor"
+    );
+    let body: Value = serde_json::from_str(text("body")?)?;
+    let operation = smallclaims::store::operation_parts(&body)
+        .map(|(id, digest)| (id.to_owned(), digest.to_owned()));
+    Ok(ClaimRecord {
+        id,
+        store_index,
+        batch_id: text("batch_id")?.into(),
+        subject: text("subject")?.into(),
+        kind: text("kind")?.into(),
+        origin: text("origin")?.into(),
+        actor: physical["actor"].as_str().map(str::to_owned),
+        operation_id: operation.as_ref().map(|value| value.0.clone()),
+        request_digest: operation.map(|value| value.1),
+        body,
+        predecessors: serde_json::from_str(text("predecessors")?)?,
+        accepted_at_unix_ms: text("accepted_at_unix_ms")?.parse()?,
+    })
 }
 
 pub fn new_fact(connection: &Connection, id: &str) -> Result<Option<Fact>> {
@@ -248,5 +352,45 @@ mod tests {
         }).unwrap().unwrap();
         let connection = store.readers.get();
         assert!(new_fact(&connection, &claim.id).is_err());
+    }
+}
+
+#[cfg(test)]
+mod retained_tests {
+    use super::*;
+    #[test]
+    fn retained_fact_decode_preserves_raw_float_and_rejects_rank_identity_and_json_recovery() {
+        let physical = json!({"id":"retained","store_index":1,"batch_id":"batch","subject":"agent/retained","kind":"usage.recorded","origin":"grove","actor":null,"body":"{\"fields\":{\"cost\":0.12345678901234568}}","predecessors":"[]","accepted_at_unix_ms":"123"});
+        let claim = decode_sql(&physical).unwrap();
+        let key = canonical::key_from_record(&claim, "grove".into(), 7, 2);
+        let fact = Fact {
+            claim,
+            key,
+            repaired: true,
+            physical,
+        };
+        let encoded = fact.encoded();
+        let decoded = Fact::decode(&encoded).unwrap();
+        assert_eq!(decoded.key, fact.key);
+        assert!(decoded.repaired);
+        assert_eq!(
+            decoded.claim.body["fields"]["cost"]
+                .as_f64()
+                .unwrap()
+                .to_bits(),
+            fact.claim.body["fields"]["cost"]
+                .as_f64()
+                .unwrap()
+                .to_bits()
+        );
+        let mut invalid = encoded.clone();
+        invalid["rank"] = json!([0]);
+        assert!(Fact::decode(&invalid).is_err());
+        let mut invalid = encoded.clone();
+        invalid["canonical"]["claim_id"] = json!("other");
+        assert!(Fact::decode(&invalid).is_err());
+        let mut invalid = encoded;
+        invalid["sql"]["body"] = json!("malformed");
+        assert!(Fact::decode(&invalid).is_err());
     }
 }
