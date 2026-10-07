@@ -997,7 +997,10 @@ fn unchanged_answer_writer_cost_and_retained_candidate_growth() {
         drop(publisher);
     }
     for fanout in [1, 8, 32] {
-        let (store, rt) = fixture(Limits::default());
+        let (store, rt) = fixture(Limits {
+            page_rows: fanout,
+            ..Limits::default()
+        });
         let publisher = Publisher::attach(&store, 16).unwrap();
         let before = rt.views.token(&store.readers.get(), "mailbox", 1).unwrap();
         let mut held = vec![];

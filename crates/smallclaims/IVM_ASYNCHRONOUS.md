@@ -17,7 +17,7 @@ Adapters must preserve their actual admission policies and complete source captu
 
 `asynchronous::step` performs one page and returns `PageReport`. Input row and encoded-byte
 bounds apply before fetching/decoding claim bodies. The queue has at most 4,096 entries and
-16 MiB of claim-field payload; a page has at most 128 entries and 1 MiB. Defaults are 32 rows
+16 MiB of claim-field payload; a page has at most 128 entries and 1 MiB. Defaults are 8 rows
 and 256 KiB per page, with 4,096 rows/16 MiB queued. SQLite/index/page overhead is additional.
 A first input exceeding the page byte cap stops rather than skipping it. Registered views
 number at most 256, and their combined declared contribution/dependency bounds are at most
@@ -92,7 +92,7 @@ These small in-memory fixtures are not a production 2 GiB or run-tree p99 accept
 
 ## Small local fixture results
 
-The isolated probe used 20 measured samples per shape, after its history setup. With only
+The first isolated probe used 20 measured samples per shape, after its history setup. With only
 20 samples, nearest-rank p99 is the maximum; these are observations, not timing gates.
 Times include the lent writer's commit/observer/return interval, and can include scheduling.
 
@@ -114,3 +114,11 @@ in-memory fixtures, not the requested production run-tree or copied 2 GiB accept
 The earlier unchanged-answer mixed-rank design's history-linear writer failure remains
 rejection evidence; oversized fallback ranks are fenced here rather than changing order
 or claiming that failed case was solved for unrestricted historical batches.
+
+A second probe on the committed successor observed materially higher holds: same-answer
+100/1,000 async admission maxima 12.666/45.565 ms and page maxima 3.607/44.817 ms;
+synchronous maxima were 4.243/2.678 ms. Genuine 1/8/32-output page maxima were
+10.867/23.603/115.822 ms. The 32-output shape exceeds the 50 ms target. Both runs are
+retained; no scheduling/CPU cause is inferred. The default is therefore eight input rows;
+32-row cost shapes explicitly request that larger page. This reduces per-page work, not
+wall-clock scheduling delay, and does not establish a production timing guarantee.

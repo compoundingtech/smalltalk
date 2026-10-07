@@ -58,7 +58,7 @@ impl Default for Limits {
         Self {
             queue_rows: 4096,
             queue_bytes: 16 * 1024 * 1024,
-            page_rows: 32,
+            page_rows: 8,
             page_bytes: 256 * 1024,
             legacy_rank_rows: 32,
         }
