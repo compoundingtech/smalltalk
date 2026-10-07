@@ -2680,7 +2680,12 @@ impl Store {
     /// One physical roster reader across HTTP pages and differently authorized WS windows.
     /// Waiting happens before SQLite snapshot acquisition, so followers pin no old WAL mark.
     pub(crate) async fn admit_agent_resources(&self) -> tokio::sync::OwnedMutexGuard<()> {
-        self.smalltalk.agent_resources_admission.clone().lock_owned().await
+        let started = std::time::Instant::now();
+        let guard = self.smalltalk.agent_resources_admission.clone().lock_owned().await;
+        // Waiting here is waiting for the shared admission or for another reader's in-flight
+        // build; the holder keeps the admission until its projection is published.
+        crate::performance::record_request("roster/admission-wait", None, started.elapsed());
+        guard
     }
 
     #[cfg(test)]
@@ -2710,12 +2715,15 @@ impl Store {
         // Local timeline rows do not advance the graph index, but do change last_activity.
         // Read their frontier inside the caller's SQLite snapshot, never from a future atomic
         // generation that could race this cut. The ordinary warm read is one primary-key seek.
-        let connection = self.readers.get();
-        let local = connection.query_row(
-            "SELECT COALESCE((SELECT id FROM local_observations WHERE after_store_index<=?1
-             ORDER BY id DESC LIMIT 1), 0)", [index], |row| row.get::<_, u64>(0),
-        )?;
-        drop(connection);
+        let local = crate::performance::task("roster/frontier-read", || -> Result<u64> {
+            let connection = self.readers.get();
+            let local = connection.query_row(
+                "SELECT COALESCE((SELECT id FROM local_observations WHERE after_store_index<=?1
+                 ORDER BY id DESC LIMIT 1), 0)", [index], |row| row.get::<_, u64>(0),
+            )?;
+            drop(connection);
+            Ok(local)
+        })?;
         let select = |items: &[Value]| items.iter().filter(|item| {
             selected.is_none_or(|names| names.contains(item["id"].as_str().unwrap_or_default()))
         }).cloned().collect::<Vec<_>>();
@@ -2731,12 +2739,14 @@ impl Store {
         }) {
             let items = Arc::clone(&entry.items);
             drop(cache);
-            return Ok(select(&items));
+            return crate::performance::task("roster/cache-hit", || Ok(select(&items)));
         }
         let previous = cache.iter()
             .filter(|entry| entry.index <= index && entry.local <= local && entry.history == history)
             .max_by_key(|entry| (entry.index, entry.local)).cloned();
         drop(cache);
+        let (items, covered) = crate::performance::task("roster/build",
+        || -> Result<(Vec<Value>, Option<BTreeSet<String>>)> {
         let previous = match previous {
             Some(entry) if entry.index == index => Some((entry, BTreeSet::new())),
             Some(entry) => self.changed_agent_resources(entry.index, index)?
@@ -2779,18 +2789,22 @@ impl Store {
                 if !changed.is_empty() {
                     #[cfg(test)]
                     self.smalltalk.agent_resources_builds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    items.extend(build(Some((&changed, &previous.items)))?);
+                    items.extend(crate::performance::task("roster/card-projection",
+                        || build(Some((&changed, &previous.items))))?);
                 }
                 (items, covered)
             }
             _ => {
                 #[cfg(test)]
                 self.smalltalk.agent_resources_builds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                (build(selected.map(|names| (names, &[][..])))?, selected.cloned())
+                (crate::performance::task("roster/card-projection",
+                    || build(selected.map(|names| (names, &[][..]))))?, selected.cloned())
             }
         };
         items.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str())
             .then_with(|| a["id"].as_str().cmp(&b["id"].as_str())));
+        Ok((items, covered))
+        })?;
         let items = Arc::new(items);
         let mut cache = self.smalltalk.agent_resources_cache.lock()
             .expect("agent resources cache poisoned");
@@ -6480,6 +6494,7 @@ impl Store {
     /// One current-step scan for the whole roster. This avoids replaying wake
     /// history or querying the step table separately for every agent card.
     pub fn agent_work_queues(&self) -> Result<BTreeMap<String, AgentWorkQueue>> {
+        crate::performance::task("agent_work_queues", || -> Result<BTreeMap<String, AgentWorkQueue>> {
         let connection = self.readers.get();
         let orders = seat_run_orders_tx(&connection, None)?;
         let rows = seat_step_rows_tx(&connection, None)?;
@@ -6523,6 +6538,7 @@ impl Store {
             );
         }
         Ok(queues)
+        })
     }
 
     /// The live mission runs queued for every seat, in seat-queue order.

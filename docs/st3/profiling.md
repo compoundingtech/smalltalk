@@ -157,6 +157,11 @@ The local-observation frontier is read by an indexed seek inside the same SQLite
 A same-index local transcript append updates the affected card's `last_activity_at` for both
 HTTP and WS; ignoring local rows here would make a shared warm roster instant but stale.
 
+The performance report exposes each roster stage under bounded task labels:
+`roster/admission-wait` (waiting for the shared admission or an in-flight build),
+`roster/frontier-read`, `roster/cache-hit`, `roster/build` (incremental advance or cold build),
+`roster/card-projection` (refolding changed cards) and `agent_work_queues`.
+
 The focused 70-agent, 20-session fixture reports card-status, usage, repeated-projection and
 incremental-update costs with `cargo test -p st3 --lib agent_roster_snapshot_fixture_timing --
 --ignored --nocapture`. It is a serial fixture micro-measure, not a load benchmark. CI's
