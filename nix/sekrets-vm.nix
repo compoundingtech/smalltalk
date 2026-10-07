@@ -213,22 +213,12 @@ pkgs.testers.runNixOSTest {
     assert out.count("exit=0") == 2, out
 
     # Every call, refusal and change is a claim on the profile, recorded by ada's daemon.
-    def history(subject):
-        return machine.succeed(
-            "su ada -s /bin/sh -c "
-            + shlex.quote(f"XDG_RUNTIME_DIR=/run/user/1000 {st} subject history {subject} --json")
-        )
-
-    def recorded(_):
-        # A call is a claim on its profile; a refusal before any profile fits is on the gateway.
-        calls = history("sekret/machine/ada/agent-gh")
-        refusals = history("sekret/machine")
-        return (
-            "sekret.called" in calls
-            and "agent/fleet/fixture-example/web" in calls
-            and "sekret.refused" in refusals
-        )
-
-    retry(recorded, timeout_seconds=120)
+    # Every call, its exit and every refusal is in the gateway's log, which ada reads; ada's
+    # daemon records them as local observations that age out and go to OpenTelemetry.
+    log = login("ada", f"{st} sekrets log --limit 200")
+    print(log)
+    assert "call" in log and "agent/fleet/fixture-example/web" in log, log
+    assert "refused" in log and "no allow rule matches" in log, log
+    assert "example-token" not in log, log
   '';
 }
