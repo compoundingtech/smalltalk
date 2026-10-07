@@ -7461,6 +7461,7 @@ fn validate_message_session(
             BTreeSet::from([recipient.clone()]),
             snapshot.store_index,
             false,
+            crate::store::ClaimsReduction::Summary,
         )
         .map_err(ApiError::internal)?;
     let current_session = status
