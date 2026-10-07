@@ -289,9 +289,24 @@ The tracer provider uses `Sampler::AlwaysOn` and a plain SDK `BatchSpanProcessor
 every span, including spans with an unsampled remote parent. There is no in-process sampler
 or span buffer beyond the SDK batch queue. The pipeline uses the crate versions and
 blocking-only OTLP feature set listed above.
+The batch queue is bounded below the SDK defaults because O11Y-R18 also caps daemon RSS:
+`max_queue_size` 256 and `max_export_batch_size` 256, with the SDK's default
+`scheduled_delay` (5 s, `OTEL_BSP_SCHEDULE_DELAY`). The SDK's 2048/512 defaults measured
++60 MiB RSS at saturation (queue of `SpanData` plus the exporter's in-flight OTLP/JSON
+batch and reqwest buffers); 256/256 keeps the worst case — one in-flight batch of at most
+the queue's spans — inside the +32 MiB budget. A 64-span batch measured within the RSS
+budget but its four-times-higher POST rate alone exceeded the +2% CPU/request budget at
+saturation, so the batch equals the queue. The `BatchConfigBuilder` setters override the
+environment, so `span_batch_config` re-applies `OTEL_BSP_MAX_QUEUE_SIZE` and
+`OTEL_BSP_MAX_EXPORT_BATCH_SIZE` explicitly — those variables keep working. A full queue
+drops spans; the SDK counts the drops and reports the first drop plus the shutdown total
+through its internal `otel_warn` diagnostics (`BatchSpanProcessor.SpanDroppingStarted`),
+which the stderr layer prints. There is no exported drop counter in this PR.
 Trace, metric, and log exporters use SDK-owned threads; none export on the daemon's
 `new_current_thread` request reactor. The log bridge uses
-`experimental_use_tracing_span_context` to attach the active trace and span ids.
+`experimental_use_tracing_span_context` to attach the active trace and span ids, and
+exports INFO-and-above only: per-request framework events are DEBUG and stay on stderr,
+so a healthy daemon exports no log stream, while WARN/ERROR diagnostics still export.
 
 With no `OTEL_EXPORTER_OTLP_ENDPOINT`, initialization builds no telemetry subscriber,
 SDK providers, exporters, or threads. An atomic enabled gate returns before span construction.

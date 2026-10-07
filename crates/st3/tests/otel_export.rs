@@ -140,6 +140,25 @@ fn cli_error_exports_root_span_and_process_identity() {
         Some(2),
         "ERROR status: {span}"
     );
+    let logs = std::fs::read_to_string(root.path().join("capture/logs.ndjson")).unwrap_or_default();
+    for line in logs.split_inclusive('\n').filter(|line| line.ends_with('\n')) {
+        let record: Value = serde_json::from_str(line).expect("valid OTLP JSON log request");
+        for resource in record["resourceLogs"].as_array().into_iter().flatten() {
+            for scope in resource["scopeLogs"].as_array().into_iter().flatten() {
+                for entry in scope["logRecords"].as_array().into_iter().flatten() {
+                    let severity = entry["severityNumber"].as_u64().or_else(|| {
+                        entry["severityNumber"]
+                            .as_str()
+                            .and_then(|value| value.parse().ok())
+                    });
+                    assert!(
+                        severity.is_some_and(|value| value >= 13),
+                        "CLI exported a below-WARN log record: {entry}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[test]

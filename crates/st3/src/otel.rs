@@ -21,7 +21,9 @@ use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::{LogExporter, MetricExporter, SpanExporter, WithExportConfig};
 use opentelemetry_sdk::logs::SdkLoggerProvider;
 use opentelemetry_sdk::metrics::{Aggregation, Instrument, SdkMeterProvider, Stream};
-use opentelemetry_sdk::trace::{BatchSpanProcessor, Sampler, SdkTracerProvider};
+use opentelemetry_sdk::trace::{
+    BatchConfig, BatchConfigBuilder, BatchSpanProcessor, Sampler, SdkTracerProvider,
+};
 use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::layer::{Layer as _, SubscriberExt};
 
@@ -61,6 +63,34 @@ impl Unit {
 }
 
 const CLI_BACKOFF_SECONDS: u64 = 300;
+
+/// Bounded span batch queue (O11Y-R18): worst case is the queue of SpanData plus the
+/// exporter's in-flight OTLP/JSON batch, and the SDK's 2048/512 defaults alone measured
+/// +60 MiB RSS at saturation. 256 queued spans with 256-span export batches keep the
+/// daemon's export state within the +32 MiB budget — one in-flight batch of at most the
+/// queue's spans — while exporting at most a quarter of the POSTs of a 64-span batch,
+/// whose per-request HTTP overhead alone exceeded the +2% CPU budget at saturation.
+/// `scheduled_delay` keeps the SDK default (and `OTEL_BSP_SCHEDULE_DELAY`): at
+/// saturation batch fullness drives the cadence; at fleet load the 5 s delay holds.
+/// A full queue drops spans, which the SDK reports through its internal diagnostics.
+/// The BatchConfigBuilder setters override the environment, so the standard
+/// `OTEL_BSP_MAX_*` variables are re-applied here explicitly.
+fn span_batch_config() -> BatchConfig {
+    BatchConfigBuilder::default()
+        .with_max_queue_size(
+            std::env::var("OTEL_BSP_MAX_QUEUE_SIZE")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(256),
+        )
+        .with_max_export_batch_size(
+            std::env::var("OTEL_BSP_MAX_EXPORT_BATCH_SIZE")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(256),
+        )
+        .build()
+}
 
 fn cli_backoff_path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_RUNTIME_DIR")
@@ -247,7 +277,11 @@ impl Telemetry {
                 Ok(exporter) => {
                     let provider = SdkTracerProvider::builder()
                         .with_sampler(Sampler::AlwaysOn)
-                        .with_span_processor(BatchSpanProcessor::builder(exporter).build())
+                        .with_span_processor(
+                            BatchSpanProcessor::builder(exporter)
+                                .with_batch_config(span_batch_config())
+                                .build(),
+                        )
                         .with_resource(resource.clone())
                         .build();
                     opentelemetry::global::set_tracer_provider(provider.clone());
@@ -311,8 +345,11 @@ impl Telemetry {
             .map(|provider| OpenTelemetryLayer::new(provider.tracer("st3")));
         // SDK processor diagnostics must never feed the log bridge that produced them.
         // RUST_LOG affects stderr only, independently of exported application signals.
+        // The bridge exports INFO and above: per-request events (transport, protocol,
+        // framework DEBUG) stay on stderr only, so a saturated daemon exports no log
+        // stream, while real WARN/ERROR diagnostics still reach the collector.
         let export_filter = tracing_subscriber::EnvFilter::new(
-            "trace,opentelemetry=off,opentelemetry_sdk=off,opentelemetry_http=off,opentelemetry_otlp=off",
+            "info,opentelemetry=off,opentelemetry_sdk=off,opentelemetry_http=off,opentelemetry_otlp=off",
         );
         let stderr_filter = tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
@@ -404,9 +441,19 @@ impl Drop for Telemetry {
 mod tests {
     use super::{
         SignalChoice, Unit, build_resource, cli_backoff_active, record_cli_failure, signal_enabled,
+        span_batch_config,
     };
     use opentelemetry::{Key, KeyValue, Value};
     use opentelemetry_sdk::Resource;
+
+    #[test]
+    fn span_batch_config_bounds_export_memory() {
+        // Debug is the only window into BatchConfig's crate-private fields; assert the
+        // documented O11Y-R18 bounds so a dependency default change cannot slip in.
+        let debug = format!("{:?}", span_batch_config());
+        assert!(debug.contains("max_queue_size: 256"), "{debug}");
+        assert!(debug.contains("max_export_batch_size: 256"), "{debug}");
+    }
 
     #[test]
     fn cli_backoff_absent_proceeds() {
