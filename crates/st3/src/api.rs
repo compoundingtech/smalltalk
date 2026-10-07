@@ -228,8 +228,8 @@ fn signal_claim_changed(state: &AppState, kind: &str) {
 // Usage samples and lease renewals are durable and visible, but neither can
 // advance a mission on its own. Terminal child state, claim expiry deadlines,
 // and harness readiness still wake the reconciler through their own paths.
-// A local observation never replicates and cannot advance a mission, so it only
-// wakes clients that follow this node's event feed.
+// Local telemetry only wakes clients following this node. Harness observations also
+// affect work eligibility and acknowledgement deadlines; their transitions wake reconciliation.
 fn signal_local_change(state: &AppState) {
     state
         .event_notify
@@ -10600,7 +10600,7 @@ async fn post_claim(
     let kind = request.kind.clone();
     let (response, appended) =
         blocking_action(move || store.append_client_claim_outcome(&request)).await?;
-    finish_claim_publication(&state, &kind, response, appended).await
+    finish_claim_publication(&state, &kind, response, appended, None).await
 }
 
 // Both claim transports must publish response-usage rollups, even on replay after the original
@@ -10610,6 +10610,7 @@ async fn finish_claim_publication(
     kind: &str,
     response: ClaimRecord,
     appended: bool,
+    harness_transition: Option<bool>,
 ) -> Result<Json<ClaimRecord>, ApiError> {
     // Publish only the cumulative buckets. The response detail and turn ID remain local.
     let store = state.store.clone();
@@ -10626,6 +10627,16 @@ async fn finish_claim_publication(
     }
     if appended {
         if crate::store::local_observation_position(&response).is_some() {
+            // Native event admission echoes its local record, including when it published a
+            // ready/idle transition. Work wakes read that observation, not just durable claims.
+            if kind == "harness.observed"
+                && harness_transition.unwrap_or_else(|| {
+                    response.body["fields"]["status_transition"] != false
+                })
+            {
+                crate::performance::record_wake("api", Some(kind));
+                state.notify.notify_one();
+            }
             signal_local_change(state);
         } else if matches!(kind, "harness.usage" | "harness.limits" | "subagent.renewed") {
             // The reconciler reads none of these. The limits policy runs on its own two-minute

@@ -9418,6 +9418,16 @@ impl Store {
         &self,
         publication: &crate::harness_events::Publication,
     ) -> Result<(ClaimRecord, bool), St3Error> {
+        self.append_harness_event_publication(publication)
+            .map(|(record, appended, _)| (record, appended))
+    }
+
+    /// Admission's transition decision, from the same transaction as its native runtime fence.
+    /// The echoed producer record stays unchanged; it need not carry derived history metadata.
+    pub(crate) fn append_harness_event_publication(
+        &self,
+        publication: &crate::harness_events::Publication,
+    ) -> Result<(ClaimRecord, bool, bool), St3Error> {
         let mut input = publication.claim.clone();
         if publication.sequence == 0
             || publication.runtime_incarnation.is_empty()
@@ -9464,12 +9474,16 @@ impl Store {
             "harness-event:{}:{}:{}:{}:{}",
             input.subject, source_runtime, publication.sequence, input.kind, slot
         ));
-        append_claim_with_fences(
-            &self.graph,
-            &input,
-            None,
-            Some(&publication.runtime_incarnation),
-        )
+        if input.kind == "harness.observed" {
+            validate_claim_input(&input)?;
+            append_latest_observation_publication(
+                &self.graph, &input, now_ms(), Some(&publication.runtime_incarnation),
+            )
+        } else {
+            append_claim_with_fences(
+                &self.graph, &input, None, Some(&publication.runtime_incarnation),
+            ).map(|(record, appended)| (record, appended, false))
+        }
     }
 
     pub fn append_claim(&self, input: &ClaimInput) -> Result<ClaimRecord, St3Error> {
@@ -53531,6 +53545,16 @@ fn append_latest_observation_fenced(
     now: u128,
     event_runtime: Option<&str>,
 ) -> Result<(ClaimRecord, bool), St3Error> {
+    append_latest_observation_publication(graph, input, now, event_runtime)
+        .map(|(record, appended, _)| (record, appended))
+}
+
+fn append_latest_observation_publication(
+    graph: &GraphStore,
+    input: &ClaimInput,
+    now: u128,
+    event_runtime: Option<&str>,
+) -> Result<(ClaimRecord, bool, bool), St3Error> {
     validate_local_observation(input)?;
     graph
         .connection
@@ -53539,7 +53563,7 @@ fn append_latest_observation_fenced(
             let (mut local, appended) =
                 insert_local_observation_tx(transaction, &graph.origin, input, now)?;
             if !appended {
-                return Ok((local, false));
+                return Ok((local, false, false));
             }
             let published = match input.kind.as_str() {
                 "harness.observed" => {
@@ -53558,10 +53582,14 @@ fn append_latest_observation_fenced(
                 )?),
                 _ => None,
             };
+            let status_transition = published.as_ref().is_some_and(|claim| {
+                input.kind == "harness.observed"
+                    && claim.body["fields"]["status_transition"] == true
+            });
             if input.kind == "harness.observed" && event_runtime.is_some() {
                 // Native acknowledgements echo the admitted producer event, including on
                 // replay. Derived history metadata belongs to its replicated publication.
-                return Ok((local, true));
+                return Ok((local, true, status_transition));
             }
             if input.kind == "harness.observed" {
                 let source = match published.as_ref() {
@@ -53582,7 +53610,7 @@ fn append_latest_observation_fenced(
                     ]).map_err(internal)?;
                 }
             }
-            Ok((published.unwrap_or(local), true))
+            Ok((published.unwrap_or(local), true, status_transition))
         })
         .map_err(|error| St3Error::new("internal", error))?
 }
