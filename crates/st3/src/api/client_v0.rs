@@ -14058,8 +14058,9 @@ mission "example/zero-run" state="ready" {
         }
         // An old gateway supplies no metadata; ordinary owner reads still discover ownership.
         let session = ClientSession::local(Some("person/example")).unwrap();
-        timeline_value(&state, &new_client_snapshot(&state), &session, &id,
+        let Json(timeline) = timeline_value(&state, &new_client_snapshot(&state), &session, &id,
             &ClientListQuery::default()).unwrap();
+        assert_eq!(timeline["session_id"], id);
         assert_eq!(session.conversation_subject_hint(), Some("agent/hinted"));
     }
 
