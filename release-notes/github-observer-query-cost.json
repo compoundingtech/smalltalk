@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Keep repository observer GraphQL pages below GitHub's execution limit",
+  "replay": {
+    "status": "none",
+    "detail": "Observation facts and their folding are unchanged. Failed or partial pages are never committed to the shared observation cache. No historical replay is required."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No resource fields, persisted cursors, database tables or schema digests change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No rule, checkpoint or retention changes."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Open-pull GraphQL pages start at 20 instead of 100, retaining all existing nested selections. A query execution refusal retries the identical cursor and identity batch with half as many pulls, down to one, and retains that size for subsequent pages. All pages are folded before publishing; the existing 1,000-open-pull bound is independent of page size. Other refusals still fail immediately."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No migration or downtime is required. A normal daemon upgrade adopts the reduced query."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No configuration changes are required. Page sizes appear in debug logs; execution-limit retries log the failed and reduced page sizes as warnings."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Downgrading needs no data conversion but restores the larger query and its execution-timeout risk. An observation that fails at the minimum page size still follows the existing failed-observation recovery path."
+  }
+}
