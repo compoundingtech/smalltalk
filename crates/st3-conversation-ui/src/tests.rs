@@ -671,7 +671,7 @@ fn the_note_that_earlier_history_is_not_shown_is_at_the_start_not_the_bottom() {
 }
 
 #[test]
-fn exposed_timeline_variants_and_media_are_visible_without_unknown_payloads() {
+fn exposed_timeline_variants_media_and_unknown_payloads_are_visible() {
     let bodies = [
         (
             "status",
@@ -732,7 +732,7 @@ fn exposed_timeline_variants_and_media_are_visible_without_unknown_payloads() {
     ] {
         assert!(display.contains(visible), "missing {visible}: {display}");
     }
-    assert!(!display.contains("must-not-render"));
+    assert!(display.contains("must-not-render"));
     assert!(!display.contains("bounded read window"), "{display}");
     assert!(!display.contains("nothing in the harness"));
     assert_eq!(rendered.len(), timeline.len());
@@ -938,7 +938,7 @@ fn review_usage_is_compact_and_preserves_supplied_tokens_cost_and_semantics() {
 }
 
 #[test]
-fn review_unknown_role_content_has_no_blank_event_or_unrecognized_payload() {
+fn unknown_role_content_preserves_payload_and_skips_blank_events() {
     for text in [None, Some(""), Some(" \n\t")] {
         let entry = review_entry("content", "future-role", serde_json::json!({
             "media_type":"text/plain","text":text
@@ -951,14 +951,14 @@ fn review_unknown_role_content_has_no_blank_event_or_unrecognized_payload() {
     let rendered = adapt::conversation(&[entry], &Default::default());
     let display = serde_json::to_string(&rendered).unwrap();
     assert!(display.contains("attachment/safe"));
-    assert!(!display.contains("UNRECOGNIZED_PAYLOAD"));
+    assert!(display.contains("UNRECOGNIZED_PAYLOAD"));
     let entry = review_entry("content", "future-role", serde_json::json!({
         "media_type":"text/plain","text":"UNRECOGNIZED_PAYLOAD"
     }));
     let rendered = adapt::conversation(&[entry], &Default::default());
     let display = serde_json::to_string(&rendered).unwrap();
-    assert!(display.contains("content not displayed"));
-    assert!(!display.contains("UNRECOGNIZED_PAYLOAD"));
+    assert!(display.contains("unknown role"));
+    assert!(display.contains("UNRECOGNIZED_PAYLOAD"));
 }
 
 #[test]
@@ -1083,4 +1083,85 @@ fn a_persons_signed_message_says_which_device_signed_it_and_whether_it_checks() 
     assert!(mark(serde_json::json!({"verdict": "invalid", "reason": "the signature does not match the claim"})).unwrap().starts_with("✕ signature invalid"));
     // An old message with no signature says nothing.
     assert_eq!(mark(serde_json::json!({"verdict": "unsigned"})), None);
+}
+
+#[test]
+fn native_unknown_system_blocks_and_user_reasoning_tags_remain_visible() {
+    let raw = "[unrecognized future]\n{\"raw\":{\"token\":\"invented-token\"}}";
+    let entry: st3_client::TimelineEntry = serde_json::from_value(serde_json::json!({"id":"timeline-entry/raw","sequence":1,"revision":1,"timestamp":"2026-10-06T12:00:00Z","role":"system","type":"content","final":true,"body":{"media_type":"text/plain","text":raw,"blocks":[{"id":"raw","kind":"unknown","source_type":"future","payload":{"raw":{"token":"invented-token"}}}]}})).unwrap();
+    let shown = crate::adapt::conversation(&[entry], &std::collections::BTreeMap::new());
+    assert!(matches!(&shown[0].body, Body::Event(text) if text == raw));
+    assert_eq!(
+        crate::clean_message_text_with_filters(
+            "<analysis>visible invented-token</analysis>",
+            crate::SHOW_EVERYTHING
+        ),
+        "<analysis>visible invented-token</analysis>"
+    );
+}
+
+#[test]
+fn display_filters_hide_context_but_raw_mode_keeps_every_entry_and_byte() {
+    let raw = "<system-reminder>invented-token</system-reminder>visible\u{1b}\n<thinking>private reasoning</thinking>";
+    let content: st3_client::TimelineEntry = serde_json::from_value(serde_json::json!({"id":"timeline-entry/filters","sequence":1,"revision":1,"timestamp":"2026-10-06T12:00:00Z","role":"user","type":"content","final":true,"body":{"media_type":"text/plain","text":raw,"blocks":[{"id":"source","kind":"source_record","source_type":"claude","visibility":"internal","payload":{"raw":{"text":raw}}}]}})).unwrap();
+    let original = serde_json::to_value(&content).unwrap();
+    let shown = adapt::conversation_with_filters(
+        std::slice::from_ref(&content),
+        &Default::default(),
+        crate::DEFAULT_FILTERS,
+    );
+    assert!(matches!(&shown[0].body, Body::User(text) if text == "visible"));
+    let everything = adapt::conversation_with_filters(
+        std::slice::from_ref(&content),
+        &Default::default(),
+        crate::SHOW_EVERYTHING,
+    );
+    let Body::User(text) = &everything[0].body else {
+        panic!("raw view")
+    };
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(text).unwrap(),
+        original
+    );
+    assert_eq!(serde_json::to_value(content).unwrap(), original);
+}
+
+#[test]
+fn native_window_notice_explains_that_the_remainder_is_not_fetchable() {
+    let entry = serde_json::from_value(serde_json::json!({
+        "id":"cut","sequence":0,"revision":1,"timestamp":"2026-10-05T10:00:00Z",
+        "role":"system","final":true,"type":"truncation",
+        "body":{"reason":"the native transcript prefix is outside the bounded read window; not fetchable through this owner read","omitted_from_sequence":0,"omitted_to_sequence":0}
+    })).unwrap();
+    let rendered = crate::adapt::conversation(&[entry], &Default::default());
+    assert!(rendered.iter().any(|entry|matches!(&entry.body,crate::Body::Event(text) if text.contains("not fetchable"))));
+}
+
+#[test]
+fn native_window_notice_with_unfetchable_remainder_stays_at_start() {
+    let entry = |index: u64, kind: &str, body: serde_json::Value, at: &str| -> st3_client::TimelineEntry {
+        serde_json::from_value(serde_json::json!({
+            "id": format!("entry/{index}"), "sequence": index, "revision": 1,
+            "timestamp": at, "role": "assistant", "final": true, "type": kind, "body": body
+        }))
+        .unwrap()
+    };
+    let timeline = vec![
+        entry(1, "content", serde_json::json!({"media_type":"text/plain","text":"first words"}), "2026-10-05T10:00:00Z"),
+        entry(2, "content", serde_json::json!({"media_type":"text/plain","text":"last words"}), "2026-10-05T11:00:00Z"),
+        entry(
+            0,
+            "truncation",
+            serde_json::json!({"reason":"the native transcript prefix is outside the bounded read window; not fetchable through this owner read","omitted_from_sequence":0,"omitted_to_sequence":0}),
+            "2026-10-06T09:00:00Z",
+        ),
+    ];
+    let rendered = adapt::conversation(&timeline, &Default::default());
+    let shown = rendered
+        .iter()
+        .map(|entry| serde_json::to_string(&entry.body).unwrap())
+        .collect::<Vec<_>>();
+    assert!(shown[0].contains("Earlier history is not shown"), "{shown:?}");
+    assert!(shown[0].contains("not fetchable"), "{shown:?}");
+    assert!(shown.last().unwrap().contains("last words"), "{shown:?}");
 }

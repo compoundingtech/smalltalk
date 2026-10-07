@@ -7,6 +7,7 @@ pub(super) mod raw_terminal;
 pub(super) mod resources;
 pub(super) mod search;
 pub(super) mod arrangements;
+pub(super) mod conversation_blocks;
 
 const TERMINAL_SUBPROTOCOL: &str = "st3.client.terminal.v0";
 const CONVERSATION_SUBPROTOCOL: &str = "st3.client.conversation.v0";
@@ -382,7 +383,7 @@ fn conversation_owner_host(
             .as_ref()
             .is_none_or(|relay| !relay.reaches(owner))
         {
-            return Err(remote_unavailable_for_owner(state, owner));
+            return Err(conversation_blocks::availability(remote_unavailable_for_owner(state, owner)));
         }
     }
     Ok(remote)
@@ -400,7 +401,7 @@ async fn conversation_page(
         let relay = state
             .client_relay
             .as_ref()
-            .ok_or_else(|| remote_unavailable_for_owner(state, owner))?;
+            .ok_or_else(|| conversation_blocks::availability(remote_unavailable_for_owner(state, owner)))?;
         return relay
             .read(
                 owner,
@@ -415,7 +416,11 @@ async fn conversation_page(
                 },
             )
             .await
-            .map_err(|error| remote_read_error(owner, error));
+            .map(|mut value| {
+                conversation_blocks::legacy(&mut value, session);
+                value
+            })
+            .map_err(|error| conversation_blocks::availability(remote_read_error(owner, error)));
     }
     let (state, session, session_id) = (state.clone(), session.clone(), session_id.to_owned());
     tokio::task::spawn_blocking(move || {
@@ -448,7 +453,7 @@ async fn conversation_changes_value(
         let relay = state
             .client_relay
             .as_ref()
-            .ok_or_else(|| remote_unavailable_for_owner(state, owner))?;
+            .ok_or_else(|| conversation_blocks::availability(remote_unavailable_for_owner(state, owner)))?;
         return relay
             .read(
                 owner,
@@ -463,7 +468,11 @@ async fn conversation_changes_value(
                 },
             )
             .await
-            .map_err(|error| remote_read_error(owner, error));
+            .map(|mut value| {
+                conversation_blocks::legacy(&mut value, session);
+                value
+            })
+            .map_err(|error| conversation_blocks::availability(remote_read_error(owner, error)));
     }
     conversation_changes_local(state, session, session_id, after, wait_ms).await
 }
@@ -1300,6 +1309,7 @@ pub(super) struct ClientSession {
     pub(super) authority_actor: String,
     pub(super) transport: &'static str,
     pub(super) custom_forms: bool,
+    pub(super) conversation_blocks: bool,
     scopes: std::collections::BTreeSet<String>,
 }
 
@@ -1311,6 +1321,7 @@ impl ClientSession {
             authority_actor: authority_actor.into(),
             transport,
             custom_forms: true,
+            conversation_blocks: false,
             scopes: std::collections::BTreeSet::new(),
         }
     }
@@ -1331,6 +1342,7 @@ impl ClientSession {
                 authority_actor: "client/local/read-only".into(),
                 transport: "unix",
                 custom_forms,
+                conversation_blocks: false,
                 scopes: ["read.projections", "terminal.read"]
                     .into_iter()
                     .map(str::to_owned)
@@ -1344,6 +1356,7 @@ impl ClientSession {
             authority_actor: person.into(),
             transport: "unix",
             custom_forms,
+            conversation_blocks: false,
             scopes: ALL_SCOPES.iter().map(|scope| (*scope).to_owned()).collect(),
         })
     }
@@ -1354,6 +1367,7 @@ impl ClientSession {
             authority_actor: "client/pairing/completion".into(),
             transport: "fabric-loopback",
             custom_forms: false,
+            conversation_blocks: false,
             scopes: std::collections::BTreeSet::new(),
         }
     }
@@ -1413,6 +1427,7 @@ pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
         json!({ "id": action, "version": 0, "state": state })
     }));
     capabilities.push(json!({"id":"device-key-proofs", "version":1, "state":"granted"}));
+    capabilities.push(json!({"id":"conversation-blocks", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities
 }
 
@@ -1463,6 +1478,15 @@ pub(super) fn authenticate(
         .is_some_and(|value| {
             value.split(',').any(|feature| feature.trim() == "custom-subjects.v1")
         });
+    let conversation_blocks = request
+        .headers()
+        .get("x-st3-features")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|features| {
+            features
+                .split(',')
+                .any(|feature| feature.trim() == "conversation-blocks.v1")
+        });
     let Some(value) = request.headers().get(AUTHORIZATION) else {
         if transport == "unix" {
             let person = request
@@ -1471,6 +1495,7 @@ pub(super) fn authenticate(
                 .and_then(|value| value.to_str().ok());
             let mut session = ClientSession::local(person)?;
             session.custom_forms = custom_forms;
+            session.conversation_blocks = conversation_blocks;
             return Ok(session);
         }
         let pairing_completion = request.method() == axum::http::Method::POST
@@ -1502,7 +1527,8 @@ pub(super) fn authenticate(
     let Some(paired) = paired else {
         return Err(forbidden("the client credential is unknown or expired"));
     };
-    let session = paired_client_session(state, paired, transport, custom_forms)?;
+    let mut session = paired_client_session(state, paired, transport, custom_forms)?;
+    session.conversation_blocks = conversation_blocks;
     if request.method() == axum::http::Method::GET {
         let scope = if request
             .uri()
@@ -1540,9 +1566,23 @@ fn paired_client_session(
     let authority_actor = paired.body.pointer("/fields/person_id").and_then(Value::as_str)
         .filter(|actor| actor.starts_with("person/") && actor.matches('/').count() == 1)
         .ok_or_else(|| ApiError::internal("a paired client has no concrete delegated person"))?;
-    let scopes = paired.body.pointer("/fields/scopes").and_then(Value::as_array)
-        .into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect();
-    Ok(ClientSession { actor: actor.into(), authority_actor: authority_actor.into(), transport, custom_forms, scopes })
+    let scopes = paired
+        .body
+        .pointer("/fields/scopes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect();
+    Ok(ClientSession {
+        actor: actor.into(),
+        authority_actor: authority_actor.into(),
+        transport,
+        custom_forms,
+        conversation_blocks: false,
+        scopes,
+    })
 }
 
 /// Held collection sockets carry no bearer secret. Re-resolve their session grant at each
@@ -1551,13 +1591,24 @@ fn revalidate_session(state: &AppState, session: &ClientSession) -> Result<Clien
     if session.transport == "unix" && acting_party(session) {
         return Ok(session.clone());
     }
-    let pairings = state.store.claims_for_kind_at(
-        "custom.client.pairing-completed", None, true, 10_000,
-    ).map_err(ApiError::internal)?;
-    let paired = pairings.claims.iter().find(|claim| {
-        claim.body.pointer("/fields/session_actor").and_then(Value::as_str) == Some(session.actor.as_str())
-    }).ok_or_else(|| forbidden("the client session grant is absent"))?;
-    let current = paired_client_session(state, paired, session.transport, session.custom_forms)?;
+    let pairings = state
+        .store
+        .claims_for_kind_at("custom.client.pairing-completed", None, true, 10_000)
+        .map_err(ApiError::internal)?;
+    let paired = pairings
+        .claims
+        .iter()
+        .find(|claim| {
+            claim
+                .body
+                .pointer("/fields/session_actor")
+                .and_then(Value::as_str)
+                == Some(session.actor.as_str())
+        })
+        .ok_or_else(|| forbidden("the client session grant is absent"))?;
+    let mut current =
+        paired_client_session(state, paired, session.transport, session.custom_forms)?;
+    current.conversation_blocks = session.conversation_blocks;
     if current.authority_actor != session.authority_actor {
         return Err(forbidden("the client session authority changed"));
     }
@@ -4008,7 +4059,7 @@ fn managed_transcript(
 /// but could not read it, the entry names the file, so the failure can be reported.
 fn transcript_notice(session_id: &str, managed: &ManagedTranscript, reason: &str) -> Value {
     let anchor = &managed.anchor;
-    let mut details = json!({ "driver": managed.driver, "claim_id": anchor.id });
+    let mut details = json!({ "driver": managed.driver, "claim_id": anchor.id, "availability":"transcript-unavailable" });
     match &managed.transcript {
         Ok(external) => {
             details["transcript"] = Value::String(external.transcript.display().to_string());
@@ -4292,6 +4343,11 @@ pub(super) fn timeline_value(
             Vec::new(),
             query,
         )?;
+        for item in &mut page.items {
+            if !session.conversation_blocks && let Some(body) = item["body"].as_object_mut() {
+                body.remove("blocks");
+            }
+        }
         page.items.reverse();
         return Ok(Json(json!({
             "kind": "timeline-page",
@@ -4308,7 +4364,12 @@ pub(super) fn timeline_value(
             &session_id,
         )
         .map_err(ApiError::internal)?;
-        let items = external_conversation_items(conversation, &session_id)?;
+        let items = match conversation {
+            Some(crate::external_sessions::ExternalConversation::Readable(external)) => {
+                conversation_blocks::read(&external, session, &session_id)?
+            }
+            other => external_conversation_items(other, &session_id)?,
+        };
         return native_timeline_page(state, snapshot, &session_id, query, items);
     };
     let owner = owner.as_str();
@@ -4319,14 +4380,14 @@ pub(super) fn timeline_value(
     if let Some(incarnation) = incarnation
         && let Some(managed) = managed_transcript(state, owner, incarnation)?
     {
-        let read = managed
-            .transcript
-            .as_ref()
-            .map_err(|missing| missing.reason.clone())
-            .and_then(|external| {
-                crate::external_sessions::normalized_timeline(external)
-                    .map_err(|error| format!("the transcript could not be read: {error:#}"))
-            });
+        let read = match managed.transcript.as_ref() {
+            Ok(external) => match conversation_blocks::read(external, session, &session_id) {
+                Ok(items) => Ok(items),
+                Err(error) if error.status == StatusCode::TOO_MANY_REQUESTS => return Err(error),
+                Err(error) => Err(format!("the transcript could not be read: {}", error.message)),
+            },
+            Err(missing) => Err(missing.reason.clone()),
+        };
         match read {
             Ok(items) => return native_timeline_page(state, snapshot, &session_id, query, items),
             Err(reason) => {
@@ -5290,12 +5351,12 @@ pub(super) async fn conversation_changes(
             let relay = state
                 .client_relay
                 .as_ref()
-                .ok_or_else(|| remote_unavailable_for_owner(&state, &owner))?;
-            let value = relay
+                .ok_or_else(|| conversation_blocks::availability(remote_unavailable_for_owner(&state, &owner)))?;
+            let mut value = relay
                 .read(
                     &owner,
                     &crate::peer::ClientReadRequest {
-                        authority_actor: session.authority_actor,
+                        authority_actor: session.authority_actor.clone(),
                         relay: None,
                         request: crate::peer::ClientReadOperation::ConversationChanges {
                             session_id,
@@ -5305,7 +5366,10 @@ pub(super) async fn conversation_changes(
                     },
                 )
                 .await
-                .map_err(|error| remote_read_error(&owner, error))?;
+                .map_err(|error| {
+                    conversation_blocks::availability(remote_read_error(&owner, error))
+                })?;
+            conversation_blocks::legacy(&mut value, &session);
             return Ok(Json(value));
         }
     }
@@ -5360,7 +5424,7 @@ pub(super) async fn conversation_stream(
             .as_ref()
             .is_none_or(|relay| !relay.reaches(owner))
         {
-            return Err(remote_unavailable_for_owner(&state, owner));
+            return Err(conversation_blocks::availability(remote_unavailable_for_owner(&state, owner)));
         }
     } else {
         conversation_read_now(&state, &session, &session_id, query.after.as_deref())?;
@@ -5390,7 +5454,7 @@ async fn conversation_stream_socket(
                 let relay = state
                     .client_relay
                     .as_ref()
-                    .ok_or_else(|| remote_unavailable_for_owner(&state, owner))?;
+                    .ok_or_else(|| conversation_blocks::availability(remote_unavailable_for_owner(&state, owner)))?;
                 relay
                     .read(
                         owner,
@@ -5405,7 +5469,9 @@ async fn conversation_stream_socket(
                         },
                     )
                     .await
-                    .map_err(|error| remote_read_error(owner, error))
+                    .map_err(|error| {
+                        conversation_blocks::availability(remote_read_error(owner, error))
+                    })
             } else {
                 conversation_changes_local(
                     &state,
@@ -5419,13 +5485,14 @@ async fn conversation_stream_socket(
         };
         tokio::pin!(read);
         let value = tokio::select! { value = &mut read => value, message = socket.recv() => { if matches!(message, None | Some(Err(_)) | Some(Ok(WsMessage::Close(_)))) { return; } else { continue; } } };
-        let value = match value {
+        let mut value = match value {
             Ok(value) => value,
             Err(error) => {
                 close_terminal_stream_with_error(&mut socket, &error).await;
                 return;
             }
         };
+        conversation_blocks::legacy(&mut value, &session);
         let next = value["next_cursor"].as_str().map(str::to_owned);
         if after.is_none()
             || value["items"]
@@ -15936,6 +16003,7 @@ mission "example/zero-run" state="ready" {
             authority_actor: "person/alex".into(),
             transport: "paired",
             custom_forms: false,
+            conversation_blocks: false,
             scopes: ["terminal.read".into()].into_iter().collect(),
         };
         let mut remote_request = request.clone();

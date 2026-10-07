@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "summary": "#1549: person-owned bounded delegation",
+  "commits": ["db524bf84a5e1ce6fb046f97531a8fa09b4f3ee2"],
+  "replay": {"status": "none", "detail": "No new projection invalidation or startup replay trigger in the merged person-owned bounded delegation change."},
+  "schema": {"status": "none", "detail": "No database table, index, trigger or migration change in person-owned bounded delegation; SQLite user_version is unchanged."},
+  "rules": {"status": "none", "detail": "Adds a durable person-owned delegation claim and audit fields, without changing RULES_VERSION or checkpoint drop rules. This does not establish mixed-build acceptance of the new authorization contract."},
+  "compatibility": {"status": "unknown", "detail": "New person.delegation-set claims, delegation proof fields and local actions require upgraded members to establish and record a policy. Person answers expose the actual agent respondent and acted_for person. Mixed-build validation of new delegation claims/actions was not established by this PR; use upgraded members for delegation and retain ordinary person responses during transition."},
+  "downtime": {"status": "none", "detail": "No additional upgrade service stop or measured outage introduced by person-owned bounded delegation; the standard daemon/client restart procedure still applies."},
+  "manual": {"status": "changed", "detail": "Delegation is opt-in: the person must publish the allowed action list with st work delegation. An agent records an existing instruction with its original message, verbatim quote, policy reference and exact episode; existing policies are not invented or enabled automatically. See docs/st3/person-delegation.md in this source."},
+  "recovery": {"status": "none", "detail": "No additional recovery procedure introduced by this change. Preserve graph state, keys and configuration and follow the standard roll-forward guidance; this note does not qualify binary-only downgrade of the whole release."}
+}

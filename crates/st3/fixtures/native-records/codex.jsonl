@@ -1,0 +1,14 @@
+{"type":"session_meta","payload":{"id":"fixture-session","cwd":"/tmp/fixture"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"fixture text"}]}}
+{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"fixture text"}]}}
+{"type":"response_item","payload":{"type":"message","role":"system","content":[{"type":"output_text","text":"fixture text"}]}}
+{"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"output_text","text":"fixture text"}]}}
+{"type":"response_item","payload":{"type":"function_call","call_id":"fixture-call","name":"shell","arguments":"{\"command\":\"printf fixture\"}","output":"fixture output","summary":[{"type":"summary_text","text":"fixture reasoning"}]}}
+{"type":"response_item","payload":{"type":"function_call_output","call_id":"fixture-call","name":"shell","arguments":"{\"command\":\"printf fixture\"}","output":"fixture output","summary":[{"type":"summary_text","text":"fixture reasoning"}]}}
+{"type":"response_item","payload":{"type":"custom_tool_call","call_id":"fixture-call","name":"shell","arguments":"{\"command\":\"printf fixture\"}","output":"fixture output","summary":[{"type":"summary_text","text":"fixture reasoning"}]}}
+{"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"fixture-call","name":"shell","arguments":"{\"command\":\"printf fixture\"}","output":"fixture output","summary":[{"type":"summary_text","text":"fixture reasoning"}]}}
+{"type":"response_item","payload":{"type":"reasoning","call_id":"fixture-call","name":"shell","arguments":"{\"command\":\"printf fixture\"}","output":"fixture output","summary":[{"type":"summary_text","text":"fixture reasoning"}]}}
+{"type":"response_item","payload":{"type":"ghost_snapshot","call_id":"fixture-call","name":"shell","arguments":"{\"command\":\"printf fixture\"}","output":"fixture output","summary":[{"type":"summary_text","text":"fixture reasoning"}]}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":10}}}}
+{"type":"turn_context","payload":{"cwd":"/tmp/fixture","approval_policy":"never"}}
+{"type":"world_state","payload":{"state":"fixture"}}

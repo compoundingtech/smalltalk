@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "summary": "#1557: first mission readiness scheduling and diagnostics",
+  "commits": ["34c5cdcffd7a2e2ccb86589a0bb736fdb7985a8c"],
+  "replay": {"status": "none", "detail": "No new projection invalidation or startup replay trigger in the merged first mission readiness scheduling and diagnostics change."},
+  "schema": {"status": "none", "detail": "No database table, index, trigger or migration change in first mission readiness scheduling and diagnostics; SQLite user_version is unchanged."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digest/drop policy are unchanged; this change adds no sealing coordination requirement."},
+  "compatibility": {"status": "changed", "detail": "All-pending mission generations are evaluated first. Admission delayed at least two minutes can record scheduler/first-readiness; leaf mission responses add optional scheduler_fault and client views show blocked while it is open. The fault recovers on later evaluation and creates no operator attention item. This is an admission diagnostic, not an independent stalled-writer watchdog."},
+  "downtime": {"status": "none", "detail": "No additional upgrade service stop or measured outage introduced by first mission readiness scheduling and diagnostics; the standard daemon/client restart procedure still applies."},
+  "manual": {"status": "none", "detail": "No data repair or configuration conversion required for existing installations by first mission readiness scheduling and diagnostics."},
+  "recovery": {"status": "none", "detail": "No additional recovery procedure introduced by this change. Preserve graph state, keys and configuration and follow the standard roll-forward guidance; this note does not qualify binary-only downgrade of the whole release."}
+}

@@ -1,4 +1,4 @@
-use crate::{Body, Entry, MailImage, ToolState, clean_message_text};
+use crate::{Body, Entry, MailImage, ToolState};
 use serde_json::Value;
 use st3_client::{TimelineBody, TimelineEntry, TimelineRole, TimelineToolStatus};
 use std::borrow::Cow;
@@ -70,6 +70,30 @@ const NATIVE_PREFIX_NOTE: &str =
     "Earlier history is not shown: st reads only the newest part of this agent's transcript";
 
 pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>) -> Vec<Entry> {
+    conversation_with_filters(timeline, names, crate::DEFAULT_FILTERS)
+}
+
+pub fn conversation_with_filters(
+    timeline: &[TimelineEntry],
+    names: &BTreeMap<String, String>,
+    filters: &[crate::DisplayFilter],
+) -> Vec<Entry> {
+    if filters.is_empty() {
+        // JSON escapes terminal controls reversibly; the data itself remains unchanged.
+        return timeline
+            .iter()
+            .map(|entry| Entry {
+                id: entry.id.clone(),
+                at: clock(&entry.timestamp),
+                body: Body::User(serde_json::to_string_pretty(entry).expect("timeline JSON")),
+            })
+            .collect();
+    }
+    let displayed = timeline
+        .iter()
+        .map(|entry| filtered_entry(entry, filters))
+        .collect::<Vec<_>>();
+    let timeline = &displayed;
     let name = |id: &str| -> String {
         names.get(id).cloned().unwrap_or_else(|| match id {
             "daemon/runtime" => "st".into(),
@@ -103,6 +127,25 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
     for entry in timeline {
         let at = clock(&entry.timestamp);
         if let TimelineBody::Message(message) = &entry.body {
+            for block in message
+                .blocks
+                .iter()
+                .filter(|block| block.kind == "raw_text")
+            {
+                if let Some(text) = block.payload.get("text").and_then(Value::as_str) {
+                    stamped.push((
+                        entry.timestamp.clone(),
+                        Entry {
+                            id: block.id.clone(),
+                            at: at.clone(),
+                            body: Body::Event(format!(
+                                "[unreadable message]\n{}",
+                                crate::clean_message_text_with_filters(text, filters)
+                            )),
+                        },
+                    ));
+                }
+            }
             if let Some((pending, message)) = mail.take() {
                 append_unpaired_media(&mut stamped, pending, message, &name);
             }
@@ -199,12 +242,17 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
                         continue;
                     }
                 }
-                // Harness markup becomes what it means; context blocks disappear.
+                // Structural harness envelopes become what they mean.
+                if content.blocks.iter().any(|block| block.kind != "text") || raw.starts_with("[unrecognized ") {
+                    stamped.push((entry.timestamp.clone(), Entry { id:entry.id.clone(), at, body: if entry.role == TimelineRole::User { Body::User(crate::clean_message_text_with_filters(raw, filters)) } else { Body::Event(crate::clean_message_text_with_filters(raw, filters)) } }));
+                    continue;
+                }
                 let mut bodies = harness_bodies(
                     entry.role == TimelineRole::User,
                     content.text.as_deref().unwrap_or(""),
                     &shown,
                     &mut delivered,
+                    filters,
                 );
                 if bodies.iter().any(|body| matches!(body, Body::User(_))) {
                     skills.clear();
@@ -361,7 +409,11 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
             (_, TimelineBody::Truncation(truncation))
                 if truncation.reason.contains("native transcript prefix") =>
             {
-                Body::Event(NATIVE_PREFIX_NOTE.into())
+                let mut notice = NATIVE_PREFIX_NOTE.to_owned();
+                if truncation.reason.contains("not fetchable") {
+                    notice.push_str("; earlier history is not fetchable through this read");
+                }
+                Body::Event(notice)
             }
             (_, TimelineBody::Truncation(truncation)) => Body::Event(format!(
                 "history omitted: {} (sequences {}–{}{})",
@@ -374,27 +426,14 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
                     ""
                 }
             )),
-            (_, TimelineBody::Unknown { entry_type, .. }) => Body::Event(format!(
-                "unsupported timeline entry: {} (content not displayed)",
-                bounded_preview(entry_type, 64)
+            (_, TimelineBody::Unknown { entry_type, body }) => Body::Event(format!(
+                "[unknown {}]\n{body}", bounded_preview(entry_type,64)
             )),
             (_, TimelineBody::Content(content)) => {
-                // Unknown roles do not authorize interpreting their payload as conversation text.
-                if content.attachment_id.is_some() || content.media_type != "text/plain" {
-                    Body::Event(format!(
-                        "[media: {} · {}]",
-                        content.media_type,
-                        content.attachment_id.as_deref().unwrap_or("reference unavailable")
-                    ))
-                } else if content
-                    .text
-                    .as_deref()
-                    .is_some_and(|text| !text.trim().is_empty())
-                {
-                    Body::Event("content not displayed (unknown role)".into())
-                } else {
-                    continue;
-                }
+                // Attribution may be unknown; authorized conversation content is still visible.
+                let text=content_text(content);
+                if text.trim().is_empty() {continue;}
+                Body::Event(format!("[unknown role]\n{text}"))
             }
             (_, TimelineBody::Message(_)) => unreachable!("messages are handled above"),
         };
@@ -414,7 +453,7 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
     // That earlier history is not shown is said at the start, where the history would be, not at
     // the time st stamped the note with (the session's last update: the bottom, by the box).
     stamped.sort_by_key(|(_, entry)| {
-        !matches!(&entry.body, Body::Event(text) if text == NATIVE_PREFIX_NOTE)
+        !matches!(&entry.body, Body::Event(text) if text.starts_with(NATIVE_PREFIX_NOTE))
     });
     for (_, entry) in &mut stamped {
         if let Body::Mail {
@@ -488,6 +527,100 @@ fn usage_line(usage: &st3_client::TimelineUsageBody) -> String {
     line
 }
 
+fn filtered_entry(entry: &TimelineEntry, filters: &[crate::DisplayFilter]) -> TimelineEntry {
+    use crate::DisplayFilter;
+    let mut value = serde_json::to_value(entry).expect("timeline JSON");
+    let body = &mut value["body"];
+    if filters.contains(&DisplayFilter::InternalBlocks)
+        && let Some(blocks) = body.get_mut("blocks").and_then(Value::as_array_mut)
+    {
+        blocks.retain(|block| {
+            !matches!(
+                block["visibility"].as_str(),
+                Some("internal" | "hidden-by-harness")
+            )
+        });
+    }
+    if let Some(raw) = body["text"].as_str() {
+        let mut text = raw.to_owned();
+        if filters.contains(&DisplayFilter::ContextBlocks)
+            && !matches!(entry.role, TimelineRole::User | TimelineRole::System)
+        {
+            filter_context_blocks(&mut text)
+        }
+        if !matches!(entry.role, TimelineRole::User | TimelineRole::System) {
+            text = crate::clean_message_text_with_filters(&text, filters);
+        }
+        if filters.contains(&DisplayFilter::Excerpts) && raw.starts_with("[unrecognized ") {
+            text = bounded_preview(&text, 512).into_owned();
+        }
+        body["text"] = Value::String(text);
+    }
+    // The default still shows an unreadable record, with its readable approximation.
+    if matches!(&entry.body, TimelineBody::Error(_))
+        && let Some(blocks) = body["blocks"].as_array()
+    {
+        let raw = blocks
+            .iter()
+            .filter(|block| block["kind"] == "raw_text")
+            .filter_map(|block| block["payload"]["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !raw.is_empty() {
+            body["message"] = Value::String(format!(
+                "{}\n{}",
+                body["message"].as_str().unwrap_or(""),
+                crate::clean_message_text_with_filters(&raw, filters)
+            ));
+        }
+    }
+    serde_json::from_value(value).expect("display copy retains timeline shape")
+}
+
+// Context wrappers may mention their own closing tag in inline code.
+fn filter_context_blocks(text: &mut String) {
+    for tag in CONTEXT_BLOCKS {
+        let open = format!("<{tag}");
+        let close = format!("</{tag}>");
+        let mut from = 0;
+        while let Some(offset) = text[from..].find(&open) {
+            let start = from + offset;
+            if crate::clean::in_inline_code(text, start)
+                || !text[start + open.len()..].starts_with(['>', ' ', '/', '\n'])
+            {
+                from = start + open.len();
+                continue;
+            }
+            let Some(head_end) = text[start..].find('>').map(|n| start + n + 1) else {
+                text.truncate(start);
+                break;
+            };
+            let end = text[head_end..]
+                .match_indices(&close)
+                .map(|(n, _)| head_end + n)
+                .find(|n| !crate::clean::in_inline_code(text, *n));
+            text.replace_range(start..end.map_or(text.len(), |n| n + close.len()), "");
+            from = start;
+        }
+    }
+}
+
+const CONTEXT_BLOCKS: &[&str] = &[
+    "system-reminder",
+    "local-command-caveat",
+    "environment_context",
+    "permissions",
+    "collaboration_mode",
+    "multi_agent_mode",
+    "apps_instructions",
+    "plugins_instructions",
+    "skills_instructions",
+    "user_instructions",
+    "developer_instructions",
+    "command-message",
+    "command-args",
+];
+
 fn bounded_preview(text: &str, max: usize) -> Cow<'_, str> {
     let Some((end, _)) = text.char_indices().nth(max) else {
         return Cow::Borrowed(text);
@@ -500,7 +633,7 @@ fn bounded_preview(text: &str, max: usize) -> Cow<'_, str> {
 
 /// Preserve authorized attachment references without fetching payloads or decoding unknown bodies.
 fn content_text(content: &st3_client::TimelineContentBody) -> String {
-    let mut text = clean_message_text(content.text.as_deref().unwrap_or(""));
+    let mut text = content.text.as_deref().unwrap_or("").to_owned();
     if let Some(reference) = &content.attachment_id {
         if !text.is_empty() {
             text.push('\n');
@@ -569,24 +702,8 @@ fn self_closing_tag(line: &str) -> bool {
 }
 
 /// Blocks harnesses add to a transcript for the model's benefit. None of it is conversation.
-const CONTEXT_BLOCKS: &[&str] = &[
-    "system-reminder",
-    "local-command-caveat",
-    "environment_context",
-    "permissions",
-    "collaboration_mode",
-    "multi_agent_mode",
-    "apps_instructions",
-    "plugins_instructions",
-    "skills_instructions",
-    "user_instructions",
-    "developer_instructions",
-    "command-message",
-    "command-args",
-];
-
 /// Take every `<tag …>…</tag>` block out of `text`, returning the inner texts. A block that
-/// never closes runs to the end, so a truncated wrapper cannot leak either.
+/// never closes runs to the end. Only structural delivery/command wrappers are parsed.
 fn take_blocks(text: &mut String, tag: &str) -> Vec<String> {
     let mut found = Vec::new();
     let open = format!("<{tag}");
@@ -759,7 +876,13 @@ fn loaded_skill(raw: &str) -> Option<&str> {
 /// `shown` holds the graph messages the stream already draws as mail: a delivery of one of
 /// those is a line, and a delivery of any other is the mail itself.
 pub fn from_harness(is_user: bool, raw: &str, shown: &BTreeSet<String>) -> Vec<Body> {
-    harness_bodies(is_user, raw, shown, &mut BTreeSet::new())
+    harness_bodies(
+        is_user,
+        raw,
+        shown,
+        &mut BTreeSet::new(),
+        crate::DEFAULT_FILTERS,
+    )
 }
 
 /// The graph message a `[PING from st3] message/ID from …` line announces.
@@ -785,6 +908,7 @@ fn harness_bodies(
     raw: &str,
     shown: &BTreeSet<String>,
     delivered: &mut BTreeSet<String>,
+    filters: &[crate::DisplayFilter],
 ) -> Vec<Body> {
     let mut text = raw.replace("\r\n", "\n");
     // A harness that ran out of context continues from a summary it writes as the person's turn.
@@ -820,7 +944,7 @@ fn harness_bodies(
             from,
             to: attribute(&head, "to").unwrap_or_default(),
             subject,
-            body: clean_message_text(&unescape(&block)),
+            body: crate::clean_message_text_with_filters(&unescape(&block), filters),
             delivered: false,
             dictated: false,
             signed: None,
@@ -854,7 +978,9 @@ fn harness_bodies(
             .lines()
             .find_map(|line| line.trim().strip_prefix("Subject:").map(str::trim))
             .map(str::to_owned)
-            .unwrap_or_else(|| shorten(&clean_message_text(&block), 70));
+            .unwrap_or_else(|| {
+                shorten(&crate::clean_message_text_with_filters(&block, filters), 70)
+            });
         bodies.push(Body::Event(format!(
             "delivered to the agent: {} · from {sender}",
             shorten(&subject, 80)
@@ -929,18 +1055,25 @@ fn harness_bodies(
             bodies.push(Body::User(answers.join("\n")));
         }
     }
-    for tag in CONTEXT_BLOCKS {
-        take_blocks(&mut text, tag);
+    if raw.contains("<command-name") {
+        take_blocks(&mut text, "command-args"); // already displayed with the parsed command
     }
     // st's own notes beside a delivery tell the agent something; the person never typed them.
-    let text = text
+    let mut text = text
         .lines()
         .filter(|line| !ST_DELIVERY_NOTES.contains(&line.trim()))
         .collect::<Vec<_>>()
         .join("\n");
-    let rest = clean_message_text(&text);
-    if is_user && !rest.is_empty() {
-        bodies.insert(0, Body::User(rest));
+    if filters.contains(&crate::DisplayFilter::ContextBlocks) {
+        filter_context_blocks(&mut text)
+    }
+    let rest = crate::clean_message_text_with_filters(&text, filters);
+    if !rest.is_empty() {
+        if is_user {
+            bodies.insert(0, Body::User(rest));
+        } else {
+            bodies.push(Body::Event(rest));
+        }
     }
     bodies
 }

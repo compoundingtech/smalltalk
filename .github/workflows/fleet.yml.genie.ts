@@ -121,6 +121,33 @@ export default githubWorkflow(auditCaches({
   },
   jobs: {
     [pickRunnerJobId]: pickRunnerJob,
+    // Start immediately on hosted capacity: no Nix setup, downloads or compilation.
+    'upgrade-impact': {
+      name: 'upgrade-impact',
+      'runs-on': 'ubuntu-latest',
+      'timeout-minutes': 5,
+      steps: [
+        { uses: 'actions/checkout@v4', with: { 'fetch-depth': 0, 'persist-credentials': false } },
+        { name: 'Test release and PR classification safety', run: 'python3 scripts/release_notes_test.py' },
+        {
+          name: 'Require a fresh fragment on the effective PR or queue merge',
+          env: {
+            IMPACT_BASE_SHA: '${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}',
+            IMPACT_PR_NUMBER: '${{ github.event.pull_request.number }}',
+            IMPACT_QUEUE_REF: '${{ github.event.merge_group.head_ref }}',
+          },
+          run: `if [ -n "$IMPACT_BASE_SHA" ]; then
+  if [ -n "$IMPACT_PR_NUMBER" ]; then
+    python3 scripts/check-release-impact --base "$IMPACT_BASE_SHA" --source "$GITHUB_SHA" --pr-number "$IMPACT_PR_NUMBER"
+  else
+    python3 scripts/check-release-impact --base "$IMPACT_BASE_SHA" --source "$GITHUB_SHA" --queue-ref "$IMPACT_QUEUE_REF"
+  fi
+else
+  echo "Manual dispatch has no PR/queue delta; classification safety tests passed."
+fi`,
+        },
+      ],
+    },
     // Watch queue refs on GitHub-hosted capacity, even when both workload pools are occupied.
     // Manual runs retain the existing Namespace capacity report.
     'namespace-capacity': {
@@ -288,7 +315,7 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
     },
     'linux-gate': {
       name: 'linux-gate',
-      needs: [pickRunnerJobId, 'linux-tests', 'linux-tests-shard-2', 'linux-clippy', 'linux-fleet-compat', 'mail-redelivery-canaries'],
+      needs: [pickRunnerJobId, 'upgrade-impact', 'linux-tests', 'linux-tests-shard-2', 'linux-clippy', 'linux-fleet-compat', 'mail-redelivery-canaries'],
       // A skipped or cancelled stage must fail the gate, so it runs even when a stage failed.
       if: 'always()',
       // Aggregation needs no build caches and must not queue behind the work it summarizes.
@@ -298,7 +325,7 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
         {
           name: 'Require every Linux stage to pass',
           // The stages only: pick-runner is skipped whenever ci1 is off.
-          env: { RESULTS: '${{ needs.linux-tests.result }} ${{ needs.linux-tests-shard-2.result }} ${{ needs.linux-clippy.result }} ${{ needs.linux-fleet-compat.result }} ${{ needs.mail-redelivery-canaries.result }}' },
+          env: { RESULTS: '${{ needs.upgrade-impact.result }} ${{ needs.linux-tests.result }} ${{ needs.linux-tests-shard-2.result }} ${{ needs.linux-clippy.result }} ${{ needs.linux-fleet-compat.result }} ${{ needs.mail-redelivery-canaries.result }}' },
           run: `echo "stage results: $RESULTS"
 for result in $RESULTS; do
   [ "$result" = success ] || exit 1
@@ -389,4 +416,4 @@ printf '| sekrets VM test | %ss |\\n' "$((SECONDS - start))" >> "$GITHUB_STEP_SU
       ],
     },
   },
-}, {"pick-runner": "Runner selection uses live API state and builds nothing.", "namespace-capacity": "Capacity is live API state and builds nothing.", "linux-gate": "Collects completed checks and builds nothing."}))
+}, {"pick-runner": "Runner selection uses live API state and builds nothing.", "upgrade-impact": "Runs Python/Git classification checks without downloads or compilation.", "namespace-capacity": "Capacity is live API state and builds nothing.", "linux-gate": "Collects completed checks and builds nothing."}))

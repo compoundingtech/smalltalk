@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "summary": "#1621: Python in the legacy st2 Nix check",
+  "commits": ["e16aff5b1b95fdd144c89607defd7ba4417c1b00"],
+  "replay": {"status": "none", "detail": "No new projection invalidation or startup replay trigger in the merged Python in the legacy st2 Nix check change."},
+  "schema": {"status": "none", "detail": "No database table, index, trigger or migration change in Python in the legacy st2 Nix check; SQLite user_version is unchanged."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digest/drop policy are unchanged; this change adds no sealing coordination requirement."},
+  "compatibility": {"status": "none", "detail": "Python in the legacy st2 nix check changes internal execution or build behavior without a new external API/claim version requirement."},
+  "downtime": {"status": "none", "detail": "No additional upgrade service stop or measured outage introduced by Python in the legacy st2 Nix check; the standard daemon/client restart procedure still applies."},
+  "manual": {"status": "none", "detail": "No data repair or configuration conversion required for existing installations by Python in the legacy st2 Nix check."},
+  "recovery": {"status": "none", "detail": "No additional recovery procedure introduced by this change. Preserve graph state, keys and configuration and follow the standard roll-forward guidance; this note does not qualify binary-only downgrade of the whole release."}
+}

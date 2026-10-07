@@ -43,7 +43,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
     case invalidArrangementFolder, invalidArrangementName, invalidArrangementKey, invalidSubjectReference
     case staleFence, cursorGap, pageCursorExpired, rateLimited
     case runtimeNotLocal, runtimeAuthorityIndeterminate, remoteUnavailable, `internal`
-    case terminalUnavailable, terminalEnded, timelineHistoryIncomplete
+    case terminalUnavailable, terminalEnded, timelineHistoryIncomplete, conversationContentInvalidated, transcriptUnavailable
     case blobTooLarge, unsupportedMediaType, blobContentMismatch, blobQuotaExceeded, blobNotFound, blobExpired
     case unknown(String)
 
@@ -65,6 +65,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
         case "cursor-gap": .cursorGap; case "page-cursor-expired": .pageCursorExpired
         case "rate-limited": .rateLimited; case "runtime-not-local": .runtimeNotLocal
         case "timeline-history-incomplete": .timelineHistoryIncomplete
+        case "conversation-content-invalidated": .conversationContentInvalidated; case "transcript-unavailable": .transcriptUnavailable
         case "terminal-unavailable": .terminalUnavailable; case "terminal-ended": .terminalEnded
         case "blob-too-large": .blobTooLarge; case "unsupported-media-type": .unsupportedMediaType; case "blob-content-mismatch": .blobContentMismatch
         case "blob-quota-exceeded": .blobQuotaExceeded; case "blob-not-found": .blobNotFound; case "blob-expired": .blobExpired
@@ -89,6 +90,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
         case .cursorGap: "cursor-gap"; case .pageCursorExpired: "page-cursor-expired"
         case .rateLimited: "rate-limited"; case .runtimeNotLocal: "runtime-not-local"
         case .timelineHistoryIncomplete: "timeline-history-incomplete"
+        case .conversationContentInvalidated: "conversation-content-invalidated"; case .transcriptUnavailable: "transcript-unavailable"
         case .terminalUnavailable: "terminal-unavailable"; case .terminalEnded: "terminal-ended"
         case .blobTooLarge: "blob-too-large"; case .unsupportedMediaType: "unsupported-media-type"; case .blobContentMismatch: "blob-content-mismatch"
         case .blobQuotaExceeded: "blob-quota-exceeded"; case .blobNotFound: "blob-not-found"; case .blobExpired: "blob-expired"
@@ -375,16 +377,16 @@ public enum TimelineToolStatus: String, Codable, Sendable { case success, error 
 public enum TimelineStatus: String, Codable, Sendable { case queued, running, waiting, completed, failed, cancelled }
 public enum TimelineUsageSemantics: String, Codable, Sendable { case contextOccupancy = "context_occupancy", sessionCumulative = "session_cumulative", response }
 public struct MessageProvenance: Codable, Sendable { public let verdict: String; public let reason, signer, key, device: String? }
-public struct TimelineMessageBody: Codable, Sendable { public let messageID: String; public let replyTo, from, to, title: String?; public let tags: [String]?; public let attachments: [Attachment]?; public let provenance: MessageProvenance?; enum CodingKeys: String, CodingKey { case messageID = "message_id", replyTo = "reply_to", from, to, title, tags, attachments, provenance } }
-public struct TimelineContentBody: Codable, Sendable { public let mediaType: String; public let text: String?; public let attachmentID: String?; enum CodingKeys: String, CodingKey { case mediaType = "media_type", text, attachmentID = "attachment_id" } }
-public struct TimelineToolCallBody: Codable, Sendable { public let callID: String; public let name: String; public let arguments: JSONValue; enum CodingKeys: String, CodingKey { case callID = "call_id", name, arguments } }
-public struct TimelineToolResultBody: Codable, Sendable { public let callID: String; public let status: TimelineToolStatus; public let mediaType: String; public let content: JSONValue; enum CodingKeys: String, CodingKey { case callID = "call_id", status, mediaType = "media_type", content } }
-public struct TimelineStatusBody: Codable, Sendable { public let status: TimelineStatus; public let detail: String? }
-public struct TimelineErrorBody: Codable, Sendable { public let code: String; public let message: String; public let retryable: Bool; public let details: [String: JSONValue] }
+public struct TimelineMessageBody: Codable, Sendable { public let blocks: [TimelineBlock]?; public let messageID: String; public let replyTo, from, to, title: String?; public let tags: [String]?; public let attachments: [Attachment]?; public let provenance: MessageProvenance?; enum CodingKeys: String, CodingKey { case blocks; case messageID = "message_id", replyTo = "reply_to", from, to, title, tags, attachments, provenance } }
+public struct TimelineContentBody: Codable, Sendable { public let blocks: [TimelineBlock]?; public let mediaType: String; public let text: String?; public let attachmentID: String?; enum CodingKeys: String, CodingKey { case blocks; case mediaType = "media_type", text, attachmentID = "attachment_id" } }
+public struct TimelineToolCallBody: Codable, Sendable { public let blocks: [TimelineBlock]?; public let callID: String; public let name: String; public let arguments: JSONValue; enum CodingKeys: String, CodingKey { case blocks; case callID = "call_id", name, arguments } }
+public struct TimelineToolResultBody: Codable, Sendable { public let blocks: [TimelineBlock]?; public let callID: String; public let status: TimelineToolStatus; public let mediaType: String; public let content: JSONValue; enum CodingKeys: String, CodingKey { case blocks; case callID = "call_id", status, mediaType = "media_type", content } }
+public struct TimelineStatusBody: Codable, Sendable { public let blocks: [TimelineBlock]?; public let status: TimelineStatus; public let detail: String? }
+public struct TimelineErrorBody: Codable, Sendable { public let blocks: [TimelineBlock]?; public let code: String; public let message: String; public let retryable: Bool; public let details: [String: JSONValue] }
 public struct TimelineAttribution: Codable, Sendable { public let agentID: String; public let missionRunID: String?; public let generationID: String?; public let stepID: String?; enum CodingKeys: String, CodingKey { case agentID = "agent_id", missionRunID = "mission_run_id", generationID = "generation_id", stepID = "step_id" } }
-public struct TimelineUsageBody: Codable, Sendable { public let semantics: TimelineUsageSemantics; public let driver: String; public let model: String?; public let inputTokens: UInt64?; public let outputTokens: UInt64?; public let cachedTokens: UInt64?; public let totalTokens: UInt64?; public let contextUsedTokens: UInt64?; public let contextWindowTokens: UInt64?; public let contextUsedPercent: Double?; public let compactions: UInt64?; public let lastCompactionMs: UInt64?; public let lastCompactionTrigger: String?; public let cost: Double?; public let currency: String?; public let attribution: TimelineAttribution; enum CodingKeys: String, CodingKey { case semantics, driver, model, inputTokens = "input_tokens", outputTokens = "output_tokens", cachedTokens = "cached_tokens", totalTokens = "total_tokens", contextUsedTokens = "context_used_tokens", contextWindowTokens = "context_window_tokens", contextUsedPercent = "context_used_percent", compactions, lastCompactionMs = "last_compaction_ms", lastCompactionTrigger = "last_compaction_trigger", cost, currency, attribution } }
-public struct TimelineRedactionBody: Codable, Sendable { public let reason: String; public let withheldBytes: UInt64; public let withheldItems: UInt64?; enum CodingKeys: String, CodingKey { case reason, withheldBytes = "withheld_bytes", withheldItems = "withheld_items" } }
-public struct TimelineTruncationBody: Codable, Sendable { public let reason: String; public let omittedFromSequence: UInt64; public let omittedToSequence: UInt64; public let continuationCursor: String?; enum CodingKeys: String, CodingKey { case reason, omittedFromSequence = "omitted_from_sequence", omittedToSequence = "omitted_to_sequence", continuationCursor = "continuation_cursor" } }
+public struct TimelineUsageBody: Codable, Sendable { public let blocks: [TimelineBlock]?; public let semantics: TimelineUsageSemantics; public let driver: String; public let model: String?; public let inputTokens: UInt64?; public let outputTokens: UInt64?; public let cachedTokens: UInt64?; public let totalTokens: UInt64?; public let contextUsedTokens: UInt64?; public let contextWindowTokens: UInt64?; public let contextUsedPercent: Double?; public let compactions: UInt64?; public let lastCompactionMs: UInt64?; public let lastCompactionTrigger: String?; public let cost: Double?; public let currency: String?; public let attribution: TimelineAttribution; enum CodingKeys: String, CodingKey { case blocks; case semantics, driver, model, inputTokens = "input_tokens", outputTokens = "output_tokens", cachedTokens = "cached_tokens", totalTokens = "total_tokens", contextUsedTokens = "context_used_tokens", contextWindowTokens = "context_window_tokens", contextUsedPercent = "context_used_percent", compactions, lastCompactionMs = "last_compaction_ms", lastCompactionTrigger = "last_compaction_trigger", cost, currency, attribution } }
+public struct TimelineRedactionBody: Codable, Sendable { public let blocks: [TimelineBlock]?; public let reason: String; public let withheldBytes: UInt64; public let withheldItems: UInt64?; enum CodingKeys: String, CodingKey { case blocks; case reason, withheldBytes = "withheld_bytes", withheldItems = "withheld_items" } }
+public struct TimelineTruncationBody: Codable, Sendable { public let blocks: [TimelineBlock]?; public let reason: String; public let omittedFromSequence: UInt64; public let omittedToSequence: UInt64; public let continuationCursor: String?; enum CodingKeys: String, CodingKey { case blocks; case reason, omittedFromSequence = "omitted_from_sequence", omittedToSequence = "omitted_to_sequence", continuationCursor = "continuation_cursor" } }
 public enum TimelineBody: Sendable { case message(TimelineMessageBody), content(TimelineContentBody), toolCall(TimelineToolCallBody), toolResult(TimelineToolResultBody), status(TimelineStatusBody), error(TimelineErrorBody), usage(TimelineUsageBody), redaction(TimelineRedactionBody), truncation(TimelineTruncationBody) }
 public struct TimelineEntry: Codable, Sendable, Identifiable {
     public let id: String; public let sequence: UInt64; public let revision: UInt; public let timestamp: String; public let role: TimelineRole; public let type: TimelineType; public let isFinal: Bool; public let body: TimelineBody
@@ -699,4 +701,19 @@ public struct ArrangementCollectionFrame: Codable, Sendable {
     public let code, message: String?
     public let retryable: Bool?
     enum CodingKeys: String, CodingKey { case kind, id, collection, snapshot, items, upserts, removes, order, code, message, retryable, hasMore = "has_more" }
+}
+
+public struct TimelineBlock: Codable, Sendable {
+    public let id: String; public let kind: String; public let sourceType: String
+    public let payload: JSONValue; public let visibility: String?; public let metadata: JSONValue?; public let continuation: ConversationContentRef?
+    enum CodingKeys: String, CodingKey { case id, kind, sourceType = "source_type", payload, visibility, metadata, continuation }
+}
+public struct ConversationContentRef: Codable, Sendable {
+    public let ref: String; public let mediaType: String; public let size: UInt64?; public let reason: String?
+    enum CodingKeys: String, CodingKey { case ref, mediaType = "media_type", size, reason }
+}
+public struct ConversationContentChunk: Codable, Sendable {
+    public let kind: String; public let ref: String; public let mediaType: String
+    public let offset: UInt64; public let size: UInt64; public let data: String; public let nextOffset: UInt64?
+    enum CodingKeys: String, CodingKey { case kind, ref, mediaType = "media_type", offset, size, data, nextOffset = "next_offset" }
 }
