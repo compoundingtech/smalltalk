@@ -1597,3 +1597,25 @@ fn manual_rollout_policy_requires_each_active_daemon_and_is_in_the_receipt_diges
         preview.blockers
     );
 }
+
+#[test]
+fn pass_staged_subject_selection_uses_the_partial_index() {
+    let store = Store::open_memory("amber").unwrap();
+    let connection = store.readers.get();
+    let plans = connection
+        .prepare(&format!(
+            "EXPLAIN QUERY PLAN {}",
+            super::owned_sets::STAGED_SUBJECTS_QUERY
+        ))
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert!(
+        plans
+            .iter()
+            .any(|plan| plan.contains("claims_owned_set_subject_index")),
+        "{plans:?}"
+    );
+}
