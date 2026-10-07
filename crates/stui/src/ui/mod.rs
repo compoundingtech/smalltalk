@@ -134,9 +134,6 @@ struct Demo {
     harbor_seen: Option<Instant>,
 }
 
-/// How long an update stays open on Home before it counts as read.
-const UPDATE_READ_AFTER: Duration = Duration::from_secs(3);
-
 /// A request the live loop sends to st. The demo never produces these.
 /// What the agent actions menu does to a seat; each is st's own agent action.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -358,10 +355,13 @@ pub struct Ui {
     /// Live: actions become `effects` for the live loop instead of demo edits.
     live: bool,
     effects: Vec<Effect>,
-    /// The update open on Home and since when: one left open a moment counts as read.
-    update_open: Option<(String, Instant)>,
     /// Updates marked read from here, so each is sent once.
     updates_read: HashSet<String>,
+    /// Attention items the person acted on from here: st closing them is their doing.
+    acted: HashSet<String>,
+    /// Attention items st no longer lists that nobody here acted on. Nothing leaves Home by
+    /// itself (Nathan, 2026-10-07): they stay, marked, until `x` clears them.
+    closed: HashSet<String>,
     /// Conversations scrolled up to their oldest entry since the last frame: each asks st for
     /// the page before it.
     older_wanted: RefCell<BTreeSet<String>>,
@@ -510,8 +510,9 @@ impl Ui {
             quit: false,
             live: false,
             effects: Vec::new(),
-            update_open: None,
             updates_read: HashSet::new(),
+            acted: HashSet::new(),
+            closed: HashSet::new(),
             older_wanted: RefCell::default(),
             popover: None,
             chat: None,
@@ -560,6 +561,48 @@ impl Ui {
     }
 
     /// Replace the world, keeping each tab's selection on the same item.
+    /// Note what the person did to an item from here, so its closing is not "closed elsewhere".
+    pub(crate) fn note_acted(&mut self, effect: &Effect) {
+        match effect {
+            Effect::Attention { id, .. }
+            | Effect::LaunchRevise { id, .. }
+            | Effect::Reply { id, .. } => {
+                self.acted.insert(id.clone());
+            }
+            _ => {}
+        }
+    }
+
+    /// An item st stopped listing stays on Home, marked, unless the person acted on it: another
+    /// device, an agent or st itself closed it, and it must not go while it is being read.
+    fn keep_closed_attention(&mut self, before: Vec<view::Attention>) {
+        let Load::Ready(items) = &mut self.world.attention else {
+            return;
+        };
+        for old in before {
+            if let Some(now) = items.iter().find(|item| item.id == old.id) {
+                if !self.closed.contains(&now.id) {
+                    continue;
+                }
+                self.closed.remove(&old.id);
+                continue;
+            }
+            if self.acted.contains(&old.id) {
+                self.closed.remove(&old.id);
+                continue;
+            }
+            let mut kept = old;
+            if self.closed.insert(kept.id.clone()) {
+                kept.waiting = Some(match kept.waiting.take() {
+                    Some(who) => format!("closed elsewhere, x clears it · {who}"),
+                    None => "closed elsewhere, x clears it".into(),
+                });
+                kept.actions.clear();
+            }
+            items.push(kept);
+        }
+    }
+
     pub fn set_world(&mut self, world: World) {
         let tab = self.tab;
         let mut chosen = Vec::new();
@@ -567,7 +610,15 @@ impl Ui {
             self.tab = index;
             chosen.push(self.selected_id());
         }
+        // Only what was on screen from a live reading can have closed under the person's eyes;
+        // a stored copy, or a reading before the first live one, is just replaced.
+        let before = if matches!(self.world.link, Link::Live) {
+            self.world.attention.items().to_vec()
+        } else {
+            Vec::new()
+        };
         self.world = world;
+        self.keep_closed_attention(before);
         for (index, id) in chosen.into_iter().enumerate() {
             self.tab = index;
             if let Some(id) = id
@@ -3902,30 +3953,6 @@ impl Ui {
         }
     }
 
-    /// An update opened on Home is read once the person leaves it, after it was open for a
-    /// moment: marking it read closes it, and it must stay put while it is being read (Nathan,
-    /// 2026-10-05: updates vanished mid-read). Passing over it with the arrows does not count,
-    /// and `x` still reads it at once.
-    pub(crate) fn read_open_update(&mut self) {
-        let open = self
-            .attention_focus()
-            .filter(|_| !self.help && self.popover.is_none())
-            .filter(|_| self.current_kind() == Some("update"));
-        if let Some((shown, since)) = &self.update_open
-            && open.as_ref() != Some(shown)
-            && since.elapsed() >= UPDATE_READ_AFTER
-        {
-            let shown = shown.clone();
-            self.update_open = None;
-            self.read_update_id(shown);
-        }
-        match (open, &self.update_open) {
-            (None, _) => self.update_open = None,
-            (Some(id), Some((shown, _))) if *shown == id => {}
-            (Some(id), _) => self.update_open = Some((id, Instant::now())),
-        }
-    }
-
     fn current_kind(&self) -> Option<&'static str> {
         let id = self.attention_focus()?;
         self.world
@@ -3984,6 +4011,22 @@ impl Ui {
                 if self.current_item().is_some_and(|item| item.actions.iter().any(|a| a == "custom.reply"))
                     && matches!(key, 'y' | 'n' | 'r' | 'x') {
                     self.flash("Reply with c using this source's declared fields");
+                    return;
+                }
+                if let Some(id) = self.attention_focus()
+                    && self.closed.contains(&id)
+                {
+                    if key == 'x' {
+                        self.closed.remove(&id);
+                        self.acted.insert(id.clone());
+                        if let Load::Ready(items) = &mut self.world.attention {
+                            items.retain(|item| item.id != id);
+                        }
+                        let index = self.selected[self.tab];
+                        self.select(index);
+                    } else {
+                        self.flash("This was closed elsewhere and stays until you clear it with x");
+                    }
                     return;
                 }
                 match (kind, key) {
@@ -6771,9 +6814,6 @@ mod tests {
         ] {
             assert!(screen.contains(shown), "{shown}: {screen}");
         }
-        // Open, but only just: not read yet.
-        ui.read_open_update();
-        assert!(ui.effects.is_empty());
         // x dismisses it: it is read, once.
         ui.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
         ui.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
@@ -6783,26 +6823,49 @@ mod tests {
             "{:?}",
             ui.effects
         );
-        // Left open a good while, it stays: it is read only once the person moves off it.
+        // Left open, or moved off, it stays: only x or r reads an update.
         ui.effects.clear();
         ui.updates_read.clear();
-        ui.update_open = Some((
-            "attention/update".into(),
-            Instant::now() - UPDATE_READ_AFTER * 10,
-        ));
-        ui.read_open_update();
-        assert!(ui.effects.is_empty(), "still being read: {:?}", ui.effects);
-        assert!(ui.updates_read.is_empty());
-        // Moving off it (here, to nothing) after it was open a moment reads it.
         ui.select(0);
-        ui.read_open_update();
-        assert_eq!(ui.effects.len(), 1, "{:?}", ui.effects);
-        // Moving off one that was only passed over does not.
-        ui.effects.clear();
-        ui.updates_read.clear();
-        ui.update_open = Some(("attention/update".into(), Instant::now()));
-        ui.read_open_update();
         assert!(ui.effects.is_empty(), "{:?}", ui.effects);
+    }
+
+    #[test]
+    fn an_item_st_stops_listing_stays_on_home_until_x_clears_it() {
+        let world = demo::world();
+        let mut ui = Ui::new(world.clone());
+        ui.live = true;
+        ui.tab = 0;
+        let ids = ui.listing(60).ids.clone();
+        let (gone, acted) = (ids[0].clone(), ids[1].clone());
+        ui.select(0);
+        // Another device closes the first; the person answers the second here.
+        ui.note_acted(&Effect::Attention {
+            id: acted.clone(),
+            action: "work.done".into(),
+            reason: None,
+            answer: None,
+        });
+        let mut next = world;
+        if let Load::Ready(items) = &mut next.attention {
+            items.retain(|item| item.id != gone && item.id != acted);
+        }
+        ui.set_world(next.clone());
+        let listing = ui.listing(60);
+        assert!(listing.ids.contains(&gone), "it stays");
+        assert!(!listing.ids.contains(&acted), "what the person acted on goes");
+        ui.select(listing.ids.iter().position(|id| *id == gone).unwrap());
+        assert!(frame(&ui, 140, 50).join("\n").contains("closed elsewhere"));
+        // It survives later updates, and only x clears it.
+        ui.set_world(next.clone());
+        assert!(ui.listing(60).ids.contains(&gone));
+        ui.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(ui.listing(60).ids.contains(&gone), "other keys leave it");
+        ui.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(!ui.listing(60).ids.contains(&gone));
+        assert!(ui.effects.is_empty(), "nothing sent for an item already closed");
+        ui.set_world(next);
+        assert!(!ui.listing(60).ids.contains(&gone));
     }
 
     #[test]
