@@ -5,6 +5,7 @@ mod agent_card_usage;
 mod agent_card_base;
 mod agent_card_rollout;
 mod agent_authority_ivm;
+pub(crate) mod agent_queue;
 pub mod custom;
 pub mod declarations;
 mod glass_heads;
@@ -19,6 +20,7 @@ pub mod owned_sets;
 mod owned_sets_tests;
 mod resources;
 mod rollouts;
+pub(crate) mod seat_queue_order;
 mod seat_status;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
