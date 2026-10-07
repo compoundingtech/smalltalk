@@ -2192,6 +2192,28 @@ fn runtime_resources_for_owner(
             history,
         )?
     };
+    runtime_resources_from_status(state, snapshot, session, status)
+}
+
+fn terminal_resources_for_owner(
+    state: &AppState,
+    history: bool,
+    snapshot: &ClientSnapshot,
+    session: &ClientSession,
+    owner: Option<&str>,
+) -> anyhow::Result<Vec<Value>> {
+    let status = state
+        .store
+        .terminal_resource_status_at(owner, snapshot.store_index, history)?;
+    runtime_resources_from_status(state, snapshot, session, status)
+}
+
+fn runtime_resources_from_status(
+    state: &AppState,
+    snapshot: &ClientSnapshot,
+    session: &ClientSession,
+    status: crate::model::StatusResponse,
+) -> anyhow::Result<Vec<Value>> {
     // Each runtime's declaration and observation time, in one statement apiece for the list.
     let desired_tokens = state.store.selected_desired_tokens(
         &status
@@ -3363,7 +3385,7 @@ pub(super) async fn terminals(
         "terminals",
         &query,
         move |state, snapshot| {
-            let mut items = runtime_resources_for_owner(
+            let mut items = terminal_resources_for_owner(
                 state,
                 history,
                 snapshot,
@@ -11517,6 +11539,157 @@ subscription "watch/source" {
         assert_eq!(statements(40), few);
     }
 
+    #[test]
+    fn terminal_resource_summary_matches_full_status_at_current_and_old_cuts() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let session = ClientSession::local(Some("person/alex")).unwrap();
+        let intent = crate::graph::parse_intent(
+            "version 2\nagent \"declared-terminal\" { command \"true\" }\n",
+            state.store.origin(),
+        )
+        .unwrap();
+        let planned = state
+            .store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: String::new(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(
+                &intent,
+                &planned.subject_tokens,
+                "terminal-summary-declaration",
+            )
+            .unwrap();
+        let subjects = [
+            "agent/declared-terminal",
+            "exec/undeclared-terminal",
+            "agent/nonterminal",
+        ];
+        let mut snapshots = vec![new_client_snapshot(&state)];
+        for (status, incarnation) in [
+            ("running", "first"),
+            ("stopped", "first"),
+            ("running", "second"),
+        ] {
+            for subject in subjects {
+                state
+                    .store
+                    .append_claim(&ClaimInput {
+                        subject: subject.into(),
+                        kind: "runtime.observed".into(),
+                        actor: Some(subject.into()),
+                        fields: serde_json::from_value(json!({
+                            "status": status, "runtime_id": subject, "incarnation_id": incarnation,
+                            "terminal": subject != "agent/nonterminal",
+                        }))
+                        .unwrap(),
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: None,
+                    })
+                    .unwrap();
+                if subject.starts_with("agent/") {
+                    state
+                        .store
+                        .append_claim(&ClaimInput {
+                            subject: subject.into(),
+                            kind: "harness.observed".into(),
+                            actor: Some(subject.into()),
+                            fields: serde_json::from_value(json!({
+                                "state": "idle", "incarnation_id": incarnation, "driver": "claude",
+                            }))
+                            .unwrap(),
+                            evidence: Vec::new(),
+                            expected_subject: None,
+                            idempotency_key: None,
+                        })
+                        .unwrap();
+                }
+            }
+            snapshots.push(new_client_snapshot(&state));
+        }
+        // Read newest first, then older cuts: a cached new incarnation cannot leak backwards.
+        for snapshot in snapshots.iter().rev() {
+            for history in [false, true] {
+                for owner in [
+                    None,
+                    Some(subjects[0]),
+                    Some(subjects[1]),
+                    Some("agent/missing"),
+                    Some("glass/missing"),
+                ] {
+                    let lean =
+                        terminal_resources_for_owner(&state, history, snapshot, &session, owner)
+                            .unwrap();
+                    let full =
+                        runtime_resources_for_owner(&state, history, snapshot, &session, owner)
+                            .unwrap();
+                    assert_eq!(
+                        lean, full,
+                        "cut={} history={history} owner={owner:?}",
+                        snapshot.store_index
+                    );
+                    state.store.forget_current_views();
+                    assert_eq!(
+                        terminal_resources_for_owner(&state, history, snapshot, &session, owner)
+                            .unwrap(),
+                        full
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_resource_summary_reuses_status_without_full_cache_warming() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let session = ClientSession::local(Some("person/alex")).unwrap();
+        let statements = |count: usize| {
+            let snapshot = new_client_snapshot(&state);
+            // Only the terminals reduction warms this read; no runtime or machine read.
+            let first =
+                terminal_resources_for_owner(&state, false, &snapshot, &session, None).unwrap();
+            assert_eq!(first.len(), count);
+            crate::store::STATEMENTS_RUN.with(|run| run.set(0));
+            let again =
+                terminal_resources_for_owner(&state, false, &snapshot, &session, None).unwrap();
+            assert_eq!(again, first);
+            crate::store::STATEMENTS_RUN.with(std::cell::Cell::get)
+        };
+        let few = std::cell::Cell::new(0);
+        for number in 0..40 {
+            let subject = format!("exec/terminal-summary/{number}");
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: subject.clone(),
+                    kind: "runtime.observed".into(),
+                    actor: Some(subject),
+                    fields: serde_json::from_value(json!({
+                        "status": "running", "runtime_id": format!("summary-{number}"),
+                        "incarnation_id": "first", "terminal": true,
+                    }))
+                    .unwrap(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+            if number == 2 {
+                few.set(statements(3));
+            }
+        }
+        assert_eq!(statements(40), few.get());
+    }
+
     /// The operations collection answers while the first diagnostic report since a start is
     /// being made, saying so, and lists the report once it is made.
     #[test]
@@ -16057,6 +16230,12 @@ mission "example/zero-run" state="ready" {
             .unwrap();
         let status = follower.store.status(Some(subject)).unwrap();
         assert_eq!(status.subjects[0].reachability, "reachable");
+        let session = ClientSession::local(Some("person/alex")).unwrap();
+        let snapshot = new_client_snapshot(&follower);
+        assert_eq!(
+            terminal_resources_for_owner(&follower, true, &snapshot, &session, Some(subject)).unwrap(),
+            runtime_resources_for_owner(&follower, true, &snapshot, &session, Some(subject)).unwrap(),
+        );
         let live = remote_terminal_live_session(&follower, subject, "same-runtime-id:i1")
             .unwrap_or_else(|error| panic!("{}: {}", error.code, error.message));
         assert_eq!(live.owner_host_id, "host/owner-node");
@@ -16268,6 +16447,11 @@ mission "example/zero-run" state="ready" {
         assert_eq!(indeterminate["state"], "unreachable");
         assert_eq!(indeterminate["terminal_access"]["read"], "unavailable");
         assert_eq!(indeterminate["operational"]["actionable"], false);
+        let snapshot = new_client_snapshot(&owner);
+        let lean = terminal_resources_for_owner(&owner, true, &snapshot, &session, Some(subject)).unwrap();
+        assert_eq!(lean, runtime_resources_for_owner(&owner, true, &snapshot, &session, Some(subject)).unwrap());
+        assert_eq!(lean[0]["state"], "unreachable");
+        assert_eq!(lean[0]["terminal_access"]["read"], "unavailable");
     }
     #[test]
     fn status_freshness_uses_cached_card_time_without_resetting_since() {
