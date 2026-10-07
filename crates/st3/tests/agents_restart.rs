@@ -324,9 +324,9 @@ async fn cli(socket: &Path, subject: &str, actor: &str, timeout: &str) -> std::p
     .await
     .unwrap()
 }
-// Cross the recorded retry deadline without waiting on the wall clock. Keep the virtual
-// reader clock within this synchronous pass; async API reads use their ordinary clock.
-fn run_due_restart(fixture: &Fixture, subject: &str) {
+// Cross the recorded retry deadline with the fixture's real clock, so later async
+// person requests and native-session writes never see time move backwards.
+async fn run_due_restart(fixture: &Fixture, subject: &str) {
     let Some(due) = fixture
         .store
         .latest_observation(subject, "runtime.reconcile-decision")
@@ -339,14 +339,12 @@ fn run_due_restart(fixture: &Fixture, subject: &str) {
     else {
         return;
     };
-    struct Clock;
-    impl Drop for Clock {
-        fn drop(&mut self) {
-            smallclaims::store::set_thread_clock(None);
-        }
-    }
-    let _clock = Clock;
-    smallclaims::store::set_thread_clock(Some(due));
+    let delay = due.saturating_sub(smallclaims::store::now_ms());
+    assert!(
+        delay <= 6_000,
+        "fresh fixture retry exceeded the first crash delay"
+    );
+    tokio::time::sleep(Duration::from_millis(delay as u64)).await;
     fixture.reconciler.reconcile_once().unwrap();
 }
 
@@ -858,7 +856,7 @@ async fn seats_without_one_shot_keep_their_exit_and_restart_behaviour() {
             for _ in 0..3 {
                 fixture.reconciler.reconcile_once().unwrap();
             }
-            run_due_restart(&fixture, &subject);
+            run_due_restart(&fixture, &subject).await;
             assert!(
                 fixture
                     .store
@@ -1562,7 +1560,7 @@ async fn every_restart_continues_the_seats_last_native_session() {
     for _ in 0..3 {
         fixture.reconciler.reconcile_once().unwrap();
     }
-    run_due_restart(&fixture, &subject);
+    run_due_restart(&fixture, &subject).await;
     let starts = fixture.runtime.starts.lock().unwrap().clone();
     assert_eq!(starts.len(), 2);
     assert_eq!(continued(&starts[1]), Some("session-one"));
@@ -1677,7 +1675,7 @@ async fn a_session_the_driver_could_not_continue_is_not_tried_again() {
     for _ in 0..3 {
         fixture.reconciler.reconcile_once().unwrap();
     }
-    run_due_restart(&fixture, &subject);
+    run_due_restart(&fixture, &subject).await;
     let starts = fixture.runtime.starts.lock().unwrap().clone();
     assert_eq!(starts.len(), 2);
     assert_eq!(continued(&starts[1]), None);

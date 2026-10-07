@@ -902,7 +902,9 @@ async fn a_new_ready_agent_attaches_to_its_requested_incarnation() {
         return;
     }
     let root = tempfile::tempdir().unwrap();
-    let state = state(root.path());
+    let mut state = state(root.path());
+    state.store =
+        Arc::new(Store::open(&root.path().join("claims.sqlite3"), "attach-node").unwrap());
     let store = state.store.clone();
     let socket = root.path().join("st3.sock");
     let server = serve_unix(state, &socket).await;
