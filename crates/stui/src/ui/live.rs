@@ -1248,6 +1248,7 @@ pub fn run(context: Context) -> Result<()> {
         }
         ui.step_voice();
         ui.step_terminal_hold();
+        ui.step_default_view();
         execute!(io::stdout(), BeginSynchronizedUpdate)?;
         terminal.draw(|frame| ui.render(frame))?;
         // The attached terminal's cursor shape (vim's bar while inserting), and the person's
