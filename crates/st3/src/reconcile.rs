@@ -747,6 +747,8 @@ fn first_readiness_since(run: &MissionRunView) -> u128 {
         .max(run.created_at_unix_ms)
 }
 
+type MemberWake = (DesiredSubject, String, MemberSpec);
+
 pub struct Reconciler<R = NativeRuntime> {
     store: Arc<Store>,
     runtime: Arc<R>,
@@ -824,7 +826,7 @@ pub struct Reconciler<R = NativeRuntime> {
     /// Why each member failed its last render, kept while render is skipped.
     render_failures: Mutex<BTreeMap<String, String>>,
     /// The work wake each live agent's last evaluation queued, queued again while it is skipped.
-    member_wakes: Mutex<HashMap<String, (DesiredSubject, String, MemberSpec)>>,
+    member_wakes: Mutex<HashMap<String, MemberWake>>,
     /// How often a skipped member's terminal screen is looked at again for a prompt.
     screen_poll_every_ms: u128,
     fault_injection: Option<Arc<dyn FaultInjection>>,
