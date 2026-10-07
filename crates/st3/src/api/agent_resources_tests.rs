@@ -36,7 +36,7 @@ fn message_commit_rebuilds_only_sender_and_recipient_cards() {
         client_agent_resources_cached(store, history, store.index().unwrap()).unwrap();
     }
     let message = append(store, "message/filtered-frontier", "message.sent", json!({
-        "from":"agent/node.amber", "to":"agent/node.cobalt", "content":"Activity",
+        "from":"agent/node.amber", "to":"agent/node.cobalt", "content":"Activity", "status":"sent",
     }));
     for history in [false, true] {
         let cards = store.read_snapshot(|index| {
@@ -112,23 +112,23 @@ async fn filtered_agents_refresh_local_observations_and_keep_frozen_cursors() {
     let app = router(state.clone());
     let (status, first) = tests::get_request(app.clone(), "/v1/client/agents?status=waiting&limit=1").await;
     assert_eq!(status, StatusCode::OK, "{first}");
-    assert_eq!(first["value"]["items"][0]["id"], "agent/node.cobalt",
+    assert_eq!(first["items"][0]["id"], "agent/node.cobalt",
         "filtering must exclude amber before applying limit=1");
-    assert_eq!(first["value"]["page"]["has_more"], true);
+    assert_eq!(first["page"]["has_more"], true);
     let index = state.store.index().unwrap();
     let observation = timeline(&state.store, "agent/node.cobalt");
     timeline(&state.store, "agent/node.indigo");
     assert_eq!(state.store.index().unwrap(), index);
     let (_, fresh) = tests::get_request(app.clone(), "/v1/client/agents?status=waiting&limit=1").await;
-    assert_eq!(fresh["value"]["items"][0]["last_activity_at"],
+    assert_eq!(fresh["items"][0]["last_activity_at"],
         json!(client_timestamp(observation.accepted_at_unix_ms)));
-    assert!(first["value"]["items"][0]["last_activity_at"].is_null());
-    let cursor = first["value"]["page"]["next_cursor"].as_str().unwrap();
+    assert!(first["items"][0]["last_activity_at"].is_null());
+    let cursor = first["page"]["next_cursor"].as_str().unwrap();
     let (status, second) = tests::get_request(app,
         &format!("/v1/client/agents?status=waiting&limit=1&cursor={cursor}")).await;
     assert_eq!(status, StatusCode::OK, "{second}");
-    assert_eq!(second["value"]["items"][0]["id"], "agent/node.indigo");
-    assert!(second["value"]["items"][0]["last_activity_at"].is_null(),
+    assert_eq!(second["items"][0]["id"], "agent/node.indigo");
+    assert!(second["items"][0]["last_activity_at"].is_null(),
         "continuations must retain their first page's pre-observation cards");
-    assert_eq!(second["value"]["page"]["has_more"], false);
+    assert_eq!(second["page"]["has_more"], false);
 }
