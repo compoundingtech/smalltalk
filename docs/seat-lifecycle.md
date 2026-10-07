@@ -261,7 +261,20 @@ After creating a seat, st explains whether it is ready or still starting and pri
 commands to attach, send it a message, inspect it, and stop it. These commands are also printed
 when startup times out or the agent needs your input. Attaching stays opt-in with `--attach`.
 Mission starts, launches, device pairing, and fleet creation or joining also finish with their
-next steps. JSON output keeps its existing shape.
+next steps. While `agents new` waits, stderr reports the host, elapsed time and declaration,
+replication, launch, readiness and attachment stages. A same-host launch explicitly skips
+replication. With `--json`, the result adds a `stages` array and startup failures add `error`.
+
+If the requested process exits before readiness, creation promptly returns that process's exit
+status, including zero, and a bounded startup output tail. Credential and structured transcript
+lines are withheld. A later retry cannot turn that failed creation into success or redirect its
+attachment. Missing executables and setup errors identify the launch stage that failed.
+
+Automatic restarts after short-lived agent exits wait at least five seconds, increasing to a
+maximum of two minutes including jitter. A sixty-second process lifetime clears this consecutive
+failure delay. An explicit person retry or changed launch configuration starts a fresh attempt;
+intentional stops remain stopped. Existing restart intensity limits can still park repeated
+failures. Inspect the fault and retry deadline before retrying after a setup correction.
 
 ## Open a shell
 

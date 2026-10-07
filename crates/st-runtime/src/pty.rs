@@ -154,6 +154,38 @@ impl PtyRuntime {
         self
     }
 
+    /// Retained output from exactly the exited incarnation. Never peek a replacement screen.
+    pub fn exit_tail(&self, id: &str, incarnation: &str) -> Result<Option<String>> {
+        let session = self.session(id)?;
+        let observed = observation(session.clone())?;
+        if !matches!(observed.status.as_str(), "exited" | "vanished")
+            || observation_incarnation(&observed).as_deref() != Some(incarnation)
+        {
+            return Ok(None);
+        }
+        Ok(session
+            .metadata
+            .and_then(|metadata| metadata.last_lines)
+            .map(|lines| {
+                lines
+                    .into_iter()
+                    .rev()
+                    .take(20)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .map(|line| {
+                        if line.chars().count() > 512 {
+                            "[long startup line withheld]".into()
+                        } else {
+                            line
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }))
+    }
+
     pub fn snapshot(&self) -> Result<Vec<PtyObservation>> {
         self.sessions()?.into_iter().map(observation).collect()
     }
@@ -421,7 +453,14 @@ impl PtyRuntime {
                 crate::protect_servers(std::slice::from_ref(&published));
                 return Ok(());
             }
-            last_error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let combined = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            last_error = crate::launch_diagnostic::safe_tail(&combined, env)
+                .trim()
+                .to_string();
             if !last_error.contains("already in use") || attempt + 1 == ATTEMPTS {
                 break;
             }
@@ -864,15 +903,55 @@ impl PtyRuntime {
 
 /// A wedged PTY command must not stall the reconciler indefinitely.
 pub(crate) fn output_within(mut command: Command, timeout: Duration) -> Result<Output> {
-    let child = command
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
     let pid = child.id();
     let (sender, receiver) = std::sync::mpsc::channel();
+    fn drain(mut reader: impl std::io::Read) -> std::io::Result<Vec<u8>> {
+        let mut tail = Vec::new();
+        let mut bytes = [0u8; 4096];
+        loop {
+            let count = reader.read(&mut bytes)?;
+            if count == 0 {
+                return Ok(tail);
+            }
+            tail.extend_from_slice(&bytes[..count]);
+            if tail.len() > 8192 {
+                tail.drain(..tail.len() - 8192);
+            }
+        }
+    }
+    let stdout = child
+        .stdout
+        .take()
+        .context("launcher stdout was not piped")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("launcher stderr was not piped")?;
     std::thread::spawn(move || {
-        let _ = sender.send(child.wait_with_output());
+        let stdout = std::thread::spawn(move || drain(stdout));
+        let stderr = std::thread::spawn(move || drain(stderr));
+        let output = (|| -> std::io::Result<Output> {
+            // Keep the child unreaped until both pipes close: a timeout must never signal
+            // a reused pid after an exited launcher left a pipe open in a descendant.
+            let stdout = stdout
+                .join()
+                .map_err(|_| std::io::Error::other("launcher stdout reader panicked"))??;
+            let stderr = stderr
+                .join()
+                .map_err(|_| std::io::Error::other("launcher stderr reader panicked"))??;
+            let status = child.wait()?;
+            Ok(Output {
+                status,
+                stdout,
+                stderr,
+            })
+        })();
+        let _ = sender.send(output);
     });
     match receiver.recv_timeout(timeout) {
         Ok(output) => Ok(output?),
@@ -896,7 +975,9 @@ fn isolation_name(mode: crate::Isolation) -> &'static str {
 
 fn observation_incarnation(observation: &PtyObservation) -> Option<String> {
     match (&observation.pid, &observation.created_at) {
-        (Some(pid), Some(created_at)) => Some(format!("{pid}:{created_at}")),
+        (Some(pid), Some(created_at)) if !created_at.is_empty() => {
+            Some(format!("{pid}:{created_at}"))
+        }
         _ => None,
     }
 }
@@ -964,8 +1045,19 @@ fn observation(session: SessionInfo) -> Result<PtyObservation> {
             tags: BTreeMap::new(),
         });
     }
+    // Exited daemons lose their pid file. The immutable metadata still names that daemon,
+    // including when the child exited before the first snapshot. Status stays terminal.
+    let retained_pid = session
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.daemon_pid);
     let pid = session
         .pid
+        .or_else(|| {
+            matches!(session.status.as_str(), "exited" | "vanished")
+                .then_some(retained_pid)
+                .flatten()
+        })
         .map(|pid| {
             u32::try_from(pid).map_err(|_| {
                 anyhow::anyhow!(
@@ -1075,6 +1167,83 @@ exit 0
     /// A live session's pid file, naming `pid` as its daemon.
     fn write_pid(registry: &Path, name: &str, pid: u32) {
         fs::write(registry.join(format!("{name}.pid")), pid.to_string()).unwrap();
+    }
+
+    #[test]
+    fn a_missing_pty_executable_fails_promptly_without_publishing_a_session() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = PtyRuntime::new(root.path().join("registry"))
+            .with_binary(root.path().join("missing-pty").to_string_lossy());
+        let began = std::time::Instant::now();
+        let error = runtime
+            .spawn(
+                "work",
+                &Launch::Argv(vec!["true".into()]),
+                root.path(),
+                &BTreeMap::new(),
+                None,
+                &BTreeMap::new(),
+                None,
+            )
+            .unwrap_err();
+        assert!(began.elapsed() < Duration::from_secs(1));
+        assert!(format!("{error:#}").contains("No such file"));
+        assert!(runtime.snapshot().unwrap().is_empty());
+    }
+
+    #[test]
+    fn immediate_exit_is_a_published_incarnation_with_its_own_retained_tail() {
+        for code in [0, 23] {
+            let root = tempfile::tempdir().unwrap();
+            let registry = root.path().join("registry");
+            let binary = fake_pty(
+                root.path(),
+                "immediate-pty",
+                &format!(
+                    r#"
+  mkdir -p "$PTY_ROOT"
+  printf '{{"createdAt":"launch-one","daemonPid":999999,"exitCode":{code},"exitedAt":"done","lastLines":["fixture marker"]}}' > "$PTY_ROOT/work.json"
+"#
+                ),
+            );
+            let runtime = PtyRuntime::new(registry.clone())
+                .with_binary(binary.to_string_lossy())
+                .with_spawn_timeout(Duration::from_millis(200));
+            runtime
+                .spawn(
+                    "work",
+                    &Launch::Argv(vec!["true".into()]),
+                    root.path(),
+                    &BTreeMap::new(),
+                    None,
+                    &BTreeMap::new(),
+                    None,
+                )
+                .unwrap();
+            let observed = runtime.snapshot().unwrap().pop().unwrap();
+            assert_eq!(observed.status, "exited");
+            assert_eq!(observed.exit_code, Some(code));
+            assert_eq!(
+                observation_incarnation(&observed).as_deref(),
+                Some("999999:launch-one")
+            );
+            assert_eq!(
+                runtime
+                    .exit_tail("work", "999999:launch-one")
+                    .unwrap()
+                    .as_deref(),
+                Some("fixture marker")
+            );
+            write_record(
+                &registry,
+                "work",
+                serde_json::json!({"createdAt":"launch-two","daemonPid":999998,"exitCode":0,"exitedAt":"done","lastLines":["replacement output"]}),
+            );
+            assert_eq!(
+                runtime.exit_tail("work", "999999:launch-one").unwrap(),
+                None
+            );
+        }
     }
 
     #[test]

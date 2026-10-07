@@ -339,6 +339,20 @@ impl ExecRuntime {
         });
     }
 
+    pub fn read_log_tail(&self, id: &str) -> Result<Option<String>> {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        let mut file = match fs::File::open(self.log_path(id, false)) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let start = file.metadata()?.len().saturating_sub(8192);
+        file.seek(SeekFrom::Start(start))?;
+        let mut bytes = Vec::new();
+        file.take(8192).read_to_end(&mut bytes)?;
+        Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+    }
+
     pub fn read_log(&self, id: &str) -> Result<Option<String>> {
         let path = self.log_path(id, false);
         match fs::read_to_string(&path) {

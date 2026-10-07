@@ -53858,3 +53858,30 @@ mod harness_event_tests {
         assert!(store.append_harness_event(&input).is_err());
     }
 }
+
+impl Store {
+    /// Bounded recent evidence for launch waits, merging owner-local receipts and claims.
+    pub fn launch_observations(
+        &self,
+        subject: &str,
+        kind: &str,
+    ) -> Result<(Vec<ClaimRecord>, bool)> {
+        smallclaims::touched::note_read(|| subject.to_owned());
+        let page = self.claims_for_subject_kind_at(subject, kind, None, true, 64)?;
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(&format!(
+            "{LOCAL_OBSERVATION_COLUMNS} WHERE subject=?1 AND kind=?2 ORDER BY id DESC LIMIT 65"
+        ))?;
+        let rows = statement.query_map(params![subject, kind], |row| {
+            local_observation_from_row(&self.origin, row)
+        })?;
+        let mut records = page.claims;
+        records.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
+        let truncated = page.next_cursor.is_some() || records.len() > 64;
+        records.sort_by_key(claim_log_order);
+        if records.len() > 64 {
+            records.drain(..records.len() - 64);
+        }
+        Ok((records, truncated))
+    }
+}

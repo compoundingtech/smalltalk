@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Report the requested harness launch exit promptly and pace short-lived automatic restarts",
+  "replay": {"status": "none", "detail": "No canonical replay change or new replay trigger. Launch waits read owner-local receipts and existing durable observations."},
+  "schema": {"status": "none", "detail": "No database tables, indexes, migrations or schema version changes. Existing observation kinds and fields carry launch diagnostics, readiness receipts and retry deadlines."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or digest changes. Existing guarded effects and clock/due dependencies remain in use."},
+  "compatibility": {"status": "changed", "detail": "The updated agents new CLI needs the new agent-launch read route on its local daemon and destination member; remote reads add an authenticated peer operation. Upgrade those binaries together. Older CLIs keep working with the updated daemon. JSON creation results add stages and error fields; early exits return the requested process status, including zero, with a failure diagnostic. Unverified mixed old/new peer routes fail explicitly rather than inventing remote readiness."},
+  "downtime": {"status": "none", "detail": "No additional service interruption beyond the normal binary deployment. No live daemon restart or fleet seat stimulus was used for validation."},
+  "manual": {"status": "changed", "detail": "Automatic short-lived agent retries wait from 5 seconds up to 120 seconds including deterministic jitter, using existing scheduler state. A stable 60-second lifetime, changed launch revision or explicit person retry resets the consecutive delay. Existing restart-intensity parking still applies. Use agents show for faults and retry explicitly after correcting setup; creation never attaches to a replacement incarnation."},
+  "recovery": {"status": "none", "detail": "No forward-only migration. Binary swap-back remains supported with existing graph state; older binaries ignore the added peer operation and CLI fields. Startup diagnostics retain only bounded pre-ready text, with credential and structured transcript lines withheld."}
+}

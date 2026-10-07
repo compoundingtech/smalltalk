@@ -1,6 +1,7 @@
 //! st3 claims graph, API, reconciliation, and CLI support.
 
 pub mod accounts;
+pub mod agent_launch;
 pub mod api;
 pub mod archive;
 pub mod backup;

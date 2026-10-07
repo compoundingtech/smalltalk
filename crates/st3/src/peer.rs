@@ -110,10 +110,19 @@ pub enum ClientReadOperation {
         parameters: serde_json::Value,
     },
     /// A portable suspended seat payload, read only for the exact fenced resume request.
-    SeatSnapshot { subject: String, suspend_operation: String, resume_operation: String, offset: u64 },
+    SeatSnapshot {
+        subject: String,
+        suspend_operation: String,
+        resume_operation: String,
+        offset: u64,
+    },
     /// The directory this host gives a new agent that names no workspace.
     AgentWorkspace {
         identity: String,
+    },
+    AgentLaunch {
+        subject: String,
+        token: String,
     },
     /// Up to 512 KiB of an attachment from `offset`, from the member that took the upload. The
     /// answer is base64 in JSON with the file's size; the reader asks again until it has it all.
@@ -1251,6 +1260,10 @@ async fn receive_client_read(
                     StatusCode::CONFLICT, format!("{error:#}")
                 ).into())
             }
+            ClientReadOperation::AgentLaunch { subject, token } => {
+                let local = crate::client::Client::unix(state.backend().socket());
+                local.get::<serde_json::Value>(&format!("/v1/hosts/{}/agent-launch?subject={}&token={}", urlencoding::encode(state.node()), urlencoding::encode(&subject), urlencoding::encode(&token))).await
+            }
             ClientReadOperation::AgentWorkspace { identity } => {
                 let workspace =
                     crate::config::default_agent_workspace(&identity).map_err(|error| {
@@ -2082,6 +2095,8 @@ mod tests {
         let mut gateway = app_state(gateway_root.path(), "gateway-node");
         let owner_socket = owner_root.path().join("st3.sock");
         let main_socket = owner_socket.clone();
+        let owner_store = owner.store.clone();
+        let gateway_store = gateway.store.clone();
         let owner_app = crate::api::router(owner);
         tokio::spawn(async move { crate::api::serve_unix(&main_socket, owner_app).await });
         let peer = PeerState::new(MainBackend::new(owner_socket.to_path_buf()), "owner-node".into(), FleetAuth::test("fleet-test", &[7; 32]), FleetContext::legacy(BTreeSet::from(["gateway-node".into()])));
@@ -2124,6 +2139,113 @@ mod tests {
                 (status, serde_json::from_slice::<Value>(&body).unwrap())
             }
         };
+
+        // Launch observations travel through the same authenticated relay, and only the
+        // destination's declaration proves replication. Local receipts never travel by sync.
+        let source = r#"version 2
+agent "example/launch" { host "owner-node"; workspace "/tmp"; command "true"; }
+"#;
+        let intent = crate::graph::parse_test_intent(source, "gateway-node").unwrap();
+        let preview = gateway_store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        gateway_store
+            .apply(&intent, &preview.subject_tokens, "launch-source")
+            .unwrap();
+        let subject = "agent/example/launch";
+        let token = gateway_store
+            .selected_desired_token(subject)
+            .unwrap()
+            .unwrap();
+        let launch_path = format!(
+            "/v1/hosts/owner-node/agent-launch?subject={}&token={}",
+            urlencoding::encode(subject),
+            urlencoding::encode(&token)
+        );
+        let read_launch = || {
+            let app = gateway_app.clone();
+            let path = launch_path.clone();
+            async move {
+                let response = app
+                    .oneshot(
+                        Request::get(path)
+                            .header("x-st3-person", "person/avery")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let body: Value =
+                    serde_json::from_slice(&to_bytes(response.into_body(), 32768).await.unwrap())
+                        .unwrap();
+                assert!(status.is_success(), "{body}");
+                body["value"].clone()
+            }
+        };
+        let before = read_launch().await;
+        assert_eq!(before["stage"], "replicating");
+        assert_eq!(before["host"], "owner-node");
+        assert_eq!(
+            crate::agent_launch::read(&gateway_store, subject, &token)
+                .unwrap()
+                .stage,
+            "replicating"
+        );
+        gateway_store.bind_fleet("fleet-test").unwrap();
+        owner_store.bind_fleet("fleet-test").unwrap();
+        for _ in 0..100 {
+            let inventory = owner_store.replication_inventory().unwrap();
+            if inventory.digest == gateway_store.replication_inventory().unwrap().digest {
+                break;
+            }
+            let exchange = gateway_store
+                .export_replication_exchange("fleet-test", &inventory)
+                .unwrap();
+            owner_store
+                .receive_replication_exchange("gateway-node", "fleet-test", &exchange)
+                .unwrap();
+            owner_store.validate_replication_backlog().unwrap();
+            owner_store.apply_replication_repairs().unwrap();
+            owner_store.project_replication_backlog().unwrap();
+        }
+        assert_eq!(read_launch().await["stage"], "replicated");
+        let append = |kind: &str, fields: Value| {
+            owner_store
+                .append_claim(&crate::model::ClaimInput {
+                    subject: subject.into(),
+                    kind: kind.into(),
+                    actor: None,
+                    fields: serde_json::from_value(fields).unwrap(),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap()
+        };
+        append(
+            "runtime.action.succeeded",
+            serde_json::json!({"action":"start", "desired_token":token, "incarnation_id":"remote-first"}),
+        );
+        append(
+            "runtime.observed",
+            serde_json::json!({"status":"exited", "incarnation_id":"remote-first", "exit_code":29}),
+        );
+        append(
+            "harness.diagnostic",
+            serde_json::json!({"code":"launch-exited-before-ready", "incarnation_id":"remote-first", "reason":"fixture launch failed", "matched_line":"remote startup marker"}),
+        );
+        let failure = read_launch().await;
+        assert_eq!(failure["stage"], "exited");
+        assert_eq!(failure["exit_code"], 29);
+        assert_eq!(failure["incarnation_id"], "remote-first");
+        assert_eq!(failure["output_tail"], "remote startup marker");
 
         let (status, body) = ask("owner-node", Some("person/avery"), "site").await;
         assert!(status.is_success(), "{body}");
