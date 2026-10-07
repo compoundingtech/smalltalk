@@ -7,7 +7,7 @@
   },
   "schema": {
     "status": "changed",
-    "detail": "Additive only. New tables account_limit_readings, account_limit_seats and fleet_generation; eleven triggers on claims, replica_envelopes, replica_envelope_signatures and meta that advance fleet_generation when fleet claims, their envelopes or signatures, or the anchor change (each guarded by a WHEN on the fleet kinds); and a partial index claims_usage_rollup_index on harness.usage response rollups, built the first time a store opens with this build. Schema version is unchanged. None of the tables is read by shared projections or digests. An older build that reopens the file ignores the tables and the index and works; its triggers are not needed. If the tables are dropped or stale after such a downgrade the new build refills them from the cursor."
+    "detail": "Additive only. New tables account_limit_readings, account_limit_seats and fleet_generation; ten triggers on claims, replica_envelopes, replica_envelope_signatures and meta that advance fleet_generation when fleet claims, their envelopes or signatures, or the anchor change (each guarded by a WHEN on the fleet kinds); and a partial index claims_usage_rollup_index on harness.usage response rollups, built the first time a store opens with this build. Schema version is unchanged. None of the tables is read by shared projections or digests. An older build that reopens the file ignores the tables and the index and works; its triggers are not needed. If the tables are dropped or stale after such a downgrade the new build refills them from the cursor."
   },
   "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged."},
   "compatibility": {
