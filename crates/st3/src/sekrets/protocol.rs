@@ -25,7 +25,7 @@ const RECV_FLAGS: libc::c_int = 0;
 /// The largest frame either side accepts.
 const MAX_FRAME: usize = 1 << 20;
 /// The most descriptors one frame carries.
-pub const MAX_FDS: usize = 8;
+pub const MAX_FDS: usize = 16;
 
 /// The terminal size a caller's terminal has, for a command that runs on a terminal.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -58,6 +58,10 @@ pub struct RunRequest {
     /// then the git directories it uses.
     #[serde(default)]
     pub directories: usize,
+    /// How many files the command reads follow the checkout directories; the arguments name
+    /// them with placeholders the gateway turns into `/dev/fd/N`. See `files`.
+    #[serde(default)]
+    pub files: usize,
     /// The working directory, relative to the first checkout directory.
     #[serde(default)]
     pub cwd_within: Option<String>,

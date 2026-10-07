@@ -108,6 +108,14 @@ impl Connection {
     pub fn run_in(self, mut run: RunRequest, cwd: &Path, streams: Streams) -> Result<i32> {
         let directories = checkout_directories(cwd)?;
         run.directories = directories.len();
+        let files = super::files::pass_files(&mut run.argv, cwd)?;
+        run.files = files.len();
+        if 3 + directories.len() + files.len() > protocol::MAX_FDS {
+            bail!(
+                "a command can read at most {} passed files",
+                protocol::MAX_FDS - 3 - directories.len()
+            );
+        }
         let interactive = matches!(streams, Streams::Terminal);
         if interactive {
             run.tty = Some(terminal_size());
@@ -118,9 +126,11 @@ impl Connection {
             fds.extend(stdio);
         }
         fds.extend(directories.iter().map(|d| d.as_raw_fd()));
+        fds.extend(files.iter().map(|f| f.as_raw_fd()));
         protocol::send(&self.stream, &Request::Run(run), &fds)
             .context("send to the sekrets gateway")?;
         drop(directories);
+        drop(files);
         let Some((reply, mut passed)) = protocol::recv::<Reply>(&self.stream)? else {
             bail!("the sekrets gateway closed the connection");
         };

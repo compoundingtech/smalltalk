@@ -463,8 +463,8 @@ fn a_seat_uses_only_what_it_was_granted_and_only_with_its_daemons_word() {
     assert_eq!(output.stdout, "gh pr create --draft --title Example\n");
     for (argv, reason) in [
         (
-            &["gh", "pr", "create", "--body-file", "notes"][..],
-            "option `--body-file` denied",
+            &["gh", "pr", "create", "--template", "x"][..],
+            "option `--template` denied",
         ),
         (&["gh", "auth", "status"][..], "no allow rule matches"),
         (
@@ -906,4 +906,105 @@ fn owners_manage_their_profiles_and_only_they_log_them_in() {
             .is_empty()
     );
     assert!(!fixture.store.join("profiles/ada/agent-gh").exists());
+}
+
+#[test]
+fn a_seat_passes_the_files_gh_reads_and_names_no_file_of_the_profile() {
+    if !sandbox_available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.tool(
+        "gh",
+        "echo \"gh $*\"\nprev=\nfor a; do [ \"$prev\" = --body-file ] && cat \"$a\"; prev=$a; done",
+    );
+    fixture
+        .manage(Request::ProfileCreate {
+            profile: "ada/agent-gh".into(),
+            description: None,
+            policy: policy(&["gh-agent"], &[]),
+            default: false,
+        })
+        .unwrap();
+    let (key, _) = MemberKey::generate().unwrap();
+    fixture
+        .manage(Request::Register {
+            node: "host/example".into(),
+            key: key.public().into(),
+        })
+        .unwrap();
+    fixture
+        .manage(Request::GrantAdd {
+            profile: "ada/agent-gh".into(),
+            to: "agent/fleet/fixture-web/**".into(),
+            policy: policy(&["gh-agent"], &[]),
+            until_unix_ms: None,
+        })
+        .unwrap();
+    let cwd = fixture.checkout("web");
+    // A body written anywhere the caller can read, outside the checkout.
+    let notes = fixture.root.join("notes.md");
+    fs::write(&notes, "the body\n").unwrap();
+    let edited = run(
+        fixture.seat(&key, "agent/fleet/fixture-web/builder"),
+        None,
+        &[
+            "gh",
+            "pr",
+            "edit",
+            "7",
+            "--body-file",
+            notes.to_str().unwrap(),
+        ],
+        &cwd,
+    );
+    assert_eq!(edited.result.as_ref().unwrap(), &0, "{}", edited.stderr);
+    assert!(
+        edited.stdout.contains("--body-file /dev/fd/"),
+        "{}",
+        edited.stdout
+    );
+    assert!(edited.stdout.ends_with("the body\n"), "{}", edited.stdout);
+    // A path the command itself would open is refused: a raw request names the profile's login.
+    {
+        use super::protocol::{self, Reply};
+        use std::os::unix::net::UnixStream;
+        // As the owner, whose own use the profile's policy governs too.
+        fixture.as_person();
+        let stream = UnixStream::connect(&fixture.socket).unwrap();
+        protocol::send(&stream, &Request::Hello { attestation: None }, &[]).unwrap();
+        let _ = protocol::recv::<Reply>(&stream).unwrap().unwrap();
+        let null: OwnedFd = fs::File::open("/dev/null").unwrap().into();
+        let directory: OwnedFd = fs::File::open(&cwd).unwrap().into();
+        protocol::send(
+            &stream,
+            &Request::Run(RunRequest {
+                profile: Some("ada/agent-gh".into()),
+                argv: [
+                    "gh",
+                    "pr",
+                    "edit",
+                    "7",
+                    "--body-file",
+                    ".config/gh/hosts.yml",
+                ]
+                .map(str::to_owned)
+                .to_vec(),
+                directories: 1,
+                ..RunRequest::default()
+            }),
+            &[
+                null.as_raw_fd(),
+                null.as_raw_fd(),
+                null.as_raw_fd(),
+                directory.as_raw_fd(),
+            ],
+        )
+        .unwrap();
+        let (reply, _) = protocol::recv::<Reply>(&stream).unwrap().unwrap();
+        let Reply::Refused { reason, .. } = reply else {
+            panic!("ran: {reply:?}");
+        };
+        assert!(reason.contains("may read only"), "{reason}");
+    }
 }

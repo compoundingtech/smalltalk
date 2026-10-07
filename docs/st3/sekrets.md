@@ -25,6 +25,16 @@ resource graph plan; this document describes what is built.
   command is allowed when some allow rule matches and no deny rule does. `*` matches exactly one
   argument. Options before a subcommand (`gh -R other/repo pr create`) match no allow prefix
   unless one names them. Presets make a policy one word; `st sekrets presets` lists them.
+  `gh-agent` covers what agents use gh for (pull requests, issues, runs, workflows, releases,
+  search, labels, variables and `gh api`) and never `gh auth token`, `auth status -t`, `secret`,
+  `alias`, `extension` or `config`.
+- **Passed files.** A deny rule can name file options, which read the file their value names
+  (`--body-file`, `--input`), and field options, which read one after `@` (`-F key=@file`).
+  Those are allowed only with the caller's standard input (`-`) or a file the caller passed. For
+  gh, `st sekrets` opens each such file itself, as the caller, passes it as a descriptor and
+  rewrites the argument to `/dev/fd/N`, so `gh pr edit 7 --body-file /tmp/notes.md` works as
+  written while no argument can make the command read a file of the sekrets user's, such as the
+  profile's own login.
 - **Grant.** The owner gives an agent, a pattern of agents (`agent/web/**`) or another
   person the use of a profile, with a policy and an optional expiry. A call through a grant must
   pass both the profile's policy and the grant's, so a grant can only narrow. A grant to an agent
@@ -94,9 +104,11 @@ The gateway runs each command as the sekrets user inside bubblewrap:
   than the checkout. A `.git` that is a symbolic link, or a gitdir file or `commondir` naming a
   directory outside the passed checkout, is refused: git would follow it to a configuration the
   gateway never sanitized.
-- The checkout is read-only to the command, so `git push` through sekrets pushes the branch and
-  exits 0 but cannot record the remote-tracking ref or `-u` upstream in the checkout; run
-  `git fetch` and `git branch --set-upstream-to` as the caller afterwards.
+- The checkout is read-only to the command: it runs as the sekrets user, which owns none of the
+  caller's files. `git push` through sekrets pushes the branch and exits 0 but cannot record the
+  remote-tracking ref or `-u` upstream in the checkout; run `git fetch` and
+  `git branch --set-upstream-to` as the caller afterwards. Commands that write files into the
+  checkout (`gh pr checkout`, `gh repo clone`, `gh run download`) do not work through sekrets.
 - The command and every tool it runs come from the gateway's configured path. Each directory and
   file on the way must belong to root (or the sekrets user) and be writable by no one else, so no
   person or seat can change what runs as sekrets. A command is a name, never a path.

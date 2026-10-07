@@ -607,9 +607,38 @@ impl Gateway {
         &self,
         stream: &UnixStream,
         caller: &Caller,
-        run: RunRequest,
-        fds: Vec<OwnedFd>,
+        mut run: RunRequest,
+        mut fds: Vec<OwnedFd>,
     ) -> Result<()> {
+        // The files the command reads come last; the policy judges the arguments as the command
+        // will see them, naming those descriptors.
+        let streams = if run.tty.is_some() { 0 } else { 3 };
+        if fds.len() != streams + run.directories + run.files {
+            let reason = format!(
+                "the request passed {} descriptors, not {}",
+                fds.len(),
+                streams + run.directories + run.files
+            );
+            return self.refuse(
+                stream,
+                caller,
+                &run,
+                None,
+                run.profile.clone().as_deref(),
+                reason,
+            );
+        }
+        let files = fds.split_off(streams + run.directories);
+        if let Err(reason) = super::files::substitute(&mut run.argv, &files) {
+            return self.refuse(
+                stream,
+                caller,
+                &run,
+                None,
+                run.profile.clone().as_deref(),
+                reason,
+            );
+        }
         let usable = match self.choose(caller, &run)? {
             Ok(usable) => usable,
             Err(reason) => {
@@ -635,7 +664,7 @@ impl Gateway {
             );
             return self.refuse(stream, caller, &run, Some(&owner), Some(&profile), reason);
         }
-        let prepared = match self.prepare(&usable.profile, &run, fds) {
+        let mut prepared = match self.prepare(&usable.profile, &run, fds) {
             Ok(prepared) => prepared,
             Err(error) => {
                 return self.refuse(
@@ -648,6 +677,7 @@ impl Gateway {
                 );
             }
         };
+        prepared.files = files;
         let cwd = prepared.cwd.display().to_string();
         let call = self.log(
             caller,
@@ -745,6 +775,7 @@ impl Gateway {
             tool,
             home,
             note,
+            files: Vec::new(),
             stdio,
             directories,
             view,
@@ -793,10 +824,12 @@ impl Gateway {
             new_session: run.tty.is_none(),
         };
         let mut command = sandbox.command();
+        // The bound directories until bubblewrap mounts them, and the passed files for the command.
         let keep: Vec<RawFd> = prepared
             .directories
             .iter()
             .map(|d| d.fd.as_raw_fd())
+            .chain(prepared.files.iter().map(|f| f.as_raw_fd()))
             .collect();
         let mut master = None;
         if let Some(size) = run.tty {
@@ -1198,6 +1231,7 @@ struct Prepared {
     tool: PathBuf,
     home: PathBuf,
     note: Option<String>,
+    files: Vec<OwnedFd>,
     stdio: Vec<OwnedFd>,
     directories: Vec<BoundDirectory>,
     view: sandbox::CheckoutView,

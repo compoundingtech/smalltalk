@@ -262,7 +262,9 @@ fn import_entries(
     cursor: &mut i64,
     mut append: impl FnMut(&smallclaims::ClaimInput) -> Result<(), St3Error>,
 ) -> anyhow::Result<()> {
-    let Some(last) = entries.last().map(|entry| entry.seq) else { return Ok(()) };
+    let Some(last) = entries.last().map(|entry| entry.seq) else {
+        return Ok(());
+    };
     for entry in entries {
         if let Some(claim) = claim_for(node, person, entry) {
             match append(&claim) {
@@ -270,7 +272,10 @@ fn import_entries(
                 Err(error) if error.code == "internal" || error.is_sqlite_contention() => {
                     return Err(error.into());
                 }
-                Err(error) => eprintln!("st3: sekrets: skipped gateway log entry {}: {error:#}", entry.seq),
+                Err(error) => eprintln!(
+                    "st3: sekrets: skipped gateway log entry {}: {error:#}",
+                    entry.seq
+                ),
             }
         }
     }
@@ -303,28 +308,44 @@ mod tests {
     #[test]
     fn busy_gateway_append_keeps_cursor_and_retries_the_same_entry() {
         for code in [rusqlite::ffi::SQLITE_BUSY, rusqlite::ffi::SQLITE_LOCKED] {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cursor");
-        std::fs::write(&path, "6\n").unwrap();
-        let entries = vec![entry("call", "person/ada", json!({"argv":["fixture"]}))];
-        let mut cursor = 6;
-        let mut attempts = Vec::new();
-        let first = import_entries(&entries, "example", "person/ada", &path, &mut cursor, |claim| {
-            attempts.push(claim.idempotency_key.clone());
-            Err(smallclaims::error::internal(rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(code), None)))
-        });
-        assert!(first.is_err());
-        assert_eq!(cursor, 6);
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "6\n");
-        import_entries(&entries, "example", "person/ada", &path, &mut cursor, |claim| {
-            attempts.push(claim.idempotency_key.clone());
-            Ok(())
-        }).unwrap();
-        assert_eq!(attempts.len(), 2);
-        assert_eq!(attempts[0], attempts[1]);
-        assert_eq!(cursor, 7);
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "7\n");
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("cursor");
+            std::fs::write(&path, "6\n").unwrap();
+            let entries = vec![entry("call", "person/ada", json!({"argv":["fixture"]}))];
+            let mut cursor = 6;
+            let mut attempts = Vec::new();
+            let first = import_entries(
+                &entries,
+                "example",
+                "person/ada",
+                &path,
+                &mut cursor,
+                |claim| {
+                    attempts.push(claim.idempotency_key.clone());
+                    Err(smallclaims::error::internal(
+                        rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None),
+                    ))
+                },
+            );
+            assert!(first.is_err());
+            assert_eq!(cursor, 6);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "6\n");
+            import_entries(
+                &entries,
+                "example",
+                "person/ada",
+                &path,
+                &mut cursor,
+                |claim| {
+                    attempts.push(claim.idempotency_key.clone());
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(attempts.len(), 2);
+            assert_eq!(attempts[0], attempts[1]);
+            assert_eq!(cursor, 7);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "7\n");
         }
     }
     #[test]
@@ -333,13 +354,29 @@ mod tests {
         let path = dir.path().join("cursor");
         let entries = vec![entry("call", "person/ada", json!({"argv":["fixture"]}))];
         let mut cursor = 6;
-        import_entries(&entries, "example", "person/ada", &path, &mut cursor,
-            |_| Err(St3Error::new("rule-denied", "fixture refusal"))).unwrap();
+        import_entries(
+            &entries,
+            "example",
+            "person/ada",
+            &path,
+            &mut cursor,
+            |_| Err(St3Error::new("rule-denied", "fixture refusal")),
+        )
+        .unwrap();
         assert_eq!(cursor, 7);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "7\n");
         cursor = 6;
-        assert!(import_entries(&entries, "example", "person/ada", dir.path(), &mut cursor,
-            |_| Ok(())).is_err());
+        assert!(
+            import_entries(
+                &entries,
+                "example",
+                "person/ada",
+                dir.path(),
+                &mut cursor,
+                |_| Ok(())
+            )
+            .is_err()
+        );
         assert_eq!(cursor, 6);
     }
     #[test]

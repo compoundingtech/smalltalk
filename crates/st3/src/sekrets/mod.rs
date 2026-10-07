@@ -9,6 +9,7 @@
 pub mod cli;
 pub mod client;
 pub mod daemon;
+pub mod files;
 pub mod gateway;
 pub mod identity;
 pub mod policy;
