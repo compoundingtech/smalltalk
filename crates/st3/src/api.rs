@@ -996,6 +996,7 @@ async fn response_envelope_unbounded(
             let cpu_kind = request_route.clone();
             let cpu_client = caller.clone();
             let handler_queue = profile.as_ref().map(|op| op.wall_span("handler/queue"));
+            let forwarded_handler = request_path == crate::peer::CLIENT_READ_FORWARD_PATH;
             match crate::api::read_deadline::spawn_handler(move || {
                 drop(handler_queue);
                 if let Some(profile) = &handler_profile {
@@ -1003,7 +1004,24 @@ async fn response_envelope_unbounded(
                 }
                 let _entered = crate::profile::enter(handler_profile.as_ref());
                 crate::performance::with_cpu(Some(&cpu_kind), Some(&cpu_client), || {
-                    runtime.block_on(next.run(request))
+                    runtime.block_on(async move {
+                        // Cancel the actual forwarded relay, not only its outer waiter.
+                        // Other routes retain their existing cooperative cancellation;
+                        // this transport's mutation variants carry no read budget.
+                        if let Some(budget) = smallclaims::read_budget::current()
+                            .filter(|_| forwarded_handler)
+                        {
+                            match tokio::time::timeout(budget.remaining(), next.run(request)).await {
+                                Ok(response) => response,
+                                Err(_) => {
+                                    budget.cancel();
+                                    ApiError::bad(budget.check().unwrap_err()).into_response()
+                                }
+                            }
+                        } else {
+                            next.run(request).await
+                        }
+                    })
                 })
             })
             .await
@@ -4429,7 +4447,8 @@ fn remote_read_error(host: &str, error: anyhow::Error) -> ApiError {
     }
     if !matches!(
         rejected.code.as_str(),
-        "page-cursor-expired"
+        "read-deadline"
+            | "page-cursor-expired"
             | "conversation-content-invalidated"
             | "transcript-unavailable"
             | "timeline-history-incomplete"
@@ -15262,6 +15281,19 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         assert_eq!(unavailable.code, "remote-unavailable");
         assert_eq!(unavailable.details["reason"], "transport-error");
         assert_eq!(unavailable.details["owner_host_id"], "host/owner");
+    }
+
+    #[test]
+    fn an_owner_read_deadline_keeps_its_typed_gateway_timeout() {
+        let rejected = crate::peer::ClientReadRejected::new(
+            "read-deadline",
+            StatusCode::GATEWAY_TIMEOUT,
+            "the owner read exceeded its budget",
+        );
+        let error = remote_read_error("host/owner", rejected.into());
+        assert_eq!(error.status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(error.code, "read-deadline");
+        assert_eq!(error.details["owner_host_id"], "host/owner");
     }
 
     #[test]
