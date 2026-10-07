@@ -49,7 +49,6 @@ impl Runtime for SmalltalkRuntime {
         resources::create_schema(connection)?;
         custom::create_schema(connection)?;
         agent_messages::create_schema(connection)?;
-        native_sources::create_schema(connection)?;
         glass_heads::create_schema(connection)?;
         limits::create_limits_schema(connection)
     }

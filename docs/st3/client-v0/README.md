@@ -378,15 +378,22 @@ history. The cost probe for `GET /v1/client/subjects?family=agent&limit=20` repo
 answer bytes grew only from 30,128 → 36,113. Limiting the result or waiving the cost gate
 would not fix those history-linear reads.
 
-`native_source_ranges` instead maintains radix-16 retained-source counts and extrema for
+`native_source_ranges_v2` maintains radix-16 retained-source counts and extrema for
 each subject, source, kind selector, and recorded-actor selector. Family enumeration seeks
 one root row per subject in each source, then merges independently bounded candidate
 pages. Current-fence fingerprints read root aggregates; older fences decompose into at
-most sixteen ranges of at most fifteen complete radix nodes. Read work depends on
-selected subject cardinality and bounded range nodes, not claims per subject. The model
-has seventeen levels for SQLite's integer positions; append work updates the relevant
-selector scopes, and removal work recomputes extrema bottom-up from at most sixteen
-children per node. Startup backfills each level with grouped source reads only once.
+most fifteen ranges of at most fifteen complete radix nodes plus a primary-position seek
+over at most fifteen uncached source rows. Read work depends on selected subject
+cardinality and bounded range nodes, not claims per subject.
+
+Normal appends update only the root's two or three selector rows, rather than every
+ancestor of each source position. Crossing a sixteen-position boundary seals the previous
+block from at most sixteen source rows; crossing larger radix boundaries combines at most
+sixteen completed child nodes, bottom-up. Sparse positions and pruning do not require
+filling gaps. The source log's indexed greatest position supplies the frontier, so there is
+no separately written high-water cache. Historical readmission updates completed ancestors;
+removals correct existing ancestors and recompute extrema only when a boundary is removed.
+Grouped source reads backfill only populated closed levels and the root once on open.
 
 Append, checkpoint deletion, local retention deletion, and repair admission changes update
 the model in the same source transaction, so pruning or repairing an unseen ref below an
@@ -404,8 +411,10 @@ retained membership it cannot read, and rebuilding the read model alone does not
 an otherwise usable cursor. No request cache, global invalidation generation, replicated
 projection digest, or public source count is introduced. Source-contract tests compare
 the aggregates and cursor hashes with direct fenced source queries across radix
-boundaries, pruning, repair/readmission, and rebuild; the unchanged daemon cost probe
-remains the end-to-end performance gate.
+boundaries, sparse integer positions, pruning, repair/readmission, and rebuild. Main-shaped
+stores and the predecessor cache both rebuild transactionally to the same model as a fresh
+store while retaining the fingerprint secret. The unchanged daemon cost probe remains the
+end-to-end read-performance gate.
 
 
 ### Applied subject definitions

@@ -150,13 +150,13 @@ impl Store {
         let (actor_scope, actor) = recorded_actor.map_or((0, ""), |actor| (1, actor));
         let mut statement = connection.prepare_cached(
             "SELECT subject FROM (
-               SELECT subject FROM (SELECT subject FROM native_source_ranges NOT INDEXED
+               SELECT subject FROM (SELECT subject FROM native_source_ranges_v2 NOT INDEXED
                WHERE source=0 AND actor_scope=?6 AND actor=?7 AND kind=''
                  AND level=16 AND node=0 AND subject>=?1 AND subject<?2
                  AND (?3 IS NULL OR subject>?3) AND first_position<=?4
                ORDER BY subject LIMIT ?8)
                UNION
-               SELECT subject FROM (SELECT subject FROM native_source_ranges NOT INDEXED
+               SELECT subject FROM (SELECT subject FROM native_source_ranges_v2 NOT INDEXED
                WHERE source=1 AND actor_scope=?6 AND actor=?7 AND kind=''
                  AND level=16 AND node=0 AND subject>=?1 AND subject<?2
                  AND (?3 IS NULL OR subject>?3) AND first_position<=?5
@@ -986,7 +986,7 @@ mod tests {
             let mut connection = store.connection.lock().unwrap();
             let transaction = connection.transaction().unwrap();
             transaction
-                .execute("DELETE FROM meta WHERE key='native_source_ranges_v1'", [])
+                .execute("DELETE FROM meta WHERE key='native_source_ranges_v2'", [])
                 .unwrap();
             native_sources::open(&transaction).unwrap();
             transaction.commit().unwrap();
