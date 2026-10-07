@@ -1975,6 +1975,10 @@ pub struct QuickAgentResponse {
     pub runtime_id: String,
     pub event_cursor: u64,
     pub incarnation_id: Option<String>,
+    /// True when an older daemon committed the declaration without its response receipt.
+    /// Readiness/incarnation were reconstructed at recovery, not at the original declaration.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub response_reconstructed: bool,
     pub ready: bool,
 }
 

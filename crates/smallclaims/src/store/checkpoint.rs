@@ -359,10 +359,7 @@ pub fn delete_dropped_rows_tx(
                 params![operation, claim.id],
             )?;
         }
-        transaction.execute(
-            "DELETE FROM events WHERE store_index IN (SELECT store_index FROM claims WHERE id=?1)",
-            [&claim.id],
-        )?;
+        super::events::remove_claim_tx(transaction, &claim.id)?;
         transaction.execute("DELETE FROM claims WHERE id=?1", [&claim.id])?;
     }
     for envelope in envelopes {

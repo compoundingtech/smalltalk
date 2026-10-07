@@ -16,6 +16,7 @@ const TREE_PATH: &str = "/v1/mission-runs?root=mission-run%2Fexample%2Ffollow-fi
 enum Reply {
     Value(Value),
     Error(u16),
+    CursorGap,
 }
 
 async fn scripted_cli(args: &[&str], script: Vec<(String, Reply)>) -> Output {
@@ -50,6 +51,13 @@ async fn scripted_cli(args: &[&str], script: Vec<(String, Reply)>) -> Output {
                         "code": "fixture-refusal", "message": "fixture read refused",
                     }),
                 ),
+                Reply::CursorGap => (
+                    410,
+                    json!({
+                        "code":"cursor-gap","message":"cursor expired",
+                        "details":{"resume_floor":30,"frontier":50,"full_resync":true}
+                    }),
+                ),
             };
             let body = serde_json::to_vec(&body).unwrap();
             caller.write_all(format!(
@@ -78,7 +86,9 @@ async fn scripted_cli(args: &[&str], script: Vec<(String, Reply)>) -> Output {
 }
 
 fn events_path(after: u64) -> String {
-    format!("/v1/events?after={after}&wait=true&timeout_ms=30000&subject=host%2Ffollow-fixture")
+    format!(
+        "/v1/events/page?after={after}&wait=true&timeout_ms=30000&subject=host%2Ffollow-fixture"
+    )
 }
 
 fn run(status: &str, phase: &str) -> Value {
@@ -108,6 +118,37 @@ fn assert_refusal(output: &Output, gaps: usize) {
         "{}",
         stderr(output)
     );
+}
+
+#[tokio::test]
+async fn a_history_gap_exits_six_with_an_explicit_continuation_command() {
+    let output = scripted_cli(
+        &[
+            "--json",
+            "trace",
+            "show",
+            SUBJECT,
+            "--after-index",
+            "10",
+            "--follow",
+        ],
+        vec![
+            (
+                "/v1/claims?limit=100&order=asc&subject=host%2Ffollow-fixture&after_index=10"
+                    .into(),
+                Reply::Value(json!({"claims":[],"next_cursor":null})),
+            ),
+            (events_path(10), Reply::CursorGap),
+        ],
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(6), "{}", stderr(&output));
+    assert!(stderr(&output).contains("retained floor 30, frontier 50"));
+    assert!(
+        stderr(&output).contains("st trace show 'host/follow-fixture' --after-index 50 --follow")
+    );
+    assert!(!stderr(&output).contains("follow gap:"));
+    assert!(output.stdout.is_empty());
 }
 
 #[tokio::test]

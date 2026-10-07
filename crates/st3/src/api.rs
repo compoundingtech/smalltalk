@@ -313,8 +313,28 @@ mod storage_contention_response_tests {
         assert_eq!(response.status, super::StatusCode::SERVICE_UNAVAILABLE);
         assert!(!response.details.contains_key("projection_stage"));
         assert!(!response.details.contains_key("projection_frontier_unknown"));
-        assert_eq!(response.details["sqlite_extended_code"], rusqlite::ffi::SQLITE_BUSY);
+        assert_eq!(
+            response.details["sqlite_extended_code"],
+            rusqlite::ffi::SQLITE_BUSY
+        );
     }
+    #[test]
+    fn expired_idempotency_response_is_a_terminal_client_error() {
+        let error = super::ApiError::bad(super::St3Error::new(
+            "idempotency-key-expired",
+            "already committed",
+        ));
+        assert_eq!(error.status, super::StatusCode::CONFLICT);
+        assert_eq!(
+            super::client_error_code(Some(&error.code)),
+            "idempotency-key-expired"
+        );
+        assert!(!super::client_error_retryable(
+            error.status,
+            Some(&error.code)
+        ));
+    }
+
     #[test]
     fn typed_sqlite_contention_is_a_service_failure_not_input_validation() {
         for code in ["database-busy", "database-locked"] {
@@ -341,6 +361,7 @@ impl ApiError {
             | "owned-set-refused"
             | "set-managed-subject"
             | "missing-subject-token"
+            | "idempotency-key-expired"
             | "stale-document-token"
             | "stale-incarnation"
             | "stale-launch-preview"
@@ -688,6 +709,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/status", get(status))
         .route("/v1/desired/{*subject}", get(get_desired))
         .route("/v1/events", get(events))
+        .route("/v1/events/page", get(events_page))
         .route("/v1/doctor", get(doctor))
         .route("/v1/repair", get(operational_repair_plan))
         .route("/v1/repair/apply", post(apply_operational_repair))
@@ -1284,6 +1306,7 @@ fn client_error_code(code: Option<&str>) -> String {
         | "unsupported-capability"
         | "validation-failed"
         | "idempotency-conflict"
+        | "idempotency-key-expired"
         | "issuer-required"
         | "arrangement-exists"
         | "arrangement-folder-exists"
@@ -1718,17 +1741,18 @@ fn client_detail(items: Vec<Value>, kind: &str, id: &str) -> Result<Json<Value>,
 
 async fn client_capabilities(
     State(state): State<AppState>,
-    Extension(snapshot): Extension<ClientSnapshot>,
+    Extension(_snapshot): Extension<ClientSnapshot>,
     Extension(session): Extension<client_v0::ClientSession>,
-) -> Json<Value> {
-    let cursor = format!("event-cursor/{}/{}", state.node, snapshot.store_index);
-    let oldest = state
-        .store
-        .event_bounds()
-        .map(|(oldest, _)| oldest.saturating_sub(1))
-        .unwrap_or_default();
+) -> Result<Json<Value>, ApiError> {
+    // The request snapshot may predate a checkpoint or legacy conversion. Advertise the
+    // frontier and floor from one current read so the SDK's first event request can resume.
+    let store = state.store.clone();
+    let (oldest, newest) =
+        blocking_store(move || store.read_snapshot(|_| store.event_bounds())).await?;
+    let oldest = oldest.saturating_sub(1);
+    let cursor = format!("event-cursor/{}/{newest}", state.node);
     let capabilities = client_v0::capabilities(&session);
-    Json(json!({
+    Ok(Json(json!({
         "kind": "capabilities",
         "machine_version": st_drivers::version::machine_version(),
         "session_actor": session.actor,
@@ -1758,7 +1782,7 @@ async fn client_capabilities(
             "../client-v0/schemas/client-v0.schema.json",
             "../client-v0/schemas/operations.json"
         ]
-    }))
+    })))
 }
 
 fn client_work_resources(
@@ -5538,7 +5562,7 @@ async fn health(State(state): State<AppState>) -> Result<Json<Value>, ApiError> 
         "isolation": isolation_name(st_runtime::isolation_mode()),
         "store_index": state.store.index().map_err(ApiError::internal)?,
         "security": "trusted-network-no-tls-no-acls",
-        "features": {"owned_sets":1,"seat_rollout":1,"seat_rollout_manual":1},
+        "features": {"owned_sets":1,"seat_rollout":1,"seat_rollout_manual":1,"bounded_legacy_events":1},
     })))
 }
 
@@ -11894,41 +11918,150 @@ struct EventQuery {
     owner_run: Option<String>,
     wait: Option<bool>,
     timeout_ms: Option<u64>,
+    limit: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct EventPage {
+    items: Vec<EventRecord>,
+    next_after: Option<u64>,
+    has_more: bool,
+    frontier: u64,
+}
+
+async fn read_event_page(state: &AppState, query: &EventQuery) -> Result<EventPage, ApiError> {
+    let limit = query.limit.unwrap_or(200);
+    if !(1..=200).contains(&limit) {
+        return Err(ApiError::bad(St3Error::new(
+            "invalid-event-limit",
+            "event page limit must be 1 through 200",
+        )));
+    }
+    let store = state.store.clone();
+    let after = query.after;
+    let subject = query.subject.clone();
+    let owner = query.owner_run.clone();
+    blocking_store(move || {
+        store.read_snapshot(|frontier| {
+            let (oldest, newest) = store.event_bounds()?;
+            let floor = oldest.saturating_sub(1);
+            if after < floor || after > newest {
+                return Ok(Err(ApiError {
+                    status: StatusCode::GONE,
+                    code: "cursor-gap".into(),
+                    message: "the event cursor is outside the retained event range".into(),
+                    details: Box::new(serde_json::Map::from_iter([
+                        ("full_resync".into(), json!(true)),
+                        ("resume_floor".into(), json!(floor)),
+                        ("frontier".into(), json!(newest)),
+                    ])),
+                }));
+            }
+            let (items, next_after, has_more) =
+                store.events_page(after, subject.as_deref(), owner.as_deref(), limit)?;
+            Ok(Ok(EventPage {
+                items,
+                next_after,
+                has_more,
+                frontier,
+            }))
+        })
+    })
+    .await?
+}
+
+async fn events_page(
+    State(state): State<AppState>,
+    Query(query): Query<EventQuery>,
+) -> Result<Json<EventPage>, ApiError> {
+    // Capture registration before the frontier/empty-page read, including a migration wake.
+    let mut changed = state.event_notify.subscribe();
+    let deadline = tokio::time::Instant::now()
+        + Duration::from_millis(query.timeout_ms.unwrap_or(30_000).clamp(10, 30_000));
+    loop {
+        let page = read_event_page(&state, &query).await?;
+        if page.next_after.is_some() || query.wait != Some(true) {
+            if query.wait == Some(true) && page.items.is_empty() {
+                // A filtered page can advance through nonmatching rows during migration.
+                // Keep its exact continuation, but pace wait-mode clients instead of inviting
+                // an immediate empty-page repoll. The caller's timeout still bounds the wait.
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                tokio::time::sleep(remaining.min(Duration::from_millis(250))).await;
+            }
+            return Ok(Json(page));
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero()
+            || !matches!(
+                tokio::time::timeout(remaining, changed.changed()).await,
+                Ok(Ok(()))
+            )
+        {
+            return read_event_page(&state, &query).await.map(Json);
+        }
+    }
 }
 
 async fn events(
     State(state): State<AppState>,
     Query(query): Query<EventQuery>,
-) -> Result<Json<Vec<EventRecord>>, ApiError> {
-    let read = |state: &AppState| {
-        let store = state.store.clone();
-        let subject = query.subject.clone();
-        let owner_run = query.owner_run.clone();
-        async move {
-            blocking_store(move || {
-                store.events_after_filtered(query.after, subject.as_deref(), owner_run.as_deref())
-            })
-            .await
-        }
-    };
-    let current = read(&state).await?;
-    if !current.is_empty() || query.wait == Some(false) {
-        return Ok(Json(current));
+) -> Result<Response, ApiError> {
+    // The old array shape has no continuation field. Keep its bounded answer and expose
+    // truncation explicitly in headers; owner traversal requires the new page envelope.
+    if query.owner_run.is_some() {
+        return Err(ApiError::bad(St3Error::new(
+            "event-pagination-required",
+            "update the st CLI to this daemon version; owner-filtered traversal uses /v1/events/page",
+        )));
     }
-    let wait = async {
-        let mut event_changed = state.event_notify.subscribe();
-        loop {
-            let current = read(&state).await?;
-            if !current.is_empty() {
-                return Ok(current);
-            }
-            event_changed.changed().await.map_err(ApiError::internal)?;
+    if query.subject.is_some() {
+        let store = state.store.clone();
+        if blocking_store(move || store.event_payload_migration_pending()).await? {
+            return Err(ApiError::bad(St3Error::new(
+                "event-pagination-required",
+                "update the st CLI to this daemon version; subject-filtered traversal during migration uses /v1/events/page",
+            )));
         }
-    };
-    let timeout_ms = query.timeout_ms.unwrap_or(30_000).clamp(10, 30_000);
-    match tokio::time::timeout(Duration::from_millis(timeout_ms), wait).await {
-        Ok(result) => result.map(Json),
-        Err(_) => Ok(Json(Vec::new())),
+    }
+    let mut changed = state.event_notify.subscribe();
+    let deadline = tokio::time::Instant::now()
+        + Duration::from_millis(query.timeout_ms.unwrap_or(30_000).clamp(10, 30_000));
+    loop {
+        let page = read_event_page(&state, &query).await?;
+        if page.next_after.is_some()
+            || query.wait == Some(false)
+            || tokio::time::Instant::now() >= deadline
+        {
+            let next = page.next_after.unwrap_or(query.after).to_string();
+            return Ok((
+                [
+                    ("x-st-next-after", next),
+                    ("x-st-has-more", page.has_more.to_string()),
+                    ("x-st-frontier", page.frontier.to_string()),
+                ],
+                Json(page.items),
+            )
+                .into_response());
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if !matches!(
+            tokio::time::timeout(remaining, changed.changed()).await,
+            Ok(Ok(()))
+        ) {
+            let page = read_event_page(&state, &query).await?;
+            return Ok((
+                [
+                    (
+                        "x-st-next-after",
+                        page.next_after.unwrap_or(query.after).to_string(),
+                    ),
+                    ("x-st-has-more", page.has_more.to_string()),
+                    ("x-st-frontier", page.frontier.to_string()),
+                ],
+                Json(page.items),
+            )
+                .into_response());
+        }
     }
 }
 
@@ -11960,7 +12093,11 @@ async fn quick_agent(
         .map_err(ApiError::internal)?
         .into_iter()
         .collect::<Vec<_>>();
-    if selected_token != request.expected_subject {
+    let historical_apply = state
+        .store
+        .cached_idempotency_response::<crate::model::ApplyResponse>(&request.idempotency_key)
+        .map_err(ApiError::internal)?;
+    if selected_token != request.expected_subject && historical_apply.is_none() {
         return Err(ApiError::bad(St3Error::new(
             "stale-subject",
             format!("the desired state for `{agent_subject}` changed"),
@@ -11995,11 +12132,6 @@ async fn quick_agent(
             },
         )
         .map_err(ApiError::bad)?;
-    state
-        .store
-        .apply(&intent, &planned.subject_tokens, &request.idempotency_key)
-        .map_err(ApiError::bad)?;
-    signal_changed(state);
     let runtime_id = intent
         .subjects
         .get(&agent_subject)
@@ -12019,15 +12151,27 @@ async fn quick_agent(
         mission_run: None,
         generation: None,
         runtime_id,
-        event_cursor: state.store.index().map_err(ApiError::internal)?,
+        event_cursor: 0, // The transaction supplies the declaration's exact committed frontier.
         incarnation_id: harness.map(|harness| harness.incarnation_id),
         ready,
+        response_reconstructed: historical_apply.is_some(),
     };
     state
         .store
-        .cache_idempotency_response(&response_key, &response)
-        .map_err(ApiError::internal)?;
-    Ok(response)
+        .apply_with_local_receipt(
+            &intent,
+            &planned.subject_tokens,
+            &request.idempotency_key,
+            &response_key,
+            &response,
+        )
+        .map_err(ApiError::bad)?;
+    signal_changed(state);
+    state
+        .store
+        .cached_idempotency_response(&response_key)
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::internal("the committed quick-agent response is missing"))
 }
 
 async fn start_eval(
@@ -17135,13 +17279,521 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
             .expect("the reconciler signal was lost");
     }
 
+    fn retention_quick_request(root: &std::path::Path) -> QuickAgentRequest {
+        QuickAgentRequest {
+            subject: "retention-worker".into(),
+            worktree: root.display().to_string(),
+            model: None,
+            effort: None,
+            arguments: vec![],
+            expected_subject: vec![],
+            idempotency_key: "retention-quick".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn retention_quick_response_failure_rolls_back_declaration() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let before = state.store.index().unwrap();
+        state
+            .store
+            .connection
+            .write()
+            .execute_batch(
+                "CREATE TRIGGER retention_quick_failure BEFORE INSERT ON idempotency
+             WHEN json_type(NEW.response,'$.runtime_id') IS NOT NULL
+             BEGIN SELECT RAISE(ABORT,'injected lost quick response'); END;",
+            )
+            .unwrap();
+        assert!(
+            quick_agent(&state, retention_quick_request(root.path()), "codex")
+                .await
+                .is_err()
+        );
+        assert_eq!(state.store.index().unwrap(), before);
+        assert!(
+            state
+                .store
+                .selected_desired_token("agent/node.retention-worker")
+                .unwrap()
+                .is_none()
+        );
+        state
+            .store
+            .connection
+            .write()
+            .execute_batch("DROP TRIGGER retention_quick_failure")
+            .unwrap();
+        let first = quick_agent(&state, retention_quick_request(root.path()), "codex")
+            .await
+            .unwrap();
+        let index = state.store.index().unwrap();
+        let second = quick_agent(&state, retention_quick_request(root.path()), "codex")
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(first).unwrap(),
+            serde_json::to_value(second).unwrap()
+        );
+        assert_eq!(state.store.index().unwrap(), index);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn retention_quick_concurrent_calls_share_the_response() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let request = retention_quick_request(root.path());
+        let workers = (0..12)
+            .map(|_| {
+                let state = state.clone();
+                let request = request.clone();
+                tokio::spawn(async move { quick_agent(&state, request, "codex").await.unwrap() })
+            })
+            .collect::<Vec<_>>();
+        let mut responses = Vec::new();
+        for worker in workers {
+            responses.push(worker.await.unwrap());
+        }
+        let first = serde_json::to_value(&responses[0]).unwrap();
+        assert!(
+            responses
+                .iter()
+                .all(|response| serde_json::to_value(response).unwrap() == first)
+        );
+        assert_eq!(
+            state
+                .store
+                .claims_for("agent/node.retention-worker", Some("intent.desired"))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn retention_quick_legacy_missing_receipt_is_explicitly_reconstructed() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let original = quick_agent(&state, retention_quick_request(root.path()), "codex")
+            .await
+            .unwrap();
+        assert!(!original.response_reconstructed);
+        let index = state.store.index().unwrap();
+        state
+            .store
+            .connection
+            .write()
+            .execute(
+                "DELETE FROM idempotency WHERE operation_id=?1",
+                [smallclaims::store::opaque_cache_key(
+                    "quick-agent-response:retention-quick",
+                )],
+            )
+            .unwrap();
+        let recovered = quick_agent(&state, retention_quick_request(root.path()), "codex")
+            .await
+            .unwrap();
+        assert!(recovered.response_reconstructed);
+        assert_eq!(recovered.event_cursor, original.event_cursor);
+        assert_eq!(state.store.index().unwrap(), index);
+        let repeated = quick_agent(&state, retention_quick_request(root.path()), "codex")
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(recovered).unwrap(),
+            serde_json::to_value(repeated).unwrap()
+        );
+        assert_eq!(
+            state
+                .store
+                .claims_for("agent/node.retention-worker", Some("intent.desired"))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    fn retention_event_query(after: u64, owner: Option<&str>, limit: usize) -> EventQuery {
+        EventQuery {
+            after,
+            subject: None,
+            owner_run: owner.map(str::to_owned),
+            wait: Some(false),
+            timeout_ms: None,
+            limit: Some(limit),
+        }
+    }
+
+    #[tokio::test]
+    async fn retention_event_http_envelope_preserves_pacing_continuation_and_410() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let mut indexes = Vec::new();
+        for subject in ["custom/test/other", "custom/test/selected"] {
+            indexes.push(
+                state
+                    .store
+                    .append_claim(&ClaimInput {
+                        subject: subject.into(),
+                        kind: "custom.test.recorded".into(),
+                        actor: None,
+                        fields: BTreeMap::new(),
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: None,
+                    })
+                    .unwrap()
+                    .store_index,
+            );
+        }
+        let app = router(state.clone());
+        let started = tokio::time::Instant::now();
+        let (status, empty) = get_request(
+            app.clone(),
+            "/v1/events/page?after=0&subject=custom%2Ftest%2Fselected&limit=1&wait=true&timeout_ms=40",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{empty}");
+        assert!(started.elapsed() >= Duration::from_millis(40));
+        assert!(started.elapsed() < Duration::from_millis(500));
+        let page = empty.get("value").unwrap_or(&empty);
+        assert_eq!(page["items"], json!([]));
+        assert_eq!(page["next_after"], json!(indexes[0]));
+        assert_eq!(page["has_more"], json!(true));
+
+        let (status, next) = get_request(app.clone(), &format!(
+            "/v1/events/page?after={}&subject=custom%2Ftest%2Fselected&limit=1&wait=true&timeout_ms=40",
+            indexes[0]
+        )).await;
+        assert_eq!(status, StatusCode::OK, "{next}");
+        let page = next.get("value").unwrap_or(&next);
+        assert_eq!(page["items"][0]["store_index"], json!(indexes[1]));
+        assert_eq!(page["next_after"], json!(indexes[1]));
+
+        state.store.connection.write().execute(
+            "INSERT INTO meta(key,value) VALUES('event_resume_floor',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [indexes[1].to_string()],
+        ).unwrap();
+        let (status, gap) = get_request(
+            app,
+            &format!(
+                "/v1/events/page?after={}&wait=true&timeout_ms=30000",
+                indexes[0]
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::GONE, "{gap}");
+        assert_eq!(gap["code"], json!("cursor-gap"));
+        assert_eq!(gap["details"]["full_resync"], json!(true));
+        assert_eq!(gap["details"]["resume_floor"], json!(indexes[1]));
+    }
+
+    #[tokio::test]
+    async fn retention_event_pages_advance_by_scanned_rows_and_refuse_stale_cursors() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let mut indexes = Vec::new();
+        for number in 0..7 {
+            indexes.push(
+                state
+                    .store
+                    .append_claim(&ClaimInput {
+                        subject: format!("custom/test/page-{number}"),
+                        kind: "custom.test.recorded".into(),
+                        actor: None,
+                        fields: BTreeMap::new(),
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: None,
+                    })
+                    .unwrap()
+                    .store_index,
+            );
+        }
+        let empty = read_event_page(
+            &state,
+            &retention_event_query(0, Some("mission-run/missing"), 3),
+        )
+        .await
+        .unwrap();
+        assert!(empty.items.is_empty());
+        assert_eq!(empty.next_after, Some(indexes[2]));
+        assert!(empty.has_more);
+        let second = read_event_page(&state, &retention_event_query(indexes[2], None, 3))
+            .await
+            .unwrap();
+        assert_eq!(
+            second
+                .items
+                .iter()
+                .map(|event| event.store_index)
+                .collect::<Vec<_>>(),
+            indexes[3..6]
+        );
+        assert_eq!(second.next_after, Some(indexes[5]));
+        assert!(second.has_more);
+        let last = read_event_page(&state, &retention_event_query(indexes[5], None, 3))
+            .await
+            .unwrap();
+        assert_eq!(last.next_after, Some(indexes[6]));
+        assert!(!last.has_more);
+        let done = read_event_page(&state, &retention_event_query(indexes[6], None, 3))
+            .await
+            .unwrap();
+        assert!(done.items.is_empty());
+        assert_eq!(done.next_after, None);
+        assert!(!done.has_more);
+        state.store.prune_events_before(indexes[3]).unwrap();
+        for _ in 0..2 {
+            let error = read_event_page(&state, &retention_event_query(0, None, 3))
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(error.status, StatusCode::GONE);
+            assert_eq!(error.code, "cursor-gap");
+            assert_eq!(
+                error.details.get("resume_floor"),
+                Some(&json!(indexes[3] - 1))
+            );
+            assert_eq!(error.details.get("full_resync"), Some(&json!(true)));
+        }
+    }
+
+    #[tokio::test]
+    async fn retention_global_empty_wait_pages_are_paced_without_losing_eligible_events() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = state(root.path());
+        let path = root.path().join("pending.sqlite3");
+        let store = Store::open(&path, "node").unwrap();
+        let append = |store: &Store, subject: &str| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "custom.test.recorded".into(),
+                    actor: None,
+                    fields: BTreeMap::new(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap()
+                .store_index
+        };
+        let floor = append(&store, "custom/test/old");
+        store.connection.write().execute_batch(
+            "BEGIN;
+             CREATE TABLE legacy_fixture_events(store_index INTEGER PRIMARY KEY,kind TEXT,subject TEXT,body TEXT);
+             INSERT INTO legacy_fixture_events SELECT * FROM events;
+             DROP VIEW events;
+             ALTER TABLE legacy_fixture_events RENAME TO events;
+             DROP TABLE event_positions;
+             PRAGMA user_version=16;
+             COMMIT;"
+        ).unwrap();
+        drop(store);
+        state.store = Arc::new(Store::open(&path, "node").unwrap());
+        let skipped = append(&state.store, "custom/test/other");
+        let eligible = append(&state.store, "custom/test/selected");
+        let mut query = retention_event_query(floor, None, 1);
+        query.subject = Some("custom/test/selected".into());
+        query.wait = Some(true);
+        query.timeout_ms = Some(1_000);
+        let started = tokio::time::Instant::now();
+        let empty = events_page(State(state.clone()), Query(query))
+            .await
+            .unwrap()
+            .0;
+        assert!(
+            started.elapsed() >= Duration::from_millis(250),
+            "an empty continuation must not invite immediate repoll"
+        );
+        assert!(empty.items.is_empty() && empty.has_more);
+        assert_eq!(empty.next_after, Some(skipped));
+        let mut next = retention_event_query(skipped, None, 1);
+        next.subject = Some("custom/test/selected".into());
+        let pending = read_event_page(&state, &next).await.unwrap();
+        assert_eq!(pending.items[0].store_index, eligible);
+        assert_eq!(pending.next_after, Some(eligible));
+        let report = crate::maintenance::migrate_event_payloads(state.store.clone())
+            .await
+            .unwrap();
+        assert!(report.pending_at_start && report.completed);
+        assert!(!state.store.event_payload_migration_pending().unwrap());
+        let complete = read_event_page(&state, &next).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(pending).unwrap(),
+            serde_json::to_value(complete).unwrap()
+        );
+        let mut from_floor = next;
+        from_floor.after = floor;
+        let global = read_event_page(&state, &from_floor).await.unwrap();
+        assert!(global.items.is_empty() && global.has_more);
+        assert_eq!(global.next_after, Some(skipped));
+        from_floor.after = global.next_after.unwrap();
+        let complete_continuation = read_event_page(&state, &from_floor).await.unwrap();
+        assert_eq!(complete_continuation.items[0].store_index, eligible);
+        assert_eq!(complete_continuation.next_after, Some(eligible));
+        assert!(!complete_continuation.has_more);
+    }
+
+    #[tokio::test]
+    async fn retention_empty_wait_page_pacing_respects_the_caller_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: "custom/test/other".into(),
+                kind: "custom.test.recorded".into(),
+                actor: None,
+                fields: BTreeMap::new(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let mut query = retention_event_query(0, Some("mission-run/missing"), 1);
+        query.wait = Some(true);
+        query.timeout_ms = Some(40);
+        let started = tokio::time::Instant::now();
+        let page = events_page(State(state), Query(query)).await.unwrap().0;
+        assert!(page.items.is_empty() && page.next_after.is_some());
+        assert!(started.elapsed() >= Duration::from_millis(40));
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "250ms pacing is capped by the requested timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn retention_event_upgrade_resyncs_lagging_cursors_and_continues_the_frontier() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = state(root.path());
+        let snapshot_before_upgrade = new_client_snapshot(&state);
+        assert!(
+            read_event_page(&state, &retention_event_query(0, None, 3))
+                .await
+                .is_ok()
+        );
+        let path = root.path().join("legacy.sqlite3");
+        let store = Store::open(&path, "node").unwrap();
+        let record = store
+            .append_claim(&ClaimInput {
+                subject: "custom/test/upgrade".into(),
+                kind: "custom.test.recorded".into(),
+                actor: None,
+                fields: BTreeMap::new(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        store.connection.write().execute_batch(
+            "BEGIN;
+             CREATE TABLE legacy_fixture_events(store_index INTEGER PRIMARY KEY,kind TEXT NOT NULL,subject TEXT NOT NULL,body TEXT NOT NULL);
+             INSERT INTO legacy_fixture_events SELECT store_index,kind,subject,body FROM events;
+             DROP VIEW events;
+             ALTER TABLE legacy_fixture_events RENAME TO events;
+             DROP TABLE event_positions;
+             PRAGMA user_version=16;
+             COMMIT;"
+        ).unwrap();
+        drop(store);
+        state.store = Arc::new(Store::open(&path, "node").unwrap());
+        let capabilities = client_capabilities(
+            State(state.clone()),
+            Extension(snapshot_before_upgrade),
+            Extension(client_v0::ClientSession::for_tests(
+                "person/alex",
+                "person/alex",
+                "unix",
+            )),
+        )
+        .await
+        .unwrap()
+        .0;
+        let frontier_cursor = format!("event-cursor/{}/{}", state.node, record.store_index);
+        assert_eq!(capabilities["event_cursor"], frontier_cursor);
+        assert_eq!(capabilities["oldest_event_cursor"], frontier_cursor);
+        let gap = read_event_page(&state, &retention_event_query(0, None, 3))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(gap.status, StatusCode::GONE);
+        assert_eq!(
+            gap.details.get("resume_floor"),
+            Some(&json!(record.store_index))
+        );
+        let caught_up =
+            read_event_page(&state, &retention_event_query(record.store_index, None, 3))
+                .await
+                .unwrap();
+        assert!(caught_up.items.is_empty());
+        let next = state
+            .store
+            .append_claim(&ClaimInput {
+                subject: "custom/test/next".into(),
+                kind: "custom.test.recorded".into(),
+                actor: None,
+                fields: BTreeMap::new(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let continued =
+            read_event_page(&state, &retention_event_query(record.store_index, None, 3))
+                .await
+                .unwrap();
+        assert_eq!(continued.items[0].store_index, next.store_index);
+        assert_eq!(continued.next_after, Some(next.store_index));
+    }
+
+    #[tokio::test]
+    async fn retention_event_timeout_rereads_a_new_unsignaled_floor() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let waiter_state = state.clone();
+        let waiter = tokio::spawn(async move {
+            let mut query = retention_event_query(0, None, 3);
+            query.wait = Some(true);
+            query.timeout_ms = Some(200);
+            events_page(State(waiter_state), Query(query)).await
+        });
+        // Observe registration, then leave time for its initial empty read. No commit signal
+        // follows below, reproducing a migration/checkpoint floor change during the wait.
+        while state.event_notify.receiver_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!waiter.is_finished());
+        let index = state
+            .store
+            .append_claim(&ClaimInput {
+                subject: "custom/test/migration-floor".into(),
+                kind: "custom.test.recorded".into(),
+                actor: None,
+                fields: BTreeMap::new(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap()
+            .store_index;
+        state.store.prune_events_before(index + 1).unwrap();
+        let error = waiter.await.unwrap().err().unwrap();
+        assert_eq!(error.status, StatusCode::GONE);
+        assert_eq!(error.details.get("resume_floor"), Some(&json!(index)));
+    }
+
     #[tokio::test]
     async fn an_event_wait_ignores_a_wake_without_a_matching_event() {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
         let waiter_state = state.clone();
         let waiter = tokio::spawn(async move {
-            events(
+            let response = events(
                 State(waiter_state),
                 Query(EventQuery {
                     after: 0,
@@ -17149,11 +17801,15 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
                     owner_run: None,
                     wait: Some(true),
                     timeout_ms: None,
+                    limit: None,
                 }),
             )
             .await
-            .unwrap()
-            .0
+            .unwrap();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<Vec<EventRecord>>(&bytes).unwrap()
         });
         tokio::time::sleep(Duration::from_millis(10)).await;
 

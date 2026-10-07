@@ -707,7 +707,7 @@ pub(crate) const PROJECTION_TABLES: [&str; 23] = [
     "local_glass_head_dirty",
     "desired",
     "documents",
-    "events",
+    "event_positions",
     "mission_revisions",
     "mission_definitions",
     "mission_run_deadlines",
@@ -725,6 +725,15 @@ pub(crate) const PROJECTION_TABLES: [&str; 23] = [
 
 /// Clear every projection and replay the claims into it from nothing, as a new node would.
 pub(crate) fn replay_from_nothing(transaction: &Transaction<'_>) -> Result<()> {
+    // A partial event migration must not restore eligibility the replay is removing.
+    let legacy: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='local_event_payloads')",
+        [],
+        |row| row.get(0),
+    )?;
+    if legacy {
+        transaction.execute("DELETE FROM local_event_payloads", [])?;
+    }
     for table in PROJECTION_TABLES {
         let exists: bool = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",

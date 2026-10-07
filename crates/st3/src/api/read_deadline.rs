@@ -68,7 +68,9 @@ fn deadline(request: &Request<Body>) -> Option<Duration> {
                 }
             })
     };
-    let wait_ms = if path == "/v1/events" && parameter("wait").as_deref() != Some("false") {
+    let wait_ms = if (path == "/v1/events" && parameter("wait").as_deref() != Some("false"))
+        || (path == "/v1/events/page" && parameter("wait").as_deref() == Some("true"))
+    {
         Some(
             parameter("timeout_ms")
                 .and_then(|value| value.parse::<u64>().ok())
@@ -111,6 +113,7 @@ fn deadline(request: &Request<Body>) -> Option<Duration> {
 
 fn long_poll_route(route: &str) -> bool {
     route == "/v1/events"
+        || route == "/v1/events/page"
         || route == "/v1/client/events"
         || (route.starts_with("/v1/client/conversations/") && route.ends_with("/changes"))
         || (route.starts_with("/v1/client/terminals/") && route.ends_with("/screen"))
@@ -543,6 +546,47 @@ mod tests {
     async fn an_idle_legacy_event_poll_is_not_cut_at_the_ordinary_deadline() {
         idle_long_poll_keeps_its_normal_empty_answer("/v1/events?timeout_ms=30000", "/v1/events")
             .await;
+    }
+
+    #[tokio::test]
+    async fn an_idle_paged_event_poll_is_not_cut_at_the_ordinary_deadline() {
+        idle_long_poll_keeps_its_normal_empty_answer(
+            "/v1/events/page?wait=true&timeout_ms=30000",
+            "/v1/events/page",
+        )
+        .await;
+    }
+
+    #[test]
+    fn paged_event_deadlines_follow_the_handlers_opt_in_wait() {
+        for path in [
+            "/v1/events/page",
+            "/v1/events/page?wait=false&timeout_ms=30000",
+            "/v1/events/page?wait=%66alse&timeout_ms=30000",
+        ] {
+            assert_eq!(deadline(&request(Method::GET, path)), Some(ORDINARY));
+        }
+        for path in [
+            "/v1/events/page?wait=true",
+            "/v1/events/page?wait=%74rue&timeout_ms=999999",
+        ] {
+            assert_eq!(deadline(&request(Method::GET, path)), Some(EVENT));
+        }
+        assert_eq!(
+            deadline(&request(
+                Method::GET,
+                "/v1/events/page?wait=true&timeout_ms=40"
+            )),
+            Some(ORDINARY + Duration::from_millis(40))
+        );
+        assert_eq!(
+            deadline(&request(
+                Method::GET,
+                "/v1/events/page?wait=true&timeout_ms=0"
+            )),
+            Some(ORDINARY + Duration::from_millis(10))
+        );
+        assert!(long_poll_route("/v1/events/page"));
     }
     #[test]
     fn wait_budgets_follow_handler_defaults_caps_and_nonwaiting_requests() {
