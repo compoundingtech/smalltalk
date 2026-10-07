@@ -4493,6 +4493,8 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "reqwest",
  "ring",
  "serde",
@@ -4507,6 +4509,9 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.27.0",
  "toml 0.9.12+spec-1.1.0",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
 ]
 
 [[package]]

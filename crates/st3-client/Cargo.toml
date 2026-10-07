@@ -5,6 +5,9 @@ edition = "2024"
 description = "Generated typed client for the st3.client.v0 API"
 license = "MIT"
 
+[features]
+trace-propagation = ["dep:opentelemetry", "dep:tracing-opentelemetry"]
+
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
@@ -16,6 +19,7 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 libc = "0.2"
+opentelemetry = { version = "0.30", optional = true }
 ring = "0.17"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
@@ -28,6 +32,8 @@ thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 tokio-tungstenite = "0.27"
 toml = "0.9"
+tracing = "0.1"
+tracing-opentelemetry = { version = "0.31", default-features = false, optional = true }
 
 [dev-dependencies]
 axum = "0.8"
@@ -38,3 +44,5 @@ sha2 = "0.10"
 smallclaims = { path = "../smallclaims" }
 st3 = { path = "../st3", features = ["test-support"] }
 tempfile = "3"
+opentelemetry_sdk = "0.30"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }

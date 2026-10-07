@@ -360,8 +360,10 @@ sampled caller. It keeps a deterministic trace-id ratio of 1% of the remaining t
 
 The sampled-caller signal is `st.parent.sampled`: because st3 exports every span with
 AlwaysOn, every exported span carries the sampled flag, and the collector cannot recover the
-caller's decision from trace flags. Server root spans set `st.parent.sampled` to the remote
-parent's sampled flag whenever a remote parent exists; the collector policy keys on that
+caller's decision from trace flags. Server spans set `st.parent.sampled=true` only when
+the remote parent is sampled and its tracestate has no `st` key. st's own clients mark
+collector-owned sampling with `st=c`; their AlwaysOn flag must not force the collector to
+keep every trace. Unsampled or st-marked parents record false; a missing parent records no
 attribute. The decision wait must be long enough for the daemon's SDK batch delay and
 delivery of the completed root and its spans. RED metrics are exported independently and
 are never sampled.
@@ -392,9 +394,8 @@ sets status `ERROR`; a 4xx response alone does not. WebSocket routes end the ser
 the 101 response, not when the socket closes.
 
 The server extracts W3C `traceparent` and `tracestate` from HTTP request and WebSocket
-upgrade headers and uses the extracted context as the parent. When a remote parent exists,
-the server root span records its sampled flag as the boolean `st.parent.sampled` attribute.
-The collector sampling policy uses that attribute; the process exports every span.
+upgrade headers and uses the extracted context as the parent. The sampled-caller signal
+follows the collector sampling policy above; the process exports every span.
 
 ### Metric naming and cardinality
 
@@ -488,9 +489,35 @@ metrics, or logs. Span names and labels use bounded operation vocabulary. Existi
 `profile::Op` and `profile::task` labels supply that vocabulary where available.
 
 W3C `traceparent` and `tracestate` are the wire context, not hash-derived identities.
-HTTP and WebSocket upgrade requests carry context; peer context belongs inside the
-`FleetAuth`-signed header set. Concrete propagation and instrumentation surfaces not
-specified by this core are recorded in [open questions](open-questions.md#st3).
+`crates/st3-client/src/propagation.rs` supplies one injector for both the CLI's internal
+daemon client and the generated typed Rust client. Every HTTP request, Unix HTTP request,
+and WebSocket handshake injects the current tracing span's OpenTelemetry context through
+the global text-map propagator. This makes the daemon's SERVER span a child of the CLI's
+`st3.cli.command` span (or its current child); hook requests use their current span in the
+same way. No SDK/OTel layer or an invalid context produces no trace headers.
+
+The wire-only tracestate entry `st=c` is owned by Smalltalk and means sampling is decided
+by the collector. Injection replaces an existing `st` entry without growing the list.
+When adding `st` to a full 32-entry list, it first drops the rightmost entry; all other
+entries retain their order. It does not mutate the current span's context. The daemon
+treats any present `st` key as collector-owned sampling, so only sampled external callers without that key set
+`st.parent.sampled=true`.
+
+The typed Rust client's optional `trace-propagation` feature owns its OTel API and tracing
+bridge dependencies, not an exporter or SDK initializer. `st3` enables the feature;
+`stui` and the client TUI example leave it disabled. Without the feature, injection is
+a no-op with no context lookup, trace headers, or OTel dependencies. The embedding
+application owns subscriber and propagator setup. The client source is generated from
+`crates/st3-client-codegen/templates/lib.rs.in`; the
+shared propagation module is handwritten. Invalid-context injection performs only a
+current-span/context check, with no allocation, header formatting, or propagator lookup.
+Valid-context injection clones/updates tracestate and uses the propagator to format the
+two W3C headers directly into each transport's existing request, without an intermediate
+header collection.
+
+Peer propagation is pending and is not enabled by these injectors. When implemented,
+peer context belongs inside the `FleetAuth`-signed header set. Other instrumentation
+surfaces are recorded in [open questions](open-questions.md#st3).
 
 ### Proof and overhead
 
@@ -502,6 +529,10 @@ The daemon request proof checks caller trace continuity, `service.name=st-daemon
 the single-span shape (phase attributes present, no admission/handler child spans), and
 that a healthy request exports no below-WARN log record. A unit test pins the batch queue
 bounds.
+The CLI-to-daemon receiver proof runs a real command with both processes exporting,
+asserts the daemon SERVER span has the CLI root's trace id and a CLI parent span id,
+and checks st-marked parents do not set `st.parent.sampled=true`. Builder unit tests pin
+both headers under a valid current context and their absence without an OTel layer.
 The CLI shutdown helper is tested with an exporter that never returns from shutdown:
 the caller reports a receive timeout and writes the negative cache within the 50 ms
 deadline plus 200 ms of scheduling/filesystem tolerance. The process-level black-hole

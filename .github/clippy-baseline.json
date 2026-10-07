@@ -40,8 +40,7 @@
     },
     "st3-client": {
       "clippy::large_enum_variant": 1,
-      "clippy::manual_is_multiple_of": 1,
-      "unused_imports": 3
+      "clippy::manual_is_multiple_of": 1
     },
     "st3-client-codegen": {
       "clippy::useless_format": 2,

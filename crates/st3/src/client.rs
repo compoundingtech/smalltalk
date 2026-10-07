@@ -613,6 +613,7 @@ impl Client {
                 }
                 .header("content-type", "application/json")
                 .header("connection", "close");
+                request = st3_client::propagation::inject_http(request);
                 if let Some(person) = self.person.as_deref() {
                     request = request.header("x-st3-person", person);
                 }
@@ -736,9 +737,11 @@ impl Client {
             fence.epoch,
             urlencoding::encode(&fence.token)
         );
+        let mut request = url.into_client_request()?;
+        st3_client::propagation::inject_headers(request.headers_mut());
         let (socket, _) = tokio::time::timeout(
             self.deadlines.terminal_handshake,
-            tokio_tungstenite::client_async(url, stream),
+            tokio_tungstenite::client_async(request, stream),
         )
         .await?
         .map_err(|error| match error {
@@ -984,6 +987,7 @@ impl std::error::Error for UnexpectedResponse {}
 
 fn terminal_request(url: &str) -> Result<tokio_tungstenite::tungstenite::http::Request<()>> {
     let mut request = url.into_client_request()?;
+    st3_client::propagation::inject_headers(request.headers_mut());
     request.headers_mut().insert(
         "Sec-WebSocket-Protocol",
         "st3.terminal.v1"
@@ -1136,10 +1140,17 @@ async fn unix_request(
             .map(|person| format!("X-St3-Person: {person}\r\n"))
             .unwrap_or_default();
         let mut request = format!(
-            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n{person_header}Content-Length: {}\r\nConnection: close\r\n\r\n",
+            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n{person_header}Content-Length: {}\r\nConnection: close\r\n",
             body.len()
         )
         .into_bytes();
+        st3_client::propagation::inject_current_context(|key, value| {
+            request.extend_from_slice(key.as_bytes());
+            request.extend_from_slice(b": ");
+            request.extend_from_slice(value.as_bytes());
+            request.extend_from_slice(b"\r\n");
+        });
+        request.extend_from_slice(b"\r\n");
         // A handler may answer without consuming its body. Keep small bodies in the same
         // write as their headers to avoid a separate body write racing Connection: close.
         request.extend_from_slice(body);
@@ -1420,6 +1431,25 @@ fn decode_api_response<O: DeserializeOwned>(bytes: &[u8]) -> Result<O> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn otel_disabled_client_sends_no_trace_headers() {
+        tracing::subscriber::with_default(tracing_subscriber::registry(), || {
+            let span = tracing::info_span!("without_sdk");
+            let _entered = span.enter();
+            let websocket = terminal_request("ws://localhost/v1/terminal").unwrap();
+            let http = st3_client::propagation::inject_http(
+                reqwest::Client::new().get("http://localhost/v1/health"),
+            ).build().unwrap();
+            for headers in [websocket.headers(), http.headers()] {
+                assert!(!headers.contains_key("traceparent"));
+                assert!(!headers.contains_key("tracestate"));
+            }
+            st3_client::propagation::inject_current_context(|_, _| {
+                panic!("the Unix header writer must not be called without a valid context");
+            });
+        });
+    }
     use axum::extract::ws::{Message as AxumWsMessage, WebSocketUpgrade};
     use axum::http::{HeaderMap, StatusCode};
     use axum::response::IntoResponse as _;

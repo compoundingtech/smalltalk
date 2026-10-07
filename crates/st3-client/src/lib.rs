@@ -6,6 +6,8 @@ pub use checkout::{agent_branch, checkout_label};
 mod contract;
 pub mod device;
 mod generated;
+/// W3C context injection, enabled by the optional `trace-propagation` feature.
+pub mod propagation;
 pub use contract::*;
 pub use generated::*;
 
@@ -3260,6 +3262,7 @@ impl Client {
                         "x-st3-features",
                         "custom-subjects.v1, conversation-blocks.v1",
                     );
+                    request = propagation::inject_http(request);
                     if let Some(key) = key {
                         request = request.header("idempotency-key", key);
                     }
@@ -3435,6 +3438,9 @@ async fn unix_request(
     if body.is_some() {
         builder = builder.header("content-type", content_type);
     }
+    if let Some(headers) = builder.headers_mut() {
+        propagation::inject_headers(headers);
+    }
     let response = sender
         .send_request(
             builder
@@ -3491,6 +3497,7 @@ fn websocket_request(
     let mut request = url
         .into_client_request()
         .map_err(|error| ClientError::Protocol(error.to_string()))?;
+    propagation::inject_headers(request.headers_mut());
     request.headers_mut().insert(
         hyper::header::HeaderName::from_static("x-st3-features"),
         hyper::header::HeaderValue::from_static("custom-subjects.v1, conversation-blocks.v1"),
@@ -3973,8 +3980,6 @@ mod tests {
     }
 
     use super::*;
-    use futures_util::SinkExt as _;
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     #[test]
     fn every_schema_error_code_is_typed_and_round_trips() {
