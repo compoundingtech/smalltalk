@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Resolve opaque managed-session owners through indexed identity candidates and exact incarnation validation",
+  "replay": {"status": "none", "detail": "No claim replay or recovery behavior changes; exact validation retains snapshot and incarnation fencing."},
+  "schema": {"status": "changed", "detail": "Adds claims_agent_session_identity_index for narrow identity candidates. No schema-version bump, table change or data rewrite. The index covers agent claims with root or nested incarnation/runtime fields while excluding non-status claim kinds."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or digest changes; no coordinated member upgrade required."},
+  "compatibility": {"status": "none", "detail": "Existing session IDs, owner routing, protocols and scopes are unchanged. Candidate identities are not authority: a matching candidate is validated against exact subject history and origin at the requested snapshot."},
+  "downtime": {"status": "unknown", "detail": "First startup builds the additive identity index. Large-store index creation and restart-to-API/health milestones have not been measured; allow startup time for index creation."},
+  "manual": {"status": "none", "detail": "No operator actions or client re-pairing required; the index is created automatically on store open and identity/state are preserved."},
+  "recovery": {"status": "none", "detail": "Binary swap-back is supported with unchanged schema and rules versions; older binaries ignore the additive index, which does not alter stored claims."}
+}
