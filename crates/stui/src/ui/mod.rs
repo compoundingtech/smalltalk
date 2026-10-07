@@ -417,6 +417,9 @@ pub struct Ui {
     stalled: HashMap<String, String>,
 }
 
+/// What the person reads when a prompt has ended before their answer could be sent.
+pub(crate) const PROMPT_GONE: &str = "This prompt is no longer waiting; look again";
+
 /// What the person reads when st refuses an answer to a harness prompt that is no longer the
 /// one waiting (it ended, or the seat restarted): plain words, not the refusal code.
 pub(crate) fn prompt_refusal(error: &st3_client::ClientError) -> Option<&'static str> {

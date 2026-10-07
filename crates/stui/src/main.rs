@@ -504,24 +504,54 @@ async fn act_on_card(
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("This prompt changed; look again"))?;
             let answer_id = answer.ok_or_else(|| anyhow::anyhow!("Choose an answer"))?;
-            fence.runtime_incarnation = prompt.runtime_incarnation.clone();
-            client
-                .prompt_respond(
-                    id,
-                    idem,
-                    fence,
-                    st3_client::PromptRespondParameters {
-                        target_id: source,
-                        episode: attention.episode.clone(),
-                        prompt_id: prompt.prompt_id.clone().unwrap_or_default(),
-                        answer_id,
-                    },
-                )
-                .await
-                .map_err(|error| match ui::prompt_refusal(&error) {
-                    Some(words) => anyhow::anyhow!(words),
-                    None => error.into(),
-                })?
+            let parameters = st3_client::PromptRespondParameters {
+                target_id: source,
+                episode: attention.episode.clone(),
+                prompt_id: prompt.prompt_id.clone().unwrap_or_default(),
+                answer_id,
+            };
+            // The incarnation is the one the person saw: a busy store moves the snapshot under
+            // the click, so a stale snapshot fence is tried again against a fresh one, while a
+            // prompt that moved on is refused by its incarnation, never sent to the new one.
+            let incarnation = prompt.runtime_incarnation.clone();
+            let mut snapshot_id = fence.snapshot_id.clone();
+            let mut revision = attention.header.revision.clone();
+            let item = attention.header.id.clone();
+            let mut attempt = 0;
+            loop {
+                attempt += 1;
+                let mut tried = Fence {
+                    snapshot_id: snapshot_id.clone(),
+                    runtime_incarnation: incarnation.clone(),
+                    ..Fence::default()
+                };
+                tried.subject_revisions.insert(item.clone(), revision.clone());
+                match client
+                    .prompt_respond(id.clone(), idem.clone(), tried, parameters.clone())
+                    .await
+                {
+                    Ok(done) => break done,
+                    Err(ClientError::Api(st3_client::ErrorCode::StaleFence, ..)) if attempt < 4 => {
+                        let fresh = client.attention_get(&item).await?;
+                        anyhow::ensure!(
+                            matches!(&fresh.value, Resource::Attention(now)
+                                if now.prompt.as_ref().is_some_and(|prompt| prompt.state.as_deref().is_none_or(|state| state == "open"))),
+                            "{}",
+                            ui::PROMPT_GONE
+                        );
+                        snapshot_id = fresh.snapshot.id;
+                        if let Resource::Attention(now) = &fresh.value {
+                            revision = now.header.revision.clone();
+                        }
+                    }
+                    Err(error) => {
+                        return Err(match ui::prompt_refusal(&error) {
+                            Some(words) => anyhow::anyhow!(words),
+                            None => error.into(),
+                        });
+                    }
+                }
+            }
         }
         "work.done" => {
             let summary = reason
