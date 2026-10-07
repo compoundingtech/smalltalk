@@ -231,12 +231,12 @@ record.
   fill. `incarnation` is carried in the record as provenance — evidence of which
   session produced a number — and is never consulted as a fence.
 - **HC-R16 Adjacent facts, one owner each:** where the same channel supplies
-  them, the record carries the model identifier, the harness-reported session
-  cost, the harness-reported account rate limits, and the cumulative session
-  token total. Each is carried as what the harness reported and nothing more;
-  absent facts are `null`, never zero. The cumulative total is named so it
-  cannot be mistaken for occupancy, and it is never the numerator of any
-  percent.
+  them, the record carries the model identifier, the harness-reported cost at
+  the scope the harness reports, the harness-reported account rate limits, and
+  the cumulative session token total. Each is carried as what the harness
+  reported and nothing more; absent facts are `null`, never zero. The cumulative
+  total is named so it cannot be mistaken for occupancy, and it is never the
+  numerator of any percent.
 - **HC-R17 Doctor advisory:** Doctor surfaces a warning for an agent it owns
   when the reading is at or above a named st2 warning threshold, and when the
   record is stale beside a `running` desired state. Both are advisory output and

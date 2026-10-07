@@ -1,14 +1,14 @@
-# DELTA-005: `costUsd` is a per-message figure on pi and omp, not a session cost
+# DELTA-005: `costUsd` is harness-reported at its reported scope
 
 Status: open
 
 ## Divergence
 
-Ratified [`HC-R16`](../08-harness-context/requirements.md) says the record
-carries "the harness-reported **session** cost", and the record's own field
-description in [`08-harness-context/spec.md`](../08-harness-context/spec.md)
-repeats it: "`costUsd` is the harness-reported session cost, in the harness's own
-accounting."
+Proposed HC-R16 says the record carries "the harness-reported cost at the scope
+the harness reports". The current accepted requirement instead says "session
+cost", creating a contradiction with pi and omp's reported values. **This
+requirement change is a proposal only: Johannes must confirm it before HC-R16
+is treated as ratified with this wording.**
 
 The pi and omp producers shipped on 2026-08-29 publish the **last assistant
 message's** `usage.cost.total`, which is what those two harnesses actually
@@ -20,14 +20,10 @@ cost at all.
 
 ## VRS
 
-[HC-R16](../08-harness-context/requirements.md) requires the adjacent facts to be
-carried as the harness reported them and nothing more, and names the cost fact a
-session cost. The spec's own producer table — HC-R16's "which adjacent facts each
-channel supplies" — already said "per-message `usage.cost.total`" for both rows,
-so the two halves of the spec disagreed with each other before any producer
-existed, and the implementation had to pick one. The pi and omp producer sections
-in [`08-harness-context/spec.md`](../08-harness-context/spec.md) state the
-divergence at the point of use.
+HC-R16 currently names a session cost, while the producer table already names
+per-message `usage.cost.total` for pi and omp. This proposal makes the scope
+harness-specific and the rows consistent with it; the pi and omp producer
+sections describe the actual published values.
 
 ## Implementation
 
@@ -58,11 +54,10 @@ update VRS
 
 ## Resolution Signal
 
-HC-R16 amended so that the adjacent cost fact is "the harness-reported cost, at
-whatever scope that harness reports it, stated per harness in the spec's producer
-table" — which is what all five rows then describe consistently — and the
-record's field description in the spec widened to match. Until then, the producer
-table is the operative statement for pi and omp, and consumers must read the
-`harness` discriminator before comparing this field across harnesses — a
-comparison that is already required for `usedTokens`, whose meaning differs
-between pi and omp for unrelated reasons (HC-T03).
+Proposed resolution: amend HC-R16 so adjacent cost is "the harness-reported
+cost at the scope the harness reports", and align the spec field description and
+producer table. **Johannes must confirm this amendment** because requirements.md
+is protected. The spec and this delta record can describe the proposed resolution
+without that ratification. Consumers must read the `harness` discriminator before
+comparing this field across harnesses — already required for `usedTokens`, whose
+meaning differs between pi and omp for unrelated reasons (HC-T03).
