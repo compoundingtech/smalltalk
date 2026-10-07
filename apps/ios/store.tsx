@@ -364,7 +364,7 @@ function useAppStore(proof?: FabricProfile) {
       if (typeof typed === 'string') { setError(typed); return false; }
       return runAction(async () => { const id = actionId(); return client.workDone({ id, idempotency_key: id, fence: await fence({ [item.id]: item.revision }), parameters: { target_id: item.source_id, episode: item.episode || item.revision, summary, ...(typed ? { answer: typed } : {}) } }); });
     },
-    /** Clear an item st closed elsewhere: only the person's own word removes it from Home. */
+    /** Clear an item st closed: only the person's own word removes it from Home. */
     clearClosed(id: string) {
       acted.current.add(id);
       setData(previous => ({ ...previous, attention: previous.attention.filter(item => item.id !== id) }));
