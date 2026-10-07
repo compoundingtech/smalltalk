@@ -650,3 +650,7 @@ mod tests {
         drop(adapter);
     }
 }
+
+#[cfg(test)]
+#[path = "agents/kernel_parity.rs"]
+mod kernel_parity;
