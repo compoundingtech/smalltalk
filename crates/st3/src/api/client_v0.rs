@@ -803,17 +803,19 @@ async fn collection_stream_socket(
 ) {
     let windows = collection_windows::Windows::attach(&state.store);
     // Complete source adapters are admitted explicitly, never inferred from partial view IDs.
-    let store = state.store.clone();
-    let sources =
-        match blocking_store(move || collection_ivm::Sources::from_store(store, BTreeMap::new()))
-            .await
-        {
+    let adapters = BTreeMap::new();
+    let sources = if adapters.is_empty() {
+        None
+    } else {
+        let store = state.store.clone();
+        match blocking_store(move || collection_ivm::Sources::from_store(store, adapters)).await {
             Ok(sources) => sources,
             Err(error) => {
                 tracing::warn!(message=%error.message, "collection source attachment failed");
                 return;
             }
-        };
+        }
+    };
     collection_stream_socket_with_sources(
         socket,
         state,
