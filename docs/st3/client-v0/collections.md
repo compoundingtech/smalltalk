@@ -7,6 +7,11 @@ The optional `collections` capability version 1 advertises this bound; older
 daemons omit it and accept eight. Clients reserve their existing conversation
 and terminal slots before adding optional windows on older daemons.
 
+The server sends a WebSocket protocol ping every eight seconds and answers client
+pings with the same payload. These frames do not read collection windows. A send
+that cannot complete within eight seconds closes the socket; reconnect and apply
+the new authoritative snapshot.
+
 Send one JSON command per subscription:
 
 ```json

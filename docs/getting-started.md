@@ -108,6 +108,12 @@ st claude-channel install
 st claude-channel status
 ```
 
+Installation keeps the plugin's shared assets available and disables user-scope activation.
+Smalltalk seats enable their channel through local and per-process settings. In an ordinary
+Claude session without a seat subject, the channel serves an empty MCP lifecycle. If an older
+install still enables it globally, run `claude plugin disable st-channel@st --scope user`
+and start a fresh ordinary Claude session, keeping agent-local settings intact.
+
 Other harnesses work too; their [seat examples](../examples/st3/README.md#run-a-durable-agent) show the KDL to use.
 
 ## 3. Start the daemon

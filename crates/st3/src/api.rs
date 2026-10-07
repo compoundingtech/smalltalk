@@ -623,7 +623,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/gate-checks/{id}", get(read_gate_check))
         .route("/v1/sets/preview", post(owned_sets::preview))
         .route("/v1/sets/apply", post(owned_sets::apply))
-        .route("/v1/intent/apply", post(apply))
+        .route("/v1/intent/apply", post(apply_with_bound))
         .route("/v1/agents/rename", post(rename_agent))
         .route("/v1/agents/restart", post(restart_agent))
         .route("/v1/agents/rollout", post(rollout_agent))
@@ -997,6 +997,7 @@ async fn response_envelope_unbounded(
             let cpu_kind = request_route.clone();
             let cpu_client = caller.clone();
             let handler_queue = profile.as_ref().map(|op| op.wall_span("handler/queue"));
+            let forwarded_handler = request_path == crate::peer::CLIENT_READ_FORWARD_PATH;
             match crate::api::read_deadline::spawn_handler(move || {
                 drop(handler_queue);
                 if let Some(profile) = &handler_profile {
@@ -1004,7 +1005,24 @@ async fn response_envelope_unbounded(
                 }
                 let _entered = crate::profile::enter(handler_profile.as_ref());
                 crate::performance::with_cpu(Some(&cpu_kind), Some(&cpu_client), || {
-                    runtime.block_on(next.run(request))
+                    runtime.block_on(async move {
+                        // Cancel the actual forwarded relay, not only its outer waiter.
+                        // Other routes retain their existing cooperative cancellation;
+                        // this transport's mutation variants carry no read budget.
+                        if let Some(budget) = smallclaims::read_budget::current()
+                            .filter(|_| forwarded_handler)
+                        {
+                            match tokio::time::timeout(budget.remaining(), next.run(request)).await {
+                                Ok(response) => response,
+                                Err(_) => {
+                                    budget.cancel();
+                                    ApiError::bad(budget.check().unwrap_err()).into_response()
+                                }
+                            }
+                        } else {
+                            next.run(request).await
+                        }
+                    })
                 })
             })
             .await
@@ -4430,7 +4448,8 @@ fn remote_read_error(host: &str, error: anyhow::Error) -> ApiError {
     }
     if !matches!(
         rejected.code.as_str(),
-        "page-cursor-expired"
+        "read-deadline"
+            | "page-cursor-expired"
             | "conversation-content-invalidated"
             | "transcript-unavailable"
             | "timeline-history-incomplete"
@@ -6424,18 +6443,54 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
         .filter(|(_, subjects)| subjects.len() > 1)
         .map(|(runtime, subjects)| format!("{runtime}: {}", subjects.join(", ")))
         .collect::<Vec<_>>();
+    let mut ownership_problems = duplicates
+        .iter()
+        .map(|item| format!("duplicate runtime owners: {item}"))
+        .collect::<Vec<_>>();
+    let local_live_ptys = pty_snapshot
+        .as_ref()
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| item.status == "running")
+                .map(|item| item.name.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let exec_runtime =
+        st_runtime::ExecRuntime::new(state.state_dir.join("exec"), state.state_dir.join("logs"));
+    for subject in &desired {
+        let Some(member) = subject
+            .member
+            .as_ref()
+            .filter(|member| member.host != state.node)
+        else {
+            continue;
+        };
+        let local_live = if member.terminal {
+            local_live_ptys.contains(&member.runtime_id)
+        } else {
+            matches!(
+                exec_runtime.observe(&member.runtime_id),
+                Ok(Some(st_runtime::ExecObservation::Running(_)))
+            )
+        };
+        if local_live {
+            ownership_problems.push(format!("local runtime {} for {} is placed on host/{} instead of host/{}; restore the same state directory's stable node identity before moving or restarting the seat", member.runtime_id, subject.subject, member.host, state.node));
+        }
+    }
     checks.push(DoctorCheck {
         name: "runtime-ownership".into(),
-        status: if duplicates.is_empty() {
+        status: if ownership_problems.is_empty() {
             "pass"
         } else {
             "fail"
         }
         .into(),
-        message: if duplicates.is_empty() {
-            "each desired member has a unique runtime ID".into()
+        message: if ownership_problems.is_empty() {
+            "each desired member has a unique runtime ID and live local runtimes match their placement".into()
         } else {
-            format!("duplicate runtime owners: {}", duplicates.join("; "))
+            ownership_problems.join("; ")
         },
     });
     checks.push(claude_hooks_check(state, &desired)?);
@@ -6452,6 +6507,7 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
     let mut desired_runtime_ids = desired
         .iter()
         .filter(|subject| !terminal_owned.contains(&subject.subject))
+        .filter(|subject| subject.member.as_ref().is_some_and(|member| member.host == state.node))
         .filter_map(|subject| {
             subject
                 .member
@@ -6460,7 +6516,8 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
         })
         .collect::<std::collections::BTreeSet<_>>();
     for subject in &desired {
-        if terminal_owned.contains(&subject.subject) {
+        if terminal_owned.contains(&subject.subject)
+            || !subject.member.as_ref().is_some_and(|member| member.host == state.node) {
             continue;
         }
         if let Some(runtime_id) = state
@@ -10157,6 +10214,22 @@ async fn apply(
     State(state): State<AppState>,
     Json(request): Json<ApplyRequest>,
 ) -> Result<Json<ApplyResponse>, ApiError> {
+    apply_with_authority(state, request, None).await
+}
+
+async fn apply_with_bound(
+    State(state): State<AppState>,
+    bound: Option<Extension<BoundAgent>>,
+    Json(request): Json<ApplyRequest>,
+) -> Result<Json<ApplyResponse>, ApiError> {
+    apply_with_authority(state, request, bound.as_ref().map(|bound| bound.0.0.as_str())).await
+}
+
+async fn apply_with_authority(
+    state: AppState,
+    request: ApplyRequest,
+    bound: Option<&str>,
+) -> Result<Json<ApplyResponse>, ApiError> {
     let actor = request.actor.as_deref().ok_or_else(|| {
         ApiError::bad(St3Error::new(
             "missing-publication-actor",
@@ -10164,6 +10237,12 @@ async fn apply(
         ))
     })?;
     let intent = parse_intent(&request.intent.kdl, &state.node).map_err(ApiError::bad)?;
+    if !intent.direct_message_registrations.is_empty()
+        && bound.is_some_and(|bound| normalized_agent_actor(actor).as_deref() != Some(bound))
+    {
+        return Err(ApiError::bad(St3Error::new("foreign-agent-actor",
+            "a bound harness registers a message subscription only as itself")));
+    }
     for declaration in intent.mission_runs.values() {
         if let Some(creation) = &declaration.creation {
             if creation.requester == "person/requester" {
@@ -15295,6 +15374,19 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
     }
 
     #[test]
+    fn an_owner_read_deadline_keeps_its_typed_gateway_timeout() {
+        let rejected = crate::peer::ClientReadRejected::new(
+            "read-deadline",
+            StatusCode::GATEWAY_TIMEOUT,
+            "the owner read exceeded its budget",
+        );
+        let error = remote_read_error("host/owner", rejected.into());
+        assert_eq!(error.status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(error.code, "read-deadline");
+        assert_eq!(error.details["owner_host_id"], "host/owner");
+    }
+
+    #[test]
     fn an_unreachable_owner_says_why_and_how_far_the_read_got() {
         let mut rejected = crate::peer::ClientReadRejected::unreachable(
             "dial-failed",
@@ -17293,6 +17385,49 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
     }
 
     #[tokio::test]
+    async fn main_performance_failures_registration_public_preview_and_apply() {
+        use crate::store::message_subscriptions::{PERFORMANCE_DECLARATIONS, PERFORMANCE_REGISTRATION};
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let declarations = crate::graph::parse_internal_intent(PERFORMANCE_DECLARATIONS, &state.node).unwrap();
+        state.store.apply_internal(&declarations, "workflow-registration-fixture").unwrap();
+        let app = router(state.clone());
+        let (status, preview) = json_request(app.clone(), "/v1/intent/mission", serde_json::json!({
+            "intent": {"kdl": PERFORMANCE_REGISTRATION}
+        })).await;
+        assert_eq!(status, StatusCode::OK, "{preview}");
+        assert_eq!(preview["blockers"], serde_json::json!([]));
+        assert!(!state.store.desired_subjects().unwrap().iter().any(|item| item.kind == "subscription"));
+        let request = apply_request(&state, PERFORMANCE_REGISTRATION, "agent/fleet/fixture-project/speed", "workflow-register");
+        let request = serde_json::to_value(request).unwrap();
+        let (status, first) = json_request(app.clone(), "/v1/intent/apply", request.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        let (status, again) = json_request(app.clone(), "/v1/intent/apply", request).await;
+        assert_eq!(status, StatusCode::OK, "{again}");
+        assert_eq!(first["claim_ids"], again["claim_ids"]);
+        assert!(state.store.active_mission_runs().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn main_performance_failures_registration_rejects_foreign_bound_actor() {
+        use crate::store::message_subscriptions::{PERFORMANCE_DECLARATIONS, PERFORMANCE_REGISTRATION};
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let declarations = crate::graph::parse_internal_intent(PERFORMANCE_DECLARATIONS, &state.node).unwrap();
+        state.store.apply_internal(&declarations, "workflow-registration-fixture").unwrap();
+        let app = router(state.clone());
+        let request = apply_request(&state, PERFORMANCE_REGISTRATION, "agent/foreign", "forged-workflow-register");
+        let response = app.oneshot(Request::builder().method("POST").uri("/v1/intent/apply")
+            .header("content-type", "application/json").extension(BoundAgent("agent/own".into()))
+            .body(Body::from(serde_json::to_vec(&request).unwrap())).unwrap()).await.unwrap();
+        assert_ne!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["code"], "foreign-agent-actor");
+        assert!(!state.store.desired_subjects().unwrap().iter().any(|item| item.kind == "subscription"));
+    }
+
+    #[tokio::test]
     async fn an_event_waiter_cannot_consume_the_reconciler_signal() {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
@@ -17372,13 +17507,21 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn retention_quick_concurrent_calls_share_the_response() {
         let root = tempfile::tempdir().unwrap();
-        let state = state(root.path());
+        let mut state = state(root.path());
+        // Shared-cache in-memory SQLite returns SQLITE_LOCKED when one caller reads
+        // during another's write. Exercise the daemon's file-backed WAL concurrency.
+        state.store = Arc::new(Store::open(&root.path().join("quick.sqlite"), "node").unwrap());
+        let start = Arc::new(tokio::sync::Barrier::new(12));
         let request = retention_quick_request(root.path());
         let workers = (0..12)
             .map(|_| {
                 let state = state.clone();
                 let request = request.clone();
-                tokio::spawn(async move { quick_agent(&state, request, "codex").await.unwrap() })
+                let start = start.clone();
+                tokio::spawn(async move {
+                    start.wait().await;
+                    quick_agent(&state, request, "codex").await.unwrap()
+                })
             })
             .collect::<Vec<_>>();
         let mut responses = Vec::new();
@@ -18051,6 +18194,76 @@ agent "good" {{ workspace {:?}; command "true" }}
                 assert!(check.is_none());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn doctor_flags_local_foreign_placement_and_exempts_actual_remote_runtimes() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let source = format!(
+            "version 2\nagent \"example/orphan\" {{ host \"orchid\"; command \"true\"; workspace {:?} }}\nagent \"example/remote\" {{ host \"fern\"; command \"true\"; workspace {:?} }}\n",
+            root.path().display().to_string(),
+            root.path().display().to_string()
+        );
+        let intent = crate::graph::parse_intent(&source, "node").unwrap();
+        state
+            .store
+            .apply_internal(&intent, "doctor-orphan")
+            .unwrap();
+        let orphan = state
+            .store
+            .desired_subject_with_writer("agent/example/orphan")
+            .unwrap()
+            .unwrap()
+            .0
+            .member
+            .unwrap();
+        fs::create_dir_all(&state.pty_root).unwrap();
+        let _socket = std::os::unix::net::UnixListener::bind(
+            state.pty_root.join(format!("{}.sock", orphan.runtime_id)),
+        )
+        .unwrap();
+        fs::write(
+            state.pty_root.join(format!("{}.pid", orphan.runtime_id)),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+        fs::write(state.pty_root.join(format!("{}.json", orphan.runtime_id)), json!({"createdAt":"2026-10-01T00:00:00Z","tags":{"st3.subject":"agent/example/orphan"}}).to_string()).unwrap();
+        let report = doctor_report(&state).unwrap().0;
+        let ownership = report
+            .checks
+            .iter()
+            .find(|c| c.name == "runtime-ownership")
+            .unwrap();
+        assert_eq!(ownership.status, "fail", "{ownership:?}");
+        assert!(
+            ownership.message.contains("host/orchid"),
+            "{}",
+            ownership.message
+        );
+        assert!(!ownership.message.contains("fern"), "{}", ownership.message);
+        let drift = report
+            .checks
+            .iter()
+            .find(|c| c.name == "runtime-drift")
+            .unwrap();
+        assert_eq!(drift.status, "warn");
+        assert!(drift.message.contains(&orphan.runtime_id));
+        fs::remove_file(state.pty_root.join(format!("{}.pid", orphan.runtime_id))).unwrap();
+        drop(_socket);
+        fs::remove_file(state.pty_root.join(format!("{}.sock", orphan.runtime_id))).unwrap();
+        fs::remove_file(state.pty_root.join(format!("{}.json", orphan.runtime_id))).unwrap();
+        let report = doctor_report(&state).unwrap().0;
+        assert_eq!(
+            report
+                .checks
+                .iter()
+                .find(|c| c.name == "runtime-ownership")
+                .unwrap()
+                .status,
+            "pass",
+            "remote placement alone is valid"
+        );
     }
 
     #[tokio::test]

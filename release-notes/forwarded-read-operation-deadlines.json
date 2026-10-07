@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Bound ordinary forwarded client reads and stop their timed-out relay futures.",
+  "replay": {
+    "status": "none",
+    "detail": "No replay, heal or projection-health behavior change. Heal-next is a mutating protocol step; its reported 49.3 s duration is not improved by this change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No table, index, schema version or claim vocabulary change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rule or authority change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Forwarded read envelopes use 15 s including body, queue, relay and response work, plus the supported operation long-poll wait (capped at 10 s), instead of the 120 s bulk budget. Each query keeps its separate 15 s child budget. Only the forwarding route newly drops its handler-owned relay future on timeout; other GET/HEAD handlers retain existing cooperative cancellation. Body timeouts log bounded route, phase and callsite. Terminal actions keep mutation acknowledgement semantics. Public 30 s long-poll and 120 s bulk/doctor budgets remain. A relay may return a generic 504/read-deadline before the owner-specific response because its local envelope does not add the HTTP client hop margin. Read-deadline ends route selection without trying an alternate hop; old gateways may map it to 503/remote-unavailable. Synchronous CPU/SQLite/IO granules still require cooperative checks; async timeouts do not preempt them."
+  },
+  "downtime": {
+    "status": "unknown",
+    "detail": "Normal daemon rollout required; restart and mixed-version behavior not independently qualified."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No settings or data repair required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Rollback restores the previous forwarding budget; no data migration."
+  }
+}
