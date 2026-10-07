@@ -27,8 +27,15 @@ head: it tests that head merged with the current base. The merge queue combines 
 the current `main`; the head does not need to be rebased first. No `pull_request_target` job runs PR code,
 and the gate has only `contents: read` permission. Forks do not receive publishing secrets.
 
+The fast `upgrade-impact` job starts independently on GitHub-hosted `ubuntu-latest`, using only
+Python and Git. It requires a fresh valid upgrade fragment for every PR, including documentation
+changes, checks schema/rules transitions, and refuses changes to existing fragments. It checks
+the effective PR merge against its immutable base, and each integrated PR in a merge group;
+unrelated unreleased main changes do not block a new PR's check. It does not download dependencies
+or compile. Manual dispatch runs the safety tests without inventing a PR delta.
+
 The Linux gate runs two test partitions plus Clippy and fleet compatibility on separate runners.
-`linux-gate` is the aggregate Linux check: it needs the four stage jobs and the named mail redelivery
+`linux-gate` is the aggregate Linux check: it needs `upgrade-impact`, the four stage jobs and the named mail redelivery
 check, and passes only when every one succeeded (a skipped or cancelled stage fails it). The stage jobs use the shape label
 `nscloud-ubuntu-24.04-amd64-8x16-with-features`; `genie-freshness`, `isolation-vm` and `typescript-client`
 use `namespace-profile-linux-x86-64` when they overflow. The `linux-gate` aggregate uses GitHub-hosted

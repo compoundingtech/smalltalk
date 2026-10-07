@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render source-pinned notes; incomplete impact metadata blocks publication only."""
+"""Validate and render source-pinned release upgrade-impact notes."""
 import argparse
 import json
 import math
@@ -155,6 +155,34 @@ def collect(repo, since, source):
         'fragments': [{'path': path, **fragments[path]} for path in selected],
         'versions': {field: [version(repo, since, field), version(repo, source, field)] for field in VERSIONS},
     }
+
+
+def check_pull_request(repo, base, source):
+    """Check the effective merge tree, independently of the unreleased main backlog.
+
+    Each first-parent merge in a queue group needs a fresh fragment. Published
+    fragments are immutable; a later correction or backfill gets its own file.
+    """
+    base, source = resolve(repo, base), resolve(repo, source)
+    if subprocess.run(['git', 'merge-base', '--is-ancestor', base, source], cwd=repo).returncode:
+        raise ImpactError('PR/queue base must be an ancestor of the effective merge source')
+    changes = git(repo, 'diff', '--no-renames', '--name-status', base, source, '--', FRAGMENTS).splitlines()
+    for change in changes:
+        status, path = change.split('\t', 1)
+        if path.endswith('.json') and status != 'A':
+            raise ImpactError(f'{path}: existing fragments are immutable; add a new fragment for corrections')
+    commits = git(repo, 'rev-list', '--first-parent', '--reverse', f'{base}..{source}').splitlines()
+    if not commits:
+        raise ImpactError('no integrated change to classify')
+    for commit in commits:
+        added = git(repo, 'diff', '--no-renames', '--name-only', '--diff-filter=A',
+                    f'{commit}^1', commit, '--', FRAGMENTS).splitlines()
+        fresh = [path for path in added if path.endswith('.json')]
+        if not fresh:
+            raise ImpactError(f'{commit}: add a uniquely named release-notes/NAME.json for this PR, including docs-only changes')
+    # Reuse the publication contract, including explicit statuses, measurements and
+    # declared schema/rules transitions. Only this merge interval is checked here.
+    return collect(repo, base, source)
 
 
 def render(repo, previous, source, tag, repository='compoundingtech/smalltalk', since=None):

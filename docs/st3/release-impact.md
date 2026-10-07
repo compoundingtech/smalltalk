@@ -24,6 +24,14 @@ summary and classifications. Each of these fields requires both `status` and `de
 Use `none` for an explicitly reviewed absence of additional impact, `changed` for known
 impact, or `unknown` with a concrete explanation of what is unresolved and what users should
 do. Omission is invalid. Unknown is visible in notes, never converted into none.
+
+The fast `upgrade-impact` check runs on every PR and merge group using Python and Git, without
+Nix or compilation, and feeds the existing required `linux-gate`. Each integrated PR must add a
+fresh valid fragment, including documentation-only PRs. Missing or malformed metadata and
+undeclared schema/rules transitions prevent merge. The check uses the effective merge tree and
+immutable event base; it does not require unrelated unreleased main changes to be backfilled.
+Existing fragments are immutable: corrections, later measurements and backfills use a new file.
+
 Reviewers check the metadata against the whole change. Labels can draw attention to an impact,
 but do not replace the committed details.
 
@@ -42,10 +50,16 @@ against matching classified transitions. Include intermediate transitions as wel
 endpoints; notes retain every fragment rather than collapsing to the newest version. An
 unchanged numeric schema version does not mean no database changes or safe rollback.
 
+Reproduce the PR check against an effective merge tree (a PR head merged with its base):
+
+```sh
+python3 scripts/check-release-impact --base BASE_COMMIT --source MERGE_COMMIT
+```
+
 ## Operations
 
 The renderer reads fragments and the installation guide from the exact candidate commit,
-never uncommitted files or the publication checkout's newer guide. A newly added or modified
+never uncommitted files or the publication checkout's newer guide. A newly added
 fragment classifies its integrating first-parent commit. Merge commits include their branch
 changes; direct commits require metadata too. Final fragment versions are authoritative.
 Keep older fragments so their impact is available when releasing a wider source interval.
@@ -96,5 +110,6 @@ fails with the missing sources. Explicit unknowns remain reviewable in the repor
 the same notes. Manual dispatch uses that same script. Tag publication invokes the same
 renderer before creating a GitHub draft. Both paths publish the impact report alongside
 the existing exact-source manifest/checksums and refuse publication when classifications
-are incomplete. Main builds and merges continue; no full soak is added per routine release.
+are incomplete. Main builds continue; the PR gate catches missing notes before merge.
+No full soak is added per routine release.
 The existing friend-ready verification requirements remain separate.
