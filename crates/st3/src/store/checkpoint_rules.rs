@@ -128,6 +128,45 @@ pub(crate) fn field_str<'a>(claim: &'a ClaimRecord, name: &str) -> Option<&'a st
         .and_then(Value::as_str)
 }
 
+/// The only kinds eligible for shared replica envelopes under this rules version. Changing a
+/// drop rule must also review this list: existing grouped envelopes retain all neighbours while
+/// any one claim remains retained, even under a future rules version.
+pub(crate) const SHARED_APPEND_KINDS: [&str; 6] = [
+    "message.sent",
+    "message.staged",
+    "message.delivered",
+    "message.read",
+    "message.closed",
+    "work.progress",
+];
+
+pub(crate) fn shared_append_class(
+    kind: &str,
+    actor: Option<&str>,
+    body: &Value,
+) -> Option<&'static str> {
+    if !SHARED_APPEND_KINDS.contains(&kind) {
+        return None;
+    }
+    let candidate = ClaimRecord {
+        id: String::new(),
+        store_index: 0,
+        batch_id: String::new(),
+        subject: String::new(),
+        kind: kind.into(),
+        origin: String::new(),
+        actor: actor.map(str::to_owned),
+        operation_id: None,
+        request_digest: None,
+        body: body.clone(),
+        predecessors: vec![],
+        accepted_at_unix_ms: 0,
+    };
+    slot_of(&candidate)
+        .is_none()
+        .then_some("checkpoint-always-retained")
+}
+
 /// The rule and slot of a claim, or `None` when no rule may drop it.
 pub(crate) fn slot_of(claim: &ClaimRecord) -> Option<(Rule, Vec<String>)> {
     let subject = claim.subject.clone();
@@ -1017,4 +1056,56 @@ pub(crate) fn clear_projections(transaction: &Transaction<'_>) -> Result<()> {
     }
     transaction.execute_batch("DELETE FROM local_observations;")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod shared_append_tests {
+    use super::*;
+
+    #[test]
+    fn every_groupable_kind_is_always_retained_under_current_rules() {
+        for kind in SHARED_APPEND_KINDS {
+            for actor in [None, Some("person/ada"), Some("agent/sample")] {
+                for body in [
+                    json!({"fields":{}}),
+                    json!({"fields":{"incarnation_id":"sample"}}),
+                ] {
+                    let claim = ClaimRecord {
+                        id: "sample".into(),
+                        store_index: 1,
+                        batch_id: "sample".into(),
+                        subject: "sample".into(),
+                        kind: kind.into(),
+                        origin: "sample".into(),
+                        actor: actor.map(str::to_owned),
+                        operation_id: None,
+                        request_digest: None,
+                        body: body.clone(),
+                        predecessors: vec![],
+                        accepted_at_unix_ms: 1234,
+                    };
+                    assert!(
+                        slot_of(&claim).is_none(),
+                        "groupable kind {kind} has a drop rule"
+                    );
+                    assert_eq!(
+                        shared_append_class(kind, actor, &body),
+                        Some("checkpoint-always-retained")
+                    );
+                }
+            }
+        }
+        for kind in [
+            "message.unknown",
+            "harness.limits",
+            "daemon.diagnostic",
+            "harness.observed",
+            "fleet.member-joined",
+            "principal.granted",
+            "rule.set",
+            "work.started",
+        ] {
+            assert_eq!(shared_append_class(kind, None, &json!({"fields":{}})), None);
+        }
+    }
 }

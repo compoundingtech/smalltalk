@@ -76,7 +76,7 @@ impl MutationState {
             missed_rows: AtomicBool::new(false),
             missed_authorizer: AtomicBool::new(false),
         });
-        install_rows(connection, Some(state.clone()));
+        install_rows(connection, Some(state.clone()), false);
         state.install_authorizer(connection);
         Ok(state)
     }
@@ -185,7 +185,7 @@ impl MutationState {
             // This is an explicit missed-observation fence, not polling after unrelated SQL.
             // Hook replacement could hide receipt mutations or DDL, so rescan watched schema
             // and publish one exact-table dirty hint before the next queued job/ACK.
-            install_rows(connection, Some(self.clone()));
+            install_rows(connection, Some(self.clone()), false);
             self.install_authorizer(connection);
             self.schema_dirty.store(true, Ordering::Relaxed);
         }
@@ -321,8 +321,12 @@ fn validate_tables(
     Ok(schema)
 }
 
-pub(crate) fn install_rows(connection: &Connection, state: Option<Arc<MutationState>>) {
-    if state.is_none() {
+pub(crate) fn install_rows(
+    connection: &Connection,
+    state: Option<Arc<MutationState>>,
+    shared: bool,
+) {
+    if state.is_none() && !shared {
         connection.update_hook(None::<fn(rusqlite::hooks::Action, &str, &str, i64)>);
         return;
     }
@@ -334,8 +338,12 @@ pub(crate) fn install_rows(connection: &Connection, state: Option<Arc<MutationSt
         rows: true,
     });
     let installed = state.clone();
-    connection.update_hook(Some(move |_, database: &str, table: &str, _| {
+    let key = unsafe { connection.handle() } as usize;
+    connection.update_hook(Some(move |_, database: &str, table: &str, rowid| {
         let _keep_lease = &lease;
+        if shared {
+            crate::append_group::row_mutated(key, database, table, rowid);
+        }
         if let Some(state) = &state {
             state.observer.mutated(database, table);
         }
@@ -701,7 +709,7 @@ mod tests {
             let tx = connection.transaction().unwrap();
             // This minimal fixture cannot create the full graph scope; dispatch swaps are
             // the same owned operation used by Scope begin/drop.
-            install_rows(&tx, Some(state.clone()));
+            install_rows(&tx, Some(state.clone()), false);
             if replace {
                 tx.update_hook(None::<fn(rusqlite::hooks::Action, &str, &str, i64)>);
                 tx.execute("INSERT INTO receipts VALUES(1,100)", [])
@@ -709,11 +717,41 @@ mod tests {
             } else {
                 tx.execute("INSERT INTO unrelated VALUES(1)", []).unwrap();
             }
-            install_rows(&tx, Some(state.clone()));
+            install_rows(&tx, Some(state.clone()), false);
             tx.commit().unwrap();
             state.resolved(&connection);
             assert_eq!(observer.queries.load(Ordering::Relaxed), u64::from(replace));
         }
         assert_eq!(*observer.deadline.lock().unwrap(), Some(100));
+    }
+    #[test]
+    fn repeated_shared_scopes_preserve_the_existing_row_observer() {
+        let store =
+            crate::Store::open_memory("sample", Arc::new(crate::store::runtime::Plain)).unwrap();
+        let mut held = store.connection.write();
+        held.execute_batch(
+            "CREATE TABLE receipts(id INTEGER PRIMARY KEY,at INTEGER NOT NULL);
+            CREATE INDEX receipts_at ON receipts(at);",
+        )
+        .unwrap();
+        let observer = Arc::new(Receipts::default());
+        let state = MutationState::new(&held, observer.clone()).unwrap();
+        for n in 0..2 {
+            let tx = held.transaction().unwrap();
+            let scope =
+                crate::append_group::Scope::begin_observed(&tx, Some(state.clone())).unwrap();
+            tx.execute(
+                "INSERT INTO receipts VALUES(?1,?2)",
+                rusqlite::params![n, 100 - n],
+            )
+            .unwrap();
+            drop(scope);
+            tx.commit().unwrap();
+            state.resolved(&held);
+            assert_eq!(*observer.deadline.lock().unwrap(), Some(100 - n));
+            held.execute("UPDATE receipts SET at=at+10", []).unwrap();
+            state.resolved(&held);
+            assert_eq!(*observer.deadline.lock().unwrap(), Some(110 - n));
+        }
     }
 }

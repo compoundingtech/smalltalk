@@ -51153,7 +51153,7 @@ fn append_claim_with_subject_fences(
     // One claim in a savepoint of the writer's next batch; its caller hears back once that
     // batch commits.
     graph.connection
-        .batched(|transaction| -> Result<(ClaimRecord, bool), St3Error> {
+        .batched_append(checkpoint_rules::shared_append_class, |transaction| -> Result<(ClaimRecord, bool), St3Error> {
             if let Some((subject, revision, current)) = observer_completion {
                 check_observer_completion(transaction, subject, revision, Some(current))?;
             }

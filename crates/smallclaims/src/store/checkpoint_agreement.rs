@@ -994,30 +994,58 @@ pub fn terms_key(terms: &SealTerms) -> String {
 /// `temp.write_clock` shifts or fixes the clock for a simulation; see
 /// `Store::set_write_clock_offset` and `Store::set_write_clock_at`.
 pub fn write_time(connection: &Connection, origin: &str) -> Result<u128> {
-    let floor: Option<i64> = connection
-        .prepare_cached("SELECT MAX(cut_unix_ms) FROM checkpoints")?
-        .query_row([], |row| row.get(0))?;
-    let newest_own: Option<String> = connection
-        .prepare_cached(
-            "SELECT accepted_at_unix_ms FROM batches WHERE origin=?1
-             ORDER BY replica_sequence DESC LIMIT 1",
-        )?
-        .query_row([origin], |row| row.get(0))
-        .optional()?;
-    let (offset, at): (i64, Option<i64>) = connection
-        .prepare_cached("SELECT offset_ms, at_ms FROM temp.write_clock")
-        .and_then(|mut statement| statement.query_row([], |row| Ok((row.get(0)?, row.get(1)?))))
-        .unwrap_or((0, None));
-    let now = match at {
-        Some(at) => i128::from(at),
-        None => i128::try_from(now_ms()).unwrap_or(i128::MAX) + i128::from(offset),
-    };
-    let now = u128::try_from(now.max(0)).unwrap_or(0);
-    let floor = floor
-        .and_then(|floor| u128::try_from(floor).ok())
-        .unwrap_or(0);
-    let newest_own = newest_own
-        .and_then(|accepted| accepted.parse::<u128>().ok())
-        .unwrap_or(0);
-    Ok(now.max(floor).max(newest_own))
+    Ok(WriteClock::read(connection, origin)?.now())
+}
+
+/// The SQL inputs to the writer clock. Wall time is sampled anew for every claim.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WriteClock {
+    floor: u128,
+    newest_own: u128,
+    offset: i64,
+    at: Option<i64>,
+}
+
+impl WriteClock {
+    pub(crate) fn read(connection: &Connection, origin: &str) -> Result<Self> {
+        let floor: Option<i64> = connection
+            .prepare_cached("SELECT MAX(cut_unix_ms) FROM checkpoints")?
+            .query_row([], |row| row.get(0))?;
+        let newest_own: Option<String> = connection
+            .prepare_cached(
+                "SELECT accepted_at_unix_ms FROM batches WHERE origin=?1
+                 ORDER BY replica_sequence DESC LIMIT 1",
+            )?
+            .query_row([origin], |row| row.get(0))
+            .optional()?;
+        let (offset, at): (i64, Option<i64>) = connection
+            .prepare_cached("SELECT offset_ms, at_ms FROM temp.write_clock")
+            .and_then(|mut statement| statement.query_row([], |row| Ok((row.get(0)?, row.get(1)?))))
+            .unwrap_or((0, None));
+        Ok(Self {
+            floor: floor
+                .and_then(|floor| u128::try_from(floor).ok())
+                .unwrap_or(0),
+            newest_own: newest_own
+                .and_then(|accepted| accepted.parse().ok())
+                .unwrap_or(0),
+            offset,
+            at,
+        })
+    }
+
+    pub(crate) fn now(&self) -> u128 {
+        let now = match self.at {
+            Some(at) => i128::from(at),
+            None => i128::try_from(now_ms()).unwrap_or(i128::MAX) + i128::from(self.offset),
+        };
+        u128::try_from(now.max(0))
+            .unwrap_or(0)
+            .max(self.floor)
+            .max(self.newest_own)
+    }
+
+    pub(crate) fn advance(&mut self, accepted_at: u128) {
+        self.newest_own = self.newest_own.max(accepted_at);
+    }
 }

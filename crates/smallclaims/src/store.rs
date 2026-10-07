@@ -884,11 +884,10 @@ impl Store {
         // that seals, so a start reads it. It is a lower bound that is always safe: sealing only
         // seals batches that still lack an envelope, so a cursor behind the truth costs a longer
         // range, never a missed batch. A store without the cursor, once, finds it the slow way.
-        let max_rowid: i64 = connection.query_row(
-            "SELECT COALESCE(MAX(rowid), 0) FROM batches",
-            [],
-            |row| row.get(0),
-        )?;
+        let max_rowid: i64 =
+            connection.query_row("SELECT COALESCE(MAX(rowid), 0) FROM batches", [], |row| {
+                row.get(0)
+            })?;
         let stored_cursor: Option<i64> = connection
             .query_row(
                 "SELECT value FROM meta WHERE key='seeded_batch_rowid'",
@@ -3213,6 +3212,7 @@ fn seed_replica_envelopes_signed_tx(
     through_rowid: Option<i64>,
     sign: Option<&dyn Fn(&principals::Unsealed<'_>) -> Option<crate::principal::ClaimSignature>>,
 ) -> Result<()> {
+    crate::append_group::invalidate();
     let order = if after_rowid.is_some() {
         "batches.rowid"
     } else {
@@ -8045,21 +8045,50 @@ pub fn append_claim_record_tx(
     predecessors: &[String],
     forced_batch: Option<&str>,
 ) -> Result<ClaimRecord> {
-    let now = write_time(transaction, origin)?;
-    let batch_id = if let Some(batch) = forced_batch {
-        batch.to_owned()
+    let prepared = crate::append_group::prepare(
+        transaction,
+        origin,
+        subject,
+        kind,
+        actor,
+        body,
+        predecessors,
+        forced_batch,
+    )
+    .transpose()?;
+    let (batch_id, now, id) = if let Some(prepared) = &prepared {
+        (
+            prepared.batch_id.clone(),
+            prepared.accepted_at,
+            prepared.id.clone(),
+        )
     } else {
-        let sequence = next_replica_sequence(transaction, origin)?;
-        let previous_hash = previous_batch_hash(transaction, origin)?;
-        let hash = batch_header_hash(origin, sequence, previous_hash.as_deref(), now)?;
-        let id = format!("batch/{origin}/{sequence}/{hash}");
-        transaction.execute(
-            "INSERT INTO batches(id, origin, replica_sequence, previous_hash, hash, accepted_at_unix_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![id, origin, sequence, previous_hash, hash, now.to_string()],
-        )?;
-        id
+        let now = {
+            let _span = crate::profile::span("append/write-time");
+            write_time(transaction, origin)?
+        };
+        let batch_span = crate::profile::span("append/batch-header");
+        let batch_id = if let Some(batch) = forced_batch {
+            batch.to_owned()
+        } else {
+            let sequence = next_replica_sequence(transaction, origin)?;
+            let previous_hash = previous_batch_hash(transaction, origin)?;
+            let hash = batch_header_hash(origin, sequence, previous_hash.as_deref(), now)?;
+            let id = format!("batch/{origin}/{sequence}/{hash}");
+            transaction.execute(
+                "INSERT INTO batches(id, origin, replica_sequence, previous_hash, hash, accepted_at_unix_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![id, origin, sequence, previous_hash, hash, now.to_string()],
+            )?;
+            id
+        };
+        drop(batch_span);
+        let id = {
+            let _span = crate::profile::span("append/claim-hash");
+            claim_hash(&batch_id, subject, kind, origin, actor, body, predecessors)?
+        };
+        (batch_id, now, id)
     };
-    let id = claim_hash(&batch_id, subject, kind, origin, actor, body, predecessors)?;
+    let insert_span = crate::profile::span("append/claim-insert");
     let store_index = insert_claim(
         transaction,
         &id,
@@ -8072,8 +8101,14 @@ pub fn append_claim_record_tx(
         predecessors,
         now,
     )?;
+    drop(insert_span);
     // A device signed this claim before the node wrote it: keep the signature with it.
+    let signature_span = crate::profile::span("append/claim-signature");
     principals::attach_expected_signature_tx(transaction, &id, subject, kind, actor)?;
+    drop(signature_span);
+    if let Some(prepared) = prepared {
+        prepared.complete();
+    }
     Ok(ClaimRecord {
         id,
         store_index,
