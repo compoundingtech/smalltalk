@@ -7,6 +7,7 @@
 
 pub mod adapt;
 mod attach;
+mod clickable;
 mod context;
 #[cfg(test)]
 mod contract;
@@ -1380,10 +1381,10 @@ impl Ui {
             self.hit(
                 Rect {
                     x: start,
-                    width,
+                    width: text::width(&format!("{glyph} {word}")) as u16,
                     ..area
                 },
-                Hit::Help,
+                Hit::Connection,
             );
         }
     }
@@ -1492,6 +1493,14 @@ impl Ui {
             .as_deref()
             .map_or(0, |build| text::width(build) as u16 + 1);
         let mut x = area.x + 1;
+        buf.set_stringn(
+            x,
+            area.y,
+            "Keys: ",
+            area.width.saturating_sub(2) as usize,
+            theme::dim().bg(theme::CRUST),
+        );
+        x += 6;
         for (key, label) in hints {
             let key_text = format!("{key} ");
             let label_text = format!("{label}   ");
@@ -2461,6 +2470,37 @@ impl Ui {
             *state
         };
         let top = state.top;
+        if matches!(
+            Pane::parse(key),
+            Some(Pane::Home(Some(_)) | Pane::Mission(Some(_)) | Pane::Declaration(Some(_)))
+        ) {
+            self.hit(
+                Rect {
+                    height: total.saturating_sub(top).min(height) as u16,
+                    width: area.width.saturating_sub(1),
+                    ..area
+                },
+                Hit::Subject,
+            );
+        }
+        if key.starts_with("chat:") {
+            for (index, (id, start)) in doc.entries.iter().enumerate() {
+                let end = doc.entries.get(index + 1).map_or(total, |(_, line)| *line);
+                let first = (*start).max(top);
+                let last = end.min(top + height);
+                if first < last && id != live::HISTORY_NOTE {
+                    self.hit(
+                        Rect {
+                            x: area.x,
+                            y: area.y + (first - top) as u16,
+                            width: area.width.saturating_sub(1),
+                            height: (last - first) as u16,
+                        },
+                        Hit::Message,
+                    );
+                }
+            }
+        }
         if area.width > 1 && height > 0 {
             self.frame.borrow_mut().read_messages.extend(
                 doc.messages
@@ -2601,6 +2641,7 @@ impl Ui {
             buf.set_line(rect.x, rect.y + offset as u16, line, rect.width);
         }
         self.hit(rect, Hit::Peek(subject.to_owned()));
+        self.links(buf, rect);
         for target in &doc.targets {
             if (target.line as u16) < height {
                 self.hit(
@@ -3114,7 +3155,7 @@ impl Ui {
         }
         let mut doc = Doc::new();
         doc.card(
-            "help · any key closes",
+            "help · any key or click closes",
             theme::ACCENT,
             false,
             inner,
@@ -3246,6 +3287,8 @@ impl Ui {
             0
         } else if id.starts_with("mission/") {
             2
+        } else if id.starts_with("machine/") {
+            3
         } else {
             1
         };
@@ -5066,7 +5109,7 @@ impl Ui {
                         .map(|(_, hit)| hit.clone())
                 };
                 self.conversation_state.selection = None;
-                if let Some(hit) = hit {
+                if let Some(hit) = hit.filter(|hit| !matches!(hit, Hit::Message | Hit::Subject)) {
                     self.click(hit);
                     return;
                 }
@@ -5332,6 +5375,7 @@ impl Ui {
 
     fn click(&mut self, hit: Hit) {
         match hit {
+            Hit::Message | Hit::Subject | Hit::Resize => {}
             Hit::GlassMenu => self.open_palette(Some(4), glass::Open::Here),
             Hit::PaletteSection(section) => self.open_palette(Some(section), glass::Open::Here),
             Hit::NewAgent => self.open_new_agent(None),

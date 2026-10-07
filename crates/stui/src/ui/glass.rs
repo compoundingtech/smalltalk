@@ -1049,6 +1049,7 @@ impl Ui {
         };
         self.frame.borrow_mut().glass_dividers = dividers.clone();
         for super::layout::Divider { rect, side, .. } in dividers {
+            self.hit(rect, Hit::Resize);
             let symbol = match side {
                 Side::Right => "│",
                 Side::Below => "─",
@@ -1175,6 +1176,11 @@ impl Ui {
     /// when the event belonged to a drag.
     pub(crate) fn drag_mouse(&mut self, mouse: crossterm::event::MouseEvent) -> bool {
         use crossterm::event::{MouseButton, MouseEventKind};
+        if matches!(mouse.kind, MouseEventKind::Down(_))
+            && (self.popover.is_some() || self.home_open() || self.palette_open())
+        {
+            return false;
+        }
         let Some(glasses) = self.glasses.as_mut() else {
             return false;
         };
@@ -3212,6 +3218,9 @@ impl Ui {
     /// A click inside a group that is not focused focuses it, and does nothing else. While the
     /// palette is open, only its rows take clicks; a click elsewhere closes it.
     pub(crate) fn glass_click(&mut self, column: u16, row: u16) -> bool {
+        if self.popover.is_some() {
+            return false;
+        }
         // A click outside the sidebar takes the keys from it (it stays shown); inside, the
         // sidebar's own targets act.
         let in_sidebar = {
@@ -3271,6 +3280,17 @@ impl Ui {
             }
             _ => false,
         }
+    }
+
+    pub(super) fn click_focuses_split(&self, column: u16, row: u16) -> bool {
+        self.glasses.as_ref().is_some_and(|glasses| {
+            self.frame
+                .borrow()
+                .glass_leaves
+                .iter()
+                .position(|rect| contains(*rect, column, row))
+                .is_some_and(|group| group != glasses.glass().focus)
+        })
     }
 
     /// Close the focused tab when it is a form that was just finished or cancelled.

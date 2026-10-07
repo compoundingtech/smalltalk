@@ -6,6 +6,11 @@ use super::*;
 type Items = Vec<(String, MenuAction)>;
 type Menu = (String, Items);
 
+pub(super) enum PointMenu {
+    Content(Menu),
+    Glass,
+}
+
 impl MenuAction {
     fn shortcut(&self) -> Option<KeyEvent> {
         let (code, modifiers) = match self {
@@ -48,13 +53,31 @@ fn entry_text(entry: &Entry) -> String {
 impl Ui {
     /// Resolve against the painted layer, rather than selecting or focusing the thing clicked.
     pub(crate) fn open_context_menu(&mut self, column: u16, row: u16) {
+        match self.point_menu(column, row) {
+            Some(PointMenu::Content((title, items))) => {
+                self.cancel_drag();
+                self.context = Some(ContextMenu {
+                    column,
+                    row,
+                    title,
+                    items,
+                    selected: 0,
+                });
+            }
+            Some(PointMenu::Glass) => self.open_glass_context_menu(column, row),
+            None => {}
+        }
+    }
+
+    /// Rendering the pointer hint uses the same resolver as opening the menu.
+    pub(super) fn point_menu(&self, column: u16, row: u16) -> Option<PointMenu> {
         if self.help || self.palette_open() {
-            return;
+            return None;
         }
         let (hit, subject, entry, pane_subject) = {
             let info = self.frame.borrow();
             if !contains(info.area, column, row) {
-                return;
+                return None;
             }
             let cover = info
                 .covers
@@ -99,8 +122,7 @@ impl Ui {
         };
         let menu = if matches!(hit, Some(Hit::GlassTab(..))) {
             // Tab structure has its own existing actions, rather than the subject's actions.
-            self.open_glass_context_menu(column, row);
-            return;
+            return Some(PointMenu::Glass);
         } else if let Some((agent, entry)) = entry {
             self.message_menu(&agent, &entry)
         } else if let Some(subject) = subject {
@@ -114,18 +136,15 @@ impl Ui {
         } else {
             None
         };
-        if let Some((title, items)) = menu {
-            self.cancel_drag();
-            self.context = Some(ContextMenu {
-                column,
-                row,
-                title,
-                items,
-                selected: 0,
+        menu.map(PointMenu::Content).or_else(|| {
+            let on_split = self.frame.borrow().glass_leaves.iter().any(|rect| {
+                contains(*rect, column, row)
+                    || (row.saturating_add(1) == rect.y
+                        && column >= rect.x
+                        && column < rect.right())
             });
-        } else if self.popover.is_none() && !self.home_open() {
-            self.open_glass_context_menu(column, row);
-        }
+            (self.popover.is_none() && !self.home_open() && on_split).then_some(PointMenu::Glass)
+        })
     }
 
     fn subject_menu(&self, subject: &str) -> Option<Menu> {
