@@ -6,6 +6,7 @@ mod arrangements;
 mod arrangements_tests;
 mod glasses;
 pub(crate) mod mailbox_wakes;
+mod mailbox_changes;
 pub mod owned_sets;
 #[cfg(test)]
 mod owned_sets_tests;
@@ -11567,11 +11568,21 @@ impl Store {
         recipient: Option<&str>,
         include_closed: bool,
     ) -> Result<Vec<MessageView>> {
+        self.messages_through(recipient, include_closed, self.index()?)
+    }
+
+    /// A pinned reader must page through its SQLite index, which can lead the process atomic
+    /// between COMMIT and publication of the committed index.
+    pub(crate) fn messages_through(
+        &self,
+        recipient: Option<&str>,
+        include_closed: bool,
+        through: u64,
+    ) -> Result<Vec<MessageView>> {
         smallclaims::touched::note_read(|| match recipient {
             Some(recipient) => format!("mailbox:{recipient}"),
             None => "kind:message.sent".to_owned(),
         });
-        let through = self.index()?;
         let mut after = None;
         let mut all = Vec::new();
         loop {
@@ -15326,23 +15337,28 @@ impl Store {
             .map_err(Into::into)
     }
 
-    /// What a mailbox stream's snapshot can depend on, read before the snapshot is taken. A change
-    /// after it to any of that brings a new snapshot; see [`Store::mailbox_changed_since`].
+    /// Durable cursors and the selected declaration/owner in one SQLite read snapshot.
+    /// Streams advance this watermark only after capturing their corresponding delta.
     pub(crate) fn mailbox_watermark(
         &self,
         fence: &crate::mailbox::Fence,
     ) -> Result<MailboxWatermark, St3Error> {
-        let index = self.index().map_err(internal)?;
         let connection = self.readers.get();
-        let local = connection
-            .prepare_cached("SELECT COALESCE(MAX(id), 0) FROM local_observations")
+        // The process-wide committed index may advance beyond a pinned reader. Capture both
+        // cursors from its SQLite snapshot, or a concurrent commit could be skipped forever.
+        let (index, local) = connection
+            .prepare_cached("SELECT COALESCE((SELECT MAX(store_index) FROM claims),0),
+                                    COALESCE((SELECT MAX(id) FROM local_observations),0)")
             .map_err(internal)?
-            .query_row([], |row| row.get(0))
+            .query_row([], |row| Ok((row.get(0)?, row.get(1)?)))
             .map_err(internal)?;
         Ok(MailboxWatermark {
             index,
             local,
             owner: mailbox_owner_key(&connection, fence)?,
+            desired: connection.prepare_cached("SELECT claim_id FROM desired WHERE subject=?1")
+                .map_err(internal)?.query_row([&fence.subject], |row| row.get(0))
+                .optional().map_err(internal)?,
         })
     }
 
@@ -15351,6 +15367,7 @@ impl Store {
     /// message sent to it or newly declared, or a claim of a message in its last snapshot. The
     /// local dispatcher targets dependent streams; this durable check still filters coalesced
     /// wakes, without trusting the ephemeral routing index for correctness.
+    #[cfg(test)]
     pub(crate) fn mailbox_changed_since(
         &self,
         fence: &crate::mailbox::Fence,
@@ -20465,6 +20482,7 @@ pub(crate) struct MailboxWatermark {
     index: u64,
     local: i64,
     owner: Option<(String, i64, bool)>,
+    desired: Option<String>,
 }
 
 /// The seat channel's current owner, and whether `fence`'s binding still exists.
