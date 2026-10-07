@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Prepare opt-in transactional old/new capture for collection source adapters without activating production readers.",
+  "replay": {"status": "none", "detail": "No source scan, replay, backfill or automatic recovery. Populated sources and changed identities remain unqualified until explicit certified installation."},
+  "schema": {"status": "changed", "detail": "Only explicit store::collection_ivm::install creates st3_ivm_capture_state, st3_ivm_capture, st3_ivm_insert_before and selected-source triggers. Ordinary Store opens install none; no numeric database schema version changes."},
+  "rules": {"status": "none", "detail": "No projection digest, claim registry or rule changes."},
+  "compatibility": {"status": "none", "detail": "No collection protocol, client schema, generated client or default reader changes. Supported explicit capture schemas retain all columns and the full primary key; alternate unique aliases and virtual/expression keys remain unqualified."},
+  "downtime": {"status": "none", "detail": "No default startup or activation work beyond normal deployment restart. Capture installation is explicit and independent of existing production readers."},
+  "manual": {"status": "none", "detail": "No default deployment action. Source owners must prove schema, transaction-start/precommit coverage, canonical/local dependencies, bypass fencing and namespace publication before any production registration."},
+  "recovery": {"status": "unknown", "detail": "Persisted explicit capture gaps survive reopen and cannot be acknowledged away. This preparation patch does not implement replacement serving lifetimes or guard raw/old-writer commits; such sources must remain unavailable until qualified."}
+}

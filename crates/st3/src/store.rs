@@ -122,6 +122,7 @@ mod unread_mail;
 mod agent_messages;
 mod conversation_reads;
 mod runtime;
+pub mod collection_ivm;
 #[cfg(test)]
 mod tombstones_tests;
 pub use runtime::SmalltalkRuntime;
