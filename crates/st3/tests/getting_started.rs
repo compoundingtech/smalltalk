@@ -320,6 +320,7 @@ fn offline_strict_checks_computed_evidence_without_contacting_a_daemon() {
     );
     assert_eq!(std::fs::read(&input).unwrap(), before);
     let connection = rusqlite::Connection::open(&input).unwrap();
+    smallclaims::store::configure_projection_writer(&connection).unwrap();
     // An unsupported schema identifier prevents a computed digest audit from finishing.
     connection
         .execute_batch("ALTER TABLE operations ADD COLUMN \"unsupported name\" TEXT")
@@ -348,6 +349,7 @@ fn offline_strict_checks_computed_evidence_without_contacting_a_daemon() {
         "ordinary offline audit permits computed warnings"
     );
     let connection = rusqlite::Connection::open(&input).unwrap();
+    smallclaims::store::configure_projection_writer(&connection).unwrap();
     connection
         .execute("UPDATE operations SET state='conflict'", [])
         .unwrap();
