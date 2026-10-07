@@ -62,7 +62,7 @@ impl Ui {
             Hit::Actions(_) => "agent actions".into(),
             Hit::Field(_) => "focus field [Tab]".into(),
             Hit::Revoke(_) => "ask to revoke; y confirms".into(),
-            Hit::Detach => "leave terminal [Ctrl+\\]".into(),
+            Hit::Detach => "leave terminal [Ctrl+\\ or Ctrl+T twice]".into(),
             Hit::GlassMenu => "spaces [Ctrl+G]".into(),
             Hit::PaletteSection(1) => "agents [Ctrl+2]".into(),
             Hit::PaletteSection(2) => "missions [Ctrl+3]".into(),

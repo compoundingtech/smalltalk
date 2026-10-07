@@ -324,6 +324,9 @@ struct ChatState {
     editing: bool,
 }
 
+/// How long a second Ctrl+T may follow the first and leave the terminal.
+const LEAVE_TAP: Duration = Duration::from_millis(400);
+
 pub struct Ui {
     world: World,
     tab: usize,
@@ -395,6 +398,8 @@ pub struct Ui {
     pub(crate) context: Option<glass::ContextMenu>,
     /// A Ctrl-C or Ctrl-D pressed once in a terminal, waiting for its confirming second press.
     terminal_confirm: Option<(KeyCode, Instant)>,
+    /// A Ctrl+T held back from an attached terminal: a second press soon leaves it.
+    terminal_hold: Option<(KeyEvent, Instant)>,
     /// The New mission form: title, request, mission id, workspace; and the focused field.
     new_mission: Option<([String; 4], usize)>,
     /// A device awaiting a confirmed revoke.
@@ -525,6 +530,7 @@ impl Ui {
             simple: false,
             terminal: None,
             terminal_confirm: None,
+            terminal_hold: None,
             new_mission: None,
             revoke: None,
             snoozed: HashSet::new(),
@@ -3106,7 +3112,7 @@ impl Ui {
                     "this agent's details beside it (ctrl+i too, where the terminal tells it from tab)",
                 ),
                 ("drag", "select text in one pane; release copies it"),
-                ("ctrl+]  ctrl+\\", "attach the agent's terminal; leave it"),
+                ("ctrl+]  ctrl+\\  ctrl+t ctrl+t", "attach the agent's terminal; leave it (or Ctrl+T twice)"),
                 (
                     "ctrl+r  backspace",
                     "a message that was not sent: send it again; take it back to change",
@@ -3401,7 +3407,49 @@ impl Ui {
         .flatten()
     }
 
+    /// Leave the attached terminal: an agent's tab turns back into its conversation; a shell's
+    /// tab stays a shell, detached.
+    fn leave_terminal(&mut self) {
+        self.terminal_selection_mode = false;
+        self.terminal_selecting = false;
+        self.terminal_hold = None;
+        if let Some(Pane::Terminal(agent)) = self.focused_pane()
+            && agent.starts_with("agent/")
+        {
+            self.swap_focused_pane(Pane::Agent(Some(agent)));
+            self.terminal = None;
+        }
+        self.effects.push(Effect::CloseTerminal);
+    }
+
+    /// A Ctrl+T held back goes to the program once no second press came to leave with.
+    pub(crate) fn step_terminal_hold(&mut self) {
+        if let Some((key, at)) = self.terminal_hold
+            && at.elapsed() >= LEAVE_TAP
+        {
+            self.terminal_hold = None;
+            if self.terminal_focused() {
+                self.terminal_key(key);
+            }
+        }
+    }
+
     pub fn key(&mut self, key: KeyEvent) {
+        let ctrl_t = key.code == KeyCode::Char('t') && key.modifiers == KeyModifiers::CONTROL;
+        if self.terminal_hold.is_some() {
+            if ctrl_t && key.kind != KeyEventKind::Press {
+                // The held press's own repeat or release goes with it.
+                return;
+            }
+            if !ctrl_t {
+                // Anything else first lets the held key go, so the program sees them in order.
+                if let Some((held, _)) = self.terminal_hold.take()
+                    && self.terminal_focused()
+                {
+                    self.terminal_key(held);
+                }
+            }
+        }
         if key.kind != KeyEventKind::Press {
             // Repeats and releases belong to the child, never to stui shortcuts or confirmations.
             if self.terminal_focused()
@@ -3425,17 +3473,7 @@ impl Ui {
             && key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('\\' | '4'))
         {
-            self.terminal_selection_mode = false;
-            self.terminal_selecting = false;
-            // In glasses an agent's tab turns back into its conversation; a shell's tab
-            // stays a shell, detached.
-            if let Some(Pane::Terminal(agent)) = self.focused_pane()
-                && agent.starts_with("agent/")
-            {
-                self.swap_focused_pane(Pane::Agent(Some(agent)));
-                self.terminal = None;
-            }
-            self.effects.push(Effect::CloseTerminal);
+            self.leave_terminal();
             return;
         }
         self.sync_terminal_slot();
@@ -3496,6 +3534,18 @@ impl Ui {
                     self.terminal_selecting = false;
                     self.terminal_confirm = None;
                     self.flash("Terminal input modes reset");
+                }
+                // Ctrl+T twice leaves the terminal. The first press is held back a moment, and
+                // the program gets it if no second one comes (a shell swaps two characters).
+                KeyCode::Char('t') if key.modifiers == KeyModifiers::CONTROL => {
+                    if self
+                        .terminal_hold
+                        .is_some_and(|(_, at)| at.elapsed() < LEAVE_TAP)
+                    {
+                        self.leave_terminal();
+                    } else {
+                        self.terminal_hold = Some((key, Instant::now()));
+                    }
                 }
                 // An agent's terminal asks twice before Ctrl-C or Ctrl-D reach it, so a reflex
                 // never stops an agent; a shell gets them at once, as in any terminal.
