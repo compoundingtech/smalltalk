@@ -7358,7 +7358,6 @@ fn consume_terminal_attachment(
     capability: Option<&str>,
 ) -> Result<(), ApiError> {
     consume_terminal_attachment_mode(state, session, terminal_id, incarnation, capability, None)
-        .map(|_| ())
 }
 
 fn consume_terminal_attachment_mode(
@@ -7368,7 +7367,7 @@ fn consume_terminal_attachment_mode(
     incarnation: &str,
     capability: Option<&str>,
     raw_mode: Option<&str>,
-) -> Result<Option<String>, ApiError> {
+) -> Result<(), ApiError> {
     let lookup_span = crate::profile::span("terminal/capability-lookup");
     let capability = capability
         .filter(|value| !value.is_empty())
@@ -7391,9 +7390,7 @@ fn consume_terminal_attachment_mode(
         && raw_mode.is_none_or(|_| {
             field("person_id").and_then(Value::as_str) == Some(session.authority_actor.as_str())
         })
-        && (raw_mode != Some("peek")
-            || field("raw_authorization_epoch").and_then(Value::as_str)
-                == Some(raw_terminal::authorization_epoch(state, session)?.as_str()))
+        && raw_mode != Some("peek")
         && raw_live.as_ref().is_none_or(|live| {
             field("owner_host_id").and_then(Value::as_str) == Some(live.owner_host_id.as_str())
                 && field("runtime_id").and_then(Value::as_str) == Some(live.runtime_id.as_str())
@@ -7420,7 +7417,7 @@ fn consume_terminal_attachment_mode(
     }
     if raw_mode.is_none() {
         // A projected-screen capability is a lease and stays valid for more streams.
-        return Ok(None);
+        return Ok(());
     }
     let _span = crate::profile::span("terminal/capability-consume");
     state
@@ -7441,9 +7438,7 @@ fn consume_terminal_attachment_mode(
         })
         .map_err(|_| forbidden("the terminal stream capability was already consumed"))?;
     signal_changed(state);
-    Ok(field("raw_authorization_epoch")
-        .and_then(Value::as_str)
-        .map(str::to_owned))
+    Ok(())
 }
 
 fn detach_terminal_attachment(

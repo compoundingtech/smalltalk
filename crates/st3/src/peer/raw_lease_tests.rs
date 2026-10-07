@@ -239,6 +239,48 @@ async fn accepted_owner_proof_releases_peek_before_next_heartbeat() {
 }
 
 #[tokio::test]
+async fn authenticated_and_capability_peek_have_no_commits_and_retain_revocation() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let pair = lease_pair().await;
+    let commits = Arc::new(AtomicUsize::new(0));
+    let observed = commits.clone();
+    let _observer = pair.gateway.store.observe_commits(move |_| {
+        observed.fetch_add(1, Ordering::Relaxed);
+    });
+    let observed = commits.clone();
+    let _owner_observer = pair.owner.store.observe_commits(move |_| {
+        observed.fetch_add(1, Ordering::Relaxed);
+    });
+    assert!(pair.client.raw_terminal_peek("terminal/agent/raw-seat", "stale").await.is_err());
+    let mut peek = pair.client
+        .raw_terminal_peek("terminal/agent/raw-seat", &pair.incarnation).await.unwrap();
+    peek.stream.write_all(&pty_core::protocol::encode_peek(false, true)).await.unwrap();
+    loop {
+        let packet = raw_packet(&mut peek.stream).await;
+        if packet.type_ == pty_core::protocol::MessageType::Screen {
+            break;
+        }
+    }
+    peek.activity.selected_use().await.unwrap();
+    let attachment = pair.client.raw_terminal_attachment(
+        "terminal/agent/raw-seat", &pair.incarnation, st3_client::RawTerminalMode::Peek,
+    ).await.unwrap();
+    let mut browser = pair.client.raw_terminal_stream_controlled(&attachment).await.unwrap();
+    assert!(pair.client.raw_terminal_stream_controlled(&attachment).await.is_err(),
+        "a browser PEEK capability must remain single-use");
+    assert_eq!(commits.load(Ordering::Relaxed), 0, "PEEK wrote to a store");
+    lease_claim(
+        &pair.gateway.store,
+        "custom/client/lease-pairing",
+        "custom.client.pairing-revoked",
+        serde_json::json!({"device_id":"lease-fixture"}),
+    );
+    lease_eof(&mut peek.stream).await;
+    lease_eof(&mut browser.stream).await;
+    assert!(pair.client.raw_terminal_peek("terminal/agent/raw-seat", &pair.incarnation).await.is_err());
+}
+
+#[tokio::test]
 async fn raw_lease_revocation_crosses_two_daemons_without_graph_replication() {
     let pair = lease_pair().await;
     let mut first = leased_peek(&pair).await;

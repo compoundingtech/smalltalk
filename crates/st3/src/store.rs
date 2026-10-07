@@ -1059,7 +1059,6 @@ enum SubjectStatusMode {
     /// conflicts. Provenance is only the last canonical claim, and only without a declaration.
     AgentCard,
 }
-
 /// One subject's status at `at_index`, and the action it asks of its host when it is current and
 /// differs from what is declared. With `owner_filter`, a subject another run owns is skipped.
 fn subject_status_at(
@@ -10025,6 +10024,7 @@ impl Store {
     /// The fields used by live terminal fences, with the same authority decisions as `status`.
     pub(crate) fn runtime_authority(&self, subject: &str) -> Result<Option<RuntimeAuthority>> {
         smallclaims::touched::note_read(|| subject.to_owned());
+
         let connection = self.readers.get();
         // Eligibility, inherited fields and unknown claims must share one snapshot: a rival
         // arriving between SELECTs must not be paired with the earlier single origin.
