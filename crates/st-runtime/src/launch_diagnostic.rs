@@ -2,6 +2,40 @@
 use std::collections::BTreeMap;
 
 pub fn safe_tail(text: &str, environment: &BTreeMap<String, String>) -> String {
+    // A marker can introduce a multi-line secret or transcript. Withhold the whole
+    // captured window, including adjacent lines that have no label of their own.
+    let lower = text.to_ascii_lowercase();
+    if [
+        "authorization",
+        "bearer ",
+        "password",
+        "client_secret",
+        "secret",
+        "token",
+        "cookie",
+        "prompt",
+        "transcript",
+        "apikey",
+        "credential",
+        "api_key",
+        "api key",
+        "sk-",
+        "ghp_",
+        "github_pat_",
+        "akia",
+        "-----begin",
+        "\"role\"",
+        "\"messages\"",
+        "\"content\"",
+        "\"text\"",
+        "user:",
+        "assistant:",
+    ]
+    .iter()
+    .any(|word| lower.contains(word))
+    {
+        return "[startup output withheld]".into();
+    }
     let mut lines = text
         .lines()
         .rev()
@@ -12,38 +46,8 @@ pub fn safe_tail(text: &str, environment: &BTreeMap<String, String>) -> String {
             }
             let mut line = line
                 .chars()
-                .take(512)
                 .filter(|ch| !ch.is_control())
                 .collect::<String>();
-            let lower = line.to_ascii_lowercase();
-            if [
-                "authorization",
-                "bearer ",
-                "password",
-                "client_secret",
-                "secret",
-                "token=",
-                "token:",
-                "apikey",
-                "credential",
-                "api_key",
-                "api key",
-                "sk-",
-                "ghp_",
-                "github_pat_",
-                "akia",
-                "-----begin",
-                "\"role\"",
-                "\"messages\"",
-                "\"content\"",
-                "user:",
-                "assistant:",
-            ]
-            .iter()
-            .any(|word| lower.contains(word))
-            {
-                return "[startup line withheld]".into();
-            }
             for (key, value) in environment {
                 if !value.is_empty()
                     && ["KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "AUTH"]
@@ -77,9 +81,24 @@ mod tests {
         );
         let tail = safe_tail(&text, &env);
         assert!(tail.len() <= 2048);
-        assert!(tail.ends_with("fixture launch rejected"));
+        assert_eq!(tail, "[startup output withheld]");
+        let ordinary = safe_tail(
+            &format!("{}\nfixture launch rejected", "é".repeat(3000)),
+            &env,
+        );
+        assert!(ordinary.len() <= 2048 && ordinary.ends_with("fixture launch rejected"));
         for private in ["abc", "private prompt", "private-value"] {
             assert!(!tail.contains(private));
+        }
+    }
+    #[test]
+    fn multiline_transcript_content_and_unlabelled_secret_values_are_withheld_together() {
+        for text in [
+            "{\n  \"role\": \"assistant\",\n  \"text\": \"private reply\"\n}",
+            "api_key:\n  private-value\nfixture rejected",
+        ] {
+            let tail = safe_tail(text, &BTreeMap::new());
+            assert_eq!(tail, "[startup output withheld]");
         }
     }
 }
