@@ -120,6 +120,7 @@ mod lanes;
 mod operations;
 mod unread_mail;
 mod agent_messages;
+pub mod agent_view;
 mod conversation_reads;
 mod runtime;
 #[cfg(test)]
