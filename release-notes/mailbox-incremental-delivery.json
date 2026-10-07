@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Refresh native mailbox streams from durable message changes and avoid periodic whole-mailbox reads",
+  "replay": {"status": "none", "detail": "The initial connection snapshot and existing recent-unoffered recovery remain. Steady reads use a per-connection durable cursor; seat declaration or rollout changes explicitly resynchronize. No history replay or projection rebuild is introduced."},
+  "schema": {"status": "none", "detail": "Uses existing claim rowid, subject/kind and local-observation indexes; no schema migration, table, index or trigger is added."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and fleet coordination are unchanged."},
+  "compatibility": {"status": "none", "detail": "Mailbox frames, durable message identities, canonical ordering, binding/incarnation fences and receipt acknowledgements retain their existing protocol. Notifications remain hints; durable cursor checks recover missed and coalesced wakes."},
+  "downtime": {"status": "none", "detail": "No additional interruption beyond the normal runtime rollout is required."},
+  "manual": {"status": "none", "detail": "No manual steps or starting-state transitions are required."},
+  "recovery": {"status": "none", "detail": "Transient read failures reconnect under the existing owner and no-replay policy. The cursor and materialized connection state are disposable and reconstructed on reconnect."}
+}
