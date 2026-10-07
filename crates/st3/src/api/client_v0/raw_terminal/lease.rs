@@ -245,10 +245,18 @@ fn snapshot(
 ) -> anyhow::Result<String> {
     membership.validate(connection, binding)?;
     let subject = terminal_subject(&binding.terminal);
-    let (origin, runtime) = latest(connection, &subject, "runtime.observed")?
+    let runtime = Store::runtime_authority_on(connection, &subject)?
         .ok_or_else(|| anyhow::anyhow!("runtime missing"))?;
-    let fields = runtime.get("fields").unwrap_or(&runtime);
-    anyhow::ensure!(client_host_id(&origin) == binding.owner, "owner changed");
+    anyhow::ensure!(
+        matches!(runtime.reachability.as_str(), "reachable" | "local"),
+        "runtime authority indeterminate"
+    );
+    let origin = runtime.actual_origin.as_deref()
+        .ok_or_else(|| anyhow::anyhow!("runtime owner missing"))?;
+    let actual = runtime.actual.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("runtime missing"))?;
+    let fields = actual.get("fields").unwrap_or(actual);
+    anyhow::ensure!(client_host_id(origin) == binding.owner, "owner changed");
     anyhow::ensure!(
         fields.get("incarnation_id").and_then(Value::as_str) == Some(binding.incarnation.as_str()),
         "incarnation changed"

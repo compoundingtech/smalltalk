@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Wait for the restarted driver to be ready before the subagent harness-kill test",
+  "replay": {"status": "none", "detail": "Test ordering only; no runtime replay change."},
+  "schema": {"status": "none", "detail": "No database schema change."},
+  "rules": {"status": "none", "detail": "No checkpoint rules change."},
+  "compatibility": {"status": "none", "detail": "Uses existing client readiness fields in the test; no client, wire or harness contract change."},
+  "downtime": {"status": "none", "detail": "No service lifecycle change or additional interruption."},
+  "manual": {"status": "none", "detail": "No installation or operator steps required."},
+  "recovery": {"status": "none", "detail": "No runtime or database recovery change."}
+}

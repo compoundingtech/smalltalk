@@ -5620,10 +5620,10 @@ async fn run_up(args: UpArgs) -> Result<()> {
             "startup/project-replication-backlog",
             |progress| startup.progress(progress),
         )
-    })?;
+    }).context("startup projection failed; stopping before daemon.started and runtime initialization")?;
     if !projected {
         eprintln!(
-            "st: the replicated projection is stale; the daemon will use its last good graph"
+            "st: the replicated projection remains deferred; the daemon will use its last good graph"
         );
     }
     if admission.unknown != 0 {
@@ -5750,11 +5750,14 @@ async fn run_up(args: UpArgs) -> Result<()> {
             },
         ));
     }
+    recycle_idle_wal(config.state_dir.join("claims.sqlite3"), Arc::downgrade(&store));
+    let _contention_retry = retry_projection_contention(Arc::downgrade(&store), notify.clone(), event_notify.clone(), config.state_dir.clone());
     tokio::spawn(convert_envelope_payloads(store.clone()));
     tokio::spawn(trim_local_observations(
         store.clone(),
         config.observations.clone(),
     ));
+    tokio::spawn(catch_up_account_limits(store.clone(), notify.clone()));
     tokio::spawn(st3::recorder_receipts::run(
         store.clone(),
         st3::recorder::receipt_path(&config.state_dir),
@@ -7883,10 +7886,14 @@ async fn run_inspect(client: &Client, args: InspectArgs, json_output: bool) -> R
             urlencoding::encode(&args.subject)
         ))
         .await?;
-    print_value(
-        &json!({ "status": status, "recent_claims": claims.claims }),
-        json_output,
-    )
+    let mut shown = json!({ "status": status, "recent_claims": claims.claims });
+    // Who signed a message a person wrote, and whether that checks.
+    if args.subject.starts_with("message/")
+        && let Some(provenance) = message_provenance(client, &args.subject).await
+    {
+        shown["provenance"] = provenance;
+    }
+    print_value(&shown, json_output)
 }
 
 async fn run_trace(client: &Client, args: TraceArgs, json_output: bool) -> Result<()> {
@@ -13720,6 +13727,11 @@ fn render_client_agent(
         agent.driver.as_deref().unwrap_or("none"),
         agent.harness_state.as_deref().unwrap_or("unobserved")
     );
+    if agent.blocked_on.as_deref() == Some("human")
+        && agent.ask.as_deref() == Some("permission")
+    {
+        let _ = writeln!(output, "AWAITING     approval");
+    }
     if let Some(todo) = &agent.todo {
         let snapshot = &todo.snapshot;
         let _ = write!(output, "Todo         ");
@@ -15636,10 +15648,18 @@ async fn run_message(
                 );
             }
             if json_output {
-                if messages.len() == 1 {
-                    print_value(&messages[0], true)?;
+                let mut shown = Vec::with_capacity(messages.len());
+                for message in &messages {
+                    let mut value = serde_json::to_value(message)?;
+                    if let Some(provenance) = message_provenance(client, &message.subject).await {
+                        value["provenance"] = provenance;
+                    }
+                    shown.push(value);
+                }
+                if shown.len() == 1 {
+                    print_value(&shown[0], true)?;
                 } else {
-                    print_value(&messages, true)?;
+                    print_value(&shown, true)?;
                 }
             } else {
                 for (index, message) in messages.iter().enumerate() {
@@ -15654,6 +15674,9 @@ async fn run_message(
                     } else {
                         println!("Message: {}", message.subject);
                         println!("From: {}", message.from);
+                        if let Some(provenance) = message_provenance(client, &message.subject).await {
+                            println!("Signed: {}", provenance_line(&provenance));
+                        }
                         println!("To: {}", message.to);
                         if let Some(title) = &message.title {
                             println!("Subject: {title}");
@@ -16228,6 +16251,39 @@ fn message_mission_intent(
     mission_body.nodes_mut().push(completion);
     mission.set_children(mission_body);
     publication_document(mission)
+}
+
+/// Who signed a message a person wrote, as the daemon read it: `None` for an agent's message or a
+/// daemon that does not say.
+async fn message_provenance(client: &Client, reference: &str) -> Option<Value> {
+    let reference = normalize_message_reference(reference);
+    let read: Value = client
+        .get(&format!(
+            "/v1/messages/read/{}",
+            urlencoding::encode(&reference)
+        ))
+        .await
+        .ok()?;
+    read.get("provenance").cloned()
+}
+
+/// A provenance as one line: `verified · person/example · example phone (secure enclave) · p256:BPLX…`.
+fn provenance_line(provenance: &Value) -> String {
+    let text = |field: &str| provenance.get(field).and_then(Value::as_str);
+    let mut parts = vec![text("verdict").unwrap_or("unknown").to_owned()];
+    if let Some(reason) = text("reason") {
+        parts.push(reason.to_owned());
+    }
+    for field in ["signer", "device"] {
+        if let Some(value) = text(field) {
+            parts.push(value.to_owned());
+        }
+    }
+    if let Some(key) = text("key") {
+        let shown: String = key.chars().take(16).collect();
+        parts.push(format!("{shown}…"));
+    }
+    parts.join(" · ")
 }
 
 async fn read_message(client: &Client, reference: &str) -> Result<MessageView> {
@@ -20914,9 +20970,17 @@ fn work_incarnation_key(incarnation: Option<&str>) -> String {
 }
 
 async fn renew_claimed_work(client: &Client, subject: &str, minute: u64) -> Result<()> {
+    let work: Vec<StepRunView> = client
+        .get(&format!("/v1/work?actor={}", urlencoding::encode(subject)))
+        .await?;
+    // Most resident seats hold no work. Only a held claim needs the status reduction
+    // that proves its harness incarnation is still live before renewing the lease.
+    if !work.iter().any(|step| work_claim_is_held_by(step, subject)) {
+        return Ok(());
+    }
     let status: StatusResponse = client
         .get(&format!(
-            "/v1/status?subject={}",
+            "/v1/status?subject={}&harness_only=true",
             urlencoding::encode(subject)
         ))
         .await?;
@@ -20925,9 +20989,6 @@ async fn renew_claimed_work(client: &Client, subject: &str, minute: u64) -> Resu
         .iter()
         .find(|candidate| candidate.subject == subject)
         .and_then(|candidate| candidate.harness.as_ref());
-    let work: Vec<StepRunView> = client
-        .get(&format!("/v1/work?actor={}", urlencoding::encode(subject)))
-        .await?;
     let mut failure = None;
     for step in work
         .into_iter()
@@ -21040,15 +21101,19 @@ fn renewal_lost_its_claim(error: &anyhow::Error) -> bool {
     )
 }
 
+fn work_claim_is_held_by(step: &StepRunView, subject: &str) -> bool {
+    matches!(
+        step.status.as_str(),
+        "claimed" | "working" | "verifying" | "blocked"
+    ) && step.claimant.as_deref() == Some(subject)
+}
+
 fn work_claim_has_active_harness(
     step: &StepRunView,
     subject: &str,
     harness: Option<&CurrentHarnessView>,
 ) -> bool {
-    matches!(
-        step.status.as_str(),
-        "claimed" | "working" | "verifying" | "blocked"
-    ) && step.claimant.as_deref() == Some(subject)
+    work_claim_is_held_by(step, subject)
         && harness.is_some_and(|harness| {
             harness.state != "ended"
                 && step.claim_incarnation.as_deref() == Some(harness.incarnation_id.as_str())
@@ -22173,6 +22238,608 @@ async fn enforce_account_limits(store: Arc<Store>, policy: st3::store::LimitsPol
     }
 }
 
+// One worker coalesces numeric contention generations. Three scheduled calls per episode,
+// at 30/60/120 seconds, preserve the existing 30 s catch-up throttle. A later external
+// contention can start a new episode; persistent failure alone cannot reset this budget.
+#[derive(Default)]
+struct ProjectionContentionRetry {
+    observed: u64,
+    attempt: usize,
+    due: Option<tokio::time::Instant>,
+}
+impl ProjectionContentionRetry {
+    const DELAYS: [Duration; 3] = [
+        Duration::from_secs(30),
+        Duration::from_secs(60),
+        Duration::from_secs(120),
+    ];
+    fn poll(
+        &mut self,
+        now: tokio::time::Instant,
+        generation: u64,
+        deferred: bool,
+    ) -> Option<usize> {
+        if !deferred {
+            self.observed = generation;
+            self.attempt = 0;
+            self.due = None;
+            return None;
+        }
+        if self.due.is_none() && generation != self.observed {
+            self.observed = generation;
+            self.attempt = 0;
+            self.due = Some(now + Self::DELAYS[0]);
+        }
+        if self.due.is_none_or(|due| now < due) {
+            return None;
+        }
+        self.due = None;
+        self.attempt += 1;
+        Some(self.attempt)
+    }
+    fn finish(&mut self, now: tokio::time::Instant, generation: u64, contention_or_throttle: bool) {
+        self.observed = generation;
+        self.due = if contention_or_throttle && self.attempt < Self::DELAYS.len() {
+            Some(now + Self::DELAYS[self.attempt])
+        } else {
+            None
+        };
+    }
+}
+
+fn retry_projection_contention(
+    store: std::sync::Weak<Store>,
+    notify: Arc<Notify>,
+    event_notify: watch::Sender<u64>,
+    state_dir: PathBuf,
+) -> tokio::task::JoinHandle<()> {
+    retry_projection_contention_observed(store, notify, event_notify, state_dir, |_| {})
+}
+
+// The observer is a no-op in the daemon; owned tests use it to synchronize on actual
+// backoff entry rather than assume a task has polled after a virtual-time advance.
+fn retry_projection_contention_observed(
+    store: std::sync::Weak<Store>,
+    notify: Arc<Notify>,
+    event_notify: watch::Sender<u64>,
+    state_dir: PathBuf,
+    mut on_poll: impl FnMut(bool) + Send + 'static,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut schedule = ProjectionContentionRetry::default();
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let Some(store) = store.upgrade() else { break };
+            let generation = store.projection_contention_generation();
+            let attempt = schedule.poll(
+                tokio::time::Instant::now(), generation, store.replication_projection_deferred());
+            on_poll(schedule.due.is_some());
+            let Some(attempt) = attempt else { continue };
+            // Only this task schedules these attempts. The existing projection mutex also
+            // serializes them with receive/wake passes. Store ownership ends at attempt return.
+            let result = tokio::task::spawn_blocking(move || {
+                let result = store.project_replication_backlog_unless_catching_up();
+                (result, store.projection_contention_generation(), store.replication_projection_deferred())
+            })
+            .await;
+            let still_deferred = match &result {
+                Ok((_, _, deferred)) => Some(*deferred),
+                Err(_) => None,
+            };
+            let (recovered, retry, generation, outcome) = match result {
+                // Own success cannot advance contention generation. Retain the pre-call
+                // watermark, so an external contention racing the success is observed on
+                // the next poll rather than cancelled as part of the completed episode.
+                Ok((Ok(Some(true)), _current, _)) => (true, false, generation, "projected"),
+                Ok((Ok(None), current, _)) => (false, true, current, "catch-up-throttled"),
+                Ok((Ok(Some(false)), current, _)) => {
+                    (false, current != generation, current, "deferred")
+                }
+                Ok((Err(error), current, _)) => {
+                    let busy = error
+                        .downcast_ref::<smallclaims::Error>()
+                        .is_some_and(|error| error.is_sqlite_contention());
+                    (
+                        false,
+                        busy,
+                        current,
+                        if busy {
+                            "sqlite-contention"
+                        } else {
+                            "other-error"
+                        },
+                    )
+                }
+                Err(_) => (false, false, generation, "worker-failed"),
+            };
+            schedule.finish(tokio::time::Instant::now(), generation, retry);
+            eprintln!(
+                "st3: projection contention retry {}",
+                json!({
+                    "attempt":attempt, "limit":3, "outcome":outcome, "rescheduled":schedule.due.is_some(),
+                    "projection_deferred_after_attempt": still_deferred,
+                    "stop_reason": if schedule.due.is_some() { None } else if recovered {
+                        Some("recovered")
+                    } else if retry { Some("budget-exhausted") } else { Some("non-retryable") },
+                })
+            );
+            if recovered {
+                st3::performance::record_wake("projection-contention-retry", None);
+                notify.notify_one();
+                event_notify.send_modify(|generation| *generation = generation.saturating_add(1));
+                let _ = fs::write(
+                    state_dir.join("replication.wake"),
+                    format!("{}\n", uuid::Uuid::now_v7()),
+                );
+            }
+        }
+    })
+}
+
+#[cfg(test)]
+mod projection_contention_retry_tests {
+    use super::*;
+    #[test]
+    fn quiet_node_retry_coalesces_and_exhausts_without_self_rearming() {
+        let now = tokio::time::Instant::now();
+        let mut retry = ProjectionContentionRetry::default();
+        assert_eq!(retry.poll(now, 1, true), None);
+        // Repeated receives do not push the first deadline back.
+        assert_eq!(retry.poll(now + Duration::from_secs(10), 50, true), None);
+        assert_eq!(retry.poll(now + Duration::from_secs(30), 50, true), Some(1));
+        retry.finish(now + Duration::from_secs(30), 51, true);
+        assert_eq!(retry.poll(now + Duration::from_secs(90), 51, true), Some(2));
+        retry.finish(now + Duration::from_secs(90), 52, true);
+        assert_eq!(
+            retry.poll(now + Duration::from_secs(210), 52, true),
+            Some(3)
+        );
+        retry.finish(now + Duration::from_secs(210), 53, true);
+        assert_eq!(retry.poll(now + Duration::from_secs(500), 53, true), None);
+        // Only a fresh external contention generation rearms an exhausted episode.
+        assert_eq!(retry.poll(now + Duration::from_secs(500), 54, true), None);
+        assert_eq!(
+            retry.poll(now + Duration::from_secs(530), 54, true),
+            Some(1)
+        );
+    }
+    #[test]
+    fn recovered_or_nonbusy_work_cancels_retry_and_no_contention_means_no_schedule() {
+        let now = tokio::time::Instant::now();
+        let mut retry = ProjectionContentionRetry::default();
+        assert_eq!(retry.poll(now, 0, true), None);
+        assert_eq!(retry.poll(now, 1, true), None);
+        assert_eq!(retry.poll(now + Duration::from_secs(30), 1, true), Some(1));
+        retry.finish(now + Duration::from_secs(30), 1, false);
+        assert_eq!(retry.poll(now + Duration::from_secs(500), 1, true), None);
+        retry.poll(now + Duration::from_secs(500), 2, true);
+        assert_eq!(retry.poll(now + Duration::from_secs(501), 2, false), None);
+        assert_eq!(retry.poll(now + Duration::from_secs(550), 2, true), None);
+    }
+    #[test]
+    fn external_contention_racing_success_is_not_lost() {
+        let now = tokio::time::Instant::now();
+        let mut retry = ProjectionContentionRetry::default();
+        retry.poll(now, 1, true);
+        assert_eq!(retry.poll(now + Duration::from_secs(30), 1, true), Some(1));
+        // The successful call reports its pre-call watermark, not a newer external busy.
+        retry.finish(now + Duration::from_secs(30), 1, false);
+        assert_eq!(retry.poll(now + Duration::from_secs(31), 2, true), None);
+        assert_eq!(retry.poll(now + Duration::from_secs(61), 2, true), Some(1));
+    }
+    #[tokio::test(start_paused = true)]
+    async fn quiet_node_recovers_automatically_after_busy_writer_releases() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claims.sqlite3");
+        const FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+        let source = Store::open_memory("source").unwrap();
+        source
+            .append_client_claim(&smallclaims::ClaimInput {
+                subject: "resource/quiet-busy".into(),
+                kind: "resource.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([("kind".into(), json!("custom.test.replication"))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        source.bind_fleet(FLEET).unwrap();
+        let store = Arc::new(Store::open(&path, "node").unwrap());
+        store.bind_fleet(FLEET).unwrap();
+        store.project_replication_backlog().unwrap();
+        let frontier =
+            || {
+                store.readers.get().query_row(
+            "SELECT last_good_store_index FROM projection_health WHERE aggregate='graph'",
+            [], |row| row.get::<_, u64>(0)).unwrap()
+            };
+        let before = frontier();
+        let inventory = store.export_replication_summary(FLEET).unwrap().inventory;
+        let exchange = source
+            .export_replication_exchange(FLEET, &inventory)
+            .unwrap();
+        store
+            .receive_replication_exchange("source", FLEET, &exchange)
+            .unwrap();
+        assert!(store.validate_replication_backlog().unwrap().changed);
+        let target = store.index().unwrap();
+        assert!(target > before);
+        assert_eq!(frontier(), before);
+        let visible = || {
+            store.readers.get().query_row(
+            "SELECT COUNT(*) FROM events WHERE subject='resource/quiet-busy' AND kind='resource.observed'",
+            [], |row| row.get::<_, i64>(0)).unwrap()
+        };
+        assert_eq!(visible(), 0);
+        store
+            .connection
+            .write()
+            .busy_timeout(Duration::ZERO)
+            .unwrap();
+        let other = rusqlite::Connection::open(&path).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert!(store.project_replication_backlog().is_err());
+        assert!(store.replication_projection_deferred());
+        assert_eq!(frontier(), before);
+        other.execute_batch("ROLLBACK").unwrap();
+        // No receive, wake or manual projection follows this release: the real worker
+        // must publish the admitted claim and its projected event by itself.
+        let (events, mut received) = watch::channel(0u64);
+        let (polls, mut polled) = watch::channel(false);
+        let worker = retry_projection_contention_observed(
+            Arc::downgrade(&store),
+            Arc::new(Notify::new()),
+            events,
+            dir.path().to_owned(),
+            move |backoff| { polls.send_replace(backoff); },
+        );
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        loop { let backoff = *polled.borrow_and_update(); if backoff { break; } polled.changed().await.unwrap(); }
+        tokio::time::advance(Duration::from_secs(30)).await;
+        let observed = store.clone();
+        let recovered = tokio::task::spawn_blocking(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while observed.replication_projection_deferred() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            !observed.replication_projection_deferred()
+        })
+        .await
+        .unwrap();
+        if recovered {
+            received.changed().await.unwrap();
+        }
+        worker.abort();
+        assert!(
+            recovered,
+            "scheduled retry must finish without a receive/wake"
+        );
+        assert_eq!(*received.borrow(), 1);
+        assert_eq!(frontier(), target);
+        assert_eq!(visible(), 1);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn retry_worker_does_not_keep_store_alive_during_scheduled_backoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(&dir.path().join("claims.sqlite3"), "node").unwrap());
+        store.project_replication_backlog().unwrap();
+        store
+            .connection
+            .write()
+            .busy_timeout(Duration::ZERO)
+            .unwrap();
+        let other = rusqlite::Connection::open(dir.path().join("claims.sqlite3")).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert!(store.project_replication_backlog().is_err());
+        other.execute_batch("ROLLBACK").unwrap();
+        let weak = Arc::downgrade(&store);
+        let (events, _) = watch::channel(0u64);
+        let (polls, mut polled) = watch::channel(false);
+        let worker = retry_projection_contention_observed(
+            weak.clone(),
+            Arc::new(Notify::new()),
+            events,
+            dir.path().to_owned(),
+            move |backoff| { polls.send_replace(backoff); },
+        );
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        loop { let backoff = *polled.borrow_and_update(); if backoff { break; } polled.changed().await.unwrap(); }
+        // The worker has observed contention and waits for its first 30s deadline.
+        assert_eq!(weak.strong_count(), 1);
+        drop(store);
+        assert!(weak.upgrade().is_none());
+        worker.abort();
+    }
+}
+
+// Ordinary samples and abnormal attempts have independent, bounded buckets. An ordinary
+// sample cannot hide the first slow/error attempt. Repeated anomalies retain counts and
+// maximum phase durations until the next allowed anomaly; shutdown does not flush them.
+#[derive(Default)]
+struct WalCheckpointLogBucket {
+    last: Option<Instant>,
+    suppressed: u64,
+    errors: u64,
+    max_passive_ms: u128,
+    max_writer_wait_ms: u128,
+    max_truncate_ms: u128,
+    max_duration_ms: u128,
+}
+impl WalCheckpointLogBucket {
+    fn record(
+        &mut self,
+        now: Instant,
+        report: Option<&smallclaims::sqlite::WalCheckpointReport>,
+        duration_ms: u128,
+    ) -> Option<serde_json::Value> {
+        self.max_duration_ms = self.max_duration_ms.max(duration_ms);
+        if let Some(report) = report {
+            self.max_passive_ms = self.max_passive_ms.max(report.passive_ms);
+            self.max_writer_wait_ms = self.max_writer_wait_ms.max(report.writer_wait_ms);
+            self.max_truncate_ms = self.max_truncate_ms.max(report.truncate_ms.unwrap_or(0));
+        } else {
+            self.errors = self.errors.saturating_add(1);
+        }
+        if self
+            .last
+            .is_some_and(|last| now.duration_since(last) < Duration::from_secs(60))
+        {
+            self.suppressed = self.suppressed.saturating_add(1);
+            return None;
+        }
+        let retained = json!({
+            "suppressed_outcomes": self.suppressed,
+            "error_outcomes": self.errors,
+            "max_passive_ms": self.max_passive_ms,
+            "max_writer_wait_ms": self.max_writer_wait_ms,
+            "max_truncate_ms": self.max_truncate_ms,
+            "max_duration_ms": self.max_duration_ms,
+        });
+        *self = Self {
+            last: Some(now),
+            ..Self::default()
+        };
+        Some(retained)
+    }
+}
+/// Counts checkpoint samples in a row that left part of the WAL un-copied and copied no more
+/// than the sample before: some reader holds an older snapshot open.
+#[derive(Default)]
+struct WalPinTracker {
+    last_backfilled: Option<i32>,
+    stuck: u32,
+}
+
+impl WalPinTracker {
+    /// Samples in a row, including this one, that made no backfill progress.
+    fn observe(&mut self, report: Option<&smallclaims::sqlite::WalCheckpointReport>) -> u32 {
+        let Some(report) = report else { return self.stuck };
+        let pinned = report.frames > report.backfilled
+            && self.last_backfilled == Some(report.backfilled);
+        self.last_backfilled = Some(report.backfilled);
+        self.stuck = if pinned { self.stuck + 1 } else { 0 };
+        self.stuck
+    }
+}
+
+const WAL_PIN_REPORT_AFTER: u32 = 3;
+
+fn abnormal_wal_checkpoint(report: Option<&smallclaims::sqlite::WalCheckpointReport>) -> bool {
+    report.is_none_or(|report| {
+        report.passive_ms >= 1000
+            || report.writer_wait_ms >= 100
+            || report.truncate_ms.is_some_and(|ms| ms >= 100)
+    })
+}
+
+#[cfg(test)]
+mod wal_pin_tracker_tests {
+    use super::*;
+
+    fn sample(frames: i32, backfilled: i32) -> smallclaims::sqlite::WalCheckpointReport {
+        smallclaims::sqlite::WalCheckpointReport {
+            frames,
+            backfilled,
+            passive_ms: 1,
+            writer_wait_ms: 0,
+            truncate_ms: None,
+            recycled: false,
+        }
+    }
+
+    #[test]
+    fn a_backfill_that_stops_advancing_counts_up_and_progress_resets_it() {
+        let mut pin = WalPinTracker::default();
+        assert_eq!(pin.observe(Some(&sample(100, 50))), 0, "the first sample has no baseline");
+        assert_eq!(pin.observe(Some(&sample(200, 50))), 1);
+        assert_eq!(pin.observe(Some(&sample(300, 50))), 2);
+        assert_eq!(pin.observe(None), 2, "an errored attempt neither counts nor resets");
+        assert_eq!(pin.observe(Some(&sample(400, 50))), 3);
+        assert_eq!(pin.observe(Some(&sample(500, 60))), 0, "backfill moved");
+        assert_eq!(pin.observe(Some(&sample(500, 500))), 0, "fully copied is not a pin");
+        assert_eq!(pin.observe(Some(&sample(500, 500))), 0);
+    }
+}
+
+#[cfg(test)]
+mod wal_checkpoint_reporting_tests {
+    use super::*;
+    fn report(wait: u128, truncate: u128) -> smallclaims::sqlite::WalCheckpointReport {
+        smallclaims::sqlite::WalCheckpointReport {
+            frames: 3,
+            backfilled: 3,
+            passive_ms: 1,
+            writer_wait_ms: wait,
+            truncate_ms: Some(truncate),
+            recycled: true,
+        }
+    }
+    #[test]
+    fn ordinary_sample_does_not_hide_first_anomaly_and_suppressed_peaks_survive() {
+        let now = Instant::now();
+        let mut ordinary = WalCheckpointLogBucket::default();
+        let mut abnormal = WalCheckpointLogBucket::default();
+        assert!(ordinary.record(now, Some(&report(0, 1)), 1).is_some());
+        assert!(!abnormal_wal_checkpoint(Some(&report(99, 99))));
+        assert!(abnormal_wal_checkpoint(Some(&report(100, 1))));
+        assert!(
+            abnormal
+                .record(now + Duration::from_secs(5), Some(&report(100, 1)), 101)
+                .is_some()
+        );
+        assert!(
+            abnormal
+                .record(now + Duration::from_secs(10), Some(&report(500, 200)), 701)
+                .is_none()
+        );
+        assert!(
+            abnormal
+                .record(now + Duration::from_secs(15), None, 900)
+                .is_none()
+        );
+        assert!(abnormal_wal_checkpoint(None));
+        let line = abnormal
+            .record(now + Duration::from_secs(65), Some(&report(100, 1)), 101)
+            .unwrap();
+        assert_eq!(line["suppressed_outcomes"], 2);
+        assert_eq!(line["error_outcomes"], 1);
+        assert_eq!(line["max_writer_wait_ms"], 500);
+        assert_eq!(line["max_truncate_ms"], 200);
+        assert_eq!(line["max_duration_ms"], 900);
+        let reset = abnormal
+            .record(now + Duration::from_secs(125), Some(&report(100, 1)), 101)
+            .unwrap();
+        assert_eq!(reset["suppressed_outcomes"], 0);
+        assert_eq!(reset["error_outcomes"], 0);
+        assert_eq!(reset["max_writer_wait_ms"], 100);
+    }
+    #[test]
+    fn passive_threshold_and_counts_are_bounded() {
+        let now = Instant::now();
+        let mut sample = report(0, 0);
+        sample.passive_ms = 1000;
+        assert!(abnormal_wal_checkpoint(Some(&sample)));
+        let mut bucket = WalCheckpointLogBucket {
+            last: Some(now),
+            suppressed: u64::MAX,
+            errors: u64::MAX,
+            ..Default::default()
+        };
+        assert!(
+            bucket
+                .record(now + Duration::from_secs(1), None, 1)
+                .is_none()
+        );
+        let line = bucket
+            .record(now + Duration::from_secs(60), None, 1)
+            .unwrap();
+        assert_eq!(line["suppressed_outcomes"], u64::MAX);
+        assert_eq!(line["error_outcomes"], u64::MAX);
+    }
+}
+
+/// Page copying runs off the writer queue; TRUNCATE joins it before taking SQLite's writer
+/// lock. Recycling has no SQLite busy wait for readers; it can wait its FIFO turn.
+fn recycle_idle_wal(path: PathBuf, store: std::sync::Weak<Store>) {
+    // Five seconds finds gaps between short readers without polling on every write.
+    const WAL_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
+    const WAL_CHECKPOINT_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+    // Backfill can take tens of seconds even with a zero busy timeout. A detached native
+    // thread owns its connection so Tokio shutdown never waits for this best-effort work
+    // in its blocking pool. Dropping the handle also avoids joining it at process exit.
+    let worker = std::thread::Builder::new()
+        .name("st3-wal-checkpoint".into())
+        .spawn(move || {
+            let mut connection = None;
+            let mut last_error_log: Option<Instant> = None;
+            let mut retry_interval = WAL_CHECKPOINT_INTERVAL;
+            let mut ordinary_outcomes = WalCheckpointLogBucket::default();
+            let mut abnormal_outcomes = WalCheckpointLogBucket::default();
+            let mut pin = WalPinTracker::default();
+            loop {
+                std::thread::sleep(retry_interval);
+                retry_interval = WAL_CHECKPOINT_INTERVAL;
+                let started = Instant::now();
+                // A weak reference does not keep the Store alive between attempts at shutdown.
+                let Some(store) = store.upgrade() else { break };
+                // The connection is taken into the attempt and dropped on unwind; no
+                // potentially panic-damaged connection is reused by the next attempt.
+                let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let connection = match connection.take() {
+                        Some(connection) => connection,
+                        None => rusqlite::Connection::open(&path)
+                            .context("open WAL checkpoint connection")?,
+                    };
+                    let result = store.checkpoint_idle_wal_report(&connection);
+                    Ok::<_, anyhow::Error>((connection, result))
+                }));
+                let result = match attempt {
+                    Ok(Ok((returned, result))) => {
+                        connection = Some(returned);
+                        result.context("recycle idle WAL")
+                    }
+                    Ok(Err(error)) => Err(error),
+                    Err(_) => {
+                        // catch_unwind still invokes the process panic hook. Back off
+                        // its retries too, without changing the hook for other threads.
+                        retry_interval = WAL_CHECKPOINT_ERROR_LOG_INTERVAL;
+                        Err(anyhow::anyhow!("WAL checkpoint panicked; reopening connection"))
+                    }
+                };
+                let now = Instant::now();
+                let duration_ms = started.elapsed().as_millis();
+                let report = result.as_ref().ok();
+                let stuck = pin.observe(report);
+                let abnormal = abnormal_wal_checkpoint(report) || stuck >= WAL_PIN_REPORT_AFTER;
+                let bucket = if abnormal { &mut abnormal_outcomes } else { &mut ordinary_outcomes };
+                if let Some(retained) = bucket.record(now, report, duration_ms) {
+                    let outcome = match report {
+                        Some(report) => json!({
+                            "outcome": if report.frames == 0 { "empty" } else if report.recycled { "recycled" } else { "deferred" },
+                            "frames": report.frames, "backfilled": report.backfilled,
+                            "passive_ms": report.passive_ms, "writer_wait_ms": report.writer_wait_ms,
+                            "truncate_ms": report.truncate_ms,
+                        }),
+                        None => json!({"outcome":"error", "phase_durations_available":false}),
+                    };
+                    let pinned = (stuck >= WAL_PIN_REPORT_AFTER).then(|| {
+                        let oldest = smallclaims::sqlite::oldest_live_read();
+                        json!({
+                            "stuck_samples": stuck,
+                            "oldest_live_read": oldest.as_ref().map(|read| json!({
+                                "age_ms": read.age_ms,
+                                "kind": if read.snapshot { "snapshot" } else { "lent-connection" },
+                                "at": read.at,
+                            })),
+                            "live_reads": oldest.as_ref().map(|read| read.live),
+                        })
+                    });
+                    eprintln!("st3: WAL checkpoint {}", json!({
+                        "bucket": if abnormal { "abnormal" } else { "ordinary" },
+                        "report": outcome, "duration_ms": duration_ms, "retained": retained,
+                        "pinned": pinned,
+                    }));
+                }
+                if let Err(error) = result {
+                    let now = Instant::now();
+                    if last_error_log.is_none_or(|last| {
+                        now.duration_since(last) >= WAL_CHECKPOINT_ERROR_LOG_INTERVAL
+                    }) {
+                        eprintln!("st3: {error:#}; checkpoint duration_ms={}", started.elapsed().as_millis());
+                        last_error_log = Some(now);
+                    }
+                }
+            }
+        });
+    if let Err(error) = worker {
+        eprintln!("st3: start WAL checkpoint worker: {error}");
+    }
+}
+
 /// Old payloads convert after startup; each page joins the normal writer queue and commits
 /// its own cursor. A failed page retries, including after a daemon restart.
 async fn convert_envelope_payloads(store: Arc<Store>) {
@@ -22187,6 +22854,64 @@ async fn convert_envelope_payloads(store: Arc<Store>) {
                 tokio::time::sleep(Duration::from_secs(60)).await;
             }
         }
+    }
+}
+
+/// Fill the account limits projection after an upgrade, a page of claims at a time. Each page is
+/// its own short writer transaction and the daemon answers between pages; the cursor is stored, so
+/// a restart resumes. Once it is caught up this only checks, once a minute, for claims that
+/// replication admitted and no append or projection pass has folded yet.
+async fn catch_up_account_limits(store: Arc<Store>, notify: Arc<Notify>) {
+    // A pool start that arrived while the projection was catching up failed with a retryable
+    // error. Nothing else tells the reconciler that limits are now known, so wake it once.
+    let mut announced = false;
+    loop {
+        let page_store = store.clone();
+        let more = tokio::task::spawn_blocking(move || {
+            st3::profile::task("task account-limits-catch-up", || {
+                page_store.catch_up_account_limits(st3::store::LIMITS_CATCH_UP_PAGE)
+            })
+        })
+        .await;
+        if !announced && matches!(more, Ok(Ok(_))) {
+            let ready_store = store.clone();
+            let ready = tokio::task::spawn_blocking(move || ready_store.account_limits_ready())
+                .await
+                .ok()
+                .and_then(|result| result.ok())
+                .unwrap_or(false);
+            if ready {
+                announced = true;
+                notify.notify_one();
+            }
+        }
+        match more {
+            Ok(Ok(true)) => tokio::time::sleep(Duration::from_millis(50)).await,
+            _ => tokio::time::sleep(Duration::from_secs(60)).await,
+        }
+    }
+}
+
+#[cfg(test)]
+mod limits_catch_up_wake_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn the_reconciler_is_woken_once_when_account_limits_become_ready() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let notify = Arc::new(Notify::new());
+        let task = tokio::spawn(catch_up_account_limits(store.clone(), notify.clone()));
+        tokio::time::timeout(Duration::from_secs(5), notify.notified())
+            .await
+            .expect("the reconciler is woken when the limits projection is ready");
+        assert!(store.account_limits_ready().unwrap());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(300), notify.notified())
+                .await
+                .is_err(),
+            "the wake happens once, not on every idle pass"
+        );
+        task.abort();
     }
 }
 
@@ -23578,6 +24303,20 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn agent_card_names_a_pending_codex_approval() {
+        let agent: st3_client::Agent = serde_json::from_value(serde_json::json!({
+            "kind": "agent", "id": "agent/approval", "revision": "one",
+            "updated_at": "2026-10-06T12:00:00Z", "name": "Approval",
+            "state": "running", "reachability": "local", "runtime_ids": [],
+            "driver": "codex", "harness_state": "blocked", "blocked_on": "human",
+            "ask": "permission", "reason": "waitingOnApproval"
+        })).unwrap();
+        let card = render_client_agent(&agent, &[], 0);
+        assert!(card.contains("HARNESS      codex · blocked\n"));
+        assert!(card.contains("AWAITING     approval\n"));
+    }
+
     fn subagent_worker() -> serde_json::Value {
         serde_json::json!({
             "kind": "agent", "id": "agent/crew/worker", "revision": "one",
@@ -24806,6 +25545,35 @@ mod tests {
             "agent/node.worker",
             Some(&replacement)
         ));
+        assert!(!work_claim_has_active_harness(
+            &step,
+            "agent/other",
+            Some(&replacement)
+        ));
+        assert!(!work_claim_has_active_harness(
+            &step,
+            "agent/node.worker",
+            None
+        ));
+        let mut ended = replacement.clone();
+        ended.incarnation_id = "worker-one".into();
+        ended.state = "ended".into();
+        assert!(!work_claim_has_active_harness(
+            &step,
+            "agent/node.worker",
+            Some(&ended)
+        ));
+        for state in ["claimed", "working", "verifying", "blocked"] {
+            let mut held = step.clone();
+            held.status = state.into();
+            assert!(work_claim_is_held_by(&held, "agent/node.worker"));
+            assert!(!work_claim_is_held_by(&held, "agent/other"));
+        }
+        for state in ["ready", "pending", "completed", "cancelled", "failed"] {
+            let mut unheld = step.clone();
+            unheld.status = state.into();
+            assert!(!work_claim_is_held_by(&unheld, "agent/node.worker"));
+        }
     }
 
     #[test]
@@ -26131,6 +26899,23 @@ mod tests {
         assert_eq!(args.references, ["message/first", "message/second"]);
         assert_eq!(args.actor.as_deref(), Some("agent/sup"));
         assert!(args.archive);
+    }
+
+    #[test]
+    fn a_provenance_reads_as_one_line() {
+        let line = provenance_line(&json!({
+            "verdict": "verified", "signer": "person/example",
+            "device": "example phone (secure enclave)", "key": "p256:BPLXtCkgqnBglKrxCU_RE"
+        }));
+        assert_eq!(
+            line,
+            "verified · person/example · example phone (secure enclave) · p256:BPLXtCkgqnB…"
+        );
+        assert_eq!(
+            provenance_line(&json!({"verdict": "held", "reason": "delegation d1 has not arrived"})),
+            "held · delegation d1 has not arrived"
+        );
+        assert_eq!(provenance_line(&json!({"verdict": "unsigned"})), "unsigned");
     }
 
     #[tokio::test]

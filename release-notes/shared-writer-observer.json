@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "summary": "Add an optional writer-owned SQLite mutation observer for commit-consistent retention deadlines.",
+  "commits": [
+    "9db16d44ec3e3060a608e8a6af8382a82ecca1fc"
+  ],
+  "replay": {
+    "status": "none",
+    "detail": "The existing Store constructors do not activate the observer; this change adds no startup replay or projection invalidation."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No stored tables, indexes, triggers or migrations change; SQLite user_version is unchanged."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint selection, retention rules and RULES_VERSION are unchanged."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Adds the optional smallclaims WriterObserver trait and WriterConnection::new_with_observer constructor. Existing constructors and CommitObserver behaviour remain compatible; no client, replication or harness wire fields change. Runtime activation is a separate change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional upgrade pause or coordinated fleet restart is introduced. Standard daemon/client restart procedure still applies; no outage timing is claimed."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Existing installations need no data repair, configuration conversion or observer activation."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No stored format changes or additional recovery procedure. Preserve graph state, keys and configuration and use normal roll-forward guidance; this note does not qualify whole-release binary-only downgrade."
+  }
+}

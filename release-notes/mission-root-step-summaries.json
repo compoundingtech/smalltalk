@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Keep mission-root tree state, summaries and queue order without full work presentation enrichment",
+  "replay": {
+    "status": "none",
+    "detail": "This changes a read-only mission-root query. It adds no replay, rehydration or read-triggered repair, and no recovery wait."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database tables, indexes, triggers, migrations or schema version changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules, canonical claim selection or coordinated membership changes."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "GET /v1/mission-runs?root= still returns the complete ordered array of descendants with effective step state, progress/completion summaries, queue labels/positions, run provenance, loops, outcomes, scheduler faults and gate annotation. Tree steps no longer populate execution start, wake, ready age, timeouts/extensions, fresh context, person answers or under fields; optional/default fields can disappear and execution_elapsed_ms is always serialized as 0. The individual mission-run and work-item detail routes retain full work presentation. Human st missions show keeps queue labels and ordering; st missions show --json reads the individual run route. Pairings with older CLI, stui, iOS and other clients have not been runtime-validated; consumers that require omitted tree fields must use the existing detail routes."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional service interruption or startup recovery is introduced by this read change. Restart-to-API and restart-to-health times for the candidate have not been measured."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "No database or identity conversion is required. Integrations that consume work presentation fields from the root-tree response must instead read GET /v1/mission-runs/{run} or GET /v1/work-items/{subject}, as appropriate, before relying on those values."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "This read-only change persists no new state and requires no migration undo or added recovery procedure. It does not establish swap-back compatibility for other changes in an upgrade interval."
+  }
+}

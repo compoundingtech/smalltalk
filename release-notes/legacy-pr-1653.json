@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "summary": "#1653: PTY smoke-test missing-marker diagnostics",
+  "commits": [
+    "d2e508b6fdcf109278ea66fdba0a9fd9ba768e1e"
+  ],
+  "replay": {
+    "status": "none",
+    "detail": "Pty smoke-test missing-marker diagnostics adds no startup replay trigger or projection invalidation."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No SQLite migration, table, index or trigger change in PTY smoke-test missing-marker diagnostics; schema version remains 16."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules remain 11; no changed digest policy or new sealing coordination requirement."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Only the development PTY smoke test changes: an absent first-frame marker now fails explicitly before the existing latency assertion. Installed daemon, CLI, stui and phone behavior and protocols are unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional service interruption or measured upgrade outage is introduced by PTY smoke-test missing-marker diagnostics; normal daemon/client restart procedures apply."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Existing installations need no configuration conversion or manual data repair for PTY smoke-test missing-marker diagnostics."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No additional recovery procedure is introduced. Preserve graph state, keys and configuration and follow roll-forward guidance; this fragment does not qualify binary-only rollback of the whole release."
+  }
+}

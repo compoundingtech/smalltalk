@@ -59,6 +59,7 @@ use crate::model::{PersonAskRequest, PersonStepResponse};
 use crate::store::Store;
 
 mod client_blobs;
+mod client_adapters;
 mod client_presence;
 mod client_v0;
 mod custom;
@@ -240,6 +241,86 @@ fn signal_visible_change(state: &AppState) {
     );
 }
 
+#[cfg(test)]
+mod storage_contention_response_tests {
+    #[test]
+    fn admitted_contention_is_pending_not_a_peer_error_and_other_faults_stay_errors() {
+        for code in ["database-busy", "database-locked"] {
+            assert_eq!(super::admitted_projection_result(Err(anyhow::Error::new(
+                super::St3Error::new(code, "fixture contention")))).unwrap(), None);
+            assert_eq!(super::client_error_code(Some(code)), code);
+        }
+        assert!(super::admitted_projection_result(Err(anyhow::anyhow!("other fault"))).is_err());
+        assert_eq!(super::admitted_projection_result(Ok(Some(true))).unwrap(), Some(true));
+    }
+    #[test]
+    fn accepted_replication_survives_a_contended_begin_and_projects_after_release() {
+        use super::*;
+        use std::collections::BTreeMap;
+        const FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claims.sqlite3");
+        let source = Store::open_memory("source").unwrap();
+        source.append_client_claim(&smallclaims::ClaimInput {
+            subject: "resource/receive-busy".into(), kind: "resource.observed".into(), actor: None,
+            fields: BTreeMap::from([("kind".into(), json!("custom.test.replication"))]),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        source.bind_fleet(FLEET).unwrap();
+        let store = Store::open(&path, "target").unwrap();
+        store.bind_fleet(FLEET).unwrap();
+        store.project_replication_backlog().unwrap();
+        let frontier = || store.readers.get().query_row(
+            "SELECT last_good_store_index FROM projection_health WHERE aggregate='graph'",
+            [], |row| row.get::<_, u64>(0)).unwrap();
+        let before = frontier();
+        let inventory = store.export_replication_summary(FLEET).unwrap().inventory;
+        let exchange = source.export_replication_exchange(FLEET, &inventory).unwrap();
+        store.receive_replication_exchange("source", FLEET, &exchange).unwrap();
+        assert!(store.validate_replication_backlog().unwrap().changed);
+        let target = store.index().unwrap();
+        assert!(target > before);
+        store.connection.write().busy_timeout(std::time::Duration::ZERO).unwrap();
+        let holder = rusqlite::Connection::open(&path).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let pending = admitted_projection_result(store.project_replication_backlog().map(Some)).unwrap();
+        assert_eq!(pending, None);
+        assert!(store.replication_projection_deferred());
+        assert_eq!(frontier(), before);
+        assert_eq!(store.index().unwrap(), target);
+        assert!(!store.claims_for("resource/receive-busy", Some("resource.observed")).unwrap().is_empty());
+        holder.execute_batch("ROLLBACK").unwrap();
+        assert!(store.project_replication_backlog().unwrap());
+        assert_eq!(frontier(), target);
+        assert!(!store.replication_projection_deferred());
+        let visible: i64 = store.readers.get().query_row(
+            "SELECT COUNT(*) FROM events WHERE subject='resource/receive-busy' AND kind='resource.observed'",
+            [], |row| row.get(0)).unwrap();
+        assert_eq!(visible, 1);
+    }
+    #[test]
+    fn private_projection_context_stays_out_of_client_details() {
+        let error = smallclaims::error::internal(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY), None))
+            .with_detail("projection_stage", "begin-immediate")
+            .with_detail("projection_frontier_unknown", true);
+        let response = super::ApiError::bad(error);
+        assert_eq!(response.status, super::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!response.details.contains_key("projection_stage"));
+        assert!(!response.details.contains_key("projection_frontier_unknown"));
+        assert_eq!(response.details["sqlite_extended_code"], rusqlite::ffi::SQLITE_BUSY);
+    }
+    #[test]
+    fn typed_sqlite_contention_is_a_service_failure_not_input_validation() {
+        for code in ["database-busy", "database-locked"] {
+            let response = super::ApiError::bad(super::St3Error::new(code, "storage contention"));
+            assert_eq!(response.status, super::StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.code, code);
+        }
+        assert_eq!(super::ApiError::bad(super::St3Error::new("internal", "other fault")).status, super::StatusCode::INTERNAL_SERVER_ERROR);
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ApiError {
     status: StatusCode,
@@ -266,14 +347,19 @@ impl ApiError {
             | "lane-approval-denied"
             | "glass-owner-forbidden" => StatusCode::FORBIDDEN,
             "lane-not-found" | "not-found" => StatusCode::NOT_FOUND,
+            "database-busy" | "database-locked" => StatusCode::SERVICE_UNAVAILABLE,
             "internal" => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::UNPROCESSABLE_ENTITY,
         };
+        let mut details = error.details;
+        details.retain(|key, _| !matches!(key.as_str(), "projection_stage" | "projection_claim_id"
+            | "projection_subject" | "projection_operation_id" | "projection_context_truncated"
+            | "projection_frontier_unknown"));
         Self {
             status,
             code: error.code.into(),
             message: error.message,
-            details: Box::new(error.details),
+            details: Box::new(details),
         }
     }
 
@@ -414,7 +500,14 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/client/lanes/{*id}", get(client_v0::lane_detail))
         .route("/v1/client/history", get(client_history))
         .route("/v1/client/history/{*id}", get(client_history_detail))
-        .route("/v1/client/conversations/search", get(client_v0::search::search))
+        .route(
+            "/v1/client/conversations/search",
+            get(client_v0::search::search),
+        )
+        .route(
+            "/v1/client/conversations/{id}/content/{reference}/chunk",
+            get(client_v0::conversation_blocks::chunk),
+        )
         .route("/v1/client/sessions", get(client_sessions))
         .route("/v1/client/sessions/{*id}", get(client_sessions_detail))
         .route(
@@ -458,6 +551,8 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         )
         .route("/v1/client/blobs/{id}", get(client_blobs::get))
         .route("/v1/client/blobs/{id}/chunk", get(client_blobs::chunk))
+        .route("/v1/client/adapter/import", post(client_adapters::import_message))
+        .route("/v1/client/adapter/deliveries", get(client_adapters::deliveries))
         .route("/v1/client/pairings", post(client_v0::pairing_begin))
         .route(
             "/v1/client/pairings/{id}/complete",
@@ -1145,6 +1240,7 @@ fn client_error_retryable(status: StatusCode, code: Option<&str>) -> bool {
             "remote-unavailable"
                 | "terminal-unavailable"
                 | "cursor-gap"
+                | "conversation-content-invalidated"
                 | "page-cursor-expired"
                 | "rate-limited"
                 | "runtime-authority-indeterminate"
@@ -1192,6 +1288,8 @@ fn client_error_code(code: Option<&str>) -> String {
         | "runtime-authority-indeterminate"
         | "remote-unavailable"
         | "terminal-unavailable"
+        | "conversation-content-invalidated"
+        | "transcript-unavailable"
         | "terminal-ended"
         | "blob-too-large"
         | "unsupported-media-type"
@@ -1199,6 +1297,8 @@ fn client_error_code(code: Option<&str>) -> String {
         | "blob-quota-exceeded"
         | "blob-not-found"
         | "blob-expired"
+        | "database-busy"
+        | "database-locked"
         | "internal" => code.unwrap_or("internal").to_owned(),
         "too-many-attachments" | "invalid-blob-reference" => "validation-failed".into(),
         "launch-review-not-authorized"
@@ -2273,7 +2373,8 @@ fn client_agent_resources_uncached(
     history: bool,
     snapshot_index: u64,
 ) -> anyhow::Result<Vec<Value>> {
-    client_agent_resources_selected(store, history, snapshot_index, None)
+    let status = store.status_for_subject_prefix_at("agent/", Some(snapshot_index), history)?;
+    client_agent_resources_from_status(store, history, snapshot_index, None, status)
 }
 
 fn client_agent_resources_selected(
@@ -2282,14 +2383,19 @@ fn client_agent_resources_selected(
     snapshot_index: u64,
     changed: Option<(&BTreeSet<String>, &[Value])>,
 ) -> anyhow::Result<Vec<Value>> {
-    // Without history the store reduces only agents that can be current, including unhealthy
-    // ones; the filters below keep the current layer either way.
-    let status = match changed {
-        Some((subjects, _)) => {
-            store.status_for_subject_names_at(subjects.clone(), snapshot_index, history)?
-        }
-        None => store.status_for_subject_prefix_at("agent/", Some(snapshot_index), history)?,
-    };
+    let status = store.agent_card_status_at(
+        changed.map(|(subjects, _)| subjects), snapshot_index, history,
+    )?;
+    client_agent_resources_from_status(store, history, snapshot_index, changed, status)
+}
+
+fn client_agent_resources_from_status(
+    store: &Store,
+    history: bool,
+    snapshot_index: u64,
+    changed: Option<(&BTreeSet<String>, &[Value])>,
+    status: StatusResponse,
+) -> anyhow::Result<Vec<Value>> {
     // Local harness/runtime observations do not change queues or their labels. Retain those
     // fields from the previous cards rather than scanning the fleet's work again.
     let retain_queues = changed.is_some_and(|(subjects, previous)| {
@@ -2314,12 +2420,15 @@ fn client_agent_resources_selected(
         .map(|subject| subject.subject.clone())
         .collect::<Vec<_>>();
     // Declarations, usage and faults of the listed agents only, not of every subject.
-    let desired_hosts = store
+    let desired_agents = store
         .desired_subjects_named(&agent_subjects)?
         .into_iter()
         .filter_map(|desired| {
-            let host = desired.member.map(|member| member.host)?;
-            Some((desired.subject, client_host_id(&host)))
+            let member = desired.member?;
+            let checkout = crate::checkout::Checkout::from_desired(&desired.desired).map(|checkout| json!({
+                "repository": checkout.repository, "base": checkout.base, "branch": checkout.branch
+            }));
+            Some((desired.subject, (client_host_id(&member.host), member.workspace, checkout)))
         })
         .collect::<BTreeMap<_, _>>();
     let usage_summaries = store.usage_summaries_at(&agent_subjects, Some(snapshot_index))?;
@@ -2538,7 +2647,9 @@ fn client_agent_resources_selected(
                 "blocked_on": subject.harness.as_ref().and_then(|harness| harness.blocked_on.as_deref()),
                 "ask": subject.harness.as_ref().and_then(|harness| harness.ask.as_deref()),
                 "reason": subject.harness.as_ref().and_then(|harness| harness.reason.as_deref()),
-                "host_id": desired_hosts.get(&subject.subject),
+                "host_id": desired_agents.get(&subject.subject).map(|(host, _, _)| host),
+                "workspace": desired_agents.get(&subject.subject).map(|(_, workspace, _)| workspace),
+                "checkout": desired_agents.get(&subject.subject).and_then(|(_, _, checkout)| checkout.as_ref()),
                 "last_activity_at": last_activity_at.map(client_timestamp),
                 "silent_since": silent_since.map(client_timestamp),
                 "fault": fault,
@@ -4123,7 +4234,7 @@ async fn client_sessions_detail(
                         "remote session detail requires a concrete person or agent",
                     )));
                 }
-                let value = relay
+                let mut value = relay
                     .read(
                         &remote_host,
                         &crate::peer::ClientReadRequest {
@@ -4137,7 +4248,13 @@ async fn client_sessions_detail(
                         },
                     )
                     .await
-                    .map_err(|error| remote_read_error(&remote_host, error))?;
+                    .map_err(|error| {
+                        client_v0::conversation_blocks::availability(remote_read_error(
+                            &remote_host,
+                            error,
+                        ))
+                    })?;
+                client_v0::conversation_blocks::legacy(&mut value, &session);
                 return Ok(Json(value));
             }
         }
@@ -4277,6 +4394,8 @@ fn remote_read_error(host: &str, error: anyhow::Error) -> ApiError {
     if !matches!(
         rejected.code.as_str(),
         "page-cursor-expired"
+            | "conversation-content-invalidated"
+            | "transcript-unavailable"
             | "timeline-history-incomplete"
             | "cursor-gap"
             | "not-found"
@@ -7039,6 +7158,16 @@ async fn replication_checkpoint_adopt(
     Ok(Json(actions))
 }
 
+// Admission is already committed here. A contended projection is pending work, not a
+// failed peer delivery; the contention generation schedules the daemon's bounded retry.
+fn admitted_projection_result(result: anyhow::Result<Option<bool>>) -> Result<Option<bool>, St3Error> {
+    match result {
+        Ok(projected) => Ok(projected),
+        Err(error) if error.downcast_ref::<St3Error>().is_some_and(|error| error.is_sqlite_contention()) => Ok(None),
+        Err(error) => Err(St3Error::new("internal", error.to_string())),
+    }
+}
+
 async fn replication_receive(
     State(state): State<AppState>,
     Json(request): Json<ReplicationReceiveRequest>,
@@ -7085,9 +7214,7 @@ async fn replication_receive(
         // with or without new data, projects what it admitted meanwhile.
         let was_deferred = store.replication_projection_deferred();
         let projection = if new_data || was_deferred {
-            store
-                .project_replication_backlog_unless_catching_up()
-                .map_err(|error| St3Error::new("internal", error.to_string()))?
+            admitted_projection_result(store.project_replication_backlog_unless_catching_up())?
         } else {
             Some(true)
         };
@@ -7112,7 +7239,7 @@ async fn replication_receive(
                 changed,
                 store_index,
             },
-            changed && !quiet_only && projection.is_some(),
+            changed && !quiet_only && projected,
         ))
     })
     .await?;
@@ -8881,7 +9008,7 @@ fn record_planning_event(
         .map_err(ApiError::bad)?;
     state
         .store
-        .rebuild_claim_projections()
+        .rebuild_planning_projection()
         .map_err(ApiError::internal)?;
     Ok(())
 }
@@ -10358,7 +10485,9 @@ async fn finish_claim_publication(
     if appended {
         if crate::store::local_observation_position(&response).is_some() {
             signal_local_change(state);
-        } else if kind == "harness.usage" || kind == "subagent.renewed" {
+        } else if matches!(kind, "harness.usage" | "harness.limits" | "subagent.renewed") {
+            // The reconciler reads none of these. The limits policy runs on its own two-minute
+            // timer, so a limits claim woke a full reconcile pass for nothing, every few seconds.
             signal_visible_change(state);
         } else if kind.starts_with("message.") {
             let store = state.store.clone();
@@ -11221,6 +11350,22 @@ fn accept_message_receipt(
     session_id: Option<String>,
     device_signature: Option<smallclaims::principal::ClaimSignature>,
 ) -> Result<MessageSendReceipt, ApiError> {
+    accept_message_receipt_with_upload_owner(state, request, session_id, device_signature, None)
+}
+
+fn accept_message_receipt_with_upload_owner(
+    state: &AppState,
+    request: MessageSendRequest,
+    session_id: Option<String>,
+    device_signature: Option<smallclaims::principal::ClaimSignature>,
+    upload_owner: Option<&str>,
+) -> Result<MessageSendReceipt, ApiError> {
+    if request.from.starts_with("external/") && upload_owner.is_none() {
+        return Err(ApiError::bad(St3Error::new(
+            "adapter-route-refused",
+            "external sender imports require the enrolled adapter endpoint",
+        )));
+    }
     if request.content.trim().is_empty() && request.attachments.is_empty() {
         return Err(ApiError::bad(St3Error::new(
             "empty-message",
@@ -11260,7 +11405,7 @@ fn accept_message_receipt(
     }
     let from = normalize_message_party(&request.from);
     let to = normalize_message_party(&request.to);
-    let attachments = client_blobs::resolve_attachments(state, &from, &request.attachments)?;
+    let attachments = client_blobs::resolve_attachments(state, upload_owner.unwrap_or(&from), &request.attachments)?;
     let id = hex::encode(Sha256::digest(request.idempotency_key.as_bytes()))[..16].to_owned();
     let subject = format!("message/{id}");
     let mut fields = BTreeMap::from([
@@ -11525,10 +11670,20 @@ async fn list_messages(
     .map(Json)
 }
 
+/// One message as it is read, with who signed it when a person wrote it (see
+/// `client_v0::message_provenance`).
+#[derive(Serialize)]
+struct MessageRead {
+    #[serde(flatten)]
+    message: MessageView,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provenance: Option<Value>,
+}
+
 async fn read_message(
     State(state): State<AppState>,
     AxumPath(subject): AxumPath<String>,
-) -> Result<Json<MessageView>, ApiError> {
+) -> Result<Json<MessageRead>, ApiError> {
     let subject = if subject.starts_with("message/") {
         subject
     } else {
@@ -11536,10 +11691,24 @@ async fn read_message(
     };
     let store = state.store.clone();
     let lookup = subject.clone();
-    blocking_store(move || store.message(&lookup))
+    let message = blocking_store(move || store.message(&lookup))
         .await?
-        .map(Json)
-        .ok_or_else(|| ApiError::not_found(format!("message `{subject}` does not exist")))
+        .ok_or_else(|| ApiError::not_found(format!("message `{subject}` does not exist")))?;
+    let provenance = {
+        let state = state.clone();
+        let lookup = message.subject.clone();
+        blocking_store(move || {
+            Ok(state
+                .store
+                .latest_claim(&lookup, Some("message.sent"))?
+                .and_then(|claim| client_v0::message_provenance(&state, &claim)))
+        })
+        .await?
+    };
+    Ok(Json(MessageRead {
+        message,
+        provenance,
+    }))
 }
 
 async fn post_message_claim(
@@ -11643,6 +11812,9 @@ struct StatusQuery {
     at_index: Option<u64>,
     #[serde(default)]
     history: bool,
+    /// Only the subject's current harness; see `Store::status_harness_only`.
+    #[serde(default)]
+    harness_only: bool,
 }
 
 /// One subject's desired record. Each Claude seat's status line reads it on every render (every
@@ -11667,7 +11839,9 @@ async fn status(
 ) -> Result<Json<StatusResponse>, ApiError> {
     let store = state.store.clone();
     blocking_store(move || {
-        if query.history {
+        if let (true, false, Some(subject)) = (query.harness_only, query.history, &query.subject) {
+            store.status_harness_only(subject)
+        } else if query.history {
             store.status_history(
                 query.subject.as_deref(),
                 query.owner_run.as_deref(),
@@ -13320,13 +13494,7 @@ fn live_session(
     subject: &str,
     expected_incarnation: Option<&str>,
 ) -> Result<LiveSession, ApiError> {
-    let status = state
-        .store
-        .status(Some(subject))
-        .map_err(ApiError::internal)?;
-    let selected = status
-        .subjects
-        .first()
+    let selected = state.store.runtime_authority(subject).map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found(format!("subject `{subject}` has no live session")))?;
     if !matches!(selected.reachability.as_str(), "reachable" | "local") {
         return Err(ApiError::bad(St3Error::new(
@@ -13375,11 +13543,9 @@ fn live_session(
     }
     let member = state
         .store
-        .desired_subjects()
+        .desired_subject_with_writer(subject)
         .map_err(ApiError::internal)?
-        .into_iter()
-        .find(|desired| desired.subject == subject)
-        .and_then(|desired| desired.member);
+        .and_then(|(desired, _)| desired.member);
     let terminal = member
         .as_ref()
         .map(|member| member.terminal)
@@ -15836,6 +16002,26 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
             "usage kept local does not wake replication"
         );
         assert!(!reconciler_woke().await);
+        assert!(client_feed_woke());
+
+        // The reconciler reads no limits claim; the limits policy runs on its own timer.
+        let limits = |weekly: f64| ClaimInput {
+            subject: subject.into(),
+            kind: "harness.limits".into(),
+            actor: Some(subject.into()),
+            fields: BTreeMap::from([
+                ("driver".into(), Value::String("codex".into())),
+                ("account".into(), Value::String("codex/ada".into())),
+                ("account_ref".into(), Value::String("ada".into())),
+                ("weekly_percent".into(), Value::from(weekly)),
+                ("measured_at_unix_ms".into(), Value::from(1u64)),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(format!("wake-limits-{weekly}")),
+        };
+        let _ = post(limits(10.0)).await.unwrap();
+        assert!(!reconciler_woke().await, "limits never reconcile");
         assert!(client_feed_woke());
     }
 
@@ -19753,6 +19939,37 @@ version 2
     }
 
     #[tokio::test]
+    async fn reading_a_persons_message_says_who_signed_it_and_an_agents_says_nothing() {
+        // Nathan, 2026-10-06: signatures existed but nothing showed them.
+        let root = tempfile::tempdir().unwrap();
+        let app = router(state(root.path()));
+        let send = |key: &str, from: &str| {
+            serde_json::to_value(MessageSendRequest {
+                idempotency_key: key.into(),
+                from: from.into(),
+                to: "agent/receiver".into(),
+                content: "Hello.".into(),
+                title: None,
+                in_reply_to: None,
+                tags: Vec::new(),
+                attachments: Vec::new(),
+            })
+            .unwrap()
+        };
+        let read = |subject: &str| {
+            format!("/v1/messages/read/{}", subject.trim_start_matches("message/"))
+        };
+        let (_, person) = json_request(app.clone(), "/v1/messages", send("prov-person", "person/alex")).await;
+        let (_, person) = get_request(app.clone(), &read(person["subject"].as_str().unwrap())).await;
+        // The fixture seals nothing, so there is no signature to show, only the verdict.
+        assert_eq!(person["provenance"]["verdict"], "unsigned", "{person}");
+        assert!(person["provenance"].get("signer").is_none(), "{person}");
+        let (_, agent) = json_request(app.clone(), "/v1/messages", send("prov-agent", "agent/sender")).await;
+        let (_, agent) = get_request(app, &read(agent["subject"].as_str().unwrap())).await;
+        assert!(agent.get("provenance").is_none(), "{agent}");
+    }
+
+    #[tokio::test]
     async fn a_sender_followup_does_not_settle_the_recipient_message() {
         let root = tempfile::tempdir().unwrap();
         let app = router(state(root.path()));
@@ -20472,6 +20689,103 @@ mission "wake" state="ready" {
     }
 
     #[test]
+    fn agent_card_status_preserves_declared_and_canonical_fallback_revisions() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = &state.store;
+        let source = "version 2\nagent \"declared\" { name \"Same\"; command \"true\" }\n";
+        let intent = crate::graph::parse_test_intent(source, "node").unwrap();
+        let planned = store.mission(&intent, IntentInput {
+            kdl: source.into(), source_name: None,
+        }).unwrap();
+        store.apply(&intent, &planned.subject_tokens, "card-status-fixture").unwrap();
+        let append = |subject: &str, kind: &str, fields: Value| {
+            store.append_claim(&ClaimInput {
+                subject: subject.into(), kind: kind.into(), actor: Some(subject.into()),
+                fields: serde_json::from_value(fields).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap()
+        };
+        append("agent/node.declared", "runtime.observed", json!({
+            "status":"running", "runtime_id":"declared", "incarnation_id":"one"
+        }));
+        let runtime = append("agent/undeclared", "runtime.observed", json!({
+            "status":"running", "runtime_id":"undeclared", "incarnation_id":"one"
+        }));
+        append("agent/undeclared", "harness.observed", json!({
+            "state":"working", "driver":"omp", "incarnation_id":"one"
+        }));
+        let first = store.index().unwrap();
+        let last = append("agent/undeclared", "harness.observed", json!({
+            "state":"idle", "driver":"omp", "incarnation_id":"one"
+        }));
+        for index in [first, last.store_index] {
+            store.read_snapshot(|_| {
+                let full = client_agent_resources_uncached(store, false, index)?;
+                let cards = client_agent_resources_selected(store, false, index, None)?;
+                assert_eq!(Sha256::digest(serde_json::to_vec(&cards)?),
+                    Sha256::digest(serde_json::to_vec(&full)?));
+                let status = store.status_for_subject_prefix_at("agent/", Some(index), false)?;
+                let declared = status.subjects.iter().find(|s| s.subject == "agent/node.declared").unwrap();
+                assert_eq!(cards.iter().find(|c| c["id"] == declared.subject).unwrap()["revision"],
+                    declared.desired_revision.as_ref().unwrap().as_str());
+                let undeclared = status.subjects.iter().find(|s| s.subject == "agent/undeclared").unwrap();
+                assert_eq!(cards.iter().find(|c| c["id"] == undeclared.subject).unwrap()["revision"],
+                    undeclared.claims.last().unwrap().as_str());
+                Ok(())
+            }).unwrap();
+        }
+        // Equal accepted times must use canonical writer order, not arrival or claim ID.
+        // Construct that metadata tie on this isolated fixture, with the first claim last.
+        {
+            let connection = store.connection.write();
+            connection.execute(
+                "UPDATE claims SET accepted_at_unix_ms='1000' WHERE subject='agent/undeclared'", [],
+            ).unwrap();
+            connection.execute("UPDATE batches SET origin='zz-card-tie' WHERE id=?1", [&runtime.batch_id]).unwrap();
+            connection.execute("UPDATE claims SET origin='zz-card-tie' WHERE batch_id=?1", [&runtime.batch_id]).unwrap();
+        }
+        store.forget_current_views();
+        let index = store.index().unwrap();
+        let full = client_agent_resources_uncached(store, false, index).unwrap();
+        let cards = client_agent_resources_selected(store, false, index, None).unwrap();
+        assert_eq!(Sha256::digest(serde_json::to_vec(&cards).unwrap()),
+            Sha256::digest(serde_json::to_vec(&full).unwrap()));
+        assert_eq!(cards.iter().find(|c| c["id"] == "agent/undeclared").unwrap()["revision"],
+            runtime.id);
+    }
+
+    #[test]
+    #[ignore = "requires ST3_AGENT_CORPUS naming an owned disposable corpus copy"]
+    fn agent_card_status_copied_corpus_parity() {
+        let path = std::env::var_os("ST3_AGENT_CORPUS").expect("owned corpus copy required");
+        for history in [false, true] {
+            let oracle = Store::open(Path::new(&path), "card-status-benchmark").unwrap();
+            let store = Store::open(Path::new(&path), "card-status-benchmark").unwrap();
+            let read = |store: &Store, full: bool| {
+                let before = smallclaims::sqlite::work::total();
+                let start = Instant::now();
+                let cards = store.read_snapshot(|index| {
+                    store.with_owned_set_snapshot_reads(|| {
+                        if full { client_agent_resources_uncached(store, history, index) }
+                        else { client_agent_resources_selected(store, history, index, None) }
+                    })
+                }).unwrap();
+                let work = smallclaims::sqlite::work::total() - before;
+                eprintln!("agent-card-status full={full} history={history} elapsed_ms={} sql={} vm_steps={} cards={}",
+                    start.elapsed().as_millis(), work.statements, work.vm_steps, cards.len());
+                cards
+            };
+            let full = read(&oracle, true);
+            let cards = read(&store, false);
+            let full_hash = hex::encode(Sha256::digest(serde_json::to_vec(&full).unwrap()));
+            let card_hash = hex::encode(Sha256::digest(serde_json::to_vec(&cards).unwrap()));
+            assert_eq!(card_hash, full_hash);
+            eprintln!("agent-card-status history={history} sha256={card_hash}");
+        }
+    }
+
+    #[test]
     fn agent_cards_advance_locally_and_keep_historical_snapshots() {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
@@ -20936,12 +21250,25 @@ mission "agent-human" state="ready" {
         // The harness schema's terminal activity keeps precedence over a stale ask.
         observe_harness("ended");
         assert_eq!(agent()["state"], "failed");
+        assert!(agent()["blocked_on"].is_null());
+        assert!(agent()["ask"].is_null());
         // Indeterminate activity keeps its existing waiting verdict; clients must not
         // present it as an answerable human ask.
         observe_harness("indeterminate");
         assert_eq!(agent()["state"], "waiting");
         assert_eq!(agent()["harness_state"], "indeterminate");
+        assert!(agent()["blocked_on"].is_null());
+        assert!(agent()["ask"].is_null());
+        // A sparse working successor in this incarnation must not revive the old ask.
+        append("harness.observed", json!({
+            "state": "working", "driver": "omp", "incarnation_id": "human-1",
+        }));
+        assert_eq!(agent()["state"], "running");
+        assert!(agent()["blocked_on"].is_null());
+        assert!(agent()["ask"].is_null());
+        // A fresh permission observation may block again.
         observe_harness("working");
+        assert_eq!(agent()["state"], "waiting");
         observe_runtime("stopped");
         assert_eq!(agent()["state"], "stopped");
         observe_runtime("starting");

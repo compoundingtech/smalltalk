@@ -4,7 +4,8 @@
 
 use super::{Ui, theme};
 use crate::voice::{self, Event, Listening};
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::time::{Duration, Instant};
 use ratatui::text::{Line, Span};
 use st3_conversation_ui::text as wrap;
 
@@ -27,7 +28,14 @@ pub struct VoiceState {
     pub then: Option<Then>,
     /// Something to know while listening (only silence so far).
     pub note: Option<String>,
+    /// When listening started, and when the person chose what to do with the words.
+    pub started: Instant,
+    pub chosen_at: Option<Instant>,
 }
+
+/// How long the helper may take to say it is ready, or to hand over the words once asked, before
+/// voice is given up (Nathan, 2026-10-06: keys stopped working until the terminal was closed).
+const VOICE_PATIENCE: Duration = Duration::from_secs(10);
 
 impl VoiceState {
     #[cfg(test)]
@@ -40,6 +48,8 @@ impl VoiceState {
             device: String::new(),
             then: None,
             note: None,
+            started: Instant::now(),
+            chosen_at: None,
         }
     }
 }
@@ -69,6 +79,8 @@ impl Ui {
                     device: String::new(),
                     then: None,
                     note: None,
+                    started: Instant::now(),
+                    chosen_at: None,
                 });
             }
             Err(error) => self.flash(format!("Voice could not start: {error}")),
@@ -91,12 +103,19 @@ impl Ui {
                 self.cancel_voice();
                 return true;
             }
+            // A chord is never typing: Ctrl+Q quits and Ctrl+C is not swallowed while a helper
+            // that never answers is waited for. Voice is dropped and the key goes on its way.
+            _ if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.cancel_voice();
+                return false;
+            }
             KeyCode::Enter => Then::Send,
             KeyCode::Tab => Then::Edit,
             _ => return true,
         };
         if state.then.is_none() {
             state.then = Some(then);
+            state.chosen_at = Some(Instant::now());
             if let Some(listening) = state.listening.as_mut() {
                 listening.finish();
             }
@@ -114,8 +133,27 @@ impl Ui {
         }
     }
 
-    /// Take in what the helper said since the last pass.
+    /// Take in what the helper said since the last pass, and give up on one that says nothing.
     pub(crate) fn step_voice(&mut self) {
+        if let Some(state) = &self.voice {
+            let waiting_since = match (state.chosen_at, state.device.is_empty()) {
+                (Some(chosen), _) => Some(chosen),
+                (None, true) => Some(state.started),
+                (None, false) => None,
+            };
+            if waiting_since.is_some_and(|since| since.elapsed() >= VOICE_PATIENCE) {
+                self.cancel_voice();
+                self.flash("Voice did not answer, so it was stopped; your keys work again");
+                return;
+            }
+            // Voice belongs to the input it started in: leaving that conversation ends it, so
+            // it cannot keep holding the keys from a tab where it is not shown.
+            if self.draft_key().as_deref() != Some(state.input.as_str()) {
+                self.cancel_voice();
+                self.flash("Voice stopped: you left that conversation");
+                return;
+            }
+        }
         let mut events = Vec::new();
         if let Some(listening) = self
             .voice

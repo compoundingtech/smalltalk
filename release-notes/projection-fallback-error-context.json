@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Retain incremental projection errors and operation context before fallback replay",
+  "replay": {
+    "status": "none",
+    "detail": "Existing projection and fallback replay decisions are unchanged; adds bounded, rate-limited diagnostics only."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema or registry digest change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint, authority or admission rule change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No wire or client response contract change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Normal forward binary deployment; no additional interruption."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No operator action or new configuration required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Existing recovery and error handling retained."
+  }
+}

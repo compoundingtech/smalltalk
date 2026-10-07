@@ -28,6 +28,11 @@ pub type LegacyDigestTable = (
 pub enum IncrementalProjection {
     Projected,
     Replay(&'static str),
+    /// The same replay decision, with identifiers from the guard that requested it.
+    ReplayWithContext {
+        reason: &'static str,
+        details: serde_json::Map<String, Value>,
+    },
 }
 
 /// Work completed inside a replay transaction; it does not advance the committed frontier.
@@ -135,6 +140,11 @@ pub trait Runtime: Send + Sync {
     /// The digest of the rules that decide what a checkpoint drops. Nodes agree on a checkpoint
     /// only when their rules digests match.
     fn checkpoint_rules_digest(&self) -> String;
+
+    /// Fail before sealing history or copying a store when a runtime has no checkpoint contract.
+    fn checkpoint_preflight(&self) -> Result<()> {
+        Ok(())
+    }
 
     /// Decide what a checkpoint drops from `sealed`: a pure function of the sealed claims.
     fn plan_checkpoint_drops(&self, sealed: &SealedSet) -> DropPlan;

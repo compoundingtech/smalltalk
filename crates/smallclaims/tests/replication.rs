@@ -159,3 +159,88 @@ fn a_documents_bytes_and_binding_replicate_by_content() {
         Some(b"# Plan\n".as_slice())
     );
 }
+
+/// Admission looks for envelopes to retry on every receive. With nothing pending that must be a
+/// handful of index seeks: scanning the replica records and envelopes held the only writer for
+/// seconds on a store of 660,000 records.
+#[test]
+fn the_admission_retry_query_seeks_by_index_and_never_scans_a_replica_table() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("claims.sqlite3");
+    drop(Store::open(&path, "ada-laptop", Arc::new(Plain)).unwrap());
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    for retry_hash_mismatches in [false, true] {
+        let sql = format!(
+            "EXPLAIN QUERY PLAN {}",
+            smallclaims::store::admission_retry_query(retry_hash_mismatches)
+        );
+        let mut statement = connection.prepare(&sql).unwrap();
+        let plan = statement
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for line in &plan {
+            assert!(
+                !line.starts_with("SCAN replica_") && !line.starts_with("SCAN envelopes"),
+                "the retry query scans a replica table: {plan:#?}"
+            );
+        }
+    }
+}
+
+/// A start used to find the first unsealed batch by probing the envelope table once per batch
+/// (611,000 probes on a real store). Sealing now stores its cursor in the transaction that seals,
+/// and a start reads it; a store without one finds it the old way, once.
+#[test]
+fn a_restart_resumes_sealing_at_the_stored_cursor_and_a_store_without_one_still_seals() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("claims.sqlite3");
+    let open = || {
+        let store = Store::open(&path, "ada-laptop", Arc::new(Plain)).unwrap();
+        store.bind_fleet(FLEET).unwrap();
+        store
+    };
+    let envelopes = || -> i64 {
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM replica_envelopes", [], |row| row.get(0))
+            .unwrap()
+    };
+    let cursor = || -> Option<String> {
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT value FROM meta WHERE key='seeded_batch_rowid'",
+                [],
+                |row| row.get(0),
+            )
+            .ok()
+    };
+    {
+        let store = open();
+        note(&store, "note/a", "one");
+        note(&store, "note/a", "two");
+        store.replication_snapshot().unwrap();
+        assert_eq!(envelopes(), 2);
+        // Written after the last seal, and the daemon stops before the next one.
+        note(&store, "note/a", "three");
+        assert_eq!(envelopes(), 2);
+    }
+    assert!(cursor().is_some(), "sealing stored how far it went");
+    {
+        let store = open();
+        store.replication_snapshot().unwrap();
+        assert_eq!(envelopes(), 3, "the restart sealed the batch written after the cursor");
+        note(&store, "note/a", "four");
+    }
+    // A store from before the cursor existed: no key, and the start finds the same place.
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute("DELETE FROM meta WHERE key='seeded_batch_rowid'", [])
+        .unwrap();
+    let store = open();
+    assert!(cursor().is_some(), "the start stores the cursor it found");
+    store.replication_snapshot().unwrap();
+    assert_eq!(envelopes(), 4);
+}

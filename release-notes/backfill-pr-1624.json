@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "summary": "#1624: embedded Claude hook interpreters in Nix builds",
+  "commits": ["672d7fe62117e116c59f7677c0de09776110e54d"],
+  "replay": {"status": "none", "detail": "No new projection invalidation or startup replay trigger in the merged embedded Claude hook interpreters in Nix builds change."},
+  "schema": {"status": "none", "detail": "No database table, index, trigger or migration change in embedded Claude hook interpreters in Nix builds; SQLite user_version is unchanged."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digest/drop policy are unchanged; this change adds no sealing coordination requirement."},
+  "compatibility": {"status": "changed", "detail": "Nix-built binaries embed the declared Nix-store Bash interpreter in Claude hooks and retain it in the runtime closure. Archive installs are unaffected. The build now fails when either hook is absent or its patched interpreter is wrong; interpreter proof alone does not establish full native Claude lifecycle readiness."},
+  "downtime": {"status": "none", "detail": "No additional upgrade service stop or measured outage introduced by embedded Claude hook interpreters in Nix builds; the standard daemon/client restart procedure still applies."},
+  "manual": {"status": "none", "detail": "No data repair or configuration conversion required for existing installations by embedded Claude hook interpreters in Nix builds."},
+  "recovery": {"status": "none", "detail": "No additional recovery procedure introduced by this change. Preserve graph state, keys and configuration and follow the standard roll-forward guidance; this note does not qualify binary-only downgrade of the whole release."}
+}

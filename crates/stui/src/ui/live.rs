@@ -14,7 +14,7 @@ use crate::feed::{self, Command, TerminalUpdate, Window};
 use crate::model::{self, Collection, Model};
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event},
+    event::Event,
     execute,
     terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate},
 };
@@ -156,6 +156,7 @@ enum Fetched {
     Sessions(Collection),
     /// The Fleet tab's machines and paired devices.
     Machines(Collection),
+    Repositories(String, Load<Vec<String>>),
     /// Token spend over a period of this many hours, or why st could not say.
     Usage(u64, Result<st3_client::UsagePeriod, String>),
     /// The clients connected to this member, or why they could not be read.
@@ -329,6 +330,7 @@ pub fn run(context: Context) -> Result<()> {
     let mut cursor_style: Option<crossterm::cursor::SetCursorStyle> = None;
     // The tab shown on the last pass: opening a tab loads what only it needs.
     let mut shown_tab = usize::MAX;
+    let mut repositories_asked: Option<String> = None;
     // When usage was last asked for and over how many hours, and whether that read is out.
     let mut usage_read: Option<(Instant, u64)> = None;
     // When the connected clients were last read, while the fleet shows, and whether a read is out.
@@ -568,6 +570,11 @@ pub fn run(context: Context) -> Result<()> {
                     model.sessions = native;
                 }
                 Fetched::Machines(machines) => model.machines = machines,
+                Fetched::Repositories(host, load) => {
+                    if ui.agent_repository_host().as_ref() == Some(&host) {
+                        ui.agent_repositories = Some((host, load));
+                    }
+                }
                 Fetched::Older {
                     target,
                     session_id,
@@ -735,6 +742,33 @@ pub fn run(context: Context) -> Result<()> {
                     }
                 });
             }
+        }
+        if !extras.live {
+            repositories_asked = None;
+        }
+        match ui.agent_repository_host() {
+            Some(host) if extras.live && repositories_asked.as_ref() != Some(&host) => {
+                repositories_asked = Some(host.clone());
+                ui.agent_repositories = Some((host.clone(), Load::Loading));
+                let client = client.clone();
+                let tx = fetched_tx.clone();
+                runtime.spawn(async move {
+                    let load = match client.host_repositories(&host).await {
+                        Ok(reply) => Load::Ready(
+                            reply
+                                .value
+                                .repositories
+                                .into_iter()
+                                .map(|repo| repo.path)
+                                .collect(),
+                        ),
+                        Err(error) => Load::Failed(error.plain()),
+                    };
+                    let _ = tx.send(Fetched::Repositories(host, load));
+                });
+            }
+            None => repositories_asked = None,
+            _ => {}
         }
         // Ctrl+K asks st's conversation search once what is typed has been still for a moment;
         // an answer to an earlier query is dropped where it lands (Ui::said_choices).
@@ -984,6 +1018,7 @@ pub fn run(context: Context) -> Result<()> {
                     }
                     {
                         ui.park_for(&agent);
+                        ui.terminal_selection_mode = false;
                         ui.terminal = Some(super::TerminalView {
                             agent: agent.clone(),
                             title: name.clone(),
@@ -1212,6 +1247,7 @@ pub fn run(context: Context) -> Result<()> {
             }
         }
         ui.step_voice();
+        ui.step_terminal_hold();
         execute!(io::stdout(), BeginSynchronizedUpdate)?;
         terminal.draw(|frame| ui.render(frame))?;
         // The attached terminal's cursor shape (vim's bar while inserting), and the person's
@@ -1303,24 +1339,21 @@ pub fn run(context: Context) -> Result<()> {
                 .chain(ui.parked.iter())
                 .filter_map(|view| view.native.as_ref())
                 .any(|native| native.flowing());
-        if event::poll(Duration::from_millis(if flowing { 16 } else { 80 }))? {
-            // crossterm's read never returns on a closed terminal, so check for one before each.
-            while !stopping.load(std::sync::atomic::Ordering::Relaxed) && !crate::stdin_hung_up() {
-                match event::read()? {
-                    Event::Key(key)
-                        if !extras.live
-                            && key.code == crossterm::event::KeyCode::Char('r')
-                            && !ui.editing =>
-                    {
-                        let _ = commands.send(Command::Reconnect);
-                    }
-                    input => ui.input_event(input),
+        super::hover::poll_input(
+            Duration::from_millis(if flowing { 16 } else { 80 }),
+            &stopping,
+            |input| match input {
+                Event::Key(key)
+                    if !extras.live
+                        && key.code == crossterm::event::KeyCode::Char('r')
+                        && !ui.editing =>
+                {
+                    let _ = commands.send(Command::Reconnect);
+                    true
                 }
-                if !event::poll(Duration::ZERO)? {
-                    break;
-                }
-            }
-        }
+                input => ui.input_event(input),
+            },
+        )?;
     }
     // Leave no attachment behind.
     if let Some(current) = attached.take() {
@@ -1811,6 +1844,10 @@ async fn perform(
             effort,
             host,
             message,
+            repo,
+            branch,
+            base,
+            workspace,
         } => {
             let snapshot = client.capabilities().await?.snapshot.id;
             let (id, idem) = crate::action_pair();
@@ -1828,7 +1865,10 @@ async fn perform(
                         host,
                         model,
                         effort,
-                        workspace: None,
+                        workspace,
+                        repo,
+                        branch,
+                        base,
                         description: None,
                         message,
                         ..Default::default()
@@ -2040,6 +2080,7 @@ async fn perform(
         Effect::Send {
             agent,
             mut text,
+            in_reply_to,
             tags,
             images,
         } => {
@@ -2091,7 +2132,7 @@ async fn perform(
                 &agent,
                 text,
                 None,
-                None,
+                in_reply_to,
                 session,
                 tags,
                 attachments,
@@ -2280,6 +2321,7 @@ mod tests {
         std::fs::write(&image, b"\x89PNG\r\n\x1a\nproof").unwrap();
         let sent = Mutex::new(None);
         let send = Effect::Send {
+            in_reply_to: None,
             agent: "agent/example/worker".into(),
             text: "Copper proof".into(),
             tags: vec![],
@@ -2325,6 +2367,43 @@ mod tests {
         .unwrap();
         assert_eq!(replay.as_deref(), Some(message.as_str()));
         assert_eq!(store.index().unwrap(), index);
+        let reply_sent = Mutex::new(None);
+        let reply = Effect::Send {
+            agent: "agent/example/worker".into(),
+            text: "Thanks for the copper proof.".into(),
+            in_reply_to: Some(message.clone()),
+            tags: vec![],
+            images: vec![],
+        };
+        let (_, replied) = perform(
+            &client,
+            "person/avery",
+            &model,
+            reply.clone(),
+            Some(&reply_sent),
+        )
+        .await
+        .unwrap();
+        let replied = replied.unwrap();
+        assert_eq!(
+            store
+                .message(&replied)
+                .unwrap()
+                .unwrap()
+                .in_reply_to
+                .as_deref(),
+            Some(message.as_str())
+        );
+        let reply_index = store.index().unwrap();
+        let (_, repeated) = perform(&client, "person/avery", &model, reply, Some(&reply_sent))
+            .await
+            .unwrap();
+        assert_eq!(repeated.as_deref(), Some(replied.as_str()));
+        assert_eq!(
+            store.index().unwrap(),
+            reply_index,
+            "threaded replies keep the same retry receipt"
+        );
         for effect in [
             Effect::Discuss {
                 to: "agent/example/worker".into(),
@@ -2337,6 +2416,10 @@ mod tests {
                 model: None,
                 effort: None,
                 host: None,
+                repo: Some("/srv/example/repo".into()),
+                branch: Some("copper".into()),
+                base: Some("origin/main".into()),
+                workspace: Some("/srv/example/copper".into()),
                 message: None,
             },
             Effect::CreateTerminal {
@@ -2364,6 +2447,21 @@ mod tests {
                 .iter()
                 .any(|item| item.subject == "agent/example/copper")
         );
+        let agent = store
+            .desired_subjects()
+            .unwrap()
+            .into_iter()
+            .find(|item| item.subject == "agent/example/copper")
+            .unwrap();
+        let checkout = agent.desired["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["name"] == "checkout")
+            .unwrap();
+        assert_eq!(checkout["arguments"][0], "/srv/example/repo");
+        assert_eq!(checkout["properties"]["branch"], "copper");
+        assert_eq!(agent.member.unwrap().workspace, "/srv/example/copper");
         assert_eq!(store.planning_sessions(true).unwrap().len(), 1);
         let launch = store.planning_sessions(true).unwrap().pop().unwrap();
         let transport = st3::client::Client::unix_as(&socket, "person/avery").unwrap();
@@ -2587,6 +2685,7 @@ mod tests {
                 body: "Here is the reply.".into(),
                 delivered: false,
                 dictated: false,
+                signed: None,
                 images: Vec::new(),
             },
         }];
@@ -2683,6 +2782,7 @@ mod tests {
                 body: "Here is the reply.".into(),
                 delivered: false,
                 dictated: false,
+                signed: None,
                 images: Vec::new(),
             },
         };
@@ -2906,6 +3006,7 @@ mod tests {
             failed: None,
             unconfirmed: false,
             effect: Effect::Send {
+                in_reply_to: None,
                 agent: "agent/example/cos".into(),
                 text: "hello".into(),
                 tags: Vec::new(),

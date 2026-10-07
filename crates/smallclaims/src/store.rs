@@ -36,6 +36,8 @@ use crate::sqlite::{
     SQLITE_NANOS, STATEMENT_CACHE_CAPACITY, WriterConnection,
 };
 
+#[cfg(test)]
+mod projection_busy_tests;
 mod binary_payloads;
 mod inventory_generation;
 pub use binary_payloads::PayloadConversion;
@@ -93,6 +95,311 @@ fn full_replay_log_line(phase: &str, reason: &str, frontier: u64, target: u64) -
         bounded(phase),
         bounded(reason)
     )
+}
+
+const PROJECTION_DIAGNOSTIC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+const PROJECTION_DIAGNOSTIC_SLOTS: usize = 16;
+
+#[derive(Default)]
+struct ProjectionDiagnosticRate {
+    last_logged: Option<std::time::Instant>,
+    suppressed: u64,
+}
+
+impl ProjectionDiagnosticRate {
+    fn observe(&mut self, now: std::time::Instant) -> Option<u64> {
+        if self.last_logged.is_some_and(|last| {
+            now.saturating_duration_since(last) < PROJECTION_DIAGNOSTIC_INTERVAL
+        }) {
+            self.suppressed = self.suppressed.saturating_add(1);
+            return None;
+        }
+        self.last_logged = Some(now);
+        Some(std::mem::take(&mut self.suppressed))
+    }
+}
+
+#[derive(Default)]
+struct ProjectionDiagnosticState {
+    slots: Vec<(String, String, ProjectionDiagnosticRate)>,
+    overflow: ProjectionDiagnosticRate,
+}
+
+#[derive(Default)]
+struct ProjectionDiagnosticEmission {
+    suppressed: u64,
+    overflow: bool,
+}
+
+impl ProjectionDiagnosticState {
+    // Keys use only bounded stage/code prefixes, never claim or subject identifiers. Keep
+    // the first 16 keys; all subsequent keys share one overflow bucket without eviction.
+    // Counts measure suppressed reporter calls, not distinct errors. They are process-local
+    // and emitted only on a later allowed error; there is no scheduled flush or retry.
+    fn observe(
+        &mut self,
+        stage: &str,
+        code: &str,
+        now: std::time::Instant,
+    ) -> Option<ProjectionDiagnosticEmission> {
+        let stage: String = stage.chars().take(128).collect();
+        let code: String = code.chars().take(128).collect();
+        if let Some((_, _, rate)) = self
+            .slots
+            .iter_mut()
+            .find(|(s, c, _)| s == &stage && c == &code)
+        {
+            return rate
+                .observe(now)
+                .map(|suppressed| ProjectionDiagnosticEmission {
+                    suppressed,
+                    overflow: false,
+                });
+        }
+        if self.slots.len() < PROJECTION_DIAGNOSTIC_SLOTS {
+            let mut rate = ProjectionDiagnosticRate::default();
+            let suppressed = rate.observe(now)?;
+            self.slots.push((stage, code, rate));
+            return Some(ProjectionDiagnosticEmission {
+                suppressed,
+                overflow: false,
+            });
+        }
+        self.overflow
+            .observe(now)
+            .map(|suppressed| ProjectionDiagnosticEmission {
+                suppressed,
+                overflow: true,
+            })
+    }
+}
+
+/// One bounded, escaped diagnostic; only named identifiers are admitted from error details.
+/// Original exception text can quote input fragments (notably serde desired-decode errors);
+/// this preserves the error for diagnosis and does not provide general payload redaction.
+/// The persistent graph health message remains unchanged. Missing context stays explicit.
+fn projection_failure_log_line(
+    phase: &str,
+    code: &str,
+    message: &str,
+    details: &serde_json::Map<String, Value>,
+    frontier: u64,
+    target: u64,
+    emission: ProjectionDiagnosticEmission,
+) -> String {
+    fn bounded(value: &str, limit: usize) -> String {
+        value.chars().take(limit).collect()
+    }
+    let field = |name: &str| {
+        details
+            .get(name)
+            .and_then(Value::as_str)
+            .map(|s| bounded(s, 256))
+    };
+    let diagnostic = json!({
+        "phase": bounded(phase, 128), "code": bounded(code, 128),
+        "error": bounded(message, 4096), "error_truncated": message.chars().take(4097).count()>4096,
+        "stage": field("projection_stage"), "claim_id": field("projection_claim_id"),
+        "subject": field("projection_subject"), "operation_id": field("projection_operation_id"),
+        "frontier": if details.get("projection_frontier_unknown").and_then(Value::as_bool).unwrap_or(false) { None } else { Some(frontier) }, "target": target,
+        "suppressed_errors": emission.suppressed, "rate_bucket_overflow": emission.overflow,
+        "context_truncated": details.get("projection_context_truncated").and_then(Value::as_bool).unwrap_or(false)
+            || phase.chars().take(129).count()>128 || code.chars().take(129).count()>128
+            || ["projection_stage", "projection_claim_id", "projection_subject", "projection_operation_id"].iter()
+                .any(|name| details.get(*name).and_then(Value::as_str).is_some_and(|value| value.chars().take(257).count()>256)),
+    });
+    format!("st: projection failure detail {diagnostic}")
+}
+
+#[cfg(test)]
+mod projection_failure_diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn diagnostic_rate_keeps_first_error_and_reports_reset_counts_by_stage_and_code() {
+        let now = std::time::Instant::now();
+        let mut state = ProjectionDiagnosticState::default();
+        assert_eq!(
+            state.observe("decode", "internal", now).unwrap().suppressed,
+            0
+        );
+        assert!(state.observe("decode", "internal", now).is_none());
+        assert!(
+            state
+                .observe(
+                    "decode",
+                    "internal",
+                    now + std::time::Duration::from_secs(59)
+                )
+                .is_none()
+        );
+        assert_eq!(
+            state
+                .observe("registry", "internal", now)
+                .unwrap()
+                .suppressed,
+            0
+        );
+        assert_eq!(
+            state.observe("decode", "conflict", now).unwrap().suppressed,
+            0
+        );
+        let next = now + PROJECTION_DIAGNOSTIC_INTERVAL;
+        assert_eq!(
+            state
+                .observe("decode", "internal", next)
+                .unwrap()
+                .suppressed,
+            2
+        );
+        assert!(state.observe("decode", "internal", next).is_none());
+        assert_eq!(
+            state
+                .observe("decode", "internal", next + PROJECTION_DIAGNOSTIC_INTERVAL)
+                .unwrap()
+                .suppressed,
+            1
+        );
+    }
+
+    #[test]
+    fn diagnostic_suppression_saturates_without_wrapping() {
+        let now = std::time::Instant::now();
+        let mut rate = ProjectionDiagnosticRate {
+            last_logged: Some(now),
+            suppressed: u64::MAX,
+        };
+        assert!(rate.observe(now).is_none());
+        assert_eq!(rate.suppressed, u64::MAX);
+        assert_eq!(
+            rate.observe(now + PROJECTION_DIAGNOSTIC_INTERVAL),
+            Some(u64::MAX)
+        );
+        assert_eq!(rate.suppressed, 0);
+    }
+
+    #[test]
+    fn diagnostic_keys_are_bounded_and_extra_keys_share_one_overflow_bucket() {
+        let now = std::time::Instant::now();
+        let mut state = ProjectionDiagnosticState::default();
+        let prefix = "é".repeat(128);
+        assert!(
+            !state
+                .observe(&format!("{prefix}first"), "internal", now)
+                .unwrap()
+                .overflow
+        );
+        assert!(
+            state
+                .observe(&format!("{prefix}second"), "internal", now)
+                .is_none()
+        );
+        for slot in 1..PROJECTION_DIAGNOSTIC_SLOTS {
+            assert!(
+                !state
+                    .observe(&slot.to_string(), "internal", now)
+                    .unwrap()
+                    .overflow
+            );
+        }
+        let first = state.observe("overflow-first", "internal", now).unwrap();
+        assert!(first.overflow);
+        assert_eq!(first.suppressed, 0);
+        for slot in 0..100 {
+            assert!(
+                state
+                    .observe(&format!("overflow-{slot}"), "different-code", now)
+                    .is_none()
+            );
+        }
+        let next = state
+            .observe(
+                "another-key",
+                "another-code",
+                now + PROJECTION_DIAGNOSTIC_INTERVAL,
+            )
+            .unwrap();
+        assert!(next.overflow);
+        assert_eq!(next.suppressed, 100);
+        assert_eq!(state.slots.len(), PROJECTION_DIAGNOSTIC_SLOTS);
+        assert!(state.slots.iter().all(|(stage, code, _)| stage.chars().count() <= 128 && code.chars().count() <= 128));
+        assert_eq!(state.overflow.suppressed, 0);
+    }
+
+    #[test]
+    fn diagnostic_reporter_releases_its_mutex_before_the_sink_and_preserves_error() {
+        let store = Store::open_memory("node", Arc::new(runtime::Plain)).unwrap();
+        let error = St3Error::new("internal", "original error with input fragment")
+            .with_detail("projection_stage", "decode");
+        let mut lines = Vec::new();
+        let mut sink = |line: &str| {
+            assert!(store.projection_diagnostics.try_lock().is_ok());
+            lines.push(line.to_owned());
+        };
+        store.log_projection_failure(&error, "receive", 7, 9, &mut sink);
+        store.log_projection_failure(&error, "receive", 7, 9, &mut sink);
+        {
+            let mut state = store.projection_diagnostics.lock().unwrap();
+            state.slots[0].2.last_logged =
+                Some(std::time::Instant::now() - PROJECTION_DIAGNOSTIC_INTERVAL);
+        }
+        store.log_projection_failure(&error, "receive", 7, 9, &mut sink);
+        assert_eq!(lines.len(), 2);
+        for (line, suppressed) in lines.iter().zip([0, 1]) {
+            let value: Value =
+                serde_json::from_str(line.strip_prefix("st: projection failure detail ").unwrap())
+                    .unwrap();
+            assert_eq!(value["error"], error.message);
+            assert_eq!(value["suppressed_errors"], suppressed);
+            assert_eq!(value["rate_bucket_overflow"], false);
+        }
+    }
+
+    #[test]
+    fn error_diagnostic_is_escaped_bounded_and_does_not_copy_extra_details() {
+        let details = serde_json::Map::from_iter([
+            ("projection_claim_id".into(), json!("claim")),
+            ("projection_subject".into(), json!("subject\nnext")),
+            ("secret-payload".into(), json!("never copy")),
+        ]);
+        let line = projection_failure_log_line(
+            "phase\nnext",
+            "internal",
+            &"é".repeat(5000),
+            &details,
+            7,
+            9,
+            ProjectionDiagnosticEmission::default(),
+        );
+        assert_eq!(line.lines().count(), 1);
+        let value: Value =
+            serde_json::from_str(line.strip_prefix("st: projection failure detail ").unwrap())
+                .unwrap();
+        assert_eq!(value["error"].as_str().unwrap().chars().count(), 4096);
+        assert_eq!(value["error_truncated"], true);
+        assert_eq!(value["claim_id"], "claim");
+        assert_eq!(value["subject"], "subject\nnext");
+        assert_eq!(value["operation_id"], Value::Null);
+        assert!(!line.contains("never copy"));
+        let short = projection_failure_log_line(
+            "phase",
+            "internal",
+            "exact original SQL error",
+            &serde_json::Map::new(),
+            7,
+            9,
+            ProjectionDiagnosticEmission::default(),
+        );
+        let value: Value = serde_json::from_str(
+            short
+                .strip_prefix("st: projection failure detail ")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(value["error"], "exact original SQL error");
+        assert_eq!(value["error_truncated"], false);
+        assert_eq!(value["claim_id"], Value::Null);
+    }
 }
 
 /// The graph's tables: the claim log and its batches, operations, documents and blobs, replica
@@ -393,13 +700,20 @@ pub struct Store {
     pub replication_sync: Mutex<BTreeMap<String, PeerSyncProgress>>,
     /// Held while replicated envelopes are admitted; see `validate_replication_backlog`.
     pub admission: Mutex<()>,
+    /// The membership last folded, and the `fleet_generation` it was folded at.
+    pub membership_cache: Mutex<Option<(i64, crate::fleet::Membership)>>,
     /// Serializes projection passes while they lend the writer back between chunks.
     pub projection: Mutex<()>,
     pub replication_timers: ReplicationTimers,
     /// Low bit means deferred; each new deferral advances the generation by two so an
     /// older projection pass cannot clear a newer admission or catch-up deferral.
     replication_projection_state: AtomicU64,
-    /// When this process last projected replicated claims, in Unix milliseconds.
+    /// Only limits new error detail lines; it never caches projection results or decisions.
+    projection_diagnostics: Mutex<ProjectionDiagnosticState>,
+    /// Advances only for numeric SQLite contention, so the daemon can coalesce a bounded
+    /// retry episode without treating arbitrary deferred work as contention.
+    projection_contention_generation: AtomicU64,
+    /// When this process last attempted projection of replicated claims, in Unix milliseconds.
     pub last_replication_projection_unix_ms: AtomicU64,
     /// The heals this node asks its peers, and when it last replayed its graph for one.
     pub heal: Mutex<heal::HealState>,
@@ -535,6 +849,7 @@ impl Store {
         reject_old_schema(connection)?;
         runtime.migrate_schema(connection)?;
         connection.execute_batch(SCHEMA)?;
+        connection.execute_batch(&fleet_generation_schema())?;
         inventory_generation::initialize(connection)?;
         connection.execute_batch(principals::PRINCIPAL_SCHEMA)?;
         runtime.create_schema(connection)?;
@@ -563,14 +878,43 @@ impl Store {
         // Opening cannot seal recent work: the caller has not loaded its signing keys yet.
         // Resume at the first batch still needing an envelope, so a restart seals it with
         // the same person and agent keys instead of permanently losing its delegation signatures.
-        let seeded_batch_rowid = connection.query_row(
-            "SELECT COALESCE(
-                (SELECT MIN(batches.rowid)-1 FROM batches WHERE NOT EXISTS (
-                    SELECT 1 FROM replica_envelopes WHERE batch_id=batches.id)),
-                (SELECT MAX(rowid) FROM batches), 0)",
+        //
+        // Finding that batch meant probing the envelope table once per batch, 611,000 probes: 3 to
+        // 9 s on every start. Sealing stores how far it has gone in `meta` in the transaction
+        // that seals, so a start reads it. It is a lower bound that is always safe: sealing only
+        // seals batches that still lack an envelope, so a cursor behind the truth costs a longer
+        // range, never a missed batch. A store without the cursor, once, finds it the slow way.
+        let max_rowid: i64 = connection.query_row(
+            "SELECT COALESCE(MAX(rowid), 0) FROM batches",
             [],
             |row| row.get(0),
         )?;
+        let stored_cursor: Option<i64> = connection
+            .query_row(
+                "SELECT value FROM meta WHERE key='seeded_batch_rowid'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|value| value.parse().ok());
+        let seeded_batch_rowid = match stored_cursor {
+            Some(cursor) => cursor.min(max_rowid),
+            None => {
+                let found: i64 = connection.query_row(
+                    "SELECT COALESCE(
+                        (SELECT MIN(batches.rowid)-1 FROM batches WHERE NOT EXISTS (
+                            SELECT 1 FROM replica_envelopes WHERE batch_id=batches.id)),
+                        (SELECT MAX(rowid) FROM batches), 0)",
+                    [],
+                    |row| row.get(0),
+                )?;
+                connection.execute(
+                    "INSERT OR REPLACE INTO meta(key,value) VALUES('seeded_batch_rowid', ?1)",
+                    [found.to_string()],
+                )?;
+                found
+            }
+        };
         let index = current_index(&connection)?;
         // Older stores have no admission watermark. Startup recovery projects this index
         // before serving; subsequent admission chunks update it in their own transaction.
@@ -589,9 +933,12 @@ impl Store {
             replication_snapshot_build: Mutex::new(()),
             replication_sync: Mutex::new(BTreeMap::new()),
             admission: Mutex::new(()),
+            membership_cache: Mutex::new(None),
             projection: Mutex::new(()),
             replication_timers: ReplicationTimers::default(),
             replication_projection_state: AtomicU64::new(0),
+            projection_diagnostics: Mutex::new(ProjectionDiagnosticState::default()),
+            projection_contention_generation: AtomicU64::new(0),
             last_replication_projection_unix_ms: AtomicU64::new(0),
             heal: Mutex::default(),
             member_key: std::sync::RwLock::new(None),
@@ -1442,10 +1789,39 @@ impl Store {
 
     /// The current fleet membership, folded from admitted `fleet.*` claims.
     pub fn fleet_membership(&self) -> Result<crate::fleet::Membership> {
+        // Membership is a function of the fleet claims, their envelopes' signatures and the
+        // anchor, and triggers advance `fleet_generation` whenever any of them changes. Fold it
+        // when the generation moved, not on every call: folding is hundreds of statements, and
+        // callers ask on every graph change, a few times a second.
+        let generation = |connection: &Connection| -> Result<i64> {
+            Ok(connection.query_row(
+                "SELECT value FROM fleet_generation WHERE id=1",
+                [],
+                |row| row.get(0),
+            )?)
+        };
+        {
+            let current = generation(&self.readers.get())?;
+            let cache = self
+                .membership_cache
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some((folded_at, membership)) = cache.as_ref()
+                && *folded_at == current
+            {
+                return Ok(membership.clone());
+            }
+        }
         // A local claim counts only once its batch is an envelope with this node's signature.
         self.replication_snapshot()?;
         let connection = self.readers.get();
-        fleet_membership_tx(&connection)
+        let folded_at = generation(&connection)?;
+        let membership = fleet_membership_tx(&connection)?;
+        *self
+            .membership_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some((folded_at, membership.clone()));
+        Ok(membership)
     }
 
     /// Whether transport observations about `peer` belong in the graph. A dial-out member is
@@ -1779,6 +2155,61 @@ pub fn max_envelope_rowid(connection: &Connection) -> Result<i64> {
 
 /// Fold the admitted `fleet.*` claims from the pinned anchor. A store without an anchor has an
 /// empty membership, in which every writer is legacy.
+/// A counter that moves whenever fleet membership could: a fleet claim, the envelope that carries
+/// it, a signature on that envelope, or the anchor. `fleet_membership` re-folds only when it moved.
+fn fleet_generation_schema() -> String {
+    let bump = "UPDATE fleet_generation SET value=value+1 WHERE id=1;";
+    let carries_fleet_claims = |envelope: &str| {
+        format!(
+            "EXISTS (SELECT 1 FROM claims WHERE batch_id={envelope}.batch_id \
+             AND kind IN ({FLEET_CLAIM_KINDS}))"
+        )
+    };
+    let signs_fleet_claims = |signature: &str| {
+        format!(
+            "EXISTS (SELECT 1 FROM replica_envelopes AS envelopes \
+             JOIN claims ON claims.batch_id=envelopes.batch_id \
+             WHERE envelopes.writer={signature}.writer AND envelopes.sequence={signature}.sequence \
+             AND envelopes.envelope_hash={signature}.envelope_hash \
+             AND claims.kind IN ({FLEET_CLAIM_KINDS}))"
+        )
+    };
+    format!(
+        "CREATE TABLE IF NOT EXISTS fleet_generation (
+             id INTEGER PRIMARY KEY CHECK(id=1), value INTEGER NOT NULL);
+         INSERT OR IGNORE INTO fleet_generation(id, value) VALUES (1, 0);
+         CREATE TRIGGER IF NOT EXISTS fleet_generation_claim_insert AFTER INSERT ON claims
+         WHEN NEW.kind IN ({FLEET_CLAIM_KINDS}) BEGIN {bump} END;
+         CREATE TRIGGER IF NOT EXISTS fleet_generation_claim_delete AFTER DELETE ON claims
+         WHEN OLD.kind IN ({FLEET_CLAIM_KINDS}) BEGIN {bump} END;
+         CREATE TRIGGER IF NOT EXISTS fleet_generation_claim_update
+         AFTER UPDATE OF kind, batch_id, body ON claims
+         WHEN NEW.kind IN ({FLEET_CLAIM_KINDS}) OR OLD.kind IN ({FLEET_CLAIM_KINDS})
+         BEGIN {bump} END;
+         CREATE TRIGGER IF NOT EXISTS fleet_generation_envelope_insert AFTER INSERT ON replica_envelopes
+         WHEN NEW.batch_id IS NOT NULL AND {insert_envelope} BEGIN {bump} END;
+         CREATE TRIGGER IF NOT EXISTS fleet_generation_envelope_update
+         AFTER UPDATE OF batch_id ON replica_envelopes
+         WHEN NEW.batch_id IS NOT NULL AND {update_envelope} BEGIN {bump} END;
+         CREATE TRIGGER IF NOT EXISTS fleet_generation_signature_insert
+         AFTER INSERT ON replica_envelope_signatures
+         WHEN {insert_signature} BEGIN {bump} END;
+         CREATE TRIGGER IF NOT EXISTS fleet_generation_signature_delete
+         AFTER DELETE ON replica_envelope_signatures
+         WHEN {delete_signature} BEGIN {bump} END;
+         CREATE TRIGGER IF NOT EXISTS fleet_generation_anchor_insert AFTER INSERT ON meta
+         WHEN NEW.key='fleet_anchor_key' BEGIN {bump} END;
+         CREATE TRIGGER IF NOT EXISTS fleet_generation_anchor_update AFTER UPDATE ON meta
+         WHEN NEW.key='fleet_anchor_key' OR OLD.key='fleet_anchor_key' BEGIN {bump} END;
+         CREATE TRIGGER IF NOT EXISTS fleet_generation_anchor_delete AFTER DELETE ON meta
+         WHEN OLD.key='fleet_anchor_key' BEGIN {bump} END;",
+        insert_envelope = carries_fleet_claims("NEW"),
+        update_envelope = carries_fleet_claims("NEW"),
+        insert_signature = signs_fleet_claims("NEW"),
+        delete_signature = signs_fleet_claims("OLD"),
+    )
+}
+
 pub fn fleet_membership_tx(connection: &Connection) -> Result<crate::fleet::Membership> {
     fleet_membership_tx_with_local_signer(connection, None)
 }
@@ -4306,6 +4737,18 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// The id of a subject's newest claim in canonical order: a seek of the newest time block,
+    /// not a read of every claim of the subject.
+    pub fn latest_claim_id(&self, subject: &str) -> Result<Option<String>> {
+        crate::touched::note_read(|| subject.to_owned());
+        let connection = self.readers.get();
+        connection
+            .prepare_cached(&canonical_sql(LATEST_CLAIM_QUERY))?
+            .query_row([subject], |row| row.get(0))
+            .optional()
+            .map_err(Into::into)
+    }
+
     /// Append a claim this node writes, through the runtime that knows its kind.
     pub fn append_claim(&self, input: &ClaimInput) -> Result<ClaimRecord, St3Error> {
         self.append_claim_outcome(input).map(|(claim, _)| claim)
@@ -4327,12 +4770,15 @@ impl Store {
         appended
     }
 
+    #[track_caller]
     pub fn read_snapshot<T>(&self, read: impl FnOnce(u64) -> Result<T>) -> Result<T> {
         let key = self.readers.key();
         if PINNED_READER.with(|slot| slot.borrow().as_ref().is_some_and(|(pool, _)| *pool == key)) {
             let index = current_index(&self.readers.get())?;
             return read(index);
         }
+        // The snapshot's own entry: the guard below is lent out and dropped at once.
+        let _live = crate::sqlite::register_live_read(true);
         let mut guard = self.readers.get();
         // Declared first so it drops last: on every exit it ends the transaction, releases the
         // pin, and returns the connection to the pool.
@@ -4822,7 +5268,8 @@ impl Store {
                 params![seeded_through, target, SEAL_CHUNK_BATCHES],
                 |row| row.get(0),
             )?;
-            let transaction = connection.transaction()?;
+            let transaction = connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             seed_replica_envelopes_signed_tx(
                 &transaction,
                 &self.origin,
@@ -4831,6 +5278,10 @@ impl Store {
                 Some(&|claim: &principals::Unsealed<'_>| self.sign_unsealed(claim)),
             )?;
             self.sign_own_envelopes_range_tx(&transaction, Some(seeded_through), Some(through))?;
+            transaction.execute(
+                "INSERT OR REPLACE INTO meta(key,value) VALUES('seeded_batch_rowid', ?1)",
+                [through.to_string()],
+            )?;
             transaction.commit()?;
             self.seeded_batch_rowid.store(through, Ordering::Release);
             // The FIFO writer services any already queued request before the next loan.
@@ -5522,26 +5973,9 @@ impl Store {
                 )
                 .optional()?
                 .is_none();
-            let mut statement = connection.prepare(
-                "WITH retry_ids AS (
-                     SELECT writer, sequence, envelope_hash FROM replica_envelopes
-                     WHERE receipt_state='pending'
-                     UNION
-                     SELECT writer, sequence, envelope_hash FROM replica_records
-                     WHERE state='unknown'
-                        OR (state='invalid' AND error_code='invalid-replicated-claim'
-                            AND error_message LIKE '%violates unknown-claim-field:%')
-                        OR (?1 AND state='invalid' AND error_code='claim-hash-mismatch')
-                 )
-                 SELECT envelopes.writer, envelopes.sequence, envelopes.envelope_hash,
-                        envelopes.previous_hash, envelopes.accepted_at_unix_ms, envelopes.payload
-                 FROM retry_ids JOIN replica_envelopes AS envelopes
-                   ON envelopes.writer=retry_ids.writer AND envelopes.sequence=retry_ids.sequence
-                  AND envelopes.envelope_hash=retry_ids.envelope_hash
-                 ORDER BY envelopes.writer, envelopes.sequence, envelopes.envelope_hash",
-            )?;
+            let mut statement = connection.prepare(&admission_retry_query(retry_hash_mismatches))?;
             let envelopes = statement
-                .query_map([retry_hash_mismatches], |row| {
+                .query_map([], |row| {
                     Ok(ReplicaEnvelope {
                         writer: row.get(0)?,
                         sequence: row.get(1)?,
@@ -5557,7 +5991,12 @@ impl Store {
             (retry_hash_mismatches, envelopes)
         };
         let mut outcome = ReplicationAdmission::default();
-        let mut membership = fleet_membership_tx(&self.connection.write())?;
+        // Membership is a few hundred statements on the writer; with nothing to admit, skip it.
+        let mut membership = if envelopes.is_empty() {
+            Default::default()
+        } else {
+            fleet_membership_tx(&self.connection.write())?
+        };
         let mut pending = envelopes;
         // Admitting one envelope can admit a membership claim that decides another envelope,
         // so held envelopes get another pass whenever membership changes.
@@ -5571,7 +6010,8 @@ impl Store {
             // one is rolled back and recorded alone.
             for chunk in pending.chunks(ADMISSION_CHUNK_ENVELOPES) {
                 let mut connection = self.connection.write();
-                let mut pass = connection.transaction()?;
+                let mut pass = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 for envelope in chunk {
                     let started = std::time::Instant::now();
                     let hold = fleet_admission_hold(&pass, &membership, envelope)?;
@@ -5673,12 +6113,42 @@ impl Store {
         self.replication_projection_state.load(Ordering::Acquire) & 1 != 0
     }
 
+    pub fn projection_contention_generation(&self) -> u64 {
+        self.projection_contention_generation.load(Ordering::Acquire)
+    }
+
+    fn note_projection_contention(&self) {
+        self.projection_contention_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
     fn defer_replication_projection(&self) {
         let _ = self.replication_projection_state.fetch_update(
             Ordering::AcqRel,
             Ordering::Acquire,
             |state| Some(state.wrapping_add(2) | 1),
         );
+    }
+
+    /// Copy WAL pages off the writer queue, then serialize the writer-lock-taking TRUNCATE.
+    /// The checkpoint connection has no busy wait; readers can still defer recycling.
+    pub fn checkpoint_idle_wal(&self, checkpoint: &Connection) -> Result<bool> {
+        Ok(self.checkpoint_idle_wal_report(checkpoint)?.recycled)
+    }
+
+    pub fn checkpoint_idle_wal_report(&self, checkpoint: &Connection) -> Result<crate::sqlite::WalCheckpointReport> {
+        let mut report = crate::sqlite::checkpoint_wal_report(checkpoint)?;
+        if report.frames <= 0 || report.frames != report.backfilled {
+            return Ok(report);
+        }
+        let waiting = std::time::Instant::now();
+        {
+            let _writer = self.connection.write();
+            report.writer_wait_ms = waiting.elapsed().as_millis();
+            let truncating = std::time::Instant::now();
+            report.recycled = crate::sqlite::truncate_idle_wal(checkpoint)?;
+            report.truncate_ms = Some(truncating.elapsed().as_millis());
+        }
+        Ok(report)
     }
 
     /// Replay the graph from nothing now, as a heal does when two nodes project different graphs
@@ -5770,6 +6240,41 @@ impl Store {
         )
     }
 
+    fn log_projection_failure(
+        &self,
+        error: &St3Error,
+        phase: &str,
+        frontier: u64,
+        target: u64,
+        log: &mut impl FnMut(&str),
+    ) {
+        let stage = error
+            .details
+            .get("projection_stage")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let emission = {
+            let mut state = self
+                .projection_diagnostics
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            state.observe(stage, error.code, std::time::Instant::now())
+        };
+        // Release the diagnostic mutex before formatting or invoking the caller's log sink.
+        // The caller still holds its existing projection transaction at this boundary.
+        if let Some(emission) = emission {
+            log(&projection_failure_log_line(
+                phase,
+                error.code,
+                &error.message,
+                &error.details,
+                frontier,
+                target,
+                emission,
+            ));
+        }
+    }
+
     fn project_replication_backlog_chunks(
         &self,
         mut between: impl FnMut(),
@@ -5792,7 +6297,24 @@ impl Store {
         let mut chunked = false;
         loop {
             let mut connection = self.connection.write();
-            let transaction = connection.transaction()?;
+            // Acquire SQLite's write lock before reading a snapshot. A deferred upgrade can
+            // fail immediately when the independent WAL checkpoint connection holds that lock.
+            let transaction = connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|error| {
+                    let error = internal(error);
+                    if error.is_sqlite_contention() {
+                        self.note_projection_contention();
+                        let error = error.with_detail("projection_stage", "begin-immediate")
+                            .with_detail("projection_frontier_unknown", true);
+                        // No transaction exists from which to read the committed frontier.
+                        self.log_projection_failure(&error, phase, 0, target, &mut log);
+                        return error;
+                    }
+                    // No transaction began: surface the typed error, preserving the entry
+                    // deferred generation and attempt time. The daemon also schedules retry.
+                    error
+                })?;
             let frontier: u64 = transaction
                 .query_row(
                     "SELECT last_good_store_index FROM projection_health WHERE aggregate='graph'",
@@ -5819,8 +6341,8 @@ impl Store {
                 total: None,
             });
             let result = (|| -> Result<bool, St3Error> {
-                // An incremental projection that fails is rolled back and replaced by a full replay,
-                // which quarantines the claim it cannot project instead of failing the graph.
+                // Non-contention incremental failures retain the full replay fallback,
+                // which quarantines claims it cannot project. SQLite contention defers below.
                 transaction
                     .execute_batch("SAVEPOINT project_incremental")
                     .map_err(internal)?;
@@ -5837,9 +6359,31 @@ impl Store {
                             match projected {
                                 IncrementalProjection::Projected => None,
                                 IncrementalProjection::Replay(reason) => Some(reason.to_owned()),
+                                IncrementalProjection::ReplayWithContext { reason, details } => {
+                                    let message = details
+                                        .get("projection_error")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or(reason)
+                                        .to_owned();
+                                    let error = St3Error {
+                                        code: reason,
+                                        message,
+                                        details,
+                                    };
+                                    self.log_projection_failure(
+                                        &error, phase, frontier, target, &mut log,
+                                    );
+                                    Some(reason.to_owned())
+                                }
                             }
                         }
                         Err(error) => {
+                            self.log_projection_failure(&error, phase, frontier, target, &mut log);
+                            if error.is_sqlite_contention() {
+                                // Roll back the whole chunk below. Replaying the same claims
+                                // cannot repair a connection lock and would lengthen its hold.
+                                return Err(error);
+                            }
                             crate::profile::note(&format!(
                                 "replay: incremental failed: {}",
                                 error.code
@@ -5869,11 +6413,21 @@ impl Store {
                                 processed: stage.processed,
                                 total: stage.total,
                             });
+                        }).map_err(|error| {
+                            let error = error.with_detail("projection_stage", "full-replay");
+                            self.log_projection_failure(&error, phase, frontier, target, &mut log);
+                            error
                         })?;
                 } else {
                     crate::profile::note("projection: incremental");
                 }
-                self.runtime.after_projection(&transaction)?;
+                self.runtime
+                    .after_projection(&transaction)
+                    .map_err(|error| {
+                        let error = error.with_detail("projection_stage", "after-projection");
+                        self.log_projection_failure(&error, phase, frontier, target, &mut log);
+                        error
+                    })?;
                 Ok(!projected)
             })();
             match result {
@@ -5917,7 +6471,17 @@ impl Store {
                         continue;
                     }
                     if self.verdicts_due.swap(false, Ordering::AcqRel) {
-                        self.judge_claims(true)?;
+                        self.judge_claims(true).map_err(|error| {
+                            self.verdicts_due.store(true, Ordering::Release);
+                            let error = crate::error::typed(error);
+                            if error.is_sqlite_contention() {
+                                self.note_projection_contention();
+                                let error = error.with_detail("projection_stage", "tail-verdict");
+                                self.log_projection_failure(&error, phase, through, target, &mut log);
+                                return error;
+                            }
+                            error
+                        })?;
                     }
                     // Admission and catch-up deferral can run after this index read. Clear
                     // only the generation observed before it; a newer deferral must survive.
@@ -5935,6 +6499,14 @@ impl Store {
                 }
                 Err(error) => {
                     transaction.rollback()?;
+                    if error.is_sqlite_contention() {
+                        // Preserve committed health/frontier, not all process state: entry
+                        // advances the deferred generation by two and updates the last attempt
+                        // time, so the existing catch-up throttle applies. A daemon retry is
+                        // scheduled separately; receive/wake passes can also recover sooner.
+                        self.note_projection_contention();
+                        return Ok(false);
+                    }
                     connection.execute(
                     "INSERT INTO projection_health(aggregate, status, error_code, error_message, updated_at_unix_ms)
                      VALUES ('graph', 'stale', ?1, ?2, ?3)
@@ -6812,6 +7384,41 @@ pub fn normalize_actor(value: &str, default_kind: &str) -> String {
     } else {
         format!("{default_kind}/{value}")
     }
+}
+
+/// The envelopes admission looks at again: pending ones, and records that wait for a newer build
+/// or failed for a reason a newer build may fix. One index seek per branch. A single
+/// `WHERE state='unknown' OR (state='invalid' ...)` made SQLite scan every replica record, and the
+/// join then scanned every envelope: seconds on the writer, on every receive, with nothing
+/// pending. The hash-mismatch branch exists only until its one-time retry has run.
+pub fn admission_retry_query(retry_hash_mismatches: bool) -> String {
+    let hash_mismatches = if retry_hash_mismatches {
+        "UNION
+             SELECT writer, sequence, envelope_hash FROM replica_records
+             WHERE state='invalid' AND error_code='claim-hash-mismatch'"
+    } else {
+        ""
+    };
+    format!(
+        "WITH retry_ids AS (
+             SELECT writer, sequence, envelope_hash FROM replica_envelopes
+             WHERE receipt_state='pending'
+             UNION
+             SELECT writer, sequence, envelope_hash FROM replica_records
+             WHERE state='unknown'
+             UNION
+             SELECT writer, sequence, envelope_hash FROM replica_records
+             WHERE state='invalid' AND error_code='invalid-replicated-claim'
+               AND error_message LIKE '%violates unknown-claim-field:%'
+             {hash_mismatches}
+         )
+         SELECT envelopes.writer, envelopes.sequence, envelopes.envelope_hash,
+                envelopes.previous_hash, envelopes.accepted_at_unix_ms, envelopes.payload
+         FROM retry_ids CROSS JOIN replica_envelopes AS envelopes
+           ON envelopes.writer=retry_ids.writer AND envelopes.sequence=retry_ids.sequence
+          AND envelopes.envelope_hash=retry_ids.envelope_hash
+         ORDER BY envelopes.writer, envelopes.sequence, envelopes.envelope_hash"
+    )
 }
 
 /// Subject `?1`'s newest claim of kind `?2` in canonical order. See [`Store::latest_claim`].
