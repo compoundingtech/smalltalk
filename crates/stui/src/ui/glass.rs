@@ -1958,7 +1958,7 @@ impl Ui {
             .attention
             .items()
             .iter()
-            .filter(|item| !self.snoozed.contains(&item.id))
+            .filter(|item| !self.snoozed.contains(&item.id) && !self.closed.contains(&item.id))
             .count();
         spans.push(Span::styled(" · ", bar(theme::dim())));
         // Each count opens the palette at what it counts.

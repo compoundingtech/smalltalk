@@ -950,7 +950,6 @@ pub fn run(context: Context) -> Result<()> {
                 }
             });
         }
-        ui.read_open_update();
         let mut effects = Vec::new();
         for effect in std::mem::take(&mut ui.effects) {
             // A glass change is kept until st confirms it, and goes once st is reachable.
@@ -964,6 +963,7 @@ pub fn run(context: Context) -> Result<()> {
                 ui.flash("Offline · reconnect before acting; nothing was queued");
                 continue;
             }
+            ui.note_acted(&effect);
             match effect {
                 Effect::OpenTerminal { agent } => {
                     // The PTY session's own bytes, through st's raw stream to whichever host owns
