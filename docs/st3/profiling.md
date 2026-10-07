@@ -160,7 +160,11 @@ so even an existing agent's `runtime.observed` rebuilds shallow refs.
 Both shallow refs and the full-card projection also expire at the earliest current-generation
 work-lease deadline. Expired work becomes ready (or disappears from a revision-draining queue)
 without a new claim; an expired entry must rebuild, not advance incrementally from stale queues.
-The deadline scan runs only on cache misses and reads unfinished steps, adding no warm-hit SQL.
+The deadline scan runs only on full rebuilds and reads unfinished steps; safe card-local
+advances carry the prior deadline forward. Warm hits add no SQL. The outer shared agents
+WS window inherits the same fence, so it cannot hide an expired full-card projection.
+HTTP reads see expiry immediately; live WS subscribers see the transition on the next
+existing 30-second authority/freshness tick. That existing live-stream bound is unchanged.
 
 The local-observation frontier is read by an indexed seek inside the same SQLite snapshot.
 A same-index local transcript append updates the affected card's `last_activity_at` for both

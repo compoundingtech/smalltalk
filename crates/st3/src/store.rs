@@ -2727,6 +2727,14 @@ impl Store {
         self.cached_agent_resources_for(index, history, None, build)
     }
 
+    /// The complete agents WS window inherits the queue deadline from its shared projection.
+    pub(crate) fn agent_roster_valid_until(&self, index: u64) -> Option<u128> {
+        self.smalltalk.agent_resources_cache.lock()
+            .expect("agent resources cache poisoned").iter().rev()
+            .find(|entry| entry.index == index && !entry.history && entry.covered.is_none())
+            .and_then(|entry| entry.valid_until_unix_ms)
+    }
+
     /// Queue selection changes at lease expiry even when the claim frontier is unchanged.
     /// Scan only on a cache miss, inside the same SQLite snapshot as the queue projection.
     fn agent_queue_valid_until(&self, now: u128) -> Result<Option<u128>> {
@@ -2833,8 +2841,8 @@ impl Store {
             .filter(|entry| entry.index <= index && entry.local <= local && entry.history == history)
             .max_by_key(|entry| (entry.index, entry.local)).cloned();
         drop(cache);
-        let (items, covered, valid_until_unix_ms) = crate::performance::task("roster/build",
-        || -> Result<(Vec<Value>, Option<BTreeSet<String>>, Option<u128>)> {
+        let entry = crate::performance::task("roster/build",
+        || -> Result<runtime::AgentResourcesEntry> {
         let previous = match previous {
             Some(entry) if entry.index == index => Some((entry, BTreeSet::new())),
             Some(entry) => self.changed_agent_resources(entry.index, index)?
@@ -2892,9 +2900,10 @@ impl Store {
         };
         items.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str())
             .then_with(|| a["id"].as_str().cmp(&b["id"].as_str())));
-        Ok((items, covered, valid_until_unix_ms))
+        Ok(runtime::AgentResourcesEntry {
+            index, local, history, covered, valid_until_unix_ms, items: Arc::new(items),
+        })
         })?;
-        let items = Arc::new(items);
         let mut cache = self.smalltalk.agent_resources_cache.lock()
             .expect("agent resources cache poisoned");
         // All endpoint callers hold admission. Direct internal readers may still race; never
@@ -2904,9 +2913,8 @@ impl Store {
         }).map(|entry| Arc::clone(&entry.items));
         let items = if let Some(published) = published { published } else {
             cache.retain(|entry| entry.index != index || entry.local != local || entry.history != history);
-            cache.push_back(runtime::AgentResourcesEntry {
-                index, local, history, covered, valid_until_unix_ms, items: Arc::clone(&items),
-            });
+            let items = Arc::clone(&entry.items);
+            cache.push_back(entry);
             if cache.len() > 8 { cache.pop_front(); }
             items
         };

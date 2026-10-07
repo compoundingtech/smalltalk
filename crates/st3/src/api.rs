@@ -15761,6 +15761,7 @@ mission "expiring-work" state="ready" {
         assert_eq!(claimed["items"][0]["current_work_ids"], json!([step]));
         let full = client_agent_resources_cached(store, false, index).unwrap();
         assert_eq!(full[0]["current_work_ids"], json!([step]));
+        assert_eq!(store.agent_roster_valid_until(index), Some(expires));
         // Wait for the actual captured lease boundary, not an arbitrary settling interval.
         tokio::time::sleep(Duration::from_millis(
             u64::try_from(expires.saturating_sub(client_now_ms()) + 1).unwrap(),
@@ -15773,6 +15774,7 @@ mission "expiring-work" state="ready" {
         let full = client_agent_resources_cached(store, false, index).unwrap();
         assert_eq!(full[0]["current_work_ids"], json!([]), "WS full-card cache also expires");
         assert_eq!(full[0]["next_work_id"], step.as_str());
+        assert_eq!(store.agent_roster_valid_until(index), None);
     }
 
     #[test]
