@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "summary": "#1579: usage-list wrapping",
+  "commits": ["144c34480e91b036b5261f2f3e3a242c60660725"],
+  "replay": {"status": "none", "detail": "No new projection invalidation or startup replay trigger in the merged usage-list wrapping change."},
+  "schema": {"status": "none", "detail": "No database table, index, trigger or migration change in usage-list wrapping; SQLite user_version is unchanged."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digest/drop policy are unchanged; this change adds no sealing coordination requirement."},
+  "compatibility": {"status": "none", "detail": "Usage-list wrapping changes presentation or UI interaction only; stored claims and daemon wire contracts are unchanged."},
+  "downtime": {"status": "none", "detail": "No additional upgrade service stop or measured outage introduced by usage-list wrapping; the standard daemon/client restart procedure still applies."},
+  "manual": {"status": "none", "detail": "No data repair or configuration conversion required for existing installations by usage-list wrapping."},
+  "recovery": {"status": "none", "detail": "No additional recovery procedure introduced by this change. Preserve graph state, keys and configuration and follow the standard roll-forward guidance; this note does not qualify binary-only downgrade of the whole release."}
+}

@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "summary": "#1564: immutable mission revision provenance",
+  "commits": ["a40f7997b195fa95349cd2e73f9a454c2c3f6731"],
+  "replay": {"status": "none", "detail": "No new projection invalidation or startup replay trigger in the merged immutable mission revision provenance change."},
+  "schema": {"status": "none", "detail": "No database table, index, trigger or migration change in immutable mission revision provenance; SQLite user_version is unchanged."},
+  "rules": {"status": "none", "detail": "No rules bump or checkpoint drop slot is introduced: existing once/unknown/no-drop-slot retention preserves the durable mission.provenance sidecar."},
+  "compatibility": {"status": "changed", "detail": "Optional mission provenance is a durable mission.provenance sidecar, outside MissionSpec, so existing revision hashes stay unchanged. Older nodes retain the unknown sidecar and run the ordinary mission but cannot apply provenance-bearing KDL and show no provenance. Publish new provenance through an upgraded member; existing client read objects accept the additive fields."},
+  "downtime": {"status": "none", "detail": "No additional upgrade service stop or measured outage introduced by immutable mission revision provenance; the standard daemon/client restart procedure still applies."},
+  "manual": {"status": "changed", "detail": "Provenance can be attached only at first publication of a mission revision. An already published revision cannot be retroactively annotated or have its provenance changed; publish a new definition revision. Existing missions require no conversion."},
+  "recovery": {"status": "none", "detail": "No additional recovery procedure introduced by this change. Preserve graph state, keys and configuration and follow the standard roll-forward guidance; this note does not qualify binary-only downgrade of the whole release."}
+}

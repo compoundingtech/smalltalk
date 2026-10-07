@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "summary": "#1572: multiple attached terminal panes",
+  "commits": ["f52433734c33e9cc4ea8959c3caee3d05b994c6a"],
+  "replay": {"status": "none", "detail": "No new projection invalidation or startup replay trigger in the merged multiple attached terminal panes change."},
+  "schema": {"status": "none", "detail": "No database table, index, trigger or migration change in multiple attached terminal panes; SQLite user_version is unchanged."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digest/drop policy are unchanged; this change adds no sealing coordination requirement."},
+  "compatibility": {"status": "none", "detail": "Multiple attached terminal panes changes presentation or UI interaction only; stored claims and daemon wire contracts are unchanged."},
+  "downtime": {"status": "none", "detail": "No additional upgrade service stop or measured outage introduced by multiple attached terminal panes; the standard daemon/client restart procedure still applies."},
+  "manual": {"status": "none", "detail": "No data repair or configuration conversion required for existing installations by multiple attached terminal panes."},
+  "recovery": {"status": "none", "detail": "No additional recovery procedure introduced by this change. Preserve graph state, keys and configuration and follow the standard roll-forward guidance; this note does not qualify binary-only downgrade of the whole release."}
+}
