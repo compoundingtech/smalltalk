@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Opt-in transaction finalization and explicit view-unavailability for source adapters",
+  "replay": {"status": "none", "detail": "No source replay, automatic initializer or production IVM activation."},
+  "schema": {"status": "none", "detail": "Adds no database tables, triggers or schema version changes."},
+  "rules": {"status": "none", "detail": "Admission, canonical ordering and checkpoint rules are unchanged."},
+  "compatibility": {"status": "changed", "detail": "Managed WriterGuard transactions now return WriterTransaction; commit returns anyhow::Result with the original cause. Default writer behavior has no finalizer."},
+  "downtime": {"status": "none", "detail": "No deployment or restart required by the library change."},
+  "manual": {"status": "changed", "detail": "An adopter explicitly installs one bounded callback and proves complete source capture, including independent fencing for raw connection and autocommit bypasses."},
+  "recovery": {"status": "changed", "detail": "Finalizer errors roll back source and derived writes together; a second installation is refused. Restore and coverage recovery remain source-adapter responsibilities."}
+}

@@ -612,6 +612,35 @@ impl Views {
         self.change_selected(transaction, old, new, epoch, None)
     }
 
+    /// Mark one registered view unavailable inside its source transaction. This preserves
+    /// source admission and the existing output/cut/generations; committed availability and
+    /// changed error evidence advance independently. Repeating the same fence is a no-op.
+    /// No recovery or Ready publication is implied; a missing view remains unavailable too.
+    pub fn fence(
+        &self,
+        transaction: &Transaction<'_>,
+        name: &str,
+        reason: &str,
+    ) -> Result<()> {
+        ensure!(
+            self.views.iter().any(|view| view.definition().name == name),
+            "unknown IVM view"
+        );
+        let bounded = reason.chars().take(1024).collect::<String>();
+        fence_error(transaction, name, &anyhow::anyhow!(bounded))
+    }
+
+    /// Fence the finite shared registry on an uncaptured source mutation. This does not
+    /// enumerate claim history and does not certify a new source epoch or processed prefix.
+    pub fn fence_all(&self, transaction: &Transaction<'_>, reason: &str) -> Result<()> {
+        let bounded = reason.chars().take(1024).collect::<String>();
+        let error = anyhow::anyhow!(bounded);
+        for view in &self.views {
+            fence_error(transaction, view.definition().name, &error)?;
+        }
+        Ok(())
+    }
+
     /// Apply the runtime's accepted repair using each view's explicit eligibility policy.
     /// Record state alone does not retract admitted facts; canonical position ignores state.
     pub fn repair(
