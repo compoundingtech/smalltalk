@@ -49,7 +49,19 @@ claim-kind check is `stream collection/invalidation`. These labels include cache
 live agent overlays as well as rebuilds; a label's operation count is not a rebuild count.
 The socket remains responsible for its own snapshot and change delivery. Equivalent session
 authority and query windows share computation through a disposable per-Store cache, while each
-read rechecks paired authority and receives its own SQLite snapshot fence.
+read rechecks paired authority and receives its own SQLite snapshot fence. Admission for an
+equivalent cached window waits asynchronously before starting its blocking snapshot reader;
+the physical worker retains admission through cancellation. Cache locks only select or publish
+immutable results. Each Store retains at most 64 windows, with 16 per session; query churn past
+that session quota evicts only that session's inactive windows. Separate local-commit epochs
+survive later ignored claims, and attention/mission computation uses the same captured clock
+as its cache period. This cache covers the six collections named above.
+
+A disposable local single-client cold-read comparison is available with:
+`cargo test -p st3 --lib shared_windows_local_single_client_cost -- --ignored --nocapture`.
+It compares uncached, cold cached and warm reads for 100 glass rows under Unix and paired
+sessions, alternating case order and reporting aggregate wall/process CPU. Debug-profile
+fixture results do not measure deployed paired-client CPU or production tail latency.
 
 Conversation collection followers (`follow_conversation`) and standalone conversation sockets
 (`conversation_stream_socket`) use the existing conversation page/change reader. Mailbox reads

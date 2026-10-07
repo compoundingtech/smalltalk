@@ -173,6 +173,31 @@ async fn collection_items_with_windows(
     } else {
         None
     };
+    let (prepared, read_permit) = if let Some(windows) = &windows {
+        let (current, read_permit) = if session.transport == "unix" {
+            (session.clone(), read_permit)
+        } else {
+            let state = state.clone();
+            let session = session.clone();
+            let label = collection_window_label(&request.collection);
+            let (current, read_permit) = super::blocking_store(move || {
+                crate::profile::task(label, || {
+                    // Preparation is physical SQL too; canceled callers retain their slot
+                    // until this indexed authority read actually finishes.
+                    Ok((revalidate_session(&state, &session), read_permit))
+                })
+            })
+            .await?;
+            (current?, read_permit)
+        };
+        (windows.prepare(state, &current, request), read_permit)
+    } else {
+        (None, read_permit)
+    };
+    let admission = match &prepared {
+        Some(prepared) => Some(prepared.admit().await),
+        None => None,
+    };
     let state = state.clone();
     let session = session.clone();
     let request = request.clone();
@@ -186,21 +211,30 @@ async fn collection_items_with_windows(
         crate::profile::task(collection_window_label(&collection), || {
             // Keep the physical read slot even if its awaiting subscription is canceled.
             let _read_permit = read_permit;
+            let _admission = admission;
             let store = state.store.clone();
             let commits = windows.as_ref().map(|windows| windows.commits());
             store.read_snapshot(|index| {
+                let now = client_now_ms();
                 // Recheck paired grants, including expiry and changed scopes, before any reuse.
-                let current = match (|| {
+                let (current, person) = match (|| {
                     let current = if session.transport == "unix" {
                         session.clone()
                     } else {
                         revalidate_session(&state, &session)?
                     };
                     require_scope(&current, "read.projections")?;
-                    if collection == "arrangements" {
-                        arrangements::person(&current, request.person.as_deref(), false)?;
-                    }
-                    Ok::<_, ApiError>(current)
+                    let person = match collection.as_str() {
+                        "glasses" => Some(glass_person(&current, false)?),
+                        "arrangements" => Some(arrangements::person(
+                            &current,
+                            request.person.as_deref(),
+                            false,
+                        )?),
+                        "attention" => person_filter(&current, request.person.as_deref())?,
+                        _ => person.clone(),
+                    };
+                    Ok::<_, ApiError>((current, person))
                 })() {
                     Ok(current) => current,
                     Err(error) => return Ok(Err(error)),
@@ -214,7 +248,7 @@ async fn collection_items_with_windows(
                                 store.mission_collection_ids(false, 0, limit.saturating_add(1))?;
                             let mut has_more = ids.len() > limit;
                             ids.truncate(limit);
-                            let mut items = mission_list_cards(&store, &ids)?;
+                            let mut items = mission_list_cards_at(&store, &ids, now)?;
                             has_more |= bound_mission_cards(&mut items)?;
                             return Ok((items, has_more));
                         }
@@ -233,7 +267,7 @@ async fn collection_items_with_windows(
                             }
                         }
                         "attention" => {
-                            client_attention_resources(&store, person.as_deref(), false)?
+                            client_attention_resources_at(&store, person.as_deref(), false, now)?
                         }
                         "agents" => client_agent_resources_cached(&store, false, index)?,
                         "work" => client_work_resources(
@@ -265,8 +299,9 @@ async fn collection_items_with_windows(
                         &request,
                         collection_windows::ReadFence {
                             index,
-                            now: client_now_ms(),
+                            now,
                             commits: commits.expect("window commit sequence"),
+                            prepared,
                         },
                         compute,
                     )?,
@@ -1821,6 +1856,14 @@ pub(super) fn mission_resources(
 /// Collection cards keep only three run headers, regardless of a mission's history size.
 /// Full run and step detail stays on the detail endpoint.
 fn mission_list_cards(store: &Store, ids: &[String]) -> anyhow::Result<Vec<Value>> {
+    mission_list_cards_at(store, ids, client_now_ms())
+}
+
+fn mission_list_cards_at(
+    store: &Store,
+    ids: &[String],
+    at_unix_ms: u128,
+) -> anyhow::Result<Vec<Value>> {
     let attention = store.human_attention_runs()?;
     let definitions = store
         .mission_definitions_for_ids(ids)?
@@ -1848,7 +1891,7 @@ fn mission_list_cards(store: &Store, ids: &[String]) -> anyhow::Result<Vec<Value
             .map(|(_,count)| count.as_u64().unwrap_or(0)).sum::<u64>();
         let details = newest.iter().rev().map(|run| {
             let run_id=run["id"].as_str().expect("run header id");
-            let (total,done,steps)=store.mission_step_preview(run_id)?;
+            let (total,done,steps)=store.mission_step_preview_at(run_id, at_unix_ms)?;
             let terminal=matches!(run["status"].as_str(),Some("completed"|"failed"|"cancelled"));
             let scheduler_fault=store.reconcile_fault(run_id, crate::reconcile::FIRST_READINESS_FAULT_SCOPE)?;
             let must_act=if terminal {"nobody"} else if attention.contains(run_id) {"you"}

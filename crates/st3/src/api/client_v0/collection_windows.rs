@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 const STORES: usize = 64;
 const WINDOWS: usize = 64;
+const SESSION_WINDOWS: usize = 16;
 const KIND_LIMIT: usize = 10_000;
 const COLLECTIONS: [&str; 6] = [
     "missions",
@@ -21,6 +22,7 @@ const COLLECTIONS: [&str; 6] = [
 struct Revisions {
     index: u64,
     commits: u64,
+    local: u64,
     values: [u64; 6],
 }
 
@@ -31,13 +33,38 @@ struct Cached {
     has_more: bool,
 }
 
-type WindowEntry = Arc<Mutex<Option<Cached>>>;
-type WindowEntries = VecDeque<(String, WindowEntry)>;
+#[derive(Default)]
+struct Observed {
+    index: u64,
+    local: u64,
+}
+
+#[derive(Default)]
+struct Entry {
+    admission: Arc<tokio::sync::Mutex<()>>,
+    cached: Mutex<Option<Arc<Cached>>>,
+}
+
+type WindowEntry = Arc<Entry>;
+type WindowEntries = VecDeque<(String, String, WindowEntry)>;
+
+#[derive(Clone)]
+pub(super) struct Prepared {
+    key: String,
+    entry: WindowEntry,
+}
+
+impl Prepared {
+    pub(super) async fn admit(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.entry.admission.clone().lock_owned().await
+    }
+}
 
 pub(super) struct ReadFence {
     pub(super) index: u64,
     pub(super) now: u128,
     pub(super) commits: u64,
+    pub(super) prepared: Option<Prepared>,
 }
 
 /// Held by all sockets using this Store, and by physical workers until they finish.
@@ -45,6 +72,7 @@ pub(super) struct ReadFence {
 pub(super) struct Windows {
     commits: AtomicU64,
     revisions: Mutex<Revisions>,
+    observed: Mutex<Observed>,
     entries: Mutex<WindowEntries>,
     observer: Mutex<Option<smallclaims::sqlite::CommitObserver>>,
     #[cfg(test)]
@@ -77,16 +105,35 @@ impl Windows {
         let windows = Arc::new(Self {
             commits: AtomicU64::new(0),
             revisions: Mutex::new(Revisions::default()),
+            observed: Mutex::new(Observed {
+                index: store.index().unwrap_or(0),
+                local: 0,
+            }),
             entries: Mutex::new(VecDeque::new()),
             observer: Mutex::new(None),
             #[cfg(test)]
             builds: std::sync::atomic::AtomicUsize::new(0),
         });
         let weak = Arc::downgrade(&windows);
+        let observed_store = store_key.clone();
         // Register before any snapshot. The callback does no SQL or publication; a shared
         // snapshot reader weighs bounded kind metadata once for all equivalent sockets.
         let observer = store.observe_commits(move |_| {
             if let Some(windows) = weak.upgrade() {
+                let mut observed = windows
+                    .observed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // The writer updates its atomic committed index before this callback. Retain
+                // a separate epoch for commits with no claim advance: a later ignored claim
+                // cannot erase their invalidation. No SQL runs on the writer callback.
+                match observed_store
+                    .upgrade()
+                    .and_then(|store| store.index().ok())
+                {
+                    Some(index) if index > observed.index => observed.index = index,
+                    _ => observed.local = observed.local.wrapping_add(1),
+                }
                 windows.commits.fetch_add(1, Ordering::Release);
             }
         });
@@ -98,7 +145,7 @@ impl Windows {
         Some(windows)
     }
 
-    fn entry(&self, key: String) -> Option<WindowEntry> {
+    fn entry(&self, key: String, session: String) -> Option<WindowEntry> {
         // Inputs are untrusted; do not retain oversized query/authority keys.
         if key.len() > 4096 {
             return None;
@@ -107,21 +154,27 @@ impl Windows {
             .entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(position) = entries.iter().position(|(held, _)| *held == key) {
+        if let Some(position) = entries.iter().position(|(held, _, _)| *held == key) {
             let entry = entries.remove(position).expect("found entry");
-            let result = entry.1.clone();
+            let result = entry.2.clone();
             entries.push_back(entry);
             return Some(result);
         }
-        if entries.len() >= WINDOWS {
-            // Never evict a computation another socket is using: that would duplicate it.
-            let position = entries
-                .iter()
-                .position(|(_, entry)| Arc::strong_count(entry) == 1)?;
+        let session_full = entries
+            .iter()
+            .filter(|(_, owner, _)| *owner == session)
+            .count()
+            >= SESSION_WINDOWS;
+        if session_full || entries.len() >= WINDOWS {
+            // Query churn beyond a session's quota evicts only its own inactive entries.
+            // Reservations protect both queued async readers and physical computations.
+            let position = entries.iter().position(|(_, owner, entry)| {
+                (!session_full || *owner == session) && Arc::strong_count(entry) == 1
+            })?;
             entries.remove(position);
         }
-        let entry = Arc::new(Mutex::new(None));
-        entries.push_back((key, entry.clone()));
+        let entry = Arc::new(Entry::default());
+        entries.push_back((key, session, entry.clone()));
         Some(entry)
     }
 
@@ -136,6 +189,10 @@ impl Windows {
             .revisions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut observed = self
+            .observed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let commits = self.commits.load(Ordering::Acquire);
         // A slower physical reader can hold an older SQLite snapshot. It cannot update the
         // shared frontier or reuse rows from a newer one.
@@ -145,6 +202,10 @@ impl Windows {
         {
             return Ok(None);
         }
+        // Seed from the first authorized snapshot in case registration raced a commit.
+        observed.index = observed.index.max(index);
+        let local = observed.local;
+        drop(observed);
         if index != revisions.index || commits != revisions.commits {
             let connection = store.readers.get();
             let mut kinds = connection.prepare_cached("SELECT kind FROM claims WHERE store_index>?1 AND store_index<=?2 ORDER BY store_index LIMIT ?3")?;
@@ -156,7 +217,10 @@ impl Windows {
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             // A non-claim commit can change local availability, ordering or lease state.
             // Overflow, replay/trim and metadata errors must never certify an unchanged view.
-            let all = index == revisions.index || kinds.is_empty() || kinds.len() > KIND_LIMIT;
+            let all = local != revisions.local
+                || index == revisions.index
+                || kinds.is_empty()
+                || kinds.len() > KIND_LIMIT;
             let arrangements = store.arrangements_changed(revisions.index, index)?;
             for (position, name) in COLLECTIONS.iter().enumerate() {
                 if all
@@ -168,6 +232,7 @@ impl Windows {
             }
             revisions.index = index;
             revisions.commits = commits;
+            revisions.local = local;
         }
         Ok(COLLECTIONS
             .iter()
@@ -197,8 +262,36 @@ impl Windows {
             .is_none_or(|position| before[position] != after[position])
     }
 
-    /// Called inside the authorized SQLite snapshot. Serializes only equivalent keys;
-    /// neither registry nor revision locks are held during the expensive computation.
+    fn key(state: &AppState, session: &ClientSession, request: &CollectionSubscribe) -> String {
+        json!({
+            "node":state.node, "fleet":state.fleet_id,
+            "actor":session.actor, "authority":session.authority_actor,
+            "grant":session.pairing_grant, "transport":session.transport,
+            "scopes":session.scopes, "custom_forms":session.custom_forms,
+            "conversation_blocks":session.conversation_blocks,
+            "collection":request.collection, "limit":request.limit.unwrap_or(CLIENT_DEFAULT_PAGE_ITEMS),
+            "person":request.person, "subject":request.subject, "filter_actor":request.actor, "status":request.status,
+        }).to_string()
+    }
+
+    /// Reserve and await admission before opening SQLite or scheduling a blocking worker.
+    pub(super) fn prepare(
+        &self,
+        state: &AppState,
+        session: &ClientSession,
+        request: &CollectionSubscribe,
+    ) -> Option<Prepared> {
+        let key = Self::key(state, session, request);
+        let owner = json!({"node":state.node, "fleet":state.fleet_id,
+            "actor":session.actor, "authority":session.authority_actor,
+            "grant":session.pairing_grant, "transport":session.transport})
+        .to_string();
+        let entry = self.entry(key.clone(), owner)?;
+        Some(Prepared { key, entry })
+    }
+
+    /// Called inside the authorized SQLite snapshot after async admission. Cache mutexes
+    /// hold only Arc loads/stores; computation, serialization and deep clones run outside them.
     pub(super) fn read(
         &self,
         state: &AppState,
@@ -211,27 +304,21 @@ impl Windows {
             index,
             now,
             commits: snapshot_commits,
+            prepared,
         } = fence;
         #[cfg(test)]
         let compute = || {
             self.builds.fetch_add(1, Ordering::SeqCst);
             compute()
         };
-        let key = json!({
-            "node":state.node, "fleet":state.fleet_id,
-            "actor":session.actor, "authority":session.authority_actor,
-            "grant":session.pairing_grant, "transport":session.transport,
-            "scopes":session.scopes, "custom_forms":session.custom_forms,
-            "conversation_blocks":session.conversation_blocks,
-            "collection":request.collection, "limit":request.limit.unwrap_or(CLIENT_DEFAULT_PAGE_ITEMS),
-            "person":request.person, "subject":request.subject, "filter_actor":request.actor, "status":request.status,
-        }).to_string();
-        let Some(entry) = self.entry(key) else {
+        let Some(prepared) = prepared else {
             return compute();
         };
-        let mut cached = entry
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Authority can change while async admission waits. The current snapshot's key
+        // must still match; otherwise this read computes without publishing a cache entry.
+        if prepared.key != Self::key(state, session, request) {
+            return compute();
+        }
         // A commit after this reader began can update local tables without advancing the
         // claim index. Such a snapshot cannot reuse/cache a newer local-state generation.
         if self.commits() != snapshot_commits {
@@ -251,7 +338,13 @@ impl Windows {
             "work" => state.store.projection_time_at(index)?,
             _ => 0,
         };
-        if let Some(cached) = &*cached
+        let cached = prepared
+            .entry
+            .cached
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(cached) = cached
             && cached.revision == revision
             && cached.period == period
         {
@@ -259,16 +352,19 @@ impl Windows {
         }
         let (items, has_more) = compute()?;
         // At most 64 bounded responses per Store. Oversized results remain uncached.
-        if serde_json::to_vec(&items)?.len() <= CLIENT_MAX_RESPONSE_BYTES {
-            *cached = Some(Cached {
+        let cached = (serde_json::to_vec(&items)?.len() <= CLIENT_MAX_RESPONSE_BYTES).then(|| {
+            Arc::new(Cached {
                 revision,
                 period,
                 items: items.clone(),
                 has_more,
-            });
-        } else {
-            *cached = None;
-        }
+            })
+        });
+        *prepared
+            .entry
+            .cached
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = cached;
         Ok((items, has_more))
     }
 
@@ -302,9 +398,13 @@ mod tests {
         now: u128,
         count: &AtomicUsize,
     ) -> Vec<Value> {
+        let prepared = windows.prepare(state, session, request);
+        let _admission = prepared
+            .as_ref()
+            .map(|p| p.entry.admission.clone().blocking_lock_owned());
         let commits = windows.commits();
         state.store.read_snapshot(|index| {
-            windows.read(state, session, request, ReadFence { index, now, commits }, || {
+            windows.read(state, session, request, ReadFence { index, now, commits, prepared }, || {
                 let n = count.fetch_add(1, Ordering::SeqCst);
                 Ok((vec![json!({"id":format!("row/{n}"), "authority":session.authority_actor})], false))
             }).map(|(rows, _)| rows)
@@ -343,6 +443,12 @@ mod tests {
         let writer = state.clone();
         let builds = count.clone();
         let thread = std::thread::spawn(move || {
+            let session = ClientSession::local(None).unwrap();
+            let query = request("missions");
+            let prepared = first.prepare(&writer, &session, &query);
+            let _admission = prepared
+                .as_ref()
+                .map(|p| p.entry.admission.clone().blocking_lock_owned());
             let commits = first.commits();
             writer
                 .store
@@ -355,6 +461,7 @@ mod tests {
                             index,
                             now: 0,
                             commits,
+                            prepared,
                         },
                         || {
                             builds.fetch_add(1, Ordering::SeqCst);
@@ -452,6 +559,92 @@ mod tests {
     }
 
     #[test]
+    fn shared_windows_local_commit_is_not_hidden_by_a_later_ignored_claim() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let windows = Windows::attach(&state.store).unwrap();
+        let session = ClientSession::local(None).unwrap();
+        let count = AtomicUsize::new(0);
+        let query = request("missions");
+        let before = read(&windows, &state, &session, &query, 0, &count);
+        let index = state.store.index().unwrap();
+        {
+            let connection = state.store.connection.lock().unwrap();
+            connection
+                .execute(
+                    "INSERT OR REPLACE INTO meta VALUES('fixture-local-window', 'changed')",
+                    [],
+                )
+                .unwrap();
+        }
+        assert_eq!(state.store.index().unwrap(), index);
+        diagnostic(&state);
+        assert!(state.store.index().unwrap() > index);
+        let after = read(&windows, &state, &session, &query, 0, &count);
+        assert_ne!(
+            after, before,
+            "ignored claims must not erase a local invalidation"
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        let mut cold = query;
+        cold.id = "cold-subscriber".into();
+        assert_eq!(read(&windows, &state, &session, &cold, 0, &count), after);
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn shared_windows_collection_scope_loss_under_the_same_grant_denies_cached_and_cold_reads()
+     {
+        for (collection, scope) in [
+            ("glasses", "read.glasses"),
+            ("arrangements", "read.arrangements"),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let state = state(root.path());
+            let grant = "custom/client/scoped-window-reader";
+            let pair = |scopes: Value| {
+                state.store.append_claim(&ClaimInput {
+                subject:grant.into(), kind:"custom.client.pairing-completed".into(), actor:Some("person/ada".into()),
+                fields:serde_json::from_value(json!({"session_actor":"client/scoped-window-reader", "person_id":"person/ada", "expires_at_unix_ms":client_now_ms() as u64 + 60_000, "scopes":scopes})).unwrap(),
+                evidence:vec![], expected_subject:None, idempotency_key:None,
+            }).unwrap()
+            };
+            let paired = pair(json!(["read.projections", scope]));
+            let original =
+                paired_client_session(&state, &paired, "fabric-loopback", false).unwrap();
+            let windows = Windows::attach(&state.store).unwrap();
+            let slots = Arc::new(tokio::sync::Semaphore::new(1));
+            let mut query = request(collection);
+            if collection == "arrangements" {
+                query.person = Some("person/ada".into());
+            }
+            collection_items_with_windows(
+                &state,
+                &original,
+                &query,
+                slots.clone().acquire_owned().await.unwrap(),
+                Some(windows.clone()),
+            )
+            .await
+            .unwrap();
+            pair(json!(["read.projections"]));
+            for cache in [Some(windows.clone()), None] {
+                let error = collection_items_with_windows(
+                    &state,
+                    &original,
+                    &query,
+                    slots.clone().acquire_owned().await.unwrap(),
+                    cache,
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(error.status, StatusCode::FORBIDDEN);
+                assert!(error.message.contains(scope), "{collection}: {error:?}");
+            }
+        }
+    }
+
+    #[test]
     fn shared_windows_isolate_authority_grants_scopes_and_query_keys() {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
@@ -463,7 +656,7 @@ mod tests {
         let mut same = query.clone();
         same.id = "another-socket-id".into();
         assert_eq!(read(&windows, &state, &session, &same, 0, &count), first);
-        let mut variants = vec![ClientSession::local(Some("person/bob")).unwrap()];
+        let mut variants = vec![ClientSession::local(Some("person/avery")).unwrap()];
         let mut grant = session.clone();
         grant.pairing_grant = Some("custom/client/another-grant".into());
         variants.push(grant);
@@ -499,6 +692,7 @@ mod tests {
         let query = request("missions");
         let session = ClientSession::local(None).unwrap();
         let count = AtomicUsize::new(0);
+        let prepared = windows.prepare(&state, &session, &query);
         let old_commits = windows.commits();
         state
             .store
@@ -518,6 +712,9 @@ mod tests {
                 })
                 .join()
                 .unwrap();
+                let _admission = prepared
+                    .as_ref()
+                    .map(|p| p.entry.admission.clone().try_lock_owned().unwrap());
                 let rows = windows
                     .read(
                         &state,
@@ -527,6 +724,7 @@ mod tests {
                             index,
                             now: 0,
                             commits: old_commits,
+                            prepared,
                         },
                         || {
                             count.fetch_add(1, Ordering::SeqCst);
@@ -553,10 +751,16 @@ mod tests {
         for limit in 1..=WINDOWS + 2 {
             let mut query = request("missions");
             query.limit = Some(limit);
-            read(&windows, &state, &session, &query, 0, &count);
+            let mut owner = session.clone();
+            owner.actor = format!("client/owner/{}", limit / SESSION_WINDOWS);
+            read(&windows, &state, &owner, &query, 0, &count);
         }
         assert_eq!(windows.entries.lock().unwrap().len(), WINDOWS);
         let query = request("attention");
+        let prepared = windows.prepare(&state, &session, &query);
+        let _admission = prepared
+            .as_ref()
+            .map(|p| p.entry.admission.clone().blocking_lock_owned());
         let commits = windows.commits();
         let result = state.store.read_snapshot(|index| {
             windows.read(
@@ -567,13 +771,248 @@ mod tests {
                     index,
                     now: 0,
                     commits,
+                    prepared: prepared.clone(),
                 },
                 || anyhow::bail!("fixture read failure"),
             )
         });
         assert!(result.is_err());
+        drop(_admission);
+        drop(prepared);
         read(&windows, &state, &session, &query, 0, &count);
         assert_eq!(count.load(Ordering::SeqCst), WINDOWS + 3);
+    }
+
+    #[test]
+    fn shared_windows_query_churn_cannot_evict_another_sessions_window() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let windows = Windows::attach(&state.store).unwrap();
+        let victim = ClientSession::local(None).unwrap();
+        let mut attacker = victim.clone();
+        attacker.actor = "client/churn".into();
+        let count = AtomicUsize::new(0);
+        let query = request("agents");
+        let rows = read(&windows, &state, &victim, &query, 0, &count);
+        for n in 0..WINDOWS * 2 {
+            let mut query = request("agents");
+            query.status = Some(format!("fixture-status/{n}"));
+            read(&windows, &state, &attacker, &query, 0, &count);
+        }
+        assert_eq!(windows.entries.lock().unwrap().len(), SESSION_WINDOWS + 1);
+        let before = count.load(Ordering::SeqCst);
+        assert_eq!(read(&windows, &state, &victim, &query, 0, &count), rows);
+        assert_eq!(count.load(Ordering::SeqCst), before);
+    }
+
+    #[tokio::test]
+    async fn shared_windows_waiters_do_not_start_physical_reads_and_cancel_without_dropping_worker_admission()
+     {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let windows = Windows::attach(&state.store).unwrap();
+        let session = ClientSession::local(None).unwrap();
+        let query = request("missions");
+        let first = windows.prepare(&state, &session, &query).unwrap();
+        let guard = first.admit().await;
+        let (release, held) = std::sync::mpsc::channel();
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let physical = tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            entered.send(()).unwrap();
+            held.recv().unwrap();
+        });
+        started.await.unwrap();
+        physical.abort(); // a started physical worker still owns admission
+        let second = windows.prepare(&state, &session, &query).unwrap();
+        let mut waiter = Box::pin(second.admit());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut waiter)
+                .await
+                .is_err()
+        );
+        // Drop the canceled async waiter: it has never opened a snapshot or a worker.
+        drop(waiter);
+        assert!(second.entry.admission.clone().try_lock_owned().is_err());
+        release.send(()).unwrap();
+        physical.await.unwrap();
+        let _guard = second.admit().await;
+    }
+
+    #[test]
+    fn shared_windows_attention_and_mission_helpers_use_the_captured_clock() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let intent = crate::graph::parse_internal_intent(
+            "version 2\nmission \"clock\" state=\"ready\" { goal \"Clock\"; step \"review\" { assigned-to \"person/ada\"; goal \"Review\"; } }\n",
+            state.store.origin(),
+        ).unwrap();
+        state
+            .store
+            .apply_internal(&intent, "clock-fixture")
+            .unwrap();
+        let run = state
+            .store
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "clock".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/ada".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "clock-run".into(),
+            })
+            .unwrap();
+        {
+            let connection = state.store.connection.lock().unwrap();
+            connection
+                .execute(
+                    "UPDATE step_runs SET status='ready' WHERE subject=?1",
+                    [&run.steps[0].subject],
+                )
+                .unwrap();
+        }
+        let current =
+            client_attention_resources_at(&state.store, Some("person/ada"), false, client_now_ms())
+                .unwrap();
+        assert!(!current.is_empty());
+        let requested =
+            chrono::DateTime::parse_from_rfc3339(current[0]["requested_at"].as_str().unwrap())
+                .unwrap()
+                .timestamp_millis() as u128;
+        assert!(
+            client_attention_resources_at(&state.store, Some("person/ada"), false, requested - 1)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !client_attention_resources_at(&state.store, Some("person/ada"), false, requested)
+                .unwrap()
+                .is_empty()
+        );
+        let step = &run.steps[0];
+        {
+            let connection = state.store.connection.lock().unwrap();
+            connection.execute("UPDATE step_runs SET status='claimed',lease_owner='agent/clock',lease_incarnation='clock',lease_expires_at_unix_ms=30000 WHERE subject=?1", [&step.subject]).unwrap();
+        }
+        let before = state
+            .store
+            .mission_step_preview_at(&run.subject, 29_999)
+            .unwrap()
+            .2;
+        let after = state
+            .store
+            .mission_step_preview_at(&run.subject, 30_000)
+            .unwrap()
+            .2;
+        assert_eq!(before[0].status, "claimed");
+        assert_eq!(after[0].status, "ready");
+        assert!(after[0].claimant.is_none());
+        assert!(after[0].claim_expires_at_unix_ms.is_none());
+        assert_eq!(after[0].readiness_epoch, before[0].readiness_epoch + 1);
+    }
+
+    /// A disposable local cost comparison, explicitly invoked by the author. This does
+    /// not run against the daemon or measure production paired-client CPU or tail latency.
+    #[tokio::test]
+    #[ignore = "local single-client cold-window cost receipt"]
+    async fn shared_windows_local_single_client_cost() {
+        fn cpu_ms() -> f64 {
+            let mut time = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            assert_eq!(
+                unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut time) },
+                0
+            );
+            time.tv_sec as f64 * 1000.0 + time.tv_nsec as f64 / 1_000_000.0
+        }
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        for n in 0..100 {
+            state.store.append_claim(&ClaimInput {
+                subject: format!("glass/person/ada/019a0000-0000-7000-8000-{n:012x}"),
+                kind: "glass.upserted".into(), actor: Some("person/ada".into()),
+                fields: serde_json::from_value(json!({"body":{"name":format!("glass/{n}"),"layout":{"tabs":[{"pane":format!("opaque:{}", "x".repeat(1024))}]}},"base_revision":null})).unwrap(),
+                evidence: vec![], expected_subject: None, idempotency_key: None,
+            }).unwrap();
+        }
+        let grant = state.store.append_claim(&ClaimInput {
+            subject: "custom/client/cost-window-reader".into(), kind: "custom.client.pairing-completed".into(), actor: Some("person/ada".into()),
+            fields: serde_json::from_value(json!({"session_actor":"client/cost-window-reader", "person_id":"person/ada", "expires_at_unix_ms":(client_now_ms()+600_000) as u64,"scopes":["read.projections","read.glasses"]})).unwrap(),
+            evidence: vec![], expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let paired = paired_client_session(&state, &grant, "fabric-loopback", false).unwrap();
+        let local = ClientSession::local(Some("person/ada")).unwrap();
+        let windows = Windows::attach(&state.store).unwrap();
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let mut query = request("glasses");
+        query.limit = Some(200);
+        let index = state.store.index().unwrap();
+        for (transport, session) in [("unix", local), ("paired", paired)] {
+            let mut receipt = serde_json::Map::new();
+            let mut expected = None;
+            for _ in 0..10 {
+                collection_items_with_windows(
+                    &state,
+                    &session,
+                    &query,
+                    slots.clone().acquire_owned().await.unwrap(),
+                    None,
+                )
+                .await
+                .unwrap();
+            }
+            // Alternate order across blocks to reduce simple warmup/order bias.
+            for block in 0..6 {
+                let modes = if block % 2 == 0 {
+                    ["uncached", "cold", "warm"]
+                } else {
+                    ["warm", "cold", "uncached"]
+                };
+                for mode in modes {
+                    let mut wall = 0.0;
+                    let mut cpu = 0.0;
+                    for _ in 0..20 {
+                        if mode == "cold" {
+                            windows.entries.lock().unwrap().clear();
+                        }
+                        let start_cpu = cpu_ms();
+                        let start = std::time::Instant::now();
+                        let result = collection_items_with_windows(
+                            &state,
+                            &session,
+                            &query,
+                            slots.clone().acquire_owned().await.unwrap(),
+                            (mode != "uncached").then(|| windows.clone()),
+                        )
+                        .await
+                        .unwrap();
+                        wall += start.elapsed().as_secs_f64() * 1000.0;
+                        cpu += cpu_ms() - start_cpu;
+                        assert_eq!(result.0.store_index, index);
+                        assert_eq!(result.1.len(), 100);
+                        if let Some(expected) = &expected {
+                            assert_eq!(&result.1, expected);
+                        } else {
+                            expected = Some(result.1);
+                        }
+                    }
+                    let totals = receipt
+                        .entry(mode.to_string())
+                        .or_insert(json!({"samples":0,"wall_ms":0.0,"process_cpu_ms":0.0}));
+                    totals["samples"] = json!(totals["samples"].as_u64().unwrap() + 20);
+                    totals["wall_ms"] = json!(totals["wall_ms"].as_f64().unwrap() + wall);
+                    totals["process_cpu_ms"] =
+                        json!(totals["process_cpu_ms"].as_f64().unwrap() + cpu);
+                }
+            }
+            println!(
+                "LOCAL_WINDOW_COST {}",
+                json!({"transport":transport,"rows":100,"response_bytes":serde_json::to_vec(&expected).unwrap().len(),"profile":"debug","cases":receipt})
+            );
+        }
     }
 
     #[tokio::test]
