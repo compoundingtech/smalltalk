@@ -892,7 +892,7 @@ pub(crate) use crate::github_http::github_auth;
 
 /// Select the daemon's GitHub source before its first request. Configuration is immutable
 /// for this process; token-file contents are revalidated when the file changes.
-pub fn configure_github(config: &crate::config::GithubConfig) -> Result<()> {
+pub fn configure_github(config: &crate::config::Config) -> Result<()> {
     crate::github_http::configure(config)
 }
 
