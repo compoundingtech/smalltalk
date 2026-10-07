@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "summary": "Deliver live declared reminder messages and expose steps waiting for actual declaration state",
+  "summary": "Deliver declared reminders, wake their waiting steps on receipts and expose declaration waits",
   "replay": {
     "status": "none",
     "detail": "No replay or rebuild. Existing native boot and reconnect age/offer exclusions remain; historical declared messages are not replayed."

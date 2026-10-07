@@ -24398,7 +24398,7 @@ mission "handoff" state="ready" {
         );
     }
 
-    fn declared_reminder_fixture(timeout: &str) -> (Arc<Store>, Reconciler, String) {
+    fn declared_reminder_fixture(timeout: &str) -> (Arc<Store>, Reconciler<FakeRuntime>, String) {
         let store = Arc::new(Store::open_memory("node").unwrap());
         apply_source(&store, &format!(r#"version 2
 mission "declaration-reminder" state="ready" {{

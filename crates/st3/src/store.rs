@@ -12017,6 +12017,15 @@ impl Store {
         claim_by_id_tx(&connection, &desired.claim_id)
     }
 
+    pub(crate) fn message_has_waiting_step(&self, subject: &str) -> Result<bool> {
+        self.readers.get().prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM desired
+             JOIN step_runs ON step_runs.subject=desired.owner_step
+             WHERE desired.subject=?1 AND desired.kind='message'
+               AND step_runs.status IN ('ready','claimed','working','verifying','blocked'))"
+        )?.query_row([subject], |row| row.get(0)).map_err(Into::into)
+    }
+
     fn message_view_cached(
         &self,
         connection: &Connection,

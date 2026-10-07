@@ -108,11 +108,8 @@ pub(super) async fn receipt(
     let (record, appended, work_wake) = blocking_action(move || {
         let (record, appended) = store.append_mailbox_receipt_outcome(&input, &request.fence)?;
         // A message this store cannot read is treated as a work wake.
-        let work_wake = store
-            .message(&input.subject)
-            .ok()
-            .flatten()
-            .is_none_or(|message| super::is_work_wake(&message.tags));
+        let message = store.message(&input.subject).ok().flatten();
+        let work_wake = super::message_wakes_reconciler(&store, message.as_ref());
         Ok((record, appended, work_wake))
     })
     .await?;
