@@ -6,7 +6,9 @@ import importlib.machinery
 import importlib.util
 import json
 import io
+import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -14,7 +16,7 @@ import unittest
 from unittest.mock import patch
 
 sys.dont_write_bytecode = True
-from release_notes import FIELDS, ImpactError, collect, render, validate
+from release_notes import FIELDS, ImpactError, check_pull_request, collect, render, validate
 
 ROOT = Path(__file__).resolve().parent.parent
 loader = importlib.machinery.SourceFileLoader('release_daily', str(ROOT / 'scripts/release-smalltalk-daily'))
@@ -61,6 +63,24 @@ class ReleaseNotes(unittest.TestCase):
         self.git('commit', '-qm', message)
         return self.git('rev-parse', 'HEAD')
 
+    def run_impact_workflow(self, source, base, pr_number='', queue_ref=''):
+        # Execute the generated production step, including event/base selection.
+        lines = (ROOT / '.github/workflows/fleet.yml').read_text().splitlines()
+        step = lines.index('      - name: Require a fresh fragment on the effective PR or queue merge')
+        start = lines.index('        run: |', step) + 1
+        script = []
+        for line in lines[start:]:
+            if line and not line.startswith('          '):
+                break
+            script.append(line[10:])
+        (self.repo / 'scripts').mkdir(exist_ok=True)
+        for name in ('check-release-impact', 'release_notes.py'):
+            shutil.copyfile(ROOT / 'scripts' / name, self.repo / 'scripts' / name)
+        return subprocess.run(['bash', '-e', '-c', '\n'.join(script)], cwd=self.repo,
+                              env={**os.environ, 'GITHUB_SHA': source, 'IMPACT_BASE_SHA': base,
+                                   'IMPACT_PR_NUMBER': str(pr_number), 'IMPACT_QUEUE_REF': queue_ref},
+                              capture_output=True, text=True)
+
     def test_missing_fields_and_ambiguous_none_are_rejected(self):
         value = fragment()
         del value['manual']
@@ -82,6 +102,180 @@ class ReleaseNotes(unittest.TestCase):
         source = self.commit('Classified later change')
         with self.assertRaisesRegex(ImpactError, missing):
             render(self.repo, 'v0.3.0', source, 'v0.3.1')
+
+    def test_pr_requires_fresh_fragment_even_for_documentation(self):
+        self.write('guide.md', '# Documentation only\n')
+        source = self.commit('Docs without upgrade note')
+        with self.assertRaisesRegex(ImpactError, 'add a uniquely named'):
+            check_pull_request(self.repo, self.base, source)
+
+    def test_adoption_boundary_grandfathers_old_pr_but_not_publication(self):
+        self.write('guide.md', '# PR opened before adoption\n')
+        source = self.commit('Old documentation PR')
+        report = check_pull_request(self.repo, self.base, source, pr_number=1661)
+        self.assertEqual(report['exemptions'], {source: 1661})
+        with self.assertRaisesRegex(ImpactError, 'add a uniquely named'):
+            check_pull_request(self.repo, self.base, source, pr_number=1662)
+        with self.assertRaisesRegex(ImpactError, 'Missing upgrade classifications'):
+            collect(self.repo, self.base, source)
+        result = subprocess.run([sys.executable, str(ROOT / 'scripts/check-release-impact'),
+                                 '--repo', str(self.repo), '--base', self.base, '--source', source,
+                                 '--pr-number', '1661'], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Public release still requires complete classification', result.stdout)
+
+    def test_queue_adoption_boundary_is_per_member_not_head_ref(self):
+        self.git('checkout', '-qb', 'old')
+        self.write('old.rs', '// Old PR without a note\n')
+        self.commit('Old implementation')
+        self.git('checkout', '-q', '-')
+        self.git('merge', '--no-ff', '-qm', 'Merge pull request #1660 from example/old', 'old')
+        old = self.git('rev-parse', 'HEAD')
+        self.git('checkout', '-qb', 'new')
+        self.write('new.rs', '// New PR without a note\n')
+        self.commit('New implementation')
+        self.git('checkout', '-q', '-')
+        self.git('merge', '--no-ff', '-qm', 'Merge pull request #1662 from example/new', 'new')
+        # Even an older head ref cannot exempt the new member in a mixed group.
+        queue_ref = 'refs/heads/gh-readonly-queue/main/pr-1660-' + self.base
+        with self.assertRaisesRegex(ImpactError, 'add a uniquely named'):
+            check_pull_request(self.repo, self.base, 'HEAD', queue_ref=queue_ref)
+        self.git('reset', '--hard', old)
+        self.git('checkout', '-q', 'new')
+        self.add_fragment('new')
+        self.commit('New PR note')
+        self.git('checkout', '-q', '-')
+        self.git('merge', '--no-ff', '-qm', 'Merge pull request #1662 from example/new', 'new')
+        source = self.git('rev-parse', 'HEAD')
+        report = check_pull_request(self.repo, self.base, source, queue_ref=queue_ref)
+        self.assertEqual(report['exemptions'], {old: 1660})
+        self.assertEqual(list(report['coverage']), [source])
+
+    def test_queue_identity_is_required_and_single_pr_ref_is_supported(self):
+        self.write('old.rs', '// Old PR with custom merge subject\n')
+        source = self.commit('Custom merge subject')
+        queue_ref = 'refs/heads/gh-readonly-queue/main/pr-1660-' + self.base
+        self.assertEqual(check_pull_request(self.repo, self.base, source, queue_ref=queue_ref)['exemptions'], {source: 1660})
+        with self.assertRaisesRegex(ImpactError, 'cannot identify PR'):
+            check_pull_request(self.repo, self.base, source, queue_ref='unrecognized-ref')
+
+    def test_pr_does_not_inherit_unreleased_main_backlog(self):
+        self.write('older.rs', '// Unclassified main change\n')
+        base = self.commit('Older main change')
+        self.git('checkout', '-qb', 'feature')
+        self.write('feature.rs', '// Multi-commit PR\n')
+        self.commit('Feature implementation')
+        self.add_fragment('feature')
+        self.commit('Feature note')
+        self.git('checkout', '-q', '-')
+        self.git('merge', '--no-ff', '-qm', 'Effective PR merge', 'feature')
+        source = self.git('rev-parse', 'HEAD')
+        self.assertEqual(list(check_pull_request(self.repo, base, source)['coverage']), [source])
+        with self.assertRaisesRegex(ImpactError, base):
+            collect(self.repo, self.base, source)
+        result = subprocess.run([sys.executable, str(ROOT / 'scripts/check-release-impact'),
+                                 '--repo', str(self.repo), '--base', base, '--source', source],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(source, result.stdout)
+
+    def test_pr_workflow_uses_merge_parent_after_recorded_base_goes_stale(self):
+        self.add_fragment('existing')
+        recorded_base = self.commit('Main when PR opened')
+        self.git('checkout', '-qb', 'feature')
+        self.write('feature.rs', '// Valid PR opened before main advanced\n')
+        self.add_fragment('feature')
+        self.commit('Feature with its own note')
+        self.git('checkout', '-q', '-')
+        self.git('checkout', '-qb', 'legacy')
+        self.add_fragment('existing', fragment('Unrelated legacy correction'))
+        self.commit('Older PR edits an existing note before gate adoption')
+        self.git('checkout', '-q', '-')
+        self.git('merge', '--no-ff', '-qm', 'Merge pull request #1658 from example/legacy', 'legacy')
+        current_main = self.git('rev-parse', 'HEAD')
+        self.git('merge', '--no-ff', '-qm', 'Effective PR merge', 'feature')
+        source = self.git('rev-parse', 'HEAD')
+        with self.assertRaisesRegex(ImpactError, 'existing fragments are immutable'):
+            check_pull_request(self.repo, recorded_base, source, pr_number=1663)
+        result = self.run_impact_workflow(source, recorded_base, pr_number=1663)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f'base {current_main}', result.stdout)
+        self.assertIn('1 integrated change(s)', result.stdout)
+
+    def test_queue_workflow_keeps_group_base_and_checks_earlier_members(self):
+        self.git('checkout', '-qb', 'one')
+        self.write('one.rs', '// New PR without its required note\n')
+        self.commit('First implementation')
+        self.git('checkout', '-q', '-')
+        self.git('merge', '--no-ff', '-qm', 'Merge pull request #1667 from example/one', 'one')
+        missing = self.git('rev-parse', 'HEAD')
+        self.git('checkout', '-qb', 'two')
+        self.add_fragment('two')
+        self.commit('Second PR with a fresh note')
+        self.git('checkout', '-q', '-')
+        self.git('merge', '--no-ff', '-qm', 'Merge pull request #1668 from example/two', 'two')
+        source = self.git('rev-parse', 'HEAD')
+        result = self.run_impact_workflow(source, self.base,
+                                         queue_ref='refs/heads/gh-readonly-queue/main/pr-1667-' + self.base)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(missing, result.stderr)
+        self.assertIn('add a uniquely named', result.stderr)
+
+    def test_queue_requires_a_fragment_from_every_integrated_pr(self):
+        self.git('checkout', '-qb', 'one')
+        self.write('one.rs', '// No note\n')
+        self.commit('First implementation')
+        self.git('checkout', '-q', '-')
+        self.git('merge', '--no-ff', '-qm', 'Merge first PR', 'one')
+        missing = self.git('rev-parse', 'HEAD')
+        self.git('checkout', '-qb', 'two')
+        value = fragment()
+        value['commits'] = [missing]  # A later backfill cannot bypass PR authorship.
+        self.add_fragment('two', value)
+        self.commit('Second PR with historical backfill')
+        self.git('checkout', '-q', '-')
+        self.git('merge', '--no-ff', '-qm', 'Merge second PR', 'two')
+        with self.assertRaisesRegex(ImpactError, missing):
+            check_pull_request(self.repo, self.base, 'HEAD')
+
+    def test_pr_cannot_edit_delete_or_rename_existing_metadata(self):
+        self.add_fragment('published')
+        base = self.commit('Published note')
+        for operation in ('edit', 'delete', 'rename'):
+            self.git('reset', '--hard', base)
+            if operation == 'edit':
+                self.add_fragment('published', fragment('Changed old summary'))
+            elif operation == 'delete':
+                self.git('rm', 'release-notes/published.json')
+            else:
+                self.git('mv', 'release-notes/published.json', 'release-notes/renamed.json')
+            self.add_fragment('fresh')
+            source = self.commit(operation)
+            with self.assertRaisesRegex(ImpactError, 'existing fragments are immutable'):
+                check_pull_request(self.repo, base, source)
+
+    def test_pr_rejects_invalid_metadata_and_undeclared_version_change(self):
+        self.write('release-notes/bad.json', '{')
+        source = self.commit('Invalid fragment')
+        with self.assertRaisesRegex(ImpactError, 'invalid JSON'):
+            check_pull_request(self.repo, self.base, source)
+        self.git('reset', '--hard', self.base)
+        self.write('crates/st3/src/store/checkpoint_rules.rs', 'pub const RULES_VERSION: u32 = 11;')
+        self.add_fragment()
+        source = self.commit('Missing rules transition')
+        with self.assertRaisesRegex(ImpactError, 'rules version 10 -> 11'):
+            check_pull_request(self.repo, self.base, source)
+
+    def test_pr_accepts_explicit_unknown_and_matching_version_transitions(self):
+        self.write('crates/smallclaims/src/store.rs', 'pub const SCHEMA_VERSION: &str = "PRAGMA user_version = 17;";')
+        self.write('crates/st3/src/store/checkpoint_rules.rs', 'pub const RULES_VERSION: u32 = 11;')
+        value = fragment()
+        value['replay'] = {'status': 'unknown', 'detail': 'Replay on populated state has not been measured; wait for API readiness.'}
+        value['schema'] = {'status': 'changed', 'detail': 'Forward migration; preserve backup.', 'transitions': [[16, 17]]}
+        value['rules'] = {'status': 'changed', 'detail': 'Coordinate members.', 'transitions': [[10, 11]]}
+        self.add_fragment(value=value)
+        source = self.commit('Classified contract change')
+        self.assertEqual(len(check_pull_request(self.repo, self.base, source)['version_changes']), 2)
 
     def test_explicit_source_backfill_and_source_pinning(self):
         self.write('fix.rs', '// Direct fix\n')

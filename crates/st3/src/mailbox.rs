@@ -41,7 +41,7 @@ impl Fence {
                 }
                 Err(error)
                     if crate::client::api_error_code(&error).is_some_and(|code| {
-                        !matches!(code, "internal" | "mailbox-session-starting")
+                        !matches!(code, "internal" | "database-busy" | "database-locked" | "mailbox-session-starting")
                     }) =>
                 {
                     return Err(error);
@@ -186,6 +186,61 @@ pub(crate) mod tests {
     use crate::store::Store;
     use serde_json::json;
     use std::collections::BTreeMap;
+    #[tokio::test]
+    async fn typed_contention_bind_retries_the_same_fence_and_refusal_does_not_retry() {
+        use axum::{Json, Router, routing::post};
+        use axum::http::StatusCode;
+        use std::sync::{Arc, Mutex};
+        for refused in [false, true] {
+            let requests = Arc::new(Mutex::new(Vec::<Fence>::new()));
+            let captured = requests.clone();
+            let app = Router::new().route("/v1/mailbox/bind", post(move |Json(mut fence): Json<Fence>| {
+                let captured = captured.clone();
+                async move {
+                    let count = {
+                        let mut requests = captured.lock().unwrap();
+                        requests.push(fence.clone());
+                        requests.len()
+                    };
+                    if refused || count <= 2 {
+                        let code = if refused { "stale-incarnation" } else if count == 1 {
+                            "database-busy"
+                        } else { "database-locked" };
+                        return (if refused { StatusCode::CONFLICT } else { StatusCode::SERVICE_UNAVAILABLE },
+                            Json(json!({"code":code,"message":"fixture refusal","details":{}})));
+                    }
+                    fence.epoch = 42;
+                    (StatusCode::OK, Json(json!({"api_version":"st3.v1","value":fence})))
+                }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+            let client = crate::client::Client::new(crate::client::Endpoint::Http(format!("http://{address}")));
+            let mut fence = Fence::new("agent/fixture", "incarnation/fixture", "component/fixture");
+            let token = fence.token.clone();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), fence.bind(&client)).await.unwrap();
+            server.abort();
+            let requests = requests.lock().unwrap();
+            if refused {
+                assert_eq!(crate::client::api_error_code(&result.unwrap_err()), Some("stale-incarnation"));
+                assert_eq!(requests.len(), 1);
+                assert_eq!(fence.epoch, 0);
+            } else {
+                result.unwrap();
+                assert_eq!(requests.len(), 3);
+                assert_eq!(fence.epoch, 42);
+            }
+            assert_eq!(fence.token, token);
+            for request in requests.iter() {
+                assert_eq!(request.epoch, 0);
+                assert_eq!(request.token, token);
+                assert_eq!(request.subject, fence.subject);
+                assert_eq!(request.incarnation, fence.incarnation);
+                assert_eq!(request.component, fence.component);
+            }
+        }
+    }
     fn claim(subject: &str, kind: &str, fields: Value, key: &str) -> ClaimInput {
         ClaimInput {
             subject: subject.into(),

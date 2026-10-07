@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "stui describes click and right-click actions in its pointer footer, fills hover gaps and documents all pointer targets.",
+  "replay": { "status": "none", "detail": "UI feedback and documentation only; no replay or projection rebuild." },
+  "schema": { "status": "none", "detail": "No database or migration changes." },
+  "rules": { "status": "none", "detail": "No checkpoint rules or coordination requirements change." },
+  "compatibility": { "status": "none", "detail": "Existing actions and menus are reused; World and client-v0 are unchanged." },
+  "downtime": { "status": "none", "detail": "No daemon restart or service interruption is required." },
+  "manual": { "status": "none", "detail": "No manual action or configuration change is required." },
+  "recovery": { "status": "none", "detail": "No stored state transition or new recovery step is introduced." }
+}

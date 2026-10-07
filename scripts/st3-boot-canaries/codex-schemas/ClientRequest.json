@@ -4,6 +4,20 @@
       "properties": {
         "method": {
           "enum": [
+            "config/read"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "method"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
             "hooks/list"
           ],
           "type": "string"

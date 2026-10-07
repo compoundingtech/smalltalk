@@ -7,12 +7,13 @@ selection text, density/fold identities, and serializable style rules. The share
 fixtures in `fixtures/clients/transcripts` are the contract with the phone's TypeScript model.
 
 Exposed status, usage, redaction, truncation and unsupported timeline variants remain visible
-as event notices. Unsupported bodies are not dumped. Attachment-only native content preserves
+as event notices. Unknown bodies retain a labelled JSON view of the authorized content.
+Attachment-only native content preserves
 its media type and authorized reference without fetching bytes; graph mail keeps image refs
 and labels other media. An unbound transcript is unavailable, not evidence that the harness
 has done nothing. Projection availability warnings keep their supplied explanation.
 Usage notices show semantics, supplied token counts and supplied cost, omitting nulls and
-attribution IDs. Unknown-role content does not expose its text; empty plain content is skipped,
+attribution IDs. Unknown-role content shows its text with an attribution notice; empty plain content is skipped,
 and media references remain visible. Diagnostic messages and unsupported type labels are
 bounded Unicode-safe previews. Mail envelopes retain their next content across intervening
 status events and emit unpaired media refs only at the next message or end of the window.

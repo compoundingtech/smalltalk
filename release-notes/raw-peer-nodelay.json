@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Disable Nagle buffering on peer sockets for interactive raw PTY replies",
+  "replay": { "status": "none", "detail": "No claim or replay behavior changes." },
+  "schema": { "status": "none", "detail": "No database changes." },
+  "rules": { "status": "none", "detail": "No checkpoint or fleet authority changes." },
+  "compatibility": { "status": "none", "detail": "The peer wire protocol and raw PEEK/ATTACH authorization are unchanged; TCP sockets send small interactive frames without waiting for delayed ACKs." },
+  "downtime": { "status": "none", "detail": "No additional interruption beyond a normal daemon upgrade." },
+  "manual": { "status": "none", "detail": "No configuration or migration steps required." },
+  "recovery": { "status": "none", "detail": "No recovery behavior changes." }
+}

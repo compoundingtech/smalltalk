@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "summary": "#1515: idle native-delivery hold reads",
+  "commits": ["cdb2c03058a374158b43ebeb10400c3e18f7e434"],
+  "replay": {"status": "none", "detail": "No new projection invalidation or startup replay trigger in the merged idle native-delivery hold reads change."},
+  "schema": {"status": "none", "detail": "No database table, index, trigger or migration change in idle native-delivery hold reads; SQLite user_version is unchanged."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digest/drop policy are unchanged; this change adds no sealing coordination requirement."},
+  "compatibility": {"status": "changed", "detail": "Codex/OpenCode drivers obtain delivery control on mail arrival and stop idle delivery-hold polling. Pending mail and predecessor hold adoption retain the three-second permit and one-second renewal. Idle is ready with a closed permission gate; failed control reads remain unavailable, and deliberate graph holds still block handoff."},
+  "downtime": {"status": "none", "detail": "No additional upgrade service stop or measured outage introduced by idle native-delivery hold reads; the standard daemon/client restart procedure still applies."},
+  "manual": {"status": "none", "detail": "No data repair or configuration conversion required for existing installations by idle native-delivery hold reads."},
+  "recovery": {"status": "none", "detail": "No additional recovery procedure introduced by this change. Preserve graph state, keys and configuration and follow the standard roll-forward guidance; this note does not qualify binary-only downgrade of the whole release."}
+}

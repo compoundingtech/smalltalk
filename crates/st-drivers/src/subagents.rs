@@ -295,6 +295,15 @@ pub fn observe_claude(agent_dir: &Path, event: &str, payload: &Value) -> Result<
 fn apply_claude(ledger: &mut Ledger, event: &str, payload: &Value, now: u64) {
     let session = text(payload, "session_id");
     let agent_id = text(payload, "agent_id");
+    // SessionStart is the native session boundary. Late child/turn/end hooks from a previous
+    // session cannot switch that boundary or end the current session's children. Missing session
+    // evidence cannot vouch for a mutation once the ledger has an owner, either.
+    if event != "SessionStart"
+        && let Some(current) = ledger.session_id.as_deref()
+        && session.as_deref() != Some(current)
+    {
+        return;
+    }
     match event {
         "SessionStart" => {
             if let Some(session) = session {
@@ -336,12 +345,10 @@ fn apply_claude(ledger: &mut Ledger, event: &str, payload: &Value, now: u64) {
             }
         }
         "SubagentStart" => {
-            let Some(id) = agent_id else {
+            let (Some(id), Some(session)) = (agent_id, session) else {
                 return;
             };
-            if let Some(session) = &session {
-                ledger.change_session(session, now);
-            }
+            ledger.change_session(&session, now);
             let subagent_type = text(payload, "agent_type");
             // Claude names the launching tool call only in a file it writes after this hook, so
             // take the oldest launch of the same type from the same prompt. The driver corrects
@@ -361,7 +368,7 @@ fn apply_claude(ledger: &mut Ledger, event: &str, payload: &Value, now: u64) {
                 id,
                 subagent_type,
                 description: launch.and_then(|launch| launch.description),
-                session_id: session,
+                session_id: Some(session),
                 started_at_ms: now,
                 unlisted_since_ms: None,
                 parent_usage: false,
@@ -781,7 +788,7 @@ mod tests {
             &mut ledger,
             "SubagentStop",
             &json!({
-                "agent_id": "a1", "agent_type": "general-purpose",
+                "session_id": "s-1", "agent_id": "a1", "agent_type": "general-purpose",
                 "agent_transcript_path": "/elsewhere/agent-a1.jsonl",
             }),
             13,
@@ -859,12 +866,69 @@ mod tests {
         assert_eq!(ledger.ended[0].outcome, "session-ended");
         started_in(&mut ledger, "s-2", "a2", "p-2", "general-purpose", 5);
         assert_eq!(ledger.running["a2"].session_id.as_deref(), Some("s-2"));
-        apply_claude(&mut ledger, "SessionEnd", &json!({"reason": "clear"}), 6);
+        apply_claude(
+            &mut ledger,
+            "SessionEnd",
+            &json!({"session_id": "s-2", "reason": "clear"}),
+            6,
+        );
         assert!(ledger.running.is_empty());
         assert_eq!(
             ledger.ended[1].reason.as_deref(),
             Some("its parent session ended (clear)")
         );
+    }
+
+    #[test]
+    fn foreign_claude_lifecycle_events_leave_current_children_unchanged() {
+        let mut current = Ledger::default();
+        started(&mut current, "current-child", "p-1", "general-purpose", 1);
+        for (event, payload) in [
+            (
+                "SessionEnd",
+                json!({"session_id": "old-session", "reason": "clear"}),
+            ),
+            (
+                "SubagentStart",
+                json!({"session_id": "old-session", "agent_id": "old-child"}),
+            ),
+            (
+                "SubagentStop",
+                json!({"session_id": "old-session", "agent_id": "current-child"}),
+            ),
+            (
+                "Stop",
+                json!({"session_id": "old-session", "background_tasks": []}),
+            ),
+            (
+                "PreToolUse",
+                json!({"session_id": "old-session", "tool_name": "Agent",
+                "tool_use_id": "old-launch", "tool_input": {"description": "foreign launch"}}),
+            ),
+        ] {
+            let mut missing = payload.clone();
+            missing.as_object_mut().unwrap().remove("session_id");
+            for payload in [payload, missing] {
+                let mut ledger = current.clone();
+                apply_claude(&mut ledger, event, &payload, 2);
+                assert_eq!(
+                    ledger, current,
+                    "unowned {event} mutated the current session"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_claude_child_needs_native_session_evidence_to_start() {
+        let mut ledger = Ledger::default();
+        for payload in [
+            json!({"agent_id": "child"}),
+            json!({"agent_id": "child", "session_id": ""}),
+        ] {
+            apply_claude(&mut ledger, "SubagentStart", &payload, 1);
+            assert_eq!(ledger, Ledger::default());
+        }
     }
 
     #[test]
@@ -1020,6 +1084,50 @@ mod tests {
         assert!(!ledger_path(directory.path()).exists());
         observe_codex(directory.path(), &activity("started", "child"), "parent").unwrap();
         assert!(read(directory.path()).running.contains_key("child"));
+    }
+
+    #[test]
+    fn codex_children_outlive_the_parent_turn_and_end_independently() {
+        let directory = tempfile::tempdir().unwrap();
+        for child in ["first", "second"] {
+            observe_codex(directory.path(), &activity("started", child), "parent").unwrap();
+        }
+        let before = read(directory.path());
+        // Finishing or interrupting the parent turn says nothing about either child's task.
+        for status in ["completed", "interrupted"] {
+            observe_codex(
+                directory.path(),
+                &json!({"method": "turn/completed", "params": {
+                    "threadId": "parent", "turn": {"id": "turn-1", "status": status},
+                }}),
+                "parent",
+            )
+            .unwrap();
+        }
+        assert_eq!(read(directory.path()), before);
+        // A different parent's child completion cannot end this parent's task.
+        let mut foreign = activity("completed", "first");
+        foreign["params"]["threadId"] = json!("other-parent");
+        observe_codex(directory.path(), &foreign, "parent").unwrap();
+        assert_eq!(read(directory.path()), before);
+        for child in ["first", "second"] {
+            let completed = activity("completed", child);
+            observe_codex(directory.path(), &completed, "parent").unwrap();
+            observe_codex(directory.path(), &completed, "parent").unwrap();
+            let ledger = read(directory.path());
+            assert_eq!(
+                ledger
+                    .ended
+                    .iter()
+                    .filter(|ended| ended.subagent.id == child)
+                    .count(),
+                1,
+            );
+            if child == "first" {
+                assert!(ledger.running.contains_key("second"));
+            }
+        }
+        assert!(read(directory.path()).running.is_empty());
     }
 
     #[test]

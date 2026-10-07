@@ -471,11 +471,13 @@ async fn connected(
                             return Ended::Closed;
                         }
                     }
+                    // st asks for a window again (its cursor fell behind a floor, or the graph moved
+                    // under it). Asked at once and again on every resync, that is a loop and, at an
+                    // upgrade, a herd; so each is asked after a wait that grows and is jittered, and
+                    // one good snapshot resets the wait.
                     CollectionEvent::Resync { id, .. } => {
-                        if let Some(window) = Window::from_id(&id)
-                            && let Err(error) = stream.subscribe(window.id(), window.id(), window.limit(), None, None).await
-                        {
-                            return Ended::Dropped(error.to_string());
+                        if let Some(window) = Window::from_id(&id) {
+                            window_retries.failed(window, Instant::now());
                         }
                     }
                     CollectionEvent::Conversation { id, session_id, replace, items, has_more } => {
@@ -606,6 +608,14 @@ async fn connected(
     }
 }
 
+/// Up to half of `wait` more, so many clients told to ask again at once do not all ask together.
+fn jitter(wait: Duration) -> Duration {
+    let spread = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| u64::from(since.subsec_nanos()) % 1000);
+    wait.mul_f64(spread as f64 / 2000.0)
+}
+
 /// Windows st stopped sending, and when to ask for each again.
 #[derive(Default)]
 struct WindowRetries {
@@ -618,10 +628,8 @@ impl WindowRetries {
     /// its first failure since it last loaded, the one worth telling the person about.
     fn failed(&mut self, window: Window, now: Instant) -> bool {
         let failures = self.failures.entry(window).or_default();
-        self.at.insert(
-            window,
-            now + RETRY_DELAYS[(*failures).min(RETRY_DELAYS.len() - 1)],
-        );
+        let wait = RETRY_DELAYS[(*failures).min(RETRY_DELAYS.len() - 1)];
+        self.at.insert(window, now + wait + jitter(wait));
         *failures += 1;
         *failures == 1
     }
@@ -1000,15 +1008,18 @@ mod tests {
             retries.failed(Window::Agents, start),
             "the first failure is said"
         );
-        assert_eq!(retries.next(), Some(start + RETRY_DELAYS[0]));
+        // The wait is the step's, plus up to half of it so clients do not all ask together.
+        let first = retries.next().unwrap();
+        assert!(first >= start + RETRY_DELAYS[0] && first <= start + RETRY_DELAYS[0] * 3 / 2);
         assert!(retries.due(start).is_empty());
-        assert_eq!(retries.due(start + RETRY_DELAYS[0]), vec![Window::Agents]);
+        assert_eq!(retries.due(start + RETRY_DELAYS[0] * 2), vec![Window::Agents]);
         assert_eq!(retries.next(), None, "asked again; it waits for an answer");
         assert!(
             !retries.failed(Window::Agents, start),
             "later failures are quiet"
         );
-        assert_eq!(retries.next(), Some(start + RETRY_DELAYS[1]));
+        let second = retries.next().unwrap();
+        assert!(second >= start + RETRY_DELAYS[1] && second <= start + RETRY_DELAYS[1] * 3 / 2);
         retries.loaded(Window::Agents);
         assert_eq!(retries.next(), None);
         assert!(
@@ -1032,6 +1043,29 @@ mod tests {
                 details: Default::default(),
             }),
         )
+    }
+
+    #[test]
+    fn a_window_st_asks_for_again_waits_longer_each_time_and_a_snapshot_resets_it() {
+        let mut retries = WindowRetries::default();
+        let now = Instant::now();
+        let mut last = Duration::ZERO;
+        for (index, base) in RETRY_DELAYS.iter().enumerate() {
+            retries.failed(Window::Missions, now);
+            let wait = retries.next().unwrap() - now;
+            assert!(
+                wait >= *base && wait <= *base + *base / 2,
+                "try {index}: {wait:?} for a base of {base:?}"
+            );
+            assert!(wait >= last, "the wait only grows");
+            last = *base;
+            // Nothing is asked again before it is due.
+            assert!(retries.due(now).is_empty());
+        }
+        retries.loaded(Window::Missions);
+        assert!(retries.next().is_none(), "a snapshot clears the wait");
+        retries.failed(Window::Missions, now);
+        assert!(retries.next().unwrap() - now < RETRY_DELAYS[0] * 2, "and starts it over");
     }
 
     #[test]

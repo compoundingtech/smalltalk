@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Two indexes for the descendant-runs query used by run-tree rebuilds and run cancellation",
+  "replay": {"status": "none", "detail": "No replay or rebuild. Query results are unchanged."},
+  "schema": {"status": "changed", "detail": "Additive: indexes step_runs_generation_index and mission_runs_parent_step_index (partial, parent_step_run IS NOT NULL). Both tables are small (about 3,800 runs and 9,900 steps on a 7 GB real store), so they build at first open in milliseconds. Schema version is unchanged; an older build that reopens the file ignores them."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged."},
+  "compatibility": {"status": "none", "detail": "No client, wire or harness contract change."},
+  "downtime": {"status": "none", "detail": "No measurable interruption: the index builds touch a few thousand rows."},
+  "manual": {"status": "none", "detail": "No manual step."},
+  "recovery": {"status": "none", "detail": "The indexes can be dropped; nothing depends on them for correctness."}
+}

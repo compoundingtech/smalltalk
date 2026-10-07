@@ -617,8 +617,12 @@ pages and updates are bounded by the negotiated byte and item limits.
 
 Pi-family native replay recognizes OMP's message-level `role: "toolResult"` records: the
 `toolCallId` correlates the result with its call, `isError` selects error or success status, and
-the result's text content is retained. Legacy tool-result blocks inside message content remain
-supported.
+the result's text content is retained. Native result `details` objects are merged verbatim into
+the normalized `tool_output` block's optional open `metadata`, preserving `wallTimeMs`,
+`timeoutSeconds`, zero/fractional values, original units, and future fields. There is no
+`tool_result` body metadata field; the complete native record remains unchanged in its
+`source_record` block. Legacy tool-result blocks inside message content remain supported and
+use the same block metadata shape.
 
 External process sessions remain listed even when st cannot identify a native transcript.
 Opening their timeline returns a non-retryable `unsupported-capability` error with
@@ -694,7 +698,7 @@ The v0 action discriminators are:
 | Lanes | `lane.join`, `lane.leave`, `lane.move`, `lane.mark`, `lane.approve` | snapshot; the lane must be open and a named entry or anchor must be in it |
 | Runtimes | `runtime.stop`, `runtime.restart`, `runtime.reset`, `runtime.context-clear`, `runtime.signal` | runtime incarnation; stop, restart, and reset also require `runtime_desired_revision` from the runtime resource |
 | Agent desired state | `agent.stop`, `agent.start` | snapshot and `runtime_desired_revision`, the agent's selected desired claim ID; no runtime incarnation required |
-| Terminals | `terminal.input`, `terminal.resize`, `terminal.attach`, `terminal.detach` | runtime incarnation; input and resize also require the screen sequence |
+| Terminals | `terminal.input`, `terminal.resize`, `terminal.attach`, `terminal.detach` | runtime incarnation; resize and a line of input (`mode` `line`) also require the screen sequence; raw and key input do not |
 | Pairing | `pairing.begin`, `pairing.complete`, `pairing.revoke` | pairing/device revision where applicable |
 
 `runtime.stop` publishes a stop for the selected member. `runtime.restart` terminates the current
@@ -927,7 +931,13 @@ client needs to encode keys and pastes (`alternate_screen`, `application_cursor`
 line per row, and `next_sequence`, an opaque numeric screen fence for input and resize. Compare
 it for equality; it is not a graph index or an ordered event counter. Unrelated graph writes do
 not change it. A terminal action may use an older snapshot from the same host, while incarnation
-and explicit revision fences still apply. Attach/detach do not require a screen sequence fence.
+and explicit revision fences still apply. Attach/detach do not require a screen sequence fence, and
+neither does `terminal.input` in `raw` or `key` mode: keys a person types cannot be made unsafe by a
+screen they did not see, and a program that redraws itself (a spinner) moves the sequence between
+any read and any send, so a client that must match it can never type. A client may send such input
+with no `terminal_sequence`; one that still sends it is not checked against it. A daemon older than
+this refuses such input with "terminal control requires a sequence fence", and the client then reads
+the screen and sends its sequence as before.
 `revision` digests the rest of
 the screen: equal revisions mean equal screens, and a stream never sends the same revision twice.
 The optional `kitty_keyboard` mode carries the active Kitty keyboard enhancement bitmask.
@@ -1035,6 +1045,10 @@ PTY's atomic SCREEN replay followed by live DATA, GEOMETRY and EXIT unchanged. T
 one PTY connection for the transport lifetime. ATTACH and RESIZE therefore participate in normal
 per-axis min-wins geometry with other persistent writers; PEEK cannot send input, resize, upgrade
 to ATTACH, or contribute geometry. DETACH and closing the transport release the connection.
+After ATTACH, an empty PTY frame of type 11 (`ResetInputModes`) can recover the daemon's
+input modes without writing reset bytes to the child. PEEK connections and nonempty reset
+frames are refused. The normal screen/history survive, and the daemon broadcasts the reset
+as DATA. Older PTY daemons ignore this extension.
 Raw clients cannot issue PTY lifecycle/CAS or ancestry-management commands through this capability.
 Bounded chunks and socket backpressure preserve every byte; slow consumers do not skip output.
 
@@ -1407,9 +1421,19 @@ for its crash boundary.
 Rust exposes `agent_create`, `terminal_create`, `terminal_end`; TypeScript and Swift expose
 `agentCreate`, `terminalCreate`, `terminalEnd` with generated typed parameter bodies.
 
+A timeline message body whose sender is a person carries `provenance`: the `verdict` every member
+recorded for the message's signature (`verified`, `unsigned`, `held` or `invalid`, with a `reason` for
+the last two), and for a signed one the `signer`, the `key` and the `device` the key was granted to,
+by the label it was given when it paired (`example phone (secure enclave)`). Clients show it beside the
+sender; an `unsigned` message is usually just older than signing and shows nothing. An agent's
+message carries none. `GET /v1/messages/read/{id}` (`st conversations read`) and `st subject show`
+for a message give the same object.
+
 Messages tagged `dictated` carry a delivery-only line explaining that voice transcription may
 contain mistakes. The stored text and body digest stay unchanged. Timeline message bodies carry
 the message's optional `tags` array so clients can mark dictation without inspecting its text.
+
+Agent projections include optional `workspace` and `checkout {repository, base, branch}` from the declaration, so clients can label a new seat before it launches. These describe the requested checkout; `state` and `fault` report whether launch succeeded. Older daemons omit the metadata. Both new-agent forms consume `host.repositories`, permit an absolute path typed on the selected host, keep the base editable, and leave an empty repository as a plain workspace. Their wire parameters and worktree label share `fixtures/clients/agent-launch.json`.
 
 The agent resource exposes observed harness status as `harness_state`, `since` (RFC 3339),
 and `observation: current | stale | missing`. `since` is the start of that state in that
@@ -1467,3 +1491,58 @@ ST3_TERMINALS_COMPAT_BIN=/path/to/older/st3 cargo test -p st3 --test integration
 
 Choose a binary built before these terminal filters. The fake legacy-server refusal
 and escaping test, server filter/paging tests, and TypeScript client checks run in CI.
+
+### Owner-native conversation blocks
+
+With `X-St3-Features: conversation-blocks.v1`, native timeline entries include
+optional `body.blocks`. Top-level timeline types stay unchanged for old Swift/iOS
+and stui decoders. Block kinds are open strings; an unrecognized native block keeps
+its complete JSON in `payload.raw` before transport bounding. Reasoning explicitly
+present in the harness transcript and full structured tool arguments are shown
+without secret or token filtering. Without the feature, the server returns known
+text/tool/status bodies with visible size-limit notices. Old clients can read those
+fallbacks but do not fetch images or expand a chunked remainder.
+
+`read.projections` authorizes **raw native conversation content**, including full
+arguments, output, reasoning shown by the harness, unknown JSON and images. It is
+the existing scope for pages, deltas and owner forwarding, and also governs
+`GET /v1/client/conversations/{id}/content/{reference}/chunk?offset=N`. Terminal
+write or message-attachment scopes are not required. A local read-only Unix client
+already has this scope; a paired client needs it in its active delegated grant.
+
+Image pixels stay off timeline pages. Blocks and nested native images carry opaque
+owner references. Every fetch verifies the authorized session, entry/revision and
+native source identity; no client-supplied file path or image URL is accepted. The
+ref encrypts the owner-located source descriptor, so native chunks do not inventory
+other sessions and the path is not exposed. Managed chunks also recheck the current
+owner binding. A
+chunk contains base64 `data`, `media_type`, `offset`, total `size` and nullable
+`next_offset`. Chunks hold at most 256 KiB of decoded bytes; native image reads are
+limited to 32 MiB, with explicit errors. Transcript URLs are never fetched by the owner. Oversized JSON
+payloads show an 8 KiB UTF-8 prefix labelled as truncated JSON text, and a reference
+recovers the full valid JSON. The existing 1 MB page bound still applies.
+
+Edited records, replacement, managed binding changes and owner restarts invalidate references;
+append-only growth preserves existing refs:
+HTTP 410 `conversation-content-invalidated`, `retryable: true`, and
+`details.full_resync: true` tell the client to reload before fetching again. A
+reachable owner with unreadable/missing bytes returns `transcript-unavailable`;
+unreachable owner reads retain `remote-unavailable` and carry
+`details.availability: owner-unavailable`. The managed transcript notice similarly
+labels `transcript-unavailable`; retiring its stored-history fallback is owned by
+the separate no-agent-history mission. This contract adds no durable content class,
+claim kind, retention rule, spool, or image blob copy.
+
+Native conversation `read.projections` grants full transcript, chunk and image access,
+including secrets in exposed reasoning, tool arguments/output and unknown JSON.
+Local people and agents, anonymous local read-only Unix readers, and default paired
+phones and wall displays have this access. No content is scrubbed. Refs die on a
+daemon restart; clients must reload the timeline. Four expensive owner timeline/chunk
+reads can run concurrently; busy reads return HTTP 429 `rate-limited`, including
+managed timeline reads. Clients must back off and retry.
+Known blocks can use `payload: {body_ref: true}` to refer to the containing fallback
+body without duplicating its bytes. Content refs authenticate one native record;
+chunk reads do not rebuild the session. The owner never requests transcript HTTP(S)
+URLs. External images use an `image_link` block for explicit client opening; file
+reads are restricted to content-addressed files in the bound Pi/OMP blob store. MIME comes from passive image
+signatures, with SVG/HTML/unrecognized bytes returned only as opaque octets.

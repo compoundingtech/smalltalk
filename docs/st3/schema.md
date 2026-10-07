@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `0ae56dbbffe32b240808b7c64ffaa25b09128f6301e1e99859d6314a7eba76f3`
+Digest: `cfaf319670ad6eb9a211cf1bc5a15821621f9681be5f89f99ac87ebfbfdb1687`
 
 ## Subject families
 
@@ -19,6 +19,7 @@ Digest: `0ae56dbbffe32b240808b7c64ffaa25b09128f6301e1e99859d6314a7eba76f3`
 | `daemon` | `daemon/NODE` | no | An st3 daemon. |
 | `doc` | `doc/NAME` | no | A named immutable document lineage. |
 | `exec` | `exec/RUN/LOCAL_ID` | no | A mission-run exec runtime. |
+| `external` | `external/PROVIDER/KIND/IDENTITY` | no | An external account or actor, distinct from a native person. |
 | `file` | `file/HOST:/ABSOLUTE_PATH` | no | A read-only file gate target. |
 | `fleet-invite` | `fleet-invite/ID` | no | A single-use fleet join invite. |
 | `gate-operation` | `gate-operation/IDENTITY` | no | One gate evaluation attempt. |
