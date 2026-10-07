@@ -16,7 +16,8 @@
         }
       ],
       "expo-secure-store",
-      "expo-font"
+      "expo-font",
+      "./plugins/withNonblockingMetro.cjs"
     ],
     "ios": {
       "bundleIdentifier": "com.compoundingtech.smalltalk.starter",
