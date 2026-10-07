@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Provide one opt-in IVM registry and shared Store publisher for collection and receipt consumers.",
+  "replay": {"status": "none", "detail": "Registration does not backfill or replay views. Populated stores preserve the certified projected prefix and expose unready views until their source adapters certify coverage."},
+  "schema": {"status": "changed", "detail": "Only open_with_ivm_views or an explicitly configured SmalltalkRuntime installs registered view schemas and the existing smallclaims IVM/event tables, indexes and triggers. Ordinary Store opens remain unregistered and create none of these tables. No numeric database version changes."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or fleet compatibility digest changes. Registration does not certify checkpoint participation of a source adapter."},
+  "compatibility": {"status": "none", "detail": "No socket frames, collection names, generated clients or default production reader changes. Opt-in callers share Store::ivm_views and the exact same Arc from Store::ivm_publisher across receipt waits and collection consumers."},
+  "downtime": {"status": "none", "detail": "Ordinary daemon opens retain their existing startup path. Opt-in registration creates schemas but does not wait for a backfill or certify source coverage."},
+  "manual": {"status": "none", "detail": "No default deployment step. Source adapter owners must explicitly install, maintain and certify their registered views before activating a production reader."},
+  "recovery": {"status": "unknown", "detail": "Default stores are unchanged. Registered view tables and event triggers persist; this patch does not certify removing an installed adapter or an old writer's local-input coverage. Such views must stay unavailable until their adapter proves coverage; no automatic replay or table cleanup is supplied."}
+}
