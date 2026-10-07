@@ -24415,7 +24415,7 @@ mission "declaration-reminder" state="ready" {{
 }}"#), "declaration-reminder-source");
         let run = store.create_mission_run(&crate::model::MissionRunRequest {
             mission: "declaration-reminder".into(), revision: None, workspace: "/tmp".into(),
-            requester: Some("person/test".into()), mode: Some("eval".into()),
+            requester: Some("person/test".into()), mode: Some("run".into()),
             inputs: BTreeMap::new(), idempotency_key: "declaration-reminder-run".into(),
         }).unwrap();
         let reconciler = Reconciler::new(store.clone(), Arc::new(FakeRuntime::default()),

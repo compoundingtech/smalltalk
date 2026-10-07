@@ -17587,7 +17587,7 @@ mission "receipt-wait" state="ready" {
         state.store.apply_internal(&intent, "receipt-wait-mission").unwrap();
         let run = state.store.create_mission_run(&crate::model::MissionRunRequest {
             mission: "receipt-wait".into(), revision: None, workspace: "/tmp".into(),
-            requester: Some("person/test".into()), mode: Some("eval".into()),
+            requester: Some("person/test".into()), mode: Some("run".into()),
             inputs: BTreeMap::new(), idempotency_key: "receipt-wait-run".into(),
         }).unwrap();
         let step = &run.steps[0].subject;

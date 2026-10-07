@@ -694,7 +694,7 @@ mod tests {
     fn declared_mail_keeps_original_age_and_never_invents_a_receipt() {
         let store = Store::open_memory("node").unwrap();
         crate::mailbox::tests::ready(&store, "declaration-boot");
-        let intent = crate::graph::parse_execution_intent(
+        let intent = crate::graph::parse_intent(
             r#"version 2
 message "declared-reminder" {
   from "agent/eval.worker"
@@ -702,7 +702,6 @@ message "declared-reminder" {
   content "Resume the bounded observation."
 }"#,
             "node",
-            "fixture",
         ).unwrap();
         store.apply_internal(&intent, "declare-reminder").unwrap();
         let subject = "message/declared-reminder";
@@ -771,10 +770,10 @@ message "declared-reminder" {
             &Fence::new(seat, "declaration-stream", "delivery")).await.unwrap();
         let mut socket = client.open_mailbox(&fence).await.unwrap();
         assert!(matches!(next(&mut socket).await, Frame::Mailbox { messages } if messages.is_empty()));
-        let intent = crate::graph::parse_execution_intent(
+        let intent = crate::graph::parse_intent(
             r#"version 2
 message "live-declaration" { from "agent/eval.worker"; to "agent/eval.worker"; content "Resume." }
-"#, "node", "fixture").unwrap();
+"#, "node").unwrap();
         state.store.apply_internal(&intent, "stream-declaration").unwrap();
         signal_changed(&state);
         let messages = match next(&mut socket).await {
