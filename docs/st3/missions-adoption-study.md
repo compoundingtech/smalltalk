@@ -120,7 +120,7 @@ mission "dotfiles/deploy" {
   step "credential-authority" { agentless
     gate "Johannes approves credential scope" type="human" { reviewer "person/schickling" } }
   step "canary"  { depends-on { step "admit" completed }; retry { attempts 2; backoff "30s" } }
-  step "system"  { depends-on { step "canary" completed } }
+  step "system"  { depends-on { step "canary" completed; step "credential-authority" completed } }
   step "hm"      { depends-on { step "system" completed } }
   step "verify"  { depends-on { step "hm" completed } }
 }
