@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Guard the staged ownership selection query plan against full claim scans",
+  "replay": {
+    "status": "none",
+    "detail": "Test-only query plan coverage; no replay or projection change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No schema/index change; the test checks the existing partial index."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules and canonical ranking unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No wire, client, protocol or harness changes."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional interruption."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual action."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No persistent state change; the production query only moves into a shared constant for its test."
+  }
+}

@@ -92,16 +92,23 @@ export function homeRows(items: KeptAttention[], actor: string | undefined, now 
     const step = item.step_run_id?.split('/').pop();
     return [{ item, ...place, ...kindGlyph(place.kind), title: cleanTitle(item.title), waiting: item.closedElsewhere ? 'closed elsewhere; stays until you clear it' : step ? `step ${step}` : null, age: ago(item.requested_at, now) }];
   });
-  // A stable sort by tier keeps st's order within each tier.
-  return rows.map((row, index) => ({ row, index })).sort((a, b) => TIERS.indexOf(a.row.tier) - TIERS.indexOf(b.row.tier) || a.index - b.index).map(({ row }) => row);
+  // A stable sort by tier keeps st's order within each tier; what st closed sits last, apart.
+  const rank = (row: HomeRow) => (row.item.closedElsewhere ? TIERS.length : 0) + TIERS.indexOf(row.tier);
+  return rows.map((row, index) => ({ row, index })).sort((a, b) => rank(a.row) - rank(b.row) || a.index - b.index).map(({ row }) => row);
 }
 
-export type HomeSection = { tier: Tier; title: string; count: number; rows: HomeRow[] };
+export type HomeSection = { tier: Tier; title: string; count: number; rows: HomeRow[]; closed?: boolean };
 export function homeSections(rows: HomeRow[]): HomeSection[] {
   const sections: HomeSection[] = [];
   for (const row of rows) {
+    const closed = !!row.item.closedElsewhere;
     const last = sections.at(-1);
-    if (last?.tier === row.tier) { last.rows.push(row); last.count++; }
+    // Items st closed while they were shown stay under a heading of their own, never mixed with
+    // what needs the person (Nathan, 2026-10-07: "2 need you", 4 listed).
+    if (closed) {
+      if (last?.closed) { last.rows.push(row); last.count++; }
+      else sections.push({ tier: row.tier, title: 'closed elsewhere: clear each', count: 1, rows: [row], closed: true });
+    } else if (last?.tier === row.tier && !last.closed) { last.rows.push(row); last.count++; }
     else sections.push({ tier: row.tier, title: tierTitle(row.tier), count: 1, rows: [row] });
   }
   return sections;

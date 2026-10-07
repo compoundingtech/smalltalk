@@ -6,9 +6,11 @@
 //! sandbox with the profile's home and environment and the caller's own standard streams. Only
 //! the command's output and exit status reach the caller. See `docs/st3/sekrets.md`.
 
+pub mod authorized;
 pub mod cli;
 pub mod client;
 pub mod daemon;
+pub mod files;
 pub mod gateway;
 pub mod identity;
 pub mod policy;

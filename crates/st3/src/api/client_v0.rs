@@ -9,6 +9,7 @@ pub(super) mod raw_terminal;
 pub(super) mod resources;
 pub(super) mod search;
 pub(super) mod subjects;
+mod collection_windows;
 
 const TERMINAL_SUBPROTOCOL: &str = "st3.client.terminal.v0";
 const CONVERSATION_SUBPROTOCOL: &str = "st3.client.conversation.v0";
@@ -78,6 +79,11 @@ fn collection_ignores(collection: &str, kind: &str) -> bool {
     if collection == "subjects" {
         return false;
     }
+    // A held window must be rechecked when its exact grant or delegated scopes change,
+    // including otherwise graph-only glasses and arrangements.
+    if matches!(kind, "custom.client.pairing-completed" | "custom.client.pairing-revoked") {
+        return false;
+    }
     if collection == "glasses" {
         return !kind.starts_with("glass.");
     }
@@ -127,11 +133,22 @@ pub(super) async fn collection_stream(
 
 /// Read one bounded window. The whole read sees one SQLite snapshot, and the fence names
 /// that snapshot's index, so commits landing meanwhile never tear or delay it.
+#[cfg(test)]
 async fn collection_items(
     state: &AppState,
     session: &ClientSession,
     request: &CollectionSubscribe,
     read_permit: tokio::sync::OwnedSemaphorePermit,
+) -> Result<(ClientSnapshot, Vec<Value>, bool), ApiError> {
+    collection_items_with_windows(state, session, request, read_permit, None).await
+}
+
+async fn collection_items_with_windows(
+    state: &AppState,
+    session: &ClientSession,
+    request: &CollectionSubscribe,
+    read_permit: tokio::sync::OwnedSemaphorePermit,
+    windows: Option<Arc<collection_windows::Windows>>,
 ) -> Result<(ClientSnapshot, Vec<Value>, bool), ApiError> {
     if request.collection == "subjects" {
         if request.person.is_some() || request.actor.is_some() || request.status.is_some() {
@@ -198,69 +215,172 @@ async fn collection_items(
     } else {
         None
     };
+    let (prepared, read_permit) = if let Some(windows) = &windows {
+        let (current, read_permit) = if session.transport == "unix" {
+            (session.clone(), read_permit)
+        } else {
+            let state = state.clone();
+            let session = session.clone();
+            let label = collection_window_label(&request.collection);
+            let (current, read_permit) = super::blocking_store(move || {
+                crate::profile::task(label, || {
+                    // Preparation is physical SQL too; canceled callers retain their slot
+                    // until this indexed authority read actually finishes.
+                    Ok((revalidate_session(&state, &session), read_permit))
+                })
+            })
+            .await?;
+            (current?, read_permit)
+        };
+        (windows.prepare(state, &current, request), read_permit)
+    } else {
+        (None, read_permit)
+    };
+    let admission = match &prepared {
+        Some(prepared) => Some(prepared.admit().await),
+        None => None,
+    };
     let state = state.clone();
+    let session = session.clone();
+    let request = request.clone();
     let actor = request.actor.clone();
     let subject = request.subject.clone();
     let status = request.status.clone();
     let collection = request.collection.clone();
     let custom_forms = session.custom_forms;
+    let arrangement_window = collection == "arrangements";
     let (snapshot, mut items, mut has_more) = super::blocking_store(move || {
-        // Keep the physical read slot even if its awaiting subscription is canceled.
-        let _read_permit = read_permit;
-        let store = state.store.clone();
-        store.read_snapshot(|index| {
-            let snapshot = client_snapshot_at(&state, index);
-            let at = snapshot.created_at.clone();
-            let mut items = match collection.as_str() {
-                "missions" => {
-                    let mut ids =
-                        store.mission_collection_ids(false, 0, limit.saturating_add(1))?;
-                    let mut has_more = ids.len() > limit;
-                    ids.truncate(limit);
-                    let mut items = mission_list_cards(&store, &ids)?;
-                    has_more |= bound_mission_cards(&mut items)?;
-                    return Ok((snapshot, items, has_more));
-                }
-                "glasses" => {
-                    store.glasses(person.as_deref().expect("authenticated glass owner"), index)?
-                }
-                "arrangements" => {
-                    if let Some(subject) = &subject {
-                        store.arrangement(subject, index)?.into_iter().collect()
+        crate::profile::task(collection_window_label(&collection), || {
+            // Keep the physical read slot even if its awaiting subscription is canceled.
+            let _read_permit = read_permit;
+            let _admission = admission;
+            let store = state.store.clone();
+            let commits = windows.as_ref().map(|windows| windows.commits());
+            store.read_snapshot(|index| {
+                let now = client_now_ms();
+                // Recheck paired grants, including expiry and changed scopes, before any reuse.
+                let (current, person) = match (|| {
+                    let current = if session.transport == "unix" {
+                        session.clone()
                     } else {
-                        store.arrangements(
-                            person.as_deref().expect("explicit arrangement owner"),
+                        revalidate_session(&state, &session)?
+                    };
+                    require_scope(&current, "read.projections")?;
+                    let person = match collection.as_str() {
+                        "glasses" => Some(glass_person(&current, false)?),
+                        "arrangements" => Some(arrangements::person(
+                            &current,
+                            request.person.as_deref(),
+                            false,
+                        )?),
+                        "attention" => person_filter(&current, request.person.as_deref())?,
+                        _ => person.clone(),
+                    };
+                    Ok::<_, ApiError>((current, person))
+                })() {
+                    Ok(current) => current,
+                    Err(error) => return Ok(Err(error)),
+                };
+                let snapshot = client_snapshot_at(&state, index);
+                let at = snapshot.created_at.clone();
+                let compute = || {
+                    let mut items = match collection.as_str() {
+                        "missions" => {
+                            let mut ids =
+                                store.mission_collection_ids(false, 0, limit.saturating_add(1))?;
+                            let mut has_more = ids.len() > limit;
+                            ids.truncate(limit);
+                            let mut items = mission_list_cards_at(&store, &ids, now)?;
+                            has_more |= bound_mission_cards(&mut items)?;
+                            return Ok((items, has_more));
+                        }
+                        "glasses" => store.glasses(
+                            person.as_deref().expect("authenticated glass owner"),
                             index,
-                        )?
+                        )?,
+                        "arrangements" => {
+                            if let Some(subject) = &subject {
+                                store.arrangement(subject, index)?.into_iter().collect()
+                            } else {
+                                store.arrangements(
+                                    person.as_deref().expect("explicit arrangement owner"),
+                                    index,
+                                )?
+                            }
+                        }
+                        "attention" => {
+                            client_attention_resources_at(&store, person.as_deref(), false, now)?
+                        }
+                        "agents" => client_agent_resources_cached(&store, false, index)?,
+                        "work" => client_work_resources(
+                            &store,
+                            actor.as_deref(),
+                            false,
+                            store.projection_time_at(index)?,
+                            index,
+                        )?,
+                        _ => unreachable!(),
+                    };
+                    client_attention_compatibility(&mut items, custom_forms);
+                    // Agent status/availability depends on live local delivery presence; overlay and
+                    // filter it on every read, after reusing the immutable graph-derived rows.
+                    if collection == "agents" {
+                        return Ok((items, false));
                     }
+                    if let Some(status) = &status {
+                        items.retain(|item| item["state"].as_str() == Some(status.as_str()));
+                    }
+                    let has_more = items.len() > limit;
+                    items.truncate(limit);
+                    Ok((items, has_more))
+                };
+                let (mut items, mut has_more) = match &windows {
+                    Some(windows) => windows.read(
+                        &state,
+                        &current,
+                        &request,
+                        collection_windows::ReadFence {
+                            index,
+                            now,
+                            commits: commits.expect("window commit sequence"),
+                            prepared,
+                        },
+                        compute,
+                    )?,
+                    None => compute()?,
+                };
+                if collection == "agents" {
+                    overlay_agent_resources(&store, &mut items, &at)?;
+                    if let Some(status) = &status {
+                        items.retain(|item| item["state"].as_str() == Some(status.as_str()));
+                    }
+                    has_more = items.len() > limit;
+                    items.truncate(limit);
                 }
-                "attention" => client_attention_resources(&store, person.as_deref(), false)?,
-                "agents" => client_agent_resources(&store, false, &at, index)?,
-                "work" => client_work_resources(
-                    &store,
-                    actor.as_deref(),
-                    false,
-                    store.projection_time_at(index)?,
-                    index,
-                )?,
-                _ => unreachable!(),
-            };
-            client_attention_compatibility(&mut items, custom_forms);
-            if let Some(status) = status {
-                items.retain(|item| item["state"].as_str() == Some(status.as_str()));
-            }
-            let has_more = items.len() > limit;
-            Ok((snapshot, items, has_more))
+                Ok(Ok((snapshot, items, has_more)))
+            })
         })
     })
-    .await?;
+    .await??;
     items.truncate(limit);
-    if request.collection == "arrangements" {
+    if arrangement_window {
         let end = arrangements::window_end(&items, 0, items.len())?;
         has_more |= end < items.len();
         items.truncate(end);
     }
     Ok((snapshot, items, has_more))
+}
+
+fn collection_window_label(collection: &str) -> &'static str {
+    match collection {
+        "missions" => "stream collection/missions",
+        "attention" => "stream collection/attention",
+        "agents" => "stream collection/agents",
+        "work" => "stream collection/work",
+        "glasses" => "stream collection/glasses",
+        "arrangements" => "stream collection/arrangements",
+        _ => "stream collection/invalid",
+    }
 }
 
 async fn send_collection(socket: &mut WebSocket, value: Value) -> bool {
@@ -668,13 +788,17 @@ async fn collection_stream_socket(
     session: ClientSession,
     presence: super::client_presence::StreamGuard,
 ) {
+    let windows = collection_windows::Windows::attach(&state.store);
     collection_stream_socket_with_reader(
         socket,
         state,
         session,
         Some(presence),
-        |state, session, request, permit| async move {
-            collection_items(&state, &session, &request, permit).await
+        move |state, session, request, permit| {
+            let windows = windows.clone();
+            async move {
+                collection_items_with_windows(&state, &session, &request, permit, windows).await
+            }
         },
     )
     .await;
@@ -696,6 +820,8 @@ async fn collection_stream_socket_with_reader<F, Fut>(
     // Subscribe before the first snapshot, so a commit while building it wakes
     // the next loop and is reflected in a following change frame.
     let mut changed = state.event_notify.subscribe();
+    let windows = collection_windows::Windows::attach(&state.store);
+    let mut window_revisions = [0; 6];
     let mut subscriptions = BTreeMap::<String, CollectionSubscription>::new();
     let mut terminals = BTreeMap::<String, watch::Receiver<TerminalFrame>>::new();
     let mut conversations = ConversationFollowers::default();
@@ -824,13 +950,30 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                 reread_due |= subscriptions.values().any(|s| s.request.collection == "subjects");
                 // can change a held window.
                 let index = state.store.index().unwrap_or(weighed);
-                if index > weighed {
-                    let claims = state.store.claims_page(None, None, weighed, index.checked_add(1), false, 10_000).map(|page| page.claims).unwrap_or_default();
+                if subscriptions.is_empty() {
+                    weighed = index;
+                    continue;
+                }
+                if let Some(windows) = &windows {
+                    let (windows, store) = (windows.clone(), state.store.clone());
+                    match blocking_store(move || crate::profile::task("stream collection/invalidation", || windows.changes(&store))).await {
+                        Ok(revisions) => {
+                            reread_due |= subscriptions.values().any(|subscription| collection_windows::Windows::changed(&subscription.request.collection, &window_revisions, &revisions));
+                            window_revisions = revisions;
+                        }
+                        Err(_) => { reread_due = true; }
+                    }
+                    weighed = index;
+                } else if index > weighed {
+                    let claims = state.store.claims_page(None, None, weighed, index.checked_add(1), false, 10_000).map(|page| page.claims);
                     let glasses_changed = subscriptions.values().any(|s| matches!(s.request.collection.as_str(), "glasses" | "subjects")) && state.store.glasses_changed(weighed, index).unwrap_or(true);
                     let arrangements_changed = subscriptions.values().any(|s| s.request.collection == "arrangements") && state.store.arrangements_changed(weighed, index).unwrap_or(true);
-                    reread_due |= glasses_changed || arrangements_changed || claims.len() >= 10_000 || subscriptions.values().any(|subscription| {
-                        claims.iter().any(|claim| !collection_ignores(&subscription.request.collection, &claim.kind))
-                    });
+                    reread_due |= glasses_changed || arrangements_changed || match claims {
+                        Err(_) => true,
+                        Ok(claims) => claims.len() >= 10_000 || subscriptions.values().any(|subscription| {
+                            claims.iter().any(|claim| !collection_ignores(&subscription.request.collection, &claim.kind))
+                        }),
+                    };
                     weighed = index;
                 }
                 if !reread_due || last_reread.elapsed() < COLLECTION_REREAD_INTERVAL { continue; }
@@ -839,8 +982,10 @@ async fn collection_stream_socket_with_reader<F, Fut>(
             () = tokio::time::sleep_until(last_reread + COLLECTION_REREAD_INTERVAL), if !command_waiting && reread_due => {
                 refresh.extend(subscriptions.keys().cloned());
             }
-            _ = attention_clock.tick(), if !command_waiting && subscriptions.values().any(|s| matches!(s.request.collection.as_str(), "attention" | "agents" | "arrangements")) => {
-                refresh.extend(subscriptions.iter().filter(|(_, s)| matches!(s.request.collection.as_str(), "attention" | "agents" | "arrangements")).map(|(id, _)| id.clone()));
+            _ = attention_clock.tick(), if !command_waiting && !subscriptions.is_empty() => {
+                // Pairing expiry and mission lease state can change without a claim. Stable
+                // rows remain reusable; authority and local overlays are rechecked on reads.
+                refresh.extend(subscriptions.keys().cloned());
             }
             () = tokio::time::sleep(subjects::expiry_delay(&session)), if !command_waiting && subscriptions.values().any(|s| s.request.collection == "subjects") => {
                 refresh.extend(subscriptions.iter().filter(|(_, s)| s.request.collection == "subjects").map(|(id, _)| id.clone()));
@@ -1712,26 +1857,19 @@ fn revalidate_session(
     if session.transport == "unix" && acting_party(session) {
         return Ok(session.clone());
     }
-    let pairings = state
-        .store
-        .claims_for_kind_at("custom.client.pairing-completed", None, true, 10_000)
-        .map_err(ApiError::internal)?;
-    let paired = pairings
-        .claims
-        .iter()
-        .find(|claim| match session.pairing_grant.as_deref() {
-            Some(subject) => claim.subject.as_str() == subject,
-            None => {
-                claim
-                    .body
-                    .pointer("/fields/session_actor")
-                    .and_then(Value::as_str)
-                    == Some(session.actor.as_str())
-            }
-        })
-        .ok_or_else(|| forbidden("the client session grant is absent"))?;
-    let mut current =
-        paired_client_session(state, paired, session.transport, session.custom_forms)?;
+    let pairings = match session.pairing_grant.as_deref() {
+        Some(subject) => state.store.claims_for_subject_kind_at(
+            subject, "custom.client.pairing-completed", None, true, 1,
+        ),
+        None => state.store.claims_for_kind_at(
+            "custom.client.pairing-completed", None, true, 10_000,
+        ),
+    }.map_err(ApiError::internal)?;
+    let paired = pairings.claims.iter().find(|claim| match session.pairing_grant.as_deref() {
+        Some(subject) => claim.subject.as_str() == subject,
+        None => claim.body.pointer("/fields/session_actor").and_then(Value::as_str) == Some(session.actor.as_str()),
+    }).ok_or_else(|| forbidden("the client session grant is absent"))?;
+    let mut current = paired_client_session(state, paired, session.transport, session.custom_forms)?;
     current.conversation_blocks = session.conversation_blocks;
     if current.authority_actor != session.authority_actor {
         return Err(forbidden("the client session authority changed"));
@@ -1822,6 +1960,14 @@ pub(super) fn mission_resources(
 /// Collection cards keep only three run headers, regardless of a mission's history size.
 /// Full run and step detail stays on the detail endpoint.
 fn mission_list_cards(store: &Store, ids: &[String]) -> anyhow::Result<Vec<Value>> {
+    mission_list_cards_at(store, ids, client_now_ms())
+}
+
+fn mission_list_cards_at(
+    store: &Store,
+    ids: &[String],
+    at_unix_ms: u128,
+) -> anyhow::Result<Vec<Value>> {
     let attention = store.human_attention_runs()?;
     let definitions = store
         .mission_definitions_for_ids(ids)?
@@ -1849,7 +1995,7 @@ fn mission_list_cards(store: &Store, ids: &[String]) -> anyhow::Result<Vec<Value
             .map(|(_,count)| count.as_u64().unwrap_or(0)).sum::<u64>();
         let details = newest.iter().rev().map(|run| {
             let run_id=run["id"].as_str().expect("run header id");
-            let (total,done,steps)=store.mission_step_preview(run_id)?;
+            let (total,done,steps)=store.mission_step_preview_at(run_id, at_unix_ms)?;
             let terminal=matches!(run["status"].as_str(),Some("completed"|"failed"|"cancelled"));
             let scheduler_fault=store.reconcile_fault(run_id, crate::reconcile::FIRST_READINESS_FAULT_SCOPE)?;
             let must_act=if terminal {"nobody"} else if attention.contains(run_id) {"you"}
@@ -10150,9 +10296,15 @@ mod tests {
                                 move |state, session, request, permit| {
                                     let (mut held, ready) = (held.clone(), ready.clone());
                                     async move {
-                                        let result =
-                                            collection_items(&state, &session, &request, permit)
-                                                .await;
+                                        // Exercise the production windows-aware dispatch, including
+                                        // its native fast path and post-change grant revalidation.
+                                        let result = collection_items_with_windows(
+                                            &state,
+                                            &session,
+                                            &request,
+                                            permit,
+                                            collection_windows::Windows::attach(&state.store),
+                                        ).await;
                                         if request.id == "held" {
                                             assert!(result.as_ref().is_ok_and(|(_, items, _)| {
                                                 items

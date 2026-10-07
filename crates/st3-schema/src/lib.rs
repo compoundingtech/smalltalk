@@ -2528,6 +2528,9 @@ fn claim_retention(kind: &str) -> Retention {
         // Only the node that made them reads these: render receipts and the readiness
         // deadline, whose attention request replicates.
         "render.applied" | "runtime.readiness-deadline-reached" => Retention::Local,
+        // A host's sekrets gateway is that host's: its calls, refusals and changes age out with
+        // the local log (seven days by default) and go to OpenTelemetry for anything longer.
+        "sekret.called" | "sekret.exited" | "sekret.refused" | "sekret.changed" => Retention::Local,
         // The owner's reconciler records its own starts, stops and kills: the stop deadline
         // fence, restart windows and adoption read them on that node only. Another node
         // stops a runtime through a replicated `stop` intent. A person's signal names its

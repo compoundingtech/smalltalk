@@ -40,16 +40,27 @@ fn native_definitions()->&'static Value {
     static SCHEMAS: OnceLock<Value> = OnceLock::new();
     SCHEMAS.get_or_init(|| serde_json::from_str(NATIVE_SCHEMAS_JSON).expect("generated native schemas are valid JSON"))
 }
-fn native_patterns()->&'static BTreeMap<String,regex::Regex> {
-    static PATTERNS:OnceLock<BTreeMap<String,regex::Regex>>=OnceLock::new();
+// Bound schema-controlled backtracking; exhausted budgets reject the wire value.
+const NATIVE_PATTERN_BACKTRACK_LIMIT:usize=100_000;
+fn native_pattern(pattern:&str)->fancy_regex::Regex {
+    fancy_regex::RegexBuilder::new(pattern)
+        .backtrack_limit(NATIVE_PATTERN_BACKTRACK_LIMIT)
+        .build()
+        .expect("generated native pattern is valid")
+}
+fn native_pattern_matches(pattern:&fancy_regex::Regex,text:&str)->bool {
+    pattern.is_match(text).unwrap_or(false)
+}
+fn native_patterns()->&'static BTreeMap<String,fancy_regex::Regex> {
+    static PATTERNS:OnceLock<BTreeMap<String,fancy_regex::Regex>>=OnceLock::new();
     PATTERNS.get_or_init(|| {
-        fn collect(value:&Value,patterns:&mut BTreeMap<String,regex::Regex>) {
+        fn collect(value:&Value,patterns:&mut BTreeMap<String,fancy_regex::Regex>) {
             match value {
                 Value::Object(fields)=>{
                     if let Some(pattern)=fields.get("pattern").and_then(Value::as_str).filter(|_| !fields.contains_key("x-st-native-ref-families"))
                         && !patterns.contains_key(pattern)
                     {
-                        patterns.insert(pattern.to_owned(),regex::Regex::new(pattern).expect("generated native pattern is valid"));
+                        patterns.insert(pattern.to_owned(),native_pattern(pattern));
                     }
                     for child in fields.values() { collect(child,patterns); }
                 },
@@ -133,7 +144,7 @@ fn native_valid(schema:&Value,value:&Value)->bool {
         for key in ["maxItems","maxLength"] { if schema.get(key).and_then(Value::as_u64).is_some_and(|bound|length>bound as usize) { return false; } }
     }
     if let (Some(pattern),Some(text))=(schema.get("pattern").and_then(Value::as_str),value.as_str())
-        && !native_patterns().get(pattern).is_some_and(|pattern|pattern.is_match(text))
+        && !native_patterns().get(pattern).is_some_and(|pattern|native_pattern_matches(pattern,text))
     {
         return false;
     }
@@ -156,5 +167,59 @@ fn native_claim_supported(value:&Value)->bool {
 fn native_subject_supported(value:&Value)->bool {
     let (Some(family),Some(reference),Some(id),Some(heads))=(value["family"].as_str(),value["ref"].as_str(),value["schema_id"].as_str(),value["heads"].as_array()) else { return false; };
     FAMILY_BINDINGS.iter().any(|(schema_id,expected)|*schema_id==id && *expected==family) && reference.strip_prefix(family).is_some_and(|rest|rest.starts_with('/')) && heads.iter().all(native_claim_supported)
+}
+
+#[cfg(test)]
+mod native_pattern_tests {
+    use super::*;
+
+    #[test]
+    fn generic_subject_patterns_follow_the_generated_base_schema() {
+        let base_schema:Value=serde_json::from_str(include_str!("../../../docs/st3/client-v0/schemas/client-v0.schema.json")).unwrap();
+        let schema=&native_definitions()["ArrangementSubject"];
+        assert_eq!(schema,&base_schema["$defs"]["ArrangementSubject"]);
+        for reference in ["message/example","future-family/example","pty-extra/example","session-extra/example"] {
+            assert!(native_valid(schema,&Value::String(reference.into())),"{reference}");
+        }
+        for reference in ["pty/example","session/example","message/","message/has whitespace","Message/example"] {
+            assert!(!native_valid(schema,&Value::String(reference.into())),"{reference}");
+        }
+    }
+
+    #[test]
+    fn native_reference_extensions_retain_the_registry_validator() {
+        let registry_schema=st3_schema::subject_reference_schema(&[]);
+        for header in ["NativeClaimHeader","NativeSubjectHeader"] {
+            let schema=&native_definitions()[header]["properties"]["ref"];
+            assert_eq!(schema,&registry_schema);
+            for reference in ["message/example","custom/team/example"] {
+                assert!(native_valid(schema,&Value::String(reference.into())),"{header}: {reference}");
+            }
+            for reference in ["pty/example","session/example","custom/team//example","message/has whitespace"] {
+                assert!(!native_valid(schema,&Value::String(reference.into())),"{header}: {reference}");
+            }
+        }
+    }
+
+    #[test]
+    fn generic_subject_patterns_handle_long_values() {
+        let schema=&native_definitions()["ArrangementSubject"];
+        let mut reference=format!("future-family/{}","a".repeat(65_536));
+        assert!(native_valid(schema,&Value::String(reference.clone())));
+        reference.push(' ');
+        assert!(!native_valid(schema,&Value::String(reference)));
+    }
+
+    #[test]
+    fn pathological_backtracking_exhausts_the_budget_and_fails_closed() {
+        // Synthetic stress pattern, not a second copy of the registry grammar.
+        let pattern=native_pattern("(?i)(a|b|ab)*(?>c)");
+        let text="ab".repeat(32_768);
+        assert!(matches!(
+            pattern.is_match(&text),
+            Err(fancy_regex::Error::RuntimeError(fancy_regex::RuntimeError::BacktrackLimitExceeded))
+        ));
+        assert!(!native_pattern_matches(&pattern,&text));
+    }
 }
 // @st3-codegen:native-rust-models

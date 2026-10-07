@@ -25,7 +25,8 @@ use smallclaims::store::checkpoint_agreement::*;
 /// bounded observed status history and the beginning of the current state.
 /// Version 10 retains native credential edges and their bounded status transitions.
 /// Version 11 includes arrangement tables in the graph proof and rebuilds them during replay.
-pub const RULES_VERSION: u32 = 11;
+/// Version 12 ages out the sekrets claims written before they became local observations.
+pub const RULES_VERSION: u32 = 12;
 
 /// Kinds that are now local observations are dropped only when they are dated at least five days
 /// before the cut, so they are seven days old when the checkpoint is due. That matches the local
@@ -82,6 +83,10 @@ harness.limits keep=all-source-observations
 resource.observed actor=null observer=set slot=subject keep=newest
 render.applied slot=subject keep=newest min-age-before-cut=5d
 runtime.readiness-deadline-reached slot=subject keep=newest min-age-before-cut=5d
+sekret.called slot=subject keep=newest min-age-before-cut=5d
+sekret.exited slot=subject keep=newest min-age-before-cut=5d
+sekret.refused slot=subject keep=newest min-age-before-cut=5d
+sekret.changed slot=subject keep=newest min-age-before-cut=5d
 sealed=every-admitted-claim-of-an-envelope-before-the-cut-but-repaired-originals
 proof=the-sealed-claims-and-the-blobs-they-reference
 graph=shared-projection-tables-including-arrangements-and-arrangement_registers-even-when-empty
@@ -166,6 +171,11 @@ pub(crate) fn slot_of(claim: &ClaimRecord) -> Option<(Rule, Vec<String>)> {
             ))
         }
         "render.applied" | "runtime.readiness-deadline-reached" => {
+            Some((Rule::NewestAged, slot(&[])))
+        }
+        // Sekrets claims are local observations now; the ones written before that go with age.
+        // Nothing projects them, and a subject's history reads only what is kept.
+        "sekret.called" | "sekret.exited" | "sekret.refused" | "sekret.changed" => {
             Some((Rule::NewestAged, slot(&[])))
         }
         // The account fold compares source times and percentages across reset windows. A later

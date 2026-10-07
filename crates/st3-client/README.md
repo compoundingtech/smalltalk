@@ -31,6 +31,12 @@ Known malformed payloads fail decoding; unknown descriptors return the payload-f
 null, and present native values. Claims/history declare retained answering-host coverage and
 local evidence provenance; they are not complete fleet-wide lifetime histories.
 
+Native pattern validators compile the generated schema's patterns with `fancy-regex`, including
+the base schema's negative-lookahead exclusions for generic arrangement subjects. Each match has an
+explicit 100,000-backtrack budget; matching errors, including budget exhaustion, reject the value.
+Reference schemas carrying `x-st-native-ref-families` retain their canonical-reference validator
+rather than using the pattern engine.
+
 ## Raw PTY connectors
 
 `raw_terminal_attachment(terminal_id, runtime_incarnation, RawTerminalMode::Attach)` acquires

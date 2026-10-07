@@ -497,14 +497,43 @@ mod resource_descriptor_tests {
         assert_eq!(observation["fields"]["facts"]["value_type"], "object");
         assert_eq!(observation["special_output"]["field"], "facts");
         assert_eq!(observation["special_output"]["additional_fields"], false);
+        assert_eq!(observation["special_output"]["historical_extra_fields"], "withheld");
+        for name in ["state", "credentials", "legacy_extra"] {
+            assert!(observation["fields"].get(name).is_none(), "{name}");
+        }
         assert_eq!(observation["special_output"]["by_kind"]["ci.run"]["fields"]["status"]["values"],
             json!(["queued", "in-progress", "completed"]));
         assert!(observation["special_output"]["by_kind"]["harness.session-file"]["fields"].get("path").is_none());
         assert!(resource_field_policy("custom.team.resource").is_none());
-        for (kind, spec) in &registry().resources {
-            for name in resource_field_policy(kind).unwrap() {
-                assert!(spec.fields.contains_key(*name), "{kind}.{name}");
+        let by_kind = observation["special_output"]["by_kind"].as_object().unwrap();
+        let native = registry();
+        // ResourceSpec has no disclosure marker. Keep reviewed exclusions explicit:
+        // arrangements contain a person-owned private body, not public resource facts.
+        let excluded_kinds = ["arrangement"];
+        for kind in excluded_kinds {
+            assert!(native.resources.contains_key(kind), "{kind}");
+            assert!(resource_field_policy(kind).is_none(), "{kind}");
+            assert!(!by_kind.contains_key(kind), "{kind}");
+        }
+        for (kind, spec) in &native.resources {
+            if excluded_kinds.contains(&kind.as_str()) {
+                continue;
             }
+            let selection = resource_field_policy(kind)
+                .unwrap_or_else(|| panic!("{kind} needs a disclosure policy or a reviewed exclusion"));
+            let disclosed = by_kind.get(kind).unwrap();
+            assert_eq!(disclosed["additional_fields"], false, "{kind}");
+            let fields = disclosed["fields"].as_object().unwrap();
+            assert_eq!(fields.len(), selection.len(), "{kind}");
+            for name in selection {
+                let mut field = spec.fields.get(*name).expect("disclosed field must be native").clone();
+                field.required = false;
+                assert_eq!(fields.get(*name), Some(&json!(field)), "{kind}.{name}");
+            }
+        }
+        for kind in by_kind.keys() {
+            assert!(native.resources.contains_key(kind), "{kind}");
+            assert!(resource_field_policy(kind).is_some(), "{kind}");
         }
     }
 }

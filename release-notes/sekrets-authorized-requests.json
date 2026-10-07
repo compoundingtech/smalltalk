@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Sekrets authorized requests: the st daemon can call GitHub's API through the gateway with a token it never holds.",
+  "replay": {
+    "status": "none",
+    "detail": "No claim, projection or replay change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No st store change; the gateway's store gains no table."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rule change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "A new gateway request (authorized) and caller kind (host/NODE). A gateway installed before this answers it with an error, which the client reports as a transport failure; nothing uses it until the daemon is configured with [github] sekrets_profile, which the daemon side adds separately. Grants may now name host/NODE."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "A normal daemon restart; the gateway restarts only when reinstalled (about a second, not measured)."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "To use it on a host running the gateway: re-run `st sekrets setup --person PERSON > s.sh && sudo sh s.sh`, create a profile with `--preset github-api`, log it in, and `st sekrets grant PROFILE --to host/NODE --preset github-api`. Nothing changes until then."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Reinstalling the previous binary (and re-running setup for the gateway) restores the previous behaviour; nothing is migrated."
+  }
+}

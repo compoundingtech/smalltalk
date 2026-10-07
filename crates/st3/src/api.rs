@@ -74,6 +74,10 @@ mod owned_sets;
 mod terminal_view;
 
 pub(crate) use client_v0::raw_terminal::splice as raw_terminal_splice;
+pub(crate) use client_v0::raw_terminal::{
+    Lease as RawTerminalLease, LeaseBinding as RawTerminalLeaseBinding,
+    ORIGIN_HEADER as RAW_ORIGIN_HEADER,
+};
 
 /// Recheck the initialized live delivery owner before replacing an unattached seat.
 pub(crate) fn claude_channel_attached(store: &Store, subject: &str, incarnation: &str) -> bool {
@@ -3057,7 +3061,16 @@ fn client_attention_resources(
     person: Option<&str>,
     _history: bool,
 ) -> anyhow::Result<Vec<Value>> {
-    let current = store.attention_snapshot(person, client_now_ms())?;
+    client_attention_resources_at(store, person, _history, client_now_ms())
+}
+
+fn client_attention_resources_at(
+    store: &Store,
+    person: Option<&str>,
+    _history: bool,
+    at_unix_ms: u128,
+) -> anyhow::Result<Vec<Value>> {
+    let current = store.attention_snapshot(person, at_unix_ms)?;
     let mut resources = Vec::new();
     for item in current {
         let id = client_attention_id(&item.subject, &item.person, &item.episode)?;

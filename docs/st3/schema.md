@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `cfaf319670ad6eb9a211cf1bc5a15821621f9681be5f89f99ac87ebfbfdb1687`
+Digest: `775fa0fb0606d458f4c7f9f3e51f456b7207af8972e00f5ed0fdfce771552ac1`
 
 ## Subject families
 
@@ -171,10 +171,10 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `schedule.work-failed` | `schedule` | `system-only` | `append` | `durable` | `code!:string`, `reason!:string`, `request!:string` | `schedule` |
 | `schedule.work-requested` | `schedule` | `system-only` | `append` | `durable` | `inputs!:object`, `mission!:subject-reference(mission)`, `mission_revision!:string`, `occurrence!:integer`, `revision!:string`, `workspace!:string` | `schedule` |
 | `schedule.work-started` | `schedule` | `system-only` | `append` | `durable` | `mission_run!:subject-reference(mission-run)`, `request!:string` | `schedule` |
-| `sekret.called` | `sekret` | `system-only` | `append` | `durable` | `argv:array`, `at_unix_ms!:integer`, `caller!:subject-reference(agent|person)`, `cwd:string`, `grant:string`, `login:boolean`, `person!:subject-reference(person)`, `profile!:string`, `seq!:integer`, `tty:boolean` |  |
-| `sekret.changed` | `sekret` | `system-only` | `append` | `durable` | `at_unix_ms!:integer`, `caller:subject-reference(agent|person)`, `change!:string`, `detail:object`, `person!:subject-reference(person)`, `profile:string`, `seq!:integer` |  |
-| `sekret.exited` | `sekret` | `system-only` | `append` | `durable` | `at_unix_ms!:integer`, `call!:integer`, `caller:subject-reference(agent|person)`, `error:string`, `exit_code:integer`, `person!:subject-reference(person)`, `profile:string`, `seq!:integer`, `signal:integer` |  |
-| `sekret.refused` | `sekret` | `system-only` | `append` | `durable` | `argv:array`, `at_unix_ms!:integer`, `caller:subject-reference(agent|person)`, `person!:subject-reference(person)`, `profile:string`, `reason!:string`, `seq!:integer` |  |
+| `sekret.called` | `sekret` | `system-only` | `append` | `local` | `argv:array`, `at_unix_ms!:integer`, `caller!:subject-reference(agent|person)`, `cwd:string`, `grant:string`, `login:boolean`, `person!:subject-reference(person)`, `profile!:string`, `seq!:integer`, `tty:boolean` |  |
+| `sekret.changed` | `sekret` | `system-only` | `append` | `local` | `at_unix_ms!:integer`, `caller:subject-reference(agent|person)`, `change!:string`, `detail:object`, `person!:subject-reference(person)`, `profile:string`, `seq!:integer` |  |
+| `sekret.exited` | `sekret` | `system-only` | `append` | `local` | `at_unix_ms!:integer`, `call!:integer`, `caller:subject-reference(agent|person)`, `error:string`, `exit_code:integer`, `person!:subject-reference(person)`, `profile:string`, `seq!:integer`, `signal:integer` |  |
+| `sekret.refused` | `sekret` | `system-only` | `append` | `local` | `argv:array`, `at_unix_ms!:integer`, `caller:subject-reference(agent|person)`, `person!:subject-reference(person)`, `profile:string`, `reason!:string`, `seq!:integer` |  |
 | `step-run.carried` | `step-run` | `system-only` | `once` | `durable` | `attempt:integer`, `claim_expires_at_unix_ms:integer`, `claim_incarnation:string`, `claimant:subject-reference`, `definition_hash:string`, `source:subject-reference`, `source_generation:subject-reference`, `source_step_run:subject-reference`, `status:string`, `worker_reported:boolean` | `step` |
 | `step-run.retried` | `step-run` | `system-only` | `append` | `durable` | `attempt:integer`, `goals:array`, `not_before_unix_ms:integer`, `reason:string`, `status:string` | `step` |
 | `step-run.state` | `step-run` | `system-only` | `state-transition` | `durable` | `attempt:integer`, `readiness_epoch:integer`, `reason:string`, `status:string` | `step` |

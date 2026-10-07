@@ -692,10 +692,11 @@ mission "eval/subagents" state="ready" {{
 }}
 ''')
         node.cli("missions", "publish", str(root / "mission.kdl"), "--as", "person/eval")
-        started = json.loads(node.cli("missions", "start", "eval/subagents", "--id", "eval-subagents",
+        run_id = "eval/subagents/c1"
+        started = json.loads(node.cli("missions", "start", "eval/subagents", "--id", run_id,
                                       "--workspace", str(root / "ws-worker"), "--as", "person/eval", "--json"))
-        run_subject = started.get("subject") or "mission-run/eval-subagents"
-        worker_subject = "agent/eval-subagents/worker"
+        run_subject = started.get("subject") or f"mission-run/{run_id}"
+        worker_subject = f"agent/{run_id}/worker"
         worker = Seat(node, worker_subject, root / "ws-worker")
         seats = [worker, killed, restarted, stopped, old_settings]
         for seat in seats:
