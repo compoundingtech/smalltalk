@@ -191,7 +191,9 @@ export class Feed {
   private retryLater(name: FeedWindow | typeof GLASSES, again: () => void): boolean {
     const retry = this.retries[name] ?? { failures: 0 };
     clearTimeout(retry.timer);
-    const delay = this.retryDelaysMs[Math.min(retry.failures, this.retryDelaysMs.length - 1)];
+    const wait = this.retryDelaysMs[Math.min(retry.failures, this.retryDelaysMs.length - 1)];
+    // Up to half again, so many clients told to ask again at once do not all ask together.
+    const delay = wait + Math.floor(Math.random() * wait / 2);
     retry.failures++;
     retry.timer = setTimeout(() => { if (this.retries[name] === retry) { retry.timer = undefined; again(); } }, delay);
     this.retries[name] = retry;
@@ -256,7 +258,7 @@ export class Feed {
       if (!(frame.id in FEED_WINDOWS)) return;
       const name = frame.id as FeedWindow;
       const next = applyWindow(this.windows[name], frame);
-      if (!next) { this.subscribeWindow(name); return; }
+      if (!next) { this.retryLater(name, () => this.subscribeWindow(name)); return; }
       this.windows[name] = next;
       this.loaded(name);
       if (frame.kind === 'snapshot') {
@@ -270,7 +272,7 @@ export class Feed {
       // copy shown can say it is stale (the owner's host is away).
       if (id === CONVERSATION && this.conversation) { if (frame.message) this.conversation.handlers.onIssue(`${plainMessage(frame.code, frame.message)} · trying again`); }
       else if (frame.id === GLASSES && this.glasses) { this.glasses.window = undefined; this.stream?.subscribeGlasses(GLASSES); }
-      else if (frame.id in FEED_WINDOWS) this.subscribeWindow(frame.id as FeedWindow);
+      else if (frame.id in FEED_WINDOWS) { const name = frame.id as FeedWindow; this.retryLater(name, () => this.subscribeWindow(name)); }
     } else if (frame.kind === 'screen') {
       if (id === TERMINAL) this.terminal?.screen(frame.value);
     } else if (frame.kind === 'conversation') {

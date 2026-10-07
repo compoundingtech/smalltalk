@@ -407,6 +407,21 @@ impl Client {
         Ok(client)
     }
 
+    /// Name a program seat over the trusted Unix boundary. The daemon still fences
+    /// the caller to its bound harness and checks the seat's enrollment.
+    pub fn unix_agent(path: impl Into<PathBuf>, agent: impl Into<String>) -> Result<Self> {
+        let agent = agent.into();
+        anyhow::ensure!(
+            agent.starts_with("agent/") && agent.split('/').all(|part| {
+                !part.is_empty() && part.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+            }),
+            "Unix agent authority must be one concrete `agent/<id>` subject"
+        );
+        let mut client = Self::unix(path);
+        client.person = Some(agent);
+        Ok(client)
+    }
+
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
         let first_page = path.starts_with("/v1/client/") && !request_has_page_cursor(path);
         for attempt in 0..3 {
@@ -2168,6 +2183,12 @@ mod tests {
             .unwrap();
         assert_eq!(named["person"], "person/alex");
         assert!(Client::unix_as(&socket, "person/alex\r\nx-forged: yes").is_err());
+        let agent: Value = Client::unix_agent(&socket, "agent/example/bridge")
+            .unwrap().get("/v1/person").await.unwrap();
+        assert_eq!(agent["person"], "agent/example/bridge");
+        assert!(Client::unix_agent(&socket, "person/alex").is_err());
+        assert!(Client::unix_agent(&socket, "agent/example\r\nx-forged: yes").is_err());
+        assert!(Client::unix_agent(&socket, "agent/").is_err());
         server.abort();
     }
 

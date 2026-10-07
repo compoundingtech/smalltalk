@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Wake the reconciler once when the account limits projection finishes catching up",
+  "replay": {"status": "none", "detail": "No replay or rebuild. The daemon task that fills the account limits projection after an upgrade now wakes the reconciler once when the projection is ready."},
+  "schema": {"status": "none", "detail": "No tables, columns, indexes or triggers."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged."},
+  "compatibility": {"status": "none", "detail": "No client, wire or harness contract change."},
+  "downtime": {"status": "none", "detail": "None."},
+  "manual": {"status": "none", "detail": "No manual step."},
+  "recovery": {"status": "none", "detail": "A pool start that failed with the retryable 'account limits are catching up' error during the first fill after an upgrade is retried by that wake. It no longer has to wait for an unrelated claim to wake the reconciler. The wake is sent once per daemon start."}
+}

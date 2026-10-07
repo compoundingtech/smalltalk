@@ -241,7 +241,7 @@ declare -A step_state replied
 deadline=$((SECONDS + work_seconds))
 while ((SECONDS < deadline)); do
   pending=0
-  st3 missions show mission-run/nb --json >"$root/run.json" 2>/dev/null || true
+  st3 missions show mission-run/eval/no-boot/nb --json >"$root/run.json" 2>/dev/null || true
   st3 conversations ls person/eval --json >"$root/inbox.json" 2>/dev/null || echo '[]' >"$root/inbox.json"
   for harness in "${harnesses[@]}"; do
     step_state[$harness]="$(jq -r --arg step "$harness" \

@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "summary": "#1651: run-tree rebuild-reason profiling",
+  "commits": [
+    "55aee65f5eb9428de4cf9dc9aaf7ba1ee6e4b453"
+  ],
+  "replay": {
+    "status": "none",
+    "detail": "Run-tree rebuild-reason profiling adds no startup replay trigger or projection invalidation."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No SQLite migration, table, index or trigger change in run-tree rebuild-reason profiling; schema version remains 16."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules remain 11; no changed digest policy or new sealing coordination requirement."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "With profiling enabled, up to eight run-tree dirty-reason counters are added. Counts represent marking invocations, not distinct trees or rebuild durations; correlate them within the same revision and process window. Projection decisions, APIs, claims and stored data remain unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional service interruption or measured upgrade outage is introduced by run-tree rebuild-reason profiling; normal daemon/client restart procedures apply."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Existing installations need no configuration conversion or manual data repair for run-tree rebuild-reason profiling."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No additional recovery procedure is introduced. Preserve graph state, keys and configuration and follow roll-forward guidance; this fragment does not qualify binary-only rollback of the whole release."
+  }
+}

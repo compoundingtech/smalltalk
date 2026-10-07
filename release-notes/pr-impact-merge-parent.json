@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Use the tested PR merge parent for upgrade-impact checks",
+  "replay": {
+    "status": "none",
+    "detail": "CI comparison-base correction only; no daemon/client runtime, stored-data or user upgrade effect."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "CI comparison-base correction only; no daemon/client runtime, stored-data or user upgrade effect."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "CI comparison-base correction only; no daemon/client runtime, stored-data or user upgrade effect."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "CI comparison-base correction only; no daemon/client runtime, stored-data or user upgrade effect."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "CI comparison-base correction only; no daemon/client runtime, stored-data or user upgrade effect."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "PR upgrade-impact checks compare the tested merge with its first parent instead of the possibly stale PR event base. A valid PR is no longer rejected for unrelated merged note edits or missing historical notes. Queue checks retain the full group base, fresh-note requirements and adoption boundary remain, and publication still requires complete interval coverage. Affected PRs need a new check run using the corrected workflow; existing user installations need no repair."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "CI comparison-base correction only; no daemon/client runtime, stored-data or user upgrade effect."
+  }
+}

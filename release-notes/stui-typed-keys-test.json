@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "A cargo test types shifted keys into the real stui as a keyboard-protocol terminal sends them",
+  "replay": {
+    "status": "none",
+    "detail": "No runtime replay change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Test only; no behavior change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional service interruption introduced."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual upgrade step."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No database or runtime recovery change."
+  }
+}

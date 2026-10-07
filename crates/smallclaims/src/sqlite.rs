@@ -11,6 +11,9 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
 use anyhow::{Context as _, Result};
 use rusqlite::{Connection, OpenFlags, Transaction};
 
+pub(crate) mod writer_observer;
+pub use writer_observer::WriterObserver;
+
 use crate::store::current_index;
 
 /// Read connections a store keeps between reads; more open while more reads run at once.
@@ -203,6 +206,54 @@ impl Drop for CommitObserver {
     }
 }
 
+/// Recycle a fully backfilled WAL using a dedicated checkpoint connection, never the writer.
+/// PASSIVE does page copying without taking the writer lock. TRUNCATE is attempted only after
+/// that copy completes, with no busy wait: an active reader or writer defers recycling.
+pub fn checkpoint_idle_wal(connection: &Connection) -> Result<bool> {
+    if !checkpoint_wal_backfilled(connection)? {
+        return Ok(false);
+    }
+    truncate_idle_wal(connection)
+}
+
+/// Copy pages without taking SQLite's writer lock. A live Store must serialize the later
+/// TRUNCATE with its writer queue; a zero busy timeout alone does not exclude a checkpoint.
+pub fn checkpoint_wal_backfilled(connection: &Connection) -> Result<bool> {
+    let report = checkpoint_wal_report(connection)?;
+    Ok(report.frames >= 0 && report.frames == report.backfilled)
+}
+
+#[derive(Debug)]
+pub struct WalCheckpointReport {
+    pub frames: i32,
+    pub backfilled: i32,
+    pub passive_ms: u128,
+    pub writer_wait_ms: u128,
+    pub truncate_ms: Option<u128>,
+    pub recycled: bool,
+}
+
+pub fn checkpoint_wal_report(connection: &Connection) -> Result<WalCheckpointReport> {
+    connection.busy_timeout(std::time::Duration::ZERO)?;
+    let started = std::time::Instant::now();
+    let (_, frames, backfilled): (i32, i32, i32) =
+        connection.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+    Ok(WalCheckpointReport {
+        frames, backfilled, passive_ms: started.elapsed().as_millis(),
+        writer_wait_ms: 0, truncate_ms: None, recycled: false,
+    })
+}
+
+/// Attempt recycling without waiting for readers. TRUNCATE takes SQLite's writer lock;
+/// the daemon calls this only while it has borrowed the Store's sole writer from its queue.
+pub fn truncate_idle_wal(connection: &Connection) -> Result<bool> {
+    connection.busy_timeout(std::time::Duration::ZERO)?;
+    let busy: i32 = connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+    Ok(busy == 0)
+}
+
 /// The store's only write connection, owned by one writer thread. Writes queue in front of it in
 /// arrival order: a batched write runs on the writer thread with the others queued behind it, each
 /// in a savepoint of one transaction that commits once for all of them, and its caller hears back
@@ -213,6 +264,7 @@ pub struct WriterConnection {
     pub thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     pub committed_index: Arc<AtomicU64>,
     observers: Arc<CommitObservers>,
+    mutation_observer: Option<Arc<writer_observer::MutationState>>,
     /// Transactions the writer committed for batched writes, and the batched writes in them.
     /// Tests read them; `st replication status` counts every commit.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -248,6 +300,7 @@ pub struct WriterGuard<'a> {
     pub give_back: std::sync::mpsc::SyncSender<Connection>,
     pub committed_index: &'a AtomicU64,
     observers: &'a CommitObservers,
+    mutation_observer: Option<&'a Arc<writer_observer::MutationState>>,
     /// When profiling, when this thread took the writer.
     pub acquired: Option<std::time::Instant>,
     /// The connection's changed-row count when it was lent, so the rows this thread changed are
@@ -257,6 +310,30 @@ pub struct WriterGuard<'a> {
 
 impl WriterConnection {
     pub fn new(connection: Connection, committed_index: Arc<AtomicU64>) -> Self {
+        Self::new_inner(connection, committed_index, None)
+            .expect("writer without an observer needs no schema check")
+    }
+
+    /// Install a row observer before handing the connection to the writer queue. Its callbacks
+    /// own the update/authorizer hooks and resolve committed state before acknowledgements.
+    /// Observers must not write, borrow the writer, panic, or retain a strong owner cycle.
+    pub fn new_with_observer(
+        connection: Connection,
+        committed_index: Arc<AtomicU64>,
+        observer: Arc<dyn WriterObserver>,
+    ) -> Result<Self> {
+        Self::new_inner(connection, committed_index, Some(observer))
+    }
+
+    fn new_inner(
+        connection: Connection,
+        committed_index: Arc<AtomicU64>,
+        observer: Option<Arc<dyn WriterObserver>>,
+    ) -> Result<Self> {
+        let mutation_observer = observer
+            .map(|observer| writer_observer::MutationState::new(&connection, observer))
+            .transpose()?;
+        let mutations = mutation_observer.clone();
         let (jobs, queue) = std::sync::mpsc::channel::<WriterJob>();
         let index = committed_index.clone();
         let batches = Arc::new((AtomicU64::new(0), AtomicU64::new(0)));
@@ -265,15 +342,16 @@ impl WriterConnection {
         let observed = observers.clone();
         let thread = std::thread::Builder::new()
             .name("st3-writer".into())
-            .spawn(move || write_queue(connection, queue, &index, &counted, &observed))
+            .spawn(move || write_queue(connection, queue, &index, &counted, &observed, mutations.as_ref()))
             .expect("the writer thread starts");
-        Self {
+        Ok(Self {
             jobs: Mutex::new(Some(jobs)),
             thread: Mutex::new(Some(thread)),
             committed_index,
             observers,
+            mutation_observer,
             batches,
-        }
+        })
     }
 
     /// Observe every successfully committed batch and every returned lent writer, synchronously
@@ -325,6 +403,7 @@ impl WriterConnection {
             give_back,
             committed_index: &self.committed_index,
             observers: &self.observers,
+            mutation_observer: self.mutation_observer.as_ref(),
             acquired: crate::profile::writer_acquired(wait),
         }
     }
@@ -437,6 +516,7 @@ fn write_queue(
     committed_index: &AtomicU64,
     batches: &(AtomicU64, AtomicU64),
     observers: &CommitObservers,
+    mutation_observer: Option<&Arc<writer_observer::MutationState>>,
 ) {
     let mut next = None;
     loop {
@@ -467,6 +547,7 @@ fn write_queue(
                     committed_index,
                     batches,
                     observers,
+                    mutation_observer,
                 );
             }
         }
@@ -484,6 +565,7 @@ fn run_write_batch(
     committed_index: &AtomicU64,
     batches: &(AtomicU64, AtomicU64),
     observers: &CommitObservers,
+    mutation_observer: Option<&Arc<writer_observer::MutationState>>,
 ) -> Option<WriterJob> {
     let started = std::time::Instant::now();
     let mut answers = Vec::new();
@@ -545,6 +627,9 @@ fn run_write_batch(
     if let Ok(index) = current_index(connection) {
         committed_index.store(index, Ordering::Release);
     }
+    if let Some(observer) = mutation_observer {
+        observer.resolved(connection);
+    }
     if committed.is_ok() {
         observers.notify(connection);
     }
@@ -580,6 +665,9 @@ impl Drop for WriterGuard<'_> {
         };
         if let Ok(index) = current_index(&connection) {
             self.committed_index.store(index, Ordering::Release);
+        }
+        if let Some(observer) = self.mutation_observer {
+            observer.resolved(&connection);
         }
         self.observers.notify(&connection);
         crate::touched::note_writes(
@@ -642,16 +730,96 @@ pub struct ReaderUsage {
     pub opened: u64,
 }
 
+/// Reads checked out right now, so a pinned WAL can be traced to its holder. SQLite keeps no
+/// list of who holds a snapshot, and the profile only records a read after it ends.
+static LIVE_READS: Mutex<std::collections::BTreeMap<u64, LiveRead>> =
+    Mutex::new(std::collections::BTreeMap::new());
+static NEXT_LIVE_READ: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy)]
+struct LiveRead {
+    started: std::time::Instant,
+    at: &'static std::panic::Location<'static>,
+    /// A `Store::read_snapshot`: one read transaction held open for the whole closure. Any other
+    /// checkout is a pooled connection lent out, which pins only while a statement is mid-step.
+    snapshot: bool,
+}
+
+/// Ends the live-read entry on every exit path.
+pub struct LiveReadToken(u64);
+
+impl Drop for LiveReadToken {
+    fn drop(&mut self) {
+        LIVE_READS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.0);
+    }
+}
+
+/// Note a read starting at the caller's location.
+#[track_caller]
+pub fn register_live_read(snapshot: bool) -> LiveReadToken {
+    let id = NEXT_LIVE_READ.fetch_add(1, Ordering::Relaxed);
+    LIVE_READS.lock().unwrap_or_else(PoisonError::into_inner).insert(
+        id,
+        LiveRead {
+            started: std::time::Instant::now(),
+            at: std::panic::Location::caller(),
+            snapshot,
+        },
+    );
+    LiveReadToken(id)
+}
+
+/// The longest-running read checked out now, and how many there are.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OldestLiveRead {
+    pub age_ms: u128,
+    pub snapshot: bool,
+    pub at: String,
+    pub live: usize,
+}
+
+pub fn oldest_live_read() -> Option<OldestLiveRead> {
+    let reads = LIVE_READS.lock().unwrap_or_else(PoisonError::into_inner);
+    let live = reads.len();
+    let oldest = reads.values().min_by_key(|read| read.started)?;
+    Some(OldestLiveRead {
+        age_ms: oldest.started.elapsed().as_millis(),
+        snapshot: oldest.snapshot,
+        at: format!("{}:{}", oldest.at.file(), oldest.at.line()),
+        live,
+    })
+}
+
+/// Every live read as (location, is_snapshot), for tests that look for their own entry.
+#[cfg(any(test, feature = "test-support"))]
+pub fn live_read_locations() -> Vec<(String, bool)> {
+    LIVE_READS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .values()
+        .map(|read| (format!("{}:{}", read.at.file(), read.at.line()), read.snapshot))
+        .collect()
+}
+
 pub struct ReadGuard<'a> {
     pub pool: &'a ReadPool,
     pub connection: Option<ReadConnection>,
     /// The connection `Store::read_snapshot` pinned for this thread, shared by every read in it.
     pub pinned: Option<Rc<ReadConnection>>,
+    /// Declared last, so it ends after the connection is returned. `None` for a read inside a
+    /// pinned snapshot, which `Store::read_snapshot` already registers.
+    _live: Option<LiveReadToken>,
 }
 
 thread_local! {
     /// While `Store::read_snapshot` runs on this thread: the pool it pinned a connection from,
     /// and that connection, held inside one read transaction.
+    /// A request worker's connection, lent without starting a transaction. Reusing it
+    /// makes acquisition fallible at the worker boundary rather than inside an infallible get.
+    static REQUEST_READER: RefCell<Option<(usize, Rc<ReadConnection>)>> = const { RefCell::new(None) };
     pub static PINNED_READER: RefCell<Option<(usize, Rc<ReadConnection>)>> = const { RefCell::new(None) };
 }
 
@@ -668,15 +836,21 @@ pub fn debug_assert_no_pinned_read() {
 pub struct PinnedRead<'a> {
     pub pool: &'a ReadPool,
     pub connection: Option<Rc<ReadConnection>>,
+    /// Restore an outer snapshot when a different store is read inside it.
+    pub previous: Option<(usize, Rc<ReadConnection>)>,
 }
 
 impl Drop for PinnedRead<'_> {
     fn drop(&mut self) {
-        PINNED_READER.with(|slot| slot.borrow_mut().take());
+        PINNED_READER.with(|slot| *slot.borrow_mut() = self.previous.take());
         let Some(connection) = self.connection.take() else {
             return;
         };
-        let _ = connection.execute_batch("COMMIT");
+        connection.progress_handler(0, None::<fn() -> bool>);
+        if connection.execute_batch("COMMIT").is_err() && !connection.is_autocommit() {
+            let _ = connection.execute_batch("ROLLBACK");
+        }
+        configure_read_cancellation(&connection);
         // Every guard lent from the pin is gone by now; if one escaped, the pool loses that
         // connection rather than sharing it.
         if let Ok(connection) = Rc::try_unwrap(connection) {
@@ -715,6 +889,60 @@ impl ReadPool {
         })
     }
 
+    /// Acquire before running an API worker. Connection-open failures are returned
+    /// immediately, and cancellation is checked before and after acquisition.
+    #[track_caller]
+    pub fn try_get(&self) -> Result<ReadGuard<'_>> {
+        crate::read_budget::check()?;
+        let idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner).pop();
+        let connection = match idle { Some(connection) => connection, None => self.open_connection()? };
+        configure_read_cancellation(&connection);
+        let guard = ReadGuard { pool: self, connection: Some(connection), pinned: None, _live: Some(register_live_read(false)) };
+        crate::read_budget::check()?;
+        Ok(guard)
+    }
+
+    /// One reader per blocking worker, without BEGIN. Reads still take a snapshot per
+    /// statement unless Store::read_snapshot explicitly pins a transaction. Nested scopes
+    /// reuse the same loan; unrelated workers acquire their own connection.
+    #[track_caller]
+    pub fn request_read<T>(&self, work: impl FnOnce() -> T) -> Result<T> {
+        if REQUEST_READER.with(|slot| slot.borrow().as_ref().is_some_and(|(key, _)| *key == self.key())) {
+            return Ok(work());
+        }
+        let mut guard = self.try_get()?;
+        let connection = Rc::new(guard.connection.take().expect("try_get holds a connection"));
+        let live = guard._live.take();
+        drop(guard);
+        struct Loan<'a> {
+            pool: &'a ReadPool,
+            connection: Option<Rc<ReadConnection>>,
+            previous: Option<(usize, Rc<ReadConnection>)>,
+            // Keep the registry entry until the entire request loan has returned its reader.
+            _live: Option<LiveReadToken>,
+        }
+        impl Drop for Loan<'_> {
+            fn drop(&mut self) {
+                REQUEST_READER.with(|slot| *slot.borrow_mut() = self.previous.take());
+                let connection = self.connection.take().expect("the loan holds its connection");
+                connection.progress_handler(0, None::<fn() -> bool>);
+                // A cancelled read must not retain its snapshot in the pool. The connection
+                // is query_only; ending a leftover read transaction cannot commit writes.
+                if !connection.is_autocommit() {
+                    let _ = connection.execute_batch("ROLLBACK");
+                }
+                if let Ok(connection) = Rc::try_unwrap(connection)
+                    && connection.is_autocommit()
+                {
+                    self.pool.release(connection);
+                }
+            }
+        }
+        let previous = REQUEST_READER.with(|slot| slot.replace(Some((self.key(), connection.clone()))));
+        let _loan = Loan { pool: self, connection: Some(connection), previous, _live: live };
+        Ok(work())
+    }
+
     /// Operational estimates remain available with SQLite MEMSTATUS disabled. These counts
     /// describe connections; page-cache targets are not measurements of process memory.
     pub fn usage(&self) -> ReaderUsage {
@@ -727,18 +955,21 @@ impl ReadPool {
         }
     }
 
+    #[track_caller]
     pub fn get(&self) -> ReadGuard<'_> {
-        let pinned = PINNED_READER.with(|slot| {
-            slot.borrow()
-                .as_ref()
-                .filter(|(pool, _)| *pool == self.key())
+        crate::read_budget::note_read_site();
+        let lookup = |slot: &RefCell<Option<(usize, Rc<ReadConnection>)>>| {
+            slot.borrow().as_ref().filter(|(pool, _)| *pool == self.key())
                 .map(|(_, connection)| connection.clone())
-        });
-        if pinned.is_some() {
+        };
+        let pinned = PINNED_READER.with(lookup).or_else(|| REQUEST_READER.with(lookup));
+        if let Some(connection) = &pinned {
+            configure_read_cancellation(connection);
             return ReadGuard {
                 pool: self,
                 connection: None,
                 pinned,
+                _live: None,
             };
         }
         let waiting = crate::profile::enabled().then(std::time::Instant::now);
@@ -772,16 +1003,22 @@ impl ReadPool {
         if let Some(waiting) = waiting {
             crate::profile::read_waited(waiting.elapsed());
         }
+        configure_read_cancellation(&connection);
         ReadGuard {
             pool: self,
             connection: Some(connection),
             pinned: None,
+            _live: Some(register_live_read(false)),
         }
     }
 
     /// Keep `connection` for the next read, or close it when the pool already holds
     /// `max_idle_read_connections()` of them.
     pub fn release(&self, connection: ReadConnection) {
+        // Remove cancellation before reuse by an unrelated request. No other thread can
+        // still own this connection; pinned readers return only after their last guard.
+        connection.progress_handler(0, None::<fn() -> bool>);
+        let _ = connection.busy_timeout(std::time::Duration::from_secs(5));
         let mut idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner);
         if idle.len() < max_idle_read_connections() {
             idle.push(connection);
@@ -790,15 +1027,35 @@ impl ReadPool {
     }
 }
 
+/// The callback consults the worker's current scope, so nested event-query budgets and
+/// pinned snapshots use the innermost deadline without caching a guard result.
+fn read_busy(attempt: i32) -> bool {
+    if attempt >= 500 || crate::read_budget::interrupted() { return false; }
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    !crate::read_budget::interrupted()
+}
+
+fn configure_read_cancellation(connection: &Connection) {
+    if crate::read_budget::current().is_some() {
+        connection.progress_handler(1000, Some(crate::read_budget::interrupted));
+        connection.busy_handler(Some(read_busy)).expect("install a read busy handler");
+    }
+}
+
 impl Deref for ReadGuard<'_> {
     type Target = Connection;
 
     fn deref(&self) -> &Self::Target {
-        self.pinned
+        let connection = self.pinned
             .as_deref()
             .or(self.connection.as_ref())
-            .map(|connection| &**connection)
-            .expect("a read guard always has a connection")
+            .expect("a read guard always has a connection");
+        // Cheap queries can finish before the normal progress interval. Once cancelled,
+        // the next operation on this guard must fail too, including a cached statement.
+        if crate::read_budget::interrupted() {
+            connection.progress_handler(1, Some(|| true));
+        }
+        connection
     }
 }
 
@@ -824,6 +1081,8 @@ pub fn record_sqlite_time(statement: &str, duration: std::time::Duration) {
     STATEMENTS_RUN.with(|run| run.set(run.get() + 1));
     crate::profile::sql(statement, duration);
     crate::performance::record_query(statement, duration);
+    #[cfg(any(test, feature = "test-support"))]
+    histogram::record(statement, duration);
     SQLITE_NANOS.fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
     if statement == "COMMIT" {
         SQLITE_COMMITS.fetch_add(1, Ordering::Relaxed);
@@ -837,6 +1096,40 @@ pub fn observe(connection: &mut Connection) {
     #[cfg(any(test, feature = "test-support"))]
     work::count(connection);
     connection.profile(Some(record_sqlite_time));
+}
+
+/// Every statement this process ran since the last [`histogram::take`], by normalized text, so a
+/// test can say which statement shapes a request ran and how many times each.
+#[cfg(any(test, feature = "test-support"))]
+pub mod histogram {
+    use std::collections::BTreeMap;
+    use std::sync::{Mutex, PoisonError};
+    use std::time::Duration;
+
+    /// Count, total nanoseconds and the slowest single run of one statement shape.
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct Shape {
+        pub count: u64,
+        pub total_ns: u64,
+        pub max_ns: u64,
+    }
+
+    static SHAPES: Mutex<BTreeMap<String, Shape>> = Mutex::new(BTreeMap::new());
+
+    pub fn record(statement: &str, duration: Duration) {
+        let shape = crate::performance::normalize_query(statement);
+        let mut shapes = SHAPES.lock().unwrap_or_else(PoisonError::into_inner);
+        let entry = shapes.entry(shape).or_default();
+        let ns = duration.as_nanos() as u64;
+        entry.count += 1;
+        entry.total_ns += ns;
+        entry.max_ns = entry.max_ns.max(ns);
+    }
+
+    /// The shapes recorded so far, emptying the table.
+    pub fn take() -> BTreeMap<String, Shape> {
+        std::mem::take(&mut *SHAPES.lock().unwrap_or_else(PoisonError::into_inner))
+    }
 }
 
 /// The work SQLite did for every statement this process ran, read from each statement's own
@@ -957,6 +1250,8 @@ pub fn open_read_connection(path: &Path, shared_memory: bool) -> Result<Connecti
     };
     let mut connection = Connection::open_with_flags(path, flags)
         .with_context(|| format!("open st read connection {}", path.display()))?;
+    crate::read_budget::check()?;
+    configure_read_cancellation(&connection);
     observe(&mut connection);
     connection.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
     connection.execute_batch(
@@ -965,6 +1260,7 @@ pub fn open_read_connection(path: &Path, shared_memory: bool) -> Result<Connecti
          PRAGMA query_only = ON;",
     )?;
     connection.pragma_update(None, "cache_size", -(read_cache_kib() as i64))?;
+    configure_read_cancellation(&connection);
     Ok(connection)
 }
 
@@ -977,6 +1273,201 @@ thread_local! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn wal_payload_values(connection: &Connection) -> Vec<String> {
+        let mut statement = connection
+            .prepare("SELECT value FROM payload ORDER BY sequence")
+            .unwrap();
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn idle_checkpoint_recycles_the_wal_after_a_reader_releases_its_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let writer = Connection::open(&path).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+                 CREATE TABLE payload(value BLOB); INSERT INTO payload VALUES (zeroblob(4096));",
+            )
+            .unwrap();
+        let reader = Connection::open(&path).unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT value FROM payload;")
+            .unwrap();
+        writer
+            .execute_batch("UPDATE payload SET value=zeroblob(8192);")
+            .unwrap();
+        let checkpoint = Connection::open(&path).unwrap();
+        let wal = path.with_extension("sqlite3-wal");
+        assert!(!checkpoint_idle_wal(&checkpoint).unwrap());
+        assert!(std::fs::metadata(&wal).unwrap().len() > 0);
+        // A failed recycle cannot block or lose a write while the old snapshot lives.
+        writer
+            .execute_batch("INSERT INTO payload VALUES (zeroblob(4096));")
+            .unwrap();
+        reader.execute_batch("COMMIT").unwrap();
+        assert!(checkpoint_idle_wal(&checkpoint).unwrap());
+        assert_eq!(std::fs::metadata(&wal).unwrap().len(), 0);
+        assert_eq!(
+            reader
+                .query_row("SELECT sum(length(value)) FROM payload", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            12288
+        );
+    }
+
+    #[test]
+    fn idle_checkpoint_defers_fully_backfilled_wal_until_current_reader_releases() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let writer = Connection::open(&path).unwrap();
+        writer.busy_timeout(std::time::Duration::ZERO).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+                 CREATE TABLE payload(sequence INTEGER PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO payload VALUES (0, 'original');",
+            )
+            .unwrap();
+        let reader = Connection::open(&path).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        assert_eq!(wal_payload_values(&reader), ["original"]);
+        let checkpoint = Connection::open(&path).unwrap();
+        let wal = path.with_extension("sqlite3-wal");
+
+        // This reader pins the current WAL end, not an older snapshot that limits PASSIVE.
+        let (busy, frames, backfilled): (i32, i32, i32) = checkpoint
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(busy, 0);
+        assert!(frames > 0);
+        assert_eq!(frames, backfilled);
+        assert!(!checkpoint_idle_wal(&checkpoint).unwrap());
+        assert!(std::fs::metadata(&wal).unwrap().len() > 0);
+        let (busy, frames, backfilled): (i32, i32, i32) = checkpoint
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(busy, 1, "the readmark prevents recycling, not backfilling");
+        assert!(frames > 0);
+        assert_eq!(frames, backfilled);
+
+        // A busy TRUNCATE neither blocks the next commit nor changes the pinned snapshot.
+        writer
+            .execute("INSERT INTO payload VALUES (1, 'committed while pinned')", [])
+            .unwrap();
+        assert_eq!(wal_payload_values(&reader), ["original"]);
+        assert_eq!(
+            wal_payload_values(&writer),
+            ["original", "committed while pinned"]
+        );
+        reader.execute_batch("COMMIT").unwrap();
+        assert!(checkpoint_idle_wal(&checkpoint).unwrap());
+        assert_eq!(std::fs::metadata(&wal).unwrap().len(), 0);
+        assert_eq!(
+            wal_payload_values(&reader),
+            ["original", "committed while pinned"]
+        );
+    }
+
+    #[test]
+    fn idle_checkpoint_defers_recycling_under_sustained_overlapping_readers_and_writes() {
+        use std::sync::mpsc::sync_channel;
+        use std::time::Duration;
+
+        const WAIT: Duration = Duration::from_secs(5);
+        const VALUES: [&str; 9] = [
+            "seed", "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+        ];
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let writer = Connection::open(&path).unwrap();
+        writer.busy_timeout(Duration::ZERO).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+                 CREATE TABLE payload(sequence INTEGER PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO payload VALUES (0, 'seed');",
+            )
+            .unwrap();
+        let checkpoint = Connection::open(&path).unwrap();
+        let wal = path.with_extension("sqlite3-wal");
+
+        std::thread::scope(|scope| {
+            let start_reader = |last: usize| {
+                let path = &path;
+                let (ready, pinned) = sync_channel(1);
+                let (release, released) = sync_channel(1);
+                let (done, finished) = sync_channel(1);
+                let thread = scope.spawn(move || {
+                    let reader = Connection::open(path).unwrap();
+                    reader.busy_timeout(Duration::ZERO).unwrap();
+                    reader.execute_batch("BEGIN").unwrap();
+                    assert_eq!(wal_payload_values(&reader), VALUES[..=last]);
+                    ready.send(()).unwrap();
+                    released.recv_timeout(WAIT).unwrap();
+                    assert_eq!(wal_payload_values(&reader), VALUES[..=last]);
+                    reader.execute_batch("COMMIT").unwrap();
+                    done.send(()).unwrap();
+                });
+                pinned.recv_timeout(WAIT).unwrap();
+                (release, finished, thread)
+            };
+
+            let mut active = start_reader(0);
+            for (sequence, value) in VALUES.iter().enumerate().skip(1) {
+                // Every commit completes while the previous snapshot is still pinned.
+                writer
+                    .execute(
+                        "INSERT INTO payload VALUES (?1, ?2)",
+                        rusqlite::params![sequence as i64, value],
+                    )
+                    .unwrap();
+                assert_eq!(wal_payload_values(&writer), VALUES[..=sequence]);
+                let next = start_reader(sequence);
+                assert!(!checkpoint_idle_wal(&checkpoint).unwrap());
+                assert!(std::fs::metadata(&wal).unwrap().len() > 0);
+
+                // Acquisition is acknowledged before releasing the previous reader:
+                // repeated handoffs deliberately provide no reader-free idle gap.
+                active.0.send(()).unwrap();
+                active.1.recv_timeout(WAIT).unwrap();
+                active.2.join().unwrap();
+                active = next;
+
+                let (busy, frames, backfilled): (i32, i32, i32) = checkpoint
+                    .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })
+                    .unwrap();
+                assert_eq!(busy, 0);
+                assert!(frames > 0);
+                assert_eq!(frames, backfilled);
+                assert!(!checkpoint_idle_wal(&checkpoint).unwrap());
+                assert!(std::fs::metadata(&wal).unwrap().len() > 0);
+            }
+
+            active.0.send(()).unwrap();
+            active.1.recv_timeout(WAIT).unwrap();
+            active.2.join().unwrap();
+            assert!(checkpoint_idle_wal(&checkpoint).unwrap());
+            assert_eq!(std::fs::metadata(&wal).unwrap().len(), 0);
+            assert_eq!(wal_payload_values(&writer), VALUES);
+        });
+    }
+
 
     #[test]
     fn repeated_bursts_of_reads_reuse_connections_instead_of_opening_new_ones() {
@@ -1036,6 +1527,7 @@ mod tests {
         drop(PinnedRead {
             pool: &pool,
             connection: Some(connection),
+            previous: None,
         });
         assert_eq!((pool.usage().open, pool.usage().idle), (1, 0));
         drop(escaped);
@@ -1324,5 +1816,94 @@ mod commit_observer_tests {
         assert!(result.is_err());
         // The commit happened before the observer panicked; it must not be reported as success.
         assert_eq!(writer.committed_index.load(Ordering::Acquire), 1);
+    }
+}
+
+#[cfg(test)]
+mod read_cancellation_tests {
+    use super::*;
+    use crate::read_budget::{self, ReadBudget};
+    use std::time::Duration;
+
+    fn pool() -> (tempfile::TempDir, Arc<ReadPool>) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("read.sqlite");
+        let writer = Connection::open(&path).unwrap();
+        writer.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE data(value); INSERT INTO data VALUES(1)").unwrap();
+        drop(writer);
+        let pool = Arc::new(ReadPool::new(&path, false).unwrap());
+        (directory, pool)
+    }
+
+    #[test]
+    fn cancellation_stops_live_sql_and_the_reader_is_clean_for_another_request() {
+        let (_directory, pool) = pool();
+        let budget = ReadBudget::new("/sql", Duration::from_secs(30));
+        let worker_budget = budget.clone();
+        let worker_pool = pool.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            read_budget::with(Some(worker_budget), || worker_pool.request_read(|| {
+                let reader = worker_pool.get();
+                started_tx.send(()).unwrap();
+                reader.query_row("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1000000000) SELECT sum(x) FROM n", [], |row| row.get::<_, i64>(0))
+            }))
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        budget.cancel();
+        let error = worker.join().unwrap().unwrap().unwrap_err();
+        assert!(matches!(error, rusqlite::Error::SqliteFailure(code, _) if code.code == rusqlite::ErrorCode::OperationInterrupted));
+        assert_eq!(pool.usage().idle, 1);
+        let reader = pool.get();
+        assert!(reader.is_autocommit());
+        assert_eq!(reader.query_row("SELECT value FROM data", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+    }
+
+    #[test]
+    fn an_expired_request_is_rejected_before_a_connection_is_opened_or_lent() {
+        let (_directory, pool) = pool();
+        let before = pool.usage();
+        let error = read_budget::with(Some(ReadBudget::new("/expired", Duration::ZERO)), || pool.try_get().map(|_| ())).unwrap_err();
+        assert_eq!(error.downcast_ref::<crate::error::Error>().unwrap().code, "read-deadline");
+        let after = pool.usage();
+        assert_eq!(after.idle, before.idle);
+        assert_eq!(after.opened, before.opened);
+    }
+
+    #[test]
+    fn failed_acquisition_returns_an_error_instead_of_waiting_for_another_reader() {
+        let (directory, pool) = pool();
+        // Keep its one reader in use and make another open impossible, using only a fixture.
+        let held = pool.get();
+        std::fs::remove_file(directory.path().join("read.sqlite")).unwrap();
+        let error = read_budget::with(Some(ReadBudget::new("/open-failed", Duration::from_secs(1))), || pool.try_get().map(|_| ())).unwrap_err();
+        assert!(error.to_string().contains("open st read connection"));
+        drop(held);
+    }
+
+    #[test]
+    fn request_loan_stays_in_the_live_reader_registry_until_the_reader_returns() {
+        let (_directory, pool) = pool();
+        let at = format!("{}:{}", file!(), line!() + 1);
+        pool.request_read(|| {
+            assert_eq!(live_read_locations().iter().filter(|(where_, snapshot)| where_ == &at && !snapshot).count(), 1);
+            { let _reader = pool.get(); }
+            pool.request_read(|| assert_eq!(live_read_locations().iter().filter(|(where_, snapshot)| where_ == &at && !snapshot).count(), 1)).unwrap();
+            assert_eq!(live_read_locations().iter().filter(|(where_, snapshot)| where_ == &at && !snapshot).count(), 1);
+        }).unwrap();
+        assert!(!live_read_locations().iter().any(|(where_, _)| where_ == &at));
+        assert_eq!(pool.usage().idle, 1);
+    }
+
+    #[test]
+    fn worker_loans_are_autocommit_and_nested_scopes_do_not_end_each_other() {
+        let (_directory, pool) = pool();
+        let budget = ReadBudget::new("/loan", Duration::from_secs(30));
+        read_budget::with(Some(budget), || pool.request_read(|| {
+            assert!(pool.get().is_autocommit());
+            pool.request_read(|| assert!(pool.get().is_autocommit())).unwrap();
+            assert!(pool.get().is_autocommit());
+        })).unwrap();
+        assert_eq!(pool.usage().idle, 1);
     }
 }

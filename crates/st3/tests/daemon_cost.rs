@@ -57,6 +57,8 @@ const GROWTH: f64 = 3.0;
 /// Work differences this small pass whatever their ratio: a few rows more or less.
 const SLACK: u64 = 5_000;
 
+const ADAPTER_ACTOR: &str = "agent/bench/cost/adapter";
+
 /// Requests whose work already grows with the store on main, measured on 2026-10-03 at
 /// 341f7ad9, each with the growth it may reach: half again its measured ratio, so it cannot get
 /// much worse unnoticed. Each breaks the daemon's rule that no query's cost grows with the whole
@@ -291,6 +293,10 @@ const NOT_MEASURED: &[(&str, &str)] = &[
         "image bytes, outside the graph",
     ),
     (
+        "GET /v1/client/conversations/{id}/content/{reference}/chunk",
+        "requires owner-native transcript content; scope, bounded chunk and revision invalidation are covered by conversation_blocks tests",
+    ),
+    (
         "GET /v1/client/blobs/{id}/chunk",
         "image bytes, outside the graph",
     ),
@@ -406,6 +412,19 @@ const fn direct(route: &'static str, call: Direct) -> Probe {
 }
 
 const PROBES: &[Probe] = &[
+    get(
+        "GET /v1/client/adapter/deliveries",
+        "/v1/client/adapter/deliveries?after={adapter_frontier}&wait_ms=0",
+    ),
+    post(
+        "POST /v1/client/adapter/import",
+        "/v1/client/adapter/import",
+        |fixture, attempt| json!({
+            "from":"external/discord/user/404", "to":fixture.subjects.seats[0],
+            "content":"Invented provider import", "attachments":[],
+            "idempotency_key":format!("cost-adapter-import-{attempt}"),
+        }),
+    ),
     post(
         "POST /v1/schema/registrations",
         "/v1/schema/registrations",
@@ -1064,6 +1083,16 @@ struct Cost {
     statements: u64,
     /// The answer's size in bytes, or the rows a trim deleted.
     answer: u64,
+    /// How many things the answer returned ([`item_count`]), at least one.
+    items: u64,
+    /// Every unit the answer counted in ([`item_units`]): the lengths of its lists of objects and
+    /// the steps nested in them, largest first, so a loop that runs once per run or once per step
+    /// can be told from the other.
+    item_units: Vec<u64>,
+    /// The most times one normalized statement text ran during the request, transaction control
+    /// aside, and that text.
+    max_repeat: u64,
+    top_shape: String,
     error: Option<String>,
 }
 
@@ -1077,6 +1106,18 @@ impl Cost {
             autoindex_rows: least(|cost| cost.autoindex_rows),
             statements: least(|cost| cost.statements),
             answer: samples.iter().map(|cost| cost.answer).max().unwrap_or(0),
+            items: samples.iter().map(|cost| cost.items).max().unwrap_or(0),
+            item_units: samples
+                .iter()
+                .max_by_key(|cost| cost.items)
+                .map(|cost| cost.item_units.clone())
+                .unwrap_or_default(),
+            max_repeat: least(|cost| cost.max_repeat),
+            top_shape: samples
+                .iter()
+                .min_by_key(|cost| cost.max_repeat)
+                .map(|cost| cost.top_shape.clone())
+                .unwrap_or_default(),
             error: samples.iter().find_map(|cost| cost.error.clone()),
         }
     }
@@ -1090,8 +1131,113 @@ impl Cost {
             statements: work.statements,
             answer,
             error,
+            ..Cost::default()
         }
     }
+}
+
+/// The units an answer counted in: the length of every list of objects in its first three levels
+/// (so a list inside a client envelope counts), and the steps nested in the elements of such a
+/// list, added up. Largest first, without repeats, at most four. A list of plain values is not a
+/// unit: it is a field, not a set of things the daemon looked up one by one.
+fn item_units(value: &Value) -> Vec<u64> {
+    fn walk(value: &Value, depth: usize, units: &mut std::collections::BTreeSet<u64>) {
+        match value {
+            Value::Array(items) => {
+                if items.iter().any(Value::is_object) {
+                    units.insert(items.len() as u64);
+                    let nested: u64 = items
+                        .iter()
+                        .filter_map(|item| item.get("steps"))
+                        .filter_map(Value::as_array)
+                        .map(|steps| steps.len() as u64)
+                        .sum();
+                    if nested > 0 {
+                        units.insert(nested);
+                    }
+                }
+                if depth < 3 {
+                    for item in items {
+                        walk(item, depth + 1, units);
+                    }
+                }
+            }
+            Value::Object(map) if depth < 3 => {
+                for value in map.values() {
+                    walk(value, depth + 1, units);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut units = std::collections::BTreeSet::new();
+    walk(value, 0, &mut units);
+    let mut units: Vec<u64> = units.into_iter().rev().take(4).collect();
+    if units.is_empty() {
+        units.push(1);
+    }
+    units
+}
+
+/// How many things an answer returned: its largest unit ([`item_units`]), or the length of its
+/// longest list of plain values when it has no list of objects. At least one.
+fn item_count(value: &Value) -> u64 {
+    fn longest(value: &Value, depth: usize) -> u64 {
+        match value {
+            Value::Array(items) => {
+                let inner = if depth < 3 {
+                    items.iter().map(|item| longest(item, depth + 1)).max().unwrap_or(0)
+                } else {
+                    0
+                };
+                (items.len() as u64).max(inner)
+            }
+            Value::Object(map) if depth < 3 => {
+                map.values().map(|value| longest(value, depth + 1)).max().unwrap_or(0)
+            }
+            _ => 0,
+        }
+    }
+    item_units(value)[0].max(longest(value, 0)).max(1)
+}
+
+/// The statement text that ran most often since the last histogram take, and how many
+/// times. Transaction control and pragmas are not counted: a request opens one transaction.
+fn most_repeated_shape() -> (u64, String) {
+    smallclaims::sqlite::histogram::take()
+        .into_iter()
+        .filter(|(shape, _)| {
+            let shape = shape.trim_start().to_ascii_uppercase();
+            !["BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE", "PRAGMA"]
+                .iter()
+                .any(|control| shape.starts_with(control))
+        })
+        .map(|(shape, counted)| (counted.count, shape))
+        .max()
+        .unwrap_or((0, String::new()))
+}
+
+#[test]
+fn item_count_finds_envelope_lists_and_nested_steps() {
+    assert_eq!(item_count(&json!({"ok": true})), 1);
+    assert_eq!(item_count(&json!([1, 2, 3])), 3);
+    assert_eq!(item_count(&json!({"value": {"items": [1, 2, 3, 4]}})), 4);
+    let runs = json!([{"steps": [1, 2, 3]}, {"steps": [1, 2, 3, 4, 5]}]);
+    assert_eq!(item_count(&runs), 8, "nested steps outnumber the two runs");
+    let deep = json!({"a": {"b": {"c": {"d": [1, 2, 3, 4, 5, 6]}}}});
+    assert_eq!(item_count(&deep), 1, "four levels down is not an item list");
+}
+
+#[test]
+fn item_units_keep_runs_and_steps_apart_and_ignore_lists_of_plain_values() {
+    let runs = json!({"value": {"items": [
+        {"id": "a", "steps": [1, 2, 3], "tags": ["x", "y"]},
+        {"id": "b", "steps": [1, 2, 3, 4, 5], "tags": []},
+    ]}});
+    assert_eq!(item_units(&runs), vec![8, 2], "eight steps in two runs; the tags are fields");
+    assert_eq!(item_units(&json!({"ok": true})), vec![1]);
+    assert_eq!(item_units(&json!(["a", "b", "c"])), vec![1], "plain values are not a unit");
+    assert_eq!(item_count(&json!(["a", "b", "c"])), 3, "but they still count as returned items");
 }
 
 /// Items of the generated store the probes refer to.
@@ -1461,6 +1607,7 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<Value, String>>,
 {
+    smallclaims::sqlite::histogram::take();
     let before = work::total();
     let answer = request().await;
     // Work a request leaves to a background task belongs to it too.
@@ -1483,13 +1630,23 @@ where
             value.to_string().chars().take(400).collect::<String>()
         );
     }
-    match answer {
-        Ok(value) => Cost::from_work(
-            spent,
-            serde_json::to_vec(&value).unwrap().len() as u64,
-            None,
-        ),
-        Err(error) => Cost::from_work(spent, 0, Some(error)),
+    let (max_repeat, top_shape) = most_repeated_shape();
+    let cost = match &answer {
+        Ok(value) => Cost {
+            items: item_count(value),
+            item_units: item_units(value),
+            ..Cost::from_work(
+                spent,
+                serde_json::to_vec(value).unwrap().len() as u64,
+                None,
+            )
+        },
+        Err(error) => Cost::from_work(spent, 0, Some(error.clone())),
+    };
+    Cost {
+        max_repeat,
+        top_shape,
+        ..cost
     }
 }
 
@@ -1575,6 +1732,40 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
         store.append_claim(&running).unwrap();
     }
     let mut fixture = fixture(&person, &client, subjects).await;
+    // Exercise successful enrolled imports and a fixed-size incremental reply page,
+    // rather than measuring a refused request or a historical mailbox scan.
+    let adapter = Client::unix_agent(&socket, ADAPTER_ACTOR).unwrap();
+    let adapter_kdl = format!(
+        "version 2\nagent \"bench/cost/adapter\" {{ workspace {:?}; argv \"/usr/bin/true\"; restart \"never\"; tags st3.adapter.source=\"external/discord/user/404\" st3.adapter.target={:?} }}\n",
+        root.to_str().unwrap(), fixture.subjects.seats[0],
+    );
+    let intent = st3::parse_intent(&adapter_kdl, NODE).unwrap();
+    let preview = store.mission(&intent, st3::model::IntentInput {
+        kdl: adapter_kdl, source_name: None,
+    }).unwrap();
+    store.apply_as(&intent, &preview.subject_tokens, "cost-adapter-enrollment", Some("person/bench-operator")).unwrap();
+    let incoming: Value = adapter.post("/v1/client/adapter/import", &json!({
+        "from":"external/discord/user/404", "to":fixture.subjects.seats[0],
+        "content":"Invented provider seed", "attachments":[],
+        "idempotency_key":"cost-adapter-seed",
+    })).await.expect("enrolled adapter seed import must succeed");
+    fixture.items.insert("adapter_frontier", store.index().unwrap().to_string());
+    store.append_claim(&ClaimInput {
+        subject:"message/cost-adapter-reply".into(), kind:"message.sent".into(),
+        actor:Some(fixture.subjects.seats[0].clone()),
+        fields:serde_json::from_value(json!({
+            "from":fixture.subjects.seats[0], "to":"external/discord/user/404",
+            "content":"Invented provider reply", "status":"sent",
+            "in_reply_to":incoming["subject"],
+        })).unwrap(),
+        evidence:vec![], expected_subject:None, idempotency_key:None,
+    }).unwrap();
+    let delivery: Value = adapter.get(&format!(
+        "/v1/client/adapter/deliveries?after={}&wait_ms=0",
+        fixture.items["adapter_frontier"],
+    )).await.expect("enrolled adapter delivery fixture must succeed");
+    assert_eq!(delivery["items"].as_array().unwrap().len(), 1);
+    assert_eq!(delivery["items"][0]["in_reply_to"], incoming["subject"]);
     // An offline source needs no live runtime: publish its exact departure before measuring
     // the operator's recorded exception, against both generated store sizes.
     for host in ["amber", "cobalt"] {
@@ -1665,6 +1856,8 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
                 let body = probe.body.map(|body| body(&fixture, attempt));
                 let client = if path.starts_with("/v1/client/arrangements") {
                     arrangement_person.clone()
+                } else if path.starts_with("/v1/client/adapter/") {
+                    adapter.clone()
                 } else if path.starts_with("/v1/client/") {
                     person.clone()
                 } else {

@@ -245,10 +245,18 @@ fn snapshot(
 ) -> anyhow::Result<String> {
     membership.validate(connection, binding)?;
     let subject = terminal_subject(&binding.terminal);
-    let (origin, runtime) = latest(connection, &subject, "runtime.observed")?
+    let runtime = Store::runtime_authority_on(connection, &subject)?
         .ok_or_else(|| anyhow::anyhow!("runtime missing"))?;
-    let fields = runtime.get("fields").unwrap_or(&runtime);
-    anyhow::ensure!(client_host_id(&origin) == binding.owner, "owner changed");
+    anyhow::ensure!(
+        matches!(runtime.reachability.as_str(), "reachable" | "local"),
+        "runtime authority indeterminate"
+    );
+    let origin = runtime.actual_origin.as_deref()
+        .ok_or_else(|| anyhow::anyhow!("runtime owner missing"))?;
+    let actual = runtime.actual.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("runtime missing"))?;
+    let fields = actual.get("fields").unwrap_or(actual);
+    anyhow::ensure!(client_host_id(origin) == binding.owner, "owner changed");
     anyhow::ensure!(
         fields.get("incarnation_id").and_then(Value::as_str) == Some(binding.incarnation.as_str()),
         "incarnation changed"
@@ -715,6 +723,23 @@ mod tests {
             &authorization_epoch(state, session).unwrap(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn partial_runtime_reports_preserve_leases_but_explicit_nulls_revoke() {
+        for null_fields in [
+            json!({"status":null}),
+            json!({"incarnation_id":null}),
+        ] {
+            let (_root, state, session) = fixture();
+            let existing = acquire(&state, &session);
+            claim(&state, "agent/shell", "runtime.observed", json!({"reason":"partial report"}));
+            assert!(existing.check().is_ok(), "omitted runtime fields must retain authority");
+            let replacement = acquire(&state, &session);
+            claim(&state, "agent/shell", "runtime.observed", null_fields);
+            assert!(existing.check().is_err(), "explicit null must revoke the old lease");
+            assert!(replacement.check().is_err(), "explicit null must revoke the new lease");
+        }
     }
 
     #[tokio::test(start_paused = true)]

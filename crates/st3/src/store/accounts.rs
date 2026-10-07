@@ -154,6 +154,17 @@ impl Store {
                 {
                     account.clone()
                 } else {
+                    // Until the limits projection has filled after an upgrade no account has a
+                    // reading, so every account would look unused and the choice, which is kept,
+                    // could pin the seat to an exhausted one. Choose and store nothing yet.
+                    if !self
+                        .account_limits_ready()
+                        .map_err(|error| error.to_string())?
+                    {
+                        return Err(
+                            "account limits are catching up, try again".to_owned()
+                        );
+                    }
                     let refs = bindable.iter().collect::<Vec<_>>();
                     let candidates = self
                         .candidates(&refs, now)
@@ -192,7 +203,8 @@ impl Store {
         limit_percent: f64,
         now: u128,
     ) -> Result<Vec<String>> {
-        if !matches!(binding.binding, Binding::Pool(_)) {
+        if !matches!(binding.binding, Binding::Pool(_)) || !self.account_limits_ready()? {
+            // Not yet known is no alternative: it must not read as every account being unused.
             return Ok(Vec::new());
         }
         let accounts = self.declared_accounts()?;

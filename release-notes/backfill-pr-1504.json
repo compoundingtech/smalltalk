@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "summary": "#1504: exact terminal owner/state lookup",
+  "commits": ["e72055618f2cb65a3343b0aa36159f26dbda82b5"],
+  "replay": {"status": "none", "detail": "No new projection invalidation or startup replay trigger in the merged exact terminal owner/state lookup change."},
+  "schema": {"status": "none", "detail": "No database table, index, trigger or migration change in exact terminal owner/state lookup; SQLite user_version is unchanged."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digest/drop policy are unchanged; this change adds no sealing coordination requirement."},
+  "compatibility": {"status": "changed", "detail": "Terminal list owner/state filters are additive in client v0 and apply before pagination. Old unfiltered clients remain supported; new filtered clients refuse old servers that do not acknowledge the requested filters. Upgrade the daemon before using filtered lookup; continuation cursors must repeat the filters."},
+  "downtime": {"status": "none", "detail": "No additional upgrade service stop or measured outage introduced by exact terminal owner/state lookup; the standard daemon/client restart procedure still applies."},
+  "manual": {"status": "changed", "detail": "Launchers using st terminals ls --owner or --state need an upgraded serving daemon. An old daemon produces an upgrade refusal rather than an unfiltered match; unfiltered listing remains available."},
+  "recovery": {"status": "none", "detail": "No additional recovery procedure introduced by this change. Preserve graph state, keys and configuration and follow the standard roll-forward guidance; this note does not qualify binary-only downgrade of the whole release."}
+}

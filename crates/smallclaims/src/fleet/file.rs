@@ -155,6 +155,56 @@ pub struct FleetFile {
 }
 
 impl FleetFile {
+    /// Serialize refusal persistence and leave cleanup, including the read before a write.
+    /// Keep the lock outside `fleet/`, and never unlink it: waiters must share one inode even
+    /// after leave removes that directory. Closing the returned file releases the lock.
+    pub fn lock_settings(state_dir: &Path) -> Result<fs::File> {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let path = state_dir.join("fleet-settings.lock");
+        let lock = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("open {}", path.display()))?;
+        // A bounded isolated control observes actual contention, rather than sleeping to
+        // guess whether the CLI reached the lock while the refusal writer was paused.
+        #[cfg(feature = "test-support")]
+        if let Some(directory) = std::env::var_os("ST3_TEST_REMOVAL_WRITE_BARRIER") {
+            // SAFETY: lock owns a valid descriptor for the duration of this call.
+            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0
+                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock
+            {
+                fs::write(
+                    Path::new(&directory).join("contended"),
+                    std::process::id().to_string(),
+                )?;
+            }
+        }
+        loop {
+            // SAFETY: lock owns a valid descriptor for the duration of this call.
+            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                return Ok(lock);
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error).with_context(|| format!("lock {}", path.display()));
+            }
+        }
+    }
+
+    /// Drain any refusal settings write before removing the fleet directory. A later writer
+    /// must reload under the same lock, so it cannot recreate settings after successful leave.
+    pub fn remove(state_dir: &Path) -> Result<()> {
+        let _lock = Self::lock_settings(state_dir)?;
+        let directory = state_dir.join("fleet");
+        fs::remove_dir_all(&directory)
+            .with_context(|| format!("remove fleet settings {}", directory.display()))
+    }
+
     pub fn path(state_dir: &Path) -> PathBuf {
         state_dir.join("fleet").join("fleet.toml")
     }

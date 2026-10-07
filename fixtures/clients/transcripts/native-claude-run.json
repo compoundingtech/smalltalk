@@ -1,0 +1,1255 @@
+[
+ {
+  "id": "timeline-entry/native-100",
+  "sequence": 100,
+  "revision": 1,
+  "timestamp": "2026-10-07T06:30:01.000Z",
+  "role": "user",
+  "final": true,
+  "type": "message",
+  "body": {
+   "message_id": "aaaa0001-0000-4000-8000-000000000001",
+   "reply_to": null,
+   "from": null,
+   "to": null,
+   "title": null,
+   "blocks": [
+    {
+     "id": "native-100/source",
+     "kind": "source_record",
+     "source_type": "claude",
+     "visibility": "internal",
+     "payload": {
+      "raw": {
+       "type": "user"
+      }
+     }
+    }
+   ]
+  }
+ },
+ {
+  "id": "timeline-entry/native-101",
+  "sequence": 101,
+  "revision": 1,
+  "timestamp": "2026-10-07T06:30:02.000Z",
+  "role": "user",
+  "final": true,
+  "type": "content",
+  "body": {
+   "media_type": "text/plain",
+   "text": "<channel source=\"plugin:st-channel:st\" from=\"person/example\" messageId=\"message/0123456789abcdef\" threadId=\"message/0123456789abcdef\" identity=\"agent/example/lead\">\n<smalltalk-message id=\"0123456789abcdef\" from=\"person/example\" to=\"agent/example/lead\" subject=\"(no subject)\" sha256=\"abababababababababababababababababababababababababababababababab\" graph=\"message/0123456789abcdef\">\nGood morning. How is the cache work going?\n</smalltalk-message>\nThe person reads replies in st, not in the agent's session.\n</channel>",
+   "attachment_id": null,
+   "blocks": [
+    {
+     "id": "native-101/0",
+     "kind": "text",
+     "source_type": "content",
+     "payload": {
+      "body_ref": true
+     }
+    }
+   ]
+  }
+ },
+ {
+  "id": "timeline-entry/native-110",
+  "sequence": 110,
+  "revision": 1,
+  "timestamp": "2026-10-07T06:30:03.000Z",
+  "role": "assistant",
+  "final": true,
+  "type": "message",
+  "body": {
+   "message_id": "msg_example01",
+   "reply_to": null,
+   "from": null,
+   "to": null,
+   "title": null,
+   "blocks": [
+    {
+     "id": "native-110/source",
+     "kind": "source_record",
+     "source_type": "claude",
+     "visibility": "internal",
+     "payload": {
+      "raw": {
+       "type": "assistant"
+      }
+     }
+    }
+   ]
+  }
+ },
+ {
+  "id": "timeline-entry/native-111",
+  "sequence": 111,
+  "revision": 1,
+  "timestamp": "2026-10-07T06:30:04.000Z",
+  "role": "assistant",
+  "final": true,
+  "type": "content",
+  "body": {
+   "media_type": "text/plain",
+   "text": "[reasoning]\n",
+   "attachment_id": null,
+   "blocks": [
+    {
+     "id": "native-111/0",
+     "kind": "reasoning",
+     "source_type": "thinking",
+     "payload": {
+      "text": "",
+      "raw": {
+       "type": "thinking",
+       "thinking": "",
+       "signature": "c2lnbmF0dXJl"
+      }
+     }
+    }
+   ]
+  }
+ },
+ {
+  "id": "timeline-entry/native-112",
+  "sequence": 112,
+  "revision": 1,
+  "timestamp": "2026-10-07T06:30:05.000Z",
+  "role": "assistant",
+  "final": true,
+  "type": "message",
+  "body": {
+   "message_id": "msg_example01",
+   "reply_to": null,
+   "from": null,
+   "to": null,
+   "title": null,
+   "blocks": [
+    {
+     "id": "native-112/source",
+     "kind": "source_record",
+     "source_type": "claude",
+     "visibility": "internal",
+     "payload": {
+      "raw": {
+       "type": "assistant"
+      }
+     }
+    }
+   ]
+  }
+ },
+ {
+  "id": "timeline-entry/native-113",
+  "sequence": 113,
+  "revision": 1,
+  "timestamp": "2026-10-07T06:30:06.000Z",
+  "role": "assistant",
+  "final": true,
+  "type": "tool_call",
+  "body": {
+   "call_id": "toolu_example01",
+   "name": "Bash",
+   "arguments": {
+    "command": "ls missions",
+    "description": "List the missions"
+   },
+   "blocks": [
+    {
+     "id": "native-113/0",
+     "kind": "tool_call",
+     "source_type": "tool_call",
+     "payload": {
+      "body_ref": true
+     }
+    }
+   ]
+  }
+ },
+ {
+  "id": "timeline-entry/native-114",
+  "sequence": 114,
+  "revision": 1,
+  "timestamp": "2026-10-07T06:30:07.000Z",
+  "role": "user",
+  "final": true,
+  "type": "message",
+  "body": {
+   "message_id": "aaaa114-0000-4000-8000-000000000001",
+   "reply_to": null,
+   "from": null,
+   "to": null,
+   "title": null,
+   "blocks": [
+    {
+     "id": "native-114/source",
+     "kind": "source_record",
+     "source_type": "claude",
+     "visibility": "internal",
+     "payload": {
+      "raw": {
+       "type": "user"
+      }
+     }
+    }
+   ]
+  }
+ },
+ {
+  "id": "timeline-entry/native-115",
+  "sequence": 115,
+  "revision": 1,
+  "timestamp": "2026-10-07T06:30:08.000Z",
+  "role": "tool",
+  "final": true,
+  "type": "tool_result",
+  "body": {
+   "call_id": "toolu_example01",
+   "status": "success",
+   "media_type": "application/json",
+   "content": "cache\nindex\n",
+   "blocks": [
+    {
+     "id": "native-115/0",
+     "kind": "tool_output",
+     "source_type": "tool_result",
+     "payload": {
+      "body_ref": true
+     }
+    }
+   ]
+  }
+ },
+ {
+  "id": "timeline-entry/native-116",
+  "sequence": 116,
+  "revision": 1,
+  "timestamp": "2026-10-07T06:30:09.000Z",
+  "role": "system",
+  "final": true,
+  "type": "content",
+  "body": {
+   "media_type": "text/plain",
+   "text": "[unrecognized claude attachment `total_tokens_reminder`]\n{\"raw\":{\"type\":\"total_tokens_reminder\"}}",
+   "attachment_id": null,
+   "blocks": [
+    {
+     "id": "native-116/0",
+     "kind": "unknown",
+     "source_type": "total_tokens_reminder",
+     "payload": {
+      "raw": {
+       "type": "total_tokens_reminder"
+      }
+     }
+    },
+    {
+     "id": "native-116/source",
+     "kind": "source_record",
+     "source_type": "claude",
+     "visibility": "internal",
+     "payload": {
+      "raw": {
+       "type": "total_tokens_reminder"
+      }
+     }
+    }
+   ]
+  }
+ },
+ {
+  "id": "timeline-entry/native-120",
+  "sequence": 120,
+  "revision": 1,
+  "timestamp": "2026-10-07T06:30:10.000Z",
+  "role": "assistant",
+  "final": true,
+  "type": "message",
+  "body": {
+   "message_id": "msg_example01",
+   "reply_to": null,
+   "from": null,
+   "to": null,
+   "title": null,
+   "blocks": [
+    {
+     "id": "native-120/source",
+     "kind": "source_record",
+     "source_type": "claude",
+     "visibility": "internal",
+     "payload": {
+      "raw": {
+       "type": "assistant"
+      }
+     }
+    }
+   ]
+  }
+ },
+ {
+  "id": "timeline-entry/native-121",
+  "sequence": 121,
+  "revision": 1,
+  "timestamp": "2026-10-07T06:30:11.000Z",
+  "role": "assistant",
+  "final": true,
+  "type": "content",
+  "body": {
+   "media_type": "text/plain",
+   "text": "[reasoning]\n",
+   "attachment_id": null,
+   "blocks": [
+    {
+     "id": "native-121/0",
+     "kind": "reasoning",
+     "source_type": "thinking",
+     "payload": {
+      "text": "",
+      "raw": {
+       "type": "thinking",
+       "thinking": "",
+       "signature": "c2lnbmF0dXJl"
+      }
+     }
+    }
+   ]
+  }
+ },
+ {
+  "id": "timeline-entry/native-122",
+  "sequence": 122,
+  "revision": 1,
+  "timestamp": "2026-10-07T06:30:12.000Z",
+  "role": "assistant",
+  "final": true,
+  "type": "message",
+  "body": {
+   "message_id": "msg_example01",
+   "reply_to": null,
+   "from": null,
+   "to": null,
+   "title": null,
+   "blocks": [
+    {
+     "id": "native-122/source",
+     "kind": "source_record",
+     "source_type": "claude",
+     "visibility": "internal",
+     "payload": {
+      "raw": {
+       "type": "assistant"
+      }
+     }
+    }
+   ]
+  }
+ },
+ {
+  "id": "timeline-entry/native-123",
+  "sequence": 123,
+  "revision": 1,
+  "timestamp": "2026-10-07T06:30:13.000Z",
+  "role": "assistant",
+  "final": true,
+  "type": "tool_call",
+  "body": {
+   "call_id": "toolu_example02",
+   "name": "Bash",
+   "arguments": {
+    "command": "ls missions/cache",
+    "description": "List the missions"
+   },
+   "blocks": [
+    {
+     "id": "native-123/0",
+     "kind": "tool_call",
+     "source_type": "tool_call",
+     "payload": {
+      "body_ref": true
+     }
+    }
+   ]
+  }
+ },
+ {
+  "id": "timeline-entry/native-124",
+  "sequence": 124,
+  "revision": 1,
+  "timestamp": "2026-10-07T06:30:14.000Z",
+  "role": "user",
+  "final": true,
+  "type": "message",
+  "body": {
+   "message_id": "aaaa124-0000-4000-8000-000000000001",
+   "reply_to": null,
+   "from": null,
+   "to": null,
+   "title": null,
+   "blocks": [
+    {
+     "id": "native-124/source",
+     "kind": "source_record",
+     "source_type": "claude",
+     "visibility": "internal",
+     "payload": {
+      "raw": {
+       "type": "user"
+      }
+     }
+    }
+   ]
+  }
+ },
+ {
+  "id": "timeline-entry/native-125",
+  "sequence": 125,
+  "revision": 1,
+  "timestamp": "2026-10-07T06:30:15.000Z",
+  "role": "tool",
+  "final": true,
+  "type": "tool_result",
+  "body": {
+   "call_id": "toolu_example02",
+   "status": "success",
+   "media_type": "application/json",
+   "content": "plan.md\n",
+   "blocks": [
+    {
+     "id": "native-125/0",
+     "kind": "tool_output",
+     "source_type": "tool_result",
+     "payload": {
+      "body_ref": true
+     }
+    }
+   ]
+  }
+ },
+ {
+  "id": "timeline-entry/native-126",
+  "sequence": 126,
+  "revision": 1,
+  "timestamp": "2026-10-07T06:30:16.000Z",
+  "role": "system",
+  "final": true,
+  "type": "content",
+  "body": {
+   "media_type": "text/plain",
+   "text": "[unrecognized claude attachment `total_tokens_reminder`]\n{\"raw\":{\"type\":\"total_tokens_reminder\"}}",
+   "attachment_id": null,
+   "blocks": [
+    {
+     "id": "native-126/0",
+     "kind": "unknown",
+     "source_type": "total_tokens_reminder",
+     "payload": {
+      "raw": {
+       "type": "total_tokens_reminder"
+      }
+     }
+    },
+    {
+     "id": "native-126/source",
+     "kind": "source_record",
+     "source_type": "claude",
+     "visibility": "internal",
+     "payload": {
+      "raw": {
+       "type": "total_tokens_reminder"
+      }
+     }
+    }
+   ]
+  }
+ },
+ {
+  "id": "timeline-entry/native-130",
+  "sequence": 130,
+  "revision": 1,
+  "timestamp": "2026-10-07T06:30:17.000Z",
+  "role": "assistant",
+  "final": true,
+  "type": "message",
+  "body": {
+   "message_id": "msg_example01",
+   "reply_to": null,
+   "from": null,
+   "to": null,
+   "title": null,
+   "blocks": [
+    {
+     "id": "native-130/source",
+     "kind": "source_record",
+     "source_type": "claude",
+     "visibility": "internal",
+     "payload": {
+      "raw": {
+       "type": "assistant"
+      }
+     }
+    }
+   ]
+  }
+ },
+ {
+  "id": "timeline-entry/native-131",
+  "sequence": 131,
+  "revision": 1,
+  "timestamp": "2026-10-07T06:30:18.000Z",
+  "role": "assistant",
+  "final": true,
+  "type": "content",
+  "body": {
+   "media_type": "text/plain",
+   "text": "[reasoning]\nCheck the queue before answering.",
+   "attachment_id": null,
+   "blocks": [
+    {
+     "id": "native-131/0",
+     "kind": "reasoning",
+     "source_type": "thinking",
+     "payload": {
+      "text": "Check the queue before answering.",
+      "raw": {
+       "type": "thinking",
+       "thinking": "Check the queue before answering.",
+       "signature": "c2lnbmF0dXJl"
+      }
+     }
+    }
+   ]
+  }
+ },
+ {
+  "id": "timeline-entry/native-132",
+  "sequence": 132,
+  "revision": 1,
+  "timestamp": "2026-10-07T06:30:19.000Z",
+  "role": "assistant",
+  "final": true,
+  "type": "message",
+  "body": {
+   "message_id": "msg_example01",
+   "reply_to": null,
+   "from": null,
+   "to": null,
+   "title": null,
+   "blocks": [
+    {
+     "id": "native-132/source",
+     "kind": "source_record",
+     "source_type": "claude",
+     "visibility": "internal",
+     "payload": {
+      "raw": {
+       "type": "assistant"
+      }
+     }
+    }
+   ]
+  }
+ },
+ {
+  "id": "timeline-entry/native-133",
+  "sequence": 133,
+  "revision": 1,
+  "timestamp": "2026-10-07T06:30:20.000Z",
+  "role": "assistant",
+  "final": true,
+  "type": "message",
+  "body": {
+   "message_id": "msg_example01",
+   "reply_to": null,
+   "from": null,
+   "to": null,
+   "title": null,
+   "blocks": [
+    {
+     "id": "native-133/source",
+     "kind": "source_record",
+     "source_type": "claude",
+     "visibility": "internal",
+     "payload": {
+      "raw": {
+       "type": "assistant"
+      }
+     }
+    }
+   ]
+  }
+ },
+ {
+  "id": "timeline-entry/native-134",
+  "sequence": 134,
+  "revision": 1,
+  "timestamp": "2026-10-07T06:30:21.000Z",
+  "role": "assistant",
+  "final": true,
+  "type": "content",
+  "body": {
+   "media_type": "text/plain",
+   "text": "Two of the three missions have stalled overnight; the cache one is moving.",
+   "attachment_id": null,
+   "blocks": [
+    {
+     "id": "native-134/0",
+     "kind": "text",
+     "source_type": "content",
+     "payload": {
+      "body_ref": true
+     }
+    }
+   ]
+  }
+ },
+ {
+  "id": "timeline-entry/native-136",
+  "sequence": 136,
+  "revision": 1,
+  "timestamp": "2026-10-07T06:30:22.000Z",
+  "role": "assistant",
+  "final": true,
+  "type": "tool_call",
+  "body": {
+   "call_id": "toolu_example03",
+   "name": "Bash",
+   "arguments": {
+    "command": "ls missions/index",
+    "description": "List the missions"
+   },
+   "blocks": [
+    {
+     "id": "native-136/0",
+     "kind": "tool_call",
+     "source_type": "tool_call",
+     "payload": {
+      "body_ref": true
+     }
+    }
+   ]
+  }
+ },
+ {
+  "id": "timeline-entry/native-140",
+  "sequence": 140,
+  "revision": 1,
+  "timestamp": "2026-10-07T06:30:23.000Z",
+  "role": "system",
+  "final": true,
+  "type": "content",
+  "body": {
+   "media_type": "text/plain",
+   "text": "[unrecognized claude entry `last-prompt`]\n{\"raw\":{\"type\":\"last-prompt\"}}",
+   "attachment_id": null,
+   "blocks": [
+    {
+     "id": "native-140/0",
+     "kind": "unknown",
+     "source_type": "last-prompt",
+     "payload": {
+      "raw": {
+       "type": "last-prompt"
+      }
+     }
+    },
+    {
+     "id": "native-140/source",
+     "kind": "source_record",
+     "source_type": "claude",
+     "visibility": "internal",
+     "payload": {
+      "raw": {
+       "type": "last-prompt"
+      }
+     }
+    }
+   ]
+  }
+ },
+ {
+  "id": "timeline-entry/native-141",
+  "sequence": 141,
+  "revision": 1,
+  "timestamp": "2026-10-07T06:30:24.000Z",
+  "role": "system",
+  "final": true,
+  "type": "content",
+  "body": {
+   "media_type": "text/plain",
+   "text": "[unrecognized claude entry `ai-title`]\n{\"raw\":{\"type\":\"ai-title\"}}",
+   "attachment_id": null,
+   "blocks": [
+    {
+     "id": "native-141/0",
+     "kind": "unknown",
+     "source_type": "ai-title",
+     "payload": {
+      "raw": {
+       "type": "ai-title"
+      }
+     }
+    },
+    {
+     "id": "native-141/source",
+     "kind": "source_record",
+     "source_type": "claude",
+     "visibility": "internal",
+     "payload": {
+      "raw": {
+       "type": "ai-title"
+      }
+     }
+    }
+   ]
+  }
+ },
+ {
+  "id": "timeline-entry/native-142",
+  "sequence": 142,
+  "revision": 1,
+  "timestamp": "2026-10-07T06:30:25.000Z",
+  "role": "system",
+  "final": true,
+  "type": "content",
+  "body": {
+   "media_type": "text/plain",
+   "text": "[unrecognized claude entry `mode`]\n{\"raw\":{\"type\":\"mode\"}}",
+   "attachment_id": null,
+   "blocks": [
+    {
+     "id": "native-142/0",
+     "kind": "unknown",
+     "source_type": "mode",
+     "payload": {
+      "raw": {
+       "type": "mode"
+      }
+     }
+    },
+    {
+     "id": "native-142/source",
+     "kind": "source_record",
+     "source_type": "claude",
+     "visibility": "internal",
+     "payload": {
+      "raw": {
+       "type": "mode"
+      }
+     }
+    }
+   ]
+  }
+ },
+ {
+  "id": "timeline-entry/native-143",
+  "sequence": 143,
+  "revision": 1,
+  "timestamp": "2026-10-07T06:30:26.000Z",
+  "role": "system",
+  "final": true,
+  "type": "content",
+  "body": {
+   "media_type": "text/plain",
+   "text": "[unrecognized claude entry `permission-mode`]\n{\"raw\":{\"type\":\"permission-mode\"}}",
+   "attachment_id": null,
+   "blocks": [
+    {
+     "id": "native-143/0",
+     "kind": "unknown",
+     "source_type": "permission-mode",
+     "payload": {
+      "raw": {
+       "type": "permission-mode"
+      }
+     }
+    },
+    {
+     "id": "native-143/source",
+     "kind": "source_record",
+     "source_type": "claude",
+     "visibility": "internal",
+     "payload": {
+      "raw": {
+       "type": "permission-mode"
+      }
+     }
+    }
+   ]
+  }
+ },
+ {
+  "id": "timeline-entry/native-144",
+  "sequence": 144,
+  "revision": 1,
+  "timestamp": "2026-10-07T06:30:27.000Z",
+  "role": "system",
+  "final": true,
+  "type": "content",
+  "body": {
+   "media_type": "text/plain",
+   "text": "[unrecognized claude entry `atis-latch`]\n{\"raw\":{\"type\":\"atis-latch\"}}",
+   "attachment_id": null,
+   "blocks": [
+    {
+     "id": "native-144/0",
+     "kind": "unknown",
+     "source_type": "atis-latch",
+     "payload": {
+      "raw": {
+       "type": "atis-latch"
+      }
+     }
+    },
+    {
+     "id": "native-144/source",
+     "kind": "source_record",
+     "source_type": "claude",
+     "visibility": "internal",
+     "payload": {
+      "raw": {
+       "type": "atis-latch"
+      }
+     }
+    }
+   ]
+  }
+ },
+ {
+  "id": "timeline-entry/native-145",
+  "sequence": 145,
+  "revision": 1,
+  "timestamp": "2026-10-07T06:30:28.000Z",
+  "role": "system",
+  "final": true,
+  "type": "content",
+  "body": {
+   "media_type": "text/plain",
+   "text": "[unrecognized claude entry `pr-link`]\n{\"raw\":{\"type\":\"pr-link\"}}",
+   "attachment_id": null,
+   "blocks": [
+    {
+     "id": "native-145/0",
+     "kind": "unknown",
+     "source_type": "pr-link",
+     "payload": {
+      "raw": {
+       "type": "pr-link"
+      }
+     }
+    },
+    {
+     "id": "native-145/source",
+     "kind": "source_record",
+     "source_type": "claude",
+     "visibility": "internal",
+     "payload": {
+      "raw": {
+       "type": "pr-link"
+      }
+     }
+    }
+   ]
+  }
+ },
+ {
+  "id": "timeline-entry/native-146",
+  "sequence": 146,
+  "revision": 1,
+  "timestamp": "2026-10-07T06:30:29.000Z",
+  "role": "system",
+  "final": true,
+  "type": "content",
+  "body": {
+   "media_type": "text/plain",
+   "text": "[unrecognized claude entry `frame-link`]\n{\"raw\":{\"type\":\"frame-link\"}}",
+   "attachment_id": null,
+   "blocks": [
+    {
+     "id": "native-146/0",
+     "kind": "unknown",
+     "source_type": "frame-link",
+     "payload": {
+      "raw": {
+       "type": "frame-link"
+      }
+     }
+    },
+    {
+     "id": "native-146/source",
+     "kind": "source_record",
+     "source_type": "claude",
+     "visibility": "internal",
+     "payload": {
+      "raw": {
+       "type": "frame-link"
+      }
+     }
+    }
+   ]
+  }
+ },
+ {
+  "id": "timeline-entry/native-147",
+  "sequence": 147,
+  "revision": 1,
+  "timestamp": "2026-10-07T06:30:30.000Z",
+  "role": "system",
+  "final": true,
+  "type": "content",
+  "body": {
+   "media_type": "text/plain",
+   "text": "[unrecognized claude entry `bridge-session`]\n{\"raw\":{\"type\":\"bridge-session\"}}",
+   "attachment_id": null,
+   "blocks": [
+    {
+     "id": "native-147/0",
+     "kind": "unknown",
+     "source_type": "bridge-session",
+     "payload": {
+      "raw": {
+       "type": "bridge-session"
+      }
+     }
+    },
+    {
+     "id": "native-147/source",
+     "kind": "source_record",
+     "source_type": "claude",
+     "visibility": "internal",
+     "payload": {
+      "raw": {
+       "type": "bridge-session"
+      }
+     }
+    }
+   ]
+  }
+ },
+ {
+  "id": "timeline-entry/native-150",
+  "sequence": 150,
+  "revision": 1,
+  "timestamp": "2026-10-07T06:30:31.000Z",
+  "role": "user",
+  "final": true,
+  "type": "message",
+  "body": {
+   "message_id": "aaaa150-0000-4000-8000-000000000001",
+   "reply_to": null,
+   "from": null,
+   "to": null,
+   "title": null,
+   "blocks": [
+    {
+     "id": "native-150/source",
+     "kind": "source_record",
+     "source_type": "claude",
+     "visibility": "internal",
+     "payload": {
+      "raw": {
+       "type": "user"
+      }
+     }
+    }
+   ]
+  }
+ },
+ {
+  "id": "timeline-entry/native-151",
+  "sequence": 151,
+  "revision": 1,
+  "timestamp": "2026-10-07T06:30:32.000Z",
+  "role": "tool",
+  "final": true,
+  "type": "tool_result",
+  "body": {
+   "call_id": "toolu_example03",
+   "status": "success",
+   "media_type": "application/json",
+   "content": "none\n",
+   "blocks": [
+    {
+     "id": "native-151/0",
+     "kind": "tool_output",
+     "source_type": "tool_result",
+     "payload": {
+      "body_ref": true
+     }
+    }
+   ]
+  }
+ },
+ {
+  "id": "timeline-entry/native-153",
+  "sequence": 153,
+  "revision": 1,
+  "timestamp": "2026-10-07T06:30:33.000Z",
+  "role": "system",
+  "final": true,
+  "type": "content",
+  "body": {
+   "media_type": "text/plain",
+   "text": "[unrecognized claude entry `future-kind`]\n{\"raw\":{\"type\":\"future-kind\"}}",
+   "attachment_id": null,
+   "blocks": [
+    {
+     "id": "native-153/0",
+     "kind": "unknown",
+     "source_type": "future-kind",
+     "payload": {
+      "raw": {
+       "type": "future-kind"
+      }
+     }
+    },
+    {
+     "id": "native-153/source",
+     "kind": "source_record",
+     "source_type": "claude",
+     "visibility": "internal",
+     "payload": {
+      "raw": {
+       "type": "future-kind"
+      }
+     }
+    }
+   ]
+  }
+ },
+ {
+  "id": "timeline-entry/native-160",
+  "sequence": 160,
+  "revision": 1,
+  "timestamp": "2026-10-07T06:30:34.000Z",
+  "role": "system",
+  "final": true,
+  "type": "truncation",
+  "body": {
+   "reason": "the native transcript prefix is outside the bounded read window; not fetchable through this owner read",
+   "omitted_from_sequence": 0,
+   "omitted_to_sequence": 0
+  }
+ },
+ {
+  "id": "timeline-entry/native-170",
+  "sequence": 170,
+  "revision": 1,
+  "timestamp": "2026-10-07T06:31:30.000Z",
+  "role": "system",
+  "final": true,
+  "type": "content",
+  "body": {
+   "media_type": "text/plain",
+   "text": "[unrecognized claude system `stop_hook_summary`]\n{\"raw\":{\"type\":\"stop_hook_summary\"}}",
+   "attachment_id": null,
+   "blocks": [
+    {
+     "id": "native-170/0",
+     "kind": "unknown",
+     "source_type": "stop_hook_summary",
+     "payload": {
+      "raw": {
+       "type": "stop_hook_summary"
+      }
+     }
+    },
+    {
+     "id": "native-170/source",
+     "kind": "source_record",
+     "source_type": "claude",
+     "visibility": "internal",
+     "payload": {
+      "raw": {
+       "type": "stop_hook_summary"
+      }
+     }
+    }
+   ]
+  }
+ },
+ {
+  "id": "timeline-entry/native-171",
+  "sequence": 171,
+  "revision": 1,
+  "timestamp": "2026-10-07T06:31:30.000Z",
+  "role": "system",
+  "final": true,
+  "type": "content",
+  "body": {
+   "media_type": "text/plain",
+   "text": "[unrecognized claude system `turn_duration`]\n{\"raw\":{\"type\":\"turn_duration\"}}",
+   "attachment_id": null,
+   "blocks": [
+    {
+     "id": "native-171/0",
+     "kind": "unknown",
+     "source_type": "turn_duration",
+     "payload": {
+      "raw": {
+       "type": "turn_duration"
+      }
+     }
+    },
+    {
+     "id": "native-171/source",
+     "kind": "source_record",
+     "source_type": "claude",
+     "visibility": "internal",
+     "payload": {
+      "raw": {
+       "type": "turn_duration"
+      }
+     }
+    }
+   ]
+  }
+ },
+ {
+  "id": "timeline-entry/native-172",
+  "sequence": 172,
+  "revision": 1,
+  "timestamp": "2026-10-07T06:31:30.000Z",
+  "role": "system",
+  "final": true,
+  "type": "content",
+  "body": {
+   "media_type": "text/plain",
+   "text": "[unrecognized claude entry `queue-operation`]\n{\"raw\":{\"type\":\"queue-operation\"}}",
+   "attachment_id": null,
+   "blocks": [
+    {
+     "id": "native-172/0",
+     "kind": "unknown",
+     "source_type": "queue-operation",
+     "payload": {
+      "raw": {
+       "type": "queue-operation"
+      }
+     }
+    },
+    {
+     "id": "native-172/source",
+     "kind": "source_record",
+     "source_type": "claude",
+     "visibility": "internal",
+     "payload": {
+      "raw": {
+       "type": "queue-operation"
+      }
+     }
+    }
+   ]
+  }
+ },
+ {
+  "id": "timeline-entry/native-173",
+  "sequence": 173,
+  "revision": 1,
+  "timestamp": "2026-10-07T06:31:30.000Z",
+  "role": "system",
+  "final": true,
+  "type": "content",
+  "body": {
+   "media_type": "text/plain",
+   "text": "[unrecognized codex record `event_msg`]\n{\"raw\":{\"type\":\"event_msg\"}}",
+   "attachment_id": null,
+   "blocks": [
+    {
+     "id": "native-173/0",
+     "kind": "unknown",
+     "source_type": "event_msg",
+     "payload": {
+      "raw": {
+       "type": "event_msg"
+      }
+     }
+    },
+    {
+     "id": "native-173/source",
+     "kind": "source_record",
+     "source_type": "codex",
+     "visibility": "internal",
+     "payload": {
+      "raw": {
+       "type": "event_msg"
+      }
+     }
+    }
+   ]
+  }
+ },
+ {
+  "id": "timeline-entry/native-174",
+  "sequence": 174,
+  "revision": 1,
+  "timestamp": "2026-10-07T06:31:30.000Z",
+  "role": "system",
+  "final": true,
+  "type": "content",
+  "body": {
+   "media_type": "text/plain",
+   "text": "[unrecognized codex record `token_usage_record`]\n{\"raw\":{\"type\":\"token_usage_record\"}}",
+   "attachment_id": null,
+   "blocks": [
+    {
+     "id": "native-174/0",
+     "kind": "unknown",
+     "source_type": "token_usage_record",
+     "payload": {
+      "raw": {
+       "type": "token_usage_record"
+      }
+     }
+    },
+    {
+     "id": "native-174/source",
+     "kind": "source_record",
+     "source_type": "codex",
+     "visibility": "internal",
+     "payload": {
+      "raw": {
+       "type": "token_usage_record"
+      }
+     }
+    }
+   ]
+  }
+ },
+ {
+  "id": "timeline-entry/native-175",
+  "sequence": 175,
+  "revision": 1,
+  "timestamp": "2026-10-07T06:31:30.000Z",
+  "role": "system",
+  "final": true,
+  "type": "content",
+  "body": {
+   "media_type": "text/plain",
+   "text": "[unrecognized codex record `turn_context`]\n{\"raw\":{\"type\":\"turn_context\"}}",
+   "attachment_id": null,
+   "blocks": [
+    {
+     "id": "native-175/0",
+     "kind": "unknown",
+     "source_type": "turn_context",
+     "payload": {
+      "raw": {
+       "type": "turn_context"
+      }
+     }
+    },
+    {
+     "id": "native-175/source",
+     "kind": "source_record",
+     "source_type": "codex",
+     "visibility": "internal",
+     "payload": {
+      "raw": {
+       "type": "turn_context"
+      }
+     }
+    }
+   ]
+  }
+ }
+]

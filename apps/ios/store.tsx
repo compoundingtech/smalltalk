@@ -3,15 +3,15 @@ import { AppState } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as SecureStore from 'expo-secure-store';
 import * as Crypto from 'expo-crypto';
-import { API_VERSION, ClientError, St3Client, isTransient, notApplied, plainError, retryTransient, type Attention, type AttachmentInput, type Capabilities, type ConversationSearch, type Glass, type Launch, type LaunchVariant, type Mission, type Resource, type Snapshot, type TimelineEntry } from '../../clients/typescript/st3-client';
-import { personAnswer, clientName, isSnapshotChurn, listSessionPages, OLDER_PAGE, readOlder, type Conversation, type Older, type SessionView, base64url, messageSubject, signatureParameter, signatureRefusal, signedBytes, type DeviceKey, type Unsigned } from '@smalltalk/st3-views';
+import { API_VERSION, ClientError, St3Client, isTransient, notApplied, plainError, retryTransient, type AgentCreateParameters, type Attention, type AttachmentInput, type Capabilities, type ConversationSearch, type Glass, type Launch, type LaunchVariant, type Mission, type Resource, type Snapshot, type TimelineEntry } from '../../clients/typescript/st3-client';
+import { keepClosed, personAnswer, clientName, isSnapshotChurn, listSessionPages, OLDER_PAGE, readOlder, type Conversation, type Older, type SessionView, base64url, messageSubject, signatureParameter, signatureRefusal, signedBytes, type DeviceKey, type Unsigned } from '@smalltalk/st3-views';
 import app from './app.json';
 import { canVerifyPairing, createDeviceKey, removeDeviceKey, signWithDeviceKey, verifyGrantSignature } from './modules/st-device-key';
 import { REPAIR_WARNING, validatePairingTrust, verifyPairing } from './pairingProof';
 import { emptyData, encodeProjectionCache, hydrateProjectionForPairedDevice, PROJECTION_CACHE_KEY, type Data } from './projectionCache';
-import { listCollectionPages } from './collectionPages';
+import { listCollectionPages, mergedRows } from './collectionPages';
 import { rememberBounded } from './boundedCache';
-import { withFreshTerminalFence } from './terminalControls';
+import { wantsScreenSequence, withFreshTerminalFence, type TerminalFence } from './terminalControls';
 import { Feed } from './feed';
 import { ForegroundGate } from './foreground';
 import type { FabricProfile } from './fabricProof';
@@ -79,6 +79,8 @@ function actionId() { return `action/ios-${Crypto.randomUUID()}`; }
 
 function useAppStore(proof?: FabricProfile) {
   const proofRef = useRef(proof); proofRef.current = proof;
+  /** The snapshot the windows last showed: a terminal key may be fenced by it, since any earlier one of this host is accepted. */
+  const lastSnapshot = useRef('');
   const [order, setOrder] = useState<Tab[]>(tabOrder(null));
   const [url, setUrl] = useState(proof?.url ?? ''), [urlDraft, setUrlDraft] = useState('');
   const [credential, setCredential] = useState<string | null>(proof?.credential ?? null);
@@ -108,6 +110,11 @@ function useAppStore(proof?: FabricProfile) {
   const conversationCache = useRef(new Map<string, Conversation<TimelineEntry>>()), draftCache = useRef(new Map<string, string>());
   // Images messages carry, as data URIs, so a conversation scrolled back to does not read them again.
   const imageCache = useRef(new Map<string, Promise<string>>());
+  // Attention the person acted on from here: st closing it is their doing, not a vanishing.
+  const acted = useRef(new Set<string>());
+  // Whether this connection has delivered its first attention window: what a stored copy held
+  // and st no longer lists was not on screen while it closed, so only later windows keep items.
+  const attentionLive = useRef(false);
   const missionDetailCache = useRef(new Map<string, Mission>());
   const client = useMemo(() => url ? new St3Client({ baseUrl: url, credential: () => credential ?? undefined, fetchImpl: gatewayFetch(), client: clientName('smalltalk-ios', app.expo.version, process.env.EXPO_PUBLIC_ST3_BUILD) }) : null, [url, credential]);
   // Image bytes go up through Expo's fetch: React Native's cannot send a byte array as a body.
@@ -164,12 +171,17 @@ function useAppStore(proof?: FabricProfile) {
     if (!client || !credential) { setStatus('setup'); return; }
     const generation = cacheGeneration.current;
     const current = () => generation === cacheGeneration.current;
+    attentionLive.current = false;
     const opened = new Feed(client, {
       onWindow: (name, rows, hasMore, at) => {
         if (!current()) return;
+        if (at?.id) lastSnapshot.current = at.id;
         // Home decides what of attention to show, as stui does; agents drop only history.
         const shown = name === 'agents' ? (rows as Array<{ operational?: { layer?: string } }>).filter(currentAgent) : rows;
-        setData(previous => ({ ...previous, [name]: shown }));
+        // Nothing leaves Home by itself: what st closes while it is shown stays until cleared.
+        const seen = attentionLive.current;
+        if (name === 'attention') attentionLive.current = true;
+        setData(previous => ({ ...previous, [name]: name === 'attention' && seen ? keepClosed(previous.attention, shown as Attention[], acted.current, capsRef.current?.session_actor) : shown }));
         setTruncated(previous => ({ ...previous, [name]: hasMore }));
         setLoadErrors(previous => { if (!(name in previous)) return previous; const rest = { ...previous }; delete rest[name]; return rest; });
         proofRef.current?.record('window', { name, rows: shown.length });
@@ -214,7 +226,7 @@ function useAppStore(proof?: FabricProfile) {
     const timer = setTimeout(() => {
       cacheSavedAt.current = Date.now();
       const truncatedKeys = (Object.keys(truncated) as Array<keyof Data>).filter(key => truncated[key]);
-      const encoded = encodeProjectionCache(url, caps.session_actor, snapshot.host_id, snapshot.store_index, data, cacheSavedAt.current, truncatedKeys);
+      const encoded = encodeProjectionCache(url, caps.session_actor, snapshot.host_id, snapshot.store_index, { ...data, attention: data.attention.filter(item => !item.closedElsewhere) }, cacheSavedAt.current, truncatedKeys);
       if (encoded) void AsyncStorage.setItem(PROJECTION_CACHE_KEY, encoded).catch(() => { cacheSavedAt.current = 0; });
     }, Math.max(0, cacheSavedAt.current + 10_000 - Date.now()));
     return () => clearTimeout(timer);
@@ -230,7 +242,7 @@ function useAppStore(proof?: FabricProfile) {
       if (key === 'sessions') return listSessionPages(options => client.sessionsList(options), limit).then(rows => ({ rows, truncated: false }));
       const list = key === 'launches' ? client.launchesList.bind(client) : key === 'machines' ? client.machinesList.bind(client) : client.devicesList.bind(client);
       const kind = key === 'launches' ? 'launch' : key === 'machines' ? 'machine' : 'device';
-      return listCollectionPages(options => list(options), limit).then(result => ({ rows: result.pages.flatMap(page => page.value.items.filter(item => (item as { kind: string }).kind === kind)) as unknown as Data[OnDemand], truncated: result.truncated }));
+      return listCollectionPages(options => list(options), limit).then(result => ({ rows: mergedRows(result.pages.flatMap(page => page.value.items.filter(item => (item as { kind: string }).kind === kind)) as Array<{ id?: string }>) as unknown as Data[OnDemand], truncated: result.truncated }));
     };
     const results = await Promise.allSettled(keys.map(read));
     if (generation !== cacheGeneration.current) return;
@@ -347,13 +359,20 @@ function useAppStore(proof?: FabricProfile) {
     /** Complete a person step; `answer` is a structured request's named answer, by id. */
     async done(item: Attention, summary: string, answer?: string) {
       if (!client) return false;
+      acted.current.add(item.id);
       const typed = personAnswer(item.request, answer, summary);
       if (typeof typed === 'string') { setError(typed); return false; }
       return runAction(async () => { const id = actionId(); return client.workDone({ id, idempotency_key: id, fence: await fence({ [item.id]: item.revision }), parameters: { target_id: item.source_id, episode: item.episode || item.revision, summary, ...(typed ? { answer: typed } : {}) } }); });
     },
+    /** Clear an item st closed elsewhere: only the person's own word removes it from Home. */
+    clearClosed(id: string) {
+      acted.current.add(id);
+      setData(previous => ({ ...previous, attention: previous.attention.filter(item => item.id !== id) }));
+    },
     /** Mark a message read from Home: it leaves the person's attention. */
     async markRead(item: Attention) {
       if (!client) return false;
+      acted.current.add(item.id);
       return runAction(async () => { const id = actionId(); return client.messageRead({ id, idempotency_key: id, fence: await fence({ [item.id]: item.revision }), parameters: { target_id: item.source_id } }); });
     },
     /** An image a message carries, as a data URI; st reads it from the member that has it. */
@@ -422,12 +441,12 @@ function useAppStore(proof?: FabricProfile) {
       return created;
     },
     /** A new agent with its first message; its id, or null with the reason shown. */
-    async createAgent(parameters: { name: string; harness: string; model?: string; effort?: string; host?: string; message?: string }): Promise<string | null> {
+    async createAgent(parameters: AgentCreateParameters): Promise<string | null> {
       if (!client) return null;
       let created: string | null = null;
       const done = await runAction(async () => {
         const id = actionId();
-        const result = await client.agentCreate({ id, idempotency_key: id, fence: await fence(), parameters: parameters as never });
+        const result = await client.agentCreate({ id, idempotency_key: id, fence: await fence(), parameters });
         created = result.value.affected_ids?.find(affected => affected.startsWith('agent/')) ?? null;
       });
       return done ? created : null;
@@ -464,6 +483,18 @@ function useAppStore(proof?: FabricProfile) {
     /** Each input takes a fresh terminal fence and refuses a changed runtime incarnation. */
     async terminalInput(terminalId: string, incarnation: string, mode: 'line' | 'key' | 'raw', value: string) {
       if (!client) throw new Error('not connected');
+      // Typed keys need no screen fence, and an agent's spinner moves the screen faster than a read
+      // and a send can race it (Nathan, 2026-10-06: nothing typed ever arrived). So one request,
+      // on the snapshot the windows last showed (any earlier one of this host is accepted), fenced
+      // by the incarnation only. An st that still asks for the screen's sequence says so, and the
+      // old way is used.
+      if ((mode === 'raw' || mode === 'key') && lastSnapshot.current) {
+        const id = actionId();
+        try {
+          await client.terminalInput({ id, idempotency_key: id, fence: { snapshot_id: lastSnapshot.current, subject_revisions: {}, runtime_incarnation: incarnation } as TerminalFence, parameters: { terminal_id: terminalId, mode, value } });
+          return;
+        } catch (error) { if (!wantsScreenSequence(error)) throw error; }
+      }
       await withFreshTerminalFence(client, terminalId, incarnation, terminalFence => {
         const id = actionId();
         return client.terminalInput({ id, idempotency_key: id, fence: terminalFence, parameters: { terminal_id: terminalId, mode, value } });

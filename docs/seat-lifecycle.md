@@ -33,6 +33,12 @@ st agents stop agent/garden/worker --as person/ada
 st agents start garden/worker --as person/ada
 ```
 
+Native drivers check their work once a minute and renew held claims only while the claim's
+exact harness incarnation remains live, including an idle or blocked harness. Seats without
+held claims do not read full subject status for lease maintenance. Checking work before
+status keeps resident seats cheap without extending the renewal period or weakening the
+incarnation check.
+
 To preserve the exact conversation, wait until the seat has finished its turn and holds no claim:
 
 ```sh

@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "summary": "Sekrets claims age out with the local observation log and go to OpenTelemetry; the gateway trims its own log.",
+  "replay": {
+    "status": "none",
+    "detail": "No replay. sekret.called/exited/refused/changed become local observations from this build on; claims of those kinds already in the graph stay until the new checkpoint rule trims them."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No st store schema change. The gateway trims rows of its own log table; no migration."
+  },
+  "rules": {
+    "status": "changed",
+    "detail": "Checkpoint rules move to version 12: sekret.* claims written before they became local keep only the newest per subject once dated five days before the cut. Members need the same rules to seal new checkpoints, so upgrade every member; a mixed fleet waits at sealing until they match.",
+    "transitions": [[11, 12]]
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "New sekrets calls are local observations on the gateway's host, exported to OpenTelemetry when [observations.otlp] is set; other members no longer receive them, and `st subject history sekret/...` shows only the earlier durable claims. `st sekrets log` on the host shows the gateway's record."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "A normal daemon restart; not measured for this change."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Nothing to do. Re-running `st sekrets setup` gives the gateway the hourly log trim."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "Rolling back the binary returns sekrets claims to durable; with rules version 11 back on some members, sealing waits until every member runs the same rules."
+  }
+}

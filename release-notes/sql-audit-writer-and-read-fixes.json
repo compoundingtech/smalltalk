@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "summary": "SQL audit fixes: writer scans, limits projection, fleet generation, usage rollup index",
+  "replay": {
+    "status": "none",
+    "detail": "No graph replay is added or triggered. Account limits are a new local projection (tables account_limit_readings and account_limit_seats, a cursor in meta) filled from the harness.limits claims in bounded pages by a daemon task after open: 200 claims per short writer transaction, 50 ms apart, resumable from the stored cursor. Until the first fill finishes, which is only on the first start after this build, the limits read returns nothing, the stop policy decides nothing, a pool start without a kept account fails with the retryable 'account limits are catching up, try again', and pool alternatives are empty. The planning write path rebuilds only the planning tables, the replication retry lookup seeks by index, and the hourly observation trim selects by index; none changes what is projected."
+  },
+  "schema": {
+    "status": "changed",
+    "detail": "Additive only. New tables account_limit_readings, account_limit_seats and fleet_generation; ten triggers on claims, replica_envelopes, replica_envelope_signatures and meta that advance fleet_generation when fleet claims, their envelopes or signatures, or the anchor change (each guarded by a WHEN on the fleet kinds); and a partial index claims_usage_rollup_index on harness.usage response rollups, built the first time a store opens with this build. Schema version is unchanged. None of the tables is read by shared projections or digests. An older build that reopens the file ignores the tables and the index and works; its triggers are not needed. If the tables are dropped or stale after such a downgrade the new build refills them from the cursor."
+  },
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged."},
+  "compatibility": {
+    "status": "changed",
+    "detail": "GET /v1/status accepts harness_only=true, which returns the subject's current harness without its claim ids; a driver renewing its leases asks for it, and an older daemon ignores the parameter and answers in full. No other client, wire or harness contract change."
+  },
+  "downtime": {
+    "status": "changed",
+    "detail": "One build of the partial index on first open: about 9 s on a copy of a 7.1 GB store (measured with the sqlite3 shell, one process, 633,000 claims), during which that daemon answers nothing; it happens once per store. The account limits projection is filled after open and adds no startup time. No other interruption beyond the ordinary restart."
+  },
+  "manual": {"status": "none", "detail": "No manual step."},
+  "recovery": {"status": "none", "detail": "No database recovery change. The new tables, triggers and index can be dropped; the limits tables are rebuilt from claims."}
+}
