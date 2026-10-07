@@ -85,7 +85,7 @@ impl View for MissionSelection {
     fn definition(&self) -> Definition {
         Definition {
             name: VIEW,
-            fingerprint: "selection.v1;projected-mission-definitions+run-headers;status-count-deltas;latest-created-text-desc-id-desc;updated-integer-desc-mission-asc;24h-failed-cancelled;captured-clock-current-membership;no-card-steps-auth",
+            fingerprint: "selection.v1;projected-mission-definitions+run-headers;status-count-deltas;latest-created-text-desc-id-desc;updated-integer-desc-mission-asc;24h-failed-cancelled;captured-clock-current-membership;unicode-public-id-rust-lower;no-card-steps-auth",
             kinds: &[],
             local_kinds: &[SOURCE],
             max_contributions: 1,
@@ -187,8 +187,10 @@ fn maintain(tx: &Transaction<'_>, key: &str, at: u128) -> Result<bool> {
         .as_ref()
         .map(|r| serde_json::from_str::<Value>(&r.3))
         .transpose()?;
-    let body = canonical_json_text(&json!({"id":key,"state":state,"updated_ms":updated,
-        "definition":definition,"latest":latest_body,"counts":counts,"grace_until_ms":grace,"current":visible}))?;
+    let body = canonical_json_text(
+        &json!({"id":key,"search_id":key.to_lowercase(),"state":state,"updated_ms":updated,
+        "definition":definition,"latest":latest_body,"counts":counts,"grace_until_ms":grace,"current":visible}),
+    )?;
     if old.as_deref() == Some(&body) {
         return Ok(false);
     }
@@ -369,7 +371,6 @@ pub(crate) fn window(
     limit: usize,
 ) -> Result<Vec<(String, u128)>> {
     anyhow::ensure!((1..=501).contains(&limit), "mission window page bound");
-    ready(connection, views)?;
     let at = i64::try_from(at).context("mission snapshot time exceeds SQLite range")?;
     let after_ms = after
         .map(|key| i64::try_from(key.0))
@@ -377,6 +378,9 @@ pub(crate) fn window(
         .context("mission seek time exceeds SQLite range")?;
     ready_at(connection, views, at as u128)?;
     let membership = if history { "1" } else { "visible=1" };
+    // IDs are Unicode-lowercased on maintenance, matching the public list matcher. Only
+    // the bounded needle is normalized here; SQLite lower() covers ASCII alone.
+    let text = text.map(str::to_lowercase);
     let seek = if after.is_some() {
         "updated_ms<=?3 AND (updated_ms<?3 OR mission_id>?4)"
     } else {
@@ -385,7 +389,7 @@ pub(crate) fn window(
     let sql = format!(
         "SELECT mission_id,updated_ms FROM local_mission_selection
         WHERE {membership} AND ?1 IN (0,1) AND ?2>=0 AND ({seek})
-          AND (?6 IS NULL OR instr(lower('mission/' || mission_id),?6)>0)
+          AND (?6 IS NULL OR instr(json_extract(body,'$.search_id'),?6)>0)
         ORDER BY updated_ms DESC,mission_id ASC LIMIT ?5"
     );
     connection
@@ -834,19 +838,37 @@ mod tests {
         let _clock = clock_snapshot();
         let at = now_ms();
         let (store, views) = fixture();
-        for (n, id) in ["alpha", "birch", "cedar", "grove-100%", "grove_under"]
-            .iter()
-            .enumerate()
+        for (n, id) in [
+            "alpha",
+            "birch",
+            "cedar",
+            "grove-100%",
+            "grove_under",
+            "Äpfel",
+            "Σύνοδος",
+        ]
+        .iter()
+        .enumerate()
         {
             publish(&store, id, &format!("publish-{n}"));
         }
         parity(&store, &views, at);
         let connection = store.readers.get();
-        for filter in ["grove", "%", "_", "mission/grove", "absent"] {
+        for filter in [
+            "grove",
+            "%",
+            "_",
+            "mission/grove",
+            "absent",
+            "ä",
+            "Ä",
+            "ÄPFEL",
+            "ΣΎ",
+        ] {
             let all = window(&connection, &views, true, at, None, None, 501).unwrap();
             let expected = all
                 .into_iter()
-                .filter(|(id, _)| id.to_ascii_lowercase().contains(filter))
+                .filter(|(id, _)| id.to_lowercase().contains(&filter.to_lowercase()))
                 .take(1)
                 .collect::<Vec<_>>();
             assert_eq!(
@@ -860,7 +882,7 @@ mod tests {
             .map(|(id, _)| id)
             .collect::<Vec<_>>();
         let selected = rows(&connection, &views, at, &ids).unwrap();
-        assert_eq!(selected.len(), 5);
+        assert_eq!(selected.len(), 7);
         for id in ids {
             assert_eq!(
                 selected.get(&id),

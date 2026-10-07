@@ -14,8 +14,12 @@ Source triggers retract/add old/new status counts and retain affected mission
 keys. Flush pages maintain only those keys. Latest run selection uses the current
 reader's created-time text DESC/run-ID DESC order, including ties. Selection uses
 numeric updated-time DESC/mission-ID ASC and the existing continuation tuple.
-The optional normalized literal ID filter is applied before LIMIT. A selected
-header/count batch uses one indexed query.
+The optional literal ID filter is applied before LIMIT. Public IDs are Unicode
+lowercased with Rust during maintenance; the bounded needle is likewise lowercased,
+preserving Unicode and mixed-case matching without SQLite's ASCII-only `lower`.
+Filtered selection can visit the ordered candidate index until enough matches
+are found, like the existing list matcher; its returned page is bounded. A
+selected header/count batch uses one indexed query.
 
 Current membership has a separate ordered partial index. Failed/cancelled runs
 remain included at exactly the 24-hour boundary. An explicit clock page processes
