@@ -6452,7 +6452,17 @@ impl Store {
                         continue;
                     }
                     if self.verdicts_due.swap(false, Ordering::AcqRel) {
-                        self.judge_claims(true)?;
+                        self.judge_claims(true).map_err(|error| {
+                            self.verdicts_due.store(true, Ordering::Release);
+                            let error = crate::error::typed(error);
+                            if error.is_sqlite_contention() {
+                                self.note_projection_contention();
+                                let error = error.with_detail("projection_stage", "tail-verdict");
+                                self.log_projection_failure(&error, phase, through, target, &mut log);
+                                return error;
+                            }
+                            error
+                        })?;
                     }
                     // Admission and catch-up deferral can run after this index read. Clear
                     // only the generation observed before it; a newer deferral must survive.

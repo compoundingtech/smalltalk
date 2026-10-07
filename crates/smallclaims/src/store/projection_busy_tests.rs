@@ -491,3 +491,31 @@ fn empty_wal_checkpoint_needs_no_writer_loan() {
     assert_eq!(report.writer_wait_ms, 0);
     assert_eq!(report.truncate_ms, None);
 }
+
+#[test]
+fn tail_verdict_busy_remains_typed_and_pending_after_projection_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("claims.sqlite3");
+    let store = Store::open(&path, "node", Arc::new(FaultRuntime::new())).unwrap();
+    store.project_replication_backlog().unwrap();
+    store.connection.write().execute("DELETE FROM meta WHERE key='claim_verdict_roots'", []).unwrap();
+    store.connection.write().busy_timeout(std::time::Duration::ZERO).unwrap();
+    store.verdicts_due.store(true, Ordering::Release);
+    let holder = Connection::open(&path).unwrap();
+    let mut held = false;
+    let error = store.project_replication_backlog_with_progress("test", |progress| {
+        if progress.phase == "projection-committed" && !held {
+            holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+            held = true;
+        }
+    }).unwrap_err();
+    assert!(held);
+    assert!(error.downcast_ref::<Error>().unwrap().is_sqlite_contention());
+    assert!(store.verdicts_due.load(Ordering::Acquire));
+    assert!(store.replication_projection_deferred());
+    assert_eq!(health(&store).0, "healthy");
+    holder.execute_batch("ROLLBACK").unwrap();
+    assert!(store.project_replication_backlog().unwrap());
+    assert!(!store.verdicts_due.load(Ordering::Acquire));
+    assert!(!store.replication_projection_deferred());
+}

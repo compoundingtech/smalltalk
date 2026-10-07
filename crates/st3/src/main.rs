@@ -22318,19 +22318,23 @@ fn retry_projection_contention_observed(
             // serializes them with receive/wake passes. Store ownership ends at attempt return.
             let result = tokio::task::spawn_blocking(move || {
                 let result = store.project_replication_backlog_unless_catching_up();
-                (result, store.projection_contention_generation())
+                (result, store.projection_contention_generation(), store.replication_projection_deferred())
             })
             .await;
+            let still_deferred = match &result {
+                Ok((_, _, deferred)) => Some(*deferred),
+                Err(_) => None,
+            };
             let (recovered, retry, generation, outcome) = match result {
                 // Own success cannot advance contention generation. Retain the pre-call
                 // watermark, so an external contention racing the success is observed on
                 // the next poll rather than cancelled as part of the completed episode.
-                Ok((Ok(Some(true)), _current)) => (true, false, generation, "projected"),
-                Ok((Ok(None), current)) => (false, true, current, "catch-up-throttled"),
-                Ok((Ok(Some(false)), current)) => {
+                Ok((Ok(Some(true)), _current, _)) => (true, false, generation, "projected"),
+                Ok((Ok(None), current, _)) => (false, true, current, "catch-up-throttled"),
+                Ok((Ok(Some(false)), current, _)) => {
                     (false, current != generation, current, "deferred")
                 }
-                Ok((Err(error), current)) => {
+                Ok((Err(error), current, _)) => {
                     let busy = error
                         .downcast_ref::<smallclaims::Error>()
                         .is_some_and(|error| error.is_sqlite_contention());
@@ -22339,7 +22343,7 @@ fn retry_projection_contention_observed(
                         busy,
                         current,
                         if busy {
-                            "begin-contention"
+                            "sqlite-contention"
                         } else {
                             "other-error"
                         },
@@ -22352,8 +22356,10 @@ fn retry_projection_contention_observed(
                 "st3: projection contention retry {}",
                 json!({
                     "attempt":attempt, "limit":3, "outcome":outcome, "rescheduled":schedule.due.is_some(),
-                    "exhausted_still_deferred": retry && schedule.due.is_none(),
-                    "stopped_still_deferred": !recovered && schedule.due.is_none(),
+                    "projection_deferred_after_attempt": still_deferred,
+                    "stop_reason": if schedule.due.is_some() { None } else if recovered {
+                        Some("recovered")
+                    } else if retry { Some("budget-exhausted") } else { Some("non-retryable") },
                 })
             );
             if recovered {

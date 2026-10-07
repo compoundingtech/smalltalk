@@ -299,6 +299,18 @@ mod storage_contention_response_tests {
         assert_eq!(visible, 1);
     }
     #[test]
+    fn private_projection_context_stays_out_of_client_details() {
+        let error = smallclaims::error::internal(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY), None))
+            .with_detail("projection_stage", "begin-immediate")
+            .with_detail("projection_frontier_unknown", true);
+        let response = super::ApiError::bad(error);
+        assert_eq!(response.status, super::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!response.details.contains_key("projection_stage"));
+        assert!(!response.details.contains_key("projection_frontier_unknown"));
+        assert_eq!(response.details["sqlite_extended_code"], rusqlite::ffi::SQLITE_BUSY);
+    }
+    #[test]
     fn typed_sqlite_contention_is_a_service_failure_not_input_validation() {
         for code in ["database-busy", "database-locked"] {
             let response = super::ApiError::bad(super::St3Error::new(code, "storage contention"));
@@ -339,11 +351,15 @@ impl ApiError {
             "internal" => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::UNPROCESSABLE_ENTITY,
         };
+        let mut details = error.details;
+        details.retain(|key, _| !matches!(key.as_str(), "projection_stage" | "projection_claim_id"
+            | "projection_subject" | "projection_operation_id" | "projection_context_truncated"
+            | "projection_frontier_unknown"));
         Self {
             status,
             code: error.code.into(),
             message: error.message,
-            details: Box::new(error.details),
+            details: Box::new(details),
         }
     }
 

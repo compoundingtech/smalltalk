@@ -302,6 +302,7 @@ mod tests {
 
     #[test]
     fn busy_gateway_append_keeps_cursor_and_retries_the_same_entry() {
+        for code in [rusqlite::ffi::SQLITE_BUSY, rusqlite::ffi::SQLITE_LOCKED] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cursor");
         std::fs::write(&path, "6\n").unwrap();
@@ -311,7 +312,7 @@ mod tests {
         let first = import_entries(&entries, "example", "person/ada", &path, &mut cursor, |claim| {
             attempts.push(claim.idempotency_key.clone());
             Err(smallclaims::error::internal(rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY), None)))
+                rusqlite::ffi::Error::new(code), None)))
         });
         assert!(first.is_err());
         assert_eq!(cursor, 6);
@@ -324,6 +325,7 @@ mod tests {
         assert_eq!(attempts[0], attempts[1]);
         assert_eq!(cursor, 7);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "7\n");
+        }
     }
     #[test]
     fn graph_refusal_remains_skippable_but_file_error_does_not_advance_memory_cursor() {
