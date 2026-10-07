@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
-"""Exercise the built TUI (spaces) in a real PTY, with or without a local st daemon.
+"""Exercise the built stui in disposable PTYs, with no network or real daemon.
 
-Run with ST3_PERSON=person/<you> python3 crates/stui/tests/pty_smoke.py.
-The script reports only checks and byte counts; it never prints terminal contents.
+Run all cases: cargo test -p stui --test pty_smoke --test typed_keys
+Run one case: python3 crates/stui/tests/pty_smoke.py target/debug/stui --case normal
+Cases: normal, signal, panic, delayed-getter, hangup, tmux-hangup, shifted-keys.
+Release binaries: add --no-panic (the panic hook exists only with debug assertions).
+Cargo requires tmux; standalone runs skip its case when tmux is unavailable.
+The script reports checks and byte counts, never terminal contents. Each invocation
+uses fresh XDG directories and removes ST_AGENT, ST3_ENDPOINT and graphics probes.
 """
 
 from __future__ import annotations
 
+import argparse
+import errno
 import fcntl
 import os
 import pty
@@ -18,123 +25,171 @@ import signal
 import socket
 import struct
 import subprocess
-import sys
 import tempfile
 import termios
 import threading
 import time
 
 
-FIRST_FRAME = b" working"  # The status bar's count is present even before st connects.
+FIRST_FRAME = b" working"  # Present even before st connects.
+FRAME_END = b"\x1b[?2026l"  # stui's synchronized-update boundary.
 
 
 def plain(output: bytes) -> bytes:
     return re.sub(rb"\x1b\[[0-9;?]*[ -/]*[@-~]", b"", output)
 
 
-def answer_queries(master: int, chunk: bytes) -> None:
-    """Answer stui's device-attributes query as a terminal does, so its keyboard-protocol
-    probe ends at once instead of waiting out its timeout."""
-    if b"\x1b[c" in chunk:
-        os.write(master, b"\x1b[?62;c")
-
-
-def run_case(binary: str, ending: str, endpoint: str | None = None) -> None:
-    master, slave = pty.openpty()
-    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
+def isolated_env(directory: str) -> dict[str, str]:
     env = os.environ.copy()
-    env["TERM"] = "xterm-256color"
-    if endpoint:
-        env["ST3_ENDPOINT"] = endpoint
-    if ending == "panic":
-        env["STUI_TEST_PANIC_AFTER_ENTER"] = "1"
-    proc = subprocess.Popen([binary], stdin=slave, stdout=slave, stderr=slave, env=env)
-    os.close(slave)
-    captured = bytearray()
+    for name in ("ST_AGENT", "ST3_ENDPOINT", "STUI_TEST_PANIC_AFTER_ENTER",
+                 "TERM_PROGRAM", "KITTY_WINDOW_ID"):
+        env.pop(name, None)
+    env.update(TERM="xterm-256color", ST3_PERSON="person/alex")
+    for name in ("XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "XDG_RUNTIME_DIR"):
+        path = os.path.join(directory, name)
+        os.mkdir(path, mode=0o700)
+        env[name] = path
+    return env
 
-    def collect(seconds: float) -> bytes:
-        output = bytearray()
-        deadline = time.monotonic() + seconds
-        while time.monotonic() < deadline:
-            ready, _, _ = select.select([master], [], [], 0.1)
-            if ready:
-                try:
-                    chunk = os.read(master, 65536)
-                    output.extend(chunk)
-                    captured.extend(chunk)
-                    answer_queries(master, chunk)
-                except OSError:
-                    break
-        return bytes(output)
 
-    def wait_for(marker: bytes, timeout: float) -> tuple[bytes, float]:
+class Terminal:
+    def __init__(self, binary: str, env: dict[str, str], keyboard: bool = False):
+        self.master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
+        self.before = termios.tcgetattr(slave)
+        try:
+            self.proc = subprocess.Popen([binary, "--local"], stdin=slave, stdout=slave,
+                                         stderr=slave, env=env)
+        except BaseException:
+            os.close(self.master)
+            raise
+        finally:
+            os.close(slave)
+        self.captured = bytearray()
+        self.keyboard = keyboard
+        self.answered: dict[bytes, int] = {}
+        self.eof = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        if self.proc.poll() is None:
+            self.proc.kill()
+        self.proc.wait(timeout=3)
+        if self.master is not None:
+            os.close(self.master)
+
+    def read(self, timeout: float) -> None:
+        if self.eof:
+            return
+        ready, _, _ = select.select([self.master], [], [], timeout)
+        if not ready:
+            return
+        try:
+            chunk = os.read(self.master, 65536)
+        except OSError as error:
+            if error.errno != errno.EIO:
+                raise
+            chunk = b""
+        if not chunk:
+            self.eof = True
+            return
+        self.captured.extend(chunk)
+        # Queries and responses can cross read boundaries. Answer each query once.
+        for query, reply in ((b"\x1b[?u", b"\x1b[?0u" if self.keyboard else b""),
+                             (b"\x1b[c", b"\x1b[?62;c")):
+            count = self.captured.count(query)
+            for _ in range(count - self.answered.get(query, 0)):
+                if reply:
+                    os.write(self.master, reply)
+            self.answered[query] = count
+
+    def wait_for(self, marker: bytes, timeout: float = 2, start: int = 0,
+                 frame: bool = True) -> float:
         started = time.monotonic()
-        output = bytearray()
-        while time.monotonic() - started < timeout:
-            ready, _, _ = select.select([master], [], [], 0.02)
-            if ready:
-                try:
-                    chunk = os.read(master, 65536)
-                    output.extend(chunk)
-                    captured.extend(chunk)
-                    answer_queries(master, chunk)
-                except OSError:
-                    break
-                if marker in (output if marker.startswith(b"\x1b") else plain(output)):
-                    break
-        return bytes(output), time.monotonic() - started
+        deadline = started + timeout
+        while True:
+            output = bytes(self.captured[start:])
+            # Only acknowledge a complete frame: its tail can otherwise look like the
+            # response to the next key, or an Esc can join that key into an Alt chord.
+            if frame:
+                boundary = output.rfind(FRAME_END)
+                output = output[:boundary] if boundary >= 0 else b""
+            if marker in (output if marker.startswith(b"\x1b") else plain(output)):
+                return time.monotonic() - started
+            remaining = deadline - time.monotonic()
+            assert remaining > 0 and not self.eof, (
+                f"marker {marker!r} was not seen in {timeout:g} s "
+                f"(exit {self.proc.poll()}, {len(self.captured)} bytes)"
+            )
+            self.read(remaining)
 
-    marker = b"\x1b[?1049h" if ending == "panic" else FIRST_FRAME
-    initial, first_frame = wait_for(marker, 2)
-    # wait_for returns its elapsed time whether or not the marker came, so a stale marker would
-    # read as a slow first frame (as it did when the top bar lost its label); say what is missing.
-    assert marker in (initial if marker.startswith(b"\x1b") else plain(initial)), (
-        f"first frame marker {marker!r} was not seen in 2 s"
-    )
-    assert first_frame < 1, f"first frame took {first_frame:.3f}s"
-    if ending != "panic":
-        assert b"\x1b[?1000h" in captured, "mouse capture was not enabled"
-        # Ctrl+K opens the palette and Esc closes it; Ctrl+S shows the sidebar and hides it.
-        for key in (b"\x0b", b"\x1b", b"\x13", b"\x13"):
-            os.write(master, key)
-            changed, latency = wait_for(b"", 1)
-            assert changed, f"{key!r} did not redraw"
-            assert latency < 0.5, f"{key!r} took {latency:.3f}s to redraw"
-            # Apart, as typed: an Esc read together with the next key is Alt and that key.
-            collect(0.2)
-        collect(1)  # A live background snapshot may redraw after navigation.
-        assert proc.poll() is None, f"{ending}: TUI exited before quit/signal ({proc.returncode})"
-        if ending == "normal":
-            os.write(master, b"\x11")  # Ctrl+Q
+    def key(self, key: bytes, marker: bytes) -> None:
+        start = len(self.captured)
+        os.write(self.master, key)
+        latency = self.wait_for(marker, timeout=1, start=start)
+        assert latency < 0.5, f"{key!r} took {latency:.3f}s to redraw"
+
+    def first_frame(self) -> float:
+        elapsed = self.wait_for(FIRST_FRAME)
+        assert elapsed < 1, f"first frame took {elapsed:.3f}s"
+        assert b"\x1b[?1000h" in self.captured, "mouse capture was not enabled"
+        return elapsed
+
+    def keys(self) -> None:
+        self.key(b"\x0b", b"open in")  # Ctrl+K: palette.
+        self.key(b"\x1b", b"Checking what needs you")  # Esc: Home restored.
+        self.key(b"\x13", b"Agents")  # Ctrl+S: show sidebar.
+        self.key(b"\x13", b"Checking what needs you")  # Ctrl+S: hide sidebar.
+        assert self.proc.poll() is None, "TUI exited while navigating"
+
+    def exit(self, panic: bool = False) -> None:
+        deadline = time.monotonic() + 3
+        while not self.eof and time.monotonic() < deadline:
+            self.read(deadline - time.monotonic())
+        try:
+            self.proc.wait(timeout=max(0.01, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            raise AssertionError("TUI did not exit") from None
+        assert (self.proc.returncode == 0) == (not panic), (
+            f"unexpected exit {self.proc.returncode}"
+        )
+        for marker in (b"\x1b[?1000l", b"\x1b[?1049l"):
+            assert marker in self.captured, f"terminal mode {marker!r} was not restored"
+        assert termios.tcgetattr(self.master) == self.before, "terminal stayed in raw mode"
+
+
+def run_case(binary: str, ending: str, env: dict[str, str]) -> None:
+    if ending == "panic":
+        env = {**env, "STUI_TEST_PANIC_AFTER_ENTER": "1"}
+    with Terminal(binary, env) as terminal:
+        if ending == "panic":
+            terminal.wait_for(b"\x1b[?1049h", frame=False)
         else:
-            proc.send_signal(signal.SIGTERM)
-    deadline = time.monotonic() + 5
-    while proc.poll() is None and time.monotonic() < deadline:
-        collect(0.02)
-    if proc.poll() is None:
-        proc.kill()
-        proc.wait()
-        raise AssertionError(f"{ending}: TUI did not exit")
-    collect(0.2)
-    os.close(master)
-    modes = sorted(set(re.findall(rb"\x1b\[\?[0-9;]*[hl]", captured)))
-    assert ending == "panic" or b"\x1b[?1000l" in captured, f"{ending}: mouse capture was not released"
-    assert b"\x1b[?1049l" in captured, (
-        f"{ending}: alternate screen was not restored "
-        f"(exit {proc.returncode}, {len(captured)} bytes, modes {modes}, tail {captured[-48:].hex()})"
-    )
-    assert (proc.returncode == 0) == (ending != "panic"), f"{ending}: unexpected exit {proc.returncode}"
-    print(f"{ending}: restoration OK" if ending == "panic" else f"{ending}: first frame {first_frame:.3f}s, keys <0.5s, restoration OK")
+            first_frame = terminal.first_frame()
+            terminal.keys()
+            if ending == "normal":
+                os.write(terminal.master, b"\x11")  # Ctrl+Q.
+            else:
+                terminal.proc.send_signal(signal.SIGTERM)
+        terminal.exit(panic=ending == "panic")
+    if ending == "panic":
+        print("panic: restoration OK")
+    else:
+        print(f"{ending}: first frame {first_frame:.3f}s, keys <0.5s, restoration OK")
 
 
-def delayed_getter_case(binary: str) -> None:
-    with tempfile.TemporaryDirectory(prefix="stui-delay-") as directory:
-        endpoint = os.path.join(directory, "slow.sock")
-        server = socket.socket(socket.AF_UNIX)
+def delayed_getter_case(binary: str, env: dict[str, str]) -> None:
+    # A local socket deliberately never answers. No daemon or invented response shapes.
+    endpoint = os.path.join(env["XDG_RUNTIME_DIR"], "st3.sock")
+    accepted = threading.Event()
+    stopping = threading.Event()
+    connections: list[socket.socket] = []
+    with socket.socket(socket.AF_UNIX) as server:
         server.bind(endpoint)
         server.listen(5)
-        server.settimeout(0.2)
-        stopping = threading.Event()
+        server.settimeout(0.1)
 
         def serve() -> None:
             while not stopping.is_set():
@@ -142,164 +197,157 @@ def delayed_getter_case(binary: str) -> None:
                     connection, _ = server.accept()
                 except socket.timeout:
                     continue
-                except OSError:
-                    break
-                # Keep the shared getter outstanding while the TUI handles keys.
-                threading.Thread(target=lambda connection=connection: (time.sleep(5), connection.close()), daemon=True).start()
+                connections.append(connection)
+                accepted.set()
 
-        thread = threading.Thread(target=serve, daemon=True)
+        thread = threading.Thread(target=serve)
         thread.start()
         try:
-            run_case(binary, "normal", endpoint)
+            with Terminal(binary, env) as terminal:
+                terminal.first_frame()
+                assert accepted.wait(timeout=2), "TUI never attempted the getter"
+                terminal.keys()
+                os.write(terminal.master, b"\x11")
+                terminal.exit()
         finally:
             stopping.set()
-            server.close()
             thread.join(timeout=1)
+            for connection in connections:
+                connection.close()
+    print("delayed getter: navigation and quit while the getter is outstanding")
 
 
-def hangup_case(binary: str) -> None:
-    master, slave = pty.openpty()
-    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
-    proc = subprocess.Popen([binary], stdin=slave, stdout=slave, stderr=slave,
-                            env={**os.environ, "TERM": "xterm-256color"})
-    os.close(slave)
-    deadline = time.monotonic() + 3
-    output = bytearray()
-    while time.monotonic() < deadline:
-        ready, _, _ = select.select([master], [], [], 0.1)
-        if ready:
-            chunk = os.read(master, 65536)
-            output.extend(chunk)
-            answer_queries(master, chunk)
-            if FIRST_FRAME in plain(output):
-                break
-    else:
-        proc.kill()
-        raise AssertionError("hangup: no first frame")
-    time.sleep(10)  # Exercise hangup after the live snapshot and event poll are running.
-    os.close(master)
-    try:
-        proc.wait(timeout=3)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
-        raise AssertionError("hangup: TUI survived terminal close")
+def hangup_case(binary: str, env: dict[str, str]) -> None:
+    with Terminal(binary, env) as terminal:
+        terminal.first_frame()
+        terminal.keys()  # The event reader has handled real input; no startup sleep.
+        os.close(terminal.master)
+        terminal.master = None
+        try:
+            terminal.proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            raise AssertionError("hangup: TUI survived terminal close") from None
+        assert terminal.proc.returncode == 0, f"hangup: exit {terminal.proc.returncode}"
     print("hangup: exited after PTY close")
 
 
-def tmux_hangup_case(binary: str) -> None:
+def tmux_hangup_case(binary: str, env: dict[str, str]) -> None:
     tmux = shutil.which("tmux") or "/opt/homebrew/bin/tmux"
-    if not os.path.exists(tmux):
-        print("tmux hangup: skipped (tmux unavailable)")
-        return
-    socket_name = f"stui-pty-smoke-{os.getpid()}"
-    target = "hup"
-    base = [tmux, "-L", socket_name]
-    subprocess.run(
-        base + ["new-session", "-d", "-s", target,
-                f"exec env ST3_PERSON=person/alex {shlex.quote(binary)}"],
-        check=True, capture_output=True,
+    assert os.path.exists(tmux), "tmux is required by the full PTY smoke (provided by CI)"
+    base = [tmux, "-f", "/dev/null", "-L", f"stui-pty-smoke-{os.getpid()}"]
+    # Control mode streams real pane bytes, so readiness needs no sleep or ps race.
+    control = subprocess.Popen(
+        base + ["-C", "new-session", "-s", "hup", "-x", "100", "-y", "24",
+                f"exec {shlex.quote(binary)} --local"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env,
     )
-    pid = int(subprocess.check_output(
-        base + ["display-message", "-p", "-t", f"{target}:0.0", "#{pane_pid}"],
-    ))
+    pid = None
+    pidfd = None
+    exited = False
     try:
+        output = bytearray()
+        pending = bytearray()
         deadline = time.monotonic() + 3
-        while time.monotonic() < deadline:
-            command = subprocess.check_output(["ps", "-p", str(pid), "-o", "comm="], text=True)
-            if "stui" in command:
-                break
-            time.sleep(0.05)
+        while FIRST_FRAME not in plain(output) or FRAME_END not in output:
+            remaining = deadline - time.monotonic()
+            assert remaining > 0, "tmux hangup: no first frame"
+            ready, _, _ = select.select([control.stdout], [], [], remaining)
+            assert ready, "tmux hangup: no first frame"
+            chunk = os.read(control.stdout.fileno(), 65536)
+            assert chunk, "tmux hangup: control session closed before first frame"
+            pending.extend(chunk)
+            while b"\n" in pending:
+                line, _, rest = pending.partition(b"\n")
+                pending = bytearray(rest)
+                if line.startswith(b"%output "):
+                    pane = line.split(b" ", 2)[2]
+                    output.extend(re.sub(rb"\\([0-7]{3})",
+                                         lambda match: bytes([int(match[1], 8)]), pane))
+        pid = int(subprocess.check_output(
+            base + ["display-message", "-p", "-t", "hup:0.0", "#{pane_pid}"], env=env,
+        ))
+        if hasattr(os, "pidfd_open"):
+            pidfd = os.pidfd_open(pid)
+        subprocess.run(base + ["kill-session", "-t", "hup"], env=env,
+                       check=True, capture_output=True, timeout=3)
+        if pidfd is not None:
+            ready, _, _ = select.select([pidfd], [], [], 3)
+            assert ready, "tmux hangup: TUI survived session close"
         else:
-            raise AssertionError("tmux hangup: TUI did not start")
-        subprocess.run(base + ["kill-session", "-t", target], check=True, capture_output=True)
-        deadline = time.monotonic() + 3
-        while time.monotonic() < deadline:
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                print("tmux hangup: exited after session close")
-                return
-            time.sleep(0.05)
-        raise AssertionError(f"tmux hangup: TUI {pid} survived session close")
+            # Darwin lacks pidfds; await process disappearance instead of a startup delay.
+            deadline = time.monotonic() + 3
+            while True:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    break
+                assert time.monotonic() < deadline, "tmux hangup: TUI survived session close"
+                select.select([], [], [], 0.02)
+        exited = True
+        print("tmux hangup: exited after session close")
     finally:
-        subprocess.run(base + ["kill-session", "-t", target], capture_output=True)
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-
-
-def shifted_keys_case(binary: str) -> None:
-    """A terminal that reports every key as an escape code sends Shift+i as `i` with Shift.
-    Play one: answer the keyboard-protocol query, check what stui asks for, and type shifted keys
-    into the palette's search box, as such a terminal would send them."""
-    master, slave = pty.openpty()
-    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
-    env = os.environ.copy()
-    env["TERM"] = "xterm-256color"
-    proc = subprocess.Popen([binary], stdin=slave, stdout=slave, stderr=slave, env=env)
-    os.close(slave)
-    captured = bytearray()
-
-    def collect(seconds: float) -> None:
-        deadline = time.monotonic() + seconds
-        while time.monotonic() < deadline:
-            ready, _, _ = select.select([master], [], [], 0.05)
-            if not ready:
-                continue
+        subprocess.run(base + ["kill-server"], env=env, capture_output=True, timeout=3)
+        if pid is not None and not exited:
             try:
-                chunk = os.read(master, 65536)
-            except OSError:
-                return
-            captured.extend(chunk)
-            if b"\x1b[?u" in chunk:
-                os.write(master, b"\x1b[?0u")  # Supports the keyboard protocol.
-            if b"\x1b[c" in chunk:
-                os.write(master, b"\x1b[?62;c")
+                if pidfd is not None and hasattr(signal, "pidfd_send_signal"):
+                    signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                else:
+                    os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if pidfd is not None:
+            os.close(pidfd)
+        control.communicate(timeout=3)
 
-    try:
-        collect(1.5)
-        pushed = re.findall(rb"\x1b\[>(\d+)u", bytes(captured))
+
+def shifted_keys_case(binary: str, env: dict[str, str]) -> None:
+    """Play a keyboard-protocol terminal; send shifted keys as real escape codes."""
+    with Terminal(binary, env, keyboard=True) as terminal:
+        terminal.first_frame()
+        pushed = re.findall(rb"\x1b\[>(\d+)u", terminal.captured)
         assert pushed, "stui did not ask the terminal for the keyboard protocol"
         flags = int(pushed[-1])
         assert flags & 4, f"stui did not ask for alternate keys (flags {flags})"
-        os.write(master, b"\x0b")  # Ctrl+K: the palette and its search box.
-        collect(0.5)
-        # Shift+i and Shift+; with the layout's character given, then Shift+j with none given.
-        # The screen is redrawn in part, so each key is checked as the cell it newly wrote,
-        # followed by the box's cursor.
-        for sequence, typed in ((b"\x1b[105:73;2u", "I"), (b"\x1b[59:58;2u", ":"), (b"\x1b[106;2u", "J")):
-            captured.clear()
-            os.write(master, sequence)
-            collect(0.5)
-            text = plain(bytes(captured)).decode("utf-8", "replace")
-            assert typed + "\u258f" in text, f"{sequence!r} did not type {typed!r} ({text[-120:]!r})"
-        os.write(master, b"\x1b")
-        collect(0.3)
-        os.write(master, b"\x11")
-        collect(0.5)
-    finally:
-        if proc.poll() is None:
-            proc.kill()
-        proc.wait()
-        os.close(master)
+        terminal.key(b"\x0b", b"open in")
+        # Shift+i and Shift+; include the layout's character; Shift+j has no alternate.
+        # The renderer may update only the new cell and the following input cursor.
+        for sequence, typed in ((b"\x1b[105:73;2u", "I"),
+                                (b"\x1b[59:58;2u", ":"), (b"\x1b[106;2u", "J")):
+            terminal.key(sequence, (typed + "▏").encode())
+        terminal.key(b"\x1b", b"Checking what needs you")
+        os.write(terminal.master, b"\x11")
+        terminal.exit()
     print("shifted keys: capitals and symbols typed from raw escape codes")
 
 
+CASES = {
+    "normal": lambda binary, env: run_case(binary, "normal", env),
+    "signal": lambda binary, env: run_case(binary, "signal", env),
+    "panic": lambda binary, env: run_case(binary, "panic", env),
+    "delayed-getter": delayed_getter_case,
+    "hangup": hangup_case,
+    "tmux-hangup": tmux_hangup_case,
+    "shifted-keys": shifted_keys_case,
+}
+
+
 if __name__ == "__main__":
-    binary = sys.argv[1] if len(sys.argv) > 1 else "target/debug/stui"
-    skip_panic = "--no-panic" in sys.argv[2:]
-    if "--only-shifted-keys" in sys.argv[2:]:
-        # The one case `cargo test` runs (tests/typed_keys.rs): keys as a terminal sends them.
-        shifted_keys_case(binary)
-        sys.exit(0)
-    for case in ("normal", "signal", "panic"):
-        if case == "panic" and skip_panic:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("binary", nargs="?", default="target/debug/stui")
+    parser.add_argument("--case", choices=CASES)
+    parser.add_argument("--no-panic", action="store_true")
+    parser.add_argument("--only-shifted-keys", action="store_true")  # Existing cargo invocation.
+    args = parser.parse_args()
+    selected = [args.case] if args.case else list(CASES)
+    if args.only_shifted_keys:
+        selected = ["shifted-keys"]
+    for case in selected:
+        if case == "panic" and args.no_panic:
             print("panic: skipped (release binary has no debug panic hook)")
             continue
-        run_case(binary, case)
-    shifted_keys_case(binary)
-    delayed_getter_case(binary)
-    hangup_case(binary)
-    tmux_hangup_case(binary)
+        if (case == "tmux-hangup" and args.case is None and not shutil.which("tmux")
+                and not os.path.exists("/opt/homebrew/bin/tmux")):
+            print("tmux hangup: skipped (tmux unavailable)")
+            continue
+        with tempfile.TemporaryDirectory(prefix="stui-smoke-") as directory:
+            CASES[case](os.path.abspath(args.binary), isolated_env(directory))

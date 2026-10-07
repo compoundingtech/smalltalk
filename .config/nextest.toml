@@ -48,3 +48,8 @@ priority = 100
 [[profile.ci.overrides]]
 filter = 'package(st3) and (test(/^action_coverage::/) or test(/^fleet::action_coverage_/))'
 retries = 0
+
+# Terminal regressions must fail on the first run, rather than hide behind a retry.
+[[profile.ci.overrides]]
+filter = 'package(stui) and (binary(=pty_smoke) or binary(=typed_keys))'
+retries = 0
