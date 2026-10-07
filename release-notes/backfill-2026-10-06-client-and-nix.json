@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "summary": "Backfill: client liveness, recovery diagnostics, OMP admission cache key, Home Manager memory options, terminal tab input, resync backoff",
+  "commits": [
+    "2ed9472814abeb4d268ee6a76f8fb0579a860aea",
+    "2cc34bce8c470ca3a077540d71aa886eef797850",
+    "2e20444887e8f5e9579fedbfec0cf9bff7ca8651",
+    "eeead9ad4af4eaf4c9769191d9ae2a3a4dcd4e38",
+    "e6e0d8c0ecec392d0f3b5613c40060de22bf6d80",
+    "4122a0080682a74e52f7b12e86f72a14a116ceef"
+  ],
+  "replay": {
+    "status": "none",
+    "detail": "None of #1587, #1593, #1559, #1602, #1489 or #1618 changes what is projected or triggers a replay or rebuild."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "None changes database tables, columns, indexes, triggers or the schema version."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules and digests are unchanged by all six."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "#1489 (terminal tab input): one new, empty PTY frame, accepted only from an attached writer, carries the stuck-key recovery; an older PTY daemon ignores it, so the recovery key does nothing there; it also moves the pty pin. #1559 (OMP admission): the admission cache key changes with the probe code, so old failed records need no cleanup. #1587 (client liveness from the stream) and #1618 (resync re-ask backoff in stui and the phone) are client-side: no wire change. #1593 only changes recovery diagnostics in a test and its eval script."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional service interruption beyond the ordinary restart from any of the six."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "#1602 adds Nix Home Manager options for the daemon's memory limits: no runtime change, but a deployer who wants the limits must use the new options. None of the other five needs a manual step."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No database or runtime recovery change from any of the six; older builds ignore the changes (an older PTY daemon ignores the new frame)."
+  }
+}

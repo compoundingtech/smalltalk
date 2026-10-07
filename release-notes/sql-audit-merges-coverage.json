@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "summary": "Coverage for the SQL audit merges that did not carry their own note",
+  "commits": [
+    "705e2333ec6078589445438cf8d77fe3a1568c72",
+    "5dec760e28bbb41bd0e91c26b6af3e9768503ac4",
+    "94a2a25535c6392f2bd30064aac8327caa786fa0",
+    "5e40eab372ee74208c89bf482b662203cd7501b5",
+    "41c2f497081d1d52ecbd9ca4d60b5b01d6ec1238",
+    "2ea89f052a24f00a4aa7fe5c2e419d3842a051fd",
+    "5a476c0768956b259d5a87ae33ef9e1e38a51e27",
+    "b510ba5847981686951cf239a248725bde5655e8"
+  ],
+  "replay": {
+    "status": "none",
+    "detail": "None of these starts or triggers a replay: #1597 uses an index hint, #1598 seeks the replication retry set by index, #1599 rebuilds only the planning tables after a planning write, #1600 selects expired observations by index, #1603 reads a seat's harness alone and seeks the newest claim of a fenced subject, #1611 folds fleet membership only when its inputs change, #1626 reads usage rollups through an index, #1648 adds tests."
+  },
+  "schema": {
+    "status": "changed",
+    "detail": "#1611 adds the fleet_generation table and eleven triggers on claims, replica_envelopes, replica_envelope_signatures and meta, each guarded by a WHEN on the fleet kinds; #1626 adds the partial index claims_usage_rollup_index. Both additive, schema version unchanged, ignored by an older build. The others change no schema."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules and digests are unchanged."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "#1603: GET /v1/status accepts harness_only=true and returns the subject's harness without its claim ids; a driver renewing its leases asks for it, an older daemon ignores the parameter and answers in full. No other client, wire or harness contract change."
+  },
+  "downtime": {
+    "status": "changed",
+    "detail": "#1626 builds claims_usage_rollup_index the first time a store opens with it: 9.6 s on one 7 GB store and 1.1 s on another host's store, measured in the daemon profiler's startup record; the daemon answers nothing meanwhile. Once per store."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual step."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No database recovery change; the new table, triggers and index can be dropped."
+  }
+}
