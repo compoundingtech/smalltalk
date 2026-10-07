@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+"""Admit optional Performance for main/queue/nightly/manual and relevant or labelled PRs."""
+import fnmatch
+import json
+import os
+from pathlib import Path
+import urllib.request
+import time
+
+PATHS = (
+    'crates/smallclaims/**', 'crates/st3/src/**',
+    'crates/st3-schema/**', 'crates/st3-client/**', 'crates/st-runtime/**',
+    'crates/st-drivers/**', 'crates/st3-conversation-ui/**', 'vendor/**', 'nix/**',
+    'build.rs', 'crates/*/build.rs', 'scripts/ci-test-paths.rs', 'crates/st3/tests/daemon_*.rs',
+    'crates/st3/tests/perf_load.rs', 'crates/st3/Cargo.toml', 'Cargo.toml', 'Cargo.lock',
+    '.cargo/config.toml', 'flake.nix', 'flake.lock', 'docs/st3/schema.md',
+    'scripts/ci-perf*', 'scripts/ci-nix-cache', '.github/workflows/perf.yml*',
+)
+
+
+def decision(event_name, event, filenames):
+    if event_name != 'pull_request':
+        return True, 'main, merge queue, nightly or manual coverage'
+    if any(label['name'] == 'ci-perf' for label in event['pull_request']['labels']):
+        return True, 'explicit ci-perf label'
+    if any(fnmatch.fnmatchcase(name, pattern) for name in filenames for pattern in PATHS):
+        return True, 'daemon read/store, workload or build input changed'
+    return False, 'PR has no Performance path or ci-perf label'
+
+
+def changed_files(event):
+    repository = os.environ['GITHUB_REPOSITORY']
+    number = event['pull_request']['number']
+    token = os.environ['GH_TOKEN']
+    deadline = time.monotonic() + 90
+    def api(suffix):
+        request = urllib.request.Request(
+            f'https://api.github.com/repos/{repository}/pulls/{number}{suffix}',
+            headers={'Authorization': f'Bearer {token}', 'Accept': 'application/vnd.github+json',
+                     'X-GitHub-Api-Version': '2022-11-28'})
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError('changed-file lookup deadline')
+        with urllib.request.urlopen(request, timeout=min(10, remaining)) as response:
+            return json.load(response)
+    if api('')['head']['sha'] != event['pull_request']['head']['sha']:
+        raise ValueError('PR head moved; do not classify a different source')
+    result = []
+    for page in range(1, 31):
+        files = api(f'/files?per_page=100&page={page}')
+        result.extend(name for item in files for name in (item['filename'], item.get('previous_filename', '')) if name)
+        if len(files) < 100:
+            return result
+    raise ValueError('changed-file inventory reached the API bound')
+
+
+def main():
+    try:
+        name = os.environ['GITHUB_EVENT_NAME']
+        event = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text())
+        preliminary, reason = decision(name, event, [])
+        allowed = preliminary
+        if not preliminary:
+            allowed, reason = decision(name, event, changed_files(event))
+    except Exception as error:
+        # Malformed events and uncertain bounded lookups must admit the workload.
+        # The workflow also admits when this entire job fails or produces no decision.
+        allowed, reason = True, f'cannot safely classify changed files ({type(error).__name__}); run Performance'
+    with open(os.environ['GITHUB_OUTPUT'], 'a') as stream:
+        stream.write(f'run={str(allowed).lower()}\n')
+    print(reason)
+    with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as stream:
+        stream.write(f'Optional Performance: {reason}.\n')
+
+
+if __name__ == '__main__':
+    main()

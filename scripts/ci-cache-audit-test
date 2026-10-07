@@ -77,6 +77,9 @@ for workflow in sorted((root / '.github/workflows').glob('*.yml')):
             assert 'CI_CACHE_DEV_SHELL: default' in block, 'workspace shell closure must be retained'
         if workflow.name == 'nix.yml':
             assert 'scripts/ci-nix-release build' in block and 'scripts/ci-nix-release verify-cache' in block
+        elif workflow.name == 'perf.yml' and 'name: Performance scope' in block:
+            assert 'runs-on: ubuntu-latest' in block
+            assert 'actions/checkout' not in block and 'nix develop' not in block and 'cargo test' not in block, 'scope must remain metadata-only'
         elif workflow.name == 'perf.yml':
             assert 'python3 scripts/ci-perf-cache restore' in block
         else:

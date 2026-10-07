@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""Keep main/queue coverage and PR label/path admission independent of runner load."""
+import importlib.machinery
+import importlib.util
+import ast
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import tempfile
+
+ROOT = Path(__file__).resolve().parent.parent
+loader = importlib.machinery.SourceFileLoader('scope', str(ROOT / 'scripts/ci-perf-scope'))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+event = {'pull_request': {'number': 42, 'labels': [], 'head': {'sha': 'a' * 40}}}
+for name in ('push', 'merge_group', 'schedule', 'workflow_dispatch'):
+    assert module.decision(name, {}, [])[0], name
+for name in ('crates/st3/src/api/client_v0.rs', 'crates/st3/src/store.rs',
+             'crates/smallclaims/src/sqlite.rs', 'crates/st3/tests/daemon_load.rs',
+             'Cargo.lock', '.github/workflows/perf.yml.genie.ts', 'scripts/ci-perf-scope',
+             'crates/st3/src/completion.rs', 'crates/st3/src/harness_events.rs',
+             'crates/st3/src/delivery_hold.rs', 'crates/st3/src/client.rs',
+             'crates/st3/src/model.rs', 'crates/st3/src/lib.rs', 'crates/st3/src/graph.rs',
+             'crates/st3/src/mailbox.rs', 'crates/st3/src/peer.rs', 'crates/st3/src/seat_queue.rs',
+             'crates/st3/src/incremental.rs', 'crates/st3/src/rules.rs', 'crates/st3/src/config.rs',
+             'crates/st3/src/startup.rs', 'crates/st3/src/blobs.rs', 'crates/st3/src/conversation_search.rs',
+             'crates/st3-schema/src/registry.rs', 'crates/st3-client/src/lib.rs',
+             'crates/st-runtime/src/lib.rs', 'crates/st-drivers/src/lib.rs',
+             'crates/st3-conversation-ui/src/lib.rs', 'vendor/component/src/lib.rs',
+             'build.rs', 'crates/st3/build.rs', 'scripts/ci-test-paths.rs', 'nix/package.nix'):
+    assert module.decision('pull_request', event, [name])[0], name
+for name in ('docs/other.md', 'apps/ios/App.tsx'):
+    assert not module.decision('pull_request', event, [name])[0], name
+labelled = json.loads(json.dumps(event))
+labelled['pull_request']['labels'] = [{'name': 'ci-perf'}]
+assert module.decision('pull_request', labelled, [])[0]
+
+# Exercise bounded API selection, renames, head drift and uncertain lookup fallback without network.
+with tempfile.TemporaryDirectory() as tmp:
+    scratch = Path(tmp)
+    event_file, outputs, summary = (scratch / name for name in ('event', 'outputs', 'summary'))
+    event_file.write_text(json.dumps(event))
+    env = {'GITHUB_EVENT_NAME': 'pull_request', 'GITHUB_EVENT_PATH': str(event_file),
+           'GITHUB_REPOSITORY': 'example/repo', 'GH_TOKEN': 'fixture',
+           'GITHUB_OUTPUT': str(outputs), 'GITHUB_STEP_SUMMARY': str(summary)}
+    original_env = dict(os.environ)
+    original_api = module.urllib.request.urlopen
+    class Response:
+        def __init__(self, value): self.value = value
+        def __enter__(self):
+            import io
+            return io.BytesIO(json.dumps(self.value).encode())
+        def __exit__(self, *_): pass
+    try:
+        os.environ.update(env)
+        def api(request, timeout):
+            assert request.full_url.startswith('https://api.github.com/repos/example/repo/pulls/42')
+            assert timeout <= 10
+            return Response([{'filename': 'docs/moved.md', 'previous_filename': 'crates/st3/src/api.rs'}]
+                            if '/files?' in request.full_url else {'head': {'sha': 'a' * 40}})
+        module.urllib.request.urlopen = api
+        assert 'crates/st3/src/api.rs' in module.changed_files(event)
+        module.main()
+        assert outputs.read_text() == 'run=true\n'
+        for malformed in ({}, {'pull_request': {'labels': None}}, {'pull_request': {'labels': [{}]}}):
+            os.environ['GITHUB_EVENT_NAME'] = 'pull_request'
+            event_file.write_text(json.dumps(malformed))
+            outputs.write_text('')
+            module.main()
+            assert outputs.read_text() == 'run=true\n', 'malformed payload must admit Performance'
+        event_file.write_text('{broken json')
+        outputs.write_text('')
+        module.main()
+        assert outputs.read_text() == 'run=true\n', 'invalid event JSON must admit Performance'
+        event_file.write_text(json.dumps(event))
+        module.urllib.request.urlopen = lambda *_args, **_kwargs: Response({'head': {'sha': 'b' * 40}})
+        outputs.write_text('')
+        module.main()
+        assert outputs.read_text() == 'run=true\n', 'head drift must admit, not suppress Performance'
+        assert 'cannot safely classify' in summary.read_text()
+        os.environ['GITHUB_EVENT_NAME'] = 'push'
+        module.urllib.request.urlopen = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError('main must not query PR files'))
+        outputs.write_text('')
+        module.main()
+        assert outputs.read_text() == 'run=true\n'
+    finally:
+        module.urllib.request.urlopen = original_api
+        os.environ.clear()
+        os.environ.update(original_env)
+
+# Evaluate the generated job conditions: an empty/failed scope must still run the load,
+# while unrelated label events skip both jobs and cannot enter the PR cancellation group.
+workflow = (ROOT / '.github/workflows/perf.yml').read_text()
+conditions = {}
+for job in ['scope', 'perf-load']:
+    match = re.search(r'^  ' + job + r':\n.*?^    if: (.+)$', workflow, re.M | re.S)
+    assert match, job
+    conditions[job] = ast.literal_eval(match.group(1).splitlines()[0])
+
+def admits(job, event='pull_request', action='synchronize', label='', result='success', output='false', cancelled=False):
+    expression = conditions[job]
+    context = locals()
+    for source, target in [('github.event_name', 'event'), ('github.event.action', 'action'),
+                           ('github.event.label.name', 'label'), ('needs.scope.result', 'result'),
+                           ('needs.scope.outputs.run', 'output'), ('cancelled()', 'cancelled')]:
+        expression = expression.replace(source, target)
+    expression = re.sub(r'!(?!=)', 'not ', expression.replace('&&', ' and ').replace('||', ' or ')).strip()
+    tree = ast.parse(expression, mode='eval')
+    allowed = (ast.Expression, ast.BoolOp, ast.And, ast.Or, ast.Compare, ast.Eq, ast.NotEq,
+               ast.UnaryOp, ast.Not, ast.Name, ast.Load, ast.Constant)
+    assert all(isinstance(node, allowed) for node in ast.walk(tree))
+    return eval(compile(tree, '<generated-perf-admission>', 'eval'), {'__builtins__': {}}, context)
+
+assert not admits('perf-load'), 'only successful explicit false may skip the load'
+for result in ['failure', 'timed_out', 'cancelled', 'skipped', '']:
+    assert admits('perf-load', result=result, output=''), result
+for output in ['true', '', 'unexpected']:
+    assert admits('perf-load', output=output), output
+assert not admits('perf-load', result='failure', output='', cancelled=True)
+for action in ['labeled', 'unlabeled']:
+    for job in ['scope', 'perf-load']:
+        assert not admits(job, action=action, label='reviewed', output='true', result='failure')
+        assert admits(job, action=action, label='ci-perf', output='true')
+assert 'nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=2' in workflow
+print('Performance scope controls passed: every main/queue/nightly/manual, labels, read paths, renames and uncertain lookup fail-open')

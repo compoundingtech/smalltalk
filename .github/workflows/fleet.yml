@@ -146,7 +146,7 @@ jobs:
   namespace-capacity:
     name: namespace-capacity
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
-    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && '["ubuntu-latest"]' || format('["namespace-profile-linux-x86-64;job.priority=1;github.run-id={0}"]', github.run_id)) }}
+    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && '["ubuntu-latest"]' || format('["namespace-profile-linux-x86-64;job.priority={1};github.run-id={0}"]', github.run_id, github.event_name == 'merge_group' && 1 || 2)) }}
     timeout-minutes: 120
     permissions:
       contents: read
@@ -277,7 +277,7 @@ jobs:
       CI_CACHE_DEV_SHELL: genie
     needs: [pick-runner]
     if: ${{ !cancelled() }}
-    runs-on: ["namespace-profile-linux-x86-64;job.priority=1;github.run-id=${{ github.run_id }}"]
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -288,13 +288,6 @@ jobs:
         run: |
           if [ -n "${CI_LOCAL_CARGO_HOME:-}" ]; then echo CI_LOCAL_CACHES=1 >> "$GITHUB_ENV"; fi
           printf 'CARGO_HOME=%s\nCI_CACHE_DIR=%s\n' "${CI_LOCAL_CARGO_HOME:-$RUNNER_TEMP/cargo-home}" "$RUNNER_TEMP/st-ci-cache" >> "$GITHUB_ENV"
-      - id: build-snapshot
-        name: Restore the exact-source build snapshot
-        if: env.CI_LOCAL_CACHES != '1'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CI_SNAPSHOT_PIPELINE: ${{ github.workflow_sha }}
-        run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" restore'
       - name: Restore the local Nix cache
         id: nix-cache
         if: env.CI_LOCAL_CACHES != '1' && env.CI_BUILD_SNAPSHOT_HIT != '1'
@@ -305,8 +298,6 @@ jobs:
           restore-keys: |
             nix5-${{ github.job }}-${{ runner.os }}-
             nix4-${{ github.job }}-${{ runner.os }}-
-      - name: Remember genuine source inputs before compiling
-        run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" prepare'
       - name: Install Nix
         uses: DeterminateSystems/determinate-nix-action@v3
         env:
@@ -332,56 +323,21 @@ jobs:
         run: 'bash scripts/ci-nix-cache use || echo "::warning::the local Nix cache is unavailable; this run builds everything"'
       - name: Check runner selection and generated files
         shell: bash
-        run: "nix develop '.#genie' -c bash -c 'python3 scripts/check-ci-runner-test && python3 scripts/ci-mail-redelivery-canaries-test && python3 scripts/ci-test-partitions-test && python3 scripts/ci-test-archive-test && python3 scripts/check-ci-test-paths && python3 scripts/ci-queue-watch-test && python3 scripts/check-main-ci-test && python3 scripts/ci-perf-cache-test && python3 scripts/ci-cache-audit-test && genie --check'"
+        run: "nix develop '.#genie' -c bash -c 'python3 scripts/check-ci-runner-test && python3 scripts/ci-mail-redelivery-canaries-test && python3 scripts/ci-test-partitions-test && python3 scripts/ci-test-archive-test && python3 scripts/check-ci-test-paths && python3 scripts/ci-perf-scope-test && python3 scripts/ci-queue-watch-test && python3 scripts/check-main-ci-test && python3 scripts/ci-perf-cache-test && python3 scripts/ci-cache-audit-test && genie --check'"
       - name: Save Nix outputs
         if: success() && env.CI_LOCAL_CACHES != '1'
         run: bash scripts/ci-nix-cache save
-      - id: build-snapshot-save
-        name: Keep valid same-source build outputs
-        if: "!cancelled()"
-        env:
-          CI_SNAPSHOT_PIPELINE: ${{ github.workflow_sha }}
-        run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" pack'
-      - id: build-snapshot-upload
-        name: Retain the same-source build snapshot
-        if: "!cancelled() && steps.build-snapshot-save.outputs.publish == 'true'"
-        continue-on-error: true
-        timeout-minutes: 5
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.build-snapshot-save.outputs.name }}
-          path: "${{ runner.temp }}/ci-build-snapshot/build.tar.zst"
-          compression-level: 0
-          retention-days: 3
-          if-no-files-found: error
-          overwrite: true
-      - name: Wait before retrying build snapshot retention
-        if: "!cancelled() && steps.build-snapshot-upload.outcome == 'failure'"
-        timeout-minutes: 1
-        shell: bash
-        run: 'echo "::warning::Build snapshot upload failed; retrying once in 15 seconds."; sleep 15'
-      - name: Retry retaining the same-source build snapshot
-        if: "!cancelled() && steps.build-snapshot-upload.outcome == 'failure'"
-        timeout-minutes: 5
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.build-snapshot-save.outputs.name }}
-          path: "${{ runner.temp }}/ci-build-snapshot/build.tar.zst"
-          compression-level: 0
-          retention-days: 3
-          if-no-files-found: error
-          overwrite: true
       - name: Report job cache coverage
         if: always()
         shell: bash
         env:
-          CACHE_ENTRIES: '[{"name":"Restore the exact-source build snapshot","outcome":"${{ steps.build-snapshot.outcome }}","hit":"${{ steps.build-snapshot.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":true,"avoidable":"${{ steps.build-snapshot.outputs.avoidable-miss }}","lookup":false},{"name":"Restore the local Nix cache","outcome":"${{ steps.nix-cache.outcome }}","hit":"${{ steps.nix-cache.outputs.cache-hit }}","matched":"${{ steps.nix-cache.outputs.cache-matched-key }}","opaqueFallback":false,"sourceOnly":false,"avoidable":"","lookup":false}]'
+          CACHE_ENTRIES: '[{"name":"Restore the local Nix cache","outcome":"${{ steps.nix-cache.outcome }}","hit":"${{ steps.nix-cache.outputs.cache-hit }}","matched":"${{ steps.nix-cache.outputs.cache-matched-key }}","opaqueFallback":false,"sourceOnly":false,"avoidable":"","lookup":false}]'
         run: 'python3 "${CI_CACHE_AUDIT_SCRIPT:-scripts/ci-cache-audit}"'
   typescript-client:
     name: typescript-client
     needs: [pick-runner, genie-freshness]
     if: ${{ !cancelled() && needs.genie-freshness.result == 'success' }}
-    runs-on: ["namespace-profile-linux-x86-64;job.priority=1;github.run-id=${{ github.run_id }}"]
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     defaults:
       run:
@@ -436,7 +392,7 @@ jobs:
     name: linux-test-build
     needs: [pick-runner]
     if: ${{ !cancelled() }}
-    runs-on: ${{ fromJSON(needs.pick-runner.outputs.ci1 || format('["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1","namespace-features:github.run-id={0}"]', github.run_id)) }}
+    runs-on: ${{ fromJSON(needs.pick-runner.outputs.ci1 || format('["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority={1}","namespace-features:github.run-id={0}"]', github.run_id, github.event_name == 'merge_group' && 1 || 2)) }}
     timeout-minutes: 120
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
@@ -580,7 +536,7 @@ jobs:
     name: linux-tests
     needs: [pick-runner, linux-test-build]
     if: ${{ !cancelled() }}
-    runs-on: ${{ fromJSON(needs.pick-runner.outputs.ci1 || format('["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1","namespace-features:github.run-id={0}"]', github.run_id)) }}
+    runs-on: ${{ fromJSON(needs.pick-runner.outputs.ci1 || format('["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority={1}","namespace-features:github.run-id={0}"]', github.run_id, github.event_name == 'merge_group' && 1 || 2)) }}
     timeout-minutes: 120
     defaults:
       run:
@@ -698,7 +654,7 @@ jobs:
     name: linux-tests-shard-2
     needs: [pick-runner, linux-test-build]
     if: ${{ !cancelled() }}
-    runs-on: ${{ fromJSON(needs.pick-runner.outputs.ci1_secondary || format('["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1","namespace-features:github.run-id={0}"]', github.run_id)) }}
+    runs-on: ${{ fromJSON(needs.pick-runner.outputs.ci1_secondary || format('["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority={1}","namespace-features:github.run-id={0}"]', github.run_id, github.event_name == 'merge_group' && 1 || 2)) }}
     timeout-minutes: 120
     defaults:
       run:
@@ -815,7 +771,7 @@ jobs:
     if: ${{ !cancelled() }}
     runs-on:
       [
-        nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1,
+        "nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=${{ github.event_name == 'merge_group' && 1 || 2 }}",
         "namespace-features:github.run-id=${{ github.run_id }}",
       ]
     timeout-minutes: 120
@@ -954,7 +910,7 @@ jobs:
     if: ${{ !cancelled() }}
     runs-on:
       [
-        nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1,
+        "nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=${{ github.event_name == 'merge_group' && 1 || 2 }}",
         "namespace-features:github.run-id=${{ github.run_id }}",
       ]
     timeout-minutes: 120
@@ -1088,7 +1044,7 @@ jobs:
         run: 'python3 "${CI_CACHE_AUDIT_SCRIPT:-scripts/ci-cache-audit}"'
   mail-redelivery-canaries:
     name: mail-redelivery-canaries
-    runs-on: ${{ fromJSON(needs.pick-runner.outputs.ci1_mail || format('["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1","namespace-features:github.run-id={0}"]', github.run_id)) }}
+    runs-on: ${{ fromJSON(needs.pick-runner.outputs.ci1_mail || format('["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority={1}","namespace-features:github.run-id={0}"]', github.run_id, github.event_name == 'merge_group' && 1 || 2)) }}
     timeout-minutes: 120
     defaults:
       run:
@@ -1275,7 +1231,7 @@ jobs:
     if: github.event_name != 'merge_group'
     runs-on:
       [
-        nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1,
+        "nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=${{ github.event_name == 'merge_group' && 1 || 2 }}",
         "namespace-features:github.run-id=${{ github.run_id }}",
       ]
     timeout-minutes: 120
@@ -1434,7 +1390,10 @@ jobs:
     name: isolation-vm
     needs: [pick-runner, linux-test-build]
     if: ${{ !cancelled() }}
-    runs-on: ["namespace-profile-linux-x86-64;job.priority=1;github.run-id=${{ github.run_id }}"]
+    runs-on:
+      [
+        "namespace-profile-linux-x86-64;job.priority=${{ github.event_name == 'merge_group' && 1 || 2 }};github.run-id=${{ github.run_id }}",
+      ]
     timeout-minutes: 60
     defaults:
       run:

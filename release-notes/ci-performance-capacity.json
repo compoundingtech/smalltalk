@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Move light CI checks to GitHub-hosted runners and scope optional PR load Performance while retaining every main/queue/nightly run.",
+  "replay": {
+    "status": "none",
+    "detail": "CI runner placement and optional workflow admission only; no deployed runtime, data or protocol change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "CI runner placement and optional workflow admission only; no deployed runtime, data or protocol change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "CI runner placement and optional workflow admission only; no deployed runtime, data or protocol change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "CI runner placement and optional workflow admission only; no deployed runtime, data or protocol change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "CI runner placement and optional workflow admission only; no deployed runtime, data or protocol change."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "CI runner placement and optional workflow admission only; no deployed runtime, data or protocol change."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "CI runner placement and optional workflow admission only; no deployed runtime, data or protocol change."
+  }
+}
