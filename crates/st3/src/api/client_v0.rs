@@ -59,7 +59,7 @@ struct CollectionSubscription {
     has_more: bool,
 }
 
-const COLLECTION_MAX_SUBSCRIPTIONS: usize = 8;
+const COLLECTION_MAX_SUBSCRIPTIONS: usize = 16;
 /// The least time between two rereads of a socket's held windows. A window read can take a
 /// few hundred milliseconds and the fleet commits about once a second, so rereading on every
 /// commit kept a daemon busy for as long as a client stayed connected. Commits in between are
@@ -1567,6 +1567,7 @@ pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
             })
         })
         .collect::<Vec<_>>();
+    capabilities.push(json!({"id":"collections", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"custom-subjects", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"owned-sets", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"glasses", "version":2, "state":if glass_person(session, false).is_ok() && glass_person(session, true).is_ok() { "granted" } else { "ungranted" }}));
@@ -9778,6 +9779,87 @@ mod tests {
     use std::os::unix::fs::MetadataExt as _;
     use std::sync::Barrier;
 
+    #[tokio::test]
+    async fn collections_socket_keeps_sixteen_windows_and_refuses_the_seventeenth() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        assert!(
+            capabilities(&ClientSession::local(None).unwrap())
+                .iter()
+                .any(|capability| {
+                    capability["id"] == "collections"
+                        && capability["version"] == 1
+                        && capability["state"] == "granted"
+                })
+        );
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let app = axum::Router::new().route(
+            "/stream",
+            axum::routing::get(move |upgrade: WebSocketUpgrade| {
+                let state = state.clone();
+                async move {
+                    upgrade.on_upgrade(move |socket| {
+                        collection_stream_socket_with_reader(
+                            socket,
+                            state,
+                            ClientSession::local(None).unwrap(),
+                            None,
+                            |state, session, request, permit| async move {
+                                collection_items(&state, &session, &request, permit).await
+                            },
+                        )
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream"))
+            .await
+            .unwrap();
+        for index in 0..17 {
+            let id = format!("window-{index}");
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    json!({"kind":"subscribe","id":id,"collection":"work","limit":2})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            assert_eq!(frame["id"], id);
+            assert_eq!(frame["kind"], if index < 16 { "snapshot" } else { "error" });
+        }
+        // A refusal leaves existing windows alive and replacements admissible at capacity.
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({"kind":"subscribe","id":"window-0","collection":"missions","limit":2})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(frame["id"], "window-0");
+        assert_eq!(frame["kind"], "snapshot");
+        socket.close(None).await.unwrap();
+        server.abort();
+    }
+
     #[test]
     fn terminal_contention_preserves_retryable_code_and_service_close() {
         for code in ["database-busy", "database-locked"] {
@@ -10229,7 +10311,7 @@ mod tests {
         }
         socket.send(tokio_tungstenite::tungstenite::Message::Text(command.into())).await.unwrap();
         // A conversation outbox frame positively confirms command/frame dispatch is live
-        // while all eight physical workers are held; no wall-clock negative wait.
+        // while all sixteen physical workers are held; no wall-clock negative wait.
         socket.send(tokio_tungstenite::tungstenite::Message::Text(
             json!({"kind":"subscribe","id":"admission","collection":"conversation","conversation":"session/missing"}).to_string().into(),
         )).await.unwrap();

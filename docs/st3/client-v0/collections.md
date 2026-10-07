@@ -2,7 +2,10 @@
 
 Connect once to `GET /v1/client/collections/stream` with WebSocket subprotocol
 `st3.client.collections.v0`. The same Unix or paired client credentials used by
-the rest of client v0 apply. One connection accepts up to eight subscriptions.
+the rest of client v0 apply. One connection accepts up to sixteen subscriptions.
+The optional `collections` capability version 1 advertises this bound; older
+daemons omit it and accept eight. Clients reserve their existing conversation
+and terminal slots before adding optional windows on older daemons.
 
 Send one JSON command per subscription:
 
@@ -65,7 +68,7 @@ subscription commands or ready conversation and terminal frames from being
 handled. Each subscription still delivers its snapshot before its changes.
 Replacing or removing a subscription discards its pending collection result;
 changes observed during a read schedule another read of that window.
-Each socket permits at most eight physical collection reads, including store
+Each socket permits at most sixteen physical collection reads, including store
 work still finishing after cancellation. Replacements wait for a read slot
 without blocking command admission or unrelated ready frames.
 
