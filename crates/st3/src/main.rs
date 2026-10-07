@@ -564,8 +564,32 @@ fn services_installed() -> bool {
         .unwrap_or(false)
 }
 
+async fn lock_fleet_admission(
+    client: &Client,
+    config: &Config,
+    services: bool,
+    verb: &str,
+) -> Result<st3::node_identity::StateLock> {
+    if client.get::<Value>("/v1/health").await.is_ok() {
+        anyhow::ensure!(
+            services,
+            "stop the running st3 daemon first: nothing may write while this machine {verb}"
+        );
+        st3::service::stop()?;
+        st3::node_identity::lock_after_stop(&config.state_dir).await
+    } else {
+        st3::node_identity::lock(&config.state_dir)
+    }
+}
+
 async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool) -> Result<()> {
-    let config = Config::load_unvalidated(None)?;
+    let mut config = Config::load_unvalidated(None)?;
+    // Explicit admissions can repair a pin after their prior attempt saved membership.
+    // Other controls must use the daemon's resolved identity, including leave's runtime check.
+    if !matches!(&command, FleetCommand::Join(_) | FleetCommand::Create(_)) {
+        config.apply_fleet_file()?;
+        st3::node_identity::resolve(&mut config)?;
+    }
     let client = Client::new(endpoint.clone());
     match command {
         FleetCommand::Create(args) => {
@@ -573,9 +597,15 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
                 config.fleet_id.is_none(),
                 "config.toml already configures a fleet with config peers; move it to membership with st fleet migrate"
             );
+            st3::node_identity::resolve(&mut config)?;
+            let services = !args.no_service && services_installed();
+            let state_identity =
+                lock_fleet_admission(&client, &config, services, "founds a fleet").await?;
             let node = args.name.unwrap_or_else(|| config.node.clone());
             let founded =
                 st3::fleet::join::found(&config.state_dir, &node, &args.member.settings())?;
+            state_identity.record_fleet_found(&founded)?;
+            drop(state_identity);
             if json_output {
                 return print_value(&founded, true);
             }
@@ -583,7 +613,6 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
                 "Created fleet {} with {} as its first member.",
                 founded.fleet_id, founded.node
             );
-            let services = !args.no_service && services_installed();
             if services {
                 st3::service::install(Config::load_with_fleet(None)?)?;
             }
@@ -732,13 +761,7 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
                 }
             };
             let use_services = !args.no_service && services_installed();
-            if client.get::<Value>("/v1/health").await.is_ok() {
-                anyhow::ensure!(
-                    use_services,
-                    "stop the running st3 daemon first: nothing may write while this machine joins"
-                );
-                st3::service::stop()?;
-            }
+            let state_identity = lock_fleet_admission(&client, &config, use_services, "joins").await?;
             let joined = st3::fleet::join::join(&st3::fleet::join::JoinOptions {
                 state_dir: config.state_dir.clone(),
                 configured_node: config.node.clone(),
@@ -752,6 +775,8 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
                 version: env!("CARGO_PKG_VERSION").into(),
             })
             .await?;
+            state_identity.record_fleet_join(&joined)?;
+            drop(state_identity);
             if let Some(path) = code_path {
                 let _ = fs::remove_file(path);
             }
@@ -1485,13 +1510,7 @@ async fn run_fleet_migrate(client: &Client, config: &Config, args: FleetMigrateA
         )
     })?;
     let use_services = !args.no_service && services_installed();
-    if client.get::<Value>("/v1/health").await.is_ok() {
-        anyhow::ensure!(
-            use_services,
-            "stop the running st3 daemon first: nothing may write while this machine migrates"
-        );
-        st3::service::stop()?;
-    }
+    let state_identity = lock_fleet_admission(client, config, use_services, "migrates").await?;
     let settings = migration_settings(&args.member, config);
     if args.anchor {
         let founded = st3::fleet::join::migrate_anchor(
@@ -1503,6 +1522,7 @@ async fn run_fleet_migrate(client: &Client, config: &Config, args: FleetMigrateA
             args.fabric_protocol.clone(),
             st3::store::runtime(),
         )?;
+        state_identity.record_fleet_found(&founded)?;
         println!(
             "{} is the anchor of fleet {}. It admits itself and signs its history when st3 starts.",
             founded.node, founded.fleet_id
@@ -1541,6 +1561,7 @@ async fn run_fleet_migrate(client: &Client, config: &Config, args: FleetMigrateA
             joined.migrate,
             "that code is a join code; use st fleet join"
         );
+        state_identity.record_fleet_join(&joined)?;
         if let Some(path) = code_path {
             let _ = fs::remove_file(path);
         }
@@ -1549,6 +1570,7 @@ async fn run_fleet_migrate(client: &Client, config: &Config, args: FleetMigrateA
             joined.name, joined.fleet_id, joined.sponsor
         );
     }
+    drop(state_identity);
     if use_services {
         st3::service::install(Config::load_with_fleet(None)?)?;
         println!(
@@ -2539,9 +2561,9 @@ enum ServiceCommand {
 
 #[derive(Subcommand)]
 enum ClaudeChannelCommand {
-    /// Install or update the user plugin and its machine approval policy.
+    /// Install channel assets and approval policy; activate only in st seats.
     Install {
-        /// Install only the user plugin. An administrator will manage the machine policy.
+        /// Install only plugin assets. An administrator will manage the machine policy.
         #[arg(long)]
         no_policy: bool,
     },
@@ -4561,10 +4583,23 @@ fn driver_environment_incarnation(cli: &Cli) -> Result<Option<String>> {
     let Command::Driver(args) = &cli.command else {
         return Ok(None);
     };
-    let subject = args
-        .subject
-        .clone()
-        .or_else(|| args.identity.as_deref().map(normalize_agent_subject));
+    let subject = args.subject.clone().or_else(|| {
+        (args.driver != "claude-mcp")
+            .then(|| args.identity.as_deref().map(normalize_agent_subject))
+            .flatten()
+    });
+    if args.driver == "claude-mcp" {
+        let scoped = subject
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+            || std::env::var("ST3_SUBJECT")
+                .ok()
+                .is_some_and(|value| !value.trim().is_empty());
+        anyhow::ensure!(
+            scoped || args.identity.is_none(),
+            "the Claude channel identity requires a subject"
+        );
+    }
     let Some(subject) = subject.as_deref() else {
         return Ok(None);
     };
@@ -4894,6 +4929,7 @@ async fn run(cli: Cli) -> Result<()> {
             config.peers = args.peer;
         }
         config.apply_fleet_file()?;
+        st3::node_identity::resolve(&mut config)?;
         return st3::peer::run_worker(config).await;
     }
     let config = Config::load_unvalidated(None)?;
@@ -5582,6 +5618,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         config.peers = args.peer;
     }
     config.apply_fleet_file()?;
+    let _state_identity = st3::node_identity::acquire(&mut config)?;
     config.validate()?;
     st3::resource::configure_github(&config.github)?;
     validate_unix_socket_path(&config.socket, "--socket")?;
@@ -16862,10 +16899,19 @@ async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -
             args.argv.is_empty(),
             "the Claude channel takes no provider argv"
         );
-        let subject = args
+        let fallback_subject = std::env::var("ST3_SUBJECT").ok();
+        let Some(subject) = args
             .subject
             .as_deref()
-            .context("the Claude channel has no subject")?;
+            .or(fallback_subject.as_deref())
+            .filter(|subject| !subject.trim().is_empty())
+        else {
+            anyhow::ensure!(
+                args.identity.is_none(),
+                "the Claude channel identity requires a subject"
+            );
+            return st3::claude_channel::run_idle().await;
+        };
         let identity = subject.strip_prefix("agent/").unwrap_or(subject);
         let paths = match st_drivers::driver_paths::Paths::from_environment(identity, &|name| {
             std::env::var(name).ok()

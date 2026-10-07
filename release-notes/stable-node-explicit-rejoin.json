@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Keep explicit authenticated fleet rejoin available after stable node identity pinning.",
+  "replay": {"status": "none", "detail": "No claim replay or rewriting old writer history."},
+  "schema": {"status": "none", "detail": "No database schema change."},
+  "rules": {"status": "none", "detail": "No admission or checkpoint rule changes; the existing authenticated join handshake establishes membership."},
+  "compatibility": {"status": "changed", "detail": "Explicit fleet create, migrate and join hold the state-directory lock and record their founded/admitted node in the stable identity pin, including checkpoint-resumed joins. Cosmetic node/config changes still cannot override the pin. Existing leave/rejoin history and writer fencing remain intact."},
+  "downtime": {"status": "changed", "detail": "Creating membership after standalone startup now stops installed services before taking the state lock, then restarts them after recording the identity. Join and migrate already require stopping the daemon. Admission waits up to ten seconds for a stopping daemon to release its lock."},
+  "manual": {"status": "changed", "detail": "For a foreground daemon or --no-service admission, stop the daemon before fleet create, migrate or join; the CLI refuses before membership writes otherwise. Existing installed-service flows stop and restart services automatically. Use these commands for deliberate membership changes, without editing or deleting the pin or membership to bypass an identity refusal."},
+  "recovery": {"status": "changed", "detail": "If admission succeeds but writing the pin fails, keep the join code and rerun the join to resume its saved checkpoint before starting services. A failed handshake leaves the prior pin intact. Retain original state and keys; no production or macOS rejoin was executed for this source fix."}
+}

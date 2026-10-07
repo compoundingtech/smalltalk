@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Keep a state directory's node identity across computer renames and leave ordinary Claude sessions with an idle channel.",
+  "replay": {"status": "none", "detail": "No claim replay or replicated history rewriting."},
+  "schema": {"status": "none", "detail": "No database schema change. The daemon adds a private stable identity file and lifetime lock to its state directory."},
+  "rules": {"status": "none", "detail": "No checkpoint or membership rule changes. Conflicting pinned fleet membership refuses startup."},
+  "compatibility": {"status": "changed", "detail": "Updated daemon, worker and service installer retain the same-state node identity instead of treating --node as a rename. Subject-less Claude MCP serves initialize, empty lists and ping without channel capability, tools or daemon access. Existing scoped channel admission remains intact."},
+  "downtime": {"status": "changed", "detail": "A daemon restart adopts the stable identity; running drivers can survive the outage. Specific macOS live-session recovery is unverified."},
+  "manual": {"status": "changed", "detail": "Back up before updating. For manually adopted seats or expired local launch receipts, restore the original launcher node before first updated startup; without proof that configured node becomes pinned and later --node changes cannot override it. Existing user-enabled st-channel may be disabled with claude plugin disable st-channel@st --scope user, then restart ordinary Claude. The updated installer keeps its assets installed but disables user activation; seat-local and per-process activation stays intact. Resolve ambiguous local history or conflicting fleet identity before startup."},
+  "recovery": {"status": "changed", "detail": "Keep original state, sockets, keys and stable identity. Revert launcher arguments to the recorded node for older binaries; older images ignore the new pin and lock. Do not restore a stale database, delete fleet state, edit member keys or bypass placement fences. Native-session preservation is tested with isolated runtime fixtures, not a live macOS provider."}
+}

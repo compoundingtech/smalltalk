@@ -948,6 +948,50 @@ async fn a_populated_standalone_daemon_founds_a_fleet_with_verified_person_and_a
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn create_after_standalone_run_records_explicit_name_before_restart() {
+    if st3::test_support::supervise_test() { return; }
+    let root = tempfile::tempdir().unwrap();
+    let mut node = Node::new(root.path(), "orchid-computer");
+    node.start().await;
+    let pin = node.state_dir().join("node-identity.json");
+    assert_eq!(serde_json::from_slice::<String>(&fs::read(&pin).unwrap()).unwrap(), node.name);
+    let blocked = node.st(&["fleet", "create", "--name", "orchid", "--no-service", "--dial-out"]);
+    assert!(!blocked.status.success(), "a manual daemon must stop before admission");
+    assert!(!node.state_dir().join("fleet/fleet.toml").exists());
+    node.stop();
+    node.name = "orchid".into();
+    node.create();
+    assert_eq!(serde_json::from_slice::<String>(&fs::read(&pin).unwrap()).unwrap(), node.name);
+    node.start().await;
+    assert_eq!(node.st_json(&["fleet", "status"])["node"], node.name);
+    node.wait_listening().await;
+    let peer = joined(root.path(), &node, "fern", &[]).await;
+    peer.st_ok(&["fleet", "wait", "--timeout", "90s"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn saved_join_resumes_when_membership_was_saved_before_the_identity_pin() {
+    if st3::test_support::supervise_test() { return; }
+    let root = tempfile::tempdir().unwrap();
+    let sponsor = anchor(root.path(), "orchid").await;
+    let mut node = Node::new(root.path(), "fern");
+    let code = sponsor.invite("fern", &[]);
+    assert!(node.join(&code, &[]).status.success());
+    // Isolated crash-boundary fixture: saved admission exists, but the previous pin remains.
+    let pin = node.state_dir().join("node-identity.json");
+    fs::write(&pin, "\"fern-before-admission\"\n").unwrap();
+    let refused = node.st(&["up"]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("fleet membership pins"));
+    let resumed = node.join(&code, &[]);
+    assert!(resumed.status.success(), "{resumed:?}");
+    assert!(String::from_utf8_lossy(&resumed.stdout).contains("resumed"));
+    assert_eq!(serde_json::from_slice::<String>(&fs::read(pin).unwrap()).unwrap(), "fern");
+    node.start().await;
+    node.st_ok(&["fleet", "wait", "--timeout", "90s"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn invite_and_join_sync_full_history() {
     if st3::test_support::supervise_test() {
         return;
