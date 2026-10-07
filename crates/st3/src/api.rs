@@ -16625,13 +16625,13 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
         };
         let mut items = (0..60).map(|n| json!({"id":format!("agent/{n:03}"),"name":"ordinary"})).collect::<Vec<_>>();
         items.extend([
-            json!({"id":"agent/fleet/stui","name":"phone"}),
+            json!({"id":"agent/fleet/fixture-stui","name":"phone"}),
             json!({"id":"agent/display","name":"STUI builder"}),
             json!({"id":"agent/body-only","content":"stui"}),
         ]);
         let first = client_page(&state, &snapshot, "agents", items, &query).unwrap();
         assert_eq!(first.items.len(), 1);
-        assert_eq!(first.items[0]["id"], "agent/fleet/stui");
+        assert_eq!(first.items[0]["id"], "agent/fleet/fixture-stui");
         assert_eq!(first.filters["filter"], "STUI");
         assert!(first.page.has_more);
         let continuation = ClientListQuery { cursor: first.page.next_cursor, ..query };
