@@ -7,14 +7,15 @@ It ships three switchable visual directions (**Folio**, **Relay**, **Orbit**). E
 ## Run
 
 ```sh
-cd packages/fractal-ui
-pnpm install --frozen-lockfile
-pnpm storybook        # http://127.0.0.1:53705
-pnpm typecheck
-pnpm build-storybook  # static build in storybook-static/
+nix develop .#web
+pnpm install --frozen-lockfile  # repository root
+pnpm --filter @smalltalk/fractal-ui storybook        # http://127.0.0.1:53705
+pnpm --filter @smalltalk/fractal-ui typecheck
+pnpm --filter @smalltalk/fractal-ui build-storybook  # packages/fractal-ui/storybook-static/
 ```
 
-Until the repository has a shared pnpm workspace, this package is self-contained: it has its own `pnpm-workspace.yaml` and lockfile, the same per-package-lockfile model the TypeScript clients use. When a root workspace lands, the package moves into it.
+The package is an explicit member of the root pnpm workspace and uses its pinned toolchain, frozen lockfile and lifecycle-script suppression. `bash scripts/ci-fractal-web` runs typechecking and the static Storybook build after the shared install and synthetic-fixtures gate.
+React and React DOM share the existing workspace's 19.2.3 cohort so the hoisted install preserves the iOS package's strict peers. The kit keeps TypeScript 6.0.3 and declares the Node types used by its Storybook configuration explicitly.
 
 The dev server binds to localhost on a fixed port (53705). To view it from another machine, forward the port, for example `ssh -L 53705:localhost:53705 <host>`, and open http://localhost:53705.
 

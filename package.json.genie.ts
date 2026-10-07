@@ -9,6 +9,7 @@ export const workspaceMembers = [
   'clients/typescript/st3-client',
   'clients/typescript/st3-views',
   'apps/ios',
+  'packages/fractal-ui',
 ] as const
 
 export default packageJson.aggregateFromPackages({

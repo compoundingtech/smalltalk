@@ -4,7 +4,8 @@
   "workspaces": [
     "apps/ios",
     "clients/typescript/st3-client",
-    "clients/typescript/st3-views"
+    "clients/typescript/st3-views",
+    "packages/fractal-ui"
   ],
   "packageManager": "pnpm@12.7.0",
   "$genie": {
