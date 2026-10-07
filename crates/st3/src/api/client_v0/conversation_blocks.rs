@@ -643,7 +643,9 @@ pub(in crate::api) async fn chunk(
 ) -> Result<Json<Value>, ApiError> {
     require_scope(&session, "read.projections")?;
     let session_id = conversation_session_id(&state, &id)?;
-    if let Some(owner) = conversation_owner_host(&state, &session, &session_id)? {
+    if let Some(owner) = conversation_owner_host(
+        &state, &session, &session_id, id.starts_with("agent/").then_some(id.as_str()),
+    )? {
         let value = state
             .client_relay
             .as_ref()

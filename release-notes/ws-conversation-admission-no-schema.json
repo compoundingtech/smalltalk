@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Keep collection snapshots responsive during bounded conversation admission and resolve agent inputs by exact subject",
+  "replay": {"status": "none", "detail": "No claim replay or recovery behavior changes; snapshot and incarnation fencing are preserved."},
+  "schema": {"status": "none", "detail": "No tables, indexes, triggers, schema-version changes or data rewrites. Exact agent history lookup uses existing subject indexes; direct-session ownership retains the existing roster lookup."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or digest changes; no coordinated member upgrade required."},
+  "compatibility": {"status": "none", "detail": "Existing collection commands, conversation frames, session IDs, scopes and owner routing are unchanged. Pending admission and queued frames are fenced on replacement and unsubscribe."},
+  "downtime": {"status": "none", "detail": "No additional startup work or expected interruption. Physical admission is bounded to eight lookups per socket and 32 process-wide, separately from collection reads."},
+  "manual": {"status": "none", "detail": "No operator actions, client re-pairing or configuration changes required; identity and stored state are preserved."},
+  "recovery": {"status": "none", "detail": "No persistent state changes or new swap-back restrictions; schema and rules versions are unchanged."}
+}
