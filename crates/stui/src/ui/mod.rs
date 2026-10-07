@@ -134,8 +134,6 @@ struct Demo {
     harbor_seen: Option<Instant>,
 }
 
-/// How long an update stays open on Home before it counts as read.
-
 /// A request the live loop sends to st. The demo never produces these.
 /// What the agent actions menu does to a seat; each is st's own agent action.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
