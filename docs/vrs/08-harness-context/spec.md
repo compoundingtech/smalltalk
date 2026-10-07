@@ -222,7 +222,11 @@ Constants, deliberately not aliases of the presence or harness-state constants
 | `HARNESS_CONTEXT_FUTURE_SKEW` | 60 s | beyond this the clock is untrusted and the record reads absent |
 | `HARNESS_CONTEXT_BUCKET_PERCENT` | 1 | window fraction that defines a write bucket |
 | `HARNESS_CONTEXT_WARN_PERCENT` | 80 | at or above this reading Doctor emits an advisory; st2's own attention threshold, not a compaction prediction |
-| `HARNESS_CONTEXT_HEARTBEAT` | 300 s | maximum interval between writes while a reading is available; deliberately equal to `HARNESS_STATE_REFRESH`, so this record never re-stamps more often than the state record beside it |
+| `HARNESS_CONTEXT_HEARTBEAT` | 300 s | maximum interval between writes while a reading is available; independent of the categorical `HARNESS_STATE_REFRESH` cadence |
+
+An idle seat with unchanged numeric readings can show older “observed N s ago”
+values between these five-minute refreshes. Numeric bucket, account/reset,
+rate-limit and compaction changes still publish immediately.
 
 The 60-minute horizon is four times harness-state's 15-minute one on purpose: a
 categorical state that is an hour old is a dangerous claim about what an agent

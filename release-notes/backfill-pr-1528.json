@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "summary": "#1528: startup full-replay fallback diagnostics",
+  "commits": ["b2f303c5d90cb5197e58e9aa35e3534ef93ebf1d"],
+  "replay": {"status": "none", "detail": "Logs the reason immediately before an existing full replay; it neither forces replay on upgrade nor changes its guard conditions. Missing/unhealthy projection health and unsupported incremental claims can still cause the pre-existing fallback before API listeners bind."},
+  "schema": {"status": "none", "detail": "No database table, index, trigger or migration change in startup full-replay fallback diagnostics; SQLite user_version is unchanged."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digest/drop policy are unchanged; this change adds no sealing coordination requirement."},
+  "compatibility": {"status": "none", "detail": "Startup full-replay fallback diagnostics changes internal execution or build behavior without a new external API/claim version requirement."},
+  "downtime": {"status": "none", "detail": "No additional upgrade service stop or measured outage introduced by startup full-replay fallback diagnostics; the standard daemon/client restart procedure still applies."},
+  "manual": {"status": "none", "detail": "No data repair or configuration conversion required for existing installations by startup full-replay fallback diagnostics."},
+  "recovery": {"status": "none", "detail": "No additional recovery procedure introduced by this change. Preserve graph state, keys and configuration and follow the standard roll-forward guidance; this note does not qualify binary-only downgrade of the whole release."}
+}

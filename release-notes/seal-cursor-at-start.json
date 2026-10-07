@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Start from a stored sealing cursor instead of probing every batch",
+  "replay": {"status": "none", "detail": "No replay or rebuild. Which batches are sealed is unchanged: sealing still seals only batches that lack an envelope."},
+  "schema": {"status": "none", "detail": "No tables, columns, indexes or triggers. One new meta key, seeded_batch_rowid, written in the transaction that seals a batch; an older build ignores it and a newer build that does not find it computes it the old way once and stores it."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged."},
+  "compatibility": {"status": "none", "detail": "No client, wire or harness contract change."},
+  "downtime": {"status": "none", "detail": "Shorter, not longer: the first start that carries it still pays the old 3 to 9 s probe once to store the cursor; every later start skips it (3.4 to 8.7 s of 'startup open-store' on one 7 GB store and 0.75 to 5.1 s on another host's store in the daemon profiler's records)."},
+  "manual": {"status": "none", "detail": "No manual step."},
+  "recovery": {"status": "none", "detail": "Delete the meta key to make the next start recompute the cursor; a cursor behind the truth only lengthens the first seal range."}
+}

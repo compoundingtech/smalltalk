@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Share equivalent authorized collection stream computations across sockets and weigh bounded claim-kind invalidations once per Store",
+  "replay": {
+    "status": "none",
+    "detail": "The shared windows are disposable read caches. Each subscription and reconnect still receives a fresh authoritative snapshot; no graph history replay or projection rebuild is introduced."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No migration, table, index, trigger or durable cache is added. Invalidation reads existing claim and arrangement indexes through the existing Store commit observer."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint retention and fleet rules are unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Existing collection commands, snapshot/change frames, subscription generations, pagination, read admission, retry and disconnect behavior remain. Cached rows are isolated by the full session authority, exact grant, scopes, compatibility and query. Paired authority is rechecked inside every read snapshot. Agent delivery and freshness overlays remain live; attention clock periods and work projection time remain inputs. Collection-specific scopes are rechecked against the current grant inside the snapshot. A single captured clock controls both attention/mission rows and their cache period; a separate local-commit epoch retains invalidation across later ignored claims."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional interruption beyond the normal daemon rollout is required."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No configuration changes or manual steps are required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "The last socket and physical reader release the shared cache and commit observer. Metadata/read failures retain existing resync/retry behavior. Bounded cache saturation and oversized results fall back to ordinary reads. Reconnect reconstructs subscriptions from current authority. Equivalent readers await async admission before pinning SQLite; their physical workers retain admission until they finish. Each session has a 16-window quota within the 64-window Store bound, with own-session eviction above that quota."
+  }
+}

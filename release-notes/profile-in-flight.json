@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Periodically report unfinished profiled work with bounded metadata and retained logs.",
+  "replay": {
+    "status": "none",
+    "detail": "No replay or projection behavior changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No store schema changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint or digest rule changes."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Opt-in profiling adds in-flight.jsonl with bounded operation metadata and visible truncation; its current and one prior file are each capped at8 MiB."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No action is required. The existing ST3_PROFILE_DIR setting enables this additional diagnostic."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No on-disk migration or recovery action."
+  },
+  "downtime": {
+    "status": "unknown",
+    "detail": "Normal binary restart; restart duration is not measured for this change."
+  }
+}

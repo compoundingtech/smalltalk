@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "summary": "#1638: optional signed-message provenance display",
+  "commits": [
+    "395b8d6f0a7b5566eb616f9b139f1eab8b42bacc"
+  ],
+  "replay": {
+    "status": "none",
+    "detail": "Optional signed-message provenance display adds no startup replay trigger or projection invalidation."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No SQLite migration, table, index or trigger change in optional signed-message provenance display; schema version remains 16."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules remain 11; no changed digest policy or new sealing coordination requirement."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Person-message reads and timeline bodies add optional provenance verdict, reason, signer, key and device label fields. CLI text and JSON, stui and the phone expose this information. Older clients ignore the optional fields; a newer CLI receiving no provenance from an older member omits it. Upgrade the serving member and display clients to see the new details. Signing and claim-verification policies are unchanged; no API-version bump or forced re-signing is required."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional service interruption or measured upgrade outage is introduced by optional signed-message provenance display; normal daemon/client restart procedures apply."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Existing installations need no configuration conversion or manual data repair for optional signed-message provenance display."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No additional recovery procedure is introduced. Preserve graph state, keys and configuration and follow roll-forward guidance; this fragment does not qualify binary-only rollback of the whole release."
+  }
+}

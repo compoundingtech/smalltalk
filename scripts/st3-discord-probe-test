@@ -1,0 +1,157 @@
+#!/usr/bin/python3 -I
+"""Token-free checks for the protected Discord REST probe."""
+
+import contextlib
+import importlib.machinery
+import importlib.util
+import io
+import json
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import patch
+import urllib.error
+
+loader = importlib.machinery.SourceFileLoader('probe', str(Path(__file__).with_name('st3-discord-probe')))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+probe = importlib.util.module_from_spec(spec)
+loader.exec_module(probe)
+
+ROUTE = dict(application_id='101', guild_id='202', channel_id='303', user_id='404', nonce='inventednonce')
+APP = {'id': '101'}
+CHANNEL = {'id': '303', 'guild_id': '202', 'type': 0}
+
+
+class FakeDiscord:
+    def __init__(self, replies):
+        self.replies = iter(replies)
+        self.calls = []
+
+    def request(self, method, path, body=None):
+        self.calls.append((method, path, body))
+        return next(self.replies)
+
+
+class ProbeTests(unittest.TestCase):
+    def test_private_normal_user_route_needs_no_root(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'route.json'
+            path.write_text(json.dumps(ROUTE))
+            path.chmod(0o600)
+            self.assertEqual(probe.load_route(path), ROUTE)
+            path.chmod(0o644)
+            with self.assertRaises(probe.ProbeError):
+                probe.load_route(path)
+
+    def test_combined_test_keeps_token_in_process_and_checks_the_reply(self):
+        token = 'invented_token_for_tests_only'
+        valid = {'id': '606', 'channel_id': '303', 'author': {'id': '404'}, 'content': probe.MARKER}
+        client = FakeDiscord([APP, CHANNEL, {'id': '505', 'channel_id': '303'}, APP, CHANNEL, [valid]])
+        output = io.StringIO()
+        terminal_entries = iter([probe.MARKER, ''])
+        def terminal_input(prompt):
+            self.assertEqual(len(client.calls), 3, 'Reading must wait until the terminal input is empty.')
+            return next(terminal_entries)
+        with patch('sys.argv', ['probe', 'test']), patch.object(probe, 'load_route', return_value=ROUTE), patch('sys.stdin.isatty', return_value=True), patch.object(probe.getpass, 'getpass', return_value=token), patch.object(probe, 'Discord', return_value=client), patch('builtins.input', side_effect=terminal_input), contextlib.redirect_stdout(output):
+            self.assertEqual(probe.main(), 0)
+        self.assertIn('Read/write test passed', output.getvalue())
+        self.assertIn('Send the message in Discord.', output.getvalue())
+        self.assertNotIn(token, output.getvalue())
+
+    def test_combined_verification_rejects_a_marker_from_before_the_send(self):
+        old = {'id': '500', 'channel_id': '303', 'author': {'id': '404'}, 'content': probe.MARKER}
+        client = FakeDiscord([APP, CHANNEL, [old]])
+        with self.assertRaises(probe.ProbeError):
+            probe.probe('verify', ROUTE, client, after_message='505')
+
+    def test_noninteractive_launch_cannot_echo_a_token_prompt(self):
+        with patch('sys.argv', ['probe', 'test']), patch.object(probe, 'load_route', return_value=ROUTE), patch('sys.stdin.isatty', return_value=False), patch.object(probe.getpass, 'getpass') as prompted, contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(probe.main(), 1)
+        prompted.assert_not_called()
+
+    def test_unavailable_hidden_input_stops_without_reading_a_token(self):
+        output = io.StringIO()
+        with patch('sys.argv', ['probe', 'test']), patch.object(probe, 'load_route', return_value=ROUTE), patch('sys.stdin.isatty', return_value=True), patch.object(probe.getpass, 'getpass', side_effect=probe.getpass.GetPassWarning()), contextlib.redirect_stderr(output):
+            self.assertEqual(probe.main(), 1)
+        self.assertNotIn('Traceback', output.getvalue())
+
+    def test_foreign_application_never_reads_or_sends_to_channel(self):
+        client = FakeDiscord([{'id': '999'}])
+        with self.assertRaises(probe.ProbeError):
+            probe.probe('send', ROUTE, client)
+        self.assertEqual(len(client.calls), 1)
+
+    def test_foreign_guild_or_channel_type_never_sends(self):
+        for channel in ({**CHANNEL, 'guild_id': '999'}, {**CHANNEL, 'type': 1}):
+            client = FakeDiscord([APP, channel])
+            with self.assertRaises(probe.ProbeError):
+                probe.probe('send', ROUTE, client)
+            self.assertTrue(all(method == 'GET' for method, _, _ in client.calls))
+
+    def test_send_disables_mentions_and_reuses_configured_nonce(self):
+        client = FakeDiscord([APP, CHANNEL, {'id': '505', 'channel_id': '303'}])
+        result = probe.probe('send', ROUTE, client)
+        self.assertFalse(result['agent_routing'])
+        method, path, body = client.calls[-1]
+        self.assertEqual((method, path), ('POST', '/channels/303/messages'))
+        self.assertEqual(body['allowed_mentions'], {'parse': []})
+        self.assertEqual(body['nonce'], ROUTE['nonce'])
+        self.assertTrue(body['enforce_nonce'])
+
+    def test_impostor_bot_webhook_wrong_channel_and_empty_content_do_not_pass(self):
+        valid = {'channel_id': '303', 'author': {'id': '404'}, 'content': probe.MARKER}
+        for message in ({**valid, 'author': {'id': '999'}},
+                        {**valid, 'author': {'id': '404', 'bot': True}},
+                        {**valid, 'webhook_id': '707'},
+                        {**valid, 'channel_id': '999'}, {**valid, 'content': ''}):
+            client = FakeDiscord([APP, CHANNEL, [message]])
+            with self.assertRaises(probe.ProbeError):
+                probe.probe('verify', ROUTE, client)
+        result = probe.probe('verify', ROUTE, FakeDiscord([APP, CHANNEL, [valid]]))
+        self.assertEqual(result['status'], 'user_message_content_confirmed')
+
+    def test_http_error_does_not_expose_body_or_exception_credentials(self):
+        token = 'invented_token_for_tests_only'
+        client = probe.Discord(token)
+        error = urllib.error.HTTPError('https://discord.com/' + token, 401, token, {}, io.BytesIO(token.encode()))
+        with patch.object(client.opener, 'open', side_effect=error):
+            with self.assertRaises(probe.ProbeError) as caught:
+                client.request('GET', '/oauth2/applications/@me')
+        self.assertNotIn(token, str(caught.exception))
+        self.assertEqual(str(caught.exception), 'Bot authentication failed.')
+
+    def test_read_failures_distinguish_missing_author_empty_content_and_wrong_text(self):
+        user_message = {'channel_id': '303', 'author': {'id': '404'}}
+        cases = [([], 'Read Message History'),
+                 ([{**user_message, 'author': {'id': '999'}, 'content': probe.MARKER}], 'No recent message'),
+                 ([{**user_message, 'content': ''}], 'Message Content Intent may be off'),
+                 ([{**user_message, 'content': 'invented private text'}], 'have readable text')]
+        for messages, expected in cases:
+            with self.subTest(expected=expected):
+                client = FakeDiscord([APP, CHANNEL, messages])
+                with self.assertRaises(probe.ProbeError) as caught:
+                    probe.probe('verify', ROUTE, client)
+                self.assertIn(expected, str(caught.exception))
+                self.assertNotIn('invented private text', str(caught.exception))
+
+    def test_post_timeout_is_uncertain_and_never_retried(self):
+        client = probe.Discord('invented_token_for_tests_only')
+        with patch.object(client.opener, 'open', side_effect=TimeoutError()) as opened:
+            with self.assertRaises(probe.ProbeError) as caught:
+                client.request('POST', '/channels/303/messages', {})
+        self.assertIn('inspect the channel before retrying', str(caught.exception))
+        self.assertEqual(opened.call_count, 1)
+
+    def test_provider_failure_never_emits_a_traceback_or_secret(self):
+        output = io.StringIO()
+        with patch('sys.argv', ['probe', 'check']), patch.object(probe, 'load_route', side_effect=ValueError('invented-secret')), contextlib.redirect_stderr(output):
+            self.assertEqual(probe.main(), 1)
+        self.assertNotIn('invented-secret', output.getvalue())
+        self.assertNotIn('Traceback', output.getvalue())
+
+    def test_redirect_is_not_followed(self):
+        self.assertIsNone(probe.NoRedirect().redirect_request(None, None, 302, '', {}, 'https://elsewhere.example'))
+
+
+if __name__ == '__main__':
+    unittest.main()

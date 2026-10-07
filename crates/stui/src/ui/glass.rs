@@ -101,6 +101,26 @@ enum Drop {
 /// What a row of the right-click menu does.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum MenuAction {
+    /// Reuse a registered action, after opening the subject it belongs to if needed.
+    Activate {
+        subject: Option<String>,
+        hit: Box<Hit>,
+    },
+    Agent {
+        agent: String,
+        key: char,
+    },
+    Declaration(String),
+    CopyText(String),
+    Reply {
+        agent: String,
+        message: Option<String>,
+    },
+    Messages(String),
+    Message {
+        agent: String,
+        entry: String,
+    },
     CloseTab(usize, usize),
     SplitTab { group: usize, tab: usize, right: bool },
     MoveTab { group: usize, tab: usize, to: usize },
@@ -113,10 +133,11 @@ pub(crate) enum MenuAction {
 /// A menu opened by a right click, at the place of the click.
 #[derive(Clone, Debug)]
 pub(crate) struct ContextMenu {
-    column: u16,
-    row: u16,
-    title: String,
-    items: Vec<(String, MenuAction)>,
+    pub(super) column: u16,
+    pub(super) row: u16,
+    pub(super) title: String,
+    pub(super) items: Vec<(String, MenuAction)>,
+    pub(super) selected: usize,
 }
 
 /// The old stui's Usage tab, which now floats over the glass as Now does.
@@ -996,9 +1017,10 @@ impl Ui {
         let Some(glasses) = &self.glasses else { return };
         let glass = glasses.glass();
         self.status_line(buf, Rect { height: 1, ..area }, glass);
+        self.top_bar_border(buf, area);
         let mut body = Rect {
-            y: area.y + 1,
-            height: area.height.saturating_sub(2),
+            y: area.y + 2,
+            height: area.height.saturating_sub(3),
             ..area
         };
         // The sidebar takes the left of the glass, beside the splits rather than over them.
@@ -1027,6 +1049,7 @@ impl Ui {
         };
         self.frame.borrow_mut().glass_dividers = dividers.clone();
         for super::layout::Divider { rect, side, .. } in dividers {
+            self.hit(rect, Hit::Resize);
             let symbol = match side {
                 Side::Right => "│",
                 Side::Below => "─",
@@ -1077,7 +1100,6 @@ impl Ui {
         if let Some(palette) = &glasses.palette {
             self.draw_palette(buf, area, palette);
         }
-        self.draw_context_menu(buf, area);
         self.draw_drag(buf);
     }
 
@@ -1154,6 +1176,11 @@ impl Ui {
     /// when the event belonged to a drag.
     pub(crate) fn drag_mouse(&mut self, mouse: crossterm::event::MouseEvent) -> bool {
         use crossterm::event::{MouseButton, MouseEventKind};
+        if matches!(mouse.kind, MouseEventKind::Down(_))
+            && (self.popover.is_some() || self.home_open() || self.palette_open())
+        {
+            return false;
+        }
         let Some(glasses) = self.glasses.as_mut() else {
             return false;
         };
@@ -1681,6 +1708,7 @@ impl Ui {
         if rect.width < 30 || rect.height < 8 {
             return;
         }
+        self.cover(body);
         for y in body.y..body.y + body.height {
             for x in body.x..body.x + body.width {
                 if !rect.contains((x, y).into()) {
@@ -1930,7 +1958,7 @@ impl Ui {
             .attention
             .items()
             .iter()
-            .filter(|item| !self.snoozed.contains(&item.id))
+            .filter(|item| !self.snoozed.contains(&item.id) && !self.closed.contains(&item.id))
             .count();
         spans.push(Span::styled(" · ", bar(theme::dim())));
         // Each count opens the palette at what it counts.
@@ -2225,6 +2253,7 @@ impl Ui {
     }
 
     fn draw_palette(&self, buf: &mut Buffer, area: Rect, palette: &Palette) {
+        self.cover(area);
         let width = area.width.saturating_sub(8).clamp(20, 84);
         let height = area.height.saturating_sub(6).clamp(6, 26);
         let rect = Rect {
@@ -2385,13 +2414,6 @@ impl Ui {
         if key.code == KeyCode::Esc && self.cancel_drag() {
             return true;
         }
-        // Esc closes the right-click menu; it is the only key the menu takes.
-        if self.context.is_some() {
-            self.context = None;
-            if key.code == KeyCode::Esc {
-                return true;
-            }
-        }
         let terminal_focused = self.terminal_focused();
         let mission_form = self.mission_form_focused();
         let Some(glasses) = self.glasses.as_mut() else {
@@ -2482,8 +2504,8 @@ impl Ui {
         {
             return false;
         }
-        // In a focused, attached terminal every key is the agent's; Ctrl+\ leaves it first.
-        if terminal_focused {
+        // Space control chords retain their owner; the other terminal keys go to the child.
+        if terminal_focused && !super::terminal_space_key(key) {
             return false;
         }
         // Alt and a letter or digit commands nothing: on a Mac Option types a character instead,
@@ -3196,6 +3218,9 @@ impl Ui {
     /// A click inside a group that is not focused focuses it, and does nothing else. While the
     /// palette is open, only its rows take clicks; a click elsewhere closes it.
     pub(crate) fn glass_click(&mut self, column: u16, row: u16) -> bool {
+        if self.popover.is_some() {
+            return false;
+        }
         // A click outside the sidebar takes the keys from it (it stays shown); inside, the
         // sidebar's own targets act.
         let in_sidebar = {
@@ -3257,6 +3282,17 @@ impl Ui {
         }
     }
 
+    pub(super) fn click_focuses_split(&self, column: u16, row: u16) -> bool {
+        self.glasses.as_ref().is_some_and(|glasses| {
+            self.frame
+                .borrow()
+                .glass_leaves
+                .iter()
+                .position(|rect| contains(*rect, column, row))
+                .is_some_and(|group| group != glasses.glass().focus)
+        })
+    }
+
     /// Close the focused tab when it is a form that was just finished or cancelled.
     pub(crate) fn close_form_tab(&mut self) {
         let form = self
@@ -3273,7 +3309,7 @@ impl Ui {
     /// Home stays.
     /// Open the right-click menu for what is under the pointer: a tab, or a split's strip or
     /// non-terminal body (a terminal body keeps the click for its program).
-    pub(crate) fn open_context_menu(&mut self, column: u16, row: u16) {
+    pub(super) fn open_glass_context_menu(&mut self, column: u16, row: u16) {
         let Some(glasses) = self.glasses.as_ref() else {
             return;
         };
@@ -3297,8 +3333,17 @@ impl Ui {
             else {
                 return;
             };
-            let subject = pane.split_once(':').map(|(_, subject)| subject.to_owned()).filter(|s| !s.is_empty());
-            let mut items = vec![("Close tab".to_owned(), MenuAction::CloseTab(group, tab))];
+            let subject = pane
+                .split_once(':')
+                .map(|(_, subject)| subject.to_owned())
+                .filter(|s| !s.is_empty());
+            let mut items = vec![(
+                "Show tab [Enter]".to_owned(),
+                MenuAction::Activate {
+                    subject: None,
+                    hit: Box::new(Hit::GlassTab(group, tab)),
+                },
+            )];
             if groups.get(group).is_some_and(|group| group.tabs.len() > 1) {
                 items.push(("Split right with this tab".into(), MenuAction::SplitTab { group, tab, right: true }));
                 items.push(("Split below with this tab".into(), MenuAction::SplitTab { group, tab, right: false }));
@@ -3313,11 +3358,16 @@ impl Ui {
             if let Some(subject) = subject {
                 items.push(("Copy its path".into(), MenuAction::CopyPath(subject.clone())));
             }
+            items.push((
+                "Close tab [Ctrl+W]".into(),
+                MenuAction::CloseTab(group, tab),
+            ));
             ContextMenu {
                 column,
                 row,
                 title: "tab".into(),
                 items,
+                selected: 0,
             }
         } else {
             let leaf = {
@@ -3353,30 +3403,45 @@ impl Ui {
                 row,
                 title: "split".into(),
                 items: vec![
-                    ("Split right".into(), MenuAction::SplitGroup { group, right: true }),
-                    ("Split below".into(), MenuAction::SplitGroup { group, right: false }),
-                    ("New tab…".into(), MenuAction::NewTab(group)),
+                    (
+                        "Split right [Ctrl+V]".into(),
+                        MenuAction::SplitGroup { group, right: true },
+                    ),
+                    (
+                        "Split below [Ctrl+X]".into(),
+                        MenuAction::SplitGroup {
+                            group,
+                            right: false,
+                        },
+                    ),
+                    ("New tab… [Ctrl+T]".into(), MenuAction::NewTab(group)),
                     ("New terminal".into(), MenuAction::NewTerminal(group)),
                 ],
+                selected: 0,
             }
         };
         self.context = Some(menu);
     }
 
     /// The right-click menu, drawn at the click and kept inside the glass; each row is a target.
-    fn draw_context_menu(&self, buf: &mut Buffer, area: Rect) {
+    pub(super) fn draw_context_menu(&self, buf: &mut Buffer, area: Rect) {
         let Some(menu) = &self.context else { return };
+        self.cover(area);
         let width = menu
             .items
             .iter()
             .map(|(label, _)| text::width(label))
             .chain([text::width(&menu.title)])
             .max()
-            .unwrap_or(8) as u16
-            + 4;
-        let height = menu.items.len() as u16 + 1;
+            .unwrap_or(8)
+            .saturating_add(4)
+            .min(area.width as usize) as u16;
+        let height = menu.items.len().saturating_add(2).min(area.height as usize) as u16;
         let x = menu.column.min((area.x + area.width).saturating_sub(width));
-        let y = (menu.row + 1).min((area.y + area.height).saturating_sub(height));
+        let y = menu
+            .row
+            .saturating_add(1)
+            .min((area.y + area.height).saturating_sub(height));
         let rect = Rect {
             x,
             y,
@@ -3385,6 +3450,11 @@ impl Ui {
         };
         self.frame.borrow_mut().menu = Some(rect);
         buf.set_style(rect, Style::default().bg(theme::MANTLE));
+        for y in rect.y..rect.bottom() {
+            for x in rect.x..rect.right() {
+                buf[(x, y)].set_symbol(" ");
+            }
+        }
         buf.set_stringn(
             rect.x + 1,
             rect.y,
@@ -3392,27 +3462,87 @@ impl Ui {
             rect.width.saturating_sub(2) as usize,
             theme::dim().bg(theme::MANTLE),
         );
-        for (index, (label, action)) in menu.items.iter().enumerate() {
+        let visible = rect.height.saturating_sub(2) as usize;
+        let top = menu.selected.saturating_sub(visible.saturating_sub(1));
+        for (offset, (index, (label, action))) in menu
+            .items
+            .iter()
+            .enumerate()
+            .skip(top)
+            .take(visible)
+            .enumerate()
+        {
             let line = Rect {
-                y: rect.y + 1 + index as u16,
+                y: rect.y + 1 + offset as u16,
                 height: 1,
                 ..rect
             };
+            let background = if index == menu.selected {
+                theme::ROW_SELECTED
+            } else {
+                theme::MANTLE
+            };
+            buf.set_style(line, theme::text().bg(background));
             buf.set_stringn(
                 line.x + 2,
                 line.y,
                 label,
                 line.width.saturating_sub(3) as usize,
-                theme::text().bg(theme::MANTLE),
+                theme::text().bg(background),
             );
             self.hit(line, Hit::Menu(action.clone()));
         }
+        buf.set_stringn(
+            rect.x + 1,
+            rect.y + rect.height.saturating_sub(1),
+            "↑↓ · Enter · Esc",
+            rect.width.saturating_sub(2) as usize,
+            theme::dim().bg(theme::MANTLE),
+        );
     }
 
     /// A row of the right-click menu was chosen.
     pub(crate) fn run_menu_action(&mut self, action: MenuAction) {
         self.context = None;
         match action {
+            MenuAction::Activate { subject, hit } => {
+                self.popover = None;
+                if let Some(subject) = subject {
+                    self.open(&subject);
+                    if let Hit::Key(key) = *hit {
+                        self.action_key(key);
+                    } else {
+                        self.click(*hit);
+                    }
+                } else {
+                    self.click(*hit);
+                }
+            }
+            MenuAction::Agent { agent, key } => {
+                self.popover = None;
+                self.agent_action(agent, key);
+            }
+            MenuAction::Declaration(mission) => {
+                self.open(&mission);
+                if !self.kdl {
+                    self.action_key('k');
+                }
+            }
+            MenuAction::CopyText(text) => {
+                copy(&text);
+                self.flash("Copied message text");
+            }
+            MenuAction::Reply { agent, message } => {
+                self.open(&agent);
+                if let Some(message) = message {
+                    self.replies.insert(agent, message);
+                } else {
+                    self.replies.remove(&agent);
+                }
+                self.editing = true;
+            }
+            MenuAction::Messages(agent) => self.open_message_choices(&agent),
+            MenuAction::Message { agent, entry } => self.open_message_actions(&agent, &entry),
             MenuAction::CloseTab(group, tab) => {
                 self.show_in(group, tab);
                 self.close_tab();
@@ -3558,6 +3688,19 @@ impl Ui {
 
     /// Point stui's own tab and selection at a pane's subject, so its keys act on it.
     fn focus_pane(&mut self, pane: &Pane) {
+        let before = (self.tab, self.selected_id());
+        self.focus_pane_inner(pane);
+        // A message box belongs to the pane it was opened in: once another pane or tab has the
+        // focus, typing must not go on into a draft nobody can see (Nathan, 2026-10-07).
+        if before != (self.tab, self.selected_id()) {
+            self.editing = false;
+            self.chat = None;
+            self.answering = None;
+            self.confirm = None;
+        }
+    }
+
+    fn focus_pane_inner(&mut self, pane: &Pane) {
         let Some((tab, subject)) = pane_subject(pane) else {
             return;
         };
@@ -3829,7 +3972,7 @@ mod tests {
         assert!(
             screen(&ui)
                 .lines()
-                .nth(1)
+                .nth(2)
                 .unwrap()
                 .contains("◆ Atlas Builder"),
             "it needs the person"
@@ -3883,6 +4026,44 @@ mod tests {
         assert_eq!(tabs(&ui).1, 1);
         ctrl(&mut ui, 'w');
         assert_eq!(tabs(&ui).2, vec![vec![ATLAS.to_owned()]]);
+    }
+
+    #[test]
+    fn typing_stops_when_another_tab_takes_the_focus() {
+        // Nathan, 2026-10-07: a message box stayed selected after switching tabs, so keys went on
+        // into a draft in a tab that was no longer shown.
+        let mut ui = glass();
+        ui.live = true;
+        ui.open_in_glass(
+            Pane::Agent(Some("agent/example/atlas/builder".to_owned())),
+            Open::Tab,
+        );
+        ui.open_in_glass(
+            Pane::Mission(Some("mission/fleet/atlas/store-move".into())),
+            Open::Tab,
+        );
+        ui.show_tab(0);
+        assert_eq!(ui.tab, 1, "the agent's tab has the focus");
+        press(&mut ui, KeyCode::Char('h'), KeyModifiers::NONE);
+        assert!(ui.editing, "a plain key opens the message box and types");
+        let draft_before = ui
+            .conversation_state
+            .drafts
+            .get("agent/example/atlas/builder")
+            .cloned();
+        assert_eq!(draft_before.as_deref(), Some("h"));
+        // A click on another tab, as a mouse does; keys stay the message box's while it is open.
+        ui.show_tab(1);
+        assert!(!ui.editing, "the message box does not follow the person to another tab");
+        press(&mut ui, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(
+            ui.conversation_state
+                .drafts
+                .get("agent/example/atlas/builder")
+                .cloned(),
+            draft_before,
+            "nothing is typed into the draft of a tab that is not shown"
+        );
     }
 
     #[test]
@@ -4059,7 +4240,7 @@ mod tests {
         );
         assert_eq!(ui.tab, 2, "the new split has the focus");
         let shown = screen(&ui);
-        let strip = shown.lines().nth(1).unwrap();
+        let strip = shown.lines().nth(2).unwrap();
         assert!(
             strip.contains("Atlas Builder")
                 && strip.contains("Weekly release")
@@ -4260,6 +4441,124 @@ mod tests {
         ui.close_tab();
         assert!(ui.terminal_view(first).is_none());
         assert!(ui.terminal_view(second).is_some(), "the other stays attached");
+    }
+
+    #[test]
+    fn native_split_terminals_route_wheel_and_focus_to_their_own_connections() {
+        use pty_core::protocol::{MessageType, PacketReader, encode_packet};
+        use std::io::{Read as _, Write as _};
+        use std::os::unix::net::UnixStream;
+        use std::time::{Duration, Instant};
+
+        fn input(peer: &mut UnixStream, reader: &mut PacketReader) -> Vec<u8> {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                assert!(Instant::now() < deadline, "no terminal input");
+                let mut bytes = [0u8; 1024];
+                let count = peer.read(&mut bytes).unwrap();
+                for packet in reader.feed(&bytes[..count]).unwrap() {
+                    if packet.type_ == MessageType::Data {
+                        return packet.payload;
+                    }
+                }
+            }
+        }
+
+        let mut ui = glass();
+        let ids: Vec<_> = ui
+            .world
+            .agents
+            .items()
+            .iter()
+            .filter(|agent| agent.terminal)
+            .take(2)
+            .map(|agent| agent.id.clone())
+            .collect();
+        let [first, second] = &ids[..] else {
+            panic!("two demo terminals")
+        };
+        ui.open_in_glass(Pane::Agent(Some(first.clone())), Open::Tab);
+        ctrl(&mut ui, ']');
+        ui.open_in_glass(Pane::Agent(Some(second.clone())), Open::Right);
+        ctrl(&mut ui, ']');
+        let mut peers = Vec::new();
+        for agent in &ids {
+            let (client, mut peer) = UnixStream::pair().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            ui.terminal_view_mut(agent).unwrap().native = Some(
+                crate::ui::pty::NativeTerminal::spawn(client, agent, "one".into(), 24, 80),
+            );
+            peer.write_all(&encode_packet(
+                MessageType::Screen,
+                b"\x1b[?1004h\x1b[?1003h\x1b[?1006h",
+            ))
+            .unwrap();
+            peers.push(peer);
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !ids.iter().all(|agent| {
+            ui.terminal_view(agent)
+                .unwrap()
+                .native
+                .as_ref()
+                .unwrap()
+                .mode()
+                .contains(alacritty_terminal::term::TermMode::MOUSE_MOTION)
+        }) {
+            assert!(Instant::now() < deadline, "screen did not arrive");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        screen(&ui);
+        let mut readers = [PacketReader::new(), PacketReader::new()];
+        ui.input_event(crossterm::event::Event::FocusGained);
+        assert_eq!(input(&mut peers[1], &mut readers[1]), b"\x1b[I");
+        let body = ui
+            .frame
+            .borrow()
+            .panes
+            .iter()
+            .find(|pane| pane.key == Pane::Terminal(first.clone()).key())
+            .unwrap()
+            .rect;
+        ui.terminal_selection_mode = true;
+        ui.input_event(crossterm::event::Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: body.x + 4,
+            row: body.y + 2,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert_eq!(
+            input(&mut peers[0], &mut readers[0]),
+            b"\x1b[<65;5;3M".repeat(3)
+        );
+        assert_eq!(
+            ui.terminal.as_ref().unwrap().agent,
+            *second,
+            "wheel does not move focus"
+        );
+        let left = ui.frame.borrow().glass_leaves[0];
+        ui.input_event(crossterm::event::Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: left.x + 2,
+            row: left.y + 2,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert_eq!(ui.terminal.as_ref().unwrap().agent, *first);
+        assert!(
+            !ui.terminal_selection_mode,
+            "selection override does not leak into another tab"
+        );
+        assert_eq!(input(&mut peers[1], &mut readers[1]), b"\x1b[O");
+        assert_eq!(input(&mut peers[0], &mut readers[0]), b"\x1b[I");
+        screen(&ui);
+        assert!(
+            ui.terminal_cursor.get().is_some(),
+            "the other split must not erase the focused cursor"
+        );
+        ui.input_event(crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+        ));
+        assert_eq!(input(&mut peers[0], &mut readers[0]), b"a");
     }
 
     #[test]
@@ -5056,14 +5355,14 @@ mod tests {
         let zoomed = screen(&ui);
         assert!(zoomed.contains("zoomed · ctrl+o"), "{zoomed}");
         assert!(
-            !zoomed.lines().nth(1).unwrap().contains("Atlas Builder"),
+            !zoomed.lines().nth(2).unwrap().contains("Atlas Builder"),
             "only the focused split shows"
         );
         ctrl(&mut ui, 'o');
         assert!(
             screen(&ui)
                 .lines()
-                .nth(1)
+                .nth(2)
                 .unwrap()
                 .contains("Atlas Builder")
         );
@@ -5140,6 +5439,61 @@ mod tests {
     }
 
     #[test]
+    fn new_agent_worktree_fields_follow_focus_and_send_the_selected_checkout() {
+        let mut ui = glass();
+        ui.live = true;
+        ui.open_new_agent(None);
+        ui.new_agent.as_mut().unwrap().name = "willow.keen-otter".into();
+        let host = ui.agent_repository_host().unwrap();
+        ui.agent_repositories = Some((
+            host,
+            super::super::view::Load::Ready(vec![
+                "/srv/example/atlas".into(),
+                "/srv/example/site".into(),
+            ]),
+        ));
+        screen(&ui);
+        for _ in 0..6 {
+            press(&mut ui, KeyCode::Tab, KeyModifiers::NONE);
+        }
+        let shown = screen(&ui);
+        assert!(
+            shown.contains("REPOSITORY") && shown.contains("/srv/example/atlas"),
+            "{shown}"
+        );
+        ctrl(&mut ui, 'n');
+        assert_eq!(
+            ui.new_agent.as_ref().unwrap().repository,
+            "/srv/example/atlas"
+        );
+        ui.click(Hit::Repository("/srv/example/site".into()));
+        press(&mut ui, KeyCode::Tab, KeyModifiers::NONE);
+        assert!(screen(&ui).contains("keen-otter"));
+        ui.paste("fix/login".into());
+        press(&mut ui, KeyCode::Tab, KeyModifiers::NONE);
+        ui.paste("origin/develop".into());
+        press(&mut ui, KeyCode::Tab, KeyModifiers::NONE);
+        ui.paste("/srv/example/login".into());
+        let shown = screen(&ui);
+        assert!(
+            shown.contains("WORKSPACE") && shown.contains("/srv/example/login"),
+            "{shown}"
+        );
+        press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(
+            matches!(&ui.effects[0], Effect::CreateAgent { repo: Some(repo), branch: Some(branch), base: Some(base), workspace: Some(workspace), .. } if repo == "/srv/example/site" && branch == "fix/login" && base == "origin/develop" && workspace == "/srv/example/login")
+        );
+        // Changing hosts clears paths and cannot cycle suggestions from the old host.
+        ui.new_agent.as_mut().unwrap().focus = 5;
+        press(&mut ui, KeyCode::Right, KeyModifiers::NONE);
+        assert!(ui.new_agent.as_ref().unwrap().repository.is_empty());
+        assert!(ui.new_agent.as_ref().unwrap().workspace.is_empty());
+        ui.new_agent.as_mut().unwrap().focus = 6;
+        ctrl(&mut ui, 'n');
+        assert!(ui.new_agent.as_ref().unwrap().repository.is_empty());
+    }
+
+    #[test]
     fn a_new_agent_starts_from_a_form_in_its_own_tab() {
         let mut ui = glass();
         ui.live = true;
@@ -5180,6 +5534,10 @@ mod tests {
                 model: Some("gpt-6-sol".into()),
                 effort: None,
                 host: None,
+                repo: None,
+                branch: None,
+                base: None,
+                workspace: None,
                 message: Some("fix the login test, then open a PR".into()),
             }],
             "a name keeps to letters, digits, dots and dashes"
@@ -5838,6 +6196,98 @@ mod tests {
             "{:?}",
             ui.flash
         );
+    }
+
+    /// A shell tab with the daemon played by the test; what the shell is sent is read back.
+    fn shell_tab() -> (Ui, std::os::unix::net::UnixStream) {
+        use pty_core::protocol::{MessageType, PacketReader, encode_packet};
+        use std::io::{Read as _, Write as _};
+        use std::os::unix::net::UnixStream;
+        let mut ui = glass();
+        ui.live = true;
+        let shell = "terminal/example-shell".to_owned();
+        ui.open_in_glass(Pane::Terminal(shell.clone()), Open::Tab);
+        let (stui, mut daemon) = UnixStream::pair().unwrap();
+        ui.terminal = Some(crate::ui::TerminalView {
+            agent: shell,
+            title: "shell".into(),
+            name: "shell".into(),
+            lines: Vec::new(),
+            cursor: None,
+            stale: None,
+            ended: None,
+            native: Some(crate::ui::pty::NativeTerminal::spawn(
+                stui,
+                "example-shell",
+                "one".into(),
+                24,
+                80,
+            )),
+        });
+        let mut reader = PacketReader::new();
+        let mut bytes = [0_u8; 256];
+        let mut attached = false;
+        while !attached {
+            let count = daemon.read(&mut bytes).unwrap();
+            attached = reader
+                .feed(&bytes[..count])
+                .unwrap()
+                .iter()
+                .any(|packet| packet.type_ == MessageType::Attach);
+        }
+        daemon
+            .write_all(&encode_packet(MessageType::Screen, b"$ "))
+            .unwrap();
+        while !screen(&ui).contains("$") {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        (ui, daemon)
+    }
+
+    /// What the shell was sent within `wait`.
+    fn sent(daemon: &mut std::os::unix::net::UnixStream, wait: std::time::Duration) -> Vec<u8> {
+        use pty_core::protocol::{MessageType, PacketReader};
+        use std::io::Read as _;
+        daemon.set_read_timeout(Some(wait)).unwrap();
+        let mut reader = PacketReader::new();
+        let mut out = Vec::new();
+        let mut bytes = [0_u8; 256];
+        while let Ok(count) = daemon.read(&mut bytes) {
+            if count == 0 {
+                break;
+            }
+            for packet in reader.feed(&bytes[..count]).unwrap() {
+                if packet.type_ == MessageType::Data {
+                    out.extend(packet.payload);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn ctrl_t_twice_leaves_a_terminal_and_once_reaches_its_program_late() {
+        let (mut ui, mut daemon) = shell_tab();
+        // Held back: nothing yet, then the program has it after the moment for a second press.
+        ctrl(&mut ui, 't');
+        assert!(sent(&mut daemon, std::time::Duration::from_millis(100)).is_empty());
+        std::thread::sleep(std::time::Duration::from_millis(350));
+        ui.step_terminal_hold();
+        assert_eq!(sent(&mut daemon, std::time::Duration::from_millis(300)), b"\x14");
+        // Another key lets a held one go first, in order.
+        ctrl(&mut ui, 't');
+        press(&mut ui, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(sent(&mut daemon, std::time::Duration::from_millis(300)), b"\x14x");
+        // Twice: the terminal is left, and the program is sent nothing.
+        ctrl(&mut ui, 't');
+        ctrl(&mut ui, 't');
+        ui.step_terminal_hold();
+        assert!(
+            ui.effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::CloseTerminal))
+        );
+        assert!(sent(&mut daemon, std::time::Duration::from_millis(500)).is_empty());
     }
 
     #[test]

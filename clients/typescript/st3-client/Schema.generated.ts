@@ -496,6 +496,14 @@ export const ActorRef = /*#__PURE__*/ (() => subjectRef(new RegExp("^(?:agent|da
 export type ActorRef = typeof ActorRef.Type
 export type ActorRefEncoded = typeof ActorRef.Encoded
 
+export const AgentCheckout = /*#__PURE__*/ (() => Schema.Struct({
+  "base": Schema.String,
+  "branch": Schema.String,
+  "repository": Schema.String
+}).annotate({ identifier: "AgentCheckout" }))()
+export type AgentCheckout = typeof AgentCheckout.Type
+export type AgentCheckoutEncoded = typeof AgentCheckout.Encoded
+
 export const AgentDelivery = /*#__PURE__*/ (() => Schema.Struct({
   "polled_seconds_ago": Schema.OptionFromOptionalNullOr(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)), NULL_NONE),
   "reason": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
@@ -707,6 +715,8 @@ export const Agent = /*#__PURE__*/ (() => Schema.Struct({
   "ask": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE).annotate({ description: "Structured human ask kind (question, permission, or review); meaningful only while blocked_on is human." }),
   /** Current incarnation's harness blocking axis; human means a person must answer before it continues. */
   "blocked_on": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE).annotate({ description: "Current incarnation's harness blocking axis; human means a person must answer before it continues." }),
+  /** The requested Git worktree repository, base and branch. Present before launch; it does not assert that checkout succeeded. */
+  "checkout": Schema.OptionFromOptionalNullOr(AgentCheckout, NULL_NONE).annotate({ description: "The requested Git worktree repository, base and branch. Present before launch; it does not assert that checkout succeeded." }),
   "current_session_id": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
   /** current_work_ids named for display, in the same order. */
   "current_work": optionalKey(Schema.Array(WorkLabel)).annotate({ description: "current_work_ids named for display, in the same order." }),
@@ -756,7 +766,9 @@ export const Agent = /*#__PURE__*/ (() => Schema.Struct({
   "upcoming_work": optionalKey(Schema.Array(WorkLabel)),
   "upcoming_work_ids": optionalKey(Schema.Array(Id)),
   "updated_at": Timestamp,
-  "usage": Schema.OptionFromOptionalNullOr(UsageSummary, NULL_NONE)
+  "usage": Schema.OptionFromOptionalNullOr(UsageSummary, NULL_NONE),
+  /** The declared workspace on the owning host. */
+  "workspace": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE).annotate({ description: "The declared workspace on the owning host." })
 }).annotate({ identifier: "Agent" }))()
 export type Agent = typeof Agent.Type
 export type AgentEncoded = typeof Agent.Encoded
@@ -1981,8 +1993,34 @@ export const TerminalScreen = /*#__PURE__*/ (() => Schema.Struct({
 export type TerminalScreen = typeof TerminalScreen.Type
 export type TerminalScreenEncoded = typeof TerminalScreen.Encoded
 
+export const ConversationContentRef = /*#__PURE__*/ (() => Schema.Struct({
+  "media_type": Schema.String,
+  "reason": optionalKey(Schema.String),
+  "ref": Schema.String,
+  "size": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)))
+}).annotate({ identifier: "ConversationContentRef" }))()
+export type ConversationContentRef = typeof ConversationContentRef.Type
+export type ConversationContentRefEncoded = typeof ConversationContentRef.Encoded
+
+export const TimelineBlock = /*#__PURE__*/ (() => Schema.Struct({
+  "continuation": optionalKey(ConversationContentRef),
+  "id": Schema.String,
+  /** text, reasoning, tool_call, tool_output, image, image_link, job, subagent, ask, status, error, document, source_record, raw_text, unknown; future kinds remain readable as JSON */
+  "kind": Schema.String.annotate({ description: "text, reasoning, tool_call, tool_output, image, image_link, job, subagent, ask, status, error, document, source_record, raw_text, unknown; future kinds remain readable as JSON" }),
+  /** Source-supplied metadata including timing (wallTimeMs, timeoutSeconds); preserve names, units, values and future fields */
+  "metadata": optionalKey(Schema.Record(Schema.String, Schema.Unknown)).annotate({ description: "Source-supplied metadata including timing (wallTimeMs, timeoutSeconds); preserve names, units, values and future fields" }),
+  /** Native JSON; {body_ref:true} refers to the containing known fallback body without duplication */
+  "payload": Schema.Unknown.annotate({ description: "Native JSON; {body_ref:true} refers to the containing known fallback body without duplication" }),
+  "source_type": Schema.String,
+  /** UI hint: visible (default), internal or hidden-by-harness; never an access restriction */
+  "visibility": optionalKey(Schema.String).annotate({ description: "UI hint: visible (default), internal or hidden-by-harness; never an access restriction" })
+}).annotate({ identifier: "TimelineBlock" }))()
+export type TimelineBlock = typeof TimelineBlock.Type
+export type TimelineBlockEncoded = typeof TimelineBlock.Encoded
+
 export const TimelineContentBody = /*#__PURE__*/ (() => Schema.Struct({
   "attachment_id": optionalKey(Id),
+  "blocks": optionalKey(Schema.Array(TimelineBlock)),
   "media_type": Schema.String,
   "text": optionalKey(Schema.String)
 }).check(Schema.makeFilter((o: object) => ("text" in o) || ("attachment_id" in o), { expected: "fields [\"text\"] or [\"attachment_id\"]" })).annotate({ identifier: "TimelineContentBody" }))()
@@ -1994,6 +2032,7 @@ export type TimelineEntryId = typeof TimelineEntryId.Type
 export type TimelineEntryIdEncoded = typeof TimelineEntryId.Encoded
 
 export const TimelineErrorBody = /*#__PURE__*/ (() => Schema.Struct({
+  "blocks": optionalKey(Schema.Array(TimelineBlock)),
   "code": Schema.String,
   "details": Schema.Record(Schema.String, Schema.Unknown),
   "message": Schema.String,
@@ -2006,10 +2045,28 @@ export const ParticipantRef = /*#__PURE__*/ (() => subjectRef(new RegExp("^(?:ag
 export type ParticipantRef = typeof ParticipantRef.Type
 export type ParticipantRefEncoded = typeof ParticipantRef.Encoded
 
+/** Who signed a message a person wrote, and whether the signature checks. Only messages whose sender is a person carry it; an agent's message does not. */
+export const MessageProvenance = /*#__PURE__*/ (() => Schema.Struct({
+  /** The device the key was granted to, by the label it was given when it paired, such as `example phone (secure enclave)`. Absent for a key with no label. */
+  "device": optionalKey(Schema.String).annotate({ description: "The device the key was granted to, by the label it was given when it paired, such as `example phone (secure enclave)`. Absent for a key with no label." }),
+  /** The public key that signed (`p256:…` or a bare Ed25519 key). */
+  "key": optionalKey(Schema.String).annotate({ description: "The public key that signed (`p256:…` or a bare Ed25519 key)." }),
+  /** Why a held or invalid signature is so. */
+  "reason": optionalKey(Schema.String).annotate({ description: "Why a held or invalid signature is so." }),
+  /** The person who signed, which may be a device that speaks for them. */
+  "signer": optionalKey(ParticipantRef),
+  /** What every member concluded when the claim arrived: `verified` its chain reaches a trust root, `unsigned` it carries no signature (written before signing), `held` a delegation in its chain has not arrived yet, `invalid` it is not acceptable (see reason). */
+  "verdict": Schema.Literals(["verified","unsigned","held","invalid"]).annotate({ description: "What every member concluded when the claim arrived: `verified` its chain reaches a trust root, `unsigned` it carries no signature (written before signing), `held` a delegation in its chain has not arrived yet, `invalid` it is not acceptable (see reason)." })
+}).annotate({ identifier: "MessageProvenance", description: "Who signed a message a person wrote, and whether the signature checks. Only messages whose sender is a person carry it; an agent's message does not." }))()
+export type MessageProvenance = typeof MessageProvenance.Type
+export type MessageProvenanceEncoded = typeof MessageProvenance.Encoded
+
 export const TimelineMessageBody = /*#__PURE__*/ (() => Schema.Struct({
   "attachments": optionalKey(Schema.Array(Attachment)),
+  "blocks": optionalKey(Schema.Array(TimelineBlock)),
   "from": optionalKey(ParticipantRef),
   "message_id": Schema.String,
+  "provenance": optionalKey(MessageProvenance),
   "reply_to": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
   "tags": optionalKey(Schema.Array(Schema.String)),
   "title": optionalKey(Schema.String),
@@ -2019,6 +2076,7 @@ export type TimelineMessageBody = typeof TimelineMessageBody.Type
 export type TimelineMessageBodyEncoded = typeof TimelineMessageBody.Encoded
 
 export const TimelineRedactionBody = /*#__PURE__*/ (() => Schema.Struct({
+  "blocks": optionalKey(Schema.Array(TimelineBlock)),
   "reason": Schema.String,
   "withheld_bytes": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   "withheld_items": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)))
@@ -2032,6 +2090,7 @@ export type TimelineStatus = typeof TimelineStatus.Type
 export type TimelineStatusEncoded = typeof TimelineStatus.Encoded
 
 export const TimelineStatusBody = /*#__PURE__*/ (() => Schema.Struct({
+  "blocks": optionalKey(Schema.Array(TimelineBlock)),
   "detail": optionalKey(Schema.String),
   "status": TimelineStatus
 }).annotate({ identifier: "TimelineStatusBody" }))()
@@ -2040,6 +2099,7 @@ export type TimelineStatusBodyEncoded = typeof TimelineStatusBody.Encoded
 
 export const TimelineToolCallBody = /*#__PURE__*/ (() => Schema.Struct({
   "arguments": Schema.Unknown,
+  "blocks": optionalKey(Schema.Array(TimelineBlock)),
   "call_id": Schema.String,
   "name": Schema.String
 }).annotate({ identifier: "TimelineToolCallBody" }))()
@@ -2047,6 +2107,7 @@ export type TimelineToolCallBody = typeof TimelineToolCallBody.Type
 export type TimelineToolCallBodyEncoded = typeof TimelineToolCallBody.Encoded
 
 export const TimelineToolResultBody = /*#__PURE__*/ (() => Schema.Struct({
+  "blocks": optionalKey(Schema.Array(TimelineBlock)),
   "call_id": Schema.String,
   "content": Schema.Unknown,
   "media_type": Schema.String,
@@ -2056,6 +2117,7 @@ export type TimelineToolResultBody = typeof TimelineToolResultBody.Type
 export type TimelineToolResultBodyEncoded = typeof TimelineToolResultBody.Encoded
 
 export const TimelineTruncationBody = /*#__PURE__*/ (() => Schema.Struct({
+  "blocks": optionalKey(Schema.Array(TimelineBlock)),
   "continuation_cursor": optionalKey(Cursor),
   "omitted_from_sequence": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   "omitted_to_sequence": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
@@ -2065,9 +2127,9 @@ export type TimelineTruncationBody = typeof TimelineTruncationBody.Type
 export type TimelineTruncationBodyEncoded = typeof TimelineTruncationBody.Encoded
 
 export const TimelineUsageBody = /*#__PURE__*/ (() => Schema.Union([
-  Schema.Struct({ "attribution": Schema.Struct({ "agent_id": Id, "generation_id": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "mission_run_id": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "step_id": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE) }), "cache_write_tokens": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "cached_tokens": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "compactions": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "context_used_percent": optionalKey(Schema.Number.check(Schema.isGreaterThanOrEqualTo(0))), "context_used_tokens": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "context_window_tokens": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "cost": optionalKey(Schema.Number.check(Schema.isGreaterThanOrEqualTo(0))), "currency": optionalKey(Schema.String), "driver": Schema.String, "input_tokens": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "last_compaction_ms": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "last_compaction_trigger": optionalKey(Schema.Literals(["manual","auto","threshold","overflow","idle","unknown"])), "model": optionalKey(Schema.String), "output_tokens": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "semantics": Schema.Literal("context_occupancy"), "total_tokens": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "turn_id": optionalKey(Schema.String) }).check(Schema.makeFilter((o: object) => ("context_used_tokens" in o) || ("context_window_tokens" in o) || ("context_used_percent" in o) || ("compactions" in o), { expected: "fields [\"context_used_tokens\"] or [\"context_window_tokens\"] or [\"context_used_percent\"] or [\"compactions\"]" })),
-  Schema.Struct({ "attribution": Schema.Struct({ "agent_id": Id, "generation_id": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "mission_run_id": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "step_id": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE) }), "cache_write_tokens": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "cached_tokens": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "compactions": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "context_used_percent": optionalKey(Schema.Number.check(Schema.isGreaterThanOrEqualTo(0))), "context_used_tokens": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "context_window_tokens": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "cost": optionalKey(Schema.Number.check(Schema.isGreaterThanOrEqualTo(0))), "currency": optionalKey(Schema.String), "driver": Schema.String, "input_tokens": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "last_compaction_ms": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "last_compaction_trigger": optionalKey(Schema.Literals(["manual","auto","threshold","overflow","idle","unknown"])), "model": optionalKey(Schema.String), "output_tokens": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "semantics": Schema.Literal("session_cumulative"), "total_tokens": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)), "turn_id": optionalKey(Schema.String) }),
-  Schema.Struct({ "attribution": Schema.Struct({ "agent_id": Id, "generation_id": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "mission_run_id": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "step_id": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE) }), "cache_write_tokens": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "cached_tokens": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "compactions": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "context_used_percent": optionalKey(Schema.Number.check(Schema.isGreaterThanOrEqualTo(0))), "context_used_tokens": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "context_window_tokens": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "cost": optionalKey(Schema.Number.check(Schema.isGreaterThanOrEqualTo(0))), "currency": optionalKey(Schema.String), "driver": Schema.String, "input_tokens": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "last_compaction_ms": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "last_compaction_trigger": optionalKey(Schema.Literals(["manual","auto","threshold","overflow","idle","unknown"])), "model": optionalKey(Schema.String), "output_tokens": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "semantics": Schema.Literal("response"), "total_tokens": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)), "turn_id": optionalKey(Schema.String) })
+  Schema.Struct({ "attribution": Schema.Struct({ "agent_id": Id, "generation_id": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "mission_run_id": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "step_id": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE) }), "blocks": optionalKey(Schema.Array(TimelineBlock)), "cache_write_tokens": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "cached_tokens": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "compactions": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "context_used_percent": optionalKey(Schema.Number.check(Schema.isGreaterThanOrEqualTo(0))), "context_used_tokens": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "context_window_tokens": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "cost": optionalKey(Schema.Number.check(Schema.isGreaterThanOrEqualTo(0))), "currency": optionalKey(Schema.String), "driver": Schema.String, "input_tokens": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "last_compaction_ms": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "last_compaction_trigger": optionalKey(Schema.Literals(["manual","auto","threshold","overflow","idle","unknown"])), "model": optionalKey(Schema.String), "output_tokens": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "semantics": Schema.Literal("context_occupancy"), "total_tokens": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "turn_id": optionalKey(Schema.String) }).check(Schema.makeFilter((o: object) => ("context_used_tokens" in o) || ("context_window_tokens" in o) || ("context_used_percent" in o) || ("compactions" in o), { expected: "fields [\"context_used_tokens\"] or [\"context_window_tokens\"] or [\"context_used_percent\"] or [\"compactions\"]" })),
+  Schema.Struct({ "attribution": Schema.Struct({ "agent_id": Id, "generation_id": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "mission_run_id": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "step_id": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE) }), "blocks": optionalKey(Schema.Array(TimelineBlock)), "cache_write_tokens": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "cached_tokens": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "compactions": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "context_used_percent": optionalKey(Schema.Number.check(Schema.isGreaterThanOrEqualTo(0))), "context_used_tokens": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "context_window_tokens": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "cost": optionalKey(Schema.Number.check(Schema.isGreaterThanOrEqualTo(0))), "currency": optionalKey(Schema.String), "driver": Schema.String, "input_tokens": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "last_compaction_ms": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "last_compaction_trigger": optionalKey(Schema.Literals(["manual","auto","threshold","overflow","idle","unknown"])), "model": optionalKey(Schema.String), "output_tokens": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "semantics": Schema.Literal("session_cumulative"), "total_tokens": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)), "turn_id": optionalKey(Schema.String) }),
+  Schema.Struct({ "attribution": Schema.Struct({ "agent_id": Id, "generation_id": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "mission_run_id": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "step_id": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE) }), "blocks": optionalKey(Schema.Array(TimelineBlock)), "cache_write_tokens": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "cached_tokens": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "compactions": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "context_used_percent": optionalKey(Schema.Number.check(Schema.isGreaterThanOrEqualTo(0))), "context_used_tokens": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "context_window_tokens": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "cost": optionalKey(Schema.Number.check(Schema.isGreaterThanOrEqualTo(0))), "currency": optionalKey(Schema.String), "driver": Schema.String, "input_tokens": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "last_compaction_ms": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "last_compaction_trigger": optionalKey(Schema.Literals(["manual","auto","threshold","overflow","idle","unknown"])), "model": optionalKey(Schema.String), "output_tokens": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "semantics": Schema.Literal("response"), "total_tokens": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)), "turn_id": optionalKey(Schema.String) })
 ], { mode: "oneOf" }).pipe(Schema.toTaggedUnion("semantics")).annotate({ identifier: "TimelineUsageBody" }))()
 export type TimelineUsageBody = typeof TimelineUsageBody.Type
 export type TimelineUsageBodyEncoded = typeof TimelineUsageBody.Encoded
@@ -2107,6 +2169,19 @@ export const ConversationChanges = /*#__PURE__*/ (() => Schema.Struct({
 }).annotate({ identifier: "ConversationChanges" }))()
 export type ConversationChanges = typeof ConversationChanges.Type
 export type ConversationChangesEncoded = typeof ConversationChanges.Encoded
+
+export const ConversationContentChunk = /*#__PURE__*/ (() => Schema.Struct({
+  /** Base64 bytes */
+  "data": Schema.String.annotate({ description: "Base64 bytes" }),
+  "kind": Schema.Literal("conversation-content-chunk"),
+  "media_type": Schema.String,
+  "next_offset": Schema.OptionFromOptionalNullOr(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)), NULL_NONE),
+  "offset": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "ref": Schema.String,
+  "size": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
+}).annotate({ identifier: "ConversationContentChunk" }))()
+export type ConversationContentChunk = typeof ConversationContentChunk.Type
+export type ConversationContentChunkEncoded = typeof ConversationContentChunk.Encoded
 
 export const ConversationSearchHit = /*#__PURE__*/ (() => Schema.Struct({
   "agent_id": Schema.OptionFromNullOr(Schema.String),
@@ -2381,7 +2456,7 @@ export type Envelope = typeof Envelope.Type
 export type EnvelopeEncoded = typeof Envelope.Encoded
 
 /** Versioned safe error code; unknown codes fall back to `retryable`. Arrangement admission and validation refusals are non-retryable. issuer-required is a non-retryable HTTP 409 pairing revocation refusal; details.issuer_host_id identifies the authoritative issuer. */
-export const ErrorCode = /*#__PURE__*/ (() => openEnum(["attention-migrated","arrangement-exists","arrangement-folder-exists","arrangement-retired","arrangement-limit","arrangement-folder-deleted","arrangement-cycle","arrangement-body-too-large","arrangement-owner-forbidden","invalid-arrangement-subject","invalid-arrangement-action","invalid-arrangement-operations","invalid-arrangement-folder","invalid-arrangement-name","invalid-arrangement-key","invalid-subject-reference","not-found","forbidden","unsupported-capability","validation-failed","idempotency-conflict","issuer-required","stale-fence","cursor-gap","page-cursor-expired","rate-limited","runtime-not-local","runtime-authority-indeterminate","remote-unavailable","terminal-unavailable","terminal-ended","timeline-history-incomplete","blob-too-large","unsupported-media-type","blob-content-mismatch","blob-quota-exceeded","blob-not-found","blob-expired","internal"]).annotate({ identifier: "ErrorCode", description: "Versioned safe error code; unknown codes fall back to `retryable`. Arrangement admission and validation refusals are non-retryable. issuer-required is a non-retryable HTTP 409 pairing revocation refusal; details.issuer_host_id identifies the authoritative issuer." }))()
+export const ErrorCode = /*#__PURE__*/ (() => openEnum(["attention-migrated","arrangement-exists","arrangement-folder-exists","arrangement-retired","arrangement-limit","arrangement-folder-deleted","arrangement-cycle","arrangement-body-too-large","arrangement-owner-forbidden","invalid-arrangement-subject","invalid-arrangement-action","invalid-arrangement-operations","invalid-arrangement-folder","invalid-arrangement-name","invalid-arrangement-key","invalid-subject-reference","not-found","forbidden","unsupported-capability","validation-failed","idempotency-conflict","issuer-required","stale-fence","cursor-gap","page-cursor-expired","rate-limited","runtime-not-local","runtime-authority-indeterminate","remote-unavailable","terminal-unavailable","terminal-ended","timeline-history-incomplete","conversation-content-invalidated","transcript-unavailable","blob-too-large","unsupported-media-type","blob-content-mismatch","blob-quota-exceeded","blob-not-found","blob-expired","internal"]).annotate({ identifier: "ErrorCode", description: "Versioned safe error code; unknown codes fall back to `retryable`. Arrangement admission and validation refusals are non-retryable. issuer-required is a non-retryable HTTP 409 pairing revocation refusal; details.issuer_host_id identifies the authoritative issuer." }))()
 export type ErrorCode = typeof ErrorCode.Type
 export type ErrorCodeEncoded = typeof ErrorCode.Encoded
 

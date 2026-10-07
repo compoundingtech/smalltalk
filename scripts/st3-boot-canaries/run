@@ -47,8 +47,8 @@ from st_boundary import fresh_seat_findings, output_findings
 
 HARNESSES = ("claude", "codex", "pi", "omp", "opencode")
 SCENARIOS = ("fresh", "restart", "daemon-restart", "reexec", "concurrent", "suspend", "utf8", "idle-hold", "channel-missing", "channel-uninitialized", "channel-parked", "import")
-RUN_ID = "c1"
 MISSION = "canary/boot"
+RUN_ID = f"{MISSION}/c1"
 LETTERS = "abcde"
 IMPORTED_SUBJECT = None
 

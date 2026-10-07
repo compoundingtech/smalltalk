@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "summary": "#1636: phone raw/key terminal-input fencing",
+  "commits": ["92751ff6bf0cbf5c95ea688c863e770eb7384bbf"],
+  "replay": {"status": "none", "detail": "No new projection invalidation or startup replay trigger in the merged phone raw/key terminal-input fencing change."},
+  "schema": {"status": "none", "detail": "No database table, index, trigger or migration change in phone raw/key terminal-input fencing; SQLite user_version is unchanged."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digest/drop policy are unchanged; this change adds no sealing coordination requirement."},
+  "compatibility": {"status": "changed", "detail": "Raw/key terminal.input is fenced by runtime incarnation without requiring a matching screen sequence. Line input and resize retain sequence fences. New phone builds fall back to read-then-send when an old daemon requires a sequence; both an upgraded phone and the daemon it connects to are needed to remove that old typing failure."},
+  "downtime": {"status": "none", "detail": "No additional upgrade service stop or measured outage introduced by phone raw/key terminal-input fencing; the standard daemon/client restart procedure still applies."},
+  "manual": {"status": "changed", "detail": "Update the phone client and its connected member for reliable typing into a frequently redrawing terminal. Existing line/resize consumers must keep their screen-sequence fence; raw/key consumers may omit it on new daemons."},
+  "recovery": {"status": "none", "detail": "No additional recovery procedure introduced by this change. Preserve graph state, keys and configuration and follow the standard roll-forward guidance; this note does not qualify binary-only downgrade of the whole release."}
+}

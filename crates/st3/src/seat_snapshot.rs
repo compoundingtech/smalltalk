@@ -56,7 +56,18 @@ pub fn sessions(drivers: &Path, subject: &str, harness: &str) -> PathBuf {
         .join("provider-sessions")
 }
 fn git(path: &Path, args: &[&str], index: Option<&Path>, input: Option<&[u8]>) -> Result<String> {
-    let mut command = Command::new("git");
+    let command = crate::environment::command("git")
+        .map_err(|error| refusal("git-unavailable", format!("resolve git: {error:#}")))?;
+    git_with_command(command, path, args, index, input)
+}
+
+fn git_with_command(
+    mut command: Command,
+    path: &Path,
+    args: &[&str],
+    index: Option<&Path>,
+    input: Option<&[u8]>,
+) -> Result<String> {
     command
         .arg("-c")
         .arg("commit.gpgsign=false")
@@ -78,18 +89,32 @@ fn git(path: &Path, args: &[&str], index: Option<&Path>, input: Option<&[u8]>) -
     if input.is_some() {
         command.stdin(Stdio::piped());
     }
-    let mut child = command.spawn()?;
+    let mut child = command
+        .spawn()
+        .map_err(|error| refusal("git-unavailable", format!("spawn git: {error}")))?;
     if let Some(input) = input {
         child.stdin.take().unwrap().write_all(input)?;
     }
     let output = child.wait_with_output()?;
-    anyhow::ensure!(
-        output.status.success(),
-        "git {}: {}",
-        args.join(" "),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    if !output.status.success() {
+        return Err(refusal(
+            "git-command-failed",
+            format!(
+                "git {}: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        ));
+    }
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+
+fn workspace_git_error(error: anyhow::Error, code: &'static str, message: &str) -> anyhow::Error {
+    if self::code(&error) == "git-command-failed" {
+        refusal(code, message)
+    } else {
+        error
+    }
 }
 
 /// Capture tracked and non-ignored untracked files using a private index, keeping HEAD intact.
@@ -102,7 +127,9 @@ pub fn workspace(state: &Path, subject: &str, operation: &str, member: &MemberSp
         ));
     }
     let top = git(path, &["rev-parse", "--show-toplevel"], None, None)
-        .map_err(|_| refusal("workspace-not-git", "suspend requires a Git workspace"))?;
+        .map_err(|error| {
+            workspace_git_error(error, "workspace-not-git", "suspend requires a Git workspace")
+        })?;
     if fs::canonicalize(&top)? != fs::canonicalize(path)? {
         return Err(refusal(
             "workspace-not-root",
@@ -117,7 +144,9 @@ pub fn workspace(state: &Path, subject: &str, operation: &str, member: &MemberSp
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
     }
     let head = git(path, &["rev-parse", "HEAD"], None, None)
-        .map_err(|_| refusal("workspace-unborn", "commit the workspace before suspending"))?;
+        .map_err(|error| {
+            workspace_git_error(error, "workspace-unborn", "commit the workspace before suspending")
+        })?;
     let branch = git(path, &["symbolic-ref", "-q", "HEAD"], None, None).ok();
     let index = dir.join("index");
     if index.exists() {
@@ -649,7 +678,14 @@ mod tests {
         git(&path, &["init", "-q"], None, None).unwrap();
         fs::write(path.join("tracked"), "original\n").unwrap();
         git(&path, &["add", "."], None, None).unwrap();
-        git(&path, &["commit", "-qm", "Original"], None, None).unwrap();
+        // Fixture commits must not run hooks inherited from the account's Git configuration.
+        git(
+            &path,
+            &["-c", "core.hooksPath=", "commit", "-qm", "Original"],
+            None,
+            None,
+        )
+        .unwrap();
         fs::write(path.join("tracked"), "changed\n").unwrap();
         fs::write(path.join("untracked"), "portable\n").unwrap();
         let sessions = sessions(&root.join("state/drivers"), "agent/sample", "omp");
@@ -676,6 +712,55 @@ mod tests {
             Store::open_memory("amber").unwrap(),
         )
     }
+    #[test]
+    fn an_absent_git_reports_unavailable_with_the_io_error() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("absent-git");
+        let expected = Command::new(&missing).spawn().unwrap_err().to_string();
+        let mut command = Command::new("git");
+        command.env("PATH", root.path());
+        let error = git_with_command(
+            command,
+            root.path(),
+            &["rev-parse", "--show-toplevel"],
+            None,
+            None,
+        )
+        .unwrap_err();
+        let error = workspace_git_error(
+            error,
+            "workspace-not-git",
+            "suspend requires a Git workspace",
+        );
+        assert_eq!(code(&error), "git-unavailable");
+        assert!(error.to_string().contains(&expected));
+    }
+
+    #[test]
+    fn a_non_git_directory_still_reports_workspace_not_git() {
+        let root = tempfile::tempdir().unwrap();
+        let error = workspace(
+            &root.path().join("state"),
+            "agent/sample",
+            "snapshot",
+            &member(root.path()),
+        )
+        .unwrap_err();
+        assert_eq!(code(&error), "workspace-not-git");
+        assert!(!root.path().join("state").exists());
+    }
+
+    #[test]
+    fn git_resolution_uses_the_supplied_environment_path() {
+        let root = tempfile::tempdir().unwrap();
+        let environment = BTreeMap::from([(
+            "PATH".into(),
+            root.path().to_string_lossy().into_owned(),
+        )]);
+        let error = crate::environment::command_in("git", &environment).unwrap_err();
+        assert!(error.to_string().contains("`git` is not executable"));
+    }
+
     #[test]
     fn a_snapshot_preserves_the_source_index_and_restores_dirty_files_and_conversation() {
         let root = tempfile::tempdir().unwrap();

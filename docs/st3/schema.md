@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `0ae56dbbffe32b240808b7c64ffaa25b09128f6301e1e99859d6314a7eba76f3`
+Digest: `50de8434a035f4965ce447589a2cf2de4d87184260897723ad256bba275f32ba`
 
 ## Subject families
 
@@ -19,6 +19,7 @@ Digest: `0ae56dbbffe32b240808b7c64ffaa25b09128f6301e1e99859d6314a7eba76f3`
 | `daemon` | `daemon/NODE` | no | An st3 daemon. |
 | `doc` | `doc/NAME` | no | A named immutable document lineage. |
 | `exec` | `exec/RUN/LOCAL_ID` | no | A mission-run exec runtime. |
+| `external` | `external/PROVIDER/KIND/IDENTITY` | no | An external account or actor, distinct from a native person. |
 | `file` | `file/HOST:/ABSOLUTE_PATH` | no | A read-only file gate target. |
 | `fleet-invite` | `fleet-invite/ID` | no | A single-use fleet join invite. |
 | `gate-operation` | `gate-operation/IDENTITY` | no | One gate evaluation attempt. |
@@ -170,10 +171,10 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `schedule.work-failed` | `schedule` | `system-only` | `append` | `durable` | `code!:string`, `reason!:string`, `request!:string` | `schedule` |
 | `schedule.work-requested` | `schedule` | `system-only` | `append` | `durable` | `inputs!:object`, `mission!:subject-reference(mission)`, `mission_revision!:string`, `occurrence!:integer`, `revision!:string`, `workspace!:string` | `schedule` |
 | `schedule.work-started` | `schedule` | `system-only` | `append` | `durable` | `mission_run!:subject-reference(mission-run)`, `request!:string` | `schedule` |
-| `sekret.called` | `sekret` | `system-only` | `append` | `durable` | `argv:array`, `at_unix_ms!:integer`, `caller!:subject-reference(agent|person)`, `cwd:string`, `grant:string`, `login:boolean`, `person!:subject-reference(person)`, `profile!:string`, `seq!:integer`, `tty:boolean` |  |
-| `sekret.changed` | `sekret` | `system-only` | `append` | `durable` | `at_unix_ms!:integer`, `caller:subject-reference(agent|person)`, `change!:string`, `detail:object`, `person!:subject-reference(person)`, `profile:string`, `seq!:integer` |  |
-| `sekret.exited` | `sekret` | `system-only` | `append` | `durable` | `at_unix_ms!:integer`, `call!:integer`, `caller:subject-reference(agent|person)`, `error:string`, `exit_code:integer`, `person!:subject-reference(person)`, `profile:string`, `seq!:integer`, `signal:integer` |  |
-| `sekret.refused` | `sekret` | `system-only` | `append` | `durable` | `argv:array`, `at_unix_ms!:integer`, `caller:subject-reference(agent|person)`, `person!:subject-reference(person)`, `profile:string`, `reason!:string`, `seq!:integer` |  |
+| `sekret.called` | `sekret` | `system-only` | `append` | `local` | `argv:array`, `at_unix_ms!:integer`, `caller!:subject-reference(agent|person)`, `cwd:string`, `grant:string`, `login:boolean`, `person!:subject-reference(person)`, `profile!:string`, `seq!:integer`, `tty:boolean` |  |
+| `sekret.changed` | `sekret` | `system-only` | `append` | `local` | `at_unix_ms!:integer`, `caller:subject-reference(agent|person)`, `change!:string`, `detail:object`, `person!:subject-reference(person)`, `profile:string`, `seq!:integer` |  |
+| `sekret.exited` | `sekret` | `system-only` | `append` | `local` | `at_unix_ms!:integer`, `call!:integer`, `caller:subject-reference(agent|person)`, `error:string`, `exit_code:integer`, `person!:subject-reference(person)`, `profile:string`, `seq!:integer`, `signal:integer` |  |
+| `sekret.refused` | `sekret` | `system-only` | `append` | `local` | `argv:array`, `at_unix_ms!:integer`, `caller:subject-reference(agent|person)`, `person!:subject-reference(person)`, `profile:string`, `reason!:string`, `seq!:integer` |  |
 | `step-run.carried` | `step-run` | `system-only` | `once` | `durable` | `attempt:integer`, `claim_expires_at_unix_ms:integer`, `claim_incarnation:string`, `claimant:subject-reference`, `definition_hash:string`, `source:subject-reference`, `source_generation:subject-reference`, `source_step_run:subject-reference`, `status:string`, `worker_reported:boolean` | `step` |
 | `step-run.retried` | `step-run` | `system-only` | `append` | `durable` | `attempt:integer`, `goals:array`, `not_before_unix_ms:integer`, `reason:string`, `status:string` | `step` |
 | `step-run.state` | `step-run` | `system-only` | `state-transition` | `durable` | `attempt:integer`, `readiness_epoch:integer`, `reason:string`, `status:string` | `step` |

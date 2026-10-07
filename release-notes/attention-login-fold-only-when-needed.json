@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Skip the harness observation fold for seats that cannot need a login when building attention",
+  "replay": {"status": "none", "detail": "No replay or rebuild, and no claim is projected differently. Which seats raise a login item is unchanged."},
+  "schema": {"status": "none", "detail": "No tables, columns, indexes or triggers. The new probe reads claims_harness_login_candidate_index, which already exists."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged."},
+  "compatibility": {"status": "none", "detail": "No client, wire or harness contract change. The Now and Attention reads return the same items, only sooner."},
+  "downtime": {"status": "none", "detail": "None."},
+  "manual": {"status": "none", "detail": "No manual step."},
+  "recovery": {"status": "none", "detail": "Nothing to recover: the change only decides sooner that a seat does not need a login. A seat that does need one takes the same path as before."}
+}

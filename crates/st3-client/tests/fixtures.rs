@@ -199,6 +199,8 @@ fn generated_resource_union_decodes_all_kinds() {
             _ => None,
         })
         .unwrap();
+    assert_eq!(agent.workspace.as_deref(), Some("/srv/example/release"));
+    assert_eq!(agent.checkout.as_ref().unwrap().branch, "release");
     assert_eq!(agent.current_work_ids, ["step-run/release/build"]);
     assert_eq!(
         agent.next_work_id.as_deref(),
@@ -285,6 +287,61 @@ fn session_usage_context_decodes_through_flattened_resource() {
 }
 
 #[test]
+fn timeline_tool_result_preserves_timing_metadata_and_decodes_legacy_results() {
+    let mut wire = serde_json::json!({
+        "id": "timeline-entry/tool-timing",
+        "sequence": 1,
+        "revision": 1,
+        "timestamp": "2026-10-05T12:00:00Z",
+        "role": "tool",
+        "type": "tool_result",
+        "final": true,
+        "body": {
+            "call_id": "call/timing",
+            "status": "success",
+            "media_type": "text/plain",
+            "content": "finished",
+            "blocks": [{
+                "id": "tool-timing/0",
+                "kind": "tool_output",
+                "source_type": "tool_result",
+                "payload": {"body_ref": true},
+                "metadata": {
+                    "wallTimeMs": 1250.5,
+                    "timeoutSeconds": 0,
+                    "future": {"unit": "ticks", "value": 0.125}
+                }
+            }]
+        }
+    });
+    let entry: TimelineEntry = serde_json::from_value(wire.clone()).unwrap();
+    let TimelineBody::ToolResult(body) = entry.body else {
+        panic!("tool result discriminator was not preserved");
+    };
+    assert_eq!(
+        body.blocks[0].metadata.as_ref(),
+        Some(&wire["body"]["blocks"][0]["metadata"])
+    );
+    assert_eq!(
+        serde_json::to_value(&body).unwrap()["blocks"][0]["metadata"],
+        wire["body"]["blocks"][0]["metadata"]
+    );
+
+    wire["body"]["blocks"][0].as_object_mut().unwrap().remove("metadata");
+    let untimed: TimelineEntry = serde_json::from_value(wire.clone()).unwrap();
+    assert!(matches!(
+        untimed.body,
+        TimelineBody::ToolResult(body) if body.blocks[0].metadata.is_none()
+    ));
+    wire["body"].as_object_mut().unwrap().remove("blocks");
+    let legacy: TimelineEntry = serde_json::from_value(wire).unwrap();
+    assert!(matches!(
+        legacy.body,
+        TimelineBody::ToolResult(body) if body.blocks.is_empty()
+    ));
+}
+
+#[test]
 fn timeline_models_tolerate_future_discriminators() {
     fn entry(entry_type: &str, body: serde_json::Value) -> serde_json::Value {
         serde_json::json!({
@@ -342,10 +399,7 @@ fn timeline_models_tolerate_future_discriminators() {
     .expect("a newer tool status must not break an older client");
     assert!(matches!(
         tool.body,
-        TimelineBody::ToolResult(TimelineToolResultBody {
-            status: TimelineToolStatus::Unknown,
-            ..
-        })
+        TimelineBody::ToolResult(result) if result.status == TimelineToolStatus::Unknown
     ));
 
     let usage: TimelineEntry = serde_json::from_value(entry(

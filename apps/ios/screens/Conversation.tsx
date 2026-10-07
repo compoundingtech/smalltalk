@@ -6,6 +6,7 @@ import { useFocusEffect } from '@react-navigation/native';
 import { useHeaderHeight } from '@react-navigation/elements';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import type { TimelineEntry } from '../../../clients/typescript/st3-client';
+import { checkoutLabel } from '../launcher';
 import { agentGlyph, agentModel, agentName, agentState, agentWord, harnessColor, harnessName, loginGuidance } from '../agentsView';
 import { Banners } from '../chrome';
 import rules from '../../../fixtures/clients/conversation-style.json';
@@ -375,6 +376,7 @@ function AgentStrip({ agent, onMission }: { agent: NonNullable<ReturnType<typeof
       <T color={harnessColor(harness)}>{harness}</T><T dim>{agentModel(agent) ? ` · ${agentModel(agent)}` : ''} · {agent.host_id?.replace(/^host\//, '') ?? '?'}</T>
     </View>
     <T dim numberOfLines={1}>{agent.id}</T>
+    {agent.checkout ? <T soft>{checkoutLabel(agent.checkout)}</T> : null}
     {state === 'needs-login' ? <T color={theme.person}>⚿ {loginGuidance(agent)}</T> : null}
     {work ? <Pressable onPress={() => onMission(work.mission_id, work.title || work.path)}><T numberOfLines={1}><T dim>mission </T><T color={theme.accent}>{work.mission_id.replace(/^mission\//, '')} › {work.path}</T></T></Pressable> : null}
   </View>;
@@ -479,13 +481,13 @@ const MailView = memo(function MailView({ entry, body, open, onToggle, brief = f
     const lines = body.text.split('\n').map(line => line.trim()).filter(Boolean);
     return <Pressable accessibilityRole="button" accessibilityState={{ expanded: false }} onPress={() => onToggle(entry.id)}
       style={[styles.entry, styles.barred, { borderLeftColor: c(look.edge) }]}>
-      <T numberOfLines={1}><T bold={look.from_bold} color={c(look.from)}>{body.to ? `${body.from} → ${body.to}` : body.from}</T>{body.subject ? <T color={c(look.text)}>  {body.subject}</T> : null}<T dim>  {entry.at}</T>{body.dictated ? <T dim>  🎙</T> : null}{body.images ? <T dim>  🖼 {body.images.length}</T> : null}</T>
+      <T numberOfLines={1}><T bold={look.from_bold} color={c(look.from)}>{body.to ? `${body.from} → ${body.to}` : body.from}</T>{body.subject ? <T color={c(look.text)}>  {body.subject}</T> : null}<T dim>  {entry.at}</T>{body.dictated ? <T dim>  🎙</T> : null}{body.signed ? <T dim>  {body.signed}</T> : null}{body.images ? <T dim>  🖼 {body.images.length}</T> : null}</T>
       <T numberOfLines={1} color={c(look.text)}>{lines[0] ?? ''}{lines.length > 1 ? ' …' : ''}</T>
     </Pressable>;
   }
   return <Pressable disabled={!long} accessibilityRole={long ? 'button' : undefined} accessibilityState={long ? { expanded: open } : undefined} onPress={() => onToggle(entry.id)}
     style={[styles.entry, styles.barred, { borderLeftColor: c(look.edge) }, toYou ? { backgroundColor: c(rule.to_you_fill) } : null]}>
-    <T>{toYou ? <T color={c(look.edge)}>● </T> : null}<T bold={look.from_bold} color={c(look.from)}>{body.to ? `${body.from} → ${body.to}` : body.from}</T>{body.subject ? <T bold={look.from_bold} color={look.from_bold ? undefined : c(look.text)}>  {body.subject}</T> : null}<T dim>  {entry.at}</T>{body.dictated ? <T dim>  🎙</T> : null}{mark ? <T color={c(mark.color)}>  {mark.text}</T> : null}</T>
+    <T>{toYou ? <T color={c(look.edge)}>● </T> : null}<T bold={look.from_bold} color={c(look.from)}>{body.to ? `${body.from} → ${body.to}` : body.from}</T>{body.subject ? <T bold={look.from_bold} color={look.from_bold ? undefined : c(look.text)}>  {body.subject}</T> : null}<T dim>  {entry.at}</T>{body.dictated ? <T dim>  🎙</T> : null}{body.signed ? <T dim>  {body.signed}</T> : null}{mark ? <T color={c(mark.color)}>  {mark.text}</T> : null}</T>
     <View style={long && !open ? { maxHeight: limit, overflow: 'hidden' } : null}>
       {/* Measured at its full height and never shrunk by the fold: a measurement the fold could
           change would fold and unfold the mail in a loop. */}

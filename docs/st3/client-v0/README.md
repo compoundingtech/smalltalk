@@ -617,8 +617,12 @@ pages and updates are bounded by the negotiated byte and item limits.
 
 Pi-family native replay recognizes OMP's message-level `role: "toolResult"` records: the
 `toolCallId` correlates the result with its call, `isError` selects error or success status, and
-the result's text content is retained. Legacy tool-result blocks inside message content remain
-supported.
+the result's text content is retained. Native result `details` objects are merged verbatim into
+the normalized `tool_output` block's optional open `metadata`, preserving `wallTimeMs`,
+`timeoutSeconds`, zero/fractional values, original units, and future fields. There is no
+`tool_result` body metadata field; the complete native record remains unchanged in its
+`source_record` block. Legacy tool-result blocks inside message content remain supported and
+use the same block metadata shape.
 
 External process sessions remain listed even when st cannot identify a native transcript.
 Opening their timeline returns a non-retryable `unsupported-capability` error with
@@ -667,7 +671,7 @@ fields are:
 
 - `id`: a client-generated stable action ID;
 - `type`: the action discriminator;
-- `idempotency_key`: unique within the paired session for at least 30 days;
+- `idempotency_key`: unique within the paired session; never reuse it for another request;
 - `fence`: the snapshot and exact mutable identities the user acted on;
 - `parameters`: the type-specific body.
 
@@ -679,6 +683,131 @@ exact original request. A snapshot fence proves the host and an index no newer t
 store; unrelated commits do not stale an action. Stale generation, subject revision, incarnation,
 preview or terminal screen fences return `stale-fence` without a partial mutation.
 Multi-subject actions commit atomically or have no effect.
+
+New completed local response receipts last at least **7 days**. Clients must never reuse a
+key for another request. After reclamation, a late retry cannot execute the original effect
+twice: the daemon seeks its primary effect claim through the existing operation index,
+including existing checkpoint operation tombstones. Document writes recover the original
+binding response, even if a retry supplies different bytes and a current binding token. Other
+associated writes return HTTP 409 `idempotency-key-expired`, with the key and original claim id,
+when the saved response cannot be rebuilt. This is terminal (`retryable: false`), not a silent
+success; inspect the committed outcome before deliberately starting a new action with a fresh key.
+
+Seven days covers the phone's eight retries with backoff and normal retries within seconds to
+minutes, including a daemon restart. Exact saved-response replay is supported for seven days;
+durable recognition continues afterward. Receipts already present at the schema-17 upgrade
+are grandfathered: their older claims do not contain the caller-key association. This PR never
+expires those rows or rewrites those claims. A separate follow-up deletes the fixed legacy
+cohort **30 days after actual deployment**, outside realistic client retry horizons. Operations
+must record the deployment timestamp and due date in
+[the legacy cleanup follow-up](https://github.com/compoundingtech/smalltalk/issues/1741).
+That future deletion is an explicit legacy exception, not an indefinite dedupe guarantee.
+
+Cleanup adds, drops and changes **no indexes**. It seeks the first rowid above a persisted legacy
+watermark and examines at most 64 response rows in completion order. It stops at the first young
+row; nonmonotonic completion deadlines can delay later expiry. Active-run receipts move to the
+tail with a renewed deadline using UPDATE, preserving their companion rows. A future writer
+that has neither a durable association nor an explicitly safe retry classification fails closed
+and retains its response. The commit callback only signals a coalesced notification; pooled
+reader deadline checks and the bounded writer transactions run off the request path, pausing
+20 ms between chunks. UTC cleanup is capped by the newest committed claim time plus five
+minutes through the existing accepted-time index. No claim clock means cleanup defers; a bad
+RTC alone cannot reclaim recent receipts. Retries do not refresh expiry.
+The clock anchor includes replicated claims, so a fast-clock peer can advance it. A pre-NTP boot
+clock followed by a forward correction can shorten saved-response retention; durable operation
+recognition still prevents a second effect, but byte-identical response replay can end early.
+The expiry trigger's `unixepoch('subsec')` requires SQLite 3.42+ (bundled SQLite is 3.46).
+Busy/locked failures retry with 200 ms to 5 s backoff; permanent errors stop visibly.
+These response rows and their legacy watermark are local SQLite state, not replicated claims
+or checkpoint authority. Existing canonical claims and checkpoint rules are unchanged.
+
+| Local-response operation | Retry after the response expires |
+| --- | --- |
+| Document binding | Recover the original binding from its `doc.bound` operation claim; refuse terminally if only the checkpoint tombstone remains. |
+| Mission/free-work start, mission output | Recognise the primary creation/output claim and refuse terminally if its response cannot be rebuilt. Deterministic run identity also prevents duplicate creation. |
+| Revision proposal create/adopt/cancel, effectful approve | Recognise the primary proposal/generation claim; terminal refusal prevents repeating its effect. Already-approved no-op responses may be checked again. |
+| Failed-step retry, run outcome, mission retirement | Recognise the primary effect claim and refuse terminally before another attempt, outcome or publication. Effect and response commit atomically. |
+| Work claim/progress/complete/fail/release/extend/handoff, published renewal | Recognise the actual work claim and refuse terminally before another transition. |
+| Quiet work renewal | No new claim: retry under current generation, attempt, actor/incarnation and lease checks. Extending a still-held lease is naturally idempotent; a released/expired lease cannot be renewed. |
+| Declarative/owned-set apply, quick agent creation | Direct declarations carry a primary caller association. Compound publication operations retain their existing durable operation ids; identical retries are no-ops. Claimless unchanged apply is safe to recompute. A compound-only apply with different bytes and a reused key after expiry is a new apply, so clients must never reuse keys. Declaration and quick-agent response commit together. |
+| Resource observation completion | Recognise the primary actual observation/state/delivery claim and refuse terminally before another delivery. A completion with no recorded change has no receipt/effect to repeat. |
+
+Asks, attention actions, message sends and held effects are not pinned by this local-response
+rule: their existing deterministic durable claim identities and action receipts provide dedupe.
+Client actions keep their durable `custom.client.action-result` receipt; normal claim append
+uses its existing operation identity and checkpoint tombstones. Cleanup never deletes these
+claims. Rust SDK/CLI and stui use the client's transient-error classification; unknown codes
+follow `retryable`, and this new code is terminal. TypeScript/phone `isTransient` and
+`retryTransient` likewise stop on this code; the phone's fresh-fence `notApplied` retry list
+contains only stale-fence/rate-limited. Swift preserves unknown codes and `retryable: false`.
+
+Caller keys have one namespace across actors and nodes that share these claims. Use a fresh,
+globally unique key for each new request; keys are not an authorization boundary. Reusing
+another caller's key can return a terminal refusal identifying their original claim. Actor-scoped
+keys would require a compatible namespace migration and are a separate follow-up.
+Revision approval currently commits its approval before cutover and response storage; a crash
+or concurrent retry in that interval can receive the same terminal refusal before seven days.
+Inspect the proposal's current state rather than retrying its effect with a fresh key.
+Compound publication receipts use existing operation identities. Checkpoint rules version 11
+has no drop rule for `publication.operation`, so those claims remain available to rebuild the
+operation registry; this release does not change that rule.
+
+Claim event positions keep their local store index through schema-17 migration. Converting an
+existing event table seeds its resume floor once at the current store frontier: older checkpoints
+did not record enough position information to prove earlier cursors continuous. Lagging followers
+receive one explicit HTTP 410 and must resync; a cursor equal to the upgrade frontier continues.
+Fresh stores keep floor zero, and ordinary excluded-claim gaps never raise it. Event payloads are
+read from claims; a local membership index records which accepted claims were eligible for the
+feed. The temporary legacy payload table drains in transactions of at most 64 rows. Schema 17
+requires the matching daemon on that node; an older binary refuses the upgraded database. Older
+peers keep their own local event cursors and continue replicating the same claim vocabulary.
+Schema 17 is a one-way database upgrade: take a supported backup before upgrade; downgrade
+requires restoring that backup. The legacy migration window ends when the 64-row worker drains
+`local_event_payloads`; its duration depends on existing rows and writer competition. No fixed
+duration or throughput is promised before copied-store measurements.
+
+Live claim bodies and positions do not change in place: local admission inserts them and replication
+uses `INSERT OR IGNORE`, with checkpoint tombstones refusing dropped claims. Live checkpoint
+deletion removes event membership and raises its floor before deleting the claim, in the same
+transaction. Checkpoint proof renumbers positions only on its proof copy, after clearing local
+projections, and rebuilds membership before comparing reader answers. Repair/replay also clears
+and rebuilds membership; it does not update a live claim body behind an existing event pointer.
+Projection tail reads bound membership before joining bodies, including during legacy migration.
+
+`GET /v1/events/page` scans at most 201 eligible rows for a page limit of 1 through 200. Its
+`items`, `next_after`, `has_more`, and `frontier` fields separate visible results from scan
+progress. An owner filter can return no items while `next_after` still advances. Subject and owner filtering
+always happen after the bounded global scan, including after migration; no subject index is added. With `wait=true`, an empty
+page that advances the cursor waits 250 ms before returning, capped by the remaining requested
+timeout. This paces following clients during migration without discarding eligible events or
+scanning additional pages inside the request. Matching pages return promptly; `wait=false`
+remains an explicit bounded catch-up read. Following clients, including the CLI, use `wait=true`.
+The server deadline envelope adds the clamped requested wait (10 ms through 30 seconds) to
+its ordinary 15-second read budget only when paged wait mode is enabled. Each bounded store
+query retains the ordinary query budget; waiting and pacing do not extend its SQL work budget.
+Trace follow
+uses this continuation and registers its wake before reading the frontier. The legacy
+`GET /v1/events` keeps its array shape, returns at most 200 rows, and reports continuation in
+`X-ST-Next-After`, `X-ST-Has-More`, and `X-ST-Frontier`; owner filters and subject filters
+during migration require the page endpoint. CLI condition, restart, and harness waits use pages.
+A new CLI probes that route once. On a bare missing-route 404, it negotiates only a legacy daemon
+that explicitly advertises `features.bounded_legacy_events=1`; otherwise it stops with daemon
+upgrade guidance before requesting legacy history. Typed refusals, errors and HTTP 410 never
+activate negotiation.
+A cursor before the recorded checkpoint deletion floor receives HTTP 410 `cursor-gap` with
+`full_resync=true`, `resume_floor`, and `frontier`. Refresh projections and establish a new
+cursor explicitly; do not silently reset or keep retrying the old cursor. Client-v0 event feeds
+continue returning their existing `oldest_cursor` and `newest_cursor` resync details. A bounded
+replacement without an old cursor returns a continuation at least at the current frontier, so the
+next request cannot loop on the upgrade floor. Raw event consumers exit with status 6 on
+`cursor-gap` and print the floor/frontier. Trace followers also print an explicit
+`st trace show ... --after-index FRONTIER --follow` continuation command on the same endpoint.
+Inspect retained claims before opting into that continuation: the reported gap is never replayed.
+Without `--after-index`, trace displays its bounded history then starts following at the observed
+global frontier, even if that subject has no claims or its newest claim predates the floor.
+Capabilities read their event cursor and floor together and advertise that observed frontier.
+Replacing a
+projection does not pretend to replay missed durable transitions.
 
 The v0 action discriminators are:
 
@@ -694,7 +823,7 @@ The v0 action discriminators are:
 | Lanes | `lane.join`, `lane.leave`, `lane.move`, `lane.mark`, `lane.approve` | snapshot; the lane must be open and a named entry or anchor must be in it |
 | Runtimes | `runtime.stop`, `runtime.restart`, `runtime.reset`, `runtime.context-clear`, `runtime.signal` | runtime incarnation; stop, restart, and reset also require `runtime_desired_revision` from the runtime resource |
 | Agent desired state | `agent.stop`, `agent.start` | snapshot and `runtime_desired_revision`, the agent's selected desired claim ID; no runtime incarnation required |
-| Terminals | `terminal.input`, `terminal.resize`, `terminal.attach`, `terminal.detach` | runtime incarnation; input and resize also require the screen sequence |
+| Terminals | `terminal.input`, `terminal.resize`, `terminal.attach`, `terminal.detach` | runtime incarnation; resize and a line of input (`mode` `line`) also require the screen sequence; raw and key input do not |
 | Pairing | `pairing.begin`, `pairing.complete`, `pairing.revoke` | pairing/device revision where applicable |
 
 `runtime.stop` publishes a stop for the selected member. `runtime.restart` terminates the current
@@ -927,7 +1056,13 @@ client needs to encode keys and pastes (`alternate_screen`, `application_cursor`
 line per row, and `next_sequence`, an opaque numeric screen fence for input and resize. Compare
 it for equality; it is not a graph index or an ordered event counter. Unrelated graph writes do
 not change it. A terminal action may use an older snapshot from the same host, while incarnation
-and explicit revision fences still apply. Attach/detach do not require a screen sequence fence.
+and explicit revision fences still apply. Attach/detach do not require a screen sequence fence, and
+neither does `terminal.input` in `raw` or `key` mode: keys a person types cannot be made unsafe by a
+screen they did not see, and a program that redraws itself (a spinner) moves the sequence between
+any read and any send, so a client that must match it can never type. A client may send such input
+with no `terminal_sequence`; one that still sends it is not checked against it. A daemon older than
+this refuses such input with "terminal control requires a sequence fence", and the client then reads
+the screen and sends its sequence as before.
 `revision` digests the rest of
 the screen: equal revisions mean equal screens, and a stream never sends the same revision twice.
 The optional `kitty_keyboard` mode carries the active Kitty keyboard enhancement bitmask.
@@ -1046,6 +1181,10 @@ PTY's atomic SCREEN replay followed by live DATA, GEOMETRY and EXIT unchanged. T
 one PTY connection for the transport lifetime. ATTACH and RESIZE therefore participate in normal
 per-axis min-wins geometry with other persistent writers; PEEK cannot send input, resize, upgrade
 to ATTACH, or contribute geometry. DETACH and closing the transport release the connection.
+After ATTACH, an empty PTY frame of type 11 (`ResetInputModes`) can recover the daemon's
+input modes without writing reset bytes to the child. PEEK connections and nonempty reset
+frames are refused. The normal screen/history survive, and the daemon broadcasts the reset
+as DATA. Older PTY daemons ignore this extension.
 Raw clients cannot issue PTY lifecycle/CAS or ancestry-management commands through this capability.
 Bounded chunks and socket backpressure preserve every byte; slow consumers do not skip output.
 
@@ -1424,9 +1563,19 @@ for its crash boundary.
 Rust exposes `agent_create`, `terminal_create`, `terminal_end`; TypeScript and Swift expose
 `agentCreate`, `terminalCreate`, `terminalEnd` with generated typed parameter bodies.
 
+A timeline message body whose sender is a person carries `provenance`: the `verdict` every member
+recorded for the message's signature (`verified`, `unsigned`, `held` or `invalid`, with a `reason` for
+the last two), and for a signed one the `signer`, the `key` and the `device` the key was granted to,
+by the label it was given when it paired (`example phone (secure enclave)`). Clients show it beside the
+sender; an `unsigned` message is usually just older than signing and shows nothing. An agent's
+message carries none. `GET /v1/messages/read/{id}` (`st conversations read`) and `st subject show`
+for a message give the same object.
+
 Messages tagged `dictated` carry a delivery-only line explaining that voice transcription may
 contain mistakes. The stored text and body digest stay unchanged. Timeline message bodies carry
 the message's optional `tags` array so clients can mark dictation without inspecting its text.
+
+Agent projections include optional `workspace` and `checkout {repository, base, branch}` from the declaration, so clients can label a new seat before it launches. These describe the requested checkout; `state` and `fault` report whether launch succeeded. Older daemons omit the metadata. Both new-agent forms consume `host.repositories`, permit an absolute path typed on the selected host, keep the base editable, and leave an empty repository as a plain workspace. Their wire parameters and worktree label share `fixtures/clients/agent-launch.json`.
 
 The agent resource exposes observed harness status as `harness_state`, `since` (RFC 3339),
 and `observation: current | stale | missing`. `since` is the start of that state in that
@@ -1484,3 +1633,58 @@ ST3_TERMINALS_COMPAT_BIN=/path/to/older/st3 cargo test -p st3 --test integration
 
 Choose a binary built before these terminal filters. The fake legacy-server refusal
 and escaping test, server filter/paging tests, and TypeScript client checks run in CI.
+
+### Owner-native conversation blocks
+
+With `X-St3-Features: conversation-blocks.v1`, native timeline entries include
+optional `body.blocks`. Top-level timeline types stay unchanged for old Swift/iOS
+and stui decoders. Block kinds are open strings; an unrecognized native block keeps
+its complete JSON in `payload.raw` before transport bounding. Reasoning explicitly
+present in the harness transcript and full structured tool arguments are shown
+without secret or token filtering. Without the feature, the server returns known
+text/tool/status bodies with visible size-limit notices. Old clients can read those
+fallbacks but do not fetch images or expand a chunked remainder.
+
+`read.projections` authorizes **raw native conversation content**, including full
+arguments, output, reasoning shown by the harness, unknown JSON and images. It is
+the existing scope for pages, deltas and owner forwarding, and also governs
+`GET /v1/client/conversations/{id}/content/{reference}/chunk?offset=N`. Terminal
+write or message-attachment scopes are not required. A local read-only Unix client
+already has this scope; a paired client needs it in its active delegated grant.
+
+Image pixels stay off timeline pages. Blocks and nested native images carry opaque
+owner references. Every fetch verifies the authorized session, entry/revision and
+native source identity; no client-supplied file path or image URL is accepted. The
+ref encrypts the owner-located source descriptor, so native chunks do not inventory
+other sessions and the path is not exposed. Managed chunks also recheck the current
+owner binding. A
+chunk contains base64 `data`, `media_type`, `offset`, total `size` and nullable
+`next_offset`. Chunks hold at most 256 KiB of decoded bytes; native image reads are
+limited to 32 MiB, with explicit errors. Transcript URLs are never fetched by the owner. Oversized JSON
+payloads show an 8 KiB UTF-8 prefix labelled as truncated JSON text, and a reference
+recovers the full valid JSON. The existing 1 MB page bound still applies.
+
+Edited records, replacement, managed binding changes and owner restarts invalidate references;
+append-only growth preserves existing refs:
+HTTP 410 `conversation-content-invalidated`, `retryable: true`, and
+`details.full_resync: true` tell the client to reload before fetching again. A
+reachable owner with unreadable/missing bytes returns `transcript-unavailable`;
+unreachable owner reads retain `remote-unavailable` and carry
+`details.availability: owner-unavailable`. The managed transcript notice similarly
+labels `transcript-unavailable`; retiring its stored-history fallback is owned by
+the separate no-agent-history mission. This contract adds no durable content class,
+claim kind, retention rule, spool, or image blob copy.
+
+Native conversation `read.projections` grants full transcript, chunk and image access,
+including secrets in exposed reasoning, tool arguments/output and unknown JSON.
+Local people and agents, anonymous local read-only Unix readers, and default paired
+phones and wall displays have this access. No content is scrubbed. Refs die on a
+daemon restart; clients must reload the timeline. Four expensive owner timeline/chunk
+reads can run concurrently; busy reads return HTTP 429 `rate-limited`, including
+managed timeline reads. Clients must back off and retry.
+Known blocks can use `payload: {body_ref: true}` to refer to the containing fallback
+body without duplicating its bytes. Content refs authenticate one native record;
+chunk reads do not rebuild the session. The owner never requests transcript HTTP(S)
+URLs. External images use an `image_link` block for explicit client opening; file
+reads are restricted to content-addressed files in the bound Pi/OMP blob store. MIME comes from passive image
+signatures, with SVG/HTML/unrecognized bytes returned only as opaque octets.

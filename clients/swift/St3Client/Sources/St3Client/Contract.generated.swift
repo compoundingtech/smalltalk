@@ -112,6 +112,7 @@ public enum ReadOperation: String, CaseIterable, Sendable {
     case sessionsGet = "sessions.get"
     case conversationSearch = "conversation.search"
     case timelineList = "timeline.list"
+    case conversationContentChunk = "conversation-content.chunk"
     case conversationChanges = "conversation.changes"
     case eventsList = "events.list"
     case terminalScreen = "terminal.screen"
@@ -174,6 +175,7 @@ public let st3ClientReadPaths: [ReadOperation: String] = [
     .sessionsGet: "/v1/client/sessions/{id}",
     .conversationSearch: "/v1/client/conversations/search",
     .timelineList: "/v1/client/sessions/{id}/timeline",
+    .conversationContentChunk: "/v1/client/conversations/{id}/content/{reference}/chunk",
     .conversationChanges: "/v1/client/conversations/{id}/changes",
     .eventsList: "/v1/client/events",
     .terminalScreen: "/v1/client/terminals/{id}/screen",

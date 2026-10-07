@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "summary": "#1512: targeted mailbox notifications and safety rechecks",
+  "commits": ["02d8a9957a94b3b4b1e17a47c6836c7e4a3b8c47"],
+  "replay": {"status": "none", "detail": "No new projection invalidation or startup replay trigger in the merged targeted mailbox notifications and safety rechecks change."},
+  "schema": {"status": "none", "detail": "No database table, index, trigger or migration change in targeted mailbox notifications and safety rechecks; SQLite user_version is unchanged."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digest/drop policy are unchanged; this change adds no sealing coordination requirement."},
+  "compatibility": {"status": "changed", "detail": "Mailbox streams route notifications by dependencies and run independent full safety reads every 30 seconds. The dispatcher is disposable in-memory state; frame, claim, incarnation and epoch contracts remain unchanged. Dispatcher errors appear in the local mailbox-wake-dispatcher doctor check, retry every five seconds, and leave safety reads active."},
+  "downtime": {"status": "none", "detail": "No additional upgrade service stop or measured outage introduced by targeted mailbox notifications and safety rechecks; the standard daemon/client restart procedure still applies."},
+  "manual": {"status": "none", "detail": "No data repair or configuration conversion required for existing installations by targeted mailbox notifications and safety rechecks."},
+  "recovery": {"status": "none", "detail": "No additional recovery procedure introduced by this change. Preserve graph state, keys and configuration and follow the standard roll-forward guidance; this note does not qualify binary-only downgrade of the whole release."}
+}

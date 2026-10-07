@@ -88,7 +88,7 @@ function tabBarHidden(route: RouteProp<TabParams>): boolean {
 
 function Main({ proofSession = false }: { proofSession?: boolean }) {
   const { pairDraft, credential, url, order, data, caps, actions, setTreeView, requestScroll, glassesOn } = useStore();
-  const homeCount = homeRows(data.attention, caps?.session_actor).length;
+  const homeCount = homeRows(data.attention, caps?.session_actor).filter(row => !row.item.closedElsewhere).length;
   const paired = !!url && !!credential;
 
   // Debug-only deep links for simulator checks; disabled in Release.

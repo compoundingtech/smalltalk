@@ -15,7 +15,7 @@
   },
   "compatibility": {
     "status": "changed",
-    "detail": "PEEK expires after60seconds idle or300seconds absolute. Output is not renewal. Authority revocation cancels observations before writer acknowledgement. Accepted owner authority proofs enable screen reads immediately without waiting for a heartbeat. ATTACH is unchanged."
+    "detail": "PEEK expires after60seconds idle or300seconds absolute. Output is not renewal. Authority revocation cancels observations before writer acknowledgement. Lease fences share folded runtime authority with live terminal admission, preserving omitted fields and rejecting explicit nulls or rival authority. ATTACH is unchanged."
   },
   "downtime": {
     "status": "none",
