@@ -353,7 +353,7 @@ async fn attach_expected_with_io(
     expected: Option<&str>,
 ) -> Result<i32> {
     let terminal_id = format!("terminal/{}", terminal_id.trim_start_matches("terminal/"));
-    let (attachment, first, stream) = open(client, &terminal_id).await?;
+    let (attachment, first, stream) = open(client, &terminal_id, expected).await?;
     if expected.is_some_and(|expected| first.runtime_incarnation != expected) {
         detach(
             client,
@@ -400,11 +400,16 @@ async fn attach_expected_with_io(
 async fn open(
     client: &Client,
     terminal_id: &str,
+    expected: Option<&str>,
 ) -> Result<(String, TerminalScreen, TerminalStream)> {
     let mut attempt = 0;
     let attachment = loop {
         attempt += 1;
         let screen = client.terminal_screen(terminal_id).await?;
+        anyhow::ensure!(
+            expected.is_none_or(|expected| screen.value.runtime_incarnation == expected),
+            "the requested launch changed incarnation before attaching"
+        );
         let capabilities = client.capabilities().await?;
         let fence = Fence {
             snapshot_id: capabilities.snapshot.id,

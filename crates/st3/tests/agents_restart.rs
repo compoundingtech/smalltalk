@@ -345,7 +345,9 @@ async fn run_due_restart(fixture: &Fixture, subject: &str) {
         "fresh fixture retry exceeded the first crash delay"
     );
     tokio::time::sleep(Duration::from_millis(delay as u64)).await;
-    fixture.reconciler.reconcile_once().unwrap();
+    for _ in 0..3 {
+        fixture.reconciler.reconcile_once().unwrap();
+    }
 }
 
 async fn restarts_preserving_declaration(mission: bool) {

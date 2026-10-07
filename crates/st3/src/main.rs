@@ -13324,6 +13324,13 @@ async fn attach_new_agent(
     subject: &str,
     expected: &str,
 ) -> Result<()> {
+    if let Ok(outer) = std::env::var("PTY_SESSION")
+        && !outer.is_empty()
+    {
+        anyhow::bail!(
+            "st terminals attach: already inside PTY session `{outer}`. Detach first with Ctrl+\\, or pass --force."
+        );
+    }
     match tokio::time::timeout(LOCAL_ATTACH_CONSULT, consult_attach(client, subject))
         .await
         .context("timed out at attaching while consulting the requested launch")?
