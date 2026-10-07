@@ -17,7 +17,7 @@
   },
   "schema": {
     "status": "changed",
-    "detail": "#1611 adds the fleet_generation table and eleven triggers on claims, replica_envelopes, replica_envelope_signatures and meta, each guarded by a WHEN on the fleet kinds; #1626 adds the partial index claims_usage_rollup_index. Both additive, schema version unchanged, ignored by an older build. The others change no schema."
+    "detail": "#1611 adds the fleet_generation table and ten triggers on claims, replica_envelopes, replica_envelope_signatures and meta, each guarded by a WHEN on the fleet kinds; #1626 adds the partial index claims_usage_rollup_index. Both additive, schema version unchanged, ignored by an older build. The others change no schema."
   },
   "rules": {
     "status": "none",
