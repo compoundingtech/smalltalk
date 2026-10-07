@@ -160,6 +160,14 @@ def command(argv):
     return result.stdout.strip()
 
 
+def tool_path(name):
+    # The devShell does not include its invoking Nix executable in PATH.
+    raw = os.environ["PERF_DIAGNOSTIC_NIX"] if name == "nix" else shutil.which(name)
+    if not raw or not Path(raw).is_absolute() or not Path(raw).is_file():
+        raise RuntimeError("missing absolute tool identity: " + name)
+    return Path(raw).resolve()
+
+
 def main():
     global TEST_EXIT
     if digest(__file__)["sha256"] != os.environ["PERF_DIAGNOSTIC_CONTROLLER_SHA256"]:
@@ -185,9 +193,9 @@ def main():
                 "cpuinfo": read("/proc/cpuinfo"), "meminfo": read("/proc/meminfo"),
                 "cgroup": read("/proc/self/cgroup"),
                 "tools": {"cargo": command(["cargo", "-Vv"]),
-                          "rustc": command(["rustc", "-Vv"]), "nix": command(["nix", "--version"])},
-                "tool_files": {name: {"resolved": str(Path(shutil.which(name)).resolve()),
-                                       **digest(Path(shutil.which(name)).resolve())}
+                          "rustc": command(["rustc", "-Vv"]), "nix": command([str(tool_path("nix")), "--version"])},
+                "tool_files": {name: {"resolved": str(tool_path(name)),
+                                       **digest(tool_path(name))}
                                for name in ["cargo", "rustc", "nix", "python3"]},
                 "fixture_hashes": {p: digest(p) for p in
                                    ["crates/st3/tests/daemon_load.rs", "crates/st3/tests/daemon_bench.rs",

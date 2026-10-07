@@ -91,8 +91,10 @@ jobs:
         shell: bash
         env:
           PERF_DIAGNOSTIC_SOURCE: ${{ inputs.source_sha }}
-          PERF_DIAGNOSTIC_CONTROLLER_SHA256: 3b1a22d87f83e6318d392dfe091924d69eccfa101278f83e1ce3762b559db302
-        run: nix develop '.#perf' -c python3 "$RUNNER_TEMP/ci-perf-diagnostic.py"
+          PERF_DIAGNOSTIC_CONTROLLER_SHA256: 39458f41f82ab469ec8e4976b5b1721aa306aa32a79ebd196d674e5eba4d5cd7
+        run: |
+          export PERF_DIAGNOSTIC_NIX="$(command -v nix)"
+          "$PERF_DIAGNOSTIC_NIX" develop '.#perf' -c python3 "$RUNNER_TEMP/ci-perf-diagnostic.py"
         id: load
       - name: Retain the load report, log and timing
         uses: actions/upload-artifact@v4
