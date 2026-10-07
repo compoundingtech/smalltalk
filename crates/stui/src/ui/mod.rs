@@ -2236,9 +2236,21 @@ impl Ui {
         } else {
             composer.len() as u16 + 2 + strip
         };
+        // An open harness prompt sits above the message box, answerable where it is asked.
+        let prompt = if find.is_none() {
+            self.prompt_card(&agent.id, area.width)
+        } else {
+            None
+        };
+        let prompt_height = prompt
+            .as_ref()
+            .map_or(0, |(lines, _)| lines.len() as u16 + 1)
+            .min(area.height.saturating_sub(header_height + composer_height + 3));
         let body = Rect {
             y: area.y + header_height,
-            height: area.height.saturating_sub(header_height + composer_height),
+            height: area
+                .height
+                .saturating_sub(header_height + composer_height + prompt_height),
             ..area
         };
         if let Some(find) = find {
@@ -2256,6 +2268,34 @@ impl Ui {
             }
         }
         self.pane(buf, &key, body, doc, true);
+        if let Some((lines, hits)) = &prompt
+            && prompt_height > 0
+        {
+            let top = body.y + body.height;
+            buf.set_stringn(
+                area.x,
+                top,
+                "━".repeat(area.width as usize),
+                area.width as usize,
+                theme::fg(theme::PERSON),
+            );
+            for (offset, line) in lines.iter().take(prompt_height as usize - 1).enumerate() {
+                buf.set_line(area.x + 1, top + 1 + offset as u16, line, area.width.saturating_sub(2));
+            }
+            for (row, hit) in hits {
+                if *row + 1 < prompt_height as usize {
+                    self.hit(
+                        Rect {
+                            x: area.x,
+                            y: top + 1 + *row as u16,
+                            width: area.width,
+                            height: 1,
+                        },
+                        hit.clone(),
+                    );
+                }
+            }
+        }
         // Every match on screen is marked; the current one stands out.
         if let Some(find) = find {
             let top = self
@@ -2287,7 +2327,7 @@ impl Ui {
             }
         }
         if composer_height > 0 {
-            let y = body.y + body.height;
+            let y = body.y + body.height + prompt_height;
             buf.set_stringn(
                 area.x,
                 y,
@@ -3148,9 +3188,102 @@ impl Ui {
 
     // ------------------------------------------------------------------- input
 
-    /// The focused Home item's structured request (#1010), with the item's id.
+    /// The open harness prompt of the agent whose conversation has the keyboard, with its item id.
+    fn inline_prompt(&self) -> Option<(String, Box<st3_client::StructuredRequest>)> {
+        let agent = if self.glasses.is_some() {
+            if self.home_open() || self.palette_open() {
+                return None;
+            }
+            self.composing_agent()?
+        } else if self.tab == 1 {
+            self.selected_id()?
+        } else {
+            return None;
+        };
+        self.open_prompt_for(&agent)
+    }
+
+    /// An agent's harness prompt that is still waiting, as its Home card.
+    fn open_prompt_for(&self, agent: &str) -> Option<(String, Box<st3_client::StructuredRequest>)> {
+        self.world.attention.items().iter().find_map(|item| {
+            if self.closed.contains(&item.id) {
+                return None;
+            }
+            let AttentionKind::Request {
+                from_id,
+                structured: Some(request),
+                ..
+            } = &item.kind
+            else {
+                return None;
+            };
+            (from_id == agent && adapt::is_open_prompt(request))
+                .then(|| (item.id.clone(), request.clone()))
+        })
+    }
+
+    /// The prompt card drawn above an agent's message box: what the harness asks, and each answer
+    /// as a row to choose, then Enter sends. Each row is a click target.
+    fn prompt_card(&self, agent: &str, width: u16) -> Option<(Vec<Line<'static>>, Vec<(usize, Hit)>)> {
+        let (id, request) = self.open_prompt_for(agent)?;
+        let here = self.inline_prompt().is_some_and(|(focused, _)| focused == id);
+        let inner = width.saturating_sub(2).max(10) as usize;
+        let mut lines = vec![Line::from(vec![
+            Span::styled("◆ prompt", theme::fg(theme::PERSON).add_modifier(Modifier::BOLD)),
+            Span::styled("  waiting on you", theme::dim()),
+        ])];
+        let content = text::markdown(&request.question, inner, theme::fg(theme::TEXT));
+        let shown = content.len().min(6);
+        lines.extend(content.iter().take(shown).cloned());
+        if content.len() > shown {
+            lines.push(Line::from(Span::styled("…", theme::dim())));
+        }
+        for reason in &request.reasons {
+            lines.push(Line::from(Span::styled(
+                format!("• {}", text::truncate(reason, inner.saturating_sub(2))),
+                theme::fg(theme::YELLOW),
+            )));
+        }
+        let mut hits = Vec::new();
+        let answering = if here { self.answering } else { None };
+        for (index, answer) in request.answers.iter().enumerate() {
+            hits.push((lines.len(), Hit::Answer(index)));
+            let chosen = answering == Some(index);
+            lines.push(Line::from(vec![
+                Span::styled(
+                    if chosen { "▸ " } else { "  " },
+                    theme::fg(theme::ACCENT),
+                ),
+                Span::styled(
+                    text::truncate(&answer.label, 40),
+                    theme::fg(theme::ACCENT).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  {}", text::truncate(&answer.consequence, inner.saturating_sub(46))),
+                    theme::dim(),
+                ),
+            ]));
+        }
+        if !request.answers.is_empty() {
+            let hint = if answering.is_some() {
+                "enter sends this answer · ↑↓ another · esc not now"
+            } else if here {
+                "click an answer, or press alt+a to choose"
+            } else {
+                "click an answer to choose it"
+            };
+            lines.push(Line::from(Span::styled(hint, theme::dim())));
+        }
+        Some((lines, hits))
+    }
+
+    /// The focused Home item's structured request (#1010), with the item's id. An open prompt in
+    /// the conversation that has the keyboard comes first.
     fn structured_request(&self) -> Option<(String, Box<st3_client::StructuredRequest>)> {
-        let id = self.attention_focus()?;
+        let id = self
+            .inline_prompt()
+            .map(|(id, _)| id)
+            .or_else(|| self.attention_focus())?;
         let item = self
             .world
             .attention
@@ -3491,6 +3624,20 @@ impl Ui {
         self.sync_terminal_slot();
         // Listening takes every key until the words are sent, kept or dropped.
         if self.voice_key(key) {
+            return;
+        }
+        // Alt+A starts choosing among an open prompt's answers, even where typing reaches the box.
+        if self.answering.is_none()
+            && key.code == KeyCode::Char('a')
+            && key.modifiers == KeyModifiers::ALT
+            && let Some((_, request)) = self.inline_prompt()
+            && !request.answers.is_empty()
+        {
+            let recommended = request
+                .recommendation
+                .as_ref()
+                .and_then(|wanted| request.answers.iter().position(|answer| answer.id == wanted.answer));
+            self.answering = Some(recommended.unwrap_or(0));
             return;
         }
         // Choosing a structured request's answer: ↑↓ another, Enter sends, Esc puts it away.
@@ -6874,6 +7021,40 @@ mod tests {
             assert!(screen.contains("Answer it in the seat's terminal."), "{state}: {screen}");
             assert!(!screen.contains("Tells the harness."), "{state}: no answers: {screen}");
         }
+    }
+
+    #[test]
+    fn an_open_harness_prompt_is_answerable_inline_in_the_agents_conversation() {
+        let mut ui = with_item(prompt_item(open_prompt(), vec!["prompt.respond".into()]));
+        // The prompt belongs to the seat the demo lists first; its conversation is the Agents tab.
+        let agent = "agent/example/lead".to_owned();
+        if let Load::Ready(agents) = &mut ui.world.agents {
+            let mut seat = agents[0].clone();
+            seat.id = agent.clone();
+            seat.unmanaged = false;
+            agents.insert(0, seat);
+        }
+        ui.tab = 1;
+        ui.select(0);
+        let screen = frame(&ui, 140, 50).join("\n");
+        for shown in ["◆ prompt", "Run cargo test in the example repository?", "Approve", "Deny", "click an answer"] {
+            assert!(screen.contains(shown), "{shown}: {screen}");
+        }
+        // Alt+A chooses, Down moves to Deny, Enter sends it through the prompt action.
+        ui.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT));
+        assert_eq!(ui.answering, Some(0));
+        ui.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert!(frame(&ui, 140, 50).join("\n").contains("enter sends this answer"));
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(&ui.effects[..], [Effect::Attention { id, action, answer: Some(answer), .. }]
+                if id == "attention/prompt" && action == "prompt.respond" && answer == "deny"),
+            "{:?}",
+            ui.effects
+        );
+        // Another seat's conversation shows no card.
+        ui.select(1);
+        assert!(!frame(&ui, 140, 50).join("\n").contains("◆ prompt"));
     }
 
     #[test]

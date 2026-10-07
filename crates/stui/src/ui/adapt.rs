@@ -1999,6 +1999,16 @@ mod tests {
     }
 }
 
+/// The card kinds of a harness prompt: open and answerable here, open but answered elsewhere, ended.
+pub(crate) const PROMPT_OPEN: &str = "harness-prompt";
+pub(crate) const PROMPT_WAITING: &str = "harness-prompt-waiting";
+pub(crate) const PROMPT_ENDED: &str = "harness-prompt-ended";
+
+/// Whether a request is a harness prompt still waiting, which the conversation shows inline.
+pub(crate) fn is_open_prompt(request: &st3_client::StructuredRequest) -> bool {
+    matches!(request.entry_type.as_str(), PROMPT_OPEN | PROMPT_WAITING)
+}
+
 /// A harness prompt as a request card: what it asks and the choices st can send. Where it cannot
 /// be answered, or has ended, the card says so plainly and offers no answers.
 pub(crate) fn prompt_request(prompt: &st3_client::HarnessPrompt, title: &str, detail: &str) -> AttentionKind {
@@ -2042,9 +2052,17 @@ pub(crate) fn prompt_request(prompt: &st3_client::HarnessPrompt, title: &str, de
             None => format!("This prompt {state}"),
         });
     }
+    // The kind says which card this is, so the conversation can show the open ones inline.
+    let entry_type = if !open {
+        PROMPT_ENDED
+    } else if answerable {
+        PROMPT_OPEN
+    } else {
+        PROMPT_WAITING
+    };
     let request = st3_client::StructuredRequest {
         version: 1,
-        entry_type: "decision".into(),
+        entry_type: entry_type.into(),
         question: content.clone(),
         why_person: "A harness is waiting for your answer.".into(),
         summary: None,

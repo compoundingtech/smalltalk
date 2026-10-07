@@ -5968,6 +5968,40 @@ mod tests {
     }
 
     #[test]
+    fn an_open_harness_prompt_shows_in_its_seats_tab_and_alt_a_chooses() {
+        let mut ui = glass();
+        let agent = ui.world.agents.items()[0].id.clone();
+        let choice = |id: &str, label: &str| st3_client::PromptChoice {
+            id: id.into(),
+            label: label.into(),
+            consequence: "Tells the harness.".into(),
+        };
+        let prompt = st3_client::HarnessPrompt {
+            content: Some("Run the checks in the example repository?".into()),
+            choices: Some(vec![choice("approve", "Approve"), choice("deny", "Deny")]),
+            seat_id: Some(agent.clone()),
+            state: Some("open".into()),
+            can_answer: Some(true),
+            ..Default::default()
+        };
+        let kind = adapt::prompt_request(&prompt, "Run?", "");
+        if let Load::Ready(items) = &mut ui.world.attention {
+            let mut item = items[0].clone();
+            item.id = "attention/prompt".into();
+            item.kind = kind;
+            item.actions = vec!["prompt.respond".into()];
+            items.insert(0, item);
+        }
+        ui.open_in_glass(Pane::Agent(Some(agent)), Open::Tab);
+        let shown = screen(&ui);
+        assert!(shown.contains("◆ prompt") && shown.contains("Run the checks"), "{shown}");
+        press(&mut ui, KeyCode::Char('a'), KeyModifiers::ALT);
+        assert_eq!(ui.answering, Some(0));
+        press(&mut ui, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(ui.answering, None);
+    }
+
+    #[test]
     fn ctrl_h_opens_home_and_closes_it_again() {
         let mut ui = glass();
         ctrl(&mut ui, 'h');
