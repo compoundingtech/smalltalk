@@ -1,24 +1,32 @@
 {
-  "title": "Maintain keyed agent harness rows in canonical order",
-  "changes": [
-    "Adds an opt-in smallclaims View for observed agent harness rows.",
-    "Maintains canonical ordered subtree summaries for sparse optional fields, legacy status episodes and native readiness fences.",
-    "Exposes certified keyed reads without a canonical-history fallback; production registry and collection activation remain separate."
-  ],
-  "validation": {
-    "command": "RUSTC_WRAPPER=sccache-rustc RUST_TEST_THREADS=4 NEXTEST_TEST_THREADS=4 cargo test -p st3 --lib ordered_agent -j 6 -- --test-threads=4 --nocapture",
-    "controls": [
-      "Sparse named and unnamed observations, optional nulls, approval blocks, runtime resets.",
-      "Native auth, update, admission and attachment fences with mixed status stamps.",
-      "Canonical ties, permuted replication and duplicate admission.",
-      "Transaction rollback, pending sources, retained-original repair, body mutation and deleted-source fencing.",
-      "Bare-body legacy and nontext incarnation observations.",
-      "Read growth control: 5 statements / 92 VM steps at 32 and 256 observations."
-    ]
+  "version": 1,
+  "summary": "Maintain keyed agent harness reductions in canonical order",
+  "replay": {
+    "status": "none",
+    "detail": "Default production Store readers and projections are unchanged. The opt-in source operator has no GET or per-commit history replay fallback; incomplete populated installation remains unavailable."
   },
-  "limits": [
-    "Harness source kernel only: no default production registration or reader activation.",
-    "Declaration, owner, work queue, placement, faults, person authorization and captured-time card overlays need complete independent dependency coverage before full card certification.",
-    "Existing populated-store installation, checkpoint restoration and historical source roots require an explicit source installer; unsupported source mutations fence output."
-  ]
+  "schema": {
+    "status": "changed",
+    "detail": "Explicit View registration adds local_agent_ordered_nodes, local_agent_ordered_roots and local_agent_harness_rows tables. No numeric core schema version change and no default registration or table installation. These are local rebuildable derived rows, not replicated identity."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules and shared projection digests are unchanged. This opt-in kernel does not certify checkpoint restoration; source deletion or canonical mutation fences its reads pending explicit installation."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No client, socket, pairing or admission change. The new library operator is inactive in default production readers and preserves canonical observed-harness semantics in ten real Store controls."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional default startup work or production activation. The connection-scoped keyed-read control uses five statements and 92 VM instructions at 32 and 256 sparse observations; this is not a deployed CPU or restart measurement."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Existing default installations need no manual step. Complete source hooks, populated/history/checkpoint installation and full card dependency certification remain separate requirements before explicit activation."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Default data and recovery paths are unchanged. Opt-in tables contain rebuildable local derived rows; uncertified or mutated sources return unavailable rather than a historical fallback. This change makes no populated-store activation or restoration claim."
+  }
 }
