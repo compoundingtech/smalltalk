@@ -8104,7 +8104,11 @@ fn terminal_keys_unfenced(request: &ActionRequest) -> bool {
         )
 }
 
-fn validate_fence(state: &AppState, fence: &Fence) -> Result<(), ApiError> {
+fn validate_fence(
+    state: &AppState,
+    fence: &Fence,
+    session: &ClientSession,
+) -> Result<(), ApiError> {
     let parsed = fence
         .snapshot_id
         .strip_prefix("snapshot/")
@@ -8125,7 +8129,13 @@ fn validate_fence(state: &AppState, fence: &Fence) -> Result<(), ApiError> {
     }
     for (subject, revision) in &fence.subject_revisions {
         let current = if subject.starts_with("attention/") {
-            client_attention_resources(&state.store, None, false)
+            // Native prompts are absent from the unscoped projection. Resolve the
+            // revision in the authenticated person's view, just as the list does.
+            let person = session
+                .authority_actor
+                .starts_with("person/")
+                .then_some(session.authority_actor.as_str());
+            client_attention_resources(&state.store, person, false)
                 .map_err(ApiError::internal)?
                 .into_iter()
                 .find(|item| item["id"] == *subject)
@@ -9569,7 +9579,7 @@ pub(super) async fn action(
         let live =
             remote_terminal_live_session(&state, &terminal_subject(&terminal_id), incarnation)?;
         if live.owner_host_id != client_host_id(&state.node) {
-            validate_fence(&state, &request.fence)?;
+            validate_fence(&state, &request.fence, &session)?;
             let relay = state
                 .client_relay
                 .as_ref()
@@ -9671,7 +9681,7 @@ pub(super) async fn action(
             subject.starts_with("attention/") || subject.starts_with("session/external-")
         });
     }
-    let fence_result = validate_fence(&state, &checked_fence);
+    let fence_result = validate_fence(&state, &checked_fence, &session);
     if let Err(error) = fence_result {
         if request.action_type == "terminal.attach" {
             reconciled_attachment =
@@ -10005,11 +10015,38 @@ mod tests {
             fence: Fence {
                 snapshot_id: snapshot.id.clone(),
                 runtime_incarnation: Some("runtime-a".into()),
+                subject_revisions: BTreeMap::from([(
+                    card["id"].as_str().unwrap().to_owned(),
+                    card["revision"].as_str().unwrap().to_owned(),
+                )]),
                 ..Default::default()
             },
             parameters: json!({"target_id":format!("prompt/{}",prompt.episode),"episode":prompt.episode,"prompt_id":prompt.prompt_id,"answer_id":"approve"}),
         };
         let session = ClientSession::local(Some("person/ada")).unwrap();
+        assert!(validate_fence(&state, &request.fence, &session).is_ok());
+        for other in [
+            ClientSession::local(Some("person/intruder")).unwrap(),
+            readonly,
+        ] {
+            assert_eq!(
+                validate_fence(&state, &request.fence, &other)
+                    .unwrap_err()
+                    .code,
+                "stale-fence"
+            );
+        }
+        let mut stale_revision = request.fence.clone();
+        stale_revision.subject_revisions.insert(
+            card["id"].as_str().unwrap().to_owned(),
+            "previous-episode".into(),
+        );
+        assert_eq!(
+            validate_fence(&state, &stale_revision, &session)
+                .unwrap_err()
+                .code,
+            "stale-fence"
+        );
         assert_eq!(
             dispatch_action(
                 &state,
@@ -16509,7 +16546,7 @@ mission "example/zero-run" state="ready" {
             })
             .unwrap();
         assert!(
-            validate_fence(&state, &fence).is_ok(),
+            validate_fence(&state, &fence, &session).is_ok(),
             "unrelated writes do not invalidate declaration mutations"
         );
         let mut attach_fence = fence.clone();
@@ -16589,19 +16626,19 @@ mission "example/zero-run" state="ready" {
         }
         let mut foreign = fence.clone();
         foreign.snapshot_id = foreign.snapshot_id.replacen(&state.node, "another-host", 1);
-        assert!(validate_fence(&state, &foreign).is_err());
+        assert!(validate_fence(&state, &foreign, &session).is_err());
         let mut future = fence.clone();
         future.snapshot_id = format!(
             "snapshot/{}/{}/digest",
             state.node,
             state.store.index().unwrap() + 1
         );
-        assert!(validate_fence(&state, &future).is_err());
+        assert!(validate_fence(&state, &future, &session).is_err());
         let mut revision = fence.clone();
         revision
             .subject_revisions
             .insert("agent/unrelated".into(), "old-revision".into());
-        assert!(validate_fence(&state, &revision).is_err());
+        assert!(validate_fence(&state, &revision, &session).is_err());
         observe("replacement-incarnation");
         let error = action(
             State(state.clone()),
