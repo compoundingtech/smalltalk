@@ -1895,11 +1895,14 @@ fn status_history_mixed_legacy_and_heartbeat_stamps_survive_both_checkpoint_cuts
     let at = cuts[0] - 1_000;
     let append = |kind: &str, fields: Value, time: u128| {
         store.set_write_clock_at(time).unwrap();
-        store.append_claim(&ClaimInput {
-            subject: subject.into(), kind: kind.into(), actor: Some(subject.into()),
-            fields: serde_json::from_value(fields).unwrap(), evidence: Vec::new(),
-            expected_subject: None, idempotency_key: None,
-        }).unwrap()
+        // Preserve legacy/stamped wire rows verbatim: the current observation producer
+        // deliberately rewrites their transition stamp, so it cannot construct this history.
+        let mut connection = store.connection.write();
+        let transaction = connection.transaction().unwrap();
+        let claim = append_claim_tx(&transaction, &store.origin, subject, kind,
+            Some(subject), &json!({"fields":fields}), &[], None).unwrap();
+        transaction.commit().unwrap();
+        claim
     };
     append("runtime.observed", json!({
         "status":"running", "runtime_id":"native", "incarnation_id":"one"
@@ -1935,6 +1938,7 @@ fn status_history_mixed_legacy_and_heartbeat_stamps_survive_both_checkpoint_cuts
         store.copy_store_to(&copy).unwrap();
         let proof = prove_on_copy(&copy, &sealed, &plan).unwrap();
         let mut connection = Connection::open(&copy).unwrap();
+        smallclaims::store::projection_digest::register(&connection).unwrap();
         let transaction = connection.transaction().unwrap();
         record_checkpoint_tombstones_tx(&transaction, &checkpoint_name(cut), &plan.envelopes, &plan.claims).unwrap();
         delete_dropped_rows_tx(&transaction, &plan.envelopes, &plan.claims).unwrap();
