@@ -440,9 +440,20 @@ fn cursors_are_database_bound_and_explicit_restore_rotation_fences_them() {
             ..
         }
     ));
-    store
+    let rejected = store
         .connection
         .batched(|tx| views.publish_cut(tx, SourceCut { epoch: 2, ..cut(0) }))
+        .unwrap();
+    assert!(rejected.is_err());
+    assert_eq!(capture(&store, &views), current);
+    // Test only the cursor's response to lifecycle metadata invalidation. This is not
+    // an accepted restore/epoch transition, which remains the source owner's job.
+    store
+        .connection
+        .batched(|tx| {
+            tx.execute("UPDATE ivm_source SET epoch=2 WHERE singleton=1", [])?;
+            Ok::<_, anyhow::Error>(())
+        })
         .unwrap()
         .unwrap();
     assert!(matches!(
