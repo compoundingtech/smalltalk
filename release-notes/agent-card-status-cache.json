@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Reuse bounded agent-card status reductions between relevant claims.",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay or projection recovery changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No schema or index changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint or digest rule change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Successful agent-card and public full-status responses retain their fields and snapshot semantics."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No setting or store repair required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No persisted cache or migration; normal binary rollback drops process-local reductions."
+  },
+  "downtime": {
+    "status": "unknown",
+    "detail": "Normal daemon restart; duration not measured for this change."
+  }
+}

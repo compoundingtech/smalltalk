@@ -22,6 +22,11 @@ pub use tombstones::{
 
 pub const DAY_MS: u128 = 86_400_000;
 
+/// Envelopes and records a sealed-set read takes per page. Each page is a read of its own, so no
+/// read holds a snapshot, and with it the WAL, for the length of the whole set.
+pub(crate) const SEALED_ENVELOPE_PAGE: i64 = 5_000;
+pub(crate) const SEALED_RECORD_PAGE: i64 = 20_000;
+
 /// The name of the checkpoint whose cut is `cut_unix_ms`, for example `checkpoint/2026-09-27`.
 pub fn checkpoint_name(cut_unix_ms: u128) -> String {
     let day = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
@@ -354,10 +359,7 @@ pub fn delete_dropped_rows_tx(
                 params![operation, claim.id],
             )?;
         }
-        transaction.execute(
-            "DELETE FROM events WHERE store_index IN (SELECT store_index FROM claims WHERE id=?1)",
-            [&claim.id],
-        )?;
+        super::events::remove_claim_tx(transaction, &claim.id)?;
         transaction.execute("DELETE FROM claims WHERE id=?1", [&claim.id])?;
     }
     for envelope in envelopes {
@@ -573,6 +575,22 @@ pub fn prove_on_copy(
     Ok(proof)
 }
 
+/// The query for one window of records in the sealed-set read: the claim columns, the record's
+/// identity and state, and the canonical order's components as columns 14 to 20 (so the pages
+/// can be sorted together in Rust as `ORDER BY canonical` sorted them), then the record's
+/// position as column 21. It must be driven from `replica_records` by its rowid range; a plan
+/// that drives from `claims` would read every claim for every window.
+pub fn sealed_records_page_sql() -> String {
+    let order = super::canonical::components("claims").join(", ");
+    format!(
+        "SELECT {CLAIM_COLUMNS}, records.writer, records.sequence, records.envelope_hash,
+                records.state, {order}, records.position
+         FROM claims JOIN batches ON batches.id=claims.batch_id
+         JOIN replica_records records ON records.claim_id=claims.id
+         WHERE records.rowid > ?1 AND records.rowid <= ?2 AND records.state<>'repaired'"
+    )
+}
+
 impl Store {
     /// The envelopes this node holds from before `cut_unix_ms`, and their admitted claims in
     /// canonical order. An envelope with any claim dated at or after the cut is not before it.
@@ -587,44 +605,137 @@ impl Store {
         cut_unix_ms: u128,
         through_rowid: Option<i64>,
     ) -> Result<SealedSet> {
+        self.checkpoint_sealed_set_paged(
+            cut_unix_ms,
+            through_rowid,
+            SEALED_ENVELOPE_PAGE,
+            SEALED_RECORD_PAGE,
+        )
+    }
+
+    /// `checkpoint_sealed_set_through`, reading `envelope_page` envelopes and `record_page`
+    /// records per read. Each page is a read of its own, so its snapshot ends with it and the WAL
+    /// can be checkpointed between pages; one transaction over the whole set pinned the WAL for
+    /// the 20 to 40 seconds a large store took. The set stays the same set: the envelopes are
+    /// those up to `seal_rowid`, and a claim is kept only if its envelope is among them, so what
+    /// arrives between pages is read and left out. Only a record changing state (a repair)
+    /// between two pages of one call could differ from a single snapshot.
+    pub fn checkpoint_sealed_set_paged(
+        &self,
+        cut_unix_ms: u128,
+        through_rowid: Option<i64>,
+        envelope_page: i64,
+        record_page: i64,
+    ) -> Result<SealedSet> {
         self.runtime.checkpoint_preflight()?;
         // Seal only new batches. A full history scan under the writer stalls live requests
         // every time a checkpoint is reconsidered, even when no new envelope is needed.
         self.seal_local_batches()?;
-        let connection = self.readers.get();
-        // One read transaction, so the envelopes, the claims and the high water agree.
-        let connection = connection.unchecked_transaction()?;
-        let seal_rowid: i64 = connection.query_row(
-            "SELECT COALESCE(MAX(rowid), 0) FROM replica_envelopes",
-            [],
-            |row| row.get(0),
-        )?;
-        let seal_rowid = through_rowid.map_or(seal_rowid, |through| through.min(seal_rowid));
-        let mut envelopes = connection
-            .prepare(
-                "SELECT envelopes.writer, envelopes.sequence, envelopes.envelope_hash,
-                        envelopes.accepted_at_unix_ms,
-                        (SELECT COUNT(*) FROM replica_records records
-                         WHERE records.writer=envelopes.writer AND records.sequence=envelopes.sequence
-                           AND records.envelope_hash=envelopes.envelope_hash)
-                 FROM replica_envelopes envelopes WHERE envelopes.rowid <= ?1",
-            )?
-            .query_map([seal_rowid], |row| {
-                Ok(SealedEnvelope {
-                    key: EnvelopeKey {
-                        writer: row.get(0)?,
-                        sequence: row.get(1)?,
-                        envelope_hash: row.get(2)?,
-                    },
-                    accepted_at_unix_ms: row
-                        .get::<_, String>(3)?
-                        .parse()
-                        .unwrap_or(u128::MAX),
-                    records: row.get(4)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let seal_rowid: i64 = {
+            let connection = self.readers.get();
+            let high: i64 = connection.query_row(
+                "SELECT COALESCE(MAX(rowid), 0) FROM replica_envelopes",
+                [],
+                |row| row.get(0),
+            )?;
+            through_rowid.map_or(high, |through| through.min(high))
+        };
+        let mut envelopes = Vec::new();
+        let mut after = 0_i64;
+        while after < seal_rowid {
+            let upto = after.saturating_add(envelope_page).min(seal_rowid);
+            let connection = self.readers.get();
+            let page = connection
+                .prepare_cached(
+                    "SELECT envelopes.writer, envelopes.sequence, envelopes.envelope_hash,
+                            envelopes.accepted_at_unix_ms,
+                            (SELECT COUNT(*) FROM replica_records records
+                             WHERE records.writer=envelopes.writer AND records.sequence=envelopes.sequence
+                               AND records.envelope_hash=envelopes.envelope_hash)
+                     FROM replica_envelopes envelopes
+                     WHERE envelopes.rowid > ?1 AND envelopes.rowid <= ?2",
+                )?
+                .query_map([after, upto], |row| {
+                    Ok(SealedEnvelope {
+                        key: EnvelopeKey {
+                            writer: row.get(0)?,
+                            sequence: row.get(1)?,
+                            envelope_hash: row.get(2)?,
+                        },
+                        accepted_at_unix_ms: row
+                            .get::<_, String>(3)?
+                            .parse()
+                            .unwrap_or(u128::MAX),
+                        records: row.get(4)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            envelopes.extend(page);
+            after = upto;
+        }
         envelopes.retain(|envelope| envelope.accepted_at_unix_ms < cut_unix_ms);
+        // A repaired original is left out, as projections leave it out: a node holds its row
+        // only when it admitted the original before the repair arrived, so including it would
+        // make the set, and every digest of it, differ between nodes that hold the same
+        // envelopes.
+        // Read the records a window at a time, each window on a read of its own, with the
+        // canonical order's components as columns so the pages sort together here exactly as
+        // `ORDER BY canonical` sorted them in SQL (binary text, then integers, NULL first).
+        let records_sql = sealed_records_page_sql();
+        let (first, last): (i64, i64) = {
+            let connection = self.readers.get();
+            connection.query_row(
+                "SELECT COALESCE(MIN(rowid), 0), COALESCE(MAX(rowid), 0) FROM replica_records",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?
+        };
+        // The canonical order, then the record's own identity, so a claim held by two records
+        // (the same claim admitted from two envelopes) orders the same way every time.
+        type OrderKey = (i64, String, Option<String>, Option<i64>, String, i64, String, String, i64, String, i64);
+        let mut keyed: Vec<(OrderKey, ClaimRecord, EnvelopeKey, bool)> = Vec::new();
+        let mut after = first.saturating_sub(1);
+        while after < last {
+            let upto = after.saturating_add(record_page).min(last);
+            let connection = self.readers.get();
+            let page = connection
+                .prepare_cached(&records_sql)?
+                .query_map([after, upto], |row| {
+                    Ok((
+                        (
+                            row.get(14)?,
+                            row.get(15)?,
+                            row.get(16)?,
+                            row.get(17)?,
+                            row.get(18)?,
+                            row.get(19)?,
+                            row.get(20)?,
+                            row.get(10)?,
+                            row.get(11)?,
+                            row.get(12)?,
+                            row.get(21)?,
+                        ),
+                        claim_from_row(row)?,
+                        EnvelopeKey {
+                            writer: row.get(10)?,
+                            sequence: row.get(11)?,
+                            envelope_hash: row.get(12)?,
+                        },
+                        row.get::<_, String>(13)? == "valid",
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            keyed.extend(page);
+            after = upto;
+        }
+        keyed.sort_by(|left, right| left.0.cmp(&right.0));
+        let claims: Vec<(ClaimRecord, EnvelopeKey, bool)> = keyed
+            .into_iter()
+            .map(|(_, claim, envelope, valid)| (claim, envelope, valid))
+            .collect();
+        // Read after the record pages, so it is at least as new as the claims: a claim that became
+        // protected while the pages were read is protected here, and the set errs toward keeping.
+        let connection = self.readers.get();
         let protected = connection
             .prepare(
                 "SELECT claim_id FROM desired WHERE claim_id IS NOT NULL
@@ -639,31 +750,7 @@ impl Store {
             .query_map([], |row| row.get::<_, Option<String>>(0))?
             .filter_map(|row| row.transpose())
             .collect::<rusqlite::Result<BTreeSet<_>>>()?;
-        // A repaired original is left out, as projections leave it out: a node holds its row
-        // only when it admitted the original before the repair arrived, so including it would
-        // make the set, and every digest of it, differ between nodes that hold the same
-        // envelopes.
-        let claims = connection
-            .prepare(&format!(
-                "SELECT {CLAIM_COLUMNS}, records.writer, records.sequence, records.envelope_hash,
-                        records.state
-                 FROM claims JOIN batches ON batches.id=claims.batch_id
-                 JOIN replica_records records ON records.claim_id=claims.id
-                 WHERE records.state<>'repaired'
-                 ORDER BY {CANONICAL_ORDER}"
-            ))?
-            .query_map([], |row| {
-                Ok((
-                    claim_from_row(row)?,
-                    EnvelopeKey {
-                        writer: row.get(10)?,
-                        sequence: row.get(11)?,
-                        envelope_hash: row.get(12)?,
-                    },
-                    row.get::<_, String>(13)? == "valid",
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let connection = self.readers.get();
         let mut late = BTreeSet::new();
         for (claim, envelope, _) in &claims {
             if claim.accepted_at_unix_ms >= cut_unix_ms {
@@ -755,45 +842,81 @@ impl Store {
         cut_unix_ms: u128,
         through_rowid: Option<i64>,
     ) -> Result<SealedIdentities> {
+        self.checkpoint_sealed_identities_paged(cut_unix_ms, through_rowid, SEALED_ENVELOPE_PAGE)
+    }
+
+    /// `checkpoint_sealed_identities`, reading `envelope_page` envelopes per read, each on a read
+    /// of its own so the WAL can be checkpointed between pages (see
+    /// `checkpoint_sealed_set_paged`). It read the whole set in one transaction before, which
+    /// held the WAL pinned for 35 seconds on a large store.
+    pub fn checkpoint_sealed_identities_paged(
+        &self,
+        cut_unix_ms: u128,
+        through_rowid: Option<i64>,
+        envelope_page: i64,
+    ) -> Result<SealedIdentities> {
         self.runtime.checkpoint_preflight()?;
         self.seal_local_batches()?;
-        let connection = self.readers.get();
-        let connection = connection.unchecked_transaction()?;
-        let seal_rowid: i64 = connection.query_row(
-            "SELECT COALESCE(MAX(rowid), 0) FROM replica_envelopes",
-            [],
-            |row| row.get(0),
-        )?;
-        let seal_rowid = through_rowid.map_or(seal_rowid, |through| through.min(seal_rowid));
+        let seal_rowid: i64 = {
+            let connection = self.readers.get();
+            let high: i64 = connection.query_row(
+                "SELECT COALESCE(MAX(rowid), 0) FROM replica_envelopes",
+                [],
+                |row| row.get(0),
+            )?;
+            through_rowid.map_or(high, |through| through.min(high))
+        };
         let cut = i64::try_from(cut_unix_ms)?;
         // As in `checkpoint_sealed_set_through`: an envelope is before the cut when it and every
         // claim admitted from it, less repaired originals, are dated before the cut.
-        let identities = connection
-            .prepare(
-                "SELECT envelopes.writer, envelopes.sequence, envelopes.envelope_hash
-                 FROM replica_envelopes AS envelopes
-                 WHERE envelopes.rowid <= ?2
-                   AND CAST(envelopes.accepted_at_unix_ms AS INTEGER) < ?1
-                   AND NOT EXISTS (
-                       SELECT 1 FROM replica_records AS records
-                       JOIN claims ON claims.id=records.claim_id
-                       WHERE records.writer=envelopes.writer
-                         AND records.sequence=envelopes.sequence
-                         AND records.envelope_hash=envelopes.envelope_hash
-                         AND records.state<>'repaired'
-                         AND CAST(claims.accepted_at_unix_ms AS INTEGER) >= ?1)
-                 UNION
-                 SELECT writer, sequence, envelope_hash FROM checkpoint_envelopes
-                 WHERE accepted_at_unix_ms < ?1",
-            )?
-            .query_map(params![cut, seal_rowid], |row| {
-                Ok(EnvelopeKey {
-                    writer: row.get(0)?,
-                    sequence: row.get(1)?,
-                    envelope_hash: row.get(2)?,
-                })
-            })?
-            .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+        let mut identities = BTreeSet::new();
+        let mut after = 0_i64;
+        while after < seal_rowid {
+            let upto = after.saturating_add(envelope_page).min(seal_rowid);
+            let connection = self.readers.get();
+            let page = connection
+                .prepare_cached(
+                    "SELECT envelopes.writer, envelopes.sequence, envelopes.envelope_hash
+                     FROM replica_envelopes AS envelopes
+                     WHERE envelopes.rowid > ?3 AND envelopes.rowid <= ?2
+                       AND CAST(envelopes.accepted_at_unix_ms AS INTEGER) < ?1
+                       AND NOT EXISTS (
+                           SELECT 1 FROM replica_records AS records
+                           JOIN claims ON claims.id=records.claim_id
+                           WHERE records.writer=envelopes.writer
+                             AND records.sequence=envelopes.sequence
+                             AND records.envelope_hash=envelopes.envelope_hash
+                             AND records.state<>'repaired'
+                             AND CAST(claims.accepted_at_unix_ms AS INTEGER) >= ?1)",
+                )?
+                .query_map(params![cut, upto, after], |row| {
+                    Ok(EnvelopeKey {
+                        writer: row.get(0)?,
+                        sequence: row.get(1)?,
+                        envelope_hash: row.get(2)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            identities.extend(page);
+            after = upto;
+        }
+        {
+            let connection = self.readers.get();
+            let tombstones = connection
+                .prepare_cached(
+                    "SELECT writer, sequence, envelope_hash FROM checkpoint_envelopes
+                     WHERE accepted_at_unix_ms < ?1",
+                )?
+                .query_map(params![cut], |row| {
+                    Ok(EnvelopeKey {
+                        writer: row.get(0)?,
+                        sequence: row.get(1)?,
+                        envelope_hash: row.get(2)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            identities.extend(tombstones);
+        }
         let mut digest = Sha256::new();
         digest.update(b"st3-checkpoint-sealed-v1\0");
         for key in &identities {
@@ -824,6 +947,10 @@ impl Store {
 
     /// Copy this store to `copy` from one consistent snapshot, while the writer carries on.
     pub fn copy_store_to(&self, copy: &Path) -> Result<()> {
+        // `VACUUM INTO` reads the whole store in one transaction on a connection of its own, which
+        // holds the WAL pinned for as long as the copy takes. Register it, so a pinned-WAL
+        // report can name it: it was the one pin with no live read to blame.
+        let _live = crate::sqlite::register_live_read(true);
         // Readers are read-only, and `VACUUM INTO` needs a connection that may write the copy.
         let flags = if self.shared_memory {
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI

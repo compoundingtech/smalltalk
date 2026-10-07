@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Scope bare mission start IDs to the mission path to prevent builder seat collisions",
+  "replay": { "status": "none", "detail": "No replay or projection behavior changes." },
+  "schema": { "status": "none", "detail": "No durable schema or field changes." },
+  "rules": { "status": "none", "detail": "No authority or checkpoint rules change." },
+  "compatibility": { "status": "changed", "detail": "missions start --id DATE now creates mission-run/MISSION/DATE instead of mission-run/DATE. Explicit path IDs, including mission-run-prefixed paths, retain their existing meaning; generated default IDs are unchanged. Existing runs and seats are not renamed." },
+  "downtime": { "status": "none", "detail": "No service interruption beyond normal deployment." },
+  "manual": { "status": "changed", "detail": "Scripts that address a newly started run by a bare ID must include the mission path in later commands or use the printed run subject. Use an explicit path to retain a custom full run ID." },
+  "recovery": { "status": "none", "detail": "Existing run recovery and restart behavior are unchanged. The new naming prevents cross-mission collisions at start." }
+}

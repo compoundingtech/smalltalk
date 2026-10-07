@@ -45,6 +45,16 @@ pub struct ReplayProgress {
 
 /// A runtime's claim kinds and projections.
 pub trait Runtime: Send + Sync {
+    /// A completed local response still names live work. Cleanup extends its retry window;
+    /// the runtime checks only the bounded candidate, never its complete history.
+    fn idempotency_response_in_use(
+        &self,
+        _connection: &Connection,
+        _response: &str,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Migrate an older store's tables before any table is created. The graph has checked that
     /// the schema version is one it supports.
     fn migrate_schema(&self, connection: &Connection) -> Result<()>;

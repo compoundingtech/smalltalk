@@ -14,6 +14,7 @@ pub struct SmalltalkRuntime {
     /// Simulate different build registries on isolated nodes in compatibility tests.
     #[cfg(test)]
     pub(crate) claim_registry: std::sync::OnceLock<st3_schema::Registry>,
+    pub(crate) conversation_owners: Mutex<VecDeque<(u64, Arc<conversation_reads::Owners>)>>,
     pub(crate) actual_cache: Mutex<HashMap<String, (u64, Option<Value>)>>,
     /// Immutable placement ancestry, keyed by the selected declaration claim.
     pub(crate) placement_cache: Mutex<HashMap<String, Option<Arc<crate::placement::Fence>>>>,
@@ -35,6 +36,79 @@ impl SmalltalkRuntime {
 }
 
 impl Runtime for SmalltalkRuntime {
+    fn idempotency_response_in_use(&self, connection: &Connection, response: &str) -> Result<bool> {
+        // Some local entries contain a digest, not JSON. They have no work lifetime to pin.
+        let Ok(value) = serde_json::from_str::<Value>(response) else {
+            return Ok(false);
+        };
+        let view = value
+            .get("mission_run")
+            .filter(|run| run.is_object())
+            .unwrap_or(&value);
+        for field in ["generation", "source_generation"] {
+            if let Some(generation) = view.get(field).and_then(Value::as_str) {
+                let active: bool = connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM run_generations g JOIN mission_runs r ON r.id=g.run_id
+                     WHERE g.id=?1 AND g.status NOT IN ('completed','failed','cancelled','superseded')
+                     AND r.phase!='terminal')",
+                    [generation.trim_start_matches("run-generation/")],
+                    |row| row.get(0),
+                )?;
+                if active {
+                    return Ok(true);
+                }
+            }
+        }
+        let run = view
+            .get("run")
+            .and_then(Value::as_str)
+            .or_else(|| view.get("mission_run").and_then(Value::as_str))
+            .or_else(|| {
+                view.get("subject")
+                    .and_then(Value::as_str)
+                    .filter(|subject| subject.starts_with("mission-run/"))
+            });
+        if let Some(run) = run {
+            return connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM mission_runs WHERE id=?1 AND phase!='terminal')",
+                    [run.trim_start_matches("mission-run/")],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into);
+        }
+        if let Some(step) = view
+            .get("step")
+            .and_then(Value::as_str)
+            .filter(|step| step.starts_with("step-run/"))
+        {
+            return connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM step_runs s JOIN mission_runs r ON r.id=s.run_id
+                 WHERE s.subject=?1 AND r.phase!='terminal')",
+                    [step],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into);
+        }
+        if let Some(tokens) = view.get("subject_tokens").and_then(Value::as_object) {
+            for subject in tokens
+                .keys()
+                .filter(|subject| subject.starts_with("mission-run/"))
+            {
+                let active: bool = connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM mission_runs WHERE id=?1 AND phase!='terminal')",
+                    [subject.trim_start_matches("mission-run/")],
+                    |row| row.get(0),
+                )?;
+                if active {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     fn migrate_schema(&self, connection: &Connection) -> Result<()> {
         migrate_schema(connection)
     }
@@ -185,7 +259,9 @@ impl Runtime for SmalltalkRuntime {
             .unwrap_or_else(PoisonError::into_inner);
         cache.views.clear();
         cache.statuses.clear();
+        cache.card_statuses.clear();
         drop(cache);
+        self.conversation_owners.lock().unwrap_or_else(PoisonError::into_inner).clear();
         self.agent_status_cache
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

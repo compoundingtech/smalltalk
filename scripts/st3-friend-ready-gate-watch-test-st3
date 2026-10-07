@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-expected_run="mission-run/friend-ready-final-audit-${ST3_FRIEND_READY_IDLE_START_UNIX:-missing}-${ST3_FRIEND_READY_MESSAGE_START_UNIX:-missing}"
+run_id="fleet/st3/friend-ready-final-audit-20260925/friend-ready-final-audit-${ST3_FRIEND_READY_IDLE_START_UNIX:-missing}-${ST3_FRIEND_READY_MESSAGE_START_UNIX:-missing}"
+expected_run="mission-run/$run_id"
 state="${ST3_GATE_TEST_RUN_STATE_PREFIX:-/nonexistent}-${ST3_FRIEND_READY_IDLE_START_UNIX:-missing}-${ST3_FRIEND_READY_MESSAGE_START_UNIX:-missing}"
 case "${1:-} ${2:-}" in
   'conversations send')
@@ -17,7 +18,7 @@ case "${1:-} ${2:-}" in
     [[ -n ${ST3_GATE_TEST_RUN_STATE_PREFIX:-} ]] || exit 2
     found_id=false
     while (( $# > 0 )); do
-      if [[ $1 == --id && ${2:-} == "friend-ready-final-audit-$ST3_FRIEND_READY_IDLE_START_UNIX-$ST3_FRIEND_READY_MESSAGE_START_UNIX" ]]; then
+      if [[ $1 == --id && ${2:-} == "$run_id" ]]; then
         found_id=true
       fi
       shift

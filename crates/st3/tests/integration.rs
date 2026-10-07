@@ -53,6 +53,7 @@ mod startup_readiness;
 mod subagent_publisher;
 mod subagents_seat;
 mod terminal_attach;
+mod terminal_binding;
 mod version;
 
 #[test]

@@ -20,6 +20,15 @@ N+1 detectors, per route, from the larger store's numbers:
                       also lists a thousand steps). Units are the lengths of the answer's lists
                       of objects and the steps nested in them.
 
+Overfetch detectors, per route, from the larger store's numbers (work per byte of answer; VM
+steps stand in for rows read, since SQLite's statement counters have no rows-read figure):
+  overfetch-steps     more than 50,000 VM steps, and more than 40 times the median VM steps per
+                      answer byte of all judged routes. The answer size is floored at 256 bytes,
+                      so a tiny answer is judged on its steps.
+  overfetch-scan      more than 20,000 full-scan steps, and more than 40 full-scan steps per
+                      answer byte (floored at 256). A table scan should not be the way a small
+                      answer is found.
+
 Only a route that was measured at both scales without an error is judged. A budget entry for a
 route that failed or was not measured is kept and reported as not judged, never as fixed.
 """
@@ -31,6 +40,11 @@ import sys
 GROWTH = 1.5
 SLACK = 10
 REPEAT_FLOOR = 20
+ANSWER_FLOOR_BYTES = 256
+STEPS_MIN = 50_000
+STEPS_MULTIPLE = 40
+SCAN_MIN = 20_000
+SCAN_PER_BYTE = 40
 
 
 def judged_routes(report):
@@ -58,11 +72,56 @@ def repeats_per_item(repeat, units):
     return repeat >= max(units) or any(u >= 5 and u <= repeat <= 5 * u for u in units)
 
 
+def per_byte(cost, field):
+    return cost.get(field, 0) / max(cost.get("answer", 0), ANSWER_FLOOR_BYTES)
+
+
+def median(values):
+    values = sorted(values)
+    if not values:
+        return 0
+    middle = len(values) // 2
+    return values[middle] if len(values) % 2 else (values[middle - 1] + values[middle]) / 2
+
+
+def overfetch_findings(report, judged):
+    found = []
+    large = report.get("large", {})
+    ratios = [per_byte(large[route], "vm_steps") for route in judged if route in large]
+    steps_limit = STEPS_MULTIPLE * median(ratios)
+    for route in sorted(judged):
+        cost = large.get(route)
+        if cost is None:
+            continue
+        steps_ratio = per_byte(cost, "vm_steps")
+        if cost.get("vm_steps", 0) > STEPS_MIN and steps_ratio > steps_limit:
+            found.append(
+                {
+                    "route": route,
+                    "detector": "overfetch-steps",
+                    "value": round(steps_ratio, 1),
+                    "detail": f"{cost['vm_steps']} VM steps for {cost.get('answer', 0)} answer bytes; the limit is {round(steps_limit, 1)} steps per byte (median x {STEPS_MULTIPLE})",
+                }
+            )
+        scan_ratio = per_byte(cost, "fullscan_steps")
+        if cost.get("fullscan_steps", 0) > SCAN_MIN and scan_ratio > SCAN_PER_BYTE:
+            found.append(
+                {
+                    "route": route,
+                    "detector": "overfetch-scan",
+                    "value": round(scan_ratio, 1),
+                    "detail": f"{cost['fullscan_steps']} full-scan steps for {cost.get('answer', 0)} answer bytes",
+                }
+            )
+    return found
+
+
 def findings(report):
     """Every detector hit in a cost report, as dicts with the value to compare to a ceiling."""
     found = []
     small, large = report.get("small", {}), report.get("large", {})
     judged, _ = judged_routes(report)
+    found += overfetch_findings(report, judged)
     for route, after in sorted(large.items()):
         before = small.get(route)
         if route not in judged:

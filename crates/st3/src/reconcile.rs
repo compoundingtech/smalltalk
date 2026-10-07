@@ -38,6 +38,21 @@ mod placement;
 
 /// The actor of every attention request the reconciler raises.
 const RECONCILER_ACTOR: &str = "agent/st3/reconciler";
+const OWNERSHIP_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Both skipped and executed items passed their guard; rejection never authorizes reporting.
+enum ReconcileItemOutcome {
+    Skipped,
+    Executed(Result<()>),
+    Rejected,
+    GuardFailed,
+}
+
+#[derive(Default)]
+struct OwnershipErrorLog {
+    last: Option<std::time::Instant>,
+    suppressed: u64,
+}
 const HARNESS_READINESS_DEADLINE_MS: u128 = 60_000;
 const WORK_WAKE_RETRY_MS: u128 = 15_000;
 // A mechanical gate may run for minutes. Each poll reruns the entire host reconciliation
@@ -732,6 +747,10 @@ fn first_readiness_since(run: &MissionRunView) -> u128 {
         .max(run.created_at_unix_ms)
 }
 
+type MemberWake = (DesiredSubject, String, MemberSpec);
+#[cfg(test)]
+type WorkWakeObserveHook = Box<dyn FnOnce(&crate::incremental::Incremental, bool) + Send>;
+
 pub struct Reconciler<R = NativeRuntime> {
     store: Arc<Store>,
     runtime: Arc<R>,
@@ -793,6 +812,8 @@ pub struct Reconciler<R = NativeRuntime> {
     faults: Mutex<Option<BTreeMap<(String, String), String>>>,
     /// Faults that could not be recorded in the graph during the current pass.
     unrecorded_faults: Mutex<Vec<String>>,
+    /// Bound ownership-error logging across all candidates without caching guard results.
+    ownership_error_log: Mutex<OwnershipErrorLog>,
     /// Step-timeout faults this reconciler has already raised, so a pass records each once.
     step_timeout_faults: Mutex<BTreeSet<String>>,
     /// Broken-gate attention episodes this reconciler has already raised, so a pass that finds a
@@ -807,7 +828,7 @@ pub struct Reconciler<R = NativeRuntime> {
     /// Why each member failed its last render, kept while render is skipped.
     render_failures: Mutex<BTreeMap<String, String>>,
     /// The work wake each live agent's last evaluation queued, queued again while it is skipped.
-    member_wakes: Mutex<HashMap<String, (String, String, MemberSpec)>>,
+    member_wakes: Mutex<HashMap<String, MemberWake>>,
     /// How often a skipped member's terminal screen is looked at again for a prompt.
     screen_poll_every_ms: u128,
     fault_injection: Option<Arc<dyn FaultInjection>>,
@@ -829,6 +850,9 @@ pub struct Reconciler<R = NativeRuntime> {
     /// cannot hide inside a test that expects a clean pass.
     #[cfg(test)]
     raised_faults: Mutex<Option<Vec<String>>>,
+    /// Publish during a unit test after the work feed was observed, before wake selection.
+    #[cfg(test)]
+    after_work_wake_observe: Mutex<Option<WorkWakeObserveHook>>,
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -923,6 +947,7 @@ impl Reconciler<NativeRuntime> {
             resource_provider: Arc::new(RegisteredResourceProvider),
             faults: Mutex::new(None),
             unrecorded_faults: Mutex::new(Vec::new()),
+            ownership_error_log: Mutex::new(OwnershipErrorLog::default()),
             step_timeout_faults: Mutex::new(BTreeSet::new()),
             raised_broken_gates: Mutex::new(BTreeSet::new()),
             gate_recheck_base_ms: GATE_RECHECK_BASE_MS,
@@ -942,6 +967,8 @@ impl Reconciler<NativeRuntime> {
             cleanup_deadline: CLEANUP_DEADLINE,
             #[cfg(test)]
             raised_faults: Mutex::new(Some(Vec::new())),
+            #[cfg(test)]
+            after_work_wake_observe: Mutex::new(None),
         })
     }
 }
@@ -990,6 +1017,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             resource_provider: Arc::new(RegisteredResourceProvider),
             faults: Mutex::new(None),
             unrecorded_faults: Mutex::new(Vec::new()),
+            ownership_error_log: Mutex::new(OwnershipErrorLog::default()),
             step_timeout_faults: Mutex::new(BTreeSet::new()),
             raised_broken_gates: Mutex::new(BTreeSet::new()),
             gate_recheck_base_ms: GATE_RECHECK_BASE_MS,
@@ -1009,6 +1037,8 @@ impl<R: RuntimeControl> Reconciler<R> {
             cleanup_deadline: CLEANUP_DEADLINE,
             #[cfg(test)]
             raised_faults: Mutex::new(Some(Vec::new())),
+            #[cfg(test)]
+            after_work_wake_observe: Mutex::new(None),
         }
     }
 
@@ -1999,11 +2029,16 @@ impl<R: RuntimeControl> Reconciler<R> {
         }));
 
         let active = desired.iter().collect::<Vec<_>>();
+        let eligible = match self.store.owned_desired_subjects(&desired) {
+            Ok(eligible) => eligible,
+            Err(error) => {
+                self.report_ownership_error("snapshot", &self.host, &error);
+                BTreeSet::new()
+            }
+        };
+        let eligible = |subject: &DesiredSubject| eligible.contains(&subject.subject);
         let mut member_errors = BTreeMap::new();
         for subject in &active {
-            if self.store.owned_desired_guard(subject).is_err() {
-                continue;
-            }
             if subject.kind == "stop" {
                 continue;
             }
@@ -2014,6 +2049,9 @@ impl<R: RuntimeControl> Reconciler<R> {
             else {
                 continue;
             };
+            if !eligible(subject) || !self.owned_desired_ready(subject) {
+                continue;
+            }
             let workspace = Path::new(&member.workspace);
             let checkout = (subject.kind == "agent")
                 .then(|| Checkout::from_desired(&subject.desired))
@@ -2053,8 +2091,15 @@ impl<R: RuntimeControl> Reconciler<R> {
         let renderable = active
             .iter()
             .copied()
+            .filter(|subject| {
+                subject.kind != "stop"
+                    && subject
+                        .member
+                        .as_ref()
+                        .is_some_and(|member| member.host == self.host)
+            })
             .filter(|subject| !member_errors.contains_key(&subject.subject))
-            .filter(|subject| self.store.owned_desired_guard(subject).is_ok())
+            .filter(|subject| eligible(subject))
             .collect::<Vec<_>>();
         // A live member is evaluated again when a claim it read, its runtime, its exec state or
         // its screen changed, when its time came, or when its workspace or render failed.
@@ -2226,7 +2271,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         drop(unreadable_span);
         let members_span = crate::profile::span("pass/members");
         for subject in &active {
-            if self.store.owned_desired_guard(subject).is_err() {
+            if !eligible(subject) {
                 continue;
             }
             // Retire this host's process even when the desired host or selected actual
@@ -2238,6 +2283,12 @@ impl<R: RuntimeControl> Reconciler<R> {
                 let item = format!("away:{}", subject.subject);
                 stops.insert(item.clone());
                 if self.needs_item(&item, !skip_stops) || !skip_stops {
+                    // An authority change skips this prepared candidate silently, as the old
+                    // pass guard did; it is not a runtime fault or a successful evaluation.
+                    if !self.owned_desired_ready(subject) {
+                        stops.remove(&item);
+                        continue;
+                    }
                     let ((result, due), reads) = smallclaims::touched::record(|| {
                         smallclaims::touched::record_due(|| {
                             caught(|| self.reconcile_placement_away(subject, ptys.as_ref()))
@@ -2250,6 +2301,9 @@ impl<R: RuntimeControl> Reconciler<R> {
                 }
             }
             if subject.kind == "stop" {
+                if !self.owned_desired_ready(subject) {
+                    continue;
+                }
                 let _member_span = crate::profile::span("pass/member stop");
                 let item = format!("stop:{}", subject.subject);
                 stops.insert(item.clone());
@@ -2288,6 +2342,12 @@ impl<R: RuntimeControl> Reconciler<R> {
                 }
                 continue;
             }
+            // Cached wakes carry their declaration to the late wake guard. Check here only
+            // when evaluating the member, avoiding another history read for a clean member.
+            if !self.owned_desired_ready(subject) {
+                members.remove(&item);
+                continue;
+            }
             let queued_before = work_message_agents.len();
             let cpu_started = crate::incremental::thread_cpu();
             let wrote_mark = smallclaims::touched::wrote_len();
@@ -2319,6 +2379,18 @@ impl<R: RuntimeControl> Reconciler<R> {
                             });
                             self.runtime.observe_exec(&member.runtime_id)?
                         };
+                        if member.lifecycle == MemberLifecycle::TerminalBound {
+                            if let Some(incarnation) =
+                                self.reconcile_terminal_binding(subject, member, observed.as_ref())?
+                            {
+                                work_message_agents.push((
+                                    (**subject).clone(),
+                                    incarnation,
+                                    member.clone(),
+                                ));
+                            }
+                            return Ok(());
+                        }
                         if self.reconcile_rollout(subject, observed.as_ref(), blocked.as_ref())? {
                             if subject.kind == "agent"
                                 && let Some(observation) =
@@ -2337,7 +2409,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                                 .map_or_else(|| member.clone(), |(_, old)| old);
                                 // Deferring cutover must not stop ready work reaching the incumbent.
                                 work_message_agents.push((
-                                    subject.subject.clone(),
+                                    (**subject).clone(),
                                     incarnation.to_owned(),
                                     old,
                                 ));
@@ -2444,7 +2516,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                                     && let Some(incarnation) = observation.incarnation_id.as_deref()
                                 {
                                     work_message_agents.push((
-                                        subject.subject.clone(),
+                                        (**subject).clone(),
                                         incarnation.to_owned(),
                                         member.clone(),
                                     ));
@@ -2626,7 +2698,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             // is recorded with that delivery.
             let deferred = work_message_agents
                 .last()
-                .is_some_and(|(agent, _, _)| agent == &subject.subject);
+                .is_some_and(|(declaration, _, _)| declaration.subject == subject.subject);
             if deferred {
                 if let Err(error) = result {
                     deferred_member_faults.insert(subject.subject.clone(), error);
@@ -2710,18 +2782,37 @@ impl<R: RuntimeControl> Reconciler<R> {
         // cancelled, so see their changes first.
         self.incremental.observe(&self.store)?;
         let skip_wakes = self.skip_unneeded && !self.incremental.take_full_pass("wake", now_ms());
+        #[cfg(test)]
+        if let Some(after) = self.after_work_wake_observe.lock().unwrap().take() {
+            after(&self.incremental, skip_wakes);
+        }
         let mut wakes = BTreeSet::new();
-        for (agent, incarnation, member) in work_message_agents {
+        for (declaration, incarnation, member) in work_message_agents {
+            let agent = &declaration.subject;
             let item = format!("wake:{agent}@{incarnation}");
             wakes.insert(item.clone());
-            let result = self.reconcile_item("wake", &item, skip_wakes, || {
-                self.reconcile_work_messages(&agent, &incarnation, Some(&member))
-            });
-            let result = match deferred_member_faults.remove(&agent) {
+            let result = self.reconcile_guarded_item(
+                "wake",
+                &item,
+                skip_wakes,
+                || self.owned_desired_check(&declaration),
+                || self.reconcile_work_messages(agent, &incarnation, Some(&member)),
+            );
+            let result = match result {
+                ReconcileItemOutcome::Rejected | ReconcileItemOutcome::GuardFailed => {
+                    // Authority rejection is a silent skip, not a member fault or recovery.
+                    wakes.remove(&item);
+                    continue;
+                }
+                // Preserve the existing skipped-wake reporting policy only after a fresh guard.
+                ReconcileItemOutcome::Skipped => Ok(()),
+                ReconcileItemOutcome::Executed(result) => result,
+            };
+            let result = match deferred_member_faults.remove(agent) {
                 Some(error) => Err(error),
                 None => result,
             };
-            if let Err(error) = self.record_member_reconcile_result(&agent, result) {
+            if let Err(error) = self.record_member_reconcile_result(agent, result) {
                 diagnostic_errors.push(format!("{agent}: {error:#}"));
             }
         }
@@ -3779,15 +3870,89 @@ impl<R: RuntimeControl> Reconciler<R> {
         skip: bool,
         work: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
+        match self.reconcile_guarded_item(section, item, skip, || Ok(true), work) {
+            ReconcileItemOutcome::Skipped => Ok(()),
+            ReconcileItemOutcome::Executed(result) => result,
+            ReconcileItemOutcome::Rejected | ReconcileItemOutcome::GuardFailed => {
+                unreachable!("the unconditional guard cannot fail")
+            }
+        }
+    }
+
+    /// Expected authority rejections are silent; storage failures keep their error identity.
+    fn owned_desired_check(&self, declaration: &DesiredSubject) -> Result<bool> {
+        match self.store.owned_desired_guard(declaration) {
+            Ok(()) => Ok(true),
+            Err(error)
+                if matches!(
+                    error.code,
+                    "owned-set-pending" | "owned-set-conflict" | "stale-set-member"
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn owned_desired_ready(&self, declaration: &DesiredSubject) -> bool {
+        match self.owned_desired_check(declaration) {
+            Ok(ready) => ready,
+            Err(error) => {
+                self.report_ownership_error("member", &declaration.subject, &error);
+                false
+            }
+        }
+    }
+
+    fn report_ownership_error(&self, section: &str, item: &str, error: &dyn std::fmt::Display) {
+        let now = std::time::Instant::now();
+        let mut log = self
+            .ownership_error_log
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if log
+            .last
+            .is_some_and(|last| now.duration_since(last) < OWNERSHIP_ERROR_LOG_INTERVAL)
+        {
+            log.suppressed = log.suppressed.saturating_add(1);
+            return;
+        }
+        log.last = Some(now);
+        let suppressed_errors = std::mem::take(&mut log.suppressed);
+        drop(log);
+        tracing::error!(section, item, error = %error, suppressed_errors, diagnostic_interval_s = OWNERSHIP_ERROR_LOG_INTERVAL.as_secs(), "reconciler ownership read failed; candidates fenced");
+    }
+
+    /// Check captured declaration authority inside the item's read recorder before effects.
+    /// A clean skip still checks authority: callers can record a result without doing work.
+    /// Rejection and skipping leave the previous evaluation untouched.
+    fn reconcile_guarded_item(
+        &self,
+        section: &'static str,
+        item: &str,
+        skip: bool,
+        guard: impl FnOnce() -> Result<bool>,
+        work: impl FnOnce() -> Result<()>,
+    ) -> ReconcileItemOutcome {
         let _clock = smallclaims::store::clock_snapshot();
         let needed = self.needs_item(item, !skip);
-        if skip && !needed {
-            return Ok(());
-        }
         let cpu_started = crate::incremental::thread_cpu();
         let wrote_mark = smallclaims::touched::wrote_len();
-        let ((result, due), reads) =
-            smallclaims::touched::record(|| smallclaims::touched::record_due(|| caught(work)));
+        let ((result, due), reads) = smallclaims::touched::record(|| {
+            smallclaims::touched::record_due(|| match guard() {
+                Ok(false) => ReconcileItemOutcome::Rejected,
+                Ok(true) if skip && !needed => ReconcileItemOutcome::Skipped,
+                Ok(true) => ReconcileItemOutcome::Executed(caught(work)),
+                Err(error) => {
+                    self.report_ownership_error(section, item, &error);
+                    ReconcileItemOutcome::GuardFailed
+                }
+            })
+        });
+        let ReconcileItemOutcome::Executed(ref outcome) = result else {
+            return result;
+        };
         crate::performance::record_evaluation(
             section,
             needed,
@@ -3800,7 +3965,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
         }
         // A failed delivery is tried again on the next pass, as before.
-        if result.is_ok() {
+        if outcome.is_ok() {
             self.incremental.evaluated(item, reads, due);
         }
         result
@@ -4349,6 +4514,18 @@ impl<R: RuntimeControl> Reconciler<R> {
             // not evidence that the owner's process stopped.
             return Ok(());
         }
+        if let Some(member) = member.filter(|m| m.lifecycle == MemberLifecycle::TerminalBound) {
+            let incarnation = member
+                .terminal_binding
+                .as_ref()
+                .context("bound seat has no binding")?
+                .agent_incarnation();
+            return self.record_once(
+                &subject.subject,
+                "runtime.observed",
+                member_fields(member, "stopped", Some(&incarnation), true),
+            );
+        }
         let Some(runtime_id) = member.map(|m| m.runtime_id.as_str())
             .or_else(|| fields.get("runtime_id").and_then(Value::as_str)) else {
             return Ok(());
@@ -4857,6 +5034,10 @@ impl<R: RuntimeControl> Reconciler<R> {
         reason: &str,
         request: Option<&crate::model::ClaimRecord>,
     ) -> Result<bool> {
+        anyhow::ensure!(
+            member.lifecycle != MemberLifecycle::TerminalBound,
+            "a bound terminal seat cannot be spawned"
+        );
         self.store.owned_desired_guard(subject)?;
         let explicit_person = request.is_some_and(|request| {
             request
@@ -6455,6 +6636,53 @@ impl<R: RuntimeControl> Reconciler<R> {
             crate::performance::record_wake("timer restart", Some(restart_wake_kind(&subject)));
             notify.notify_one();
         });
+    }
+
+    /// Observe only the invocation, never the borrowed shell's lifecycle as an agent exit.
+    fn reconcile_terminal_binding(
+        &self,
+        subject: &DesiredSubject,
+        member: &MemberSpec,
+        observed: Option<&RuntimeObservation>,
+    ) -> Result<Option<String>> {
+        let binding = member
+            .terminal_binding
+            .as_ref()
+            .context("bound seat has no binding")?;
+        let incarnation = binding.agent_incarnation();
+        let prior = self.store.latest_actual_value(&subject.subject)?;
+        if let Some(prior) = prior.as_ref().filter(|actual| {
+            actual_field(actual, "incarnation_id").and_then(Value::as_str)
+                == Some(incarnation.as_str())
+                && matches!(
+                    actual_field(actual, "status").and_then(Value::as_str),
+                    Some("exited" | "vanished" | "stopped")
+                )
+        }) {
+            let status = actual_field(prior, "status")
+                .and_then(Value::as_str)
+                .expect("exit status");
+            let mut fields = member_fields(member, status, Some(&incarnation), true);
+            for key in ["exit_code", "exit_signal"] {
+                if let Some(value) = actual_field(prior, key) {
+                    fields.insert(key.into(), value.clone());
+                }
+            }
+            self.record_once(&subject.subject, "runtime.observed", fields)?;
+            return Ok(None);
+        }
+        // Refuse a replacement PTY with the same runtime ID, including after daemon restart.
+        let running = observed.is_some_and(|o| {
+            o.status == "running"
+                && o.incarnation_id.as_deref() == Some(binding.incarnation.as_str())
+        });
+        let status = if running { "running" } else { "vanished" };
+        self.record_once(
+            &subject.subject,
+            "runtime.observed",
+            member_fields(member, status, Some(&incarnation), true),
+        )?;
+        Ok(running.then_some(incarnation))
     }
 
     fn record_member(
@@ -8454,6 +8682,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             tags: BTreeMap::new(),
             display_name: Some(format!("loop metric {}", metric.name)),
             lifecycle: MemberLifecycle::Service,
+            terminal_binding: None,
             one_shot: false,
             restart: RestartType::Never,
             restart_intensity: RestartIntensity::default(),
@@ -13112,6 +13341,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             tags: BTreeMap::new(),
             display_name: None,
             lifecycle: MemberLifecycle::Service,
+            terminal_binding: None,
             one_shot: false,
             restart: RestartType::Never,
             restart_intensity: RestartIntensity::default(),
@@ -13647,6 +13877,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             tags: BTreeMap::new(),
             display_name: None,
             lifecycle: MemberLifecycle::Service,
+            terminal_binding: None,
             one_shot: false,
             restart: RestartType::Never,
             restart_intensity: RestartIntensity::default(),
@@ -15401,6 +15632,7 @@ mod tests {
     mod differential;
     mod first_readiness_tests;
     mod incremental_deadlines;
+    mod ownership_guard_tests;
     mod pull_request_run_tests;
     mod ref_watch_tests;
     mod rollout_tests;
@@ -15572,6 +15804,7 @@ exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
     #[derive(Default)]
     struct FakeRuntime {
         snapshot_error: Mutex<bool>,
+        before_observe_exec: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         ptys: Mutex<Vec<RuntimeObservation>>,
         execs: Mutex<HashMap<String, RuntimeObservation>>,
         logs: Mutex<HashMap<String, String>>,
@@ -15638,6 +15871,9 @@ exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
             Ok(self.ptys.lock().unwrap().clone())
         }
         fn observe_exec(&self, runtime_id: &str) -> Result<Option<RuntimeObservation>> {
+            if let Some(before) = self.before_observe_exec.lock().unwrap().take() {
+                before();
+            }
             if let Some(at) = self.observe_at.lock().unwrap().take() {
                 smallclaims::store::set_thread_clock(Some(at));
             }

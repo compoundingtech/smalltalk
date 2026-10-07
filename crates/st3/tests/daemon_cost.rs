@@ -728,7 +728,11 @@ const PROBES: &[Probe] = &[
     ),
     get("GET /v1/status", "/v1/status?subject={seat}"),
     get("GET /v1/desired/{*subject}", "/v1/desired/{seat}"),
-    get("GET /v1/events", "/v1/events?limit=100"),
+    get("GET /v1/events", "/v1/events?after={event_after}&limit=100"),
+    get(
+        "GET /v1/events/page",
+        "/v1/events/page?after={event_after}&limit=100",
+    ),
     // The route streams JSON Lines rather than the JSON document the HTTP probe expects.
     // Measure the same paged exporter directly, normalizing work by archive bytes.
     direct("GET /v1/backup", |store, _, _| {
@@ -1732,6 +1736,10 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
         store.append_claim(&running).unwrap();
     }
     let mut fixture = fixture(&person, &client, subjects).await;
+    fixture.items.insert(
+        "event_after",
+        store.event_bounds().unwrap().0.saturating_sub(1).to_string(),
+    );
     // Exercise successful enrolled imports and a fixed-size incremental reply page,
     // rather than measuring a refused request or a historical mailbox scan.
     let adapter = Client::unix_agent(&socket, ADAPTER_ACTOR).unwrap();
@@ -1831,6 +1839,14 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
     assert_eq!(page["items"], json!([selected]));
 
     prepare_custom_fixture(&store, &mut fixture, scale);
+    let event_page: Value = client
+        .get(&fixture.fill("/v1/events/page?after={event_after}&limit=100", 0))
+        .await
+        .expect("the event cost probe must use a retained cursor");
+    assert!(
+        !event_page["items"].as_array().unwrap().is_empty(),
+        "measure a populated event page, not a refused or empty traversal"
+    );
 
     let mut costs = BTreeMap::new();
     for probe in PROBES {

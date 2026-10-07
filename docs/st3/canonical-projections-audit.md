@@ -33,7 +33,9 @@ Mixed storage tables below are classified by their logical shared fields; local 
 | `desired` | Shared projection | Shared selected declaration, ancestry/conflicts, ownership and full canonical body; existing ancestry/revision/id selection is deterministic and must be preserved. |
 | `idempotency` | Local | Local opaque HTTP/operation response cache with local indexes; shared operation identity is operations plus checkpoint_claims. |
 | `mission_run_requests` | Local | Local original request-hash cache paired with idempotency; run identities in this legacy API are origin-scoped. |
-| `events` | Local | Local stream notifications keyed by arrival index; replay/admission history can differ. |
+| `events` | Local view | Canonical claim payloads joined to local admitted membership by arrival index. |
+| `event_positions` | Local | Payload-free admitted event positions and subject routing; replay/admission history can differ. |
+| `local_event_payloads` | Temporary local | Present only during bounded schema-17 migration of legacy event payloads. |
 | `message_index` | Shared projection | Shared message membership/closed fact. created_index is a local cache cursor. Subject order/onset/lifecycle must come from canonical message claims, never this cursor. |
 | `peer_cursors` | Local | Local per-peer legacy transport progress. |
 | `peer_replica_cursors` | Local | Local per-peer/per-writer transport progress. |

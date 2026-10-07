@@ -11,7 +11,7 @@ for start in "$ST3_FRIEND_READY_IDLE_START_UNIX" "$ST3_FRIEND_READY_MESSAGE_STAR
 done
 
 mission=mission/fleet/st3/friend-ready-final-audit-20260925
-run_id="friend-ready-final-audit-$ST3_FRIEND_READY_IDLE_START_UNIX-$ST3_FRIEND_READY_MESSAGE_START_UNIX"
+run_id="${mission#mission/}/friend-ready-final-audit-$ST3_FRIEND_READY_IDLE_START_UNIX-$ST3_FRIEND_READY_MESSAGE_START_UNIX"
 run="mission-run/$run_id"
 
 [[ -d $ST3_FRIEND_READY_AUDIT_WORKSPACE ]] || {

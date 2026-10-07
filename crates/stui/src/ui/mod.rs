@@ -134,9 +134,6 @@ struct Demo {
     harbor_seen: Option<Instant>,
 }
 
-/// How long an update stays open on Home before it counts as read.
-const UPDATE_READ_AFTER: Duration = Duration::from_secs(3);
-
 /// A request the live loop sends to st. The demo never produces these.
 /// What the agent actions menu does to a seat; each is st's own agent action.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -235,18 +232,6 @@ pub enum Effect {
     CreateTerminal {
         name: String,
     },
-    CreateAgent {
-        name: String,
-        harness: String,
-        model: Option<String>,
-        effort: Option<String>,
-        host: Option<String>,
-        message: Option<String>,
-        repo: Option<String>,
-        branch: Option<String>,
-        base: Option<String>,
-        workspace: Option<String>,
-    },
     /// Send a failed or unconfirmed message again, as the same request.
     Resend {
         entry: String,
@@ -255,25 +240,6 @@ pub enum Effect {
     Forget {
         entry: String,
     },
-}
-
-pub(crate) fn agent_parameters(
-    form: &screens::AgentForm,
-    host: Option<String>,
-) -> st3_client::AgentCreateParameters {
-    st3_client::AgentCreateParameters {
-        name: form.name.trim().to_owned(),
-        harness: form.harness().to_owned(),
-        host,
-        model: form.model().map(str::to_owned),
-        effort: form.effort().map(str::to_owned),
-        message: (!form.task.trim().is_empty()).then(|| form.task.trim().to_owned()),
-        repo: (!form.repository.trim().is_empty()).then(|| form.repository.trim().to_owned()),
-        branch: (!form.repository.trim().is_empty()).then(|| form.branch()),
-        base: (!form.repository.trim().is_empty()).then(|| form.base().to_owned()),
-        workspace: (!form.workspace.trim().is_empty()).then(|| form.workspace.trim().to_owned()),
-        ..Default::default()
-    }
 }
 
 /// An agent's live terminal screen, drawn in place of its conversation.
@@ -358,10 +324,13 @@ pub struct Ui {
     /// Live: actions become `effects` for the live loop instead of demo edits.
     live: bool,
     effects: Vec<Effect>,
-    /// The update open on Home and since when: one left open a moment counts as read.
-    update_open: Option<(String, Instant)>,
     /// Updates marked read from here, so each is sent once.
     updates_read: HashSet<String>,
+    /// Attention items the person acted on from here: st closing them is their doing.
+    acted: HashSet<String>,
+    /// Attention items st no longer lists that nobody here acted on. Nothing leaves Home by
+    /// itself (Nathan, 2026-10-07): they stay, marked, until `x` clears them.
+    closed: HashSet<String>,
     /// Conversations scrolled up to their oldest entry since the last frame: each asks st for
     /// the page before it.
     older_wanted: RefCell<BTreeSet<String>>,
@@ -417,14 +386,6 @@ pub struct Ui {
     details_here: HashSet<String>,
     /// Finding text in a conversation.
     find: Option<Find>,
-    /// The new agent form, kept while the person looks elsewhere.
-    new_agent: Option<screens::AgentForm>,
-    agent_repositories: Option<(String, view::Load<Vec<String>>)>,
-    agent_form_focus: Cell<Option<usize>>,
-    /// The Agents tab shows the new agent form rather than the selected agent.
-    agent_form: bool,
-    /// An agent just started from here, to select once st lists it.
-    started: Option<String>,
     /// Images attached to each draft, by its key, until it is sent.
     attachments: HashMap<String, Vec<attach::Attachment>>,
     /// Where typing goes in the input that has the keyboard.
@@ -510,8 +471,9 @@ impl Ui {
             quit: false,
             live: false,
             effects: Vec::new(),
-            update_open: None,
             updates_read: HashSet::new(),
+            acted: HashSet::new(),
+            closed: HashSet::new(),
             older_wanted: RefCell::default(),
             popover: None,
             chat: None,
@@ -538,11 +500,6 @@ impl Ui {
             build: false,
             details_here: HashSet::new(),
             find: None,
-            new_agent: None,
-            agent_repositories: None,
-            agent_form_focus: Cell::new(None),
-            agent_form: false,
-            started: None,
             attachments: HashMap::new(),
             cursor: edit::Cursor::default(),
             terminal_size: Cell::new((24, 80)),
@@ -560,6 +517,48 @@ impl Ui {
     }
 
     /// Replace the world, keeping each tab's selection on the same item.
+    /// Note what the person did to an item from here, so its closing is not "closed elsewhere".
+    pub(crate) fn note_acted(&mut self, effect: &Effect) {
+        match effect {
+            Effect::Attention { id, .. }
+            | Effect::LaunchRevise { id, .. }
+            | Effect::Reply { id, .. } => {
+                self.acted.insert(id.clone());
+            }
+            _ => {}
+        }
+    }
+
+    /// An item st stopped listing stays on Home, marked, unless the person acted on it: another
+    /// device, an agent or st itself closed it, and it must not go while it is being read.
+    fn keep_closed_attention(&mut self, before: Vec<view::Attention>) {
+        let Load::Ready(items) = &mut self.world.attention else {
+            return;
+        };
+        for old in before {
+            if let Some(now) = items.iter().find(|item| item.id == old.id) {
+                if !self.closed.contains(&now.id) {
+                    continue;
+                }
+                self.closed.remove(&old.id);
+                continue;
+            }
+            if self.acted.contains(&old.id) {
+                self.closed.remove(&old.id);
+                continue;
+            }
+            let mut kept = old;
+            if self.closed.insert(kept.id.clone()) {
+                kept.waiting = Some(match kept.waiting.take() {
+                    Some(who) => format!("closed elsewhere, x clears it · {who}"),
+                    None => "closed elsewhere, x clears it".into(),
+                });
+                kept.actions.clear();
+            }
+            items.push(kept);
+        }
+    }
+
     pub fn set_world(&mut self, world: World) {
         let tab = self.tab;
         let mut chosen = Vec::new();
@@ -567,7 +566,15 @@ impl Ui {
             self.tab = index;
             chosen.push(self.selected_id());
         }
+        // Only what was on screen from a live reading can have closed under the person's eyes;
+        // a stored copy, or a reading before the first live one, is just replaced.
+        let before = if matches!(self.world.link, Link::Live) {
+            self.world.attention.items().to_vec()
+        } else {
+            Vec::new()
+        };
         self.world = world;
+        self.keep_closed_attention(before);
         for (index, id) in chosen.into_iter().enumerate() {
             self.tab = index;
             if let Some(id) = id
@@ -577,7 +584,6 @@ impl Ui {
             }
         }
         self.tab = tab;
-        self.select_started();
         if self.glasses.is_some() {
             self.resync_focus();
         }
@@ -903,27 +909,6 @@ impl Ui {
         if self.paste_into_palette(&first) {
             return;
         }
-        if self.agent_form
-            && self.tab == 1
-            && let Some(form) = self.new_agent.as_mut()
-        {
-            let (value, input) = match form.focus {
-                0 => (&mut form.task, "agent:task"),
-                1 => (&mut form.name, "agent:name"),
-                6 => (&mut form.repository, "agent:repository"),
-                7 => (&mut form.branch, "agent:branch"),
-                8 => (&mut form.base, "agent:base"),
-                9 => (&mut form.workspace, "agent:workspace"),
-                _ => return,
-            };
-            edit::insert(
-                value,
-                &self.cursor,
-                input,
-                if form.focus == 0 { &text } else { &first },
-            );
-            return;
-        }
         if self.mission_form_focused()
             && let Some((fields, focus)) = self.new_mission.as_mut()
         {
@@ -1099,7 +1084,7 @@ impl Ui {
 
     fn listing_for(&self, tab: usize, width: usize) -> Listing {
         match tab {
-            0 => screens::home_list(&self.world, &self.snoozed),
+            0 => screens::home_list(&self.world, &self.snoozed, &self.closed),
             1 if self.tree => screens::agents_tree(&self.world, self.spinner(), width),
             1 => screens::agents_list(&self.world, self.spinner(), width),
             2 if self.tree => screens::missions_tree(&self.world, self.spinner(), self.system),
@@ -1899,6 +1884,15 @@ impl Ui {
             editing: self.editing,
             confirm: self.confirm,
             answering: self.answering,
+            needs_words: self.changes_answer.as_ref().and_then(|wanted| {
+                self.structured_request().and_then(|(_, request)| {
+                    request
+                        .answers
+                        .iter()
+                        .find(|answer| &answer.id == wanted)
+                        .map(|answer| answer.label.clone())
+                })
+            }),
             chat,
         }
     }
@@ -1908,7 +1902,6 @@ impl Ui {
         let id = self.selected_id();
         match self.tab {
             0 => Pane::Home(id),
-            1 if self.agent_form => Pane::NewAgent,
             // In spaces an attached terminal is its own tab's: another tab shows what it holds,
             // and the terminal stays attached behind it (Nathan, 2026-10-02).
             1 => match &self.terminal {
@@ -1952,28 +1945,6 @@ impl Ui {
                     fields,
                     *focus,
                     self.cursor.at(&format!("mission:{focus}"), &fields[*focus]),
-                    width,
-                )
-            }
-            Pane::NewAgent => {
-                let empty = Default::default();
-                let form = self.new_agent.as_ref().unwrap_or(&empty);
-                screens::new_agent_form(
-                    form,
-                    &self.other_hosts(),
-                    [
-                        self.cursor.at("agent:task", &form.task),
-                        self.cursor.at("agent:name", &form.name),
-                        self.cursor.at("agent:repository", &form.repository),
-                        self.cursor.at("agent:branch", &form.branch),
-                        self.cursor.at("agent:base", &form.base),
-                        self.cursor.at("agent:workspace", &form.workspace),
-                    ],
-                    self.agent_repositories
-                        .as_ref()
-                        .filter(|(host, _)| Some(host) == self.agent_repository_host().as_ref())
-                        .map(|(_, load)| load)
-                        .unwrap_or(&view::Load::Loading),
                     width,
                 )
             }
@@ -2424,29 +2395,6 @@ impl Ui {
                 state.top = start.saturating_add_signed(anchor.offset);
             }
             state.reconcile(total, height);
-            if key == Pane::NewAgent.key()
-                && let Some(form) = &self.new_agent
-                && self.agent_form_focus.replace(Some(form.focus)) != Some(form.focus)
-            {
-                let mut lines = doc
-                    .targets
-                    .iter()
-                    .filter(|target| target.hit == Hit::Field(form.focus))
-                    .map(|target| target.line);
-                if let Some(first) = lines.next() {
-                    let last = lines
-                        .next_back()
-                        .unwrap_or(first)
-                        .min(first + height.saturating_sub(1));
-                    if first < state.top {
-                        state.top = first;
-                    }
-                    if last >= state.top + height {
-                        state.top = last.saturating_sub(height.saturating_sub(1));
-                    }
-                    state.follow = false;
-                }
-            }
             // The note about earlier entries stays first while they load above it, so the
             // place is kept by the first entry read instead.
             let entries = || {
@@ -3057,7 +3005,6 @@ impl Ui {
                     ("ctrl+o", "zoom the split, and back"),
                     ("ctrl+s", "show or hide the sidebar"),
                     ("ctrl+g", "another space, or a new one"),
-                    ("ctrl+n", "start a new agent"),
                     ("1-5", "open the palette at a section"),
                 ],
             );
@@ -3434,6 +3381,35 @@ impl Ui {
         }
     }
 
+    /// Whether a held key may act again as a press. While text is being typed (a message box,
+    /// the palette, find, a form) any key but Enter, Esc, Tab and the function keys may; outside
+    /// it only the keys that move. Never a pending confirmation or answer: Enter, y and the
+    /// commands that change things act once per press, so holding one can never repeat them.
+    fn repeat_is_safe(&self, key: &KeyEvent) -> bool {
+        if self.confirm.is_some() || self.answering.is_some() || self.terminal_focused() {
+            return false;
+        }
+        let typing = self.editing
+            || self.find.is_some()
+            || self.palette_open()
+            || self.chat.as_ref().is_some_and(|chat| chat.editing)
+            || self.new_mission.is_some();
+        match key.code {
+            KeyCode::Enter | KeyCode::Esc | KeyCode::Tab | KeyCode::BackTab | KeyCode::F(_) => {
+                false
+            }
+            KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::PageUp
+            | KeyCode::PageDown
+            | KeyCode::Home
+            | KeyCode::End => true,
+            _ => typing,
+        }
+    }
+
     pub fn key(&mut self, key: KeyEvent) {
         let ctrl_t = key.code == KeyCode::Char('t') && key.modifiers == KeyModifiers::CONTROL;
         if self.terminal_hold.is_some() {
@@ -3465,6 +3441,11 @@ impl Ui {
                 && !matches!(key.code, KeyCode::Char('c' | 'd') if key.modifiers.contains(KeyModifiers::CONTROL) && !self.shell_focused())
             {
                 self.terminal_key(key);
+            } else if key.kind == KeyEventKind::Repeat && self.repeat_is_safe(&key) {
+                // Held down, a key goes on: Ctrl+W deletes word after word, an arrow moves on.
+                let mut again = key;
+                again.kind = KeyEventKind::Press;
+                self.key(again);
             }
             return;
         }
@@ -3623,10 +3604,6 @@ impl Ui {
                     }
                 }
             }
-            return;
-        }
-        if self.agent_form && self.tab == 1 && self.new_agent.is_some() {
-            self.agent_form_key(key);
             return;
         }
         if self.mission_form_focused()
@@ -3829,7 +3806,6 @@ impl Ui {
             {
                 self.open_terminal()
             }
-            KeyCode::Char('n') if self.tab == 1 => self.open_new_agent(None),
             KeyCode::Char('n') if self.tab == 2 => {
                 self.new_mission = Some((Default::default(), 0));
             }
@@ -3902,30 +3878,6 @@ impl Ui {
         }
     }
 
-    /// An update opened on Home is read once the person leaves it, after it was open for a
-    /// moment: marking it read closes it, and it must stay put while it is being read (Nathan,
-    /// 2026-10-05: updates vanished mid-read). Passing over it with the arrows does not count,
-    /// and `x` still reads it at once.
-    pub(crate) fn read_open_update(&mut self) {
-        let open = self
-            .attention_focus()
-            .filter(|_| !self.help && self.popover.is_none())
-            .filter(|_| self.current_kind() == Some("update"));
-        if let Some((shown, since)) = &self.update_open
-            && open.as_ref() != Some(shown)
-            && since.elapsed() >= UPDATE_READ_AFTER
-        {
-            let shown = shown.clone();
-            self.update_open = None;
-            self.read_update_id(shown);
-        }
-        match (open, &self.update_open) {
-            (None, _) => self.update_open = None,
-            (Some(id), Some((shown, _))) if *shown == id => {}
-            (Some(id), _) => self.update_open = Some((id, Instant::now())),
-        }
-    }
-
     fn current_kind(&self) -> Option<&'static str> {
         let id = self.attention_focus()?;
         self.world
@@ -3984,6 +3936,22 @@ impl Ui {
                 if self.current_item().is_some_and(|item| item.actions.iter().any(|a| a == "custom.reply"))
                     && matches!(key, 'y' | 'n' | 'r' | 'x') {
                     self.flash("Reply with c using this source's declared fields");
+                    return;
+                }
+                if let Some(id) = self.attention_focus()
+                    && self.closed.contains(&id)
+                {
+                    if key == 'x' {
+                        self.closed.remove(&id);
+                        self.acted.insert(id.clone());
+                        if let Load::Ready(items) = &mut self.world.attention {
+                            items.retain(|item| item.id != id);
+                        }
+                        let index = self.selected[self.tab];
+                        self.select(index);
+                    } else {
+                        self.flash("This was closed elsewhere and stays until you clear it with x");
+                    }
                     return;
                 }
                 match (kind, key) {
@@ -4278,181 +4246,6 @@ impl Ui {
         }
     }
 
-    /// The fleet's machines other than this one, in list order: the new agent form's hosts.
-    fn other_hosts(&self) -> Vec<String> {
-        self.world
-            .machines
-            .items()
-            .iter()
-            .filter(|machine| machine.reach != Reach::Here)
-            .map(|machine| machine.name.clone())
-            .collect()
-    }
-
-    /// Open the new agent form: in a new tab of the focused split in a glass, on the Agents
-    /// tab otherwise. `task` fills in what it should do.
-    pub(crate) fn open_new_agent(&mut self, task: Option<String>) {
-        self.agent_form_focus.set(None);
-        match self.new_agent.as_mut() {
-            Some(form) => {
-                if let Some(task) = task {
-                    form.task = task;
-                }
-            }
-            None => self.new_agent = Some(screens::AgentForm::new(task.unwrap_or_default())),
-        }
-        if self.glasses.is_some() {
-            self.open_in_glass(Pane::NewAgent, glass::Open::Tab);
-        } else {
-            self.tab = 1;
-            self.agent_form = true;
-            self.terminal = None;
-        }
-    }
-
-    fn cancel_agent_form(&mut self) {
-        self.new_agent = None;
-        self.agent_form = false;
-        if self.glasses.is_some() {
-            self.close_form_tab();
-        }
-    }
-
-    fn agent_repository_host(&self) -> Option<String> {
-        let form = self.new_agent.as_ref()?;
-        Some(
-            form.host
-                .checked_sub(1)
-                .and_then(|index| self.other_hosts().get(index).cloned())
-                .unwrap_or_else(|| {
-                    if self.world.host == "this machine" {
-                        "local".into()
-                    } else {
-                        self.world.host.clone()
-                    }
-                }),
-        )
-    }
-
-    fn agent_form_key(&mut self, key: KeyEvent) {
-        let suggestions = self
-            .agent_repositories
-            .as_ref()
-            .filter(|(host, _)| Some(host) == self.agent_repository_host().as_ref())
-            .map(|(_, load)| load.items().to_vec())
-            .unwrap_or_default();
-        let hosts = self.other_hosts().len();
-        let Some(form) = self.new_agent.as_mut() else {
-            return;
-        };
-        let shifted = key
-            .modifiers
-            .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT);
-        match key.code {
-            KeyCode::Esc => self.cancel_agent_form(),
-            KeyCode::Char(choice @ ('n' | 'p'))
-                if form.focus == 6 && key.modifiers.contains(KeyModifiers::CONTROL) =>
-            {
-                if !suggestions.is_empty() {
-                    let index = suggestions
-                        .iter()
-                        .position(|path| path == &form.repository)
-                        .map(|index| {
-                            if choice == 'n' {
-                                (index + 1) % suggestions.len()
-                            } else {
-                                (index + suggestions.len() - 1) % suggestions.len()
-                            }
-                        })
-                        .unwrap_or(if choice == 'n' {
-                            0
-                        } else {
-                            suggestions.len() - 1
-                        });
-                    form.repository = suggestions[index].clone();
-                }
-            }
-            KeyCode::Tab | KeyCode::Down if form.choice() || key.code == KeyCode::Tab => {
-                form.focus = (form.focus + 1) % screens::AgentForm::FIELDS;
-            }
-            KeyCode::BackTab | KeyCode::Up if form.choice() || key.code == KeyCode::BackTab => {
-                form.focus =
-                    (form.focus + screens::AgentForm::FIELDS - 1) % screens::AgentForm::FIELDS;
-            }
-            KeyCode::Left | KeyCode::Right if form.choice() => {
-                form.cycle(key.code == KeyCode::Right, hosts);
-            }
-            KeyCode::Enter if shifted && form.focus == 0 => {
-                edit::insert(&mut form.task, &self.cursor, "agent:task", "\n")
-            }
-            KeyCode::Enter => self.start_agent(),
-            _ => match form.focus {
-                0 => {
-                    edit::edit(&mut form.task, &self.cursor, "agent:task", key);
-                }
-                1 => {
-                    // A name is one word of letters, digits, dots and dashes.
-                    if let KeyCode::Char(character) = key.code
-                        && !key.modifiers.contains(KeyModifiers::CONTROL)
-                        && !(character.is_ascii_alphanumeric() || matches!(character, '-' | '.'))
-                    {
-                        return;
-                    }
-                    edit::edit(&mut form.name, &self.cursor, "agent:name", key);
-                }
-                6 => {
-                    edit::edit(&mut form.repository, &self.cursor, "agent:repository", key);
-                }
-                7 => {
-                    edit::edit(&mut form.branch, &self.cursor, "agent:branch", key);
-                }
-                8 => {
-                    edit::edit(&mut form.base, &self.cursor, "agent:base", key);
-                }
-                9 => {
-                    edit::edit(&mut form.workspace, &self.cursor, "agent:workspace", key);
-                }
-                _ => {}
-            },
-        }
-    }
-
-    fn start_agent(&mut self) {
-        let hosts = self.other_hosts();
-        let Some(form) = self.new_agent.clone() else {
-            return;
-        };
-        if form.name.trim().is_empty() {
-            if let Some(form) = self.new_agent.as_mut() {
-                form.focus = 1;
-            }
-            self.flash("Give it a name");
-            return;
-        }
-        let host = form
-            .host
-            .checked_sub(1)
-            .and_then(|index| hosts.get(index).cloned());
-        if self.live {
-            let parameters = agent_parameters(&form, host);
-            self.effects.push(Effect::CreateAgent {
-                name: parameters.name,
-                harness: parameters.harness,
-                model: parameters.model,
-                effort: parameters.effort,
-                host: parameters.host,
-                message: parameters.message,
-                repo: parameters.repo,
-                branch: parameters.branch,
-                base: parameters.base,
-                workspace: parameters.workspace,
-            });
-            self.flash(format!("Starting {}…", form.name.trim()));
-        } else {
-            self.flash("Agent started · demo: nothing was sent");
-        }
-    }
-
     /// st started the agent asked for here: its conversation replaces the form.
     /// The new mission form: in a new tab of the focused split in a glass, on Missions otherwise.
     pub(crate) fn open_new_mission(&mut self) {
@@ -4484,34 +4277,6 @@ impl Ui {
             self.open_in_glass(Pane::Terminal(id.clone()), glass::Open::Tab);
         }
         self.attach_terminal(&id);
-    }
-
-    pub(crate) fn agent_started(&mut self, id: String) {
-        self.new_agent = None;
-        self.agent_form = false;
-        if self.glasses.is_some() {
-            // The agent's conversation takes the form's tab.
-            self.close_form_tab();
-            self.open_in_glass(Pane::Agent(Some(id.clone())), glass::Open::Tab);
-        } else {
-            self.tab = 1;
-        }
-        self.started = Some(id);
-        self.select_started();
-    }
-
-    /// Select the agent just started once st lists it.
-    fn select_started(&mut self) {
-        let Some(id) = self.started.clone() else {
-            return;
-        };
-        let tab = self.tab;
-        self.tab = 1;
-        if let Some(position) = self.ids().iter().position(|candidate| *candidate == id) {
-            self.selected[1] = position;
-            self.started = None;
-        }
-        self.tab = tab;
     }
 
     fn create_launch(&mut self) {
@@ -4690,7 +4455,22 @@ impl Ui {
             _ => None,
         };
         let Some(mut draft) = draft else {
-            self.flash("Write something first");
+            // An answer that asks for changes is sent with the changes in words.
+            let wanted = self.changes_answer.clone().and_then(|wanted| {
+                self.structured_request().and_then(|(_, request)| {
+                    request
+                        .answers
+                        .iter()
+                        .find(|answer| answer.id == wanted)
+                        .map(|answer| answer.label.clone())
+                })
+            });
+            self.flash(match wanted {
+                Some(label) => format!(
+                    "“{label}” needs your words: write what should change, then Enter. Esc cancels"
+                ),
+                None => "Write something first".to_owned(),
+            });
             return;
         };
         // Live, the images go to st with the message, so an agent on any machine can read them
@@ -4837,7 +4617,7 @@ impl Ui {
 
     /// The agent whose conversation is shown, by name, while it is working.
     fn working_agent(&self) -> Option<String> {
-        if self.tab != 1 || self.agent_form || self.terminal_focused() {
+        if self.tab != 1 || self.terminal_focused() {
             return None;
         }
         let id = self.selected_id()?;
@@ -5428,7 +5208,6 @@ impl Ui {
             Hit::Message | Hit::Subject | Hit::Resize => {}
             Hit::GlassMenu => self.open_palette(Some(4), glass::Open::Here),
             Hit::PaletteSection(section) => self.open_palette(Some(section), glass::Open::Here),
-            Hit::NewAgent => self.open_new_agent(None),
             Hit::Home if self.home_open() && !self.usage_open() => self.close_home(),
             Hit::Home => self.open_home(),
             // The terminal may be on another machine than stui (over SSH or fabric): the
@@ -5485,11 +5264,6 @@ impl Ui {
                     _ => {}
                 }
             }
-            Hit::Key('\t') if self.agent_form => {
-                if let Some(form) = self.new_agent.as_mut() {
-                    form.focus = (form.focus + 1) % screens::AgentForm::FIELDS;
-                }
-            }
             Hit::Key('\t') => {
                 if let Some((_, focus)) = self.new_mission.as_mut() {
                     *focus = (*focus + 1) % 4;
@@ -5507,8 +5281,6 @@ impl Ui {
                 }
             }
             Hit::Enter if self.new_mission.is_some() => self.create_launch(),
-            Hit::Enter if self.agent_form && self.tab == 1 => self.start_agent(),
-            Hit::Escape if self.agent_form && self.tab == 1 => self.cancel_agent_form(),
             Hit::Enter => {
                 if self.chat.is_some() {
                     self.submit_chat()
@@ -5573,17 +5345,6 @@ impl Ui {
                 self.start_voice();
             }
             Hit::Open(id) => self.open(&id),
-            Hit::Repository(path) => {
-                if let Some(form) = self.new_agent.as_mut() {
-                    form.repository = path;
-                    form.focus = 6;
-                }
-            }
-            Hit::Field(index) if self.agent_form => {
-                if let Some(form) = self.new_agent.as_mut() {
-                    form.focus = index;
-                }
-            }
             Hit::Field(index) => {
                 if let Some((_, focus)) = self.new_mission.as_mut() {
                     *focus = index;
@@ -6660,6 +6421,7 @@ mod tests {
             "Read it",
             "Clears this item.",
             "Why you: You asked for a summary.",
+            "x cannot dismiss this: it needs one of its answers",
         ] {
             assert!(screen.contains(shown), "{shown}: {screen}");
         }
@@ -6674,6 +6436,87 @@ mod tests {
             "{:?}",
             ui.effects
         );
+    }
+
+    #[test]
+    fn an_answer_that_asks_for_changes_says_it_needs_words() {
+        // Nathan, 2026-10-07: "it says I must type something. What does this mean?"
+        let mut world = demo::world();
+        let request = st3_client::StructuredRequest {
+            version: 1,
+            entry_type: "decision".into(),
+            question: "Approve as written?".into(),
+            why_person: "Only you can waive it.".into(),
+            summary: None,
+            reasons: Vec::new(),
+            recommendation: Some(st3_client::RequestRecommendation {
+                answer: "follow".into(),
+                reason: "it keeps the brief".into(),
+            }),
+            subjects: Vec::new(),
+            answers: vec![
+                st3_client::RequestAnswerOption {
+                    id: "follow".into(),
+                    label: "Follow the brief".into(),
+                    consequence: "The author gets your terms.".into(),
+                    outcome: Some("request_changes".into()),
+                    ..Default::default()
+                },
+                st3_client::RequestAnswerOption {
+                    id: "approve".into(),
+                    label: "Approve as written".into(),
+                    consequence: "It is queued.".into(),
+                    outcome: Some("accept".into()),
+                    ..Default::default()
+                },
+            ],
+            custom: false,
+        };
+        let item = Attention {
+            id: "attention/decide".into(),
+            tier: Tier::Stopped,
+            title: "Decide".into(),
+            waiting: None,
+            age: "1m".into(),
+            mission: None,
+            agent: Some("agent/example/cos".into()),
+            kind: AttentionKind::Request {
+                from: "Chief of Staff".into(),
+                from_id: "agent/example/cos".into(),
+                question: request.question.clone(),
+                structured: Some(Box::new(request)),
+            },
+            actions: vec!["work.done".into()],
+            related: Vec::new(),
+            raised_by: None,
+            blocked: None,
+        };
+        if let Load::Ready(items) = &mut world.attention {
+            items.insert(0, item);
+        }
+        let mut ui = Ui::new(world);
+        ui.live = true;
+        ui.tab = 0;
+        let at = ui
+            .listing(60)
+            .ids
+            .iter()
+            .position(|id| id == "attention/decide")
+            .unwrap();
+        ui.select(at);
+        assert!(frame(&ui, 140, 50).join("\n").contains("needs your words"));
+        ui.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let screen = frame(&ui, 140, 50).join("\n");
+        assert!(screen.contains("what should change? Enter sends it with “Follow the brief”"), "{screen}");
+        // Enter with nothing written says what is wanted, not just "Write something first".
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            ui.flash.as_ref().is_some_and(|(text, _)| text.contains("“Follow the brief” needs your words")),
+            "{:?}",
+            ui.flash
+        );
+        assert!(ui.effects.is_empty());
     }
 
     #[test]
@@ -6771,9 +6614,6 @@ mod tests {
         ] {
             assert!(screen.contains(shown), "{shown}: {screen}");
         }
-        // Open, but only just: not read yet.
-        ui.read_open_update();
-        assert!(ui.effects.is_empty());
         // x dismisses it: it is read, once.
         ui.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
         ui.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
@@ -6783,26 +6623,91 @@ mod tests {
             "{:?}",
             ui.effects
         );
-        // Left open a good while, it stays: it is read only once the person moves off it.
+        // Left open, or moved off, it stays: only x or r reads an update.
         ui.effects.clear();
         ui.updates_read.clear();
-        ui.update_open = Some((
-            "attention/update".into(),
-            Instant::now() - UPDATE_READ_AFTER * 10,
-        ));
-        ui.read_open_update();
-        assert!(ui.effects.is_empty(), "still being read: {:?}", ui.effects);
-        assert!(ui.updates_read.is_empty());
-        // Moving off it (here, to nothing) after it was open a moment reads it.
         ui.select(0);
-        ui.read_open_update();
-        assert_eq!(ui.effects.len(), 1, "{:?}", ui.effects);
-        // Moving off one that was only passed over does not.
-        ui.effects.clear();
-        ui.updates_read.clear();
-        ui.update_open = Some(("attention/update".into(), Instant::now()));
-        ui.read_open_update();
         assert!(ui.effects.is_empty(), "{:?}", ui.effects);
+    }
+
+    #[test]
+    fn an_item_st_stops_listing_stays_on_home_until_x_clears_it() {
+        let world = demo::world();
+        let mut ui = Ui::new(world.clone());
+        ui.live = true;
+        ui.tab = 0;
+        let ids = ui.listing(60).ids.clone();
+        let (gone, acted) = (ids[0].clone(), ids[1].clone());
+        ui.select(0);
+        // Another device closes the first; the person answers the second here.
+        ui.note_acted(&Effect::Attention {
+            id: acted.clone(),
+            action: "work.done".into(),
+            reason: None,
+            answer: None,
+        });
+        let mut next = world;
+        if let Load::Ready(items) = &mut next.attention {
+            items.retain(|item| item.id != gone && item.id != acted);
+        }
+        ui.set_world(next.clone());
+        let listing = ui.listing(60);
+        assert!(listing.ids.contains(&gone), "it stays");
+        assert!(!listing.ids.contains(&acted), "what the person acted on goes");
+        ui.select(listing.ids.iter().position(|id| *id == gone).unwrap());
+        let shown = frame(&ui, 140, 50).join("\n");
+        assert!(shown.contains("closed elsewhere"));
+        // It sits under its own heading, apart from what needs the person.
+        assert!(shown.contains("closed elsewhere: x clears each"), "{shown}");
+        // It survives later updates, and only x clears it.
+        ui.set_world(next.clone());
+        assert!(ui.listing(60).ids.contains(&gone));
+        ui.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(ui.listing(60).ids.contains(&gone), "other keys leave it");
+        ui.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(!ui.listing(60).ids.contains(&gone));
+        assert!(ui.effects.is_empty(), "nothing sent for an item already closed");
+        ui.set_world(next);
+        assert!(!ui.listing(60).ids.contains(&gone));
+    }
+
+    #[test]
+    fn a_held_key_repeats_while_typing_and_never_repeats_a_command() {
+        // Nathan, 2026-10-07: holding Ctrl+W deleted one word, not word after word.
+        let mut ui = Ui::new(demo::world());
+        ui.live = true;
+        ui.tab = 1;
+        ui.select(0);
+        let agent = ui.selected_id().unwrap();
+        ui.editing = true;
+        ui.conversation_state
+            .drafts
+            .insert(agent.clone(), "one two three four".into());
+        let key = |code, modifiers, kind| {
+            let mut key = KeyEvent::new(code, modifiers);
+            key.kind = kind;
+            key
+        };
+        ui.key(key(KeyCode::Char('w'), KeyModifiers::CONTROL, KeyEventKind::Press));
+        for _ in 0..2 {
+            ui.key(key(KeyCode::Char('w'), KeyModifiers::CONTROL, KeyEventKind::Repeat));
+        }
+        assert_eq!(ui.conversation_state.drafts[&agent], "one ");
+        // A release is nothing, and a held Enter never sends again.
+        ui.key(key(KeyCode::Char('w'), KeyModifiers::CONTROL, KeyEventKind::Release));
+        ui.key(key(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Repeat));
+        assert!(ui.effects.is_empty(), "{:?}", ui.effects);
+        assert_eq!(ui.conversation_state.drafts[&agent], "one ");
+        // Not typing, a held command key acts once (its press), never on repeats; a held arrow moves on.
+        ui.editing = false;
+        ui.tab = 0;
+        ui.select(0);
+        ui.key(key(KeyCode::Char('x'), KeyModifiers::NONE, KeyEventKind::Repeat));
+        assert!(ui.confirm.is_none() && ui.effects.is_empty() && ui.flash.is_none());
+        ui.key(key(KeyCode::Down, KeyModifiers::NONE, KeyEventKind::Press));
+        let after_press = ui.selected[0];
+        ui.key(key(KeyCode::Down, KeyModifiers::NONE, KeyEventKind::Repeat));
+        assert_eq!(ui.selected[0], after_press + 1);
     }
 
     #[test]

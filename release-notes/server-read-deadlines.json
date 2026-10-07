@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Bound server reads and stop cancelled blocking read work.",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay or projection recovery changes. Read cancellation does not change frontier or projection health."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, indexes, triggers or schema-version change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or digest change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Reads return HTTP 504/read-deadline when the server budget expires: ordinary 15 seconds, long-poll envelopes add their configured wait (up to 30 seconds) to the 15-second read budget, with a separate 15-second query budget, and administrative bulk and doctor 120 seconds. Existing successful response shapes are unchanged. Mixed client/server versions are not independently qualified."
+  },
+  "downtime": {
+    "status": "unknown",
+    "detail": "Requires the normal daemon binary restart. Restart-to-API and restart-to-health duration have not been measured for this change."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No setting, store repair or identity migration is required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No on-disk migration. A binary rollback restores prior read behavior; it does not repair a slow read."
+  }
+}

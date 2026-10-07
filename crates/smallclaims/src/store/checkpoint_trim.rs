@@ -266,11 +266,20 @@ impl Store {
                 seal_rowid,
             }) => {
                 let cut = certificate.terms.cut_unix_ms;
+                let verified = |plan: &super::checkpoint::DropPlan| {
+                    plan.sealed_digest == certificate.terms.sealed_digest
+                        && plan.drop_digest == certificate.terms.drop_digest
+                };
                 let sealed = self.checkpoint_sealed_set_through(cut, Some(seal_rowid))?;
-                let plan = self.runtime.plan_checkpoint_drops(&sealed);
-                if plan.sealed_digest == certificate.terms.sealed_digest
-                    && plan.drop_digest == certificate.terms.drop_digest
-                {
+                let mut plan = self.runtime.plan_checkpoint_drops(&sealed);
+                if !verified(&plan) {
+                    // The set is read in pages, each its own snapshot, so a write between two
+                    // pages (a repair changing a record's state) could tear one read. A torn read
+                    // must not send the node to adopt a peer's manifest: read once more first.
+                    let sealed = self.checkpoint_sealed_set_through(cut, Some(seal_rowid))?;
+                    plan = self.runtime.plan_checkpoint_drops(&sealed);
+                }
+                if verified(&plan) {
                     self.trim_checkpoint(
                         &checkpoint,
                         cut,

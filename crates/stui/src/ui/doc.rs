@@ -56,9 +56,6 @@ pub enum Hit {
     GlassMenu,
     /// Glasses: open the palette at one section.
     PaletteSection(usize),
-    /// Open the new agent form.
-    NewAgent,
-    Repository(String),
     /// Glasses: open or close Home over the glass.
     Home,
     /// A link: copied to the person's clipboard, wherever their terminal is.

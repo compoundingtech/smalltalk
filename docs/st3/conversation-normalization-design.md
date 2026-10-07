@@ -385,3 +385,45 @@ strictly as a UI presentation choice on rebase. Native source records here retai
 all those fields. The latter's optional timing extraction can use open block
 metadata; arbitrary native result details remain available in `source_record`,
 without copying its numeric whitelist into this normalizer.
+
+## Graph reads for conversation changes
+
+Conversation routing uses a volatile map of runtime identities at eight recent
+claim frontiers. A changed read folds only agents whose actual-state claims changed;
+harness-only and unrelated commits do not repeat agent status/history reductions.
+Catch-up copies at most 4,097 small subject/kind rows before releasing the statement;
+a gap beyond 4,096 rebuilds the identity map. The map contains routing metadata,
+not conversation bytes. Mixed origins and other actual kinds retain the existing
+canonical identity reduction for that agent. This is not a history-independent
+cold-read proof or a replacement for the shared incremental read-model mechanism.
+
+Message reads preserve the newest 10,000 fleet-send window, but existing endpoint
+indexes select the owner's sends before any payload decoding. Two partial indexes
+retain legacy sends whose endpoint fields are at the body root. Replay additionally
+selects only sends after its cursor and before the captured claim frontier. Runtime
+membership reads indexed acceptance times instead of decoding every observation
+into Rust. Message payloads are copied in batches of at most 64 rows, stopping at
+1 MiB plus one complete row; each SQL statement and connection is released before
+JSON decoding. No encompassing SQLite transaction spans native I/O, preparation,
+payload decoding or long-poll waiting. A concurrent-checkpoint test pauses decoding
+a 2 MiB message and proves a subsequent write can be fully checkpointed.
+
+The isolated before/after changes-handler measurement uses a consistent 10.55 GB
+store copy with 784,162 retained claims (frontier 960,761), a representative agent
+with 19,339 claims, and a fixed 128-record native fixture. Four warmed debug-build
+samples append one native reply and one harness observation, request negotiated
+blocks, and use zero long-poll wait. Both variants return two items and 1,006 bytes.
+Handler time changes from 781–787 ms to 246–277 ms; CPU from 781–787 ms to 244–269 ms;
+SQLite VM work from about 343,000 steps to 118,500. The longest SQL statement/reader
+lifetime drops from 229–231 ms to 4–5 ms. Statement count rises from 103–105 to
+117–119 because payload copies use short bounded batches. These measurements
+isolate graph work and do not reproduce the full production 11-second read or
+identify its WAL holder. Owned-message processing and native window preparation
+remain separate costs; the incremental native-window/page slice is #1665.
+
+The two legacy indexes add no payload class, claim kind, retention rule, client
+contract or projection digest. Their first builds on the isolated store took
+17.08 seconds and 0.34 seconds (the second reused warmed pages); subsequent opens
+reuse them. This startup cost belongs in rollout planning. Older builds ignore
+the additional indexes. The routing cache is cleared with projection repairs and
+rebuilds after restart.

@@ -232,6 +232,7 @@ impl Ui {
             editing: false,
             confirm: None,
             answering: None,
+            needs_words: None,
             chat: None,
         };
         let doc = screens::home_detail(&self.world, Some(subject), 120, &drafts);
@@ -310,7 +311,6 @@ impl Ui {
             Hit::PaletteSection(2) => "Open missions [Ctrl+3]",
             Hit::PaletteSection(3) => "Open fleet [Ctrl+4]",
             Hit::GlassMenu => "Open spaces [Ctrl+G]",
-            Hit::NewAgent => "New agent [Ctrl+N]",
             Hit::NewTerminal => "New terminal",
             Hit::Split(true) => "Split right [Ctrl+V]",
             Hit::Split(false) => "Split below [Ctrl+X]",
@@ -440,7 +440,6 @@ impl Ui {
             && !self.palette_open()
             && self.confirm.is_none()
             && self.find.is_none()
-            && !self.agent_form
             && self.new_mission.is_none()
         {
             if bar_key {
@@ -675,6 +674,7 @@ mod tests {
                     editing: false,
                     confirm: None,
                     answering: None,
+                    needs_words: None,
                     chat: None,
                 },
             );

@@ -42,6 +42,36 @@ It writes three files:
 
 Work on a thread that runs no named operation appears as `(unlabeled THREAD)`.
 
+Collection socket reads name their work `stream collection/missions`,
+`stream collection/attention`, `stream collection/agents`, `stream collection/work`,
+`stream collection/glasses` and `stream collection/arrangements`. Their shared bounded
+claim-kind check is `stream collection/invalidation`. These labels include cache lookup and
+live agent overlays as well as rebuilds; a label's operation count is not a rebuild count.
+The socket remains responsible for its own snapshot and change delivery. Equivalent session
+authority and query windows share computation through a disposable per-Store cache, while each
+read rechecks paired authority and receives its own SQLite snapshot fence. Admission for an
+equivalent cached window waits asynchronously before starting its blocking snapshot reader;
+the physical worker retains admission through cancellation. Cache locks only select or publish
+immutable results. Each Store retains at most 64 windows, with 16 per session; query churn past
+that session quota evicts only that session's inactive windows. Separate local-commit epochs
+survive later ignored claims, and attention/mission computation uses the same captured clock
+as its cache period. This cache covers the six collections named above.
+
+A disposable local single-client cold-read comparison is available with:
+`cargo test -p st3 --lib shared_windows_local_single_client_cost -- --ignored --nocapture`.
+It compares uncached, cold cached and warm reads for 100 glass rows under Unix and paired
+sessions, alternating case order and reporting aggregate wall/process CPU. Debug-profile
+fixture results do not measure deployed paired-client CPU or production tail latency.
+
+Conversation collection followers (`follow_conversation`) and standalone conversation sockets
+(`conversation_stream_socket`) use the existing conversation page/change reader. Mailbox reads
+already name `task mailbox-snapshot` and `task mailbox-update`. Attention's collection clock
+handles grace and expiry without a claim; HTTP Home/now reads retain their route labels.
+Terminal sockets (`terminal_stream_socket`) follow the shared latest-screen source and periodically
+recheck their live fence; the existing fence span is `terminal/live-fence`. These are source
+locations for investigating ongoing work, not an attribution of process CPU. Long-poll waits and
+socket lifetime must be distinguished from the cost of a completed read.
+
 A slow record's `completion` is `finished` when the request or task explicitly finished its
 profile. If its owner exits without finishing, including a canceled HTTP request, the last
 worker records it with `completion: dropped`. That record includes blocking work that continued
