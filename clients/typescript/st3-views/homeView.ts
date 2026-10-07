@@ -39,6 +39,8 @@ export function homeKind(item: Kindish): { tier: Tier; kind: HomeKind } | null {
     // Information the person asked for (`st work update`): nothing waits on it.
     case 'person-step': return item.update ? { tier: 'later', kind: 'update' } : { tier: 'stopped', kind: 'request' };
     case 'agent-request': return { tier: 'stopped', kind: 'request' };
+    // A prompt a harness is waiting on: answered with its own action (`prompt.respond`).
+    case 'harness-prompt': return { tier: 'stopped', kind: 'request' };
     case 'launch-approval': return { tier: 'today', kind: 'launch' };
     case 'revision-approval': return { tier: 'today', kind: 'revision' };
     default: return null;

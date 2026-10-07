@@ -18,6 +18,11 @@ const items = [
   item('theirs', 'human-gate', { person_id: 'person/someone-else' }),
   item('new-kind', 'something-new'),
 ];
+// A prompt a harness is waiting on is a request on Home, in the tier of what stops on the person.
+{
+  const prompt = homeRows([item('prompt', 'harness-prompt', { actions: ['prompt.respond'], prompt: { state: 'open' } })], 'person/alex', now);
+  assert.deepEqual(prompt.map(row => [row.kind, row.tier]), [['request', 'stopped']]);
+}
 const rows = homeRows(items, 'person/alex', now);
 assert.deepEqual(rows.map(row => row.item.id.replace('attention/', '')), ['gate', 'ask', 'step', 'launch']);
 assert.deepEqual(homeSections(rows).map(section => [section.title, section.count]), [['somebody is stopped on you', 3], ['today', 1]]);
