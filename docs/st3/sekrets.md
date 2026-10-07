@@ -47,6 +47,10 @@ resource graph plan; this document describes what is built.
   `sekret.refused`, `sekret.changed`). Entries and claims carry who called, which profile, the
   arguments and the exit status. They never carry a credential or a command's output. Arguments
   are recorded, so pass a secret with `st sekrets put`, never as an argument.
+- **Retention.** Nothing is kept forever. The claims are local observations of the gateway's
+  host: they age out with the local observation log (`observations.retention`, seven days by
+  default) and, when `[observations.otlp]` is set, go to OpenTelemetry for longer history. The
+  gateway keeps its own log for seven days, long enough to bridge a daemon that was offline.
 
 ## Who is calling
 

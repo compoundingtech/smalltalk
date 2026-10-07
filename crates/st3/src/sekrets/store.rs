@@ -531,6 +531,14 @@ impl GatewayStore {
         Ok(self.db.last_insert_rowid())
     }
 
+    /// Drop log entries older than `keep_ms`. The daemon records each person's entries as claims
+    /// within moments, so the gateway's own copy only needs to bridge an offline daemon.
+    pub fn trim_log(&mut self, keep_ms: i64) -> Result<usize> {
+        Ok(self
+            .db
+            .execute("DELETE FROM log WHERE at < ?1", [now_unix_ms() - keep_ms])?)
+    }
+
     pub fn log_for(&self, person: &str, after: i64, limit: i64) -> Result<Vec<LogEntry>> {
         let mut statement = self.db.prepare(
             "SELECT seq, at, event, actor, profile, detail, caller_person, owner_person FROM log
@@ -661,7 +669,23 @@ mod tests {
             .unwrap();
         let entries = store.log_for("person/ada", 0, 10).unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].seq, seq);
+        assert_eq!(store.trim_log(60_000).unwrap(), 0);
+        assert_eq!(store.trim_log(-60_000).unwrap(), 1);
+        assert!(store.log_for("person/ada", 0, 10).unwrap().is_empty());
+        store
+            .log(
+                Some("person/robin"),
+                Some("person/ada"),
+                "call",
+                Some("agent/x"),
+                Some("ada/agent-gh"),
+                &serde_json::json!({"argv": ["gh"]}),
+            )
+            .unwrap();
+        let entries = store.log_for("person/ada", 0, 10).unwrap();
+        assert_eq!(entries.len(), 1);
+        // A trimmed sequence number is never handed out again, so a daemon's cursor stays good.
+        assert_eq!(entries[0].seq, seq + 1);
         assert_eq!(entries[0].caller_person.as_deref(), Some("person/robin"));
         assert_eq!(store.log_for("person/robin", 0, 10).unwrap().len(), 1);
         assert!(store.log_for("person/avery", 0, 10).unwrap().is_empty());
