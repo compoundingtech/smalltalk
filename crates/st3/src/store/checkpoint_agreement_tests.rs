@@ -302,6 +302,32 @@ fn nodes_seal_then_verify_once_every_participant_sealed_the_same_set() {
 }
 
 #[test]
+fn verification_refuses_stale_rule_terms_without_consuming_first_verification() {
+    let scratch = tempfile::tempdir().unwrap();
+    let context = context(scratch.path(), 0);
+    let cut = newest_due_cut(context.now_unix_ms);
+    let checkpoint = checkpoint_name(cut);
+    let store = Store::open_memory("alder").unwrap();
+    observe(&store, 4);
+    let sealed = store.checkpoint_sealed_identities(cut, None).unwrap();
+    let terms = SealTerms {
+        cut_unix_ms: cut, participants: names(&["alder"]),
+        sealed_digest: sealed.digest.clone(), rules_digest: "previous-rules".into(),
+    };
+    store.publish_seal(&checkpoint, &terms, &sealed, None).unwrap();
+    let mut actions = Vec::new();
+    store.verify_checkpoint(&checkpoint, &terms, sealed.seal_rowid, &context, &mut actions).unwrap();
+    assert!(actions.is_empty());
+    assert!(first_verifications(&store.checkpoint_claims().unwrap(), &checkpoint).is_empty());
+    assert_eq!(kinds(&step(&store, &context)), ["sealed"]);
+    assert_eq!(kinds(&step(&store, &context)), ["verified"]);
+    let claims = store.checkpoint_claims().unwrap();
+    assert_eq!(first_verifications(&claims, &checkpoint).len(), 1);
+    assert_eq!(kinds(&step(&store, &context)), ["trimmed"]);
+    assert!(step(&store, &context).is_empty());
+}
+
+#[test]
 fn a_late_envelope_before_the_cut_reseals_until_someone_verified() {
     let scratch = tempfile::tempdir().unwrap();
     let context = context(scratch.path(), 0);

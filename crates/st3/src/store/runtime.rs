@@ -304,6 +304,15 @@ impl Runtime for SmalltalkRuntime {
     ) -> Result<Value> {
         checkpoint_rules::subject_answers(connection, subject, cut)
     }
+
+    fn checkpoint_subject_answers_with_sources(
+        &self,
+        connection: &Connection,
+        subject: &str,
+        cut: u128,
+    ) -> Result<(Value, smallclaims::store::checkpoint::CheckpointAnswerSources)> {
+        checkpoint_rules::subject_answers_with_sources(connection, subject, cut)
+    }
 }
 
 /// The version of smalltalk's shared projection layout, beside the claim vocabulary. Nodes whose

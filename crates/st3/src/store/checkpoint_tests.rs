@@ -1887,6 +1887,20 @@ fn status_history_survives_checkpoint_trimming_and_reports_the_gap() {
 
 #[test]
 fn status_history_mixed_legacy_and_heartbeat_stamps_survive_both_checkpoint_cuts() {
+    mixed_stamp_checkpoint_history(false, false, false);
+}
+
+#[test]
+fn status_history_mixed_stamps_keep_baselines_prompts_auth_and_canonical_ties() {
+    for (ties, channels, older_baseline) in [
+        (true, false, false), (false, true, false),
+        (false, false, true), (true, true, true),
+    ] {
+        mixed_stamp_checkpoint_history(ties, channels, older_baseline);
+    }
+}
+
+fn mixed_stamp_checkpoint_history(ties: bool, channels: bool, older_baseline: bool) {
     let cuts = ["2026-10-04T00:00:00Z", "2026-10-05T00:00:00Z"].map(|cut| {
         chrono::DateTime::parse_from_rfc3339(cut).unwrap().timestamp_millis() as u128
     });
@@ -1904,21 +1918,34 @@ fn status_history_mixed_legacy_and_heartbeat_stamps_survive_both_checkpoint_cuts
         transaction.commit().unwrap();
         claim
     };
+    let baseline = if older_baseline { cuts[0] - seat_status::WINDOW_MS - 100 } else { at };
     append("runtime.observed", json!({
         "status":"running", "runtime_id":"native", "incarnation_id":"one"
-    }), at);
+    }), baseline);
     let observations = [
         ("idle", Some(true)), ("working", Some(false)), ("working", None),
         ("idle", Some(true)), ("working", Some(true)), ("idle", Some(true)),
     ].into_iter().enumerate().map(|(offset, (state, stamp))| {
-        let time = at + 1 + offset as u128;
+        let time = if older_baseline && offset == 0 { baseline + 1 }
+            else if ties { at + 1 } else { at + 1 + offset as u128 * 10 };
         let mut fields = json!({
             "state": state, "incarnation_id":"one", "observed_at_ms":time as u64
         });
         if let Some(stamp) = stamp {
             fields["status_transition"] = json!(stamp);
         }
-        append("harness.observed", fields, time)
+        let claim = append("harness.observed", fields, time);
+        if channels && offset == 2 {
+            for (step, code) in [
+                "provider-trust-prompt", "provider-auth-expired", "provider-auth-restored",
+                "provider-update-prompt", "provider-update-restored",
+            ].into_iter().enumerate() {
+                append("harness.diagnostic", json!({
+                    "incarnation_id":"one", "code":code, "severity":"warning"
+                }), if ties { time } else { time + 1 + step as u128 });
+            }
+        }
+        claim
     }).collect::<Vec<_>>();
     let legacy = &observations[2];
     let full_sources = observations.iter().collect::<Vec<_>>();
