@@ -10467,6 +10467,31 @@ impl Store {
         Ok(StatusResponse { store_index: index, subjects, pending_actions: Vec::new() })
     }
 
+    /// The terminals collection consumes the same authority fields as full status, but
+    /// discards harness history, claim provenance and desired conflicts. Reuse the capped
+    /// card reduction for this read only; runtime control still uses full status.
+    pub(crate) fn terminal_resource_status_at(
+        &self,
+        owner: Option<&str>,
+        index: u64,
+        history: bool,
+    ) -> Result<StatusResponse> {
+        let connection = self.readers.get();
+        let index =
+            selected_index(current_index(&connection)?, Some(index)).map_err(anyhow::Error::new)?;
+        let mut names = match owner {
+            Some(owner) => BTreeSet::from([owner.to_owned()]),
+            None => connection
+                .prepare_cached(RUNTIME_SUBJECTS)?
+                .query_map([index], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<BTreeSet<_>>>()?,
+        };
+        // Match the public status reducer's exclusions, including exact-owner reads.
+        names.retain(|name| !name.starts_with("glass/") && !name.starts_with("arrangement/"));
+        drop(connection);
+        self.agent_card_status_at(Some(&names), index, history)
+    }
+
     pub(crate) fn status_for_subject_names_at(
         &self,
         subjects: BTreeSet<String>,
@@ -34885,6 +34910,65 @@ observer "ordered/file" {
         let again = store.agent_card_status_at(None, cut, true).unwrap();
         assert_eq!(serde_json::to_value(again).unwrap(), serde_json::to_value(card).unwrap());
         assert_eq!(SUBJECT_REDUCTIONS.with(std::cell::Cell::get), 0);
+    }
+
+    #[test]
+    fn terminal_resource_status_never_warms_full_harness_or_provenance() {
+        let store = Store::open_memory("node").unwrap();
+        let subject = "agent/terminal-summary";
+        observe_runtime(&store, subject, "running", "one");
+        for _ in 0..20 {
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "harness.observed".into(),
+                    actor: Some(subject.into()),
+                    fields: BTreeMap::from([
+                        ("state".into(), json!("idle")),
+                        ("incarnation_id".into(), json!("one")),
+                        ("driver".into(), json!("claude")),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+        let cut = store.index().unwrap();
+        let lean = store.terminal_resource_status_at(None, cut, true).unwrap();
+        assert_eq!(lean.subjects.len(), 1);
+        assert!(lean.subjects[0].harness.is_none());
+        assert_eq!(lean.subjects[0].claims.len(), 1);
+        assert!(
+            store
+                .smalltalk
+                .subject_cache
+                .lock()
+                .unwrap()
+                .statuses
+                .is_empty()
+        );
+        SUBJECT_REDUCTIONS.with(|count| count.set(0));
+        store.terminal_resource_status_at(None, cut, true).unwrap();
+        assert_eq!(SUBJECT_REDUCTIONS.with(std::cell::Cell::get), 0);
+        let full = store
+            .status_for_claim_kind_at("runtime.observed", Some(cut), true)
+            .unwrap();
+        assert!(full.subjects[0].harness.is_some());
+        assert!(full.subjects[0].claims.len() > 1);
+        observe_runtime(&store, subject, "stopped", "two");
+        let newer = store
+            .terminal_resource_status_at(None, store.index().unwrap(), true)
+            .unwrap();
+        assert_eq!(
+            newer.subjects[0].actual.as_ref().unwrap()["status"],
+            "stopped"
+        );
+        assert_eq!(
+            serde_json::to_value(store.terminal_resource_status_at(None, cut, true).unwrap())
+                .unwrap(),
+            serde_json::to_value(lean).unwrap()
+        );
     }
 
     #[test]
