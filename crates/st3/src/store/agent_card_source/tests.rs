@@ -596,3 +596,153 @@ fn native_requests_reject_foreign_epoch_expired_and_missing_inputs_with_shared_b
     );
     tx.rollback().unwrap();
 }
+
+#[test]
+fn future_local_activity_anchor_is_excluded_then_promoted_by_captured_claim_position() {
+    let store = seed();
+    let ns = context(&store);
+    let index = store.index().unwrap();
+    let observed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    {
+        let mut w = store.connection.write();
+        let tx = w.transaction().unwrap();
+        // A retained local anchor may exceed the current position after a checkpoint trim.
+        // This physical fixture exercises that supported read predicate without a runtime.
+        tx.execute("INSERT INTO local_observations(after_store_index,subject,kind,body,observed_at_unix_ms) VALUES(?1,'agent/node.amber','harness.timeline',?2,?3)",params![index+1,json!({"fields":{"incarnation_id":"one","entry_type":"message"}}).to_string(),observed]).unwrap();
+        tx.commit().unwrap();
+    }
+    let at = clock(&store);
+    let kernel = Kernel::new("node");
+    for inputs in capture(&store).chunks(WORK) {
+        let mut w = store.connection.write();
+        let tx = w.transaction().unwrap();
+        kernel.apply(&tx, &ns, inputs).unwrap();
+        tx.commit().unwrap();
+    }
+    drain(&store, &ns, &kernel);
+    compare(&store, &ns, at);
+    assert_eq!(rows(&store, &ns, at)[0]["last_activity_at"], Value::Null);
+    store
+        .append_claim(&ClaimInput {
+            subject: "daemon/fixture".into(),
+            kind: "daemon.diagnostic".into(),
+            actor: None,
+            fields: BTreeMap::from([
+                ("severity".into(), json!("warning")),
+                ("code".into(), json!("fixture")),
+                ("reason".into(), json!("advance admission")),
+            ]),
+            evidence: vec![],
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+    assert_eq!(store.index().unwrap(), index + 1);
+    let at = clock(&store);
+    for inputs in capture(&store).chunks(WORK) {
+        let mut w = store.connection.write();
+        let tx = w.transaction().unwrap();
+        kernel.apply(&tx, &ns, inputs).unwrap();
+        tx.commit().unwrap();
+    }
+    drain(&store, &ns, &kernel);
+    compare(&store, &ns, at);
+    assert_eq!(
+        rows(&store, &ns, at)[0]["last_activity_at"],
+        crate::api::client_timestamp(u128::from(observed))
+    );
+}
+
+#[test]
+fn equal_anchor_repair_pages_preserve_seek_continuation_and_current_head_skips_future_rows() {
+    let store = seed();
+    let ns = context(&store);
+    let mut w = store.connection.write();
+    let tx = w.transaction().unwrap();
+    agent_card_signals::set_captured_cut(&tx, &ns, 10).unwrap();
+    for n in 0..4096 {
+        tx.execute("INSERT INTO local_agent_card_activity_inputs VALUES(?1,1,?2,'content','agent/node.amber',?3,?4,11,?5,0)",params![ns.as_str(),format!("local/{n:04}"),serde_json::to_string(&Some("one")).unwrap(),n+1,n.to_string()]).unwrap();
+    }
+    assert_eq!(
+        agent_card_signals::current_activity(&tx, &ns, "agent/node.amber", Some("one")).unwrap(),
+        None
+    );
+    let mut cursor = None;
+    let mut visited = 0;
+    loop {
+        let (page, more) = agent_card_signals::local_cut_page(
+            &tx,
+            &ns,
+            10,
+            11,
+            cursor
+                .as_ref()
+                .map(|(at, id): &(u64, String)| (*at, id.as_str())),
+            128,
+        )
+        .unwrap();
+        assert!(page.len() <= 128);
+        if let Some((at, id, _)) = page.last() {
+            cursor = Some((*at, id.clone()));
+        }
+        for (_, id, _) in &page {
+            agent_card_signals::repair_local_cut(&tx, &ns, id, 11).unwrap();
+        }
+        visited += page.len();
+        if !more {
+            break;
+        }
+    }
+    assert_eq!(visited, 4096);
+    assert_eq!(
+        agent_card_signals::current_activity(&tx, &ns, "agent/node.amber", Some("one")).unwrap(),
+        Some(4095)
+    );
+    tx.rollback().unwrap();
+}
+
+#[test]
+fn local_scan_page_before_clock_does_not_adopt_a_future_anchor() {
+    let store = seed();
+    let ns = context(&store);
+    let index = store.index().unwrap();
+    {
+        let mut w = store.connection.write();
+        let tx = w.transaction().unwrap();
+        tx.execute("INSERT INTO local_observations(after_store_index,subject,kind,body,observed_at_unix_ms) VALUES(?1,'agent/node.amber','harness.timeline',?2,1)",params![index+100,json!({"fields":{"incarnation_id":"one","entry_type":"message"}}).to_string()]).unwrap();
+        tx.commit().unwrap();
+    }
+    let at = clock(&store);
+    let kernel = Kernel::new("node");
+    let inputs = capture(&store);
+    let (clock, other): (Vec<_>, Vec<_>) = inputs
+        .into_iter()
+        .partition(|m| key_parts(&m.key).unwrap().0 == "local_agent_card_clock");
+    for page in other.chunks(WORK) {
+        let mut w = store.connection.write();
+        let tx = w.transaction().unwrap();
+        kernel.apply(&tx, &ns, page).unwrap();
+        tx.commit().unwrap();
+    }
+    {
+        let mut w = store.connection.write();
+        let tx = w.transaction().unwrap();
+        kernel.apply(&tx, &ns, &clock).unwrap();
+        tx.commit().unwrap();
+    }
+    drain(&store, &ns, &kernel);
+    compare(&store, &ns, at);
+    let c = store.readers.get();
+    assert_eq!(
+        c.query_row(
+            "SELECT eligible FROM local_agent_card_activity_inputs WHERE namespace=?1 AND source=1",
+            [ns.as_str()],
+            |r| r.get::<_, bool>(0)
+        )
+        .unwrap(),
+        false
+    );
+}

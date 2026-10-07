@@ -8,7 +8,7 @@ use crate::api::delivery_presence::source::{
 };
 use smallclaims::ivm::install::{Mutation, Namespace, Operator, SourcePosition};
 
-pub(crate) const FINGERPRINT: &str = "st3.agent-card.complete.v2;namespace-v2;physical-source-v3;registry-unfiltered-admission;canonical-decimal-time;original-sql-body;harness-v3-captured-since;authority-v2-parent-identity;owned-v2-relevant-members128-sets64-lineage64-claims100k-captured64m;unmanaged-leaves128-body256k;queue-v1-labels-path1024-preview5;usage-v2-f64-groups128-slots128;rollout-field-heads-v1;launch-v1-physical-ties-bounds128;aux-v1-appear64-open256-record64k;native-global-v1-files64-indexed-requests;clock-v1;shared-work128-seek-cursors-public-queue-ack;window200;public-card-v0;current-state-only";
+pub(crate) const FINGERPRINT: &str = "st3.agent-card.complete.v2;namespace-v2;physical-source-v5;registry-unfiltered-admission;canonical-decimal-time;original-sql-body;harness-v3-captured-since;activity-v2-native-cut-ranges128;authority-v2-parent-identity;owned-v2-relevant-members128-sets64-lineage64-claims100k-captured64m;unmanaged-leaves128-body256k;queue-v1-labels-path1024-preview5;usage-v2-f64-groups128-slots128;rollout-field-heads-v1;launch-v1-physical-ties-bounds128;aux-v1-appear64-open256-record64k;native-global-v1-files64-indexed-requests;clock-v2-snapshot-position;shared-work128-seek-cursors-public-queue-ack;window200;public-card-v0;current-state-only";
 pub(crate) fn complete_manifest() -> String {
     format!(
         "{FINGERPRINT};source={}",
@@ -33,7 +33,8 @@ CREATE INDEX IF NOT EXISTS local_agent_card_source_native_epoch ON local_agent_c
 CREATE INDEX IF NOT EXISTS local_agent_card_source_native_deadline ON local_agent_card_source_native(namespace,needed,deadline,agent,driver) WHERE deadline IS NOT NULL;
 CREATE TABLE IF NOT EXISTS local_agent_card_source_files(namespace TEXT NOT NULL,path TEXT NOT NULL,identity TEXT NOT NULL,count INTEGER NOT NULL CHECK(count>0),PRIMARY KEY(namespace,path,identity));
 CREATE TABLE IF NOT EXISTS local_agent_card_source_reclaim(namespace TEXT PRIMARY KEY,phase INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS local_agent_card_source_clock(namespace TEXT PRIMARY KEY,at TEXT NOT NULL,revision INTEGER NOT NULL,phase INTEGER NOT NULL,authority_agent TEXT NOT NULL,authority_id TEXT NOT NULL,lifecycle_after TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS local_agent_card_source_clock(namespace TEXT PRIMARY KEY,at TEXT NOT NULL,revision INTEGER NOT NULL,phase INTEGER NOT NULL,authority_agent TEXT NOT NULL,authority_id TEXT NOT NULL,lifecycle_after TEXT NOT NULL,snapshot_index INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS local_agent_card_source_local_cut(namespace TEXT NOT NULL,revision INTEGER NOT NULL,lower_index INTEGER NOT NULL,upper_index INTEGER NOT NULL,after_index INTEGER NOT NULL,after_claim TEXT NOT NULL,PRIMARY KEY(namespace,revision));
 "#;
 
 pub(crate) struct Kernel {
@@ -136,6 +137,14 @@ fn key_parts(key: &str) -> Result<(String, Vec<Value>)> {
     );
     Ok((table, pk))
 }
+fn captured_index(c: &Connection, ns: &Namespace) -> Result<u64> {
+    Ok(c.query_row(
+        "SELECT snapshot_index FROM local_agent_card_source_clock WHERE namespace=?1",
+        [ns.as_str()],
+        |r| r.get(0),
+    )?)
+}
+
 fn fact(c: &Connection, ns: &Namespace, id: &str) -> Result<Option<Fact>> {
     let body: Option<String> = c
         .query_row(
@@ -489,20 +498,35 @@ impl Kernel {
                 let revision = row["revision"]
                     .as_u64()
                     .context("captured clock revision")?;
-                let prior: Option<(String, u64)> = tx
+                let snapshot_index = row["snapshot_index"]
+                    .as_u64()
+                    .context("captured activity snapshot position")?;
+                anyhow::ensure!(
+                    snapshot_index <= i64::MAX as u64,
+                    "captured native position exceeds SQL range"
+                );
+                let prior: Option<(String, u64, u64)> = tx
                     .query_row(
-                        "SELECT at,revision FROM local_agent_card_source_clock WHERE namespace=?1",
+                        "SELECT at,revision,snapshot_index FROM local_agent_card_source_clock WHERE namespace=?1",
                         [ns.as_str()],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                     )
                     .optional()?;
-                if let Some((old_at, old_revision)) = prior {
+                if let Some((old_at, old_revision, old_index)) = prior {
                     anyhow::ensure!(
                         at >= old_at.parse()? && revision >= old_revision,
                         "captured clock regressed"
                     );
+                    if old_index != snapshot_index {
+                        let count:usize=tx.query_row("SELECT count(*) FROM (SELECT 1 FROM local_agent_card_source_local_cut WHERE namespace=?1 LIMIT 128)",[ns.as_str()],|r|r.get(0))?;
+                        anyhow::ensure!(count < 128, "local activity cut repair backlog exhausted");
+                        let lower = old_index.min(snapshot_index);
+                        let upper = old_index.max(snapshot_index);
+                        tx.execute("INSERT INTO local_agent_card_source_local_cut VALUES(?1,?2,?3,?4,?3,'')",params![ns.as_str(),revision,lower,upper])?;
+                    }
                 }
-                tx.execute("INSERT INTO local_agent_card_source_clock VALUES(?1,?2,?3,0,'','','') ON CONFLICT(namespace) DO UPDATE SET at=excluded.at,revision=excluded.revision",params![ns.as_str(),at.to_string(),revision])?;
+                agent_card_signals::set_captured_cut(tx, ns, snapshot_index)?;
+                tx.execute("INSERT INTO local_agent_card_source_clock VALUES(?1,?2,?3,0,'','','',?4) ON CONFLICT(namespace) DO UPDATE SET at=excluded.at,revision=excluded.revision,snapshot_index=excluded.snapshot_index",params![ns.as_str(),at.to_string(),revision,snapshot_index])?;
             }
             _ => anyhow::bail!("card unexpected private physical work"),
         }
@@ -748,7 +772,11 @@ impl Kernel {
             .collect::<Vec<_>>();
         let labels = agent_queue::labels(tx, ns, &ids)?;
         let incarnation = subject.harness.as_ref().map(|h| h.incarnation_id.as_str());
-        let last_activity_at = agent_card_signals::activity(tx, ns, agent, incarnation, projected)?;
+        anyhow::ensure!(
+            projected == captured_index(tx, ns)?,
+            "activity captured cut changed"
+        );
+        let last_activity_at = agent_card_signals::current_activity(tx, ns, agent, incarnation)?;
         let working_since = incarnation
             .map(|i| agent_card_signals::working_since(tx, ns, agent, i))
             .transpose()?
@@ -875,7 +903,7 @@ impl Kernel {
         {
             return Ok(false);
         };
-        let work:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM local_agent_card_source_work WHERE namespace=?1 AND kind<>'card')",[ns.as_str()],|r|r.get(0))?;
+        let work:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM local_agent_card_source_work WHERE namespace=?1 AND kind<>'card') OR EXISTS(SELECT 1 FROM local_agent_card_source_local_cut WHERE namespace=?1)",[ns.as_str()],|r|r.get(0))?;
         Ok(!work)
     }
 
@@ -914,6 +942,34 @@ impl Kernel {
                 self.physical(tx, ns, &key)?;
                 used += 1;
             }
+        }
+        while used < WORK {
+            let job:Option<(u64,u64,u64,u64,String)>=tx.query_row("SELECT revision,lower_index,upper_index,after_index,after_claim FROM local_agent_card_source_local_cut WHERE namespace=?1 ORDER BY revision LIMIT 1",[ns.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
+            let Some((revision, lower, upper, after, id)) = job else {
+                break;
+            };
+            let (crossed, more) = agent_card_signals::local_cut_page(
+                tx,
+                ns,
+                lower,
+                upper,
+                Some((after, &id)),
+                WORK - used,
+            )?;
+            used += crossed.len().max(1);
+            if more {
+                let (at, id, _) = crossed
+                    .last()
+                    .context("activity cut continuation missing")?;
+                tx.execute("UPDATE local_agent_card_source_local_cut SET after_index=?3,after_claim=?4 WHERE namespace=?1 AND revision=?2",params![ns.as_str(),revision,at,id])?;
+            } else {
+                tx.execute("DELETE FROM local_agent_card_source_local_cut WHERE namespace=?1 AND revision=?2",params![ns.as_str(),revision])?;
+            }
+            let snapshot_index = captured_index(tx, ns)?;
+            for (_, id, _) in &crossed {
+                agent_card_signals::repair_local_cut(tx, ns, id, snapshot_index)?;
+            }
+            cards(tx, ns, crossed.into_iter().map(|(_, _, agent)| agent))?;
         }
         if used < WORK {
             for id in page(tx, ns, "owned-reference", WORK - used)? {
@@ -1057,7 +1113,8 @@ impl Kernel {
                 // Prospective rows are unavailable until independent source-prefix proof and
                 // catch-up bind them to the exact current cut. No historical cut is served.
                 for agent in page(tx, ns, "card", WORK - used)? {
-                    changed |= self.materialize(tx, ns, &agent, at, i64::MAX as u64)?;
+                    let snapshot_index = captured_index(tx, ns)?;
+                    changed |= self.materialize(tx, ns, &agent, at, snapshot_index)?;
                     used += 1;
                 }
             }
@@ -1102,7 +1159,13 @@ impl Operator for Kernel {
     fn apply(&self, tx: &Transaction<'_>, ns: &Namespace, rows: &[Mutation]) -> Result<bool> {
         anyhow::ensure!(rows.len() <= WORK, "card physical apply page bound");
         shadow::apply(tx, ns, rows)?;
-        tx.execute("INSERT INTO local_agent_card_source_clock VALUES(?1,'0',0,0,'','','') ON CONFLICT DO NOTHING",[ns.as_str()])?;
+        tx.execute("INSERT INTO local_agent_card_source_clock VALUES(?1,'0',0,0,'','','',0) ON CONFLICT DO NOTHING",[ns.as_str()])?;
+        // Extraction can encounter local rows before its captured clock page. Unknown
+        // admission starts at zero, so future anchors are never provisionally eligible.
+        tx.execute(
+            "INSERT INTO local_agent_card_activity_cut VALUES(?1,0) ON CONFLICT DO NOTHING",
+            [ns.as_str()],
+        )?;
         let mut captured_clock = false;
         for row in rows {
             let (table, _) = key_parts(&row.key)?;
@@ -1144,7 +1207,7 @@ impl Operator for Kernel {
             )?,
             "complete public card publication pending"
         );
-        let stamped:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM local_agent_card_coverage c JOIN ivm_install_sources s ON s.name=?2 AND s.epoch=c.source_epoch AND s.revision=c.source_revision AND s.available=1 WHERE c.namespace=?1 AND c.incomplete=0 AND c.pending=0 AND c.evaluation_time=?3)",params![ns.as_str(),agent_card_ivm::SOURCE,at.to_string()],|r|r.get(0))?;
+        let stamped:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM local_agent_card_coverage c JOIN ivm_install_sources s ON s.name=?2 AND s.epoch=c.source_epoch AND s.revision=c.source_revision AND s.available=1 WHERE c.namespace=?1 AND c.incomplete=0 AND c.pending=0 AND c.evaluation_time=?3 AND c.projected=?4)",params![ns.as_str(),agent_card_ivm::SOURCE,at.to_string(),captured_index(tx,ns)?],|r|r.get(0))?;
         anyhow::ensure!(
             stamped,
             "certified source cut/producer coverage not stamped"
@@ -1302,11 +1365,11 @@ pub(crate) fn certify_coverage(
 ) -> Result<()> {
     anyhow::ensure!(
         position.source == agent_card_ivm::SOURCE
-            && position.fingerprint == agent_source::capture_fingerprint(),
+            && position.fingerprint == agent_source::capture_fingerprint_for(origin)?,
         "agent card certified source binding mismatch"
     );
     anyhow::ensure!(
-        cut.admitted == cut.projected,
+        cut.admitted == cut.projected && cut.projected == captured_index(tx, ns)?,
         "agent card healthy prefix not complete"
     );
     let at = current_at(tx, ns)?;
@@ -1334,6 +1397,7 @@ fn reclaim_remaining(tx: &Transaction<'_>, ns: &Namespace, limit: usize) -> Resu
         "DELETE FROM local_agent_card_harness_nodes WHERE namespace=?1 AND rowid IN (SELECT rowid FROM local_agent_card_harness_nodes WHERE namespace=?1 LIMIT ?2)",
         "DELETE FROM local_agent_card_harness_roots WHERE namespace=?1 AND rowid IN (SELECT rowid FROM local_agent_card_harness_roots WHERE namespace=?1 LIMIT ?2)",
         "DELETE FROM local_agent_card_harness_sequence WHERE namespace=?1 AND rowid IN (SELECT rowid FROM local_agent_card_harness_sequence WHERE namespace=?1 LIMIT ?2)",
+        "DELETE FROM local_agent_card_activity_cut WHERE namespace=?1 AND rowid IN (SELECT rowid FROM local_agent_card_activity_cut WHERE namespace=?1 LIMIT ?2)",
         "DELETE FROM local_agent_card_activity_inputs WHERE namespace=?1 AND rowid IN (SELECT rowid FROM local_agent_card_activity_inputs WHERE namespace=?1 LIMIT ?2)",
         "DELETE FROM local_agent_card_working_inputs WHERE namespace=?1 AND rowid IN (SELECT rowid FROM local_agent_card_working_inputs WHERE namespace=?1 LIMIT ?2)",
         "DELETE FROM local_agent_card_usage_inputs WHERE namespace=?1 AND rowid IN (SELECT rowid FROM local_agent_card_usage_inputs WHERE namespace=?1 LIMIT ?2)",
@@ -1368,6 +1432,7 @@ fn reclaim_remaining(tx: &Transaction<'_>, ns: &Namespace, limit: usize) -> Resu
         "DELETE FROM local_agent_card_source_cards WHERE namespace=?1 AND rowid IN (SELECT rowid FROM local_agent_card_source_cards WHERE namespace=?1 LIMIT ?2)",
         "DELETE FROM local_agent_card_source_native WHERE namespace=?1 AND rowid IN (SELECT rowid FROM local_agent_card_source_native WHERE namespace=?1 LIMIT ?2)",
         "DELETE FROM local_agent_card_source_files WHERE namespace=?1 AND rowid IN (SELECT rowid FROM local_agent_card_source_files WHERE namespace=?1 LIMIT ?2)",
+        "DELETE FROM local_agent_card_source_local_cut WHERE namespace=?1 AND rowid IN (SELECT rowid FROM local_agent_card_source_local_cut WHERE namespace=?1 LIMIT ?2)",
         "DELETE FROM local_agent_card_source_clock WHERE namespace=?1 AND rowid IN (SELECT rowid FROM local_agent_card_source_clock WHERE namespace=?1 LIMIT ?2)",
     ];
     for sql in PAGES {

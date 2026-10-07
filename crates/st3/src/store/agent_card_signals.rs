@@ -11,11 +11,16 @@ const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS local_agent_card_activity_inputs (
  namespace TEXT NOT NULL, source INTEGER NOT NULL, claim TEXT NOT NULL,
  category TEXT NOT NULL, agent TEXT NOT NULL, incarnation TEXT NOT NULL,
- position INTEGER NOT NULL, after_index INTEGER NOT NULL, at TEXT NOT NULL,
+ position INTEGER NOT NULL, after_index INTEGER NOT NULL, at TEXT NOT NULL, eligible INTEGER NOT NULL,
  PRIMARY KEY(namespace,source,claim,category)
 );
 CREATE INDEX IF NOT EXISTS local_agent_card_activity_head
  ON local_agent_card_activity_inputs(namespace,agent,incarnation,category,source,position DESC,claim DESC);
+CREATE TABLE IF NOT EXISTS local_agent_card_activity_cut(namespace TEXT PRIMARY KEY,snapshot_index INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS local_agent_card_activity_current_head
+ ON local_agent_card_activity_inputs(namespace,agent,incarnation,category,source,eligible,position DESC,claim DESC);
+CREATE INDEX IF NOT EXISTS local_agent_card_activity_local_cut
+ ON local_agent_card_activity_inputs(namespace,source,after_index,claim,agent);
 CREATE TABLE IF NOT EXISTS local_agent_card_working_inputs (
  namespace TEXT NOT NULL, claim TEXT NOT NULL, agent TEXT NOT NULL,
  incarnation TEXT NOT NULL, working INTEGER NOT NULL, rank BLOB NOT NULL, at TEXT NOT NULL,
@@ -86,7 +91,7 @@ fn apply(
     }
     if let Some((claim, key)) = new {
         for (agent, incarnation, category) in activity_keys(claim) {
-            tx.execute("INSERT INTO local_agent_card_activity_inputs VALUES(?1,0,?2,?3,?4,?5,?6,?6,?7) ON CONFLICT(namespace,source,claim,category) DO UPDATE SET agent=excluded.agent,incarnation=excluded.incarnation,position=excluded.position,after_index=excluded.after_index,at=excluded.at",params![namespace,claim.id,category,agent,serde_json::to_string(&incarnation)?,claim.store_index,claim.accepted_at_unix_ms.to_string()])?;
+            tx.execute("INSERT INTO local_agent_card_activity_inputs VALUES(?1,0,?2,?3,?4,?5,?6,?6,?7,1) ON CONFLICT(namespace,source,claim,category) DO UPDATE SET agent=excluded.agent,incarnation=excluded.incarnation,position=excluded.position,after_index=excluded.after_index,at=excluded.at",params![namespace,claim.id,category,agent,serde_json::to_string(&incarnation)?,claim.store_index,claim.accepted_at_unix_ms.to_string()])?;
             agents.insert(agent);
         }
         if claim.kind == "harness.observed" && claim.subject.starts_with("agent/") {
@@ -167,8 +172,16 @@ fn local(
     if let Some(claim) = new.filter(|claim| claim.kind == "harness.timeline") {
         let position = local_observation_position(claim)
             .context("local activity input missing observation identity")?;
+        let cut: Option<u64> = tx
+            .query_row(
+                "SELECT snapshot_index FROM local_agent_card_activity_cut WHERE namespace=?1",
+                [namespace],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let eligible = cut.is_none_or(|cut| claim.store_index <= cut);
         for (agent, incarnation, category) in activity_keys(claim) {
-            tx.execute("INSERT INTO local_agent_card_activity_inputs VALUES(?1,1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(namespace,source,claim,category) DO UPDATE SET agent=excluded.agent,incarnation=excluded.incarnation,position=excluded.position,after_index=excluded.after_index,at=excluded.at",params![namespace,claim.id,category,agent,serde_json::to_string(&incarnation)?,position,claim.store_index,claim.accepted_at_unix_ms.to_string()])?;
+            tx.execute("INSERT INTO local_agent_card_activity_inputs VALUES(?1,1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(namespace,source,claim,category) DO UPDATE SET agent=excluded.agent,incarnation=excluded.incarnation,position=excluded.position,after_index=excluded.after_index,at=excluded.at,eligible=excluded.eligible",params![namespace,claim.id,category,agent,serde_json::to_string(&incarnation)?,position,claim.store_index,claim.accepted_at_unix_ms.to_string(),eligible])?;
             agents.insert(agent);
         }
     }
@@ -189,6 +202,89 @@ pub(super) fn activity(
         incarnation,
         projected,
     )
+}
+
+pub(super) fn set_captured_cut(
+    tx: &Transaction<'_>,
+    ns: &Namespace,
+    snapshot_index: u64,
+) -> Result<()> {
+    tx.execute("INSERT INTO local_agent_card_activity_cut VALUES(?1,?2) ON CONFLICT(namespace) DO UPDATE SET snapshot_index=excluded.snapshot_index",params![ns.as_str(),snapshot_index])?;
+    Ok(())
+}
+pub(super) fn repair_local_cut(
+    tx: &Transaction<'_>,
+    ns: &Namespace,
+    claim: &str,
+    snapshot_index: u64,
+) -> Result<()> {
+    tx.execute("UPDATE local_agent_card_activity_inputs SET eligible=(after_index<=?3) WHERE namespace=?1 AND source=1 AND claim=?2",params![ns.as_str(),claim,snapshot_index])?;
+    Ok(())
+}
+/// Current-state namespace head, only after the owner's indexed local cut repair closes.
+/// Historical readers retain `activity`'s explicit filter; this current head never serves them.
+pub(super) fn current_activity(
+    c: &Connection,
+    ns: &Namespace,
+    agent: &str,
+    incarnation: Option<&str>,
+) -> Result<Option<u128>> {
+    let mut latest = None;
+    for (category, incarnation, source) in [
+        ("work", None, 0),
+        ("sent", None, 0),
+        ("received", None, 0),
+        ("content", incarnation, 0),
+        ("content", incarnation, 1),
+    ] {
+        if category == "content" && incarnation.is_none() {
+            continue;
+        }
+        let at:Option<String>=c.query_row("SELECT at FROM local_agent_card_activity_inputs INDEXED BY local_agent_card_activity_current_head WHERE namespace=?1 AND agent=?2 AND incarnation=?3 AND category=?4 AND source=?5 AND eligible=1 ORDER BY position DESC,claim DESC LIMIT 1",params![ns.as_str(),agent,serde_json::to_string(&incarnation)?,category,source],|r|r.get(0)).optional()?;
+        if let Some(at) = at {
+            let at: u128 = at.parse()?;
+            latest = Some(latest.map_or(at, |prior: u128| prior.max(at)));
+        }
+    }
+    Ok(latest)
+}
+
+/// Indexed invalidation when the captured native claim position crosses local anchors.
+/// This predicate input establishes no projected prefix or readiness on its own. The owner
+/// retains the range/cursor transactionally, shares its budget, and rejects incomplete repair.
+pub(super) fn local_cut_page(
+    c: &Connection,
+    ns: &Namespace,
+    lower: u64,
+    upper: u64,
+    after: Option<(u64, &str)>,
+    limit: usize,
+) -> Result<(Vec<(u64, String, String)>, bool)> {
+    anyhow::ensure!(
+        (1..=128).contains(&limit) && lower <= upper && upper <= i64::MAX as u64,
+        "local activity cut page bounds"
+    );
+    let (at, id) = after.unwrap_or((lower, ""));
+    anyhow::ensure!(
+        lower <= at && at <= upper,
+        "local activity cut continuation"
+    );
+    // Keep the continuation as the index range itself, rather than a residual predicate
+    // behind the original lower bound. This also bounds repeated equal-anchor pages.
+    let sql = if id.is_empty() {
+        "SELECT after_index,claim,agent FROM local_agent_card_activity_inputs INDEXED BY local_agent_card_activity_local_cut WHERE namespace=?1 AND source=1 AND after_index>?2 AND after_index<=?3 ORDER BY after_index,claim LIMIT ?6"
+    } else {
+        "SELECT after_index,claim,agent FROM local_agent_card_activity_inputs INDEXED BY local_agent_card_activity_local_cut WHERE namespace=?1 AND source=1 AND (after_index,claim)>(?4,?5) AND after_index<=?3 ORDER BY after_index,claim LIMIT ?6"
+    };
+    let mut rows: Vec<(u64, String, String)> = c
+        .prepare_cached(sql)?
+        .query_map(params![ns.as_str(), lower, upper, at, id, limit + 1], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let more = rows.len() > limit;
+    rows.truncate(limit);
+    Ok((rows, more))
 }
 
 fn read_activity(
