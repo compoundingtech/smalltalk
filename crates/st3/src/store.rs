@@ -6,6 +6,7 @@ mod agent_card_base;
 mod agent_card_rollout;
 mod agent_card_lifecycle;
 mod agent_card_desired;
+mod agent_card_owned;
 mod agent_authority_ivm;
 pub(crate) mod agent_queue;
 pub mod custom;
