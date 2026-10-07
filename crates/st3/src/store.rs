@@ -31975,6 +31975,32 @@ agent "test/empty" { command "true" }
         assert!(!store.repair_operation_projection_drift().unwrap());
     }
 
+    /// The drift audit reads every claim an operation row can come from. Walking the whole
+    /// claims table evaluated json_extract on every claim in the store, seconds of work and
+    /// hundreds of megabytes of reads on a populated member, while the partial operation index
+    /// already names exactly the claims the audit keeps.
+    #[test]
+    fn the_operation_audit_walks_the_partial_operation_index() {
+        let store = Store::open_memory("node").unwrap();
+        let connection = store.readers.get();
+        let plan = connection
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                smallclaims::store::EXPECTED_OPERATIONS_QUERY
+            ))
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("; ");
+        assert!(
+            plan.contains("USING INDEX claims_operation_index")
+                && !plan.contains("USING INDEX sqlite_autoindex_claims_1"),
+            "{plan}"
+        );
+    }
+
     #[test]
     fn persistent_store_uses_bounded_sqlite_page_caches() {
         let directory = tempfile::tempdir().unwrap();
