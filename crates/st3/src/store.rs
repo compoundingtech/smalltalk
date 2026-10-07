@@ -303,6 +303,17 @@ ON claims(
 WHERE json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
     THEN '$.incarnation_id' ELSE '$.fields.incarnation_id' END) IS NOT NULL;
 
+-- A legacy observation without a text incarnation remains eligible for the current
+-- runtime's optional-field fold. Keep those rare rows separate: checking their JSON
+-- predicate against every named heartbeat made attached agent windows scan whole epochs.
+CREATE INDEX IF NOT EXISTS claims_harness_unnamed_accepted_index
+ON claims(subject, length(accepted_at_unix_ms), accepted_at_unix_ms)
+WHERE kind='harness.observed'
+    AND (json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
+        THEN '$.incarnation_id' ELSE '$.fields.incarnation_id' END) IS NULL
+        OR typeof(json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
+            THEN '$.incarnation_id' ELSE '$.fields.incarnation_id' END))!='text');
+
 -- Attachment checks must not walk a quiet seat's accumulated hook and work history.
 -- Only phase transitions publish these diagnostics, so a current-runtime lookup stays small.
 CREATE INDEX IF NOT EXISTS claims_claude_attachment_index
@@ -1048,7 +1059,6 @@ enum SubjectStatusMode {
     /// conflicts. Provenance is only the last canonical claim, and only without a declaration.
     AgentCard,
 }
-
 /// One subject's status at `at_index`, and the action it asks of its host when it is current and
 /// differs from what is declared. With `owner_filter`, a subject another run owns is skipped.
 fn subject_status_at(
@@ -10014,6 +10024,7 @@ impl Store {
     /// The fields used by live terminal fences, with the same authority decisions as `status`.
     pub(crate) fn runtime_authority(&self, subject: &str) -> Result<Option<RuntimeAuthority>> {
         smallclaims::touched::note_read(|| subject.to_owned());
+
         let connection = self.readers.get();
         // Eligibility, inherited fields and unknown claims must share one snapshot: a rival
         // arriving between SELECTs must not be paired with the earlier single origin.
@@ -20541,7 +20552,7 @@ fn harness_observations_of_incarnation_query() -> String {
 fn harness_observations_without_incarnation_query() -> String {
     format!(
         "SELECT claims.id, claims.body, claims.accepted_at_unix_ms
-         FROM claims INDEXED BY claims_subject_kind_accepted_index
+         FROM claims INDEXED BY claims_harness_unnamed_accepted_index
          JOIN batches ON batches.id=claims.batch_id
          WHERE claims.subject=?1 AND claims.kind='harness.observed' AND +claims.store_index<=?2
            AND (length(claims.accepted_at_unix_ms)>length(?3)
@@ -42504,6 +42515,162 @@ version 2
         let after = work();
         assert_eq!(after.0, before.0);
         assert!(after.1 <= before.1 + 20, "attachment lookup grew with unrelated history: {before:?} -> {after:?}");
+    }
+
+    #[test]
+    fn unnamed_harness_seek_preserves_legacy_candidates_and_snapshot_cut() {
+        let store = Store::open_memory("legacy-seek").unwrap();
+        let mut connection = store.connection.write();
+        let transaction = connection.transaction().unwrap();
+        transaction
+            .execute(
+                "INSERT INTO batches(id,origin,replica_sequence,hash,accepted_at_unix_ms)
+             VALUES ('legacy-batch','legacy-seek',1,'synthetic','1')",
+                [],
+            )
+            .unwrap();
+        let bodies = [
+            json!({"fields":{"state":"idle"}}),
+            json!({"state":"working","incarnation_id":null}),
+            json!({"fields":{"state":"idle","incarnation_id":7}}),
+            json!({"fields":{"state":"idle","incarnation_id":false}}),
+            json!({"fields":{"state":"idle","incarnation_id":"current"}}),
+            json!({"state":"idle","incarnation_id":"current"}),
+            json!({"fields":{"state":"idle","incarnation_id":[7]}}),
+            json!({"fields":null,"state":"idle","incarnation_id":"current"}),
+            json!({"fields":{"reason":"sparse legacy fields"}}),
+        ];
+        for (position, body) in bodies.iter().enumerate() {
+            let index = position + 1;
+            transaction.execute(
+                "INSERT INTO claims(store_index,id,batch_id,subject,kind,origin,body,predecessors,accepted_at_unix_ms)
+                 VALUES (?1,?2,'legacy-batch','agent/legacy-seek','harness.observed','legacy-seek',?3,'[]',?4)",
+                params![index as i64,format!("legacy-{index}"),body.to_string(),index.to_string()],
+            ).unwrap();
+        }
+        transaction.commit().unwrap();
+        let read = |sql: &str, cut: i64, since: &str| {
+            connection
+                .prepare(sql)
+                .unwrap()
+                .query_map(params!["agent/legacy-seek", cut, since], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let query = harness_observations_without_incarnation_query();
+        // The retained pre-change SQL is an independent candidate oracle; only its index differs.
+        let oracle = query.replace(
+            "claims_harness_unnamed_accepted_index",
+            "claims_subject_kind_accepted_index",
+        );
+        for (cut, since, expected) in [
+            (
+                9,
+                "1",
+                vec![
+                    "legacy-9", "legacy-8", "legacy-4", "legacy-3", "legacy-2", "legacy-1",
+                ],
+            ),
+            (4, "1", vec!["legacy-4", "legacy-3", "legacy-2", "legacy-1"]),
+            (9, "4", vec!["legacy-9", "legacy-8", "legacy-4"]),
+            (9, "10", vec![]),
+        ] {
+            assert_eq!(read(&query, cut, since), expected);
+            assert_eq!(read(&query, cut, since), read(&oracle, cut, since));
+        }
+        // The partial index also follows updates/deletes; repaired observation bodies cannot
+        // leave a stale legacy candidate, and becoming unnamed must make a new candidate.
+        connection.execute("UPDATE claims SET body=json_set(body,'$.fields.incarnation_id','current') WHERE id='legacy-3'",[]).unwrap();
+        connection.execute("UPDATE claims SET body=json_remove(body,'$.fields.incarnation_id') WHERE id='legacy-5'",[]).unwrap();
+        connection
+            .execute("DELETE FROM claims WHERE id='legacy-2'", [])
+            .unwrap();
+        assert_eq!(
+            read(&query, 9, "1"),
+            vec!["legacy-9", "legacy-8", "legacy-5", "legacy-4", "legacy-1"]
+        );
+        assert_eq!(read(&query, 9, "1"), read(&oracle, 9, "1"));
+    }
+
+    #[test]
+    fn unnamed_harness_seek_cost_ignores_named_heartbeat_growth() {
+        let measure = |named: usize| {
+            let store = Store::open_memory("legacy-cost").unwrap();
+            let mut connection = store.connection.write();
+            let transaction = connection.transaction().unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO batches(id,origin,replica_sequence,hash,accepted_at_unix_ms)
+                VALUES ('cost-batch','legacy-cost',1,'synthetic','1')",
+                    [],
+                )
+                .unwrap();
+            for index in 1..=named {
+                let body = json!({"fields":{"incarnation_id":"current","state":"idle","status_transition":false}});
+                transaction.execute("INSERT INTO claims(store_index,id,batch_id,subject,kind,origin,body,predecessors,accepted_at_unix_ms)
+                    VALUES (?1,?2,'cost-batch','agent/legacy-cost','harness.observed','legacy-cost',?3,'[]',?4)",
+                    params![index as i64,format!("named-{index}"),body.to_string(),index.to_string()]).unwrap();
+            }
+            transaction.execute("INSERT INTO claims(store_index,id,batch_id,subject,kind,origin,body,predecessors,accepted_at_unix_ms)
+                VALUES (100000,'legacy-tail','cost-batch','agent/legacy-cost','harness.observed','legacy-cost',?1,'[]','100000')",[json!({"fields":{"state":"idle"}}).to_string()]).unwrap();
+            // Native claims have a recorded canonical position. Without it, the unchanged
+            // legacy-position fallback counts this synthetic batch's preceding rows, a
+            // separate ordering cost from selecting unnamed candidates.
+            transaction.execute(
+                "INSERT INTO replica_records(record_ref,writer,sequence,envelope_hash,position,raw,state,claim_id,updated_at_unix_ms)
+                 VALUES ('cost-record','legacy-cost',1,'synthetic',0,X'', 'valid','legacy-tail','1')",
+                [],
+            ).unwrap();
+            transaction.commit().unwrap();
+            let query = harness_observations_without_incarnation_query();
+            let plans = connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+                .unwrap()
+                .query_map(params!["agent/legacy-cost", 100000, "1"], |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert!(
+                plans
+                    .iter()
+                    .any(|p| p.contains("claims_harness_unnamed_accepted_index")),
+                "{plans:?}"
+            );
+            let work = |sql: &str| {
+                let mut statement = connection.prepare(sql).unwrap();
+                let ids = statement
+                    .query_map(params!["agent/legacy-cost", 100000, "1"], |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                assert_eq!(ids, vec!["legacy-tail"]);
+                statement.get_status(rusqlite::StatementStatus::VmStep)
+            };
+            let new = work(&query);
+            let old = work(&query.replace(
+                "claims_harness_unnamed_accepted_index",
+                "claims_subject_kind_accepted_index",
+            ));
+            println!("unnamed seek: named={named} new_vm_steps={new} old_vm_steps={old}");
+            (new, old)
+        };
+        let small = measure(128);
+        let large = measure(4096);
+        assert!(
+            small.0 > 0 && large.0 <= small.0 + 20,
+            "{small:?} -> {large:?}"
+        );
+        assert!(
+            large.1 > small.1 * 8,
+            "the retained old query must demonstrate the scan: {small:?} -> {large:?}"
+        );
     }
 
     #[test]
