@@ -59,7 +59,7 @@ with tempfile.TemporaryDirectory(prefix='st3-old-cli-wire-') as name:
         directory.mkdir(mode=0o700)
         environment[key] = str(directory)
     try:
-        answer = subprocess.run([str(binary), '--endpoint', str(endpoint), 
+        answer = subprocess.run([str(binary), '--endpoint', str(endpoint),
             'replication', 'checkpoint', 'status'], env=environment,
             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=7)
         worker.join(timeout=1)
