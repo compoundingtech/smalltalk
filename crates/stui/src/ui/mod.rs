@@ -14,6 +14,7 @@ pub mod demo;
 pub mod doc;
 mod edit;
 mod glass;
+mod hover;
 #[cfg(test)]
 #[path = "../../tests/support/terminal_tab.rs"]
 mod terminal_tab;
@@ -80,7 +81,12 @@ struct FramePane {
 
 #[derive(Default)]
 struct FrameInfo {
+    area: Rect,
     hits: Vec<(Rect, Hit)>,
+    /// Opaque layers and the first hit painted on each layer.
+    covers: Vec<(Rect, usize)>,
+    /// The unobscured focused terminal that retains ownership of program motion.
+    terminal_motion: Option<Rect>,
     panes: Vec<FramePane>,
     sidebar: Rect,
     sidebar_lines: usize,
@@ -330,6 +336,7 @@ pub struct Ui {
     sidebar: bool,
     system: bool,
     frame: RefCell<FrameInfo>,
+    hover: hover::Hover,
     dragging: bool,
     demo: Option<Demo>,
     quit: bool,
@@ -478,6 +485,7 @@ impl Ui {
             sidebar: true,
             system: false,
             frame: RefCell::new(FrameInfo::default()),
+            hover: hover::Hover::default(),
             dragging: false,
             demo: None,
             quit: false,
@@ -1109,7 +1117,10 @@ impl Ui {
     pub fn render(&self, frame: &mut ratatui::Frame<'_>) {
         let area = frame.area();
         let buf = frame.buffer_mut();
-        *self.frame.borrow_mut() = FrameInfo::default();
+        *self.frame.borrow_mut() = FrameInfo {
+            area,
+            ..FrameInfo::default()
+        };
         self.terminal_cursor.set(None);
         buf.set_style(area, Style::default().bg(theme::BASE).fg(theme::TEXT));
         if area.width < 20 || area.height < 6 {
@@ -1150,6 +1161,7 @@ impl Ui {
         if self.help {
             self.draw_help(buf, area);
         }
+        self.draw_hover(buf);
         for view in self.terminal.iter().chain(self.parked.iter()) {
             if let Some(native) = &view.native
                 && (!self
@@ -2561,6 +2573,7 @@ impl Ui {
         };
         // Everything outside the card closes it.
         self.hit(area, Hit::Escape);
+        self.cover(area);
         buf.set_style(rect, Style::default().bg(theme::MANTLE));
         for (offset, line) in doc.lines.iter().take(height as usize).enumerate() {
             buf.set_line(rect.x, rect.y + offset as u16, line, rect.width);
@@ -3247,7 +3260,19 @@ impl Ui {
     }
 
     /// Dispatch the outer terminal's decoded input, shared by the live and demo loops.
-    fn input_event(&mut self, event: Event) {
+    fn input_event(&mut self, event: Event) -> bool {
+        if let Event::Mouse(mouse) = event
+            && mouse.kind == MouseEventKind::Moved
+        {
+            return self.mouse_moved(mouse);
+        }
+        if event == Event::FocusLost {
+            self.hover.clear();
+            self.hover.pressed.set(false);
+            self.dragging = false;
+            self.terminal_selecting = false;
+            self.cancel_drag();
+        }
         let focused = self.input_terminal();
         match event {
             Event::Key(key) => self.key(key),
@@ -3276,6 +3301,7 @@ impl Ui {
                 }
             }
         }
+        true
     }
 
     fn input_terminal(&self) -> Option<String> {
@@ -4899,6 +4925,18 @@ impl Ui {
     }
 
     pub fn mouse(&mut self, mouse: MouseEvent) {
+        if mouse.kind == MouseEventKind::Moved {
+            self.mouse_moved(mouse);
+            return;
+        }
+        match mouse.kind {
+            MouseEventKind::Down(_) | MouseEventKind::Drag(_) => {
+                self.hover.pressed.set(true);
+                self.hover.clear();
+            }
+            MouseEventKind::Up(_) => self.hover.pressed.set(false),
+            _ => {}
+        }
         self.sync_terminal_slot();
         if self.help {
             if matches!(mouse.kind, MouseEventKind::Down(_)) {
@@ -5800,16 +5838,9 @@ pub fn run_demo(args: &[String]) -> Result<()> {
         execute!(io::stdout(), BeginSynchronizedUpdate)?;
         terminal.draw(|frame| ui.render(frame))?;
         execute!(io::stdout(), EndSynchronizedUpdate)?;
-        if event::poll(Duration::from_millis(80))? {
-            // Drain everything queued so a fast wheel does not lag behind. crossterm's read never
-            // returns on a closed terminal, so check for one before each read.
-            while !stopping.load(std::sync::atomic::Ordering::Relaxed) && !crate::stdin_hung_up() {
-                ui.input_event(event::read()?);
-                if !event::poll(Duration::ZERO)? {
-                    break;
-                }
-            }
-        }
+        hover::poll_input(Duration::from_millis(80), &stopping, |input| {
+            ui.input_event(input)
+        })?;
     }
     Ok(())
 }

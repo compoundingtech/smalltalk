@@ -39,6 +39,17 @@ pub const QUIET: Color = OVERLAY0;
 
 /// Row backgrounds.
 pub const ROW_SELECTED: Color = SURFACE0;
+/// Lift the painted background, preserving the contrast of selected buttons and rows.
+pub fn hover_background(background: Color) -> Color {
+    match background {
+        Color::Rgb(r, g, b) => Color::Rgb(
+            r.saturating_add(24),
+            g.saturating_add(24),
+            b.saturating_add(24),
+        ),
+        _ => SURFACE1,
+    }
+}
 /// The user's own messages in a conversation.
 pub const USER_BG: Color = Color::Rgb(0x28, 0x29, 0x3d);
 pub const TOOL_BG: Color = Color::Rgb(0x23, 0x24, 0x36);

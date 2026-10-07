@@ -14,7 +14,7 @@ use crate::feed::{self, Command, TerminalUpdate, Window};
 use crate::model::{self, Collection, Model};
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event},
+    event::Event,
     execute,
     terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate},
 };
@@ -1338,24 +1338,21 @@ pub fn run(context: Context) -> Result<()> {
                 .chain(ui.parked.iter())
                 .filter_map(|view| view.native.as_ref())
                 .any(|native| native.flowing());
-        if event::poll(Duration::from_millis(if flowing { 16 } else { 80 }))? {
-            // crossterm's read never returns on a closed terminal, so check for one before each.
-            while !stopping.load(std::sync::atomic::Ordering::Relaxed) && !crate::stdin_hung_up() {
-                match event::read()? {
-                    Event::Key(key)
-                        if !extras.live
-                            && key.code == crossterm::event::KeyCode::Char('r')
-                            && !ui.editing =>
-                    {
-                        let _ = commands.send(Command::Reconnect);
-                    }
-                    input => ui.input_event(input),
+        super::hover::poll_input(
+            Duration::from_millis(if flowing { 16 } else { 80 }),
+            &stopping,
+            |input| match input {
+                Event::Key(key)
+                    if !extras.live
+                        && key.code == crossterm::event::KeyCode::Char('r')
+                        && !ui.editing =>
+                {
+                    let _ = commands.send(Command::Reconnect);
+                    true
                 }
-                if !event::poll(Duration::ZERO)? {
-                    break;
-                }
-            }
-        }
+                input => ui.input_event(input),
+            },
+        )?;
     }
     // Leave no attachment behind.
     if let Some(current) = attached.take() {
