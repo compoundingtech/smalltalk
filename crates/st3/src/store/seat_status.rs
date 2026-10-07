@@ -139,6 +139,7 @@ pub(super) fn state_run_since(
     let mut rows = statement.query(params![subject, index, incarnation])?;
     let mut since = None;
     while let Some(row) = rows.next()? {
+        smallclaims::read_budget::check()?;
         let body: Value = serde_json::from_str(&row.get::<_, String>(1)?)?;
         let fields = body.get("fields").unwrap_or(&body);
         if fields.get("state").and_then(Value::as_str) != Some(state) {
@@ -354,6 +355,7 @@ pub(super) fn history_at(
         let mut statement = connection.prepare_cached(&query)?;
         let mut rows = statement.query(params![subject, index])?;
         while let Some(row) = rows.next()? {
+            smallclaims::read_budget::check()?;
             let claim = claim_from_row(row)?;
             let before_window = claim.accepted_at_unix_ms < cutoff;
             let key = canonical::key_from_record(&claim, row.get(10)?, row.get(11)?, row.get(12)?);

@@ -339,7 +339,7 @@ async fn open_terminal_subscription(
         let session = session.clone();
         let incarnation = request.incarnation.clone();
         let capability = request.capability.clone();
-        tokio::task::spawn_blocking(move || {
+        crate::api::read_deadline::spawn_blocking(move || {
             prepare_terminal_follow(
                 &state,
                 &session,
@@ -423,7 +423,7 @@ async fn conversation_page(
             .map_err(|error| conversation_blocks::availability(remote_read_error(owner, error)));
     }
     let (state, session, session_id) = (state.clone(), session.clone(), session_id.to_owned());
-    tokio::task::spawn_blocking(move || {
+    crate::api::read_deadline::spawn_blocking(move || {
         timeline_value(
             &state,
             &new_client_snapshot(&state),
@@ -4918,6 +4918,17 @@ fn conversation_read_now(
     session_id: &str,
     after: Option<&str>,
 ) -> Result<Value, ApiError> {
+    super::read_deadline::query(&state.store, "/v1/client/conversations/{id}/changes", || {
+        conversation_read_now_unbounded(state, session, session_id, after)
+    })
+}
+
+fn conversation_read_now_unbounded(
+    state: &AppState,
+    session: &ClientSession,
+    session_id: &str,
+    after: Option<&str>,
+) -> Result<Value, ApiError> {
     #[cfg(test)]
     if let Ok(mut rebuilds) = timeline_rebuilds().lock() {
         *rebuilds.entry(session_id.to_owned()).or_default() += 1;
@@ -5191,6 +5202,12 @@ fn transcript_seen(path: Option<&std::path::Path>) -> Option<(u64, std::time::Sy
 
 impl ConversationMark {
     fn new(state: &AppState, session_id: &str) -> Result<Self, ApiError> {
+        super::read_deadline::query(&state.store, "/v1/client/conversations/{id}/changes", || {
+            Self::new_unbounded(state, session_id)
+        })
+    }
+
+    fn new_unbounded(state: &AppState, session_id: &str) -> Result<Self, ApiError> {
         let index = state.store.index().map_err(ApiError::internal)?;
         let managed = super::managed_session_owner_at(&state.store, index, session_id)
             .map_err(ApiError::internal)?;
@@ -5216,6 +5233,12 @@ impl ConversationMark {
 
     /// Whether anything that concerns the conversation changed since the last look.
     fn changed(&mut self, state: &AppState) -> Result<bool, ApiError> {
+        super::read_deadline::query(&state.store, "/v1/client/conversations/{id}/changes", || {
+            self.changed_unbounded(state)
+        })
+    }
+
+    fn changed_unbounded(&mut self, state: &AppState) -> Result<bool, ApiError> {
         let mut changed = false;
         let index = state.store.index().map_err(ApiError::internal)?;
         if index > self.store_index {
@@ -5728,7 +5751,9 @@ pub(super) async fn events(
 ) -> Result<Json<Value>, ApiError> {
     require_scope(&session, "read.projections")?;
     let limit = query.limit.unwrap_or(100).clamp(1, 500);
-    let (oldest, newest) = state.store.event_bounds().map_err(ApiError::internal)?;
+    let (oldest, newest) = super::read_deadline::query(&state.store, "/v1/client/events", || {
+        state.store.event_bounds().map_err(ApiError::internal)
+    })?;
     let after = decode_event_cursor(&state.node, query.after.as_deref())?;
     validate_event_cursor(
         &state.node,
@@ -5743,12 +5768,13 @@ pub(super) async fn events(
     // page and subscribing must wake this long poll, not wait for another event.
     let mut changed = state.event_notify.subscribe();
     let records = loop {
-        let records = if query.after.is_some() {
-            feed_events_after(&state.store, after, limit.saturating_add(1))
-        } else {
-            feed_events_tail(&state.store, limit)
-        }
-        .map_err(ApiError::internal)?;
+        let records = super::read_deadline::query(&state.store, "/v1/client/events", || {
+            if query.after.is_some() {
+                feed_events_after(&state.store, after, limit.saturating_add(1))
+            } else {
+                feed_events_tail(&state.store, limit)
+            }.map_err(ApiError::internal)
+        })?;
         if !records.is_empty() || tokio::time::Instant::now() >= deadline {
             break records;
         }
@@ -6474,7 +6500,7 @@ const TERMINAL_FACTS_TIMEOUT: Duration = Duration::from_secs(1);
 async fn terminal_facts(state: &AppState, id: &str) -> Option<Value> {
     let live = terminal_live_session(state, &terminal_subject(id), None).ok()?;
     let root = state.pty_root.clone();
-    tokio::task::spawn_blocking(move || {
+    crate::api::read_deadline::spawn_blocking(move || {
         let stats = pty_client::stats::query_stats_in_with_timeout(
             &root,
             &live.runtime_id,
@@ -7720,7 +7746,7 @@ async fn import_external_session_action(
     // until the exact native process has stopped, so two harnesses never own one native session.
     if let Some(process) = external.process.clone() {
         let driver = external.driver;
-        tokio::task::spawn_blocking(move || {
+        crate::api::read_deadline::spawn_blocking(move || {
             crate::external_sessions::terminate_exact_process(driver, &process)
         })
         .await
@@ -8843,7 +8869,7 @@ async fn dispatch_action(
             }
             let socket = state.pty_root.join(format!("{}.sock", live.runtime_id));
             let runtime_id = live.runtime_id.clone();
-            tokio::task::spawn_blocking(move || {
+            crate::api::read_deadline::spawn_blocking(move || {
                 let stream = std::os::unix::net::UnixStream::connect(&socket)?;
                 let mut connection = pty_client::SessionConnection::attach_over(
                     stream,
@@ -9812,7 +9838,7 @@ mod tests {
                                         let (sender, receiver) = tokio::sync::oneshot::channel();
                                         tokio::spawn(async move { let _ = receiver.await; let _ = dropped.send(()); });
                                         let _dropped = Dropped(Some(sender));
-                                        tokio::task::spawn_blocking(move || {
+                                        crate::api::read_deadline::spawn_blocking(move || {
                                             entered.send(()).unwrap();
                                             let _ = tokio::runtime::Handle::current().block_on(held.wait_for(|released| *released));
                                             completed.send(()).unwrap();
@@ -10050,7 +10076,7 @@ mod tests {
                             move |state, session, request, permit| {
                                 let (mut gate, started) = (gate.clone(), started.clone());
                                 async move {
-                                    let permit = tokio::task::spawn_blocking(move || {
+                                    let permit = crate::api::read_deadline::spawn_blocking(move || {
                                         started.send(permit.semaphore().clone()).unwrap();
                                         let _ = tokio::runtime::Handle::current().block_on(gate.wait_for(|released| *released));
                                         permit
@@ -15720,7 +15746,7 @@ mission "example/zero-run" state="ready" {
         }
         let _cleanup = Cleanup(runtime.clone());
         let pty_root = state.pty_root.clone();
-        let output = tokio::task::spawn_blocking(move || std::process::Command::new(pty)
+        let output = crate::api::read_deadline::spawn_blocking(move || std::process::Command::new(pty)
             .env("PTY_ROOT", pty_root)
             .args(["run", "-d", "--force", "--id", "fence-test", "--tag", "keep=true", "--", "/bin/sh", "-c", "stty -echo; printf ready; while IFS= read -r line; do printf '\\r\\naccepted:%s' \"$line\"; done"])
             .output().unwrap()).await.unwrap();

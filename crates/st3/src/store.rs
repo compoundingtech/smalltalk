@@ -10517,21 +10517,26 @@ impl Store {
         let subjects = subjects.into_iter().collect::<Vec<_>>();
         let chunk_size = subjects.len().div_ceil(STATUS_WORKERS);
         let profile = crate::profile::current();
+        let read_budget = smallclaims::read_budget::current();
         let parts = std::thread::scope(|scope| {
             subjects
                 .chunks(chunk_size)
                 .map(|chunk| {
                     let names = chunk.iter().cloned().collect::<BTreeSet<_>>();
                     let profile = profile.clone();
+                    let read_budget = read_budget.clone();
                     scope.spawn(move || {
                         let _entered = crate::profile::enter(profile.as_ref());
-                        self.status_at_view_for_names(
-                            None,
-                            None,
-                            Some(store_index),
-                            include_history,
-                            Some(names),
-                        )
+                        let read = || self.status_at_view_for_names(
+                            None, None, Some(store_index), include_history, Some(names),
+                        );
+                        if let Some(budget) = read_budget {
+                            smallclaims::read_budget::with(Some(budget), || {
+                                self.readers.request_read(read)?
+                            })
+                        } else {
+                            read()
+                        }
                     })
                 })
                 .collect::<Vec<_>>()
@@ -20888,6 +20893,7 @@ fn current_harness_fold_at(
         .prepare_cached(&harness_observations_without_incarnation_query())?
         .query_map(params![subject, at_index, runtime_key.0.to_string()], row)?
         .map(|row| {
+            smallclaims::read_budget::check()?;
             let (claim, body, observed_at_unix_ms) = row?;
             let key = canonical::claim_key(connection, &claim)?;
             Ok::<_, anyhow::Error>((key, claim, body, observed_at_unix_ms))
@@ -20902,6 +20908,7 @@ fn current_harness_fold_at(
     let mut current = None;
     let mut optional = BTreeMap::<&'static str, Option<String>>::new();
     loop {
+        smallclaims::read_budget::check()?;
         if next_named.is_none() {
             next_named = match named.next() {
                 Some(row) => {
@@ -21111,6 +21118,7 @@ fn agent_working_since_at(
             Ok(false)
         };
         for row in &mut rows {
+            smallclaims::read_budget::check()?;
             let row = row?;
             if group.last().is_some_and(|previous| previous.2 != row.2)
                 && fold_group(&mut group, &mut since)?
@@ -35036,6 +35044,25 @@ mission "card-owner" state="ready" {
         store.forget_current_views();
         assert_eq!(serde_json::to_value(store.agent_card_status_at(None, index, true).unwrap()).unwrap(),
             serde_json::to_value(after).unwrap());
+    }
+
+    #[test]
+    fn status_projection_threads_inherit_cancellation_and_release_their_readers() {
+        let store = Store::open_memory("node").unwrap();
+        let names = (0..65).map(|n| format!("agent/budget/seat-{n}")).collect::<BTreeSet<_>>();
+        let index = store.index().unwrap();
+        let expired = smallclaims::read_budget::ReadBudget::new("/parallel-status", std::time::Duration::ZERO);
+        smallclaims::read_budget::with(Some(expired), || {
+            let error = store.status_for_subject_names_at(names.clone(), index, true).unwrap_err();
+            assert_eq!(smallclaims::error::typed(error).code, "read-deadline");
+        });
+        let eligible = smallclaims::read_budget::ReadBudget::new("/parallel-status", std::time::Duration::from_secs(15));
+        let result = smallclaims::read_budget::with(Some(eligible.clone()), || {
+            store.status_for_subject_names_at(names, index, true)
+        }).unwrap();
+        assert_eq!(result.subjects.len(), 65);
+        assert!(!eligible.expired());
+        assert!(store.readers.get().is_autocommit());
     }
 
     #[test]

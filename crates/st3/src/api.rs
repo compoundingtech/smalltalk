@@ -69,6 +69,7 @@ mod github_watch;
 mod harness_events;
 mod mailbox;
 mod mail_backlog;
+mod read_deadline;
 mod owned_sets;
 mod terminal_view;
 
@@ -348,6 +349,7 @@ impl ApiError {
             | "glass-owner-forbidden" => StatusCode::FORBIDDEN,
             "lane-not-found" | "not-found" => StatusCode::NOT_FOUND,
             "database-busy" | "database-locked" => StatusCode::SERVICE_UNAVAILABLE,
+            "read-deadline" => StatusCode::GATEWAY_TIMEOUT,
             "internal" => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::UNPROCESSABLE_ENTITY,
         };
@@ -365,6 +367,13 @@ impl ApiError {
 
     fn internal(error: impl std::fmt::Display + 'static) -> Self {
         let typed = &error as &dyn std::any::Any;
+        if let Some(error) = typed.downcast_ref::<read_deadline::WorkError>()
+            && let Some(error) = read_deadline::error(error) {
+            return error;
+        }
+        if smallclaims::read_budget::check().is_err() {
+            return Self::bad(St3Error::new("read-deadline", "the read exceeded its deadline or was cancelled"));
+        }
         let store_error = typed.downcast_ref::<St3Error>().or_else(|| {
             typed
                 .downcast_ref::<anyhow::Error>()
@@ -845,6 +854,14 @@ async fn schema() -> Json<Value> {
 }
 
 async fn response_envelope(
+    State(state): State<(AppState, ClientTransportBoundary)>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    read_deadline::envelope(state, request, next).await
+}
+
+async fn response_envelope_unbounded(
     State((state, transport)): State<(AppState, ClientTransportBoundary)>,
     mut request: Request<Body>,
     next: Next,
@@ -913,7 +930,7 @@ async fn response_envelope(
         let transport = transport.as_str();
         let auth_profile = profile.clone();
         let admission_queue = profile.as_ref().map(|op| op.wall_span("admission/queue"));
-        let admitted = tokio::task::spawn_blocking(move || {
+        let admitted = crate::api::read_deadline::spawn_blocking(move || {
             drop(admission_queue);
             let _entered = crate::profile::enter(auth_profile.as_ref());
             let authentication_span = crate::profile::span("admission/authenticate");
@@ -953,7 +970,7 @@ async fn response_envelope(
             let cpu_kind = request_route.clone();
             let cpu_client = caller.clone();
             let handler_queue = profile.as_ref().map(|op| op.wall_span("handler/queue"));
-            match tokio::task::spawn_blocking(move || {
+            match crate::api::read_deadline::spawn_handler(move || {
                 drop(handler_queue);
                 if let Some(profile) = &handler_profile {
                     profile.queued();
@@ -4860,7 +4877,7 @@ where
 {
     let profile = crate::profile::current();
     let cpu_kind = crate::performance::current();
-    tokio::task::spawn_blocking(move || {
+    crate::api::read_deadline::spawn_blocking(move || {
         let _entered = crate::profile::enter(profile.as_ref());
         crate::performance::with_charged(cpu_kind, operation)
     })
@@ -4876,7 +4893,7 @@ where
 {
     let profile = crate::profile::current();
     let cpu_kind = crate::performance::current();
-    tokio::task::spawn_blocking(move || {
+    crate::api::read_deadline::spawn_blocking(move || {
         let _entered = crate::profile::enter(profile.as_ref());
         crate::performance::with_charged(cpu_kind, operation)
     })
@@ -4894,7 +4911,7 @@ where
 {
     let profile = crate::profile::current();
     let cpu_kind = crate::performance::current();
-    tokio::task::spawn_blocking(move || {
+    crate::api::read_deadline::spawn_blocking(move || {
         let _entered = crate::profile::enter(profile.as_ref());
         crate::performance::with_charged(cpu_kind, operation)
     })
@@ -5071,7 +5088,7 @@ async fn serve_unix_with_ancestor_ready(
             // /proc ancestry may fault in pages on a loaded host. Keep that work
             // out of the accept loop so a slow lookup delays only this peer.
             let (bound_agent, caller, delivery_peer) = match peer_pid {
-                Some(pid) => tokio::task::spawn_blocking(move || {
+                Some(pid) => crate::api::read_deadline::spawn_blocking(move || {
                     let bound_agent = bind_ancestry.then(|| ancestor(pid)).flatten();
                     let caller = Some(crate::profile::Caller::of_command(
                         local_process_arguments(pid).map(|(arguments, _)| arguments),
@@ -5540,22 +5557,22 @@ fn isolation_name(mode: st_runtime::Isolation) -> &'static str {
 
 async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, ApiError> {
     let reader_store = state.store.clone();
-    let environment = tokio::task::spawn_blocking(crate::environment::snapshot)
+    let environment = crate::api::read_deadline::spawn_blocking(crate::environment::snapshot)
         .await
         .map_err(ApiError::internal)?;
     // Linking a crate takes seconds, so it runs while the other checks do.
     let build_tools = environment.as_ref().ok().cloned().map(|environment| {
-        tokio::task::spawn_blocking(move || crate::environment::check_build_tools(&environment))
+        crate::api::read_deadline::spawn_blocking(move || crate::environment::check_build_tools(&environment))
     });
     let pty_root = state.pty_root.clone();
-    let priority = tokio::task::spawn_blocking(move || {
+    let priority = crate::api::read_deadline::spawn_blocking(move || {
         let observations = st_runtime::PtyRuntime::new(pty_root)
             .snapshot()
             .unwrap_or_default();
         st_runtime::priority_report(&observations)
     });
     let token = crate::resource::github_token().await;
-    let mut report = tokio::task::spawn_blocking(move || {
+    let mut report = crate::api::read_deadline::spawn_blocking(move || {
         // This node's claims are signed as their batches are sealed; seal and judge them so
         // the signature counts cover everything written so far.
         state.store.replication_snapshot().map_err(ApiError::internal)?;
@@ -9268,7 +9285,7 @@ async fn start_gate_check(
         )));
     }
     let (node, state_dir, pty_root) = (state.node, state.state_dir, state.pty_root);
-    let view = tokio::task::spawn_blocking(move || {
+    let view = crate::api::read_deadline::spawn_blocking(move || {
         crate::gate_check::start(
             crate::gate_check::CheckHost {
                 node: &node,
@@ -9289,7 +9306,7 @@ async fn start_gate_check(
 async fn read_gate_check(
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<crate::model::GateCheckView>, ApiError> {
-    tokio::task::spawn_blocking(move || crate::gate_check::poll(&id))
+    crate::api::read_deadline::spawn_blocking(move || crate::gate_check::poll(&id))
         .await
         .map_err(|error| ApiError::internal(anyhow::anyhow!(error)))?
         .map(Json)
@@ -13157,7 +13174,7 @@ async fn sekrets_attest(
             "attestations are only given over the local socket",
         )));
     };
-    tokio::task::spawn_blocking(move || {
+    crate::api::read_deadline::spawn_blocking(move || {
         crate::sekrets::daemon::attest(
             &state.store,
             &state.node,
@@ -14151,7 +14168,7 @@ async fn local_terminal(
 ) -> Result<Json<LocalTerminal>, ApiError> {
     // A read can still wait on a saturated disk; it must not hold a runtime worker meanwhile.
     let (lookup, lookup_subject) = (state.clone(), subject.clone());
-    let session = tokio::task::spawn_blocking(move || live_session(&lookup, &lookup_subject, None))
+    let session = crate::api::read_deadline::spawn_blocking(move || live_session(&lookup, &lookup_subject, None))
         .await
         .map_err(ApiError::internal)??;
     if !session.terminal {
@@ -16351,7 +16368,7 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
         runtime.block_on(async {
             let (ready_tx, ready_rx) = std::sync::mpsc::channel();
             let (release_tx, release_rx) = std::sync::mpsc::channel();
-            let blocker = tokio::task::spawn_blocking(move || {
+            let blocker = crate::api::read_deadline::spawn_blocking(move || {
                 ready_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
             });
