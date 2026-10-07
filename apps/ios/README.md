@@ -41,6 +41,10 @@ Conversation and session views, Home rows, requests and answers, device-signing 
 ## Private client diagnostics
 
 The iOS entry point installs diagnostics before importing the React app. A native Expo app-delegate subscriber starts earlier, establishes the process launch UUID, and durably records native launch markers. JS uses that same launch UUID with sequences in the upper half of `u32`; native sequences use the lower half. JS records `js-start`, `root-mounted`, foreground/background transitions, a 16-entry in-memory launch breadcrumb ring, global errors, unhandled promise rejections, and root React render failures. It preserves React Native's original global handler and Debug rejection reporting. RN 0.86's Hermes promise rejection tracker and C++ exception listener are used directly; a browser `unhandledrejection` listener would not capture these paths.
+Historical MetricKit retrieval, sanitization, hashing and persistence run asynchronously
+on a serial utility queue, with a runtime assertion forbidding main-thread processing.
+Once the synchronous process marker is durable, later pre-JS callbacks and
+`launchContext()` do not wait for that report queue.
 
 Reports contain only the generated `ClientDiagnosticEvent` contract: bounded build/runtime/update/OS tokens, UUIDs, times/sequences, severity/source, fixed breadcrumb/error names, and up to 32 numeric JS frame locations or native binary-category/hex-offset frames. Raw error messages, stacks, function names, URLs, headers, credentials, filesystem paths, arbitrary keys, and user content never enter the persisted/uploaded report. Invalid metadata is replaced with `unknown`; update identity is a UUID or `embedded`. Running JS reports use the optional native Expo Updates module's current runtime/update identity when installed. Native-only reports use app/build runtime metadata and `embedded`, because MetricKit cannot recover the original OTA bundle identity.
 

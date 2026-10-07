@@ -1,6 +1,7 @@
 import CoreFoundation
 import Foundation
 import MetricKit
+import OSLog
 
 // Only these allowlisted fields cross into the store/bridge. Raw MetricKit JSON, binary
 // names/UUIDs, memory addresses, termination reasons and exception messages never persist.
@@ -119,6 +120,32 @@ enum MetricKitReports {
       return "system"
     default:
       return "unknown"
+    }
+  }
+}
+
+// UIKit delegate subscribers are main-actor isolated. MetricKit delivers on a background
+// queue, so keep its callback on a separate NSObject and serialize persistence in the store.
+// This immutable subscriber only schedules work; mutable journal state stays serialized.
+final class DiagnosticMetricKitSubscriber: NSObject, MXMetricManagerSubscriber, @unchecked Sendable {
+  private static let logger = Logger(subsystem: "smalltalk.diagnostics", category: "native-storage")
+  private let processing = DispatchQueue(label: "smalltalk.diagnostics.metrickit", qos: .utility)
+
+  func didReceive(_ payloads: [MXDiagnosticPayload]) {
+    processing.async { self.persist(payloads) }
+  }
+
+  func replayHistoricalReports() {
+    processing.async { self.persist(MXMetricManager.shared.pastDiagnosticPayloads) }
+  }
+
+  private func persist(_ payloads: [MXDiagnosticPayload]) {
+    precondition(!Thread.isMainThread, "MetricKit diagnostics must never run on the launch thread")
+    guard !payloads.isEmpty else { return }
+    do {
+      try DiagnosticStore.shared.capture(payloads)
+    } catch {
+      Self.logger.error("Sanitized MetricKit diagnostics could not be persisted")
     }
   }
 }

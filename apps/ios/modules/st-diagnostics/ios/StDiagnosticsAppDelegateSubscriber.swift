@@ -52,27 +52,9 @@ public final class StDiagnosticsAppDelegateSubscriber: ExpoAppDelegateSubscriber
     guard !subscribed else { return }
     subscribed = true
     MXMetricManager.shared.add(metrics)
-    // Collect OS-delayed reports even when they predate this subscriber. Stable event
-    // IDs and bounded durable tombstones deduplicate subsequent callback/replay delivery.
-    metrics.persist(MXMetricManager.shared.pastDiagnosticPayloads)
+    // Retrieving, sanitizing and persisting historical reports all happen off the
+    // launch thread. Repeated launch callbacks must not wait for this replay.
+    metrics.replayHistoricalReports()
   }
 }
 
-// UIKit delegate subscribers are main-actor isolated. MetricKit delivers on a background
-// queue, so keep its callback on a separate NSObject and serialize persistence in the store.
-private final class DiagnosticMetricKitSubscriber: NSObject, MXMetricManagerSubscriber {
-  private static let logger = Logger(subsystem: "smalltalk.diagnostics", category: "native-storage")
-
-  func didReceive(_ payloads: [MXDiagnosticPayload]) {
-    persist(payloads)
-  }
-
-  func persist(_ payloads: [MXDiagnosticPayload]) {
-    guard !payloads.isEmpty else { return }
-    do {
-      try DiagnosticStore.shared.capture(payloads)
-    } catch {
-      Self.logger.error("Sanitized MetricKit diagnostics could not be persisted")
-    }
-  }
-}

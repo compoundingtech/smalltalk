@@ -36,6 +36,9 @@ final class DiagnosticStore: @unchecked Sendable {
 
   let context = DiagnosticLaunchContext.current()
   private let queue = DispatchQueue(label: "smalltalk.diagnostics.disk")
+  // Independent of the report queue: after the marker is durable, subsequent
+  // pre-JS callbacks and launchContext() return without waiting for MetricKit I/O.
+  private let startup = NSLock()
   private var cached: DiagnosticState?
   private var cachedDirectory: URL?
   private var started = false
@@ -43,12 +46,15 @@ final class DiagnosticStore: @unchecked Sendable {
   // All readers/writers, including MetricKit's background callback, run on this serial
   // queue. The new snapshot becomes visible only after the atomic disk commit succeeds.
   func start() throws {
+    startup.lock()
+    defer { startup.unlock() }
+    guard !started else { return }
     try queue.sync { try startLocked() }
   }
 
   func pending() throws -> [[String: Any]] {
-    try queue.sync {
-      try startLocked()
+    try start()
+    return try queue.sync {
       let state = try load()
       let oldest = cutoff(diagnosticMilliseconds(Date()))
       if state.reports.contains(where: { $0.captured_at_unix_ms < oldest }) ||
@@ -60,16 +66,16 @@ final class DiagnosticStore: @unchecked Sendable {
   }
 
   func acknowledge(_ ids: [String]) throws {
+    try start()
     try queue.sync {
-      try startLocked()
       let acknowledged = Set(ids.prefix(Self.maxReports).compactMap { UUID(uuidString: $0)?.uuidString.lowercased() })
       try transaction { state in state.reports.removeAll { acknowledged.contains($0.event_id) } }
     }
   }
 
   func capture(_ payloads: [MXDiagnosticPayload]) throws {
+    try start()
     try queue.sync {
-      try startLocked()
       let capturedAt = diagnosticMilliseconds(Date())
       let reports = try MetricKitReports.reports(payloads, capturedAt: capturedAt)
       try transaction { state in
@@ -84,8 +90,8 @@ final class DiagnosticStore: @unchecked Sendable {
   }
 
   func terminateCleanly() throws {
+    try start()
     try queue.sync {
-      try startLocked()
       try transaction { state in
         if state.marker?.context.launch_id == context.launch_id { state.marker = nil }
       }
