@@ -42558,6 +42558,14 @@ version 2
             }
             transaction.execute("INSERT INTO claims(store_index,id,batch_id,subject,kind,origin,body,predecessors,accepted_at_unix_ms)
                 VALUES (100000,'legacy-tail','cost-batch','agent/legacy-cost','harness.observed','legacy-cost',?1,'[]','100000')",[json!({"fields":{"state":"idle"}}).to_string()]).unwrap();
+            // Native claims have a recorded canonical position. Without it, the unchanged
+            // legacy-position fallback counts this synthetic batch's preceding rows, a
+            // separate ordering cost from selecting unnamed candidates.
+            transaction.execute(
+                "INSERT INTO replica_records(record_ref,writer,sequence,envelope_hash,position,raw,state,claim_id,updated_at_unix_ms)
+                 VALUES ('cost-record','legacy-cost',1,'synthetic',0,X'', 'valid','legacy-tail','1')",
+                [],
+            ).unwrap();
             transaction.commit().unwrap();
             let query = harness_observations_without_incarnation_query();
             let plans = connection
