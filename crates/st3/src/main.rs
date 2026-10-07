@@ -5750,11 +5750,13 @@ async fn run_up(args: UpArgs) -> Result<()> {
             },
         ));
     }
+    recycle_idle_wal(config.state_dir.join("claims.sqlite3"));
     tokio::spawn(convert_envelope_payloads(store.clone()));
     tokio::spawn(trim_local_observations(
         store.clone(),
         config.observations.clone(),
     ));
+    tokio::spawn(catch_up_account_limits(store.clone()));
     tokio::spawn(st3::recorder_receipts::run(
         store.clone(),
         st3::recorder::receipt_path(&config.state_dir),
@@ -7883,10 +7885,14 @@ async fn run_inspect(client: &Client, args: InspectArgs, json_output: bool) -> R
             urlencoding::encode(&args.subject)
         ))
         .await?;
-    print_value(
-        &json!({ "status": status, "recent_claims": claims.claims }),
-        json_output,
-    )
+    let mut shown = json!({ "status": status, "recent_claims": claims.claims });
+    // Who signed a message a person wrote, and whether that checks.
+    if args.subject.starts_with("message/")
+        && let Some(provenance) = message_provenance(client, &args.subject).await
+    {
+        shown["provenance"] = provenance;
+    }
+    print_value(&shown, json_output)
 }
 
 async fn run_trace(client: &Client, args: TraceArgs, json_output: bool) -> Result<()> {
@@ -13720,6 +13726,11 @@ fn render_client_agent(
         agent.driver.as_deref().unwrap_or("none"),
         agent.harness_state.as_deref().unwrap_or("unobserved")
     );
+    if agent.blocked_on.as_deref() == Some("human")
+        && agent.ask.as_deref() == Some("permission")
+    {
+        let _ = writeln!(output, "AWAITING     approval");
+    }
     if let Some(todo) = &agent.todo {
         let snapshot = &todo.snapshot;
         let _ = write!(output, "Todo         ");
@@ -15636,10 +15647,18 @@ async fn run_message(
                 );
             }
             if json_output {
-                if messages.len() == 1 {
-                    print_value(&messages[0], true)?;
+                let mut shown = Vec::with_capacity(messages.len());
+                for message in &messages {
+                    let mut value = serde_json::to_value(message)?;
+                    if let Some(provenance) = message_provenance(client, &message.subject).await {
+                        value["provenance"] = provenance;
+                    }
+                    shown.push(value);
+                }
+                if shown.len() == 1 {
+                    print_value(&shown[0], true)?;
                 } else {
-                    print_value(&messages, true)?;
+                    print_value(&shown, true)?;
                 }
             } else {
                 for (index, message) in messages.iter().enumerate() {
@@ -15654,6 +15673,9 @@ async fn run_message(
                     } else {
                         println!("Message: {}", message.subject);
                         println!("From: {}", message.from);
+                        if let Some(provenance) = message_provenance(client, &message.subject).await {
+                            println!("Signed: {}", provenance_line(&provenance));
+                        }
                         println!("To: {}", message.to);
                         if let Some(title) = &message.title {
                             println!("Subject: {title}");
@@ -16228,6 +16250,39 @@ fn message_mission_intent(
     mission_body.nodes_mut().push(completion);
     mission.set_children(mission_body);
     publication_document(mission)
+}
+
+/// Who signed a message a person wrote, as the daemon read it: `None` for an agent's message or a
+/// daemon that does not say.
+async fn message_provenance(client: &Client, reference: &str) -> Option<Value> {
+    let reference = normalize_message_reference(reference);
+    let read: Value = client
+        .get(&format!(
+            "/v1/messages/read/{}",
+            urlencoding::encode(&reference)
+        ))
+        .await
+        .ok()?;
+    read.get("provenance").cloned()
+}
+
+/// A provenance as one line: `verified · person/example · example phone (secure enclave) · p256:BPLX…`.
+fn provenance_line(provenance: &Value) -> String {
+    let text = |field: &str| provenance.get(field).and_then(Value::as_str);
+    let mut parts = vec![text("verdict").unwrap_or("unknown").to_owned()];
+    if let Some(reason) = text("reason") {
+        parts.push(reason.to_owned());
+    }
+    for field in ["signer", "device"] {
+        if let Some(value) = text(field) {
+            parts.push(value.to_owned());
+        }
+    }
+    if let Some(key) = text("key") {
+        let shown: String = key.chars().take(16).collect();
+        parts.push(format!("{shown}…"));
+    }
+    parts.join(" · ")
 }
 
 async fn read_message(client: &Client, reference: &str) -> Result<MessageView> {
@@ -20914,9 +20969,17 @@ fn work_incarnation_key(incarnation: Option<&str>) -> String {
 }
 
 async fn renew_claimed_work(client: &Client, subject: &str, minute: u64) -> Result<()> {
+    let work: Vec<StepRunView> = client
+        .get(&format!("/v1/work?actor={}", urlencoding::encode(subject)))
+        .await?;
+    // Most resident seats hold no work. Only a held claim needs the status reduction
+    // that proves its harness incarnation is still live before renewing the lease.
+    if !work.iter().any(|step| work_claim_is_held_by(step, subject)) {
+        return Ok(());
+    }
     let status: StatusResponse = client
         .get(&format!(
-            "/v1/status?subject={}",
+            "/v1/status?subject={}&harness_only=true",
             urlencoding::encode(subject)
         ))
         .await?;
@@ -20925,9 +20988,6 @@ async fn renew_claimed_work(client: &Client, subject: &str, minute: u64) -> Resu
         .iter()
         .find(|candidate| candidate.subject == subject)
         .and_then(|candidate| candidate.harness.as_ref());
-    let work: Vec<StepRunView> = client
-        .get(&format!("/v1/work?actor={}", urlencoding::encode(subject)))
-        .await?;
     let mut failure = None;
     for step in work
         .into_iter()
@@ -21040,15 +21100,19 @@ fn renewal_lost_its_claim(error: &anyhow::Error) -> bool {
     )
 }
 
+fn work_claim_is_held_by(step: &StepRunView, subject: &str) -> bool {
+    matches!(
+        step.status.as_str(),
+        "claimed" | "working" | "verifying" | "blocked"
+    ) && step.claimant.as_deref() == Some(subject)
+}
+
 fn work_claim_has_active_harness(
     step: &StepRunView,
     subject: &str,
     harness: Option<&CurrentHarnessView>,
 ) -> bool {
-    matches!(
-        step.status.as_str(),
-        "claimed" | "working" | "verifying" | "blocked"
-    ) && step.claimant.as_deref() == Some(subject)
+    work_claim_is_held_by(step, subject)
         && harness.is_some_and(|harness| {
             harness.state != "ended"
                 && step.claim_incarnation.as_deref() == Some(harness.incarnation_id.as_str())
@@ -22173,6 +22237,64 @@ async fn enforce_account_limits(store: Arc<Store>, policy: st3::store::LimitsPol
     }
 }
 
+/// Page copying runs off the writer queue; recycling never waits for a reader or writer lock.
+fn recycle_idle_wal(path: PathBuf) {
+    // Five seconds finds gaps between short readers without polling on every write.
+    const WAL_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
+    const WAL_CHECKPOINT_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+    // Backfill can take tens of seconds even with a zero busy timeout. A detached native
+    // thread owns its connection so Tokio shutdown never waits for this best-effort work
+    // in its blocking pool. Dropping the handle also avoids joining it at process exit.
+    let worker = std::thread::Builder::new()
+        .name("st3-wal-checkpoint".into())
+        .spawn(move || {
+            let mut connection = None;
+            let mut last_error_log: Option<Instant> = None;
+            let mut retry_interval = WAL_CHECKPOINT_INTERVAL;
+            loop {
+                std::thread::sleep(retry_interval);
+                retry_interval = WAL_CHECKPOINT_INTERVAL;
+                // The connection is taken into the attempt and dropped on unwind; no
+                // potentially panic-damaged connection is reused by the next attempt.
+                let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let connection = match connection.take() {
+                        Some(connection) => connection,
+                        None => rusqlite::Connection::open(&path)
+                            .context("open WAL checkpoint connection")?,
+                    };
+                    let result = smallclaims::sqlite::checkpoint_idle_wal(&connection);
+                    Ok::<_, anyhow::Error>((connection, result))
+                }));
+                let result = match attempt {
+                    Ok(Ok((returned, result))) => {
+                        connection = Some(returned);
+                        result.context("recycle idle WAL")
+                    }
+                    Ok(Err(error)) => Err(error),
+                    Err(_) => {
+                        // catch_unwind still invokes the process panic hook. Back off
+                        // its retries too, without changing the hook for other threads.
+                        retry_interval = WAL_CHECKPOINT_ERROR_LOG_INTERVAL;
+                        Err(anyhow::anyhow!("WAL checkpoint panicked; reopening connection"))
+                    }
+                };
+                if let Err(error) = result {
+                    let now = Instant::now();
+                    if last_error_log.is_none_or(|last| {
+                        now.duration_since(last) >= WAL_CHECKPOINT_ERROR_LOG_INTERVAL
+                    }) {
+                        eprintln!("st3: {error:#}");
+                        last_error_log = Some(now);
+                    }
+                }
+            }
+        });
+    if let Err(error) = worker {
+        eprintln!("st3: start WAL checkpoint worker: {error}");
+    }
+}
+
 /// Old payloads convert after startup; each page joins the normal writer queue and commits
 /// its own cursor. A failed page retries, including after a daemon restart.
 async fn convert_envelope_payloads(store: Arc<Store>) {
@@ -22186,6 +22308,26 @@ async fn convert_envelope_payloads(store: Arc<Store>) {
                 eprintln!("st3: binary envelope conversion failed: {error:?}");
                 tokio::time::sleep(Duration::from_secs(60)).await;
             }
+        }
+    }
+}
+
+/// Fill the account limits projection after an upgrade, a page of claims at a time. Each page is
+/// its own short writer transaction and the daemon answers between pages; the cursor is stored, so
+/// a restart resumes. Once it is caught up this only checks, once a minute, for claims that
+/// replication admitted and no append or projection pass has folded yet.
+async fn catch_up_account_limits(store: Arc<Store>) {
+    loop {
+        let page_store = store.clone();
+        let more = tokio::task::spawn_blocking(move || {
+            st3::profile::task("task account-limits-catch-up", || {
+                page_store.catch_up_account_limits(st3::store::LIMITS_CATCH_UP_PAGE)
+            })
+        })
+        .await;
+        match more {
+            Ok(Ok(true)) => tokio::time::sleep(Duration::from_millis(50)).await,
+            _ => tokio::time::sleep(Duration::from_secs(60)).await,
         }
     }
 }
@@ -23578,6 +23720,20 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn agent_card_names_a_pending_codex_approval() {
+        let agent: st3_client::Agent = serde_json::from_value(serde_json::json!({
+            "kind": "agent", "id": "agent/approval", "revision": "one",
+            "updated_at": "2026-10-06T12:00:00Z", "name": "Approval",
+            "state": "running", "reachability": "local", "runtime_ids": [],
+            "driver": "codex", "harness_state": "blocked", "blocked_on": "human",
+            "ask": "permission", "reason": "waitingOnApproval"
+        })).unwrap();
+        let card = render_client_agent(&agent, &[], 0);
+        assert!(card.contains("HARNESS      codex · blocked\n"));
+        assert!(card.contains("AWAITING     approval\n"));
+    }
+
     fn subagent_worker() -> serde_json::Value {
         serde_json::json!({
             "kind": "agent", "id": "agent/crew/worker", "revision": "one",
@@ -24806,6 +24962,35 @@ mod tests {
             "agent/node.worker",
             Some(&replacement)
         ));
+        assert!(!work_claim_has_active_harness(
+            &step,
+            "agent/other",
+            Some(&replacement)
+        ));
+        assert!(!work_claim_has_active_harness(
+            &step,
+            "agent/node.worker",
+            None
+        ));
+        let mut ended = replacement.clone();
+        ended.incarnation_id = "worker-one".into();
+        ended.state = "ended".into();
+        assert!(!work_claim_has_active_harness(
+            &step,
+            "agent/node.worker",
+            Some(&ended)
+        ));
+        for state in ["claimed", "working", "verifying", "blocked"] {
+            let mut held = step.clone();
+            held.status = state.into();
+            assert!(work_claim_is_held_by(&held, "agent/node.worker"));
+            assert!(!work_claim_is_held_by(&held, "agent/other"));
+        }
+        for state in ["ready", "pending", "completed", "cancelled", "failed"] {
+            let mut unheld = step.clone();
+            unheld.status = state.into();
+            assert!(!work_claim_is_held_by(&unheld, "agent/node.worker"));
+        }
     }
 
     #[test]
@@ -26131,6 +26316,23 @@ mod tests {
         assert_eq!(args.references, ["message/first", "message/second"]);
         assert_eq!(args.actor.as_deref(), Some("agent/sup"));
         assert!(args.archive);
+    }
+
+    #[test]
+    fn a_provenance_reads_as_one_line() {
+        let line = provenance_line(&json!({
+            "verdict": "verified", "signer": "person/example",
+            "device": "example phone (secure enclave)", "key": "p256:BPLXtCkgqnBglKrxCU_RE"
+        }));
+        assert_eq!(
+            line,
+            "verified · person/example · example phone (secure enclave) · p256:BPLXtCkgqnB…"
+        );
+        assert_eq!(
+            provenance_line(&json!({"verdict": "held", "reason": "delegation d1 has not arrived"})),
+            "held · delegation d1 has not arrived"
+        );
+        assert_eq!(provenance_line(&json!({"verdict": "unsigned"})), "unsigned");
     }
 
     #[tokio::test]

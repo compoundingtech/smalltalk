@@ -28,6 +28,11 @@ pub type LegacyDigestTable = (
 pub enum IncrementalProjection {
     Projected,
     Replay(&'static str),
+    /// The same replay decision, with identifiers from the guard that requested it.
+    ReplayWithContext {
+        reason: &'static str,
+        details: serde_json::Map<String, Value>,
+    },
 }
 
 /// Work completed inside a replay transaction; it does not advance the committed frontier.

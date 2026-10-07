@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "summary": "#1631: person answers to spontaneous-work asks",
+  "commits": ["ef25cb84b650c39fd313524b960c5dbbc4d5f82e"],
+  "replay": {"status": "none", "detail": "No new projection invalidation or startup replay trigger in the merged person answers to spontaneous-work asks change."},
+  "schema": {"status": "none", "detail": "No database table, index, trigger or migration change in person answers to spontaneous-work asks; SQLite user_version is unchanged."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digest/drop policy are unchanged; this change adds no sealing coordination requirement."},
+  "compatibility": {"status": "changed", "detail": "A person can answer a structured ask created from spontaneous work without supplying evidence. Closing a handed-off spontaneous work step still requires evidence. Existing pending asks can be answered normally; they need no recreation."},
+  "downtime": {"status": "none", "detail": "No additional upgrade service stop or measured outage introduced by person answers to spontaneous-work asks; the standard daemon/client restart procedure still applies."},
+  "manual": {"status": "none", "detail": "No data repair or configuration conversion required for existing installations by person answers to spontaneous-work asks."},
+  "recovery": {"status": "none", "detail": "No additional recovery procedure introduced by this change. Preserve graph state, keys and configuration and follow the standard roll-forward guidance; this note does not qualify binary-only downgrade of the whole release."}
+}

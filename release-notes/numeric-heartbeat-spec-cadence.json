@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Clarify independent numeric heartbeat cadence and idle observation age in the harness-context specification.",
+  "replay": {
+    "status": "none",
+    "detail": "Documentation only; no runtime or upgrade behavior changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Documentation only; no runtime or upgrade behavior changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Documentation only; no runtime or upgrade behavior changes."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Documentation only; no runtime or upgrade behavior changes."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Documentation only; no runtime or upgrade behavior changes."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Documentation only; no runtime or upgrade behavior changes."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Documentation only; no runtime or upgrade behavior changes."
+  }
+}

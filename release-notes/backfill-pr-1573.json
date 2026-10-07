@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "summary": "#1573: bounded conversation first-screen loading",
+  "commits": ["b448ed061415caaaf27c1b761cabeb0acd9e1b06"],
+  "replay": {"status": "none", "detail": "No new projection invalidation or startup replay trigger in the merged bounded conversation first-screen loading change."},
+  "schema": {"status": "none", "detail": "No database table, index, trigger or migration change in bounded conversation first-screen loading; SQLite user_version is unchanged."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digest/drop policy are unchanged; this change adds no sealing coordination requirement."},
+  "compatibility": {"status": "none", "detail": "Bounded conversation first-screen loading changes internal execution or build behavior without a new external API/claim version requirement."},
+  "downtime": {"status": "none", "detail": "No additional upgrade service stop or measured outage introduced by bounded conversation first-screen loading; the standard daemon/client restart procedure still applies."},
+  "manual": {"status": "none", "detail": "No data repair or configuration conversion required for existing installations by bounded conversation first-screen loading."},
+  "recovery": {"status": "none", "detail": "No additional recovery procedure introduced by this change. Preserve graph state, keys and configuration and follow the standard roll-forward guidance; this note does not qualify binary-only downgrade of the whole release."}
+}

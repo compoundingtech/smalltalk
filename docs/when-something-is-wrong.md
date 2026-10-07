@@ -1,6 +1,13 @@
 # When something is wrong
 
-Start with the smallest question: is the daemon reachable, is the seat ready, or is the work waiting on a dependency? These commands are read-only and use the invented garden from [getting started](getting-started.md):
+If a populated v0.3.4 store may have unsigned delegation grants, preserve raw state and keys
+and follow the [founder signing audit](st3/founder-signing-audit.md) **before** doctor, restart or
+export. Doctor can seal pending work; these diagnostics are not the initial read-only capture
+for that affected history.
+
+For other stores, start with the smallest question: is the daemon reachable, is the seat ready,
+or is the work waiting on a dependency? These checks use the invented garden from
+[getting started](getting-started.md):
 
 ```sh
 st doctor
@@ -12,12 +19,14 @@ st agents queue agent/garden/worker
 
 | What you see | Next check |
 | --- | --- |
-| Daemon unavailable | `service status`; the local socket and the user service on that machine. |
+| Daemon unavailable | `service status` and [startup replay](#startup-replay-and-an-unavailable-api); an active process may still be recovering. |
+| Missing `st` or `pty` | [PATH and PTY](#path-pty-and-harness-login); check the daemon user's login-shell PATH too. |
+| macOS launch or permission denied | [Signing and permissions](#macos-signing-and-permissions). |
 | Seat starting or waiting | Attach to its terminal and finish login, trust, or permission prompts. |
 | Seat stopped, failed, or missing from the list | Show its exact ID and history; read its stop reason before starting it. |
 | Mission queued or blocked | Its predecessor run, step dependencies, human gate, and seat queue. |
 | Message waiting or delivery stale | The recipient's local doctor and delivery assessment; inspect the message receipt. |
-| Remote member last seen | Check the encrypted route; a sleeping member is normal and catches up on return. |
+| Remote member last seen | Check the encrypted route; a sleeping member is normal and catches up on return. See [replication checks](#replication-and-upgrade-checks). |
 
 To inspect a stopped seat and why it stopped:
 
@@ -67,6 +76,8 @@ A watcher cannot fix a missing harness login, choose a product preference, or ma
 
 See [CLI tour](st3/cli-guided-tour.md), [operational state](st3/operational-state/README.md), and [replication](st3/replication.md) for deeper diagnosis.
 
+## Startup replay and an unavailable API
+
 During daemon startup, `st doctor` reads a local readiness file without waiting for SQLite or
 an API listener. It reports `starting`, the current recovery phase, and committed frontier/target
 when projection has begun. Full replay also reports its stage and, during base claims, processed
@@ -99,3 +110,96 @@ a sidecar. Doctor and command clients then use their existing API checks and out
 Only lock-contention errors refuse a second observer; other observation failures never block
 startup. Writers and readers resolve socket discovery links and canonicalize the parent
 directory, including paths through symlinked directories.
+
+
+If the frontier or replay counts continue moving, allow recovery to finish. Repeated restarts
+can repeat work and make a long replay harder to diagnose. Retain the starting source, target
+source, graph size, recovery phase and elapsed time; compare them with the release's impact
+notes. On macOS there is no local startup sidecar: use service logs and the existing API checks.
+If recovery stops advancing or exits, preserve its bounded error log and report it. Do not
+reset state, delete the database or downgrade across a migration to get a reachable API.
+
+## PATH, PTY and harness login
+
+```sh
+command -v st st3 stui pty
+st --version --json
+st doctor
+```
+
+Use the bin directory from your chosen archive or Nix route in the daemon user's login-shell
+PATH. Open a new terminal after updating your shell profile. Avoid mixing an old archive's
+`st` with a new Nix profile or another PTY install. `doctor` checks the daemon's environment;
+working commands in your current shell alone do not prove the service sees them. Refresh
+service definitions with `st service install` after a changed executable path when they are
+manually managed. If Home Manager owns the daemon, update its pinned input and activate that
+configuration instead; follow the [Home Manager upgrade](upgrading-st.md#restart-the-services-and-verify).
+
+Log in to the harness as that same OS user, attach to the affected seat and finish login/trust
+prompts. Check its declared workspace and [account](st3/accounts.md) rather than copying another
+user's credentials. A missing Claude channel needs `st claude-channel status` and the connection
+check above. A failed omp/OpenCode admission has exact boundary diagnostics; use
+[admission guidance](st3/seat-deploys.md#harness-admission-at-the-next-launch). Attach and inspect
+before restarting repeatedly or overriding admission.
+
+## macOS signing and permissions
+
+Verify Python 3 is installed, the configured app path is stable, and the selected signing
+identity exists. Release executables are ad-hoc signed, not notarized. Follow macOS's explicit
+approval flow for the verified download and run `st service permissions` for the service's
+Full Disk Access/Developer Tools guidance. Permissions can need renewed approval after ad-hoc
+updates. Do not globally disable Gatekeeper or remove quarantine from unrelated files.
+A configured missing or wrong-team signing identity fails instead of falling back; see
+[macOS installation](st3/macos-installation.md). The optional voice helper is separate from
+ordinary agent and mission use.
+
+## Imported seats and saved sessions
+
+```sh
+st import ls --all
+st import show SESSION
+st agents show agent/import/codex/ID
+```
+
+Use actual IDs from discovery; these are placeholders. Check the native session's owning home,
+workspace and saved declaration. An older imported Codex seat with explicit `resume` arguments
+can time out even after installing a new binary. Follow the [exact declaration repair](seat-lifecycle.md#repair-a-codex-import-created-before-strict-resume);
+re-importing does not rewrite an existing seat. Keep exported environment values and transcript
+contents private. Inspect delivery state and stop reasons for other stale seats before deciding
+whether to resume, start or restart them.
+
+## Replication and upgrade checks
+
+```sh
+st replication status
+st doctor
+```
+
+Compare sources on every member and follow [two-machine checks](two-machines.md#check-what-arrived)
+for frontier/digest inspection and a real message receipt. A sleeping member can catch up later;
+a mixed-rules fleet cannot finish new checkpoint sealing. Equal replicated history does not prove
+equal projections or valid inner claim signatures. Review those doctor checks separately.
+Follow [replication recovery](st3/replication.md#recovery); a reset or copying another member's
+keys/database is not a normal troubleshooting step.
+
+## Report an install or upgrade problem
+
+Use [Smalltalk GitHub issues](https://github.com/compoundingtech/smalltalk/issues/new/choose)
+with the **Install or upgrade problem** template as the single support path. Initial triage is
+owned by the Smalltalk distribution agent, which routes
+runtime, signing and replication failures to the relevant maintainer. No separate support
+account or chat channel is required.
+
+Include the exact installed and responding-daemon sources, OS/architecture, install route,
+starting/target release, sanitized doctor and service output, failing command and expected
+behavior. If the daemon is unavailable, say that and include its startup phase and elapsed
+time instead of waiting for doctor to succeed. Harness problems also need the harness version
+and a bounded error excerpt. Preserve timing context; replay observations are not guarantees.
+
+Review output **before posting**. Replace host names, usernames, real paths, seat, person and fleet
+IDs, tailnet addresses and repository names with consistent invented values. Remove tokens,
+private keys, invite/pairing secrets, bearer credentials, transcript prompts, claim/document
+bodies and exported environment values. Keep source hashes, versions, error codes, field names
+and relative timing intact. Doctor output, terminal screens and logs are not automatically safe
+to publish. Do not upload a database, claim backup, configuration file or full transcript to a
+public issue. If an excerpt cannot be made safe, describe the error and say evidence was withheld.

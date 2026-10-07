@@ -1,0 +1,680 @@
+#!/usr/bin/python3 -I
+"""Credential-free bridge scenarios, plus optional isolated native st API verification."""
+
+import contextlib
+import hashlib
+import importlib.machinery
+import importlib.util
+import io
+import json
+import os
+import sqlite3
+from pathlib import Path
+import subprocess
+import tempfile
+import time
+import unittest
+from unittest.mock import patch
+import urllib.error
+import urllib.parse
+
+loader = importlib.machinery.SourceFileLoader('bridge', str(Path(__file__).with_name('st3-discord-bridge')))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+bridge = importlib.util.module_from_spec(spec)
+loader.exec_module(bridge)
+ROUTE = dict(application_id='101', guild_id='202', channel_id='303', user_id='404')
+AGENT = 'agent/example/discord-test'
+TOKEN = 'invented_credential_for_tests_only'
+PNG = b'\x89PNG\r\n\x1a\n' + b'invented-image-bytes'
+
+
+def attachment(data=PNG, number='505'):
+    return {'id': number, 'url': 'https://cdn.discordapp.com/attachments/303/' + number + '/image.png',
+            'size': len(data), 'content_type': 'image/png', 'filename': 'image.png'}
+
+
+def source(number, text='hello', **changes):
+    return {'id': str(number), 'channel_id': '303', 'author': {'id': '404'}, 'content': text, 'type': 0, **changes}
+
+
+class FakeDiscord:
+    token, bot_id = TOKEN, '707'
+
+    def __init__(self):
+        self.messages = []
+        self.posts = []
+        self.lose_receipt = False
+        self.images = {}
+
+    def image(self, item, channel):
+        return self.images[item['url']]
+
+    def request(self, method, path, body=None, files=None):
+        if method == 'POST':
+            self.posts.append(body)
+            message = source(9000 + len(self.posts), body['content'], author={'id': self.bot_id, 'bot': True},
+                             nonce=body['nonce'], message_reference=body['message_reference'])
+            if files:
+                message['attachments'] = []
+                for index, (name, media, data) in enumerate(files):
+                    item = attachment(data, str(8000 + index))
+                    item.update(filename=name, content_type=media)
+                    self.images[item['url']] = data
+                    message['attachments'].append(item)
+            self.messages.append(message)
+            if self.lose_receipt:
+                self.lose_receipt = False
+                raise bridge.Uncertain('invented timeout')
+            return message
+        parsed = urllib.parse.urlsplit(path)
+        if parsed.path.rsplit('/', 1)[-1].isdigit():
+            return next(item for item in self.messages if item['id'] == parsed.path.rsplit('/', 1)[-1])
+        query = urllib.parse.parse_qs(parsed.query)
+        candidates = sorted(self.messages, key=lambda item: int(item['id']), reverse=True)
+        if 'after' in query:
+            candidates = [item for item in candidates if int(item['id']) > int(query['after'][0])]
+        if 'before' in query:
+            candidates = [item for item in candidates if int(item['id']) < int(query['before'][0])]
+        return candidates[:int(query.get('limit', ['100'])[0])]
+
+
+class FakeSt:
+    actor = AGENT
+    def __init__(self):
+        self.sent = {}
+        self.attempts = []
+        self.mailbox = []
+        self.lose_receipt = False
+        self.blobs = {}
+
+    def upload(self, data, media, sender):
+        digest = hashlib.sha256(data).hexdigest()
+        self.blobs[digest] = data
+        return {'blob': 'blob/' + digest, 'media_type': media, 'name': 'image-' + digest[:16] + '.png'}
+
+    def image(self, item, message, actor):
+        return ('image-' + item['sha256'][:16] + '.png', item['media_type'], self.blobs[item['sha256']])
+
+    def send(self, body):
+        self.attempts.append(body.copy())
+        subject = 'message/' + hashlib.sha256(body['idempotency_key'].encode()).hexdigest()[:16]
+        if subject in self.sent:
+            assert self.sent[subject] == body
+        self.sent[subject] = body.copy()
+        if self.lose_receipt:
+            self.lose_receipt = False
+            raise bridge.Later('invented timeout')
+        return subject
+
+    def replies(self, sender):
+        return self.mailbox
+
+
+class BridgeScenarios(unittest.TestCase):
+    def setUp(self):
+        self.folder = tempfile.TemporaryDirectory()
+        self.path = Path(self.folder.name) / 'state.sqlite'
+        self.state = bridge.State(self.path, ROUTE, AGENT)
+        self.state.put('cursor', '100')
+        self.discord, self.st, self.logs = FakeDiscord(), FakeSt(), []
+        self.link = bridge.Bridge(ROUTE, AGENT, self.state, self.discord, self.st, self.logs.append)
+
+    def tearDown(self):
+        self.state.close()
+        self.folder.cleanup()
+
+    def restart(self):
+        self.state.close()
+        self.state = bridge.State(self.path, ROUTE, AGENT)
+        self.link = bridge.Bridge(ROUTE, AGENT, self.state, self.discord, self.st, self.logs.append)
+
+    def imported(self, number=101):
+        self.discord.messages.append(source(number))
+        self.link.tick()
+        return self.state.db.execute('SELECT st_id FROM inbox WHERE discord_id=?', (str(number),)).fetchone()[0]
+
+    def answer(self, parent, text='agent says hello', **changes):
+        message = {'subject': 'message/' + hashlib.sha256((parent + text).encode()).hexdigest()[:16],
+                   'from': AGENT, 'to': self.link.sender, 'in_reply_to': parent, 'content': text, **changes}
+        self.st.mailbox.append(message)
+        return message['subject']
+
+    def test_only_allowlisted_human_is_imported_with_a_distinct_native_sender(self):
+        self.discord.messages = [source(101), source(102, author={'id': '999'}),
+                                 source(103, author={'id': '404', 'bot': True}), source(104, webhook_id='808'),
+                                 source(105, type=21)]
+        self.link.tick()
+        self.assertEqual(len(self.st.sent), 1)
+        sent = next(iter(self.st.sent.values()))
+        self.assertEqual(sent['from'], 'external/discord/user/404')
+        self.assertEqual(sent['to'], AGENT)
+        self.assertIn('no native-person link', sent['content'])
+        self.assertEqual(self.state.get('cursor'), '105')
+
+    def test_two_enrolled_legacy_accounts_keep_distinct_senders_and_reply_routes(self):
+        self.link = bridge.Bridge(ROUTE, AGENT, self.state, self.discord, self.st, self.logs.append, allowed_users=['606'], legacy_text=True)
+        self.discord.messages = [source(101), source(102, author={'id': '606'}), source(103, author={'id': '999'})]
+        self.link.tick()
+        sent = list(self.st.sent.values())
+        self.assertEqual({item['from'] for item in sent}, {'person/discord-404', 'person/discord-606'})
+        for item in sent:
+            parent = 'message/' + hashlib.sha256(item['idempotency_key'].encode()).hexdigest()[:16]
+            self.answer(parent, 'hello ' + item['from'], to=item['from'])
+        self.link.tick()
+        self.assertEqual({item['message_reference']['message_id'] for item in self.discord.posts}, {'101', '102'})
+
+    def test_legacy_database_migration_preserves_sender_cursor_and_uncertain_receipt(self):
+        self.state.close()
+        self.path.unlink()
+        db = sqlite3.connect(self.path)
+        db.executescript('''CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE inbox (discord_id TEXT PRIMARY KEY, content TEXT NOT NULL, parent TEXT, st_id TEXT UNIQUE, responded INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE outbox (st_id TEXT NOT NULL, part INTEGER NOT NULL, content TEXT NOT NULL, parent TEXT NOT NULL, nonce TEXT NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'pending', discord_id TEXT, PRIMARY KEY(st_id, part));
+            INSERT INTO meta VALUES ('cursor', '101');
+            INSERT INTO inbox VALUES ('101', 'original', NULL, 'message/abc', 0);
+            INSERT INTO outbox VALUES ('message/def', 0, 'reply', '101', '707', 'sending', NULL);''')
+        db.close()
+        self.path.chmod(0o600)
+        self.state = bridge.State(self.path, ROUTE, AGENT)
+        self.assertEqual(self.state.get('cursor'), '101')
+        row = self.state.db.execute('SELECT * FROM inbox').fetchone()
+        self.assertEqual((row['sender'], row['st_id'], row['content'], row['images']), ('person/discord-404', 'message/abc', 'original', '[]'))
+        held = self.state.db.execute('SELECT * FROM outbox').fetchone()
+        self.assertEqual((held['status'], held['nonce'], held['parent']), ('uncertain', '707', '101'))
+
+    def test_wrong_channel_page_is_refused_before_import(self):
+        self.discord.messages = [source(101, channel_id='999')]
+        with self.assertRaises(bridge.Stop):
+            self.link.tick()
+        self.assertEqual(len(self.st.sent), 0)
+        self.assertEqual(self.state.get('cursor'), '100')
+
+    def test_restart_and_edits_never_repeat_an_import(self):
+        self.imported()
+        self.discord.messages[0]['content'] = 'edited instruction'
+        self.restart()
+        self.link.tick()
+        self.assertEqual(len(self.st.attempts), 1)
+        self.assertNotIn('edited instruction', next(iter(self.st.sent.values()))['content'])
+
+    def test_native_timeout_reuses_the_same_key_payload_and_sender(self):
+        self.discord.messages = [source(101)]
+        self.st.lose_receipt = True
+        with self.assertRaises(bridge.Later):
+            self.link.tick()
+        self.restart()
+        self.link.tick()
+        self.assertEqual(len(self.st.attempts), 2)
+        self.assertEqual(self.st.attempts[0], self.st.attempts[1])
+        self.assertEqual(len(self.st.sent), 1)
+
+    def test_reply_round_trip_and_discord_reply_preserve_correlation(self):
+        original = self.imported()
+        answer = self.answer(original)
+        self.link.tick()
+        posted = self.discord.messages[-1]
+        self.assertEqual(posted['message_reference']['message_id'], '101')
+        self.assertEqual(self.discord.posts[0]['allowed_mentions'], {'parse': [], 'replied_user': False})
+        self.discord.messages.append(source(9100, 'follow-up', message_reference={'message_id': posted['id'], 'channel_id': '303'}))
+        self.link.tick()
+        follow_up = self.state.db.execute("SELECT st_id FROM inbox WHERE discord_id='9100'").fetchone()[0]
+        self.assertEqual(self.st.sent[follow_up]['in_reply_to'], answer)
+        self.answer(follow_up, 'second answer')
+        self.link.tick()
+        self.assertEqual(self.discord.posts[-1]['message_reference']['message_id'], '9100')
+        self.restart()
+        self.link.tick()
+        self.assertEqual(len(self.discord.posts), 2)
+
+    def test_private_unrelated_wrong_sender_and_wrong_recipient_replies_do_not_escape(self):
+        original = self.imported()
+        self.answer(original, 'wrong author', **{'from': 'agent/example/other'})
+        self.answer(original, 'wrong recipient', to='person/avery')
+        self.answer('message/0000000000000000', 'unrelated private reply')
+        self.link.tick()
+        self.assertEqual(self.discord.posts, [])
+
+    def test_uncertain_discord_send_is_found_after_restart_without_reposting(self):
+        original = self.imported()
+        self.answer(original)
+        self.discord.lose_receipt = True
+        self.link.tick()
+        self.assertEqual(self.state.db.execute('SELECT status FROM outbox').fetchone()[0], 'uncertain')
+        self.restart()
+        self.link.tick()
+        self.assertEqual(len(self.discord.posts), 1)
+        self.assertEqual(self.state.db.execute('SELECT status FROM outbox').fetchone()[0], 'sent')
+
+    def test_missing_or_impostor_uncertain_receipt_is_held_indefinitely(self):
+        original = self.imported()
+        self.answer(original)
+        self.discord.lose_receipt = True
+        self.link.tick()
+        self.discord.messages[-1]['author'] = {'id': '999'}
+        self.restart()
+        self.link.tick()
+        self.link.tick()
+        self.assertEqual(len(self.discord.posts), 1)
+        self.assertEqual(self.state.db.execute('SELECT status FROM outbox').fetchone()[0], 'uncertain')
+
+    def test_optional_nonce_requires_explicit_receipt_for_uncertain_recovery(self):
+        original = self.imported()
+        self.answer(original)
+        self.discord.lose_receipt = True
+        self.link.tick()
+        message = self.discord.messages[-1]
+        del message['nonce']
+        self.restart()
+        self.link.tick()
+        row = self.state.db.execute('SELECT * FROM outbox').fetchone()
+        self.assertEqual(row['status'], 'uncertain')
+        self.assertFalse(self.link.receipt(row, message, require_nonce=True))
+        self.assertTrue(self.link.receipt(row, message))
+        self.link.delivered(row, message)
+        self.link.tick()
+        self.assertEqual(len(self.discord.posts), 1)
+
+    def test_hidden_content_preserves_the_cursor_and_can_be_read_after_intent_is_fixed(self):
+        self.discord.messages = [source(101, '')]
+        with self.assertRaises(bridge.Stop):
+            self.link.tick()
+        self.assertEqual(self.state.get('cursor'), '100')
+        self.discord.messages[0]['content'] = 'hello after enabling intent'
+        self.restart()
+        self.link.tick()
+        self.assertEqual(len(self.st.sent), 1)
+
+    def test_crash_checkpoint_is_uncertain_on_restart(self):
+        original = self.imported()
+        self.answer(original)
+        self.link.queue_replies()
+        self.state.db.execute("UPDATE outbox SET status='sending'")
+        self.state.db.commit()
+        self.restart()
+        self.link.tick()
+        self.assertEqual(self.discord.posts, [])
+        self.assertEqual(self.state.db.execute('SELECT status FROM outbox').fetchone()[0], 'uncertain')
+
+    def test_burst_pagination_and_full_reply_queue_preserve_the_unaccepted_boundary(self):
+        self.discord.messages = [source(number) for number in range(101, 306)]
+        self.link.incoming()
+        self.assertEqual(self.state.db.execute('SELECT count(*) FROM inbox').fetchone()[0], 100)
+        self.assertEqual(self.state.get('cursor'), '200')
+        self.state.db.execute('UPDATE inbox SET responded=1')
+        self.state.db.commit()
+        self.link.incoming()
+        self.assertEqual(self.state.get('cursor'), '300')
+        self.assertEqual(self.state.db.execute('SELECT count(*) FROM inbox').fetchone()[0], 200)
+
+    def test_new_state_skips_existing_channel_history(self):
+        self.state.db.execute("DELETE FROM meta WHERE key='cursor'")
+        self.state.db.commit()
+        self.discord.messages = [source(101, 'older message')]
+        self.link.tick()
+        self.assertEqual(self.st.sent, {})
+        self.imported(102)
+        self.assertEqual(len(self.st.sent), 1)
+
+    def test_changed_route_and_two_processes_cannot_share_state(self):
+        with self.assertRaises(bridge.Stop):
+            bridge.State(self.path, ROUTE, AGENT)
+        self.state.close()
+        with self.assertRaises(bridge.Stop):
+            bridge.State(self.path, ROUTE, 'agent/example/other')
+        self.state = bridge.State(self.path, ROUTE, AGENT)
+
+    def test_credentials_and_oversized_input_are_never_saved_or_imported(self):
+        self.discord.messages = [source(101, TOKEN), source(102, '😀' * 1000), source(103, '', attachments=[{'id': '505'}])]
+        self.link.tick()
+        self.assertEqual(len(self.st.sent), 0)
+        self.assertEqual(self.state.db.execute('SELECT count(*) FROM inbox').fetchone()[0], 0)
+        self.assertNotIn(TOKEN, '\n'.join(self.logs))
+
+    def test_long_unicode_reply_is_split_and_all_mentions_are_disabled(self):
+        original = self.imported()
+        self.answer(original, '😀' * 1000 + ' @everyone')
+        self.link.tick()
+        for post in self.discord.posts:
+            self.assertLessEqual(len(post['content'].encode('utf-16-le')) // 2, 1900)
+            self.assertEqual(post['allowed_mentions']['parse'], [])
+        self.assertEqual(''.join(post['content'] for post in self.discord.posts), '😀' * 1000 + ' @everyone')
+
+    def test_image_only_message_uploads_as_its_provider_sender_and_replies_with_image(self):
+        item = attachment()
+        self.discord.images[item['url']] = PNG
+        self.discord.messages.append(source(101, '', attachments=[item]))
+        with patch.object(self.st, 'upload', wraps=self.st.upload) as uploaded:
+            self.link.tick()
+            self.assertEqual(uploaded.call_args.args, (PNG, 'image/png', AGENT))
+        sent = next(iter(self.st.sent.values()))
+        self.assertEqual(len(sent['attachments']), 1)
+        parent = self.state.db.execute('SELECT st_id FROM inbox').fetchone()[0]
+        image = {'sha256': hashlib.sha256(PNG).hexdigest(), 'size': len(PNG), 'media_type': 'image/png'}
+        self.answer(parent, '', attachments=[image])
+        self.link.tick()
+        self.assertEqual(self.state.db.execute('SELECT status FROM outbox').fetchone()[0], 'sent')
+        self.assertEqual(self.discord.messages[-1]['attachments'][0]['size'], len(PNG))
+        self.restart()
+        self.link.tick()
+        self.assertEqual(len(self.discord.posts), 1)
+
+    def test_image_receipt_timeout_recovers_by_hash_without_duplicate_upload(self):
+        parent = self.imported()
+        digest = hashlib.sha256(PNG).hexdigest()
+        self.st.blobs[digest] = PNG
+        self.answer(parent, 'picture', attachments=[{'sha256': digest, 'size': len(PNG), 'media_type': 'image/png'}])
+        self.discord.lose_receipt = True
+        self.link.tick()
+        self.restart()
+        self.link.tick()
+        self.assertEqual(len(self.discord.posts), 1)
+        self.assertEqual(self.state.db.execute('SELECT status FROM outbox').fetchone()[0], 'sent')
+
+    def test_impostor_image_receipt_with_wrong_bytes_stays_uncertain(self):
+        parent = self.imported()
+        digest = hashlib.sha256(PNG).hexdigest()
+        self.st.blobs[digest] = PNG
+        self.answer(parent, 'picture', attachments=[{'sha256': digest, 'size': len(PNG), 'media_type': 'image/png'}])
+        self.discord.lose_receipt = True
+        self.link.tick()
+        self.discord.images[self.discord.messages[-1]['attachments'][0]['url']] = PNG[:-1] + b'x'
+        self.restart()
+        self.link.tick()
+        self.assertEqual(self.state.db.execute('SELECT status FROM outbox').fetchone()[0], 'uncertain')
+        self.assertEqual(len(self.discord.posts), 1)
+
+    def test_removed_source_image_keeps_import_queued_without_advancing_to_native(self):
+        self.discord.messages.append(source(101, 'picture', attachments=[attachment()]))
+        self.link.incoming()
+        self.discord.messages[0]['attachments'] = []
+        with self.assertRaises(bridge.Stop):
+            self.link.imports()
+        self.assertEqual(self.st.sent, {})
+        self.assertIsNone(self.state.db.execute('SELECT st_id FROM inbox').fetchone()[0])
+
+    def test_delivery_watch_checkpoints_after_queueing_and_replays_without_duplicates(self):
+        parent = self.imported()
+        self.answer(parent, 'streamed reply')
+        page = {'contract': 'st3.adapter.delivery.v0', 'items': self.st.mailbox, 'cursor': 707, 'host': 'orchid', 'more': False}
+        with patch.object(self.st, 'deliveries', return_value=page, create=True), \
+                patch.object(self.st, 'replies', side_effect=AssertionError('mailbox scan')):
+            self.link.watch_replies()
+            self.assertEqual(self.state.get('outbound_cursor'), '707')
+            self.restart()
+            self.link.watch_replies()
+            self.link.exports()
+        self.assertEqual(len(self.discord.posts), 1)
+
+    def test_delivery_watch_does_not_advance_when_reply_queueing_fails(self):
+        parent = self.imported()
+        self.answer(parent, 'x' * 9000)
+        page = {'contract': 'st3.adapter.delivery.v0', 'items': self.st.mailbox, 'cursor': 707, 'host': 'orchid'}
+        with patch.object(self.st, 'deliveries', return_value=page, create=True), self.assertRaises(bridge.Stop):
+            self.link.watch_replies()
+        self.assertIsNone(self.state.get('outbound_cursor'))
+
+    def test_nested_reply_waits_for_parent_receipt_across_restart(self):
+        incoming = self.imported()
+        parent = self.answer(incoming, 'first reply')
+        self.answer(parent, 'nested reply')
+        page = {'contract': 'st3.adapter.delivery.v0', 'items': self.st.mailbox, 'cursor': 707, 'host': 'orchid'}
+        with patch.object(self.st, 'deliveries', return_value=page, create=True):
+            self.assertFalse(self.link.watch_replies())
+            self.assertIsNone(self.state.get('outbound_cursor'))
+            self.restart()
+            self.link.exports()
+            self.assertTrue(self.link.watch_replies())
+            self.assertEqual(self.state.get('outbound_cursor'), '707')
+            self.link.exports()
+        self.assertEqual(len(self.discord.posts), 2)
+        self.assertEqual(self.discord.posts[0]['message_reference']['message_id'], '101')
+        self.assertEqual(self.discord.posts[1]['message_reference']['message_id'],
+                         self.state.db.execute('SELECT discord_id FROM outbox WHERE st_id=?', (parent,)).fetchone()[0])
+
+    def test_delivery_watch_refuses_another_hosts_frontier(self):
+        self.state.put('outbound_host', 'orchid')
+        self.state.put('outbound_cursor', '606')
+        page = {'contract': 'st3.adapter.delivery.v0', 'items': [], 'cursor': 707, 'host': 'iris'}
+        with patch.object(self.st, 'deliveries', return_value=page, create=True), self.assertRaises(bridge.Stop):
+            self.link.watch_replies()
+        self.assertEqual(self.state.get('outbound_cursor'), '606')
+
+    def test_outgoing_image_total_limit_holds_reply_without_posting(self):
+        parent = self.imported()
+        image = {'sha256': 'a' * 64, 'size': bridge.IMAGE_LIMIT, 'media_type': 'image/png'}
+        self.answer(parent, 'too much', attachments=[image, image])
+        with self.assertRaises(bridge.Stop):
+            self.link.queue_replies()
+        self.assertEqual(self.discord.posts, [])
+
+
+class TransportScenarios(unittest.TestCase):
+    def test_cdn_download_is_anonymous_bounded_and_refuses_other_hosts(self):
+        client = bridge.Discord(TOKEN)
+        item = attachment()
+        response = io.BytesIO(PNG)
+        with patch.object(bridge.urllib.request, 'build_opener') as factory:
+            factory.return_value.open.return_value = response
+            self.assertEqual(client.image(item, '303'), PNG)
+            request = factory.return_value.open.call_args.args[0]
+            self.assertFalse(request.has_header('Authorization'))
+            self.assertEqual(request.get_header('User-agent'), 'DiscordBot (https://github.com/compoundingtech/smalltalk, 0.1)')
+        for url in ('http://cdn.discordapp.com/attachments/303/505/a.png',
+                    'https://localhost/attachments/303/505/a.png',
+                    'https://cdn.discordapp.com/attachments/999/505/a.png',
+                    'https://cdn.discordapp.com:444/attachments/303/505/a.png'):
+            with self.assertRaises(bridge.Stop):
+                client.image({**item, 'url': url}, '303')
+
+    def test_multipart_uses_safe_names_and_payload_json_without_changing_mentions_or_nonce(self):
+        payload = {'content': '', 'nonce': 'abc', 'allowed_mentions': {'parse': []}}
+        data, media = bridge.multipart(payload, [('image-123.png', 'image/png', PNG)])
+        self.assertIn(b'name="payload_json"', data)
+        self.assertIn(b'name="files[0]"', data)
+        self.assertIn(PNG, data)
+        self.assertIn(json.dumps(payload).encode(), data)
+        self.assertTrue(media.startswith('multipart/form-data; boundary='))
+    def test_rate_limit_respects_provider_delay_without_retrying_early_or_logging_credentials(self):
+        client = bridge.Discord(TOKEN)
+        error = urllib.error.HTTPError('https://discord.com/' + TOKEN, 429, TOKEN,
+                                       {'Retry-After': '45'}, io.BytesIO(b'{"retry_after":60}'))
+        with patch.object(client.opener, 'open', side_effect=error) as opened, patch.object(bridge.time, 'monotonic', return_value=100):
+            with self.assertRaises(bridge.Later) as caught:
+                client.request('POST', '/channels/303/messages', {})
+            self.assertEqual(caught.exception.delay, 60)
+            self.assertNotIn(TOKEN, str(caught.exception))
+            with self.assertRaises(bridge.Later):
+                client.request('GET', '/users/@me')
+            self.assertEqual(opened.call_count, 1)
+
+    def test_post_failure_is_uncertain_and_auth_refusal_is_permanent_and_redacted(self):
+        client = bridge.Discord(TOKEN)
+        for failure, kind in [(TimeoutError(TOKEN), bridge.Uncertain),
+                              (urllib.error.HTTPError('https://discord.com/' + TOKEN, 401, TOKEN, {}, io.BytesIO(TOKEN.encode())), bridge.Stop)]:
+            with patch.object(client.opener, 'open', side_effect=failure) as opened:
+                with self.assertRaises(kind) as caught:
+                    client.request('POST', '/channels/303/messages', {})
+                self.assertNotIn(TOKEN, str(caught.exception))
+                self.assertEqual(opened.call_count, 1)
+
+    def test_noninteractive_launch_never_requests_a_token(self):
+        with tempfile.TemporaryDirectory() as folder:
+            argv = ['bridge', 'run', '--agent', AGENT, '--state', str(Path(folder) / 'state.sqlite')]
+            with patch('sys.argv', argv), patch.object(bridge, 'route_file', return_value=ROUTE), patch('sys.stdin.isatty', return_value=False), patch.object(bridge.getpass, 'getpass') as prompt, contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(bridge.main(), 1)
+                prompt.assert_not_called()
+
+    def test_unavailable_hidden_input_and_unexpected_exceptions_never_echo_a_credential(self):
+        with tempfile.TemporaryDirectory() as folder:
+            argv = ['bridge', 'run', '--agent', AGENT, '--state', str(Path(folder) / 'state.sqlite')]
+            for error in [bridge.getpass.GetPassWarning(TOKEN), ValueError(TOKEN)]:
+                stderr = io.StringIO()
+                with patch('sys.argv', argv), patch.object(bridge, 'route_file', return_value=ROUTE), patch('sys.stdin.isatty', return_value=True), patch.object(bridge.getpass, 'getpass', side_effect=error), contextlib.redirect_stderr(stderr):
+                    self.assertEqual(bridge.main(), 1)
+                self.assertNotIn(TOKEN, stderr.getvalue())
+                self.assertNotIn('Traceback', stderr.getvalue())
+
+    def test_redirects_are_never_followed(self):
+        self.assertIsNone(bridge.NoRedirect().redirect_request(None, None, 302, '', {}, 'https://elsewhere.example'))
+
+
+class TokenFileScenarios(unittest.TestCase):
+    def setUp(self):
+        self.folder = tempfile.TemporaryDirectory()
+        self.path = Path(self.folder.name) / 'bot.env'
+        self.path.write_text('DISCORD_BOT_TOKEN=' + TOKEN + '\n')
+        self.path.chmod(0o600)
+
+    def tearDown(self):
+        self.folder.cleanup()
+
+    def test_private_dotenv_entry_and_quotes_are_read_without_environment_changes(self):
+        before = dict(os.environ)
+        for quote in ('', "'", '"'):
+            self.path.write_text('# private bot credential\n\nDISCORD_BOT_TOKEN=' + quote + TOKEN + quote + '\n')
+            self.assertEqual(bridge.token_file(self.path), TOKEN)
+        self.assertEqual(dict(os.environ), before)
+
+    def test_shared_file_symlinks_hardlinks_and_non_regular_files_are_refused(self):
+        self.path.chmod(0o644)
+        with self.assertRaises(bridge.Stop):
+            bridge.token_file(self.path)
+        self.path.chmod(0o600)
+        symlink = self.path.with_name('link.env')
+        symlink.symlink_to(self.path)
+        with self.assertRaises(bridge.Stop):
+            bridge.token_file(symlink)
+        hardlink = self.path.with_name('hardlink.env')
+        os.link(self.path, hardlink)
+        with self.assertRaises(bridge.Stop):
+            bridge.token_file(self.path)
+        with self.assertRaises(bridge.Stop):
+            bridge.token_file(self.path.parent)
+        fifo = self.path.with_name('fifo.env')
+        os.mkfifo(fifo, 0o600)
+        with self.assertRaises(bridge.Stop):
+            bridge.token_file(fifo)
+
+    def test_wrong_owner_missing_and_oversized_files_are_refused_without_contents(self):
+        with patch.object(bridge.os, 'geteuid', return_value=os.geteuid() + 1):
+            with self.assertRaises(bridge.Stop) as caught:
+                bridge.token_file(self.path)
+            self.assertNotIn(TOKEN, str(caught.exception))
+        with self.assertRaises(bridge.Stop):
+            bridge.token_file(self.path.with_name('missing.env'))
+        self.path.write_text('DISCORD_BOT_TOKEN=' + TOKEN + '\n' + '#' * 4096)
+        with self.assertRaises(bridge.Stop) as caught:
+            bridge.token_file(self.path)
+        self.assertNotIn(TOKEN, str(caught.exception))
+
+    def test_multiple_entries_shell_expressions_and_invalid_values_are_not_evaluated_or_echoed(self):
+        for value in ('DISCORD_BOT_TOKEN=' + TOKEN + '\nDISCORD_BOT_TOKEN=duplicate',
+                      'DISCORD_BOT_TOKEN=' + TOKEN + '\nOTHER=value',
+                      'export DISCORD_BOT_TOKEN=' + TOKEN,
+                      'DISCORD_BOT_TOKEN=$(touch should-never-exist)',
+                      'DISCORD_BOT_TOKEN=', 'DISCORD_BOT_TOKEN="' + TOKEN,
+                      'DISCORD_BOT_TOKEN=' + TOKEN + ' # inline comment'):
+            self.path.write_text(value)
+            with self.assertRaises(bridge.Stop) as caught:
+                bridge.token_file(self.path)
+            self.assertNotIn(TOKEN, str(caught.exception))
+        self.path.write_bytes(b'DISCORD_BOT_TOKEN=\xff')
+        with self.assertRaises(bridge.Stop):
+            bridge.token_file(self.path)
+
+    def test_noninteractive_run_reads_private_file_without_prompting_or_logging_token(self):
+        argv = ['bridge', 'run', '--agent', AGENT, '--token-file', str(self.path),
+                '--state', str(self.path.with_name('state.sqlite'))]
+        output = io.StringIO()
+        with patch('sys.argv', argv), patch.object(bridge, 'route_file', return_value=ROUTE), \
+                patch('sys.stdin.isatty', return_value=False), \
+                patch.object(bridge.getpass, 'getpass') as prompt, \
+                patch.object(bridge.Discord, 'validate'), \
+                patch.object(bridge.Bridge, 'tick', side_effect=KeyboardInterrupt), \
+                contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+            self.assertEqual(bridge.main(), 0)
+            prompt.assert_not_called()
+        self.assertNotIn(TOKEN, output.getvalue())
+        self.assertIn('Text bridge running', output.getvalue())
+
+
+@unittest.skipUnless(os.environ.get('ST3_BRIDGE_NATIVE_TEST_BIN'), 'Set ST3_BRIDGE_NATIVE_TEST_BIN for the isolated real st API test.')
+class NativeContract(unittest.TestCase):
+    def test_distinct_sender_idempotency_pagination_and_native_reply_contract(self):
+        binary = os.environ['ST3_BRIDGE_NATIVE_TEST_BIN']
+        with tempfile.TemporaryDirectory(prefix='discord-native-') as folder:
+            root = Path(folder)
+            config = root / 'config.toml'
+            sock = root / 'st.sock'
+            config.write_text('node="orchid"\nperson="person/avery"\nstate_dir=' + json.dumps(str(root / 'daemon')) + '\nsocket=' + json.dumps(str(sock)) + '\nclient_gateway_socket=' + json.dumps(str(root / 'client.sock')) + '\n')
+            env = {key: value for key, value in os.environ.items() if not key.startswith('ST_') and not key.startswith('ST3_')}
+            log = (root / 'daemon.log').open('wb')
+            daemon = subprocess.Popen([binary, 'up', '--config', str(config)], env=env, stdout=log, stderr=log)
+            try:
+                deadline = time.monotonic() + 30
+                while not sock.exists():
+                    self.assertIsNone(daemon.poll(), 'Isolated st daemon did not start.')
+                    self.assertLess(time.monotonic(), deadline, 'Isolated st daemon startup timed out.')
+                    time.sleep(0.1)
+                native = bridge.St(sock)
+                payload = {'idempotency_key': 'invented-discord-message-505', 'from': 'person/discord-404',
+                           'to': AGENT, 'content': 'invented bridge contract test', 'in_reply_to': None,
+                           'title': 'Discord message', 'tags': ['discord-origin'], 'attachments': []}
+                subject = native.send(payload)
+                self.assertEqual(native.send(payload), subject)
+                answer = {'idempotency_key': 'invented-agent-reply-606', 'from': AGENT,
+                          'to': 'person/discord-404', 'content': 'invented test reply', 'in_reply_to': subject,
+                          'title': None, 'tags': [], 'attachments': []}
+                answer_id = native.send(answer)
+                replies = list(native.replies('person/discord-404'))
+                self.assertEqual(len(replies), 1)
+                self.assertEqual(replies[0]['subject'], answer_id)
+                self.assertEqual(replies[0]['in_reply_to'], subject)
+                self.assertEqual(replies[0]['to'], 'person/discord-404')
+                actor = os.environ.get('ST_AGENT', AGENT)
+                declaration = root / 'bridge.kdl'
+                declaration.write_text('version 2\nagent ' + json.dumps(actor.removeprefix('agent/')) + ' { workspace ' + json.dumps(str(root)) + '; argv "/usr/bin/true"; restart "never"; tags st3.adapter.source="external/discord/user/404" st3.adapter.target=' + json.dumps(AGENT) + ' }\n')
+                subprocess.run([binary, '--endpoint', str(sock), 'apply', str(declaration), '--as', actor], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                uploaded = native.upload(PNG, 'image/png', actor)
+                picture = {**payload, 'from': 'external/discord/user/404', 'idempotency_key': 'invented-picture-808', 'attachments': [uploaded]}
+                picture_id = native.send(picture)
+                self.assertEqual(native.send(picture), picture_id)
+                digest = hashlib.sha256(PNG).hexdigest()
+                reference = {'sha256': digest, 'size': len(PNG), 'media_type': 'image/png'}
+                self.assertEqual(native.image(reference, picture_id, actor)[2], PNG)
+                deliveries = native.deliveries(0, 0)
+                self.assertEqual(deliveries['contract'], 'st3.adapter.delivery.v0')
+                self.assertEqual([item['subject'] for item in deliveries['items']], [answer_id])
+                self.assertEqual(native.deliveries(deliveries['cursor'], 1)['items'], [])
+                # Exercise the ordinary CLI reply and upload path as this harness's
+                # own actor, including a reply to a canonical external account.
+                declaration.write_text(declaration.read_text().replace(
+                    'st3.adapter.target=' + json.dumps(AGENT),
+                    'st3.adapter.target=' + json.dumps(actor)))
+                subprocess.run([binary, '--endpoint', str(sock), 'apply', str(declaration), '--as', actor], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                incoming = native.send({**picture, 'to': actor, 'idempotency_key': 'invented-cli-picture-909',
+                                        'attachments': [native.upload(PNG, 'image/png', actor)]})
+                image_path = root / 'invented.png'
+                image_path.write_bytes(PNG)
+                subprocess.run([binary, '--endpoint', str(sock), 'conversations', 'reply', incoming,
+                                '--from', actor, '--body', 'invented image reply', '--attach', str(image_path)],
+                               check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                page = native.deliveries(deliveries['cursor'], 0)
+                self.assertEqual(len(page['items']), 1)
+                reply = page['items'][0]
+                self.assertEqual(reply['from'], actor)
+                self.assertEqual(reply['to'], 'external/discord/user/404')
+                self.assertEqual(reply['in_reply_to'], incoming)
+                self.assertEqual(native.image(reference, reply['subject'], actor)[2], PNG)
+            finally:
+                daemon.terminate()
+                try:
+                    daemon.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    daemon.kill()
+                    daemon.wait()
+                log.close()
+
+
+if __name__ == '__main__':
+    unittest.main()

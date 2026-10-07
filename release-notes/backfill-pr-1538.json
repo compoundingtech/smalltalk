@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "summary": "#1538: PR subscription snapshot deduplication and cancellation",
+  "commits": ["ffea2fc1b95bf09368968a0ae4227e1c0e7d5b40"],
+  "replay": {"status": "none", "detail": "No new projection invalidation or startup replay trigger in the merged PR subscription snapshot deduplication and cancellation change."},
+  "schema": {"status": "changed", "detail": "Adds claims_subscription_started_run_index on subscription.mission-started claims at store open without changing SQLite user_version. This index is built over retained claims; the numeric version is not evidence of downgrade compatibility."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digest/drop policy are unchanged; this change adds no sealing coordination requirement."},
+  "compatibility": {"status": "changed", "detail": "Subscription PR reviews already completed for an exact observation are suppressed. Active subscription runs cancel with normal cleanup when their PR head moves, closes, or becomes a draft. Authored missions keep pinned inputs and failed snapshots remain retryable; disconnected members do not share a reservation."},
+  "downtime": {"status": "unknown", "detail": "Initial construction of the new subscription-start expression index can extend startup before serving on populated stores. No restart-to-API or restart-to-health duration was measured for this change; budget depends on retained history and storage."},
+  "manual": {"status": "none", "detail": "No data repair or configuration conversion required for existing installations by PR subscription snapshot deduplication and cancellation."},
+  "recovery": {"status": "changed", "detail": "Keep a pre-upgrade state/key/configuration backup and roll forward if startup fails. The added index is automatic; binary replacement is not a qualified store downgrade. Cancellation of superseded subscription runs is durable and is not undone by swapping binaries."}
+}

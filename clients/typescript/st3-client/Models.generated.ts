@@ -31,6 +31,7 @@ export type Agent = ResourceHeader & {
   active_work_count?: number;
   ask?: string | null;
   blocked_on?: string | null;
+  checkout?: (AgentCheckout | null);
   current_session_id?: string | null;
   current_work?: Array<WorkLabel>;
   current_work_ids?: Array<StepRunId>;
@@ -67,6 +68,13 @@ export type Agent = ResourceHeader & {
   upcoming_work?: Array<WorkLabel>;
   upcoming_work_ids?: Array<Id>;
   usage?: (UsageSummary | null);
+  workspace?: string | null;
+};
+
+export type AgentCheckout = {
+  base: string;
+  branch: string;
+  repository: string;
 };
 
 export type AgentCreateParameters = {
@@ -607,6 +615,23 @@ export type ConversationChanges = {
   session_id: Id;
 };
 
+export type ConversationContentChunk = {
+  data: string;
+  kind: "conversation-content-chunk";
+  media_type: string;
+  next_offset?: number | null;
+  offset: number;
+  ref: string;
+  size: number;
+};
+
+export type ConversationContentRef = {
+  media_type: string;
+  reason?: string;
+  ref: string;
+  size?: number;
+};
+
 export type ConversationSearch = {
   host_id: Id;
   incomplete_sources: Array<string>;
@@ -698,7 +723,7 @@ export type Envelope = {
   value: (Capabilities | DocumentContent | SubjectDefinition | PublicationDefinition | AgentWorkspace | Page | ResourcesPage | Resource | TimelinePage | ConversationChanges | ConversationSearch | EventPage | ActionResult | PairingChallenge | PairedSession | TerminalScreen | StatusHistory | AgentQueue | UsagePeriod | MailBacklog);
 };
 
-export type ErrorCode = ("attention-migrated" | "arrangement-exists" | "arrangement-folder-exists" | "arrangement-retired" | "arrangement-limit" | "arrangement-folder-deleted" | "arrangement-cycle" | "arrangement-body-too-large" | "arrangement-owner-forbidden" | "invalid-arrangement-subject" | "invalid-arrangement-action" | "invalid-arrangement-operations" | "invalid-arrangement-folder" | "invalid-arrangement-name" | "invalid-arrangement-key" | "invalid-subject-reference" | "not-found" | "forbidden" | "unsupported-capability" | "validation-failed" | "idempotency-conflict" | "stale-fence" | "cursor-gap" | "page-cursor-expired" | "rate-limited" | "runtime-not-local" | "runtime-authority-indeterminate" | "remote-unavailable" | "terminal-unavailable" | "terminal-ended" | "timeline-history-incomplete" | "blob-too-large" | "unsupported-media-type" | "blob-content-mismatch" | "blob-quota-exceeded" | "blob-not-found" | "blob-expired" | "internal" | string);
+export type ErrorCode = ("attention-migrated" | "arrangement-exists" | "arrangement-folder-exists" | "arrangement-retired" | "arrangement-limit" | "arrangement-folder-deleted" | "arrangement-cycle" | "arrangement-body-too-large" | "arrangement-owner-forbidden" | "invalid-arrangement-subject" | "invalid-arrangement-action" | "invalid-arrangement-operations" | "invalid-arrangement-folder" | "invalid-arrangement-name" | "invalid-arrangement-key" | "invalid-subject-reference" | "not-found" | "forbidden" | "unsupported-capability" | "validation-failed" | "idempotency-conflict" | "stale-fence" | "cursor-gap" | "page-cursor-expired" | "rate-limited" | "runtime-not-local" | "runtime-authority-indeterminate" | "remote-unavailable" | "terminal-unavailable" | "terminal-ended" | "timeline-history-incomplete" | "conversation-content-invalidated" | "transcript-unavailable" | "blob-too-large" | "unsupported-media-type" | "blob-content-mismatch" | "blob-quota-exceeded" | "blob-not-found" | "blob-expired" | "internal" | string);
 
 export type ErrorEnvelope = {
   api_version: "st3.client.v0";
@@ -990,6 +1015,14 @@ export type Message = ResourceHeader & {
   tags?: Array<string>;
   title?: string | null;
   to: Id;
+};
+
+export type MessageProvenance = {
+  device?: string;
+  key?: string;
+  reason?: string;
+  signer?: ParticipantRef;
+  verdict: "verified" | "unsigned" | "held" | "invalid";
 };
 
 export type Mission = ResourceHeader & {
@@ -1618,6 +1651,18 @@ export type TerminalScreen = {
   truncated: boolean;
 };
 
+export type TimelineBlock = {
+  continuation?: ConversationContentRef;
+  id: string;
+  kind: string;
+  metadata?: {
+
+};
+  payload: unknown;
+  source_type: string;
+  visibility?: string;
+};
+
 export type TimelineContentBody = (unknown | unknown);
 
 export type TimelineDelta = {
@@ -1643,6 +1688,7 @@ export type TimelineEntry = Omit<{
 export type TimelineEntryId = string;
 
 export type TimelineErrorBody = {
+  blocks?: Array<TimelineBlock>;
   code: string;
   details: {
 
@@ -1653,8 +1699,10 @@ export type TimelineErrorBody = {
 
 export type TimelineMessageBody = {
   attachments?: Array<Attachment>;
+  blocks?: Array<TimelineBlock>;
   from?: ParticipantRef;
   message_id: string;
+  provenance?: MessageProvenance;
   reply_to?: string | null;
   tags?: Array<string>;
   title?: string;
@@ -1669,6 +1717,7 @@ export type TimelinePage = {
 };
 
 export type TimelineRedactionBody = {
+  blocks?: Array<TimelineBlock>;
   reason: string;
   withheld_bytes: number;
   withheld_items?: number;
@@ -1677,17 +1726,20 @@ export type TimelineRedactionBody = {
 export type TimelineStatus = ("queued" | "running" | "waiting" | "completed" | "failed" | "cancelled" | string);
 
 export type TimelineStatusBody = {
+  blocks?: Array<TimelineBlock>;
   detail?: string;
   status: TimelineStatus;
 };
 
 export type TimelineToolCallBody = {
   arguments: unknown;
+  blocks?: Array<TimelineBlock>;
   call_id: string;
   name: string;
 };
 
 export type TimelineToolResultBody = {
+  blocks?: Array<TimelineBlock>;
   call_id: string;
   content: unknown;
   media_type: string;
@@ -1695,6 +1747,7 @@ export type TimelineToolResultBody = {
 };
 
 export type TimelineTruncationBody = {
+  blocks?: Array<TimelineBlock>;
   continuation_cursor?: Cursor;
   omitted_from_sequence: number;
   omitted_to_sequence: number;
@@ -1708,6 +1761,7 @@ export type TimelineUsageBody = {
   mission_run_id?: string | null;
   step_id?: string | null;
 };
+  blocks?: Array<TimelineBlock>;
   cache_write_tokens?: number;
   cached_tokens?: number;
   compactions?: number;

@@ -38,7 +38,7 @@ def main():
                 tab.env.pop(name, None)
         tab.env.update({
             # Select the app's kitty renderer. No kitty process, screen or remote control is used.
-            "TERM": "xterm-kitty", "XDG_RUNTIME_DIR": str(root / "runtime"),
+            "TERM": "xterm-kitty", "STUI_PROBE_GRAPHICS": "1", "XDG_RUNTIME_DIR": str(root / "runtime"),
             "XDG_DATA_HOME": str(root / "data"), "TERMINAL_BROWSER_DIST_ROOT": str(app),
             "TERMINAL_BROWSER_DISABLE_GPU": "1", "DISPLAY": "", "WAYLAND_DISPLAY": "",
             "DO_NOT_TRACK": "1", "TERMINAL_BROWSER_NO_TELEMETRY": "1",
@@ -75,6 +75,7 @@ def main():
                 tab.start()
                 wait_for(lambda: bytes(tab.program_output), lambda data: data.count(b"\x1b_G") > 3,
                          "live browser graphics", seconds=20)
+                wait_for(lambda: bytes(tab.output), lambda data: data.count(b"\x1b_G") > 0, "pane graphics", seconds=20)
                 before = tab.status()
                 start = len(tab.wire_input)
                 tab.send(tab.mouse(65))
@@ -88,6 +89,7 @@ def main():
                     "program": "terminal-browser", "version": "0.13.4", "headless": True,
                     "started": True, "mode": before["mode"],
                     "graphics_apc_count": raw.count(b"\x1b_G"),
+                    "graphics_headers": sorted(set(re.findall(rb"\x1b_G([^;]*);", raw)[i].decode("ascii") for i in range(len(re.findall(rb"\x1b_G([^;]*);", raw))))),
                     "outer_graphics_apc_count": bytes(tab.output).count(b"\x1b_G"),
                     "wheel_received": wheel.hex(),
                     "ctrl_alt_shift_a_received": bytes(tab.wire_input[start:]).hex(),

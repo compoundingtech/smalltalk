@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Validate chat message sessions without constructing fleet agent cards",
+  "replay": {
+    "status": "none",
+    "detail": "No replay or projection rebuild is introduced."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, indexes, triggers or migrations change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules and fleet coordination are unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Message session IDs, current-agent membership, incarnation/runtime and placement fences, authorization and error codes are preserved."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional interruption beyond the normal runtime rollout is required."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual steps or starting-state transitions are required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No recovery or database swap-back behavior changes."
+  }
+}

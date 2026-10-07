@@ -68,16 +68,21 @@ esac
 
 ### With Nix
 
-Install the same tools from source (this can take a while):
+Install the same tools from a pinned release source (this can take a while).
+The command uses v0.3.16 as an example; choose a release after reading its Upgrade impact:
 
 ```sh
-nix --extra-experimental-features 'nix-command flakes' profile install github:compoundingtech/smalltalk
+nix --extra-experimental-features 'nix-command flakes' profile install github:compoundingtech/smalltalk/v0.3.16
 command -v st stui pty
 ```
 
 Nix builds `st3`, its `st` alias, `stui`, and `st3-migrate`, and supplies the pinned `pty` runtime and build dependencies. You do not need a separate Rust toolchain or PTY install. Use this **instead of** the archive route; the commands below are the same. Check that the paths above belong to your Nix profile, then continue with the daemon setup.
 
 For a declarative setup, use the [Home Manager module](home-manager.md): it installs the tools, writes the person configuration, and starts the user daemon on Linux or macOS. If that module owns your daemon, configure its person there and skip the manual config/service-install block in step 3. Lingering on Linux, macOS permissions, harness login, and fleet joining remain host setup. Nix profile installs use store paths; the macOS app-bundle setup above belongs to the source/release installers.
+
+Archive installation replaces files; it does not restart an existing daemon. For an existing
+fleet, use [upgrading st](upgrading-st.md) before running the new build against populated state.
+Keep the downloaded archive, checksum and `BUILD.json` as the installed-source record.
 
 See [binary releases](st3/binary-releases.md) for pinned versions and upgrades, and [macOS installation](st3/macos-installation.md) for Python, signing, and permission setup.
 
@@ -129,7 +134,10 @@ On macOS, run the permission helper and follow its instructions:
 st service permissions
 ```
 
-`doctor` should report a reachable daemon and `pty`. A machine with no fleet configured is healthy. Warnings about optional build tools, GitHub login, or Linux IO priority do not block this walkthrough. Fix any failed check before continuing; [daemon setup](#daemon-details) has the details.
+`doctor` should report a reachable daemon and `pty`.
+
+Compare `st --version --json` with the daemon's `machine_version` in `st doctor --json` if
+an older daemon was already running. A machine with no fleet configured is healthy. Warnings about optional build tools, GitHub login, or Linux IO priority do not block this walkthrough. Fix any failed check before continuing; [daemon setup](#daemon-details) has the details.
 
 ## 4. Start an agent and attach
 
@@ -260,6 +268,7 @@ at either socket path is never replaced; choose a different path instead.
 - [Talking to agents](talking-to-agents.md): UI, phone, CLI, attachments, and structured requests.
 - [Build and run the iOS app](ios-app.md): local simulator and iPhone builds, then gateway pairing.
 - [Seat lifecycle](seat-lifecycle.md): restart, suspend/resume, native sessions, and stopped seats.
+- [0.x compatibility](st3/compatibility.md): upgrade baselines, clients, harnesses and current platform proof.
 - [Upgrading st](upgrading-st.md): install the same build everywhere and check recovery options.
 - [GitHub integration](github-integration.md): repository intake, review, triage, and landing work.
 - [When something is wrong](when-something-is-wrong.md): health, work, usage, and stop reasons.

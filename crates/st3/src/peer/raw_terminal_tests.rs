@@ -325,6 +325,22 @@ async fn membership_only_gateway_holds_raw_writers_and_fences_capabilities() {
             .unwrap(),
         0
     );
+    // Recovery is a writable output-side operation through the actual gateway and peer.
+    first
+        .write_all(&pty_core::protocol::encode_packet(
+            MessageType::ResetInputModes,
+            &[],
+        ))
+        .await
+        .unwrap();
+    let recovered = raw_packet(&mut first).await;
+    assert_eq!(recovered.type_, MessageType::Data);
+    assert!(
+        recovered
+            .payload
+            .windows(b"\x1b[?1003l".len())
+            .any(|bytes| bytes == b"\x1b[?1003l")
+    );
     first
         .write_all(&encode_data(b"raw-input-proof\n"))
         .await

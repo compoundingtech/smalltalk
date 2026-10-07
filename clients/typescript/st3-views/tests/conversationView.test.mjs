@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { unreadableTranscript, cleanMessageText, conversationEntries, entryMatches, foldDeliveryFlaps, fromHarness, shownToolLines, toolTitle } from '@smalltalk/st3-views/conversationView';
+import { unreadableTranscript, cleanMessageText, conversationEntries, entryMatches, foldDeliveryFlaps, fromHarness, shownToolLines, toolTitle, DEFAULT_FILTERS, SHOW_EVERYTHING } from '@smalltalk/st3-views/conversationView';
 
 let sequence = 0;
 const at = minute => `2026-09-30T12:${String(minute).padStart(2, '0')}:00Z`;
@@ -106,6 +106,21 @@ assert.equal(shownToolLines({ ...tool, state: 'failed' }, false).hidden, 14, 'fa
   assert.equal(spoken(['urgent']).dictated, undefined);
 }
 
+// A message a person wrote says which device signed it and whether that checks; an old, unsigned
+// one says nothing (Nathan, 2026-10-06).
+{
+  const signed = (provenance) => conversationEntries([
+    { id: 'm', sequence: 1, revision: 1, timestamp: '2026-10-01T10:00:00Z', role: 'user', type: 'message', final: true, body: { message_id: 'message/one', from: 'person/avery', to: 'agent/example/harbor/keeper', ...(provenance ? { provenance } : {}) } },
+    { id: 'c', sequence: 2, revision: 1, timestamp: '2026-10-01T10:00:00Z', role: 'user', type: 'content', final: true, body: { media_type: 'text/plain', text: 'ship the harbor fix' } },
+  ], new Map([['person/avery', 'you']]))[0].body.signed;
+  assert.equal(signed({ verdict: 'verified', signer: 'person/avery', device: 'example phone (secure enclave)', key: 'p256:AAAA' }), '✓ example phone (secure enclave)');
+  assert.equal(signed({ verdict: 'verified', signer: 'person/avery' }), '✓ person/avery');
+  assert.equal(signed({ verdict: 'held', reason: 'delegation d1 has not arrived' }), '⚠ signature held: delegation d1 has not arrived');
+  assert.equal(signed({ verdict: 'invalid', reason: 'the signature does not match the claim' }), '✕ signature invalid: the signature does not match the claim');
+  assert.equal(signed({ verdict: 'unsigned' }), undefined);
+  assert.equal(signed(undefined), undefined);
+}
+
 // A message's images ride on its mail entry; a message may be only its images.
 {
   const sent = (text) => conversationEntries([
@@ -142,6 +157,12 @@ assert.equal(shownToolLines({ ...tool, state: 'failed' }, false).hidden, 14, 'fa
   assert.equal(shown[0].body.text, 'older entries are not shown');
   assert.equal(shown[0].at, '');
   assert.deepEqual(shown.slice(1).map(entry => entry.body.text), ['first', 'second']);
+}
+
+// A source-window omission distinguishes an unavailable remainder from an owner chunk.
+{
+  const notice = e('truncation', 'system', { reason: 'native transcript prefix; not fetchable through this owner read', omitted_from_sequence: 0, omitted_to_sequence: 0 });
+  assert.match(conversationEntries([notice], names)[0].body.text, /not fetchable/);
 }
 
 // A conversation st is refusing says why, how old what is shown is, and that the phone retries.
@@ -185,3 +206,20 @@ assert.equal(shownToolLines({ ...tool, state: 'failed' }, false).hidden, 14, 'fa
   const bodies = fromHarness(true, turn);
   assert.deepEqual(bodies.map(body => [body.kind, body.text]), [['mail', 'is this a watcher?']]);
 }
+
+const exposed = '<analysis>invented-token</analysis><thinking>visible</thinking>';
+assert.equal(JSON.parse(conversationEntries([{id:'raw',timestamp:'2026-10-06T12:00:00Z',role:'assistant',type:'content',body:{text:exposed}}], new Map(), SHOW_EVERYTHING)[0].body.text).body.text, exposed);
+
+const unknownNative = '[unrecognized future]\n{"raw":{"token":"invented-token"}}';
+assert.equal(conversationEntries([{id:'unknown',timestamp:'2026-10-06T12:00:00Z',role:'system',type:'content',body:{text:unknownNative,blocks:[{kind:'unknown'}]}}],new Map())[0].body.text,unknownNative);
+assert.equal(cleanMessageText('<analysis>visible invented-token</analysis>', SHOW_EVERYTHING), '<analysis>visible invented-token</analysis>');
+assert.deepEqual(fromHarness(true,'<analysis>visible invented-token</analysis>'), []);
+
+// Display preferences do not mutate the normalized data; raw mode is reversible JSON.
+const rawText = '<system-reminder>invented-token</system-reminder>visible\u001b\n<thinking>private reasoning</thinking>';
+const rawEntry = e('content', 'user', {text:rawText, blocks:[{id:'source', kind:'source_record', source_type:'claude', visibility:'internal', payload:{raw:{text:rawText}}}]});
+const original = structuredClone(rawEntry);
+assert.equal(conversationEntries([rawEntry], names, DEFAULT_FILTERS)[0].body.text, 'visible');
+assert.deepEqual(JSON.parse(conversationEntries([rawEntry], names, SHOW_EVERYTHING)[0].body.text), original);
+assert.deepEqual(rawEntry, original);
+assert.equal(cleanMessageText(rawText, SHOW_EVERYTHING), rawText);

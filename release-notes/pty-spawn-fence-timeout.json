@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Recover seats stuck behind a PTY spawn publication fence after a transient timeout.",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay change. Existing PTY publication fences are recovered during the next seat spawn pass."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema or fence format change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint, retention or fleet coordination change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No client, protocol or harness contract change; the existing pty run --force replacement behavior is reused."
+  },
+  "downtime": {
+    "status": "changed",
+    "detail": "After one failed recovery publication window, the same spawn pass force-replaces an unresolved PTY session. A late publication within that window is adopted instead. Normal live sessions are unchanged; deployment restart-to-health has not been measured."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual action is required after upgrading. On affected older builds an operator may delete only the seat's .pending fence under <PTY_ROOT parent>/.st3-pty-spawn-locks/<SHA-256 of canonical PTY_ROOT>/<SHA-256 of runtime id>.pending after checking that no spawn is in flight. Deletion does not itself launch the seat: the next spawn pass re-spawns if no live session is observed. Do not remove the .lock file."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "A successful run with no publication keeps its fence for one recovery window on the next pass. A recovery publication timeout clears that fence and proceeds to one fresh run --force in the same pass; other recovery errors remain errors. Older pending fences use the same recovery path without migration. Swapping back restores the old possibility of an indefinitely stuck fence."
+  }
+}

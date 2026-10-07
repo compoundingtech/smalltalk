@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "summary": "#1606: empty person-ask writer avoidance",
+  "commits": ["7fbd853ed3c5a2c81a29144ca6fffa36ab88a705"],
+  "replay": {"status": "none", "detail": "No new projection invalidation or startup replay trigger in the merged empty person-ask writer avoidance change."},
+  "schema": {"status": "none", "detail": "No database table, index, trigger or migration change in empty person-ask writer avoidance; SQLite user_version is unchanged."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digest/drop policy are unchanged; this change adds no sealing coordination requirement."},
+  "compatibility": {"status": "none", "detail": "Empty person-ask writer avoidance changes internal execution or build behavior without a new external API/claim version requirement."},
+  "downtime": {"status": "none", "detail": "No additional upgrade service stop or measured outage introduced by empty person-ask writer avoidance; the standard daemon/client restart procedure still applies."},
+  "manual": {"status": "none", "detail": "No data repair or configuration conversion required for existing installations by empty person-ask writer avoidance."},
+  "recovery": {"status": "none", "detail": "No additional recovery procedure introduced by this change. Preserve graph state, keys and configuration and follow the standard roll-forward guidance; this note does not qualify binary-only downgrade of the whole release."}
+}

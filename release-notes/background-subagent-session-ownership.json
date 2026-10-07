@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Keep Claude child lifecycle events within their native session",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay or retained lifecycle history changes. The local Claude ledger rejects foreign or missing native-session identity on nonboundary events."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema, versions, migrations, tables or indexes change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Existing child lifecycle leases, checkpoint rules and fleet coordination contracts are unchanged."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Claude child/turn/end hooks must name the current native session once the ledger knows it; child starts require a native session ID. Valid older hook payloads retain their existing common session_id field. No client, wire field, claim kind or production launch settings change. Codex capture and the existing child lease contract are unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "The regression coverage introduces no production service interruption."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual schema or starting-version transitions are required. This source guard does not rewrite launch settings retained by existing harness processes."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No production recovery or database swap-back behavior changes."
+  }
+}

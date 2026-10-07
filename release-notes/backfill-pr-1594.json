@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "summary": "#1594: effective Codex approval and saved-resume settings",
+  "commits": ["2ffd338cb9a575c0070f513ca5c5a2fa9b696ccb"],
+  "replay": {"status": "none", "detail": "No new projection invalidation or startup replay trigger in the merged effective Codex approval and saved-resume settings change."},
+  "schema": {"status": "none", "detail": "No database table, index, trigger or migration change in effective Codex approval and saved-resume settings; SQLite user_version is unchanged."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digest/drop policy are unchanged; this change adds no sealing coordination requirement."},
+  "compatibility": {"status": "changed", "detail": "Codex launch resolves the effective workspace approval policy via config/read. Unattended mission seats default to never only when no policy is configured; explicit settings retain precedence. Saved-thread resume applies model/effort/sandbox/approval and fails before binding on rejection or mismatch, with no declaration-dropping fallback. Installed Codex 0.160.1 accepts untrusted/on-request/never; on-failure is refused. Conflicting unproven project/profile ordering fails launch. Live approval requests show a human permission block."},
+  "downtime": {"status": "changed", "detail": "An affected Codex seat may fail launch or resume and stay parked after three starts until its declaration is repaired. The daemon API need not stop for that repair; no elapsed seat-recovery duration is claimed."},
+  "manual": {"status": "changed", "detail": "Review existing Codex declarations and project/profile policies before restarting seats. Replace unsupported on-failure or a model alias whose returned ID differs from the declaration with provider-supported explicit settings. After three failed starts the seat parks until its declaration changes; inspect the wrapper diagnostic, correct the declaration and verify the resumed thread/model/effort. Provider acceptance of the reported controlled-seat model remained a separate deployment check."},
+  "recovery": {"status": "changed", "detail": "Correct the provider policy/model/effort declaration and roll forward while preserving the saved thread. Do not use a retry that silently discards declared settings; this change deliberately removes that fallback."}
+}
