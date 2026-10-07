@@ -1,0 +1,34 @@
+[
+  {
+    "program": "cha",
+    "mode": "TermMode(SHOW_CURSOR | BRACKETED_PASTE | SGR_MOUSE | LINE_WRAP | ALT_SCREEN | MOUSE_DRAG | ALTERNATE_SCROLL | URGENCY_HINTS)",
+    "wheel_received": "1b5b3c36353b353b334d1b5b3c36353b353b334d1b5b3c36353b353b334d",
+    "wheel_changed_screen": true,
+    "key_received": "6a",
+    "key_changed_screen": true
+  },
+  {
+    "program": "hx",
+    "mode": "TermMode(BRACKETED_PASTE | SGR_MOUSE | MOUSE_MOTION | LINE_WRAP | FOCUS_IN_OUT | ALT_SCREEN | ALTERNATE_SCROLL | URGENCY_HINTS | DISAMBIGUATE_ESC_CODES | REPORT_ALTERNATE_KEYS)",
+    "wheel_received": "1b5b39373b353b334d1b5b39373b353b334d1b5b39373b353b334d",
+    "wheel_changed_screen": true,
+    "key_received": "1b5b42",
+    "key_changed_screen": true
+  },
+  {
+    "program": "vim",
+    "mode": "TermMode(SHOW_CURSOR | APP_CURSOR | BRACKETED_PASTE | SGR_MOUSE | LINE_WRAP | FOCUS_IN_OUT | ALT_SCREEN | MOUSE_DRAG | ALTERNATE_SCROLL | URGENCY_HINTS)",
+    "wheel_received": "1b5b3c36353b353b334d1b5b3c36353b353b334d1b5b3c36353b353b334d",
+    "wheel_changed_screen": true,
+    "key_received": "1b4f42",
+    "key_changed_screen": true
+  },
+  {
+    "program": "less",
+    "mode": "TermMode(SHOW_CURSOR | APP_CURSOR | LINE_WRAP | ALT_SCREEN | ALTERNATE_SCROLL | URGENCY_HINTS)",
+    "wheel_received": "1b4f421b4f421b4f42",
+    "wheel_changed_screen": true,
+    "key_received": "1b4f42",
+    "key_changed_screen": true
+  }
+]

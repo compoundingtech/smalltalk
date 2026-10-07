@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "stui context menus expose existing row, message and top-bar actions with keyboard access in both layouts.",
+  "replay": {
+    "status": "none",
+    "detail": "UI-only change; no claim replay or projection rebuild is added."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database tables, indexes, triggers or migrations change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules, digests or fleet coordination requirements change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Menus reuse existing actions and the existing optional in_reply_to message field. The shared World and client-v0 schema are unchanged; terminal bodies retain program right-clicks."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "The stui-only change adds no daemon restart, API interruption or recovery wait."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual action or configuration change is required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No new recovery or rollback step is required; this change introduces no stored state transition."
+  }
+}

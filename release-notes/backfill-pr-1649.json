@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "summary": "#1649: lease maintenance for seats without held work",
+  "commits": ["a964946c21395ed4379f54c4ffb0a729915ac806"],
+  "replay": {"status": "none", "detail": "No new projection invalidation or startup replay trigger in the merged lease maintenance for seats without held work change."},
+  "schema": {"status": "none", "detail": "No database table, index, trigger or migration change in lease maintenance for seats without held work; SQLite user_version is unchanged."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digest/drop policy are unchanged; this change adds no sealing coordination requirement."},
+  "compatibility": {"status": "none", "detail": "Lease maintenance for seats without held work changes internal execution or build behavior without a new external API/claim version requirement."},
+  "downtime": {"status": "none", "detail": "No additional upgrade service stop or measured outage introduced by lease maintenance for seats without held work; the standard daemon/client restart procedure still applies."},
+  "manual": {"status": "none", "detail": "No data repair or configuration conversion required for existing installations by lease maintenance for seats without held work."},
+  "recovery": {"status": "none", "detail": "No additional recovery procedure introduced by this change. Preserve graph state, keys and configuration and follow the standard roll-forward guidance; this note does not qualify binary-only downgrade of the whole release."}
+}

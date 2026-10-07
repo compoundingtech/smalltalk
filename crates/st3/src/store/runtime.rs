@@ -48,7 +48,8 @@ impl Runtime for SmalltalkRuntime {
         resources::create_schema(connection)?;
         custom::create_schema(connection)?;
         agent_messages::create_schema(connection)?;
-        glass_heads::create_schema(connection)
+        glass_heads::create_schema(connection)?;
+        limits::create_limits_schema(connection)
     }
 
     fn open_projections(&self, transaction: &Transaction<'_>, shared_memory: bool) -> Result<()> {
@@ -57,6 +58,7 @@ impl Runtime for SmalltalkRuntime {
         glass_heads::open(transaction)?;
         agent_messages::open(transaction)?;
         arrangements::open(transaction)?;
+        limits::open_limits(transaction)?;
         if shared_memory {
             rebuild_operations_tx(transaction)?;
             rebuild_planning_tx(transaction)?;
@@ -172,6 +174,7 @@ impl Runtime for SmalltalkRuntime {
         resources::flush(transaction).map_err(internal)?;
         glass_heads::flush(transaction).map_err(internal)?;
         agent_messages::flush(transaction).map_err(internal)?;
+        limits::flush_limits(transaction).map_err(internal)?;
         reapply_local_work_lease_renewals_tx(transaction)
     }
 

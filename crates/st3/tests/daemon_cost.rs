@@ -57,6 +57,8 @@ const GROWTH: f64 = 3.0;
 /// Work differences this small pass whatever their ratio: a few rows more or less.
 const SLACK: u64 = 5_000;
 
+const ADAPTER_ACTOR: &str = "agent/bench/cost/adapter";
+
 /// Requests whose work already grows with the store on main, measured on 2026-10-03 at
 /// 341f7ad9, each with the growth it may reach: half again its measured ratio, so it cannot get
 /// much worse unnoticed. Each breaks the daemon's rule that no query's cost grows with the whole
@@ -291,6 +293,10 @@ const NOT_MEASURED: &[(&str, &str)] = &[
         "image bytes, outside the graph",
     ),
     (
+        "GET /v1/client/conversations/{id}/content/{reference}/chunk",
+        "requires owner-native transcript content; scope, bounded chunk and revision invalidation are covered by conversation_blocks tests",
+    ),
+    (
         "GET /v1/client/blobs/{id}/chunk",
         "image bytes, outside the graph",
     ),
@@ -406,6 +412,19 @@ const fn direct(route: &'static str, call: Direct) -> Probe {
 }
 
 const PROBES: &[Probe] = &[
+    get(
+        "GET /v1/client/adapter/deliveries",
+        "/v1/client/adapter/deliveries?after={adapter_frontier}&wait_ms=0",
+    ),
+    post(
+        "POST /v1/client/adapter/import",
+        "/v1/client/adapter/import",
+        |fixture, attempt| json!({
+            "from":"external/discord/user/404", "to":fixture.subjects.seats[0],
+            "content":"Invented provider import", "attachments":[],
+            "idempotency_key":format!("cost-adapter-import-{attempt}"),
+        }),
+    ),
     post(
         "POST /v1/schema/registrations",
         "/v1/schema/registrations",
@@ -1575,6 +1594,40 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
         store.append_claim(&running).unwrap();
     }
     let mut fixture = fixture(&person, &client, subjects).await;
+    // Exercise successful enrolled imports and a fixed-size incremental reply page,
+    // rather than measuring a refused request or a historical mailbox scan.
+    let adapter = Client::unix_agent(&socket, ADAPTER_ACTOR).unwrap();
+    let adapter_kdl = format!(
+        "version 2\nagent \"bench/cost/adapter\" {{ workspace {:?}; argv \"/usr/bin/true\"; restart \"never\"; tags st3.adapter.source=\"external/discord/user/404\" st3.adapter.target={:?} }}\n",
+        root.to_str().unwrap(), fixture.subjects.seats[0],
+    );
+    let intent = st3::parse_intent(&adapter_kdl, NODE).unwrap();
+    let preview = store.mission(&intent, st3::model::IntentInput {
+        kdl: adapter_kdl, source_name: None,
+    }).unwrap();
+    store.apply_as(&intent, &preview.subject_tokens, "cost-adapter-enrollment", Some("person/bench-operator")).unwrap();
+    let incoming: Value = adapter.post("/v1/client/adapter/import", &json!({
+        "from":"external/discord/user/404", "to":fixture.subjects.seats[0],
+        "content":"Invented provider seed", "attachments":[],
+        "idempotency_key":"cost-adapter-seed",
+    })).await.expect("enrolled adapter seed import must succeed");
+    fixture.items.insert("adapter_frontier", store.index().unwrap().to_string());
+    store.append_claim(&ClaimInput {
+        subject:"message/cost-adapter-reply".into(), kind:"message.sent".into(),
+        actor:Some(fixture.subjects.seats[0].clone()),
+        fields:serde_json::from_value(json!({
+            "from":fixture.subjects.seats[0], "to":"external/discord/user/404",
+            "content":"Invented provider reply", "status":"sent",
+            "in_reply_to":incoming["subject"],
+        })).unwrap(),
+        evidence:vec![], expected_subject:None, idempotency_key:None,
+    }).unwrap();
+    let delivery: Value = adapter.get(&format!(
+        "/v1/client/adapter/deliveries?after={}&wait_ms=0",
+        fixture.items["adapter_frontier"],
+    )).await.expect("enrolled adapter delivery fixture must succeed");
+    assert_eq!(delivery["items"].as_array().unwrap().len(), 1);
+    assert_eq!(delivery["items"][0]["in_reply_to"], incoming["subject"]);
     // An offline source needs no live runtime: publish its exact departure before measuring
     // the operator's recorded exception, against both generated store sizes.
     for host in ["amber", "cobalt"] {
@@ -1665,6 +1718,8 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
                 let body = probe.body.map(|body| body(&fixture, attempt));
                 let client = if path.starts_with("/v1/client/arrangements") {
                     arrangement_person.clone()
+                } else if path.starts_with("/v1/client/adapter/") {
+                    adapter.clone()
                 } else if path.starts_with("/v1/client/") {
                     person.clone()
                 } else {
