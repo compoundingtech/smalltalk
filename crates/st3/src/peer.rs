@@ -804,6 +804,7 @@ impl ClientRelay {
                     let port = request.uri().port_u16().unwrap_or(80);
                     let tcp_span = profile.as_ref().map(|op| op.wall_span("raw/tcp-dial"));
                     let tcp = tokio::net::TcpStream::connect((host, port)).await?;
+                    tcp.set_nodelay(true)?;
                     drop(tcp_span);
                     let upgrade_span = profile.as_ref().map(|op| op.wall_span("raw/peer-upgrade"));
                     let result = tokio_tungstenite::client_async_with_config(request, tcp, Some(config)).await?;

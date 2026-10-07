@@ -104,6 +104,13 @@ struct FrameInfo {
     menu: Option<Rect>,
 }
 
+/// The palette remains reachable from a focused terminal. Other space shortcuts
+/// keep the terminal's established ownership until the person detaches.
+fn terminal_space_key(key: KeyEvent) -> bool {
+    key.code == KeyCode::Char('k')
+        && (key.modifiers == KeyModifiers::CONTROL || key.modifiers == KeyModifiers::SUPER)
+}
+
 struct Demo {
     started: Instant,
     loaded: bool,
@@ -409,6 +416,7 @@ pub struct Ui {
     terminal_cursor: Cell<Option<pty::Cursor>>,
     /// Whether a drag is selecting in the attached terminal.
     terminal_selecting: bool,
+    terminal_selection_mode: bool,
     /// The last press in the attached terminal, where and when, and how many in a row: a
     /// second selects a word, a third a line.
     terminal_press: Option<(Instant, u16, u16, u8)>,
@@ -513,6 +521,7 @@ impl Ui {
             terminal_body: Cell::new(None),
             terminal_cursor: Cell::new(None),
             terminal_selecting: false,
+            terminal_selection_mode: false,
             terminal_press: None,
             anchors: RefCell::new(HashMap::new()),
             picker: None,
@@ -1140,6 +1149,18 @@ impl Ui {
         if self.help {
             self.draw_help(buf, area);
         }
+        for view in self.terminal.iter().chain(self.parked.iter()) {
+            if let Some(native) = &view.native
+                && (!self
+                .frame
+                .borrow()
+                .panes
+                .iter()
+                .any(|pane| pane.key == Pane::Terminal(view.agent.clone()).key()))
+            {
+                native.hide_graphics();
+            }
+        }
         if let Some(cursor) = self.terminal_cursor.get() {
             frame.set_cursor_position((cursor.x, cursor.y));
         }
@@ -1356,11 +1377,32 @@ impl Ui {
                 ("ctrl+k", "find"),
             ]
         } else if self.terminal_focused() {
-            vec![
-                ("ctrl+\\", "back to stui"),
-                ("keys", "go to the terminal"),
-                ("ctrl-c twice", "interrupt"),
-            ]
+            if self.native_terminal().is_some_and(|native| {
+                native
+                    .mode()
+                    .intersects(alacritty_terminal::term::TermMode::MOUSE_MODE)
+            }) || self.terminal_selection_mode
+            {
+                vec![
+                    ("ctrl+\\", "back"),
+                    ("alt+drag", "copy"),
+                    (
+                        "ctrl+alt+s",
+                        if self.terminal_selection_mode {
+                            "program mouse"
+                        } else {
+                            "select"
+                        },
+                    ),
+                    ("ctrl+alt+r", "reset modes"),
+                ]
+            } else {
+                vec![
+                    ("ctrl+\\", "back to stui"),
+                    ("drag", "copy"),
+                    ("ctrl+alt+r", "reset modes"),
+                ]
+            }
         } else if self.new_mission.is_some() && self.tab == 2 {
             vec![
                 ("tab", "next field"),
@@ -2543,9 +2585,25 @@ impl Ui {
         if let Some(native) = view.native.as_ref() {
             // One line for where this is and how to leave; the PTY gets the rest of the pane.
             let scrolled = native.scrolled();
+            let selection_here = self.terminal_selection_mode
+                && self
+                    .terminal
+                    .as_ref()
+                    .is_some_and(|view| view.agent == agent);
             let status = match (native.ended(), native.attached(), scrolled) {
                 (Some(reason), _, _) => format!("ended: {reason}"),
                 (None, false, _) => "attaching…".into(),
+                (None, true, 0) if selection_here => {
+                    "selection on · drag copies · ctrl+alt+s resumes program mouse".into()
+                }
+                (None, true, 0)
+                    if native
+                        .mode()
+                        .intersects(alacritty_terminal::term::TermMode::MOUSE_MODE) =>
+                {
+                    "program mouse · alt+drag copies · ctrl+alt+s selects · ctrl+alt+r resets"
+                        .into()
+                }
                 (None, true, 0) if self.shell_focused() => {
                     "drag selects and copies · wheel or shift+pgup scrolls back".into()
                 }
@@ -2581,13 +2639,26 @@ impl Ui {
                 self.terminal_body.set(Some(body));
             }
             native.fit(body.height, body.width);
+            self.frame.borrow_mut().panes.push(FramePane {
+                key: Pane::Terminal(agent.to_owned()).key(),
+                rect: body,
+                top: scrolled,
+                total: usize::from(body.height) + scrolled,
+                lines: Rc::new(Vec::new()),
+            });
             // The person's own cursor only where nothing is drawn over the terminal.
             let real = self.terminal_focused()
                 && self.focused_pane() == Some(Pane::Terminal(agent.to_owned()))
                 && !self.help
                 && self.popover.is_none()
                 && !self.palette_open();
-            self.terminal_cursor.set(native.draw(buf, body, real));
+            let cursor = native.draw(buf, body, real);
+            if real {
+                self.terminal_cursor.set(cursor);
+            }
+            if let Some(picker) = &self.picker {
+                native.draw_graphics(buf, body, picker);
+            }
             return;
         }
         let header = format!(" ← Return · Ctrl+\\   {}", view.title);
@@ -2648,9 +2719,7 @@ impl Ui {
     fn terminal_key(&mut self, key: KeyEvent) {
         match self.native_terminal() {
             Some(native) => {
-                if let Some(bytes) = pty::key_bytes(key, native.mode()) {
-                    native.write(bytes);
-                }
+                native.key(key);
             }
             None => self.effects.push(Effect::TerminalKey(key)),
         }
@@ -3169,6 +3238,7 @@ impl Ui {
 
     /// Dispatch the outer terminal's decoded input, shared by the live and demo loops.
     fn input_event(&mut self, event: Event) {
+        let focused = self.input_terminal();
         match event {
             Event::Key(key) => self.key(key),
             Event::Paste(text) => {
@@ -3176,12 +3246,77 @@ impl Ui {
                 self.paste(text)
             }
             Event::Mouse(mouse) => self.mouse(mouse),
+            Event::FocusGained | Event::FocusLost if focused.is_some() => {
+                if let Some(native) = self.native_terminal() {
+                    native.focus(matches!(event, Event::FocusGained));
+                }
+            }
             _ => {}
         }
+        self.sync_terminal_slot();
+        let now = self.input_terminal();
+        if focused != now {
+            for (agent, gained) in [(focused, false), (now, true)] {
+                if let Some(agent) = agent
+                    && let Some(native) = self
+                        .terminal_view(&agent)
+                        .and_then(|view| view.native.as_ref())
+                {
+                    native.focus(gained);
+                }
+            }
+        }
+    }
+
+    fn input_terminal(&self) -> Option<String> {
+        (self.terminal_focused()
+            && !self.palette_open()
+            && !self.help
+            && self.popover.is_none()
+            && self.voice.is_none()
+            && self.context.is_none())
+        .then(|| match self.focused_pane() {
+            Some(Pane::Terminal(agent)) => Some(agent),
+            _ => self.terminal.as_ref().map(|view| view.agent.clone()),
+        })
+        .flatten()
     }
 
     pub fn key(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Press {
+            // Repeats and releases belong to the child, never to stui shortcuts or confirmations.
+            if self.terminal_focused()
+                && !self.palette_open()
+                && !self.help
+                && self.popover.is_none()
+                && self.voice.is_none()
+                && self.context.is_none()
+                && !terminal_space_key(key)
+                && !matches!(key.code, KeyCode::Char('\\' | '4') if key.modifiers.contains(KeyModifiers::CONTROL))
+                && !matches!(key.code, KeyCode::Char('s' | 'S' | 'r' | 'R') if key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::ALT))
+                && !matches!(key.code, KeyCode::PageUp | KeyCode::PageDown if key.modifiers.contains(KeyModifiers::SHIFT))
+                && !matches!(key.code, KeyCode::Char('c' | 'd') if key.modifiers.contains(KeyModifiers::CONTROL) && !self.shell_focused())
+            {
+                self.terminal_key(key);
+            }
+            return;
+        }
+        // Ctrl+\ always leaves the attached tab, including through palette overlays.
+        if self.terminal_focused()
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('\\' | '4'))
+        {
+            self.terminal_selection_mode = false;
+            self.terminal_selecting = false;
+            // In glasses an agent's tab turns back into its conversation; a shell's tab
+            // stays a shell, detached.
+            if let Some(Pane::Terminal(agent)) = self.focused_pane()
+                && agent.starts_with("agent/")
+            {
+                self.swap_focused_pane(Pane::Agent(Some(agent)));
+                self.terminal = None;
+            }
+            self.effects.push(Effect::CloseTerminal);
             return;
         }
         self.sync_terminal_slot();
@@ -3200,17 +3335,30 @@ impl Ui {
         if self.terminal_focused() {
             let control = key.modifiers.contains(KeyModifiers::CONTROL);
             match key.code {
-                // Terminals send Ctrl+\\ as 0x1c, which crossterm reports as Ctrl+4.
-                KeyCode::Char('\\' | '4') if control => {
-                    // In glasses an agent's tab turns back into its conversation; a shell's tab
-                    // stays a shell, detached.
-                    if let Some(Pane::Terminal(agent)) = self.focused_pane()
-                        && agent.starts_with("agent/")
-                    {
-                        self.swap_focused_pane(Pane::Agent(Some(agent)));
-                        self.terminal = None;
+                KeyCode::Char('s' | 'S')
+                    if key
+                        .modifiers
+                        .contains(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    self.terminal_selection_mode = !self.terminal_selection_mode;
+                    self.flash(if self.terminal_selection_mode {
+                        "Selection on · drag copies · Ctrl+Alt+S resumes program mouse"
+                    } else {
+                        "Program mouse restored"
+                    });
+                }
+                KeyCode::Char('r' | 'R')
+                    if key
+                        .modifiers
+                        .contains(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    if let Some(native) = self.native_terminal() {
+                        native.reset_modes();
                     }
-                    self.effects.push(Effect::CloseTerminal);
+                    self.terminal_selection_mode = false;
+                    self.terminal_selecting = false;
+                    self.terminal_confirm = None;
+                    self.flash("Terminal input modes reset");
                 }
                 // An agent's terminal asks twice before Ctrl-C or Ctrl-D reach it, so a reflex
                 // never stops an agent; a shell gets them at once, as in any terminal.
@@ -3873,6 +4021,21 @@ impl Ui {
             let wanted = self.parked.remove(index);
             if let Some(old) = self.terminal.replace(wanted) {
                 self.parked.push(old);
+            }
+            self.terminal_selection_mode = false;
+            self.terminal_selecting = false;
+            self.terminal_press = None;
+            if let Some(body) = self
+                .frame
+                .borrow()
+                .panes
+                .iter()
+                .find(|pane| pane.key == Pane::Terminal(agent.clone()).key())
+                .map(|pane| pane.rect)
+            {
+                self.terminal_body.set(Some(body));
+                self.terminal_size
+                    .set((body.height.max(1), body.width.max(1)));
             }
         }
     }
@@ -4843,8 +5006,14 @@ impl Ui {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown if self.palette_open() => {
                 self.scroll_palette(matches!(mouse.kind, MouseEventKind::ScrollUp));
             }
-            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-                let delta = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+            MouseEventKind::ScrollUp
+            | MouseEventKind::ScrollDown
+            | MouseEventKind::ScrollLeft
+            | MouseEventKind::ScrollRight => {
+                let delta = if matches!(
+                    mouse.kind,
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollLeft
+                ) {
                     -3
                 } else {
                     3
@@ -4867,7 +5036,12 @@ impl Ui {
                             .map(|pane| pane.key.clone()),
                     )
                 };
-                if in_sidebar {
+                if in_sidebar
+                    && !matches!(
+                        mouse.kind,
+                        MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight
+                    )
+                {
                     let (lines, height, tab) = {
                         let info = self.frame.borrow();
                         (info.sidebar_lines, info.sidebar_height, info.sidebar_tab)
@@ -4878,15 +5052,44 @@ impl Ui {
                         as usize;
                 } else if let Some(key) = pane {
                     // An attached terminal scrolls its own history (or tells its program).
-                    match self.native_terminal() {
-                        Some(native)
-                            if self.terminal.as_ref().is_some_and(|view| {
-                                key == Pane::Terminal(view.agent.clone()).key()
-                            }) =>
-                        {
-                            native.wheel(-(delta as i32));
+                    let target = self
+                        .terminal
+                        .iter()
+                        .chain(self.parked.iter())
+                        .find(|view| key == Pane::Terminal(view.agent.clone()).key());
+                    match target.and_then(|view| view.native.as_ref()) {
+                        Some(native) => {
+                            if let Some(body) = self
+                                .frame
+                                .borrow()
+                                .panes
+                                .iter()
+                                .find(|pane| pane.key == key)
+                                .map(|pane| pane.rect)
+                            {
+                                native.wheel(
+                                    -(delta as i32),
+                                    mouse,
+                                    mouse.column.saturating_sub(body.x),
+                                    mouse.row.saturating_sub(body.y),
+                                    (self.terminal_selection_mode
+                                        && self.terminal.as_ref().is_some_and(|view| {
+                                            key == Pane::Terminal(view.agent.clone()).key()
+                                        }))
+                                        || mouse
+                                            .modifiers
+                                            .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT),
+                                );
+                            }
                         }
-                        _ => self.scroll_pane(&key, delta),
+                        _ if !matches!(
+                            mouse.kind,
+                            MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight
+                        ) =>
+                        {
+                            self.scroll_pane(&key, delta)
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -4896,7 +5099,8 @@ impl Ui {
 
     /// The mouse in the focused terminal, as a terminal takes it: a program that asked for the
     /// mouse gets it, and otherwise a drag selects and copies on release. Shift selects even
-    /// while the program has the mouse. Whether the terminal took it.
+    /// while the program has the mouse; Alt/Option and selection mode work when kitty owns Shift.
+    /// Whether the terminal took it.
     fn terminal_mouse(&mut self, mouse: MouseEvent) -> bool {
         if !self.terminal_focused() {
             return false;
@@ -4910,11 +5114,34 @@ impl Ui {
             i32::from(mouse.row) - i32::from(body.y),
         );
         if inside
-            && !self.terminal_selecting
-            && !mouse.modifiers.contains(KeyModifiers::SHIFT)
-            && let Some(bytes) = pty::mouse_bytes(mouse, column as u16, row as u16, native.mode())
+            && mouse
+                .modifiers
+                .contains(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && let Some(link) = native.hyperlink(column as u16, row as u16)
         {
-            native.write(bytes);
+            copy(&link);
+            self.flash("Copied link destination");
+            return true;
+        }
+        if inside
+            && !self.terminal_selecting
+            && !self.terminal_selection_mode
+            && !mouse
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+            && !matches!(
+                mouse.kind,
+                MouseEventKind::ScrollUp
+                    | MouseEventKind::ScrollDown
+                    | MouseEventKind::ScrollLeft
+                    | MouseEventKind::ScrollRight
+            )
+            && native
+                .mode()
+                .intersects(alacritty_terminal::term::TermMode::MOUSE_MODE)
+        {
+            native.mouse(mouse, column as u16, row as u16);
             return true;
         }
         match mouse.kind {
@@ -5462,7 +5689,8 @@ impl Guard {
             io::stdout(),
             EnterAlternateScreen,
             EnableMouseCapture,
-            crossterm::event::EnableBracketedPaste
+            crossterm::event::EnableBracketedPaste,
+            crossterm::event::EnableFocusChange
         )?;
         let enhanced = keys && crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
         if enhanced {
@@ -5470,6 +5698,8 @@ impl Guard {
                 io::stdout(),
                 crossterm::event::PushKeyboardEnhancementFlags(
                     crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                        | crossterm::event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                        | crossterm::event::KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
                 )
             )?;
         }
@@ -5486,6 +5716,7 @@ impl Drop for Guard {
             io::stdout(),
             crossterm::cursor::SetCursorStyle::DefaultUserShape,
             crossterm::event::DisableBracketedPaste,
+            crossterm::event::DisableFocusChange,
             DisableMouseCapture,
             LeaveAlternateScreen
         );
@@ -6968,6 +7199,47 @@ mod tests {
         ui.switch_tab(2);
         let listed = frame(&ui, 150, 40).join("\n");
         assert!(listed.contains("Tests pass; opening the PR"), "{listed}");
+    }
+
+    #[test]
+    fn voice_that_never_answers_cannot_hold_the_keys() {
+        // Nathan, 2026-10-06: keys stopped working, Ctrl+Q did not quit, until the
+        // terminal tab was closed.
+        let mut ui = Ui::new(demo::world());
+        ui.switch_tab(1);
+        let input = ui.draft_key().expect("a conversation is open");
+        let mut waiting = voice::VoiceState::stand_in(&input);
+        waiting.started = Instant::now() - Duration::from_secs(30);
+        ui.voice = Some(waiting);
+        ui.step_voice();
+        assert!(ui.voice.is_none(), "a helper silent for 30 s is given up");
+        assert!(
+            ui.flash.as_ref().is_some_and(|(text, _)| text.contains("keys work again")),
+            "{:?}",
+            ui.flash
+        );
+        // While it listens, a chord is not swallowed: Ctrl+Q quits.
+        ui.voice = Some(voice::VoiceState::stand_in(&input));
+        ui.key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+        assert!(ui.voice.is_none());
+        assert!(ui.quit, "Ctrl+Q went through");
+        // Plain typing still waits (it must not mix into the words) and Esc drops them.
+        let mut ui = Ui::new(demo::world());
+        ui.switch_tab(1);
+        let input = ui.draft_key().unwrap();
+        let mut heard = voice::VoiceState::stand_in(&input);
+        heard.device = "Built-in microphone".into();
+        ui.voice = Some(heard);
+        ui.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(ui.voice.is_some());
+        ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(ui.voice.is_none());
+        // Leaving its conversation ends it.
+        let mut away = voice::VoiceState::stand_in("agent/example/someone-else");
+        away.device = "Built-in microphone".into();
+        ui.voice = Some(away);
+        ui.step_voice();
+        assert!(ui.voice.is_none());
     }
 
     #[test]

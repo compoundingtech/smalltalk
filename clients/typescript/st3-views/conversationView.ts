@@ -135,7 +135,7 @@ function pingId(text: string): string | undefined {
  */
 /**
  * How a message's signature reads beside its sender: the device that signed it and whether that
- * checks ("✓ thinboi (secure enclave)"). A message with no signature is usually just old, so it
+ * checks ("✓ example phone (secure enclave)"). A message with no signature is usually just old, so it
  * says nothing. The same words as stui's `signature_mark`.
  */
 export function signatureMark(provenance: unknown): string | undefined {

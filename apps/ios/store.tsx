@@ -9,7 +9,7 @@ import app from './app.json';
 import { canVerifyPairing, createDeviceKey, removeDeviceKey, signWithDeviceKey, verifyGrantSignature } from './modules/st-device-key';
 import { REPAIR_WARNING, validatePairingTrust, verifyPairing } from './pairingProof';
 import { emptyData, encodeProjectionCache, hydrateProjectionForPairedDevice, PROJECTION_CACHE_KEY, type Data } from './projectionCache';
-import { listCollectionPages } from './collectionPages';
+import { listCollectionPages, mergedRows } from './collectionPages';
 import { rememberBounded } from './boundedCache';
 import { withFreshTerminalFence } from './terminalControls';
 import { Feed } from './feed';
@@ -230,7 +230,7 @@ function useAppStore(proof?: FabricProfile) {
       if (key === 'sessions') return listSessionPages(options => client.sessionsList(options), limit).then(rows => ({ rows, truncated: false }));
       const list = key === 'launches' ? client.launchesList.bind(client) : key === 'machines' ? client.machinesList.bind(client) : client.devicesList.bind(client);
       const kind = key === 'launches' ? 'launch' : key === 'machines' ? 'machine' : 'device';
-      return listCollectionPages(options => list(options), limit).then(result => ({ rows: result.pages.flatMap(page => page.value.items.filter(item => (item as { kind: string }).kind === kind)) as unknown as Data[OnDemand], truncated: result.truncated }));
+      return listCollectionPages(options => list(options), limit).then(result => ({ rows: mergedRows(result.pages.flatMap(page => page.value.items.filter(item => (item as { kind: string }).kind === kind)) as Array<{ id?: string }>) as unknown as Data[OnDemand], truncated: result.truncated }));
     };
     const results = await Promise.allSettled(keys.map(read));
     if (generation !== cacheGeneration.current) return;

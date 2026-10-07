@@ -2272,7 +2272,8 @@ fn client_agent_resources_uncached(
     history: bool,
     snapshot_index: u64,
 ) -> anyhow::Result<Vec<Value>> {
-    client_agent_resources_selected(store, history, snapshot_index, None)
+    let status = store.status_for_subject_prefix_at("agent/", Some(snapshot_index), history)?;
+    client_agent_resources_from_status(store, history, snapshot_index, None, status)
 }
 
 fn client_agent_resources_selected(
@@ -2281,14 +2282,19 @@ fn client_agent_resources_selected(
     snapshot_index: u64,
     changed: Option<(&BTreeSet<String>, &[Value])>,
 ) -> anyhow::Result<Vec<Value>> {
-    // Without history the store reduces only agents that can be current, including unhealthy
-    // ones; the filters below keep the current layer either way.
-    let status = match changed {
-        Some((subjects, _)) => {
-            store.status_for_subject_names_at(subjects.clone(), snapshot_index, history)?
-        }
-        None => store.status_for_subject_prefix_at("agent/", Some(snapshot_index), history)?,
-    };
+    let status = store.agent_card_status_at(
+        changed.map(|(subjects, _)| subjects), snapshot_index, history,
+    )?;
+    client_agent_resources_from_status(store, history, snapshot_index, changed, status)
+}
+
+fn client_agent_resources_from_status(
+    store: &Store,
+    history: bool,
+    snapshot_index: u64,
+    changed: Option<(&BTreeSet<String>, &[Value])>,
+    status: StatusResponse,
+) -> anyhow::Result<Vec<Value>> {
     // Local harness/runtime observations do not change queues or their labels. Retain those
     // fields from the previous cards rather than scanning the fleet's work again.
     let retain_queues = changed.is_some_and(|(subjects, previous)| {
@@ -8885,7 +8891,7 @@ fn record_planning_event(
         .map_err(ApiError::bad)?;
     state
         .store
-        .rebuild_claim_projections()
+        .rebuild_planning_projection()
         .map_err(ApiError::internal)?;
     Ok(())
 }
@@ -20531,6 +20537,103 @@ mission "wake" state="ready" {
     }
 
     #[test]
+    fn agent_card_status_preserves_declared_and_canonical_fallback_revisions() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = &state.store;
+        let source = "version 2\nagent \"declared\" { name \"Same\"; command \"true\" }\n";
+        let intent = crate::graph::parse_test_intent(source, "node").unwrap();
+        let planned = store.mission(&intent, IntentInput {
+            kdl: source.into(), source_name: None,
+        }).unwrap();
+        store.apply(&intent, &planned.subject_tokens, "card-status-fixture").unwrap();
+        let append = |subject: &str, kind: &str, fields: Value| {
+            store.append_claim(&ClaimInput {
+                subject: subject.into(), kind: kind.into(), actor: Some(subject.into()),
+                fields: serde_json::from_value(fields).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap()
+        };
+        append("agent/node.declared", "runtime.observed", json!({
+            "status":"running", "runtime_id":"declared", "incarnation_id":"one"
+        }));
+        let runtime = append("agent/undeclared", "runtime.observed", json!({
+            "status":"running", "runtime_id":"undeclared", "incarnation_id":"one"
+        }));
+        append("agent/undeclared", "harness.observed", json!({
+            "state":"working", "driver":"omp", "incarnation_id":"one"
+        }));
+        let first = store.index().unwrap();
+        let last = append("agent/undeclared", "harness.observed", json!({
+            "state":"idle", "driver":"omp", "incarnation_id":"one"
+        }));
+        for index in [first, last.store_index] {
+            store.read_snapshot(|_| {
+                let full = client_agent_resources_uncached(store, false, index)?;
+                let cards = client_agent_resources_selected(store, false, index, None)?;
+                assert_eq!(Sha256::digest(serde_json::to_vec(&cards)?),
+                    Sha256::digest(serde_json::to_vec(&full)?));
+                let status = store.status_for_subject_prefix_at("agent/", Some(index), false)?;
+                let declared = status.subjects.iter().find(|s| s.subject == "agent/node.declared").unwrap();
+                assert_eq!(cards.iter().find(|c| c["id"] == declared.subject).unwrap()["revision"],
+                    declared.desired_revision.as_ref().unwrap().as_str());
+                let undeclared = status.subjects.iter().find(|s| s.subject == "agent/undeclared").unwrap();
+                assert_eq!(cards.iter().find(|c| c["id"] == undeclared.subject).unwrap()["revision"],
+                    undeclared.claims.last().unwrap().as_str());
+                Ok(())
+            }).unwrap();
+        }
+        // Equal accepted times must use canonical writer order, not arrival or claim ID.
+        // Construct that metadata tie on this isolated fixture, with the first claim last.
+        {
+            let connection = store.connection.write();
+            connection.execute(
+                "UPDATE claims SET accepted_at_unix_ms='1000' WHERE subject='agent/undeclared'", [],
+            ).unwrap();
+            connection.execute("UPDATE batches SET origin='zz-card-tie' WHERE id=?1", [&runtime.batch_id]).unwrap();
+            connection.execute("UPDATE claims SET origin='zz-card-tie' WHERE batch_id=?1", [&runtime.batch_id]).unwrap();
+        }
+        store.forget_current_views();
+        let index = store.index().unwrap();
+        let full = client_agent_resources_uncached(store, false, index).unwrap();
+        let cards = client_agent_resources_selected(store, false, index, None).unwrap();
+        assert_eq!(Sha256::digest(serde_json::to_vec(&cards).unwrap()),
+            Sha256::digest(serde_json::to_vec(&full).unwrap()));
+        assert_eq!(cards.iter().find(|c| c["id"] == "agent/undeclared").unwrap()["revision"],
+            runtime.id);
+    }
+
+    #[test]
+    #[ignore = "requires ST3_AGENT_CORPUS naming an owned disposable corpus copy"]
+    fn agent_card_status_copied_corpus_parity() {
+        let path = std::env::var_os("ST3_AGENT_CORPUS").expect("owned corpus copy required");
+        for history in [false, true] {
+            let oracle = Store::open(Path::new(&path), "card-status-benchmark").unwrap();
+            let store = Store::open(Path::new(&path), "card-status-benchmark").unwrap();
+            let read = |store: &Store, full: bool| {
+                let before = smallclaims::sqlite::work::total();
+                let start = Instant::now();
+                let cards = store.read_snapshot(|index| {
+                    store.with_owned_set_snapshot_reads(|| {
+                        if full { client_agent_resources_uncached(store, history, index) }
+                        else { client_agent_resources_selected(store, history, index, None) }
+                    })
+                }).unwrap();
+                let work = smallclaims::sqlite::work::total() - before;
+                eprintln!("agent-card-status full={full} history={history} elapsed_ms={} sql={} vm_steps={} cards={}",
+                    start.elapsed().as_millis(), work.statements, work.vm_steps, cards.len());
+                cards
+            };
+            let full = read(&oracle, true);
+            let cards = read(&store, false);
+            let full_hash = hex::encode(Sha256::digest(serde_json::to_vec(&full).unwrap()));
+            let card_hash = hex::encode(Sha256::digest(serde_json::to_vec(&cards).unwrap()));
+            assert_eq!(card_hash, full_hash);
+            eprintln!("agent-card-status history={history} sha256={card_hash}");
+        }
+    }
+
+    #[test]
     fn agent_cards_advance_locally_and_keep_historical_snapshots() {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
@@ -20995,12 +21098,25 @@ mission "agent-human" state="ready" {
         // The harness schema's terminal activity keeps precedence over a stale ask.
         observe_harness("ended");
         assert_eq!(agent()["state"], "failed");
+        assert!(agent()["blocked_on"].is_null());
+        assert!(agent()["ask"].is_null());
         // Indeterminate activity keeps its existing waiting verdict; clients must not
         // present it as an answerable human ask.
         observe_harness("indeterminate");
         assert_eq!(agent()["state"], "waiting");
         assert_eq!(agent()["harness_state"], "indeterminate");
+        assert!(agent()["blocked_on"].is_null());
+        assert!(agent()["ask"].is_null());
+        // A sparse working successor in this incarnation must not revive the old ask.
+        append("harness.observed", json!({
+            "state": "working", "driver": "omp", "incarnation_id": "human-1",
+        }));
+        assert_eq!(agent()["state"], "running");
+        assert!(agent()["blocked_on"].is_null());
+        assert!(agent()["ask"].is_null());
+        // A fresh permission observation may block again.
         observe_harness("working");
+        assert_eq!(agent()["state"], "waiting");
         observe_runtime("stopped");
         assert_eq!(agent()["state"], "stopped");
         observe_runtime("starting");

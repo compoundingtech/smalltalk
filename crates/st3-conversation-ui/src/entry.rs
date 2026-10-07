@@ -83,7 +83,7 @@ pub enum Body {
         delivered: bool,
         /// Spoken and transcribed (st's `dictated` tag): it may hold transcription mistakes.
         dictated: bool,
-        /// Who signed it and whether that checks, as a person reads it ("✓ thinboi (secure
+        /// Who signed it and whether that checks, as a person reads it ("✓ example phone (secure
         /// enclave)"); set only for a message a person wrote.
         #[serde(skip_serializing_if = "Option::is_none")]
         signed: Option<String>,

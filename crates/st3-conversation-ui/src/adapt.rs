@@ -42,7 +42,7 @@ fn not_yet(error: &st3_client::TimelineErrorBody) -> bool {
 /// Draw one conversation as st joined it: the harness's turns and the agent's Small Talk, in
 /// the order st sent them.
 /// How a message's signature reads beside its sender: the device that signed it and whether
-/// that checks ("✓ thinboi (secure enclave)"). A message st holds no signature for is usually
+/// that checks ("✓ example phone (secure enclave)"). A message st holds no signature for is usually
 /// just old, so it says nothing and a conversation is not covered in "unsigned".
 pub fn signature_mark(provenance: &st3_client::MessageProvenance) -> Option<String> {
     let who = provenance
@@ -64,6 +64,10 @@ pub fn signature_mark(provenance: &st3_client::MessageProvenance) -> Option<Stri
         _ => None,
     }
 }
+
+/// Said once at the start of a conversation st read only the newest part of.
+const NATIVE_PREFIX_NOTE: &str =
+    "Earlier history is not shown: st reads only the newest part of this agent's transcript";
 
 pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>) -> Vec<Entry> {
     let name = |id: &str| -> String {
@@ -357,10 +361,7 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
             (_, TimelineBody::Truncation(truncation))
                 if truncation.reason.contains("native transcript prefix") =>
             {
-                Body::Event(
-                    "Earlier history is not shown: st reads only the newest part of this agent's transcript"
-                        .into(),
-                )
+                Body::Event(NATIVE_PREFIX_NOTE.into())
             }
             (_, TimelineBody::Truncation(truncation)) => Body::Event(format!(
                 "history omitted: {} (sequences {}–{}{})",
@@ -410,6 +411,11 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
         append_unpaired_media(&mut stamped, pending, message, &name);
     }
     stamped.sort_by(|a, b| a.0.cmp(&b.0));
+    // That earlier history is not shown is said at the start, where the history would be, not at
+    // the time st stamped the note with (the session's last update: the bottom, by the box).
+    stamped.sort_by_key(|(_, entry)| {
+        !matches!(&entry.body, Body::Event(text) if text == NATIVE_PREFIX_NOTE)
+    });
     for (_, entry) in &mut stamped {
         if let Body::Mail {
             delivered: mark, ..

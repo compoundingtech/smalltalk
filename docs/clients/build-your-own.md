@@ -32,6 +32,11 @@ agents. The conversation follows its end, showing the recent page and saying whe
 history exists. This example has no history scrolling, search, terminal attachment, fold toggles,
 read acknowledgements, attachments or persistent cache; the pieces for those are described below.
 
+Agent rows are ordered by effective display name, then resource ID. HTTP agents pagination
+captures immutable final cards with its first page; later pages retain their original values
+even when agents change. Card reads use declaration revision directly when present, otherwise
+the last canonical claim, and use observed harness evidence rather than status-only work hints.
+
 Open [main.rs](../../examples/client-tui/src/main.rs) for startup/input and
 [lib.rs](../../examples/client-tui/src/lib.rs) for update handling, layout and sending.
 

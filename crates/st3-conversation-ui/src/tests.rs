@@ -642,6 +642,35 @@ fn claude_skill_renders_folded_and_opens_with_its_newlines_and_quoted_tag() {
 }
 
 #[test]
+fn the_note_that_earlier_history_is_not_shown_is_at_the_start_not_the_bottom() {
+    // Nathan, 2026-10-06: the note showed at the bottom of a conversation, by the message box.
+    let entry = |index: u64, kind: &str, body: serde_json::Value, at: &str| -> st3_client::TimelineEntry {
+        serde_json::from_value(serde_json::json!({
+            "id": format!("entry/{index}"), "sequence": index, "revision": 1,
+            "timestamp": at, "role": "assistant", "final": true, "type": kind, "body": body
+        }))
+        .unwrap()
+    };
+    let timeline = vec![
+        entry(1, "content", serde_json::json!({"media_type":"text/plain","text":"first words"}), "2026-10-05T10:00:00Z"),
+        entry(2, "content", serde_json::json!({"media_type":"text/plain","text":"last words"}), "2026-10-05T11:00:00Z"),
+        entry(
+            0,
+            "truncation",
+            serde_json::json!({"reason":"the native transcript prefix is outside the bounded read window","omitted_from_sequence":0,"omitted_to_sequence":0}),
+            "2026-10-06T09:00:00Z",
+        ),
+    ];
+    let rendered = adapt::conversation(&timeline, &Default::default());
+    let shown = rendered
+        .iter()
+        .map(|entry| serde_json::to_string(&entry.body).unwrap())
+        .collect::<Vec<_>>();
+    assert!(shown[0].contains("Earlier history is not shown"), "{shown:?}");
+    assert!(shown.last().unwrap().contains("last words"), "{shown:?}");
+}
+
+#[test]
 fn exposed_timeline_variants_and_media_are_visible_without_unknown_payloads() {
     let bodies = [
         (

@@ -1527,6 +1527,7 @@ The seat's bare `fresh-context` node starts a new harness session before each st
 A seat's bare `handles-faults` node makes it the fleet's fault agent: it receives each fault that no step assignee or agent requester owns, such as a failed loop on a run a person requested. When several live seats carry it, the first by subject takes them. Faults never go to a person's attention.
 
 Two seat faults reach that owner so a seat that cannot start is never found by looking. A seat parked by the crash-loop guard is a fault that carries the driver's last `harness.diagnostic` (its code and reason). A seat that is declared to run but that no runtime observation has ever described for ten minutes, which `st agents ls` shows as `desired`, is a fault too ("An agent seat has not started", with the same diagnostic, or the note that the driver never ran). Both end when the seat's runtime is observed or its declaration changes. A mission's seat reaches the run's requester first, like any other fault.
+Codex compares the model ID and effort returned by a saved-thread resume with the declaration exactly. If Codex normalizes a declared model alias to a different ID, the driver fails before binding; three failed starts park the seat under the Codex crash-loop guard until its declaration changes.
 Typed harnesses always run their real interactive TUI in a PTY. Claude always loads the native st
 channel. Use `exec {}` for non-interactive provider commands.
 

@@ -1035,6 +1035,10 @@ PTY's atomic SCREEN replay followed by live DATA, GEOMETRY and EXIT unchanged. T
 one PTY connection for the transport lifetime. ATTACH and RESIZE therefore participate in normal
 per-axis min-wins geometry with other persistent writers; PEEK cannot send input, resize, upgrade
 to ATTACH, or contribute geometry. DETACH and closing the transport release the connection.
+After ATTACH, an empty PTY frame of type 11 (`ResetInputModes`) can recover the daemon's
+input modes without writing reset bytes to the child. PEEK connections and nonempty reset
+frames are refused. The normal screen/history survive, and the daemon broadcasts the reset
+as DATA. Older PTY daemons ignore this extension.
 Raw clients cannot issue PTY lifecycle/CAS or ancestry-management commands through this capability.
 Bounded chunks and socket backpressure preserve every byte; slow consumers do not skip output.
 
