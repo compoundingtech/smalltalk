@@ -80,11 +80,13 @@ it does not retry any of these HTTP requests.
 Repository pull-request GraphQL reads start with 20 open pulls per cursor page and preserve
 the existing nested review, check and merge-queue selections. GitHub's “Something went wrong
 while executing your query” refusal retries the same cursor with half as many pulls, down to
-one, and keeps that smaller size for the remaining pages. Debug logs record each page size;
-retry warnings record the failed and reduced sizes. Other failures, or an execution refusal
-at one pull, fail the observation without caching any partial result. The complete listing
-remains bounded at 1,000 open pulls regardless of page size; exceeding it or receiving a
-non-advancing continuation cursor fails rather than silently truncating facts.
+one. Each successful continuation page doubles the next page's size back toward 20, and each
+new observation starts at 20. Debug logs record each page size; retry warnings record the
+failed and reduced sizes. Other failures, or an execution refusal at one pull, fail the
+observation without caching any partial result. The complete listing remains bounded at
+1,000 open pulls regardless of page size. An observation also permits at most 200 GraphQL
+calls, including retries and empty pages with advancing cursors. Exceeding either bound or
+receiving a non-advancing continuation cursor fails rather than silently truncating facts.
 
 ## Main Performance failure messages
 

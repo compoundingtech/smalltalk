@@ -54,6 +54,9 @@ const OPEN_PULL_REQUEST_LIMIT: usize = 1_000;
 /// Keep the nested reviews and check contexts below GitHub's query execution limit.
 const PULL_REQUEST_PAGE_SIZE: usize = 20;
 
+/// Include retries and empty continuation pages in the bound on one observation's API work.
+const PULL_REQUEST_CALL_LIMIT: usize = 200;
+
 /// The most mentions one item keeps, newest first.
 const ITEM_MENTIONS: usize = 50;
 
@@ -1457,11 +1460,17 @@ async fn open_pull_requests(
     let mut after = Value::Null;
     let mut identities_read = 0;
     let mut page_size = PULL_REQUEST_PAGE_SIZE;
+    let mut calls = 0;
     loop {
         anyhow::ensure!(
             nodes.len() < OPEN_PULL_REQUEST_LIMIT,
             "the repository has more than {OPEN_PULL_REQUEST_LIMIT} open pull requests"
         );
+        anyhow::ensure!(
+            calls < PULL_REQUEST_CALL_LIMIT,
+            "the GitHub pull request observation exceeded {PULL_REQUEST_CALL_LIMIT} GraphQL calls"
+        );
+        calls += 1;
         tracing::debug!(owner, repository, page_size, "reading GitHub pull request page");
         let data = match github_graphql(
             client,
@@ -1524,6 +1533,7 @@ async fn open_pull_requests(
             .filter(|cursor| cursor.is_string() && **cursor != after)
             .context("the GitHub pull request page has no advancing cursor")?;
         after = next.clone();
+        page_size = (page_size * 2).min(PULL_REQUEST_PAGE_SIZE);
     }
     let mut required = BTreeMap::<String, Option<Vec<RequiredCheck>>>::new();
     for node in &nodes {
@@ -1968,11 +1978,53 @@ mod tests {
         assert_eq!(details.open[2]["number"], 3);
         let requests = github.graphql_requests.lock();
         assert_eq!(requests.iter().map(|request| request["variables"]["first"].as_u64().unwrap())
-            .collect::<Vec<_>>(), [20, 20, 10, 10]);
+            .collect::<Vec<_>>(), [20, 20, 10, 20]);
         assert_eq!(requests[1]["variables"]["after"], "next");
         assert_eq!(requests[2]["variables"]["after"], "next");
         assert_eq!(requests[1]["variables"]["ids"], requests[2]["variables"]["ids"]);
         assert_eq!(requests[3]["variables"]["after"], "last");
+    }
+
+    #[tokio::test]
+    async fn successful_pages_recover_from_one_pull_to_the_default_page_size() {
+        let (github, base) = FakeGithub::start().await;
+        let mut pages = github.graphql_pages.lock();
+        for _ in 0..4 {
+            pages.push_back(json!({"errors": [{
+                "message": "Something went wrong while executing your query",
+            }]}));
+        }
+        for number in 1..=6 {
+            let cursor = format!("page-{number}");
+            pages.push_back(pull_page(
+                json!([open_pull(number, "head", "SUCCESS")]),
+                (number < 6).then_some(cursor.as_str()), json!([]),
+            ));
+        }
+        drop(pages);
+        let details = read_pull_pages(&base, &[]).await.unwrap();
+        assert_eq!(details.open.len(), 6);
+        let requests = github.graphql_requests.lock();
+        assert_eq!(requests.iter().map(|request| request["variables"]["first"].as_u64().unwrap())
+            .collect::<Vec<_>>(), [20, 10, 5, 2, 1, 2, 4, 8, 16, 20]);
+        assert!(requests[..5].iter().all(|request| request["variables"]["after"].is_null()));
+        assert_eq!(requests[5]["variables"]["after"], "page-1");
+    }
+
+    #[tokio::test]
+    async fn empty_advancing_pages_exhaust_the_call_cap_without_caching() {
+        let (github, base) = FakeGithub::start().await;
+        github.graphql_pages.lock().extend((0..PULL_REQUEST_CALL_LIMIT).map(|page| {
+            pull_page(json!([]), Some(&format!("page-{page}")), json!([]))
+        }));
+        let error = read_pull_pages(&base, &[]).await.err().unwrap();
+        assert!(error.to_string().contains("exceeded 200 GraphQL calls"));
+        let requests = github.graphql_requests.lock();
+        assert_eq!(requests.len(), PULL_REQUEST_CALL_LIMIT);
+        assert_eq!(requests[199]["variables"]["after"], "page-198");
+        assert!(!pull_request_checks().lock().unwrap_or_else(PoisonError::into_inner).contains_key(
+            &format!("{base} github/acme/garden"),
+        ));
     }
 
     #[tokio::test]
