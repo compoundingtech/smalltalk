@@ -2685,11 +2685,15 @@ enum DocCommand {
         #[arg(long = "as")]
         name: String,
     },
-    /// Read exact document bytes by immutable name-and-hash reference.
+    /// Read a document by name (the newest version) or by immutable name-and-hash reference.
+    /// Printed to a terminal, markdown is rendered; a pipe, --output and --raw give the bytes.
     Get {
         reference: String,
         #[arg(long)]
         output: Option<PathBuf>,
+        /// Print the document's bytes as stored, even on a terminal.
+        #[arg(long)]
+        raw: bool,
     },
     /// List selected document bindings; use --all for immutable version history.
     Ls {
@@ -11643,6 +11647,30 @@ async fn run_rules(
     }
 }
 
+/// A document as terminal markdown, or `None` when it is not text (a binary, or JSON and KDL
+/// that read better as they are), so it prints as stored.
+fn render_document(bytes: &[u8], width: usize) -> Option<String> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let start = text.trim_start();
+    if text.contains('\0') || start.starts_with('{') || start.starts_with('[') || start.starts_with("version ") {
+        return None;
+    }
+    let theme = st3_conversation_ui::Theme::default();
+    let lines = st3_conversation_ui::text::markdown(
+        text,
+        width.saturating_sub(2),
+        theme.text(),
+        &theme,
+    );
+    Some(
+        lines
+            .iter()
+            .map(|line| format!("  {}", st3_conversation_ui::text::ansi(line)))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
 async fn run_doc(client: &Client, command: DocCommand, json_output: bool) -> Result<()> {
     match command {
         DocCommand::Put { file, name } => {
@@ -11687,7 +11715,11 @@ async fn run_doc(client: &Client, command: DocCommand, json_output: bool) -> Res
                 Ok(())
             }
         }
-        DocCommand::Get { reference, output } => {
+        DocCommand::Get {
+            reference,
+            output,
+            raw,
+        } => {
             let reference = if reference.contains('@') {
                 reference
             } else {
@@ -11718,6 +11750,11 @@ async fn run_doc(client: &Client, command: DocCommand, json_output: bool) -> Res
             if let Some(output) = output {
                 fs::write(&output, bytes)
                     .with_context(|| format!("write document {}", output.display()))?;
+            } else if let Some(rendered) = (!raw && std::io::stdout().is_terminal())
+                .then(|| render_document(&bytes, terminal_columns().unwrap_or(100).clamp(20, 140)))
+                .flatten()
+            {
+                println!("{rendered}");
             } else {
                 use std::io::Write as _;
                 std::io::stdout().write_all(&bytes)?;
@@ -24352,6 +24389,17 @@ mod tests {
         }
         let raw = timeline_entries_text("session/example", &items);
         assert!(raw.contains("<task-notification>"), "raw keeps what was stored");
+    }
+
+    #[test]
+    fn documents_get_renders_markdown_on_a_terminal_and_leaves_data_alone() {
+        let rendered = render_document(b"# Title\n\nSome **bold** words.\n\n- one\n- two\n", 60).unwrap();
+        assert!(rendered.contains("Title") && rendered.contains("\x1b["), "{rendered:?}");
+        assert!(rendered.contains("bold") && !rendered.contains("**bold**"), "{rendered:?}");
+        // Data and binaries print as stored.
+        assert!(render_document(br#"{"a": 1}"#, 60).is_none());
+        assert!(render_document(b"version 2\nmission \"x\" {}", 60).is_none());
+        assert!(render_document(&[0xff, 0xfe, 0x00], 60).is_none());
     }
 
     #[test]
