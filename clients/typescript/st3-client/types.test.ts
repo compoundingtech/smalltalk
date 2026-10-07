@@ -1,4 +1,13 @@
 import type { ActionOf, ConversationSearchHit, TimelineMessageBody } from './Models.generated.ts';
+import type { ClientOptions, TraceContext } from './Client.generated.ts';
+
+const traceContext: TraceContext = {
+    traceparent: '00-0123456789abcdef0123456789abcdef-0123456789abcdef-01',
+    tracestate: 'vendor=value',
+};
+const tracedOptions: ClientOptions = { baseUrl: 'https://example.test', traceContext: () => traceContext };
+const untracedOptions: ClientOptions = { baseUrl: 'https://example.test', traceContext: () => undefined };
+void [tracedOptions, untracedOptions];
 
 const valid: ActionOf<'launch.approve'> = {
     api_version: 'st3.client.v0',

@@ -22,6 +22,67 @@ const capabilityFixture = require('../../../docs/st3/client-v0/fixtures/capabili
 const cursorGapFixture = require('../../../docs/st3/client-v0/fixtures/cursor-gap-error.json');
 const capabilities = { ...capabilityFixture.value, limits: { ...capabilityFixture.value.limits, max_page_items: 2, max_event_items: 3, max_wait_ms: 10 } };
 
+const validTraceparent = '00-0123456789abcdef0123456789abcdef-0123456789abcdef-01';
+const traceCases = [
+    ['absent callback', undefined, undefined],
+    ['undefined context', () => undefined, undefined],
+    ['valid context', () => ({ traceparent: validTraceparent }), { traceparent: validTraceparent }],
+    ['verbatim tracestate', () => ({ traceparent: validTraceparent, tracestate: 'vendor=value,other=opaque' }), { traceparent: validTraceparent, tracestate: 'vendor=value,other=opaque' }],
+    ['empty tracestate', () => ({ traceparent: validTraceparent, tracestate: '' }), { traceparent: validTraceparent, tracestate: '' }],
+    ...[
+        'not-a-traceparent',
+        validTraceparent.toUpperCase(),
+        validTraceparent + '\n',
+        'ff' + validTraceparent.slice(2),
+        '00-00000000000000000000000000000000-0123456789abcdef-01',
+        '00-0123456789abcdef0123456789abcdef-0000000000000000-01',
+    ].map(parent => [`invalid ${JSON.stringify(parent)}`, () => ({ traceparent: parent, tracestate: 'vendor=must-not-leak' }), undefined]),
+];
+
+for (const [name, callback, expected] of traceCases) {
+    test(`trace context: ${name} on HTTP and every WebSocket open`, async () => {
+        let reads = 0;
+        const headers = [];
+        const client = new St3Client({
+            baseUrl: 'https://example.test',
+            ...(callback === undefined ? {} : { traceContext: () => { reads++; return callback(); } }),
+            fetchImpl: async (_url, init) => { headers.push(init.headers); return response(envelope(capabilities)); },
+        });
+        const socket = (_url, _protocols, fields) => {
+            headers.push(fields);
+            return { onopen: null, onmessage: null, onclose: null, onerror: null, send() {}, close() {} };
+        };
+        await client.capabilities();
+        const terminal = await client.terminalStream('terminal/test', { streamCapability: 'proof', onScreen() {}, socket });
+        const conversation = await client.conversationStream('session/test', { onChange() {}, socket });
+        const collection = await client.collectionStream({ onFrame() {}, socket });
+        terminal.close();
+        conversation.close();
+        collection.close();
+        assert.equal(headers.length, 4);
+        assert.equal(reads, callback === undefined ? 0 : 4);
+        for (const fields of headers) {
+            assert.equal(fields.traceparent, expected?.traceparent);
+            assert.equal(fields.tracestate, expected?.tracestate);
+            assert.equal(Object.hasOwn(fields, 'traceparent'), expected !== undefined);
+            assert.equal(Object.hasOwn(fields, 'tracestate'), expected?.tracestate !== undefined);
+        }
+    });
+}
+
+test('trace context is read afresh for each HTTP request', async () => {
+    let active;
+    const headers = [];
+    const client = new St3Client({ baseUrl: 'https://example.test', traceContext: () => active,
+        fetchImpl: async (_url, init) => { headers.push(init.headers); return response(envelope(capabilities)); } });
+    await client.capabilities();
+    active = { traceparent: validTraceparent };
+    await client.capabilities();
+    active = undefined;
+    await client.capabilities();
+    assert.deepEqual(headers.map(fields => fields.traceparent), [undefined, validTraceparent, undefined]);
+});
+
 test('discovers capabilities, bounds pages, and encodes opaque cursors', async () => {
     const calls = [];
     const client = new St3Client({ baseUrl: 'https://example.test/', credential: () => 'secret', fetchImpl: async (url, init) => {
