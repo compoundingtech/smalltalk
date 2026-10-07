@@ -259,6 +259,7 @@ impl CollectionStream {
         self.subscribe_filtered(id, collection, limit, actor, status, None).await
     }
     /// Subscribe to a server-filtered collection window.
+    /// The server rejects filters exceeding 256 UTF-8 bytes; it never truncates the text.
     pub async fn subscribe_filtered(
         &mut self,
         id: &str,
@@ -749,6 +750,7 @@ impl Client {
         self
     }
     /// Apply literal id/name/title filtering on the server before list pagination.
+    /// The server rejects filters exceeding 256 UTF-8 bytes; this builder remains infallible.
     pub fn with_list_filter(mut self, filter: Option<&str>) -> Self {
         self.list_filter = filter.filter(|text| !text.is_empty()).map(str::to_owned);
         self

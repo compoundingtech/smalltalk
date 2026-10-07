@@ -147,9 +147,28 @@ struct ClientSnapshot {
 /// A client page and the snapshot it was read in, which the envelope names.
 type ClientPageResponse = (Extension<ClientSnapshot>, Json<ClientResourcePage>);
 
+const LIST_FILTER_MAX_BYTES: usize = 256;
+const LIST_FILTER_LENGTH_ERROR: &str = "list filter must be at most 256 UTF-8 bytes";
+
+/// Bound work from query/subscription text before it reaches a collection reader.
+/// Empty text has the same semantics as an absent filter; whitespace remains literal.
+fn deserialize_list_filter<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let filter = Option::<String>::deserialize(deserializer)?;
+    if filter
+        .as_ref()
+        .is_some_and(|text| text.len() > LIST_FILTER_MAX_BYTES)
+    {
+        return Err(serde::de::Error::custom(LIST_FILTER_LENGTH_ERROR));
+    }
+    Ok(filter.filter(|text| !text.is_empty()))
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 struct ClientListQuery {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_list_filter")]
     filter: Option<String>,
     limit: Option<usize>,
     cursor: Option<String>,
@@ -169,7 +188,7 @@ struct ClientListQuery {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct ClientPageCursor {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_list_filter")]
     filter: Option<String>,
     snapshot: ClientSnapshot,
     collection: String,
@@ -1411,6 +1430,7 @@ fn list_item_matches(item: &Value, filter: Option<&str>) -> bool {
 
 #[derive(Default, Deserialize)]
 struct TextFilterQuery {
+    #[serde(default, deserialize_with = "deserialize_list_filter")]
     filter: Option<String>,
 }
 
@@ -10330,7 +10350,7 @@ async fn set_rule(
 
 #[derive(Deserialize)]
 struct DocumentQuery {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_list_filter")]
     filter: Option<String>,
     name: Option<String>,
     prefix: Option<String>,
@@ -10342,7 +10362,7 @@ struct DocumentQuery {
 
 #[derive(Serialize, Deserialize)]
 struct DocumentCursor {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_list_filter")]
     filter: Option<String>,
     name: String,
     created_index: u64,
@@ -11622,7 +11642,7 @@ struct MessagesQuery {
 
 #[derive(Deserialize)]
 struct MessagesPageQuery {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_list_filter")]
     filter: Option<String>,
     to: Option<String>,
     #[serde(default)]
@@ -11635,7 +11655,7 @@ struct MessagesPageQuery {
 
 #[derive(Serialize, Deserialize)]
 struct MessagesPageCursor {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_list_filter")]
     filter: Option<String>,
     after: u64,
     through: u64,
@@ -12359,7 +12379,7 @@ async fn mission_overview(
 
 #[derive(Deserialize)]
 struct OutcomeHistoryQuery {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_list_filter")]
     filter: Option<String>,
     collection: String,
     #[serde(default)]
@@ -13197,7 +13217,7 @@ async fn move_agent_queue(
 
 #[derive(Debug, Default, Deserialize)]
 struct LaneListQuery {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_list_filter")]
     filter: Option<String>,
     #[serde(default)]
     all: bool,

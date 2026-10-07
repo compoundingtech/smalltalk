@@ -10,7 +10,9 @@ import type {
 } from './Models.generated.ts';
 
 export type PageOptions = { cursor?: string; limit?: number };
+/** List `filter` values are limited to 256 UTF-8 bytes; the server rejects larger text. */
 export type TerminalListOptions = PageOptions & { history?: boolean; owner?: string; state?: string; filter?: string };
+/** Literal id/name/title text, at most 256 UTF-8 bytes, matched by the server before paging. */
 export type ListOptions = PageOptions & { history?: boolean; owner_run?: string; actor?: string; status?: string; native_only?: boolean; filter?: string };
 export type EventOptions = { after?: string; limit?: number; wait_ms?: number };
 export type ClientOptions = {
@@ -47,7 +49,8 @@ export type TerminalStreamOptions = {
 };
 export type TerminalStream = { close(): void };
 
-/** `person` applies to attention, `actor` to work, `status` to agents, and `filter` matches id/name/title before the window limit. */
+/** `person` applies to attention, `actor` to work, `status` to agents, and `filter` matches id/name/title before the window limit.
+ * A filter may contain at most 256 UTF-8 bytes; larger text is rejected by the server. */
 export type CollectionFilters = { person?: string | null; actor?: string | null; status?: string | null; filter?: string | null };
 /** The WebSocket surface the collections socket uses: a terminal socket that also sends. */
 export type CollectionSocket = TerminalSocket & {

@@ -27,6 +27,7 @@ pub(super) async fn request_latency(
 // more subscription on the same socket: whole screens, the latest only.
 #[derive(Clone, Deserialize)]
 struct CollectionSubscribe {
+    #[serde(default, deserialize_with = "deserialize_list_filter")]
     filter: Option<String>,
     kind: String,
     id: String,
@@ -679,9 +680,17 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                             if matches!(message, WsMessage::Close(_)) { return; }
                             break 'command;
                         };
-                        let Ok(request) = serde_json::from_str::<CollectionSubscribe>(&payload) else {
-                            if !send_collection(&mut socket, json!({"kind":"error", "message":"invalid collection command"})).await { return; }
-                            break 'command;
+                        let request = match serde_json::from_str::<CollectionSubscribe>(&payload) {
+                            Ok(request) => request,
+                            Err(error) => {
+                                let message = if error.to_string().contains(LIST_FILTER_LENGTH_ERROR) {
+                                    LIST_FILTER_LENGTH_ERROR
+                                } else {
+                                    "invalid collection command"
+                                };
+                                if !send_collection(&mut socket, json!({"kind":"error", "message":message})).await { return; }
+                                break 'command;
+                            }
                         };
                         if request.kind == "unsubscribe" {
                             if let Some(presence) = &presence { presence.unfollow(&request.id); }
@@ -9604,6 +9613,120 @@ mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt as _;
     use std::sync::Barrier;
+
+    #[tokio::test]
+    async fn list_http_filter_limits_count_utf8_bytes_and_normalize_empty_text() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        publish_list_filter_window_missions(&state);
+        let app = super::super::router(state);
+        for route in [
+            "/v1/client/missions",
+            "/v1/client/agents",
+            "/v1/documents",
+            "/v1/messages/page",
+            "/v1/outcome-history?collection=missions",
+            "/v1/lanes",
+            "/v1/rules",
+            "/v1/github/watches",
+        ] {
+            for filter in ["ä".repeat(129), "x".repeat(257)] {
+                let separator = if route.contains('?') { '&' } else { '?' };
+                let uri = format!("{route}{separator}filter={}", urlencoding::encode(&filter));
+                let response = app
+                    .clone()
+                    .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{route}");
+                let body = to_bytes(response.into_body(), CLIENT_MAX_RESPONSE_BYTES)
+                    .await
+                    .unwrap();
+                let body = String::from_utf8(body.to_vec()).unwrap();
+                assert!(body.contains(LIST_FILTER_LENGTH_ERROR), "{route}: {body}");
+            }
+        }
+        for filter in ["ä".repeat(128), "x".repeat(256)] {
+            let uri = format!(
+                "/v1/client/missions?filter={}",
+                urlencoding::encode(&filter)
+            );
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), CLIENT_MAX_RESPONSE_BYTES)
+                .await
+                .unwrap();
+            let page: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(page["value"]["filters"]["filter"], filter);
+            assert_eq!(page["value"]["items"], json!([]));
+        }
+        for uri in ["/v1/client/missions?filter=", "/v1/client/missions"] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), CLIENT_MAX_RESPONSE_BYTES)
+                .await
+                .unwrap();
+            let page: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(page["value"]["items"].as_array().unwrap().len(), 3);
+            assert!(page["value"]["filters"].get("filter").is_none(), "{page}");
+        }
+    }
+
+    #[tokio::test]
+    async fn collection_websocket_rejects_excessive_utf8_filter_and_accepts_boundary_and_empty() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        publish_list_filter_window_missions(&state);
+        let app = super::super::router(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut request = format!("ws://{address}/v1/client/collections/stream")
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            "Sec-WebSocket-Protocol",
+            COLLECTION_SUBPROTOCOL.parse().unwrap(),
+        );
+        let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        for (filter, expected_kind, expected_items) in [
+            ("ä".repeat(129), "error", 0),
+            ("ä".repeat(128), "snapshot", 0),
+            (String::new(), "snapshot", 3),
+        ] {
+            socket.send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({"kind":"subscribe","id":"filter-limit","collection":"missions","filter":filter,"limit":10}).to_string().into(),
+            )).await.unwrap();
+            let message = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let frame: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+            assert_eq!(frame["kind"], expected_kind, "{frame}");
+            if expected_kind == "error" {
+                assert_eq!(frame["message"], LIST_FILTER_LENGTH_ERROR);
+            } else {
+                assert_eq!(frame["id"], "filter-limit");
+                assert_eq!(frame["items"].as_array().unwrap().len(), expected_items);
+                assert_eq!(frame["has_more"], false);
+            }
+        }
+        socket.close(None).await.unwrap();
+        server.abort();
+    }
 
     fn publish_list_filter_window_missions(state: &AppState) {
         let source = r#"version 2

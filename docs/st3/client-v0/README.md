@@ -208,9 +208,10 @@ the stable `id` ascending. No locale-sensitive ordering is permitted.
 
 The agents, attention, devices, lanes, launches, messages, missions, sessions, sets, terminals,
 and work list routes also accept `filter=TEXT`. It is a case-insensitive literal substring of
-an item's id, name, or title. It composes with the other filters and runs on the server before
-pagination; page membership, counts, and `has_more` describe the matching collection. Empty
-text has the same membership as an omitted filter. Repeat the same filter and page size with
+an item's id, name, or title, limited to 256 UTF-8 bytes rather than 256 characters. The server
+rejects larger filters instead of truncating them. It composes with the other filters and runs
+on the server before pagination; page membership, counts, and `has_more` describe the matching
+collection. Empty text has the same membership as an omitted filter. Repeat the same filter and page size with
 `cursor`; changing either is refused. A nonempty filter is echoed exactly in `value.filters.filter`.
 Rust and TypeScript paged HTTP SDK methods refuse a response without that acknowledgment and
 ask for a server upgrade. Raw CLI reads and collection subscriptions do not yet verify the

@@ -4983,7 +4983,6 @@ impl Store {
         filter: Option<&str>,
     ) -> Result<Vec<DocumentVersion>> {
         let connection = self.readers.get();
-        register_list_filter_function(&connection)?;
         let query = "SELECT d.name, d.hash, b.size, d.created_index,
                      d.hash=(SELECT n.hash FROM documents n
                  WHERE n.name=d.name ORDER BY n.binding_key DESC LIMIT 1)

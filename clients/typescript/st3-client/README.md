@@ -10,9 +10,10 @@ The client uses standard `fetch`, so callers can supply a fetch implementation a
 
 Operational list methods accept `filter` in `ListOptions`, for example
 `client.workList({ filter: 'release review', limit: 10 })`. The server matches a literal,
-case-insensitive substring of id, name, or title before paging. Repeat the filter with the
-next cursor. Paged HTTP methods require the exact `value.filters.filter` acknowledgment and
-refuse older servers that silently ignore it. Collection subscriptions accept the same text in
+case-insensitive substring of id, name, or title before paging. Filters may contain at most
+256 UTF-8 bytes; the server rejects larger values instead of truncating them. Repeat the
+filter with the next cursor. Paged HTTP methods require the exact `value.filters.filter`
+acknowledgment and refuse older servers that silently ignore it. Collection subscriptions accept the same text in
 `CollectionFilters`: `stream.subscribe('work', 'work', 50, { filter: 'release review' })`.
 Subscriptions do not yet verify server acknowledgment.
 

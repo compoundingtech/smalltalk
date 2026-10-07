@@ -163,7 +163,6 @@ impl Store {
             "status must be failed, cancelled, timed-out, or completed"
         );
         let connection = self.readers.get();
-        smallclaims::store::register_list_filter_function(&connection)?;
         let kinds = if collection == "missions" {
             "c.kind='mission-run.state'"
         } else {

@@ -49,6 +49,7 @@ pub struct OwnRequest {
 
 #[derive(Clone, Debug, Deserialize)]
 pub(super) struct WatchesQuery {
+    #[serde(default, deserialize_with = "deserialize_list_filter")]
     filter: Option<String>,
     #[serde(default)]
     agent: Option<String>,

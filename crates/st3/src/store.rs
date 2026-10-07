@@ -3080,7 +3080,7 @@ impl Store {
         self.mission_collection_page_filtered(history, offset, limit, after, None)
     }
 
-    /// Match the projected mission identity/title before paging and card enrichment.
+    /// Match the projected mission identity before paging and card enrichment.
     /// Run summaries are still computed from the mission projection tables.
     pub(crate) fn mission_collection_page_filtered(
         &self,
@@ -3092,7 +3092,6 @@ impl Store {
     ) -> Result<Vec<(String, u128)>> {
         let ended_since = recently_ended_since();
         let connection = self.readers.get();
-        smallclaims::store::register_list_filter_function(&connection)?;
         let mut statement = connection.prepare(
             "WITH ids AS (
                 SELECT mission_id FROM mission_definitions
@@ -6712,7 +6711,6 @@ impl Store {
         // Both variants expose the same current subject/title fields. Matching before the
         // presentation reduction avoids replaying the histories of nonmatching steps.
         let query = if filter.is_some() {
-            smallclaims::store::register_list_filter_function(&connection)?;
             query.replace(
                 "         ORDER BY created_at_unix_ms, step_path",
                 "           AND (st_list_contains(subject,?4) OR st_list_contains(title,?4))\n         ORDER BY created_at_unix_ms, step_path",
@@ -6845,7 +6843,6 @@ impl Store {
     ) -> Result<(Vec<StepRunView>, bool)> {
         let actor = actor.map(|value| normalize_actor(value, "agent"));
         let connection = self.readers.get();
-        smallclaims::store::register_list_filter_function(&connection)?;
         // Enrichment can clear a step's claimant, through its effective state alone, but
         // never changes its assignee, its candidates or its update time. So this finds every
         // step the actor can see, in the order the history shows them, and a step it matches
@@ -52130,6 +52127,26 @@ mod harness_event_tests {
 #[cfg(test)]
 mod list_filter_tests {
     use super::*;
+
+    #[test]
+    fn list_filter_reads_preserve_an_active_cached_statement_on_the_pinned_reader() {
+        let store = Store::open_memory("filter").unwrap();
+        store.put_document("doc/one", b"one", &None, "one").unwrap();
+        store.put_document("doc/two", b"two", &None, "two").unwrap();
+        store.read_snapshot(|_| {
+            let connection = store.readers.get();
+            let mut statement = connection.prepare_cached("SELECT name FROM documents ORDER BY name")?;
+            let mut rows = statement.query([])?;
+            assert_eq!(rows.next()?.unwrap().get::<_, String>(0)?, "doc/one");
+            for filter in [None, Some("two")] {
+                let documents = store.list_documents_page_filtered(None, None, false, None, 2, filter)?;
+                assert_eq!(documents.len(), if filter.is_some() { 1 } else { 2 });
+            }
+            assert_eq!(rows.next()?.unwrap().get::<_, String>(0)?, "doc/two");
+            assert!(rows.next()?.is_none());
+            Ok(())
+        }).unwrap();
+    }
 
     #[test]
     fn list_filter_is_literal_unicode_and_applied_before_document_paging() {
