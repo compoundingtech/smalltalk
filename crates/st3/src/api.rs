@@ -58,6 +58,7 @@ use crate::model::{
 use crate::model::{PersonAskRequest, PersonStepResponse};
 use crate::store::Store;
 
+pub(crate) mod agent_card;
 mod client_blobs;
 mod client_adapters;
 mod client_presence;

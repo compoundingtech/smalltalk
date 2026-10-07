@@ -50,7 +50,7 @@ fn operation(connection: &Connection, subject: &str) -> Result<Option<Operation>
     operation_for_selection(connection, subject, &selected)
 }
 
-fn operation_for_selection(
+pub(super) fn operation_for_selection(
     connection: &Connection,
     subject: &str,
     selected: &Selection,

@@ -7,18 +7,43 @@
 
 use super::*;
 use smallclaims::ivm::install::{Namespace, Root};
+use smallclaims::ivm::{Definition, View};
 
 pub(crate) const VIEW: &str = "st3.agents.cards.v1";
 pub(crate) const SOURCE: &str = "st3.agent-card-source.v1";
 pub(crate) const FINGERPRINT: &str = "agent-cards.v1;namespace-v1;ordered-harness-v2;current-authority-v1;queue-v1;usage-v1;lifecycle-v1;local-clock-v1;public-card-v0";
 pub(crate) const WINDOW_LIMIT: usize = 200;
 
+struct CardView;
+impl View for CardView {
+    fn definition(&self) -> Definition {
+        Definition {
+            name: VIEW,
+            fingerprint: FINGERPRINT,
+            kinds: &[],
+            local_kinds: &[],
+            max_contributions: 1,
+        }
+    }
+    fn installed_source(&self) -> Option<&'static str> {
+        Some(SOURCE)
+    }
+    fn create_schema(&self, connection: &Connection) -> Result<()> {
+        create_schema(connection)
+    }
+}
+pub(crate) fn definitions() -> Vec<Box<dyn View>> {
+    vec![Box::new(CardView)]
+}
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS local_agent_card_rows (
  namespace TEXT NOT NULL, agent TEXT NOT NULL,
  name TEXT NOT NULL COLLATE BINARY, state TEXT NOT NULL,
  current INTEGER NOT NULL CHECK(current IN (0,1)),
- key_generation INTEGER NOT NULL CHECK(key_generation>0), body TEXT,
+ key_generation INTEGER NOT NULL CHECK(key_generation>0), body TEXT, body_hash TEXT NOT NULL,
+ request_time INTEGER NOT NULL CHECK(request_time IN(0,1)),
+ number_bits TEXT NOT NULL,
  PRIMARY KEY(namespace,agent)
 );
 CREATE INDEX IF NOT EXISTS local_agent_card_current_order
@@ -48,6 +73,8 @@ pub(crate) fn create_schema(connection: &Connection) -> Result<()> {
 pub(crate) struct RankedKey {
     pub agent: String,
     pub generation: u64,
+    pub body_hash: String,
+    pub request_time: bool,
 }
 
 #[derive(Debug)]
@@ -143,16 +170,16 @@ fn window(
     );
     let sql = match (history, state.is_some()) {
         (false, false) => {
-            "SELECT agent,key_generation FROM local_agent_card_rows WHERE namespace=?1 AND current=1 AND body IS NOT NULL ORDER BY name,agent LIMIT ?2"
+            "SELECT agent,key_generation,body_hash,request_time FROM local_agent_card_rows WHERE namespace=?1 AND current=1 AND body IS NOT NULL ORDER BY name,agent LIMIT ?2"
         }
         (false, true) => {
-            "SELECT agent,key_generation FROM local_agent_card_rows WHERE namespace=?1 AND current=1 AND state=?3 AND body IS NOT NULL ORDER BY name,agent LIMIT ?2"
+            "SELECT agent,key_generation,body_hash,request_time FROM local_agent_card_rows WHERE namespace=?1 AND current=1 AND state=?3 AND body IS NOT NULL ORDER BY name,agent LIMIT ?2"
         }
         (true, false) => {
-            "SELECT agent,key_generation FROM local_agent_card_rows WHERE namespace=?1 AND body IS NOT NULL ORDER BY name,agent LIMIT ?2"
+            "SELECT agent,key_generation,body_hash,request_time FROM local_agent_card_rows WHERE namespace=?1 AND body IS NOT NULL ORDER BY name,agent LIMIT ?2"
         }
         (true, true) => {
-            "SELECT agent,key_generation FROM local_agent_card_rows WHERE namespace=?1 AND state=?3 AND body IS NOT NULL ORDER BY name,agent LIMIT ?2"
+            "SELECT agent,key_generation,body_hash,request_time FROM local_agent_card_rows WHERE namespace=?1 AND state=?3 AND body IS NOT NULL ORDER BY name,agent LIMIT ?2"
         }
     };
     let mut statement = connection.prepare(sql)?;
@@ -165,6 +192,8 @@ fn window(
         keys.push(RankedKey {
             agent: row.get(0)?,
             generation: row.get(1)?,
+            body_hash: row.get(2)?,
+            request_time: row.get(3)?,
         });
     }
     let has_more = keys.len() > limit;
@@ -182,14 +211,122 @@ pub(crate) fn row(
     read_row(connection, namespace.as_str(), key)
 }
 
+/// The current ranked metadata proves membership/order independently of this
+/// comparison. Retained public JSON may be reused only after current authority
+/// and complete source coverage have been checked in that same snapshot.
+pub(crate) fn reusable(key: &RankedKey, retained: &Value) -> Result<bool> {
+    let mut template = retained.clone();
+    if key.request_time {
+        template["updated_at"] = json!("");
+    }
+    Ok(retained["id"].as_str() == Some(key.agent.as_str())
+        && smallclaims::hash::canonical_hash(&template)? == key.body_hash)
+}
+
+/// All authority, Installer binding and coverage checks precede this bounded
+/// read in the same snapshot. A blank legacy timestamp is frame presentation;
+/// filling it cannot change namespace rows, generations, ordering or status.
+pub(crate) fn current_rows(
+    connection: &Connection,
+    root: &Root,
+    limit: usize,
+    state: Option<&str>,
+    retained: &BTreeMap<String, Value>,
+    frame_time: &str,
+) -> Result<(Vec<Value>, bool)> {
+    current_rows_at(
+        connection,
+        root.namespace.as_str(),
+        limit,
+        state,
+        retained,
+        frame_time,
+    )
+}
+fn current_rows_at(
+    connection: &Connection,
+    namespace: &str,
+    limit: usize,
+    state: Option<&str>,
+    retained: &BTreeMap<String, Value>,
+    frame_time: &str,
+) -> Result<(Vec<Value>, bool)> {
+    let window = window(connection, namespace, limit, false, state)?;
+    let mut values = Vec::with_capacity(window.keys.len());
+    for key in window.keys {
+        let mut value = if let Some(previous) = retained.get(&key.agent)
+            && reusable(&key, previous)?
+        {
+            previous.clone()
+        } else {
+            read_row(connection, namespace, &key)?
+                .context("ranked agent row changed within snapshot")?
+        };
+        if key.request_time {
+            value["updated_at"] = json!(frame_time);
+        }
+        values.push(value);
+    }
+    Ok((values, window.has_more))
+}
+
 fn read_row(connection: &Connection, namespace: &str, key: &RankedKey) -> Result<Option<Value>> {
-    let body: Option<String> = connection.query_row(
-        "SELECT body FROM local_agent_card_rows WHERE namespace=?1 AND agent=?2 AND key_generation=?3 AND body IS NOT NULL",
+    let body: Option<(String,String)> = connection.query_row(
+        "SELECT body,number_bits FROM local_agent_card_rows WHERE namespace=?1 AND agent=?2 AND key_generation=?3 AND body IS NOT NULL",
         params![namespace, key.agent, key.generation],
-        |r| r.get(0),
+        |r| Ok((r.get(0)?,r.get(1)?)),
     ).optional()?;
-    body.map(|body| Ok(serde_json::from_str(&body)?))
-        .transpose()
+    body.map(|(body, bits)| {
+        let mut value: Value = serde_json::from_str(&body)?;
+        let bits: BTreeMap<String, u64> = serde_json::from_str(&bits)?;
+        for (pointer, bits) in bits {
+            let number = f64::from_bits(bits);
+            anyhow::ensure!(number.is_finite(), "non-finite public card number");
+            *value
+                .pointer_mut(&pointer)
+                .context("public card numeric pointer missing")? = json!(number);
+        }
+        Ok(value)
+    })
+    .transpose()
+}
+
+fn numeric_bits(value: &Value) -> Result<BTreeMap<String, u64>> {
+    fn visit(
+        value: &Value,
+        path: &str,
+        depth: usize,
+        out: &mut BTreeMap<String, u64>,
+    ) -> Result<()> {
+        anyhow::ensure!(depth <= 128, "public card JSON depth exceeded");
+        match value {
+            Value::Number(number) if number.is_f64() => {
+                out.insert(
+                    path.into(),
+                    number
+                        .as_f64()
+                        .context("public card number invalid")?
+                        .to_bits(),
+                );
+            }
+            Value::Array(values) => {
+                for (index, value) in values.iter().enumerate() {
+                    visit(value, &format!("{path}/{index}"), depth + 1, out)?;
+                }
+            }
+            Value::Object(values) => {
+                for (name, value) in values {
+                    let name = name.replace('~', "~0").replace('/', "~1");
+                    visit(value, &format!("{path}/{name}"), depth + 1, out)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    let mut bits = BTreeMap::new();
+    visit(value, "", 0, &mut bits)?;
+    Ok(bits)
 }
 
 /// Called after every dependency family has supplied its current output. This
@@ -212,6 +349,13 @@ fn replace(
     body: Option<&Value>,
 ) -> Result<bool> {
     anyhow::ensure!(agent.starts_with("agent/"), "invalid agent public ID");
+    let body_hash = body
+        .map(smallclaims::hash::canonical_hash)
+        .transpose()?
+        .unwrap_or_default();
+    let request_time = body.is_some_and(|value| value["updated_at"] == "");
+    let number_bits =
+        serde_json::to_string(&body.map(numeric_bits).transpose()?.unwrap_or_default())?;
     let (name, state, body) = match body {
         None => (String::new(), String::new(), None),
         Some(body) => {
@@ -247,8 +391,8 @@ fn replace(
         return Ok(false);
     }
     tx.execute(
-        "INSERT INTO local_agent_card_rows(namespace,agent,name,state,current,key_generation,body) VALUES(?1,?2,?3,?4,?5,1,?6) ON CONFLICT(namespace,agent) DO UPDATE SET name=excluded.name,state=excluded.state,current=excluded.current,key_generation=key_generation+1,body=excluded.body",
-        params![namespace, agent, next.0, next.1, next.2, next.3],
+        "INSERT INTO local_agent_card_rows(namespace,agent,name,state,current,key_generation,body,body_hash,request_time,number_bits) VALUES(?1,?2,?3,?4,?5,1,?6,?7,?8,?9) ON CONFLICT(namespace,agent) DO UPDATE SET name=excluded.name,state=excluded.state,current=excluded.current,key_generation=key_generation+1,body=excluded.body,body_hash=excluded.body_hash,request_time=excluded.request_time,number_bits=excluded.number_bits",
+        params![namespace, agent, next.0, next.1, next.2, next.3, body_hash, request_time, number_bits],
     )?;
     Ok(true)
 }
@@ -424,6 +568,76 @@ mod tests {
     }
 
     #[test]
+    fn retained_rows_require_current_content_and_blank_timestamp_is_frame_only() {
+        let store = Store::open_memory("grove").unwrap();
+        let mut connection = store.connection.write();
+        create_schema(&connection).unwrap();
+        let mut a = card("agent/a", "A", "running");
+        a["updated_at"] = json!("");
+        let b = card("agent/b", "B", "waiting");
+        let tx = connection.transaction().unwrap();
+        replace(&tx, "n", "agent/a", true, Some(&a)).unwrap();
+        replace(&tx, "n", "agent/b", true, Some(&b)).unwrap();
+        tx.commit().unwrap();
+        let (first, more) =
+            current_rows_at(&connection, "n", 1, None, &BTreeMap::new(), "frame-one").unwrap();
+        assert!(more);
+        assert_eq!(first[0]["updated_at"], "frame-one");
+        let generation = window(&connection, "n", 1, false, None).unwrap().keys[0].generation;
+        let retained = [("agent/a".into(), first[0].clone())].into_iter().collect();
+        let (next, _) = current_rows_at(&connection, "n", 1, None, &retained, "frame-two").unwrap();
+        assert_eq!(next[0]["updated_at"], "frame-two");
+        assert_eq!(
+            window(&connection, "n", 1, false, None).unwrap().keys[0].generation,
+            generation
+        );
+        let mut stale = next[0].clone();
+        stale["ask"] = json!("obsolete unauthorized prompt");
+        let retained = [("agent/a".into(), stale)].into_iter().collect();
+        let (fresh, _) =
+            current_rows_at(&connection, "n", 1, None, &retained, "frame-three").unwrap();
+        assert_eq!(fresh[0]["ask"], a["ask"]);
+        let tx = connection.transaction().unwrap();
+        replace(&tx, "n", "agent/a", true, None).unwrap();
+        tx.commit().unwrap();
+        let (promoted, _) =
+            current_rows_at(&connection, "n", 1, None, &retained, "frame-four").unwrap();
+        assert_eq!(promoted[0]["id"], "agent/b");
+        assert!(
+            current_rows_at(&connection, "missing", 1, None, &retained, "frame-five")
+                .unwrap()
+                .0
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn public_row_storage_preserves_float_bits_and_json_pointer_escaping() {
+        let store = Store::open_memory("grove").unwrap();
+        let mut writer = store.connection.write();
+        create_schema(&writer).unwrap();
+        let mut value = card("agent/a", "A", "running");
+        value["usage"] = json!({"cost":0.9999999999999999,"context":{"used_percent":-0.0},"escaped/~key":[0.9999999999999999]});
+        let tx = writer.transaction().unwrap();
+        replace(&tx, "n", "agent/a", true, Some(&value)).unwrap();
+        tx.commit().unwrap();
+        let key = window(&writer, "n", 1, false, None).unwrap().keys.remove(0);
+        let actual = read_row(&writer, "n", &key).unwrap().unwrap();
+        assert_eq!(actual, value);
+        assert_eq!(
+            actual["usage"]["context"]["used_percent"]
+                .as_f64()
+                .unwrap()
+                .to_bits(),
+            (-0.0_f64).to_bits()
+        );
+        assert!(reusable(&key, &actual).unwrap());
+        let mut altered = actual;
+        altered["usage"]["cost"] = json!(1.0);
+        assert!(!reusable(&key, &altered).unwrap());
+    }
+
+    #[test]
     fn independent_coverage_rejects_local_changes_deadlines_and_pending_inputs() {
         let store = Store::open_memory("grove").unwrap();
         let connection = store.connection.write();
@@ -493,19 +707,19 @@ mod tests {
         create_schema(&connection).unwrap();
         for (query, index) in [
             (
-                "SELECT agent,key_generation FROM local_agent_card_rows WHERE namespace='n' AND current=1 AND body IS NOT NULL ORDER BY name,agent LIMIT 201",
+                "SELECT agent,key_generation,body_hash,request_time FROM local_agent_card_rows WHERE namespace='n' AND current=1 AND body IS NOT NULL ORDER BY name,agent LIMIT 201",
                 "local_agent_card_current_order",
             ),
             (
-                "SELECT agent,key_generation FROM local_agent_card_rows WHERE namespace='n' AND current=1 AND state='running' AND body IS NOT NULL ORDER BY name,agent LIMIT 201",
+                "SELECT agent,key_generation,body_hash,request_time FROM local_agent_card_rows WHERE namespace='n' AND current=1 AND state='running' AND body IS NOT NULL ORDER BY name,agent LIMIT 201",
                 "local_agent_card_current_status_order",
             ),
             (
-                "SELECT agent,key_generation FROM local_agent_card_rows WHERE namespace='n' AND body IS NOT NULL ORDER BY name,agent LIMIT 201",
+                "SELECT agent,key_generation,body_hash,request_time FROM local_agent_card_rows WHERE namespace='n' AND body IS NOT NULL ORDER BY name,agent LIMIT 201",
                 "local_agent_card_history_order",
             ),
             (
-                "SELECT agent,key_generation FROM local_agent_card_rows WHERE namespace='n' AND state='running' AND body IS NOT NULL ORDER BY name,agent LIMIT 201",
+                "SELECT agent,key_generation,body_hash,request_time FROM local_agent_card_rows WHERE namespace='n' AND state='running' AND body IS NOT NULL ORDER BY name,agent LIMIT 201",
                 "local_agent_card_history_status_order",
             ),
         ] {

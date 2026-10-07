@@ -62,6 +62,7 @@ fn apply(
     for claim in old.into_iter().chain(new.map(|(claim, _)| claim)) {
         if let Some(agent) = tx.query_row("SELECT subject FROM local_agent_card_harness_nodes WHERE namespace=?1 AND claim=?2",params![namespace,claim.id],|r|r.get::<_,String>(0)).optional()? {
             agents.insert(agent);
+            ordered::retract(tx, namespace, &claim.id)?;
         }
     }
     if let Some(old) =

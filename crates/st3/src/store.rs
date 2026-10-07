@@ -1,6 +1,10 @@
 pub(crate) mod agent_card_ivm;
 mod agent_card_harness;
 mod agent_card_signals;
+mod agent_card_usage;
+mod agent_card_base;
+mod agent_card_rollout;
+mod agent_authority_ivm;
 pub mod custom;
 pub mod declarations;
 mod glass_heads;
