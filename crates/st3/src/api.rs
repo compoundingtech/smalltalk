@@ -5554,7 +5554,7 @@ async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, Api
             .unwrap_or_default();
         st_runtime::priority_report(&observations)
     });
-    let token = crate::resource::github_token().await;
+    let token = crate::resource::github_auth().await;
     let mut report = tokio::task::spawn_blocking(move || {
         // This node's claims are signed as their batches are sealed; seal and judge them so
         // the signature counts cover everything written so far.
@@ -5593,10 +5593,9 @@ async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, Api
     report.checks.push(DoctorCheck {
         name: "github-observer-auth".into(),
         status: if token.is_ok() { "pass" } else { "warn" }.into(),
-        message: if token.is_ok() {
-            "GitHub observers have a token; credential values are not displayed".into()
-        } else {
-            crate::resource::GITHUB_AUTH_REMEDY.into()
+        message: match token {
+            Ok(_) => "GitHub observers have a credential source; credential values are not displayed".into(),
+            Err(error) => error.to_string(),
         },
     });
     // Request samples are live operational telemetry. Keep them on /v1/doctor,
