@@ -3688,6 +3688,19 @@ impl Ui {
 
     /// Point stui's own tab and selection at a pane's subject, so its keys act on it.
     fn focus_pane(&mut self, pane: &Pane) {
+        let before = (self.tab, self.selected_id());
+        self.focus_pane_inner(pane);
+        // A message box belongs to the pane it was opened in: once another pane or tab has the
+        // focus, typing must not go on into a draft nobody can see (Nathan, 2026-10-07).
+        if before != (self.tab, self.selected_id()) {
+            self.editing = false;
+            self.chat = None;
+            self.answering = None;
+            self.confirm = None;
+        }
+    }
+
+    fn focus_pane_inner(&mut self, pane: &Pane) {
         let Some((tab, subject)) = pane_subject(pane) else {
             return;
         };
@@ -4013,6 +4026,44 @@ mod tests {
         assert_eq!(tabs(&ui).1, 1);
         ctrl(&mut ui, 'w');
         assert_eq!(tabs(&ui).2, vec![vec![ATLAS.to_owned()]]);
+    }
+
+    #[test]
+    fn typing_stops_when_another_tab_takes_the_focus() {
+        // Nathan, 2026-10-07: a message box stayed selected after switching tabs, so keys went on
+        // into a draft in a tab that was no longer shown.
+        let mut ui = glass();
+        ui.live = true;
+        ui.open_in_glass(
+            Pane::Agent(Some("agent/example/atlas/builder".to_owned())),
+            Open::Tab,
+        );
+        ui.open_in_glass(
+            Pane::Mission(Some("mission/fleet/atlas/store-move".into())),
+            Open::Tab,
+        );
+        ui.show_tab(0);
+        assert_eq!(ui.tab, 1, "the agent's tab has the focus");
+        press(&mut ui, KeyCode::Char('h'), KeyModifiers::NONE);
+        assert!(ui.editing, "a plain key opens the message box and types");
+        let draft_before = ui
+            .conversation_state
+            .drafts
+            .get("agent/example/atlas/builder")
+            .cloned();
+        assert_eq!(draft_before.as_deref(), Some("h"));
+        // A click on another tab, as a mouse does; keys stay the message box's while it is open.
+        ui.show_tab(1);
+        assert!(!ui.editing, "the message box does not follow the person to another tab");
+        press(&mut ui, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(
+            ui.conversation_state
+                .drafts
+                .get("agent/example/atlas/builder")
+                .cloned(),
+            draft_before,
+            "nothing is typed into the draft of a tab that is not shown"
+        );
     }
 
     #[test]
