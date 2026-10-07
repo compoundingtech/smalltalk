@@ -34,7 +34,10 @@ their prior merge policy; they still require classification before public releas
 fragments are validated, including schema/rules transitions, and existing fragments are immutable.
 PR events supply their number; queue refs identify a single PR, while multi-PR queue groups
 identify each member by its merge subject so an old head PR cannot exempt a newer member. It checks
-the effective PR merge against its immutable base, and each integrated PR in a merge group;
+the effective PR merge against that merge commit's first parent, and each integrated PR in a
+merge group against the group's supplied base. A PR event's recorded `base.sha` can be stale
+after main advances; it is not the PR check's comparison base. Both bases stay pinned to the
+tested source rather than a later `origin/main` fetch;
 unrelated unreleased main changes do not block a new PR's check. It does not download dependencies
 or compile. Manual dispatch runs the safety tests without inventing a PR delta.
 

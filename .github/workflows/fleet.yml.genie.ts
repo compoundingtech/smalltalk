@@ -132,16 +132,15 @@ export default githubWorkflow(auditCaches({
         {
           name: 'Require a fresh fragment on the effective PR or queue merge',
           env: {
-            IMPACT_BASE_SHA: '${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}',
+            IMPACT_BASE_SHA: '${{ github.event.merge_group.base_sha }}',
             IMPACT_PR_NUMBER: '${{ github.event.pull_request.number }}',
             IMPACT_QUEUE_REF: '${{ github.event.merge_group.head_ref }}',
           },
-          run: `if [ -n "$IMPACT_BASE_SHA" ]; then
-  if [ -n "$IMPACT_PR_NUMBER" ]; then
-    python3 scripts/check-release-impact --base "$IMPACT_BASE_SHA" --source "$GITHUB_SHA" --pr-number "$IMPACT_PR_NUMBER"
-  else
-    python3 scripts/check-release-impact --base "$IMPACT_BASE_SHA" --source "$GITHUB_SHA" --queue-ref "$IMPACT_QUEUE_REF"
-  fi
+          run: `if [ -n "$IMPACT_PR_NUMBER" ]; then
+  impact_pr_base=$(git rev-parse "$GITHUB_SHA^1")
+  python3 scripts/check-release-impact --base "$impact_pr_base" --source "$GITHUB_SHA" --pr-number "$IMPACT_PR_NUMBER"
+elif [ -n "$IMPACT_BASE_SHA" ]; then
+  python3 scripts/check-release-impact --base "$IMPACT_BASE_SHA" --source "$GITHUB_SHA" --queue-ref "$IMPACT_QUEUE_REF"
 else
   echo "Manual dispatch has no PR/queue delta; classification safety tests passed."
 fi`,

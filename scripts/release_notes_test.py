@@ -6,7 +6,9 @@ import importlib.machinery
 import importlib.util
 import json
 import io
+import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -60,6 +62,24 @@ class ReleaseNotes(unittest.TestCase):
         self.git('add', '.')
         self.git('commit', '-qm', message)
         return self.git('rev-parse', 'HEAD')
+
+    def run_impact_workflow(self, source, base, pr_number='', queue_ref=''):
+        # Execute the generated production step, including event/base selection.
+        lines = (ROOT / '.github/workflows/fleet.yml').read_text().splitlines()
+        step = lines.index('      - name: Require a fresh fragment on the effective PR or queue merge')
+        start = lines.index('        run: |', step) + 1
+        script = []
+        for line in lines[start:]:
+            if line and not line.startswith('          '):
+                break
+            script.append(line[10:])
+        (self.repo / 'scripts').mkdir(exist_ok=True)
+        for name in ('check-release-impact', 'release_notes.py'):
+            shutil.copyfile(ROOT / 'scripts' / name, self.repo / 'scripts' / name)
+        return subprocess.run(['bash', '-e', '-c', '\n'.join(script)], cwd=self.repo,
+                              env={**os.environ, 'GITHUB_SHA': source, 'IMPACT_BASE_SHA': base,
+                                   'IMPACT_PR_NUMBER': str(pr_number), 'IMPACT_QUEUE_REF': queue_ref},
+                              capture_output=True, text=True)
 
     def test_missing_fields_and_ambiguous_none_are_rejected(self):
         value = fragment()
@@ -158,6 +178,48 @@ class ReleaseNotes(unittest.TestCase):
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(source, result.stdout)
+
+    def test_pr_workflow_uses_merge_parent_after_recorded_base_goes_stale(self):
+        self.add_fragment('existing')
+        recorded_base = self.commit('Main when PR opened')
+        self.git('checkout', '-qb', 'feature')
+        self.write('feature.rs', '// Valid PR opened before main advanced\n')
+        self.add_fragment('feature')
+        self.commit('Feature with its own note')
+        self.git('checkout', '-q', '-')
+        self.git('checkout', '-qb', 'legacy')
+        self.add_fragment('existing', fragment('Unrelated legacy correction'))
+        self.commit('Older PR edits an existing note before gate adoption')
+        self.git('checkout', '-q', '-')
+        self.git('merge', '--no-ff', '-qm', 'Merge pull request #1658 from example/legacy', 'legacy')
+        current_main = self.git('rev-parse', 'HEAD')
+        self.git('merge', '--no-ff', '-qm', 'Effective PR merge', 'feature')
+        source = self.git('rev-parse', 'HEAD')
+        with self.assertRaisesRegex(ImpactError, 'existing fragments are immutable'):
+            check_pull_request(self.repo, recorded_base, source, pr_number=1663)
+        result = self.run_impact_workflow(source, recorded_base, pr_number=1663)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f'base {current_main}', result.stdout)
+        self.assertIn('1 integrated change(s)', result.stdout)
+
+    def test_queue_workflow_keeps_group_base_and_checks_earlier_members(self):
+        self.git('checkout', '-qb', 'one')
+        self.write('one.rs', '// New PR without its required note\n')
+        self.commit('First implementation')
+        self.git('checkout', '-q', '-')
+        self.git('merge', '--no-ff', '-qm', 'Merge pull request #1667 from example/one', 'one')
+        missing = self.git('rev-parse', 'HEAD')
+        self.git('checkout', '-qb', 'two')
+        self.add_fragment('two')
+        self.commit('Second PR with a fresh note')
+        self.git('checkout', '-q', '-')
+        self.git('merge', '--no-ff', '-qm', 'Merge pull request #1668 from example/two', 'two')
+        source = self.git('rev-parse', 'HEAD')
+        result = self.run_impact_workflow(source, self.base,
+                                         queue_ref='refs/heads/gh-readonly-queue/main/pr-1667-' + self.base)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(missing, result.stderr)
+        self.assertIn('add a uniquely named', result.stderr)
 
     def test_queue_requires_a_fragment_from_every_integrated_pr(self):
         self.git('checkout', '-qb', 'one')
