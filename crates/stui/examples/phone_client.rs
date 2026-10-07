@@ -17,15 +17,43 @@ use st3_client::{Client, set_client_name};
 async fn main() {
     let mut seconds = 180_u64;
     let mut label = "measure-phone".to_owned();
+    let mut timing: Option<String> = None;
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--seconds" => seconds = arguments.next().and_then(|v| v.parse().ok()).unwrap_or(seconds),
             "--label" => label = arguments.next().unwrap_or(label),
+            // Log the timing of this client's requests and frames: routes, statuses, sizes and
+            // durations as JSON lines, never contents.
+            "--timing" => timing = arguments.next(),
             _ => {}
         }
     }
     set_client_name(format!("smalltalk-ios 0.1.0 [{label}]"));
+    if let Some(path) = timing {
+        use std::io::Write as _;
+        let started = Instant::now();
+        let file = std::sync::Mutex::new(
+            std::fs::OpenOptions::new().create(true).append(true).open(path).expect("timing log"),
+        );
+        st3_client::set_observer(move |observation| {
+            let at_ms = started.elapsed().as_millis() as u64;
+            let line = match observation {
+                st3_client::Observation::Request { method, route, status, took } => format!(
+                    "{{\"at_ms\":{at_ms},\"type\":\"request\",\"method\":\"{method}\",\"route\":\"{route}\",\"status\":{},\"took_ms\":{:.3}}}",
+                    status.map_or("null".into(), |s| s.to_string()),
+                    took.as_secs_f64() * 1000.0
+                ),
+                st3_client::Observation::Frame { id, kind, bytes, since_subscribe } => format!(
+                    "{{\"at_ms\":{at_ms},\"type\":\"frame\",\"id\":\"{id}\",\"kind\":\"{kind}\",\"bytes\":{bytes},\"since_subscribe_ms\":{}}}",
+                    since_subscribe.map_or("null".into(), |d| format!("{:.3}", d.as_secs_f64() * 1000.0))
+                ),
+            };
+            if let Ok(mut file) = file.lock() {
+                let _ = writeln!(file, "{line}");
+            }
+        });
+    }
     let path = st3_client::discover_unix_endpoint(None).expect("a local st endpoint");
     // The person as stui resolves it: ST3_PERSON, else `person` in the st config.
     let person = std::env::var("ST3_PERSON").ok().or_else(|| {

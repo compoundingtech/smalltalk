@@ -136,3 +136,45 @@ async fn a_collection_stream_answers_a_websocket_ping_without_a_request() {
     );
     server.abort();
 }
+
+/// A utility that asks to see its own timings gets routes without queries, statuses, sizes and
+/// durations, and the first frame of a subscription with how long it took. Nothing is added to
+/// what the client sends.
+#[tokio::test]
+async fn an_observer_sees_request_and_frame_timings_without_contents() {
+    static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    st3_client::set_observer(|observation| {
+        SEEN.lock().unwrap().push(format!("{observation:?}"));
+    });
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("client.sock");
+    let app = st3::api::router(state(root.path()));
+    let server_socket = socket.clone();
+    let server = tokio::spawn(async move {
+        st3::api::serve_unix(&server_socket, app).await.unwrap();
+    });
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let client = Client::unix_as(&socket, "person/ada");
+    client.usage_period(Some(1), Some(2)).await.unwrap();
+    let mut stream = client.collection_stream().await.unwrap();
+    stream.subscribe_glasses("timing-glasses").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), stream.next_event())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let seen = SEEN.lock().unwrap().join("\n");
+    assert!(seen.contains("route: \"/v1/client/usage\""), "{seen}");
+    assert!(!seen.contains('?') && !seen.contains("since_ms"), "{seen}");
+    assert!(seen.contains("status: Some(200)"), "{seen}");
+    assert!(
+        seen.contains("id: \"timing-glasses\", kind: \"snapshot\"") && seen.contains("since_subscribe: Some("),
+        "{seen}"
+    );
+    server.abort();
+}

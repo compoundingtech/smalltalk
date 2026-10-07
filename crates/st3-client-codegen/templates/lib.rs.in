@@ -122,6 +122,43 @@ fn client_name() -> Option<&'static str> {
     CLIENT_NAME.get().map(String::as_str)
 }
 
+/// One thing the client did, timed, for a test utility that asked to see them with
+/// [`set_observer`]. It names the route without its query, the status, the sizes and the
+/// durations, and never a body, a header or a credential. Observing sends nothing to st.
+#[derive(Clone, Debug)]
+pub enum Observation<'a> {
+    /// An HTTP request: its method, route, status (`None` when none came), and how long it took.
+    Request {
+        method: &'a str,
+        route: &'a str,
+        status: Option<u16>,
+        took: Duration,
+    },
+    /// A collections-stream frame: the subscription, the frame kind, its size, and for the
+    /// first frame of a subscription how long after the subscribe command it arrived.
+    Frame {
+        id: &'a str,
+        kind: &'a str,
+        bytes: usize,
+        since_subscribe: Option<Duration>,
+    },
+}
+
+type Observer = Box<dyn Fn(&Observation<'_>) + Send + Sync>;
+static OBSERVER: std::sync::OnceLock<Observer> = std::sync::OnceLock::new();
+
+/// Report each request and collections frame of this process to `observer`, once; later calls
+/// are ignored. Without it nothing is measured and nothing is allocated.
+pub fn set_observer(observer: impl Fn(&Observation<'_>) + Send + Sync + 'static) {
+    let _ = OBSERVER.set(Box::new(observer));
+}
+
+fn observe(observation: Observation<'_>) {
+    if let Some(observer) = OBSERVER.get() {
+        observer(&observation);
+    }
+}
+
 #[derive(Clone)]
 pub struct Client {
     endpoint: Endpoint,
@@ -207,6 +244,8 @@ pub struct CollectionStream {
     socket: TerminalSocket,
     limit: usize,
     heard: Heard,
+    /// When each subscription was asked for, until its first frame; kept only when observed.
+    subscribed: std::collections::HashMap<String, std::time::Instant>,
 }
 
 /// When anything last arrived on a stream, a frame or a WebSocket pong alike. A clone of it
@@ -292,6 +331,12 @@ impl CollectionStream {
     async fn send(&mut self, command: &serde_json::Value) -> Result<(), ClientError> {
         let payload = serde_json::to_string(command)
             .map_err(|error| ClientError::Protocol(error.to_string()))?;
+        if OBSERVER.get().is_some()
+            && command["kind"] == "subscribe"
+            && let Some(id) = command["id"].as_str()
+        {
+            self.subscribed.insert(id.to_owned(), std::time::Instant::now());
+        }
         match &mut self.socket {
             TerminalSocket::Unix(socket) => socket.send(WsMessage::Text(payload.into())).await,
             TerminalSocket::Remote(socket) => socket.send(WsMessage::Text(payload.into())).await,
@@ -308,12 +353,26 @@ impl CollectionStream {
                 next_websocket_payload_noting(socket, self.limit, &heard).await?
             }
         };
-        payload
+        let frame = payload
+            .as_ref()
             .map(|bytes| {
-                serde_json::from_slice(&bytes)
+                serde_json::from_slice::<serde_json::Value>(bytes)
                     .map_err(|error| ClientError::Protocol(error.to_string()))
             })
-            .transpose()
+            .transpose()?;
+        if let (Some(frame), Some(bytes)) = (&frame, &payload)
+            && OBSERVER.get().is_some()
+        {
+            let id = frame["id"].as_str().unwrap_or("");
+            let since_subscribe = self.subscribed.remove(id).map(|at| at.elapsed());
+            observe(Observation::Frame {
+                id,
+                kind: frame["kind"].as_str().unwrap_or(""),
+                bytes: bytes.len(),
+                since_subscribe,
+            });
+        }
+        Ok(frame)
     }
     /// Where the stream last heard anything: a clone to read while the stream is being waited on.
     pub fn heard(&self) -> Heard {
@@ -1525,6 +1584,7 @@ impl Client {
             socket,
             limit: self.response_limit(),
             heard,
+            subscribed: std::collections::HashMap::new(),
         })
     }
 
@@ -1700,6 +1760,8 @@ impl Client {
         content_type: &str,
     ) -> Result<T, ClientError> {
         let limit = self.response_limit();
+        let observed_method = method.as_str().to_owned();
+        let observed_method = observed_method.as_str();
         let request = async {
             match &self.endpoint {
                 Endpoint::Unix(socket) => {
@@ -1748,9 +1810,20 @@ impl Client {
                 }
             }
         };
-        let (status, bytes) = tokio::time::timeout(REQUEST_DEADLINE, request)
+        let began = std::time::Instant::now();
+        let outcome = tokio::time::timeout(REQUEST_DEADLINE, request)
             .await
-            .map_err(|_| ClientError::Transport("client-v0 request deadline exceeded".into()))??;
+            .map_err(|_| ClientError::Transport("client-v0 request deadline exceeded".into()))
+            .and_then(|result| result);
+        if OBSERVER.get().is_some() {
+            observe(Observation::Request {
+                method: observed_method,
+                route: path.split('?').next().unwrap_or(path),
+                status: outcome.as_ref().ok().map(|(status, _)| *status),
+                took: began.elapsed(),
+            });
+        }
+        let (status, bytes) = outcome?;
         if !(200..300).contains(&status) {
             if status == 404 && bytes.is_empty() && path.starts_with("/v1/client/launches/") {
                 let error = ErrorEnvelope {
