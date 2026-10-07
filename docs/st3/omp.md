@@ -75,12 +75,30 @@ it is a structural explanation. Replay does not infer retry success or terminal 
 `willContinue` belongs to the live `agent_end` event, not persisted assistant messages.
 An abort does not imply a user cancellation.
 
-Every native `custom/session_exit` checkpoint uses a status entry with a `status` block and
-`{body_ref:true}`. Its body has `status: completed` (the native process has exited) and `detail`
-containing the complete native `data` serialized as JSON, including exact `kind`, `reason`,
-pending-tool arguments/intent and future fields. Fatal and unfamiliar exits retain this same
-shape so a presentation view can classify them without changing the native data. A process exit
-proves neither user cancellation, tool completion nor the outcome of the next process.
+Native `custom/session_exit` checkpoints are classified from their `data.kind` and
+`data.reason`, without inferring the outcome of a turn or pending tools:
+
+| Native exit | Timeline entry |
+| --- | --- |
+| `normal` (including `dispose` and `manual`); `signal` with `sigterm`, `sigint` or `sighup` | `status: completed` |
+| `process_exit` or `exit` with explicit numeric `exitCode` (or `code`) zero | `status: completed` |
+| `fatal`, `crash`, `uncaughtException` / `uncaught_exception`, or `unhandledRejection` / `unhandled_rejection` | `error`, code `native_session_exit_fatal` |
+| Recognized normal/signal/process-exit kinds with a fatal reason or a nonzero exit code | `error`, code `native_session_exit_fatal` |
+| Unknown/missing kinds, unfamiliar signals, or process exits without a known exit code | `error`, code `native_session_exit_unknown` |
+
+OMP's native kinds are `normal`, `signal`, `fatal` and `process_exit`. Its fatal reasons
+are `uncaught_exception` and `unhandled_rejection`; camel-case forms are also recognized.
+The native `process_exit` / `exit` checkpoint currently omits the process code, so its
+outcome stays unknown unless a numeric code is supplied. Unknown kinds remain unknown
+even if their reason looks like a normal signal.
+
+Recognized stops use the existing status entry and `status` block with `{body_ref:true}`;
+the body has `status: completed` and `detail` containing the complete native `data` serialized
+as JSON. Fatal and unknown stops use a system error entry and `error` block with
+`{body_ref:true}`, `retryable: false` and the complete native `data` in `details`.
+Both retain exact kind, reason, pending-tool arguments/intent and future fields.
+A process exit proves neither user cancellation, tool completion nor the outcome of
+the next process.
 
 The normalizer does not withhold or truncate diagnostics or pending-tool values. Parsed records
 also retain the complete native record in an internal `source_record` block; malformed input

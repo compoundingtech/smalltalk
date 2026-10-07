@@ -3278,19 +3278,55 @@ fn push_omp_stop(items: &mut Vec<Value>, sequence: u64, timestamp: &str, message
 }
 
 fn push_omp_exit(items: &mut Vec<Value>, sequence: u64, timestamp: &str, data: &Value) {
-    // A checkpoint describes the native process, not the outcome of its turn or pending tools.
-    // Keep every native value in the known status body's JSON detail; a later display view can
-    // classify kind/reason without changing this entry or its status block.
-    items.push(timeline_item(
-        sequence,
-        timestamp,
-        "system",
-        "status",
-        json!({
-            "status":"completed",
-            "detail":serde_json::to_string(data).expect("native exit metadata serializes"),
-        }),
-    ));
+    // Process completion says nothing about the turn or pending tools. Unknown exits
+    // must not look successful; keep the complete checkpoint in either body shape.
+    let kind = data.get("kind").and_then(Value::as_str).unwrap_or_default();
+    let reason = data.get("reason").and_then(Value::as_str).unwrap_or_default();
+    let exit_code = data
+        .get("exitCode")
+        .or_else(|| data.get("code"))
+        .and_then(Value::as_i64);
+    let fatal_reason = matches!(
+        reason,
+        "fatal" | "crash" | "uncaughtException" | "uncaught_exception"
+            | "unhandledRejection" | "unhandled_rejection"
+    );
+    let code = match kind {
+        "fatal" | "crash" | "uncaughtException" | "uncaught_exception"
+        | "unhandledRejection" | "unhandled_rejection" => Some("native_session_exit_fatal"),
+        "normal" | "signal" | "process_exit" | "exit"
+            if fatal_reason || exit_code.is_some_and(|code| code != 0) =>
+        {
+            Some("native_session_exit_fatal")
+        }
+        "normal" => None,
+        "signal" if matches!(reason, "sigterm" | "sigint" | "sighup") => None,
+        "process_exit" | "exit" if exit_code == Some(0) => None,
+        _ => Some("native_session_exit_unknown"),
+    };
+    let (entry_type, body) = if let Some(code) = code {
+        (
+            "error",
+            json!({
+                "code":code,
+                "message":if code == "native_session_exit_fatal" {
+                    "The native OMP process exited abnormally."
+                } else {
+                    "The native OMP process exit outcome is unknown."
+                },
+                "retryable":false,"details":data,
+            }),
+        )
+    } else {
+        (
+            "status",
+            json!({
+                "status":"completed",
+                "detail":serde_json::to_string(data).expect("native exit metadata serializes"),
+            }),
+        )
+    };
+    items.push(timeline_item(sequence, timestamp, "system", entry_type, body));
 }
 
 fn push_omp_content(
@@ -4199,15 +4235,71 @@ mod tests {
             "",
             &mut items,
         );
-        assert_eq!(items[0]["type"], "status");
-        let detail: Value =
-            serde_json::from_str(items[0]["body"]["detail"].as_str().unwrap()).unwrap();
-        assert_eq!(detail, data);
-        assert_eq!(items[0]["body"]["blocks"][0]["kind"], "status");
+        assert_eq!(items[0]["type"], "error");
+        assert_eq!(items[0]["body"]["code"], "native_session_exit_unknown");
+        assert_eq!(items[0]["body"]["details"], data);
+        assert_eq!(items[0]["body"]["blocks"][0]["kind"], "error");
         assert_eq!(
             items[0]["body"]["blocks"][0]["payload"],
             json!({"body_ref":true})
         );
+    }
+
+    #[test]
+    fn omp_session_exits_classify_native_kinds_without_losing_details() {
+        for (data, expected_code) in [
+            (json!({"kind":"signal","reason":"sigterm"}), None),
+            (json!({"kind":"signal","reason":"sigint"}), None),
+            (json!({"kind":"signal","reason":"sighup"}), None),
+            (json!({"kind":"normal","reason":"dispose"}), None),
+            (json!({"kind":"normal","reason":"manual"}), None),
+            (json!({"kind":"process_exit","reason":"exit","exitCode":0}), None),
+            (json!({"kind":"exit","reason":"exit","code":0}), None),
+            (json!({"kind":"fatal","reason":"uncaught_exception"}), Some("native_session_exit_fatal")),
+            (json!({"kind":"fatal","reason":"unhandled_rejection"}), Some("native_session_exit_fatal")),
+            (json!({"kind":"uncaughtException","reason":"exception"}), Some("native_session_exit_fatal")),
+            (json!({"kind":"unhandledRejection","reason":"rejection"}), Some("native_session_exit_fatal")),
+            (json!({"kind":"crash","reason":"crash"}), Some("native_session_exit_fatal")),
+            (json!({"kind":"normal","reason":"uncaughtException"}), Some("native_session_exit_fatal")),
+            (json!({"kind":"signal","reason":"unhandledRejection"}), Some("native_session_exit_fatal")),
+            (json!({"kind":"process_exit","reason":"exit","exitCode":1}), Some("native_session_exit_fatal")),
+            (json!({"kind":"exit","reason":"exit","code":2}), Some("native_session_exit_fatal")),
+            (json!({"kind":"normal","reason":"exit","exitCode":1}), Some("native_session_exit_fatal")),
+            (json!({"kind":"process_exit","reason":"exit"}), Some("native_session_exit_unknown")),
+            (json!({"kind":"signal","reason":"future-signal"}), Some("native_session_exit_unknown")),
+            (json!({"kind":"future-kind","reason":"sigterm"}), Some("native_session_exit_unknown")),
+            (json!({"reason":"dispose"}), Some("native_session_exit_unknown")),
+        ] {
+            let mut data = data;
+            data["pendingToolCalls"] = json!([{"toolName":"ask","args":{"future":[false,null,42]}}]);
+            data["future"] = json!({"native":"unchanged"});
+            let mut items = Vec::new();
+            normalize_omp(
+                ExternalDriver::Omp,
+                &json!({"type":"custom","customType":"session_exit","data":data}),
+                0,
+                "",
+                &mut items,
+            );
+            let entry = &items[0];
+            assert_eq!(entry["role"], "system", "{data}");
+            let block = &entry["body"]["blocks"][0];
+            assert_eq!(block["payload"], json!({"body_ref":true}), "{data}");
+            if let Some(code) = expected_code {
+                assert_eq!(entry["type"], "error", "{data}");
+                assert_eq!(entry["body"]["code"], code, "{data}");
+                assert_eq!(entry["body"]["retryable"], false, "{data}");
+                assert_eq!(entry["body"]["details"], data);
+                assert_eq!(block["kind"], "error", "{data}");
+            } else {
+                assert_eq!(entry["type"], "status", "{data}");
+                assert_eq!(entry["body"]["status"], "completed", "{data}");
+                let detail: Value =
+                    serde_json::from_str(entry["body"]["detail"].as_str().unwrap()).unwrap();
+                assert_eq!(detail, data);
+                assert_eq!(block["kind"], "status", "{data}");
+            }
+        }
     }
 
     #[test]
@@ -4290,14 +4382,12 @@ mod tests {
             error["body"]["message"],
             records[0]["message"]["errorMessage"]
         );
-        let status = timeline
+        let exit = timeline
             .iter()
-            .find(|entry| entry["type"] == "status")
+            .find(|entry| entry["body"]["code"] == "native_session_exit_fatal")
             .unwrap();
-        let detail: Value =
-            serde_json::from_str(status["body"]["detail"].as_str().unwrap()).unwrap();
-        assert_eq!(detail, records[1]["data"]);
-        for entry in [error, status] {
+        assert_eq!(exit["body"]["details"], records[1]["data"]);
+        for entry in [error, exit] {
             let locator = serde_json::from_value(entry["_source"].clone()).unwrap();
             let fetched = normalized_record(&session, &locator).unwrap();
             assert!(
