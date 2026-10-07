@@ -5,7 +5,8 @@
 //! followed, and nothing is retried.
 //!
 //! The caller is `host/NODE`: it signs a statement for its own process with the node key the
-//! person registered with `st sekrets enable`, and the person grants the profile to that node.
+//! person registered with `sekrets enable`, and the person grants the profile to that node. st
+//! wraps this as `st3::sekrets::authorized::authorized_request(&config, profile, &request)`.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -15,7 +16,6 @@ use serde::{Deserialize, Serialize};
 
 use super::identity::{self, STATEMENT_VERSION, Statement};
 use super::protocol::{Attestation, CallerView, Reply, Request};
-use crate::config::Config;
 
 /// The largest request body the gateway forwards.
 pub const MAX_REQUEST_BODY: usize = 16 << 20;
@@ -127,50 +127,33 @@ pub fn check_url(url: &str, base: &str) -> Result<reqwest::Url, String> {
     Ok(parsed)
 }
 
-/// This node's name and the key it signs with: the fleet member key, or the standalone node
-/// key, as the daemon loads them. Never creates one.
-fn node_identity(config: &Config) -> Result<(String, smallclaims::fleet::MemberKey), String> {
-    let mut config = config.clone();
-    if config.fleet.is_none() {
-        config
-            .apply_fleet_file()
-            .map_err(|error| format!("read the fleet file: {error:#}"))?;
-    }
-    let path = match &config.fleet {
-        Some(file) => file.node_key_path(&config.state_dir),
-        None => crate::fleet::join::key_directory(&config.state_dir).join("node.key"),
-    };
-    let key = smallclaims::fleet::MemberKey::load(&path)
-        .map_err(|error| format!("this node has no key at {}: {error:#}", path.display()))?;
-    Ok((config.node.clone(), key))
+/// Who a host caller is: the node it speaks for, the person it works for, and the node key the
+/// person registered with `sekrets enable`.
+pub struct HostIdentity {
+    pub node: String,
+    pub person: String,
+    pub key: crate::keys::Signer,
 }
 
-/// Make `request` with `profile`'s credential, through this host's gateway. Blocking: call it
-/// from `spawn_blocking`. One request, one response; nothing is retried. A 4xx or 5xx is a
-/// response, not an error.
-pub fn authorized_request(
-    config: &Config,
-    profile: &str,
-    request: &AuthorizedRequest,
-) -> Result<AuthorizedResponse, AuthorizedError> {
-    authorized_request_at(&super::client::socket_path(), config, profile, request)
-}
-
-pub fn authorized_request_at(
+/// Make `request` with `profile`'s credential, through the gateway at `socket`. `identity` is
+/// asked for only when the gateway does not already take the caller for a person in a login
+/// session. Blocking. One request, one response; nothing is retried. A 4xx or 5xx is a response,
+/// not an error.
+pub fn request_at(
     socket: &Path,
-    config: &Config,
+    identity: impl FnOnce() -> Result<HostIdentity, String>,
     profile: &str,
     request: &AuthorizedRequest,
 ) -> Result<AuthorizedResponse, AuthorizedError> {
     let pid = std::process::id() as i32;
     let cgroup = identity::process_cgroup(pid).unwrap_or_default();
-    request_from_cgroup(socket, config, profile, request, cgroup)
+    request_from_cgroup(socket, identity, profile, request, cgroup)
 }
 
 /// The request, naming `cgroup` as this process's in its statement; tests stand in for /proc.
 pub(crate) fn request_from_cgroup(
     socket: &Path,
-    config: &Config,
+    host: impl FnOnce() -> Result<HostIdentity, String>,
     profile: &str,
     request: &AuthorizedRequest,
     cgroup: String,
@@ -184,10 +167,7 @@ pub(crate) fn request_from_cgroup(
     let mut connection = super::client::Connection::open(socket)
         .map_err(|error| AuthorizedError::Unavailable(format!("{error:#}")))?;
     if !matches!(connection.caller, CallerView::Person { .. }) {
-        let person = config.person.clone().ok_or_else(|| {
-            AuthorizedError::Unavailable("set `person` in st's configuration".into())
-        })?;
-        let (node, key) = node_identity(config).map_err(AuthorizedError::Unavailable)?;
+        let HostIdentity { node, person, key } = host().map_err(AuthorizedError::Unavailable)?;
         let pid = std::process::id() as i32;
         let statement = Statement {
             version: STATEMENT_VERSION,

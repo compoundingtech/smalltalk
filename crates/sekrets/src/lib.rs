@@ -1,0 +1,25 @@
+//! Sekrets: a command gateway that runs any CLI with credentials no caller can read.
+//!
+//! Opt-in and Linux first. A `sekrets` Unix user owns the store and runs the gateway
+//! (`sekrets serve`). A caller asks the gateway to run a command as one of its profiles; the
+//! gateway checks who is calling, the profile's policy and any grant, then runs the command in a
+//! sandbox with the profile's home and environment and the caller's own standard streams. Only
+//! the command's output and exit status reach the caller. See `docs/st3/sekrets.md`.
+//!
+//! This crate is the gateway and the `sekrets` command. It depends on nothing of st: the st
+//! daemon vouches for its seats and records the gateway's log through this crate's protocol.
+
+pub mod authorized;
+pub mod cli;
+pub mod client;
+pub mod files;
+pub mod gateway;
+pub mod identity;
+pub mod keys;
+pub mod policy;
+pub mod protocol;
+pub mod sandbox;
+pub mod store;
+
+#[cfg(test)]
+mod tests;
