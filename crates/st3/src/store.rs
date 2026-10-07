@@ -120,6 +120,7 @@ mod lanes;
 mod operations;
 mod unread_mail;
 mod agent_messages;
+mod conversation_reads;
 mod runtime;
 #[cfg(test)]
 mod tombstones_tests;
@@ -204,6 +205,14 @@ WHERE kind='message.sent';
 CREATE INDEX IF NOT EXISTS claims_message_from_index
 ON claims(json_extract(body, '$.fields.from'), store_index)
 WHERE kind='message.sent';
+-- Legacy sends can put endpoint fields at the body root. They must remain readable without
+-- making every conversation parse the entire fleet's message payloads to find them.
+CREATE INDEX IF NOT EXISTS claims_message_legacy_to_index
+ON claims(json_extract(body, '$.to'), store_index)
+WHERE kind='message.sent' AND json_type(body, '$.fields') IS NULL;
+CREATE INDEX IF NOT EXISTS claims_message_legacy_from_index
+ON claims(json_extract(body, '$.from'), store_index)
+WHERE kind='message.sent' AND json_type(body, '$.fields') IS NULL;
 CREATE INDEX IF NOT EXISTS claims_resume_host_index
 ON claims(json_extract(body, '$.fields.host'), subject)
 WHERE kind='runtime.action.requested' AND json_extract(body,'$.fields.action')='resume';
@@ -977,12 +986,14 @@ pub(crate) struct RuntimeAuthority {
 fn runtime_only_authority(
     connection: &Connection,
     subject: &str,
+    through: u64,
+    fields: &[&str],
 ) -> Result<Option<(Value, String)>> {
     let mut sources = connection.prepare_cached(&format!(
         "SELECT DISTINCT claims.kind, claims.origin FROM claims INDEXED BY claims_subject_kind_index
-         WHERE claims.subject=?1 AND {ACTUAL_STATE_CLAIM} LIMIT 2"
+         WHERE claims.subject=?1 AND claims.store_index<=?2 AND {ACTUAL_STATE_CLAIM} LIMIT 2"
     ))?;
-    let mut rows = sources.query([subject])?;
+    let mut rows = sources.query(params![subject, through])?;
     let Some(row) = rows.next()? else { return Ok(None); };
     if row.get::<_, String>(0)? != "runtime.observed" {
         return Ok(None);
@@ -993,30 +1004,26 @@ fn runtime_only_authority(
     }
     let body: String = connection.prepare_cached(&format!(
         "{} LIMIT 1", newest_claims_of_kind_query("claims.body", "runtime.observed"),
-    ))?.query_row(params![subject, i64::MAX], |row| row.get(0))?;
+    ))?.query_row(params![subject, through], |row| row.get(0))?;
     let latest: Value = serde_json::from_str(&body)?;
     let latest = latest.get("fields").unwrap_or(&latest);
     let mut older = connection.prepare_cached(&format!(
         "SELECT claims.body FROM claims INDEXED BY claims_subject_kind_accepted_index
          JOIN batches ON batches.id=claims.batch_id
-         WHERE claims.subject=?1 AND claims.kind='runtime.observed'
+         WHERE claims.subject=?1 AND claims.kind='runtime.observed' AND claims.store_index<=?4
            AND json_type(claims.body, CASE WHEN json_type(claims.body, '$.fields') IS NULL
                          THEN ?2 ELSE ?3 END) IS NOT NULL
          ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
     ))?;
     let mut actual = serde_json::Map::new();
-    for (field, root_path, fields_path) in [
-        ("status", "$.status", "$.fields.status"),
-        ("runtime_id", "$.runtime_id", "$.fields.runtime_id"),
-        ("incarnation_id", "$.incarnation_id", "$.fields.incarnation_id"),
-        ("terminal", "$.terminal", "$.fields.terminal"),
-        ("reachability", "$.reachability", "$.fields.reachability"),
-    ] {
+    for &field in fields {
+        let root_path = format!("$.{field}");
+        let fields_path = format!("$.fields.{field}");
         if let Some(value) = latest.get(field) {
             actual.insert(field.into(), value.clone());
         } else {
             let body: Option<String> = older.query_row(
-                params![subject, root_path, fields_path],
+                params![subject, root_path, fields_path, through],
                 |row| row.get(0),
             ).optional()?;
             if let Some(body) = body {
@@ -10039,7 +10046,7 @@ impl Store {
             return Ok(None);
         }
         let desired = desired_row_at(connection, subject, None)?;
-        let (actual, actual_origin, conflict) = match runtime_only_authority(connection, subject)? {
+        let (actual, actual_origin, conflict) = match runtime_only_authority(connection, subject, i64::MAX as u64, &["status", "runtime_id", "incarnation_id", "terminal", "reachability"])? {
             Some((actual, origin)) => (Some(actual), Some(origin), false),
             None => {
                 let member = desired.as_ref()

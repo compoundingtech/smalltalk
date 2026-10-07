@@ -2714,31 +2714,13 @@ fn managed_session_owner_at(
     snapshot_index: u64,
     session_id: &str,
 ) -> anyhow::Result<Option<(String, Option<String>, Option<String>)>> {
-    let status = store.status_for_subject_prefix_at("agent/", Some(snapshot_index), true)?;
-    for subject in status.subjects {
-        if !subject.subject.starts_with("agent/") && subject.kind.as_deref() != Some("agent") {
-            continue;
-        }
-        let fields = subject
-            .actual
-            .as_ref()
-            .map(|actual| actual.get("fields").unwrap_or(actual));
-        let incarnation = fields
-            .and_then(|fields| fields.get("incarnation_id"))
-            .and_then(Value::as_str)
-            .or(subject.projection.runtime_incarnation.as_deref());
-        let runtime = fields
-            .and_then(|fields| fields.get("runtime_id"))
-            .and_then(Value::as_str);
-        let Some(identity) = incarnation.or(runtime) else {
+    let owners = store.conversation_owners_at(snapshot_index)?;
+    for owner in owners.values() {
+        let Some(identity) = owner.incarnation.as_deref().or(owner.runtime.as_deref()) else {
             continue;
         };
-        if managed_session_id(&subject.subject, identity) == session_id {
-            return Ok(Some((
-                subject.subject,
-                incarnation.map(str::to_owned),
-                subject.actual_origin,
-            )));
+        if managed_session_id(&owner.subject, identity) == session_id {
+            return Ok(Some((owner.subject.clone(), owner.incarnation.clone(), owner.origin.clone())));
         }
     }
     Ok(None)
