@@ -35,7 +35,7 @@ This is a proposed boundary extension, not either of those records.
 - There is no client command catalog or runtime model-setting action.
 - `GET /v1/client/capabilities` advertises daemon capabilities. Required unknown capabilities stop a client; optional unknown capabilities are ignored.
 
-Sources: [schema](schemas/client-v0.schema.json), [operation manifest](schemas/operations.json), [pi channel](../../../crates/st-drivers/src/pi_channel.rs), [omp channel](../../../hooks/omp-channel.ts), and [harness-context spec](../../vrs/08-harness-context/spec.md).
+Sources: [schema](schemas/client-v0.schema.json), [operation manifest](schemas/operations.json), [pi channel](../../../crates/st-drivers/src/pi_channel.rs), [omp channel](../../../crates/st-drivers/hooks/omp-channel.ts), and [harness-context spec](../../vrs/08-harness-context/spec.md).
 
 ## Proposed send envelope
 
