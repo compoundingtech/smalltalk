@@ -1657,8 +1657,6 @@ impl LineTimelineFold {
     }
 
     fn refresh(&mut self, session: &ExternalSession) -> Result<Vec<Value>> {
-        #[cfg(test)]
-        timeline_test_support::gate_refresh(session.transcript.as_path());
         let mut file = File::open(&session.transcript)
             .with_context(|| format!("read transcript {}", session.transcript.display()))?;
         let metadata = file.metadata()?;
@@ -1694,6 +1692,8 @@ impl LineTimelineFold {
             match reader.read_until(b'\n', &mut buffer) {
                 Ok(0) => break,
                 Ok(_) if buffer.last() == Some(&b'\n') => {
+                    #[cfg(test)]
+                    timeline_test_support::gate_refresh(session.transcript.as_path());
                     let line = FoldedLine::new(self.consumed, self.next_line_number, buffer);
                     self.next_line_number += 1;
                     self.consumed += line.bytes.len() as u64;
@@ -6539,12 +6539,12 @@ mod tests {
             std::thread::spawn(move || normalized_timeline(&session).unwrap())
         };
         timeline_test_support::wait_refresh_arrived(&path);
-        // The append lands while the fold's refresh is parked inside its read.
+        // The size was captured and the first record read, but EOF has not been checked.
         let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
         write!(file, "{}", codex_record("two", "two")).unwrap();
         timeline_test_support::release_refresh(&path);
         let parked = reader.join().unwrap();
-        assert_eq!(texts(&parked), ["one", "two"]);
+        assert_eq!(texts(&parked), ["one"]);
         let session = transcript_session(ExternalDriver::Codex, &path);
         let after = timeline_slice(&session, TimelineOrder::Sequence, None, 10).unwrap();
         assert_eq!(texts(&after.items), ["two", "one"]);

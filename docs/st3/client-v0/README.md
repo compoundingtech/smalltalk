@@ -1542,6 +1542,7 @@ Native timeline page cursors also carry the transcript's content generation. App
 a page valid, while an in-place replacement or truncation of the same file — identical
 driver, native session, path and inode — expires outstanding cursors with
 `page-cursor-expired` so no old page boundary is ever applied to rewritten records.
+An edit to an earlier record that leaves the last complete record intact is not detected by the generation check; this is an accepted, known limit.
 Known blocks can use `payload: {body_ref: true}` to refer to the containing fallback
 body without duplicating its bytes. Content refs authenticate one native record;
 chunk reads do not rebuild the session. The owner never requests transcript HTTP(S)
