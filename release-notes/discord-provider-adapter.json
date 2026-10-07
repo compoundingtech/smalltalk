@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "summary": "Enrolled Discord adapter with external accounts, images and resumable reply waits",
+  "commits": [
+    "0c121990881f1b49c97d5f0ec5f14e61cf62407c",
+    "7c91c72f26003035af53518ef067466382674135",
+    "54c94b240eb2028fbe4751fab0ff854fa848f27a",
+    "fba2f9f75157ed05ce3a0008423719e51c0aea70",
+    "303e8f733fd4bcf849ef8f8ebcd98e4ec30ce39b",
+    "06c69fe80fe54ee15fa85736bd7ca330d61e3f8e",
+    "5a72a3c75e4ee17b41a0f62920e8ae1ad2c666f7",
+    "bce758fb59e041a93a909b3cb7fbf7bd11a7e039",
+    "095e9ae6feadbf9db1267b05a8947667a51fdade"
+  ],
+  "replay": {
+    "status": "none",
+    "detail": "No startup replay or replay-rule change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database table or schema-version change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules remain unchanged at v11."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Adds the external account subject family and enrolled adapter APIs, changing the replication schema compatibility digest. Mixed builds continue exchanging authority logs but suppress projection-root comparison and healing until their registries match. Older builds lack the external family and adapter import API."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional daemon interruption introduced; the existing legacy text bridge remains available until the native cutover."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Upgrade all members together in a coordinated window. Confirm every member is reachable first; verify installed commits, matching replication schema digests, health gates and resumed exchange. Only then switch the live program seat from legacy text to the enrolled adapter, preserving private delivery checkpoints, and verify a live image round trip."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "Swapping back does not erase external identities or messages already recorded in the claim log. Older builds can exchange existing authority envelopes but lack the adapter API and external subject family; direct claims on that new family are unsupported, and mixed registries skip projection comparison/healing. Stop native imports before rollback and retain the bridge checkpoints, pending imports and delivery receipts. Do not rewrite pending external senders as people or replay channel history. Roll forward to an adapter-capable fleet before resuming unfinished external imports; a legacy text fallback requires explicit state reconciliation."
+  }
+}
