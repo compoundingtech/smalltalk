@@ -1,14 +1,14 @@
 # DELTA-005: `costUsd` is harness-reported at its reported scope
 
-Status: open
+Status: resolved — HC-R16 wording confirmed by Johannes (axe Q168, 2026-10-07 ~20:45Z)
 
 ## Divergence
 
-Proposed HC-R16 says the record carries "the harness-reported cost at the scope
-the harness reports". The current accepted requirement instead says "session
-cost", creating a contradiction with pi and omp's reported values. **This
-requirement change is a proposal only: Johannes must confirm it before HC-R16
-is treated as ratified with this wording.**
+HC-R16 originally required "session cost", contradicting the values pi and omp
+report. Johannes confirmed the amendment to "the harness-reported cost at the
+scope the harness reports, stated per harness in the spec producer table"
+(axe Q168, 2026-10-07 ~20:45Z); the accepted requirement now matches the
+producer scope and this delta is resolved.
 
 The pi and omp producers shipped on 2026-08-29 publish the **last assistant
 message's** `usage.cost.total`, which is what those two harnesses actually
@@ -20,10 +20,10 @@ cost at all.
 
 ## VRS
 
-HC-R16 currently names a session cost, while the producer table already names
-per-message `usage.cost.total` for pi and omp. This proposal makes the scope
-harness-specific and the rows consistent with it; the pi and omp producer
-sections describe the actual published values.
+The producer table already named per-message `usage.cost.total` for pi and omp.
+The confirmed HC-R16 wording allows harness-specific scope and makes the
+requirement and producer rows consistent; the pi and omp producer sections
+describe the actual published values.
 
 ## Implementation
 
@@ -54,10 +54,9 @@ update VRS
 
 ## Resolution Signal
 
-Proposed resolution: amend HC-R16 so adjacent cost is "the harness-reported
-cost at the scope the harness reports", and align the spec field description and
-producer table. **Johannes must confirm this amendment** because requirements.md
-is protected. The spec and this delta record can describe the proposed resolution
-without that ratification. Consumers must read the `harness` discriminator before
+Resolution: HC-R16 and the spec field description now state that cost is
+harness-reported at the scope the harness reports, stated per harness in the
+producer table. Johannes confirmed the protected requirement change in axe Q168
+(2026-10-07 ~20:45Z). Consumers must read the `harness` discriminator before
 comparing this field across harnesses — already required for `usedTokens`, whose
 meaning differs between pi and omp for unrelated reasons (HC-T03).
