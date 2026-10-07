@@ -5,6 +5,7 @@ pub mod custom;
 pub mod declarations;
 mod glass_heads;
 mod glasses;
+mod mailbox_changes;
 pub(crate) mod mailbox_wakes;
 mod native_sources;
 pub mod owned_sets;
@@ -108,7 +109,7 @@ mod person_work;
 mod subagents;
 mod watches;
 pub use checkpoint_rules::{RULES_VERSION, plan_drops, rules_digest};
-pub use limits::{AccountLimit, LIMITS_ACTOR, LimitsOutcome, LimitsPolicy};
+pub use limits::{AccountLimit, LIMITS_ACTOR, LIMITS_CATCH_UP_PAGE, LimitsOutcome, LimitsPolicy};
 pub use subagents::{
     EndedSubagent, SUBAGENT_KINDS, SUBAGENT_LEASE_MS, SubagentSweep, SubagentView,
 };
@@ -280,6 +281,10 @@ WHERE kind='gate.requested' AND json_extract(body, '$.fields.reviewer') IS NOT N
 -- of other kinds plan as they did.
 CREATE INDEX IF NOT EXISTS claims_runtime_subject_index ON claims(subject, store_index)
 WHERE kind='runtime.observed';
+-- An already-open raw stream revalidates the original paired actor, never a full graph scan.
+CREATE INDEX IF NOT EXISTS claims_client_pairing_actor_index
+ON claims(json_extract(body, '$.fields.session_actor'))
+WHERE kind='custom.client.pairing-completed';
 -- A runtime incarnation's claims about a subject by acceptance time, so when a session began
 -- and last changed are two seeks instead of a read of every claim the subject has. The
 -- expression is INCARNATION_OF_CLAIM, which queries repeat so the planner uses this index.
@@ -847,7 +852,11 @@ pub(crate) struct SubjectCache {
     conflicts: u64,
     views: HashMap<String, ViewEntry>,
     statuses: HashMap<String, StatusEntry>,
+    // Summary and full statuses never share entries: their provenance/harness fields differ.
+    card_statuses: HashMap<String, StatusEntry>,
 }
+
+const AGENT_CARD_STATUS_LIMIT: usize = 4096;
 
 /// One subject's reduction, read at snapshot `read_at`, so it holds from there on.
 struct StatusEntry {
@@ -968,6 +977,80 @@ fn runtime_view_entry(
         declared: true,
         owners,
     })
+}
+
+/// Runtime authority without presentation, harness, planning or claim-history reduction.
+pub(crate) struct RuntimeAuthority {
+    pub actual: Option<Value>,
+    pub actual_origin: Option<String>,
+    pub reachability: String,
+}
+
+/// A single-origin runtime-only history cannot have rival runtime authority. Runtime observations
+/// append fields, so an omitted field retains its newest earlier value; explicit null replaces it.
+/// Other actual kinds and origins use the general fold and causal source selection instead.
+fn runtime_only_authority(
+    connection: &Connection,
+    subject: &str,
+) -> Result<Option<(Value, String)>> {
+    let mut sources = connection.prepare_cached(&format!(
+        "SELECT DISTINCT claims.kind, claims.origin FROM claims INDEXED BY claims_subject_kind_index
+         WHERE claims.subject=?1 AND {ACTUAL_STATE_CLAIM} LIMIT 2"
+    ))?;
+    let mut rows = sources.query([subject])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    if row.get::<_, String>(0)? != "runtime.observed" {
+        return Ok(None);
+    }
+    let origin = row.get::<_, String>(1)?;
+    if rows.next()?.is_some() {
+        return Ok(None);
+    }
+    let body: String = connection
+        .prepare_cached(&format!(
+            "{} LIMIT 1",
+            newest_claims_of_kind_query("claims.body", "runtime.observed"),
+        ))?
+        .query_row(params![subject, i64::MAX], |row| row.get(0))?;
+    let latest: Value = serde_json::from_str(&body)?;
+    let latest = latest.get("fields").unwrap_or(&latest);
+    let mut older = connection.prepare_cached(&format!(
+        "SELECT claims.body FROM claims INDEXED BY claims_subject_kind_accepted_index
+         JOIN batches ON batches.id=claims.batch_id
+         WHERE claims.subject=?1 AND claims.kind='runtime.observed'
+           AND json_type(claims.body, CASE WHEN json_type(claims.body, '$.fields') IS NULL
+                         THEN ?2 ELSE ?3 END) IS NOT NULL
+         ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
+    ))?;
+    let mut actual = serde_json::Map::new();
+    for (field, root_path, fields_path) in [
+        ("status", "$.status", "$.fields.status"),
+        ("runtime_id", "$.runtime_id", "$.fields.runtime_id"),
+        (
+            "incarnation_id",
+            "$.incarnation_id",
+            "$.fields.incarnation_id",
+        ),
+        ("terminal", "$.terminal", "$.fields.terminal"),
+        ("reachability", "$.reachability", "$.fields.reachability"),
+    ] {
+        if let Some(value) = latest.get(field) {
+            actual.insert(field.into(), value.clone());
+        } else {
+            let body: Option<String> = older
+                .query_row(params![subject, root_path, fields_path], |row| row.get(0))
+                .optional()?;
+            if let Some(body) = body {
+                let value: Value = serde_json::from_str(&body)?;
+                if let Some(value) = value.get("fields").unwrap_or(&value).get(field) {
+                    actual.insert(field.into(), value.clone());
+                }
+            }
+        }
+    }
+    Ok(Some((Value::Object(actual), origin)))
 }
 
 #[derive(Clone, Copy)]
@@ -6242,7 +6325,15 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()?;
         ids.into_iter()
             .map(|id| {
-                let view = mission_run_view_tx(&connection, &id)?;
+                // The legacy tree consumes step state, summaries and queue order, not
+                // each worker's wake, timing and harness presentation histories.
+                let mut view = mission_run_steps_view_tx(&connection, &id, true)?;
+                enrich_run_step_queues_tx(&connection, &mut view)?;
+                // Keep the run-level fields of the existing tree response.
+                view.provenance =
+                    crate::provenance::read(&connection, &view.mission, &view.revision)?;
+                view.loops = loop_run_views_tx(&connection, &view)?;
+                view.outcome = mission_run_outcome_tx(&connection, &view)?;
                 note_run_view_reads(&view);
                 Ok(view)
             })
@@ -10049,6 +10140,66 @@ impl Store {
         })
     }
 
+    /// The fields used by live terminal fences, with the same authority decisions as `status`.
+    pub(crate) fn runtime_authority(&self, subject: &str) -> Result<Option<RuntimeAuthority>> {
+        smallclaims::touched::note_read(|| subject.to_owned());
+        let connection = self.readers.get();
+        // Eligibility, inherited fields and unknown claims must share one snapshot: a rival
+        // arriving between SELECTs must not be paired with the earlier single origin.
+        let connection = connection.unchecked_transaction()?;
+        Self::runtime_authority_on(&connection, subject)
+    }
+
+    /// Runtime fences inside an existing read or committed-write snapshot.
+    pub(crate) fn runtime_authority_on(
+        connection: &Connection,
+        subject: &str,
+    ) -> Result<Option<RuntimeAuthority>> {
+        if subject.starts_with("glass/") || subject.starts_with("arrangement/") {
+            return Ok(None);
+        }
+        let desired = desired_row_at(connection, subject, None)?;
+        let (actual, actual_origin, conflict) = match runtime_only_authority(connection, subject)? {
+            Some((actual, origin)) => (Some(actual), Some(origin), false),
+            None => {
+                let member = desired
+                    .as_ref()
+                    .and_then(|row| row.member.as_deref())
+                    .and_then(|value| serde_json::from_str::<crate::model::MemberSpec>(value).ok());
+                let actual = latest_actual_at(connection, subject, None)?;
+                let (_, origin, conflict) = selected_actual_source_at(
+                    connection,
+                    subject,
+                    None,
+                    member.as_ref().map(|member| member.host.as_str()),
+                )?;
+                (actual, origin, conflict)
+            }
+        };
+        let reachability =
+            if conflict || has_unknown_claim_at(connection, subject, None)?.is_some() {
+                "indeterminate"
+            } else {
+                actual
+                    .as_ref()
+                    .and_then(|value| value.get("reachability"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(if actual.is_some() {
+                        "reachable"
+                    } else if desired.is_some() {
+                        "indeterminate"
+                    } else {
+                        "unknown"
+                    })
+            }
+            .to_owned();
+        Ok(Some(RuntimeAuthority {
+            actual,
+            actual_origin,
+            reachability,
+        }))
+    }
+
     pub fn status(&self, selected: Option<&str>) -> Result<StatusResponse> {
         self.status_at_view(selected, None, None, false)
     }
@@ -10253,8 +10404,12 @@ impl Store {
             if conflicts != cache.conflicts {
                 cache.views.clear();
                 cache.statuses.clear();
+                cache.card_statuses.clear();
                 cache.conflicts = conflicts;
-            } else if !cache.views.is_empty() || !cache.statuses.is_empty() {
+            } else if !cache.views.is_empty()
+                || !cache.statuses.is_empty()
+                || !cache.card_statuses.is_empty()
+            {
                 // The subjects and actors of the claims that arrived.
                 let mut statement = connection.prepare_cached(
                     "SELECT subject, actor FROM claims WHERE store_index>?1 AND store_index<=?2",
@@ -10277,6 +10432,9 @@ impl Store {
                 cache
                     .statuses
                     .retain(|subject, entry| !stale(subject, &entry.owners));
+                cache
+                    .card_statuses
+                    .retain(|subject, entry| !stale(subject, &entry.owners));
             }
             cache.through = store_index;
         }
@@ -10292,22 +10450,43 @@ impl Store {
         store_index: u64,
         newest: bool,
     ) -> Result<(SubjectStatus, Option<PlannedAction>)> {
+        self.cached_subject_status_with_mode(
+            connection,
+            subject,
+            store_index,
+            newest,
+            SubjectStatusMode::Full,
+        )
+    }
+
+    fn cached_subject_status_with_mode(
+        &self,
+        connection: &Connection,
+        subject: &str,
+        store_index: u64,
+        newest: bool,
+        mode: SubjectStatusMode,
+    ) -> Result<(SubjectStatus, Option<PlannedAction>)> {
         {
             let cache = self
                 .smalltalk
                 .subject_cache
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            if let Some(entry) = cache
-                .statuses
+            let entries = match mode {
+                SubjectStatusMode::Full => &cache.statuses,
+                SubjectStatusMode::AgentCard => &cache.card_statuses,
+            };
+            if let Some(entry) = entries
                 .get(subject)
                 .filter(|entry| entry.read_at <= store_index && store_index <= cache.through)
             {
                 return Ok((entry.status.clone(), entry.action.clone()));
             }
         }
-        let (status, action) = subject_status_at(connection, subject, Some(store_index), None)?
-            .expect("a reduction without an owner filter always has a status");
+        let (status, action) =
+            subject_status_at_with_mode(connection, subject, Some(store_index), None, mode)?
+                .expect("a reduction without an owner filter always has a status");
         if newest {
             let mut cache = self
                 .smalltalk
@@ -10322,7 +10501,19 @@ impl Store {
                     .chain(status.projection.owner_generation.iter())
                     .cloned()
                     .collect();
-                cache.statuses.insert(
+                let entries = match mode {
+                    SubjectStatusMode::Full => &mut cache.statuses,
+                    SubjectStatusMode::AgentCard => &mut cache.card_statuses,
+                };
+                // At capacity, a cold summary remains correct and uncached. Invalidation
+                // frees slots; no growing history map or full-status cache warming is needed.
+                if matches!(mode, SubjectStatusMode::AgentCard)
+                    && entries.len() >= AGENT_CARD_STATUS_LIMIT
+                    && !entries.contains_key(subject)
+                {
+                    return Ok((status, action));
+                }
+                entries.insert(
                     subject.to_owned(),
                     StatusEntry {
                         read_at: store_index,
@@ -10423,16 +10614,17 @@ impl Store {
         } else {
             self.current_view_candidates(&connection, names, index, true)?
         };
+        let newest = self.advance_subject_cache(&connection, index)?;
         let mut subjects = Vec::with_capacity(names.len());
         for name in names {
-            if let Some((status, _)) = subject_status_at_with_mode(
+            let (status, _) = self.cached_subject_status_with_mode(
                 &connection,
                 &name,
-                Some(index),
-                None,
+                index,
+                newest,
                 SubjectStatusMode::AgentCard,
-            )? && (history || status.projection.layer == "current")
-            {
+            )?;
+            if history || status.projection.layer == "current" {
                 subjects.push(status);
             }
         }
@@ -11566,11 +11758,21 @@ impl Store {
         recipient: Option<&str>,
         include_closed: bool,
     ) -> Result<Vec<MessageView>> {
+        self.messages_through(recipient, include_closed, self.index()?)
+    }
+
+    /// A pinned reader must page through its SQLite index, which can lead the process atomic
+    /// between COMMIT and publication of the committed index.
+    pub(crate) fn messages_through(
+        &self,
+        recipient: Option<&str>,
+        include_closed: bool,
+        through: u64,
+    ) -> Result<Vec<MessageView>> {
         smallclaims::touched::note_read(|| match recipient {
             Some(recipient) => format!("mailbox:{recipient}"),
             None => "kind:message.sent".to_owned(),
         });
-        let through = self.index()?;
         let mut after = None;
         let mut all = Vec::new();
         loop {
@@ -15370,23 +15572,33 @@ impl Store {
             .map_err(Into::into)
     }
 
-    /// What a mailbox stream's snapshot can depend on, read before the snapshot is taken. A change
-    /// after it to any of that brings a new snapshot; see [`Store::mailbox_changed_since`].
+    /// Durable cursors and the selected declaration/owner in one SQLite read snapshot.
+    /// Streams advance this watermark only after capturing their corresponding delta.
     pub(crate) fn mailbox_watermark(
         &self,
         fence: &crate::mailbox::Fence,
     ) -> Result<MailboxWatermark, St3Error> {
-        let index = self.index().map_err(internal)?;
         let connection = self.readers.get();
-        let local = connection
-            .prepare_cached("SELECT COALESCE(MAX(id), 0) FROM local_observations")
+        // The process-wide committed index may advance beyond a pinned reader. Capture both
+        // cursors from its SQLite snapshot, or a concurrent commit could be skipped forever.
+        let (index, local) = connection
+            .prepare_cached(
+                "SELECT COALESCE((SELECT MAX(store_index) FROM claims),0),
+                                    COALESCE((SELECT MAX(id) FROM local_observations),0)",
+            )
             .map_err(internal)?
-            .query_row([], |row| row.get(0))
+            .query_row([], |row| Ok((row.get(0)?, row.get(1)?)))
             .map_err(internal)?;
         Ok(MailboxWatermark {
             index,
             local,
             owner: mailbox_owner_key(&connection, fence)?,
+            desired: connection
+                .prepare_cached("SELECT claim_id FROM desired WHERE subject=?1")
+                .map_err(internal)?
+                .query_row([&fence.subject], |row| row.get(0))
+                .optional()
+                .map_err(internal)?,
         })
     }
 
@@ -15395,6 +15607,7 @@ impl Store {
     /// message sent to it or newly declared, or a claim of a message in its last snapshot. The
     /// local dispatcher targets dependent streams; this durable check still filters coalesced
     /// wakes, without trusting the ephemeral routing index for correctness.
+    #[cfg(test)]
     pub(crate) fn mailbox_changed_since(
         &self,
         fence: &crate::mailbox::Fence,
@@ -15450,7 +15663,7 @@ impl Store {
             if !person_work::declaration_live(&self.readers.get(), &desired.subject)? {
                 continue;
             }
-            let Some(harness) = self.current_harness(&desired.subject)? else {
+            let Some(harness) = self.current_harness_for_login(&desired.subject)? else {
                 continue;
             };
             if harness.state != "needs-login" {
@@ -15622,6 +15835,22 @@ impl Store {
         smallclaims::touched::note_read(|| format!("actor:{subject}"));
         let connection = self.readers.get();
         current_harness_at(&connection, subject, None)
+    }
+
+    /// The seat's harness for the one question the login attention item asks: does it need a
+    /// login? A seat that does not returns without the observation fold, which is what a
+    /// full `current_harness` costs, so an attention read no longer folds every seat that ever
+    /// had a login problem. The view a seat that does need one gets is `current_harness`'s,
+    /// except that its `since` is not refined (attention reads the state, incarnation and
+    /// observation time).
+    pub(crate) fn current_harness_for_login(
+        &self,
+        subject: &str,
+    ) -> Result<Option<crate::model::CurrentHarnessView>> {
+        smallclaims::touched::note_read(|| subject.to_owned());
+        smallclaims::touched::note_read(|| format!("actor:{subject}"));
+        let connection = self.readers.get();
+        current_harness_fold_at(&connection, subject, None, true, true)
     }
 
     /// Positive attachment proof under the indexed current-incarnation diagnostic fence.
@@ -19842,6 +20071,9 @@ pub(crate) fn append_claim_tx(
     if kind == "message.sent" {
         agent_messages::flush(transaction)?;
     }
+    if kind == "harness.limits" {
+        limits::flush_limits(transaction)?;
+    }
     if kind == "arrangement.edited" {
         arrangements::project(transaction, &record)?;
     }
@@ -20551,6 +20783,7 @@ pub(crate) struct MailboxWatermark {
     index: u64,
     local: i64,
     owner: Option<(String, i64, bool)>,
+    desired: Option<String>,
 }
 
 /// The seat channel's current owner, and whether `fence`'s binding still exists.
@@ -20647,7 +20880,7 @@ fn current_harness_at(
     subject: &str,
     at_index: Option<u64>,
 ) -> Result<Option<crate::model::CurrentHarnessView>> {
-    let mut view = current_harness_fold_at(connection, subject, at_index, true)?;
+    let mut view = current_harness_fold_at(connection, subject, at_index, true, false)?;
     if let Some(harness) = view.as_mut() {
         seat_status::enrich_harness(connection, subject, at_index, harness)?;
     }
@@ -20708,11 +20941,61 @@ fn claude_attachment_fence(
     }))
 }
 
+/// Whether any observation of this runtime epoch of `subject` carries the reason `providerAuth`
+/// or the state `needs-login`, the two ways the observation fold can end in `needs-login`. Today's
+/// claim validation refuses the state `needs-login` in an observation, so only claims written
+/// before that rule can carry it, which is why no test can append one; the probe still asks, so a
+/// store holding such a claim keeps raising its login item:
+/// those that name `incarnation_id`, and those that name no incarnation as text and were accepted
+/// no earlier than the runtime observation (`runtime_accepted_at`), the same two sets the
+/// observation fold reads. The seat's login evidence sits in `claims_harness_login_candidate_index`,
+/// so this reads that partial index, not every observation the seat ever made.
+fn provider_auth_reason_in_epoch(
+    connection: &Connection,
+    subject: &str,
+    at_index: u64,
+    incarnation_id: &str,
+    runtime_accepted_at: &str,
+) -> Result<bool> {
+    let reason = "json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
+                            THEN '$.reason' ELSE '$.fields.reason' END)";
+    let state = "json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
+                            THEN '$.state' ELSE '$.fields.state' END)";
+    let sql = format!(
+        "SELECT EXISTS(SELECT 1 FROM claims INDEXED BY claims_harness_login_candidate_index
+           WHERE claims.subject=?1 AND (
+             (kind='harness.observed' AND (
+               json_type(body, '$.fields.provider_auth')='false'
+               OR json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
+                   THEN '$.reason' ELSE '$.fields.reason' END)='providerAuth'
+               OR json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
+                   THEN '$.state' ELSE '$.fields.state' END)='needs-login'))
+             OR (kind='harness.diagnostic'
+               AND json_extract(body, '$.fields.code')='provider-auth-expired'))
+           AND kind='harness.observed' AND store_index<=?2
+           AND ({reason}='providerAuth' OR {state}='needs-login')
+           AND ({INCARNATION_OF_CLAIM}=?3
+                OR (({INCARNATION_OF_CLAIM} IS NULL OR typeof({INCARNATION_OF_CLAIM})!='text')
+                    AND (length(claims.accepted_at_unix_ms)>length(?4)
+                         OR (length(claims.accepted_at_unix_ms)=length(?4)
+                             AND claims.accepted_at_unix_ms>=?4)))))"
+    );
+    Ok(connection.prepare_cached(&sql)?.query_row(
+        params![subject, at_index, incarnation_id, runtime_accepted_at],
+        |row| row.get(0),
+    )?)
+}
+
+/// `login_only` answers only whether the seat needs a login: it returns as soon as the cheap
+/// fences have spoken and no observation of this runtime epoch says `providerAuth`, which is the
+/// one thing the observation fold below can add to them. Every other view it returns is the one
+/// the full fold would return, and the view it skips is never `needs-login`.
 fn current_harness_fold_at(
     connection: &Connection,
     subject: &str,
     at_index: Option<u64>,
     include_work_activity: bool,
+    login_only: bool,
 ) -> Result<Option<crate::model::CurrentHarnessView>> {
     let at_index = at_index.unwrap_or(i64::MAX as u64);
     let runtime = connection
@@ -20873,6 +21156,18 @@ fn current_harness_fold_at(
 
     if let Some(harness) = claude_attachment_fence(connection, subject, incarnation_id, at_index)? {
         return Ok(Some(harness));
+    }
+
+    if login_only
+        && !provider_auth_reason_in_epoch(
+            connection,
+            subject,
+            at_index,
+            incarnation_id,
+            &runtime_key.0.to_string(),
+        )?
+    {
+        return Ok(None);
     }
 
     // The observations of this runtime epoch, newest first in canonical order, so every node that
@@ -23514,6 +23809,10 @@ mod fleet_admission_tests {
         assert_eq!(worker.reachability, "reachable", "{:?}", worker.reason);
         assert_eq!(worker.actual_origin.as_deref(), Some("current"));
         assert_eq!(worker.reason, None);
+        let authority = older.runtime_authority(subject).unwrap().unwrap();
+        assert_eq!(authority.reachability, "reachable");
+        assert_eq!(authority.actual_origin.as_deref(), Some("current"));
+        assert_eq!(authority.actual, worker.actual);
 
         // An unknown kind in the runtime family could change the answer: stay conservative.
         append(
@@ -23525,12 +23824,83 @@ mod fleet_admission_tests {
         sync(&current, &older);
         let status = older.status(Some(subject)).unwrap();
         assert_eq!(status.subjects[0].reachability, "indeterminate");
+        assert_eq!(
+            older
+                .runtime_authority(subject)
+                .unwrap()
+                .unwrap()
+                .reachability,
+            "indeterminate"
+        );
         assert!(
             status.subjects[0]
                 .reason
                 .as_deref()
                 .is_some_and(|reason| reason.contains("runtime.restart-window-reset"))
         );
+    }
+
+    #[test]
+    fn runtime_authority_preserves_append_fields_nulls_and_other_actual_kinds() {
+        let subject = "agent/runtime-fence-fields";
+        for missing in [
+            "status",
+            "runtime_id",
+            "incarnation_id",
+            "terminal",
+            "reachability",
+        ] {
+            let store = Store::open_memory("owner").unwrap();
+            let original = json!({"status":"running","runtime_id":"r","incarnation_id":"i",
+                                  "terminal":true,"reachability":"reachable"});
+            append(&store, "runtime.observed", subject, original.clone());
+            append(
+                &store,
+                "runtime.observed",
+                subject,
+                json!({"reason":"later partial report"}),
+            );
+            let narrow = store.runtime_authority(subject).unwrap().unwrap();
+            let status = store.status(Some(subject)).unwrap();
+            for field in [
+                "status",
+                "runtime_id",
+                "incarnation_id",
+                "terminal",
+                "reachability",
+            ] {
+                assert_eq!(
+                    narrow.actual.as_ref().unwrap().get(field),
+                    status.subjects[0].actual.as_ref().unwrap().get(field)
+                );
+                assert_eq!(
+                    narrow.actual.as_ref().unwrap().get(field),
+                    original.get(field)
+                );
+            }
+            append(&store, "runtime.observed", subject, json!({missing: null}));
+            let narrow = store.runtime_authority(subject).unwrap().unwrap();
+            let status = store.status(Some(subject)).unwrap();
+            assert_eq!(
+                narrow.actual.as_ref().unwrap().get(missing),
+                Some(&Value::Null)
+            );
+            assert_eq!(narrow.reachability, status.subjects[0].reachability);
+            assert_eq!(
+                narrow.actual.as_ref().unwrap().get(missing),
+                status.subjects[0].actual.as_ref().unwrap().get(missing)
+            );
+            append(
+                &store,
+                "runtime.reconcile-decision",
+                subject,
+                json!({"decision":"hold","reachability":"unreachable"}),
+            );
+            let narrow = store.runtime_authority(subject).unwrap().unwrap();
+            let status = store.status(Some(subject)).unwrap();
+            assert_eq!(narrow.reachability, "unreachable");
+            assert_eq!(narrow.actual, status.subjects[0].actual);
+        }
     }
 
     #[test]
@@ -29336,6 +29706,47 @@ fn enrich_step_definition(connection: &Connection, view: &mut StepRunView) -> ru
     Ok(())
 }
 
+/// Keep the tree's queue labels and order without work presentation enrichment.
+/// Read the current generation's pinned definition once for all of this run's steps.
+fn enrich_run_step_queues_tx(
+    connection: &Connection,
+    view: &mut MissionRunView,
+) -> rusqlite::Result<()> {
+    if view.steps.is_empty() {
+        return Ok(());
+    }
+    let body = connection
+        .query_row(
+            "SELECT mission_revisions.body
+             FROM run_generations
+             JOIN mission_runs ON mission_runs.id=run_generations.run_id
+             JOIN mission_revisions
+               ON mission_revisions.mission_id=mission_runs.mission_id
+              AND mission_revisions.revision=run_generations.revision
+             WHERE run_generations.id=?1",
+            [generation_id_from_subject(&view.generation)],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(body) = body else {
+        return Ok(());
+    };
+    let mission = serde_json::from_str::<MissionSpec>(&body).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            body.len(),
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })?;
+    for view in &mut view.steps {
+        if let Some(step) = crate::mission::find_step(&mission, &view.step) {
+            view.queue.clone_from(&step.queue);
+            view.queue_position = step.queue_position;
+        }
+    }
+    Ok(())
+}
+
 fn fresh_context_ready_tx(
     connection: &Connection,
     step: &StepRunView,
@@ -29883,6 +30294,10 @@ fn apply_effective_step_state(
     {
         view.status = "ready".into();
         view.blocked_reason = Some("the worker lease expired".into());
+        // Expiry is a new readiness episode even before a repair writes it. Old
+        // consumed wakes must not acknowledge this newly unclaimed work. A claim
+        // persists this effective epoch, so later expiries advance it once more.
+        view.readiness_epoch = view.readiness_epoch.saturating_add(1);
         view.claimant = None;
         view.claim_incarnation = None;
         view.claim_expires_at_unix_ms = None;
@@ -30709,10 +31124,9 @@ fn mission_run_view_for_projection_tx(
 }
 
 /// A run's header and each step's effective state, and with `summaries` each step's latest
-/// progress and completion summaries: what a mission detail and the missions tree show of a
-/// run. The work view's enrichment also folds every step's execution timing, reads the wake
-/// messages and harness history of its assignee and parses the mission for its queue, none of
-/// which those views show; `mission_run_view_tx` does that.
+/// progress and completion summaries. The legacy tree adds queue labels and positions with
+/// `enrich_run_step_queues_tx`. Full work presentation, including execution timing, wake
+/// messages and harness history, remains in `mission_run_view_tx`.
 fn mission_run_steps_view_tx(
     connection: &Connection,
     run_id: &str,
@@ -31209,6 +31623,39 @@ fn step_generation_is_current(
         |row| row.get(0),
     )?;
     Ok(generation_id_from_subject(&step.generation) == current)
+}
+
+#[cfg(test)]
+pub(crate) fn expire_work_lease_by_claim(
+    store: &Store,
+    subject: &str,
+    actor: &str,
+    incarnation: &str,
+) {
+    let current = store.step_run(subject).unwrap().unwrap();
+    let mut connection = store.connection.lock().unwrap();
+    let transaction = connection.transaction().unwrap();
+    let claim = append_claim_tx(
+        &transaction,
+        &store.origin,
+        subject,
+        "work.renewed",
+        Some(actor),
+        &json!({"fields": {
+            "attempt": current.attempt,
+            "status": current.status,
+            "worker_reported": current.worker_reported,
+            "claimant": actor,
+            "claim_incarnation": incarnation,
+            "claim_expires_at_unix_ms": 0,
+            "readiness_epoch": current.readiness_epoch,
+        }}),
+        &[],
+        None,
+    )
+    .unwrap();
+    project_mission_run_update(&transaction, &claim).unwrap();
+    transaction.commit().unwrap();
 }
 
 #[cfg(test)]
@@ -33493,30 +33940,7 @@ agent "test/empty" { command "true" }
     }
 
     fn expire_work_lease_by_claim(store: &Store, subject: &str, actor: &str, incarnation: &str) {
-        let current = store.step_run(subject).unwrap().unwrap();
-        let mut connection = store.connection.lock().unwrap();
-        let transaction = connection.transaction().unwrap();
-        let claim = append_claim_tx(
-            &transaction,
-            &store.origin,
-            subject,
-            "work.renewed",
-            Some(actor),
-            &json!({"fields": {
-                "attempt": current.attempt,
-                "status": current.status,
-                "worker_reported": current.worker_reported,
-                "claimant": actor,
-                "claim_incarnation": incarnation,
-                "claim_expires_at_unix_ms": 0,
-                "readiness_epoch": current.readiness_epoch,
-            }}),
-            &[],
-            None,
-        )
-        .unwrap();
-        project_mission_run_update(&transaction, &claim).unwrap();
-        transaction.commit().unwrap();
+        super::expire_work_lease_by_claim(store, subject, actor, incarnation);
     }
 
     fn simple(command: &str) -> NormalizedIntent {
@@ -33572,6 +33996,235 @@ agent "test/empty" { command "true" }
             .next()
             .expect("published mission")
             .clone()
+    }
+
+    #[test]
+    fn mission_root_tree_preserves_state_and_summaries_without_work_enrichment() {
+        let store = Store::open_memory("node").unwrap();
+        publish_mission(
+            &store,
+            r#"version 2
+mission "summary-root" state="ready" {
+  goal "Preserve the complete descendant tree."
+  step "child" { agentless }
+  loop "rounds" {
+    max-rounds 1
+    round { completion { when "all-steps-exhausted" } }
+  }
+}
+mission "summary-child" state="ready" {
+  goal "Preserve effective states and summaries."
+  concurrent-runs max=2
+  queue "investigations" {
+    assigned-to "agent/tree/worker"
+    step "work" { }
+    step "after" { }
+  }
+}
+    "#,
+            "summary-missions",
+        );
+        let request = |mission: &str, key: &str| MissionRunRequest {
+            mission: mission.into(),
+            revision: None,
+            workspace: "/tmp".into(),
+            requester: Some("person/test".into()),
+            mode: Some("run".into()),
+            inputs: BTreeMap::new(),
+            idempotency_key: key.into(),
+        };
+        let root = store
+            .create_mission_run(&request("summary-root", "summary-root"))
+            .unwrap();
+        let root_step = &root
+            .steps
+            .iter()
+            .find(|step| step.step == "child")
+            .unwrap()
+            .subject;
+        let child = store
+            .create_child_mission_run(
+                &request("summary-child", "summary-child"),
+                &root,
+                root_step,
+                None,
+            )
+            .unwrap();
+        let work = &child
+            .steps
+            .iter()
+            .find(|step| step.step == "work")
+            .unwrap()
+            .subject;
+        let grandchild = store
+            .create_child_mission_run(
+                &request("summary-child", "summary-grandchild"),
+                &child,
+                work,
+                None,
+            )
+            .unwrap();
+        for (kind, summary) in [
+            ("work.progress", "selected progress"),
+            ("work.submitted", "selected completion"),
+        ] {
+            store
+                .append_claim(&ClaimInput {
+                    subject: work.clone(),
+                    kind: kind.into(),
+                    actor: Some("agent/tree/worker".into()),
+                    fields: BTreeMap::from([
+                        ("attempt".into(), Value::from(1)),
+                        ("summary".into(), Value::String(summary.into())),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+        // An expired lease must be interpreted, not copied as held work.
+        store
+            .connection
+            .write()
+            .execute(
+                "UPDATE step_runs SET status='working', lease_owner='agent/tree/worker',
+                 lease_incarnation='expired', lease_expires_at_unix_ms='0' WHERE subject=?1",
+                [work],
+            )
+            .unwrap();
+        store
+            .set_mission_run_state(&grandchild.id, "completed", "terminal", None)
+            .unwrap();
+        store
+            .append_claim(&ClaimInput {
+                subject: root.subject.clone(),
+                kind: "reconcile.fault".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    (
+                        "scope".into(),
+                        Value::String("scheduler/first-readiness".into()),
+                    ),
+                    ("status".into(), Value::String("faulted".into())),
+                    (
+                        "reason".into(),
+                        Value::String("preserved scheduler fault".into()),
+                    ),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let index = store.index().unwrap();
+        STEPS_ENRICHED.with(|enriched| enriched.set(0));
+        let tree = store.mission_runs_for_root(&root.subject).unwrap();
+        assert_eq!(STEPS_ENRICHED.with(std::cell::Cell::get), 0);
+        assert_eq!(store.index().unwrap(), index, "tree reads must remain pure");
+        assert_eq!(tree.len(), 3, "no descendants may be truncated");
+        assert_eq!(
+            tree.iter().map(|run| &run.subject).collect::<BTreeSet<_>>(),
+            BTreeSet::from([&root.subject, &child.subject, &grandchild.subject])
+        );
+        assert_eq!(
+            serde_json::to_value(store.mission_runs_for_root(&root.id).unwrap()).unwrap(),
+            serde_json::to_value(&tree).unwrap(),
+            "both root ID forms must work"
+        );
+        let root_view = tree.iter().find(|run| run.subject == root.subject).unwrap();
+        assert!(!root_view.loops.is_empty(), "loop fields must be preserved");
+        assert_eq!(
+            root_view.scheduler_fault.as_deref(),
+            Some("preserved scheduler fault")
+        );
+        let child_view = tree
+            .iter()
+            .find(|run| run.subject == child.subject)
+            .unwrap();
+        // Names sort opposite to queue positions: both fields must survive so the
+        // human tree can keep its labels and definition order.
+        for (name, position) in [("work", 1), ("after", 2)] {
+            let step = child_view
+                .steps
+                .iter()
+                .find(|step| step.step == name)
+                .unwrap();
+            assert_eq!(step.queue.as_deref(), Some("investigations"));
+            assert_eq!(step.queue_position, Some(position));
+        }
+        let step = child_view
+            .steps
+            .iter()
+            .find(|step| step.step == "work")
+            .unwrap();
+        assert_eq!(step.status, "ready");
+        assert!(step.claimant.is_none());
+        assert_eq!(step.progress_summary.as_deref(), Some("selected progress"));
+        assert_eq!(
+            step.completion_summary.as_deref(),
+            Some("selected completion")
+        );
+        // Compare the old reader's observable tree fields and ordering. Only
+        // work-presentation fields deliberately omitted by the summary reader differ.
+        let connection = store.readers.get();
+        let full = tree
+            .iter()
+            .map(|run| mission_run_view_tx(&connection, &run.id).unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            STEPS_ENRICHED.with(std::cell::Cell::get) > 0,
+            "old-reader negative control"
+        );
+        let tree_fields = |views: &[MissionRunView]| {
+            let mut value = serde_json::to_value(views).unwrap();
+            for run in value.as_array_mut().unwrap() {
+                for step in run["steps"].as_array_mut().unwrap() {
+                    for name in [
+                        "execution_started_at_unix_ms",
+                        "execution_elapsed_ms",
+                        "timeout_extension_ms",
+                        "timeout_ms",
+                        "wake",
+                        "ready_age_ms",
+                        "fresh_context",
+                        "person_answers",
+                        "under",
+                    ] {
+                        step.as_object_mut().unwrap().remove(name);
+                    }
+                }
+            }
+            value
+        };
+        assert_eq!(tree_fields(&tree), tree_fields(&full));
+
+        // Only a finished root accepts a user-set outcome. Exercise that separately
+        // after checking active descendants and their expired leases above.
+        store
+            .set_mission_run_state(&root.id, "completed", "terminal", None)
+            .unwrap();
+        store
+            .set_mission_run_outcome(
+                &root.id,
+                "failed",
+                "person/test",
+                "preserved outcome",
+                "summary-outcome",
+            )
+            .unwrap();
+        let index = store.index().unwrap();
+        let finished_tree = store.mission_runs_for_root(&root.id).unwrap();
+        assert_eq!(store.index().unwrap(), index);
+        let finished = finished_tree.iter().find(|run| run.id == root.id).unwrap();
+        assert_eq!(
+            finished.outcome.as_ref().unwrap().reason,
+            "preserved outcome"
+        );
+        assert_eq!(
+            finished.outcome,
+            store.mission_run(&root.id).unwrap().unwrap().outcome
+        );
     }
 
     #[test]
@@ -34870,6 +35523,209 @@ observer "ordered/file" {
                 .collect(),
             SUBJECT_REDUCTIONS.with(std::cell::Cell::get),
         )
+    }
+
+    #[test]
+    fn agent_card_status_cache_reduces_only_changed_subjects_and_keeps_old_cuts() {
+        let store = Store::open_memory("node").unwrap();
+        observe_runtime(&store, "agent/cache/first", "running", "one");
+        observe_runtime(&store, "agent/cache/second", "running", "two");
+        let first_cut = store.index().unwrap();
+        let view =
+            |at| serde_json::to_value(store.agent_card_status_at(None, at, true).unwrap()).unwrap();
+        let original = view(first_cut);
+        SUBJECT_REDUCTIONS.with(|count| count.set(0));
+        assert_eq!(view(first_cut), original);
+        assert_eq!(SUBJECT_REDUCTIONS.with(std::cell::Cell::get), 0);
+        observe_runtime(&store, "exec/unrelated", "running", "other");
+        SUBJECT_REDUCTIONS.with(|count| count.set(0));
+        let newer = view(store.index().unwrap());
+        assert_eq!(newer["subjects"], original["subjects"]);
+        assert_eq!(SUBJECT_REDUCTIONS.with(std::cell::Cell::get), 0);
+        observe_runtime(&store, "agent/cache/first", "stopped", "three");
+        SUBJECT_REDUCTIONS.with(|count| count.set(0));
+        let changed = view(store.index().unwrap());
+        assert_eq!(SUBJECT_REDUCTIONS.with(std::cell::Cell::get), 1);
+        assert_eq!(
+            view(first_cut),
+            original,
+            "a newer entry must not serve an old cut"
+        );
+        store.forget_current_views();
+        assert_eq!(
+            view(store.index().unwrap()),
+            changed,
+            "cache and fresh reducer must agree"
+        );
+    }
+
+    #[test]
+    fn agent_card_and_full_status_caches_never_exchange_harness_or_provenance() {
+        let store = Store::open_memory("node").unwrap();
+        let subject = "agent/cache/modes";
+        observe_runtime(&store, subject, "running", "one");
+        store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "harness.observed".into(),
+                actor: Some(subject.into()),
+                fields: BTreeMap::from([
+                    ("state".into(), json!("idle")),
+                    ("incarnation_id".into(), json!("one")),
+                    ("driver".into(), json!("claude")),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let cut = store.index().unwrap();
+        let card = store.agent_card_status_at(None, cut, true).unwrap();
+        assert!(card.subjects[0].harness.is_none());
+        assert_eq!(card.subjects[0].claims.len(), 1);
+        let full = store
+            .status_for_subject_prefix_at("agent/", Some(cut), true)
+            .unwrap();
+        assert!(full.subjects[0].harness.is_some());
+        assert_eq!(full.subjects[0].claims.len(), 2);
+        SUBJECT_REDUCTIONS.with(|count| count.set(0));
+        let again = store.agent_card_status_at(None, cut, true).unwrap();
+        assert_eq!(
+            serde_json::to_value(again).unwrap(),
+            serde_json::to_value(card).unwrap()
+        );
+        assert_eq!(SUBJECT_REDUCTIONS.with(std::cell::Cell::get), 0);
+    }
+
+    #[test]
+    fn agent_card_status_cache_has_a_fixed_entry_cap_and_repair_clears_it() {
+        let store = Store::open_memory("node").unwrap();
+        observe_runtime(&store, "agent/cache/cold", "running", "one");
+        let cut = store.index().unwrap();
+        let first = store.agent_card_status_at(None, cut, true).unwrap();
+        {
+            let mut cache = store.smalltalk.subject_cache.lock().unwrap();
+            cache.card_statuses.clear();
+            for n in 0..AGENT_CARD_STATUS_LIMIT {
+                cache.card_statuses.insert(
+                    format!("agent/fill/{n}"),
+                    StatusEntry {
+                        read_at: cut,
+                        owners: Vec::new(),
+                        status: first.subjects[0].clone(),
+                        action: None,
+                    },
+                );
+            }
+        }
+        let cold = store.agent_card_status_at(None, cut, true).unwrap();
+        assert_eq!(
+            serde_json::to_value(cold).unwrap(),
+            serde_json::to_value(first).unwrap()
+        );
+        let cache = store.smalltalk.subject_cache.lock().unwrap();
+        assert_eq!(cache.card_statuses.len(), AGENT_CARD_STATUS_LIMIT);
+        assert!(!cache.card_statuses.contains_key("agent/cache/cold"));
+        drop(cache);
+        store.forget_current_views();
+        assert!(
+            store
+                .smalltalk
+                .subject_cache
+                .lock()
+                .unwrap()
+                .card_statuses
+                .is_empty()
+        );
+        store.agent_card_status_at(None, cut, true).unwrap();
+        assert_eq!(
+            store
+                .smalltalk
+                .subject_cache
+                .lock()
+                .unwrap()
+                .card_statuses
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn agent_card_status_cache_follows_owning_generation_changes() {
+        let store = Store::open_memory("node").unwrap();
+        publish_mission(
+            &store,
+            r#"version 2
+mission "card-owner" state="ready" {
+  goal "Fence card status to its owner."; step "work" { agentless }
+}"#,
+            "card-owner-mission",
+        );
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "card-owner".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "card-owner-run".into(),
+            })
+            .unwrap();
+        let mut intent =
+            parse_intent("version 2\nagent \"worker\" { command \"true\" }\n", "node").unwrap();
+        let desired = intent.subjects.values_mut().next().unwrap();
+        desired.owner_run = Some(run.subject.clone());
+        desired.owner_generation = Some(run.generation.clone());
+        let preview = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: String::new(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &preview.subject_tokens, "card-owned-runtime")
+            .unwrap();
+        let first = store.index().unwrap();
+        let before = store.agent_card_status_at(None, first, true).unwrap();
+        assert_eq!(before.subjects[0].projection.layer, "current");
+        store
+            .append_claim(&ClaimInput {
+                subject: run.generation,
+                kind: "run-generation.superseded".into(),
+                actor: Some("person/test".into()),
+                fields: BTreeMap::from([
+                    ("status".into(), json!("superseded")),
+                    ("successor".into(), json!("run-generation/replacement")),
+                    ("reason".into(), json!("test revision")),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let index = store.index().unwrap();
+        let after = store.agent_card_status_at(None, index, true).unwrap();
+        assert_eq!(after.subjects[0].projection.layer, "history");
+        assert!(
+            store
+                .agent_card_status_at(None, index, false)
+                .unwrap()
+                .subjects
+                .is_empty()
+        );
+        assert_eq!(
+            serde_json::to_value(store.agent_card_status_at(None, first, true).unwrap()).unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
+        store.forget_current_views();
+        assert_eq!(
+            serde_json::to_value(store.agent_card_status_at(None, index, true).unwrap()).unwrap(),
+            serde_json::to_value(after).unwrap()
+        );
     }
 
     #[test]

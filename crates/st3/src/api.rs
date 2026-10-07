@@ -241,6 +241,86 @@ fn signal_visible_change(state: &AppState) {
     );
 }
 
+#[cfg(test)]
+mod storage_contention_response_tests {
+    #[test]
+    fn admitted_contention_is_pending_not_a_peer_error_and_other_faults_stay_errors() {
+        for code in ["database-busy", "database-locked"] {
+            assert_eq!(super::admitted_projection_result(Err(anyhow::Error::new(
+                super::St3Error::new(code, "fixture contention")))).unwrap(), None);
+            assert_eq!(super::client_error_code(Some(code)), code);
+        }
+        assert!(super::admitted_projection_result(Err(anyhow::anyhow!("other fault"))).is_err());
+        assert_eq!(super::admitted_projection_result(Ok(Some(true))).unwrap(), Some(true));
+    }
+    #[test]
+    fn accepted_replication_survives_a_contended_begin_and_projects_after_release() {
+        use super::*;
+        use std::collections::BTreeMap;
+        const FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claims.sqlite3");
+        let source = Store::open_memory("source").unwrap();
+        source.append_client_claim(&smallclaims::ClaimInput {
+            subject: "resource/receive-busy".into(), kind: "resource.observed".into(), actor: None,
+            fields: BTreeMap::from([("kind".into(), json!("custom.test.replication"))]),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        source.bind_fleet(FLEET).unwrap();
+        let store = Store::open(&path, "target").unwrap();
+        store.bind_fleet(FLEET).unwrap();
+        store.project_replication_backlog().unwrap();
+        let frontier = || store.readers.get().query_row(
+            "SELECT last_good_store_index FROM projection_health WHERE aggregate='graph'",
+            [], |row| row.get::<_, u64>(0)).unwrap();
+        let before = frontier();
+        let inventory = store.export_replication_summary(FLEET).unwrap().inventory;
+        let exchange = source.export_replication_exchange(FLEET, &inventory).unwrap();
+        store.receive_replication_exchange("source", FLEET, &exchange).unwrap();
+        assert!(store.validate_replication_backlog().unwrap().changed);
+        let target = store.index().unwrap();
+        assert!(target > before);
+        store.connection.write().busy_timeout(std::time::Duration::ZERO).unwrap();
+        let holder = rusqlite::Connection::open(&path).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let pending = admitted_projection_result(store.project_replication_backlog().map(Some)).unwrap();
+        assert_eq!(pending, None);
+        assert!(store.replication_projection_deferred());
+        assert_eq!(frontier(), before);
+        assert_eq!(store.index().unwrap(), target);
+        assert!(!store.claims_for("resource/receive-busy", Some("resource.observed")).unwrap().is_empty());
+        holder.execute_batch("ROLLBACK").unwrap();
+        assert!(store.project_replication_backlog().unwrap());
+        assert_eq!(frontier(), target);
+        assert!(!store.replication_projection_deferred());
+        let visible: i64 = store.readers.get().query_row(
+            "SELECT COUNT(*) FROM events WHERE subject='resource/receive-busy' AND kind='resource.observed'",
+            [], |row| row.get(0)).unwrap();
+        assert_eq!(visible, 1);
+    }
+    #[test]
+    fn private_projection_context_stays_out_of_client_details() {
+        let error = smallclaims::error::internal(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY), None))
+            .with_detail("projection_stage", "begin-immediate")
+            .with_detail("projection_frontier_unknown", true);
+        let response = super::ApiError::bad(error);
+        assert_eq!(response.status, super::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!response.details.contains_key("projection_stage"));
+        assert!(!response.details.contains_key("projection_frontier_unknown"));
+        assert_eq!(response.details["sqlite_extended_code"], rusqlite::ffi::SQLITE_BUSY);
+    }
+    #[test]
+    fn typed_sqlite_contention_is_a_service_failure_not_input_validation() {
+        for code in ["database-busy", "database-locked"] {
+            let response = super::ApiError::bad(super::St3Error::new(code, "storage contention"));
+            assert_eq!(response.status, super::StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.code, code);
+        }
+        assert_eq!(super::ApiError::bad(super::St3Error::new("internal", "other fault")).status, super::StatusCode::INTERNAL_SERVER_ERROR);
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ApiError {
     status: StatusCode,
@@ -267,14 +347,19 @@ impl ApiError {
             | "lane-approval-denied"
             | "glass-owner-forbidden" => StatusCode::FORBIDDEN,
             "lane-not-found" | "not-found" => StatusCode::NOT_FOUND,
+            "database-busy" | "database-locked" => StatusCode::SERVICE_UNAVAILABLE,
             "internal" => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::UNPROCESSABLE_ENTITY,
         };
+        let mut details = error.details;
+        details.retain(|key, _| !matches!(key.as_str(), "projection_stage" | "projection_claim_id"
+            | "projection_subject" | "projection_operation_id" | "projection_context_truncated"
+            | "projection_frontier_unknown"));
         Self {
             status,
             code: error.code.into(),
             message: error.message,
-            details: Box::new(error.details),
+            details: Box::new(details),
         }
     }
 
@@ -1183,6 +1268,7 @@ fn client_error_code(code: Option<&str>) -> String {
         | "unsupported-capability"
         | "validation-failed"
         | "idempotency-conflict"
+        | "issuer-required"
         | "arrangement-exists"
         | "arrangement-folder-exists"
         | "arrangement-retired"
@@ -1216,6 +1302,8 @@ fn client_error_code(code: Option<&str>) -> String {
         | "blob-quota-exceeded"
         | "blob-not-found"
         | "blob-expired"
+        | "database-busy"
+        | "database-locked"
         | "internal" => code.unwrap_or("internal").to_owned(),
         "too-many-attachments" | "invalid-blob-reference" => "validation-failed".into(),
         "launch-review-not-authorized"
@@ -7075,6 +7163,16 @@ async fn replication_checkpoint_adopt(
     Ok(Json(actions))
 }
 
+// Admission is already committed here. A contended projection is pending work, not a
+// failed peer delivery; the contention generation schedules the daemon's bounded retry.
+fn admitted_projection_result(result: anyhow::Result<Option<bool>>) -> Result<Option<bool>, St3Error> {
+    match result {
+        Ok(projected) => Ok(projected),
+        Err(error) if error.downcast_ref::<St3Error>().is_some_and(|error| error.is_sqlite_contention()) => Ok(None),
+        Err(error) => Err(St3Error::new("internal", error.to_string())),
+    }
+}
+
 async fn replication_receive(
     State(state): State<AppState>,
     Json(request): Json<ReplicationReceiveRequest>,
@@ -7121,9 +7219,7 @@ async fn replication_receive(
         // with or without new data, projects what it admitted meanwhile.
         let was_deferred = store.replication_projection_deferred();
         let projection = if new_data || was_deferred {
-            store
-                .project_replication_backlog_unless_catching_up()
-                .map_err(|error| St3Error::new("internal", error.to_string()))?
+            admitted_projection_result(store.project_replication_backlog_unless_catching_up())?
         } else {
             Some(true)
         };
@@ -7148,7 +7244,7 @@ async fn replication_receive(
                 changed,
                 store_index,
             },
-            changed && !quiet_only && projection.is_some(),
+            changed && !quiet_only && projected,
         ))
     })
     .await?;
@@ -10394,7 +10490,9 @@ async fn finish_claim_publication(
     if appended {
         if crate::store::local_observation_position(&response).is_some() {
             signal_local_change(state);
-        } else if kind == "harness.usage" || kind == "subagent.renewed" {
+        } else if matches!(kind, "harness.usage" | "harness.limits" | "subagent.renewed") {
+            // The reconciler reads none of these. The limits policy runs on its own two-minute
+            // timer, so a limits claim woke a full reconcile pass for nothing, every few seconds.
             signal_visible_change(state);
         } else if kind.starts_with("message.") {
             let store = state.store.clone();
@@ -13401,13 +13499,7 @@ fn live_session(
     subject: &str,
     expected_incarnation: Option<&str>,
 ) -> Result<LiveSession, ApiError> {
-    let status = state
-        .store
-        .status(Some(subject))
-        .map_err(ApiError::internal)?;
-    let selected = status
-        .subjects
-        .first()
+    let selected = state.store.runtime_authority(subject).map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found(format!("subject `{subject}` has no live session")))?;
     if !matches!(selected.reachability.as_str(), "reachable" | "local") {
         return Err(ApiError::bad(St3Error::new(
@@ -13456,11 +13548,9 @@ fn live_session(
     }
     let member = state
         .store
-        .desired_subjects()
+        .desired_subject_with_writer(subject)
         .map_err(ApiError::internal)?
-        .into_iter()
-        .find(|desired| desired.subject == subject)
-        .and_then(|desired| desired.member);
+        .and_then(|(desired, _)| desired.member);
     let terminal = member
         .as_ref()
         .map(|member| member.terminal)
@@ -15917,6 +16007,26 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
             "usage kept local does not wake replication"
         );
         assert!(!reconciler_woke().await);
+        assert!(client_feed_woke());
+
+        // The reconciler reads no limits claim; the limits policy runs on its own timer.
+        let limits = |weekly: f64| ClaimInput {
+            subject: subject.into(),
+            kind: "harness.limits".into(),
+            actor: Some(subject.into()),
+            fields: BTreeMap::from([
+                ("driver".into(), Value::String("codex".into())),
+                ("account".into(), Value::String("codex/ada".into())),
+                ("account_ref".into(), Value::String("ada".into())),
+                ("weekly_percent".into(), Value::from(weekly)),
+                ("measured_at_unix_ms".into(), Value::from(1u64)),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(format!("wake-limits-{weekly}")),
+        };
+        let _ = post(limits(10.0)).await.unwrap();
+        assert!(!reconciler_woke().await, "limits never reconcile");
         assert!(client_feed_woke());
     }
 

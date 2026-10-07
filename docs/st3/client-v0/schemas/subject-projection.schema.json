@@ -4472,6 +4472,7 @@
             "unsupported-capability",
             "validation-failed",
             "idempotency-conflict",
+            "issuer-required",
             "stale-fence",
             "cursor-gap",
             "page-cursor-expired",
@@ -4497,7 +4498,7 @@
           "type": "string"
         }
       ],
-      "description": "Versioned safe error code; unknown codes fall back to `retryable`. Arrangement admission and validation refusals are non-retryable."
+      "description": "Versioned safe error code; unknown codes fall back to `retryable`. Arrangement admission and validation refusals are non-retryable. issuer-required is a non-retryable HTTP 409 pairing revocation refusal; details.issuer_host_id identifies the authoritative issuer."
     },
     "ErrorEnvelope": {
       "additionalProperties": false,

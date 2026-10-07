@@ -5620,10 +5620,10 @@ async fn run_up(args: UpArgs) -> Result<()> {
             "startup/project-replication-backlog",
             |progress| startup.progress(progress),
         )
-    })?;
+    }).context("startup projection failed; stopping before daemon.started and runtime initialization")?;
     if !projected {
         eprintln!(
-            "st: the replicated projection is stale; the daemon will use its last good graph"
+            "st: the replicated projection remains deferred; the daemon will use its last good graph"
         );
     }
     if admission.unknown != 0 {
@@ -5751,12 +5751,14 @@ async fn run_up(args: UpArgs) -> Result<()> {
             },
         ));
     }
-    recycle_idle_wal(config.state_dir.join("claims.sqlite3"));
+    recycle_idle_wal(config.state_dir.join("claims.sqlite3"), Arc::downgrade(&store));
+    let _contention_retry = retry_projection_contention(Arc::downgrade(&store), notify.clone(), event_notify.clone(), config.state_dir.clone());
     tokio::spawn(convert_envelope_payloads(store.clone()));
     tokio::spawn(trim_local_observations(
         store.clone(),
         config.observations.clone(),
     ));
+    tokio::spawn(catch_up_account_limits(store.clone(), notify.clone()));
     tokio::spawn(st3::recorder_receipts::run(
         store.clone(),
         st3::recorder::receipt_path(&config.state_dir),
@@ -17224,6 +17226,30 @@ struct NativeLoopState {
     claude_attachment_phase: String,
     #[serde(default)]
     claude_attachment_episode: u64,
+    #[serde(default)]
+    claude_attachment_pending: Option<PendingClaudeAttachment>,
+    // An acknowledged phase survives graceful re-exec. Legacy resume files lack this
+    // flag and require one corrective publication because their last POST was uncertain.
+    #[serde(default)]
+    claude_attachment_reconciled: bool,
+    #[serde(default)]
+    claude_attachment_terminal: Option<ClaudeAttachmentTerminal>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PendingClaudeAttachment {
+    fence: st3::mailbox::Fence,
+    phase: String,
+    input: ClaimInput,
+    input_digest: String,
+}
+
+// One terminal rejection inhibits publication for this binding, including re-exec.
+// Readiness still reports; a replacement binding starts a new publication lifecycle.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ClaudeAttachmentTerminal {
+    fence: st3::mailbox::Fence,
+    reason: String,
 }
 
 /// What a native driver hands its next image across `execve`.
@@ -21383,20 +21409,32 @@ async fn check_claude_attachment(
     state: &mut NativeLoopState,
 ) -> Result<()> {
     let fence = &mailbox.fence;
-    let path = format!(
-        "/v1/mailbox/attachment?subject={}&incarnation={}&component={}&epoch={}&token={}",
-        urlencoding::encode(&fence.subject),
-        urlencoding::encode(&fence.incarnation),
-        fence.component,
-        fence.epoch,
-        fence.token,
-    );
-    let checked: Result<st3::mailbox::Attachment> = match tokio::time::timeout(
-        Duration::from_secs(2), client.get(&path),
-    ).await {
-        Ok(checked) => checked,
-        Err(_) => Err(anyhow::anyhow!("the channel attachment check exceeded two seconds")),
-    };
+    let mut checked = checked_claude_attachment(client, subject, incarnation, fence).await;
+    // Readiness is independent of diagnostic publication. A rejected or uncertain
+    // POST must not silence a current subscription's readiness report.
+    report_claude_attachment(mailbox, &checked, state.claude_attachment_terminal.as_ref())?;
+    if let Some(terminal) = &state.claude_attachment_terminal {
+        if same_claude_attachment_binding(&terminal.fence, fence) {
+            return Err(claude_attachment_parked_error(terminal));
+        }
+        // A changed binding is not sufficient: the endpoint must admit its current
+        // ownership before this publisher leaves its parked state.
+        checked.as_ref().map_err(|error| {
+            anyhow::anyhow!("validating replacement Claude attachment ownership: {error:#}")
+        })?;
+        state.claude_attachment_terminal = None;
+        state.claude_attachment_reconciled = false;
+    }
+    if state.claude_attachment_pending.is_some() {
+        // Resolve the identical operation before advancing the acknowledged episode.
+        let published =
+            publish_pending_claude_attachment(client, subject, incarnation, fence, state).await;
+        finish_claude_attachment_publication(published, mailbox, &checked, state)?;
+        // Recovery publication needs an admission check AFTER the pending operation
+        // resolved; the earlier check was only used to keep readiness reporting.
+        checked = checked_claude_attachment(client, subject, incarnation, fence).await;
+        report_claude_attachment(mailbox, &checked, state.claude_attachment_terminal.as_ref())?;
+    }
     let attached = checked.as_ref().is_ok_and(|attachment| attachment.attached);
     let phase = if attached {
         "attached"
@@ -21407,39 +21445,313 @@ async fn check_claude_attachment(
     } else {
         "starting"
     };
-    let reason = match checked {
+    if state.claude_attachment_reconciled && state.claude_attachment_phase == phase {
+        return Ok(());
+    }
+    let reason = claude_attachment_reason(&checked);
+    let input =
+        claude_attachment_diagnostic(fence, state.claude_attachment_episode, phase, &reason);
+    let input_digest = claude_attachment_input_digest(&input)?;
+    // Retained in memory before POST; only the existing graceful re-exec write_state
+    // serializes it to disk. This does not promise recovery from abrupt process death.
+    state.claude_attachment_pending = Some(PendingClaudeAttachment {
+        fence: fence.clone(),
+        phase: phase.into(),
+        input,
+        input_digest,
+    });
+    state.claude_attachment_reconciled = false;
+    let published =
+        publish_pending_claude_attachment(client, subject, incarnation, fence, state).await;
+    finish_claude_attachment_publication(published, mailbox, &checked, state)
+}
+
+fn finish_claude_attachment_publication(
+    published: Result<()>,
+    mailbox: &NativeMailbox,
+    checked: &Result<st3::mailbox::Attachment>,
+    state: &NativeLoopState,
+) -> Result<()> {
+    // Terminal retirement must be visible in THIS tick, using the already admitted
+    // readiness result. ACK also clears any old parked metadata immediately.
+    if published.is_ok() || state.claude_attachment_terminal.is_some() {
+        let reported =
+            report_claude_attachment(mailbox, checked, state.claude_attachment_terminal.as_ref());
+        if let Err(report_error) = reported {
+            return match published {
+                Err(error) => Err(error.context(format!(
+                    "reporting attachment publication outcome: {report_error:#}"
+                ))),
+                Ok(()) => Err(report_error),
+            };
+        }
+    }
+    published
+}
+
+fn same_claude_attachment_binding(a: &st3::mailbox::Fence, b: &st3::mailbox::Fence) -> bool {
+    a.subject == b.subject
+        && a.incarnation == b.incarnation
+        && a.component == b.component
+        && a.epoch == b.epoch
+        && a.token == b.token
+}
+
+async fn checked_claude_attachment(
+    client: &Client,
+    subject: &str,
+    incarnation: &str,
+    fence: &st3::mailbox::Fence,
+) -> Result<st3::mailbox::Attachment> {
+    anyhow::ensure!(
+        fence.subject == subject && fence.incarnation == incarnation,
+        "the Claude attachment check belongs to another mailbox binding"
+    );
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        client.get(&claude_attachment_path(fence)),
+    )
+    .await
+    .context("the channel attachment check exceeded two seconds")?
+}
+
+fn claude_attachment_reason(checked: &Result<st3::mailbox::Attachment>) -> String {
+    match checked {
+        Ok(attachment) if attachment.attached => "claude-channel-attached: the current Claude channel is initialized and subscribed.".into(),
         Ok(_) => "claude-channel-unattached: the current Claude session has no live, initialized channel subscription; mail is held in the graph until attachment. The driver rechecks attachment and st will restart the harness with bounded retries if the channel stays missing.".into(),
         Err(error) => format!("claude-channel-unattached: attachment could not be verified; mail is held while the driver retries: {error:#}"),
-    };
+    }
+}
+
+fn report_claude_attachment(
+    mailbox: &NativeMailbox,
+    checked: &Result<st3::mailbox::Attachment>,
+    terminal: Option<&ClaudeAttachmentTerminal>,
+) -> Result<()> {
+    // A predecessor binding's parked state does not describe this new binding.
+    let terminal =
+        terminal.filter(|fault| same_claude_attachment_binding(&fault.fence, &mailbox.fence));
     let mut report: Value = serde_json::from_str(&native_delivery_report("claude-channel", None))?;
-    report["ready"] = json!(attached);
-    report["reason"] = json!(&reason);
+    report["ready"] = json!(checked.as_ref().is_ok_and(|attachment| attachment.attached));
+    report["reason"] = json!(match terminal {
+        Some(fault) => format!(
+            "{}; attachment diagnostic publication is parked: {}. The durable graph fence has not been corrected; recovery requires an authorized replacement binding.",
+            claude_attachment_reason(checked),
+            fault.reason
+        ),
+        None => claude_attachment_reason(checked),
+    });
+    report["attachment_diagnostic_publication"] = match terminal {
+        Some(fault) => {
+            json!({"state":"parked", "reason":fault.reason, "incarnation":fault.fence.incarnation, "epoch":fault.fence.epoch})
+        }
+        None => Value::Null,
+    };
     if let Some(subscription) = &mailbox.subscription {
         subscription.report(report);
     }
-    if state.claude_attachment_phase == phase {
-        return Ok(());
-    }
+    Ok(())
+}
+
+fn claude_attachment_diagnostic(
+    fence: &st3::mailbox::Fence,
+    episode: u64,
+    phase: &str,
+    reason: &str,
+) -> ClaimInput {
+    let subject = &fence.subject;
+    let incarnation = &fence.incarnation;
+    let attached = phase == "attached";
     let code = if attached {
         "claude-channel-attached"
     } else {
         "claude-channel-unattached"
     };
-    let _: ClaimRecord = client.post("/v1/claims", &ClaimInput {
-        subject: subject.into(), kind: "harness.diagnostic".into(), actor: Some(subject.into()),
+    ClaimInput {
+        subject: subject.into(),
+        kind: "harness.diagnostic".into(),
+        actor: Some(subject.into()),
         fields: BTreeMap::from([
-            ("severity".into(), json!(if phase == "blocked" { "error" } else { "warning" })),
-            ("status".into(), json!(if attached { "recovered" } else { phase })),
+            (
+                "severity".into(),
+                json!(if phase == "blocked" {
+                    "error"
+                } else {
+                    "warning"
+                }),
+            ),
+            (
+                "status".into(),
+                json!(if attached { "recovered" } else { phase }),
+            ),
             ("code".into(), json!(code)),
-            ("reason".into(), json!(if attached { "The current Claude channel is initialized and subscribed; durable mail delivery resumes." } else { &reason })),
+            (
+                "reason".into(),
+                json!(if attached {
+                    "The current Claude channel is initialized and subscribed; durable mail delivery resumes."
+                } else {
+                    reason
+                }),
+            ),
             ("driver".into(), json!("claude")),
             ("incarnation_id".into(), json!(incarnation)),
-        ]), evidence: Vec::new(), expected_subject: None,
-        idempotency_key: Some(format!("{code}:{subject}:{incarnation}:{}:{}:{phase}", fence.epoch, state.claude_attachment_episode)),
-    }).await?;
-    state.claude_attachment_phase = phase.into();
-    state.claude_attachment_episode += 1;
+        ]),
+        evidence: Vec::new(),
+        expected_subject: None,
+        // A new namespace avoids reusing a predecessor image's uncertain key with
+        // a reason that may have changed since that image attempted publication.
+        // Abrupt process death loses the pending slot and episode. If a caller then
+        // reuses this epoch/episode/phase with a different reason, the same-key
+        // mismatch parks publication; this safeguard covers graceful re-exec only.
+        idempotency_key: Some(format!(
+            "claude-attachment-publication-v2:{code}:{subject}:{incarnation}:{}:{episode}:{phase}",
+            fence.epoch
+        )),
+    }
+}
+
+fn claude_attachment_input_digest(input: &ClaimInput) -> Result<String> {
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(input)?)))
+}
+
+async fn publish_pending_claude_attachment(
+    client: &Client,
+    subject: &str,
+    incarnation: &str,
+    fence: &st3::mailbox::Fence,
+    state: &mut NativeLoopState,
+) -> Result<()> {
+    let Some(pending) = state.claude_attachment_pending.as_ref() else {
+        return Ok(());
+    };
+    let valid_binding = fence.subject == subject
+        && fence.incarnation == incarnation
+        && same_claude_attachment_binding(&pending.fence, fence)
+        && pending.input.subject == subject
+        && pending.input.actor.as_deref() == Some(subject)
+        && pending
+            .input
+            .fields
+            .get("incarnation_id")
+            .and_then(Value::as_str)
+            == Some(incarnation);
+    if !valid_binding {
+        return Err(retire_claude_attachment(
+            state,
+            fence,
+            "the pending Claude attachment diagnostic belongs to another mailbox binding",
+        ));
+    }
+    let valid_input = (|| -> Result<bool> {
+        let reason = pending
+            .input
+            .fields
+            .get("reason")
+            .and_then(Value::as_str)
+            .context("the pending Claude attachment diagnostic has no reason")?;
+        Ok(
+            matches!(pending.phase.as_str(), "starting" | "blocked" | "attached")
+                && pending.input_digest == claude_attachment_input_digest(&pending.input)?
+                && serde_json::to_value(&pending.input)?
+                    == serde_json::to_value(claude_attachment_diagnostic(
+                        fence,
+                        state.claude_attachment_episode,
+                        &pending.phase,
+                        reason,
+                    ))?,
+        )
+    })();
+    if !matches!(valid_input, Ok(true)) {
+        return Err(retire_claude_attachment(
+            state,
+            fence,
+            "the pending Claude attachment diagnostic request was changed or malformed",
+        ));
+    }
+    let Some(next_episode) = state.claude_attachment_episode.checked_add(1) else {
+        return Err(retire_claude_attachment(
+            state,
+            fence,
+            "the Claude attachment diagnostic episode overflowed",
+        ));
+    };
+    // Validate the current title binding before retrying a retained operation.
+    // This result is not reused as recovery proof.
+    let result: Result<ClaimRecord> = async {
+        let _ = checked_claude_attachment(client, subject, incarnation, fence).await?;
+        client.post("/v1/claims", &pending.input).await
+    }
+    .await;
+    if let Err(error) = result {
+        // A mismatch of this SAME immutable request/key or a checkpointed claim cannot
+        // be resolved by reposting it; park visibly without assuming whether it committed.
+        // Authentication renewal, generic conflicts and rate limits do not establish
+        // a permanent outcome. Keep their uncertain operation unchanged.
+        if matches!(
+            st3::client::api_error_code(&error),
+            Some(
+                "idempotency-mismatch"
+                    | "claim-checkpointed"
+                    | "stale-mailbox-session"
+                    | "foreign-mailbox"
+                    | "invalid-mailbox-token"
+                    | "unknown-claim-kind"
+                    | "invalid-claim-actor"
+                    | "unknown-claim-field"
+            )
+        ) {
+            return Err(retire_claude_attachment(
+                state,
+                fence,
+                &format!("{error:#}"),
+            ));
+        }
+        return Err(error);
+    }
+    state.claude_attachment_phase = pending.phase.clone();
+    state.claude_attachment_episode = next_episode;
+    state.claude_attachment_reconciled = true;
+    state.claude_attachment_pending = None;
     Ok(())
+}
+
+fn retire_claude_attachment(
+    state: &mut NativeLoopState,
+    fence: &st3::mailbox::Fence,
+    reason: &str,
+) -> anyhow::Error {
+    let reason: String = reason.chars().take(2_000).collect();
+    state.claude_attachment_pending = None;
+    state.claude_attachment_terminal = Some(ClaudeAttachmentTerminal {
+        fence: fence.clone(),
+        reason: reason.clone(),
+    });
+    // The fault remains visible on every tick under the driver's existing warning
+    // throttle, but network publication is capped at the one rejected operation.
+    // Neither phase nor acknowledged episode advances; graceful re-exec retains it.
+    anyhow::anyhow!(
+        "Claude attachment diagnostic publication stopped for this binding: {reason}; no further POSTs; recovery requires an authorized replacement binding"
+    )
+}
+
+fn claude_attachment_parked_error(fault: &ClaudeAttachmentTerminal) -> anyhow::Error {
+    anyhow::anyhow!(
+        "Claude attachment diagnostic publication is parked for incarnation {} epoch {}: {}; no further POSTs; the durable graph fence is unchanged; recovery requires an authorized replacement binding",
+        fault.fence.incarnation,
+        fault.fence.epoch,
+        fault.reason
+    )
+}
+
+fn claude_attachment_path(fence: &st3::mailbox::Fence) -> String {
+    format!(
+        "/v1/mailbox/attachment?subject={}&incarnation={}&component={}&epoch={}&token={}",
+        urlencoding::encode(&fence.subject),
+        urlencoding::encode(&fence.incarnation),
+        fence.component,
+        fence.epoch,
+        fence.token,
+    )
 }
 
 struct NativeMailbox {
@@ -22237,8 +22549,512 @@ async fn enforce_account_limits(store: Arc<Store>, policy: st3::store::LimitsPol
     }
 }
 
-/// Page copying runs off the writer queue; recycling never waits for a reader or writer lock.
-fn recycle_idle_wal(path: PathBuf) {
+// One worker coalesces numeric contention generations. Three scheduled calls per episode,
+// at 30/60/120 seconds, preserve the existing 30 s catch-up throttle. A later external
+// contention can start a new episode; persistent failure alone cannot reset this budget.
+#[derive(Default)]
+struct ProjectionContentionRetry {
+    observed: u64,
+    attempt: usize,
+    due: Option<tokio::time::Instant>,
+}
+impl ProjectionContentionRetry {
+    const DELAYS: [Duration; 3] = [
+        Duration::from_secs(30),
+        Duration::from_secs(60),
+        Duration::from_secs(120),
+    ];
+    fn poll(
+        &mut self,
+        now: tokio::time::Instant,
+        generation: u64,
+        deferred: bool,
+    ) -> Option<usize> {
+        if !deferred {
+            self.observed = generation;
+            self.attempt = 0;
+            self.due = None;
+            return None;
+        }
+        if self.due.is_none() && generation != self.observed {
+            self.observed = generation;
+            self.attempt = 0;
+            self.due = Some(now + Self::DELAYS[0]);
+        }
+        if self.due.is_none_or(|due| now < due) {
+            return None;
+        }
+        self.due = None;
+        self.attempt += 1;
+        Some(self.attempt)
+    }
+    fn finish(&mut self, now: tokio::time::Instant, generation: u64, contention_or_throttle: bool) {
+        self.observed = generation;
+        self.due = if contention_or_throttle && self.attempt < Self::DELAYS.len() {
+            Some(now + Self::DELAYS[self.attempt])
+        } else {
+            None
+        };
+    }
+}
+
+fn retry_projection_contention(
+    store: std::sync::Weak<Store>,
+    notify: Arc<Notify>,
+    event_notify: watch::Sender<u64>,
+    state_dir: PathBuf,
+) -> tokio::task::JoinHandle<()> {
+    retry_projection_contention_observed(store, notify, event_notify, state_dir, |_| {})
+}
+
+// The observer is a no-op in the daemon; owned tests use it to synchronize on actual
+// backoff entry rather than assume a task has polled after a virtual-time advance.
+fn retry_projection_contention_observed(
+    store: std::sync::Weak<Store>,
+    notify: Arc<Notify>,
+    event_notify: watch::Sender<u64>,
+    state_dir: PathBuf,
+    mut on_poll: impl FnMut(bool) + Send + 'static,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut schedule = ProjectionContentionRetry::default();
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let Some(store) = store.upgrade() else { break };
+            let generation = store.projection_contention_generation();
+            let attempt = schedule.poll(
+                tokio::time::Instant::now(), generation, store.replication_projection_deferred());
+            on_poll(schedule.due.is_some());
+            let Some(attempt) = attempt else { continue };
+            // Only this task schedules these attempts. The existing projection mutex also
+            // serializes them with receive/wake passes. Store ownership ends at attempt return.
+            let result = tokio::task::spawn_blocking(move || {
+                let result = store.project_replication_backlog_unless_catching_up();
+                (result, store.projection_contention_generation(), store.replication_projection_deferred())
+            })
+            .await;
+            let still_deferred = match &result {
+                Ok((_, _, deferred)) => Some(*deferred),
+                Err(_) => None,
+            };
+            let (recovered, retry, generation, outcome) = match result {
+                // Own success cannot advance contention generation. Retain the pre-call
+                // watermark, so an external contention racing the success is observed on
+                // the next poll rather than cancelled as part of the completed episode.
+                Ok((Ok(Some(true)), _current, _)) => (true, false, generation, "projected"),
+                Ok((Ok(None), current, _)) => (false, true, current, "catch-up-throttled"),
+                Ok((Ok(Some(false)), current, _)) => {
+                    (false, current != generation, current, "deferred")
+                }
+                Ok((Err(error), current, _)) => {
+                    let busy = error
+                        .downcast_ref::<smallclaims::Error>()
+                        .is_some_and(|error| error.is_sqlite_contention());
+                    (
+                        false,
+                        busy,
+                        current,
+                        if busy {
+                            "sqlite-contention"
+                        } else {
+                            "other-error"
+                        },
+                    )
+                }
+                Err(_) => (false, false, generation, "worker-failed"),
+            };
+            schedule.finish(tokio::time::Instant::now(), generation, retry);
+            eprintln!(
+                "st3: projection contention retry {}",
+                json!({
+                    "attempt":attempt, "limit":3, "outcome":outcome, "rescheduled":schedule.due.is_some(),
+                    "projection_deferred_after_attempt": still_deferred,
+                    "stop_reason": if schedule.due.is_some() { None } else if recovered {
+                        Some("recovered")
+                    } else if retry { Some("budget-exhausted") } else { Some("non-retryable") },
+                })
+            );
+            if recovered {
+                st3::performance::record_wake("projection-contention-retry", None);
+                notify.notify_one();
+                event_notify.send_modify(|generation| *generation = generation.saturating_add(1));
+                let _ = fs::write(
+                    state_dir.join("replication.wake"),
+                    format!("{}\n", uuid::Uuid::now_v7()),
+                );
+            }
+        }
+    })
+}
+
+#[cfg(test)]
+mod projection_contention_retry_tests {
+    use super::*;
+    #[test]
+    fn quiet_node_retry_coalesces_and_exhausts_without_self_rearming() {
+        let now = tokio::time::Instant::now();
+        let mut retry = ProjectionContentionRetry::default();
+        assert_eq!(retry.poll(now, 1, true), None);
+        // Repeated receives do not push the first deadline back.
+        assert_eq!(retry.poll(now + Duration::from_secs(10), 50, true), None);
+        assert_eq!(retry.poll(now + Duration::from_secs(30), 50, true), Some(1));
+        retry.finish(now + Duration::from_secs(30), 51, true);
+        assert_eq!(retry.poll(now + Duration::from_secs(90), 51, true), Some(2));
+        retry.finish(now + Duration::from_secs(90), 52, true);
+        assert_eq!(
+            retry.poll(now + Duration::from_secs(210), 52, true),
+            Some(3)
+        );
+        retry.finish(now + Duration::from_secs(210), 53, true);
+        assert_eq!(retry.poll(now + Duration::from_secs(500), 53, true), None);
+        // Only a fresh external contention generation rearms an exhausted episode.
+        assert_eq!(retry.poll(now + Duration::from_secs(500), 54, true), None);
+        assert_eq!(
+            retry.poll(now + Duration::from_secs(530), 54, true),
+            Some(1)
+        );
+    }
+    #[test]
+    fn recovered_or_nonbusy_work_cancels_retry_and_no_contention_means_no_schedule() {
+        let now = tokio::time::Instant::now();
+        let mut retry = ProjectionContentionRetry::default();
+        assert_eq!(retry.poll(now, 0, true), None);
+        assert_eq!(retry.poll(now, 1, true), None);
+        assert_eq!(retry.poll(now + Duration::from_secs(30), 1, true), Some(1));
+        retry.finish(now + Duration::from_secs(30), 1, false);
+        assert_eq!(retry.poll(now + Duration::from_secs(500), 1, true), None);
+        retry.poll(now + Duration::from_secs(500), 2, true);
+        assert_eq!(retry.poll(now + Duration::from_secs(501), 2, false), None);
+        assert_eq!(retry.poll(now + Duration::from_secs(550), 2, true), None);
+    }
+    #[test]
+    fn external_contention_racing_success_is_not_lost() {
+        let now = tokio::time::Instant::now();
+        let mut retry = ProjectionContentionRetry::default();
+        retry.poll(now, 1, true);
+        assert_eq!(retry.poll(now + Duration::from_secs(30), 1, true), Some(1));
+        // The successful call reports its pre-call watermark, not a newer external busy.
+        retry.finish(now + Duration::from_secs(30), 1, false);
+        assert_eq!(retry.poll(now + Duration::from_secs(31), 2, true), None);
+        assert_eq!(retry.poll(now + Duration::from_secs(61), 2, true), Some(1));
+    }
+    #[tokio::test(start_paused = true)]
+    async fn quiet_node_recovers_automatically_after_busy_writer_releases() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claims.sqlite3");
+        const FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+        let source = Store::open_memory("source").unwrap();
+        source
+            .append_client_claim(&smallclaims::ClaimInput {
+                subject: "resource/quiet-busy".into(),
+                kind: "resource.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([("kind".into(), json!("custom.test.replication"))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        source.bind_fleet(FLEET).unwrap();
+        let store = Arc::new(Store::open(&path, "node").unwrap());
+        store.bind_fleet(FLEET).unwrap();
+        store.project_replication_backlog().unwrap();
+        let frontier =
+            || {
+                store.readers.get().query_row(
+            "SELECT last_good_store_index FROM projection_health WHERE aggregate='graph'",
+            [], |row| row.get::<_, u64>(0)).unwrap()
+            };
+        let before = frontier();
+        let inventory = store.export_replication_summary(FLEET).unwrap().inventory;
+        let exchange = source
+            .export_replication_exchange(FLEET, &inventory)
+            .unwrap();
+        store
+            .receive_replication_exchange("source", FLEET, &exchange)
+            .unwrap();
+        assert!(store.validate_replication_backlog().unwrap().changed);
+        let target = store.index().unwrap();
+        assert!(target > before);
+        assert_eq!(frontier(), before);
+        let visible = || {
+            store.readers.get().query_row(
+            "SELECT COUNT(*) FROM events WHERE subject='resource/quiet-busy' AND kind='resource.observed'",
+            [], |row| row.get::<_, i64>(0)).unwrap()
+        };
+        assert_eq!(visible(), 0);
+        store
+            .connection
+            .write()
+            .busy_timeout(Duration::ZERO)
+            .unwrap();
+        let other = rusqlite::Connection::open(&path).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert!(store.project_replication_backlog().is_err());
+        assert!(store.replication_projection_deferred());
+        assert_eq!(frontier(), before);
+        other.execute_batch("ROLLBACK").unwrap();
+        // No receive, wake or manual projection follows this release: the real worker
+        // must publish the admitted claim and its projected event by itself.
+        let (events, mut received) = watch::channel(0u64);
+        let (polls, mut polled) = watch::channel(false);
+        let worker = retry_projection_contention_observed(
+            Arc::downgrade(&store),
+            Arc::new(Notify::new()),
+            events,
+            dir.path().to_owned(),
+            move |backoff| { polls.send_replace(backoff); },
+        );
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        loop { let backoff = *polled.borrow_and_update(); if backoff { break; } polled.changed().await.unwrap(); }
+        tokio::time::advance(Duration::from_secs(30)).await;
+        let observed = store.clone();
+        let recovered = tokio::task::spawn_blocking(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while observed.replication_projection_deferred() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            !observed.replication_projection_deferred()
+        })
+        .await
+        .unwrap();
+        if recovered {
+            received.changed().await.unwrap();
+        }
+        worker.abort();
+        assert!(
+            recovered,
+            "scheduled retry must finish without a receive/wake"
+        );
+        assert_eq!(*received.borrow(), 1);
+        assert_eq!(frontier(), target);
+        assert_eq!(visible(), 1);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn retry_worker_does_not_keep_store_alive_during_scheduled_backoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(&dir.path().join("claims.sqlite3"), "node").unwrap());
+        store.project_replication_backlog().unwrap();
+        store
+            .connection
+            .write()
+            .busy_timeout(Duration::ZERO)
+            .unwrap();
+        let other = rusqlite::Connection::open(dir.path().join("claims.sqlite3")).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert!(store.project_replication_backlog().is_err());
+        other.execute_batch("ROLLBACK").unwrap();
+        let weak = Arc::downgrade(&store);
+        let (events, _) = watch::channel(0u64);
+        let (polls, mut polled) = watch::channel(false);
+        let worker = retry_projection_contention_observed(
+            weak.clone(),
+            Arc::new(Notify::new()),
+            events,
+            dir.path().to_owned(),
+            move |backoff| { polls.send_replace(backoff); },
+        );
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        loop { let backoff = *polled.borrow_and_update(); if backoff { break; } polled.changed().await.unwrap(); }
+        // The worker has observed contention and waits for its first 30s deadline.
+        assert_eq!(weak.strong_count(), 1);
+        drop(store);
+        assert!(weak.upgrade().is_none());
+        worker.abort();
+    }
+}
+
+// Ordinary samples and abnormal attempts have independent, bounded buckets. An ordinary
+// sample cannot hide the first slow/error attempt. Repeated anomalies retain counts and
+// maximum phase durations until the next allowed anomaly; shutdown does not flush them.
+#[derive(Default)]
+struct WalCheckpointLogBucket {
+    last: Option<Instant>,
+    suppressed: u64,
+    errors: u64,
+    max_passive_ms: u128,
+    max_writer_wait_ms: u128,
+    max_truncate_ms: u128,
+    max_duration_ms: u128,
+}
+impl WalCheckpointLogBucket {
+    fn record(
+        &mut self,
+        now: Instant,
+        report: Option<&smallclaims::sqlite::WalCheckpointReport>,
+        duration_ms: u128,
+    ) -> Option<serde_json::Value> {
+        self.max_duration_ms = self.max_duration_ms.max(duration_ms);
+        if let Some(report) = report {
+            self.max_passive_ms = self.max_passive_ms.max(report.passive_ms);
+            self.max_writer_wait_ms = self.max_writer_wait_ms.max(report.writer_wait_ms);
+            self.max_truncate_ms = self.max_truncate_ms.max(report.truncate_ms.unwrap_or(0));
+        } else {
+            self.errors = self.errors.saturating_add(1);
+        }
+        if self
+            .last
+            .is_some_and(|last| now.duration_since(last) < Duration::from_secs(60))
+        {
+            self.suppressed = self.suppressed.saturating_add(1);
+            return None;
+        }
+        let retained = json!({
+            "suppressed_outcomes": self.suppressed,
+            "error_outcomes": self.errors,
+            "max_passive_ms": self.max_passive_ms,
+            "max_writer_wait_ms": self.max_writer_wait_ms,
+            "max_truncate_ms": self.max_truncate_ms,
+            "max_duration_ms": self.max_duration_ms,
+        });
+        *self = Self {
+            last: Some(now),
+            ..Self::default()
+        };
+        Some(retained)
+    }
+}
+/// Counts checkpoint samples in a row that left part of the WAL un-copied and copied no more
+/// than the sample before: some reader holds an older snapshot open.
+#[derive(Default)]
+struct WalPinTracker {
+    last_backfilled: Option<i32>,
+    stuck: u32,
+}
+
+impl WalPinTracker {
+    /// Samples in a row, including this one, that made no backfill progress.
+    fn observe(&mut self, report: Option<&smallclaims::sqlite::WalCheckpointReport>) -> u32 {
+        let Some(report) = report else { return self.stuck };
+        let pinned = report.frames > report.backfilled
+            && self.last_backfilled == Some(report.backfilled);
+        self.last_backfilled = Some(report.backfilled);
+        self.stuck = if pinned { self.stuck + 1 } else { 0 };
+        self.stuck
+    }
+}
+
+const WAL_PIN_REPORT_AFTER: u32 = 3;
+
+fn abnormal_wal_checkpoint(report: Option<&smallclaims::sqlite::WalCheckpointReport>) -> bool {
+    report.is_none_or(|report| {
+        report.passive_ms >= 1000
+            || report.writer_wait_ms >= 100
+            || report.truncate_ms.is_some_and(|ms| ms >= 100)
+    })
+}
+
+#[cfg(test)]
+mod wal_pin_tracker_tests {
+    use super::*;
+
+    fn sample(frames: i32, backfilled: i32) -> smallclaims::sqlite::WalCheckpointReport {
+        smallclaims::sqlite::WalCheckpointReport {
+            frames,
+            backfilled,
+            passive_ms: 1,
+            writer_wait_ms: 0,
+            truncate_ms: None,
+            recycled: false,
+        }
+    }
+
+    #[test]
+    fn a_backfill_that_stops_advancing_counts_up_and_progress_resets_it() {
+        let mut pin = WalPinTracker::default();
+        assert_eq!(pin.observe(Some(&sample(100, 50))), 0, "the first sample has no baseline");
+        assert_eq!(pin.observe(Some(&sample(200, 50))), 1);
+        assert_eq!(pin.observe(Some(&sample(300, 50))), 2);
+        assert_eq!(pin.observe(None), 2, "an errored attempt neither counts nor resets");
+        assert_eq!(pin.observe(Some(&sample(400, 50))), 3);
+        assert_eq!(pin.observe(Some(&sample(500, 60))), 0, "backfill moved");
+        assert_eq!(pin.observe(Some(&sample(500, 500))), 0, "fully copied is not a pin");
+        assert_eq!(pin.observe(Some(&sample(500, 500))), 0);
+    }
+}
+
+#[cfg(test)]
+mod wal_checkpoint_reporting_tests {
+    use super::*;
+    fn report(wait: u128, truncate: u128) -> smallclaims::sqlite::WalCheckpointReport {
+        smallclaims::sqlite::WalCheckpointReport {
+            frames: 3,
+            backfilled: 3,
+            passive_ms: 1,
+            writer_wait_ms: wait,
+            truncate_ms: Some(truncate),
+            recycled: true,
+        }
+    }
+    #[test]
+    fn ordinary_sample_does_not_hide_first_anomaly_and_suppressed_peaks_survive() {
+        let now = Instant::now();
+        let mut ordinary = WalCheckpointLogBucket::default();
+        let mut abnormal = WalCheckpointLogBucket::default();
+        assert!(ordinary.record(now, Some(&report(0, 1)), 1).is_some());
+        assert!(!abnormal_wal_checkpoint(Some(&report(99, 99))));
+        assert!(abnormal_wal_checkpoint(Some(&report(100, 1))));
+        assert!(
+            abnormal
+                .record(now + Duration::from_secs(5), Some(&report(100, 1)), 101)
+                .is_some()
+        );
+        assert!(
+            abnormal
+                .record(now + Duration::from_secs(10), Some(&report(500, 200)), 701)
+                .is_none()
+        );
+        assert!(
+            abnormal
+                .record(now + Duration::from_secs(15), None, 900)
+                .is_none()
+        );
+        assert!(abnormal_wal_checkpoint(None));
+        let line = abnormal
+            .record(now + Duration::from_secs(65), Some(&report(100, 1)), 101)
+            .unwrap();
+        assert_eq!(line["suppressed_outcomes"], 2);
+        assert_eq!(line["error_outcomes"], 1);
+        assert_eq!(line["max_writer_wait_ms"], 500);
+        assert_eq!(line["max_truncate_ms"], 200);
+        assert_eq!(line["max_duration_ms"], 900);
+        let reset = abnormal
+            .record(now + Duration::from_secs(125), Some(&report(100, 1)), 101)
+            .unwrap();
+        assert_eq!(reset["suppressed_outcomes"], 0);
+        assert_eq!(reset["error_outcomes"], 0);
+        assert_eq!(reset["max_writer_wait_ms"], 100);
+    }
+    #[test]
+    fn passive_threshold_and_counts_are_bounded() {
+        let now = Instant::now();
+        let mut sample = report(0, 0);
+        sample.passive_ms = 1000;
+        assert!(abnormal_wal_checkpoint(Some(&sample)));
+        let mut bucket = WalCheckpointLogBucket {
+            last: Some(now),
+            suppressed: u64::MAX,
+            errors: u64::MAX,
+            ..Default::default()
+        };
+        assert!(
+            bucket
+                .record(now + Duration::from_secs(1), None, 1)
+                .is_none()
+        );
+        let line = bucket
+            .record(now + Duration::from_secs(60), None, 1)
+            .unwrap();
+        assert_eq!(line["suppressed_outcomes"], u64::MAX);
+        assert_eq!(line["error_outcomes"], u64::MAX);
+    }
+}
+
+/// Page copying runs off the writer queue; TRUNCATE joins it before taking SQLite's writer
+/// lock. Recycling has no SQLite busy wait for readers; it can wait its FIFO turn.
+fn recycle_idle_wal(path: PathBuf, store: std::sync::Weak<Store>) {
     // Five seconds finds gaps between short readers without polling on every write.
     const WAL_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
     const WAL_CHECKPOINT_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(60);
@@ -22252,9 +23068,15 @@ fn recycle_idle_wal(path: PathBuf) {
             let mut connection = None;
             let mut last_error_log: Option<Instant> = None;
             let mut retry_interval = WAL_CHECKPOINT_INTERVAL;
+            let mut ordinary_outcomes = WalCheckpointLogBucket::default();
+            let mut abnormal_outcomes = WalCheckpointLogBucket::default();
+            let mut pin = WalPinTracker::default();
             loop {
                 std::thread::sleep(retry_interval);
                 retry_interval = WAL_CHECKPOINT_INTERVAL;
+                let started = Instant::now();
+                // A weak reference does not keep the Store alive between attempts at shutdown.
+                let Some(store) = store.upgrade() else { break };
                 // The connection is taken into the attempt and dropped on unwind; no
                 // potentially panic-damaged connection is reused by the next attempt.
                 let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -22263,7 +23085,7 @@ fn recycle_idle_wal(path: PathBuf) {
                         None => rusqlite::Connection::open(&path)
                             .context("open WAL checkpoint connection")?,
                     };
-                    let result = smallclaims::sqlite::checkpoint_idle_wal(&connection);
+                    let result = store.checkpoint_idle_wal_report(&connection);
                     Ok::<_, anyhow::Error>((connection, result))
                 }));
                 let result = match attempt {
@@ -22279,12 +23101,46 @@ fn recycle_idle_wal(path: PathBuf) {
                         Err(anyhow::anyhow!("WAL checkpoint panicked; reopening connection"))
                     }
                 };
+                let now = Instant::now();
+                let duration_ms = started.elapsed().as_millis();
+                let report = result.as_ref().ok();
+                let stuck = pin.observe(report);
+                let abnormal = abnormal_wal_checkpoint(report) || stuck >= WAL_PIN_REPORT_AFTER;
+                let bucket = if abnormal { &mut abnormal_outcomes } else { &mut ordinary_outcomes };
+                if let Some(retained) = bucket.record(now, report, duration_ms) {
+                    let outcome = match report {
+                        Some(report) => json!({
+                            "outcome": if report.frames == 0 { "empty" } else if report.recycled { "recycled" } else { "deferred" },
+                            "frames": report.frames, "backfilled": report.backfilled,
+                            "passive_ms": report.passive_ms, "writer_wait_ms": report.writer_wait_ms,
+                            "truncate_ms": report.truncate_ms,
+                        }),
+                        None => json!({"outcome":"error", "phase_durations_available":false}),
+                    };
+                    let pinned = (stuck >= WAL_PIN_REPORT_AFTER).then(|| {
+                        let oldest = smallclaims::sqlite::oldest_live_read();
+                        json!({
+                            "stuck_samples": stuck,
+                            "oldest_live_read": oldest.as_ref().map(|read| json!({
+                                "age_ms": read.age_ms,
+                                "kind": if read.snapshot { "snapshot" } else { "lent-connection" },
+                                "at": read.at,
+                            })),
+                            "live_reads": oldest.as_ref().map(|read| read.live),
+                        })
+                    });
+                    eprintln!("st3: WAL checkpoint {}", json!({
+                        "bucket": if abnormal { "abnormal" } else { "ordinary" },
+                        "report": outcome, "duration_ms": duration_ms, "retained": retained,
+                        "pinned": pinned,
+                    }));
+                }
                 if let Err(error) = result {
                     let now = Instant::now();
                     if last_error_log.is_none_or(|last| {
                         now.duration_since(last) >= WAL_CHECKPOINT_ERROR_LOG_INTERVAL
                     }) {
-                        eprintln!("st3: {error:#}");
+                        eprintln!("st3: {error:#}; checkpoint duration_ms={}", started.elapsed().as_millis());
                         last_error_log = Some(now);
                     }
                 }
@@ -22309,6 +23165,64 @@ async fn convert_envelope_payloads(store: Arc<Store>) {
                 tokio::time::sleep(Duration::from_secs(60)).await;
             }
         }
+    }
+}
+
+/// Fill the account limits projection after an upgrade, a page of claims at a time. Each page is
+/// its own short writer transaction and the daemon answers between pages; the cursor is stored, so
+/// a restart resumes. Once it is caught up this only checks, once a minute, for claims that
+/// replication admitted and no append or projection pass has folded yet.
+async fn catch_up_account_limits(store: Arc<Store>, notify: Arc<Notify>) {
+    // A pool start that arrived while the projection was catching up failed with a retryable
+    // error. Nothing else tells the reconciler that limits are now known, so wake it once.
+    let mut announced = false;
+    loop {
+        let page_store = store.clone();
+        let more = tokio::task::spawn_blocking(move || {
+            st3::profile::task("task account-limits-catch-up", || {
+                page_store.catch_up_account_limits(st3::store::LIMITS_CATCH_UP_PAGE)
+            })
+        })
+        .await;
+        if !announced && matches!(more, Ok(Ok(_))) {
+            let ready_store = store.clone();
+            let ready = tokio::task::spawn_blocking(move || ready_store.account_limits_ready())
+                .await
+                .ok()
+                .and_then(|result| result.ok())
+                .unwrap_or(false);
+            if ready {
+                announced = true;
+                notify.notify_one();
+            }
+        }
+        match more {
+            Ok(Ok(true)) => tokio::time::sleep(Duration::from_millis(50)).await,
+            _ => tokio::time::sleep(Duration::from_secs(60)).await,
+        }
+    }
+}
+
+#[cfg(test)]
+mod limits_catch_up_wake_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn the_reconciler_is_woken_once_when_account_limits_become_ready() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let notify = Arc::new(Notify::new());
+        let task = tokio::spawn(catch_up_account_limits(store.clone(), notify.clone()));
+        tokio::time::timeout(Duration::from_secs(5), notify.notified())
+            .await
+            .expect("the reconciler is woken when the limits projection is ready");
+        assert!(store.account_limits_ready().unwrap());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(300), notify.notified())
+                .await
+                .is_err(),
+            "the wake happens once, not on every idle pass"
+        );
+        task.abort();
     }
 }
 
@@ -22448,6 +23362,9 @@ fn unique_pairs(values: Vec<(String, String)>, kind: &str) -> Result<BTreeMap<St
     }
     Ok(output)
 }
+
+#[cfg(test)]
+mod claude_attachment_tests;
 
 #[cfg(test)]
 mod tests {
@@ -23604,6 +24521,9 @@ mod tests {
                 delivery_episode: 2,
                 claude_attachment_phase: "blocked".into(),
                 claude_attachment_episode: 3,
+                claude_attachment_pending: None,
+                claude_attachment_reconciled: false,
+                claude_attachment_terminal: None,
             },
         };
         let back: DriverResume =

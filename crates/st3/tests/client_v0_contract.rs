@@ -1834,6 +1834,102 @@ async fn concurrent_pairing_completion_mints_exactly_one_credential() {
 }
 
 #[tokio::test]
+async fn nonissuer_pairing_revoke_preserves_public_error_envelope() {
+    let issuer_root = tempfile::tempdir().unwrap();
+    let issuer = test_state(issuer_root.path());
+    let receiver_root = tempfile::tempdir().unwrap();
+    let mut receiver = test_state(receiver_root.path());
+    receiver.node = "client-v0-receiver".into();
+    receiver.store = Arc::new(
+        Store::open(&receiver_root.path().join("receiver.sqlite3"), &receiver.node).unwrap(),
+    );
+    let fleet = "issuer-envelope-proof";
+    issuer.store.bind_fleet(fleet).unwrap();
+    receiver.store.bind_fleet(fleet).unwrap();
+    let issuer_app = st3::api::router(issuer.clone());
+    let (status, challenge) = client_post_json(
+        issuer_app.clone(),
+        "/v1/client/pairings",
+        serde_json::json!({
+            "api_version": "st3.client.v0",
+            "device_name": "Issuer envelope phone",
+            "person_id": "person/alex"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{challenge}");
+    let pairing = challenge["value"]["pairing_id"]
+        .as_str()
+        .unwrap()
+        .trim_start_matches("pairing/");
+    let (status, paired) = client_post_json(
+        issuer_app,
+        &format!("/v1/client/pairings/{pairing}/complete"),
+        serde_json::json!({
+            "api_version": "st3.client.v0",
+            "code": challenge["value"]["code"],
+            "device_public_key": "issuer-envelope-public-key-000000000000000"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{paired}");
+    for _ in 0..100 {
+        let inventory = receiver.store.replication_inventory().unwrap();
+        if inventory.digest == issuer.store.replication_inventory().unwrap().digest {
+            break;
+        }
+        let exchange = issuer
+            .store
+            .export_replication_exchange(fleet, &inventory)
+            .unwrap();
+        receiver
+            .store
+            .receive_replication_exchange(&issuer.node, fleet, &exchange)
+            .unwrap();
+        receiver.store.validate_replication_backlog().unwrap();
+        receiver.store.apply_replication_repairs().unwrap();
+    }
+    assert!(receiver.store.project_replication_backlog().unwrap());
+    let app = st3::api::router(receiver.clone());
+    let (status, capabilities) =
+        client_json_person(app.clone(), "/v1/client/capabilities", "person/alex").await;
+    assert_eq!(status, StatusCode::OK, "{capabilities}");
+    let (status, error) = client_post_json(
+        app,
+        "/v1/client/actions",
+        serde_json::json!({
+            "api_version": "st3.client.v0",
+            "id": "action/nonissuer-revoke",
+            "type": "pairing.revoke",
+            "idempotency_key": "nonissuer-revoke-envelope-0001",
+            "fence": { "snapshot_id": capabilities["snapshot"]["id"], "subject_revisions": {} },
+            "parameters": { "target_id": paired["value"]["device_id"] }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{error}");
+    assert_eq!(error["code"], "issuer-required", "{error}");
+    assert_eq!(error["retryable"], false, "{error}");
+    assert_eq!(
+        error["details"]["issuer_host_id"],
+        format!("host/{}", issuer.node)
+    );
+    assert_conforms(
+        &contract_validator("ErrorEnvelope"),
+        "nonissuer revoke",
+        &error,
+    );
+    assert!(
+        receiver
+            .store
+            .claims_for_kind_at("custom.client.pairing-revoked", None, true, 100)
+            .unwrap()
+            .claims
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn pairing_is_single_use_and_fenced_actions_are_idempotent() {
     let root = tempfile::tempdir().unwrap();
     let state = test_state(root.path());

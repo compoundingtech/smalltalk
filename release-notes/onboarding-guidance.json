@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Reconcile first-user installation, coordinated upgrades, claim recovery and compatibility guidance",
+  "replay": {
+    "status": "none",
+    "detail": "Documentation and sanitized issue intake only; no runtime, database, rules, driver or user upgrade behavior changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Documentation and sanitized issue intake only; no runtime, database, rules, driver or user upgrade behavior changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Documentation and sanitized issue intake only; no runtime, database, rules, driver or user upgrade behavior changes."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Documentation and sanitized issue intake only; no runtime, database, rules, driver or user upgrade behavior changes."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Documentation and sanitized issue intake only; no runtime, database, rules, driver or user upgrade behavior changes."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Documentation and sanitized issue intake only; no runtime, database, rules, driver or user upgrade behavior changes."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Documentation and sanitized issue intake only; no runtime, database, rules, driver or user upgrade behavior changes."
+  }
+}

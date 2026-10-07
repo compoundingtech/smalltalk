@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "summary": "Account limits as an incrementally updated local projection (merge of the limits change)",
+  "commits": ["d9693a49456e72d4f1f3210b27aec6b756da2129"],
+  "replay": {"status": "none", "detail": "No graph replay. The limits read comes from new local tables filled from harness.limits claims, as each reading arrives and, after the first start with this build, in bounded background pages (200 claims per short writer transaction, 50 ms apart, resumable from a stored cursor). Until that first fill finishes the limits read returns nothing, the stop policy decides nothing, a pool start without a kept account fails with the retryable 'account limits are catching up, try again', and pool alternatives are empty."},
+  "schema": {"status": "changed", "detail": "Additive only: tables account_limit_readings and account_limit_seats and a cursor in meta, all local and outside shared projections and digests. Schema version is unchanged. An older build ignores them; a newer build refills stale or dropped tables from the cursor. The earlier fragment sql-audit-writer-and-read-fixes describes the same tables and is the detailed reference."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged."},
+  "compatibility": {"status": "none", "detail": "No client, wire or harness contract change. The only visible difference is the retryable pool-start error while the first fill runs."},
+  "downtime": {"status": "none", "detail": "The fill runs after open and adds no startup time; the first start with this build has a short period in which pool starts may need a retry."},
+  "manual": {"status": "none", "detail": "No manual step."},
+  "recovery": {"status": "none", "detail": "The new tables can be dropped; they are rebuilt from claims."}
+}

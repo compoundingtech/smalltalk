@@ -1,0 +1,58 @@
+name: Install or upgrade problem
+description: Report a first install, upgrade, startup, harness or recovery failure.
+title: '[Install/upgrade] '
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Start with [the troubleshooting guide](https://github.com/compoundingtech/smalltalk/blob/main/docs/when-something-is-wrong.md). The Smalltalk distribution agent owns initial triage and routes runtime failures to the appropriate maintainer.
+        Review every excerpt before posting. Use invented host names, paths and person and seat IDs. Remove credentials, keys, pairing/invite secrets, transcript prompts, claim/document bodies and exported environment values. Never attach a database, backup, config file or full transcript. Keep source hashes, versions, error codes and timing.
+  - type: input
+    id: platform
+    attributes:
+      label: OS and architecture
+      description: Include OS version and architecture; Linux reports should include glibc version.
+      placeholder: Ubuntu 22.04, x86_64, glibc 2.35
+    validations:
+      required: true
+  - type: dropdown
+    id: install-route
+    attributes:
+      label: Install route
+      options:
+        - Release archive
+        - Nix profile
+        - Home Manager
+        - Source build
+    validations:
+      required: true
+  - type: textarea
+    id: sources
+    attributes:
+      label: Exact sources and upgrade interval
+      description: Include st --version --json, responding daemon machine_version from doctor (or unavailable), BUILD.json source, and previous/target release for an upgrade. Include harness version if relevant.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Command, expected result and actual result
+      description: Give minimal steps with invented names and paths. Say whether this is fresh or populated state and whether all fleet members use the same source.
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized diagnostics and timing
+      description: Include reviewed st doctor --json and st service status excerpts. For an unavailable daemon, include startup phase, elapsed time and a bounded log error instead. For replication, include reviewed status and signature/projection checks. Remove sensitive data before posting.
+      render: text
+    validations:
+      required: true
+  - type: checkboxes
+    id: redaction
+    attributes:
+      label: Public evidence review
+      options:
+        - label: I reviewed these excerpts, removed private data and used invented identities and paths; I did not attach a database, backup, config file or full transcript.
+          required: true

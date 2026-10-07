@@ -7,6 +7,7 @@
 
 pub mod adapt;
 mod attach;
+mod clickable;
 mod context;
 #[cfg(test)]
 mod contract;
@@ -132,9 +133,6 @@ struct Demo {
     cos_seen: Option<Instant>,
     harbor_seen: Option<Instant>,
 }
-
-/// How long an update stays open on Home before it counts as read.
-const UPDATE_READ_AFTER: Duration = Duration::from_secs(3);
 
 /// A request the live loop sends to st. The demo never produces these.
 /// What the agent actions menu does to a seat; each is st's own agent action.
@@ -323,6 +321,9 @@ struct ChatState {
     editing: bool,
 }
 
+/// How long a second Ctrl+T may follow the first and leave the terminal.
+const LEAVE_TAP: Duration = Duration::from_millis(400);
+
 pub struct Ui {
     world: World,
     tab: usize,
@@ -354,10 +355,13 @@ pub struct Ui {
     /// Live: actions become `effects` for the live loop instead of demo edits.
     live: bool,
     effects: Vec<Effect>,
-    /// The update open on Home and since when: one left open a moment counts as read.
-    update_open: Option<(String, Instant)>,
     /// Updates marked read from here, so each is sent once.
     updates_read: HashSet<String>,
+    /// Attention items the person acted on from here: st closing them is their doing.
+    acted: HashSet<String>,
+    /// Attention items st no longer lists that nobody here acted on. Nothing leaves Home by
+    /// itself (Nathan, 2026-10-07): they stay, marked, until `x` clears them.
+    closed: HashSet<String>,
     /// Conversations scrolled up to their oldest entry since the last frame: each asks st for
     /// the page before it.
     older_wanted: RefCell<BTreeSet<String>>,
@@ -394,6 +398,8 @@ pub struct Ui {
     pub(crate) context: Option<glass::ContextMenu>,
     /// A Ctrl-C or Ctrl-D pressed once in a terminal, waiting for its confirming second press.
     terminal_confirm: Option<(KeyCode, Instant)>,
+    /// A Ctrl+T held back from an attached terminal: a second press soon leaves it.
+    terminal_hold: Option<(KeyEvent, Instant)>,
     /// The New mission form: title, request, mission id, workspace; and the focused field.
     new_mission: Option<([String; 4], usize)>,
     /// A device awaiting a confirmed revoke.
@@ -504,8 +510,9 @@ impl Ui {
             quit: false,
             live: false,
             effects: Vec::new(),
-            update_open: None,
             updates_read: HashSet::new(),
+            acted: HashSet::new(),
+            closed: HashSet::new(),
             older_wanted: RefCell::default(),
             popover: None,
             chat: None,
@@ -524,6 +531,7 @@ impl Ui {
             simple: false,
             terminal: None,
             terminal_confirm: None,
+            terminal_hold: None,
             new_mission: None,
             revoke: None,
             snoozed: HashSet::new(),
@@ -553,6 +561,48 @@ impl Ui {
     }
 
     /// Replace the world, keeping each tab's selection on the same item.
+    /// Note what the person did to an item from here, so its closing is not "closed elsewhere".
+    pub(crate) fn note_acted(&mut self, effect: &Effect) {
+        match effect {
+            Effect::Attention { id, .. }
+            | Effect::LaunchRevise { id, .. }
+            | Effect::Reply { id, .. } => {
+                self.acted.insert(id.clone());
+            }
+            _ => {}
+        }
+    }
+
+    /// An item st stopped listing stays on Home, marked, unless the person acted on it: another
+    /// device, an agent or st itself closed it, and it must not go while it is being read.
+    fn keep_closed_attention(&mut self, before: Vec<view::Attention>) {
+        let Load::Ready(items) = &mut self.world.attention else {
+            return;
+        };
+        for old in before {
+            if let Some(now) = items.iter().find(|item| item.id == old.id) {
+                if !self.closed.contains(&now.id) {
+                    continue;
+                }
+                self.closed.remove(&old.id);
+                continue;
+            }
+            if self.acted.contains(&old.id) {
+                self.closed.remove(&old.id);
+                continue;
+            }
+            let mut kept = old;
+            if self.closed.insert(kept.id.clone()) {
+                kept.waiting = Some(match kept.waiting.take() {
+                    Some(who) => format!("closed elsewhere, x clears it · {who}"),
+                    None => "closed elsewhere, x clears it".into(),
+                });
+                kept.actions.clear();
+            }
+            items.push(kept);
+        }
+    }
+
     pub fn set_world(&mut self, world: World) {
         let tab = self.tab;
         let mut chosen = Vec::new();
@@ -560,7 +610,15 @@ impl Ui {
             self.tab = index;
             chosen.push(self.selected_id());
         }
+        // Only what was on screen from a live reading can have closed under the person's eyes;
+        // a stored copy, or a reading before the first live one, is just replaced.
+        let before = if matches!(self.world.link, Link::Live) {
+            self.world.attention.items().to_vec()
+        } else {
+            Vec::new()
+        };
         self.world = world;
+        self.keep_closed_attention(before);
         for (index, id) in chosen.into_iter().enumerate() {
             self.tab = index;
             if let Some(id) = id
@@ -1380,10 +1438,10 @@ impl Ui {
             self.hit(
                 Rect {
                     x: start,
-                    width,
+                    width: text::width(&format!("{glyph} {word}")) as u16,
                     ..area
                 },
-                Hit::Help,
+                Hit::Connection,
             );
         }
     }
@@ -1492,6 +1550,14 @@ impl Ui {
             .as_deref()
             .map_or(0, |build| text::width(build) as u16 + 1);
         let mut x = area.x + 1;
+        buf.set_stringn(
+            x,
+            area.y,
+            "Keys: ",
+            area.width.saturating_sub(2) as usize,
+            theme::dim().bg(theme::CRUST),
+        );
+        x += 6;
         for (key, label) in hints {
             let key_text = format!("{key} ");
             let label_text = format!("{label}   ");
@@ -2461,6 +2527,37 @@ impl Ui {
             *state
         };
         let top = state.top;
+        if matches!(
+            Pane::parse(key),
+            Some(Pane::Home(Some(_)) | Pane::Mission(Some(_)) | Pane::Declaration(Some(_)))
+        ) {
+            self.hit(
+                Rect {
+                    height: total.saturating_sub(top).min(height) as u16,
+                    width: area.width.saturating_sub(1),
+                    ..area
+                },
+                Hit::Subject,
+            );
+        }
+        if key.starts_with("chat:") {
+            for (index, (id, start)) in doc.entries.iter().enumerate() {
+                let end = doc.entries.get(index + 1).map_or(total, |(_, line)| *line);
+                let first = (*start).max(top);
+                let last = end.min(top + height);
+                if first < last && id != live::HISTORY_NOTE {
+                    self.hit(
+                        Rect {
+                            x: area.x,
+                            y: area.y + (first - top) as u16,
+                            width: area.width.saturating_sub(1),
+                            height: (last - first) as u16,
+                        },
+                        Hit::Message,
+                    );
+                }
+            }
+        }
         if area.width > 1 && height > 0 {
             self.frame.borrow_mut().read_messages.extend(
                 doc.messages
@@ -2601,6 +2698,7 @@ impl Ui {
             buf.set_line(rect.x, rect.y + offset as u16, line, rect.width);
         }
         self.hit(rect, Hit::Peek(subject.to_owned()));
+        self.links(buf, rect);
         for target in &doc.targets {
             if (target.line as u16) < height {
                 self.hit(
@@ -3065,7 +3163,7 @@ impl Ui {
                     "this agent's details beside it (ctrl+i too, where the terminal tells it from tab)",
                 ),
                 ("drag", "select text in one pane; release copies it"),
-                ("ctrl+]  ctrl+\\", "attach the agent's terminal; leave it"),
+                ("ctrl+]  ctrl+\\  ctrl+t ctrl+t", "attach the agent's terminal; leave it (or Ctrl+T twice)"),
                 (
                     "ctrl+r  backspace",
                     "a message that was not sent: send it again; take it back to change",
@@ -3114,7 +3212,7 @@ impl Ui {
         }
         let mut doc = Doc::new();
         doc.card(
-            "help · any key closes",
+            "help · any key or click closes",
             theme::ACCENT,
             false,
             inner,
@@ -3246,6 +3344,8 @@ impl Ui {
             0
         } else if id.starts_with("mission/") {
             2
+        } else if id.starts_with("machine/") {
+            3
         } else {
             1
         };
@@ -3315,7 +3415,7 @@ impl Ui {
         }
         let focused = self.input_terminal();
         match event {
-            Event::Key(key) => self.key(key),
+            Event::Key(key) => self.key(shifted(key)),
             Event::Paste(text) => {
                 self.sync_terminal_slot();
                 self.paste(text)
@@ -3358,7 +3458,49 @@ impl Ui {
         .flatten()
     }
 
+    /// Leave the attached terminal: an agent's tab turns back into its conversation; a shell's
+    /// tab stays a shell, detached.
+    fn leave_terminal(&mut self) {
+        self.terminal_selection_mode = false;
+        self.terminal_selecting = false;
+        self.terminal_hold = None;
+        if let Some(Pane::Terminal(agent)) = self.focused_pane()
+            && agent.starts_with("agent/")
+        {
+            self.swap_focused_pane(Pane::Agent(Some(agent)));
+            self.terminal = None;
+        }
+        self.effects.push(Effect::CloseTerminal);
+    }
+
+    /// A Ctrl+T held back goes to the program once no second press came to leave with.
+    pub(crate) fn step_terminal_hold(&mut self) {
+        if let Some((key, at)) = self.terminal_hold
+            && at.elapsed() >= LEAVE_TAP
+        {
+            self.terminal_hold = None;
+            if self.terminal_focused() {
+                self.terminal_key(key);
+            }
+        }
+    }
+
     pub fn key(&mut self, key: KeyEvent) {
+        let ctrl_t = key.code == KeyCode::Char('t') && key.modifiers == KeyModifiers::CONTROL;
+        if self.terminal_hold.is_some() {
+            if ctrl_t && key.kind != KeyEventKind::Press {
+                // The held press's own repeat or release goes with it.
+                return;
+            }
+            if !ctrl_t {
+                // Anything else first lets the held key go, so the program sees them in order.
+                if let Some((held, _)) = self.terminal_hold.take()
+                    && self.terminal_focused()
+                {
+                    self.terminal_key(held);
+                }
+            }
+        }
         if key.kind != KeyEventKind::Press {
             // Repeats and releases belong to the child, never to stui shortcuts or confirmations.
             if self.terminal_focused()
@@ -3382,17 +3524,7 @@ impl Ui {
             && key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('\\' | '4'))
         {
-            self.terminal_selection_mode = false;
-            self.terminal_selecting = false;
-            // In glasses an agent's tab turns back into its conversation; a shell's tab
-            // stays a shell, detached.
-            if let Some(Pane::Terminal(agent)) = self.focused_pane()
-                && agent.starts_with("agent/")
-            {
-                self.swap_focused_pane(Pane::Agent(Some(agent)));
-                self.terminal = None;
-            }
-            self.effects.push(Effect::CloseTerminal);
+            self.leave_terminal();
             return;
         }
         self.sync_terminal_slot();
@@ -3453,6 +3585,18 @@ impl Ui {
                     self.terminal_selecting = false;
                     self.terminal_confirm = None;
                     self.flash("Terminal input modes reset");
+                }
+                // Ctrl+T twice leaves the terminal. The first press is held back a moment, and
+                // the program gets it if no second one comes (a shell swaps two characters).
+                KeyCode::Char('t') if key.modifiers == KeyModifiers::CONTROL => {
+                    if self
+                        .terminal_hold
+                        .is_some_and(|(_, at)| at.elapsed() < LEAVE_TAP)
+                    {
+                        self.leave_terminal();
+                    } else {
+                        self.terminal_hold = Some((key, Instant::now()));
+                    }
                 }
                 // An agent's terminal asks twice before Ctrl-C or Ctrl-D reach it, so a reflex
                 // never stops an agent; a shell gets them at once, as in any terminal.
@@ -3809,30 +3953,6 @@ impl Ui {
         }
     }
 
-    /// An update opened on Home is read once the person leaves it, after it was open for a
-    /// moment: marking it read closes it, and it must stay put while it is being read (Nathan,
-    /// 2026-10-05: updates vanished mid-read). Passing over it with the arrows does not count,
-    /// and `x` still reads it at once.
-    pub(crate) fn read_open_update(&mut self) {
-        let open = self
-            .attention_focus()
-            .filter(|_| !self.help && self.popover.is_none())
-            .filter(|_| self.current_kind() == Some("update"));
-        if let Some((shown, since)) = &self.update_open
-            && open.as_ref() != Some(shown)
-            && since.elapsed() >= UPDATE_READ_AFTER
-        {
-            let shown = shown.clone();
-            self.update_open = None;
-            self.read_update_id(shown);
-        }
-        match (open, &self.update_open) {
-            (None, _) => self.update_open = None,
-            (Some(id), Some((shown, _))) if *shown == id => {}
-            (Some(id), _) => self.update_open = Some((id, Instant::now())),
-        }
-    }
-
     fn current_kind(&self) -> Option<&'static str> {
         let id = self.attention_focus()?;
         self.world
@@ -3891,6 +4011,22 @@ impl Ui {
                 if self.current_item().is_some_and(|item| item.actions.iter().any(|a| a == "custom.reply"))
                     && matches!(key, 'y' | 'n' | 'r' | 'x') {
                     self.flash("Reply with c using this source's declared fields");
+                    return;
+                }
+                if let Some(id) = self.attention_focus()
+                    && self.closed.contains(&id)
+                {
+                    if key == 'x' {
+                        self.closed.remove(&id);
+                        self.acted.insert(id.clone());
+                        if let Load::Ready(items) = &mut self.world.attention {
+                            items.retain(|item| item.id != id);
+                        }
+                        let index = self.selected[self.tab];
+                        self.select(index);
+                    } else {
+                        self.flash("This was closed elsewhere and stays until you clear it with x");
+                    }
                     return;
                 }
                 match (kind, key) {
@@ -5066,7 +5202,7 @@ impl Ui {
                         .map(|(_, hit)| hit.clone())
                 };
                 self.conversation_state.selection = None;
-                if let Some(hit) = hit {
+                if let Some(hit) = hit.filter(|hit| !matches!(hit, Hit::Message | Hit::Subject)) {
                     self.click(hit);
                     return;
                 }
@@ -5332,6 +5468,7 @@ impl Ui {
 
     fn click(&mut self, hit: Hit) {
         match hit {
+            Hit::Message | Hit::Subject | Hit::Resize => {}
             Hit::GlassMenu => self.open_palette(Some(4), glass::Open::Here),
             Hit::PaletteSection(section) => self.open_palette(Some(section), glass::Open::Here),
             Hit::NewAgent => self.open_new_agent(None),
@@ -5666,6 +5803,19 @@ impl Ui {
 }
 
 /// Editing at the text's end, for an input without a cursor of its own (the palette's query).
+/// A terminal that reports every key as an escape code may send Shift+i as `i` with Shift, and
+/// a terminal that does not give the layout's own character leaves that to us: a letter at least.
+fn shifted(mut key: KeyEvent) -> KeyEvent {
+    if let KeyCode::Char(letter) = key.code
+        && key.modifiers.contains(KeyModifiers::SHIFT)
+        && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        && letter.is_ascii_lowercase()
+    {
+        key.code = KeyCode::Char(letter.to_ascii_uppercase());
+    }
+    key
+}
+
 fn edit_text(text: &mut String, key: KeyEvent) -> bool {
     edit::edit(text, &edit::Cursor::default(), "", key)
 }
@@ -5831,6 +5981,9 @@ impl Guard {
                     crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                         | crossterm::event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES
                         | crossterm::event::KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+                        // With every key an escape code, Shift+; arrives as `;` plus Shift. This
+                        // asks the terminal to say what the layout makes of it: `:`.
+                        | crossterm::event::KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
                 )
             )?;
         }
@@ -6100,6 +6253,14 @@ mod tests {
         assert_eq!(text, "look ", "a control key never types its letter");
         edit_text(&mut text, key(KeyCode::Char('X'), KeyModifiers::SHIFT));
         assert_eq!(text, "look X");
+        // A terminal that reports Shift+i as `i` with Shift still types a capital.
+        edit_text(&mut text, shifted(key(KeyCode::Char('i'), KeyModifiers::SHIFT)));
+        assert_eq!(text, "look XI");
+        assert_eq!(
+            shifted(key(KeyCode::Char('c'), KeyModifiers::CONTROL | KeyModifiers::SHIFT)).code,
+            KeyCode::Char('c'),
+            "a chord keeps its key"
+        );
         let mut lines = "first\nsecond line".to_owned();
         edit_text(&mut lines, key(KeyCode::Char('u'), KeyModifiers::CONTROL));
         assert_eq!(lines, "first\n");
@@ -6653,9 +6814,6 @@ mod tests {
         ] {
             assert!(screen.contains(shown), "{shown}: {screen}");
         }
-        // Open, but only just: not read yet.
-        ui.read_open_update();
-        assert!(ui.effects.is_empty());
         // x dismisses it: it is read, once.
         ui.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
         ui.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
@@ -6665,26 +6823,49 @@ mod tests {
             "{:?}",
             ui.effects
         );
-        // Left open a good while, it stays: it is read only once the person moves off it.
+        // Left open, or moved off, it stays: only x or r reads an update.
         ui.effects.clear();
         ui.updates_read.clear();
-        ui.update_open = Some((
-            "attention/update".into(),
-            Instant::now() - UPDATE_READ_AFTER * 10,
-        ));
-        ui.read_open_update();
-        assert!(ui.effects.is_empty(), "still being read: {:?}", ui.effects);
-        assert!(ui.updates_read.is_empty());
-        // Moving off it (here, to nothing) after it was open a moment reads it.
         ui.select(0);
-        ui.read_open_update();
-        assert_eq!(ui.effects.len(), 1, "{:?}", ui.effects);
-        // Moving off one that was only passed over does not.
-        ui.effects.clear();
-        ui.updates_read.clear();
-        ui.update_open = Some(("attention/update".into(), Instant::now()));
-        ui.read_open_update();
         assert!(ui.effects.is_empty(), "{:?}", ui.effects);
+    }
+
+    #[test]
+    fn an_item_st_stops_listing_stays_on_home_until_x_clears_it() {
+        let world = demo::world();
+        let mut ui = Ui::new(world.clone());
+        ui.live = true;
+        ui.tab = 0;
+        let ids = ui.listing(60).ids.clone();
+        let (gone, acted) = (ids[0].clone(), ids[1].clone());
+        ui.select(0);
+        // Another device closes the first; the person answers the second here.
+        ui.note_acted(&Effect::Attention {
+            id: acted.clone(),
+            action: "work.done".into(),
+            reason: None,
+            answer: None,
+        });
+        let mut next = world;
+        if let Load::Ready(items) = &mut next.attention {
+            items.retain(|item| item.id != gone && item.id != acted);
+        }
+        ui.set_world(next.clone());
+        let listing = ui.listing(60);
+        assert!(listing.ids.contains(&gone), "it stays");
+        assert!(!listing.ids.contains(&acted), "what the person acted on goes");
+        ui.select(listing.ids.iter().position(|id| *id == gone).unwrap());
+        assert!(frame(&ui, 140, 50).join("\n").contains("closed elsewhere"));
+        // It survives later updates, and only x clears it.
+        ui.set_world(next.clone());
+        assert!(ui.listing(60).ids.contains(&gone));
+        ui.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(ui.listing(60).ids.contains(&gone), "other keys leave it");
+        ui.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(!ui.listing(60).ids.contains(&gone));
+        assert!(ui.effects.is_empty(), "nothing sent for an item already closed");
+        ui.set_world(next);
+        assert!(!ui.listing(60).ids.contains(&gone));
     }
 
     #[test]

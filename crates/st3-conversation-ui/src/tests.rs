@@ -544,6 +544,10 @@ fn shared_transcripts_match_without_a_renderer() {
             include_str!("../../../fixtures/clients/transcripts/deliveries.json"),
             include_str!("../../../fixtures/clients/transcripts/deliveries.expected.json"),
         ),
+        (
+            include_str!("../../../fixtures/clients/transcripts/native-claude-run.json"),
+            include_str!("../../../fixtures/clients/transcripts/native-claude-run.expected.json"),
+        ),
     ] {
         let items = serde_json::from_str::<Vec<st3_client::TimelineEntry>>(input).unwrap();
         let mut entries =
@@ -1164,4 +1168,58 @@ fn native_window_notice_with_unfetchable_remainder_stays_at_start() {
     assert!(shown[0].contains("Earlier history is not shown"), "{shown:?}");
     assert!(shown[0].contains("not fetchable"), "{shown:?}");
     assert!(shown.last().unwrap().contains("last words"), "{shown:?}");
+}
+
+// A real native Claude run (names invented): every turn is a wrapper entry, an empty reasoning
+// step, and the harness's own records between calls. None of that is conversation.
+#[test]
+fn native_run_shows_one_mail_and_collates_calls_without_bookkeeping() {
+    let items = serde_json::from_str::<Vec<st3_client::TimelineEntry>>(include_str!(
+        "../../../fixtures/clients/transcripts/native-claude-run.json"
+    ))
+    .unwrap();
+    let shown = adapt::conversation(&items, &Default::default());
+    let text = serde_json::to_string(&shown).unwrap();
+    assert_eq!(
+        shown
+            .iter()
+            .filter(|entry| matches!(entry.body, Body::Mail { .. }))
+            .count(),
+        1,
+        "the delivery reads once"
+    );
+    assert!(!text.contains("total_tokens_reminder") && !text.contains("last-prompt"));
+    assert!(
+        !shown.iter().any(
+            |entry| matches!(&entry.body, Body::Assistant(text) if text.trim() == "[reasoning]")
+        )
+    );
+    // Reasoning the model shared stays, and a record st does not know stays visible.
+    assert!(text.contains("Check the queue before answering."));
+    assert!(text.contains("future-kind"));
+    // The two calls that the empty reasoning and the reminder separated are one run.
+    let tools = shown
+        .windows(2)
+        .filter(|pair| {
+            matches!(pair[0].body, Body::Tool { .. }) && matches!(pair[1].body, Body::Tool { .. })
+        })
+        .count();
+    assert_eq!(tools, 1);
+    assert_eq!(display_rows(&shown), shown.len() - 1);
+    // Showing everything keeps every entry, and the switch alone brings the records back.
+    let without = crate::DEFAULT_FILTERS
+        .iter()
+        .copied()
+        .filter(|filter| *filter != crate::DisplayFilter::Bookkeeping)
+        .collect::<Vec<_>>();
+    let all = adapt::conversation_with_filters(&items, &Default::default(), &without);
+    assert!(
+        serde_json::to_string(&all)
+            .unwrap()
+            .contains("total_tokens_reminder")
+    );
+    assert_eq!(
+        adapt::conversation_with_filters(&items, &Default::default(), crate::SHOW_EVERYTHING).len(),
+        items.len()
+    );
 }

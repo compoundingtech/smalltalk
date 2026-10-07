@@ -33,6 +33,8 @@ pub enum DisplayFilter {
     ControlCharacters,
     InternalBlocks,
     Excerpts,
+    /// Records a harness writes for itself (titles, modes, empty reasoning), not conversation.
+    Bookkeeping,
 }
 pub const DEFAULT_FILTERS: &[DisplayFilter] = &[
     DisplayFilter::HarnessMarkup,
@@ -40,6 +42,7 @@ pub const DEFAULT_FILTERS: &[DisplayFilter] = &[
     DisplayFilter::ControlCharacters,
     DisplayFilter::InternalBlocks,
     DisplayFilter::Excerpts,
+    DisplayFilter::Bookkeeping,
 ];
 /// Empty filters render every entry as reversible JSON, including metadata and raw byte blocks.
 pub const SHOW_EVERYTHING: &[DisplayFilter] = &[];

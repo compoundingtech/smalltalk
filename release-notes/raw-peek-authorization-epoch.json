@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Bind raw PEEK capabilities to authorization epochs and restrict pairing revocation to its issuer",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay behavior changes."
+  },
+  "schema": {
+    "status": "changed",
+    "detail": "Adds an index for pairing-completed session_actor lookup; no schema version or data migration changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "RULES_VERSION remains11; no checkpoint rule changes."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "PEEK admission is issuer-gateway-bound and rejects an acquisition whose authority epoch changed. A non-issuer pairing revoke returns issuer-required instead of committing."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional service interruption beyond a normal daemon upgrade."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Revoke pairings at their issuing gateway; a non-issuer refusal identifies issuer_host_id. This is an intermediate lease-stack behavior, not the authenticated PEEK cutover."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No data rewrite or destructive migration; existing binary swap-back behavior is unchanged. Older builds retain their older observation enforcement."
+  }
+}

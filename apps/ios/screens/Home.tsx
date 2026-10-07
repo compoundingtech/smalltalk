@@ -42,6 +42,8 @@ export function HomeScreen() {
   // the person to do (after a confirm), an update or a message is read. A decision has none.
   const dismiss = (row: HomeRow): (() => void) | undefined => {
     const item = row.item;
+    // Closed elsewhere: only clearing it takes it off Home.
+    if (item.closedElsewhere) return () => actions.clearClosed(item.id);
     if (item.update && item.actions.includes('work.done')) return () => void actions.done(item, 'Read', 'read');
     if (isRequest(item.attention_kind) && item.actions.includes('work.done')) {
       const asker = item.requester_id?.replace(/^agent\//, '') ?? 'the agent';
@@ -93,22 +95,30 @@ export function HomeScreen() {
 export function AttentionScreen({ route, navigation }: RootScreen<'Attention'>) {
   const { data, busy, status, actions } = useStore();
   const found = data.attention.find(candidate => candidate.id === route.params.id);
-  // An update clears once read, which is as soon as it is opened; it stays here while it is read.
+  // Nothing leaves Home by itself: an update is read when the person says so, never by opening it.
   const kept = useRef(found);
   if (found) kept.current = found;
-  const item = found ?? (kept.current?.update ? kept.current : undefined);
-  const read = useRef(false);
-  useEffect(() => {
-    if (!item?.update || read.current || status !== 'online') return;
-    read.current = true;
-    void actions.done(item, 'Read', 'read');
-  }, [item?.id, status]);
+  const item = found ?? kept.current;
   if (!item) return <Screen><Banners /><Empty text="This item is no longer open." /></Screen>;
   const [row] = homeRows([item], undefined);
   const agentId = [item.requester_id, item.source_id].find(id => id?.startsWith('agent/'));
   const agent = agentId ? data.agents.find(candidate => candidate.id === agentId) : undefined;
   const mission = item.mission_id ? data.missions.find(candidate => candidate.id === item.mission_id) : undefined;
   const other = item.actions.filter(action => action !== 'work.done' && action !== 'message.read');
+  // Closed elsewhere, so nothing here can be answered; it stays until the person clears it.
+  if (item.closedElsewhere && !item.update) {
+    return <Screen>
+      <Banners />
+      <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ padding: 12, gap: 6, paddingBottom: 32 }}>
+        <T><T bold color={theme[row.color]}>{row.glyph} {row.kind}</T><T dim>  {row.age} ago</T></T>
+        <T bold selectable>{row.title}</T>
+        {item.detail ? <Markdown text={item.detail} color={theme.subtext0} /> : null}
+        <T dim>This was closed elsewhere. It stays until you clear it.</T>
+        <Button label="clear from Home" onPress={() => { actions.clearClosed(item.id); navigation.goBack(); }} />
+        <T dim selectable>{item.id}</T>
+      </ScrollView>
+    </Screen>;
+  }
   if (item.update) {
     const from = agent ? agentName(agent) : item.requester_id?.replace(/^agent\//, '') ?? 'An agent';
     return <Screen>
@@ -122,7 +132,10 @@ export function AttentionScreen({ route, navigation }: RootScreen<'Attention'>) 
         {item.update.subjects?.map((subject, index) => subject.url
           ? <Pressable key={index} onPress={() => void Linking.openURL(subject.url!)}><T color={theme.accent}>↗ {subject.label}</T></Pressable>
           : <T key={index} dim>↗ {subject.label}  {subject.ref ?? ''}</T>)}
-        <T dim>Nothing waits on this. Opening it marked it read, so it has left Home.</T>
+        <T dim>{item.closedElsewhere ? 'This was closed elsewhere. It stays until you clear it.' : 'Nothing waits on this. It stays on Home until you mark it read.'}</T>
+        {item.closedElsewhere
+          ? <Button label="clear from Home" onPress={() => { actions.clearClosed(item.id); navigation.goBack(); }} />
+          : item.actions.includes('work.done') ? <Button label="mark read" disabled={busy || status !== 'online'} onPress={() => void actions.done(item, 'Read', 'read').then(done => { if (done) navigation.goBack(); })} /> : null}
         {agentId ? <Button label={`chat with ${from}`} onPress={() => navigation.navigate('Conversation', { target: agentId, title: from })} /> : null}
         <T dim selectable>{item.id}</T>
       </ScrollView>

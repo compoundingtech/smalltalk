@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Observe committed SQLite authority synchronously before writer acknowledgement",
+  "replay": { "status": "none", "detail": "No claim or replay changes." },
+  "schema": { "status": "none", "detail": "No database schema or migration changes." },
+  "rules": { "status": "none", "detail": "Checkpoint rules remain version 11; no coordinated fleet upgrade is required by the observer API." },
+  "compatibility": { "status": "none", "detail": "The new process-local Store and WriterConnection observer API does not alter client, peer, or harness protocols." },
+  "downtime": { "status": "none", "detail": "No additional interruption beyond a normal daemon upgrade." },
+  "manual": { "status": "none", "detail": "No configuration or migration steps required." },
+  "recovery": { "status": "none", "detail": "No persistent changes are introduced; existing binary swap-back behavior is unchanged." }
+}

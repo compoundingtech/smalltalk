@@ -32,10 +32,12 @@ use crate::hash::{
 };
 use crate::replication::*;
 use crate::sqlite::{
-    PINNED_READER, PinnedRead, ReadPool, SQLITE_COMMIT_NANOS, SQLITE_COMMITS, SQLITE_NANOS,
-    STATEMENT_CACHE_CAPACITY, WriterConnection,
+    CommitObserver, PINNED_READER, PinnedRead, ReadPool, SQLITE_COMMIT_NANOS, SQLITE_COMMITS,
+    SQLITE_NANOS, STATEMENT_CACHE_CAPACITY, WriterConnection,
 };
 
+#[cfg(test)]
+mod projection_busy_tests;
 mod binary_payloads;
 mod inventory_generation;
 pub use binary_payloads::PayloadConversion;
@@ -199,7 +201,7 @@ fn projection_failure_log_line(
         "error": bounded(message, 4096), "error_truncated": message.chars().take(4097).count()>4096,
         "stage": field("projection_stage"), "claim_id": field("projection_claim_id"),
         "subject": field("projection_subject"), "operation_id": field("projection_operation_id"),
-        "frontier": frontier, "target": target,
+        "frontier": if details.get("projection_frontier_unknown").and_then(Value::as_bool).unwrap_or(false) { None } else { Some(frontier) }, "target": target,
         "suppressed_errors": emission.suppressed, "rate_bucket_overflow": emission.overflow,
         "context_truncated": details.get("projection_context_truncated").and_then(Value::as_bool).unwrap_or(false)
             || phase.chars().take(129).count()>128 || code.chars().take(129).count()>128
@@ -708,7 +710,10 @@ pub struct Store {
     replication_projection_state: AtomicU64,
     /// Only limits new error detail lines; it never caches projection results or decisions.
     projection_diagnostics: Mutex<ProjectionDiagnosticState>,
-    /// When this process last projected replicated claims, in Unix milliseconds.
+    /// Advances only for numeric SQLite contention, so the daemon can coalesce a bounded
+    /// retry episode without treating arbitrary deferred work as contention.
+    projection_contention_generation: AtomicU64,
+    /// When this process last attempted projection of replicated claims, in Unix milliseconds.
     pub last_replication_projection_unix_ms: AtomicU64,
     /// The heals this node asks its peers, and when it last replayed its graph for one.
     pub heal: Mutex<heal::HealState>,
@@ -741,6 +746,22 @@ pub struct Store {
 }
 
 impl Store {
+    /// Observe committed authority before writes acknowledge success. The callback reads through
+    /// the supplied writer connection and must not acquire the writer itself. Keep the returned
+    /// handle for the authorization's lifetime; dropping it unregisters and waits for a callback
+    /// running on another thread. Self-drop is safe. Register before rechecking current authority
+    /// outside a pinned snapshot, because registration does not report a commit whose observer
+    /// snapshot was already taken.
+    ///
+    /// Callbacks must fail closed on read errors, must not panic, and should capture owners weakly
+    /// to avoid cycles. See [`WriterConnection::observe_commits`].
+    pub fn observe_commits(
+        &self,
+        callback: impl Fn(&Connection) + Send + Sync + 'static,
+    ) -> CommitObserver {
+        self.connection.observe_commits(callback)
+    }
+
     /// Open the store at `path`, creating it when it does not exist, with `runtime`'s tables
     /// and projections beside the graph's.
     pub fn open(path: &Path, origin: impl Into<String>, runtime: Arc<dyn Runtime>) -> Result<Self> {
@@ -917,6 +938,7 @@ impl Store {
             replication_timers: ReplicationTimers::default(),
             replication_projection_state: AtomicU64::new(0),
             projection_diagnostics: Mutex::new(ProjectionDiagnosticState::default()),
+            projection_contention_generation: AtomicU64::new(0),
             last_replication_projection_unix_ms: AtomicU64::new(0),
             heal: Mutex::default(),
             member_key: std::sync::RwLock::new(None),
@@ -4748,12 +4770,15 @@ impl Store {
         appended
     }
 
+    #[track_caller]
     pub fn read_snapshot<T>(&self, read: impl FnOnce(u64) -> Result<T>) -> Result<T> {
         let key = self.readers.key();
         if PINNED_READER.with(|slot| slot.borrow().as_ref().is_some_and(|(pool, _)| *pool == key)) {
             let index = current_index(&self.readers.get())?;
             return read(index);
         }
+        // The snapshot's own entry: the guard below is lent out and dropped at once.
+        let _live = crate::sqlite::register_live_read(true);
         let mut guard = self.readers.get();
         // Declared first so it drops last: on every exit it ends the transaction, releases the
         // pin, and returns the connection to the pool.
@@ -5243,7 +5268,8 @@ impl Store {
                 params![seeded_through, target, SEAL_CHUNK_BATCHES],
                 |row| row.get(0),
             )?;
-            let transaction = connection.transaction()?;
+            let transaction = connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             seed_replica_envelopes_signed_tx(
                 &transaction,
                 &self.origin,
@@ -5984,7 +6010,8 @@ impl Store {
             // one is rolled back and recorded alone.
             for chunk in pending.chunks(ADMISSION_CHUNK_ENVELOPES) {
                 let mut connection = self.connection.write();
-                let mut pass = connection.transaction()?;
+                let mut pass = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 for envelope in chunk {
                     let started = std::time::Instant::now();
                     let hold = fleet_admission_hold(&pass, &membership, envelope)?;
@@ -6086,12 +6113,42 @@ impl Store {
         self.replication_projection_state.load(Ordering::Acquire) & 1 != 0
     }
 
+    pub fn projection_contention_generation(&self) -> u64 {
+        self.projection_contention_generation.load(Ordering::Acquire)
+    }
+
+    fn note_projection_contention(&self) {
+        self.projection_contention_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
     fn defer_replication_projection(&self) {
         let _ = self.replication_projection_state.fetch_update(
             Ordering::AcqRel,
             Ordering::Acquire,
             |state| Some(state.wrapping_add(2) | 1),
         );
+    }
+
+    /// Copy WAL pages off the writer queue, then serialize the writer-lock-taking TRUNCATE.
+    /// The checkpoint connection has no busy wait; readers can still defer recycling.
+    pub fn checkpoint_idle_wal(&self, checkpoint: &Connection) -> Result<bool> {
+        Ok(self.checkpoint_idle_wal_report(checkpoint)?.recycled)
+    }
+
+    pub fn checkpoint_idle_wal_report(&self, checkpoint: &Connection) -> Result<crate::sqlite::WalCheckpointReport> {
+        let mut report = crate::sqlite::checkpoint_wal_report(checkpoint)?;
+        if report.frames <= 0 || report.frames != report.backfilled {
+            return Ok(report);
+        }
+        let waiting = std::time::Instant::now();
+        {
+            let _writer = self.connection.write();
+            report.writer_wait_ms = waiting.elapsed().as_millis();
+            let truncating = std::time::Instant::now();
+            report.recycled = crate::sqlite::truncate_idle_wal(checkpoint)?;
+            report.truncate_ms = Some(truncating.elapsed().as_millis());
+        }
+        Ok(report)
     }
 
     /// Replay the graph from nothing now, as a heal does when two nodes project different graphs
@@ -6240,7 +6297,24 @@ impl Store {
         let mut chunked = false;
         loop {
             let mut connection = self.connection.write();
-            let transaction = connection.transaction()?;
+            // Acquire SQLite's write lock before reading a snapshot. A deferred upgrade can
+            // fail immediately when the independent WAL checkpoint connection holds that lock.
+            let transaction = connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|error| {
+                    let error = internal(error);
+                    if error.is_sqlite_contention() {
+                        self.note_projection_contention();
+                        let error = error.with_detail("projection_stage", "begin-immediate")
+                            .with_detail("projection_frontier_unknown", true);
+                        // No transaction exists from which to read the committed frontier.
+                        self.log_projection_failure(&error, phase, 0, target, &mut log);
+                        return error;
+                    }
+                    // No transaction began: surface the typed error, preserving the entry
+                    // deferred generation and attempt time. The daemon also schedules retry.
+                    error
+                })?;
             let frontier: u64 = transaction
                 .query_row(
                     "SELECT last_good_store_index FROM projection_health WHERE aggregate='graph'",
@@ -6267,8 +6341,8 @@ impl Store {
                 total: None,
             });
             let result = (|| -> Result<bool, St3Error> {
-                // An incremental projection that fails is rolled back and replaced by a full replay,
-                // which quarantines the claim it cannot project instead of failing the graph.
+                // Non-contention incremental failures retain the full replay fallback,
+                // which quarantines claims it cannot project. SQLite contention defers below.
                 transaction
                     .execute_batch("SAVEPOINT project_incremental")
                     .map_err(internal)?;
@@ -6305,6 +6379,11 @@ impl Store {
                         }
                         Err(error) => {
                             self.log_projection_failure(&error, phase, frontier, target, &mut log);
+                            if error.is_sqlite_contention() {
+                                // Roll back the whole chunk below. Replaying the same claims
+                                // cannot repair a connection lock and would lengthen its hold.
+                                return Err(error);
+                            }
                             crate::profile::note(&format!(
                                 "replay: incremental failed: {}",
                                 error.code
@@ -6334,6 +6413,10 @@ impl Store {
                                 processed: stage.processed,
                                 total: stage.total,
                             });
+                        }).map_err(|error| {
+                            let error = error.with_detail("projection_stage", "full-replay");
+                            self.log_projection_failure(&error, phase, frontier, target, &mut log);
+                            error
                         })?;
                 } else {
                     crate::profile::note("projection: incremental");
@@ -6388,7 +6471,17 @@ impl Store {
                         continue;
                     }
                     if self.verdicts_due.swap(false, Ordering::AcqRel) {
-                        self.judge_claims(true)?;
+                        self.judge_claims(true).map_err(|error| {
+                            self.verdicts_due.store(true, Ordering::Release);
+                            let error = crate::error::typed(error);
+                            if error.is_sqlite_contention() {
+                                self.note_projection_contention();
+                                let error = error.with_detail("projection_stage", "tail-verdict");
+                                self.log_projection_failure(&error, phase, through, target, &mut log);
+                                return error;
+                            }
+                            error
+                        })?;
                     }
                     // Admission and catch-up deferral can run after this index read. Clear
                     // only the generation observed before it; a newer deferral must survive.
@@ -6406,6 +6499,14 @@ impl Store {
                 }
                 Err(error) => {
                     transaction.rollback()?;
+                    if error.is_sqlite_contention() {
+                        // Preserve committed health/frontier, not all process state: entry
+                        // advances the deferred generation by two and updates the last attempt
+                        // time, so the existing catch-up throttle applies. A daemon retry is
+                        // scheduled separately; receive/wake passes can also recover sooner.
+                        self.note_projection_contention();
+                        return Ok(false);
+                    }
                     connection.execute(
                     "INSERT INTO projection_health(aggregate, status, error_code, error_message, updated_at_unix_ms)
                      VALUES ('graph', 'stale', ?1, ?2, ?3)

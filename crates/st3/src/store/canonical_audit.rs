@@ -68,6 +68,8 @@ fn every_persistent_table_has_a_projection_scope() {
         "local_usage_responses",
         "local_limit_stops",
         "local_seat_accounts",
+        "account_limit_readings",
+        "account_limit_seats",
         "local_latest_slots",
         "local_resource_projection_pending",
         "local_glass_head_pending",

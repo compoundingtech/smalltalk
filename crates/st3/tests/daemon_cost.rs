@@ -1097,6 +1097,16 @@ struct Cost {
     statements: u64,
     /// The answer's size in bytes, or the rows a trim deleted.
     answer: u64,
+    /// How many things the answer returned ([`item_count`]), at least one.
+    items: u64,
+    /// Every unit the answer counted in ([`item_units`]): the lengths of its lists of objects and
+    /// the steps nested in them, largest first, so a loop that runs once per run or once per step
+    /// can be told from the other.
+    item_units: Vec<u64>,
+    /// The most times one normalized statement text ran during the request, transaction control
+    /// aside, and that text.
+    max_repeat: u64,
+    top_shape: String,
     error: Option<String>,
 }
 
@@ -1110,6 +1120,18 @@ impl Cost {
             autoindex_rows: least(|cost| cost.autoindex_rows),
             statements: least(|cost| cost.statements),
             answer: samples.iter().map(|cost| cost.answer).max().unwrap_or(0),
+            items: samples.iter().map(|cost| cost.items).max().unwrap_or(0),
+            item_units: samples
+                .iter()
+                .max_by_key(|cost| cost.items)
+                .map(|cost| cost.item_units.clone())
+                .unwrap_or_default(),
+            max_repeat: least(|cost| cost.max_repeat),
+            top_shape: samples
+                .iter()
+                .min_by_key(|cost| cost.max_repeat)
+                .map(|cost| cost.top_shape.clone())
+                .unwrap_or_default(),
             error: samples.iter().find_map(|cost| cost.error.clone()),
         }
     }
@@ -1123,8 +1145,113 @@ impl Cost {
             statements: work.statements,
             answer,
             error,
+            ..Cost::default()
         }
     }
+}
+
+/// The units an answer counted in: the length of every list of objects in its first three levels
+/// (so a list inside a client envelope counts), and the steps nested in the elements of such a
+/// list, added up. Largest first, without repeats, at most four. A list of plain values is not a
+/// unit: it is a field, not a set of things the daemon looked up one by one.
+fn item_units(value: &Value) -> Vec<u64> {
+    fn walk(value: &Value, depth: usize, units: &mut std::collections::BTreeSet<u64>) {
+        match value {
+            Value::Array(items) => {
+                if items.iter().any(Value::is_object) {
+                    units.insert(items.len() as u64);
+                    let nested: u64 = items
+                        .iter()
+                        .filter_map(|item| item.get("steps"))
+                        .filter_map(Value::as_array)
+                        .map(|steps| steps.len() as u64)
+                        .sum();
+                    if nested > 0 {
+                        units.insert(nested);
+                    }
+                }
+                if depth < 3 {
+                    for item in items {
+                        walk(item, depth + 1, units);
+                    }
+                }
+            }
+            Value::Object(map) if depth < 3 => {
+                for value in map.values() {
+                    walk(value, depth + 1, units);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut units = std::collections::BTreeSet::new();
+    walk(value, 0, &mut units);
+    let mut units: Vec<u64> = units.into_iter().rev().take(4).collect();
+    if units.is_empty() {
+        units.push(1);
+    }
+    units
+}
+
+/// How many things an answer returned: its largest unit ([`item_units`]), or the length of its
+/// longest list of plain values when it has no list of objects. At least one.
+fn item_count(value: &Value) -> u64 {
+    fn longest(value: &Value, depth: usize) -> u64 {
+        match value {
+            Value::Array(items) => {
+                let inner = if depth < 3 {
+                    items.iter().map(|item| longest(item, depth + 1)).max().unwrap_or(0)
+                } else {
+                    0
+                };
+                (items.len() as u64).max(inner)
+            }
+            Value::Object(map) if depth < 3 => {
+                map.values().map(|value| longest(value, depth + 1)).max().unwrap_or(0)
+            }
+            _ => 0,
+        }
+    }
+    item_units(value)[0].max(longest(value, 0)).max(1)
+}
+
+/// The statement text that ran most often since the last histogram take, and how many
+/// times. Transaction control and pragmas are not counted: a request opens one transaction.
+fn most_repeated_shape() -> (u64, String) {
+    smallclaims::sqlite::histogram::take()
+        .into_iter()
+        .filter(|(shape, _)| {
+            let shape = shape.trim_start().to_ascii_uppercase();
+            !["BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE", "PRAGMA"]
+                .iter()
+                .any(|control| shape.starts_with(control))
+        })
+        .map(|(shape, counted)| (counted.count, shape))
+        .max()
+        .unwrap_or((0, String::new()))
+}
+
+#[test]
+fn item_count_finds_envelope_lists_and_nested_steps() {
+    assert_eq!(item_count(&json!({"ok": true})), 1);
+    assert_eq!(item_count(&json!([1, 2, 3])), 3);
+    assert_eq!(item_count(&json!({"value": {"items": [1, 2, 3, 4]}})), 4);
+    let runs = json!([{"steps": [1, 2, 3]}, {"steps": [1, 2, 3, 4, 5]}]);
+    assert_eq!(item_count(&runs), 8, "nested steps outnumber the two runs");
+    let deep = json!({"a": {"b": {"c": {"d": [1, 2, 3, 4, 5, 6]}}}});
+    assert_eq!(item_count(&deep), 1, "four levels down is not an item list");
+}
+
+#[test]
+fn item_units_keep_runs_and_steps_apart_and_ignore_lists_of_plain_values() {
+    let runs = json!({"value": {"items": [
+        {"id": "a", "steps": [1, 2, 3], "tags": ["x", "y"]},
+        {"id": "b", "steps": [1, 2, 3, 4, 5], "tags": []},
+    ]}});
+    assert_eq!(item_units(&runs), vec![8, 2], "eight steps in two runs; the tags are fields");
+    assert_eq!(item_units(&json!({"ok": true})), vec![1]);
+    assert_eq!(item_units(&json!(["a", "b", "c"])), vec![1], "plain values are not a unit");
+    assert_eq!(item_count(&json!(["a", "b", "c"])), 3, "but they still count as returned items");
 }
 
 /// Items of the generated store the probes refer to.
@@ -1494,6 +1621,7 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<Value, String>>,
 {
+    smallclaims::sqlite::histogram::take();
     let before = work::total();
     let answer = request().await;
     // Work a request leaves to a background task belongs to it too.
@@ -1516,13 +1644,23 @@ where
             value.to_string().chars().take(400).collect::<String>()
         );
     }
-    match answer {
-        Ok(value) => Cost::from_work(
-            spent,
-            serde_json::to_vec(&value).unwrap().len() as u64,
-            None,
-        ),
-        Err(error) => Cost::from_work(spent, 0, Some(error)),
+    let (max_repeat, top_shape) = most_repeated_shape();
+    let cost = match &answer {
+        Ok(value) => Cost {
+            items: item_count(value),
+            item_units: item_units(value),
+            ..Cost::from_work(
+                spent,
+                serde_json::to_vec(value).unwrap().len() as u64,
+                None,
+            )
+        },
+        Err(error) => Cost::from_work(spent, 0, Some(error.clone())),
+    };
+    Cost {
+        max_repeat,
+        top_shape,
+        ..cost
     }
 }
 

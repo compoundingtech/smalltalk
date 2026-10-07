@@ -1161,6 +1161,10 @@ Errors have `error_version: st3.client.error.v0`, a stable kebab-case code, safe
 `runtime-authority-indeterminate`, `remote-unavailable`, `terminal-unavailable`, `terminal-ended`,
 and `internal`.
 
+Revoking a pairing from a non-issuer returns HTTP 409 with `code: issuer-required`,
+`retryable: false`, and `details.issuer_host_id` naming the authoritative issuer.
+The caller must direct revocation to that issuer rather than retrying the same gateway.
+
 Adding optional fields is compatible. Removing or retyping a field, changing ordering or token
 rules, adding a required action parameter, or changing action semantics requires a new capability
 version or API version. Clients preserve unknown enum cases for display but never send an action

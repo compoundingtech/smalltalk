@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Defer SQLite contention without replay and serialize WAL truncation with the writer queue",
+  "replay": {
+    "status": "changed",
+    "detail": "SQLite BUSY/LOCKED during incremental or post-projection rolls the chunk back and leaves it deferred without full replay or marking healthy projections stale. Other projection failures retain existing fallback and quarantine behavior."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, indexes, user_version or stored claim shape changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No authority, admission, checkpoint retention or proof rules change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Numeric SQLite BUSY/LOCKED conversions through internal()/typed() across the crate use database-busy/database-locked with sqlite_extended_code, not just incremental code. API mappings preserving them return 503; client envelopes preserve the code and WebSocket error close is 1011, not 1008 validation refusal. Mailbox bind retries busy/locked with its unchanged allocation token/epoch. Gateway importer retries contention without advancing memory/disk cursor, retaining graph-refusal skip semantics. Already-admitted replication receive treats typed projection contention as pending success 200 without a completed-projection wake. Other error maps may still rebuild internal500; replication envelope/claim shapes unchanged. Schedule/subscription starts retain pending requests on typed contention, without durable failure claims. Projection diagnostic context is removed from API/client error details; SQLite extended code remains."
+  },
+  "downtime": {
+    "status": "changed",
+    "detail": "A projection BEGIN IMMEDIATE that remains contended through existing 5 s busy timeout explicitly fails startup before daemon.started/runtime initialization; no retry worker exists yet. Existing service restart/operator policy may attempt start again. In-chunk rollback returning false can continue with last-good state; subsequent mandatory initialization writes may still fail and abort. Worker recovery applies only after startup completes. No unsafe bypass of those writes or new restart policy. The admission and verdict IMMEDIATE starts can also fail during mandatory startup work. During sustained receive contention a projection begin can wait five seconds holding the projection mutex; multiple peers may queue behind it and reach their request deadlines."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No setting or operator action needed. Existing busy timeout and worker interval stay unchanged."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "Contended chunks preserve committed frontier/health, but entry advances the deferred generation by two and updates last-attempt time, retaining the existing 30 s catch-up throttle. The daemon coalesces contention generations into at most three scheduled calls after 30/60/120 s backoff; a throttled call also consumes budget. Success cancels retry and notifies clients/reconciler; non-contention failure or exhausted budget stops automatic retry until new external contention. Four receive-path transaction starts acquire IMMEDIATE and may wait up to the existing 5 s busy timeout. A busy projection begin surfaces typed Err before a transaction exists and schedules retry; later chunk contention rolls back and returns false. API 503 occurs only where callers preserve typed code; some maps retain internal 500. PASSIVE stays off queue; nonempty backfilled WAL TRUNCATE borrows FIFO writer, empty WAL skips it. New idle outcome stderr samples and abnormal reports use independent first-immediate/60 s buckets; suppressed counts and maximum durations appear on the next allowed same-bucket outcome, with no final flush or complete trace. Errors have no partial phase durations. After exhaustion/nonbusy stop, last-good projections may lag; deferred gates graph/digest comparisons and schedule admission, not durable log admission. Retry line reports one stop reason (recovered, budget-exhausted, or non-retryable) separately from the actual deferred state sampled after the attempted call; join failure leaves that state unknown. BEGIN failure diagnostics have stage begin-immediate with null frontier because no transaction exists; no context SQL query is added. A non-contention projection returning Some(false) also no longer wakes the reconciler as completed work; event_notify still fires when admitted store_index changes. Busy at the tail verdict pass is typed, restores its pending-verdict flag and retries without replay; the preceding projection chunk is already committed at that boundary."
+  }
+}

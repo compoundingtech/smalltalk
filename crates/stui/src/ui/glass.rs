@@ -1049,6 +1049,7 @@ impl Ui {
         };
         self.frame.borrow_mut().glass_dividers = dividers.clone();
         for super::layout::Divider { rect, side, .. } in dividers {
+            self.hit(rect, Hit::Resize);
             let symbol = match side {
                 Side::Right => "│",
                 Side::Below => "─",
@@ -1175,6 +1176,11 @@ impl Ui {
     /// when the event belonged to a drag.
     pub(crate) fn drag_mouse(&mut self, mouse: crossterm::event::MouseEvent) -> bool {
         use crossterm::event::{MouseButton, MouseEventKind};
+        if matches!(mouse.kind, MouseEventKind::Down(_))
+            && (self.popover.is_some() || self.home_open() || self.palette_open())
+        {
+            return false;
+        }
         let Some(glasses) = self.glasses.as_mut() else {
             return false;
         };
@@ -1952,7 +1958,7 @@ impl Ui {
             .attention
             .items()
             .iter()
-            .filter(|item| !self.snoozed.contains(&item.id))
+            .filter(|item| !self.snoozed.contains(&item.id) && !self.closed.contains(&item.id))
             .count();
         spans.push(Span::styled(" · ", bar(theme::dim())));
         // Each count opens the palette at what it counts.
@@ -3212,6 +3218,9 @@ impl Ui {
     /// A click inside a group that is not focused focuses it, and does nothing else. While the
     /// palette is open, only its rows take clicks; a click elsewhere closes it.
     pub(crate) fn glass_click(&mut self, column: u16, row: u16) -> bool {
+        if self.popover.is_some() {
+            return false;
+        }
         // A click outside the sidebar takes the keys from it (it stays shown); inside, the
         // sidebar's own targets act.
         let in_sidebar = {
@@ -3271,6 +3280,17 @@ impl Ui {
             }
             _ => false,
         }
+    }
+
+    pub(super) fn click_focuses_split(&self, column: u16, row: u16) -> bool {
+        self.glasses.as_ref().is_some_and(|glasses| {
+            self.frame
+                .borrow()
+                .glass_leaves
+                .iter()
+                .position(|rect| contains(*rect, column, row))
+                .is_some_and(|group| group != glasses.glass().focus)
+        })
     }
 
     /// Close the focused tab when it is a form that was just finished or cancelled.
@@ -6125,6 +6145,98 @@ mod tests {
             "{:?}",
             ui.flash
         );
+    }
+
+    /// A shell tab with the daemon played by the test; what the shell is sent is read back.
+    fn shell_tab() -> (Ui, std::os::unix::net::UnixStream) {
+        use pty_core::protocol::{MessageType, PacketReader, encode_packet};
+        use std::io::{Read as _, Write as _};
+        use std::os::unix::net::UnixStream;
+        let mut ui = glass();
+        ui.live = true;
+        let shell = "terminal/example-shell".to_owned();
+        ui.open_in_glass(Pane::Terminal(shell.clone()), Open::Tab);
+        let (stui, mut daemon) = UnixStream::pair().unwrap();
+        ui.terminal = Some(crate::ui::TerminalView {
+            agent: shell,
+            title: "shell".into(),
+            name: "shell".into(),
+            lines: Vec::new(),
+            cursor: None,
+            stale: None,
+            ended: None,
+            native: Some(crate::ui::pty::NativeTerminal::spawn(
+                stui,
+                "example-shell",
+                "one".into(),
+                24,
+                80,
+            )),
+        });
+        let mut reader = PacketReader::new();
+        let mut bytes = [0_u8; 256];
+        let mut attached = false;
+        while !attached {
+            let count = daemon.read(&mut bytes).unwrap();
+            attached = reader
+                .feed(&bytes[..count])
+                .unwrap()
+                .iter()
+                .any(|packet| packet.type_ == MessageType::Attach);
+        }
+        daemon
+            .write_all(&encode_packet(MessageType::Screen, b"$ "))
+            .unwrap();
+        while !screen(&ui).contains("$") {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        (ui, daemon)
+    }
+
+    /// What the shell was sent within `wait`.
+    fn sent(daemon: &mut std::os::unix::net::UnixStream, wait: std::time::Duration) -> Vec<u8> {
+        use pty_core::protocol::{MessageType, PacketReader};
+        use std::io::Read as _;
+        daemon.set_read_timeout(Some(wait)).unwrap();
+        let mut reader = PacketReader::new();
+        let mut out = Vec::new();
+        let mut bytes = [0_u8; 256];
+        while let Ok(count) = daemon.read(&mut bytes) {
+            if count == 0 {
+                break;
+            }
+            for packet in reader.feed(&bytes[..count]).unwrap() {
+                if packet.type_ == MessageType::Data {
+                    out.extend(packet.payload);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn ctrl_t_twice_leaves_a_terminal_and_once_reaches_its_program_late() {
+        let (mut ui, mut daemon) = shell_tab();
+        // Held back: nothing yet, then the program has it after the moment for a second press.
+        ctrl(&mut ui, 't');
+        assert!(sent(&mut daemon, std::time::Duration::from_millis(100)).is_empty());
+        std::thread::sleep(std::time::Duration::from_millis(350));
+        ui.step_terminal_hold();
+        assert_eq!(sent(&mut daemon, std::time::Duration::from_millis(300)), b"\x14");
+        // Another key lets a held one go first, in order.
+        ctrl(&mut ui, 't');
+        press(&mut ui, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(sent(&mut daemon, std::time::Duration::from_millis(300)), b"\x14x");
+        // Twice: the terminal is left, and the program is sent nothing.
+        ctrl(&mut ui, 't');
+        ctrl(&mut ui, 't');
+        ui.step_terminal_hold();
+        assert!(
+            ui.effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::CloseTerminal))
+        );
+        assert!(sent(&mut daemon, std::time::Duration::from_millis(500)).is_empty());
     }
 
     #[test]

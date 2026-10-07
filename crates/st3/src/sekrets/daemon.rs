@@ -243,27 +243,42 @@ fn import_until_error(
             wait_ms: 55_000,
         })?;
         let entries: Vec<super::store::LogEntry> = serde_json::from_value(value)?;
-        let Some(last) = entries.last().map(|entry| entry.seq) else {
+        let Some(_) = entries.last() else {
             continue;
         };
-        for entry in &entries {
-            if let Some(claim) = claim_for(node, person, entry) {
-                match store.append_claim(&claim) {
-                    Ok(_) => {}
-                    // The graph refuses this entry's claim: record the rest rather than stall.
-                    Err(error) if error.code != "internal" => {
-                        eprintln!(
-                            "st3: sekrets: skipped gateway log entry {}: {error:#}",
-                            entry.seq
-                        );
-                    }
-                    Err(error) => return Err(error.into()),
+        import_entries(&entries, node, person, cursor_path, cursor, |claim| {
+            store.append_claim(claim).map(|_| ())
+        })?;
+    }
+}
+
+// Advance a gateway page only after all retryable storage failures are excluded. Entries
+// before a failed append can be replayed safely using their existing idempotency keys.
+fn import_entries(
+    entries: &[super::store::LogEntry],
+    node: &str,
+    person: &str,
+    cursor_path: &Path,
+    cursor: &mut i64,
+    mut append: impl FnMut(&smallclaims::ClaimInput) -> Result<(), St3Error>,
+) -> anyhow::Result<()> {
+    let Some(last) = entries.last().map(|entry| entry.seq) else { return Ok(()) };
+    for entry in entries {
+        if let Some(claim) = claim_for(node, person, entry) {
+            match append(&claim) {
+                Ok(()) => {}
+                Err(error) if error.code == "internal" || error.is_sqlite_contention() => {
+                    return Err(error.into());
                 }
+                Err(error) => eprintln!("st3: sekrets: skipped gateway log entry {}: {error:#}", entry.seq),
             }
         }
-        *cursor = last;
-        std::fs::write(cursor_path, format!("{last}\n"))?;
     }
+    // Write the durable cursor first; a failed file write must not leave the in-memory
+    // cursor past the entry either.
+    std::fs::write(cursor_path, format!("{last}\n"))?;
+    *cursor = last;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -285,6 +300,48 @@ mod tests {
         }
     }
 
+    #[test]
+    fn busy_gateway_append_keeps_cursor_and_retries_the_same_entry() {
+        for code in [rusqlite::ffi::SQLITE_BUSY, rusqlite::ffi::SQLITE_LOCKED] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cursor");
+        std::fs::write(&path, "6\n").unwrap();
+        let entries = vec![entry("call", "person/ada", json!({"argv":["fixture"]}))];
+        let mut cursor = 6;
+        let mut attempts = Vec::new();
+        let first = import_entries(&entries, "example", "person/ada", &path, &mut cursor, |claim| {
+            attempts.push(claim.idempotency_key.clone());
+            Err(smallclaims::error::internal(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code), None)))
+        });
+        assert!(first.is_err());
+        assert_eq!(cursor, 6);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "6\n");
+        import_entries(&entries, "example", "person/ada", &path, &mut cursor, |claim| {
+            attempts.push(claim.idempotency_key.clone());
+            Ok(())
+        }).unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0], attempts[1]);
+        assert_eq!(cursor, 7);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "7\n");
+        }
+    }
+    #[test]
+    fn graph_refusal_remains_skippable_but_file_error_does_not_advance_memory_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cursor");
+        let entries = vec![entry("call", "person/ada", json!({"argv":["fixture"]}))];
+        let mut cursor = 6;
+        import_entries(&entries, "example", "person/ada", &path, &mut cursor,
+            |_| Err(St3Error::new("rule-denied", "fixture refusal"))).unwrap();
+        assert_eq!(cursor, 7);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "7\n");
+        cursor = 6;
+        assert!(import_entries(&entries, "example", "person/ada", dir.path(), &mut cursor,
+            |_| Ok(())).is_err());
+        assert_eq!(cursor, 6);
+    }
     #[test]
     fn each_entry_becomes_one_claim_its_callers_daemon_records() {
         let call = claim_for(

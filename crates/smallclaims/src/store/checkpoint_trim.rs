@@ -246,6 +246,7 @@ impl Store {
         claims: &[CheckpointClaim],
         actions: &mut Vec<CheckpointAction>,
     ) -> Result<Option<CheckpointManifestNeed>> {
+        self.runtime.checkpoint_preflight()?;
         let interrupted = {
             let connection = self.readers.get();
             connection
@@ -305,6 +306,7 @@ impl Store {
     /// worker asks when a peer advertises a checkpoint this node has not applied, and fetches
     /// the manifest from a peer that applied this one.
     pub fn checkpoint_manifest_need(&self) -> Result<Option<CheckpointManifestNeed>> {
+        self.runtime.checkpoint_preflight()?;
         let claims = self.checkpoint_claims()?;
         Ok(match self.newest_application(&claims)? {
             Some(Application::Manifest(need)) => Some(need),
@@ -340,6 +342,7 @@ impl Store {
         &self,
         manifest: &CheckpointManifest,
     ) -> Result<Vec<CheckpointAction>, St3Error> {
+        self.runtime.checkpoint_preflight().map_err(internal)?;
         self.adopt_checkpoint_checked(manifest, true)
     }
 
@@ -351,6 +354,7 @@ impl Store {
         &self,
         manifest: &CheckpointManifest,
     ) -> Result<Vec<CheckpointAction>, St3Error> {
+        self.runtime.checkpoint_preflight().map_err(internal)?;
         let occupied: bool = self
             .readers
             .get()
@@ -376,6 +380,7 @@ impl Store {
         manifest: &CheckpointManifest,
         require_newest: bool,
     ) -> Result<Vec<CheckpointAction>, St3Error> {
+        self.runtime.checkpoint_preflight().map_err(internal)?;
         let claims = self.checkpoint_claims().map_err(internal)?;
         // Adoption replaces every tombstone this node holds, so only the newest stable
         // checkpoint may be adopted: an older manifest lacks the newer drops.
@@ -442,6 +447,7 @@ impl Store {
         &self,
         manifest: &CheckpointManifest,
     ) -> Result<Vec<CheckpointAction>> {
+        self.runtime.checkpoint_preflight()?;
         let claims = self.checkpoint_claims()?;
         let certificates = certificates(&claims, &manifest.checkpoint);
         let certificate = chosen_certificate(&certificates)
@@ -464,6 +470,7 @@ impl Store {
     /// calls it.
     #[doc(hidden)]
     pub fn forget_tombstones_for_tests(&self) -> Result<usize> {
+        self.runtime.checkpoint_preflight()?;
         let forgotten = {
             let connection = self.connection.write();
             connection.execute("DELETE FROM checkpoint_envelopes", [])?
@@ -479,6 +486,7 @@ impl Store {
         cut_unix_ms: u128,
         state: &str,
     ) -> Result<()> {
+        self.runtime.checkpoint_preflight()?;
         let connection = self.connection.write();
         connection.execute(
             "INSERT INTO checkpoints(id, cut_unix_ms, state, updated_at_unix_ms)
@@ -532,6 +540,7 @@ impl Store {
         exact: bool,
         actions: &mut Vec<CheckpointAction>,
     ) -> Result<()> {
+        self.runtime.checkpoint_preflight()?;
         {
             let mut connection = self.connection.write();
             let transaction = connection.transaction()?;
@@ -568,6 +577,7 @@ impl Store {
     /// before the next chunk takes the writer again. Each chunk checks, inside its own
     /// transaction, that the graph did not change; the proof showed it cannot.
     pub fn finish_trim(&self, checkpoint: &str, actions: &mut Vec<CheckpointAction>) -> Result<()> {
+        self.runtime.checkpoint_preflight()?;
         let mut chunks = 0;
         let mut deleted_envelopes = 0;
         let mut deleted_claims = 0;

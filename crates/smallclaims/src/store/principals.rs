@@ -912,7 +912,8 @@ impl Store {
         let mut judged = 0;
         loop {
             let mut connection = self.connection.write();
-            let transaction = connection.transaction()?;
+            let transaction = connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let roots = roots(&transaction, &self.origin)?;
             let fresh = transaction
                 .prepare_cached("SELECT claim_id FROM claim_verdict_fresh LIMIT ?1")?
