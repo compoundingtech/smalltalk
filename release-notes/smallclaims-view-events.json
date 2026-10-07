@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Opt-in committed smallclaims view invalidations with bounded journals and cursor gaps",
+  "replay": {
+    "status": "none",
+    "detail": "Event installation is explicit and starts at current frontiers without scanning history. No GET/open/migration backfill or asynchronous catch-up is enabled."
+  },
+  "schema": {
+    "status": "changed",
+    "detail": "Explicit events::install creates three local derived tables, indexes and invalidation triggers in an already opt-in IVM store. Existing daemon stores/runtimes create none of them. No production schema/rules version bump or automatic migration."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Replicated claim order, admission rules and checkpoint rules remain unchanged. No production checkpoint participation or retention policy is added."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Adds Rust library feed and publisher APIs, without a daemon wire or consumer switch. The reference ViewRuntime now rejects ReplaceOriginal registrations until repair-before-projection eligibility is proved; RetainOriginal remains supported. Storage errors propagate instead of persisting an operator fence."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No service restart or production activation. Commit-inclusive writer cost and production source coverage remain adoption gates."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Library adopters explicitly install the event feed and attach a Publisher after certifying source coverage. Follow IVM_EVENTS.md; graph-watch owns transport and client authority. Restore/clone owners must explicitly rotate database identity before exposing the file."
+  },
+  "recovery": {
+    "status": "unknown",
+    "detail": "Rollback/reopen controls cover local event state; production checkpoint/restore/cross-runtime recovery is not certified. Expired or replaced cursors require explicit resync, and missing/oversized feed evidence cannot silently become ready."
+  }
+}

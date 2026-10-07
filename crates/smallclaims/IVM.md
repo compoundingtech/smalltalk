@@ -85,6 +85,12 @@ current-key invalidation feed with retained removals and gap detection. It is no
 transition replay, an action request, authorization, or an immutable historical page.
 Commit-only notifications and subscribe-before-snapshot/recheck are consumer-owned.
 
+The opt-in [`events` feed](IVM_EVENTS.md) supplies bounded committed keyed invalidations,
+independent availability delivery, stable provider identity and explicit retained floors.
+It uses the existing writer commit observer; graph-watch still owns client transport and
+authorization. The reference runtime gates replacement-repair views pending a proved
+repair-before-projection eligibility implementation.
+
 For current observations, `LocalChange` captures old/new keys and a separate local generation.
 Clock, deadline, ownership and external-file dependencies require explicit adapters;
 replicated claim frontiers cannot stand in for them.
