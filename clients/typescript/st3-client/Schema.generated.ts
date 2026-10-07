@@ -2018,10 +2018,27 @@ export const ParticipantRef = /*#__PURE__*/ (() => subjectRef(new RegExp("^(?:ag
 export type ParticipantRef = typeof ParticipantRef.Type
 export type ParticipantRefEncoded = typeof ParticipantRef.Encoded
 
+/** Who signed a message a person wrote, and whether the signature checks. Only messages whose sender is a person carry it; an agent's message does not. */
+export const MessageProvenance = /*#__PURE__*/ (() => Schema.Struct({
+  /** The device the key was granted to, by the label it was given when it paired, such as `example phone (secure enclave)`. Absent for a key with no label. */
+  "device": optionalKey(Schema.String).annotate({ description: "The device the key was granted to, by the label it was given when it paired, such as `example phone (secure enclave)`. Absent for a key with no label." }),
+  /** The public key that signed (`p256:…` or a bare Ed25519 key). */
+  "key": optionalKey(Schema.String).annotate({ description: "The public key that signed (`p256:…` or a bare Ed25519 key)." }),
+  /** Why a held or invalid signature is so. */
+  "reason": optionalKey(Schema.String).annotate({ description: "Why a held or invalid signature is so." }),
+  /** The person who signed, which may be a device that speaks for them. */
+  "signer": optionalKey(ParticipantRef),
+  /** What every member concluded when the claim arrived: `verified` its chain reaches a trust root, `unsigned` it carries no signature (written before signing), `held` a delegation in its chain has not arrived yet, `invalid` it is not acceptable (see reason). */
+  "verdict": Schema.Literals(["verified","unsigned","held","invalid"]).annotate({ description: "What every member concluded when the claim arrived: `verified` its chain reaches a trust root, `unsigned` it carries no signature (written before signing), `held` a delegation in its chain has not arrived yet, `invalid` it is not acceptable (see reason)." })
+}).annotate({ identifier: "MessageProvenance", description: "Who signed a message a person wrote, and whether the signature checks. Only messages whose sender is a person carry it; an agent's message does not." }))()
+export type MessageProvenance = typeof MessageProvenance.Type
+export type MessageProvenanceEncoded = typeof MessageProvenance.Encoded
+
 export const TimelineMessageBody = /*#__PURE__*/ (() => Schema.Struct({
   "attachments": optionalKey(Schema.Array(Attachment)),
   "from": optionalKey(ParticipantRef),
   "message_id": Schema.String,
+  "provenance": optionalKey(MessageProvenance),
   "reply_to": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
   "tags": optionalKey(Schema.Array(Schema.String)),
   "title": optionalKey(Schema.String),

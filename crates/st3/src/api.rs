@@ -11554,10 +11554,20 @@ async fn list_messages(
     .map(Json)
 }
 
+/// One message as it is read, with who signed it when a person wrote it (see
+/// `client_v0::message_provenance`).
+#[derive(Serialize)]
+struct MessageRead {
+    #[serde(flatten)]
+    message: MessageView,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provenance: Option<Value>,
+}
+
 async fn read_message(
     State(state): State<AppState>,
     AxumPath(subject): AxumPath<String>,
-) -> Result<Json<MessageView>, ApiError> {
+) -> Result<Json<MessageRead>, ApiError> {
     let subject = if subject.starts_with("message/") {
         subject
     } else {
@@ -11565,10 +11575,24 @@ async fn read_message(
     };
     let store = state.store.clone();
     let lookup = subject.clone();
-    blocking_store(move || store.message(&lookup))
+    let message = blocking_store(move || store.message(&lookup))
         .await?
-        .map(Json)
-        .ok_or_else(|| ApiError::not_found(format!("message `{subject}` does not exist")))
+        .ok_or_else(|| ApiError::not_found(format!("message `{subject}` does not exist")))?;
+    let provenance = {
+        let state = state.clone();
+        let lookup = message.subject.clone();
+        blocking_store(move || {
+            Ok(state
+                .store
+                .latest_claim(&lookup, Some("message.sent"))?
+                .and_then(|claim| client_v0::message_provenance(&state, &claim)))
+        })
+        .await?
+    };
+    Ok(Json(MessageRead {
+        message,
+        provenance,
+    }))
 }
 
 async fn post_message_claim(
@@ -19784,6 +19808,37 @@ version 2
         let (_, mailbox) =
             get_request(app, "/v1/messages/page?to=agent%2Freceiver&limit=100").await;
         assert!(mailbox["items"].as_array().unwrap().is_empty(), "{mailbox}");
+    }
+
+    #[tokio::test]
+    async fn reading_a_persons_message_says_who_signed_it_and_an_agents_says_nothing() {
+        // Nathan, 2026-10-06: signatures existed but nothing showed them.
+        let root = tempfile::tempdir().unwrap();
+        let app = router(state(root.path()));
+        let send = |key: &str, from: &str| {
+            serde_json::to_value(MessageSendRequest {
+                idempotency_key: key.into(),
+                from: from.into(),
+                to: "agent/receiver".into(),
+                content: "Hello.".into(),
+                title: None,
+                in_reply_to: None,
+                tags: Vec::new(),
+                attachments: Vec::new(),
+            })
+            .unwrap()
+        };
+        let read = |subject: &str| {
+            format!("/v1/messages/read/{}", subject.trim_start_matches("message/"))
+        };
+        let (_, person) = json_request(app.clone(), "/v1/messages", send("prov-person", "person/alex")).await;
+        let (_, person) = get_request(app.clone(), &read(person["subject"].as_str().unwrap())).await;
+        // The fixture seals nothing, so there is no signature to show, only the verdict.
+        assert_eq!(person["provenance"]["verdict"], "unsigned", "{person}");
+        assert!(person["provenance"].get("signer").is_none(), "{person}");
+        let (_, agent) = json_request(app.clone(), "/v1/messages", send("prov-agent", "agent/sender")).await;
+        let (_, agent) = get_request(app, &read(agent["subject"].as_str().unwrap())).await;
+        assert!(agent.get("provenance").is_none(), "{agent}");
     }
 
     #[tokio::test]

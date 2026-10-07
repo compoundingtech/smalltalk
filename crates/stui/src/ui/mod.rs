@@ -4489,6 +4489,7 @@ impl Ui {
                     body: text,
                     delivered: false,
                     dictated: false,
+                    signed: None,
                     images: Vec::new(),
                 },
             });
@@ -4502,6 +4503,7 @@ impl Ui {
                     body: "Good question. Here is what I know, and what I would need from you to go on. (demo reply)".into(),
                     delivered: false,
                     dictated: false,
+                    signed: None,
                     images: Vec::new(),
                 },
             });
@@ -4647,6 +4649,7 @@ impl Ui {
                             body: draft,
                             delivered: false,
                             dictated: false,
+                            signed: None,
                             images: Vec::new(),
                         },
                     });

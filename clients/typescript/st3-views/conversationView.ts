@@ -12,7 +12,7 @@ export type Body =
   | { kind: 'assistant'; text: string }
   | { kind: 'tool'; title: string; state: ToolState; output: string[] }
   /** `delivered`: the recipient's harness has it, seen in the agent's own transcript. */
-  | { kind: 'mail'; from: string; to: string; subject: string; text: string; delivered?: boolean; dictated?: boolean; images?: MailImage[] }
+  | { kind: 'mail'; from: string; to: string; subject: string; text: string; delivered?: boolean; dictated?: boolean; signed?: string; images?: MailImage[] }
   | { kind: 'event'; text: string; tone: 'quiet' | 'warning' | 'fault' };
 export type ConversationEntry = { id: string; at: string; timestamp: string; body: Body };
 
@@ -133,6 +133,23 @@ function pingId(text: string): string | undefined {
  * A delivery of mail the stream already shows (`shown`) is not announced again: its id goes in
  * `delivered`, and the mail itself says it arrived.
  */
+/**
+ * How a message's signature reads beside its sender: the device that signed it and whether that
+ * checks ("✓ example phone (secure enclave)"). A message with no signature is usually just old, so it
+ * says nothing. The same words as stui's `signature_mark`.
+ */
+export function signatureMark(provenance: unknown): string | undefined {
+  if (!provenance || typeof provenance !== 'object') return undefined;
+  const p = provenance as { verdict?: string; reason?: string; signer?: string; device?: string };
+  const who = p.device ?? p.signer ?? '';
+  switch (p.verdict) {
+    case 'verified': return `✓ ${who}`.trimEnd();
+    case 'held': return `⚠ ${p.reason ? `signature held: ${p.reason}` : 'signature held'}`;
+    case 'invalid': return `✕ ${p.reason ? `signature invalid: ${p.reason}` : 'signature invalid'}`;
+    default: return undefined;
+  }
+}
+
 /** The lines st adds beside a delivery for the agent (st-drivers `ding`). */
 const ST_DELIVERY_NOTES = [
   "The person reads replies in st, not in the agent's session.",
@@ -335,6 +352,7 @@ export function conversationEntries(timeline: Entry[], names: Names): Conversati
           text: text || (images.length ? '' : '(notification)'),
           // Spoken, then transcribed: marked so a reader allows for transcription mistakes.
           ...(Array.isArray(message.tags) && message.tags.includes('dictated') ? { dictated: true } : {}),
+          ...(signatureMark(message.provenance) ? { signed: signatureMark(message.provenance)! } : {}),
           ...(images.length ? { images } : {}),
         });
       }

@@ -7884,10 +7884,14 @@ async fn run_inspect(client: &Client, args: InspectArgs, json_output: bool) -> R
             urlencoding::encode(&args.subject)
         ))
         .await?;
-    print_value(
-        &json!({ "status": status, "recent_claims": claims.claims }),
-        json_output,
-    )
+    let mut shown = json!({ "status": status, "recent_claims": claims.claims });
+    // Who signed a message a person wrote, and whether that checks.
+    if args.subject.starts_with("message/")
+        && let Some(provenance) = message_provenance(client, &args.subject).await
+    {
+        shown["provenance"] = provenance;
+    }
+    print_value(&shown, json_output)
 }
 
 async fn run_trace(client: &Client, args: TraceArgs, json_output: bool) -> Result<()> {
@@ -15642,10 +15646,18 @@ async fn run_message(
                 );
             }
             if json_output {
-                if messages.len() == 1 {
-                    print_value(&messages[0], true)?;
+                let mut shown = Vec::with_capacity(messages.len());
+                for message in &messages {
+                    let mut value = serde_json::to_value(message)?;
+                    if let Some(provenance) = message_provenance(client, &message.subject).await {
+                        value["provenance"] = provenance;
+                    }
+                    shown.push(value);
+                }
+                if shown.len() == 1 {
+                    print_value(&shown[0], true)?;
                 } else {
-                    print_value(&messages, true)?;
+                    print_value(&shown, true)?;
                 }
             } else {
                 for (index, message) in messages.iter().enumerate() {
@@ -15660,6 +15672,9 @@ async fn run_message(
                     } else {
                         println!("Message: {}", message.subject);
                         println!("From: {}", message.from);
+                        if let Some(provenance) = message_provenance(client, &message.subject).await {
+                            println!("Signed: {}", provenance_line(&provenance));
+                        }
                         println!("To: {}", message.to);
                         if let Some(title) = &message.title {
                             println!("Subject: {title}");
@@ -16234,6 +16249,39 @@ fn message_mission_intent(
     mission_body.nodes_mut().push(completion);
     mission.set_children(mission_body);
     publication_document(mission)
+}
+
+/// Who signed a message a person wrote, as the daemon read it: `None` for an agent's message or a
+/// daemon that does not say.
+async fn message_provenance(client: &Client, reference: &str) -> Option<Value> {
+    let reference = normalize_message_reference(reference);
+    let read: Value = client
+        .get(&format!(
+            "/v1/messages/read/{}",
+            urlencoding::encode(&reference)
+        ))
+        .await
+        .ok()?;
+    read.get("provenance").cloned()
+}
+
+/// A provenance as one line: `verified · person/example · example phone (secure enclave) · p256:BPLX…`.
+fn provenance_line(provenance: &Value) -> String {
+    let text = |field: &str| provenance.get(field).and_then(Value::as_str);
+    let mut parts = vec![text("verdict").unwrap_or("unknown").to_owned()];
+    if let Some(reason) = text("reason") {
+        parts.push(reason.to_owned());
+    }
+    for field in ["signer", "device"] {
+        if let Some(value) = text(field) {
+            parts.push(value.to_owned());
+        }
+    }
+    if let Some(key) = text("key") {
+        let shown: String = key.chars().take(16).collect();
+        parts.push(format!("{shown}…"));
+    }
+    parts.join(" · ")
 }
 
 async fn read_message(client: &Client, reference: &str) -> Result<MessageView> {
@@ -26247,6 +26295,23 @@ mod tests {
         assert_eq!(args.references, ["message/first", "message/second"]);
         assert_eq!(args.actor.as_deref(), Some("agent/sup"));
         assert!(args.archive);
+    }
+
+    #[test]
+    fn a_provenance_reads_as_one_line() {
+        let line = provenance_line(&json!({
+            "verdict": "verified", "signer": "person/example",
+            "device": "example phone (secure enclave)", "key": "p256:BPLXtCkgqnBglKrxCU_RE"
+        }));
+        assert_eq!(
+            line,
+            "verified · person/example · example phone (secure enclave) · p256:BPLXtCkgqnB…"
+        );
+        assert_eq!(
+            provenance_line(&json!({"verdict": "held", "reason": "delegation d1 has not arrived"})),
+            "held · delegation d1 has not arrived"
+        );
+        assert_eq!(provenance_line(&json!({"verdict": "unsigned"})), "unsigned");
     }
 
     #[tokio::test]

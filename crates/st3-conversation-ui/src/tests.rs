@@ -407,6 +407,7 @@ fn copying_wrapped_lines_gives_back_only_the_real_newlines() {
             body: body.into(),
             delivered: false,
             dictated: false,
+            signed: None,
             images: Vec::new(),
         },
     }];
@@ -440,6 +441,7 @@ fn mail_to_the_person_leads_with_a_bullet_and_their_own_keeps_the_bar() {
             body: "hello\nthere".into(),
             delivered: false,
             dictated: false,
+            signed: None,
             images: Vec::new(),
         },
     };
@@ -1037,4 +1039,48 @@ fn review_unpaired_mail_refs_do_not_leak_into_the_next_envelope() {
         Entry { id: first, body: Body::Event(refs), .. },
         Entry { id: second, body: Body::Mail { body, .. }, .. }
     ] if first == "message/first" && refs.contains("application/pdf") && second == "message/second" && body == "Second message"), "{rendered:?}");
+}
+
+#[test]
+fn a_persons_signed_message_says_which_device_signed_it_and_whether_it_checks() {
+    // Nathan, 2026-10-06: signatures existed but no screen showed them.
+    let timeline = |provenance: serde_json::Value| -> Vec<st3_client::TimelineEntry> {
+        vec![
+            serde_json::from_value(serde_json::json!({
+                "id": "entry/1", "sequence": 1, "revision": 1, "timestamp": "2026-10-06T21:00:00Z",
+                "role": "user", "final": true, "type": "message",
+                "body": {"message_id": "message/example", "from": "person/example", "to": "agent/example/atlas",
+                         "provenance": provenance}
+            }))
+            .unwrap(),
+            serde_json::from_value(serde_json::json!({
+                "id": "entry/2", "sequence": 2, "revision": 1, "timestamp": "2026-10-06T21:00:01Z",
+                "role": "assistant", "final": true, "type": "content",
+                "body": {"media_type": "text/plain", "text": "hello"}
+            }))
+            .unwrap(),
+        ]
+    };
+    let mark = |provenance: serde_json::Value| {
+        adapt::conversation(&timeline(provenance), &Default::default())
+            .into_iter()
+            .find_map(|entry| match entry.body {
+                crate::Body::Mail { signed, .. } => Some(signed),
+                _ => None,
+            })
+            .expect("a mail entry")
+    };
+    assert_eq!(
+        mark(serde_json::json!({"verdict": "verified", "signer": "person/example", "key": "p256:AAAA", "device": "example phone (secure enclave)"})).as_deref(),
+        Some("✓ example phone (secure enclave)")
+    );
+    // A key with no label falls back to who signed.
+    assert_eq!(
+        mark(serde_json::json!({"verdict": "verified", "signer": "person/example", "key": "p256:AAAA"})).as_deref(),
+        Some("✓ person/example")
+    );
+    assert!(mark(serde_json::json!({"verdict": "held", "reason": "delegation d1 has not arrived"})).unwrap().starts_with("⚠ signature held: delegation"));
+    assert!(mark(serde_json::json!({"verdict": "invalid", "reason": "the signature does not match the claim"})).unwrap().starts_with("✕ signature invalid"));
+    // An old message with no signature says nothing.
+    assert_eq!(mark(serde_json::json!({"verdict": "unsigned"})), None);
 }

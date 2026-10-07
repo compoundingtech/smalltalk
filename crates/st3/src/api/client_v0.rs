@@ -3780,7 +3780,50 @@ fn session_messages(
 
 /// A message's timeline body: who wrote to whom, about what, so a client can draw Small Talk
 /// apart from the harness's own turns.
-fn session_message_body(claim: &ClaimRecord) -> Value {
+/// Who signed a message a person wrote and whether it checks: the verdict st recorded, and the
+/// device the signing key was granted to, by the label the person gave it when it paired. A
+/// message an agent wrote carries none: its key is the node's, and only people's words need
+/// their provenance shown.
+pub(super) fn message_provenance(state: &AppState, claim: &ClaimRecord) -> Option<Value> {
+    let fields = claim.body.get("fields").unwrap_or(&claim.body);
+    if !fields
+        .get("from")
+        .and_then(Value::as_str)?
+        .starts_with("person/")
+    {
+        return None;
+    }
+    let verdict = state.store.claim_verdict(&claim.id).ok()?;
+    let mut provenance = json!({"verdict": verdict.name()});
+    if let smallclaims::principal::Verdict::Held(reason)
+    | smallclaims::principal::Verdict::Invalid(reason) = &verdict
+    {
+        provenance["reason"] = json!(reason);
+    }
+    if let Some(signature) = state.store.claim_signature(&claim.id).ok().flatten() {
+        provenance["signer"] = json!(signature.signer);
+        provenance["key"] = json!(signature.key);
+        let label = signature
+            .chain
+            .first()
+            .and_then(|grant| state.store.claim_by_id(grant).ok().flatten())
+            .and_then(|grant| key_grant_label(&grant.body));
+        if let Some(label) = label {
+            provenance["device"] = json!(label);
+        }
+    }
+    Some(provenance)
+}
+
+/// The label a device gave its key when it paired, from the grant claim's body.
+fn key_grant_label(body: &Value) -> Option<String> {
+    body.pointer("/fields/label")
+        .and_then(Value::as_str)
+        .filter(|label| !label.trim().is_empty())
+        .map(str::to_owned)
+}
+
+fn session_message_body(state: &AppState, claim: &ClaimRecord) -> Value {
     let fields = claim.body.get("fields").unwrap_or(&claim.body);
     let mut body = json!({
         "message_id": claim.subject,
@@ -3790,6 +3833,9 @@ fn session_message_body(claim: &ClaimRecord) -> Value {
     });
     if let Some(title) = fields.get("title").and_then(Value::as_str) {
         body["title"] = Value::String(title.to_owned());
+    }
+    if let Some(provenance) = message_provenance(state, claim) {
+        body["provenance"] = provenance;
     }
     if let Some(tags) = fields.get("tags").and_then(Value::as_array)
         && !tags.is_empty()
@@ -3835,7 +3881,7 @@ fn native_timeline_page(
             let stamp = client_timestamp(claim.accepted_at_unix_ms);
             let digest = hex::encode(Sha256::digest(claim.id.as_bytes()));
             let base = claim.store_index.saturating_mul(4);
-            items.push(json!({"id":format!("timeline-entry/{}/{}-message", session_id.trim_start_matches("session/"), &digest[..16]), "sequence":base, "revision":1, "timestamp":stamp, "role":role, "type":"message", "final":true, "body":session_message_body(&claim)}));
+            items.push(json!({"id":format!("timeline-entry/{}/{}-message", session_id.trim_start_matches("session/"), &digest[..16]), "sequence":base, "revision":1, "timestamp":stamp, "role":role, "type":"message", "final":true, "body":session_message_body(state, &claim)}));
             items.push(json!({"id":format!("timeline-entry/{}/{}-content", session_id.trim_start_matches("session/"), &digest[..16]), "sequence":base+1, "revision":1, "timestamp":stamp, "role":role, "type":"content", "final":true, "body":{"media_type":"text/plain","text":fields.get("content").and_then(Value::as_str).unwrap_or_default()}}));
         }
         items.sort_by(|a, b| {
@@ -4612,7 +4658,7 @@ pub(super) fn timeline_value(
             items.push(json!({
                 "id": entry_id(&claim, "message"), "sequence": base_sequence,
                 "revision": 1, "timestamp": timestamp, "role": role, "type": "message",
-                "final": true, "body": session_message_body(&claim)
+                "final": true, "body": session_message_body(state, &claim)
             }));
             items.push(json!({
                 "id": entry_id(&claim, "content"), "sequence": base_sequence + 1,
@@ -10203,7 +10249,7 @@ mod tests {
             .claims_for(&sent.subject, Some("message.sent"))
             .unwrap()
             .remove(0);
-        let body = session_message_body(&claim);
+        let body = session_message_body(&state, &claim);
         assert_eq!(
             body["attachments"],
             json!([{
@@ -10236,7 +10282,30 @@ mod tests {
             .claims_for(&plain.subject, Some("message.sent"))
             .unwrap()
             .remove(0);
-        assert!(session_message_body(&claim).get("attachments").is_none());
+        assert!(session_message_body(&state, &claim).get("attachments").is_none());
+        // What a person wrote carries its provenance (here no signature: the fixture seals
+        // nothing); what an agent wrote carries none.
+        let provenance = session_message_body(&state, &claim)["provenance"].clone();
+        assert_eq!(provenance["verdict"], "unsigned", "{provenance}");
+        assert!(provenance.get("signer").is_none());
+        let agent_claim = state
+            .store
+            .claims_for(&plain.subject, Some("message.sent"))
+            .unwrap()
+            .remove(0);
+        let mut agent_claim = agent_claim;
+        agent_claim.body["fields"]["from"] = json!("agent/terminal-test.seat");
+        assert!(session_message_body(&state, &agent_claim).get("provenance").is_none());
+    }
+
+    #[test]
+    fn a_devices_label_is_read_from_its_key_grant() {
+        assert_eq!(
+            key_grant_label(&json!({"fields": {"label": "example phone (secure enclave)", "role": "device"}})).as_deref(),
+            Some("example phone (secure enclave)")
+        );
+        assert_eq!(key_grant_label(&json!({"fields": {"role": "device"}})), None);
+        assert_eq!(key_grant_label(&json!({"fields": {"label": "  "}})), None);
     }
 
     #[tokio::test]

@@ -2648,6 +2648,7 @@ mod tests {
                 body: "Here is the reply.".into(),
                 delivered: false,
                 dictated: false,
+                signed: None,
                 images: Vec::new(),
             },
         }];
@@ -2744,6 +2745,7 @@ mod tests {
                 body: "Here is the reply.".into(),
                 delivered: false,
                 dictated: false,
+                signed: None,
                 images: Vec::new(),
             },
         };

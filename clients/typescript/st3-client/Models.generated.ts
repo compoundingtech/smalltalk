@@ -1000,6 +1000,14 @@ export type Message = ResourceHeader & {
   to: Id;
 };
 
+export type MessageProvenance = {
+  device?: string;
+  key?: string;
+  reason?: string;
+  signer?: ParticipantRef;
+  verdict: "verified" | "unsigned" | "held" | "invalid";
+};
+
 export type Mission = ResourceHeader & {
   active_runs?: number;
   id?: MissionId;
@@ -1663,6 +1671,7 @@ export type TimelineMessageBody = {
   attachments?: Array<Attachment>;
   from?: ParticipantRef;
   message_id: string;
+  provenance?: MessageProvenance;
   reply_to?: string | null;
   tags?: Array<string>;
   title?: string;

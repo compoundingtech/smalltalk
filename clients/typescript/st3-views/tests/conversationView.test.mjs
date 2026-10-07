@@ -106,6 +106,21 @@ assert.equal(shownToolLines({ ...tool, state: 'failed' }, false).hidden, 14, 'fa
   assert.equal(spoken(['urgent']).dictated, undefined);
 }
 
+// A message a person wrote says which device signed it and whether that checks; an old, unsigned
+// one says nothing (Nathan, 2026-10-06).
+{
+  const signed = (provenance) => conversationEntries([
+    { id: 'm', sequence: 1, revision: 1, timestamp: '2026-10-01T10:00:00Z', role: 'user', type: 'message', final: true, body: { message_id: 'message/one', from: 'person/avery', to: 'agent/example/harbor/keeper', ...(provenance ? { provenance } : {}) } },
+    { id: 'c', sequence: 2, revision: 1, timestamp: '2026-10-01T10:00:00Z', role: 'user', type: 'content', final: true, body: { media_type: 'text/plain', text: 'ship the harbor fix' } },
+  ], new Map([['person/avery', 'you']]))[0].body.signed;
+  assert.equal(signed({ verdict: 'verified', signer: 'person/avery', device: 'example phone (secure enclave)', key: 'p256:AAAA' }), '✓ example phone (secure enclave)');
+  assert.equal(signed({ verdict: 'verified', signer: 'person/avery' }), '✓ person/avery');
+  assert.equal(signed({ verdict: 'held', reason: 'delegation d1 has not arrived' }), '⚠ signature held: delegation d1 has not arrived');
+  assert.equal(signed({ verdict: 'invalid', reason: 'the signature does not match the claim' }), '✕ signature invalid: the signature does not match the claim');
+  assert.equal(signed({ verdict: 'unsigned' }), undefined);
+  assert.equal(signed(undefined), undefined);
+}
+
 // A message's images ride on its mail entry; a message may be only its images.
 {
   const sent = (text) => conversationEntries([
