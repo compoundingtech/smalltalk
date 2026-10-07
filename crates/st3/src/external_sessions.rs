@@ -3208,7 +3208,8 @@ fn normalize_omp(
         role,
     );
     if driver == ExternalDriver::Omp && native_role == Some("assistant") {
-        let next_sequence = items.last()
+        let next_sequence = items
+            .last()
             .and_then(|item| item["sequence"].as_u64())
             .unwrap_or(sequence)
             .saturating_add(1);
@@ -3216,13 +3217,10 @@ fn normalize_omp(
     }
 }
 
-fn push_omp_stop(
-    items: &mut Vec<Value>,
-    sequence: u64,
-    timestamp: &str,
-    message: &Value,
-) {
-    let Some(native_stop) = message.get("stopReason") else { return };
+fn push_omp_stop(items: &mut Vec<Value>, sequence: u64, timestamp: &str, message: &Value) {
+    let Some(native_stop) = message.get("stopReason") else {
+        return;
+    };
     let stop = native_stop.as_str().unwrap_or_default();
     let mut details = json!({"stopReason": native_stop});
     for key in ["errorMessage", "errorStatus", "errorId", "retryRecovery"] {
@@ -3235,37 +3233,64 @@ fn push_omp_stop(
             // Continuation belongs to the live agent_end event, not persisted assistant messages.
             details["outcome"] = json!("unknown");
             details["retry_outcome_known"] = json!(false);
-            ("native_provider_error", "The provider reported an error; retry outcome is unknown.")
+            (
+                "native_provider_error",
+                "The provider reported an error; retry outcome is unknown.",
+            )
         }
         "aborted" => {
             details["outcome"] = json!("aborted");
-            ("native_turn_aborted", "The native assistant turn was aborted; the cause is not inferred.")
+            (
+                "native_turn_aborted",
+                "The native assistant turn was aborted; the cause is not inferred.",
+            )
         }
         // Routine completion and tool hand-off add no new information to the conversation.
         "stop" | "toolUse" => return,
         "length" => {
             details["outcome"] = json!("output_truncated");
-            ("native_output_truncated", "The native assistant reached its output limit; its response may be incomplete.")
+            (
+                "native_output_truncated",
+                "The native assistant reached its output limit; its response may be incomplete.",
+            )
         }
         _ => {
             details["outcome"] = json!("unknown");
-            ("native_stop_unknown", "The native assistant stopped with an unsupported reason.")
+            (
+                "native_stop_unknown",
+                "The native assistant stopped with an unsupported reason.",
+            )
         }
     };
-    let diagnostic = message.get("errorMessage").and_then(Value::as_str).unwrap_or(diagnostic);
-    items.push(timeline_item(sequence, timestamp, "system", "error", json!({
-        "code":code,"message":diagnostic,"retryable":false,"details":details,
-    })));
+    let diagnostic = message
+        .get("errorMessage")
+        .and_then(Value::as_str)
+        .unwrap_or(diagnostic);
+    items.push(timeline_item(
+        sequence,
+        timestamp,
+        "system",
+        "error",
+        json!({
+            "code":code,"message":diagnostic,"retryable":false,"details":details,
+        }),
+    ));
 }
 
 fn push_omp_exit(items: &mut Vec<Value>, sequence: u64, timestamp: &str, data: &Value) {
     // A checkpoint describes the native process, not the outcome of its turn or pending tools.
     // Keep every native value in the known status body's JSON detail; a later display view can
     // classify kind/reason without changing this entry or its status block.
-    items.push(timeline_item(sequence, timestamp, "system", "status", json!({
-        "status":"completed",
-        "detail":serde_json::to_string(data).expect("native exit metadata serializes"),
-    })));
+    items.push(timeline_item(
+        sequence,
+        timestamp,
+        "system",
+        "status",
+        json!({
+            "status":"completed",
+            "detail":serde_json::to_string(data).expect("native exit metadata serializes"),
+        }),
+    ));
 }
 
 fn push_omp_content(
@@ -4085,19 +4110,32 @@ mod tests {
     fn omp_native_outcomes_use_recorded_aborts_without_inferred_retries() {
         let mut items = Vec::new();
         for (offset, line) in include_str!("../fixtures/omp-resume/run4-08-after-retry.jsonl")
-            .lines().enumerate()
+            .lines()
+            .enumerate()
         {
             let entry: Value = serde_json::from_str(line).unwrap();
-            normalize_omp(ExternalDriver::Omp, &entry, offset as u64 * 16, "", &mut items);
+            normalize_omp(
+                ExternalDriver::Omp,
+                &entry,
+                offset as u64 * 16,
+                "",
+                &mut items,
+            );
         }
-        let errors = items.iter().filter(|item| item["type"] == "error").collect::<Vec<_>>();
+        let errors = items
+            .iter()
+            .filter(|item| item["type"] == "error")
+            .collect::<Vec<_>>();
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0]["body"]["code"], "native_turn_aborted");
         assert_eq!(errors[0]["body"]["details"]["outcome"], "aborted");
         assert_eq!(errors[0]["body"]["retryable"], false);
         assert!(!items.iter().any(|item| item["type"] == "status"));
         assert!(!items.iter().any(|item| {
-            matches!(item["body"]["details"]["outcome"].as_str(), Some("retrying" | "terminal_failure"))
+            matches!(
+                item["body"]["details"]["outcome"].as_str(),
+                Some("retrying" | "terminal_failure")
+            )
         }));
     }
 
@@ -4106,21 +4144,40 @@ mod tests {
         let mut items = Vec::new();
         let mut checkpoint = Value::Null;
         for (offset, line) in include_str!("../fixtures/omp-resume/managed-stop-cancelled.jsonl")
-            .lines().enumerate()
+            .lines()
+            .enumerate()
         {
             let entry: Value = serde_json::from_str(line).unwrap();
             if entry["customType"] == "session_exit" {
                 checkpoint = entry["data"].clone();
             }
-            normalize_omp(ExternalDriver::Omp, &entry, offset as u64 * 16, "", &mut items);
+            normalize_omp(
+                ExternalDriver::Omp,
+                &entry,
+                offset as u64 * 16,
+                "",
+                &mut items,
+            );
         }
-        assert!(!items.iter().any(|item| item["body"]["code"] == "native_process_exit"));
+        assert!(
+            !items
+                .iter()
+                .any(|item| item["body"]["code"] == "native_process_exit")
+        );
         let status = items.iter().find(|item| item["type"] == "status").unwrap();
         assert_eq!(status["body"]["status"], "completed");
-        let details: Value = serde_json::from_str(status["body"]["detail"].as_str().unwrap()).unwrap();
+        let details: Value =
+            serde_json::from_str(status["body"]["detail"].as_str().unwrap()).unwrap();
         assert_eq!(details, checkpoint);
-        assert_eq!(details["pendingToolCalls"][0]["args"]["questions"][0]["question"], "Heal canary: which color?");
-        assert!(items.windows(2).all(|pair| pair[0]["sequence"].as_u64() < pair[1]["sequence"].as_u64()));
+        assert_eq!(
+            details["pendingToolCalls"][0]["args"]["questions"][0]["question"],
+            "Heal canary: which color?"
+        );
+        assert!(
+            items
+                .windows(2)
+                .all(|pair| pair[0]["sequence"].as_u64() < pair[1]["sequence"].as_u64())
+        );
     }
 
     #[test]
@@ -4133,14 +4190,24 @@ mod tests {
             "future":{"native":true},
         });
         let mut items = Vec::new();
-        normalize_omp(ExternalDriver::Omp, &json!({
-            "type":"custom","customType":"session_exit","data":data
-        }), 0, "", &mut items);
+        normalize_omp(
+            ExternalDriver::Omp,
+            &json!({
+                "type":"custom","customType":"session_exit","data":data
+            }),
+            0,
+            "",
+            &mut items,
+        );
         assert_eq!(items[0]["type"], "status");
-        let detail: Value = serde_json::from_str(items[0]["body"]["detail"].as_str().unwrap()).unwrap();
+        let detail: Value =
+            serde_json::from_str(items[0]["body"]["detail"].as_str().unwrap()).unwrap();
         assert_eq!(detail, data);
         assert_eq!(items[0]["body"]["blocks"][0]["kind"], "status");
-        assert_eq!(items[0]["body"]["blocks"][0]["payload"], json!({"body_ref":true}));
+        assert_eq!(
+            items[0]["body"]["blocks"][0]["payload"],
+            json!({"body_ref":true})
+        );
     }
 
     #[test]
@@ -4158,17 +4225,32 @@ mod tests {
                 "retryRecovery":{"attempt":2,"future":[false,null,"unchanged"]},
             });
             let mut items = Vec::new();
-            normalize_omp(ExternalDriver::Omp, &json!({
-                "type":"message","message":message
-            }), 0, "", &mut items);
+            normalize_omp(
+                ExternalDriver::Omp,
+                &json!({
+                    "type":"message","message":message
+                }),
+                0,
+                "",
+                &mut items,
+            );
             let error = items.iter().find(|entry| entry["type"] == "error").unwrap();
             assert_eq!(error["body"]["code"], code);
             assert_eq!(error["body"]["message"], message["errorMessage"]);
-            for key in ["stopReason", "errorMessage", "errorStatus", "errorId", "retryRecovery"] {
+            for key in [
+                "stopReason",
+                "errorMessage",
+                "errorStatus",
+                "errorId",
+                "retryRecovery",
+            ] {
                 assert_eq!(error["body"]["details"][key], message[key], "{stop}/{key}");
             }
             assert_eq!(error["body"]["blocks"][0]["kind"], "error");
-            assert_eq!(error["body"]["blocks"][0]["payload"], json!({"body_ref":true}));
+            assert_eq!(
+                error["body"]["blocks"][0]["payload"],
+                json!({"body_ref":true})
+            );
         }
     }
 
@@ -4192,19 +4274,37 @@ mod tests {
         let session = transcript_session(ExternalDriver::Omp, &path);
         let timeline = normalized_timeline(&session).unwrap();
         for record in &records {
-            assert!(timeline.iter().flat_map(|entry| entry["body"]["blocks"]
-                .as_array().into_iter().flatten()).any(|block|
-                block["kind"] == "source_record" && block["payload"]["raw"] == *record));
+            assert!(
+                timeline
+                    .iter()
+                    .flat_map(|entry| entry["body"]["blocks"].as_array().into_iter().flatten())
+                    .any(|block| block["kind"] == "source_record"
+                        && block["payload"]["raw"] == *record)
+            );
         }
-        let error = timeline.iter().find(|entry| entry["type"] == "error").unwrap();
-        assert_eq!(error["body"]["message"], records[0]["message"]["errorMessage"]);
-        let status = timeline.iter().find(|entry| entry["type"] == "status").unwrap();
-        let detail: Value = serde_json::from_str(status["body"]["detail"].as_str().unwrap()).unwrap();
+        let error = timeline
+            .iter()
+            .find(|entry| entry["type"] == "error")
+            .unwrap();
+        assert_eq!(
+            error["body"]["message"],
+            records[0]["message"]["errorMessage"]
+        );
+        let status = timeline
+            .iter()
+            .find(|entry| entry["type"] == "status")
+            .unwrap();
+        let detail: Value =
+            serde_json::from_str(status["body"]["detail"].as_str().unwrap()).unwrap();
         assert_eq!(detail, records[1]["data"]);
         for entry in [error, status] {
             let locator = serde_json::from_value(entry["_source"].clone()).unwrap();
             let fetched = normalized_record(&session, &locator).unwrap();
-            assert!(fetched.iter().any(|item| item["id"] == entry["id"] && item["body"] == entry["body"]));
+            assert!(
+                fetched
+                    .iter()
+                    .any(|item| item["id"] == entry["id"] && item["body"] == entry["body"])
+            );
         }
     }
 
