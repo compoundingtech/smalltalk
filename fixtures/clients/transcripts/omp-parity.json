@@ -224,6 +224,22 @@
                 {
                   "content": "Render cards",
                   "status": "in_progress"
+                },
+                {
+                  "content": "Check pending work",
+                  "status": "pending"
+                },
+                {
+                  "content": "Exercise progress",
+                  "status": "in_progress"
+                },
+                {
+                  "content": "Await dependency",
+                  "status": "blocked"
+                },
+                {
+                  "content": "Discard obsolete approach",
+                  "status": "abandoned"
                 }
               ]
             }
@@ -485,6 +501,22 @@
                     {
                       "content": "Render cards",
                       "status": "completed"
+                    },
+                    {
+                      "content": "Check pending work",
+                      "status": "pending"
+                    },
+                    {
+                      "content": "Exercise progress",
+                      "status": "in_progress"
+                    },
+                    {
+                      "content": "Await dependency",
+                      "status": "blocked"
+                    },
+                    {
+                      "content": "Discard obsolete approach",
+                      "status": "abandoned"
                     }
                   ]
                 }
@@ -1170,6 +1202,22 @@
             {
               "content": "Render cards",
               "status": "completed"
+            },
+            {
+              "content": "Check pending work",
+              "status": "pending"
+            },
+            {
+              "content": "Exercise progress",
+              "status": "in_progress"
+            },
+            {
+              "content": "Await dependency",
+              "status": "blocked"
+            },
+            {
+              "content": "Discard obsolete approach",
+              "status": "abandoned"
             }
           ]
         }

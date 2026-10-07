@@ -16,6 +16,7 @@ import { addImages, fromDataUri, MAX_IMAGES, megabytes, picked, type Picked } fr
 import { rememberBounded } from '../boundedCache';
 import { dictationAvailable, startDictation } from '../modules/st-dictation';
 import type { RootScreen } from '../navigation';
+import { openSubagentConversation } from '../conversationNavigation';
 import { useStore } from '../store';
 import { fonts, theme } from '../theme';
 import { Button, Field, LINE, Markdown, T } from '../ui';
@@ -282,14 +283,14 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
   }, [loaded]);
   const toggle = useCallback((id: string) => setOpen(previous => { const next = new Set(previous); if (next.has(id)) next.delete(id); else next.add(id); return next; }), []);
   // A subagent card opens its child conversation as its own, through the session's own route.
-  const openSession = useCallback((sessionId: string, title: string) => navigation.navigate('Conversation', { target: sessionId, sessionId, title }), [navigation]);
+  const openSession = useCallback((sessionId: string, title: string) => openSubagentConversation(navigation, sessionId, title), [navigation]);
   // The conversation header, as st last sent it: what is running, what it costs, what waits.
   const header = useMemo(() => headerLine(timeline.header, new Date(lastFrame ?? Date.now()).toISOString()), [timeline.header, lastFrame]);
 
   return <KeyboardAvoidingView style={styles.screen} behavior={Platform.OS === 'ios' ? 'padding' : undefined} keyboardVerticalOffset={headerHeight}>
     <Banners />
     {agent ? <AgentStrip agent={agent} onMission={(id, missionTitle) => navigation.navigate('Mission', { id, title: missionTitle })} /> : session ? <View style={styles.strip}><T dim numberOfLines={1}>{session.driver ?? 'harness'} · {session.state} · {session.id}</T></View> : null}
-    {header ? <View style={styles.strip}><T dim numberOfLines={2}>{header}</T></View> : null}
+    {header ? <View style={styles.strip}><T dim>{header}</T></View> : null}
     {issue ? <View style={styles.strip}><T color={theme.waiting}>{staleLine(issue, loaded, lastFrame, now)}</T></View> : null}
     {findOpen ? <View style={[styles.strip, { flexDirection: 'row', alignItems: 'center', gap: 8 }]}>
       <Field value={find} onChangeText={setFind} placeholder="Find in this conversation" autoFocus autoCapitalize="none" autoCorrect={false} spellCheck={false} returnKeyType="search" style={{ flex: 1 }} />
@@ -307,7 +308,7 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
         : row.kind === 'bundle' ? <BundleView row={row} onToggle={toggle} />
         : row.kind === 'call' && !open.has(row.entry.id) ? <CallView entry={row.entry} tool={row.tool} onToggle={toggle} />
         // A long press opens the entry's text to select any part of it; iOS text selects only whole.
-        : <Pressable onLongPress={() => navigation.navigate('SelectText', { text: entryText(row.entry), title })} delayLongPress={350}><EntryView entry={row.entry} open={open.has(row.entry.id)} onToggle={toggle} brief={simpleOn && !finding} onOpenSession={openSession} /></Pressable>}
+        : <Pressable accessible={false} onLongPress={() => navigation.navigate('SelectText', { text: entryText(row.entry), title })} delayLongPress={350}><EntryView entry={row.entry} open={open.has(row.entry.id)} onToggle={toggle} brief={simpleOn && !finding} onOpenSession={openSession} /></Pressable>}
       ListEmptyComponent={<View style={[styles.entry, { transform: [{ scaleY: -1 }] }]}>{unreadable ? <T color={theme.waiting} selectable>{unreadable}</T> : <T dim>{unresolved ? 'This process has no exact native session history.' : !loaded ? (issue ? `Not loaded yet: ${issue}. Trying again.` : status === 'online' ? 'Loading the conversation…' : 'Offline; this conversation has not been loaded yet.') : 'No conversation in the recent timeline.'}</T>}</View>}
       // Scrolled up, a new entry must not move what is being read, so the position is kept. At
       // the newest it must not be: the position-keeping scrolls to a new entry with an animation,
@@ -423,15 +424,16 @@ const EntryView = memo(function EntryView({ entry, open, onToggle, brief = false
       const look = quiet ? rule.quiet : rule.open;
       // A subagent card's `open session/…` line is the link to that conversation (q2).
       const session = subagentSession(body.output);
-      return <Pressable accessibilityRole={expandable ? 'button' : undefined} accessibilityState={expandable ? { expanded: open } : undefined} disabled={!expandable} onPress={() => onToggle(entry.id)} style={[styles.tool, { borderLeftColor: color }]}>
-        <T numberOfLines={1}><T bold color={color}>{glyph} </T><T bold={look.title_bold} color={c(look.title)}>{body.title}</T></T>
-        {shown.hidden ? <T color={c(rule.collapse.color)}>  … {shown.hidden} more lines · tap to show</T> : null}
-        {open && expandable ? <T color={c(rule.collapse.color)}>  {rule.collapse.text}</T> : null}
-        {shown.lines.map((line, index) => session && line === `open ${session}`
-          ? <Pressable key={index} accessibilityRole="link" accessibilityLabel={`Open the conversation of ${body.title}`} onPress={() => onOpenSession?.(session, body.title.split(' · ')[0] ?? session)}><T color={theme.accent} style={styles.toolLine}>↗ {line}</T></Pressable>
-          : <T key={index} numberOfLines={quiet ? 1 : undefined} style={[styles.toolLine, quiet && { opacity: 0.7 }]} color={c(line.startsWith('+') ? rule.added : line.startsWith('-') || line.includes('error') ? rule.removed : look.rows)}>{line || ' '}</T>)}
-        {open && expandable ? <T color={c(rule.collapse.color)}>  {rule.collapse.text}</T> : null}
-      </Pressable>;
+      return <View accessible={false} style={[styles.tool, { borderLeftColor: color }]}>
+        <Pressable accessible={expandable} accessibilityRole={expandable ? 'button' : undefined} accessibilityLabel={expandable ? `${body.title}, ${open ? 'collapse' : 'expand'} output` : undefined} accessibilityState={expandable ? { expanded: open } : undefined} disabled={!expandable} onPress={() => onToggle(entry.id)}>
+          <T numberOfLines={1}><T bold color={color}>{glyph} </T><T bold={look.title_bold} color={c(look.title)}>{body.title}</T></T>
+          {shown.hidden ? <T color={c(rule.collapse.color)}>  … {shown.hidden} more lines · tap to show</T> : null}
+          {open && expandable ? <T color={c(rule.collapse.color)}>  {rule.collapse.text}</T> : null}
+        </Pressable>
+        {shown.lines.filter(line => !session || line !== `open ${session}`).map((line, index) =>
+          <T key={index} numberOfLines={quiet ? 1 : undefined} style={[styles.toolLine, quiet && { opacity: 0.7 }]} color={c(line.startsWith('+') ? rule.added : line.startsWith('-') || line.includes('error') ? rule.removed : look.rows)}>{line || ' '}</T>)}
+        {session ? <Pressable accessibilityRole="link" accessibilityLabel={`Open subagent conversation ${body.title.split(' · ')[0]}`} onPress={() => onOpenSession?.(session, body.title.split(' · ')[0] ?? session)}><T color={theme.accent} style={styles.toolLine}>↗ open {session}</T></Pressable> : null}
+      </View>;
     }
   }
 });

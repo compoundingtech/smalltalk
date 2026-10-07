@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { conversationEntries, DEFAULT_FILTERS, SHOW_EVERYTHING } from '@smalltalk/st3-views';
+import { conversationEntries, DEFAULT_FILTERS, SHOW_EVERYTHING, headerLine } from '@smalltalk/st3-views';
 import { simplify } from '@smalltalk/st3-views/conversationSimple';
 
 // Every harness transcript in fixtures/clients/transcripts reads the same in this model as in
@@ -51,4 +51,5 @@ for (const name of ['claude', 'codex', 'deliveries', 'native-claude-run', 'nativ
   const page = fixture('omp-parity.json');
   const phone = conversationEntries(page.items, new Map()).map(entry => ({ body: asStui(entry.body), id: entry.id }));
   assert.deepEqual(phone, expected, 'omp-parity: the phone reads this transcript differently from stui');
+  assert.equal(headerLine(page.header, '2026-10-06T12:00:00Z'), 'model synthetic/model · context 50 tokens · cost $0.02 · todo 1/5 · jobs 1 · agents 1 · ask Continue? · working [register · 0s ago] · transcript · 0s ago', 'omp-parity: compact header matches stui');
 }

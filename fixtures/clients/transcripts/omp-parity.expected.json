@@ -93,7 +93,11 @@
         "state": "ok",
         "output": [
           "Render",
-          "[x] Render cards"
+          "[x] Render cards",
+          "[ ] Check pending work",
+          "[~] Exercise progress",
+          "[!] Await dependency",
+          "[/] Discard obsolete approach"
         ]
       }
     }

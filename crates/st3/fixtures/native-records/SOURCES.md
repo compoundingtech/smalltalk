@@ -11,6 +11,8 @@ family, extension and bookkeeping view, hidden extensions, and assistant usage/c
 metadata. Field shapes follow native OMP records; no live conversation text is copied.
 Pi exercises the same normalizer and fixture. The task output names `ParityChild`
 for owner-local child-conversation linking.
+The todo snapshot uses the five native OMP statuses: `completed`, `pending`,
+`in_progress`, `blocked`, and `abandoned`; `done` is not an OMP todo status.
 
 The coverage test also reads the existing redacted OMP native resume/tool-result
 captures (Pi shares that JSONL session format), and extracts actual message `info`
