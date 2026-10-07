@@ -187,7 +187,7 @@ impl Store {
              LEFT JOIN mission_runs r ON r.id=substr(c.subject,13) AND c.subject LIKE 'mission-run/%'
              WHERE c.kind IN ('mission-run.state','step-run.state','work.failed')
                AND {kinds} AND c.store_index < ?1
-               AND (?7 IS NULL OR st_list_contains(c.subject,?7)
+               AND (?7 IS NULL OR st_list_contains(c.id,?7) OR st_list_contains(c.subject,?7)
                     OR st_list_contains('mission/' || COALESCE(r.mission_id,sr.mission_id),?7)
                     OR st_list_contains(s.title,?7))
                AND CAST(c.accepted_at_unix_ms AS INTEGER)>=?2
@@ -364,6 +364,12 @@ mod tests {
             .unwrap();
         assert_eq!(second["items"][0]["subject"], "mission-run/Ä_%/one");
         assert_eq!(second["has_more"], false);
+        let by_id = store.outcome_history_filtered(
+            "missions", 0, 100, None, None, u64::MAX, 1, Some("OUTCOME-2"),
+        ).unwrap();
+        assert_eq!(by_id["items"][0]["id"], "outcome-2");
+        assert_eq!(by_id["items"].as_array().unwrap().len(), 1);
+        assert_eq!(by_id["has_more"], false);
     }
     #[test]
     fn cleanup_reason_recovery_uses_canonical_order_despite_reversed_arrival() {
