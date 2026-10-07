@@ -32,11 +32,11 @@ fn cleanup_fixture() {
     }
     let evidence = std::env::var_os("ST3_CLEANUP_FIXTURE").expect("regression fixture directory");
     let mode = std::env::var("ST3_CLEANUP_FIXTURE_MODE").unwrap();
-    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let repo = PathBuf::from(test_env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut fixture = Command::new("python3")
         .arg(repo.join("scripts/st3-test-process-test"))
         .arg("--boot-fixture")
-        .arg(env!("CARGO_BIN_EXE_st3-fixture"))
+        .arg(test_env!("CARGO_BIN_EXE_st3-fixture"))
         .arg(&evidence)
         .arg(&mode)
         .spawn()
@@ -62,11 +62,11 @@ fn every_exit_reaps_the_daemon_even_when_the_rust_test_is_killed() {
     if st3::test_support::supervise_test() {
         return;
     }
-    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let repo = PathBuf::from(test_env!("CARGO_MANIFEST_DIR")).join("../..");
     let output = Command::new("python3")
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .arg(repo.join("scripts/st3-test-process-test"))
-        .arg(env!("CARGO_BIN_EXE_st3-fixture"))
+        .arg(test_env!("CARGO_BIN_EXE_st3-fixture"))
         .arg(std::env::current_exe().unwrap())
         .output()
         .unwrap();
@@ -79,7 +79,7 @@ fn every_exit_reaps_the_daemon_even_when_the_rust_test_is_killed() {
 }
 
 fn canary(harness: &str, scenario: &str) {
-    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let repo = PathBuf::from(test_env!("CARGO_MANIFEST_DIR")).join("../..");
     let in_ci = std::env::var_os("CI_RUN_ID").is_some();
     let path = std::env::var_os("PATH").unwrap_or_default();
     let on_path =
@@ -135,7 +135,7 @@ fn canary(harness: &str, scenario: &str) {
         } else {
             "scripts/st3-boot-canaries/run"
         }))
-        .arg(env!("CARGO_BIN_EXE_st3-fixture"))
+        .arg(test_env!("CARGO_BIN_EXE_st3-fixture"))
         .arg(&evidence)
         .args([harness, scenario, "--bound", "180", "--scratch"])
         .arg(scratch.path())
@@ -176,7 +176,7 @@ fn the_canary_never_names_its_root_after_st2() {
     if st3::test_support::supervise_test() {
         return;
     }
-    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let repo = PathBuf::from(test_env!("CARGO_MANIFEST_DIR")).join("../..");
     let output = Command::new("python3")
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .arg(repo.join("scripts/st3-boot-canaries/run"))

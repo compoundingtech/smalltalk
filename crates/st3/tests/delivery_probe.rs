@@ -7,7 +7,7 @@ fn native_delivery_probe_alerts_and_recovers_without_model_turns() {
     }
     use std::path::PathBuf;
 
-    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let repo = PathBuf::from(test_env!("CARGO_MANIFEST_DIR")).join("../..");
     let scratch = tempfile::Builder::new()
         .prefix("delivery-probe-scratch-")
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
@@ -16,7 +16,7 @@ fn native_delivery_probe_alerts_and_recovers_without_model_turns() {
         .args(["-f", "env", "-u", "ST_AGENT", "python3"])
         .arg(repo.join("scripts/st3-delivery-probe-test"))
         .arg("--binary")
-        .arg(env!("CARGO_BIN_EXE_st3-fixture"))
+        .arg(test_env!("CARGO_BIN_EXE_st3-fixture"))
         .arg("--scratch")
         .arg(scratch.path())
         .output()

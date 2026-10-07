@@ -32,7 +32,7 @@ fn doctor_rejects_a_partial_pty_snapshot_atomically() {
         "#!/bin/sh\nprintf '[{\"name\":\"h.gone.agent\",\"status\":\"running\"},'\n",
     );
 
-    let output = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let output = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .arg("doctor")
         .arg("--catalog")
         .arg(&catalog)

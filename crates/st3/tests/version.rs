@@ -2,7 +2,7 @@
 use std::process::Command;
 
 fn version(directory: &std::path::Path, args: &[&str]) -> String {
-    let output = Command::new(env!("CARGO_BIN_EXE_st3"))
+    let output = Command::new(test_env!("CARGO_BIN_EXE_st3"))
         .args(args)
         .current_dir(directory)
         .env_clear()

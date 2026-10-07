@@ -72,7 +72,7 @@ fn catalog_up_once_exits_nonzero_when_the_pass_is_skipped() {
     .unwrap();
 
     assert_skipped_once_exits_nonzero(
-        Command::new(env!("CARGO_BIN_EXE_st2"))
+        Command::new(test_env!("CARGO_BIN_EXE_st2"))
             .arg("up")
             .arg("--catalog")
             .arg(tmp.path().join("catalog"))
@@ -95,7 +95,7 @@ fn catalog_up_once_exits_nonzero_when_the_report_has_errors() {
     .unwrap();
 
     assert_errors_once_exits_nonzero(
-        Command::new(env!("CARGO_BIN_EXE_st2"))
+        Command::new(test_env!("CARGO_BIN_EXE_st2"))
             .arg("up")
             .arg("--catalog")
             .arg(tmp.path().join("catalog"))
@@ -117,7 +117,7 @@ fn spec_up_once_exits_nonzero_when_the_pass_is_skipped() {
     .unwrap();
 
     assert_skipped_once_exits_nonzero(
-        Command::new(env!("CARGO_BIN_EXE_st2"))
+        Command::new(test_env!("CARGO_BIN_EXE_st2"))
             .arg("up")
             .arg(&spec)
             .args(["--host", "h", "--once"])
@@ -138,7 +138,7 @@ fn spec_up_once_exits_nonzero_when_the_report_has_errors() {
     .unwrap();
 
     assert_errors_once_exits_nonzero(
-        Command::new(env!("CARGO_BIN_EXE_st2"))
+        Command::new(test_env!("CARGO_BIN_EXE_st2"))
             .arg("up")
             .arg(&spec)
             .args(["--host", "h", "--once"])

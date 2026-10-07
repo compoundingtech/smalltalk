@@ -573,7 +573,7 @@ struct Node(Vec<Child>);
 impl Node {
     fn start(dir: &Path, path_dir: &Path) -> Self {
         let spawn = |args: &[&str], log: &str| {
-            st3::test_support::command(env!("CARGO_BIN_EXE_st3-fixture"))
+            st3::test_support::command(test_env!("CARGO_BIN_EXE_st3-fixture"))
                 .args(args)
                 .arg("--config")
                 .arg(dir.join("config.toml"))

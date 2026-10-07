@@ -277,6 +277,25 @@ done`,
   nixDevelopStep({ name: 'Install matching rendered hooks', command: ['bash', 'scripts/ci-install-built-hooks'] }),
 ]
 
+/** Archive consumers restore tools/fixtures, never Cargo targets or another job's build snapshot. */
+export const testArchiveConsumerSetup = [
+  ...commonSetupSteps.filter((step: any) => step.id !== 'cargo-cache'
+    && step !== buildSnapshotRestore && step !== buildSnapshotPrepare),
+  ...testBuildSteps.slice(0, 2),
+  {
+    name: 'Download this run attempt’s successful test build',
+    uses: 'actions/download-artifact@v4',
+    with: {
+      'artifact-ids': '${{ needs.linux-test-build.outputs.artifact-id }}',
+      path: '${{ runner.temp }}/ci-test-archives',
+    },
+  },
+  { ...nixDevelopStep({ name: 'Verify source, hashes and extract test archives',
+    command: ['python3', 'scripts/ci-test-archive', 'consume'] }),
+    env: { CI_TEST_ARCHIVE_MANIFEST_SHA256: '${{ needs.linux-test-build.outputs.manifest-sha256 }}' } },
+  testBuildSteps[3],
+]
+
 /** Everything a job that runs the workspace tests needs. */
 export const workspacePreparationSteps = [...commonSetupSteps, ...testBuildSteps]
 

@@ -3,6 +3,10 @@
 //! build wrote. Cargo builds only the test targets the manifest names (`autotests = false`),
 //! so add a `mod NAME;` line here for a new file; `every_test_file_is_built` fails until then.
 
+#[macro_use]
+#[path = "../../../scripts/ci-test-paths.rs"]
+mod ci_test_paths;
+
 mod github_issue_component;
 mod github_pr_component;
 
@@ -10,7 +14,7 @@ mod github_pr_component;
 fn every_test_file_is_built() {
     let modules = include_str!("integration.rs");
     let manifest = include_str!("../Cargo.toml");
-    let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let directory = std::path::Path::new(test_env!("CARGO_MANIFEST_DIR")).join("tests");
     let mut unbuilt = Vec::new();
     for entry in std::fs::read_dir(&directory).unwrap() {
         let path = entry.unwrap().path();

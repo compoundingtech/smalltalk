@@ -120,7 +120,7 @@ impl Fixture {
     /// Returns the systemd-run handle; the scope is registered for teardown.
     fn spawn_transport(&self, transport_unit: &str) -> Child {
         self.scopes.borrow_mut().push(transport_unit.to_string());
-        let st2 = env!("CARGO_BIN_EXE_st2");
+        let st2 = test_env!("CARGO_BIN_EXE_st2");
         let script = self.root().join(format!("{transport_unit}.sh"));
         std::fs::write(
             &script,

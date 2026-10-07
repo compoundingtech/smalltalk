@@ -22,6 +22,7 @@ import {
   supportingStageRunsOn,
   secondaryStageRunsOn,
   workspacePreparationSteps,
+  testArchiveConsumerSetup,
 } from './workspace-ci.ts'
 
 // Namespace offers nested virtualization on linux/amd64. Prove /dev/kvm can create a VM before
@@ -82,7 +83,7 @@ const linuxStageJob = ({
       if: "success() && env.CI_LOCAL_CACHES != '1'",
       run: 'bash scripts/ci-nix-cache save || echo "::warning::could not save the local Nix cache"',
     },
-    ...buildSnapshotSave,
+    ...(setup === testArchiveConsumerSetup ? [] : buildSnapshotSave),
     {
       name: 'Retain stage logs and timings',
       uses: 'actions/upload-artifact@v4',
@@ -200,7 +201,7 @@ printf '\\n\\x60\\x60\\x60\\n' >> "$GITHUB_STEP_SUMMARY"`,
       'timeout-minutes': 20,
       steps: [
         ...commonSetupSteps.filter((step) => !('id' in step && step.id === 'cargo-cache')),
-        nixDevelopStep({ name: 'Check runner selection and generated files', flake: '.#genie', command: ['bash', '-c', 'python3 scripts/check-ci-runner-test && python3 scripts/ci-mail-redelivery-canaries-test && python3 scripts/ci-test-partitions-test && python3 scripts/ci-queue-watch-test && python3 scripts/check-main-ci-test && python3 scripts/ci-perf-cache-test && python3 scripts/ci-cache-audit-test && genie --check'] }),
+        nixDevelopStep({ name: 'Check runner selection and generated files', flake: '.#genie', command: ['bash', '-c', 'python3 scripts/check-ci-runner-test && python3 scripts/ci-mail-redelivery-canaries-test && python3 scripts/ci-test-partitions-test && python3 scripts/ci-test-archive-test && python3 scripts/ci-queue-watch-test && python3 scripts/check-main-ci-test && python3 scripts/ci-perf-cache-test && python3 scripts/ci-cache-audit-test && genie --check'] }),
         { name: 'Save Nix outputs', if: "success() && env.CI_LOCAL_CACHES != '1'", run: 'bash scripts/ci-nix-cache save' },
         ...buildSnapshotSave,
       ],
@@ -256,32 +257,62 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
         { name: 'Check shared views, fixtures and iOS consumers', run: 'npm test --prefix clients/typescript/st3-views\nnpm run typecheck --prefix clients/typescript/st3-views\napps/ios/node_modules/.bin/tsc --noEmit -p apps/ios\nnpm test --prefix apps/ios' },
       ],
     },
+    'linux-test-build': {
+      name: 'linux-test-build',
+      ...afterPickRunner,
+      'runs-on': linuxStageRunsOn,
+      'timeout-minutes': 120,
+      env: { ...buildEnv, CI_CACHE_DEV_SHELL: 'default' },
+      outputs: {
+        'artifact-id': '${{ steps.upload.outputs.artifact-id }}',
+        'manifest-sha256': '${{ steps.archive.outputs.manifest-sha256 }}',
+      },
+      steps: [
+        ...workspacePreparationSteps.slice(0, -2).map((step: any) =>
+          step.id === 'cargo-cache' || step.id === 'nix-cache'
+            ? { ...step, with: { ...step.with, key: step.with.key.replace('${{ github.job }}', 'linux-tests'),
+                'restore-keys': step.with['restore-keys'].replaceAll('${{ github.job }}', 'linux-tests') } }
+            : step),
+        { ...nixDevelopStep({ name: 'Compile and archive each selected target group once',
+          command: ['python3', 'scripts/ci-test-archive', 'build'] }), id: 'archive' },
+        {
+          name: 'Publish this run attempt’s exact-source test archives', id: 'upload',
+          uses: 'actions/upload-artifact@v4',
+          with: { name: 'linux-test-archives-${{ github.run_attempt }}',
+            path: '${{ runner.temp }}/ci-test-archives', 'if-no-files-found': 'error',
+            'compression-level': 0, 'retention-days': 3 },
+        },
+      ],
+    },
     // Two test partitions and the two supporting stages retain independent CPU capacity.
     // `linux-gate` below is the single required check that collects them.
-    'linux-tests': linuxStageJob({
-      name: 'linux-tests',
-      stage: 'tests',
-      setup: workspacePreparationSteps,
-      runsOn: linuxStageRunsOn,
-      // CI_RUN_ID keeps the messaging-fault evidence under target/messaging-faults and a failed
-      // boot canary's evidence under target/boot-canaries.
-      env: { CI_RUN_ID: '${{ github.run_id }}', CI_TEST_PARTITION: 'hash:1/2', CI_TEST_THREADS: '8' },
-      extraLogs: 'target/messaging-faults/\ntarget/boot-canaries/',
-      before: [nixDevelopStep({ name: 'Prove both shards cover every selected test', command: ['python3', 'scripts/ci-test-partitions'] })],
-    }),
-    'linux-tests-shard-2': linuxStageJob({
-      name: 'linux-tests-shard-2',
-      stage: 'tests',
-      runsOn: secondaryStageRunsOn,
-      // Reuse the main-seeded test caches; each checkout keeps its own executable paths.
-      setup: workspacePreparationSteps.map((step: any) =>
-        step.id === 'cargo-cache' || step.id === 'nix-cache'
-          ? { ...step, with: { ...step.with, key: step.with.key.replace('${{ github.job }}', 'linux-tests'),
-              'restore-keys': step.with['restore-keys'].replaceAll('${{ github.job }}', 'linux-tests') } }
-          : step),
-      env: { CI_RUN_ID: '${{ github.run_id }}', CI_TEST_PARTITION: 'hash:2/2', CI_TEST_THREADS: '8' },
-      extraLogs: 'target/messaging-faults/\ntarget/boot-canaries/',
-    }),
+    'linux-tests': {
+      ...linuxStageJob({
+        name: 'linux-tests',
+        stage: 'tests',
+        setup: testArchiveConsumerSetup,
+        runsOn: linuxStageRunsOn,
+        // CI_RUN_ID keeps the messaging-fault evidence under target/messaging-faults and a failed
+        // boot canary's evidence under target/boot-canaries.
+        env: { CI_RUN_ID: '${{ github.run_id }}', CI_TEST_PARTITION: 'hash:1/2', CI_TEST_THREADS: '8' },
+        extraLogs: 'target/messaging-faults/\ntarget/boot-canaries/',
+        before: [nixDevelopStep({ name: 'Prove both shards cover every selected test', command: ['python3', 'scripts/ci-test-partitions'] })],
+      }),
+      needs: [pickRunnerJobId, 'linux-test-build'],
+      if: "${{ !cancelled() && needs.linux-test-build.result == 'success' }}",
+    },
+    'linux-tests-shard-2': {
+      ...linuxStageJob({
+        name: 'linux-tests-shard-2',
+        stage: 'tests',
+        runsOn: secondaryStageRunsOn,
+        setup: testArchiveConsumerSetup,
+        env: { CI_RUN_ID: '${{ github.run_id }}', CI_TEST_PARTITION: 'hash:2/2', CI_TEST_THREADS: '8' },
+        extraLogs: 'target/messaging-faults/\ntarget/boot-canaries/',
+      }),
+      needs: [pickRunnerJobId, 'linux-test-build'],
+      if: "${{ !cancelled() && needs.linux-test-build.result == 'success' }}",
+    },
     'linux-clippy': linuxStageJob({
       name: 'linux-clippy',
       stage: 'clippy',
@@ -302,15 +333,12 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
         stage: 'mail-redelivery-canaries',
         runsOn: mailStageRunsOn,
         description: 'Require every harness to hold old mail across boot and reconnect',
-        setup: workspacePreparationSteps.map((step: any) =>
-          step.id === 'cargo-cache' || step.id === 'nix-cache'
-            ? { ...step, with: { ...step.with, key: step.with.key.replace('${{ github.job }}', 'linux-tests'),
-                'restore-keys': step.with['restore-keys'].replaceAll('${{ github.job }}', 'linux-tests') } }
-            : step),
+        setup: testArchiveConsumerSetup,
         env: { CI_RUN_ID: '${{ github.run_id }}', CI_TEST_THREADS: '8' },
         extraLogs: 'target/messaging-faults/\ntarget/boot-canaries/',
       }),
-      ...afterPickRunner,
+      needs: [pickRunnerJobId, 'linux-test-build'],
+      if: "${{ !cancelled() && needs.linux-test-build.result == 'success' }}",
     },
     'linux-gate': {
       name: 'linux-gate',
@@ -354,7 +382,8 @@ done`,
     // runner image lacks. A NixOS VM runs this job's prebuilt test binary; it compiles nothing.
     'isolation-vm': {
       name: 'isolation-vm',
-      ...afterPickRunner,
+      needs: [pickRunnerJobId, 'linux-test-build'],
+      if: "${{ !cancelled() && needs.linux-test-build.result == 'success' }}",
       'runs-on': supportingLinuxRunsOn,
       'timeout-minutes': 60,
       defaults: { run: { shell: 'bash' } },
@@ -362,13 +391,7 @@ done`,
       steps: [
         commonSetupSteps[0],
         { name: 'Probe KVM', run: kvmProbe },
-        ...commonSetupSteps.slice(1),
-        {
-          name: 'Archive the st2 integration test binary',
-          run: `start=$SECONDS
-nix develop -c cargo nextest archive --locked -p st2 --test integration --archive-file "$RUNNER_TEMP/isolation.tar.zst"
-printf '| test archive build | %ss |\\n' "$((SECONDS - start))" >> "$GITHUB_STEP_SUMMARY"`,
-        },
+        ...testArchiveConsumerSetup.slice(1),
         {
           name: 'Build the NixOS VM test driver',
           run: `start=$SECONDS
@@ -378,7 +401,7 @@ printf '| VM driver build | %ss |\\n' "$((SECONDS - start))" >> "$GITHUB_STEP_SU
         {
           name: 'Run all three systemd-scope tests in the VM',
           env: {
-            ST_ISOLATION_ARCHIVE: '${{ runner.temp }}/isolation.tar.zst',
+            ST_ISOLATION_ARCHIVE: '${{ runner.temp }}/ci-test-archives/st2.tar.zst',
             ST_ISOLATION_WORKSPACE: '${{ github.workspace }}',
             ST_ISOLATION_TIMINGS: '${{ runner.temp }}/vm-timings.json',
           },
@@ -391,12 +414,6 @@ printf '| VM test driver total | %ss |\\n' "$((SECONDS - start))" >> "$GITHUB_ST
         // The sekrets gateway needs real Unix users, a login session and a user manager: a second
         // VM runs it with this st binary (nix/sekrets-vm.nix).
         {
-          name: 'Build the st binary for the sekrets VM',
-          run: `start=$SECONDS
-nix develop -c cargo build --locked -p st3 --bin st3
-printf '| st build | %ss |\\n' "$((SECONDS - start))" >> "$GITHUB_STEP_SUMMARY"`,
-        },
-        {
           name: 'Build the sekrets VM test driver',
           run: `start=$SECONDS
 nix build --print-build-logs --out-link "$RUNNER_TEMP/sekrets-vm-driver" .#legacyPackages.x86_64-linux.sekrets-vm.driver
@@ -404,7 +421,7 @@ printf '| sekrets VM driver build | %ss |\\n' "$((SECONDS - start))" >> "$GITHUB
         },
         {
           name: 'Run the sekrets gateway test in the VM',
-          env: { ST_SEKRETS_BINARY: '${{ github.workspace }}/target/debug/st3' },
+          env: { ST_SEKRETS_BINARY: '${{ runner.temp }}/ci-test-extracted/workspace/target/debug/st3' },
           run: `start=$SECONDS
 mkdir -p "$RUNNER_TEMP/sekrets-vm-out"
 "$RUNNER_TEMP/sekrets-vm-driver/bin/nixos-test-driver" --output_directory "$RUNNER_TEMP/sekrets-vm-out"

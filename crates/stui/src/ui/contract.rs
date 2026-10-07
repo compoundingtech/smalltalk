@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 
 fn root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/clients")
+    PathBuf::from(test_env!("CARGO_MANIFEST_DIR")).join("../../fixtures/clients")
 }
 
 fn hex(color: Color) -> String {

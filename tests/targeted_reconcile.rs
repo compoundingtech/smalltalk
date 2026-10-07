@@ -70,7 +70,7 @@ fn prepend_path(directory: &Path) -> String {
 }
 
 fn selected_once(catalog: &Path, xdg: &Path, pty_root: &Path, selector: &str) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_st2"))
+    Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args(["up", "--catalog"])
         .arg(catalog)
         .args(["--host", HOST, "--once", "--task", selector])
@@ -154,7 +154,7 @@ fn targeted_once_cli_resolves_before_listing_and_runs_only_the_selected_exec() {
         pidfiles: vec![owner_pidfile.clone(), sibling_pidfile.clone()],
     };
     let invoke = |selector: &str| {
-        Command::new(env!("CARGO_BIN_EXE_st2"))
+        Command::new(test_env!("CARGO_BIN_EXE_st2"))
             .args(["up", "--catalog"])
             .arg(&catalog)
             .args(["--host", HOST, "--once", "--task", selector])
@@ -244,7 +244,7 @@ fn targeted_once_cli_owner_render_failure_is_nonzero_before_listing() {
         ),
     );
 
-    let output = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let output = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args(["up", "--catalog"])
         .arg(&catalog)
         .args(["--host", HOST, "--once", "--task", OWNER])

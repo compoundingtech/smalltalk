@@ -1,3 +1,8 @@
+#[cfg(test)]
+#[macro_use]
+#[path = "../../../scripts/ci-test-paths.rs"]
+mod ci_test_paths;
+
 mod connection;
 mod ui;
 mod version;

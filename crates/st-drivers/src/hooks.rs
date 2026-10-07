@@ -781,10 +781,7 @@ mod tests {
     /// two drift, a driver-declared and a hand-authored seat stop registering the same hooks.
     #[test]
     fn example_claude_declaration_registers_the_canonical_hook_settings() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../examples/native/agent-claude.kdl"
-        );
+        let path = test_env!("CARGO_MANIFEST_DIR", "/../../examples/native/agent-claude.kdl");
         let raw = std::fs::read_to_string(path).unwrap();
         let document: kdl::KdlDocument = raw.parse().unwrap();
         let agent = document.get("agent").unwrap();

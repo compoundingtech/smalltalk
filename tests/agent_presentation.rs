@@ -25,7 +25,7 @@ fn declaration(identity: &str, supervisor: Option<&str>, managed_by: &str) -> St
 }
 
 fn run(root: &Path, command: &str, args: &[&str], actor: Option<&str>) -> std::process::Output {
-    let mut process = Command::new(env!("CARGO_BIN_EXE_st2"));
+    let mut process = Command::new(test_env!("CARGO_BIN_EXE_st2"));
     process
         .args(["--catalog", root.to_str().unwrap(), command])
         .args(args)
@@ -90,7 +90,7 @@ fn cli_sets_replaces_and_clears_fields_without_changing_identity_or_other_bytes(
         "the retired sibling source is ignored, not rewritten or consulted"
     );
 
-    let roster = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let roster = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args([
             "--catalog",
             root.to_str().unwrap(),
@@ -132,7 +132,7 @@ fn cli_sets_replaces_and_clears_fields_without_changing_identity_or_other_bytes(
         fs::read_to_string(root.join("h/worker/agent.kdl")).unwrap(),
         initial
     );
-    let cleared_roster = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let cleared_roster = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args([
             "--catalog",
             root.to_str().unwrap(),
@@ -215,7 +215,7 @@ fn cli_preserves_declaration_mode_under_a_restrictive_umask() {
     );
     fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
 
-    let mut process = Command::new(env!("CARGO_BIN_EXE_st2"));
+    let mut process = Command::new(test_env!("CARGO_BIN_EXE_st2"));
     process
         .args([
             "--catalog",
@@ -369,7 +369,7 @@ fn concurrent_cli_writers_serialize_without_losing_either_field() {
     let inode = fs::metadata(&lock_path).unwrap().ino();
 
     let spawn = |command: &str, value: &str| {
-        Command::new(env!("CARGO_BIN_EXE_st2"))
+        Command::new(test_env!("CARGO_BIN_EXE_st2"))
             .args([
                 "--catalog",
                 root.to_str().unwrap(),
@@ -435,7 +435,7 @@ fn presentation_and_publication_contend_on_the_same_persistent_catalog_lock() {
     let inode = fs::metadata(&lock_path).unwrap().ino();
 
     let rename_attempt = temporary.path().join("rename-lock-attempt");
-    let mut rename = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let mut rename = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args([
             "--catalog",
             root.to_str().unwrap(),
@@ -471,7 +471,7 @@ fn presentation_and_publication_contend_on_the_same_persistent_catalog_lock() {
     .unwrap();
     assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
     let publish_attempt = temporary.path().join("publish-lock-attempt");
-    let mut publish = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let mut publish = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args([
             "agent",
             "publish",
@@ -542,7 +542,7 @@ fn presentation_crash_stages_only_in_the_control_plane() {
     let root = temporary.path().join("catalog");
     let original = declaration("worker", None, "catalog");
     write(&root, "agents/h/worker/agent.kdl", &original);
-    let crashed = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let crashed = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args([
             "--catalog",
             root.to_str().unwrap(),
@@ -604,7 +604,7 @@ fn presentation_post_commit_generation_failure_is_fenced_and_recovered() {
         "agents/h/worker/agent.kdl",
         &declaration("worker", None, "catalog"),
     );
-    let failed = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let failed = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args([
             "--catalog",
             root.to_str().unwrap(),
@@ -626,7 +626,7 @@ fn presentation_post_commit_generation_failure_is_fenced_and_recovered() {
     );
     assert!(root.join(".st2/catalog-generation-incomplete").is_file());
     assert!(!root.join(".st2/catalog-generation").exists());
-    let shared = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let shared = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args(["agents", "--catalog", root.to_str().unwrap(), "--json"])
         .output()
         .unwrap();
@@ -661,7 +661,7 @@ fn control_directory_swap_cannot_redirect_presentation_staging() {
     );
     let ready = temporary.path().join("ready");
     let release = temporary.path().join("release");
-    let writer = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let writer = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args([
             "--catalog",
             root.to_str().unwrap(),

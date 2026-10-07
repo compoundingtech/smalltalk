@@ -4003,7 +4003,7 @@ fn action_inventory_matches_contract_and_has_existing_test_references() {
             "{action} is absent from the real typed-client dispatch"
         );
     }
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let root = Path::new(test_env!("CARGO_MANIFEST_DIR")).join("../..");
     for group in [
         "typed_actions",
         "cli",
