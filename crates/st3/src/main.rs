@@ -15918,6 +15918,44 @@ fn current_local_pty_incarnation(actor: &str) -> Result<Option<String>> {
     Ok(pty_observation_incarnation(actor, &observations))
 }
 
+async fn current_local_agent_incarnation(client: &Client, actor: &str) -> Result<Option<String>> {
+    let status: StatusResponse = client
+        .get(&format!(
+            "/v1/status?subject={}",
+            urlencoding::encode(actor)
+        ))
+        .await?;
+    let binding = status
+        .subjects
+        .first()
+        .and_then(|s| s.desired.as_ref())
+        .map(st3::terminal_binding::from_desired)
+        .transpose()?
+        .flatten();
+    let Some(binding) = binding else {
+        return current_local_pty_incarnation(actor);
+    };
+    let Some(root) = std::env::var_os("PTY_ROOT").filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let observations = st_runtime::PtyRuntime::new(PathBuf::from(root)).snapshot()?;
+    Ok(bound_pty_incarnation(&binding, &observations))
+}
+
+fn bound_pty_incarnation(
+    binding: &st3::model::TerminalBinding,
+    observations: &[st_runtime::PtyObservation],
+) -> Option<String> {
+    let matched = observations.iter().any(|o| {
+        o.status == "running"
+            && o.tags.get("st3.subject") == Some(&binding.subject)
+            && o.pid
+                .zip(o.created_at.as_deref())
+                .is_some_and(|(pid, created)| format!("{pid}:{created}") == binding.incarnation)
+    });
+    matched.then(|| binding.agent_incarnation())
+}
+
 fn has_local_pty_registry() -> bool {
     std::env::var_os("PTY_ROOT").is_some_and(|value| !value.is_empty())
 }
@@ -15938,27 +15976,26 @@ async fn wait_for_agent_incarnation_from(
         // observation. Reading the graph immediately would then bind this new driver to the old
         // incarnation forever. The local registry already contains the process executing us and
         // is the exact source from which the reconciler will derive the graph incarnation.
-        if use_local_pty_registry {
-            if let Some(incarnation) = current_local_pty_incarnation(actor)? {
-                return Ok(incarnation);
-            }
+        let lookup = if use_local_pty_registry {
+            current_local_agent_incarnation(client, actor).await
         } else {
-            match current_agent_incarnation(client, actor).await {
-                Ok(Some(incarnation)) => return Ok(incarnation),
-                Ok(None) => {}
-                // A restarting daemon cannot answer yet; its outage does not use up the wait.
-                Err(error) if st3::client::daemon_unreachable(&error).is_some() => {
-                    if !outage_logged {
-                        let _ = write_driver_log(
-                            actor,
-                            "waiting for the runtime incarnation while the daemon restarts",
-                        );
-                        outage_logged = true;
-                    }
-                    deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+            current_agent_incarnation(client, actor).await
+        };
+        match lookup {
+            Ok(Some(incarnation)) => return Ok(incarnation),
+            Ok(None) => {}
+            // A restarting daemon cannot answer yet; its outage does not use up the wait.
+            Err(error) if st3::client::daemon_unreachable(&error).is_some() => {
+                if !outage_logged {
+                    let _ = write_driver_log(
+                        actor,
+                        "waiting for the runtime incarnation while the daemon restarts",
+                    );
+                    outage_logged = true;
                 }
-                Err(error) => return Err(error),
+                deadline = tokio::time::Instant::now() + Duration::from_secs(15);
             }
+            Err(error) => return Err(error),
         }
         if tokio::time::Instant::now() >= deadline {
             anyhow::bail!(
@@ -28006,6 +28043,38 @@ mod tests {
             pty_observation_incarnation("agent/run/other", &observations),
             None
         );
+    }
+
+    #[test]
+    fn native_driver_binds_the_terminal_tag_only_under_its_declared_invocation() {
+        let binding = st3::model::TerminalBinding {
+            subject: "pty/person/avery/019a0000-0000-7000-8000-000000000001".into(),
+            incarnation: "42:created".into(),
+            id: "019a0000-0000-7000-8000-000000000002".into(),
+        };
+        let mut observation = st_runtime::PtyObservation {
+            name: "fixture".into(),
+            status: "running".into(),
+            exit_code: None,
+            pid: Some(42),
+            created_at: Some("created".into()),
+            display_name: None,
+            tags: BTreeMap::from([("st3.subject".into(), binding.subject.clone())]),
+        };
+        assert_eq!(
+            bound_pty_incarnation(&binding, &[observation.clone()]),
+            Some(binding.agent_incarnation())
+        );
+        observation.pid = Some(43);
+        assert_eq!(
+            bound_pty_incarnation(&binding, &[observation.clone()]),
+            None
+        );
+        observation.pid = Some(42);
+        observation
+            .tags
+            .insert("st3.subject".into(), "agent/example/other".into());
+        assert_eq!(bound_pty_incarnation(&binding, &[observation]), None);
     }
 
     #[test]

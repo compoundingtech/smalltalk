@@ -19,6 +19,7 @@ use serde_json::Value;
 
 use crate::{ClaimRecord, store::canonical};
 
+pub mod after_write;
 pub mod claim_source;
 pub mod events;
 pub mod install;
