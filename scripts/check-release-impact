@@ -13,14 +13,23 @@ def main():
     parser.add_argument('--base', required=True, help='Immutable PR/merge-group base commit')
     parser.add_argument('--source', default='HEAD', help='Effective merge source, not the unmerged PR head')
     parser.add_argument('--repo', type=Path, default=Path(__file__).resolve().parent.parent)
+    identity = parser.add_mutually_exclusive_group()
+    identity.add_argument('--pr-number', type=int, help='PR event number for the adoption boundary')
+    identity.add_argument('--queue-ref', help='Merge-group head ref; members are identified separately')
     args = parser.parse_args()
     try:
-        report = check_pull_request(args.repo, args.base, args.source)
+        if args.pr_number is not None and args.pr_number < 1:
+            parser.error('--pr-number must be positive')
+        report = check_pull_request(args.repo, args.base, args.source, args.pr_number, args.queue_ref)
     except ImpactError as error:
         print(f'upgrade impact: {error}', file=sys.stderr)
         return 1
     print(f'Upgrade impact validated for {len(report["coverage"])} integrated change(s) '
           f'at {report["source"]}; base {report["previous_source"]}.')
+    if report['exemptions']:
+        numbers = ', '.join(f'#{number}' for number in report['exemptions'].values())
+        print(f'Adoption boundary: {numbers} predates the required PR note check. '
+              'Public release still requires complete classification of these changes.')
     return 0
 
 

@@ -26,9 +26,12 @@ impact, or `unknown` with a concrete explanation of what is unresolved and what 
 do. Omission is invalid. Unknown is visible in notes, never converted into none.
 
 The fast `upgrade-impact` check runs on every PR and merge group using Python and Git, without
-Nix or compilation, and feeds the existing required `linux-gate`. Each integrated PR must add a
-fresh valid fragment, including documentation-only PRs. Missing or malformed metadata and
-undeclared schema/rules transitions prevent merge. The check uses the effective merge tree and
+Nix or compilation, and feeds the existing required `linux-gate`. PRs numbered **above #1661**
+must add a fresh valid fragment, including documentation-only PRs. PRs #1661 and below without
+notes retain their prior merge policy at adoption; publication still requires their full
+classifications, so authors should add notes even to those older PRs. The boundary is applied
+to each PR in a queue group, not just its head ref. Supplied metadata must be valid and
+include matching schema/rules transitions. New PRs missing metadata cannot merge. The check uses the effective merge tree and
 immutable event base; it does not require unrelated unreleased main changes to be backfilled.
 Existing fragments are immutable: corrections, later measurements and backfills use a new file.
 
@@ -53,8 +56,11 @@ unchanged numeric schema version does not mean no database changes or safe rollb
 Reproduce the PR check against an effective merge tree (a PR head merged with its base):
 
 ```sh
-python3 scripts/check-release-impact --base BASE_COMMIT --source MERGE_COMMIT
+python3 scripts/check-release-impact --base BASE_COMMIT --source MERGE_COMMIT --pr-number PR_NUMBER
 ```
+
+Without an event identity (`--pr-number` or `--queue-ref`), the local check is strict and
+applies no adoption exemption. The publication renderer never applies this PR boundary.
 
 ## Operations
 

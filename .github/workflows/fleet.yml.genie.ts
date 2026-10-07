@@ -131,9 +131,17 @@ export default githubWorkflow(auditCaches({
         { name: 'Test release and PR classification safety', run: 'python3 scripts/release_notes_test.py' },
         {
           name: 'Require a fresh fragment on the effective PR or queue merge',
-          env: { IMPACT_BASE_SHA: '${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}' },
+          env: {
+            IMPACT_BASE_SHA: '${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}',
+            IMPACT_PR_NUMBER: '${{ github.event.pull_request.number }}',
+            IMPACT_QUEUE_REF: '${{ github.event.merge_group.head_ref }}',
+          },
           run: `if [ -n "$IMPACT_BASE_SHA" ]; then
-  python3 scripts/check-release-impact --base "$IMPACT_BASE_SHA" --source "$GITHUB_SHA"
+  if [ -n "$IMPACT_PR_NUMBER" ]; then
+    python3 scripts/check-release-impact --base "$IMPACT_BASE_SHA" --source "$GITHUB_SHA" --pr-number "$IMPACT_PR_NUMBER"
+  else
+    python3 scripts/check-release-impact --base "$IMPACT_BASE_SHA" --source "$GITHUB_SHA" --queue-ref "$IMPACT_QUEUE_REF"
+  fi
 else
   echo "Manual dispatch has no PR/queue delta; classification safety tests passed."
 fi`,

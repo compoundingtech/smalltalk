@@ -28,8 +28,12 @@ the current `main`; the head does not need to be rebased first. No `pull_request
 and the gate has only `contents: read` permission. Forks do not receive publishing secrets.
 
 The fast `upgrade-impact` job starts independently on GitHub-hosted `ubuntu-latest`, using only
-Python and Git. It requires a fresh valid upgrade fragment for every PR, including documentation
-changes, checks schema/rules transitions, and refuses changes to existing fragments. It checks
+Python and Git. The adoption boundary is **PR #1661**: PR numbers above it require a fresh valid
+upgrade fragment, including documentation changes. PRs #1661 and below without a fragment retain
+their prior merge policy; they still require classification before public release. Supplied
+fragments are validated, including schema/rules transitions, and existing fragments are immutable.
+PR events supply their number; queue refs identify a single PR, while multi-PR queue groups
+identify each member by its merge subject so an old head PR cannot exempt a newer member. It checks
 the effective PR merge against its immutable base, and each integrated PR in a merge group;
 unrelated unreleased main changes do not block a new PR's check. It does not download dependencies
 or compile. Manual dispatch runs the safety tests without inventing a PR delta.

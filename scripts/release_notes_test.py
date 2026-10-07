@@ -89,6 +89,56 @@ class ReleaseNotes(unittest.TestCase):
         with self.assertRaisesRegex(ImpactError, 'add a uniquely named'):
             check_pull_request(self.repo, self.base, source)
 
+    def test_adoption_boundary_grandfathers_old_pr_but_not_publication(self):
+        self.write('guide.md', '# PR opened before adoption\n')
+        source = self.commit('Old documentation PR')
+        report = check_pull_request(self.repo, self.base, source, pr_number=1661)
+        self.assertEqual(report['exemptions'], {source: 1661})
+        with self.assertRaisesRegex(ImpactError, 'add a uniquely named'):
+            check_pull_request(self.repo, self.base, source, pr_number=1662)
+        with self.assertRaisesRegex(ImpactError, 'Missing upgrade classifications'):
+            collect(self.repo, self.base, source)
+        result = subprocess.run([sys.executable, str(ROOT / 'scripts/check-release-impact'),
+                                 '--repo', str(self.repo), '--base', self.base, '--source', source,
+                                 '--pr-number', '1661'], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Public release still requires complete classification', result.stdout)
+
+    def test_queue_adoption_boundary_is_per_member_not_head_ref(self):
+        self.git('checkout', '-qb', 'old')
+        self.write('old.rs', '// Old PR without a note\n')
+        self.commit('Old implementation')
+        self.git('checkout', '-q', '-')
+        self.git('merge', '--no-ff', '-qm', 'Merge pull request #1660 from example/old', 'old')
+        old = self.git('rev-parse', 'HEAD')
+        self.git('checkout', '-qb', 'new')
+        self.write('new.rs', '// New PR without a note\n')
+        self.commit('New implementation')
+        self.git('checkout', '-q', '-')
+        self.git('merge', '--no-ff', '-qm', 'Merge pull request #1662 from example/new', 'new')
+        # Even an older head ref cannot exempt the new member in a mixed group.
+        queue_ref = 'refs/heads/gh-readonly-queue/main/pr-1660-' + self.base
+        with self.assertRaisesRegex(ImpactError, 'add a uniquely named'):
+            check_pull_request(self.repo, self.base, 'HEAD', queue_ref=queue_ref)
+        self.git('reset', '--hard', old)
+        self.git('checkout', '-q', 'new')
+        self.add_fragment('new')
+        self.commit('New PR note')
+        self.git('checkout', '-q', '-')
+        self.git('merge', '--no-ff', '-qm', 'Merge pull request #1662 from example/new', 'new')
+        source = self.git('rev-parse', 'HEAD')
+        report = check_pull_request(self.repo, self.base, source, queue_ref=queue_ref)
+        self.assertEqual(report['exemptions'], {old: 1660})
+        self.assertEqual(list(report['coverage']), [source])
+
+    def test_queue_identity_is_required_and_single_pr_ref_is_supported(self):
+        self.write('old.rs', '// Old PR with custom merge subject\n')
+        source = self.commit('Custom merge subject')
+        queue_ref = 'refs/heads/gh-readonly-queue/main/pr-1660-' + self.base
+        self.assertEqual(check_pull_request(self.repo, self.base, source, queue_ref=queue_ref)['exemptions'], {source: 1660})
+        with self.assertRaisesRegex(ImpactError, 'cannot identify PR'):
+            check_pull_request(self.repo, self.base, source, queue_ref='unrecognized-ref')
+
     def test_pr_does_not_inherit_unreleased_main_backlog(self):
         self.write('older.rs', '// Unclassified main change\n')
         base = self.commit('Older main change')
