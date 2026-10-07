@@ -476,7 +476,7 @@ async fn stream_with_timers<F, S, H>(
             let mut admitted = recovered.clone();
             let mut policies = policy_rechecks.clone();
             let previous = last.take();
-            let result = tokio::task::spawn_blocking(move || {
+            let result = crate::api::read_deadline::spawn_blocking(move || {
                 crate::profile::task("task mailbox-update", || {
                     let result = update_snapshot(
                         &store,

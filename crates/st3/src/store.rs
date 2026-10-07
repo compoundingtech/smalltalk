@@ -124,6 +124,7 @@ mod convergence;
 mod document_index_tests;
 mod lanes;
 mod operations;
+mod conversation_reads;
 mod runtime;
 #[cfg(test)]
 mod tombstones_tests;
@@ -209,6 +210,14 @@ WHERE kind='message.sent';
 CREATE INDEX IF NOT EXISTS claims_message_from_index
 ON claims(json_extract(body, '$.fields.from'), store_index)
 WHERE kind='message.sent';
+-- Legacy sends can put endpoint fields at the body root. They must remain readable without
+-- making every conversation parse the entire fleet's message payloads to find them.
+CREATE INDEX IF NOT EXISTS claims_message_legacy_to_index
+ON claims(json_extract(body, '$.to'), store_index)
+WHERE kind='message.sent' AND json_type(body, '$.fields') IS NULL;
+CREATE INDEX IF NOT EXISTS claims_message_legacy_from_index
+ON claims(json_extract(body, '$.from'), store_index)
+WHERE kind='message.sent' AND json_type(body, '$.fields') IS NULL;
 CREATE INDEX IF NOT EXISTS claims_resume_host_index
 ON claims(json_extract(body, '$.fields.host'), subject)
 WHERE kind='runtime.action.requested' AND json_extract(body,'$.fields.action')='resume';
@@ -992,15 +1001,15 @@ pub(crate) struct RuntimeAuthority {
 fn runtime_only_authority(
     connection: &Connection,
     subject: &str,
+    through: u64,
+    fields: &[&str],
 ) -> Result<Option<(Value, String)>> {
     let mut sources = connection.prepare_cached(&format!(
         "SELECT DISTINCT claims.kind, claims.origin FROM claims INDEXED BY claims_subject_kind_index
-         WHERE claims.subject=?1 AND {ACTUAL_STATE_CLAIM} LIMIT 2"
+         WHERE claims.subject=?1 AND claims.store_index<=?2 AND {ACTUAL_STATE_CLAIM} LIMIT 2"
     ))?;
-    let mut rows = sources.query([subject])?;
-    let Some(row) = rows.next()? else {
-        return Ok(None);
-    };
+    let mut rows = sources.query(params![subject, through])?;
+    let Some(row) = rows.next()? else { return Ok(None); };
     if row.get::<_, String>(0)? != "runtime.observed" {
         return Ok(None);
     }
@@ -1008,40 +1017,30 @@ fn runtime_only_authority(
     if rows.next()?.is_some() {
         return Ok(None);
     }
-    let body: String = connection
-        .prepare_cached(&format!(
-            "{} LIMIT 1",
-            newest_claims_of_kind_query("claims.body", "runtime.observed"),
-        ))?
-        .query_row(params![subject, i64::MAX], |row| row.get(0))?;
+    let body: String = connection.prepare_cached(&format!(
+        "{} LIMIT 1", newest_claims_of_kind_query("claims.body", "runtime.observed"),
+    ))?.query_row(params![subject, through], |row| row.get(0))?;
     let latest: Value = serde_json::from_str(&body)?;
     let latest = latest.get("fields").unwrap_or(&latest);
     let mut older = connection.prepare_cached(&format!(
         "SELECT claims.body FROM claims INDEXED BY claims_subject_kind_accepted_index
          JOIN batches ON batches.id=claims.batch_id
-         WHERE claims.subject=?1 AND claims.kind='runtime.observed'
+         WHERE claims.subject=?1 AND claims.kind='runtime.observed' AND claims.store_index<=?4
            AND json_type(claims.body, CASE WHEN json_type(claims.body, '$.fields') IS NULL
                          THEN ?2 ELSE ?3 END) IS NOT NULL
          ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
     ))?;
     let mut actual = serde_json::Map::new();
-    for (field, root_path, fields_path) in [
-        ("status", "$.status", "$.fields.status"),
-        ("runtime_id", "$.runtime_id", "$.fields.runtime_id"),
-        (
-            "incarnation_id",
-            "$.incarnation_id",
-            "$.fields.incarnation_id",
-        ),
-        ("terminal", "$.terminal", "$.fields.terminal"),
-        ("reachability", "$.reachability", "$.fields.reachability"),
-    ] {
+    for &field in fields {
+        let root_path = format!("$.{field}");
+        let fields_path = format!("$.fields.{field}");
         if let Some(value) = latest.get(field) {
             actual.insert(field.into(), value.clone());
         } else {
-            let body: Option<String> = older
-                .query_row(params![subject, root_path, fields_path], |row| row.get(0))
-                .optional()?;
+            let body: Option<String> = older.query_row(
+                params![subject, root_path, fields_path, through],
+                |row| row.get(0),
+            ).optional()?;
             if let Some(body) = body {
                 let value: Value = serde_json::from_str(&body)?;
                 if let Some(value) = value.get("fields").unwrap_or(&value).get(field) {
@@ -10159,7 +10158,7 @@ impl Store {
             return Ok(None);
         }
         let desired = desired_row_at(connection, subject, None)?;
-        let (actual, actual_origin, conflict) = match runtime_only_authority(connection, subject)? {
+        let (actual, actual_origin, conflict) = match runtime_only_authority(connection, subject, i64::MAX as u64, &["status", "runtime_id", "incarnation_id", "terminal", "reachability"])? {
             Some((actual, origin)) => (Some(actual), Some(origin), false),
             None => {
                 let member = desired
@@ -10685,21 +10684,26 @@ impl Store {
         let subjects = subjects.into_iter().collect::<Vec<_>>();
         let chunk_size = subjects.len().div_ceil(STATUS_WORKERS);
         let profile = crate::profile::current();
+        let read_budget = smallclaims::read_budget::current();
         let parts = std::thread::scope(|scope| {
             subjects
                 .chunks(chunk_size)
                 .map(|chunk| {
                     let names = chunk.iter().cloned().collect::<BTreeSet<_>>();
                     let profile = profile.clone();
+                    let read_budget = read_budget.clone();
                     scope.spawn(move || {
                         let _entered = crate::profile::enter(profile.as_ref());
-                        self.status_at_view_for_names(
-                            None,
-                            None,
-                            Some(store_index),
-                            include_history,
-                            Some(names),
-                        )
+                        let read = || self.status_at_view_for_names(
+                            None, None, Some(store_index), include_history, Some(names),
+                        );
+                        if let Some(budget) = read_budget {
+                            smallclaims::read_budget::with(Some(budget), || {
+                                self.readers.request_read(read)?
+                            })
+                        } else {
+                            read()
+                        }
                     })
                 })
                 .collect::<Vec<_>>()
@@ -21207,6 +21211,7 @@ fn current_harness_fold_at(
         .prepare_cached(&harness_observations_without_incarnation_query())?
         .query_map(params![subject, at_index, runtime_key.0.to_string()], row)?
         .map(|row| {
+            smallclaims::read_budget::check()?;
             let (claim, body, observed_at_unix_ms) = row?;
             let key = canonical::claim_key(connection, &claim)?;
             Ok::<_, anyhow::Error>((key, claim, body, observed_at_unix_ms))
@@ -21221,6 +21226,7 @@ fn current_harness_fold_at(
     let mut current = None;
     let mut optional = BTreeMap::<&'static str, Option<String>>::new();
     loop {
+        smallclaims::read_budget::check()?;
         if next_named.is_none() {
             next_named = match named.next() {
                 Some(row) => {
@@ -21436,6 +21442,7 @@ fn agent_working_since_at(
             Ok(false)
         };
         for row in &mut rows {
+            smallclaims::read_budget::check()?;
             let row = row?;
             if group.last().is_some_and(|previous| previous.2 != row.2)
                 && fold_group(&mut group, &mut since)?
@@ -32495,6 +32502,32 @@ agent "test/empty" { command "true" }
         assert!(!store.repair_operation_projection_drift().unwrap());
     }
 
+    /// The drift audit reads every claim an operation row can come from. Walking the whole
+    /// claims table evaluated json_extract on every claim in the store, seconds of work and
+    /// hundreds of megabytes of reads on a populated member, while the partial operation index
+    /// already names exactly the claims the audit keeps.
+    #[test]
+    fn the_operation_audit_walks_the_partial_operation_index() {
+        let store = Store::open_memory("node").unwrap();
+        let connection = store.readers.get();
+        let plan = connection
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                smallclaims::store::EXPECTED_OPERATIONS_QUERY
+            ))
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("; ");
+        assert!(
+            plan.contains("USING INDEX claims_operation_index")
+                && !plan.contains("USING INDEX sqlite_autoindex_claims_1"),
+            "{plan}"
+        );
+    }
+
     #[test]
     fn persistent_store_uses_bounded_sqlite_page_caches() {
         let directory = tempfile::tempdir().unwrap();
@@ -35810,6 +35843,25 @@ mission "card-owner" state="ready" {
             serde_json::to_value(store.agent_card_status_at(None, index, true).unwrap()).unwrap(),
             serde_json::to_value(after).unwrap()
         );
+    }
+
+    #[test]
+    fn status_projection_threads_inherit_cancellation_and_release_their_readers() {
+        let store = Store::open_memory("node").unwrap();
+        let names = (0..65).map(|n| format!("agent/budget/seat-{n}")).collect::<BTreeSet<_>>();
+        let index = store.index().unwrap();
+        let expired = smallclaims::read_budget::ReadBudget::new("/parallel-status", std::time::Duration::ZERO);
+        smallclaims::read_budget::with(Some(expired), || {
+            let error = store.status_for_subject_names_at(names.clone(), index, true).unwrap_err();
+            assert_eq!(smallclaims::error::typed(error).code, "read-deadline");
+        });
+        let eligible = smallclaims::read_budget::ReadBudget::new("/parallel-status", std::time::Duration::from_secs(15));
+        let result = smallclaims::read_budget::with(Some(eligible.clone()), || {
+            store.status_for_subject_names_at(names, index, true)
+        }).unwrap();
+        assert_eq!(result.subjects.len(), 65);
+        assert!(!eligible.expired());
+        assert!(store.readers.get().is_autocommit());
     }
 
     #[test]

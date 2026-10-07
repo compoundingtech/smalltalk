@@ -388,7 +388,7 @@ async fn open_terminal_subscription(
         let session = session.clone();
         let incarnation = request.incarnation.clone();
         let capability = request.capability.clone();
-        tokio::task::spawn_blocking(move || {
+        crate::api::read_deadline::spawn_blocking(move || {
             prepare_terminal_follow(
                 &state,
                 &session,
@@ -473,7 +473,7 @@ async fn conversation_page(
             .map_err(|error| conversation_blocks::availability(remote_read_error(owner, error)));
     }
     let (state, session, session_id) = (state.clone(), session.clone(), session_id.to_owned());
-    tokio::task::spawn_blocking(move || {
+    crate::api::read_deadline::spawn_blocking(move || {
         timeline_value(
             &state,
             &new_client_snapshot(&state),
@@ -3931,41 +3931,13 @@ fn session_messages(
     incarnation: Option<&str>,
     before: Option<u64>,
 ) -> Result<Vec<ClaimRecord>, ApiError> {
-    // The incarnation's life: from its first runtime observation to the next incarnation's.
-    let (mut started, mut ended) = (None::<u128>, None::<u128>);
-    if let Some(incarnation) = incarnation {
-        let observed = state
-            .store
-            .claims_for(owner, Some("runtime.observed"))
-            .map_err(ApiError::internal)?;
-        let of = |claim: &ClaimRecord| {
-            claim
-                .body
-                .pointer("/fields/incarnation_id")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        };
-        started = observed
-            .iter()
-            .filter(|claim| of(claim).as_deref() == Some(incarnation))
-            .map(|claim| claim.accepted_at_unix_ms)
-            .min();
-        if let Some(started) = started {
-            ended = observed
-                .iter()
-                .filter(|claim| {
-                    claim.accepted_at_unix_ms > started
-                        && of(claim).is_some_and(|other| other != incarnation)
-                })
-                .map(|claim| claim.accepted_at_unix_ms)
-                .min();
-        }
-    }
-    let mut messages = state
-        .store
-        .claims_for_kind_at("message.sent", before, true, 10_000)
-        .map_err(ApiError::internal)?
-        .claims;
+    let (started, ended) = match incarnation {
+        Some(incarnation) => state.store.conversation_runtime_span(owner, incarnation)
+            .map_err(ApiError::internal)?,
+        None => (None, None),
+    };
+    let mut messages = state.store.conversation_messages_at(owner, before, 0)
+        .map_err(ApiError::internal)?;
     messages.retain(|claim| {
         let fields = claim.body.get("fields").unwrap_or(&claim.body);
         let from = fields.get("from").and_then(Value::as_str);
@@ -4997,28 +4969,11 @@ fn conversation_cursor(
 
 pub(super) fn conversation_session_id(state: &AppState, id: &str) -> Result<String, ApiError> {
     if id.starts_with("agent/") {
-        let status = state
-            .store
-            .status_for_subject_prefix_at("agent/", None, true)
-            .map_err(ApiError::internal)?;
-        let subject = status
-            .subjects
-            .into_iter()
-            .find(|subject| subject.subject == id)
+        let frontier = state.store.index().map_err(ApiError::internal)?;
+        let owners = state.store.conversation_owners_at(frontier).map_err(ApiError::internal)?;
+        let owner = owners.get(id)
             .ok_or_else(|| ApiError::not_found(format!("agent `{id}` does not exist")))?;
-        let fields = subject
-            .actual
-            .as_ref()
-            .map(|actual| actual.get("fields").unwrap_or(actual));
-        let incarnation = fields
-            .and_then(|fields| fields.get("incarnation_id"))
-            .and_then(Value::as_str)
-            .or(subject.projection.runtime_incarnation.as_deref())
-            .or_else(|| {
-                fields
-                    .and_then(|fields| fields.get("runtime_id"))
-                    .and_then(Value::as_str)
-            })
+        let incarnation = owner.incarnation.as_deref().or(owner.runtime.as_deref())
             .ok_or_else(|| validation("the agent has no current session"))?;
         return Ok(client_session_id(id, incarnation));
     }
@@ -5073,6 +5028,17 @@ fn conversation_position(
 }
 
 fn conversation_read_now(
+    state: &AppState,
+    session: &ClientSession,
+    session_id: &str,
+    after: Option<&str>,
+) -> Result<Value, ApiError> {
+    super::read_deadline::query(&state.store, "/v1/client/conversations/{id}/changes", || {
+        conversation_read_now_unbounded(state, session, session_id, after)
+    })
+}
+
+fn conversation_read_now_unbounded(
     state: &AppState,
     session: &ClientSession,
     session_id: &str,
@@ -5165,23 +5131,12 @@ fn conversation_read_now(
                 }
             }
         }
-        for claim in state
-            .store
-            .claims_for_kind_at("message.sent", None, true, 10_000)
-            .map_err(ApiError::internal)?
-            .claims
-        {
+        for claim in owner.as_deref().map(|owner| {
+            state.store.conversation_messages_at(owner, snapshot.store_index.checked_add(1), store_index)
+        }).transpose().map_err(ApiError::internal)?.unwrap_or_default() {
             let fields = claim.body.get("fields").unwrap_or(&claim.body);
-            if claim.store_index > store_index
-                && fields
-                    .get("session_id")
-                    .and_then(Value::as_str)
-                    .is_none_or(|message_session| message_session == session_id)
-                && owner.as_deref().is_some_and(|owner| {
-                    fields.get("from").and_then(Value::as_str) == Some(owner)
-                        || fields.get("to").and_then(Value::as_str) == Some(owner)
-                })
-            {
+            if fields.get("session_id").and_then(Value::as_str)
+                .is_none_or(|message_session| message_session == session_id) {
                 changed_indexes.insert(claim.store_index);
                 message_indexes.insert(claim.store_index);
             }
@@ -5363,6 +5318,12 @@ fn transcript_seen(path: Option<&std::path::Path>) -> Option<(u64, std::time::Sy
 
 impl ConversationMark {
     fn new(state: &AppState, session_id: &str) -> Result<Self, ApiError> {
+        super::read_deadline::query(&state.store, "/v1/client/conversations/{id}/changes", || {
+            Self::new_unbounded(state, session_id)
+        })
+    }
+
+    fn new_unbounded(state: &AppState, session_id: &str) -> Result<Self, ApiError> {
         let index = state.store.index().map_err(ApiError::internal)?;
         let managed = super::managed_session_owner_at(&state.store, index, session_id)
             .map_err(ApiError::internal)?;
@@ -5388,6 +5349,12 @@ impl ConversationMark {
 
     /// Whether anything that concerns the conversation changed since the last look.
     fn changed(&mut self, state: &AppState) -> Result<bool, ApiError> {
+        super::read_deadline::query(&state.store, "/v1/client/conversations/{id}/changes", || {
+            self.changed_unbounded(state)
+        })
+    }
+
+    fn changed_unbounded(&mut self, state: &AppState) -> Result<bool, ApiError> {
         let mut changed = false;
         let index = state.store.index().map_err(ApiError::internal)?;
         if index > self.store_index {
@@ -5908,7 +5875,9 @@ pub(super) async fn events(
 ) -> Result<Json<Value>, ApiError> {
     require_scope(&session, "read.projections")?;
     let limit = query.limit.unwrap_or(100).clamp(1, 500);
-    let (oldest, newest) = state.store.event_bounds().map_err(ApiError::internal)?;
+    let (oldest, newest) = super::read_deadline::query(&state.store, "/v1/client/events", || {
+        state.store.event_bounds().map_err(ApiError::internal)
+    })?;
     let after = decode_event_cursor(&state.node, query.after.as_deref())?;
     validate_event_cursor(
         &state.node,
@@ -5923,12 +5892,13 @@ pub(super) async fn events(
     // page and subscribing must wake this long poll, not wait for another event.
     let mut changed = state.event_notify.subscribe();
     let records = loop {
-        let records = if query.after.is_some() {
-            feed_events_after(&state.store, after, limit.saturating_add(1))
-        } else {
-            feed_events_tail(&state.store, limit)
-        }
-        .map_err(ApiError::internal)?;
+        let records = super::read_deadline::query(&state.store, "/v1/client/events", || {
+            if query.after.is_some() {
+                feed_events_after(&state.store, after, limit.saturating_add(1))
+            } else {
+                feed_events_tail(&state.store, limit)
+            }.map_err(ApiError::internal)
+        })?;
         if !records.is_empty() || tokio::time::Instant::now() >= deadline {
             break records;
         }
@@ -6661,7 +6631,7 @@ const TERMINAL_FACTS_TIMEOUT: Duration = Duration::from_secs(1);
 async fn terminal_facts(state: &AppState, id: &str) -> Option<Value> {
     let live = terminal_live_session(state, &terminal_subject(id), None).ok()?;
     let root = state.pty_root.clone();
-    tokio::task::spawn_blocking(move || {
+    crate::api::read_deadline::spawn_blocking(move || {
         let stats = pty_client::stats::query_stats_in_with_timeout(
             &root,
             &live.runtime_id,
@@ -7919,7 +7889,7 @@ async fn import_external_session_action(
     // until the exact native process has stopped, so two harnesses never own one native session.
     if let Some(process) = external.process.clone() {
         let driver = external.driver;
-        tokio::task::spawn_blocking(move || {
+        crate::api::read_deadline::spawn_blocking(move || {
             crate::external_sessions::terminate_exact_process(driver, &process)
         })
         .await
@@ -9048,7 +9018,7 @@ async fn dispatch_action(
             }
             let socket = state.pty_root.join(format!("{}.sock", live.runtime_id));
             let runtime_id = live.runtime_id.clone();
-            tokio::task::spawn_blocking(move || {
+            crate::api::read_deadline::spawn_blocking(move || {
                 let stream = std::os::unix::net::UnixStream::connect(&socket)?;
                 let mut connection = pty_client::SessionConnection::attach_over(
                     stream,
@@ -10583,7 +10553,7 @@ mod tests {
                                             let _ = dropped.send(());
                                         });
                                         let _dropped = Dropped(Some(sender));
-                                        tokio::task::spawn_blocking(move || {
+                                        crate::api::read_deadline::spawn_blocking(move || {
                                             entered.send(()).unwrap();
                                             let _ = tokio::runtime::Handle::current()
                                                 .block_on(held.wait_for(|released| *released));
@@ -10961,7 +10931,7 @@ mod tests {
                             move |state, session, request, permit| {
                                 let (mut gate, started) = (gate.clone(), started.clone());
                                 async move {
-                                    let permit = tokio::task::spawn_blocking(move || {
+                                    let permit = crate::api::read_deadline::spawn_blocking(move || {
                                         started.send(permit.semaphore().clone()).unwrap();
                                         let _ = tokio::runtime::Handle::current()
                                             .block_on(gate.wait_for(|released| *released));
@@ -14703,6 +14673,10 @@ mission "example/zero-run" state="ready" {
             .unwrap();
         let session_id = managed_session_id(agent, incarnation);
         assert_eq!(conversation_session_id(&owner, agent).unwrap(), session_id);
+        let before_alias = crate::store::STATEMENTS_RUN.with(std::cell::Cell::get);
+        assert_eq!(conversation_session_id(&owner, agent).unwrap(), session_id);
+        let alias_queries = crate::store::STATEMENTS_RUN.with(std::cell::Cell::get) - before_alias;
+        assert!(alias_queries <= 3, "a warm agent alias must not reduce fleet history: {alias_queries}");
         let session = ClientSession::local(Some("person/example")).unwrap();
         let origin = super::super::managed_session_owner_at(
             &follower.store,
@@ -16941,7 +16915,7 @@ mission "example/zero-run" state="ready" {
         }
         let _cleanup = Cleanup(runtime.clone());
         let pty_root = state.pty_root.clone();
-        let output = tokio::task::spawn_blocking(move || std::process::Command::new(pty)
+        let output = crate::api::read_deadline::spawn_blocking(move || std::process::Command::new(pty)
             .env("PTY_ROOT", pty_root)
             .args(["run", "-d", "--force", "--id", "fence-test", "--tag", "keep=true", "--", "/bin/sh", "-c", "stty -echo; printf ready; while IFS= read -r line; do printf '\\r\\naccepted:%s' \"$line\"; done"])
             .output().unwrap()).await.unwrap();

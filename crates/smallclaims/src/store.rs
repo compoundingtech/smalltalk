@@ -1602,6 +1602,9 @@ pub fn selected_index(current: u64, requested: Option<u64>) -> Result<u64, St3Er
 }
 
 pub fn claim_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClaimRecord> {
+    if crate::read_budget::check().is_err() {
+        return Err(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_INTERRUPT), None));
+    }
     let body = row.get::<_, String>(7)?;
     let predecessors = row.get::<_, String>(8)?;
     let accepted = row.get::<_, String>(9)?;
@@ -4784,12 +4787,11 @@ impl Store {
         // pin, and returns the connection to the pool.
         let pinned = PinnedRead {
             pool: &self.readers,
-            connection: Some(Rc::new(
-                guard
-                    .connection
-                    .take()
-                    .expect("an unpinned read guard holds a pooled connection"),
-            )),
+            previous: PINNED_READER.with(|slot| slot.borrow_mut().take()),
+            connection: Some(match guard.connection.take() {
+                Some(connection) => Rc::new(connection),
+                None => guard.pinned.take().expect("a request loan holds its connection"),
+            }),
         };
         drop(guard);
         let connection = pinned
@@ -7607,16 +7609,20 @@ pub fn checkpointed_operation_outcome(
     .with_detail("claim_id", claim_id.clone()))
 }
 
+/// The claims every stored operation row must come from, in canonical order. The partial
+/// operation index names exactly the claims this scan keeps, so the audit walks it instead of
+/// evaluating json_extract over every claim in the store.
+pub const EXPECTED_OPERATIONS_QUERY: &str =
+    "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
+     FROM claims INDEXED BY claims_operation_index
+     WHERE json_extract(body, '$._operation.id') IS NOT NULL
+       AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=claims.id)
+     ORDER BY id";
+
 pub fn expected_operations(
     connection: &Connection,
 ) -> Result<BTreeMap<String, (String, String, String)>> {
-    let mut statement = connection.prepare(
-        "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
-         FROM claims
-         WHERE json_extract(body, '$._operation.id') IS NOT NULL
-           AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=claims.id)
-         ORDER BY id",
-    )?;
+    let mut statement = connection.prepare(EXPECTED_OPERATIONS_QUERY)?;
     let claims = statement
         .query_map([], claim_from_row)?
         .collect::<Result<Vec<_>, _>>()?;
