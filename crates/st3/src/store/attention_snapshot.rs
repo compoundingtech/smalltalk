@@ -1079,6 +1079,16 @@ impl Store {
                     continue;
                 }
             }
+            // Diagnostic history stays immutable; current work/runtime state decides whether
+            // this episode still needs an owner. This changes no canonical timing fold.
+            let wake = if f["condition"] == "work-wake-exhausted" {
+                let Some(context) = self.current_exhausted_work_wake(&failure, as_of)? else {
+                    continue;
+                };
+                Some(context)
+            } else {
+                None
+            };
             let mut item = attention_item_from_failure(failure);
             item.kind = "fault".into();
             item.subject = source.clone();
@@ -1093,8 +1103,64 @@ impl Store {
                 "inspect source",
                 &["st", "subject", source],
             )];
+            if let Some((step, diagnostic)) = wake {
+                item.step = Some(step.subject.clone());
+                item.mission_run = Some(step.run);
+                item.actions = vec![
+                    attention_action("inspect step", &["st", "work", "show", &step.subject]),
+                    attention_action("inspect seat history", &["st", "trace", "show", &diagnostic.subject, "--limit", "20"]),
+                ];
+            }
             items.push(item);
         }
         Ok(items)
+    }
+
+    fn current_exhausted_work_wake(
+        &self,
+        failure: &AttentionRequestView,
+        as_of: u128,
+    ) -> Result<Option<(StepRunView, ClaimRecord)>> {
+        let [agent, step_subject, diagnostic_id] = failure.targets.as_slice() else {
+            return Ok(None);
+        };
+        let Some(diagnostic) = self.claim_by_id(diagnostic_id)? else {
+            return Ok(None);
+        };
+        let fields = &diagnostic.body["fields"];
+        if diagnostic.kind != "harness.diagnostic"
+            || &diagnostic.subject != agent
+            || diagnostic.accepted_at_unix_ms > as_of
+            || fields["code"] != "work-wake-exhausted"
+            || fields["status"] != "failed"
+            || fields["step_run"].as_str() != Some(step_subject)
+        {
+            return Ok(None);
+        }
+        let Some(step) = self.step_run(step_subject)? else {
+            return Ok(None);
+        };
+        if step.status != "ready"
+            || step.assigned_to.as_ref() != Some(agent)
+            || fields["attempt"].as_u64() != Some(u64::from(step.attempt))
+            || fields["readiness_epoch"].as_u64() != Some(u64::from(step.readiness_epoch))
+            || !person_work::run_live(
+                &self.readers.get(),
+                &step.run,
+                Some(&step.generation),
+                false,
+            )?
+        {
+            return Ok(None);
+        }
+        let Some(harness) = self.current_harness(agent)? else {
+            return Ok(None);
+        };
+        if !matches!(harness.state.as_str(), "ready" | "idle")
+            || fields["incarnation_id"].as_str() != Some(harness.incarnation_id.as_str())
+        {
+            return Ok(None);
+        }
+        Ok(Some((step, diagnostic)))
     }
 }
