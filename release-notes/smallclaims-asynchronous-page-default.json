@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Smaller default asynchronous pages with retained writer-cost counterexamples",
+  "replay": {
+    "status": "none",
+    "detail": "No automatic open/read/repair replay; explicit pages drain a captured delta queue."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "The explicit asynchronous runtime defaults to eight rows per page; existing compatible files retain their pinned limits and require explicit compatible configuration."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Canonical/admission/checkpoint rules unchanged. Unsupported rank/repair and local adapters fence or are refused."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Async default page size is eight. Caller-specified limits remain explicit and must match the installed file."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No live restart or existing-store conversion."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Retains both local cost probes, including the 115.822 ms 32-output target miss. Consumer writer bounds remain unqualified."
+  },
+  "recovery": {
+    "status": "unknown",
+    "detail": "Quota overflow, capture loss, incompatible metadata and unsupported mutation require explicit recovery; no automatic rebuild. Production authority, checkpoint, retention and ordered operators remain gates."
+  }
+}

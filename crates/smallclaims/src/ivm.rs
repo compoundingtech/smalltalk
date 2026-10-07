@@ -20,6 +20,7 @@ use serde_json::Value;
 use crate::{ClaimRecord, store::canonical};
 
 pub mod after_write;
+pub mod asynchronous;
 pub mod claim_source;
 pub mod events;
 pub mod install;
@@ -1054,6 +1055,15 @@ impl Views {
         let Some(source) = source_cut(connection)? else {
             return Ok(Readiness::SourcePending);
         };
+        if !asynchronous::readiness(connection)? {
+            return Ok(Readiness::SourcePending);
+        }
+        if asynchronous::installed(connection)?
+            && asynchronous::applied_prefix(connection, self, name, epoch)?
+                != Some(source.projected)
+        {
+            return Ok(Readiness::SourcePending);
+        }
         if source.epoch != epoch
             || source.admitted != source.projected
             || source.admitted != crate::store::current_index(connection)?
@@ -1109,7 +1119,7 @@ impl Views {
             },
             frontier,
             readiness,
-            error,
+            error: error.or(asynchronous::error(connection)?),
         })
     }
 
