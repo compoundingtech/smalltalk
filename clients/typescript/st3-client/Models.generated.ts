@@ -252,6 +252,20 @@ export type AgentWorkspace = {
   workspace: string;
 };
 
+export type AppUpdateTarget = {
+  app: string;
+  channel: string;
+};
+
+export type AppUpdateToken = {
+  expiresAtUnixMs: number;
+  token: string;
+};
+
+export type AppUpdateTokensRevoked = {
+  revoked: boolean;
+};
+
 export type Arrangement = ResourceHeader & {
   body: ArrangementBody;
   deleted: false;
@@ -1229,7 +1243,7 @@ export type PairingBegin = {
   device_name: string;
   full_control?: boolean;
   person_id: string;
-  scopes?: Array<"read.projections" | "read.glasses" | "control.glasses" | "terminal.read" | "control.attention" | "control.launches">;
+  scopes?: Array<"read.projections" | "read.app-updates" | "read.glasses" | "control.glasses" | "terminal.read" | "control.attention" | "control.launches">;
 };
 
 export type PairingChallenge = {

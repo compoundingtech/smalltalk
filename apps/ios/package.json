@@ -27,6 +27,7 @@
     "expo-font": "~57.0.4",
     "expo-image-picker": "~57.0.20",
     "expo-secure-store": "~57.0.4",
+    "expo-updates": "~57.0.23",
     "react": "19.2.3",
     "react-native": "0.86.3",
     "react-native-safe-area-context": "~5.7.0",
@@ -35,5 +36,12 @@
   "devDependencies": {
     "@types/react": "~19.2.0",
     "typescript": "~6.0.3"
+  },
+  "expo": {
+    "autolinking": {
+      "ios": {
+        "buildFromSource": ["expo-updates"]
+      }
+    }
   }
 }

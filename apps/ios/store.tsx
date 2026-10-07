@@ -20,6 +20,8 @@ import { normalizeGatewayUrl } from './gatewayUrl';
 import { tabOrder, type Tab } from './tabs';
 import { fetch as expoFetch } from 'expo/fetch';
 import { decodeBase64, encodeBase64, type Picked } from './images';
+import { createAppUpdates } from './appUpdatesNative.ts';
+import type { AppUpdateSession } from './appUpdates.ts';
 
 // Everything the screens share: the paired gateway, the one collections socket, the lists it keeps
 // current, the lists a screen loads when it opens, and the actions. Screens follow a conversation
@@ -89,6 +91,7 @@ function useAppStore(proof?: FabricProfile) {
   const [truncated, setTruncated] = useState<Partial<Record<keyof Data, boolean>>>({});
   const [loadErrors, setLoadErrors] = useState<Partial<Record<keyof Data, string>>>({});
   const foreground = useRef(new ForegroundGate(proof && !proof.ready ? 'background' : AppState.currentState));
+  const appUpdates = useRef<AppUpdateSession | null>(null);
   const [feed, setFeed] = useState<Feed | null>(null), [connectionIssue, setConnectionIssue] = useState('');
   const [cachedHostId, setCachedHostId] = useState('');
   const [caps, setCaps] = useState<Capabilities | null>(null), [snapshot, setSnapshot] = useState<Snapshot | null>(null);
@@ -168,6 +171,8 @@ function useAppStore(proof?: FabricProfile) {
   // One collections socket per paired gateway and credential keeps attention, missions, and agents
   // current. It closes in the background and opens fresh, snapshots first, in the foreground.
   useEffect(() => {
+    // credential is populated only after SecureStore hydration or completed pairing.
+    appUpdates.current?.setPairing(url, credential);
     if (!client || !credential) { setStatus('setup'); return; }
     const generation = cacheGeneration.current;
     const current = () => generation === cacheGeneration.current;
@@ -206,8 +211,11 @@ function useAppStore(proof?: FabricProfile) {
     if (proof) foreground.current.update(proof.ready && url === proof.url ? AppState.currentState : 'background');
   }, [url, proof?.url, proof?.ready]);
   useEffect(() => {
+    const updates = createAppUpdates(foreground.current);
+    appUpdates.current = updates;
+    updates.setPairing(url, credential);
     const subscription = AppState.addEventListener('change', state => foreground.current.update(proofRef.current && !proofRef.current.ready ? 'background' : state));
-    return () => subscription.remove();
+    return () => { updates.close(); appUpdates.current = null; subscription.remove(); };
   }, []);
 
   // Glasses: followed on the feed's socket while the experiment is on and the gateway grants them.

@@ -55,6 +55,7 @@ use tokio::sync::{Notify, watch};
 use clap_complete::engine::ArgValueCompleter;
 use completion::{Complete, Entity, WorkFilter};
 
+mod app_updates_cli;
 mod cli_help;
 mod completion;
 #[cfg(test)]
@@ -157,6 +158,11 @@ enum Command {
     /// The clients connected to this member now and those seen in the last few minutes:
     /// stui, the phone and st itself, with their builds as they report them.
     Clients,
+    /// Publish signed Expo app updates that paired devices fetch through the gateway.
+    AppUpdates {
+        #[command(subcommand)]
+        command: app_updates_cli::AppUpdatesCommand,
+    },
     /// Claim and update durable mission work.
     ///
     /// Claim existing work first. work start records a small independent authorized job;
@@ -5044,6 +5050,17 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Rules { command } => run_rules(&client, &config, command, cli.json).await,
         Command::Import { command } => run_import(&endpoint, command, cli.json).await,
+        Command::AppUpdates { command } => {
+            let published = app_updates_cli::run(&client, &endpoint, command).await?;
+            if cli.json {
+                return print_value(&published, true);
+            }
+            println!(
+                "published update {} to {}/{} (runtime {})",
+                published.id, published.app, published.channel, published.runtime_version
+            );
+            Ok(())
+        }
         Command::Completions(args) => {
             let shell = match args.shell {
                 CompletionShell::Bash => "bash",

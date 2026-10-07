@@ -8,3 +8,6 @@ clients/typescript/st3-client/*.generated.ts linguist-generated=true
 clients/swift/St3Client/Sources/St3Client/*.generated.swift linguist-generated=true
 clients/swift/St3Client/Sources/St3Client/Models.swift linguist-generated=true
 clients/swift/St3Client/Sources/St3Client/Client.swift linguist-generated=true
+# Generated asset/fixture provenance and regeneration are in apps/ios/README.md.
+apps/ios/assets/icon-dev.png linguist-generated=true
+apps/ios/certs/test-fixture.pem linguist-generated=true

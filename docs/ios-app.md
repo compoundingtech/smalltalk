@@ -31,16 +31,20 @@ cd ~/src/smalltalk/apps/ios
 npm ci
 npm run typecheck
 npm test
-npx expo prebuild --platform ios --clean --no-install
+APP_VARIANT=dev npx expo prebuild --platform ios --clean --no-install
 npm run pods
-open ios/smalltalk.xcworkspace
+open ios/*.xcworkspace
 ```
 
-`prebuild --clean` regenerates the ignored `ios/` directory from app configuration. Keep native changes in the checked-in Expo modules or configuration before regenerating. `npm run pods` supplies the UTF-8 locale CocoaPods needs. Open the **workspace**, which includes the pods, rather than the Xcode project.
+`prebuild --clean` regenerates the ignored `ios/` directory from `apps/ios/app.config.js` and its shared `app.json` settings. `APP_VARIANT=dev` (the default) installs **Smalltalk Dev**, bundle `com.compoundingtech.smalltalk.starter`, with a DEV-badged icon and OTA disabled. `APP_VARIANT=daily` installs **Smalltalk**, bundle `com.compoundingtech.smalltalk`, with signed paired-gateway OTA. They coexist and have separate Keychain profiles. Keep native changes in checked-in Expo modules/config plugins before regenerating; switching variants requires a clean prebuild and new pods. `npm run pods` supplies the UTF-8 locale CocoaPods needs. Open the **workspace**, which includes the pods, rather than the Xcode project.
+
+For daily builds, first generate your own update signing identity and set `ST_IOS_UPDATES_CERT`
+to its public certificate path as described in the [publication guide](../apps/ios/README.md#local-signing-and-publication).
+Daily fails closed without that setting; no deployer's certificate/key is bundled with this public repo.
 
 ## Run in the simulator
 
-In Xcode, select the **smalltalk** scheme and an installed iPhone simulator. Use the scheme's **Debug** configuration and press **Run**. Keep normal simulator code signing enabled: `CODE_SIGNING_ALLOWED=NO` leaves the app without a usable Keychain and pairing fails.
+In Xcode, select the generated app scheme and an installed iPhone simulator. Use the scheme's **Debug** configuration and press **Run**. Keep normal simulator code signing enabled: `CODE_SIGNING_ALLOWED=NO` leaves the app without a usable Keychain and pairing fails.
 
 In another terminal, start Metro from the app directory:
 
@@ -69,13 +73,18 @@ Open **Agents**, select `garden/worker`, and send a message. Home shows what nee
 
 For a Debug build, connect the phone to the Mac, enable its Developer Mode when asked, and choose it as Xcode's run destination. In **Signing & Capabilities**, select your own Apple Development team and let Xcode manage provisioning. If that team cannot register the default bundle identifier, choose your own unique identifier for this local target; regenerating `ios/` resets that local change. Run the app; keep Metro reachable from the phone. Do not commit team IDs, provisioning profiles, device IDs, or pairing credentials.
 
-For an app that runs without Metro, export the iOS JavaScript first:
+For the daily app that runs without Metro, regenerate the native project for the daily variant and export the iOS JavaScript:
 
 ```sh
 cd ~/src/smalltalk/apps/ios
-npm run export:ios
+APP_VARIANT=daily npx expo prebuild --platform ios --clean --no-install
+npm run pods
+APP_VARIANT=daily npm run export:ios
+open ios/*.xcworkspace
 ```
 
-Set the scheme's **Run → Build Configuration** to **Release**, choose your phone, and build/run with its Apple Development signing and provisioning. Release embeds the bundle and can run with Metro stopped. It still needs the gateway connection to read current work and send actions.
+Set the generated scheme's **Run → Build Configuration** to **Release**, choose your phone, and build/run with its Apple Development signing and provisioning. Release embeds the bundle and can run with Metro stopped. It still needs the gateway connection to read current work and send actions. Keep the daily bundle identifier unchanged: update authentication and the native gateway bridge target `com.compoundingtech.smalltalk`. The config plugin pins the variant in generated `ios/.xcode.env` for Xcode's bundle/resource phases; do not override it in `.xcode.env.local`.
+
+The daily build starts offline from its embedded/cached verified bundle and checks only after the paired credential has been read from Keychain. Only a narrow 15-minute app/channel-bound token reaches Expo's persisted header override. Downloads require explicit foreground restart consent or wait for the next app launch; native recovery/anti-bricking remains enabled. See [daily signing, publication and on-phone acceptance](../apps/ios/README.md#daily-signed-app-updates) for local publisher commands, key custody, compatibility/runtime changes, and the release-device test plan. Never put the private manifest signing key in st3 or a gateway.
 
 Keep pairing codes out of logs and Git. Debug-only pairing deep links and an invented-data demo gateway are documented in [the app README](../apps/ios/README.md#build-locally) for development checks. See [Expo local development](https://docs.expo.dev/guides/local-app-development/) for native rebuilds and Metro troubleshooting.

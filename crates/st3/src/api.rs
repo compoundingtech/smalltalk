@@ -58,6 +58,7 @@ use crate::model::{
 use crate::model::{PersonAskRequest, PersonStepResponse};
 use crate::store::Store;
 
+mod app_updates;
 mod client_blobs;
 mod client_adapters;
 mod client_presence;
@@ -453,6 +454,10 @@ pub fn fabric_router(state: AppState) -> Router {
 fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> Router {
     let app = Router::new()
         .route("/v1/health", get(health))
+        .route("/v1/client/app-updates/token", post(app_updates::mint))
+        .route("/v1/client/app-updates/token/revoke", post(app_updates::revoke))
+        .route("/v1/client/app-updates/manifest", get(app_updates::manifest))
+        .route("/v1/client/app-updates/assets/{hash}", get(app_updates::asset))
         .route("/v1/client/capabilities", get(client_capabilities))
         .route("/v1/client/sets", get(owned_sets::list))
         .route("/v1/client/sets/{*id}", get(owned_sets::get))
@@ -860,6 +865,14 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             "/v1/hosts/{host}/agent-workspace",
             get(host_agent_workspace),
         );
+    let app = if matches!(transport, ClientTransportBoundary::Unix) {
+        app.route(
+            "/v1/app-updates/publish",
+            post(app_updates::publish).layer(DefaultBodyLimit::max(app_updates::MAX_REQUEST_BYTES)),
+        )
+    } else {
+        app
+    };
     app.layer(from_fn_with_state(state.clone(), refuse_while_leaving))
         .layer(from_fn_with_state(
             (state.clone(), transport),
@@ -1014,6 +1027,7 @@ async fn response_envelope_unbounded(
         }
     };
     if response.status() == StatusCode::SWITCHING_PROTOCOLS
+        || app_updates::is_protocol_read(&request_path)
         || !response
             .headers()
             .get(axum::http::header::CONTENT_TYPE)

@@ -19,6 +19,7 @@ web-build/
 *.cer
 *.key
 *.pem
+!certs/test-fixture.pem
 *.ipa
 
 # Local render-proof screenshots (which may include device or account details).

@@ -43,6 +43,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "rules",
             "repair",
             "uninstall",
+            "app-updates",
         ],
     ),
     (

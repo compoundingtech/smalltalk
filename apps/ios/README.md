@@ -42,9 +42,9 @@ Conversation and session views, Home rows, requests and answers, device-signing 
 
 For a step-by-step setup, see [build and run the iOS app](../../docs/ios-app.md), including prerequisites, simulator and device builds, and pairing.
 
-First install the shared package's locked dependencies from the repository root: `npm ci --prefix clients/typescript/st3-views --ignore-scripts --no-audit --no-fund`. npm links this local package; it does not install the linked package's dependencies from the phone directory. Then from this directory run `npm ci`, `npm run typecheck`, `npm test`, and `npx expo prebuild --platform ios --clean --no-install`. Install CocoaPods, run `npm run pods` (the wrapper sets `LANG` and `LC_ALL` to `en_US.UTF-8`), and open the generated `ios/smalltalk.xcworkspace` in Xcode. For daily development, build the Debug scheme for an iOS Simulator and run `npm run start` for Metro. Keep normal simulator code signing enabled: building with `CODE_SIGNING_ALLOWED=NO` leaves the app without a usable Keychain, so device pairing fails. A physical device is optional for this development proof.
+First install the shared package's locked dependencies from the repository root: `npm ci --prefix clients/typescript/st3-views --ignore-scripts --no-audit --no-fund`. npm links this local package; it does not install the linked package's dependencies from the phone directory. Then from this directory run `npm ci`, `npm run typecheck`, `npm test`, and `APP_VARIANT=dev npx expo prebuild --platform ios --clean --no-install`. Install CocoaPods, run `npm run pods` (the wrapper sets `LANG` and `LC_ALL` to `en_US.UTF-8`), and open the generated workspace under `ios/` in Xcode. For development, build the Debug scheme for an iOS Simulator and run `npm run start` for Metro. Keep normal simulator code signing enabled: building with `CODE_SIGNING_ALLOWED=NO` leaves the app without a usable Keychain, so device pairing fails. A physical device is optional for this development proof.
 
-For an offline device build, run `npm run export:ios` and build Release with local Apple Development signing and provisioning for that device. The Release bundle is embedded and runs without Metro. No Expo account, EAS service, App Store, or Shareup signing is part of this path.
+For the daily offline device build, prebuild with `APP_VARIANT=daily npx expo prebuild --platform ios --clean --no-install`, install pods, and build Release with local Apple Development signing and provisioning for that device. The Release bundle is embedded and runs without Metro. The plugin records the selected variant in generated `ios/.xcode.env` for both bundle and update-resource build phases; do not override it in `.xcode.env.local`. No Expo account, EAS service, App Store, or Shareup signing is part of this path.
 
 The Debug app accepts a short-lived pairing deep link for headless simulator checks: `com.compoundingtech.smalltalk.starter://pair?gateway=...&id=...&code=...`. The link opens the pairing form with the code prefilled; it does not submit the code until a separately supplied fingerprint or explicit unpinned override is chosen. The handler is disabled in Release. Treat the link as a temporary credential and do not commit or log its populated form.
 
@@ -57,3 +57,90 @@ For screenshots without a real st, `node demoGateway.mjs 8791` serves invented d
 Generated `ios/`, build output, signing material, local configuration, and proof screenshots are ignored by Git. Do not commit Apple team/device IDs, credentials, machine paths, or private network addresses. Expo SDK 57 needs the `expo-build-properties` scene-lifecycle opt-in for Xcode 27/iOS 27.
 
 An opt-in Debug fabric carrier has its own [build and isolated proof instructions](modules/st-fabric/README.md). Default builds do not link it. Its temporary client uses only a native-created loopback listener and leaves the saved Tailscale or LAN gateway unchanged.
+
+## Daily signed app updates
+
+`app.config.js` selects `APP_VARIANT=dev` (the default) or `APP_VARIANT=daily`:
+
+| Variant | Installed identity | Bundle identifier | Updates |
+| --- | --- | --- | --- |
+| `dev` | Smalltalk Dev, amber DEV-badged icon | `com.compoundingtech.smalltalk.starter` | Disabled; Debug/Metro behavior unchanged |
+| `daily` | Smalltalk, ordinary icon | `com.compoundingtech.smalltalk` | Embedded/cached signed bundle; paired-gateway OTA |
+
+The two apps coexist and keep separate Keychain profiles. Changing variants requires a clean prebuild, not just changing the Metro environment. The optional EAS simulator profile selects dev; preview selects daily. Daily requires a Release binary: Expo's update APIs do not run in ordinary Debug/Metro builds. Set `ST_IOS_UPDATES_CERT` to your own public certificate path for daily prebuild, builds and export; without it daily configuration fails closed. Dev requires no update certificate. The plugin carries the public path into the ignored generated `.xcode.env` so Xcode's embedded-bundle phase uses the same certificate configuration.
+
+Daily uses Expo SDK 57 / `expo-updates ~57.0.23`, `checkAutomatically: NEVER`, an inert build-time `Authorization: Bearer unavailable` placeholder, and `nativeVersion` runtime selection. The initial daily runtime is **`0.1.0(1)`**. Increase `ios.buildNumber` in `app.config.js` for **every native dependency, module, configuration, or certificate change**, then rebuild and reinstall. JS/assets-only publications keep the installed runtime; do not override a compatibility mismatch by relabeling an update.
+
+### Authentication and recovery
+
+1. Start immediately from the embedded or previously verified cached bundle. Native startup never anonymously checks the gateway.
+2. Await the existing SecureStore/Keychain profile read (or a completed verified pairing). Missing, locked, invalid or revoked credentials leave the current bundle usable offline.
+3. On an active app, POST `{app:"com.compoundingtech.smalltalk",channel:"daily"}` to the paired gateway's `/v1/client/app-updates/token`, authenticated by the paired credential and requiring `read.app-updates`. Decode the standard st response's `value: {token,expiresAtUnixMs}`.
+4. Set the paired gateway's in-memory update endpoint to `/v1/client/app-updates/manifest?app=com.compoundingtech.smalltalk&channel=daily`. Pass **only** the returned 15-minute, update-read-only, app/channel-bound bearer to Expo's stock `setUpdateRequestHeadersOverride`. Expo applies it to manifests and assets. The broad paired credential is never passed to Expo or persisted in UserDefaults.
+5. Use stock `checkForUpdateAsync` / `fetchUpdateAsync`; Expo verifies the RSA-SHA256 signed exact manifest bytes and asset hashes. Clear the narrow header after the check/download. It can still have existed in UserDefaults: clearing is hygiene, not a Keychain-only guarantee. Tokens expire, are invalidated by parent pairing revocation or daemon restart, and can be explicitly revoked through the paired-only token-revocation endpoint.
+6. Downloading **never automatically reloads active work**. An explicit “Restart now” consent applies it only while foregrounded and still paired to that gateway. “Next launch” keeps the current session untouched. A download that completes in the background offers consent on the next foreground; a normal process restart selects the cached verified update. Failed authentication, incompatible runtimes, invalid signatures and download failures keep the current verified bundle.
+
+SDK 57's [stock URL override](https://docs.expo.dev/eas-update/override/) requires `disableAntiBrickingMeasures` and is intended for previews. **We do not use it.** `plugins/with-paired-app-updates.js` compiles `plugins/native/StPairedGateway.swift` into a source-built EXUpdates pod, exposing the narrow `StAppUpdates.setPairedGateway` bridge. It changes only the in-memory URL, keeps a fixed app/channel cache scope, requires signing/NEVER/embedded recovery, and does not persist the URL or change the certificate, runtime, launch selection or recovery policy. The Expo header/check/fetch/reload APIs remain stock. The plugin rejects a non-SDK-57 dependency until this integration is reviewed. Do not set `disableAntiBrickingMeasures`, disable embedded updates, or use the preview override to work around pairing.
+
+Source compilation is selected by `expo.autolinking.ios.buildFromSource` in `package.json` and the Podfile source opt-in. The native bridge and JS session accept only a bare gateway origin (no reverse-proxy path prefix); all update routes are fixed root paths.
+
+See [SDK 57 updates](https://docs.expo.dev/versions/v57.0.0/sdk/updates/), [download controls](https://docs.expo.dev/eas-update/download-updates/), and [code signing](https://docs.expo.dev/eas-update/code-signing/).
+
+### Local signing and publication
+
+Every deployer owns their own signing identity. This public repository does **not** ship an operator's verification certificate or private key. `ST_IOS_UPDATES_CERT` is a required daily-build setting and is resolved at prebuild to the deployer's public certificate; missing configuration or an unreadable file fails the build rather than shipping unsigned OTA. The private counterpart belongs only to the publisher's approved credential store (password manager or KMS), never tracked source, st3, a gateway or an export. Record its ownership, location and rotation in that private inventory.
+
+From `apps/ios`, generate your own pair locally using Expo's code-signing utility. Set `SIGNING_DIR` to an approved private directory outside tracked source first; no Expo/EAS account is needed:
+
+```sh
+umask 077
+mkdir -p "$SIGNING_DIR"
+npx expo-updates codesigning:generate \
+  --key-output-directory "$SIGNING_DIR" \
+  --certificate-output-directory "$SIGNING_DIR" \
+  --certificate-validity-duration-years 10 \
+  --certificate-common-name "Your Organization"
+export ST_IOS_UPDATES_CERT="$SIGNING_DIR/certificate.pem"
+APP_VARIANT=daily npx expo prebuild --platform ios --clean --no-install
+```
+
+The public certificate is embedded in the native daily binary; the signing key remains outside the repo. Losing or rotating the key or certificate requires incrementing daily `buildNumber`, rebuilding/installing and targeting the new runtime. The gateway preserves exact signed bytes and headers; it never needs the private key and does not perform the device's cryptographic verification. `certs/test-fixture.pem` is a **throwaway configuration-test fixture only** (OpenSSL RSA-2048, CN=Smalltalk Test Fixture Only; its newly generated private key was discarded directly to `/dev/null`). Never select it for a deployed build: there is no retained publishing key for it.
+
+The test fixture is generated, not hand-edited: LibreSSL 3.3.6 on 2026-10-07, RSA-2048 with fresh throwaway entropy, digital-signature/code-signing usage and a 3650-day lifetime. Its SHA-256 is `ef35e28fae28972b20c8cfea0729ab114d45400a3daad2449721c917eec8dd80`. From the repository root, regeneration is:
+
+```sh
+openssl req -x509 -newkey rsa:2048 -nodes -keyout /dev/null \
+  -out apps/ios/certs/test-fixture.pem -days 3650 \
+  -subj '/CN=Smalltalk Test Fixture Only' \
+  -addext 'keyUsage=critical,digitalSignature' -addext 'extendedKeyUsage=codeSigning'
+```
+
+Regeneration intentionally creates a different throwaway identity: update this fingerprint and never reuse the fixture as a deployed identity.
+
+From `apps/ios`, export and sign for the origin the paired phone actually uses:
+
+```sh
+export ST_IOS_UPDATES_CERT="$SIGNING_DIR/certificate.pem"
+APP_VARIANT=daily npm run export:ios -- --output-dir dist
+APP_VARIANT=daily npx expo config --type public --json > dist/expo-config.json
+node scripts/sign-app-update.mjs --dir dist \
+  --app com.compoundingtech.smalltalk --channel daily \
+  --origin https://gateway.example --runtime-version '0.1.0(1)' \
+  --private-key "$SIGNING_DIR/private-key.pem" --expo-config dist/expo-config.json
+st app-updates publish --app com.compoundingtech.smalltalk --channel daily --dir dist
+```
+
+Replace the example origin and runtime with the paired gateway origin and installed binary runtime. The helper generates `manifest.json` (exact Expo v1 signed bytes), `manifest.signature` (the structured `expo-signature` header, keyid `main`), and `publication.json` (asset hash/content-type/export-relative-path index) beside Expo's exported files. Expo bundler asset keys are preserved; manifest asset hashes are unpadded base64url SHA-256 and authenticated asset URLs use lowercase hex SHA-256. Never modify the manifest after signing. Manifest and assets must use the same authenticated origin; the backend refuses a Host/origin mismatch rather than redirecting credentials.
+
+The CLI publishes only through st's local Unix socket, importing JSON/base64 manifest/signature/assets into immutable durable storage before promoting the channel head. No client-gateway credential, even full-control, may publish. Use `--ref <branch/ref>` for an explicit branch publication and `--expected-head <update-UUID>` as a channel-head fence. Publication retains all published manifest/asset references; the node rejects capacity beyond 2 GiB or 10,000 publications per channel instead of deleting referenced objects.
+
+Local orchestration—not this public app—watches each merge to main, serializes publication and prevents stale jobs overwriting a newer selection. An explicit branch publish is selected until the next main publication. A native mismatch leaves the last compatible update available and emits the deduplicated local `app-update.native-build-required` observation; the local watcher notifies its configured maintainer, who owns Apple signing/build/install access. st3 does not build native binaries.
+
+### On-phone acceptance plan
+
+After repository checks, install both variants with normal signing. Dev must retain Metro/pairing behavior and show its DEV badge; daily must launch its embedded Release bundle with Metro stopped and the gateway unreachable. Pair daily with a device granted `read.app-updates`, publish one correctly signed compatible update and confirm narrow authorization is used for both manifest and asset reads. Decline the reload prompt during a conversation or terminal session: nothing reloads or loses active work; restart explicitly or cold-launch and confirm the new update ID. Background during download: no reload happens, and consent is offered only after foreground.
+
+Exercise missing/locked Keychain credentials, revoked pairing, expired token, daemon restart, offline launch, wrong signing key, altered manifest bytes, altered asset bytes, origin mismatch and a mismatched native runtime. Each must retain a usable embedded/cached bundle without anonymous fallback. Re-pair during an in-flight mint/download and ensure stale credentials cannot set headers or trigger consent. Publish a broken-but-signed JS update and verify Expo recovers to a working cached/embedded bundle with anti-bricking enabled. Change the native certificate/buildNumber, reinstall, and ensure the old runtime cannot displace the new one. These are release-device/native acceptance checks, not claims that Node unit tests prove native recovery.
+
+`appUpdates.unit.test.mjs` covers hydration ordering, narrow-header confinement, expiration/revocation failures, serialization/re-pair fencing, consent/background safety, header clearing and foreground refresh; `appConfig.unit.test.mjs` covers both variants, recovery/signing defaults and failure without an operator certificate. The DEV icon is generated, not hand-edited: regenerate on macOS with `swift scripts/generate-dev-icon.swift assets/icon.png assets/icon-dev.png`. Its source icon SHA-256 is `267eef3f93327ee1825f2cf480f61c1c466474140b962227b8b44f5aab964aec`; generator inputs are that image, CoreGraphics/ImageIO/CoreText and Helvetica-Bold on macOS, plus the badge geometry/colors in the script.
+

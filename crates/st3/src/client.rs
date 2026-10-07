@@ -1259,6 +1259,8 @@ fn request_deadline(path: &str, deadlines: ClientDeadlines) -> Duration {
         || path.starts_with("/v1/internal/replication/receive")
         || path.starts_with("/v1/internal/replication/checkpoint")
         || path.starts_with(crate::peer::CLIENT_READ_FORWARD_PATH)
+        // An app update publish carries up to 128 MiB of assets over the local socket.
+        || path == "/v1/app-updates/publish"
     {
         // A forwarded client read is bounded by the relay's own per-hop timeouts.
         deadlines.bulk

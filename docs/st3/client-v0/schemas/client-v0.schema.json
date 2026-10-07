@@ -2144,6 +2144,31 @@
         "arrangement_revision": { "$ref": "#/$defs/Revision" }
       }
     },
+    "AppUpdateTarget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["app", "channel"],
+      "properties": {
+        "app": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._-]+$" },
+        "channel": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._-]+$" }
+      }
+    },
+    "AppUpdateToken": {
+      "description": "Short-lived, app/channel-only bearer; pairing revocation and daemon restart also revoke it.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["token", "expiresAtUnixMs"],
+      "properties": {
+        "token": { "type": "string" },
+        "expiresAtUnixMs": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "AppUpdateTokensRevoked": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["revoked"],
+      "properties": { "revoked": { "type": "boolean" } }
+    },
     "PairingBegin": {
       "type": "object",
       "additionalProperties": false,
@@ -2158,7 +2183,7 @@
           "minItems": 1,
           "uniqueItems": true,
           "description": "Narrows the default limited grant. Must not be combined with full_control.",
-          "items": { "type": "string", "enum": ["read.projections", "read.glasses", "control.glasses", "terminal.read", "control.attention", "control.launches"] }
+          "items": { "type": "string", "enum": ["read.projections", "read.app-updates", "read.glasses", "control.glasses", "terminal.read", "control.attention", "control.launches"] }
         }
       }
     },
