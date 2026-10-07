@@ -1,0 +1,121 @@
+@import 'tailwindcss';
+
+@theme inline {
+  --color-canvas: var(--canvas);
+  --color-panel: var(--panel);
+  --color-recess: var(--recess);
+  --color-ink: var(--ink);
+  --color-muted: var(--muted);
+  --color-line: var(--line);
+  --color-accent: var(--accent);
+  --color-on-accent: var(--on-accent);
+  --color-selection: var(--selection);
+  --color-good: var(--good);
+  --color-warning: var(--warning);
+  --color-danger: var(--danger);
+  --color-added: var(--added);
+  --color-removed: var(--removed);
+  --font-sans: var(--sans);
+  --font-display: var(--display);
+  --font-mono: var(--mono);
+  --radius-control: var(--radius);
+  --radius-panel: var(--panel-radius);
+  --spacing-unit: var(--space);
+  --spacing-control: var(--control-height);
+  --text-chrome: var(--chrome-size);
+  --default-transition-duration: var(--motion-duration);
+  --default-transition-timing-function: var(--motion-curve);
+}
+
+/* Independently authored palettes. System fonts only; no downloaded assets. */
+[data-direction='folio'] {
+  --canvas: #efeae1; --panel: #fffcf6; --recess: #e9e1d5;
+  --ink: #302a31; --muted: #645765; --line: #cec0cd;
+  --accent: #674577; --on-accent: #ffffff; --selection: #e8dced;
+  --good: #28644b; --warning: #815314; --danger: #a03543;
+  --added: #e0eee1; --removed: #f5e0e1;
+  --sans: 'Trebuchet MS', sans-serif; --display: Georgia, serif;
+  --mono: 'Courier New', ui-monospace, monospace;
+  --radius: 5px; --panel-radius: 10px;
+  --motion-duration: 180ms; --motion-curve: cubic-bezier(.2,.7,.2,1);
+  --density-bias: 1px;
+}
+[data-direction='folio'][data-scheme='dark'] {
+  --canvas: #211d24; --panel: #2b252e; --recess: #362e38;
+  --ink: #f5ede9; --muted: #c9bac9; --line: #685568;
+  --accent: #d0ade5; --on-accent: #261a30; --selection: #50395d;
+  --good: #a0d2b6; --warning: #efc487; --danger: #f3a1af;
+  --added: #263d30; --removed: #4b2c38;
+}
+[data-direction='relay'] {
+  --canvas: #e6eff0; --panel: #f8fcfc; --recess: #dce9ea;
+  --ink: #183438; --muted: #426368; --line: #a3bfc2;
+  --accent: #006874; --on-accent: #ffffff; --selection: #c9e5e7;
+  --good: #17603d; --warning: #855208; --danger: #a62c46;
+  --added: #d9eddf; --removed: #f4dfe5;
+  --sans: Arial, sans-serif; --display: Arial, sans-serif;
+  --mono: 'Lucida Console', ui-monospace, monospace;
+  --radius: 2px; --panel-radius: 2px;
+  --motion-duration: 90ms; --motion-curve: linear;
+  --density-bias: -1px;
+}
+[data-direction='relay'][data-scheme='dark'] {
+  --canvas: #102428; --panel: #173136; --recess: #203e43;
+  --ink: #e8f6f5; --muted: #abc8cc; --line: #4d777d;
+  --accent: #78dae3; --on-accent: #0c2c31; --selection: #28565e;
+  --good: #96dcb3; --warning: #e7bf74; --danger: #f2a2b5;
+  --added: #214a37; --removed: #4e2c3e;
+}
+[data-direction='orbit'] {
+  --canvas: #e7eaf5; --panel: #fafbff; --recess: #e0e5f4;
+  --ink: #273455; --muted: #536286; --line: #b1bbd5;
+  --accent: #78491e; --on-accent: #ffffff; --selection: #f1dfc3;
+  --good: #22664e; --warning: #78491e; --danger: #a53653;
+  --added: #dcefe8; --removed: #f5e0e9;
+  --sans: Verdana, sans-serif; --display: Verdana, sans-serif;
+  --mono: Consolas, ui-monospace, monospace;
+  --radius: 14px; --panel-radius: 20px;
+  --motion-duration: 240ms; --motion-curve: cubic-bezier(.16,1,.3,1);
+  --density-bias: 2px;
+}
+[data-direction='orbit'][data-scheme='dark'] {
+  --canvas: #182039; --panel: #222e4b; --recess: #2c3a59;
+  --ink: #f2f3fe; --muted: #bac6e4; --line: #63749b;
+  --accent: #f0bf79; --on-accent: #34230d; --selection: #51462f;
+  --good: #99d9c0; --warning: #f0bf79; --danger: #f1a6c2;
+  --added: #26493e; --removed: #512e47;
+}
+[data-density='compact'] {
+  --space: calc(5px + var(--density-bias));
+  --control-height: calc(28px + var(--density-bias));
+  --chrome-size: 12px;
+}
+[data-density='comfortable'] {
+  --space: calc(8px + var(--density-bias));
+  --control-height: calc(36px + var(--density-bias));
+  --chrome-size: 13px;
+}
+[data-workshop] { color-scheme: light; }
+[data-workshop][data-scheme='dark'] { color-scheme: dark; }
+[data-focus-visible], [data-workshop] :focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 3px;
+}
+[data-workshop] ::selection { background: var(--selection); }
+@media (prefers-reduced-motion: reduce) {
+  [data-workshop], [data-workshop] * { --motion-duration: 0ms; }
+}
+
+/* Unlayered overrides: theme-inline font utilities resolve at :root, before a
+   direction is set, so pin the families onto the active direction instead. */
+.font-sans { font-family: var(--sans); }
+.font-display { font-family: var(--display); }
+.font-mono { font-family: var(--mono); }
+.tabular { font-variant-numeric: tabular-nums; }
+
+@keyframes fui-spin { to { transform: rotate(360deg); } }
+@keyframes fui-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+.fui-spin { animation: fui-spin var(--motion-duration, 180ms) linear infinite; }
+.fui-pulse { animation: fui-pulse calc(var(--motion-duration, 180ms) * 3) ease-in-out infinite; }
+@media (prefers-reduced-motion: reduce) {
+  .fui-spin, .fui-pulse { animation: none; }
+}
