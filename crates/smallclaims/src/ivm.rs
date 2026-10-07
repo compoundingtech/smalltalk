@@ -22,6 +22,7 @@ use crate::{ClaimRecord, store::canonical};
 pub mod claim_source;
 pub mod events;
 pub mod install;
+pub mod installed;
 pub mod runtime;
 mod source_gap;
 
@@ -275,6 +276,13 @@ pub enum RepairPolicy {
 /// Repeated (key,register) writes in one atomic claim use the last write, as operations do.
 pub trait View: Send + Sync {
     fn definition(&self) -> Definition;
+    /// Explicit namespace operator registration. The matching Installer operator must have
+    /// this source, the same name and the same raw definition fingerprint. Such views use
+    /// namespace callbacks exclusively; ordinary claim/local callbacks are not dispatched.
+    fn installed_source(&self) -> Option<&'static str> {
+        None
+    }
+
     fn repair_policy(&self) -> RepairPolicy {
         RepairPolicy::RetainOriginal
     }
@@ -455,7 +463,7 @@ impl Views {
         for (index, view) in views.iter().enumerate() {
             let definition = view.definition();
             use sha2::{Digest, Sha256};
-            fingerprints.push(hex::encode(Sha256::digest(serde_json::to_vec(&(
+            let legacy_fingerprint = hex::encode(Sha256::digest(serde_json::to_vec(&(
                 LAYOUT,
                 definition.name,
                 definition.fingerprint,
@@ -463,7 +471,18 @@ impl Views {
                 definition.local_kinds,
                 definition.max_contributions,
                 format!("{:?}", view.repair_policy()),
-            ))?)));
+            ))?));
+            fingerprints.push(match view.installed_source() {
+                Some(source) => {
+                    ensure!(!source.is_empty(), "empty installed view source");
+                    hex::encode(Sha256::digest(serde_json::to_vec(&(
+                        installed::LAYOUT,
+                        legacy_fingerprint,
+                        source,
+                    ))?))
+                }
+                None => legacy_fingerprint,
+            });
             ensure!(
                 !definition.name.is_empty() && !definition.fingerprint.is_empty(),
                 "empty view identity"
@@ -476,19 +495,25 @@ impl Views {
                     !kind.is_empty() && !kind.contains('*') && local_kinds.insert(kind),
                     "invalid/duplicate current-source kind"
                 );
-                local.entry(kind).or_default().push(index);
+                if view.installed_source().is_none() {
+                    local.entry(kind).or_default().push(index);
+                }
             }
             let mut kinds = BTreeSet::new();
             for &kind in definition.kinds {
                 ensure!(kinds.insert(kind), "duplicate input kind");
                 if kind == "custom.*.*" {
-                    custom.push(index);
+                    if view.installed_source().is_none() {
+                        custom.push(index);
+                    }
                 } else {
                     ensure!(
                         !kind.is_empty() && !kind.contains('*'),
                         "unsupported input pattern"
                     );
-                    exact.entry(kind).or_default().push(index);
+                    if view.installed_source().is_none() {
+                        exact.entry(kind).or_default().push(index);
+                    }
                 }
             }
         }
@@ -617,12 +642,7 @@ impl Views {
     /// source admission and the existing output/cut/generations; committed availability and
     /// changed error evidence advance independently. Repeating the same fence is a no-op.
     /// No recovery or Ready publication is implied; a missing view remains unavailable too.
-    pub fn fence(
-        &self,
-        transaction: &Transaction<'_>,
-        name: &str,
-        reason: &str,
-    ) -> Result<()> {
+    pub fn fence(&self, transaction: &Transaction<'_>, name: &str, reason: &str) -> Result<()> {
         ensure!(
             self.views.iter().any(|view| view.definition().name == name),
             "unknown IVM view"
@@ -1088,6 +1108,17 @@ impl Views {
         if !ready {
             return Ok(Readiness::Fenced);
         }
+        if let Some(source) = self.views[index].installed_source() {
+            let state = installed::readiness(
+                connection,
+                name,
+                source,
+                self.views[index].definition().fingerprint,
+            )?;
+            if let Some(state) = state {
+                return Ok(state);
+            }
+        }
         Ok(Readiness::Ready(Token {
             fingerprint,
             epoch,
@@ -1204,6 +1235,15 @@ impl Views {
         register: &str,
         epoch: u64,
     ) -> Result<RegisterEvidence> {
+        ensure!(
+            self.views
+                .iter()
+                .find(|v| v.definition().name == name)
+                .context("unknown IVM view")?
+                .installed_source()
+                .is_none(),
+            "namespace-installed view has no legacy register relation; use installed_root"
+        );
         let readiness = self.readiness(connection, name, epoch)?;
         let expected=connection.query_row(
             "SELECT value,claim_id,rank FROM ivm_contributions WHERE view=?1 AND key=?2 AND register=?3 ORDER BY rank DESC,claim_id DESC LIMIT 1",
