@@ -84,7 +84,13 @@ def run_case(binary: str, ending: str, endpoint: str | None = None) -> None:
                     break
         return bytes(output), time.monotonic() - started
 
-    initial, first_frame = wait_for(b"\x1b[?1049h" if ending == "panic" else FIRST_FRAME, 2)
+    marker = b"\x1b[?1049h" if ending == "panic" else FIRST_FRAME
+    initial, first_frame = wait_for(marker, 2)
+    # wait_for returns its elapsed time whether or not the marker came, so a stale marker would
+    # read as a slow first frame (as it did when the top bar lost its label); say what is missing.
+    assert marker in (initial if marker.startswith(b"\x1b") else plain(initial)), (
+        f"first frame marker {marker!r} was not seen in 2 s"
+    )
     assert first_frame < 1, f"first frame took {first_frame:.3f}s"
     if ending != "panic":
         assert b"\x1b[?1000h" in captured, "mouse capture was not enabled"
