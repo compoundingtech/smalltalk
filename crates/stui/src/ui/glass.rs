@@ -5027,7 +5027,8 @@ mod tests {
             shown.contains("ctrl+k open") && shown.contains("tab tabs") && shown.contains("? help"),
             "the footer: {shown}"
         );
-        assert!(!shown.contains("q quit"), "{shown}");
+        // A bare q does not quit here (letters type); only Ctrl+Q does.
+        assert!(!shown.contains(" q quit") && shown.contains("ctrl+q quit"), "{shown}");
         // Leaving the box keeps the draft; the next letter goes on typing into it.
         typed(&mut ui, "!");
         assert!(ui.editing);
