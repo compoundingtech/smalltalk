@@ -474,6 +474,32 @@ fn source_rollback_logical_unsupported_and_selected_query_plans() {
         Coverage::Unsupported(_)
     ));
     assert_eq!(rows(&tx, &ns, &agents, at).unwrap(), before);
+    changed["agentless"] = source.steps[subject]["agentless"].clone();
+    changed["title"] = json!({"tagged_blob":"00"});
+    assert!(matches!(
+        replace_step(&tx, &ns, subject, Some(&changed)).unwrap(),
+        Coverage::Unsupported(_)
+    ));
+    changed["title"] = source.steps[subject]["title"].clone();
+    changed["goals"] = json!("not JSON");
+    assert!(matches!(
+        replace_step(&tx, &ns, subject, Some(&changed)).unwrap(),
+        Coverage::Unsupported(_)
+    ));
+    changed["goals"] = source.steps[subject]["goals"].clone();
+    changed["updated_at_unix_ms"] = json!("not a timestamp");
+    assert!(matches!(
+        replace_step(&tx, &ns, subject, Some(&changed)).unwrap(),
+        Coverage::Unsupported(_)
+    ));
+    let (run, raw) = source.runs.iter().next().unwrap();
+    let mut invalid_run = raw.clone();
+    invalid_run["mission_id"] = json!({"tagged_blob":"00"});
+    assert!(matches!(
+        replace_run(&tx, &ns, run, Some(&invalid_run)).unwrap(),
+        Coverage::Unsupported(_)
+    ));
+    assert_eq!(rows(&tx, &ns, &agents, at).unwrap(), before);
     // Logical gaps are returned to the shared source owner, which can commit and fence.
     tx.commit().unwrap();
     let plan = writer

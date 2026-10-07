@@ -23,6 +23,11 @@ that run's old/new generation worklists. Assignee and claimant changes invalidat
 both old and new public agents. No run_generations dependency is inferred here:
 the existing queue reader uses the projected current-generation selector.
 The full agent card's operational state has its separate canonical dependency.
+Installation includes historical projected step rows: earliest run-join time
+uses all generations, while live membership uses current-generation counters.
+Captured label SQL types, goal JSON and updated-time values must decode exactly
+as the existing strict label accessor; invalid values return Unsupported at
+the replacement seam instead of a later formatter error.
 
 `replace_claim` accepts the owner's normalized canonical row:
 `{id,subject,kind,rank:[byte,...],body:<complete claim JSON>,eligible:bool}`.

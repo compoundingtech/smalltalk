@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Fence malformed captured agent queue label values at the source replacement seam",
+  "replay": {
+    "status": "none",
+    "detail": "No startup replay, backfill or default activation changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No table, index, trigger or schema version changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rule or digest changes."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "No public route, protocol, pagination or default Store reader changes. Explicit namespace callers receive Unsupported before storing malformed label SQL types, goal JSON or timestamps; valid existing semantics remain unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No restart or additional interruption is introduced."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No default installation or user action is required. The composing owner maps Unsupported to its existing source/Root/Views fence."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "The existing source-gap recovery and explicit namespace installation contract remain required; no new recovery procedure or private namespace rewrite is added."
+  }
+}

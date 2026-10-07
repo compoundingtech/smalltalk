@@ -185,6 +185,11 @@ pub(crate) fn replace_step(
                 text(new, "subject")? == subject,
                 "queue step PK reassignment must retract then insert"
             );
+            // Reject values the existing label SQL accessor cannot decode at the writer
+            // seam, so the source owner can fence without rejecting source admission.
+            optional_text(new, "title")?;
+            let _: Vec<String> = serde_json::from_str(text(new, "goals")?)?;
+            let _: u128 = text(new, "updated_at_unix_ms")?.parse()?;
             let path = text(new, "step_path")?;
             anyhow::ensure!(
                 path.len() <= 1024,
@@ -266,6 +271,7 @@ pub(crate) fn replace_run(
                 text(new, "id")? == run,
                 "queue run PK reassignment must retract then insert"
             );
+            text(new, "mission_id")?;
             Ok((
                 text(new, "current_generation_id")?,
                 text(new, "status")?,
