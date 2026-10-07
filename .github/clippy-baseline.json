@@ -33,7 +33,7 @@
       "clippy::needless_return": 2,
       "clippy::redundant_closure": 1,
       "clippy::too_many_arguments": 3,
-      "clippy::type_complexity": 10,
+      "clippy::type_complexity": 9,
       "clippy::unnecessary_get_then_check": 1,
       "clippy::unnecessary_lazy_evaluations": 1,
       "clippy::useless_format": 1
