@@ -386,7 +386,7 @@ def judge(proof):
         if proof["incarnation_before"] is None or proof["incarnation_before"] != proof["incarnation_after"]:
             failures.append("runtime incarnation changed after the fault")
     if proof["case"] == "handoff-failed":
-        for field in ("failed_path_visible", "failed_doctor_visible", "failed_sender_visible"):
+        for field in ("failed_path_visible", "unchecked_doctor_visible", "failed_sender_visible"):
             if not proof.get(field):
                 failures.append(f"blocked handoff was not visible: {field}")
     if proof["case"] in RECOVERY_CASES:
@@ -567,14 +567,13 @@ agent "fault-probe" {{
             # counts: scheduling can put the third failure before five seconds.
             await until(old_enough, 20)
             blocked_agent = await agent(target)
-            # Doctor also links a scratch crate, with a ten-second build deadline.
             blocked_doctor = await target.api("/v1/doctor", timeout=30)
             blocked_sender = await source.api("/v1/messages/delivery/" + subject)
             write_json(directory / "blocked-agent.json", blocked_agent)
             write_json(directory / "blocked-doctor.json", blocked_doctor)
             write_json(directory / "blocked-sender.json", blocked_sender)
             result["failed_path_visible"] = blocked_agent.get("delivery", {}).get("state") == "stale"
-            result["failed_doctor_visible"] = any(row.get("name") == "message-delivery" and row.get("status") == "warn"
+            result["unchecked_doctor_visible"] = any(row.get("name") == "message-delivery" and row.get("status") == "unknown" and "evidence incomplete" in row.get("message", "")
                 for row in (blocked_doctor or {}).get("checks", []))
             result["failed_sender_visible"] = (blocked_sender or {}).get("delivery", {}).get("state") == "waiting"
             (target.root / "ws/handoff-blocked").unlink()

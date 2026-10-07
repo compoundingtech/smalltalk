@@ -369,6 +369,9 @@ st repair apply --help
 
 Apply nothing unless the dry-run reports a real, understood plan. Check pass/warn/fail semantics,
 exit status, evidence, remediation, stable repair classes, approval token, and zero-change retry.
+Doctor lists unchecked invariants by name as `unknown` in text and JSON. `--strict` fails on
+computed warnings and errors; it excludes unknown checks until maintained views cover them.
+A strict success therefore certifies only the computed checks.
 
 ### 13. `replication` — prove fleet convergence
 
@@ -569,3 +572,17 @@ The walkthrough is complete when every public path above has a recorded disposit
 bug has reproducible evidence, and the entire agreed finding set is encoded in one autonomous
 follow-up mission. The walkthrough itself does not rename the repository or begin TUI/iOS
 implementation.
+
+An explicit full audit runs only on a frozen private database copy:
+
+```sh
+st doctor --offline-audit /private/copy.sqlite3 --audit-scratch-dir /scratch/audits --strict --json
+```
+
+Include the copy's WAL when present. The command requires an explicit scratch directory;
+choose a filesystem with room for the copy, snapshot and replay oracle. It refuses the
+configured live database and inode aliases, preserves the input, and contacts no daemon or
+network. Unsupported checks stay named `unknown`; strict fails on computed warnings or
+failures, and success certifies only computed checks. SIGINT, SIGTERM and SIGHUP clean up
+private scratch. SIGKILL or a host crash can leave capped scratch files; remove a leftover
+`st3-offline-command-*` directory only after its audit process has stopped.

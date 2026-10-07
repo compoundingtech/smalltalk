@@ -840,7 +840,7 @@ without checkpoints. Three days after a checkpoint became due, a participant ask
 `st now` to bring the machine back or excuse it:
 
 ```sh
-st replication checkpoint status                  # the newest stable checkpoint, and who sealed the next
+st replication checkpoint status                  # evidence incomplete: unknown, exit 2
 st replication checkpoint plan --cut 2026-09-27    # what it would drop here, proved on a copy
 st replication checkpoint excuse node-c --reason "away for a week" --as person/operator
 ```
@@ -857,7 +857,10 @@ answer stays the same, and the nodes still agree with each other. Person and mis
 never dropped, so they are never forgotten. Issue #1052 tracks keeping those tombstones too.
 
 When verifications differ, that checkpoint never becomes stable, and the next due checkpoint
-tries again. `status` names which digests differ for each participant. Seals that differ in
+tries again. Until maintained comparison evidence is integrated, `status` returns an
+`evidence incomplete` error (HTTP 503, `comparison_state=uncomputed`) and exits 2 for
+all clients. It does not seal or start an audit, and it does not mean the daemon is down.
+No participant digest comparison is certified by this response. Seals that differ in
 `rules` mean the nodes run builds with different checkpoint rules; they wait until every
 participant runs the same rules.
 

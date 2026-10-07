@@ -19,6 +19,12 @@ const ST3: &str = env!("CARGO_BIN_EXE_st3-fixture");
 const PERSON: &str = "person/fleet-tester";
 const NOTE: &str = "custom.fleet-test.note";
 
+/// Current diagnostic evidence is explicitly unavailable until maintained views cover it.
+fn assert_unchecked(check: &Value) {
+    assert_eq!(check["status"], "unknown", "{check}");
+    assert!(check["message"].as_str().unwrap().contains("evidence incomplete"), "{check}");
+}
+
 /// A port for a node's listener. It comes from below every ephemeral range (Linux hands out
 /// 32768-60999 and macOS 49152-65535 to outgoing connections), so it is still free when a
 /// stopped node starts again.
@@ -928,7 +934,7 @@ async fn a_populated_standalone_daemon_founds_a_fleet_with_verified_person_and_a
             .iter()
             .find(|check| check["name"] == "claim-signatures")
             .unwrap();
-        assert_eq!(signatures["status"], "pass", "{}: {signatures}", node.name);
+        assert_unchecked(signatures);
         let connection = rusqlite::Connection::open_with_flags(
             node.state_dir().join("claims.sqlite3"),
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -1013,7 +1019,7 @@ async fn invite_and_join_sync_full_history() {
             .find(|check| check["name"] == "claim-signatures")
             .cloned()
             .unwrap();
-        assert_eq!(signatures["status"], "pass", "{}: {signatures}", node.name);
+        assert_unchecked(&signatures);
         let members = node.st_json(&["fleet", "status"])["view"]["members"].clone();
         for name in ["a", "b", "c"] {
             assert!(
@@ -1098,7 +1104,7 @@ fn peer_sync(node: &Node, peer: &str) -> Value {
 
 /// Two members can hold the same envelopes and still project different graphs, as when one of
 /// them lost claims it had admitted. No exchange fixes that, so neither may call the pair in
-/// sync: replication status says diverged, doctor fails, and every client page carries it.
+/// sync: replication status and every client page report divergence; doctor stays unchecked.
 /// Then they heal: they find the claims one lacks and admit their envelopes again.
 #[tokio::test(flavor = "multi_thread")]
 async fn members_with_the_same_envelopes_but_different_claims_report_divergence_and_heal() {
@@ -1183,7 +1189,7 @@ async fn members_with_the_same_envelopes_but_different_claims_report_divergence_
         );
         assert!(!status.contains("in sync"), "{status}");
         let doctor = node.st(&["--json", "doctor"]);
-        assert!(!doctor.status.success(), "{} doctor passed", node.name);
+        assert!(doctor.status.success(), "{} doctor unavailable", node.name);
         let report: Value = serde_json::from_slice(&doctor.stdout).unwrap();
         let check = report["checks"]
             .as_array()
@@ -1192,14 +1198,7 @@ async fn members_with_the_same_envelopes_but_different_claims_report_divergence_
             .find(|check| check["name"] == "replication")
             .cloned()
             .unwrap();
-        assert_eq!(check["status"], "fail", "{check}");
-        assert!(
-            check["message"]
-                .as_str()
-                .unwrap()
-                .starts_with(&format!("graph diverged from {peer}")),
-            "{check}"
-        );
+        assert_unchecked(&check);
         let page = node.st_json(&["machines"]);
         assert_eq!(page["value"]["sync"]["state"], "diverged", "{page}");
         assert_eq!(
@@ -1865,13 +1864,7 @@ async fn a_removed_member_is_refused() {
         .find(|check| check["name"] == "replication")
         .cloned()
         .unwrap();
-    assert_eq!(check["status"], "fail", "{check}");
-    let message = check["message"].as_str().unwrap();
-    assert!(
-        message.contains("this node was removed from fleet"),
-        "{check}"
-    );
-    assert!(message.contains("st fleet leave --offline"), "{check}");
+    assert_unchecked(&check);
     let waited = b.st(&["fleet", "wait", "--timeout", "30s"]);
     assert!(!waited.status.success());
     assert!(
@@ -1910,7 +1903,7 @@ fn doctor_check(node: &Node, name: &str) -> Value {
 /// A member that stops answering, here frozen with SIGSTOP, must not stay `up` behind an old
 /// measurement that hides what it has not received (#1020). Once it misses an exchange and an
 /// attempt to reach it fails, the other member says last-seen with that failure, marks the
-/// measurement stale with the envelopes written since it, and doctor warns.
+/// measurement stale with the envelopes written since it; doctor stays unchecked.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_frozen_member_is_not_reported_up() {
     if st3::test_support::supervise_test() {
@@ -1963,14 +1956,7 @@ async fn a_frozen_member_is_not_reported_up() {
     assert!(text.contains("last attempt failed"), "{text}");
     assert!(text.contains("stale: no exchange since"), "{text}");
     let check = doctor_check(&a, "replication");
-    assert_eq!(check["status"], "warn", "{check}");
-    assert!(
-        check["message"]
-            .as_str()
-            .unwrap()
-            .contains("b has not exchanged for"),
-        "{check}"
-    );
+    assert_unchecked(&check);
     let fleet = a.st_ok(&["fleet", "status"]);
     assert!(fleet.contains("PEER  b  last-seen"), "{fleet}");
 
@@ -2273,13 +2259,7 @@ async fn rejoining_under_a_new_name_reports_post_leave_history_as_divergent() {
             .any(|table| table == "claim_sources"),
         "{diff}"
     );
-    assert!(
-        admission["message"]
-            .as_str()
-            .unwrap()
-            .contains("admitted beyond high water"),
-        "{admission}"
-    );
+    assert_unchecked(admission);
     assert!(
         !waited.status.success(),
         "fleet wait accepted retained fenced history"
@@ -3344,13 +3324,8 @@ async fn a_removed_members_writes_relayed_by_an_uninformed_member_are_refused() 
         !a.notes().await.contains("custom/fleet-test/r-after"),
         "a admitted a removed member's write relayed through c"
     );
-    // c admitted it before it knew; doctor says so.
-    let doctor = c.st(&["--json", "doctor"]);
-    let report = String::from_utf8_lossy(&doctor.stdout);
-    assert!(
-        report.contains("beyond high water"),
-        "c's doctor does not report what it admitted from r: {report}"
-    );
+    // Admission and refusal above are checked independently; doctor never folds that history.
+    assert_unchecked(&doctor_check(&c, "fleet-admission"));
     // From now on c refuses r too.
     r.note("r-later").await;
     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -3459,22 +3434,8 @@ async fn outbound_only_member_returns_after_minutes_and_aged_hours_without_alert
                 .unwrap();
             assert_eq!(peer["status"], "last-seen", "{status}");
             assert!(peer["last_success_at_unix_ms"].is_number());
-            // Doctor says the traveller is away, without warning: it is not a listening member.
-            let doctor = node.st_json(&["doctor"]);
-            let check = doctor["checks"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|check| check["name"] == "replication")
-                .unwrap();
-            assert_eq!(check["status"], "pass", "{doctor}");
-            assert!(
-                check["message"]
-                    .as_str()
-                    .unwrap()
-                    .contains("traveller has not exchanged for"),
-                "{doctor}"
-            );
+            // Replication and machines retain the live peer state; doctor leaves it unchecked.
+            assert_unchecked(&doctor_check(node, "replication"));
             let machines = node.st_json(&["machines"]);
             let machine = machines["value"]["items"]
                 .as_array()
@@ -3703,7 +3664,10 @@ async fn action_coverage_fleet_controls_and_checkpoint_administration_survive_re
         "The fixture writer may be offline.",
     ]);
     amber.restart().await;
-    amber.st_json(&["replication", "checkpoint", "status"]);
+    let status = amber.st(&["--json", "replication", "checkpoint", "status"]);
+    assert_eq!(status.status.code(), Some(2), "{status:?}");
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["details"]["comparison_state"], "uncomputed");
     amber.st_json(&[
         "replication",
         "checkpoint",

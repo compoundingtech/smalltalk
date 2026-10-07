@@ -134,3 +134,8 @@ the session's start is reached, later live deltas do not reopen older-history pa
 
 `st missions ls --watch`, `st attention ls --watch`, `st agents ls --watch`,
 and `st work ls --watch` consume this same transport.
+
+Unchecked diagnostic operations use the existing `degraded` state and `warning` severity.
+Their revision ends in `:unknown` and their summary says evidence is incomplete; this does
+not certify a failed invariant or start a diagnostic job. The published Operation enum is
+unchanged. Doctor reports retain the explicit `unknown` check status.

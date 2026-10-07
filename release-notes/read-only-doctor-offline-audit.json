@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Diagnostic reads stop sealing or rebuilding store state; an explicit offline audit inspects private copies.",
+  "replay": {
+    "status": "changed",
+    "detail": "GET doctor and operations no longer run full invariant reducers or start a whole-store diagnostic job. The explicit doctor --offline-audit command can replay on a second private scratch copy, before starting a runtime or client. Startup replay behavior is unchanged. Current invariants remain named unknown until maintained evidence is integrated."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No production table, index, trigger or schema version change. Offline audit neither opens a Store nor migrates caller evidence."
+  },
+  "rules": {
+    "status": "changed",
+    "detail": "Checkpoint rules and digests are unchanged. Sealing formerly reached through diagnostic fleet-membership reads now runs explicitly on the due checkpoint writer path. Peer SealTerms and exchange formats are unchanged; no coordinated rules-version transition is introduced."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "For every client, GET checkpoint/status returns HTTP 503 diagnostic-evidence-incomplete with comparison_state=uncomputed until current maintained comparison evidence exists. st replication checkpoint status prints unknown and exits 2; old clients see a readable nonzero error. Doctor and operations expose unchecked invariants by name as unknown. Updated st doctor --strict excludes unchecked invariants from its failure condition, while computed warnings and errors still fail. Unknown checks stay named in text and JSON and the report remains warn; strict success certifies only computed checks. Older CLIs still exit 2 on the aggregate warning. Successful checkpoint-status and peer-wire shapes are unchanged. The offline audit flags are additive. Operation resources map unchecked diagnostics to the existing degraded state with warning severity and an explicit unknown revision/incomplete summary; the published Operation enum and generated clients are unchanged. Offline strict uses the same computed-only predicate; most store invariants remain unknown, so strict success certifies only the few computed checks."
+  },
+  "downtime": {
+    "status": "unknown",
+    "detail": "No extra restart or recovery phase is added. Restart-to-API and restart-to-health were not measured for this change; operations deploys the binary through the normal service update. The diagnostic checkpoint 503 describes uncertified evidence, not daemon health."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Upgrade the CLI along with the daemon before using st doctor --strict as a computed-check upgrade gate: older CLIs still exit 2 on the aggregate warning. Updated strict success excludes named unchecked invariants and cannot certify them. Compare st --version --json with the daemon machine_version in st doctor --json and verify peer health to identify the running daemon; these checks do not certify store invariants. Scripts using st replication checkpoint status or GET checkpoint/status must handle evidence-incomplete as unknown rather than restarting the daemon. Full audit is opt-in: supply a frozen private database copy, including its WAL when present, with st doctor --offline-audit DATABASE. An explicit --audit-scratch-dir is required on a filesystem with room; the default scratch cap is 32 GiB. Live-database inode aliases are refused; unsupported audit checks remain unknown. SIGINT, SIGTERM and SIGHUP clean private scratch; SIGKILL or a host crash can leave capped scratch files for manual cleanup after the process is stopped."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "This change introduces no production migration or persistent diagnostic cache. Installing the previous binary restores previous read behavior. Audit scratch is removed on ordinary failure and handled SIGINT/SIGTERM; original evidence is never repaired."
+  }
+}

@@ -130,6 +130,7 @@ pub fn snapshot() -> Result<Environment> {
 
 /// What building and gating this repository needs on the login PATH. The repository selects
 /// mold for Linux links only, so other platforms do not need it.
+#[cfg(test)]
 fn build_tools() -> Vec<&'static str> {
     let mut tools = vec!["cargo", "rustc"];
     if cfg!(target_os = "linux") {
@@ -139,14 +140,17 @@ fn build_tools() -> Vec<&'static str> {
     tools
 }
 
+#[cfg(test)]
 const LINK_TIMEOUT: Duration = Duration::from_secs(10);
 
+#[cfg(test)]
 pub(crate) struct BuildTools {
     pub found: Vec<&'static str>,
     pub missing: Vec<&'static str>,
     pub link: LinkResult,
 }
 
+#[cfg(test)]
 pub(crate) enum LinkResult {
     Linked,
     /// Building needs cargo and rustc, so no crate was built.
@@ -156,6 +160,7 @@ pub(crate) enum LinkResult {
 
 /// Look for each build tool on the environment's PATH, then build and link a small crate the way
 /// the repository does.
+#[cfg(test)]
 pub(crate) fn check_build_tools(environment: &Environment) -> BuildTools {
     let (found, missing): (Vec<_>, Vec<_>) = build_tools()
         .into_iter()
@@ -176,6 +181,7 @@ pub(crate) fn check_build_tools(environment: &Environment) -> BuildTools {
     }
 }
 
+#[cfg(test)]
 fn link_small_crate(environment: &Environment, timeout: Duration) -> Result<(), String> {
     use std::os::unix::process::CommandExt as _;
     let scratch =

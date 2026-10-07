@@ -465,7 +465,9 @@ impl Store {
         };
         known.insert(self.origin.clone());
         known.extend(configured_peers.iter().cloned());
-        let membership = self.fleet_membership()?;
+        // Diagnostic attention/status reads observe only already admitted membership.
+        // The checkpoint writer seals explicitly before making participant decisions.
+        let membership = fleet_membership_tx(&self.readers.get())?;
         known.extend(
             membership
                 .incarnations()
@@ -477,7 +479,7 @@ impl Store {
     /// Writers that left the fleet: every incarnation ended with a drained `leave`. A removal
     /// does not count; see section 3 of the design.
     pub fn checkpoint_left_writers(&self) -> Result<BTreeSet<String>> {
-        let membership = self.fleet_membership()?;
+        let membership = fleet_membership_tx(&self.readers.get())?;
         let names = membership
             .incarnations()
             .map(|incarnation| incarnation.name.clone())
@@ -648,8 +650,14 @@ impl Store {
             return Ok(actions);
         }
         let checkpoint = checkpoint_name(cut);
-        let (participants, left) =
-            self.checkpoint_participants(&claims, &context.configured_peers)?;
+        // Admission and sealing belong only to a due writer decision, after the quiet exits.
+        // Re-read its claims and membership together after admission on one SQLite cut.
+        self.replication_snapshot()?;
+        let (claims, (participants, left)) = self.read_snapshot(|_| {
+            let claims = self.checkpoint_claims()?;
+            let participants = self.checkpoint_participants(&claims, &context.configured_peers)?;
+            Ok((claims, participants))
+        })?;
         if left.contains(&self.origin) {
             return Ok(actions);
         }
