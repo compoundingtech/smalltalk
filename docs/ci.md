@@ -44,18 +44,21 @@ or compile. Manual dispatch runs the safety tests without inventing a PR delta.
 The Linux gate runs two test partitions plus Clippy and fleet compatibility on separate runners.
 `linux-gate` is the aggregate Linux check: it needs `upgrade-impact`, the four stage jobs and the named mail redelivery
 check, and passes only when every one succeeded (a skipped or cancelled stage fails it). The stage jobs use the shape label
-`nscloud-ubuntu-24.04-amd64-8x16-with-features`; `genie-freshness`, `isolation-vm` and `typescript-client`
-use `namespace-profile-linux-x86-64` when they overflow. The `linux-gate` aggregate uses GitHub-hosted
+`nscloud-ubuntu-24.04-amd64-8x16-with-features`; `isolation-vm`
+uses `namespace-profile-linux-x86-64`. Genie freshness, TypeScript and the `linux-gate` aggregate use GitHub-hosted
 `ubuntu-latest`, so it cannot queue behind build or benchmark jobs. The stages ran on `nscloud-ubuntu-24.04-amd64-16x32`
 until 2026-10-03, when that label stopped getting runners; on the profile they queued behind its
 limit of about five runners at once.
 
-All Linux Namespace jobs use run affinity and the same inline `job.priority=1`: required
-Workspace jobs, optional benchmarks, manual Performance controls, main upkeep and releases.
-Using one class prevents a continuous stream of required jobs from overtaking older performance
-requests. Run affinity ensures that a runner started for a request is assigned to that run,
-so GitHub cannot hand it to a newer run with the same shape. Local `ci1-priority` and `ci1-merge`
-reservations continue to select only the primary test shard.
+Required Linux Namespace merge-group jobs use inline `job.priority=1`; PR, main, nightly, manual
+and release jobs share priority 2. Advisory `perf-load` stays at priority 2 even for merge groups,
+so a 30-minute load job cannot take the required checks' priority class. Namespace starts pending lower-numbered jobs
+first when the fixed quota is full. This gives the merge queue the next available capacity
+without cancelling running workloads or changing the Linux quota. Sustained merge traffic
+can delay the second class until that queue drains; this policy has no starvation bound during
+a continuous merge stream. Monitor assignment wait for main upkeep, main Performance and PRs.
+Run affinity ensures that a provisioned runner is assigned to its own workflow run.
+Local `ci1-priority` and `ci1-merge` reservations keep their existing primary routing.
 
 Profile labels carry affinity inline, for example
 `namespace-profile-linux-x86-64;job.priority=1;github.run-id=${{ github.run_id }}`.
@@ -64,12 +67,10 @@ Shape labels retain `-with-features` and a separate
 separate `namespace-features:` label with profiles; see the
 [Runner Controls syntax](https://namespace.so/docs/solutions/github-actions/runner-controls).
 
-The queue still shares the existing Linux limit of 320 vCPUs / 640 GiB and must drain its older
-backlog. Queue time is measured separately from execution time; the shared class removes
-indefinite overtaking, rather than promising a fixed start time under arbitrary overload.
-An already queued job retains the labels from its immutable workflow revision. Recover old
-unprioritized controls with label-only revisions and new dispatches, preserving their source,
-fixtures and budgets; retain completed failures as evidence. See Namespace's
+The queue still shares the existing Linux limit of 320 vCPUs / 640 GiB. Queue wait and
+execution time are measured separately; priority does not promise a start time under overload.
+Already queued jobs retain the labels from their immutable workflow revision. This source
+change does not rerun or relabel them. See Namespace's
 [job ordering and priority controls](https://namespace.so/docs/solutions/github-actions/runner-controls/job-ordering).
 
 `scripts/ci-linux STAGE` runs one stage:
@@ -121,7 +122,18 @@ Merge-group and PR caches have their own ref scope; they cannot replace these ma
 which all PRs and Namespace overflow runs can restore. Manual Workspace CI dispatch on main
 remains available for a full run. Release and deployment workflows keep their own push triggers.
 
-Each stage restores a job-keyed `actions/cache` entry (Namespace serves it from its accelerated
+Genie freshness and TypeScript use GitHub-hosted `ubuntu-latest`; picker, public/upgrade checks
+and Linux aggregation already use that pool. Record their assignment waits and limit errors from
+normal runs; if GitHub queues or limits these jobs, route the light work to ordinary ci1 capacity
+without taking priority/merge reservations. No GitHub concurrency-limit value is inferred from
+the runner label.
+
+Hosted Genie freshness and its main warmer retain the existing job-keyed Nix cache, without a
+Cargo target cache. These entries share the repository cache pool; monitor its configured
+limit, entry sizes and evictions as well as hosted assignment waits. A successful hosted run does not prove
+cache headroom, and this change does not increase the pool or change cache trust boundaries.
+
+Each compiling stage restores a job-keyed `actions/cache` entry (Namespace serves it from its accelerated
 backend) holding Cargo's registry and the workspace `target/` directory, keyed on `Cargo.lock` and
 `flake.lock`, workspace manifests and linker configuration. A second keyed entry (`nix5-<job>-...`) holds a signed local Nix binary cache in
 `$RUNNER_TEMP/st-ci-cache`. Its key includes `flake.lock`, the flake, Nix expressions and both compatibility baseline pins.
@@ -396,7 +408,7 @@ through the API and picks the primary test partition's pool:
 The second shard and mail canaries read separate outputs, each choosing only `ci1` general
 capacity. The picker counts online, idle general runners and subtracts one slot when the primary
 may also use that pool. It offers the remaining slots to the second shard, then the canaries;
-each falls back to the same Namespace priority and run affinity when no slot remains. The
+each falls back to its event’s Namespace priority and run affinity when no slot remains. The
 primary's admission threshold does not strand idle slots for these two extra jobs. A previous
 threshold of four sent the primary to Namespace even when three general workers were free;
 the one-slot default lets both shards and canaries use those three workers.
@@ -477,7 +489,15 @@ with `opt-level = 1` only to generate the stores faster.
   work per deleted row grew 7.3 times, its full-scan steps 9.3 times).
 
 `perf-load` runs `daemon_load::` in a release build, in its own `Performance` workflow
-(`perf.yml`): on relevant `main` pushes and pull requests, nightly on `main`, and on dispatch.
+(`perf.yml`): on every `main` push, every merge group, nightly on `main`, and on dispatch.
+Pull requests run it when any st3 source, workload dependency, vendor, Nix or build input changes,
+or carry the `ci-perf` label. A metadata-only GitHub-hosted scope job runs workflow bytes from
+the event ref (the PR merge ref for pull requests) and checks changed and renamed paths with a
+90-second bound. Missing/incomplete source metadata, a failed/timed-out scope job or an absent
+decision admits Performance. Only an explicit successful `run=false` decision skips it.
+Only `ci-perf` label additions/removals participate in PR cancellation and admission; unrelated
+label events use separate concurrency groups and skip both jobs. Main failures are P0 to Speed;
+the shared-observer delivery subscription is separately deployed and recipient-registered.
 It always uses Namespace, including when Workspace CI picks ci1. It serves a store the size of a busy host's (scale 1, about 240,000 claims) to the
 request mix and rates that host's daemon reported in its busiest five-minute window (30 requests a
 second: harness events, mailbox pages, claims, desired state, delivery holds, replication rounds,

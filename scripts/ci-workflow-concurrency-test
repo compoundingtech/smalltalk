@@ -7,22 +7,24 @@ import re
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def policy(workflow, event, run_id, pr=None, ref='refs/heads/main'):
+def policy(workflow, event, run_id, pr=None, ref='refs/heads/main', action='synchronize', label=''):
     text = (ROOT / '.github/workflows' / workflow).read_text()
     block = re.search(r'^concurrency:\n((?:  .+\n)+)', text, re.M)
     assert block, (workflow, 'missing concurrency policy')
     fields = {}
-    context = {'event': event, 'run_id': run_id, 'pr': pr, 'ref': ref}
+    context = {'event': event, 'run_id': run_id, 'pr': pr, 'ref': ref, 'action': action, 'label': label}
 
     def expression(value):
         for source, name in [('github.event.pull_request.number', 'pr'),
+                             ('github.event.action', 'action'), ('github.event.label.name', 'label'),
                              ('github.event_name', 'event'), ('github.run_id', 'run_id'),
                              ('github.ref', 'ref')]:
             value = value.replace(source, name)
         value = value.replace('&&', ' and ').replace('||', ' or ').strip()
+        value = re.sub(r'!(?!=)', 'not ', value)
         tree = ast.parse(value, mode='eval')
         allowed = (ast.Expression, ast.BoolOp, ast.And, ast.Or, ast.Compare,
-                   ast.Eq, ast.Name, ast.Load, ast.Constant)
+                   ast.Eq, ast.NotEq, ast.UnaryOp, ast.Not, ast.Name, ast.Load, ast.Constant)
         assert all(isinstance(node, allowed) for node in ast.walk(tree)), value
         assert all(node.id in context for node in ast.walk(tree) if isinstance(node, ast.Name)), value
         return eval(compile(tree, '<generated-concurrency>', 'eval'), {'__builtins__': {}}, context)
@@ -66,3 +68,10 @@ for workflow in ['fleet.yml', 'main-upkeep.yml', 'perf.yml', 'public-repo.yml']:
 assert policy('fleet.yml', 'merge_group', 100) == ('workspace-100-merge_group', False)
 assert not policy('main-upkeep.yml', 'push', 100, ref='refs/heads/other')[1]
 assert not policy('perf.yml', 'push', 100, ref='refs/heads/other')[1]
+
+for action in ['labeled', 'unlabeled']:
+    unrelated = policy('perf.yml', 'pull_request', 100, 42, action=action, label='reviewed')
+    assert unrelated[0] != 'perf-42' and not unrelated[1], (action, 'unrelated labels must not cancel or replace PR work')
+    assert policy('perf.yml', 'pull_request', 101, 42, action=action, label='reviewed')[0] != unrelated[0]
+    assert policy('perf.yml', 'pull_request', 100, 42, action=action, label='ci-perf') == ('perf-42', True)
+print('passed: only ci-perf label changes enter the existing PR cancellation group')

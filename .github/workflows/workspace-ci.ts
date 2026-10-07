@@ -7,9 +7,10 @@ import {
 } from '../../repos/effect-utils/genie/external.ts'
 
 // Profiles require controls inline; namespace-features labels apply only to shape labels.
-export const linuxRunnerProfile = 'namespace-profile-linux-x86-64;job.priority=1'
+export const linuxRunnerProfile = 'namespace-profile-linux-x86-64;job.priority=2'
 export const macosRunnerProfile = 'namespace-profile-macos-arm64'
-export const linuxRunner = [`${linuxRunnerProfile};github.run-id=\${{ github.run_id }}`] as const
+const namespacePriority = "${{ github.event_name == 'merge_group' && 1 || 2 }}"
+export const linuxRunner = [`${linuxRunnerProfile.replace('job.priority=2', `job.priority=${namespacePriority}`)};github.run-id=\${{ github.run_id }}`] as const
 /**
  * The Linux gate's stage jobs. On 2026-10-03 the shape label `nscloud-ubuntu-24.04-amd64-16x32`
  * stopped getting runners at about 12:10Z, and the profile allows only about five runners at
@@ -17,9 +18,14 @@ export const linuxRunner = [`${linuxRunnerProfile};github.run-id=\${{ github.run
  * got runners at once.
  */
 const linuxStageShape = 'nscloud-ubuntu-24.04-amd64-8x16-with-features'
-/** All Linux Namespace work shares one class: older benchmarks cannot be overtaken forever. */
+/** Merge checks start first under quota; PR, main, nightly and manual work share the next class. */
 export const linuxStageRunner = [
-  `${linuxStageShape};job.priority=1`,
+  `${linuxStageShape};job.priority=${namespacePriority}`,
+  'namespace-features:github.run-id=${{ github.run_id }}',
+] as const
+/** Advisory load tests never take the required merge checks' priority class. */
+export const performanceRunner = [
+  `${linuxStageShape};job.priority=2`,
   'namespace-features:github.run-id=${{ github.run_id }}',
 ] as const
 export const macosRunner = [`${macosRunnerProfile};github.run-id=\${{ github.run_id }}`] as const
@@ -146,26 +152,27 @@ done`,
 const pickedOr = (namespaceLabels: string, output = 'ci1') =>
   `\${{ fromJSON(needs.${pickRunnerJobId}.outputs.${output} || ${namespaceLabels}) }}`
 
-// Same priority for required, optional and manual jobs. Run affinity makes Namespace's
-// scheduled order deterministic; a newer required run cannot steal an older benchmark's runner.
-/** `runs-on` for a stage job: picked ci1, else the shared Namespace queue class. */
+export const namespaceFormat = (labels: readonly string[]) =>
+  `format('${JSON.stringify(labels).replaceAll('${{ github.run_id }}', '{0}').replaceAll(namespacePriority, '{1}')}', github.run_id, github.event_name == 'merge_group' && 1 || 2)`
+
+/** `runs-on` for a stage job: picked ci1, else the event's Namespace queue class. */
 export const linuxStageRunsOn = pickedOr(
-  `format('${JSON.stringify(linuxStageRunner).replaceAll('${{ github.run_id }}', '{0}')}', github.run_id)`,
+  namespaceFormat(linuxStageRunner),
 )
 
 /** Extra test jobs can consume only general ci1 slots, never the primary's reserved label. */
 export const secondaryStageRunsOn = pickedOr(
-  `format('${JSON.stringify(linuxStageRunner).replaceAll('${{ github.run_id }}', '{0}')}', github.run_id)`,
+  namespaceFormat(linuxStageRunner),
   'ci1_secondary',
 )
 export const mailStageRunsOn = pickedOr(
-  `format('${JSON.stringify(linuxStageRunner).replaceAll('${{ github.run_id }}', '{0}')}', github.run_id)`,
+  namespaceFormat(linuxStageRunner),
   'ci1_mail',
 )
 
-/** `runs-on` for a Linux profile job: picked ci1, else the shared Namespace queue class. */
+/** `runs-on` for a Linux profile job: picked ci1, else the event's Namespace queue class. */
 export const linuxRunsOn = pickedOr(
-  `format('${JSON.stringify(linuxRunner).replaceAll('${{ github.run_id }}', '{0}')}', github.run_id)`,
+  namespaceFormat(linuxRunner),
 )
 
 /** Other supporting jobs stay on Namespace rather than spending the test runners. */

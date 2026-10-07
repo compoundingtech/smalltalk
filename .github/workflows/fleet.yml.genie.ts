@@ -1,4 +1,4 @@
-import { buildSnapshotSave } from './build-snapshot.ts'
+import { buildSnapshotPrepare, buildSnapshotRestore, buildSnapshotSave } from './build-snapshot.ts'
 import { auditCaches } from './cache-audit.ts'
 import { readFileSync } from 'node:fs'
 import {
@@ -14,6 +14,7 @@ import {
   linuxStageJob as namespaceStageJob,
   linuxStageRunner,
   linuxStageRunsOn,
+  namespaceFormat,
   perfStoresCache,
   mailStageRunsOn,
   pickRunnerJob,
@@ -153,7 +154,7 @@ fi`,
     'namespace-capacity': {
       name: 'namespace-capacity',
       if: "github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'",
-      'runs-on': `\${{ fromJSON(github.event_name == 'merge_group' && '["ubuntu-latest"]' || format('${JSON.stringify(linuxRunner).replaceAll('${{ github.run_id }}', '{0}')}', github.run_id)) }}`,
+      'runs-on': `\${{ fromJSON(github.event_name == 'merge_group' && '["ubuntu-latest"]' || ${namespaceFormat(linuxRunner)}) }}`,
       'timeout-minutes': 120,
       permissions: { contents: 'read', actions: 'write' },
       defaults: { run: { shell: 'bash' } },
@@ -197,13 +198,13 @@ printf '\\n\\x60\\x60\\x60\\n' >> "$GITHUB_STEP_SUMMARY"`,
       name: 'genie-freshness',
       env: { CI_CACHE_DEV_SHELL: 'genie' },
       ...afterPickRunner,
-      'runs-on': supportingLinuxRunsOn,
+      'runs-on': 'ubuntu-latest',
       'timeout-minutes': 20,
       steps: [
-        ...commonSetupSteps.filter((step) => !('id' in step && step.id === 'cargo-cache')),
-        nixDevelopStep({ name: 'Check runner selection and generated files', flake: '.#genie', command: ['bash', '-c', 'python3 scripts/check-ci-runner-test && python3 scripts/ci-mail-redelivery-canaries-test && python3 scripts/ci-test-partitions-test && python3 scripts/ci-test-archive-test && python3 scripts/check-ci-test-paths && python3 scripts/ci-queue-watch-test && python3 scripts/check-main-ci-test && python3 scripts/ci-perf-cache-test && python3 scripts/ci-cache-audit-test && genie --check'] }),
+        ...commonSetupSteps.filter((step) => !('id' in step && step.id === 'cargo-cache')
+          && step !== buildSnapshotPrepare && step !== buildSnapshotRestore),
+        nixDevelopStep({ name: 'Check runner selection and generated files', flake: '.#genie', command: ['bash', '-c', 'python3 scripts/check-ci-runner-test && python3 scripts/ci-mail-redelivery-canaries-test && python3 scripts/ci-test-partitions-test && python3 scripts/ci-test-archive-test && python3 scripts/check-ci-test-paths && python3 scripts/ci-perf-scope-test && python3 scripts/ci-queue-watch-test && python3 scripts/check-main-ci-test && python3 scripts/ci-perf-cache-test && python3 scripts/ci-cache-audit-test && genie --check'] }),
         { name: 'Save Nix outputs', if: "success() && env.CI_LOCAL_CACHES != '1'", run: 'bash scripts/ci-nix-cache save' },
-        ...buildSnapshotSave,
       ],
     },
     // Check the shared client and its iOS consumer before merge.
@@ -212,7 +213,7 @@ printf '\\n\\x60\\x60\\x60\\n' >> "$GITHUB_STEP_SUMMARY"`,
       // Keep generated-file validation ahead of its consumers.
       needs: ['pick-runner', 'genie-freshness'],
       if: "${{ !cancelled() && needs.genie-freshness.result == 'success' }}",
-      'runs-on': supportingLinuxRunsOn,
+      'runs-on': 'ubuntu-latest',
       'timeout-minutes': 10,
       defaults: { run: { shell: 'bash' } },
       steps: [
