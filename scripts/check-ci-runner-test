@@ -136,6 +136,14 @@ for consumer in ('linux-tests', 'linux-tests-shard-2', 'mail-redelivery-canaries
     assert 'cargo-cache' not in blocks[consumer] and 'Build selected test targets' not in blocks[consumer], (consumer, 'archive consumers must not restore/rebuild Cargo targets')
     assert 'needs.linux-test-build.outputs.artifact-id' in blocks[consumer], (consumer, 'artifact must come from its successful producer')
     assert 'needs.linux-test-build.outputs.manifest-sha256' in blocks[consumer], (consumer, 'manifest hash must come from its successful producer')
+assert 'needs.linux-test-build.result' in blocks['linux-gate'], 'the gate must explicitly fail a failed producer'
+for consumer in ('linux-tests', 'linux-tests-shard-2', 'mail-redelivery-canaries', 'isolation-vm'):
+    assert 'Require the shared test producer to succeed' in blocks[consumer]
+    assert 'PRODUCER_RESULT' in blocks[consumer] and 'shared test producer failed or was skipped' in blocks[consumer]
+    assert 'CI_TEST_ARCHIVE_PRODUCER_ATTEMPT' in blocks[consumer]
+    assert 'merge-multiple: true' in blocks[consumer], 'exact artifact ID must extract directly into the archive directory'
+assert 'ST_ISOLATION_BUILD_WORKSPACE' in blocks['isolation-vm']
+assert 'Keep valid same-source build outputs' in blocks['linux-test-build'], 'shared producer must retain its build snapshot'
 assert 'CI_TEST_PARTITION' not in canaries, "every required canary must run"
 assert 'mail_redelivery' not in blocks['linux-tests'] and 'scripts/ci-mail-redelivery-canaries' not in blocks['linux-tests'], "canaries cannot serialize the primary shard"
 assert 'needs.mail-redelivery-canaries.result' in blocks['linux-gate'], "failures and skips must still fail the Linux gate"

@@ -115,7 +115,7 @@ fn canary(harness: &str, scenario: &str) {
     // it goes on the target directory's disk, not the small tmpfs the daemon's sockets live on.
     let scratch = tempfile::Builder::new()
         .prefix("boot-canary-scratch-")
-        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .tempdir_in(test_env!("CARGO_TARGET_TMPDIR"))
         .unwrap();
     // Double-fork out of the calling seat's ancestry: the isolated daemon binds a caller to the
     // nearest ST_AGENT above it, and the canary acts as person/eval.

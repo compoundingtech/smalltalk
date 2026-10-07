@@ -97,11 +97,16 @@ and all three inventories.
 The Linux `linux-test-build` job compiles the existing two selected Cargo groups once and
 publishes nextest archives. Both shards, the zero-retry mail job and isolation VM require that
 successful producer and download its exact artifact ID. They check the manifest SHA, source/tree,
-run/attempt, architecture, nextest/rustc versions and each archive digest before extracting. Cargo
-target caches remain on the producer; consumers restore only runtime/Nix fixtures. The primary
-still separately checks the standalone conversation-model feature boundary.
+run, the successful producer attempt, architecture, nextest/rustc versions and each archive digest before extracting.
+A failed-jobs-only rerun can inherit the earlier successful producer output; its attempt and
+manifest remain explicitly pinned, with the same run/source/tree/tool identities required. Cargo
+target caches remain on the producer; consumers restore only runtime/Nix fixtures. The producer also runs the unchanged standalone conversation-model tests (including doctests)
+and dependency boundary, and builds the gateway binary with its standalone production features.
+Its Cargo JSON and binary hash are retained alongside the archives; the VM does not substitute
+the workspace-unified test binary. A failed producer explicitly fails consumer checks and the gate.
 
-Tests resolve archived executables through nextest's runtime binary paths. Manifest/fixture paths
+Tests resolve archived executables through nextest's runtime binary paths. A source guard rejects raw compiled binary, manifest and temporary-directory lookups in test code.
+Manifest/fixture paths
 map each compiled package beneath the recorded producer root to the consumer checkout, including
 library fixtures launched by another package. Outside archives the original compiled path remains
 the fallback. Archive mode rejects missing or mismatched roots/binaries. Tests, assertions,

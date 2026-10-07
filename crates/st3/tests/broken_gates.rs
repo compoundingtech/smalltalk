@@ -34,7 +34,7 @@ impl Daemon {
             executable(&bin.join(name), source);
         }
         let log = File::create(root.join("daemon.log")).unwrap();
-        let child = st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
+        let child = st3::test_support::command(test_bin!("st3-fixture"))
             .env_clear()
             .env("HOME", root)
             .env(
@@ -87,7 +87,7 @@ impl Daemon {
     }
 
     fn run_cli_format(&self, args: &[&str], json: bool) -> std::process::Output {
-        let mut command = st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"));
+        let mut command = st3::test_support::command(test_bin!("st3-fixture"));
         command
             .env_clear()
             .env("HOME", &self.root)
@@ -717,7 +717,7 @@ mission "orchid/replay" state="ready" {
         health["message"].as_str().unwrap().contains(stuck),
         "{health}"
     );
-    let output = st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
+    let output = st3::test_support::command(test_bin!("st3-fixture"))
         .env_clear()
         .env("HOME", root.path())
         .env("ST3_DAEMON_WAIT", "0")

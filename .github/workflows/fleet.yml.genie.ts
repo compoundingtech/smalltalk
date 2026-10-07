@@ -201,7 +201,7 @@ printf '\\n\\x60\\x60\\x60\\n' >> "$GITHUB_STEP_SUMMARY"`,
       'timeout-minutes': 20,
       steps: [
         ...commonSetupSteps.filter((step) => !('id' in step && step.id === 'cargo-cache')),
-        nixDevelopStep({ name: 'Check runner selection and generated files', flake: '.#genie', command: ['bash', '-c', 'python3 scripts/check-ci-runner-test && python3 scripts/ci-mail-redelivery-canaries-test && python3 scripts/ci-test-partitions-test && python3 scripts/ci-test-archive-test && python3 scripts/ci-queue-watch-test && python3 scripts/check-main-ci-test && python3 scripts/ci-perf-cache-test && python3 scripts/ci-cache-audit-test && genie --check'] }),
+        nixDevelopStep({ name: 'Check runner selection and generated files', flake: '.#genie', command: ['bash', '-c', 'python3 scripts/check-ci-runner-test && python3 scripts/ci-mail-redelivery-canaries-test && python3 scripts/ci-test-partitions-test && python3 scripts/ci-test-archive-test && python3 scripts/check-ci-test-paths && python3 scripts/ci-queue-watch-test && python3 scripts/check-main-ci-test && python3 scripts/ci-perf-cache-test && python3 scripts/ci-cache-audit-test && genie --check'] }),
         { name: 'Save Nix outputs', if: "success() && env.CI_LOCAL_CACHES != '1'", run: 'bash scripts/ci-nix-cache save' },
         ...buildSnapshotSave,
       ],
@@ -266,6 +266,7 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
       outputs: {
         'artifact-id': '${{ steps.upload.outputs.artifact-id }}',
         'manifest-sha256': '${{ steps.archive.outputs.manifest-sha256 }}',
+        'producer-attempt': '${{ steps.archive.outputs.producer-attempt }}',
       },
       steps: [
         ...workspacePreparationSteps.slice(0, -2).map((step: any) =>
@@ -282,6 +283,7 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
             path: '${{ runner.temp }}/ci-test-archives', 'if-no-files-found': 'error',
             'compression-level': 0, 'retention-days': 3 },
         },
+        ...buildSnapshotSave,
       ],
     },
     // Two test partitions and the two supporting stages retain independent CPU capacity.
@@ -299,7 +301,7 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
         before: [nixDevelopStep({ name: 'Prove both shards cover every selected test', command: ['python3', 'scripts/ci-test-partitions'] })],
       }),
       needs: [pickRunnerJobId, 'linux-test-build'],
-      if: "${{ !cancelled() && needs.linux-test-build.result == 'success' }}",
+      if: "${{ !cancelled() }}",
     },
     'linux-tests-shard-2': {
       ...linuxStageJob({
@@ -311,7 +313,7 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
         extraLogs: 'target/messaging-faults/\ntarget/boot-canaries/',
       }),
       needs: [pickRunnerJobId, 'linux-test-build'],
-      if: "${{ !cancelled() && needs.linux-test-build.result == 'success' }}",
+      if: "${{ !cancelled() }}",
     },
     'linux-clippy': linuxStageJob({
       name: 'linux-clippy',
@@ -338,11 +340,11 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
         extraLogs: 'target/messaging-faults/\ntarget/boot-canaries/',
       }),
       needs: [pickRunnerJobId, 'linux-test-build'],
-      if: "${{ !cancelled() && needs.linux-test-build.result == 'success' }}",
+      if: "${{ !cancelled() }}",
     },
     'linux-gate': {
       name: 'linux-gate',
-      needs: [pickRunnerJobId, 'upgrade-impact', 'linux-tests', 'linux-tests-shard-2', 'linux-clippy', 'linux-fleet-compat', 'mail-redelivery-canaries'],
+      needs: [pickRunnerJobId, 'linux-test-build', 'upgrade-impact', 'linux-tests', 'linux-tests-shard-2', 'linux-clippy', 'linux-fleet-compat', 'mail-redelivery-canaries'],
       // A skipped or cancelled stage must fail the gate, so it runs even when a stage failed.
       if: 'always()',
       // Aggregation needs no build caches and must not queue behind the work it summarizes.
@@ -352,7 +354,7 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
         {
           name: 'Require every Linux stage to pass',
           // The stages only: pick-runner is skipped whenever ci1 is off.
-          env: { RESULTS: '${{ needs.upgrade-impact.result }} ${{ needs.linux-tests.result }} ${{ needs.linux-tests-shard-2.result }} ${{ needs.linux-clippy.result }} ${{ needs.linux-fleet-compat.result }} ${{ needs.mail-redelivery-canaries.result }}' },
+          env: { RESULTS: '${{ needs.linux-test-build.result }} ${{ needs.upgrade-impact.result }} ${{ needs.linux-tests.result }} ${{ needs.linux-tests-shard-2.result }} ${{ needs.linux-clippy.result }} ${{ needs.linux-fleet-compat.result }} ${{ needs.mail-redelivery-canaries.result }}' },
           run: `echo "stage results: $RESULTS"
 for result in $RESULTS; do
   [ "$result" = success ] || exit 1
@@ -383,15 +385,14 @@ done`,
     'isolation-vm': {
       name: 'isolation-vm',
       needs: [pickRunnerJobId, 'linux-test-build'],
-      if: "${{ !cancelled() && needs.linux-test-build.result == 'success' }}",
+      if: "${{ !cancelled() }}",
       'runs-on': supportingLinuxRunsOn,
       'timeout-minutes': 60,
       defaults: { run: { shell: 'bash' } },
       env: { ...buildEnv, CI_CACHE_DEV_SHELL: 'default' },
       steps: [
-        commonSetupSteps[0],
+        ...testArchiveConsumerSetup,
         { name: 'Probe KVM', run: kvmProbe },
-        ...testArchiveConsumerSetup.slice(1),
         {
           name: 'Build the NixOS VM test driver',
           run: `start=$SECONDS
@@ -404,6 +405,7 @@ printf '| VM driver build | %ss |\\n' "$((SECONDS - start))" >> "$GITHUB_STEP_SU
             ST_ISOLATION_ARCHIVE: '${{ runner.temp }}/ci-test-archives/st2.tar.zst',
             ST_ISOLATION_WORKSPACE: '${{ github.workspace }}',
             ST_ISOLATION_TIMINGS: '${{ runner.temp }}/vm-timings.json',
+            ST_ISOLATION_BUILD_WORKSPACE: '${{ env.CI_TEST_BUILD_WORKSPACE }}',
           },
           run: `start=$SECONDS
 mkdir -p "$RUNNER_TEMP/vm-out"
@@ -421,14 +423,13 @@ printf '| sekrets VM driver build | %ss |\\n' "$((SECONDS - start))" >> "$GITHUB
         },
         {
           name: 'Run the sekrets gateway test in the VM',
-          env: { ST_SEKRETS_BINARY: '${{ runner.temp }}/ci-test-extracted/workspace/target/debug/st3' },
+          env: { ST_SEKRETS_BINARY: '${{ env.CI_SEKRETS_BINARY }}' },
           run: `start=$SECONDS
 mkdir -p "$RUNNER_TEMP/sekrets-vm-out"
 "$RUNNER_TEMP/sekrets-vm-driver/bin/nixos-test-driver" --output_directory "$RUNNER_TEMP/sekrets-vm-out"
 printf '| sekrets VM test | %ss |\\n' "$((SECONDS - start))" >> "$GITHUB_STEP_SUMMARY"`,
         },
         { name: 'Save Nix outputs', if: "success() && env.CI_LOCAL_CACHES != '1'", run: 'bash scripts/ci-nix-cache save' },
-        ...buildSnapshotSave,
       ],
     },
   },
