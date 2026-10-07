@@ -5,7 +5,7 @@
 use super::*;
 use crate::api::delivery_presence::source::boundary as producer;
 use crate::store::{
-    agent_card_ivm as cards,
+    agent_card_ivm as cards, agent_card_source,
     collection_ivm::{agent_source, scope},
 };
 use anyhow::{Context as _, ensure};
@@ -97,11 +97,23 @@ pub(in crate::api::client_v0) fn factory(
                         "agent row and collection boundaries differ"
                     );
                     let frame_time = client_snapshot_at(state, cut.projected).created_at;
-                    // The fully proved Operator row coverage and the exact root-bound complete
-                    // footprint certificate authenticate all dependencies. No current delivery SQL
-                    // oracle or selected-only footprint is read here. A future materialized row
-                    // certificate API may additionally use read_boundary_rows under this same stamp.
-                    producer::read_boundary(&certificate, || {
+                    // Select only indexed metadata before fetching public bodies. Native row
+                    // evidence must belong to the complete namespace footprint; an empty native
+                    // selection still authenticates that entire boundary, including silent changes.
+                    let window = cards::ranked_window(
+                        connection,
+                        &root.namespace,
+                        limit,
+                        false,
+                        request.status.as_deref(),
+                    )?;
+                    let ids: Vec<_> = window.keys.iter().map(|key| key.agent.clone()).collect();
+                    let row_certificates = agent_card_source::selected_certificates(
+                        connection,
+                        &root.namespace,
+                        &ids,
+                    )?;
+                    producer::read_boundary_rows(&certificate, &row_certificates, || {
                         unchanged(connection, &views, &installer, &root, &cut)?;
                         let rows = cards::current_rows(
                             connection,
@@ -111,6 +123,15 @@ pub(in crate::api::client_v0) fn factory(
                             retained,
                             &frame_time,
                         )?;
+                        ensure!(
+                            rows.1 == window.has_more
+                                && rows
+                                    .0
+                                    .iter()
+                                    .map(|row| row["id"].as_str())
+                                    .eq(ids.iter().map(|id| Some(id.as_str()))),
+                            "agent selection changed during row read"
+                        );
                         ensure!(
                             cards::coverage(connection, &root, &cut, client_now_ms())?,
                             "agent deadline expired during row read"
