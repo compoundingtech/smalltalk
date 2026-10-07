@@ -518,14 +518,9 @@ async fn act_on_card(
                     },
                 )
                 .await
-                .map_err(|error| {
-                    if format!("{error:?}").contains("stale-permission-prompt") {
-                        anyhow::anyhow!(
-                            "This prompt is no longer the one waiting (it ended or the seat restarted); look again"
-                        )
-                    } else {
-                        error.into()
-                    }
+                .map_err(|error| match ui::prompt_refusal(&error) {
+                    Some(words) => anyhow::anyhow!(words),
+                    None => error.into(),
                 })?
         }
         "work.done" => {

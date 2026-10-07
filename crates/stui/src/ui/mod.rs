@@ -417,6 +417,14 @@ pub struct Ui {
     stalled: HashMap<String, String>,
 }
 
+/// What the person reads when st refuses an answer to a harness prompt that is no longer the
+/// one waiting (it ended, or the seat restarted): plain words, not the refusal code.
+pub(crate) fn prompt_refusal(error: &st3_client::ClientError) -> Option<&'static str> {
+    format!("{error:?}")
+        .contains("stale-permission-prompt")
+        .then_some("This prompt is no longer the one waiting (it ended or the seat restarted); look again")
+}
+
 /// What clicking a link says it did: an address is pasted in a browser; a path names a file on the
 /// machine the writer works on, which stui cannot open.
 fn link_note(target: &str) -> String {
@@ -604,6 +612,17 @@ impl Ui {
         self.tab = tab;
         if self.glasses.is_some() {
             self.resync_focus();
+        }
+        // An answer being chosen for a request that has since closed, ended or changed is put
+        // away, with word of it: Enter must never send it on.
+        if let Some(index) = self.answering {
+            let live = self.structured_request().is_some_and(|(id, request)| {
+                !self.closed.contains(&id) && index < request.answers.len()
+            });
+            if !live {
+                self.answering = None;
+                self.flash("That prompt ended or changed; look again");
+            }
         }
     }
 
@@ -7055,6 +7074,77 @@ mod tests {
         // Another seat's conversation shows no card.
         ui.select(1);
         assert!(!frame(&ui, 140, 50).join("\n").contains("◆ prompt"));
+    }
+
+    #[test]
+    fn a_prompt_that_vanishes_under_the_open_item_clears_the_choice_and_stays_listed_as_closed() {
+        // Home and inline are one episode: when the prompt ends (answered in the terminal, timed
+        // out, the seat restarted) while its card is open, the choice is put away, Enter sends
+        // nothing, and the item stays under Recently closed rather than vanishing from under the
+        // person's eyes.
+        let mut ui = with_item(prompt_item(open_prompt(), vec!["prompt.respond".into()]));
+        let before = ui.world.clone();
+        ui.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert_eq!(ui.answering, Some(0));
+        let mut gone = before;
+        if let Load::Ready(items) = &mut gone.attention {
+            items.retain(|item| item.id != "attention/prompt");
+        }
+        ui.set_world(gone);
+        assert_eq!(ui.answering, None, "the choice is put away");
+        assert!(ui.flash.as_ref().is_some_and(|(text, _)| text.contains("ended or changed")));
+        assert!(ui.listing(60).ids.contains(&"attention/prompt".to_owned()), "it stays");
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(ui.effects.is_empty(), "{:?}", ui.effects);
+    }
+
+    #[test]
+    fn a_prompt_that_changes_state_under_the_choice_offers_no_answer_and_sends_nothing() {
+        let mut ui = with_item(prompt_item(open_prompt(), vec!["prompt.respond".into()]));
+        let mut world = ui.world.clone();
+        ui.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert_eq!(ui.answering, Some(0));
+        // The same item, now timed out: no choices, no action.
+        let mut ended = open_prompt();
+        ended.state = Some("timed_out".into());
+        ended.can_answer = Some(false);
+        if let Load::Ready(items) = &mut world.attention {
+            items[0] = prompt_item(ended, Vec::new());
+        }
+        ui.set_world(world);
+        assert_eq!(ui.answering, None);
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(ui.effects.is_empty(), "{:?}", ui.effects);
+        assert!(frame(&ui, 140, 50).join("\n").contains("This prompt timed out"));
+    }
+
+    #[test]
+    fn a_reconnect_keeps_the_open_prompt_and_the_choice_made() {
+        let mut ui = with_item(prompt_item(open_prompt(), vec!["prompt.respond".into()]));
+        ui.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        ui.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        // The link drops and comes back with the same prompt: the choice stands.
+        let mut offline = ui.world.clone();
+        offline.link = Link::Offline("connection lost".into());
+        ui.set_world(offline);
+        let mut back = ui.world.clone();
+        back.link = Link::Live;
+        ui.set_world(back);
+        assert_eq!(ui.answering, Some(1));
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(&ui.effects[..], [Effect::Attention { action, answer: Some(answer), .. }]
+                if action == "prompt.respond" && answer == "deny"),
+            "{:?}",
+            ui.effects
+        );
+    }
+
+    #[test]
+    fn a_stale_prompt_refusal_reads_as_words_and_other_errors_are_left_alone() {
+        let stale = st3_client::ClientError::Protocol("refused: stale-permission-prompt".into());
+        assert!(prompt_refusal(&stale).is_some_and(|words| words.contains("no longer the one waiting")));
+        assert!(prompt_refusal(&st3_client::ClientError::Protocol("other".into())).is_none());
     }
 
     #[test]
