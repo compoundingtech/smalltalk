@@ -473,8 +473,9 @@ renewals, status and work reads, and a person's reads), with the reconciler runn
 concurrent seat event long-polls. Quiet polls have a 31-second budget for their intentional
 30-second wait; mailbox WebSockets require authenticated native drivers and are excluded.
 The client usage endpoint has a dedicated 0.5-request/second scenario with a 300 ms p99 budget.
-Generated usage history contains cumulative response rollups, so this scenario exercises period
-baselines and totals rather than an empty report.
+Generated usage history contains cumulative response rollups for long-lived standing sessions
+with stable attribution, so this scenario exercises many observations per series and period
+baselines and totals rather than an empty report or one series per observation.
 It fails when
 a request's p99 or the daemon's CPU passes its budget, or is more than 20% worse than the worst of
 main's last five reports: one run's p99 on a shared runner can be twice the next run's, so a

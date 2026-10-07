@@ -1429,6 +1429,11 @@ fn generate(store: &Store, prefix: &str, scale: f64) {
                     fields.insert("sequence".into(), Value::from(written as u64));
                 }
                 "harness.usage" => {
+                    // These are long-lived standing sessions, not a different mission step
+                    // on every observation. Changing synthetic ownership would turn each
+                    // cumulative reading into its own series and erase the history workload.
+                    fields.remove("owner_run");
+                    fields.remove("owner_step");
                     let sample = *index / *subjects;
                     let at = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
