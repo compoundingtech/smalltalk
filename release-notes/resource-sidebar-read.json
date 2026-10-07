@@ -14,7 +14,7 @@
     "detail": "No checkpoint rules change."
   },
   "compatibility": {
-    "status": "compatible",
+    "status": "changed",
     "detail": "Read-only arrangement views use existing optional arrangements capability and collections stream. stui reserves its three conversations and terminal on older daemons; the phone falls back to grouped resources with older pairings. No arrangement edits or new required wire fields."
   },
   "downtime": {
