@@ -24418,7 +24418,7 @@ mission "declaration-reminder" state="ready" {{
         let reason = waiting.blocked_reason.as_deref().unwrap();
         assert!(reason.contains("waiting for declared message `message/reminder/"), "{reason}");
         assert!(reason.contains("to be delivered"), "{reason}");
-        let runtime_view = store.mission_run_for_reconcile(&run).unwrap().unwrap();
+        let runtime_view = store.mission_run_for_reconcile(&run).unwrap();
         assert_eq!(runtime_view.steps[0].status, "working");
         assert_eq!(runtime_view.steps[0].blocked_reason, None);
         assert!(waiting.execution_started_at_unix_ms.is_some());
