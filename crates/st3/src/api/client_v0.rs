@@ -4480,7 +4480,7 @@ pub(super) fn timeline_value(
         })));
     }
     crate::performance::task("conversation/first-page", || {
-        timeline_first_page(state, snapshot, session, &session_id, query)
+        timeline_first_page(state, snapshot, session, session_id, query)
     })
 }
 
@@ -4489,7 +4489,7 @@ fn timeline_first_page(
     state: &AppState,
     snapshot: &ClientSnapshot,
     session: &ClientSession,
-    session_id: &str,
+    session_id: String,
     query: &ClientListQuery,
 ) -> Result<Json<Value>, ApiError> {
     let managed = super::managed_session_owner_at_with_hint(&state.store, snapshot.store_index, &session_id, session.conversation_subject_hint())
