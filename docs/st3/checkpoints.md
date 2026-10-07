@@ -60,6 +60,7 @@ checkpoint once.
 
 The rules identity covers projection inputs and replay as well as retention. Version 11 includes
 `arrangements` and `arrangement_registers`, even when empty, and rebuilds them from sealed claims.
+Version 12 ages out the sekrets claims written before they became local observations.
 Different builds' rules digests must match exactly, not by version ordering: a mixed-version
 fleet waits at sealing until its participants use compatible rules, including during rollback.
 
@@ -142,6 +143,7 @@ same rules. In summary:
 | `observer.observed`, `daemon.diagnostic`, `transport.observed` | subject (and code, or origin) | the newest |
 | `resource.observed` written by an observer | subject | the newest |
 | `runtime.action.*` with no actor, `render.applied`, `runtime.readiness-deadline-reached` | subject (and action, incarnation, status) | the newest; only claims dated at least five days before the cut go |
+| `sekret.called`, `sekret.exited`, `sekret.refused`, `sekret.changed` written before they became local observations | subject | the newest; only claims dated at least five days before the cut go |
 | `harness.limits` | subject | the newest |
 | `harness.usage`, response rollups | subject, incarnation, model, account, run, step, host | the last snapshot of each UTC hour in the seven days before the cut, the newest snapshot before that window, and the newest of all |
 | `harness.usage`, session cumulative | subject, incarnation | the newest and the last claim of the largest total |
