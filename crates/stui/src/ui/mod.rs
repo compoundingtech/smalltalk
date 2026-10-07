@@ -3358,7 +3358,7 @@ impl Ui {
         }
         let focused = self.input_terminal();
         match event {
-            Event::Key(key) => self.key(key),
+            Event::Key(key) => self.key(shifted(key)),
             Event::Paste(text) => {
                 self.sync_terminal_slot();
                 self.paste(text)
@@ -5710,6 +5710,19 @@ impl Ui {
 }
 
 /// Editing at the text's end, for an input without a cursor of its own (the palette's query).
+/// A terminal that reports every key as an escape code may send Shift+i as `i` with Shift, and
+/// a terminal that does not give the layout's own character leaves that to us: a letter at least.
+fn shifted(mut key: KeyEvent) -> KeyEvent {
+    if let KeyCode::Char(letter) = key.code
+        && key.modifiers.contains(KeyModifiers::SHIFT)
+        && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        && letter.is_ascii_lowercase()
+    {
+        key.code = KeyCode::Char(letter.to_ascii_uppercase());
+    }
+    key
+}
+
 fn edit_text(text: &mut String, key: KeyEvent) -> bool {
     edit::edit(text, &edit::Cursor::default(), "", key)
 }
@@ -5875,6 +5888,9 @@ impl Guard {
                     crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                         | crossterm::event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES
                         | crossterm::event::KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+                        // With every key an escape code, Shift+; arrives as `;` plus Shift. This
+                        // asks the terminal to say what the layout makes of it: `:`.
+                        | crossterm::event::KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
                 )
             )?;
         }
@@ -6144,6 +6160,14 @@ mod tests {
         assert_eq!(text, "look ", "a control key never types its letter");
         edit_text(&mut text, key(KeyCode::Char('X'), KeyModifiers::SHIFT));
         assert_eq!(text, "look X");
+        // A terminal that reports Shift+i as `i` with Shift still types a capital.
+        edit_text(&mut text, shifted(key(KeyCode::Char('i'), KeyModifiers::SHIFT)));
+        assert_eq!(text, "look XI");
+        assert_eq!(
+            shifted(key(KeyCode::Char('c'), KeyModifiers::CONTROL | KeyModifiers::SHIFT)).code,
+            KeyCode::Char('c'),
+            "a chord keeps its key"
+        );
         let mut lines = "first\nsecond line".to_owned();
         edit_text(&mut lines, key(KeyCode::Char('u'), KeyModifiers::CONTROL));
         assert_eq!(lines, "first\n");

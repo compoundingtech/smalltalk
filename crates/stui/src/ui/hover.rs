@@ -110,7 +110,13 @@ impl Ui {
             info.hits[target.index].1,
             Hit::Link(_) | Hit::Pane(PaneIntent::Open(_))
         );
-        let rect = target.rect.intersection(buf.area);
+        // Text to read and select is not a control: it is described in the footer, not lit.
+        let plain = matches!(info.hits[target.index].1, Hit::Message | Hit::Subject);
+        let rect = if plain {
+            Rect::default()
+        } else {
+            target.rect.intersection(buf.area)
+        };
         for y in rect.y..rect.bottom() {
             for x in rect.x..rect.right() {
                 if info
