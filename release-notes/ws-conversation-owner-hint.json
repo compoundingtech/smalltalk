@@ -1,10 +1,10 @@
 {
   "version": 1,
-  "summary": "Preserve validated conversation subject hints through local reads and internal owner forwarding without a database index",
+  "summary": "Preserve validated conversation subject hints through local reads, remote WebSocket polling and internal owner forwarding without a database index",
   "replay": {"status": "none", "detail": "No claim replay or recovery changes. Ownership is still validated against exact history status at the requested snapshot and the existing managed-session hash."},
   "schema": {"status": "none", "detail": "No database tables, indexes, triggers, schema-version changes or data rewrites. Exact subject reads use existing subject indexes."},
   "rules": {"status": "none", "detail": "No checkpoint rules, digests or coordinated-upgrade requirement."},
-  "compatibility": {"status": "none", "detail": "Public client contracts, session IDs and existing peer JSON are unchanged. Optional internal HTTP metadata selects an exact lookup only after hash validation; old owners ignore it and old gateways omit it. Missing or mismatched hints use existing roster resolution, without changing the authenticated authority actor or permissions."},
+  "compatibility": {"status": "none", "detail": "Public client contracts, session IDs and existing peer JSON are unchanged. Optional internal HTTP metadata selects an exact lookup only after hash validation; old owners ignore it and old gateways omit it. Missing or mismatched hints use existing opaque ownership resolution, without changing the authenticated authority actor or permissions."},
   "downtime": {"status": "none", "detail": "No additional startup work or expected interruption. A peer or gateway running an older build retains the existing owner-resolution performance until upgraded."},
   "manual": {"status": "none", "detail": "No operator actions, client re-pairing or configuration changes required; identity and stored state are preserved."},
   "recovery": {"status": "none", "detail": "No persistent state change or new binary swap-back restriction. Older builds ignore optional HTTP metadata and retain existing peer JSON handling."}

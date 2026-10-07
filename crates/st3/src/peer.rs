@@ -3325,6 +3325,15 @@ mod tests {
 
     #[tokio::test]
     async fn a_gateway_receives_remote_conversation_changes_without_idle_data() {
+        remote_conversation_changes_and_websocket(false).await;
+    }
+
+    #[tokio::test]
+    async fn conversation_subject_hint_remote_websocket_polls_never_reads_roster() {
+        remote_conversation_changes_and_websocket(true).await;
+    }
+
+    async fn remote_conversation_changes_and_websocket(hinted: bool) {
         let owner_root = tempfile::tempdir().unwrap();
         let gateway_root = tempfile::tempdir().unwrap();
         let make_state = |root: &Path, node: &str| crate::api::AppState {
@@ -3378,6 +3387,9 @@ mod tests {
                 format!("{agent}:{incarnation}").as_bytes()
             ))[..24]
         );
+        let target = if hinted { agent } else { session_id.as_str() };
+        let owner_roster_before = crate::api::managed_session_roster_lookup_count(&owner.store);
+        assert_eq!(owner_roster_before, 0);
         let owner_socket = owner_root.path().join("st3.sock");
         let served_owner = owner_socket.clone();
         let owner_app = crate::api::router(owner.clone());
@@ -3415,28 +3427,32 @@ mod tests {
         }
         let client = st3_client::Client::unix_as(&gateway_socket, "person/example");
         let baseline = client
-            .conversation_changes(&session_id, None, 0)
+            .conversation_changes(target, None, 0)
             .await
             .unwrap()
             .value;
         assert!(baseline.items.is_empty());
         let cursor = baseline.next_cursor;
-        let mut stream = client.conversation_stream(&session_id, None).await.unwrap();
+        let mut stream = client.conversation_stream(target, None).await.unwrap();
         let opened = stream.next().await.unwrap().unwrap();
         assert!(opened.value.items.is_empty());
+        if hinted {
+            assert_eq!(crate::api::managed_session_roster_lookup_count(&owner.store), owner_roster_before,
+                "the remote WebSocket's first poll reversed the owner roster");
+        }
         assert!(
             tokio::time::timeout(Duration::from_millis(100), stream.next())
                 .await
                 .is_err()
         );
         let idle = client
-            .conversation_changes(&session_id, Some(&cursor), 100)
+            .conversation_changes(target, Some(&cursor), 100)
             .await
             .unwrap()
             .value;
         assert!(idle.items.is_empty());
         let waiting_client = client.clone();
-        let waiting_id = session_id.clone();
+        let waiting_id = target.to_owned();
         let waiting_cursor = cursor.clone();
         let waiting = tokio::spawn(async move {
             waiting_client
@@ -3477,6 +3493,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(streamed.value.items.len(), 2);
+        if hinted {
+            assert_eq!(crate::api::managed_session_roster_lookup_count(&owner.store), owner_roster_before,
+                "the remote WebSocket's resumed polling lost its subject hint");
+        }
         let stream_cursor = streamed.value.next_cursor;
         stream.close().await;
         owner
@@ -3509,18 +3529,27 @@ mod tests {
             })
             .unwrap();
         let replay = client
-            .conversation_changes(&session_id, Some(&resume), 0)
+            .conversation_changes(target, Some(&resume), 0)
             .await
             .unwrap()
             .value;
         assert_eq!(replay.items.len(), 1);
         let mut reconnected = client
-            .conversation_stream(&session_id, Some(&stream_cursor))
+            .conversation_stream(target, Some(&stream_cursor))
             .await
             .unwrap();
         let resumed = reconnected.next().await.unwrap().unwrap();
         assert_eq!(resumed.value.items.len(), 1);
         reconnected.close().await;
+        if hinted {
+            assert_eq!(crate::api::managed_session_roster_lookup_count(&owner.store), owner_roster_before,
+                "remote WebSocket reconnect lost its subject hint");
+            // A direct hintless owner read must increment the same store-local counter.
+            // The gateway would discover and forward a hint even for its opaque input.
+            st3_client::Client::unix_as(&owner_socket, "person/example")
+                .conversation_changes(&session_id, None, 0).await.unwrap();
+            assert!(crate::api::managed_session_roster_lookup_count(&owner.store) > owner_roster_before);
+        }
     }
 
     #[tokio::test]

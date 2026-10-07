@@ -5587,7 +5587,7 @@ async fn conversation_stream_socket(
                     .as_ref()
                     .ok_or_else(|| conversation_blocks::availability(remote_unavailable_for_owner(&state, owner)))?;
                 relay
-                    .read(
+                    .read_with_subject_hint(
                         owner,
                         &crate::peer::ClientReadRequest {
                             authority_actor: session.authority_actor.clone(),
@@ -5598,6 +5598,7 @@ async fn conversation_stream_socket(
                                 wait_ms: 10_000,
                             },
                         },
+                        session.conversation_subject_hint(),
                     )
                     .await
                     .map_err(|error| {
