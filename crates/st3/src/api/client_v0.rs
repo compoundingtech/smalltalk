@@ -6311,13 +6311,7 @@ fn remote_terminal_live_session(
     expected_incarnation: &str,
 ) -> Result<LiveSession, ApiError> {
     let _span = crate::profile::span("terminal/live-fence");
-    let status = state
-        .store
-        .status(Some(subject))
-        .map_err(ApiError::internal)?;
-    let selected = status
-        .subjects
-        .first()
+    let selected = state.store.runtime_authority(subject).map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found(format!("subject `{subject}` has no live session")))?;
     if !matches!(selected.reachability.as_str(), "reachable" | "local") {
         return Err(terminal_unavailable("the terminal owner is not reachable"));
@@ -15841,6 +15835,147 @@ mission "example/zero-run" state="ready" {
         assert!(!stored.contains(capability));
         assert!(!stored.contains("st3.cap."));
         assert!(!stored.contains("stream_capability"));
+    }
+
+    #[test]
+    fn terminal_live_fence_refusal_matrix() {
+        let subject = "agent/fence-matrix";
+        for (label, fields, expected, message) in [
+            ("running", json!({"status":"running","runtime_id":"r","incarnation_id":"i","terminal":true}), None, None),
+            ("stale", json!({"status":"running","runtime_id":"r","incarnation_id":"old","terminal":true}), Some("stale-fence"), Some("subject `agent/fence-matrix` changed incarnation")),
+            ("exited", json!({"status":"exited","runtime_id":"r","incarnation_id":"i","terminal":true}), Some("not-found"), Some("subject `agent/fence-matrix` has no running session")),
+            ("unreachable", json!({"status":"running","runtime_id":"r","incarnation_id":"i","terminal":true,"reachability":"unreachable"}), Some("terminal-unavailable"), Some("the terminal owner is not reachable")),
+            ("no-runtime", json!({"status":"running","incarnation_id":"i","terminal":true}), Some("not-found"), Some("subject `agent/fence-matrix` has no runtime")),
+            ("no-incarnation", json!({"status":"running","runtime_id":"r","terminal":true}), Some("not-found"), Some("subject `agent/fence-matrix` has no incarnation")),
+            ("no-kind", json!({"status":"running","runtime_id":"r","incarnation_id":"i"}), Some("not-found"), Some("subject `agent/fence-matrix` has no runtime kind")),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let state = test_state_named(root.path(), "matrix-owner");
+            state.store.append_claim(&ClaimInput {
+                subject: subject.into(), kind: "runtime.observed".into(),
+                actor: Some(subject.into()), fields: serde_json::from_value(fields).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+            let result = remote_terminal_live_session(&state, subject, "i");
+            if let Some(code) = expected {
+                let error = result.unwrap_err();
+                assert_eq!(error.code, code, "{label}");
+                assert_eq!(error.message, message.unwrap(), "{label}");
+            } else {
+                let live = result.unwrap();
+                assert_eq!(live.runtime_id, "r");
+                assert_eq!(live.incarnation_id, "i");
+                assert!(live.terminal);
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "matrix-owner");
+        let error = remote_terminal_live_session(&state, subject, "i").unwrap_err();
+        assert_eq!(error.code, "terminal-unavailable");
+        assert_eq!(error.message, "the terminal owner is not reachable");
+
+        let runtime = ClaimInput {
+            subject: subject.into(), kind: "runtime.observed".into(),
+            actor: Some(subject.into()),
+            fields: serde_json::from_value(json!({"status":"running","runtime_id":"r","incarnation_id":"i","terminal":true})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        };
+        state.store.append_claim(&runtime).unwrap();
+        let rival_root = tempfile::tempdir().unwrap();
+        let rival = test_state_named(rival_root.path(), "matrix-rival");
+        rival.store.append_claim(&runtime).unwrap();
+        state.store.import_replication("matrix-rival", &rival.store.export_replication(0).unwrap()).unwrap();
+        let error = remote_terminal_live_session(&state, subject, "i").unwrap_err();
+        assert_eq!(error.code, "terminal-unavailable");
+        assert_eq!(error.message, "the terminal owner is not reachable");
+        assert_eq!(terminal_live_session(&state, subject, Some("i")).unwrap_err().code, "runtime-authority-indeterminate");
+
+        let gateway_root = tempfile::tempdir().unwrap();
+        let gateway = test_state_named(gateway_root.path(), "matrix-gateway");
+        gateway.store.import_replication("matrix-rival", &rival.store.export_replication(0).unwrap()).unwrap();
+        let error = remote_terminal_live_session(&gateway, subject, "i").unwrap_err();
+        assert_eq!(error.code, "remote-unavailable");
+        assert_eq!(terminal_live_session(&gateway, subject, Some("i")).unwrap_err().code, "runtime-not-local");
+    }
+
+    #[test]
+    fn remote_terminal_live_fence_refusal_matrix() {
+        let subject = "agent/remote-fence-matrix";
+        for (fields, code, message) in [
+            (json!({"status":"exited","runtime_id":"r","incarnation_id":"i","terminal":true}), "not-found", "the terminal is not running"),
+            (json!({"status":"running","runtime_id":"r","terminal":true}), "not-found", "the terminal has no incarnation"),
+            (json!({"status":"running","runtime_id":"r","incarnation_id":"old","terminal":true}), "stale-fence", "the terminal incarnation fence is stale"),
+            (json!({"status":"running","incarnation_id":"i","terminal":true}), "not-found", "the terminal has no runtime ID"),
+        ] {
+            let owner_root = tempfile::tempdir().unwrap();
+            let gateway_root = tempfile::tempdir().unwrap();
+            let owner = test_state_named(owner_root.path(), "matrix-remote-owner");
+            let mut gateway = test_state_named(gateway_root.path(), "matrix-remote-gateway");
+            let secret = gateway_root.path().join("fleet-secret");
+            std::fs::write(&secret, [7_u8; 32]).unwrap();
+            std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
+            gateway.client_relay = crate::peer::ClientRelay::from_config(&crate::config::Config {
+                node: "matrix-remote-gateway".into(),
+                fleet_id: Some("fleet-test".into()), shared_secret_file: Some(secret),
+                peers: vec![crate::config::PeerConfig {
+                    name: "matrix-remote-owner".into(), url: "http://127.0.0.1:9".into(),
+                }],
+                ..Default::default()
+            }).unwrap();
+            owner.store.append_claim(&ClaimInput {
+                subject: subject.into(), kind: "runtime.observed".into(),
+                actor: Some(subject.into()), fields: serde_json::from_value(fields).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+            gateway.store.import_replication("matrix-remote-owner", &owner.store.export_replication(0).unwrap()).unwrap();
+            let error = remote_terminal_live_session(&gateway, subject, "i").unwrap_err();
+            assert_eq!(error.code, code);
+            assert_eq!(error.message, message);
+        }
+    }
+
+    #[test]
+    fn raw_capability_refuses_changed_selected_owner_or_runtime() {
+        for (bound_owner, bound_runtime) in [("host/another-owner", "r"), ("host/matrix-owner", "old")] {
+            let root = tempfile::tempdir().unwrap();
+            let mut state = test_state_named(root.path(), "matrix-owner");
+            let secret = root.path().join("fleet-secret");
+            std::fs::write(&secret, [7_u8; 32]).unwrap();
+            std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
+            state.client_relay = crate::peer::ClientRelay::from_config(&crate::config::Config {
+                node: "matrix-owner".into(),
+                fleet_id: Some("fleet-test".into()), shared_secret_file: Some(secret),
+                peers: vec![crate::config::PeerConfig {
+                    name: "another-owner".into(), url: "http://127.0.0.1:9".into(),
+                }],
+                ..Default::default()
+            }).unwrap();
+            let session = ClientSession::local(Some("person/alex")).unwrap();
+            state.store.append_claim(&ClaimInput {
+                subject: "agent/fence-matrix".into(), kind: "runtime.observed".into(),
+                actor: None, fields: serde_json::from_value(json!({"status":"running","runtime_id":"r","incarnation_id":"i","terminal":true})).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+            let capability = "matrix-capability";
+            state.store.append_claim(&ClaimInput {
+                subject: terminal_attachment_subject("terminal-attachment/matrix").unwrap(),
+                kind: "custom.client.terminal-attached".into(),
+                actor: Some(session_claim_actor(&session)),
+                fields: serde_json::from_value(json!({
+                    "attachment_id":"terminal-attachment/matrix", "terminal_id":"terminal/agent/fence-matrix",
+                    "runtime_incarnation":"i", "runtime_id":bound_runtime, "owner_host_id":bound_owner,
+                    "session_actor":session.actor, "person_id":session.authority_actor, "raw_mode":"peek",
+                    "capability_hash":credential_digest(capability), "expires_at_unix_ms":client_now_ms()+60_000,
+                })).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+            let before = state.store.status(Some("terminal-attachment/matrix")).unwrap().store_index;
+            let error = consume_terminal_attachment_mode(
+                &state, &session, "terminal/agent/fence-matrix", "i", Some(capability), Some("peek"),
+            ).unwrap_err();
+            assert_eq!(error.code, "forbidden");
+            assert_eq!(state.store.status(Some("terminal-attachment/matrix")).unwrap().store_index, before);
+        }
     }
 
     /// A member one build behind still routes to a terminal on a newer member whose seat reports

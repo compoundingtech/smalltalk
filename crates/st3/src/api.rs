@@ -13491,13 +13491,7 @@ fn live_session(
     subject: &str,
     expected_incarnation: Option<&str>,
 ) -> Result<LiveSession, ApiError> {
-    let status = state
-        .store
-        .status(Some(subject))
-        .map_err(ApiError::internal)?;
-    let selected = status
-        .subjects
-        .first()
+    let selected = state.store.runtime_authority(subject).map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found(format!("subject `{subject}` has no live session")))?;
     if !matches!(selected.reachability.as_str(), "reachable" | "local") {
         return Err(ApiError::bad(St3Error::new(
@@ -13546,11 +13540,9 @@ fn live_session(
     }
     let member = state
         .store
-        .desired_subjects()
+        .desired_subject_with_writer(subject)
         .map_err(ApiError::internal)?
-        .into_iter()
-        .find(|desired| desired.subject == subject)
-        .and_then(|desired| desired.member);
+        .and_then(|(desired, _)| desired.member);
     let terminal = member
         .as_ref()
         .map(|member| member.terminal)
