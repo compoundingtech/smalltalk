@@ -2272,7 +2272,12 @@ fn client_agent_resources_uncached(
     history: bool,
     snapshot_index: u64,
 ) -> anyhow::Result<Vec<Value>> {
-    let status = store.status_for_subject_prefix_at("agent/", Some(snapshot_index), history)?;
+    let status = store.status_for_subject_prefix_at(
+        "agent/",
+        Some(snapshot_index),
+        history,
+        crate::store::ClaimsReduction::Summary,
+    )?;
     client_agent_resources_from_status(store, history, snapshot_index, None, status)
 }
 
@@ -20524,7 +20529,12 @@ mission "wake" state="ready" {
                 let cards = client_agent_resources_selected(store, false, index, None)?;
                 assert_eq!(Sha256::digest(serde_json::to_vec(&cards)?),
                     Sha256::digest(serde_json::to_vec(&full)?));
-                let status = store.status_for_subject_prefix_at("agent/", Some(index), false)?;
+                let status = store.status_for_subject_prefix_at(
+                    "agent/",
+                    Some(index),
+                    false,
+                    crate::store::ClaimsReduction::Full,
+                )?;
                 let declared = status.subjects.iter().find(|s| s.subject == "agent/node.declared").unwrap();
                 assert_eq!(cards.iter().find(|c| c["id"] == declared.subject).unwrap()["revision"],
                     declared.desired_revision.as_ref().unwrap().as_str());
