@@ -19,6 +19,7 @@ import { AgentsScreen, HistoryScreen } from './screens/Agents';
 import { ConversationScreen } from './screens/Conversation';
 import { FleetScreen, PairScreen } from './screens/Fleet';
 import { UsageDetailScreen, UsageScreen } from './screens/Usage';
+import { DocumentScreen } from './screens/Document';
 import { NewAgentScreen } from './screens/NewAgent';
 import { AttentionScreen, HomeScreen } from './screens/Home';
 import { LaunchScreen, MissionScreen, MissionsScreen, NewMissionScreen } from './screens/Missions';
@@ -65,6 +66,7 @@ function TabStack({ tab }: { tab: Tab | 'Glasses' }) {
     <Stack.Screen name="Terminal" component={TerminalScreen} options={{ title: 'Terminal', contentStyle: { backgroundColor: theme.crust } }} />
     <Stack.Screen name="Mission" component={MissionScreen} options={{ title: 'Mission' }} />
     <Stack.Screen name="Attention" component={AttentionScreen} options={{ title: 'Needs you' }} />
+    <Stack.Screen name="Document" component={DocumentScreen} options={{ title: 'Document' }} />
     <Stack.Screen name="Launch" component={LaunchScreen} options={{ title: 'Launch' }} />
     <Stack.Screen name="History" component={HistoryScreen} options={{ title: 'Past sessions' }} />
     <Stack.Screen name="NewMission" component={NewMissionScreen} options={{ title: 'New mission', presentation: 'modal' }} />

@@ -20,6 +20,7 @@ import { normalizeGatewayUrl } from './gatewayUrl';
 import { tabOrder, type Tab } from './tabs';
 import { fetch as expoFetch } from 'expo/fetch';
 import { decodeBase64, encodeBase64, type Picked } from './images';
+import { documentText } from './documents';
 
 // Everything the screens share: the paired gateway, the one collections socket, the lists it keeps
 // current, the lists a screen loads when it opens, and the actions. Screens follow a conversation
@@ -374,6 +375,12 @@ function useAppStore(proof?: FabricProfile) {
       if (!client) return false;
       acted.current.add(item.id);
       return runAction(async () => { const id = actionId(); return client.messageRead({ id, idempotency_key: id, fence: await fence({ [item.id]: item.revision }), parameters: { target_id: item.source_id } }); });
+    },
+    /** A document's text by `doc/NAME@HASH`, read from st. */
+    async document(name: string): Promise<string> {
+      if (!client) throw new Error('not connected');
+      const result = await client.documentGet(name);
+      return documentText(result.value.bytes);
     },
     /** An image a message carries, as a data URI; st reads it from the member that has it. */
     image(image: { sha256: string; message: string; mediaType: string }): Promise<string> {

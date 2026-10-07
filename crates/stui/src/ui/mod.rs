@@ -64,7 +64,7 @@ use st3_conversation_ui::pane::order;
 use st3_conversation_ui::{PaneIntent, PaneState, Selection};
 use std::{
     cell::{Cell, RefCell},
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     io::{self, Write},
     rc::Rc,
     time::{Duration, Instant},
@@ -365,6 +365,9 @@ pub struct Ui {
     /// Conversations scrolled up to their oldest entry since the last frame: each asks st for
     /// the page before it.
     older_wanted: RefCell<BTreeSet<String>>,
+    /// Documents opened in a tab: what was read of each, and which are still to be read.
+    documents: RefCell<BTreeMap<String, view::Load<String>>>,
+    documents_wanted: RefCell<BTreeSet<String>>,
     popover: Option<String>,
     chat: Option<ChatState>,
     /// st's conversation search for the palette: the query asked and what came back.
@@ -514,6 +517,8 @@ impl Ui {
             acted: HashSet::new(),
             closed: HashSet::new(),
             older_wanted: RefCell::default(),
+            documents: RefCell::default(),
+            documents_wanted: RefCell::default(),
             popover: None,
             chat: None,
             parked: Vec::new(),
@@ -1965,6 +1970,10 @@ impl Ui {
 
     /// What the main area shows for the current tab and selection.
     fn main_pane(&self) -> Pane {
+        // A document tab shows its document whatever the sidebar's own tab and selection are.
+        if let Some(Pane::Document(name)) = self.focused_pane() {
+            return Pane::Document(name);
+        }
         let id = self.selected_id();
         match self.tab {
             0 => Pane::Home(id),
@@ -2005,6 +2014,7 @@ impl Ui {
                 let drafts = self.drafts_for(id.as_deref().unwrap_or_default(), width);
                 screens::home_detail(&self.world, id.as_deref(), width, &drafts)
             }
+            Pane::Document(name) => self.document_doc(name, width),
             Pane::NewMission => {
                 let empty = Default::default();
                 let (fields, focus) = self.new_mission.as_ref().unwrap_or(&empty);
@@ -2067,6 +2077,35 @@ impl Ui {
             Pane::Usage(id) => usage::detail(&self.world, id.as_deref(), self.usage_hours, width),
         };
         self.pane(buf, &pane.key(), area, doc, false);
+    }
+
+    /// A document as markdown, read from st the first time its tab is drawn.
+    fn document_doc(&self, name: &str, width: usize) -> Doc {
+        let mut doc = Doc::new();
+        doc.line(Line::from(vec![
+            Span::styled(" document ", theme::fg(theme::LAVENDER)),
+            Span::styled(name.to_owned(), theme::dim()),
+        ]));
+        doc.blank();
+        let load = self.documents.borrow().get(name).cloned();
+        match load {
+            Some(view::Load::Ready(body)) => doc.lines(text::markdown(&body, width, theme::text())),
+            Some(view::Load::Failed(reason)) => doc.line(Line::from(Span::styled(
+                format!(" Could not read it: {reason}"),
+                theme::fg(theme::FAULT),
+            ))),
+            other => {
+                // Asked for once, the first time it is drawn.
+                if other.is_none() && self.live {
+                    self.documents_wanted.borrow_mut().insert(name.to_owned());
+                    self.documents
+                        .borrow_mut()
+                        .insert(name.to_owned(), view::Load::Loading);
+                }
+                doc.line(Line::from(Span::styled(" Reading the document…", theme::dim())));
+            }
+        }
+        doc
     }
 
     fn draw_agent(&self, buf: &mut Buffer, area: Rect, id: Option<&str>) {
@@ -3386,6 +3425,20 @@ impl Ui {
         }
     }
 
+    /// A document st read for a tab, or why it could not.
+    pub(crate) fn set_document(&self, name: String, outcome: Result<String, String>) {
+        let load = match outcome {
+            Ok(body) => view::Load::Ready(body),
+            Err(reason) => view::Load::Failed(reason),
+        };
+        self.documents.borrow_mut().insert(name, load);
+    }
+
+    /// The documents shown and not yet read, once each.
+    pub(crate) fn take_documents_wanted(&self) -> BTreeSet<String> {
+        std::mem::take(&mut *self.documents_wanted.borrow_mut())
+    }
+
     /// The conversations scrolled up to their start since this was last asked.
     pub(crate) fn take_older_wanted(&self) -> BTreeSet<String> {
         std::mem::take(&mut *self.older_wanted.borrow_mut())
@@ -4075,6 +4128,7 @@ impl Ui {
                         "A {word} waits on your decision, so x cannot dismiss it: answer it with the keys on its card"
                     )),
                     (_, 'g') => self.go_to_subject(),
+                    ("request", 'v') => self.read_document(),
                     (_, 't') => self.start_chat(),
                     ("message", 'l') => {
                         if let Some(id) = self.selected_id() {
@@ -4606,6 +4660,24 @@ impl Ui {
     }
 
     /// Go to what a Home item is about: its mission, or else its agent.
+    /// Open the first document a request names, in a tab of its own.
+    fn read_document(&mut self) {
+        let Some((_, request)) = self.structured_request() else {
+            return;
+        };
+        let document = request.subjects.iter().find_map(|subject| {
+            subject
+                .reference
+                .clone()
+                .filter(|reference| reference.starts_with("doc/") && reference.contains('@'))
+        });
+        match document {
+            Some(name) if self.glasses.is_some() => self.open(&name),
+            Some(_) => self.flash("Documents open in a tab of a space"),
+            None => self.flash("This asks about no document"),
+        }
+    }
+
     fn go_to_subject(&mut self) {
         let Some(item) = self.current_item() else {
             return;

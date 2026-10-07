@@ -25,6 +25,8 @@ export type StackParams = {
   Mission: { id: string; title?: string };
   Attention: { id: string };
   Launch: { id: string };
+  /** An st document by its name and hash (`doc/NAME@HASH`), drawn as markdown. */
+  Document: { name: string };
   NewMission: undefined;
   NewAgent: undefined;
   History: undefined;
