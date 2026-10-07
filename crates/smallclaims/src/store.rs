@@ -550,14 +550,43 @@ impl Store {
         // Opening cannot seal recent work: the caller has not loaded its signing keys yet.
         // Resume at the first batch still needing an envelope, so a restart seals it with
         // the same person and agent keys instead of permanently losing its delegation signatures.
-        let seeded_batch_rowid = connection.query_row(
-            "SELECT COALESCE(
-                (SELECT MIN(batches.rowid)-1 FROM batches WHERE NOT EXISTS (
-                    SELECT 1 FROM replica_envelopes WHERE batch_id=batches.id)),
-                (SELECT MAX(rowid) FROM batches), 0)",
+        //
+        // Finding that batch meant probing the envelope table once per batch, 611,000 probes: 3 to
+        // 9 s on every start. Sealing stores how far it has gone in `meta` in the transaction
+        // that seals, so a start reads it. It is a lower bound that is always safe: sealing only
+        // seals batches that still lack an envelope, so a cursor behind the truth costs a longer
+        // range, never a missed batch. A store without the cursor, once, finds it the slow way.
+        let max_rowid: i64 = connection.query_row(
+            "SELECT COALESCE(MAX(rowid), 0) FROM batches",
             [],
             |row| row.get(0),
         )?;
+        let stored_cursor: Option<i64> = connection
+            .query_row(
+                "SELECT value FROM meta WHERE key='seeded_batch_rowid'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|value| value.parse().ok());
+        let seeded_batch_rowid = match stored_cursor {
+            Some(cursor) => cursor.min(max_rowid),
+            None => {
+                let found: i64 = connection.query_row(
+                    "SELECT COALESCE(
+                        (SELECT MIN(batches.rowid)-1 FROM batches WHERE NOT EXISTS (
+                            SELECT 1 FROM replica_envelopes WHERE batch_id=batches.id)),
+                        (SELECT MAX(rowid) FROM batches), 0)",
+                    [],
+                    |row| row.get(0),
+                )?;
+                connection.execute(
+                    "INSERT OR REPLACE INTO meta(key,value) VALUES('seeded_batch_rowid', ?1)",
+                    [found.to_string()],
+                )?;
+                found
+            }
+        };
         let index = current_index(&connection)?;
         // Older stores have no admission watermark. Startup recovery projects this index
         // before serving; subsequent admission chunks update it in their own transaction.
@@ -4903,6 +4932,10 @@ impl Store {
                 Some(&|claim: &principals::Unsealed<'_>| self.sign_unsealed(claim)),
             )?;
             self.sign_own_envelopes_range_tx(&transaction, Some(seeded_through), Some(through))?;
+            transaction.execute(
+                "INSERT OR REPLACE INTO meta(key,value) VALUES('seeded_batch_rowid', ?1)",
+                [through.to_string()],
+            )?;
             transaction.commit()?;
             self.seeded_batch_rowid.store(through, Ordering::Release);
             // The FIFO writer services any already queued request before the next loan.
