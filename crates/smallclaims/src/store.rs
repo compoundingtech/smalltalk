@@ -79,6 +79,30 @@ pub struct ProjectionProgress {
     pub total: Option<u64>,
 }
 
+/// Why an incremental projection failed, on one bounded line: the error code and message (240
+/// characters), the first kinds of claim in the range, and the range.
+fn incremental_failure_log_line(
+    code: &str,
+    message: &str,
+    kinds: &[String],
+    frontier: u64,
+    through: u64,
+) -> String {
+    fn bounded(value: &str, limit: usize) -> String {
+        value
+            .chars()
+            .take(limit)
+            .map(|c| if c.is_control() { '?' } else { c })
+            .collect()
+    }
+    format!(
+        "st: projection incremental failed code={} kinds={} frontier={frontier} through={through} message={}",
+        bounded(code, 64),
+        bounded(&kinds.join(","), 256),
+        bounded(message, 240)
+    )
+}
+
 /// Keep diagnostics on one bounded line even when an error code or caller phase is untrusted.
 fn full_replay_log_line(phase: &str, reason: &str, frontier: u64, target: u64) -> String {
     fn bounded(value: &str) -> String {
@@ -5954,6 +5978,29 @@ impl Store {
                                     "ROLLBACK TO project_incremental; RELEASE project_incremental",
                                 )
                                 .map_err(internal)?;
+                            // The code alone ("internal") says nothing about what failed. Say what
+                            // the error was and which claim kinds were in the range, on one bounded
+                            // line, so a fallback can be traced to a cause without a repro.
+                            let kinds = transaction
+                                .prepare(
+                                    "SELECT DISTINCT kind FROM claims
+                                     WHERE store_index>?1 AND store_index<=?2 LIMIT 8",
+                                )
+                                .and_then(|mut statement| {
+                                    statement
+                                        .query_map(params![frontier, through], |row| {
+                                            row.get::<_, String>(0)
+                                        })?
+                                        .collect::<rusqlite::Result<Vec<_>>>()
+                                })
+                                .unwrap_or_default();
+                            log(&incremental_failure_log_line(
+                                error.code,
+                                &error.message,
+                                &kinds,
+                                frontier,
+                                through,
+                            ));
                             Some(format!("incremental-error:{}", error.code))
                         }
                     };
@@ -7634,5 +7681,21 @@ mod replay_log_tests {
         assert!(!line.contains(['\n', '\r', '\t']));
         assert!(line.len() < 1200);
         assert!(line.contains(&format!("frontier={} target={}", u64::MAX, u64::MAX)));
+    }
+
+    #[test]
+    fn an_incremental_failure_line_is_one_bounded_line_with_the_cause() {
+        let kinds = (0..8).map(|n| format!("kind.{n}\n")).collect::<Vec<_>>();
+        let line = incremental_failure_log_line(
+            "internal",
+            &format!("constraint failed\nat {}", "x".repeat(10_000)),
+            &kinds,
+            3,
+            9,
+        );
+        assert!(!line.contains(['\n', '\r', '\t']));
+        assert!(line.len() < 700);
+        assert!(line.starts_with("st: projection incremental failed code=internal kinds=kind.0?,"));
+        assert!(line.contains("frontier=3 through=9 message=constraint failed?at "));
     }
 }

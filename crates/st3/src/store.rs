@@ -26018,6 +26018,14 @@ fn try_project_simple_replication_tx(
             operation_tx(transaction, operation_id).map_err(internal)?
             && (stored_digest != request_digest || state != "active")
         {
+            // Name what conflicted: the replay that follows is the whole graph.
+            eprintln!(
+                "st: projection operation conflict operation={} stored_state={} digest_differs={} claim_kind={}",
+                operation_id.chars().take(96).collect::<String>(),
+                state.chars().take(32).collect::<String>(),
+                stored_digest != request_digest,
+                claim.kind.chars().take(64).collect::<String>()
+            );
             return Ok(replay_needed("operation-conflict"));
         }
         register_operation_tx(transaction, claim).map_err(internal)?;
