@@ -59,6 +59,11 @@ typecheck, measurement contract tests and production/development bundle-exclusio
 proof. The measurement module has no package dependencies; its tests run directly
 with Node and its compile-time instrumentation boundary is checked with Bun.
 The generated Workspace workflow runs these lanes only for web-relevant changes.
+The synthetic-fixtures lane generates deterministic examples, checks their freshness
+and linked references, decodes with the canonical client schema and runs the
+fail-closed privacy scanner. To run it alone after the root install, use
+`bash apps/fractal-web/scripts/ci/fixtures-gate.sh`. Private owner policies stay
+outside the repository and are supplied to `scan.mjs --policy FILE` before publishing.
 
 ## Continuous integration
 

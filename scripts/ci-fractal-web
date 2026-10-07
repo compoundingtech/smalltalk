@@ -38,3 +38,4 @@ lane "Frozen install" pnpm install --frozen-lockfile
 lane "Buck typecheck" buck2 build //:typecheck
 lane "Measurement contracts" node --experimental-strip-types --test apps/fractal-web/src/telemetry/measurement/measurement.node-test.ts
 lane "Measurement bundle exclusion" bun apps/fractal-web/src/telemetry/measurement/check-bundles.mjs
+lane "Synthetic fixtures" bash apps/fractal-web/scripts/ci/fixtures-gate.sh
