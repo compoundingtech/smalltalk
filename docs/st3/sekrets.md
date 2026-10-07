@@ -25,6 +25,16 @@ resource graph plan; this document describes what is built.
   command is allowed when some allow rule matches and no deny rule does. `*` matches exactly one
   argument. Options before a subcommand (`gh -R other/repo pr create`) match no allow prefix
   unless one names them. Presets make a policy one word; `st sekrets presets` lists them.
+  `gh-agent` covers what agents use gh for (pull requests, issues, runs, workflows, releases,
+  search, labels, variables and `gh api`) and never `gh auth token`, `auth status -t`, `secret`,
+  `alias`, `extension` or `config`.
+- **Passed files.** A deny rule can name file options, which read the file their value names
+  (`--body-file`, `--input`), and field options, which read one after `@` (`-F key=@file`).
+  Those are allowed only with the caller's standard input (`-`) or a file the caller passed. For
+  gh, `st sekrets` opens each such file itself, as the caller, passes it as a descriptor and
+  rewrites the argument to `/dev/fd/N`, so `gh pr edit 7 --body-file /tmp/notes.md` works as
+  written while no argument can make the command read a file of the sekrets user's, such as the
+  profile's own login.
 - **Grant.** The owner gives an agent, a pattern of agents (`agent/web/**`) or another
   person the use of a profile, with a policy and an optional expiry. A call through a grant must
   pass both the profile's policy and the grant's, so a grant can only narrow. A grant to an agent
@@ -70,6 +80,33 @@ Until seats run as another user, keep a person's own profile on a policy that le
 commands that print credentials (`no-credential-printing`), and remove credentials from the
 person's home (`st sekrets adopt`, the next step).
 
+## Authorized requests
+
+The st daemon, and st commands such as gates, call GitHub's API themselves. With a sekrets
+profile they do it without ever holding the token: each request goes to the gateway, which adds
+the profile's token and returns the response. It is one request and one response over the
+gateway socket, not a proxy.
+
+- The caller is `host/NODE`: the process signs a statement with the node key its person
+  registered (`st sekrets enable`), bound to its pid, cgroup and the gateway's nonce, as a seat's
+  daemon does for a seat. A person in a login session can also call with their own profiles.
+- The profile and the grant must allow `http METHOD github`; the `github-api` preset allows any
+  method. Grant it to the node: `st sekrets grant ada/daemon-gh --to host/alder --preset github-api`.
+- Only URLs under the gateway's `github_api` base (`https://api.github.com` unless root's
+  configuration says otherwise) are reachable. A request that carries its own `Authorization` or
+  `Cookie` header is refused; host and hop-by-hop headers are dropped; the gateway adds
+  `Authorization: Bearer TOKEN`.
+- Redirects are never followed: a 3xx comes back as it is. Every response header (ETag, Link,
+  rate limits) and the raw body come back; a 4xx or 5xx is a response, not an error. Nothing is
+  retried. Request bodies are limited to 16 MiB and response bodies to 64 MiB; each request has 60
+  seconds.
+- The token is a value put into the profile (`GH_TOKEN` or `GITHUB_TOKEN`), else the profile's gh
+  login, read once and kept until a 401 says it changed.
+- Each request is logged by method, path and status, never with the token or the body.
+
+In Rust: `st3::sekrets::authorized::authorized_request(&config, "ada/daemon-gh", &request)`
+returns the response or `Unavailable` (no gateway or no node key), `Refused` or `Transport`.
+
 ## The sandbox
 
 The gateway runs each command as the sekrets user inside bubblewrap:
@@ -94,9 +131,11 @@ The gateway runs each command as the sekrets user inside bubblewrap:
   than the checkout. A `.git` that is a symbolic link, or a gitdir file or `commondir` naming a
   directory outside the passed checkout, is refused: git would follow it to a configuration the
   gateway never sanitized.
-- The checkout is read-only to the command, so `git push` through sekrets pushes the branch and
-  exits 0 but cannot record the remote-tracking ref or `-u` upstream in the checkout; run
-  `git fetch` and `git branch --set-upstream-to` as the caller afterwards.
+- The checkout is read-only to the command: it runs as the sekrets user, which owns none of the
+  caller's files. `git push` through sekrets pushes the branch and exits 0 but cannot record the
+  remote-tracking ref or `-u` upstream in the checkout; run `git fetch` and
+  `git branch --set-upstream-to` as the caller afterwards. Commands that write files into the
+  checkout (`gh pr checkout`, `gh repo clone`, `gh run download`) do not work through sekrets.
 - The command and every tool it runs come from the gateway's configured path. Each directory and
   file on the way must belong to root (or the sekrets user) and be writable by no one else, so no
   person or seat can change what runs as sekrets. A command is a name, never a path.
