@@ -2309,6 +2309,9 @@ pub struct LoopRoundView {
     pub recorded_at_unix_ms: u128,
 }
 
+pub(crate) const DECLARATIONS_PENDING: &str =
+    "waiting for declarations to reach their required actual state";
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct StepRunView {
     pub subject: String,
@@ -2375,6 +2378,15 @@ pub struct StepRunView {
     pub not_before_unix_ms: Option<u128>,
     pub created_at_unix_ms: u128,
     pub updated_at_unix_ms: u128,
+}
+
+impl StepRunView {
+    pub(crate) fn execution_is_active(&self) -> bool {
+        matches!(self.status.as_str(), "claimed" | "working")
+            || (self.agentless
+                && self.status == "blocked"
+                && self.blocked_reason.as_deref() == Some(DECLARATIONS_PENDING))
+    }
 }
 
 pub fn fresh_context_operation(step: &StepRunView) -> String {

@@ -151,7 +151,7 @@ fn retain_live_mail(
 ) -> anyhow::Result<()> {
     let mut live = Vec::new();
     for message in messages.drain(..) {
-        let Some(sent) = store.latest_claim(&message.subject, Some("message.sent"))? else {
+        let Some(sent) = store.message_acceptance(&message.subject)? else {
             continue;
         };
         let after_connection = through.is_none_or(|index| message.created_index > index)
@@ -190,7 +190,7 @@ pub(super) fn hold_pre_boot_mail(
     // A closed projection only removes old native inbox files. Explicit conversation
     // reads still see the original graph status, with no synthetic receipt or close.
     for message in messages {
-        let Some(sent) = store.latest_claim(&message.subject, Some("message.sent"))? else {
+        let Some(sent) = store.message_acceptance(&message.subject)? else {
             message.status = "closed".into();
             continue;
         };
@@ -691,6 +691,110 @@ mod tests {
                 other => panic!("unexpected {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn declared_mail_keeps_original_age_and_never_invents_a_receipt() {
+        let store = Store::open_memory("node").unwrap();
+        crate::mailbox::tests::ready(&store, "declaration-boot");
+        let intent = crate::graph::parse_execution_intent(
+            r#"version 2
+message "declared-reminder" {
+  from "agent/eval.worker"
+  to "agent/eval.worker"
+  content "Resume the bounded observation."
+}"#,
+            "node",
+            "fixture",
+        ).unwrap();
+        store.apply_internal(&intent, "declare-reminder").unwrap();
+        let subject = "message/declared-reminder";
+        let admitted = store.message_acceptance(subject).unwrap().unwrap();
+        assert_eq!(admitted.kind, "intent.desired");
+        let index = store.index().unwrap();
+        let mailbox = store.messages(Some("agent/eval.worker"), false).unwrap();
+        assert_eq!(mailbox.len(), 1);
+        let mut live = mailbox.clone();
+        retain_live_mail(&store, &mut live, admitted.accepted_at_unix_ms,
+            Some(admitted.store_index - 1), &mut Default::default()).unwrap();
+        assert_eq!(live.len(), 1, "a post-connection declaration is live queued mail");
+        let peer = NativeDeliveryPeer {
+            agent: "agent/eval.worker".into(), transport: "app-server", pid: 7,
+            archives_inbox: true,
+        };
+        let mut legacy = mailbox.clone();
+        hold_pre_boot_mail(&store, Some(&peer), Some(&peer.agent), &mut legacy).unwrap();
+        assert_eq!(legacy[0].status, "sent");
+        let mut recent = mailbox.clone();
+        retain_live_mail(&store, &mut recent, admitted.accepted_at_unix_ms + 1,
+            Some(index), &mut Default::default()).unwrap();
+        assert_eq!(recent.len(), 1, "recent unoffered declarations recover");
+        let mut old = mailbox.clone();
+        retain_live_mail(&store, &mut old,
+            admitted.accepted_at_unix_ms + u128::from(super::super::mail_backlog::THRESHOLD_MS),
+            Some(index), &mut Default::default()).unwrap();
+        assert!(old.is_empty(), "the original one-hour exclusion still holds");
+        assert_eq!(store.index().unwrap(), index, "filtering writes no lifecycle evidence");
+        for kind in ["message.sent", "message.staged", "message.delivered", "message.read", "message.closed"] {
+            assert!(store.claims_for(subject, Some(kind)).unwrap().is_empty());
+        }
+        let fence = store.bind_mailbox(&Fence::new(&peer.agent, "declaration-boot", "delivery")).unwrap();
+        store.append_mailbox_receipt(&ClaimInput {
+            subject: subject.into(), kind: "message.staged".into(), actor: Some(peer.agent.clone()),
+            fields: BTreeMap::from([
+                ("status".into(), json!("staged")), ("recipient".into(), json!(peer.agent)),
+                ("transport".into(), json!("app-server")),
+            ]), evidence: vec![], expected_subject: None, idempotency_key: None,
+        }, &fence).unwrap();
+        let mut offered = store.messages(Some(&peer.agent), false).unwrap();
+        retain_live_mail(&store, &mut offered, admitted.accepted_at_unix_ms + 1,
+            Some(index), &mut Default::default()).unwrap();
+        assert!(offered.is_empty(), "a prior offer is never recovered as unoffered");
+    }
+
+    #[tokio::test]
+    async fn native_stream_offers_a_live_declaration_and_requires_a_fenced_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        let state = super::super::tests::state(root.path());
+        let seat = "agent/eval.worker";
+        crate::mailbox::tests::ready(&state.store, "declaration-stream");
+        let peer = NativeDeliveryPeer {
+            agent: seat.into(), transport: "app-server", pid: 7, archives_inbox: true,
+        };
+        let app = router(state.clone()).layer(Extension(peer));
+        let path = root.path().join("daemon.sock");
+        let server_path = path.clone();
+        let server = tokio::spawn(async move { serve_unix(&server_path, app).await.unwrap() });
+        for _ in 0..100 {
+            if path.exists() { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let client = Client::new(Endpoint::Unix(path));
+        let fence: Fence = client.post("/v1/mailbox/bind",
+            &Fence::new(seat, "declaration-stream", "delivery")).await.unwrap();
+        let mut socket = client.open_mailbox(&fence).await.unwrap();
+        assert!(matches!(next(&mut socket).await, Frame::Mailbox { messages } if messages.is_empty()));
+        let intent = crate::graph::parse_execution_intent(
+            r#"version 2
+message "live-declaration" { from "agent/eval.worker"; to "agent/eval.worker"; content "Resume." }
+"#, "node", "fixture").unwrap();
+        state.store.apply_internal(&intent, "stream-declaration").unwrap();
+        signal_changed(&state);
+        let messages = match next(&mut socket).await {
+            Frame::Mailbox { messages } => messages,
+            other => panic!("expected queued declaration, got {other:?}"),
+        };
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].subject, "message/live-declaration");
+        assert_eq!(messages[0].status, "sent");
+        assert!(state.store.latest_claim(&messages[0].subject, Some("message.delivered")).unwrap().is_none());
+        let receipt: ClaimRecord = client.post("/v1/mailbox/receipt", &Receipt {
+            fence, message: messages[0].subject.clone(), lifecycle: "delivered".into(),
+        }).await.unwrap();
+        assert_eq!(receipt.kind, "message.delivered");
+        assert_eq!(state.store.message(&messages[0].subject).unwrap().unwrap().status, "delivered");
+        server.abort();
+        let _ = server.await;
     }
 
     fn age_sent(store: &Store, database: &Path, subject: &str) {

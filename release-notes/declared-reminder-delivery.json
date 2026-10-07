@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Deliver live declared reminder messages and expose steps waiting for actual declaration state",
+  "replay": {
+    "status": "none",
+    "detail": "No replay or rebuild. Existing native boot and reconnect age/offer exclusions remain; historical declared messages are not replayed."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No schema change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint timing uses the existing shared fold; declaration waits retain their execution budget."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Uses existing blocked step status and message receipt contracts. A desired declaration proves queued mail only, never delivery."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "None."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "None."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Live declarations use their selected admission claim for existing native delivery eligibility. A declaration-only step waits visibly for actual state and resumes after that evidence arrives."
+  }
+}

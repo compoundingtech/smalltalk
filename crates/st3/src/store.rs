@@ -12002,6 +12002,21 @@ impl Store {
             .transpose()
     }
 
+    /// Native mail can be admitted by a send or a KDL declaration. A declaration is
+    /// queued mail, never proof of transport acceptance or recipient consumption.
+    pub(crate) fn message_acceptance(&self, subject: &str) -> Result<Option<ClaimRecord>> {
+        if let Some(sent) = self.latest_claim(subject, Some("message.sent"))? {
+            return Ok(Some(sent));
+        }
+        let connection = self.readers.get();
+        let Some(desired) = current_desired_row(&connection, subject)?
+            .filter(|desired| desired.kind == "message")
+        else {
+            return Ok(None);
+        };
+        claim_by_id_tx(&connection, &desired.claim_id)
+    }
+
     fn message_view_cached(
         &self,
         connection: &Connection,
@@ -29838,7 +29853,7 @@ fn enrich_step_queue_at(
         &view.subject,
         view.attempt,
         snapshot_unix_ms,
-        matches!(view.status.as_str(), "claimed" | "working"),
+        view.execution_is_active(),
     )?;
     view.execution_started_at_unix_ms = execution_started_at_unix_ms;
     view.execution_elapsed_ms = execution_elapsed_ms;
@@ -30364,9 +30379,11 @@ pub(crate) fn fold_step_timing(
             lease_expires = None;
         }
 
+        let declarations_pending = fields.get("status").and_then(Value::as_str) == Some("blocked")
+            && fields.get("reason").and_then(Value::as_str) == Some(crate::model::DECLARATIONS_PENDING);
         match kind.as_str() {
             "step-run.state"
-                if fields
+                if declarations_pending || fields
                     .get("status")
                     .and_then(Value::as_str)
                     .is_some_and(|status| matches!(status, "claimed" | "working")) =>
@@ -30422,7 +30439,7 @@ pub(crate) fn fold_step_timing(
                 lease_expires = None;
             }
             "step-run.state"
-                if fields
+                if !declarations_pending && fields
                     .get("status")
                     .and_then(Value::as_str)
                     .is_some_and(|status| !matches!(status, "claimed" | "working")) =>
@@ -31461,7 +31478,7 @@ fn mission_run_view_with_enrichment_tx(
                 &step.subject,
                 step.attempt,
                 now_ms(),
-                matches!(step.status.as_str(), "claimed" | "working"),
+                step.execution_is_active(),
             )?;
             step.execution_started_at_unix_ms = started;
             step.execution_elapsed_ms = elapsed;
