@@ -49,8 +49,17 @@ Run `st service install` after the first install or a changed executable path; i
 service definitions and restarts daemon and replication services. `st service restart` suffices
 when those definitions already point at the intended binaries. Schedule that restart, compare
 `st --version --json` with the daemon's `machine_version` in `st doctor --json`, and verify peer
-health. `st doctor --strict` also treats warnings as failures: inspect each warning rather than
-assuming an optional-tool warning means that the API is unavailable. Restarting
+health. A reachable doctor response and matching version identify the running daemon; they do
+not certify store invariants. Until maintained invariant evidence is integrated, live doctor
+lists unchecked invariants by name as `unknown`, reports `warn`, and `st doctor --strict`
+always exits 2. Do not use strict success as an upgrade-readiness gate during this stage, or
+interpret the warning as evidence that the API is unavailable. Strict still requires complete
+evidence and fails on computed warnings and errors. An explicit offline audit preserves unknown
+results for unsupported checks and cannot substitute for complete certification.
+
+`st replication checkpoint status` also exits 2 while checkpoint comparison evidence is
+uncomputed: its HTTP 503 `diagnostic-evidence-incomplete` response describes an uncertified
+current set. It does not indicate a daemon outage or require a restart. Restarting
 invalidates an ongoing continuous soak window, so coordinate that separately from downloading or
 installing files.
 
