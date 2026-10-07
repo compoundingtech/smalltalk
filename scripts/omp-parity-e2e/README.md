@@ -59,8 +59,10 @@ terminal and daemon and removes isolation unless `--keep` was supplied.
   in that range. A full old-keyset walk after append equals the entire baseline
   id set without duplicates. The old ref returns identical bytes, size and ref
   after append, with size greater than 8 KiB.
-- Shared TS rendering runs and shows a bash `$ ` row, todo checklist mark,
-  child `open session/` row, IRC sender/message, and transcript header.
+- Shared TS rendering runs and shows a bash `$ ` row, all five todo checklist
+  marks (`[x]` completed, `[ ]` pending, `[~]` in progress, `[!]` blocked, `[/]`
+  abandoned), the completed header count `todo 1/5`, child `open session/` row,
+  IRC sender/message, and one shared transcript provenance suffix.
 - Real stui connects, opens its palette and the saved parent, renders parent
   content, a bash command row, transcript model header and child open row.
   Activating that row shows child completion without parent assistant content.

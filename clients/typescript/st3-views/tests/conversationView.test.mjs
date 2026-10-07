@@ -243,7 +243,7 @@ assert.equal(cleanMessageText(rawText, SHOW_EVERYTHING), rawText);
   assert.equal(subagentSession(['reviewed, nothing to open']), undefined);
 }
 
-// The conversation header reads as one compact line, each field with its source and its age.
+// Hand-built mixed-source header: only the register field gets an individual marker.
 {
   const asOf = '2026-10-06T12:00:00Z';
   const field = (value, source = 'transcript') => ({ value, source, as_of: asOf });
@@ -256,11 +256,22 @@ assert.equal(cleanMessageText(rawText, SHOW_EVERYTHING), rawText);
     subagents: field([{ id: 'child-live', status: 'running' }]),
     ask: field({ call_id: 'active', questions: [{ question: 'Continue?', options: [], multi: false }] }),
     working: field(true, 'register'),
-  }, asOf), 'model synthetic/model [transcript · 0s] · context 50 tokens [transcript · 0s] · cost $0.02 [transcript · 0s] · todo 1/1 [transcript · 0s] · jobs 1 [transcript · 0s] · agents 1 [transcript · 0s] · ask Continue? [transcript · 0s] · working [register · 0s]');
-  assert.equal(headerLine({ cost: { value: { usd: 3 }, source: 'register', as_of: '2026-10-06T11:30:00Z' } }, asOf), 'cost $3.00 [register · 30m]');
-  assert.equal(headerLine({ model: field('synthetic/model ') }, '2026-10-06T12:59:30Z'), 'model synthetic/model [transcript · 1h]', 'rounded minutes promote to hours without extra spaces');
-  assert.equal(headerLine({ working: field(false, 'register') }, '2026-10-07T11:30:00Z'), 'idle [register · 1d]', 'rounded hours promote to days');
-  assert.equal(headerLine({ working: field(false, 'register') }, asOf), 'idle [register · 0s]');
+  }, asOf), 'model synthetic/model · context 50 tokens · cost $0.02 · todo 1/1 · jobs 1 · agents 1 · ask Continue? · working [register · 0s ago] · transcript · 0s ago');
+  assert.equal(headerLine({ cost: { value: { usd: 3 }, source: 'register', as_of: '2026-10-06T11:30:00Z' } }, asOf), 'cost $3.00 · register · 30m ago');
+  assert.equal(headerLine({ model: field('synthetic/model ') }, '2026-10-06T12:59:30Z'), 'model synthetic/model · transcript · 1h ago', 'rounded minutes promote to hours without extra spaces');
+  assert.equal(headerLine({ working: field(false, 'register') }, '2026-10-07T11:30:00Z'), 'idle · register · 1d ago', 'rounded hours promote to days');
+  assert.equal(headerLine({ working: field(false, 'register') }, asOf), 'idle · register · 0s ago');
   assert.equal(headerLine({ ask: field(null) }, asOf), null, 'a header with nothing to say says nothing');
   assert.equal(headerLine(undefined, asOf), null);
+}
+
+// Shared provenance conservatively ages from its oldest field, even with a live register cost.
+{
+  const header = {
+    model: { value: 'm', source: 'transcript', as_of: '2026-10-06T11:59:00Z' },
+    context: { value: { tokens: 50 }, source: 'transcript', as_of: '2026-10-06T11:00:00Z' },
+    cost: { value: { usd: 0.02 }, source: 'register', as_of: '2026-10-06T11:30:00Z' },
+  };
+  assert.equal(headerLine(header, '2026-10-06T12:00:00Z'), 'model m · context 50 tokens · cost $0.02 [register · 30m ago] · transcript · 1h ago');
+  assert.equal(headerLine({ todos: { value: [], source: 'transcript', as_of: '2026-10-06T12:00:00Z' } }, '2026-10-06T12:00:00Z'), 'todo 0/0 · transcript · 0s ago');
 }

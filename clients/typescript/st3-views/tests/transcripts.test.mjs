@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { conversationEntries } from '@smalltalk/st3-views';
+import { conversationEntries, headerLine } from '@smalltalk/st3-views';
 
 // Every harness transcript in fixtures/clients/transcripts reads the same in this model as in
 // st3-conversation-ui. Rust's model-only tests (crates/st3-conversation-ui/src/tests.rs) check
@@ -33,4 +33,5 @@ for (const name of ['claude', 'codex', 'deliveries']) {
   const page = fixture('omp-parity.json');
   const phone = conversationEntries(page.items, new Map()).map(entry => ({ body: asStui(entry.body), id: entry.id }));
   assert.deepEqual(phone, expected, 'omp-parity: the phone reads this transcript differently from stui');
+  assert.equal(headerLine(page.header, '2026-10-06T12:00:00Z'), 'model synthetic/model · context 50 tokens · cost $0.02 · todo 1/5 · jobs 1 · agents 1 · ask Continue? · working [register · 0s ago] · transcript · 0s ago', 'omp-parity: compact header matches stui');
 }

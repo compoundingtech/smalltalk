@@ -352,7 +352,7 @@ function jobLine(job: unknown): string {
   return [str(value.name) ?? str(value.id), str(value.state), exit, took].filter(Boolean).join(' · ');
 }
 
-const todoMark = (status: string | undefined) => status === 'completed' ? '[x]' : status === 'in_progress' ? '[~]' : status === 'pending' ? '[ ]' : '[-]';
+const todoMark = (status: string | undefined) => status === 'completed' ? '[x]' : status === 'in_progress' ? '[~]' : status === 'pending' ? '[ ]' : status === 'blocked' ? '[!]' : status === 'abandoned' ? '[/]' : '[-]';
 
 /** A todo list as lines: each phase's name, then its items as `[x] content`. */
 function todoLines(view: BlockView): string[] {
@@ -487,15 +487,19 @@ function headerAge(asOf: string, now: string): string | undefined {
   return hours < 24 ? `${hours}h` : `${Math.floor((seconds + 43200) / 86400)}d`;
 }
 
-/** The conversation header as one compact line: each field with where it came from and how old
- * that is (`model gpt-5 [register · 2m] · cost $1.20 [transcript · 2m] · working [register · 2m]`),
- * as stui draws it. Nothing when the header is empty. */
+/** Every present field in fixed order, with shared provenance once and minority sources
+ * marked individually. The shared age is the oldest field from that source, as in stui. */
 export function headerLine(header: ConversationHeader | undefined, now: string): string | null {
   if (!header) return null;
+  const fields: HeaderField[] = [];
+  const marker = (field: HeaderField): string => {
+    const age = headerAge(field.as_of, now);
+    return `${field.source}${age ? ` · ${age} ago` : ''}`;
+  };
   const marked = (label: string, field: HeaderField): string | undefined => {
     if (field === undefined) return undefined;
-    const age = headerAge(field.as_of, now);
-    return `${label.trim()} [${field.source}${age ? ` · ${age}` : ''}]`;
+    fields.push(field);
+    return label.trim();
   };
   const parts: string[] = [];
   const model = str(header.model?.value) ? marked(`model ${str(header.model?.value)}`, header.model!) : undefined;
@@ -522,7 +526,24 @@ export function headerLine(header: ConversationHeader | undefined, now: string):
   if (ask) parts.push(ask);
   const working = typeof header.working?.value === 'boolean' ? marked(header.working.value ? 'working' : 'idle', header.working!) : undefined;
   if (working) parts.push(working);
-  return parts.length ? parts.join(' · ') : null;
+  if (!parts.length) return null;
+  let common = '', commonCount = 0;
+  for (const field of fields) {
+    const count = fields.filter(other => other.source === field.source).length;
+    if (field.source && count > commonCount) {
+      common = field.source;
+      commonCount = count;
+    }
+  }
+  const timestamp = (field: HeaderField): number => {
+    const at = Date.parse(field.as_of);
+    return Number.isFinite(at) ? at : -Infinity;
+  };
+  const shared = fields.filter(field => field.source === common);
+  const oldest = shared.reduce<HeaderField | undefined>((old, field) => old === undefined || timestamp(field) < timestamp(old) ? field : old, undefined);
+  const rendered = parts.map((part, index) => fields[index].source && fields[index].source !== common ? `${part} [${marker(fields[index])}]` : part);
+  if (oldest && common) rendered.push(marker(oldest));
+  return rendered.join(' · ');
 }
 
 // ------------------------------------------------------------------ entries

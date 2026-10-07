@@ -186,6 +186,16 @@ outputs whose status is not terminal; ask = the last ask call without a matching
 result. `docs/st3/client-v0/fixtures/timeline-views.json` fixes the wire shape with a
 synthetic page that carries views, an `irc` block and a full header.
 
+The Rust and TypeScript renderers show every populated header field in the same fixed
+order. The most common source appears once at the end (`· transcript · 2d ago`);
+ties use the first source in field order. Only fields from another source get their own
+marker (`cost $0.02 [register · 30m ago]`). The shared age uses the oldest field from
+that source, so compaction cannot hide stale data. Phone headers wrap without a line
+limit. A subagent's open-child link is an independent accessible control, outside the
+card's expand/collapse control; opening it pushes a conversation so Back restores
+the parent. Todo statuses remain distinct: `[x]` completed, `[ ]` pending, `[~]`
+in progress, `[!]` blocked and `[/]` abandoned. Only `completed` counts as done.
+
 ## UI filters and show-everything mode
 
 Rust `conversation_with_filters` and TypeScript `conversationEntries` accept an

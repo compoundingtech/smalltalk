@@ -1483,6 +1483,8 @@ fn todo_mark(status: &str) -> &'static str {
         "completed" => "[x]",
         "in_progress" => "[~]",
         "pending" => "[ ]",
+        "blocked" => "[!]",
+        "abandoned" => "[/]",
         _ => "[-]",
     }
 }

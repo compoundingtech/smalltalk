@@ -178,6 +178,7 @@ for field in model context cost todos; do
   check "header $field has transcript provenance and value" assert_json --arg field "$field" '.value.header[$field] | .source == "transcript" and has("value") and (.as_of | type == "string")' "$PAGE"
 done
 check 'header model/context/cost/todos are populated' assert_json '.value.header | (.model.value | type == "string") and (.context.value.tokens > 0) and (.cost.value.usd > 0) and (.todos.value | length > 0)' "$PAGE"
+check 'header todos preserve all five OMP statuses' assert_json '[.value.header.todos.value[].items[].status] | sort == (["completed", "pending", "in_progress", "blocked", "abandoned"] | sort)' "$PAGE"
 check 'task output links ParityChild conversation' assert_json '.value.items | any(.[] | .body.blocks[]?; .kind == "tool_output" and .view.type == "task" and any(.view.agents[]?; .id == "ParityChild" and (.conversation.session_id | startswith("session/external-child-"))))' "$PAGE"
 check 'fetch legacy parent page' http "$URL?limit=200" -o "$OUT/legacy-page.json"
 check 'unnegotiated page omits blocks and header' assert_json '(.value | has("header") | not) and all(.value.items[]; (.body | has("blocks") | not))' "$OUT/legacy-page.json"
@@ -285,10 +286,14 @@ check 'old ref returns identical content bytes after append' jq -en --slurpfile 
 check 'TypeScript shared renderer runs' bash -c 'node "$1" "$2" > "$3"' _ "$ROOT/scripts/omp-parity-e2e/render.mjs" "$PAGE" "$OUT/ts-rows.txt"
 contains_text() { grep -Fq -- "$1" "$2"; }
 check 'TypeScript bash row' contains_text '$ ' "$OUT/ts-rows.txt"
-check 'TypeScript todo checklist' grep -Eq '\[(x|~| |-)\] Verify parity' "$OUT/ts-rows.txt"
+check 'TypeScript completed todo' contains_text '[x] Verify parity' "$OUT/ts-rows.txt"
+check 'TypeScript pending todo' contains_text '[ ] Check pending work' "$OUT/ts-rows.txt"
+check 'TypeScript in-progress todo' contains_text '[~] Exercise progress' "$OUT/ts-rows.txt"
+check 'TypeScript blocked todo' contains_text '[!] Await dependency' "$OUT/ts-rows.txt"
+check 'TypeScript abandoned todo' contains_text '[/] Discard obsolete approach' "$OUT/ts-rows.txt"
 check 'TypeScript child open row' contains_text "open $CHILD" "$OUT/ts-rows.txt"
 check 'TypeScript IRC sender and message' grep -Eq 'ParityChild.*Synthetic child message' "$OUT/ts-rows.txt"
-check 'TypeScript transcript header' grep -Eq 'model synthetic/model.*context .*cost .*todo .*\[transcript' "$OUT/ts-rows.txt"
+check 'TypeScript compact transcript header and completed count' grep -Eq 'model synthetic/model.*context .*cost .*todo 1/5.* · transcript · .* ago$' "$OUT/ts-rows.txt"
 
 # Open the actual saved session through Ctrl+K's direct session-id affordance.
 # No host-wide fake OMP process: the fixture remains a historical session.
@@ -316,7 +321,7 @@ check 'stui opens saved parent content' wait_pane 'Synthetic assistant response|
 # The header sits above the entries inside the scrolling document: Home shows it,
 # End returns to the newest rows. Both captures are the real terminal.
 tmux -S "$TMUX_SOCKET" send-keys -t "$TARGET" Home
-check 'stui conversation transcript header visible' wait_pane 'model synthetic/appended-model.*\[transcript' "$OUT/stui-header.txt"
+check 'stui compact conversation transcript header visible' wait_pane 'model synthetic/appended-model.* · transcript · ' "$OUT/stui-header.txt"
 # Shift+O toggles full density; o opens all tool outputs; End follows the showcase.
 tmux -S "$TMUX_SOCKET" send-keys -t "$TARGET" O o End
 check 'stui bash command row visible' wait_pane '\$ printf E2E-BASH-ROW' "$OUT/stui.txt"

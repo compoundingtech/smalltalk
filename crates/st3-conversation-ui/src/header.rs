@@ -1,6 +1,6 @@
-//! The conversation header (contract §3): one quiet line above the conversation, every field
-//! saying where it came from and how old it is. Field order is fixed so the Rust and web
-//! renderers draw the same line.
+//! The conversation header (contract §3): every present field in fixed order.
+//! Shared provenance appears once; minority sources are marked on their fields.
+//! The shared age is the oldest field from that source, so stale data stays visible.
 
 use serde_json::Value;
 
@@ -9,7 +9,7 @@ use serde_json::Value;
 /// Empty when no field has a value.
 pub fn line(header: &Value, now: &str) -> String {
     let now = age_now(now);
-    let mut parts: Vec<String> = Vec::new();
+    let mut parts: Vec<(String, &Value)> = Vec::new();
     for (name, render) in [
         ("model", model as fn(&str, &Value) -> Option<String>),
         ("context", context),
@@ -30,12 +30,47 @@ pub fn line(header: &Value, now: &str) -> String {
         if value.is_empty() {
             continue;
         }
-        match sourced(field, now.as_deref()) {
-            marker if marker.is_empty() => parts.push(value.to_owned()),
-            marker => parts.push(format!("{value} {marker}")),
+        parts.push((value.to_owned(), field));
+    }
+    // At most eight fields: count sources without a separate map or copied source keys.
+    // Ties keep the first source in the fixed field order.
+    let mut common = "";
+    let mut common_count = 0;
+    for (_, field) in &parts {
+        let source = field["source"].as_str().unwrap_or_default();
+        let count = parts.iter().filter(|(_, other)| other["source"].as_str().unwrap_or_default() == source).count();
+        if !source.is_empty() && count > common_count {
+            common = source;
+            common_count = count;
         }
     }
-    parts.join(" · ")
+    let oldest = parts.iter()
+        .filter(|(_, field)| field["source"].as_str() == Some(common))
+        .min_by_key(|(_, field)| field["as_of"].as_str().and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok()))
+        .map(|(_, field)| *field);
+    let mut rendered = String::new();
+    for (value, field) in &parts {
+        if !rendered.is_empty() {
+            rendered.push_str(" · ");
+        }
+        rendered.push_str(value);
+        if field["source"].as_str().unwrap_or_default() != common {
+            let marker = sourced(field, now.as_deref());
+            if !marker.is_empty() {
+                rendered.push_str(" [");
+                rendered.push_str(&marker);
+                rendered.push(']');
+            }
+        }
+    }
+    if let Some(field) = oldest {
+        let marker = sourced(field, now.as_deref());
+        if !marker.is_empty() {
+            rendered.push_str(" · ");
+            rendered.push_str(&marker);
+        }
+    }
+    rendered
 }
 
 /// One field's value and, when the field says where it came from, its source and age.
@@ -53,12 +88,12 @@ fn sourced(field: &Value, now: Option<&str>) -> String {
         (Some(source), Some((at, now))) => {
             let age = age(at, now);
             if age.is_empty() {
-                format!("[{source}]")
+                source.to_owned()
             } else {
-                format!("[{source} · {age}]")
+                format!("{source} · {age} ago")
             }
         }
-        (Some(source), None) => format!("[{source}]"),
+        (Some(source), None) => source.to_owned(),
         _ => return String::new(),
     };
     marker
@@ -84,25 +119,17 @@ fn cost(_: &str, value: &Value) -> Option<String> {
 }
 
 fn todos(_: &str, value: &Value) -> Option<String> {
-    let items: Vec<&Value> = value
-        .as_array()?
-        .iter()
-        .flat_map(|phase| {
-            phase
-                .get("items")
-                .and_then(Value::as_array)
-                .map(Vec::as_slice)
-                .unwrap_or(&[])
-        })
-        .collect();
-    if items.is_empty() {
-        return None;
+    let mut total = 0;
+    let mut done = 0;
+    for phase in value.as_array()? {
+        for item in phase.get("items").and_then(Value::as_array).into_iter().flatten() {
+            total += 1;
+            if item.get("status").and_then(Value::as_str) == Some("completed") {
+                done += 1;
+            }
+        }
     }
-    let done = items
-        .iter()
-        .filter(|item| item.get("status").and_then(Value::as_str) == Some("completed"))
-        .count();
-    Some(format!("todo {done}/{}", items.len()))
+    Some(format!("todo {done}/{total}"))
 }
 
 fn count(name: &str, value: &Value) -> Option<String> {
@@ -172,7 +199,24 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn every_field_says_where_it_came_from_and_how_old() {
+    fn shared_provenance_uses_the_oldest_age_and_marks_register_cost() {
+        let header = json!({
+            "model": {"value": "m", "source": "transcript", "as_of": "2026-10-06T11:59:00Z"},
+            "context": {"value": {"tokens": 50}, "source": "transcript", "as_of": "2026-10-06T11:00:00Z"},
+            "cost": {"value": {"usd": 0.02}, "source": "register", "as_of": "2026-10-06T11:30:00Z"}
+        });
+        assert_eq!(
+            line(&header, "2026-10-06T12:00:00Z"),
+            "model m · context 50 tokens · cost $0.02 [register · 30m ago] · transcript · 1h ago"
+        );
+        assert_eq!(
+            line(&json!({"todos": {"value": [], "source": "transcript", "as_of": "2026-10-06T12:00:00Z"}}), "2026-10-06T12:00:00Z"),
+            "todo 0/0 · transcript · 0s ago"
+        );
+    }
+
+    #[test]
+    fn mixed_sources_mark_only_the_minority_field() {
         let header = json!({
             "model": {"value": "synthetic/model", "source": "transcript", "as_of": "2026-10-06T12:00:00Z"},
             "context": {"value": {"tokens": 50, "window": null}, "source": "transcript", "as_of": "2026-10-06T12:00:00Z"},
@@ -185,9 +229,8 @@ mod tests {
         });
         assert_eq!(
             line(&header, "2026-10-06T12:00:00Z"),
-            "model synthetic/model [transcript · 0s] · context 50 tokens [transcript · 0s] \
-             · cost $0.02 [transcript · 0s] · todo 1/1 [transcript · 0s] · jobs 1 [transcript · 0s] \
-             · agents 1 [transcript · 0s] · ask Continue? [transcript · 0s] · working [register · 0s]"
+            "model synthetic/model · context 50 tokens · cost $0.02 · todo 1/1 · jobs 1 \
+             · agents 1 · ask Continue? · working [register · 0s ago] · transcript · 0s ago"
         );
     }
 
@@ -200,7 +243,7 @@ mod tests {
         });
         assert_eq!(
             line(&header, "2026-10-06T12:00:00Z"),
-            "model m [register · 1h] · idle"
+            "model m · idle · register · 1h ago"
         );
         assert_eq!(age("2026-10-05T12:00:00Z", "2026-10-06T12:00:00Z"), "1d");
     }

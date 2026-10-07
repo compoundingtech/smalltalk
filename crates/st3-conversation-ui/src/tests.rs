@@ -586,12 +586,11 @@ fn omp_parity_header_renders_one_line_with_source_and_age() {
     ))
     .unwrap();
     let line = header::line(&page["header"], "2026-10-06T12:00:00Z");
-    assert!(
-        line.starts_with("model synthetic/model [transcript · 0s]"),
-        "{line}"
+    assert_eq!(
+        line,
+        "model synthetic/model · context 50 tokens · cost $0.02 · todo 1/5 · jobs 1 · agents 1 \
+         · ask Continue? · working [register · 0s ago] · transcript · 0s ago"
     );
-    assert!(line.contains("ask Continue? [transcript · 0s]"), "{line}");
-    assert!(line.ends_with("working [register · 0s]"), "{line}");
 }
 
 #[test]
