@@ -8,7 +8,7 @@ use crate::api::delivery_presence::source::{
 };
 use smallclaims::ivm::install::{Mutation, Namespace, Operator, SourcePosition};
 
-pub(crate) const FINGERPRINT: &str = "st3.agent-card.complete.v1;namespace-v1;physical-source-v3;registry-unfiltered-admission;canonical-decimal-time;original-sql-body;harness-v3-captured-since;authority-v2-parent-identity;owned-v2-relevant-members128-sets64-lineage64-claims100k-captured64m;unmanaged-leaves128-body256k;queue-v1-labels-path1024-preview5;usage-v2-f64-groups128-slots128;rollout-field-heads-v1;launch-v1-physical-ties-bounds128;aux-v1-appear64-open256-record64k;native-global-v1-files64;clock-v1;shared-work128;window200;public-card-v0;current-state-only";
+pub(crate) const FINGERPRINT: &str = "st3.agent-card.complete.v2;namespace-v2;physical-source-v3;registry-unfiltered-admission;canonical-decimal-time;original-sql-body;harness-v3-captured-since;authority-v2-parent-identity;owned-v2-relevant-members128-sets64-lineage64-claims100k-captured64m;unmanaged-leaves128-body256k;queue-v1-labels-path1024-preview5;usage-v2-f64-groups128-slots128;rollout-field-heads-v1;launch-v1-physical-ties-bounds128;aux-v1-appear64-open256-record64k;native-global-v1-files64;clock-v1;shared-work128-seek-cursors-public-queue-ack;window200;public-card-v0;current-state-only";
 pub(crate) fn complete_manifest() -> String {
     format!(
         "{FINGERPRINT};source={}",
@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS local_agent_card_source_facts(namespace TEXT NOT NULL
 CREATE INDEX IF NOT EXISTS local_agent_card_source_subject ON local_agent_card_source_facts(namespace,subject,id);
 CREATE TABLE IF NOT EXISTS local_agent_card_source_links(namespace TEXT NOT NULL,id TEXT NOT NULL,body TEXT NOT NULL,PRIMARY KEY(namespace,id));
 CREATE TABLE IF NOT EXISTS local_agent_card_source_physical(namespace TEXT NOT NULL,key TEXT NOT NULL,body TEXT NOT NULL,PRIMARY KEY(namespace,key));
+CREATE TABLE IF NOT EXISTS local_agent_card_source_cursor(namespace TEXT NOT NULL,kind TEXT NOT NULL,after_key TEXT NOT NULL,PRIMARY KEY(namespace,kind));
 CREATE TABLE IF NOT EXISTS local_agent_card_source_work(namespace TEXT NOT NULL,kind TEXT NOT NULL,key TEXT NOT NULL,PRIMARY KEY(namespace,kind,key));
 CREATE TABLE IF NOT EXISTS local_agent_card_source_cards(namespace TEXT NOT NULL,agent TEXT NOT NULL,deadline BLOB,files TEXT NOT NULL,mono_deadline INTEGER,certificate TEXT,PRIMARY KEY(namespace,agent));
 CREATE INDEX IF NOT EXISTS local_agent_card_source_deadline ON local_agent_card_source_cards(namespace,deadline,agent) WHERE deadline IS NOT NULL;
@@ -70,9 +71,47 @@ fn agents(
     }
     Ok(())
 }
-fn page(c: &Connection, ns: &Namespace, kind: &str, limit: usize) -> Result<Vec<String>> {
-    Ok(c.prepare_cached("SELECT key FROM local_agent_card_source_work WHERE namespace=?1 AND kind=?2 ORDER BY key LIMIT ?3")?.query_map(params![ns.as_str(),kind,limit],|r|r.get(0))?.collect::<rusqlite::Result<_>>()?)
+fn cursor(c: &Connection, ns: &Namespace, kind: &str) -> Result<String> {
+    Ok(c.query_row(
+        "SELECT after_key FROM local_agent_card_source_cursor WHERE namespace=?1 AND kind=?2",
+        params![ns.as_str(), kind],
+        |r| r.get(0),
+    )
+    .optional()?
+    .unwrap_or_default())
 }
+fn set_cursor(tx: &Transaction<'_>, ns: &Namespace, kind: &str, after: &str) -> Result<()> {
+    tx.execute("INSERT INTO local_agent_card_source_cursor VALUES(?1,?2,?3) ON CONFLICT(namespace,kind) DO UPDATE SET after_key=excluded.after_key",params![ns.as_str(),kind,after])?;
+    Ok(())
+}
+fn page(tx: &Transaction<'_>, ns: &Namespace, kind: &str, limit: usize) -> Result<Vec<String>> {
+    let after = cursor(tx, ns, kind)?;
+    let mut keys:Vec<String>=tx.prepare_cached("SELECT key FROM local_agent_card_source_work WHERE namespace=?1 AND kind=?2 AND key>?3 ORDER BY key LIMIT ?4")?.query_map(params![ns.as_str(),kind,after,limit+1],|r|r.get(0))?.collect::<rusqlite::Result<_>>()?;
+    let more = keys.len() > limit;
+    keys.truncate(limit);
+    set_cursor(
+        tx,
+        ns,
+        kind,
+        if more {
+            keys.last().map(String::as_str).unwrap_or("")
+        } else {
+            ""
+        },
+    )?;
+    Ok(keys)
+}
+fn card_work(c: &Connection, ns: &Namespace) -> Result<bool> {
+    Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM local_agent_card_source_work WHERE namespace=?1 AND kind='card')",[ns.as_str()],|r|r.get(0))?)
+}
+fn queue_public_pending(c: &Connection, ns: &Namespace) -> Result<bool> {
+    Ok(c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM local_agent_queue_dirty WHERE namespace=?1)",
+        [ns.as_str()],
+        |r| r.get(0),
+    )?)
+}
+
 fn ack(tx: &Transaction<'_>, ns: &Namespace, kind: &str, key: &str) -> Result<()> {
     tx.execute(
         "DELETE FROM local_agent_card_source_work WHERE namespace=?1 AND kind=?2 AND key=?3",
@@ -805,6 +844,10 @@ impl Kernel {
 
 impl Kernel {
     fn families_closed(&self, c: &Connection, ns: &Namespace, at: u128) -> Result<bool> {
+        Ok(self.dependencies_closed(c, ns, at)? && !queue_public_pending(c, ns)?)
+    }
+
+    fn dependencies_closed(&self, c: &Connection, ns: &Namespace, at: u128) -> Result<bool> {
         if !shadow::clean(c, ns)?
             || !agent_card_base::clean(c, ns)?
             || !agent_card_usage::clean(c, ns)?
@@ -830,10 +873,27 @@ impl Kernel {
         // empty dirty job consumes scheduling work; a captured clock never spins to closure.
         used += shadow::expand_page(tx, ns, WORK)?;
         if used < WORK {
-            for id in shadow::dirty_page(tx, ns, WORK - used)? {
-                self.normalize(tx, ns, &id)?;
+            let after = cursor(tx, ns, "normalize")?;
+            let (ids, more) = shadow::dirty_page_after(
+                tx,
+                ns,
+                (!after.is_empty()).then_some(after.as_str()),
+                WORK - used,
+            )?;
+            for id in &ids {
+                self.normalize(tx, ns, id)?;
                 used += 1;
             }
+            set_cursor(
+                tx,
+                ns,
+                "normalize",
+                if more {
+                    ids.last().map(String::as_str).unwrap_or("")
+                } else {
+                    ""
+                },
+            )?;
         }
         if used < WORK {
             for key in page(tx, ns, "physical", WORK - used)? {
@@ -874,8 +934,8 @@ impl Kernel {
             used += drained.processed;
             ensure_queue(drained.coverage)?;
         }
-        if used < WORK {
-            let dirty:Vec<String>=tx.prepare_cached("SELECT agent FROM local_agent_queue_dirty d WHERE namespace=?1 AND NOT EXISTS(SELECT 1 FROM local_agent_card_source_work w WHERE w.namespace=d.namespace AND w.kind='card' AND w.key=d.agent) ORDER BY agent LIMIT ?2")?.query_map(params![ns.as_str(),WORK-used],|r|r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        if used < WORK && !card_work(tx, ns)? {
+            let dirty = agent_queue::dirty_agents(tx, ns, WORK - used)?;
             used += dirty.len();
             cards(tx, ns, dirty)?;
         }
@@ -937,7 +997,21 @@ impl Kernel {
             }
         }
         if used < WORK {
-            let repaired = agent_card_launch::flush_page(tx, ns, None, 1)?;
+            let encoded = cursor(tx, ns, "launch")?;
+            let after = if encoded.is_empty() {
+                None
+            } else {
+                let (agent, incarnation): (String, String) = serde_json::from_str(&encoded)?;
+                Some(agent_card_launch::Key { agent, incarnation })
+            };
+            let repaired = agent_card_launch::flush_page(tx, ns, after.as_ref(), 1)?;
+            let next = repaired
+                .after
+                .as_ref()
+                .map(|k| serde_json::to_string(&(k.agent.as_str(), k.incarnation.as_str())))
+                .transpose()?
+                .unwrap_or_default();
+            set_cursor(tx, ns, "launch", &next)?;
             if repaired.after.is_some() {
                 used += 1;
             }
@@ -958,10 +1032,12 @@ impl Kernel {
                 )?;
             }
         }
-        if used < WORK && self.families_closed(tx, ns, at)? {
-            let due:Vec<String>=tx.prepare_cached("SELECT agent FROM local_agent_card_source_cards WHERE namespace=?1 AND deadline<=?2 ORDER BY deadline,agent LIMIT ?3")?.query_map(params![ns.as_str(),at.to_be_bytes().as_slice(),WORK-used],|r|r.get(0))?.collect::<rusqlite::Result<_>>()?;
-            used += due.len();
-            cards(tx, ns, due)?;
+        if used < WORK && self.dependencies_closed(tx, ns, at)? {
+            if !card_work(tx, ns)? {
+                let due:Vec<String>=tx.prepare_cached("SELECT agent FROM local_agent_card_source_cards WHERE namespace=?1 AND deadline<=?2 ORDER BY deadline,agent LIMIT ?3")?.query_map(params![ns.as_str(),at.to_be_bytes().as_slice(),WORK-used],|r|r.get(0))?.collect::<rusqlite::Result<_>>()?;
+                used += due.len();
+                cards(tx, ns, due)?;
+            }
             if used < WORK {
                 // This reducer describes every input captured in this current-state namespace.
                 // Prospective rows are unavailable until independent source-prefix proof and
@@ -1054,10 +1130,14 @@ impl Operator for Kernel {
             )?,
             "complete public card publication pending"
         );
-        let stamped:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM local_agent_card_coverage WHERE namespace=?1 AND incomplete=0 AND pending=0)",[ns.as_str()],|r|r.get(0))?;
+        let stamped:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM local_agent_card_coverage c JOIN ivm_install_sources s ON s.name=?2 AND s.epoch=c.source_epoch AND s.revision=c.source_revision AND s.available=1 WHERE c.namespace=?1 AND c.incomplete=0 AND c.pending=0 AND c.evaluation_time=?3)",params![ns.as_str(),agent_card_ivm::SOURCE,at.to_string()],|r|r.get(0))?;
         anyhow::ensure!(
             stamped,
             "certified source cut/producer coverage not stamped"
+        );
+        anyhow::ensure!(
+            next_deadline(tx, ns)?.is_none_or(|d| at < d),
+            "card publication deadline expired"
         );
         Ok(())
     }
@@ -1269,6 +1349,7 @@ fn reclaim_remaining(tx: &Transaction<'_>, ns: &Namespace, limit: usize) -> Resu
         "DELETE FROM local_agent_card_source_facts WHERE namespace=?1 AND rowid IN (SELECT rowid FROM local_agent_card_source_facts WHERE namespace=?1 LIMIT ?2)",
         "DELETE FROM local_agent_card_source_links WHERE namespace=?1 AND rowid IN (SELECT rowid FROM local_agent_card_source_links WHERE namespace=?1 LIMIT ?2)",
         "DELETE FROM local_agent_card_source_physical WHERE namespace=?1 AND rowid IN (SELECT rowid FROM local_agent_card_source_physical WHERE namespace=?1 LIMIT ?2)",
+        "DELETE FROM local_agent_card_source_cursor WHERE namespace=?1 AND rowid IN (SELECT rowid FROM local_agent_card_source_cursor WHERE namespace=?1 LIMIT ?2)",
         "DELETE FROM local_agent_card_source_work WHERE namespace=?1 AND rowid IN (SELECT rowid FROM local_agent_card_source_work WHERE namespace=?1 LIMIT ?2)",
         "DELETE FROM local_agent_card_source_cards WHERE namespace=?1 AND rowid IN (SELECT rowid FROM local_agent_card_source_cards WHERE namespace=?1 LIMIT ?2)",
         "DELETE FROM local_agent_card_source_files WHERE namespace=?1 AND rowid IN (SELECT rowid FROM local_agent_card_source_files WHERE namespace=?1 LIMIT ?2)",

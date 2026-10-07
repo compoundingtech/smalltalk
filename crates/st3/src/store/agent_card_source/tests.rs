@@ -351,3 +351,117 @@ fn complete_card_sparse_human_fields_null_clear_and_future_global_replacement_pr
     compare(&store, &ns, at);
     assert_eq!(rows(&store, &ns, at)[0]["ask"], Value::Null);
 }
+
+#[test]
+fn exact_budget_deadline_transfer_drains_staged_absent_cards_before_requeue() {
+    let store = seed();
+    let ns = context(&store);
+    let at = clock(&store);
+    let kernel = Kernel::new("node");
+    for inputs in capture(&store).chunks(WORK) {
+        let mut w = store.connection.write();
+        let tx = w.transaction().unwrap();
+        kernel.apply(&tx, &ns, inputs).unwrap();
+        tx.commit().unwrap();
+    }
+    drain(&store, &ns, &kernel);
+    {
+        let mut w = store.connection.write();
+        let tx = w.transaction().unwrap();
+        // Retained deadlines for subjects removed from the complete captured source.
+        // There are exactly WORK due keys, which previously consumed every retry budget.
+        for n in 0..WORK {
+            tx.execute(
+                "INSERT INTO local_agent_card_source_cards VALUES(?1,?2,?3,'[]',NULL,NULL)",
+                params![
+                    ns.as_str(),
+                    format!("agent/expired/{n:03}"),
+                    at.to_be_bytes().as_slice()
+                ],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+    for _ in 0..3 {
+        let mut w = store.connection.write();
+        let tx = w.transaction().unwrap();
+        kernel.apply(&tx, &ns, &[]).unwrap();
+        tx.commit().unwrap();
+    }
+    let c = store.readers.get();
+    let remaining: usize=c.query_row("SELECT count(*) FROM local_agent_card_source_cards WHERE namespace=?1 AND agent LIKE 'agent/expired/%'",[ns.as_str()],|r|r.get(0)).unwrap();
+    assert_eq!(
+        remaining, 0,
+        "due retries must reach absent-card materialization"
+    );
+    assert!(!card_work(&c, &ns).unwrap());
+    assert!(kernel.families_closed(&c, &ns, at).unwrap());
+}
+
+#[test]
+fn unacknowledged_public_queue_updates_fence_footprint_even_when_computation_is_clean() {
+    let store = seed();
+    let ns = context(&store);
+    let at = clock(&store);
+    let kernel = Kernel::new("node");
+    for inputs in capture(&store).chunks(WORK) {
+        let mut w = store.connection.write();
+        let tx = w.transaction().unwrap();
+        kernel.apply(&tx, &ns, inputs).unwrap();
+        tx.commit().unwrap();
+    }
+    drain(&store, &ns, &kernel);
+    let mut w = store.connection.write();
+    let tx = w.transaction().unwrap();
+    tx.execute(
+        "INSERT INTO local_agent_queue_dirty VALUES(?1,'agent/removed')",
+        [ns.as_str()],
+    )
+    .unwrap();
+    assert!(kernel.dependencies_closed(&tx, &ns, at).unwrap());
+    assert!(!kernel.families_closed(&tx, &ns, at).unwrap());
+    assert!(footprint(&tx, &ns, "node").is_err());
+    assert!(kernel.validate_publication(&tx, &ns).is_err());
+    tx.commit().unwrap();
+    drop(w);
+    drain(&store, &ns, &kernel);
+    let c = store.readers.get();
+    assert!(!queue_public_pending(&c, &ns).unwrap());
+    assert!(footprint(&c, &ns, "node").is_ok());
+}
+
+#[test]
+fn pending_work_seek_cursor_reaches_later_keys_and_rollback_restores_continuation() {
+    let store = seed();
+    let ns = context(&store);
+    let kernel = Kernel::new("node");
+    let mut w = store.connection.write();
+    let tx = w.transaction().unwrap();
+    kernel.apply(&tx, &ns, &[]).unwrap();
+    for n in 0..257 {
+        queue(&tx, &ns, "operation", &format!("pending/{n:03}")).unwrap();
+    }
+    let first = page(&tx, &ns, "operation", WORK).unwrap();
+    assert_eq!(first.first().unwrap(), "pending/000");
+    assert_eq!(first.last().unwrap(), "pending/127");
+    tx.commit().unwrap();
+    {
+        let tx = w.transaction().unwrap();
+        let second = page(&tx, &ns, "operation", WORK).unwrap();
+        assert_eq!(second.first().unwrap(), "pending/128");
+        assert_eq!(second.last().unwrap(), "pending/255");
+        tx.rollback().unwrap();
+    }
+    let tx = w.transaction().unwrap();
+    let second = page(&tx, &ns, "operation", WORK).unwrap();
+    assert_eq!(second.first().unwrap(), "pending/128");
+    tx.commit().unwrap();
+    let tx = w.transaction().unwrap();
+    assert_eq!(page(&tx, &ns, "operation", WORK).unwrap(), ["pending/256"]);
+    assert_eq!(
+        page(&tx, &ns, "operation", WORK).unwrap().first().unwrap(),
+        "pending/000"
+    );
+    tx.rollback().unwrap();
+}
