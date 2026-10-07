@@ -155,6 +155,22 @@ owner read**; there is no prefix continuation in this slice. A line exceeding th
 window can therefore have no complete record in this response, with the same
 explicit marker. Within the window, clipped values have fetchable continuations.
 
+Open `block.metadata` retains its outer object and keys: strings over 8 KiB use
+the existing `[st truncated this native timeline value: size limit; N bytes]`
+suffix, and nested collections still over 16 KiB after leaf clipping become
+clipped JSON-text previews. The block's existing `continuation` shape fetches
+the original `/body/blocks/N/metadata` when no payload continuation is present;
+an existing payload continuation takes precedence (a `/body` ref also includes
+the original metadata). Error/status `message`, `details` and `detail` fallback
+fields are bounded in the same preparation pass; strings remain strings and
+negotiated body-ref blocks fetch the complete original `/body`. Legacy clients
+receive the same visible clipping without blocks or continuation refs. A final
+entry-size guard bounds remaining large body fields; an entry whose retained
+keys still cannot fit becomes a visible `native-entry-too-large` error with the
+same identity and ordering, without discarding its page's other entries.
+Negotiated clients fetch that entry's exact original `/body`; legacy clients
+receive the error message without its blocks.
+
 A single 32 MiB text-heavy JSONL line is held several times during parsing,
 source-record attachment, normalization and response preparation: budget roughly
 150–250 MiB transient per read, or 600 MiB–1 GiB for four concurrent reads, in
