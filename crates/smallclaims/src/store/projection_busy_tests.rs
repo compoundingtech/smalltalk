@@ -302,8 +302,17 @@ fn a_busy_begin_preserves_health_and_deferred_work_then_recovers() {
         .unwrap();
     let other = Connection::open(&path).unwrap();
     other.execute_batch("BEGIN IMMEDIATE").unwrap();
-    let error = store.project_replication_backlog().unwrap_err();
+    let mut lines = Vec::new();
+    let error = store
+        .project_replication_backlog_with_log("test", |line| lines.push(line.to_owned()))
+        .unwrap_err();
     assert_eq!(error.downcast_ref::<Error>().unwrap().code, "database-busy");
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("\"stage\":\"begin-immediate\"")
+                && line.contains("\"frontier\":null"))
+    );
     assert_eq!(health(&store), before);
     assert!(store.replication_projection_deferred());
     other.execute_batch("ROLLBACK").unwrap();

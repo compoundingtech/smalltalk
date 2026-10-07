@@ -201,7 +201,7 @@ fn projection_failure_log_line(
         "error": bounded(message, 4096), "error_truncated": message.chars().take(4097).count()>4096,
         "stage": field("projection_stage"), "claim_id": field("projection_claim_id"),
         "subject": field("projection_subject"), "operation_id": field("projection_operation_id"),
-        "frontier": frontier, "target": target,
+        "frontier": if details.get("projection_frontier_unknown").and_then(Value::as_bool).unwrap_or(false) { None } else { Some(frontier) }, "target": target,
         "suppressed_errors": emission.suppressed, "rate_bucket_overflow": emission.overflow,
         "context_truncated": details.get("projection_context_truncated").and_then(Value::as_bool).unwrap_or(false)
             || phase.chars().take(129).count()>128 || code.chars().take(129).count()>128
@@ -6284,7 +6284,14 @@ impl Store {
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(|error| {
                     let error = internal(error);
-                    if error.is_sqlite_contention() { self.note_projection_contention(); }
+                    if error.is_sqlite_contention() {
+                        self.note_projection_contention();
+                        let error = error.with_detail("projection_stage", "begin-immediate")
+                            .with_detail("projection_frontier_unknown", true);
+                        // No transaction exists from which to read the committed frontier.
+                        self.log_projection_failure(&error, phase, 0, target, &mut log);
+                        return error;
+                    }
                     // No transaction began: surface the typed error, preserving the entry
                     // deferred generation and attempt time. The daemon also schedules retry.
                     error

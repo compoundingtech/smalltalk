@@ -5620,10 +5620,10 @@ async fn run_up(args: UpArgs) -> Result<()> {
             "startup/project-replication-backlog",
             |progress| startup.progress(progress),
         )
-    })?;
+    }).context("startup projection failed; stopping before daemon.started and runtime initialization")?;
     if !projected {
         eprintln!(
-            "st: the replicated projection is stale; the daemon will use its last good graph"
+            "st: the replicated projection remains deferred; the daemon will use its last good graph"
         );
     }
     if admission.unknown != 0 {
@@ -22292,19 +22292,28 @@ fn retry_projection_contention(
     event_notify: watch::Sender<u64>,
     state_dir: PathBuf,
 ) -> tokio::task::JoinHandle<()> {
+    retry_projection_contention_observed(store, notify, event_notify, state_dir, |_| {})
+}
+
+// The observer is a no-op in the daemon; owned tests use it to synchronize on actual
+// backoff entry rather than assume a task has polled after a virtual-time advance.
+fn retry_projection_contention_observed(
+    store: std::sync::Weak<Store>,
+    notify: Arc<Notify>,
+    event_notify: watch::Sender<u64>,
+    state_dir: PathBuf,
+    mut on_poll: impl FnMut(bool) + Send + 'static,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut schedule = ProjectionContentionRetry::default();
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
             let Some(store) = store.upgrade() else { break };
             let generation = store.projection_contention_generation();
-            let Some(attempt) = schedule.poll(
-                tokio::time::Instant::now(),
-                generation,
-                store.replication_projection_deferred(),
-            ) else {
-                continue;
-            };
+            let attempt = schedule.poll(
+                tokio::time::Instant::now(), generation, store.replication_projection_deferred());
+            on_poll(schedule.due.is_some());
+            let Some(attempt) = attempt else { continue };
             // Only this task schedules these attempts. The existing projection mutex also
             // serializes them with receive/wake passes. Store ownership ends at attempt return.
             let result = tokio::task::spawn_blocking(move || {
@@ -22343,6 +22352,8 @@ fn retry_projection_contention(
                 "st3: projection contention retry {}",
                 json!({
                     "attempt":attempt, "limit":3, "outcome":outcome, "rescheduled":schedule.due.is_some(),
+                    "exhausted_still_deferred": retry && schedule.due.is_none(),
+                    "stopped_still_deferred": !recovered && schedule.due.is_none(),
                 })
             );
             if recovered {
@@ -22468,15 +22479,17 @@ mod projection_contention_retry_tests {
         // No receive, wake or manual projection follows this release: the real worker
         // must publish the admitted claim and its projected event by itself.
         let (events, mut received) = watch::channel(0u64);
-        let worker = retry_projection_contention(
+        let (polls, mut polled) = watch::channel(false);
+        let worker = retry_projection_contention_observed(
             Arc::downgrade(&store),
             Arc::new(Notify::new()),
             events,
             dir.path().to_owned(),
+            move |backoff| { polls.send_replace(backoff); },
         );
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(1)).await;
-        tokio::task::yield_now().await;
+        loop { let backoff = *polled.borrow_and_update(); if backoff { break; } polled.changed().await.unwrap(); }
         tokio::time::advance(Duration::from_secs(30)).await;
         let observed = store.clone();
         let recovered = tokio::task::spawn_blocking(move || {
@@ -22516,15 +22529,17 @@ mod projection_contention_retry_tests {
         other.execute_batch("ROLLBACK").unwrap();
         let weak = Arc::downgrade(&store);
         let (events, _) = watch::channel(0u64);
-        let worker = retry_projection_contention(
+        let (polls, mut polled) = watch::channel(false);
+        let worker = retry_projection_contention_observed(
             weak.clone(),
             Arc::new(Notify::new()),
             events,
             dir.path().to_owned(),
+            move |backoff| { polls.send_replace(backoff); },
         );
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(1)).await;
-        tokio::task::yield_now().await;
+        loop { let backoff = *polled.borrow_and_update(); if backoff { break; } polled.changed().await.unwrap(); }
         // The worker has observed contention and waits for its first 30s deadline.
         assert_eq!(weak.strong_count(), 1);
         drop(store);
