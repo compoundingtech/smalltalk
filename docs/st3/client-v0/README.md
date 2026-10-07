@@ -1162,6 +1162,9 @@ PEEK capabilities live only in daemon memory: expiry, single-use consumption and
 terminal/runtime binding are retained, but restarting the gateway invalidates outstanding PEEK
 capabilities. Neither issuing nor consuming PEEK creates store claims. ATTACH keeps its durable
 attachment and consumption claims.
+The daemon retains at most 4096 unconsumed PEEK capabilities, pruning expired entries on issuance
+and consumption. Full admission returns HTTP 429 `rate-limited` rather than evicting live tokens;
+consume an outstanding token or wait for expiry before requesting another.
 
 Open `/v1/client/terminals/{id}/raw-stream?incarnation=...&mode=attach` using WebSocket subprotocol
 `st3.client.pty.v0` and secondary `st3.cap.CAPABILITY`. The credential and capability never appear
