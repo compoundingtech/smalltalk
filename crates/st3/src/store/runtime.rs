@@ -22,7 +22,21 @@ pub struct SmalltalkRuntime {
     pub(crate) subject_cache: Mutex<SubjectCache>,
     pub(crate) message_cache: Mutex<HashMap<String, MessageCacheEntry>>,
     pub(crate) agent_status_cache: Mutex<VecDeque<AgentStatusEntry>>,
-    pub(crate) agent_resources_cache: Mutex<VecDeque<(u64, bool, Arc<Vec<Value>>)>>,
+    pub(crate) agent_resources_cache: Mutex<VecDeque<AgentResourcesEntry>>,
+    /// Acquire before opening a SQLite snapshot, never while pinning a WAL read mark.
+    pub(crate) agent_resources_admission: Arc<tokio::sync::Mutex<()>>,
+    #[cfg(test)]
+    pub(crate) agent_resources_builds: std::sync::atomic::AtomicUsize,
+}
+
+#[derive(Clone)]
+pub(crate) struct AgentResourcesEntry {
+    pub(crate) index: u64,
+    pub(crate) local: u64,
+    pub(crate) history: bool,
+    /// None certifies the whole roster; Some records the lazily materialized page subjects.
+    pub(crate) covered: Option<BTreeSet<String>>,
+    pub(crate) items: Arc<Vec<Value>>,
 }
 
 impl SmalltalkRuntime {

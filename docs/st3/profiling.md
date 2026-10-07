@@ -142,8 +142,26 @@ every subject's status read into a scan of its historical JSON bodies. The opera
 TEXT affinity is removed in that join so SQLite can seek the JSON-expression index.
 
 The agent-card cache holds its mutex only while selecting or publishing immutable cached
-rows, not while building cards. A request's SQLite snapshot therefore does not wait at that
-mutex behind another request's disk reads.
+rows, not while building cards. HTTP agent pages and WS roster windows share one asynchronous
+admission per store, acquired before opening SQLite snapshots. Followers therefore pin no old
+WAL read mark while another reader builds the projection. The worker retains admission through
+completion even if its caller disconnects.
+
+Eight immutable graph-index/local-frontier/history cuts are retained. HTTP pages lazily fill missing subjects into
+the same projection used by the complete WS roster, without reducing unrelated cards. Local
+agent observations update only affected cards; daemon diagnostics reuse rows; other claims
+conservatively invalidate the projection. Authorization is checked before reuse, and local
+delivery presence stays a per-read overlay rather than graph-cached authority.
+
+The local-observation frontier is read by an indexed seek inside the same SQLite snapshot.
+A same-index local transcript append updates the affected card's `last_activity_at` for both
+HTTP and WS; ignoring local rows here would make a shared warm roster instant but stale.
+
+The focused 70-agent, 20-session fixture reports card-status, usage, repeated-projection and
+incremental-update costs with `cargo test -p st3 --lib agent_roster_snapshot_fixture_timing --
+--ignored --nocapture`. It is a serial fixture micro-measure, not a load benchmark. CI's
+`perf-load` workload holds concurrent agents WS subscribers and measures first-snapshot
+latency against the roster's 300 ms budget.
 
 Every five seconds a dedicated native thread attempts a passive WAL checkpoint outside the
 writer queue. Once every frame is backfilled, it attempts `TRUNCATE` with zero busy timeout.

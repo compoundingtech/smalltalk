@@ -1657,8 +1657,14 @@ where
         let page = client_page(state, &snapshot, collection, Vec::new(), query)?;
         return Ok((Extension(snapshot), Json(page)));
     }
+    let roster_admission = if collection == "agents" {
+        Some(state.store.admit_agent_resources().await)
+    } else {
+        None
+    };
     let reader = state.clone();
     let (snapshot, items) = blocking_store(move || {
+        let _roster_admission = roster_admission;
         reader.store.clone().read_snapshot(|index| {
             let snapshot = client_snapshot_at(&reader, index);
             let items = reader
@@ -2253,8 +2259,18 @@ fn client_agent_cards_for_page(
         .iter()
         .filter_map(|r| r["id"].as_str().map(str::to_owned))
         .collect::<BTreeSet<_>>();
-    let mut cards = client_agent_resources_selected(store, history, index, Some((&selected, refs)))
-        .map_err(ApiError::internal)?;
+    let mut cards = store.cached_agent_resources_for(index, history, Some(&selected), |changed| {
+        let (subjects, previous) = changed.expect("a selected page always names its missing cards");
+        // Continuations retain the first page's queue metadata, not today's mutable queue.
+        let metadata = refs.iter().chain(previous.iter().filter(|item| {
+            !selected.contains(item["id"].as_str().unwrap_or_default())
+        })).cloned().collect::<Vec<_>>();
+        let mut cards = client_agent_resources_selected(
+            store, history, index, Some((subjects, &metadata)),
+        )?;
+        add_agent_todos(store, &mut cards, index)?;
+        Ok(cards)
+    }).map_err(ApiError::internal)?;
     if cards.len() != refs.len() {
         return Err(client_page_expired(
             "agent page membership is no longer available; restart pagination",
@@ -2274,9 +2290,14 @@ fn client_agent_cards_for_page(
         // The original cut's ordering and host metadata must survive later declaration changes.
         card["name"] = reference["name"].clone();
         card["host_id"] = reference["host_id"].clone();
+        for field in [
+            "current_work_ids", "active_work_count", "next_work_id", "upcoming_work_ids",
+            "queued_work_count", "current_work", "next_work", "upcoming_work",
+        ] {
+            card[field] = reference[field].clone();
+        }
         ordered.push(card);
     }
-    add_agent_todos(store, &mut ordered, index).map_err(ApiError::internal)?;
     overlay_agent_resources(store, &mut ordered, at).map_err(ApiError::internal)?;
     Ok(ordered)
 }
@@ -4163,7 +4184,9 @@ async fn client_agents(
     }
     // Name/id ordering is independent of the live overlays. Only the returned page needs them.
     let store = state.store.clone();
+    let roster_admission = store.admit_agent_resources().await;
     blocking_store(move || {
+        let _roster_admission = roster_admission;
         let (Extension(snapshot), Json(mut page)) = page;
         let items = store.read_snapshot(|_| {
             Ok(store.with_owned_set_snapshot_reads(|| {
@@ -15362,7 +15385,7 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
     }
 
     #[test]
-    fn repeated_agent_list_does_not_wait_for_busy_read_connections() {
+    fn repeated_agent_list_reads_only_local_frontier_without_rebuilding() {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
         let index = state.store.index().unwrap();
@@ -15388,28 +15411,14 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
             .unwrap()
             .store_index;
         client_agent_resources(&state.store, false, "after diagnostic", index).unwrap();
-        let (ready_send, ready_recv) = std::sync::mpsc::channel();
-        let (release_send, release_recv) = std::sync::mpsc::channel();
-        let holder = state.store.clone();
-        let held = std::thread::spawn(move || {
-            holder.hold_read_connections_for_test(|| {
-                ready_send.send(()).unwrap();
-                release_recv.recv().unwrap();
-            });
-        });
-        ready_recv.recv().unwrap();
-        let store = state.store.clone();
-        let (result_send, result_recv) = std::sync::mpsc::channel();
-        let read = std::thread::spawn(move || {
-            result_send
-                .send(client_agent_resources(&store, false, "second", index))
-                .unwrap();
-        });
-        let result = result_recv.recv_timeout(Duration::from_millis(250));
-        release_send.send(()).unwrap();
-        held.join().unwrap();
-        read.join().unwrap();
-        assert!(result.unwrap().unwrap().is_empty());
+        // The former zero-reader cache hit missed same-index local activity. Correct warm
+        // reads now perform one indexed frontier seek, but never reduce cards again.
+        let builds = state.store.agent_resources_builds_for_test();
+        let work = smallclaims::sqlite::work::total();
+        let rows = client_agent_resources(&state.store, false, "second", index).unwrap();
+        assert!(rows.is_empty());
+        assert_eq!(state.store.agent_resources_builds_for_test(), builds);
+        assert!((smallclaims::sqlite::work::total() - work).vm_steps < 100);
     }
 
     #[tokio::test]
@@ -15570,6 +15579,15 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
             1
         );
         assert_eq!(cards, oracle[..1]);
+        let builds = state.store.agent_resources_builds_for_test();
+        assert_eq!(client_agent_cards_for_page(&state.store, false, index, &refs[..1], "cut")
+            .unwrap(), cards);
+        assert_eq!(state.store.agent_resources_builds_for_test(), builds);
+        assert_eq!(client_agent_resources(&state.store, false, "cut", index).unwrap(), oracle);
+        assert_eq!(crate::store::SUBJECT_REDUCTIONS.with(std::cell::Cell::get), 16);
+        assert_eq!(state.store.agent_resources_builds_for_test(), builds + 1);
+        client_agent_cards_for_page(&state.store, false, index, &refs[1..2], "cut").unwrap();
+        assert_eq!(state.store.agent_resources_builds_for_test(), builds + 1);
     }
 
     #[test]
@@ -21353,6 +21371,90 @@ mission "wake" state="ready" {
             client_agent_resources_uncached(store, history, index).unwrap()
         );
         cached
+    }
+
+    #[test]
+    #[ignore = "focused roster timing fixture; run explicitly with --ignored --nocapture"]
+    fn agent_roster_snapshot_fixture_timing() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = &state.store;
+        let source = format!("version 2\n{}", (0..70)
+            .map(|n| format!("agent \"roster-{n:02}\" {{ command \"true\" }}\n"))
+            .collect::<String>());
+        let intent = crate::graph::parse_test_intent(&source, "node").unwrap();
+        let plan = store.mission(&intent, crate::model::IntentInput {
+            kdl: source, source_name: None,
+        }).unwrap();
+        store.apply(&intent, &plan.subject_tokens, "roster-fixture").unwrap();
+        let subjects = (0..70).map(|n| format!("agent/node.roster-{n:02}")).collect::<Vec<_>>();
+        for subject in &subjects {
+            for session in 0..20 {
+                let incarnation = format!("session-{session}");
+                for (kind, fields) in [
+                    ("runtime.observed", json!({"status":"running", "runtime_id":subject,
+                        "incarnation_id":incarnation})),
+                    ("harness.observed", json!({"state":"idle", "driver":"codex",
+                        "incarnation_id":incarnation})),
+                    ("harness.usage", json!({"semantics":"response", "driver":"codex",
+                        "incarnation_id":incarnation, "model":"fixture",
+                        "input_tokens":10, "output_tokens":5, "total_tokens":15})),
+                ] {
+                    store.append_claim(&ClaimInput {
+                        subject: subject.clone(), kind: kind.into(), actor: Some(subject.clone()),
+                        fields: serde_json::from_value(fields).unwrap(), evidence: Vec::new(),
+                        expected_subject: None, idempotency_key: None,
+                    }).unwrap();
+                }
+            }
+        }
+        let index = store.index().unwrap();
+        let measure = |label: &str, read: &dyn Fn()| {
+            let before = smallclaims::sqlite::work::total();
+            let started = Instant::now();
+            read();
+            println!("roster fixture {label}: {:.3} ms; sqlite_work={:?}",
+                started.elapsed().as_secs_f64() * 1000.0,
+                smallclaims::sqlite::work::total() - before);
+        };
+        store.forget_current_views();
+        measure("main cold card status", &|| {
+            store.agent_card_status_at(None, index, false).unwrap();
+        });
+        measure("main usage fold", &|| {
+            store.usage_summaries_at(&subjects, Some(index)).unwrap();
+        });
+        let oracle = client_agent_resources_uncached(store, false, index).unwrap();
+        measure("main repeated projections x22", &|| {
+            for _ in 0..22 {
+                let mut rows = client_agent_resources_selected(store, false, index, None).unwrap();
+                add_agent_todos(store, &mut rows, index).unwrap();
+            }
+        });
+        store.forget_current_views();
+        measure("shared cold projection", &|| {
+            let mut rows = client_agent_resources_cached(store, false, index).unwrap();
+            for row in &mut rows { row.as_object_mut().unwrap().remove("todo"); }
+            assert_eq!(rows, oracle);
+        });
+        measure("shared warm projections x22", &|| {
+            for _ in 0..22 { client_agent_resources_cached(store, false, index).unwrap(); }
+        });
+        store.append_claim(&ClaimInput {
+            subject: subjects[0].clone(), kind: "harness.observed".into(),
+            actor: Some(subjects[0].clone()),
+            fields: serde_json::from_value(json!({"state":"working", "driver":"codex",
+                "incarnation_id":"session-19"})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let index = store.index().unwrap();
+        let mut advanced = Vec::new();
+        let started = Instant::now();
+        advanced.extend(client_agent_resources_cached(store, false, index).unwrap());
+        println!("roster fixture shared one-card advance: {:.3} ms",
+            started.elapsed().as_secs_f64() * 1000.0);
+        for row in &mut advanced { row.as_object_mut().unwrap().remove("todo"); }
+        assert_eq!(advanced, client_agent_resources_uncached(store, false, index).unwrap());
     }
 
     #[test]
