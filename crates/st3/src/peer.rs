@@ -2240,8 +2240,15 @@ agent "example/launch" { host "owner-node"; workspace "/tmp"; command "true"; }
         );
         append(
             "harness.diagnostic",
-            serde_json::json!({"code":"launch-exited-before-ready", "incarnation_id":"remote-first", "reason":"fixture launch failed", "matched_line":"remote startup marker"}),
+            serde_json::json!({"code":"launch-exited-before-ready", "incarnation_id":"remote-first", "reason":"fixture launch failed"}),
         );
+        owner_store.append_claim(&crate::model::ClaimInput {
+            subject:subject.into(), kind:"runtime.action.failed".into(), actor:None,
+            fields:serde_json::from_value(serde_json::json!({
+                "action":"startup-output", "incarnation_id":"remote-first", "reason":"remote startup marker",
+            })).unwrap(), evidence:vec![], expected_subject:None,
+            idempotency_key:Some(format!("launch-output:{subject}:remote-first")),
+        }).unwrap();
         let failure = read_launch().await;
         assert_eq!(failure["stage"], "exited");
         assert_eq!(failure["exit_code"], 29);

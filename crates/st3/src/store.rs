@@ -53868,6 +53868,27 @@ mod harness_event_tests {
 }
 
 impl Store {
+    /// Read an owner-local idempotent observation without entering the writer queue.
+    pub(crate) fn local_observation_for_key(
+        &self,
+        subject: &str,
+        kind: &str,
+        key: &str,
+    ) -> Result<Option<ClaimRecord>> {
+        smallclaims::touched::note_read(|| subject.to_owned());
+        let connection = self.readers.get();
+        connection
+            .query_row(
+                &format!(
+                    "{LOCAL_OBSERVATION_COLUMNS} WHERE dedupe_key=?1 AND subject=?2 AND kind=?3"
+                ),
+                params![local_observation_dedupe_key(kind, key), subject, kind],
+                |row| local_observation_from_row(&self.origin, row),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     /// Bounded recent evidence for launch waits, merging owner-local receipts and claims.
     pub fn launch_observations(
         &self,

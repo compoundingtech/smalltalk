@@ -55,6 +55,79 @@ fn launch(
         })
         .unwrap();
 }
+
+#[test]
+fn quiet_ready_passes_do_not_enqueue_duplicate_local_receipts() {
+    let _clock = Clock;
+    let now = 1_800_000_000_000;
+    let (store, reconciler, desired) = fixture(now);
+    let mut member = desired.member.clone().unwrap();
+    member.driver = Some("pi".into());
+    let observed = RuntimeObservation {
+        runtime_id: member.runtime_id.clone(),
+        terminal: true,
+        status: "running".into(),
+        exit_code: None,
+        incarnation_id: Some("quiet-ready".into()),
+    };
+    reconciler
+        .record_member(&desired, &observed, false)
+        .unwrap();
+    store
+        .append_claim(&ClaimInput {
+            subject: desired.subject.clone(),
+            kind: "harness.observed".into(),
+            actor: Some(desired.subject.clone()),
+            fields: serde_json::from_value(serde_json::json!({
+                "state":"ready", "driver":"pi", "incarnation_id":"quiet-ready",
+            }))
+            .unwrap(),
+            evidence: vec![],
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+    assert!(
+        store
+            .current_harness(&desired.subject)
+            .unwrap()
+            .unwrap()
+            .is_ready()
+    );
+    reconciler
+        .reconcile_driver_readiness(&desired, &member, &observed, now)
+        .unwrap();
+    let key = format!("launch-ready:{}:quiet-ready", desired.subject);
+    assert!(
+        store.operation_claim(&key).unwrap().is_none(),
+        "the receipt is local"
+    );
+    assert!(
+        store
+            .local_observation_for_key(&desired.subject, "runtime.action.succeeded", &key)
+            .unwrap()
+            .is_some()
+    );
+    let queued = store
+        .connection
+        .batches
+        .1
+        .load(std::sync::atomic::Ordering::Relaxed);
+    for pass in 0..100 {
+        reconciler
+            .reconcile_driver_readiness(&desired, &member, &observed, now + pass)
+            .unwrap();
+    }
+    assert_eq!(
+        store
+            .connection
+            .batches
+            .1
+            .load(std::sync::atomic::Ordering::Relaxed),
+        queued,
+        "quiet ready passes entered the writer queue even if local dedupe avoided row inserts"
+    );
+}
 #[test]
 fn crash_backoff_caps_total_delay_and_keeps_absolute_due_across_accounting_windows() {
     let _clock = Clock;

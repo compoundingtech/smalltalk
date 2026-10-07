@@ -89,10 +89,16 @@ pub fn read(store: &Store, subject: &str, token: &str) -> anyhow::Result<LaunchS
                     status.reason = diagnostic.body["fields"]["reason"]
                         .as_str()
                         .map(str::to_owned);
-                    status.output_tail = diagnostic.body["fields"]["matched_line"]
-                        .as_str()
-                        .map(str::to_owned);
                 }
+                status.output_tail = store
+                    .local_observation_for_key(
+                        subject,
+                        "runtime.action.failed",
+                        &format!("launch-output:{subject}:{incarnation}"),
+                    )?
+                    .and_then(|receipt| {
+                        receipt.body["fields"]["reason"].as_str().map(str::to_owned)
+                    });
                 return Ok(status);
             }
             if store

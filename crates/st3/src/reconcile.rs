@@ -3114,7 +3114,11 @@ impl<R: RuntimeControl> Reconciler<R> {
             .is_some_and(|harness| harness.incarnation_id == incarnation && harness.is_ready());
         if harness_ready {
             let key = format!("launch-ready:{}:{incarnation}", subject.subject);
-            if self.store.operation_claim(&key)?.is_none() {
+            if self
+                .store
+                .local_observation_for_key(&subject.subject, "runtime.action.succeeded", &key)?
+                .is_none()
+            {
                 self.store.append_claim(&ClaimInput {
                     subject: subject.subject.clone(),
                     kind: "runtime.action.succeeded".into(),
@@ -5412,7 +5416,9 @@ impl<R: RuntimeControl> Reconciler<R> {
                 "runtime.observed",
                 member_fields(member, "absent", None, false),
             )?;
-            return Err(anyhow::anyhow!(reason)).context("start member runtime");
+            anyhow::bail!(
+                "the requested runtime could not start; inspect its host's launch status"
+            );
         }
         let launched = if member.terminal {
             self.runtime.snapshot_ptys().ok().and_then(|items| {
@@ -6960,7 +6966,11 @@ impl<R: RuntimeControl> Reconciler<R> {
             && let Some(incarnation) = observation.incarnation_id.as_deref()
             && self
                 .store
-                .operation_claim(&format!("launch-ready:{}:{incarnation}", subject.subject))?
+                .local_observation_for_key(
+                    &subject.subject,
+                    "runtime.action.succeeded",
+                    &format!("launch-ready:{}:{incarnation}", subject.subject),
+                )?
                 .is_none()
             && !self
                 .store
@@ -6978,13 +6988,39 @@ impl<R: RuntimeControl> Reconciler<R> {
                         )
                 })
         {
-            let tail = self
-                .runtime
-                .exit_tail(observation)
-                .ok()
-                .flatten()
-                .unwrap_or_default();
-            let tail = st_runtime::launch_diagnostic::safe_tail(&tail, &member.environment);
+            let output_key = format!("launch-output:{}:{incarnation}", subject.subject);
+            if self
+                .store
+                .local_observation_for_key(&subject.subject, "runtime.action.failed", &output_key)?
+                .is_none()
+            {
+                let tail = self
+                    .runtime
+                    .exit_tail(observation)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                let tail = st_runtime::launch_diagnostic::safe_tail(&tail, &member.environment);
+                // Runtime action receipts with no actor have SystemLocal retention. Startup
+                // output stays on this host; the durable diagnostic contains only fixed text.
+                self.store.append_claim(&ClaimInput {
+                    subject: subject.subject.clone(),
+                    kind: "runtime.action.failed".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("action".into(), Value::String("startup-output".into())),
+                        (
+                            "code".into(),
+                            Value::String("launch-exited-before-ready".into()),
+                        ),
+                        ("incarnation_id".into(), Value::String(incarnation.into())),
+                        ("reason".into(), Value::String(tail)),
+                    ]),
+                    evidence: evidence.clone(),
+                    expected_subject: None,
+                    idempotency_key: Some(output_key),
+                })?;
+            }
             let exit = observation.exit_code.map_or_else(
                 || "exit code unavailable".into(),
                 |code| format!("exit code {code}"),
@@ -7006,7 +7042,6 @@ impl<R: RuntimeControl> Reconciler<R> {
                             observation.status
                         )),
                     ),
-                    ("matched_line".into(), Value::String(tail)),
                 ]),
                 evidence.clone(),
             )?;

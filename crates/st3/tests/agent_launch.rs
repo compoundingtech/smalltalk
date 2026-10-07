@@ -259,6 +259,15 @@ async fn early_exit_cli(code: i32, structured: bool, attach: bool) {
         "{stderr}"
     );
     assert_eq!(*runtime.starts.lock().unwrap(), 1);
+    let durable =
+        serde_json::to_string(&store.claims_for("agent/example/early-exit", None).unwrap())
+            .unwrap();
+    for marker in ["fixture-stdout-marker", "fixture-stderr-marker"] {
+        assert!(
+            !durable.contains(marker),
+            "startup output entered the replicated claim log"
+        );
+    }
     if structured {
         let result: Value = serde_json::from_str(&stdout).unwrap();
         assert_eq!(result["error"]["exit_code"], code);

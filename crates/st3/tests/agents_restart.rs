@@ -458,8 +458,20 @@ async fn restart_reports_timeout_and_launch_failure() {
     let _ = driver.await;
     assert!(!output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("fixture rejected launch"),
+        String::from_utf8_lossy(&output.stderr).contains("the requested runtime could not start"),
         "{output:?}"
+    );
+    assert!(
+        fixture
+            .store
+            .observations_for(&subject, "runtime.action.failed")
+            .unwrap()
+            .iter()
+            .any(|claim| claim.actor.is_none()
+                && claim.body["fields"]["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("fixture rejected launch"))),
+        "the exact launcher error must remain in the host-local receipt"
     );
 }
 
@@ -1864,7 +1876,8 @@ async fn a_failed_explicit_retry_is_completed_parked_and_visible_until_a_new_req
         assert_eq!(result.body["evidence"][0], request.id);
         let reason = result.body["fields"]["reason"].as_str().unwrap();
         assert!(
-            reason.contains("parked again") && reason.contains("fixture rejected launch"),
+            reason.contains("parked again")
+                && reason.contains("the requested runtime could not start"),
             "{reason}"
         );
         // `st agents show` and clients consume the same agents read, including this fault.
@@ -1882,7 +1895,23 @@ async fn a_failed_explicit_retry_is_completed_parked_and_visible_until_a_new_req
             &["agents", "show", &subject],
         )
         .await;
-        assert!(succeeded(&show).contains("fixture rejected launch"));
+        assert!(succeeded(&show).contains("the requested runtime could not start"));
+        assert!(
+            !reason.contains("fixture rejected launch"),
+            "starter output must not replicate in the control result"
+        );
+        assert!(
+            fixture
+                .store
+                .observations_for(&subject, "runtime.action.failed")
+                .unwrap()
+                .iter()
+                .any(|claim| claim.actor.is_none()
+                    && claim.body["fields"]["reason"]
+                        .as_str()
+                        .is_some_and(|reason| reason.contains("fixture rejected launch"))),
+            "the launcher detail must remain available locally"
+        );
         assert_eq!(fixture.request(&subject, key).await.id, request.id);
     }
     // Restoring the launcher alone cannot reattempt a completed failure.

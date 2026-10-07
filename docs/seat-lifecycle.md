@@ -266,9 +266,14 @@ replication, launch, readiness and attachment stages. A same-host launch explici
 replication. With `--json`, the result adds a `stages` array and startup failures add `error`.
 
 If the requested process exits before readiness, creation promptly returns that process's exit
-status, including zero, and a bounded startup output tail. Credential and structured transcript
+status, including zero, and a bounded startup output tail served from the requested host.
+Startup text stays in local runtime receipts; replicated diagnostics contain fixed exit text only. Credential and structured transcript
 lines are withheld. A later retry cannot turn that failed creation into success or redirect its
 attachment. Missing executables and setup errors identify the launch stage that failed.
+If the launch read is unavailable on an older daemon or relay (404/503), creation uses the
+prior readiness/event wait within the same timeout and retains the declaration and first
+observed incarnation. This compatibility path cannot recover an exit that was never observed
+or its startup output, and does not claim remote replication from a local card.
 
 Automatic restarts after short-lived agent exits wait at least five seconds, increasing to a
 maximum of two minutes including jitter. A sixty-second process lifetime clears this consecutive
