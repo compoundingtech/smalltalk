@@ -50,7 +50,7 @@
   {
     "body": {
       "kind": "assistant",
-      "value": "[reasoning]\nCheck the queue before answering."
+      "value": "Thinking · Check the queue before answering."
     },
     "id": "timeline-entry/native-131"
   },

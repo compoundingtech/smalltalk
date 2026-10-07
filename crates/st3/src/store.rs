@@ -8433,6 +8433,20 @@ impl Store {
                 }
                 let intent = owned_plan.as_ref().map_or(intent, |p| &p.intent);
                 let expected = owned_plan.as_ref().map_or(expected, |p| &p.preview.expected_subjects);
+                for desired in intent.subjects.values() {
+                    crate::terminal_binding::validate_declaration(desired, actor)?;
+                    if let Some(binding) = desired.member.as_ref().and_then(|m| m.terminal_binding.as_ref()) {
+                        let terminal = current_desired_row_tx(transaction, &binding.subject).map_err(internal)?
+                            .filter(|row| row.kind == "pty")
+                            .and_then(|row| row.member)
+                            .and_then(|member| serde_json::from_str::<crate::model::MemberSpec>(&member).ok())
+                            .ok_or_else(|| St3Error::new("invalid-terminal-binding", "the terminal must already be declared"))?;
+                        let member = desired.member.as_ref().expect("binding member");
+                        if terminal.host != member.host || terminal.runtime_id != member.runtime_id {
+                            return Err(St3Error::new("invalid-terminal-binding", "the bound seat must use its terminal's host and runtime"));
+                        }
+                    }
+                }
                 validate_documents(transaction, &intent.document_refs)?;
                 for desired in intent
                     .subjects
@@ -19791,6 +19805,7 @@ pub(crate) fn append_claim_tx(
     if matches!(kind, "intent.desired" | "mission.published") {
         owned_sets::refuse_unmanaged(transaction, subject).map_err(anyhow::Error::new)?;
     }
+    crate::terminal_binding::validate_claim(kind, body, actor).map_err(anyhow::Error::new)?;
     st3_schema::owned_terminals::validate_declaration_owner(subject, kind, actor)
         .map_err(anyhow::Error::new)?;
     st3_schema::glasses::validate_owner(subject, actor).map_err(anyhow::Error::new)?;
@@ -25686,6 +25701,7 @@ fn classify_replicated_claim_with_registry(
             ),
         ));
     }
+    crate::terminal_binding::validate_claim(&claim.kind, &claim.body, claim.actor.as_deref())?;
     if claim.kind == "owned-set.revised" { owned_sets::validate_receipt(&claim.subject, &claim.body)?; }
     st3_schema::owned_terminals::validate_declaration_owner(
         &claim.subject,
@@ -25706,6 +25722,48 @@ fn classify_replicated_claim_with_registry(
         ));
     }
     Ok(ReplicatedClaimAdmission::Valid)
+}
+
+#[cfg(test)]
+#[test]
+fn terminal_binding_replica_admission_rejects_a_foreign_actor() {
+    let store = Store::open_memory("orchid").unwrap();
+    for (key, source) in [
+        (
+            "terminal",
+            "version 2\nterminal \"person/avery/019a0000-0000-7000-8000-000000000001\" { command \"shell\"; restart \"never\"; }",
+        ),
+        (
+            "binding",
+            "version 2\nagent \"example/bound\" { harness \"claude\" {}; bind-terminal \"pty/person/avery/019a0000-0000-7000-8000-000000000001\" incarnation=\"shell:created\" id=\"019a0000-0000-7000-8000-000000000002\"; }",
+        ),
+    ] {
+        let intent = crate::parse_intent(source, "orchid").unwrap();
+        let expected = intent
+            .subjects
+            .keys()
+            .map(|subject| (subject.clone(), Vec::new()))
+            .collect();
+        store
+            .apply_as(&intent, &expected, key, Some("person/avery"))
+            .unwrap();
+    }
+    let mut claim = store
+        .latest_claim("agent/example/bound", Some("intent.desired"))
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        classify_replicated_claim_with_registry(&claim, st3_schema::registry()),
+        Ok(ReplicatedClaimAdmission::Valid)
+    ));
+    claim.actor = Some("person/intruder".into());
+    assert_eq!(
+        classify_replicated_claim_with_registry(&claim, st3_schema::registry())
+            .err()
+            .unwrap()
+            .code,
+        "terminal-owner-forbidden"
+    );
 }
 
 /// Reapply this host's lease renewals that have not replicated yet after a projection replay,
@@ -26262,7 +26320,7 @@ fn rebuild_base_aggregate_tx(
 /// Identify the claim being processed, without copying its fields, payload or authority data.
 fn incremental_claim_error(error: St3Error, claim: &ClaimRecord, stage: &'static str) -> St3Error {
     let operation = operation_parts(&claim.body).map(|(operation, _)| operation);
-    let truncated = [&claim.id, &claim.subject]
+    let truncated = [&claim.id, &claim.subject, &claim.kind]
         .into_iter()
         .any(|value| value.chars().take(257).count() > 256)
         || operation.is_some_and(|value| value.chars().take(257).count() > 256);
@@ -26271,6 +26329,7 @@ fn incremental_claim_error(error: St3Error, claim: &ClaimRecord, stage: &'static
         .with_detail("projection_stage", stage)
         .with_detail("projection_claim_id", bounded(&claim.id))
         .with_detail("projection_subject", bounded(&claim.subject))
+        .with_detail("projection_claim_kind", bounded(&claim.kind))
         .with_detail("projection_context_truncated", truncated);
     match operation {
         Some(operation) => error.with_detail("projection_operation_id", bounded(operation)),
@@ -26412,11 +26471,10 @@ fn try_project_simple_replication_tx(
     }
     for claim in &claims {
         let has_operation = claim.body.get("_operation").is_some();
-        // Local response associations identify the work claim already applied by its writer;
-        // they are not compound publication operations that need canonical replay selection.
-        // Malformed metadata and non-cache work operations still take their existing guards.
-        let work_publication_operation = claim.kind.starts_with("work.")
-            && operation_parts(&claim.body).is_some_and(|(id, _)| !id.starts_with("cache/"));
+        // Supported work transitions already share canonical ordering and affected-tree
+        // repair with replay. An operation identity alone changes neither the work fields
+        // nor that ordering. Validate its shape here and its digest/state in the registry
+        // below; do not force a full-store replay based on the identity's prefix.
         if claim.kind.starts_with("planning-session.") {
             rebuild_planning = true;
         }
@@ -26443,19 +26501,22 @@ fn try_project_simple_replication_tx(
                     | "step-run.state"
                     | "step-run.retried"
             )
-            || (has_operation
-                && (work_publication_operation || operation_parts(&claim.body).is_none()))
+            || (has_operation && operation_parts(&claim.body).is_none())
         {
-            let reason = if !Store::simple_replication_kind(&claim.kind) && !has_operation {
-                "non-incremental-kind"
-            } else if work_publication_operation {
-                "work-operation"
-            } else if operation_parts(&claim.body).is_none() && has_operation {
+            let reason = if operation_parts(&claim.body).is_none() && has_operation {
                 "malformed-operation"
             } else {
                 "non-incremental-kind"
             };
-            return Ok(replay_needed(reason));
+            crate::profile::note(&format!("replay: {reason}"));
+            return Ok(IncrementalProjection::ReplayWithContext {
+                reason,
+                details: incremental_claim_error(
+                    St3Error::new(reason, "claim requires canonical replay"),
+                    claim,
+                    "incremental-guard",
+                ).details,
+            });
         }
         // Person asks add steps (and sometimes a whole run) in their own claim. Their response
         // also resumes an originating step. Rebuild the affected tree so a response received
@@ -33402,7 +33463,6 @@ agent "test/empty" { command "true" }
             "unhealthy-projection",
             "frontier-ahead",
             "non-incremental-kind",
-            "work-operation",
             "malformed-operation",
             "operation-conflict",
             "incremental-error:internal",
@@ -33419,7 +33479,6 @@ agent "test/empty" { command "true" }
                 let operation = json!({"id":"op/replay-test", "request_digest":"digest-a"});
                 let (kind, body) = match reason {
                     "non-incremental-kind" => ("work.unknown", json!({"fields":{}})),
-                    "work-operation" => ("work.claimed", json!({"fields":{}, "_operation":operation})),
                     "malformed-operation" => (
                         "harness.observed",
                         json!({"fields":{"state":"ready"}, "_operation":{"id":"op/malformed"}}),
@@ -33503,7 +33562,8 @@ agent "test/empty" { command "true" }
                 .filter_map(|line| line.strip_prefix("st: projection failure detail "))
                 .map(|line| serde_json::from_str::<Value>(line).unwrap())
                 .collect::<Vec<_>>();
-            if reason == "incremental-error:internal" || reason == "operation-conflict" {
+            if matches!(reason, "incremental-error:internal" | "operation-conflict"
+                | "malformed-operation" | "non-incremental-kind") {
                 assert_eq!(details.len(), 1, "{reason}");
                 assert_eq!(details[0]["subject"], "agent/node.test");
                 assert!(
@@ -33515,13 +33575,26 @@ agent "test/empty" { command "true" }
                 if reason == "operation-conflict" {
                     assert_eq!(details[0]["operation_id"], "op/replay-test");
                     assert!(details[0]["error"].as_str().unwrap().contains("digest_matches=false"));
-                } else {
+                } else if reason == "incremental-error:internal" {
                     assert!(
                         details[0]["error"]
                             .as_str()
                             .unwrap()
                             .contains("missing field")
                     );
+                } else {
+                    assert_eq!(details[0]["stage"], "incremental-guard");
+                    assert_eq!(details[0]["code"], reason);
+                    let expected_kind = match reason {
+                        "malformed-operation" => "harness.observed",
+                        _ => "work.unknown",
+                    };
+                    assert_eq!(details[0]["claim_kind"], expected_kind);
+                    let detail_position = lines.iter().position(|line|
+                        line.starts_with("st: projection failure detail ")).unwrap();
+                    let replay_position = lines.iter().position(|line|
+                        line.starts_with("st: projection full replay ")).unwrap();
+                    assert!(detail_position < replay_position);
                 }
             } else {
                 assert!(details.is_empty(), "{reason}");
@@ -37939,6 +38012,130 @@ version 2
             controller.step_run(&step).unwrap().unwrap().status,
             "verifying"
         );
+    }
+
+    #[test]
+    fn supported_work_operations_do_not_require_a_cache_prefix() {
+        for operation in ["op/invented-work", "cache/invented-work"] {
+            let (controller, worker, step) = replicated_step_pair();
+            worker_work(&worker, &step, "claim", None, "work-operation-source");
+            let original = worker
+                .claims_for(&step, Some("work.claimed"))
+                .unwrap()
+                .pop()
+                .unwrap();
+            let mut body = original.body.clone();
+            body["_operation"] = json!({"id": operation, "request_digest": "invented-digest"});
+            {
+                let mut connection = controller.connection.lock().unwrap();
+                let transaction = connection.transaction().unwrap();
+                // Historical admitted input with the actual endpoint's transition fields;
+                // changing metadata here is not a production admission bypass.
+                append_claim_record_tx(
+                    &transaction,
+                    "worker",
+                    &step,
+                    "work.claimed",
+                    original.actor.as_deref(),
+                    &body,
+                    &[],
+                    None,
+                )
+                .unwrap();
+                transaction.commit().unwrap();
+            }
+            FULL_REPLAYS.with(|count| count.set(0));
+            assert!(controller.project_replication_backlog().unwrap());
+            assert_eq!(FULL_REPLAYS.with(std::cell::Cell::get), 0, "{operation}");
+            assert_eq!(
+                controller.step_run(&step).unwrap().unwrap().status,
+                "claimed"
+            );
+            assert!(controller.operation_projection_drift().unwrap().is_empty());
+            let incremental = graph_digest_of(&controller);
+            controller.replay_replication_graph().unwrap();
+            assert_eq!(incremental, graph_digest_of(&controller), "{operation}");
+
+            // A conflicting identity still requires canonical replay and names its work claim.
+            body["_operation"]["request_digest"] = json!("different-digest");
+            let incoming = {
+                let mut connection = controller.connection.lock().unwrap();
+                let transaction = connection.transaction().unwrap();
+                let claim = append_claim_record_tx(
+                    &transaction,
+                    "worker",
+                    &step,
+                    "work.claimed",
+                    original.actor.as_deref(),
+                    &body,
+                    &[],
+                    None,
+                )
+                .unwrap();
+                transaction.commit().unwrap();
+                claim
+            };
+            FULL_REPLAYS.with(|count| count.set(0));
+            let mut lines = Vec::new();
+            assert!(
+                controller
+                    .project_replication_backlog_with_log("test", |line| lines.push(line.to_owned()))
+                    .unwrap()
+            );
+            assert_eq!(FULL_REPLAYS.with(std::cell::Cell::get), 1);
+            let detail: Value = serde_json::from_str(
+                lines
+                    .iter()
+                    .find_map(|line| line.strip_prefix("st: projection failure detail "))
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(detail["code"], "operation-conflict");
+            assert_eq!(detail["claim_kind"], "work.claimed");
+            assert_eq!(detail["claim_id"], incoming.id);
+            assert_eq!(detail["operation_id"], operation);
+            assert!(controller.operation_projection_drift().unwrap().is_empty());
+            let conflicted = graph_digest_of(&controller);
+            controller.replay_replication_graph().unwrap();
+            assert_eq!(conflicted, graph_digest_of(&controller));
+        }
+    }
+
+    #[test]
+    fn cache_receipt_work_lifecycle_matches_replay_on_updated_peers() {
+        for action in ["renew", "progress", "release", "fail", "complete"] {
+            let (controller, worker, step) = replicated_step_pair();
+            worker_work(&worker, &step, "claim", None, "receipt-claim");
+            assert!(!projection_replayed(&controller, "worker", &worker));
+            worker_work(
+                &worker,
+                &step,
+                action,
+                Some("invented lifecycle"),
+                "receipt-action",
+            );
+            assert!(
+                !projection_replayed(&worker, "controller", &controller),
+                "local {action}"
+            );
+            assert!(
+                !projection_replayed(&controller, "worker", &worker),
+                "remote {action}"
+            );
+            let incremental = graph_digest_of(&controller);
+            assert_eq!(
+                incremental,
+                graph_digest_of(&worker),
+                "peer parity {action}"
+            );
+            controller.replay_replication_graph().unwrap();
+            assert_eq!(
+                incremental,
+                graph_digest_of(&controller),
+                "canonical parity {action}"
+            );
+            assert!(controller.operation_projection_drift().unwrap().is_empty());
+        }
     }
 
     #[test]

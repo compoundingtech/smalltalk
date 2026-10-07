@@ -2685,11 +2685,15 @@ enum DocCommand {
         #[arg(long = "as")]
         name: String,
     },
-    /// Read exact document bytes by immutable name-and-hash reference.
+    /// Read a document by name (the newest version) or by immutable name-and-hash reference.
+    /// Printed to a terminal, markdown is rendered; a pipe, --output and --raw give the bytes.
     Get {
         reference: String,
         #[arg(long)]
         output: Option<PathBuf>,
+        /// Print the document's bytes as stored, even on a terminal.
+        #[arg(long)]
+        raw: bool,
     },
     /// List selected document bindings; use --all for immutable version history.
     Ls {
@@ -11643,6 +11647,30 @@ async fn run_rules(
     }
 }
 
+/// A document as terminal markdown, or `None` when it is not text (a binary, or JSON and KDL
+/// that read better as they are), so it prints as stored.
+fn render_document(bytes: &[u8], width: usize) -> Option<String> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let start = text.trim_start();
+    if text.contains('\0') || start.starts_with('{') || start.starts_with('[') || start.starts_with("version ") {
+        return None;
+    }
+    let theme = st3_conversation_ui::Theme::default();
+    let lines = st3_conversation_ui::text::markdown(
+        text,
+        width.saturating_sub(2),
+        theme.text(),
+        &theme,
+    );
+    Some(
+        lines
+            .iter()
+            .map(|line| format!("  {}", st3_conversation_ui::text::ansi(line)))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
 async fn run_doc(client: &Client, command: DocCommand, json_output: bool) -> Result<()> {
     match command {
         DocCommand::Put { file, name } => {
@@ -11687,7 +11715,11 @@ async fn run_doc(client: &Client, command: DocCommand, json_output: bool) -> Res
                 Ok(())
             }
         }
-        DocCommand::Get { reference, output } => {
+        DocCommand::Get {
+            reference,
+            output,
+            raw,
+        } => {
             let reference = if reference.contains('@') {
                 reference
             } else {
@@ -11718,6 +11750,11 @@ async fn run_doc(client: &Client, command: DocCommand, json_output: bool) -> Res
             if let Some(output) = output {
                 fs::write(&output, bytes)
                     .with_context(|| format!("write document {}", output.display()))?;
+            } else if let Some(rendered) = (!raw && std::io::stdout().is_terminal())
+                .then(|| render_document(&bytes, terminal_columns().unwrap_or(100).clamp(20, 140)))
+                .flatten()
+            {
+                println!("{rendered}");
             } else {
                 use std::io::Write as _;
                 std::io::stdout().write_all(&bytes)?;
@@ -15574,6 +15611,44 @@ fn current_local_pty_incarnation(actor: &str) -> Result<Option<String>> {
     Ok(pty_observation_incarnation(actor, &observations))
 }
 
+async fn current_local_agent_incarnation(client: &Client, actor: &str) -> Result<Option<String>> {
+    let status: StatusResponse = client
+        .get(&format!(
+            "/v1/status?subject={}",
+            urlencoding::encode(actor)
+        ))
+        .await?;
+    let binding = status
+        .subjects
+        .first()
+        .and_then(|s| s.desired.as_ref())
+        .map(st3::terminal_binding::from_desired)
+        .transpose()?
+        .flatten();
+    let Some(binding) = binding else {
+        return current_local_pty_incarnation(actor);
+    };
+    let Some(root) = std::env::var_os("PTY_ROOT").filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let observations = st_runtime::PtyRuntime::new(PathBuf::from(root)).snapshot()?;
+    Ok(bound_pty_incarnation(&binding, &observations))
+}
+
+fn bound_pty_incarnation(
+    binding: &st3::model::TerminalBinding,
+    observations: &[st_runtime::PtyObservation],
+) -> Option<String> {
+    let matched = observations.iter().any(|o| {
+        o.status == "running"
+            && o.tags.get("st3.subject") == Some(&binding.subject)
+            && o.pid
+                .zip(o.created_at.as_deref())
+                .is_some_and(|(pid, created)| format!("{pid}:{created}") == binding.incarnation)
+    });
+    matched.then(|| binding.agent_incarnation())
+}
+
 fn has_local_pty_registry() -> bool {
     std::env::var_os("PTY_ROOT").is_some_and(|value| !value.is_empty())
 }
@@ -15594,27 +15669,26 @@ async fn wait_for_agent_incarnation_from(
         // observation. Reading the graph immediately would then bind this new driver to the old
         // incarnation forever. The local registry already contains the process executing us and
         // is the exact source from which the reconciler will derive the graph incarnation.
-        if use_local_pty_registry {
-            if let Some(incarnation) = current_local_pty_incarnation(actor)? {
-                return Ok(incarnation);
-            }
+        let lookup = if use_local_pty_registry {
+            current_local_agent_incarnation(client, actor).await
         } else {
-            match current_agent_incarnation(client, actor).await {
-                Ok(Some(incarnation)) => return Ok(incarnation),
-                Ok(None) => {}
-                // A restarting daemon cannot answer yet; its outage does not use up the wait.
-                Err(error) if st3::client::daemon_unreachable(&error).is_some() => {
-                    if !outage_logged {
-                        let _ = write_driver_log(
-                            actor,
-                            "waiting for the runtime incarnation while the daemon restarts",
-                        );
-                        outage_logged = true;
-                    }
-                    deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+            current_agent_incarnation(client, actor).await
+        };
+        match lookup {
+            Ok(Some(incarnation)) => return Ok(incarnation),
+            Ok(None) => {}
+            // A restarting daemon cannot answer yet; its outage does not use up the wait.
+            Err(error) if st3::client::daemon_unreachable(&error).is_some() => {
+                if !outage_logged {
+                    let _ = write_driver_log(
+                        actor,
+                        "waiting for the runtime incarnation while the daemon restarts",
+                    );
+                    outage_logged = true;
                 }
-                Err(error) => return Err(error),
+                deadline = tokio::time::Instant::now() + Duration::from_secs(15);
             }
+            Err(error) => return Err(error),
         }
         if tokio::time::Instant::now() >= deadline {
             anyhow::bail!(
@@ -24355,6 +24429,17 @@ mod tests {
     }
 
     #[test]
+    fn documents_get_renders_markdown_on_a_terminal_and_leaves_data_alone() {
+        let rendered = render_document(b"# Title\n\nSome **bold** words.\n\n- one\n- two\n", 60).unwrap();
+        assert!(rendered.contains("Title") && rendered.contains("\x1b["), "{rendered:?}");
+        assert!(rendered.contains("bold") && !rendered.contains("**bold**"), "{rendered:?}");
+        // Data and binaries print as stored.
+        assert!(render_document(br#"{"a": 1}"#, 60).is_none());
+        assert!(render_document(b"version 2\nmission \"x\" {}", 60).is_none());
+        assert!(render_document(&[0xff, 0xfe, 0x00], 60).is_none());
+    }
+
+    #[test]
     fn cli_timeline_folds_claude_skill_and_raw_preserves_the_expansion() {
         let items: Vec<ClientTimelineEntry> = serde_json::from_str(include_str!(
             "../../../fixtures/clients/transcripts/claude-skill.json"
@@ -27326,6 +27411,38 @@ mod tests {
             pty_observation_incarnation("agent/run/other", &observations),
             None
         );
+    }
+
+    #[test]
+    fn native_driver_binds_the_terminal_tag_only_under_its_declared_invocation() {
+        let binding = st3::model::TerminalBinding {
+            subject: "pty/person/avery/019a0000-0000-7000-8000-000000000001".into(),
+            incarnation: "42:created".into(),
+            id: "019a0000-0000-7000-8000-000000000002".into(),
+        };
+        let mut observation = st_runtime::PtyObservation {
+            name: "fixture".into(),
+            status: "running".into(),
+            exit_code: None,
+            pid: Some(42),
+            created_at: Some("created".into()),
+            display_name: None,
+            tags: BTreeMap::from([("st3.subject".into(), binding.subject.clone())]),
+        };
+        assert_eq!(
+            bound_pty_incarnation(&binding, &[observation.clone()]),
+            Some(binding.agent_incarnation())
+        );
+        observation.pid = Some(43);
+        assert_eq!(
+            bound_pty_incarnation(&binding, &[observation.clone()]),
+            None
+        );
+        observation.pid = Some(42);
+        observation
+            .tags
+            .insert("st3.subject".into(), "agent/example/other".into());
+        assert_eq!(bound_pty_incarnation(&binding, &[observation]), None);
     }
 
     #[test]

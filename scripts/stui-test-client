@@ -37,6 +37,7 @@ def main() -> None:
     parser.add_argument("--rows", type=int, default=50)
     parser.add_argument("--columns", type=int, default=160)
     parser.add_argument("--keys", action="append", default=[])
+    parser.add_argument("--timing", help="append JSON lines of this client's request and frame timings (routes, statuses, sizes, durations; never contents)")
     arguments = parser.parse_args()
 
     master, slave = pty.openpty()
@@ -45,6 +46,8 @@ def main() -> None:
     env["TERM"] = "xterm-256color"
     env["STUI_CLIENT_LABEL"] = arguments.label
     env.pop("ST_AGENT", None)
+    if arguments.timing:
+        env["STUI_TIMING_LOG"] = arguments.timing
     process = subprocess.Popen([arguments.binary], stdin=slave, stdout=slave, stderr=slave, env=env)
     os.close(slave)
     received = 0

@@ -1338,12 +1338,72 @@ fn parse_agent(
             tags: BTreeMap::new(),
             display_name: display_name.clone(),
             lifecycle: lifecycle.clone(),
+            terminal_binding: None,
             one_shot: false,
             restart: restart.clone(),
             restart_intensity: restart_intensity.clone(),
             shutdown_timeout_ms,
             driver: None,
             terminal_size: None,
+        });
+    }
+
+    if let Some(binding) = unique_child(children, "bind-terminal")? {
+        if context.owner_run.is_some()
+            || driver_nodes.is_empty()
+            || [
+                "checkout",
+                "render",
+                "fresh-context",
+                "one-shot",
+                "pty",
+                "exec",
+                "rollout",
+            ]
+            .iter()
+            .any(|name| children.nodes().iter().any(|n| n.name().value() == *name))
+        {
+            return Err(St3Error::new(
+                "invalid-terminal-binding",
+                "bind-terminal requires a top-level harness seat without managed side effects",
+            ));
+        }
+        ensure_only_properties(binding, &["incarnation", "id", "runtime-id"])?;
+        let terminal = one_string(binding)?;
+        if st3_schema::owned_terminals::owner(&terminal)
+            .map_err(|e| St3Error::new(e.code, e.message))?
+            .is_none_or(|owner| !owner.starts_with("person/"))
+        {
+            return Err(St3Error::new(
+                "invalid-terminal-binding",
+                "bind-terminal needs a person's terminal subject",
+            ));
+        }
+        let incarnation = property_string(binding, "incarnation")?
+            .filter(|s| !s.is_empty() && s.len() <= 256)
+            .ok_or_else(|| {
+                St3Error::new(
+                    "invalid-terminal-binding",
+                    "bind-terminal needs its PTY incarnation",
+                )
+            })?;
+        let id = property_string(binding, "id")?
+            .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+            .ok_or_else(|| {
+                St3Error::new(
+                    "invalid-terminal-binding",
+                    "bind-terminal needs a unique invocation UUID",
+                )
+            })?;
+        let member = primary.as_mut().expect("a bound seat has a harness");
+        member.runtime_id =
+            property_string(binding, "runtime-id")?.unwrap_or_else(|| terminal.replace('/', "."));
+        member.lifecycle = MemberLifecycle::TerminalBound;
+        member.restart = RestartType::Never;
+        member.terminal_binding = Some(crate::model::TerminalBinding {
+            subject: terminal,
+            incarnation,
+            id,
         });
     }
 
@@ -2507,6 +2567,7 @@ fn driver_member(
         tags: BTreeMap::from([("st3.subject".into(), subject.into())]),
         display_name,
         lifecycle,
+        terminal_binding: None,
         one_shot: false,
         restart,
         restart_intensity,
@@ -2598,6 +2659,7 @@ fn task_member(
         tags: parse_tags(body)?,
         display_name: None,
         lifecycle,
+        terminal_binding: None,
         one_shot: false,
         restart,
         restart_intensity,
@@ -2721,6 +2783,7 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "render",
         "harness",
         "fresh-context",
+        "bind-terminal",
         "one-shot",
         "handles-faults",
         "mission-authority",
@@ -2761,6 +2824,7 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "render",
         "harness",
         "fresh-context",
+        "bind-terminal",
         "one-shot",
         "handles-faults",
         "mission-authority",

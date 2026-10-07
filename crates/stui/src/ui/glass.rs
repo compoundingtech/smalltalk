@@ -545,8 +545,6 @@ enum Action {
     RenameGlass(String),
     DuplicateGlass(String),
     CloseGlass,
-    /// The new agent form, with what it should do when the query says it.
-    NewAgent(Option<String>),
     /// Home, over the glass.
     Home,
     /// A plain shell in a new tab.
@@ -821,12 +819,6 @@ impl Ui {
             action,
         };
         choices.push(start(
-            "New agent".into(),
-            "ctrl+n",
-            "new agent start".into(),
-            Action::NewAgent(None),
-        ));
-        choices.push(start(
             "New mission".into(),
             "describe it; a planner drafts it for you to approve",
             "new mission launch".into(),
@@ -848,14 +840,6 @@ impl Ui {
             "simplified simple full conversations tools compact".into(),
             Action::ToggleSimple,
         ));
-        if !name.is_empty() {
-            choices.push(start(
-                format!("Start an agent: “{name}”"),
-                "its first message",
-                String::new(),
-                Action::NewAgent(Some(name.to_owned())),
-            ));
-        }
         choices.extend(self.said_choices(name));
         let Some(glasses) = &self.glasses else {
             return choices;
@@ -1004,10 +988,9 @@ impl Ui {
             // agents come first, then missions, whatever a mission's title starts with
             // (Nathan, 2026-10-06); within a section, what begins as typed comes first.
             scored.sort_by_key(|(choice, score)| {
-                let catch_all = matches!(choice.action, Action::NewAgent(Some(_)));
                 let named = choice.label.to_lowercase().starts_with(&typed);
                 let command = named && choice.section > 3;
-                (catch_all, !command, RANK[choice.section], !named, -score)
+                (!command, RANK[choice.section], !named, -score)
             });
         }
         scored.into_iter().map(|(choice, _)| choice).collect()
@@ -1847,7 +1830,6 @@ impl Ui {
     fn launcher_bar(&self, buf: &mut Buffer, area: Rect) {
         let mut x = area.x + 1;
         for (glyph, label, key, hit) in [
-            ("＋", "New agent", "ctrl+n", Hit::NewAgent),
             ("⌨", "New terminal", "", Hit::NewTerminal),
             ("⇥", "Split right", "ctrl+v", Hit::Split(true)),
             ("⤓", "Split below", "ctrl+x", Hit::Split(false)),
@@ -2498,7 +2480,6 @@ impl Ui {
         // Esc leaves the input and glasses keys work again.
         if self.editing
             || self.find.is_some()
-            || (self.agent_form && self.tab == 1 && self.new_agent.is_some())
             || mission_form
             || self.chat.as_ref().is_some_and(|chat| chat.editing)
         {
@@ -2595,7 +2576,6 @@ impl Ui {
             KeyCode::Char('v') if control => self.split_group(Side::Right),
             KeyCode::Char('x') if control => self.split_group(Side::Below),
             KeyCode::Char('w') if control => self.close_tab(),
-            KeyCode::Char('n') if control => self.open_new_agent(None),
             KeyCode::Char('o') if control => {
                 glasses.zoomed = !glasses.zoomed && glasses.glass().layout.groups().len() > 1;
             }
@@ -2684,7 +2664,6 @@ impl Ui {
         // keys again when Home closes.
         self.tab = 0;
         self.kdl = false;
-        self.agent_form = false;
     }
 
     /// Close Home; stui's own tab follows the focused split again.
@@ -2773,7 +2752,6 @@ impl Ui {
             }
             Action::Open(pane) => self.open_in_glass(pane, how),
             Action::ShowGlass(index) => self.show_glass(index),
-            Action::NewAgent(task) => self.open_new_agent(task),
             Action::NewTerminal => self.open_new_terminal(),
             Action::NewMission => self.open_new_mission(),
             Action::ToggleSimple => self.toggle_simple(),
@@ -3299,7 +3277,7 @@ impl Ui {
             .glasses
             .as_ref()
             .and_then(|glasses| glasses.glass().focused())
-            .is_some_and(|key| key == Pane::NewAgent.key() || key == Pane::NewMission.key());
+            .is_some_and(|key| key == Pane::NewMission.key());
         if form {
             self.close_tab();
         }
@@ -3708,7 +3686,6 @@ impl Ui {
         // Focus only moves focus: an attached terminal stays attached until Ctrl+\\ or its tab
         // closes, and takes keys only while its tab has focus.
         self.kdl = matches!(pane, Pane::Declaration(_));
-        self.agent_form = matches!(pane, Pane::NewAgent);
         let Some(subject) = subject else { return };
         let mut position = self
             .listing_for(tab, 40)
@@ -3737,7 +3714,6 @@ fn pane_subject(pane: &Pane) -> Option<(usize, Option<String>)> {
         Pane::Agent(id) => (1, id.clone()),
         Pane::Terminal(id) => (1, Some(id.clone())),
         Pane::Mission(id) | Pane::Declaration(id) => (2, id.clone()),
-        Pane::NewAgent => (1, None),
         Pane::Usage(id) => (4, id.clone()),
         Pane::Machine(id) => (
             3,
@@ -3950,7 +3926,7 @@ mod tests {
         );
         assert!(!first.contains("⌂") && first.contains("active"), "{first}");
         // A glass with nothing open shows Home, under a bar for starting things.
-        assert!(shown.contains("New agent ctrl+n"), "{shown}");
+        assert!(shown.contains("New terminal") && !shown.contains("New agent"), "{shown}");
         assert!(shown.contains("ctrl+k open"));
         let plain = screen(&Ui::new(demo::world()));
         assert!(!plain.contains("ctrl+k") && !plain.lines().next().unwrap().contains("need you"));
@@ -5436,121 +5412,6 @@ mod tests {
         ui.picker = Some(ratatui_image::picker::Picker::halfblocks());
         let with = screen(&ui);
         assert!(with.contains('▀') || with.contains('▄'), "{with}");
-    }
-
-    #[test]
-    fn new_agent_worktree_fields_follow_focus_and_send_the_selected_checkout() {
-        let mut ui = glass();
-        ui.live = true;
-        ui.open_new_agent(None);
-        ui.new_agent.as_mut().unwrap().name = "willow.keen-otter".into();
-        let host = ui.agent_repository_host().unwrap();
-        ui.agent_repositories = Some((
-            host,
-            super::super::view::Load::Ready(vec![
-                "/srv/example/atlas".into(),
-                "/srv/example/site".into(),
-            ]),
-        ));
-        screen(&ui);
-        for _ in 0..6 {
-            press(&mut ui, KeyCode::Tab, KeyModifiers::NONE);
-        }
-        let shown = screen(&ui);
-        assert!(
-            shown.contains("REPOSITORY") && shown.contains("/srv/example/atlas"),
-            "{shown}"
-        );
-        ctrl(&mut ui, 'n');
-        assert_eq!(
-            ui.new_agent.as_ref().unwrap().repository,
-            "/srv/example/atlas"
-        );
-        ui.click(Hit::Repository("/srv/example/site".into()));
-        press(&mut ui, KeyCode::Tab, KeyModifiers::NONE);
-        assert!(screen(&ui).contains("keen-otter"));
-        ui.paste("fix/login".into());
-        press(&mut ui, KeyCode::Tab, KeyModifiers::NONE);
-        ui.paste("origin/develop".into());
-        press(&mut ui, KeyCode::Tab, KeyModifiers::NONE);
-        ui.paste("/srv/example/login".into());
-        let shown = screen(&ui);
-        assert!(
-            shown.contains("WORKSPACE") && shown.contains("/srv/example/login"),
-            "{shown}"
-        );
-        press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
-        assert!(
-            matches!(&ui.effects[0], Effect::CreateAgent { repo: Some(repo), branch: Some(branch), base: Some(base), workspace: Some(workspace), .. } if repo == "/srv/example/site" && branch == "fix/login" && base == "origin/develop" && workspace == "/srv/example/login")
-        );
-        // Changing hosts clears paths and cannot cycle suggestions from the old host.
-        ui.new_agent.as_mut().unwrap().focus = 5;
-        press(&mut ui, KeyCode::Right, KeyModifiers::NONE);
-        assert!(ui.new_agent.as_ref().unwrap().repository.is_empty());
-        assert!(ui.new_agent.as_ref().unwrap().workspace.is_empty());
-        ui.new_agent.as_mut().unwrap().focus = 6;
-        ctrl(&mut ui, 'n');
-        assert!(ui.new_agent.as_ref().unwrap().repository.is_empty());
-    }
-
-    #[test]
-    fn a_new_agent_starts_from_a_form_in_its_own_tab() {
-        let mut ui = glass();
-        ui.live = true;
-        // Home's bar and Ctrl+N both open the form; Ctrl+K can start one from a sentence.
-        assert!(screen(&ui).contains("New agent ctrl+n"));
-        ctrl(&mut ui, 'k');
-        typed(&mut ui, "fix the login test");
-        let palette = ui.glasses.as_ref().unwrap().palette.as_ref().unwrap();
-        let start = ui
-            .matches(palette)
-            .iter()
-            .position(|choice| choice.action == Action::NewAgent(Some("fix the login test".into())))
-            .unwrap();
-        ui.open_choice(Some(start), Open::Here);
-        assert_eq!(tabs(&ui).2, vec![vec!["new-agent:".to_owned()]]);
-        let shown = screen(&ui);
-        assert!(
-            shown.contains("fix the login test") && shown.contains("claude"),
-            "{shown}"
-        );
-        let name = ui.new_agent.as_ref().unwrap().name.clone();
-        assert!(name.contains('-'), "a name is made up: {name}");
-        // Typing goes to the form; Tab moves on; ← → choose.
-        typed(&mut ui, ", then open a PR");
-        press(&mut ui, KeyCode::Tab, KeyModifiers::NONE);
-        ctrl(&mut ui, 'u');
-        typed(&mut ui, "login fixer");
-        press(&mut ui, KeyCode::Tab, KeyModifiers::NONE);
-        press(&mut ui, KeyCode::Right, KeyModifiers::NONE);
-        press(&mut ui, KeyCode::Tab, KeyModifiers::NONE);
-        press(&mut ui, KeyCode::Right, KeyModifiers::NONE);
-        press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
-        assert_eq!(
-            std::mem::take(&mut ui.effects),
-            [Effect::CreateAgent {
-                name: "loginfixer".into(),
-                harness: "codex".into(),
-                model: Some("gpt-6-sol".into()),
-                effort: None,
-                host: None,
-                repo: None,
-                branch: None,
-                base: None,
-                workspace: None,
-                message: Some("fix the login test, then open a PR".into()),
-            }],
-            "a name keeps to letters, digits, dots and dashes"
-        );
-        // Once st starts it, its conversation takes the form's place.
-        ui.agent_started("agent/example/atlas/builder".into());
-        assert_eq!(tabs(&ui).2, vec![vec![ATLAS.to_owned()]]);
-        assert!(ui.new_agent.is_none());
-        // Ctrl+N again opens a fresh form; Esc closes it and its tab.
-        ctrl(&mut ui, 'n');
-        assert_eq!(tabs(&ui).2[0].len(), 2);
-        press(&mut ui, KeyCode::Esc, KeyModifiers::NONE);
-        assert_eq!(tabs(&ui).2, vec![vec![ATLAS.to_owned()]]);
     }
 
     #[test]

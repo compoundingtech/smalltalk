@@ -204,8 +204,7 @@ fn the_shared_client_contract_matches_stui() {
 }
 
 #[test]
-fn agent_launch_contract_matches_phone() {
-    use super::screens::{AgentForm, EFFORTS, HARNESSES, models};
+fn agent_branch_and_checkout_label_match_the_phone() {
     let fixture: Value = serde_json::from_str(include_str!(
         "../../../../fixtures/clients/agent-launch.json"
     ))
@@ -214,36 +213,6 @@ fn agent_launch_contract_matches_phone() {
         assert_eq!(
             st3_client::agent_branch(case["name"].as_str().unwrap()),
             case["branch"]
-        );
-    }
-    for case in fixture["launches"].as_array().unwrap() {
-        let value = &case["form"];
-        let field = |name: &str| value[name].as_str().unwrap_or("").to_owned();
-        let form = AgentForm {
-            task: field("message"),
-            name: field("name"),
-            repository: field("repository"),
-            branch: field("branch"),
-            base: field("base"),
-            workspace: field("workspace"),
-            harness: HARNESSES
-                .iter()
-                .position(|h| *h == field("harness"))
-                .unwrap(),
-            model: models(&field("harness"))
-                .iter()
-                .position(|m| *m == field("model"))
-                .unwrap(),
-            effort: EFFORTS.iter().position(|e| *e == field("effort")).unwrap(),
-            ..Default::default()
-        };
-        assert_eq!(
-            serde_json::to_value(super::agent_parameters(
-                &form,
-                value["host"].as_str().map(str::to_owned)
-            ))
-            .unwrap(),
-            case["parameters"]
         );
     }
     let checkout = serde_json::from_value(fixture["checkout"].clone()).unwrap();

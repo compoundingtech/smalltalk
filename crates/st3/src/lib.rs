@@ -84,6 +84,7 @@ pub mod telemetry;
 pub mod test_support;
 /// Attaches a local terminal to another fleet host's PTY session over Fabric, without st daemons.
 pub mod terminal_fabric;
+pub mod terminal_binding;
 
 pub use graph::{parse_intent, validate_mission_runtimes};
 pub use model::{NormalizedIntent, St3Error};

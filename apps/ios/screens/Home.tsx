@@ -24,13 +24,12 @@ export function HomeScreen() {
   const refresh = useRefresh();
   const agentOf = (row: HomeRow) => [row.item.requester_id, row.item.source_id].find(id => id?.startsWith('agent/'));
   const rows = useMemo(() => homeRows(data.attention, caps?.session_actor), [data.attention, caps?.session_actor]);
-  // Start something, as stui's launcher does: an agent with its first message, or a shell.
+  // Start something, as stui's launcher does: a shell or a mission.
   useLayoutEffect(() => {
     navigation.setOptions({
       unstable_headerRightItems: () => [{
         type: 'menu', label: 'New', icon: { type: 'sfSymbol', name: 'plus' },
         menu: { items: [
-          { type: 'action', label: 'New agent', icon: { type: 'sfSymbol', name: 'person.badge.plus' }, onPress: () => navigation.navigate('NewAgent') },
           { type: 'action', label: 'New terminal', icon: { type: 'sfSymbol', name: 'terminal' }, onPress: () => void actions.createTerminal(randomName()).then(terminalId => { if (terminalId) navigation.navigate('Terminal', { terminalId, title: 'shell' }); }) },
           { type: 'action', label: 'New mission', icon: { type: 'sfSymbol', name: 'point.3.connected.trianglepath.dotted' }, onPress: () => navigation.navigate('NewMission') },
         ] },

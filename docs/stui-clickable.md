@@ -86,8 +86,6 @@ from the painted label, so a card's specific action stays visible in the footer.
 | `Detach` | Terminal status row leaves terminal (`Ctrl+\\`) | Context | Background; leave terminal |
 | `GlassMenu` | Space name opens spaces palette (`Ctrl+G`) | Own action | Background; spaces |
 | `PaletteSection(index)` | Top-bar counts open that palette section | Own action | Background; agents / missions / fleet |
-| `NewAgent` | Home launcher control opens new-agent form (`Ctrl+N`) | Own action | Background; new agent |
-| `Repository(path)` | New-agent repository row chooses it | Context | Background; choose repository |
 | `Home` | `⌂` and needs-you count toggle Now (`Ctrl+H`) | Own action | Background; show/hide Now |
 | `Link(url)` | Raw HTTP(S) or remembered markdown link copies complete URL; wrapped parts copy the same address | Message/subject context where applicable, otherwise copy-link action | Underline; copy link |
 | `Split(right)` | Home launcher controls split right/below (`Ctrl+V` / `Ctrl+X`) | Own action | Background; split right/below |
@@ -124,7 +122,7 @@ making hidden rows clickable. Test-only synthetic hits are excluded.
 | `mod.rs`: `draw_help` | Full-area `Help` dismissal target, with input/hover override |
 | `glass.rs`: `render_glass` | Each divider `Resize` alongside existing drag metadata |
 | `glass.rs`: `draw_sidebar` | Section headings `SidebarSection`; invokes `draw_list_as` with `SidebarRow` |
-| `glass.rs`: `launcher_bar` | Home launcher buttons `NewAgent`, `NewTerminal`, `Split(true/false)`; used by empty initial group's `draw_group` and `draw_home_popover` |
+| `glass.rs`: `launcher_bar` | Home launcher buttons `NewTerminal`, `Split(true/false)`; used by empty initial group's `draw_group` and `draw_home_popover` |
 | `glass.rs`: `status_line` | `Connection`, `Home`, `PaletteSection(1/2/3)`, `Usage`, `GlassMenu` |
 | `glass.rs`: `tab_strip` | Each painted tab `GlassTab`; `+` `GlassAdd` |
 | `glass.rs`: `draw_palette` | Each visible result `PaletteChoice` |
@@ -147,7 +145,6 @@ making hidden rows clickable. Test-only synthetic hits are excluded.
 | `screens.rs`: `peek` | Agent go/message `Key('g'/'t')`; mission/Home go `Key('g')` |
 | `screens.rs`: `agent_details` | Back-to-conversation `Key('i')` |
 | `screens.rs`: `new_mission_form` | Each field `Field`; next/create/cancel `Key(Tab)`, `Enter`, `Escape` |
-| `screens.rs`: `new_agent_form` | Each editable field `Field`; repository choices `Repository`; next/start/cancel `Key(Tab)`, `Enter`, `Escape` |
 | `screens.rs`: `devices_card` | Per-device `Revoke` button |
 
 The shared [`st3-conversation-ui`](../crates/st3-conversation-ui/src) renderer
