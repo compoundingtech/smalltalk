@@ -471,6 +471,148 @@ fn apply_restart_superseding_revert_rejects_stale_proof_and_releases_hidden_barr
     assert!(seat.runtime.stops.lock().is_empty());
 }
 
+fn independent_ask_request(key: &str) -> crate::model::PersonAskRequest {
+    crate::model::PersonAskRequest {
+        legacy_request: None, person: "person/operator".into(), title: "Which bed?".into(),
+        reason: "Choose the next bed".into(), actor: SUBJECT.into(), step: None,
+        new_run: Some("independent-bed".into()), incarnation: Some("original-1".into()),
+        request: None, idempotency_key: key.into(),
+    }
+}
+
+#[test]
+fn apply_restart_waits_for_live_independent_asks_before_and_after_publication() {
+    for ask_before_publication in [false, true] {
+        let seat = Seat::new_with_owned(false);
+        let policy = Policy::when_idle(1_800_000, false);
+        if !ask_before_publication {
+            seat.publish_plain("second", Some(&policy), "defer-independent");
+        }
+        let ask = seat.store.ask_person(&independent_ask_request("bed")).unwrap();
+        if ask_before_publication {
+            seat.publish_plain("second", Some(&policy), "defer-independent");
+        }
+        seat.busy(false);
+        seat.publish_plain("second", Some(&Policy::when_idle(3_600_000, false)), "renew-independent-wait");
+        seat.store.reconcile_person_asks().unwrap();
+        assert!(seat.store.attention_items(Some("person/operator")).unwrap().iter()
+            .any(|item| item.subject == ask.subject));
+        seat.plain_step();
+        assert!(seat.runtime.stops.lock().is_empty());
+        assert!(!seat.store.restart_cutover(SUBJECT).unwrap());
+        assert!(rollout::status(&seat.store, SUBJECT).unwrap().unwrap()["blocking"]
+            .as_array().unwrap().contains(&json!("pending-person-work")));
+        seat.store.finish_person_step(&crate::model::PersonStepResponse {
+            delegation: None, subject: ask.subject, actor: SUBJECT.into(),
+            summary: "No longer needed".into(), evidence: Vec::new(), episode: None,
+            answer: None, idempotency_key: "cancel-bed".into(),
+        }, true).unwrap();
+        assert!(!seat.store.restart_person_work_pending(SUBJECT).unwrap());
+        seat.plain_step();
+        assert!(seat.store.restart_cutover(SUBJECT).unwrap());
+        seat.plain_step();
+        assert_eq!(*seat.runtime.stops.lock(), ["original-1"]);
+    }
+}
+
+#[test]
+fn apply_restart_fences_independent_ask_admission_but_preserves_recorded_retries() {
+    let seat = Seat::new_with_owned(false);
+    seat.publish_plain("second", Some(&Policy::when_idle(1_800_000, false)), "defer-ask-intake");
+    seat.busy(false);
+    let input = independent_ask_request("original-bed");
+    let ask = seat.store.ask_person(&input).unwrap();
+    seat.store.finish_person_step(&crate::model::PersonStepResponse {
+        delegation: None, subject: ask.subject.clone(), actor: SUBJECT.into(),
+        summary: "No longer needed".into(), evidence: Vec::new(), episode: None,
+        answer: None, idempotency_key: "cancel-original".into(),
+    }, true).unwrap();
+    seat.plain_step();
+    assert!(seat.store.restart_cutover(SUBJECT).unwrap());
+    assert_eq!(seat.store.ask_person(&input).unwrap().subject, ask.subject);
+    assert_eq!(seat.store.ask_person(&crate::model::PersonAskRequest {
+        idempotency_key: "new-bed".into(), ..input.clone()
+    }).unwrap_err().code, "seat-rollout-draining");
+    // Creating queued work does not execute it; its claim and origin-ask admissions remain fenced.
+    let queued = seat.store.start_work(&crate::model::WorkStartRequest {
+        actor: SUBJECT.into(), title: "Continue later".into(), idempotency_key: "queued-work".into(),
+    }).unwrap();
+    assert_eq!(queued.status, "ready");
+    assert_eq!(seat.store.work_action(&queued.subject, "claim", &crate::model::WorkRequest {
+        actor: Some(SUBJECT.into()), incarnation: Some("original-1".into()),
+        summary: None, reason: None, evidence: Vec::new(), idempotency_key: "queued-claim".into(),
+    }).unwrap_err().code, "seat-rollout-draining");
+    assert_eq!(seat.store.ask_person(&crate::model::PersonAskRequest {
+        step: Some(queued.subject), new_run: None, idempotency_key: "origin-ask".into(), ..input
+    }).unwrap_err().code, "seat-rollout-draining");
+}
+
+#[test]
+fn apply_restart_blocks_native_and_legacy_delivery_admission_and_keeps_receipt_retries() {
+    let seat = Seat::new_with_owned(false);
+    seat.publish_plain("second", Some(&Policy::when_idle(1_800_000, false)), "defer-mail-intake");
+    seat.busy(false);
+    let binding = seat.store.bind_mailbox(&crate::mailbox::Fence::new(
+        SUBJECT, "original-1", "delivery",
+    )).unwrap();
+    let mail = |subject: &str| {
+        seat.store.append_claim(&ClaimInput {
+            subject: subject.into(), kind: "message.sent".into(), actor: Some("person/operator".into()),
+            fields: serde_json::from_value(json!({
+                "status":"sent","from":"person/operator","to":SUBJECT,"content":"Tend the garden",
+            })).unwrap(), evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+    };
+    let receipt = |subject: &str, kind: &str, key: &str| ClaimInput {
+        subject: subject.into(), kind: format!("message.{kind}"), actor: Some(SUBJECT.into()),
+        fields: BTreeMap::from([("status".into(), json!(kind))]),
+        evidence: Vec::new(), expected_subject: None, idempotency_key: Some(key.into()),
+    };
+    mail("message/already-read");
+    let staged = receipt("message/already-read", "staged", "recorded-stage");
+    let committed = seat.store.append_mailbox_receipt(&staged, &binding).unwrap();
+    seat.store.append_mailbox_receipt(
+        &receipt("message/already-read", "delivered", "recorded-delivery"), &binding,
+    ).unwrap();
+    seat.store.append_mailbox_receipt(
+        &receipt("message/already-read", "read", "recorded-read"), &binding,
+    ).unwrap();
+    seat.plain_step();
+    assert!(seat.store.restart_cutover(SUBJECT).unwrap());
+    assert_eq!(seat.store.append_mailbox_receipt(&staged, &binding).unwrap().id, committed.id);
+    for (subject, native) in [("message/new-native", true), ("message/new-legacy", false)] {
+        mail(subject);
+        for kind in ["staged", "delivered"] {
+            let input = receipt(subject, kind, &format!("{subject}:{kind}"));
+            let error = if native {
+                seat.store.append_mailbox_receipt(&input, &binding).unwrap_err()
+            } else {
+                seat.store.append_claim(&input).unwrap_err()
+            };
+            assert_eq!(error.code, "seat-rollout-draining");
+        }
+        assert_eq!(seat.store.message(subject).unwrap().unwrap().status, "sent");
+    }
+}
+
+#[test]
+fn apply_restart_blocked_leased_work_is_not_a_safe_point() {
+    let seat = Seat::new_with_owned(false);
+    let run = seat.work();
+    seat.store.work_action(&run.steps[0].subject, "claim", &crate::model::WorkRequest {
+        actor: Some(SUBJECT.into()), incarnation: Some("original-1".into()),
+        summary: None, reason: None, evidence: Vec::new(), idempotency_key: "blocked-claim".into(),
+    }).unwrap();
+    seat.store.set_step_state(&run.steps[0].subject, "blocked", Some("waiting for a gate")).unwrap();
+    seat.publish_plain("second", Some(&Policy::when_idle(1_800_000, false)), "defer-blocked-lease");
+    seat.busy(false);
+    seat.plain_step();
+    assert!(rollout::status(&seat.store, SUBJECT).unwrap().unwrap()["blocking"]
+        .as_array().unwrap().contains(&json!("claimed-work")));
+    assert!(!seat.store.restart_cutover(SUBJECT).unwrap());
+    assert!(seat.runtime.stops.lock().is_empty());
+}
+
 #[test]
 fn apply_restart_now_interrupts_work_immediately() {
     let seat = Seat::new_with_owned(false);

@@ -384,7 +384,7 @@ pub fn blockers(store: &Store, subject: &str, incarnation: &str) -> Result<Vec<S
     }
     if store.work_for_reconcile(subject)?.iter().any(|step| {
         step.claimant.as_deref() == Some(subject)
-            && matches!(step.status.as_str(), "claimed" | "working" | "verifying")
+            && matches!(step.status.as_str(), "claimed" | "working" | "verifying" | "blocked")
     }) {
         blocking.push("claimed-work".into());
     }

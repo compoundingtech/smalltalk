@@ -382,6 +382,8 @@ CREATE INDEX IF NOT EXISTS claims_person_ask_owner_index ON claims(json_extract(
 WHERE kind='work.person-asked';
 CREATE INDEX IF NOT EXISTS claims_person_ask_origin_step_index ON claims(json_extract(body, '$.fields.origin_step'))
 WHERE kind='work.person-asked';
+CREATE INDEX IF NOT EXISTS claims_person_ask_requester_index ON claims(actor)
+WHERE kind='work.person-asked';
 
 CREATE TABLE IF NOT EXISTS mission_run_requests (
     operation_id TEXT PRIMARY KEY,
@@ -19690,6 +19692,21 @@ fn running_restart_at(
     let Some(incarnation) = actual["incarnation_id"].as_str() else {
         return Ok(None);
     };
+    let Some(launched) = running_member_at(connection, &desired.subject, incarnation, at_index)? else {
+        return Ok(None);
+    };
+    let changes = member.launch_changes(&launched);
+    Ok((!changes.is_empty()).then(|| PlannedAction {
+        subject: desired.subject.clone(),
+        action: "restart".into(),
+        reason: format!("the declared {} differs from the running launch receipt", changes.join(" and ")),
+    }))
+}
+
+/// Resolve only the start receipt for this exact incumbent, including driver-local receipts.
+fn running_member_at(
+    connection: &Connection, subject: &str, incarnation: &str, at_index: Option<u64>,
+) -> Result<Option<crate::model::MemberSpec>, St3Error> {
     let mut statement = connection
         .prepare_cached(
             "SELECT body, store_index, 0 AS local_id FROM claims
@@ -19704,7 +19721,7 @@ fn running_restart_at(
         .map_err(internal)?;
     let mut rows = statement
         .query(params![
-            &desired.subject,
+            subject,
             at_index.unwrap_or(i64::MAX as u64).min(i64::MAX as u64)
         ])
         .map_err(internal)?;
@@ -19729,15 +19746,7 @@ fn running_restart_at(
         let Some(launched) = launched.member else {
             continue;
         };
-        let changes = member.launch_changes(&launched);
-        return Ok((!changes.is_empty()).then(|| PlannedAction {
-            subject: desired.subject.clone(),
-            action: "restart".into(),
-            reason: format!(
-                "the declared {} differs from the running launch receipt",
-                changes.join(" and ")
-            ),
-        }));
+        return Ok(Some(launched));
     }
     Ok(None)
 }
@@ -50543,7 +50552,7 @@ fn append_claim_with_subject_fences(
             }
             let outcome = (|| {
             check_harness_event_runtime(transaction, &input.subject, event_runtime)?;
-            let settled_receipt = if let Some(fence) = fence {
+            let receipt_message = if let Some(fence) = fence {
                 check_mailbox_fence(transaction, fence)?;
                 let index = transaction.query_row(
                     "SELECT MIN(store_index) FROM claims WHERE subject=?1 AND subject LIKE 'message/%'",
@@ -50553,12 +50562,8 @@ fn append_claim_with_subject_fences(
                 if message.to != fence.subject || input.actor.as_deref() != Some(&fence.subject) {
                     return Err(St3Error::new("wrong-message-recipient", "receipt belongs to another seat"));
                 }
-                if input.kind == "message.staged" && !rollouts::message_allowed(transaction, &message)? {
-                    return Err(St3Error::new("seat-rollout-draining", "new independent delivery waits for the seat rollout"));
-                }
-                matches!((input.kind.as_str(), message.status.as_str()),
-                    ("message.staged", "delivered" | "read" | "closed") | ("message.delivered", "read" | "closed") | ("message.read", "closed"))
-            } else { false };
+                Some(message)
+            } else { None };
             if let Some((operation_id, request_digest)) = &operation
                 && let Some((stored_digest, canonical_claim, state)) =
                     operation_tx(transaction, operation_id).map_err(internal)?
@@ -50703,7 +50708,30 @@ fn append_claim_with_subject_fences(
                 );
                 stored_fields = Some(fields);
             }
-            if settled_receipt || validate_message_transition(transaction, input)? {
+            let settled_receipt = receipt_message.as_ref().is_some_and(|message| {
+                matches!((input.kind.as_str(), message.status.as_str()),
+                    ("message.staged", "delivered" | "read" | "closed")
+                    | ("message.delivered", "read" | "closed") | ("message.read", "closed"))
+            }) || validate_message_transition(transaction, input)?;
+            // Native mailbox and legacy lifecycle posts share this writer admission fence.
+            // Recorded retries and settled receipts never admit another delivery.
+            if !settled_receipt && matches!(input.kind.as_str(), "message.staged" | "message.delivered") {
+                let unfenced;
+                let message = if let Some(message) = receipt_message.as_ref() {
+                    message
+                } else {
+                    let index = transaction.query_row(
+                        "SELECT MIN(store_index) FROM claims WHERE subject=?1 AND subject LIKE 'message/%'",
+                        [&input.subject], |row| row.get::<_, Option<u64>>(0),
+                    ).map_err(internal)?.ok_or_else(|| St3Error::new("missing-message", "message does not exist"))?;
+                    unfenced = message_view_tx(transaction, &input.subject, index).map_err(internal)?;
+                    &unfenced
+                };
+                if !rollouts::message_allowed(transaction, message)? {
+                    return Err(St3Error::new("seat-rollout-draining", "new delivery waits for the seat cutover"));
+                }
+            }
+            if settled_receipt {
                 let latest_id = latest_claim_id_tx(transaction, &input.subject)
                     .map_err(internal)?
                     .ok_or_else(|| {

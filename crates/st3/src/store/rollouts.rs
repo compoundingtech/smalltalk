@@ -45,8 +45,39 @@ fn restart_cutover_request(connection: &Connection, subject: &str) -> Result<Opt
     Ok(request)
 }
 
-fn restart_cutover(connection: &Connection, subject: &str) -> Result<bool> {
+pub(super) fn restart_cutover(connection: &Connection, subject: &str) -> Result<bool> {
     Ok(restart_cutover_request(connection, subject)?.is_some())
+}
+
+/// An independent ask made by the incumbent remains live while its changed launch waits.
+/// Keep the incumbent's request context across pending publications, never across owner generations.
+pub(super) fn deferred_ask_live(connection: &Connection, ask: &ClaimRecord) -> Result<bool> {
+    let Some(subject) = ask.actor.as_deref() else { return Ok(false); };
+    let Some(token) = ask.body.pointer("/fields/requester_declaration").and_then(Value::as_str) else {
+        return Ok(false);
+    };
+    let Some(current) = current_desired_row(connection, subject)? else { return Ok(false); };
+    let Some(selected) = claim_by_id_tx(connection, &current.claim_id)? else { return Ok(false); };
+    if selected.body.get("deferred_restart").is_none() { return Ok(false); }
+    let Ok(selected) = serde_json::from_value::<DesiredSubject>(selected.body) else { return Ok(false); };
+    let Some(declared) = claim_by_id_tx(connection, token)? else { return Ok(false); };
+    if declared.subject != subject || declared.kind != "intent.desired" { return Ok(false); }
+    let declared_pending = declared.body.get("deferred_restart").is_some();
+    let Ok(declared) = serde_json::from_value::<DesiredSubject>(declared.body) else { return Ok(false); };
+    if declared.owner_run != selected.owner_run || declared.owner_generation != selected.owner_generation {
+        return Ok(false);
+    }
+    let (_, _, conflict) = selected_actual_source_at(connection, subject, None, None)?;
+    let Some(actual) = latest_actual(connection, subject)?.filter(|actual| actual["status"] == "running") else {
+        return Ok(false);
+    };
+    if conflict { return Ok(false); }
+    let Some(incarnation) = actual["incarnation_id"].as_str() else { return Ok(false); };
+    let Some(incumbent) = running_member_at(connection, subject, incarnation, None).map_err(internal)? else {
+        return Ok(false);
+    };
+    Ok(selected.member.is_some_and(|member| !member.launch_changes(&incumbent).is_empty())
+        && (declared_pending || declared.member.is_some_and(|member| member.launch_changes(&incumbent).is_empty())))
 }
 
 fn selection(connection: &Connection, subject: &str) -> Result<Option<Selection>, St3Error> {
@@ -406,13 +437,31 @@ impl Store {
     /// Keep publication-era asks attached to their running incumbent. The same
     /// origin-step/attempt fence is used by owned rollouts to allow retiring work.
     pub(crate) fn restart_person_work_pending(&self, subject: &str) -> Result<bool> {
-        Ok(self.readers.get().query_row(
+        let connection = self.readers.get();
+        if connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM step_runs step JOIN claims ask
                 ON json_extract(ask.body,'$.fields.origin_step')=step.subject
                 WHERE step.status IN ('waiting-person','ready') AND ask.kind='work.person-asked'
                 AND ask.actor=?1 AND json_extract(ask.body,'$.fields.origin_attempt')=step.attempt)",
-            [subject], |row| row.get(0),
-        )?)
+            [subject], |row| row.get::<_, bool>(0),
+        )? {
+            return Ok(true);
+        }
+        // Independent asks own their person step. Use the existing requester/run/attempt
+        // liveness rules instead of treating every historical asking claim as open.
+        let mut query = connection.prepare_cached(
+            "SELECT ask.id,ask.store_index,ask.batch_id,ask.subject,ask.kind,ask.origin,
+                    ask.actor,ask.body,ask.predecessors,ask.accepted_at_unix_ms
+             FROM claims ask JOIN step_runs step ON step.subject=ask.subject
+             WHERE ask.kind='work.person-asked' AND ask.actor=?1
+                AND json_extract(ask.body,'$.fields.origin_step') IS NULL
+                AND json_extract(ask.body,'$.fields.request.type') IS NOT 'update'
+                AND step.status IN ('pending','ready')",
+        )?;
+        for ask in query.query_map([subject], claim_from_row)? {
+            if person_work::current(&connection, &ask?, now_ms())? { return Ok(true); }
+        }
+        Ok(false)
     }
 
     /// A proof taken outside the writer is accepted only if neither frontier changed.

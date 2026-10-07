@@ -346,16 +346,22 @@ st agents show agent/example/worker
 ```
 
 The safe point reuses suspend/rollout's incarnation-fenced quiescence proof: the harness is
-idle with no open harness or `ask_person` request, unsent input, claimed work, running
-subagent or pending message delivery, and a known native session. An answered person request
-still blocks until its origin work resumes and finishes. Unknown harness state is not idle.
+idle with no open harness or `ask_person` request, unsent input, leased work (including blocked
+work), running subagent or pending message delivery, and a known native session. An answered
+person request still blocks until its origin work resumes and finishes. Independent
+`work ask --new-run` requests also block while live; asks opened before or during a deferred
+change remain answerable across a renewed wait, without weakening owner/run-generation fences.
+Unknown harness state is not idle.
 The pending declaration and absolute deadline survive daemon restarts; the incumbent's
 rendered files stay unchanged while it waits, and harness servicing and ready-work wakes continue.
 Plain publication keeps work and message intake open while pending or held. At the safe
-point, a durable desired-token/incarnation-fenced cutover barrier closes new work claims and
-message delivery before rendering or stopping. A concurrent claim either precedes that proof
-and postpones cutover, or sees the barrier and is refused. The writer validates the exact
-evaluated declaration and confirms it still differs from the incumbent's launch receipt.
+point, a durable desired-token/incarnation-fenced cutover barrier closes new work claims,
+person asks and fresh native or legacy message staging/delivery before rendering or stopping.
+A concurrent admission either precedes that proof and postpones cutover, or sees the barrier
+and is refused. Recorded idempotent retries and settled receipts remain usable; queued work
+and messages may still be recorded but cannot be claimed or delivered through the fence.
+The writer validates the exact evaluated declaration and confirms it still differs from the
+incumbent's launch receipt.
 Replacement, superseding publication or a now-current launch releases the fence. If target
 rendering or workspace preparation fails before termination, an explicit aborted cutover
 reopens intake and returns the change to pending/held; the original process stays alive and
