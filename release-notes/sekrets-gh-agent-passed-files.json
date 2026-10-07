@@ -23,7 +23,7 @@
   },
   "manual": {
     "status": "changed",
-    "detail": "Hosts running the sekrets gateway (hetz) re-run `st sekrets setup --person PERSON > s.sh && sudo sh s.sh` to give the gateway this build, which passed files need. Optional: move agent grants to `--preset gh-agent`."
+    "detail": "Hosts running the sekrets gateway re-run `st sekrets setup --person PERSON > s.sh && sudo sh s.sh` to give the gateway this build, which passed files need. Optional: move agent grants to `--preset gh-agent`."
   },
   "recovery": {
     "status": "none",
