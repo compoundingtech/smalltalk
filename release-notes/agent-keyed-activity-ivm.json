@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Maintain keyed agent activity timestamps without replaying activity history",
+  "replay": {"status":"none","detail":"Default readers and source capture are unchanged. Explicit registration maintains only affected activity categories and uses bounded reads; populated installation remains unavailable without complete capture."},
+  "schema": {"status":"changed","detail":"Explicit activity View registration adds rebuildable local_agent_activity_rows and a partial local_agent_content_latest_index over content timeline sources. No default table/index installation or numeric core schema version change."},
+  "rules": {"status":"none","detail":"No checkpoint or shared projection digest rule changes. Claims select by arrival position and local timeline by local ID, matching existing card activity semantics."},
+  "compatibility": {"status":"none","detail":"No client protocol, actor authorization or production reader change. Private dependency keys map to public agent IDs only after authorization in the caller snapshot."},
+  "downtime": {"status":"none","detail":"No default activation or startup work. This partial card dependency makes no deployed CPU or restart claim."},
+  "manual": {"status":"none","detail":"Default stores need no action. Claim/local/trim/prefix-promotion capture and complete card dependency certificates are required before explicit registration can serve public cards."},
+  "recovery": {"status":"none","detail":"Existing recovery paths are unchanged. Missing certification or a mutated/deleted claim returns unavailable. Derived rows are local rebuildable outputs, not authority evidence."}
+}
