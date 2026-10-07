@@ -6205,9 +6205,10 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()?;
         ids.into_iter()
             .map(|id| {
-                // The legacy tree consumes step state and summaries, not each worker's
-                // wake, timing, harness and definition presentation histories.
+                // The legacy tree consumes step state, summaries and queue order, not
+                // each worker's wake, timing and harness presentation histories.
                 let mut view = mission_run_steps_view_tx(&connection, &id, true)?;
+                enrich_run_step_queues_tx(&connection, &mut view)?;
                 // Keep the run-level fields of the existing tree response.
                 view.provenance =
                     crate::provenance::read(&connection, &view.mission, &view.revision)?;
@@ -29189,6 +29190,47 @@ fn enrich_step_definition(connection: &Connection, view: &mut StepRunView) -> ru
     Ok(())
 }
 
+/// Keep the tree's queue labels and order without work presentation enrichment.
+/// Read the current generation's pinned definition once for all of this run's steps.
+fn enrich_run_step_queues_tx(
+    connection: &Connection,
+    view: &mut MissionRunView,
+) -> rusqlite::Result<()> {
+    if view.steps.is_empty() {
+        return Ok(());
+    }
+    let body = connection
+        .query_row(
+            "SELECT mission_revisions.body
+             FROM run_generations
+             JOIN mission_runs ON mission_runs.id=run_generations.run_id
+             JOIN mission_revisions
+               ON mission_revisions.mission_id=mission_runs.mission_id
+              AND mission_revisions.revision=run_generations.revision
+             WHERE run_generations.id=?1",
+            [generation_id_from_subject(&view.generation)],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(body) = body else {
+        return Ok(());
+    };
+    let mission = serde_json::from_str::<MissionSpec>(&body).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            body.len(),
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })?;
+    for view in &mut view.steps {
+        if let Some(step) = crate::mission::find_step(&mission, &view.step) {
+            view.queue.clone_from(&step.queue);
+            view.queue_position = step.queue_position;
+        }
+    }
+    Ok(())
+}
+
 fn fresh_context_ready_tx(
     connection: &Connection,
     step: &StepRunView,
@@ -30562,10 +30604,9 @@ fn mission_run_view_for_projection_tx(
 }
 
 /// A run's header and each step's effective state, and with `summaries` each step's latest
-/// progress and completion summaries: what a mission detail and the missions tree show of a
-/// run. The work view's enrichment also folds every step's execution timing, reads the wake
-/// messages and harness history of its assignee and parses the mission for its queue, none of
-/// which those views show; `mission_run_view_tx` does that.
+/// progress and completion summaries. The legacy tree adds queue labels and positions with
+/// `enrich_run_step_queues_tx`. Full work presentation, including execution timing, wake
+/// messages and harness history, remains in `mission_run_view_tx`.
 fn mission_run_steps_view_tx(
     connection: &Connection,
     run_id: &str,
@@ -33293,7 +33334,11 @@ mission "summary-root" state="ready" {
 }
 mission "summary-child" state="ready" {
   goal "Preserve effective states and summaries."
-  step "work" { assigned-to "agent/tree/worker" }
+  queue "investigations" {
+    assigned-to "agent/tree/worker"
+    step "work" { }
+    step "after" { }
+  }
 }
     "#,
             "summary-missions",
@@ -33324,7 +33369,12 @@ mission "summary-child" state="ready" {
                 None,
             )
             .unwrap();
-        let work = &child.steps[0].subject;
+        let work = &child
+            .steps
+            .iter()
+            .find(|step| step.step == "work")
+            .unwrap()
+            .subject;
         let grandchild = store
             .create_child_mission_run(
                 &request("summary-child", "summary-grandchild"),
@@ -33416,11 +33466,26 @@ mission "summary-child" state="ready" {
             root_view.scheduler_fault.as_deref(),
             Some("preserved scheduler fault")
         );
-        let step = &tree
+        let child_view = tree
             .iter()
             .find(|run| run.subject == child.subject)
-            .unwrap()
-            .steps[0];
+            .unwrap();
+        // Names sort opposite to queue positions: both fields must survive so the
+        // human tree can keep its labels and definition order.
+        for (name, position) in [("work", 1), ("after", 2)] {
+            let step = child_view
+                .steps
+                .iter()
+                .find(|step| step.step == name)
+                .unwrap();
+            assert_eq!(step.queue.as_deref(), Some("investigations"));
+            assert_eq!(step.queue_position, Some(position));
+        }
+        let step = child_view
+            .steps
+            .iter()
+            .find(|step| step.step == "work")
+            .unwrap();
         assert_eq!(step.status, "ready");
         assert!(step.claimant.is_none());
         assert_eq!(step.progress_summary.as_deref(), Some("selected progress"));
@@ -33460,8 +33525,6 @@ mission "summary-child" state="ready" {
                         "timeout_ms",
                         "wake",
                         "ready_age_ms",
-                        "queue",
-                        "queue_position",
                         "fresh_context",
                         "person_answers",
                         "under",
