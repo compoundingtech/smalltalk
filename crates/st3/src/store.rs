@@ -25705,6 +25705,25 @@ fn rebuild_base_aggregate_tx(
     Ok(())
 }
 
+/// Identify the claim being processed, without copying its fields, payload or authority data.
+fn incremental_claim_error(error: St3Error, claim: &ClaimRecord, stage: &'static str) -> St3Error {
+    let operation = operation_parts(&claim.body).map(|(operation, _)| operation);
+    let truncated = [&claim.id, &claim.subject]
+        .into_iter()
+        .any(|value| value.chars().take(257).count() > 256)
+        || operation.is_some_and(|value| value.chars().take(257).count() > 256);
+    let bounded = |value: &str| value.chars().take(256).collect::<String>();
+    let error = error
+        .with_detail("projection_stage", stage)
+        .with_detail("projection_claim_id", bounded(&claim.id))
+        .with_detail("projection_subject", bounded(&claim.subject))
+        .with_detail("projection_context_truncated", truncated);
+    match operation {
+        Some(operation) => error.with_detail("projection_operation_id", bounded(operation)),
+        None => error,
+    }
+}
+
 /// Retain the guard reason for the always-on log at the actual fallback boundary.
 fn replay_needed(reason: &'static str) -> IncrementalProjection {
     crate::profile::note(&format!("replay: {reason}"));
@@ -25774,7 +25793,9 @@ fn try_project_simple_replication_tx(
         .map(|claim| {
             Ok((
                 claim.id.clone(),
-                canonical::claim_key(transaction, &claim.id).map_err(internal)?,
+                canonical::claim_key(transaction, &claim.id).map_err(|error| {
+                    incremental_claim_error(internal(error), claim, "canonical-key")
+                })?,
             ))
         })
         .collect::<Result<BTreeMap<_, _>, St3Error>>()?;
@@ -25809,7 +25830,9 @@ fn try_project_simple_replication_tx(
             .iter()
             .filter(|claim| claim.origin != origin && run_tree_kind(&claim.kind))
         {
-            if let Some(root) = run_tree_of_tx(transaction, &claim.subject)? {
+            if let Some(root) = run_tree_of_tx(transaction, &claim.subject)
+                .map_err(|error| incremental_claim_error(error, claim, "run-tree-owner"))?
+            {
                 roots.insert(root);
             }
         }
@@ -25824,7 +25847,8 @@ fn try_project_simple_replication_tx(
         if foreign_roots.is_empty() && claim.kind != "work.extended" {
             continue;
         }
-        if let Some(root) = run_tree_of_tx(transaction, &claim.subject)?
+        if let Some(root) = run_tree_of_tx(transaction, &claim.subject)
+            .map_err(|error| incremental_claim_error(error, claim, "run-tree-owner"))?
             && (claim.kind == "work.extended" || foreign_roots.contains(&root))
         {
             // The label means a local claim that forces a rebuild: a work extension, or a local
@@ -25880,12 +25904,15 @@ fn try_project_simple_replication_tx(
         if matches!(
             claim.kind.as_str(),
             "work.person-asked" | "work.person-done" | "work.person-cancelled"
-        ) && let Some(aggregate) = aggregate_of_tx(transaction, claim)?
+        ) && let Some(aggregate) = aggregate_of_tx(transaction, claim)
+            .map_err(|error| incremental_claim_error(error, claim, "aggregate-owner"))?
         {
             mark_dirty(&mut dirty, aggregate, "person ask, answer or cancel");
         }
         if !Store::simple_replication_kind(&claim.kind) {
-            let key = canonical::claim_key(transaction, &claim.id).map_err(internal)?;
+            let key = canonical::claim_key(transaction, &claim.id).map_err(|error| {
+                incremental_claim_error(internal(error), claim, "canonical-key")
+            })?;
             let out_of_order = last_key.as_ref().is_some_and(|last| key < *last);
             if last_key.as_ref().is_none_or(|last| key > *last) {
                 last_key = Some(key);
@@ -25903,7 +25930,8 @@ fn try_project_simple_replication_tx(
             // bindings arrive in, so only a repair rebuilds one. Rebuilding every version of a
             // document that is republished all day costs more with each version.
             if ((out_of_order && claim.kind != "doc.bound") || repaired)
-                && let Some(aggregate) = aggregate_of_tx(transaction, claim)?
+                && let Some(aggregate) = aggregate_of_tx(transaction, claim)
+                    .map_err(|error| incremental_claim_error(error, claim, "aggregate-owner"))?
             {
                 let reason = if repaired {
                     "repaired claim"
@@ -25934,8 +25962,15 @@ fn try_project_simple_replication_tx(
                         |row| row.get(0),
                     )
                     .map_err(internal)?;
-                if prior_dependents && let Some(aggregate) = aggregate_of_tx(transaction, claim)? {
-                    mark_dirty(&mut dirty, aggregate, "run created after claims that depend on it");
+                if prior_dependents
+                    && let Some(aggregate) = aggregate_of_tx(transaction, claim)
+                        .map_err(|error| incremental_claim_error(error, claim, "aggregate-owner"))?
+                {
+                    mark_dirty(
+                        &mut dirty,
+                        aggregate,
+                        "run created after claims that depend on it",
+                    );
                 }
             }
             if claim.kind == "run-generation.created" {
@@ -25953,8 +25988,15 @@ fn try_project_simple_replication_tx(
                         |row| row.get(0),
                     )
                     .map_err(internal)?;
-                if prior_dependents && let Some(aggregate) = aggregate_of_tx(transaction, claim)? {
-                    mark_dirty(&mut dirty, aggregate, "generation created after its steps' claims");
+                if prior_dependents
+                    && let Some(aggregate) = aggregate_of_tx(transaction, claim)
+                        .map_err(|error| incremental_claim_error(error, claim, "aggregate-owner"))?
+                {
+                    mark_dirty(
+                        &mut dirty,
+                        aggregate,
+                        "generation created after its steps' claims",
+                    );
                 }
             }
             if claim.kind == "mission.published" {
@@ -26015,20 +26057,24 @@ fn try_project_simple_replication_tx(
             continue;
         };
         if let Some((stored_digest, _, state)) =
-            operation_tx(transaction, operation_id).map_err(internal)?
+            operation_tx(transaction, operation_id).map_err(|error| {
+                incremental_claim_error(internal(error), claim, "operation-registry")
+            })?
             && (stored_digest != request_digest || state != "active")
         {
-            // Name what conflicted: the replay that follows is the whole graph.
-            eprintln!(
-                "st: projection operation conflict operation={} stored_state={} digest_differs={} claim_kind={}",
-                operation_id.chars().take(96).collect::<String>(),
-                state.chars().take(32).collect::<String>(),
-                stored_digest != request_digest,
-                claim.kind.chars().take(64).collect::<String>()
-            );
-            return Ok(replay_needed("operation-conflict"));
+            crate::profile::note("replay: operation-conflict");
+            return Ok(IncrementalProjection::ReplayWithContext {
+                reason: "operation-conflict",
+                details: incremental_claim_error(St3Error::new("operation-conflict",
+                    "operation digest differs or registry state is not active"), claim,
+                    "operation-registry").with_detail("projection_error", format!(
+                        "operation registry refuses incoming claim: digest_matches={}; stored state {}", stored_digest == request_digest, state.chars().take(32).collect::<String>()
+                    )).details,
+            });
         }
-        register_operation_tx(transaction, claim).map_err(internal)?;
+        register_operation_tx(transaction, claim).map_err(|error| {
+            incremental_claim_error(internal(error), claim, "operation-registry")
+        })?;
     }
     let mut latest_work_by_subject = BTreeMap::new();
     for claim in &work_claims {
@@ -26042,13 +26088,15 @@ fn try_project_simple_replication_tx(
                     |row| row.get(0),
                 )
                 .optional()
-                .map_err(internal)?
+                .map_err(|error| incremental_claim_error(internal(error), claim, "work-frontier"))?
                 .and_then(|value: String| value.parse::<u128>().ok())
         };
         if previous.is_none_or(|value| claim.accepted_at_unix_ms <= value) {
             // A work claim for a step that is not projected yet waits in the claim log; the
             // generation that creates the step rebuilds its tree and applies it.
-            if let Some(root) = run_tree_of_tx(transaction, &claim.subject)? {
+            if let Some(root) = run_tree_of_tx(transaction, &claim.subject)
+                .map_err(|error| incremental_claim_error(error, claim, "run-tree-owner"))?
+            {
                 mark_dirty(
                     &mut dirty,
                     Aggregate::RunTree(root),
@@ -26067,11 +26115,13 @@ fn try_project_simple_replication_tx(
             &claim.subject,
             &claim.body,
         )
-        .map_err(internal)?;
+        .map_err(|error| incremental_claim_error(internal(error), claim, "event-insert"))?;
     }
     for claim in &claims {
         if claim.kind == "arrangement.edited" {
-            arrangements::project(transaction, claim).map_err(internal)?;
+            arrangements::project(transaction, claim).map_err(|error| {
+                incremental_claim_error(internal(error), claim, "arrangement-project")
+            })?;
         }
     }
     let mut aggregates = BTreeMap::<String, Option<Aggregate>>::new();
@@ -26084,7 +26134,8 @@ fn try_project_simple_replication_tx(
         let aggregate = match aggregates.get(claim.subject.as_str()) {
             Some(aggregate) => aggregate.clone(),
             None => {
-                let aggregate = aggregate_of_tx(transaction, claim)?;
+                let aggregate = aggregate_of_tx(transaction, claim)
+                    .map_err(|error| incremental_claim_error(error, claim, "aggregate-owner"))?;
                 aggregates.insert(claim.subject.clone(), aggregate.clone());
                 aggregate
             }
@@ -26101,14 +26152,20 @@ fn try_project_simple_replication_tx(
         match claim.kind.as_str() {
             "intent.desired" => {
                 let desired = serde_json::from_value::<DesiredSubject>(claim.body.clone())
-                    .map_err(internal)?;
-                select_replicated_desired(transaction, claim, &desired)?;
+                    .map_err(|error| {
+                        incremental_claim_error(internal(error), claim, "desired-decode")
+                    })?;
+                select_replicated_desired(transaction, claim, &desired)
+                    .map_err(|error| incremental_claim_error(error, claim, "claim-project"))?;
             }
-            "doc.bound" => select_replicated_document(transaction, claim, claim.store_index)?,
+            "doc.bound" => select_replicated_document(transaction, claim, claim.store_index)
+                .map_err(|error| incremental_claim_error(error, claim, "claim-project"))?,
             "mission.published" => {
-                select_replicated_mission(transaction, claim, claim.store_index)?;
+                select_replicated_mission(transaction, claim, claim.store_index)
+                    .map_err(|error| incremental_claim_error(error, claim, "claim-project"))?;
             }
-            "mission-run.created" => project_mission_run_created(transaction, claim)?,
+            "mission-run.created" => project_mission_run_created(transaction, claim)
+                .map_err(|error| incremental_claim_error(error, claim, "claim-project"))?,
             _ => {}
         }
     }
@@ -26138,7 +26195,8 @@ fn try_project_simple_replication_tx(
         if claim.origin == origin || in_dirty(claim)? {
             continue;
         }
-        project_mission_run_update(transaction, claim)?;
+        project_mission_run_update(transaction, claim)
+            .map_err(|error| incremental_claim_error(error, claim, "claim-project"))?;
     }
     for claim in claims
         .iter()
@@ -26147,24 +26205,41 @@ fn try_project_simple_replication_tx(
         if claim.origin == origin || in_dirty(claim)? {
             continue;
         }
-        reconcile_carried_step_tx(transaction, claim)?;
+        reconcile_carried_step_tx(transaction, claim)
+            .map_err(|error| incremental_claim_error(error, claim, "claim-project"))?;
     }
     // Missions first, since a rebuilt run reads the revision it runs.
     let (trees, bases): (Vec<_>, Vec<_>) = dirty
         .iter()
         .partition(|aggregate| matches!(aggregate, Aggregate::RunTree(_)));
     for aggregate in bases {
-        rebuild_base_aggregate_tx(transaction, aggregate)?;
+        rebuild_base_aggregate_tx(transaction, aggregate).map_err(|error| {
+            let subject = match aggregate {
+                Aggregate::Desired(subject)
+                | Aggregate::Document(subject)
+                | Aggregate::Mission(subject) => subject.clone(),
+                Aggregate::RunTree(root) => format!("mission-run/{root}"),
+            };
+            error
+                .with_detail("projection_stage", "base-aggregate-rebuild")
+                .with_detail("projection_subject", subject)
+        })?;
     }
     for aggregate in trees {
         if let Aggregate::RunTree(root) = aggregate {
-            rebuild_run_tree_tx(transaction, root)?;
+            rebuild_run_tree_tx(transaction, root).map_err(|error| {
+                error
+                    .with_detail("projection_stage", "run-tree-rebuild")
+                    .with_detail("projection_subject", format!("mission-run/{root}"))
+            })?;
         }
     }
     if rebuild_planning {
-        rebuild_planning_tx(transaction).map_err(internal)?;
+        rebuild_planning_tx(transaction)
+            .map_err(|error| internal(error).with_detail("projection_stage", "planning-rebuild"))?;
     }
-    owned_sets::project_tx(transaction)?;
+    owned_sets::project_tx(transaction)
+        .map_err(|error| error.with_detail("projection_stage", "owned-set-project"))?;
     Ok(IncrementalProjection::Projected)
 }
 
@@ -32687,9 +32762,7 @@ agent "test/empty" { command "true" }
                 let operation = json!({"id":"op/replay-test", "request_digest":"digest-a"});
                 let (kind, body) = match reason {
                     "non-incremental-kind" => ("work.unknown", json!({"fields":{}})),
-                    "work-operation" => {
-                        ("work.claimed", json!({"fields":{}, "_operation":operation}))
-                    }
+                    "work-operation" => ("work.claimed", json!({"fields":{}, "_operation":operation})),
                     "malformed-operation" => (
                         "harness.observed",
                         json!({"fields":{"state":"ready"}, "_operation":{"id":"op/malformed"}}),
@@ -32723,7 +32796,12 @@ agent "test/empty" { command "true" }
                             .unwrap();
                     }
                     "unhealthy-projection" => {
-                        transaction.execute("UPDATE projection_health SET status='stale' WHERE aggregate='graph'", []).unwrap();
+                        transaction
+                            .execute(
+                                "UPDATE projection_health SET status='stale' WHERE aggregate='graph'",
+                                [],
+                            )
+                            .unwrap();
                     }
                     "frontier-ahead" => {
                         transaction.execute("UPDATE projection_health SET last_good_store_index=999999 WHERE aggregate='graph'", []).unwrap();
@@ -32752,23 +32830,44 @@ agent "test/empty" { command "true" }
                 "frontier-ahead" => 999999,
                 _ => frontier,
             };
-            let replay_line = format!(
-                "st: projection full replay phase=startup/project-replication-backlog reason={reason} frontier={expected_frontier} target={target}"
+            assert_eq!(
+                lines
+                    .iter()
+                    .filter(|line| line.starts_with("st: projection full replay "))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                [format!(
+                    "st: projection full replay phase=startup/project-replication-backlog reason={reason} frontier={expected_frontier} target={target}"
+                )],
+                "{reason}"
             );
-            if reason == "incremental-error:internal" {
-                // An incremental failure says what failed before the replay line: its error, the
-                // claim kinds of the range and the range.
-                assert_eq!(lines.len(), 2, "{lines:?}");
+            let details = lines
+                .iter()
+                .filter_map(|line| line.strip_prefix("st: projection failure detail "))
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            if reason == "incremental-error:internal" || reason == "operation-conflict" {
+                assert_eq!(details.len(), 1, "{reason}");
+                assert_eq!(details[0]["subject"], "agent/node.test");
                 assert!(
-                    lines[0].starts_with(
-                        "st: projection incremental failed code=internal kinds=intent.desired "
-                    ) && lines[0].contains("message=missing field `subject`"),
-                    "{}",
-                    lines[0]
+                    details[0]["claim_id"]
+                        .as_str()
+                        .is_some_and(|id| id.len() == 64)
                 );
-                assert_eq!(lines[1], replay_line);
+                assert_eq!(details[0]["error_truncated"], false);
+                if reason == "operation-conflict" {
+                    assert_eq!(details[0]["operation_id"], "op/replay-test");
+                    assert!(details[0]["error"].as_str().unwrap().contains("digest_matches=false"));
+                } else {
+                    assert!(
+                        details[0]["error"]
+                            .as_str()
+                            .unwrap()
+                            .contains("missing field")
+                    );
+                }
             } else {
-                assert_eq!(lines, [replay_line], "{reason}");
+                assert!(details.is_empty(), "{reason}");
             }
             assert_eq!(
                 FULL_REPLAYS.with(std::cell::Cell::get),
@@ -32801,7 +32900,6 @@ agent "test/empty" { command "true" }
             );
         }
     }
-
 
     #[test]
     fn simple_replication_rejects_structural_and_malformed_operation_claims() {
