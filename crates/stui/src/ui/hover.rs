@@ -110,7 +110,19 @@ impl Ui {
             info.hits[target.index].1,
             Hit::Link(_) | Hit::Pane(PaneIntent::Open(_))
         );
-        let rect = target.rect.intersection(buf.area);
+        // Text to read and select is not a control: it is described in the footer, not lit.
+        // The same goes for a list row that is a block of lines, such as Home's items: the lit
+        // background behind a paragraph is hard to read.
+        let plain = match &info.hits[target.index].1 {
+            Hit::Message | Hit::Subject => true,
+            Hit::Row(_) | Hit::SidebarRow(_) | Hit::Peek(_) => target.rect.height > 1,
+            _ => false,
+        };
+        let rect = if plain {
+            Rect::default()
+        } else {
+            target.rect.intersection(buf.area)
+        };
         for y in rect.y..rect.bottom() {
             for x in rect.x..rect.right() {
                 if info
