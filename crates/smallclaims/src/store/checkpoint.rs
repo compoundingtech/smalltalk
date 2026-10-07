@@ -472,6 +472,7 @@ pub fn prove_on_copy(
     sealed: &SealedSet,
     plan: &DropPlan,
 ) -> Result<CheckpointProof> {
+    runtime.checkpoint_preflight()?;
     let mut connection = Connection::open(copy)?;
     projection_digest::register(&connection)?;
     connection.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = MEMORY;")?;
@@ -586,6 +587,7 @@ impl Store {
         cut_unix_ms: u128,
         through_rowid: Option<i64>,
     ) -> Result<SealedSet> {
+        self.runtime.checkpoint_preflight()?;
         // Seal only new batches. A full history scan under the writer stalls live requests
         // every time a checkpoint is reconsidered, even when no new envelope is needed.
         self.seal_local_batches()?;
@@ -753,6 +755,7 @@ impl Store {
         cut_unix_ms: u128,
         through_rowid: Option<i64>,
     ) -> Result<SealedIdentities> {
+        self.runtime.checkpoint_preflight()?;
         self.seal_local_batches()?;
         let connection = self.readers.get();
         let connection = connection.unchecked_transaction()?;
@@ -852,6 +855,7 @@ impl Store {
         through_rowid: Option<i64>,
         scratch: &Path,
     ) -> Result<(SealedSet, DropPlan, CheckpointProof)> {
+        self.runtime.checkpoint_preflight()?;
         let sealed = self.checkpoint_sealed_set_through(cut_unix_ms, through_rowid)?;
         let plan = self.runtime.plan_checkpoint_drops(&sealed);
         fs::create_dir_all(scratch)?;

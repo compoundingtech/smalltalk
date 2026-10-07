@@ -368,6 +368,7 @@ impl Store {
         envelopes: &[EnvelopeTombstone],
         claims: &[ClaimTombstone],
     ) -> Result<()> {
+        self.runtime.checkpoint_preflight()?;
         let mut connection = self.connection.write();
         let transaction = connection.transaction()?;
         record_checkpoint_tombstones_tx(&transaction, checkpoint, envelopes, claims)?;

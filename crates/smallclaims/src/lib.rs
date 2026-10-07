@@ -13,6 +13,7 @@ pub mod claim;
 pub mod error;
 pub mod fleet;
 pub mod hash;
+pub mod ivm;
 pub mod performance;
 pub mod principal;
 /// Opt-in accounting of where the daemon's time goes, turned on by `ST3_PROFILE_DIR`.

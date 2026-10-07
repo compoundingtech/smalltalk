@@ -141,6 +141,11 @@ pub trait Runtime: Send + Sync {
     /// only when their rules digests match.
     fn checkpoint_rules_digest(&self) -> String;
 
+    /// Fail before sealing history or copying a store when a runtime has no checkpoint contract.
+    fn checkpoint_preflight(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Decide what a checkpoint drops from `sealed`: a pure function of the sealed claims.
     fn plan_checkpoint_drops(&self, sealed: &SealedSet) -> DropPlan;
 
