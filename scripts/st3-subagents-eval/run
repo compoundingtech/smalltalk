@@ -206,18 +206,32 @@ class Seat:
         return until(lambda: [row for row in self.receipts() if row["event"] == "ready" and row["at"] > after],
                      timeout, f"{self.subject}: the stand-in never started")[-1]
 
-    def restarted_driver_ready(self, previous_incarnation, session, timeout=30):
+    def restarted_driver_ready(self, previous_incarnation, session, ledger_path, timeout=30):
         """The stand-in's ready receipt precedes the driver's current harness observation."""
+        card, ledger = None, None
         def ready():
+            nonlocal card, ledger
             card = self.node.api("/v1/client/agents/" + self.subject) or {}
+            try:
+                ledger = json.loads(ledger_path.read_text())
+            except (ValueError, FileNotFoundError) as error:
+                ledger = {"read_error": str(error)}
+                return None
             if (card.get("state") == "running"
                     and card.get("harness_state") in ("ready", "working", "idle")
                     and card.get("incarnation_id")
                     and card["incarnation_id"] != previous_incarnation
-                    and card.get("current_session_id") == session):
+                    # The card's current_session_id is a managed session/hash, not Claude's UUID.
+                    and ledger.get("incarnation") == card["incarnation_id"]
+                    and ledger.get("session_id") == session):
                 return card
-        return until(ready, timeout,
-                     f"{self.subject}: the restarted driver never became ready for session {session}")
+        try:
+            return until(ready, timeout,
+                         f"{self.subject}: the restarted driver never became ready for session {session}")
+        except Failure as error:
+            fail(f"{error}; previous incarnation: {previous_incarnation}; "
+                 f"last card: {json.dumps(card)}; ledger: {json.dumps(ledger)}; "
+                 f"stand-in receipts: {json.dumps(self.receipts())}")
 
     def claims(self):
         """The seat's subagent claims, oldest first, a trace page at a time."""
@@ -545,10 +559,11 @@ def killed_scenarios(node, seat, checks):
 
     # Wait before starting k3's short lease: a stand-in receipt alone does not prove that
     # the restarted driver is ready to observe its harness exiting.
-    driver = seat.restarted_driver_ready(previous_incarnation, restarted["session"])
+    driver = seat.restarted_driver_ready(previous_incarnation, restarted["session"], ledger_path)
     checks["killed_harness_ready"] = {
         "previous_incarnation": previous_incarnation,
         "incarnation": driver["incarnation_id"], "session": restarted["session"],
+        "managed_session": driver.get("current_session_id"),
         "harness_state": driver["harness_state"], "stand_in": restarted,
     }
 
