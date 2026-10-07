@@ -846,7 +846,11 @@ pub(crate) struct SubjectCache {
     conflicts: u64,
     views: HashMap<String, ViewEntry>,
     statuses: HashMap<String, StatusEntry>,
+    // Summary and full statuses never share entries: their provenance/harness fields differ.
+    card_statuses: HashMap<String, StatusEntry>,
 }
+
+const AGENT_CARD_STATUS_LIMIT: usize = 4096;
 
 /// One subject's reduction, read at snapshot `read_at`, so it holds from there on.
 struct StatusEntry {
@@ -10248,8 +10252,9 @@ impl Store {
             if conflicts != cache.conflicts {
                 cache.views.clear();
                 cache.statuses.clear();
+                cache.card_statuses.clear();
                 cache.conflicts = conflicts;
-            } else if !cache.views.is_empty() || !cache.statuses.is_empty() {
+            } else if !cache.views.is_empty() || !cache.statuses.is_empty() || !cache.card_statuses.is_empty() {
                 // The subjects and actors of the claims that arrived.
                 let mut statement = connection.prepare_cached(
                     "SELECT subject, actor FROM claims WHERE store_index>?1 AND store_index<=?2",
@@ -10272,6 +10277,7 @@ impl Store {
                 cache
                     .statuses
                     .retain(|subject, entry| !stale(subject, &entry.owners));
+                cache.card_statuses.retain(|subject, entry| !stale(subject, &entry.owners));
             }
             cache.through = store_index;
         }
@@ -10287,21 +10293,30 @@ impl Store {
         store_index: u64,
         newest: bool,
     ) -> Result<(SubjectStatus, Option<PlannedAction>)> {
+        self.cached_subject_status_with_mode(connection, subject, store_index, newest, SubjectStatusMode::Full)
+    }
+
+    fn cached_subject_status_with_mode(
+        &self, connection: &Connection, subject: &str, store_index: u64,
+        newest: bool, mode: SubjectStatusMode,
+    ) -> Result<(SubjectStatus, Option<PlannedAction>)> {
         {
             let cache = self
                 .smalltalk
                 .subject_cache
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            if let Some(entry) = cache
-                .statuses
-                .get(subject)
+            let entries = match mode {
+                SubjectStatusMode::Full => &cache.statuses,
+                SubjectStatusMode::AgentCard => &cache.card_statuses,
+            };
+            if let Some(entry) = entries.get(subject)
                 .filter(|entry| entry.read_at <= store_index && store_index <= cache.through)
             {
                 return Ok((entry.status.clone(), entry.action.clone()));
             }
         }
-        let (status, action) = subject_status_at(connection, subject, Some(store_index), None)?
+        let (status, action) = subject_status_at_with_mode(connection, subject, Some(store_index), None, mode)?
             .expect("a reduction without an owner filter always has a status");
         if newest {
             let mut cache = self
@@ -10317,7 +10332,17 @@ impl Store {
                     .chain(status.projection.owner_generation.iter())
                     .cloned()
                     .collect();
-                cache.statuses.insert(
+                let entries = match mode {
+                    SubjectStatusMode::Full => &mut cache.statuses,
+                    SubjectStatusMode::AgentCard => &mut cache.card_statuses,
+                };
+                // At capacity, a cold summary remains correct and uncached. Invalidation
+                // frees slots; no growing history map or full-status cache warming is needed.
+                if matches!(mode, SubjectStatusMode::AgentCard)
+                    && entries.len() >= AGENT_CARD_STATUS_LIMIT && !entries.contains_key(subject) {
+                    return Ok((status, action));
+                }
+                entries.insert(
                     subject.to_owned(),
                     StatusEntry {
                         read_at: store_index,
@@ -10412,11 +10437,13 @@ impl Store {
         let names = if history { names } else {
             self.current_view_candidates(&connection, names, index, true)?
         };
+        let newest = self.advance_subject_cache(&connection, index)?;
         let mut subjects = Vec::with_capacity(names.len());
         for name in names {
-            if let Some((status, _)) = subject_status_at_with_mode(
-                &connection, &name, Some(index), None, SubjectStatusMode::AgentCard,
-            )? && (history || status.projection.layer == "current") {
+            let (status, _) = self.cached_subject_status_with_mode(
+                &connection, &name, index, newest, SubjectStatusMode::AgentCard,
+            )?;
+            if history || status.projection.layer == "current" {
                 subjects.push(status);
             }
         }
@@ -34426,6 +34453,123 @@ observer "ordered/file" {
                 .collect(),
             SUBJECT_REDUCTIONS.with(std::cell::Cell::get),
         )
+    }
+
+    #[test]
+    fn agent_card_status_cache_reduces_only_changed_subjects_and_keeps_old_cuts() {
+        let store = Store::open_memory("node").unwrap();
+        observe_runtime(&store, "agent/cache/first", "running", "one");
+        observe_runtime(&store, "agent/cache/second", "running", "two");
+        let first_cut = store.index().unwrap();
+        let view = |at| serde_json::to_value(store.agent_card_status_at(None, at, true).unwrap()).unwrap();
+        let original = view(first_cut);
+        SUBJECT_REDUCTIONS.with(|count| count.set(0));
+        assert_eq!(view(first_cut), original);
+        assert_eq!(SUBJECT_REDUCTIONS.with(std::cell::Cell::get), 0);
+        observe_runtime(&store, "exec/unrelated", "running", "other");
+        SUBJECT_REDUCTIONS.with(|count| count.set(0));
+        let newer = view(store.index().unwrap());
+        assert_eq!(newer["subjects"], original["subjects"]);
+        assert_eq!(SUBJECT_REDUCTIONS.with(std::cell::Cell::get), 0);
+        observe_runtime(&store, "agent/cache/first", "stopped", "three");
+        SUBJECT_REDUCTIONS.with(|count| count.set(0));
+        let changed = view(store.index().unwrap());
+        assert_eq!(SUBJECT_REDUCTIONS.with(std::cell::Cell::get), 1);
+        assert_eq!(view(first_cut), original, "a newer entry must not serve an old cut");
+        store.forget_current_views();
+        assert_eq!(view(store.index().unwrap()), changed, "cache and fresh reducer must agree");
+    }
+
+    #[test]
+    fn agent_card_and_full_status_caches_never_exchange_harness_or_provenance() {
+        let store = Store::open_memory("node").unwrap();
+        let subject = "agent/cache/modes";
+        observe_runtime(&store, subject, "running", "one");
+        store.append_claim(&ClaimInput {
+            subject: subject.into(), kind: "harness.observed".into(), actor: Some(subject.into()),
+            fields: BTreeMap::from([
+                ("state".into(), json!("idle")), ("incarnation_id".into(), json!("one")),
+                ("driver".into(), json!("claude")),
+            ]), evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let cut = store.index().unwrap();
+        let card = store.agent_card_status_at(None, cut, true).unwrap();
+        assert!(card.subjects[0].harness.is_none());
+        assert_eq!(card.subjects[0].claims.len(), 1);
+        let full = store.status_for_subject_prefix_at("agent/", Some(cut), true).unwrap();
+        assert!(full.subjects[0].harness.is_some());
+        assert_eq!(full.subjects[0].claims.len(), 2);
+        SUBJECT_REDUCTIONS.with(|count| count.set(0));
+        let again = store.agent_card_status_at(None, cut, true).unwrap();
+        assert_eq!(serde_json::to_value(again).unwrap(), serde_json::to_value(card).unwrap());
+        assert_eq!(SUBJECT_REDUCTIONS.with(std::cell::Cell::get), 0);
+    }
+
+    #[test]
+    fn agent_card_status_cache_has_a_fixed_entry_cap_and_repair_clears_it() {
+        let store = Store::open_memory("node").unwrap();
+        observe_runtime(&store, "agent/cache/cold", "running", "one");
+        let cut = store.index().unwrap();
+        let first = store.agent_card_status_at(None, cut, true).unwrap();
+        {
+            let mut cache = store.smalltalk.subject_cache.lock().unwrap();
+            cache.card_statuses.clear();
+            for n in 0..AGENT_CARD_STATUS_LIMIT {
+                cache.card_statuses.insert(format!("agent/fill/{n}"), StatusEntry {
+                    read_at: cut, owners: Vec::new(), status: first.subjects[0].clone(), action: None,
+                });
+            }
+        }
+        let cold = store.agent_card_status_at(None, cut, true).unwrap();
+        assert_eq!(serde_json::to_value(cold).unwrap(), serde_json::to_value(first).unwrap());
+        let cache = store.smalltalk.subject_cache.lock().unwrap();
+        assert_eq!(cache.card_statuses.len(), AGENT_CARD_STATUS_LIMIT);
+        assert!(!cache.card_statuses.contains_key("agent/cache/cold"));
+        drop(cache);
+        store.forget_current_views();
+        assert!(store.smalltalk.subject_cache.lock().unwrap().card_statuses.is_empty());
+        store.agent_card_status_at(None, cut, true).unwrap();
+        assert_eq!(store.smalltalk.subject_cache.lock().unwrap().card_statuses.len(), 1);
+    }
+
+    #[test]
+    fn agent_card_status_cache_follows_owning_generation_changes() {
+        let store = Store::open_memory("node").unwrap();
+        publish_mission(&store, r#"version 2
+mission "card-owner" state="ready" {
+  goal "Fence card status to its owner."; step "work" { agentless }
+}"#, "card-owner-mission");
+        let run = store.create_mission_run(&MissionRunRequest {
+            mission: "card-owner".into(), revision: None, workspace: "/tmp".into(),
+            requester: Some("person/test".into()), mode: Some("run".into()),
+            inputs: BTreeMap::new(), idempotency_key: "card-owner-run".into(),
+        }).unwrap();
+        let mut intent = parse_intent("version 2\nagent \"worker\" { command \"true\" }\n", "node").unwrap();
+        let desired = intent.subjects.values_mut().next().unwrap();
+        desired.owner_run = Some(run.subject.clone());
+        desired.owner_generation = Some(run.generation.clone());
+        let preview = store.mission(&intent, IntentInput { kdl: String::new(), source_name: None }).unwrap();
+        store.apply(&intent, &preview.subject_tokens, "card-owned-runtime").unwrap();
+        let first = store.index().unwrap();
+        let before = store.agent_card_status_at(None, first, true).unwrap();
+        assert_eq!(before.subjects[0].projection.layer, "current");
+        store.append_claim(&ClaimInput {
+            subject: run.generation, kind: "run-generation.superseded".into(),
+            actor: Some("person/test".into()), fields: BTreeMap::from([
+                ("status".into(), json!("superseded")),
+                ("successor".into(), json!("run-generation/replacement")),
+                ("reason".into(), json!("test revision")),
+            ]), evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let index = store.index().unwrap();
+        let after = store.agent_card_status_at(None, index, true).unwrap();
+        assert_eq!(after.subjects[0].projection.layer, "history");
+        assert!(store.agent_card_status_at(None, index, false).unwrap().subjects.is_empty());
+        assert_eq!(serde_json::to_value(store.agent_card_status_at(None, first, true).unwrap()).unwrap(),
+            serde_json::to_value(before).unwrap());
+        store.forget_current_views();
+        assert_eq!(serde_json::to_value(store.agent_card_status_at(None, index, true).unwrap()).unwrap(),
+            serde_json::to_value(after).unwrap());
     }
 
     #[test]
