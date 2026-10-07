@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Sekrets becomes its own `sekrets` binary, shipped beside st; `st sekrets` is gone.",
+  "replay": {
+    "status": "none",
+    "detail": "No claim, projection or replay change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No st store change; the gateway's store is unchanged and carries over."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rule change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "`st sekrets ...` is removed; run `sekrets ...` (same subcommands and flags). Release archives, `scripts/install` and the Nix package add `bin/sekrets`. `sekrets` asks the st daemon to vouch for a seat through two hidden st commands, so a seat's `sekrets` and the daemon should come from the same release: an older daemon ignores the request's new `for_parent` field, vouches for the `st` process instead of `sekrets`, and the gateway then refuses the seat. The gateway protocol is unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "A normal daemon restart; the gateway restarts only when setup is re-run."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "On a host running the gateway, after installing this release: `sekrets setup --person PERSON > s.sh && sudo sh s.sh`. It installs /usr/local/libexec/sekrets, removes /usr/local/libexec/st-sekrets and points st-sekrets.service at `sekrets serve`; profiles, grants and logins are kept. Replace any `st sekrets` in scripts or shims with `sekrets`."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "To go back, reinstall the previous release and run its `st sekrets setup` again, which reinstalls the old gateway path; the store is unchanged."
+  }
+}
