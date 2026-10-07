@@ -5757,7 +5757,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         store.clone(),
         config.observations.clone(),
     ));
-    tokio::spawn(catch_up_account_limits(store.clone()));
+    tokio::spawn(catch_up_account_limits(store.clone(), notify.clone()));
     tokio::spawn(st3::recorder_receipts::run(
         store.clone(),
         st3::recorder::receipt_path(&config.state_dir),
@@ -22795,7 +22795,10 @@ async fn convert_envelope_payloads(store: Arc<Store>) {
 /// its own short writer transaction and the daemon answers between pages; the cursor is stored, so
 /// a restart resumes. Once it is caught up this only checks, once a minute, for claims that
 /// replication admitted and no append or projection pass has folded yet.
-async fn catch_up_account_limits(store: Arc<Store>) {
+async fn catch_up_account_limits(store: Arc<Store>, notify: Arc<Notify>) {
+    // A pool start that arrived while the projection was catching up failed with a retryable
+    // error. Nothing else tells the reconciler that limits are now known, so wake it once.
+    let mut announced = false;
     loop {
         let page_store = store.clone();
         let more = tokio::task::spawn_blocking(move || {
@@ -22804,10 +22807,45 @@ async fn catch_up_account_limits(store: Arc<Store>) {
             })
         })
         .await;
+        if !announced && matches!(more, Ok(Ok(_))) {
+            let ready_store = store.clone();
+            let ready = tokio::task::spawn_blocking(move || ready_store.account_limits_ready())
+                .await
+                .ok()
+                .and_then(|result| result.ok())
+                .unwrap_or(false);
+            if ready {
+                announced = true;
+                notify.notify_one();
+            }
+        }
         match more {
             Ok(Ok(true)) => tokio::time::sleep(Duration::from_millis(50)).await,
             _ => tokio::time::sleep(Duration::from_secs(60)).await,
         }
+    }
+}
+
+#[cfg(test)]
+mod limits_catch_up_wake_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn the_reconciler_is_woken_once_when_account_limits_become_ready() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let notify = Arc::new(Notify::new());
+        let task = tokio::spawn(catch_up_account_limits(store.clone(), notify.clone()));
+        tokio::time::timeout(Duration::from_secs(5), notify.notified())
+            .await
+            .expect("the reconciler is woken when the limits projection is ready");
+        assert!(store.account_limits_ready().unwrap());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(300), notify.notified())
+                .await
+                .is_err(),
+            "the wake happens once, not on every idle pass"
+        );
+        task.abort();
     }
 }
 
