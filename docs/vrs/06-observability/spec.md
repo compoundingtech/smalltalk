@@ -573,6 +573,73 @@ Excluded from FIFO telemetry are coalesced Notify/watch states, caches,
 durable inbox and seat queues, driver-side mailbox `Subscription` queues, and
 ping sidecar queues.
 
+### Daemon startup telemetry (O11Y-R10, O11Y-R11, O11Y-R14, O11Y-R16, O11Y-R18)
+
+```text
+node_identity::acquire → resolve stable node before telemetry initialization
+Telemetry::init        → st.startup (local root, start backdated to acquisition)
+                         └── st.startup.phase (one per phase, no chunk spans)
+serving()     → close phase and root; batch export while the API serves
+early return  → close phase and root with failed outcome and ERROR
+```
+
+`startup_telemetry::StartupTelemetry` starts after node identity acquisition and
+telemetry initialization, with an explicit root start timestamp measured before acquisition.
+The completed `node_identity` child uses acquisition's measured start and end.
+Successful initialization uses the resolved stable node in the telemetry resource;
+acquisition failure uses the configured node, closes the failed root and phase, flushes
+telemetry, and returns the original error. Acquisition runs only once.
+The root uses `parent: None` and an empty OpenTelemetry parent context.
+`st.startup.outcome` is `serving` or `failed`; failure status uses the constant
+description `startup failed`, not error prose or paths. `span.label` is `startup`.
+Readiness closes both the last phase and the root without an explicit flush.
+The collector retains local roots longer than one second, so slow starts are
+kept. Startup has no local sampling.
+
+The repository-owned phase registry maps the existing kebab-case startup names
+to these closed snake_case values, shared by `st.startup.phase`, `span.label`,
+and the duration metric's `phase` attribute:
+
+| Phase |
+| --- |
+| `node_identity` |
+| `install_hooks` |
+| `open_store` |
+| `judge_claims` |
+| `validate_replication_backlog` |
+| `apply_replication_repairs` |
+| `settle_runs` |
+| `project_replication_backlog` |
+| `initialize_runtime` |
+| `start_services` |
+| `bind_listeners` |
+| `other` (unknown-name fallback) |
+
+Except for the retrospectively recorded `node_identity` phase, each phase starts
+at its readiness transition and ends at the next phase or readiness/failure.
+The active phase receives ERROR on failure. Existing `profile::task` boundaries remain unchanged inside
+their phase; no entered tracing guard crosses an await or enters spawned
+services. `start_services` covers background-service setup before listener binding.
+The projection phase records integer `st.startup.claims_processed` and boolean
+`st.startup.full_replay`. Incremental progress counts actual committed claims,
+not store-index distance; full replay reports base-claim progress from the runtime.
+These numeric/boolean observations are span-only, never metric labels.
+
+`st.startup.duration` is a seconds histogram, recorded once per phase and once
+with `phase=total` per start, including failed starts. Its explicit boundaries
+are `0.01`, `0.025`, `0.05`, `0.1`, `0.25`, `0.5`, `1`, `2.5`, `5`, `10`,
+`30`, `60`, `120`, `300`, `600`, `1200`, `1800`. The metric contributes at most
+13 attribute series and is independent of trace sampling.
+
+The otelite receiver proof observes the completed serving root before stopping
+the daemon, eleven direct child phase spans, projection attributes, and duration
+points for `total`, `node_identity`, and `open_store`. The root starts at or before
+the identity phase. A database path occupied by a directory proves identity recovery
+failure exports `failed` with ERROR on the root and phase; a readable database with
+an unsupported schema version proves the separate `open_store` failure.
+Unit proofs cover all call-site phase mappings, explicit acquisition timestamps,
+and root completion on serving or guard drop.
+
 ### Attribute and context policy
 
 Agent, session, message, terminal, attachment, and lease ids are span attributes only:

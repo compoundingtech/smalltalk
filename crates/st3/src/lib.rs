@@ -88,6 +88,7 @@ pub mod service;
 pub mod skill;
 pub mod slo;
 pub mod startup;
+pub mod startup_telemetry;
 pub mod store;
 pub mod subagents;
 /// Suspends a quiet seat and resumes its own native session.

@@ -5953,8 +5953,32 @@ async fn run_up(args: UpArgs) -> Result<()> {
         config.peers = args.peer;
     }
     config.apply_fleet_file()?;
-    let _state_identity = st3::node_identity::acquire(&mut config)?;
-    let mut telemetry = st3::otel::Telemetry::init(st3::otel::Unit::Daemon, Some(&config.node));
+    let configured_node = config.node.clone();
+    let identity_started = std::time::SystemTime::now();
+    let startup_started = std::time::Instant::now();
+    let state_identity = st3::node_identity::acquire(&mut config);
+    let identity_ended = std::time::SystemTime::now();
+    let identity_duration = startup_started.elapsed();
+    let mut telemetry = st3::otel::Telemetry::init(
+        st3::otel::Unit::Daemon,
+        Some(if state_identity.is_ok() { &config.node } else { &configured_node }),
+    );
+    let startup_telemetry =
+        st3::startup_telemetry::StartupTelemetry::begin_at(identity_started, startup_started);
+    startup_telemetry.node_identity(
+        identity_started,
+        identity_ended,
+        identity_duration,
+        state_identity.is_err(),
+    );
+    let _state_identity = match state_identity {
+        Ok(identity) => identity,
+        Err(error) => {
+            drop(startup_telemetry);
+            telemetry.shutdown();
+            return Err(error);
+        }
+    };
     config.validate()?;
     st3::resource::configure_github(&config)?;
     validate_unix_socket_path(&config.socket, "--socket")?;
@@ -5962,13 +5986,15 @@ async fn run_up(args: UpArgs) -> Result<()> {
     fs::create_dir_all(&config.state_dir)?;
     let startup = Arc::new(st3::startup::Startup::begin(&config.socket)?);
     startup.phase("install-hooks");
+    startup_telemetry.phase("install-hooks");
     st3::hooks::ensure_installed(&st3::hooks::root(&config.state_dir)).context(
         "publishing this st binary's required lifecycle hook set before starting the daemon",
     )?;
     st3::profile::init_from_env();
     raise_open_file_limit();
     startup.phase("open-store");
-    let store = Arc::new(st3::profile::task("startup open-store", || {
+    startup_telemetry.phase("open-store");
+    let store = Arc::new(startup_telemetry.task("startup open-store", || {
         Store::open(&config.state_dir.join("claims.sqlite3"), &config.node)
     })?);
     if let Some(fleet_id) = &config.fleet_id {
@@ -5986,25 +6012,34 @@ async fn run_up(args: UpArgs) -> Result<()> {
     }
     store.use_key_directory(&keys)?;
     startup.phase("judge-claims");
-    st3::profile::task("startup judge-claims", || store.judge_claims(true))?;
+    startup_telemetry.phase("judge-claims");
+    startup_telemetry.task("startup judge-claims", || store.judge_claims(true))?;
     startup.phase("validate-replication-backlog");
-    let admission = st3::profile::task("startup validate-replication-backlog", || {
+    startup_telemetry.phase("validate-replication-backlog");
+    let admission = startup_telemetry.task("startup validate-replication-backlog", || {
         store.validate_replication_backlog()
     })?;
     startup.phase("apply-replication-repairs");
-    st3::profile::task("startup apply-replication-repairs", || {
+    startup_telemetry.phase("apply-replication-repairs");
+    startup_telemetry.task("startup apply-replication-repairs", || {
         store.apply_replication_repairs()
     })?;
     startup.phase("settle-runs");
-    for run in st3::profile::task("startup settle-runs", || {
+    startup_telemetry.phase("settle-runs");
+    for run in startup_telemetry.task("startup settle-runs", || {
         store.settle_runs_for_canonical_replay()
     })? {
         eprintln!("st: mission run `{run}` stays over as this node's graph showed it");
     }
-    let projected = st3::profile::task("startup project-replication-backlog", || {
+    startup.phase("project-replication-backlog");
+    startup_telemetry.phase("project-replication-backlog");
+    let projected = startup_telemetry.task("startup project-replication-backlog", || {
         store.project_replication_backlog_with_progress(
             "startup/project-replication-backlog",
-            |progress| startup.progress(progress),
+            |progress| {
+                startup_telemetry.progress(progress);
+                startup.progress(progress);
+            },
         )
     }).context("startup projection failed; stopping before daemon.started and runtime initialization")?;
     if !projected {
@@ -6019,6 +6054,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         eprintln!("st: replication has {} invalid records", admission.invalid);
     }
     startup.phase("initialize-runtime");
+    startup_telemetry.phase("initialize-runtime");
     store.append_claim(&ClaimInput {
         subject: format!("daemon/{}", config.node),
         kind: "daemon.started".into(),
@@ -6105,6 +6141,8 @@ async fn run_up(args: UpArgs) -> Result<()> {
         recorder.map(|installation| installation.directory),
     )?.with_schedule_peers(state.configured_peers.clone()).with_client_relay(state.client_relay.clone()).with_person(config.person.clone()));
     reconciler.set_max_passes_per_minute(config.reconcile.max_passes_per_minute)?;
+    startup.phase("start-services");
+    startup_telemetry.phase("start-services");
     tokio::spawn(reconciler.clone().supervise());
     tokio::spawn(st3::profile::watch_runtime_lag());
     // The policy reads `[limits]` again on every pass, so an edit applies without a restart.
@@ -6197,9 +6235,11 @@ async fn run_up(args: UpArgs) -> Result<()> {
     // Nor does the first agents roster read fold every agent's card.
     st3::api::start_agent_roster(&state);
     startup.phase("bind-listeners");
+    startup_telemetry.phase("bind-listeners");
     let bound = std::sync::atomic::AtomicUsize::new(0);
     let ready = || {
         if bound.fetch_add(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+            startup_telemetry.serving();
             startup.serving();
             eprintln!("st: local API listening at {}", config.socket.display());
             eprintln!(
