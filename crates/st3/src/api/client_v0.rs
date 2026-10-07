@@ -10133,13 +10133,13 @@ mod tests {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
         let windows = collection_windows::Windows::attach(&state.store);
         let (_, expected, _) = collection_items_with_windows(&state, &session, &request,
-            windows.clone(), semaphore.clone().acquire_owned().await.unwrap()).await.unwrap();
+            semaphore.clone().acquire_owned().await.unwrap(), windows.clone()).await.unwrap();
         let builds = state.store.agent_resources_builds_for_test();
         let _cold_builder = state.store.admit_agent_resources().await;
         let start = std::time::Instant::now();
         let (_, actual, _) = tokio::time::timeout(std::time::Duration::from_secs(1),
-            collection_items_with_windows(&state, &session, &request, windows,
-                semaphore.acquire_owned().await.unwrap())).await
+            collection_items_with_windows(&state, &session, &request,
+                semaphore.acquire_owned().await.unwrap(), windows)).await
             .expect("warm WS roster must not wait for a cold builder").unwrap();
         println!("warm WS roster under held cold-build admission: {:.3} ms",
             start.elapsed().as_secs_f64() * 1000.0);
