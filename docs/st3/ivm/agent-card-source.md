@@ -10,7 +10,12 @@ Publication selects an Installer namespace. Every operator-owned primary key,
 secondary index, read, write and reclamation predicate includes that namespace.
 The published row binding is `local_agent_card_rows(namespace, agent)` with
 `agent` equal to the public subject ID. Rows carry `name`, `state`, `current`,
-`key_generation` and the complete client-v0 JSON `body`. The ranked window uses
+`key_generation`, `body_hash` and the complete client-v0 JSON `body`. Internal
+numeric bit evidence preserves floating-point public values across SQL JSON
+storage; decimal parsing must not change a cost or percentage. A blank legacy
+`updated_at` is marked `request_time` and filled from the captured frame timestamp.
+That presentation step never changes row generation, status or ordering.
+The ranked window uses
 `(namespace, current, name, agent)` or `(namespace, current, state, name, agent)`.
 No substring, generated identity, claim ID or private dependency key is a
 public row ID. Name ordering uses SQLite BINARY and then the subject ID.
@@ -45,6 +50,8 @@ dependent claims, rather than only keys from new claim insertions.
 | local_observations | id, INTEGER PRIMARY KEY/rowid alias | dedupe_key where non-null | after_store_index, subject, kind, actor, body, request_digest, observed_at_unix_ms and both identities |
 | local_mailbox_owners | subject, component | none | incarnation, epoch |
 | local_mailbox_bindings | token | none | subject, component, incarnation, epoch |
+| local_agent_delivery_presence | recipient, driver | none | complete captured assessment and live producer certificate; source-owner schema |
+| local_agent_card_clock | singleton | none | captured unsigned evaluation time, monotone revision and finite maintenance reason |
 
 Claim extraction must include all same-agent intermediate claims for causal
 authority, not only runtime heads. A claim affecting another agent through its
@@ -62,10 +69,20 @@ The six card families are desired/current membership; actual authority and
 operational ownership; observed harness/activity/working episode; work queue and
 labels; usage/todos/fault; handoff/suspension/rollout/subagents. Existing kernels
 for individual families do not certify the complete public card. Legacy usage
-response costs require the exact canonical floating-point fold or a bounded
-suffix repair with an explicit exhaustion fence. Activity retains the existing
+response costs use exact canonical suffix repair with bit-preserved sums and an
+explicit exhaustion fence. Usage GET reads one published row. Its affected-write
+aggregation currently admits at most 128 incarnation groups and 128 selected
+rollup slots per group; exceeding either bound refuses publication.
+Activity retains the existing
 replica-local arrival selector and must be refreshed on prefix promotion and
 checkpoint renumbering; canonical claim rank is not an equivalent substitute.
+
+Canonical owner status/mode heads preserve the snapshot-index membership rule;
+projected queue generation selection is a separate dependency. Owner and operation
+reverse invalidation is durably paged. Rollout phases use fixed canonical sparse
+field heads, including sticky forced/start flags and explicit reason/block clears,
+before one published row is written. Literal nested `fields.fields` actual inputs
+are outside the fixed-head compatibility domain and refuse publication.
 
 Delivery presence is currently in memory and includes monotonic time and
 followed executable file identity. It requires a committed, versioned local
@@ -74,6 +91,20 @@ Harness freshness (strictly more than 90 seconds), native presence expiry,
 startup grace, subagent expiry and inclusive work lease boundaries are captured
 clock inputs. Client grants are revalidated in the same authorized snapshot;
 provider notifications and installer roots grant no authority.
+
+The existing public snapshot fold uses admitted claims without consulting mutable
+signature/verdict caches. This is an explicit unfiltered verdict admission domain,
+bound to the st3 schema/claim registry digest. Verdict mutations are not assumed
+immutable. Changing that admission policy requires new capture dependencies and
+an explicit fingerprint/install. Repaired eligibility remains family-specific:
+owned declarations and queue moves exclude repaired originals, while actual,
+harness, activity, usage and provenance retain the original admitted facts.
+
+Clock/deferred repair work enters through captured maintenance replacements and
+`Operator::apply`; direct Installer generation updates are forbidden. Incomplete
+bounded repair/producer acknowledgements temporarily refuse independent coverage.
+Unsupported semantics, missing manifest coverage and raw write gaps permanently
+fence the source and view until a qualified replacement namespace is installed.
 
 The production callback selects at most the requested limit plus one (limit is
 1..=200) from the namespaced ranked index, then reads only selected public keys.

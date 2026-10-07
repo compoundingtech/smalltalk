@@ -15,7 +15,7 @@ pub(crate) struct CardParts {
     pub labels: BTreeMap<String, StepLabel>,
     pub usage: Option<UsageSummary>,
     pub fault: Option<String>,
-    pub handoff: Option<crate::placement::Handoff>,
+    pub handoff: Option<Value>,
     pub suspension: Option<crate::suspension::Suspension>,
     pub rollout: Option<Value>,
     pub todo: Option<ClaimRecord>,
@@ -138,7 +138,7 @@ pub(crate) fn format(
         _ if subject.desired.is_some() => "desired",
         _ => "stopped",
     };
-    let moving = handoff.as_ref().is_some_and(|h| h.phase != "running");
+    let moving = handoff.as_ref().is_some_and(|h| h["phase"] != "running");
     let state = if fault.is_some() {
         "failed"
     } else if moving {
@@ -321,7 +321,8 @@ mod tests {
         let handoff = subject
             .desired_token
             .as_deref()
-            .and_then(|t| crate::placement::handoff(store, AGENT, t, index).unwrap());
+            .and_then(|t| crate::placement::handoff(store, AGENT, t, index).unwrap())
+            .map(|h| serde_json::to_value(h).unwrap());
         CardParts {
             subject,
             declaration,

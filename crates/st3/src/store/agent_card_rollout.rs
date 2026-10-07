@@ -384,7 +384,7 @@ mod tests {
                 desired_token: "desired/invented".into(),
                 target: crate::rollout::target(&d).unwrap(),
                 desired: d,
-                actor: Some("person/invented".into()),
+                actor: Some("person/fixture".into()),
             };
             let mut writer = store.connection.write();
             create_schema(&writer).unwrap();
@@ -491,17 +491,17 @@ mod tests {
         let f = Fixture::new();
         let request = f.append(
             "node",
-            Some("person/invented"),
+            Some("person/fixture"),
             "runtime.action.requested",
             json!({"action":"rollout","rollout":f.seed()}),
             100,
         );
         let phase = |name: &str, state: Value| json!({"operation":request.id,"operation_status":name,"rollout":state});
-        f.append("node",Some("person/invented"),"runtime.action.succeeded",phase("verifying",json!({"native_session_id":"selected-session","forced":true,"blocking":["new",42],"reason":"waiting"})),300);
-        f.append("node",Some("person/invented"),"runtime.action.succeeded",phase("starting",json!({"native_session_id":null,"native_path":"invented/path","forced":false,"blocking":null,"reason":null})),200);
+        f.append("node",Some("person/fixture"),"runtime.action.succeeded",phase("verifying",json!({"native_session_id":"selected-session","forced":true,"blocking":["new",42],"reason":"waiting"})),300);
+        f.append("node",Some("person/fixture"),"runtime.action.succeeded",phase("starting",json!({"native_session_id":null,"native_path":"invented/path","forced":false,"blocking":null,"reason":null})),200);
         f.append(
             "node",
-            Some("person/invented"),
+            Some("person/fixture"),
             "runtime.action.succeeded",
             phase(
                 "drain-ack",
@@ -511,7 +511,7 @@ mod tests {
         );
         f.append(
             "node",
-            Some("person/invented"),
+            Some("person/fixture"),
             "runtime.action.succeeded",
             phase(
                 "start-attempted",
@@ -521,14 +521,14 @@ mod tests {
         );
         let failed = f.append(
             "node",
-            Some("person/invented"),
+            Some("person/fixture"),
             "runtime.action.failed",
             phase("failed-replacement", Value::Null),
             600,
         );
         f.append(
             "foreign",
-            Some("person/invented"),
+            Some("person/fixture"),
             "runtime.action.succeeded",
             phase("running", json!({"native_session_id":"foreign"})),
             700,
@@ -564,7 +564,7 @@ mod tests {
         let f = Fixture::new();
         f.append(
             "node",
-            Some("person/invented"),
+            Some("person/fixture"),
             "runtime.action.requested",
             json!({"action":"rollout","rollout":f.seed()}),
             100,
@@ -578,7 +578,7 @@ mod tests {
         );
         f.append(
             "node",
-            Some("person/invented"),
+            Some("person/fixture"),
             "runtime.action.requested",
             json!({"action":"rollout","rollout":{"invalid":"operation"}}),
             300,
