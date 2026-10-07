@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Keep unchanged observer polls on their own timers instead of waking the reconciler.",
+  "replay": { "status": "none", "detail": "No startup replay or projection invalidation changes." },
+  "schema": { "status": "none", "detail": "No stored schema, migrations or wire formats change." },
+  "rules": { "status": "none", "detail": "Observation normalization, delivery rules and RULES_VERSION are unchanged." },
+  "compatibility": { "status": "changed", "detail": "Unchanged polls continue at their existing cadence without a global reconcile wake. Durable observations and error state changes still wake reconciliation; cancellation and retry deadlines remain fenced." },
+  "downtime": { "status": "none", "detail": "The normal daemon restart activates the scheduling change; no coordinated restart is required." },
+  "manual": { "status": "none", "detail": "No configuration conversion, repair or operator action is required." },
+  "recovery": { "status": "none", "detail": "No stored format changes or additional recovery procedure; normal roll-forward guidance applies." }
+}
