@@ -2769,11 +2769,12 @@ impl Store {
         let previous = cache.iter().filter(valid).filter(|entry| entry.index < index && entry.history == history)
             .max_by_key(|entry| entry.index).cloned();
         drop(cache);
-        let items = match previous {
-            Some(previous) if self.agent_page_refs_unchanged(previous.index, index, &previous.items)? => previous.items,
-            _ => Arc::new(build()?),
+        let (items, valid_until_unix_ms) = match previous {
+            Some(previous) if self.agent_page_refs_unchanged(previous.index, index, &previous.items)? => {
+                (previous.items, previous.valid_until_unix_ms)
+            }
+            _ => (Arc::new(build()?), self.agent_queue_valid_until(now)?),
         };
-        let valid_until_unix_ms = self.agent_queue_valid_until(now)?;
         let mut cache = self.smalltalk.agent_page_refs_cache.lock()
             .expect("agent page refs cache poisoned");
         cache.push_back(runtime::AgentResourcesEntry {
@@ -2832,15 +2833,15 @@ impl Store {
             .filter(|entry| entry.index <= index && entry.local <= local && entry.history == history)
             .max_by_key(|entry| (entry.index, entry.local)).cloned();
         drop(cache);
-        let (items, covered) = crate::performance::task("roster/build",
-        || -> Result<(Vec<Value>, Option<BTreeSet<String>>)> {
+        let (items, covered, valid_until_unix_ms) = crate::performance::task("roster/build",
+        || -> Result<(Vec<Value>, Option<BTreeSet<String>>, Option<u128>)> {
         let previous = match previous {
             Some(entry) if entry.index == index => Some((entry, BTreeSet::new())),
             Some(entry) => self.changed_agent_resources(entry.index, index)?
                 .map(|changed| (entry, changed)),
             None => None,
         };
-        let (mut items, covered) = match previous {
+        let (mut items, covered, valid_until_unix_ms) = match previous {
             Some((previous, mut changed)) => {
                 if previous.local != local {
                     let connection = self.readers.get();
@@ -2879,20 +2880,20 @@ impl Store {
                     items.extend(crate::performance::task("roster/card-projection",
                         || build(Some((&changed, &previous.items))))?);
                 }
-                (items, covered)
+                (items, covered, previous.valid_until_unix_ms)
             }
             _ => {
                 #[cfg(test)]
                 self.smalltalk.agent_resources_builds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 (crate::performance::task("roster/card-projection",
-                    || build(selected.map(|names| (names, &[][..]))))?, selected.cloned())
+                    || build(selected.map(|names| (names, &[][..]))))?, selected.cloned(),
+                    self.agent_queue_valid_until(now)?)
             }
         };
         items.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str())
             .then_with(|| a["id"].as_str().cmp(&b["id"].as_str())));
-        Ok((items, covered))
+        Ok((items, covered, valid_until_unix_ms))
         })?;
-        let valid_until_unix_ms = self.agent_queue_valid_until(now)?;
         let items = Arc::new(items);
         let mut cache = self.smalltalk.agent_resources_cache.lock()
             .expect("agent resources cache poisoned");
