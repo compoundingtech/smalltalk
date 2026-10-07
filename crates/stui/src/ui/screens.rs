@@ -248,6 +248,8 @@ pub struct Drafts<'a> {
     pub confirm: Option<char>,
     /// The named answer chosen on a structured request, before Enter sends it.
     pub answering: Option<usize>,
+    /// The chosen answer that needs the person's words, while they write them.
+    pub needs_words: Option<String>,
     /// "Chat about this": who it goes to, the draft, and the thread so far.
     pub chat: Option<Chat<'a>>,
 }
@@ -286,6 +288,16 @@ fn text_box(doc: &mut Doc, title: &str, drafts: &Drafts<'_>, placeholder: &str, 
         let at = drafts.editing.then_some(drafts.cursor);
         for runs in super::edit::lines(body, at, theme::text()) {
             inner.lines(text::wrap(&runs, width.saturating_sub(4), &[], &[], None));
+        }
+        // What is wanted stays in view under the cursor until something is typed.
+        if body.is_empty() && !placeholder.is_empty() {
+            inner.lines(text::wrap(
+                &[text::run(placeholder.to_owned(), theme::dim())],
+                width.saturating_sub(4),
+                &[],
+                &[],
+                None,
+            ));
         }
     }
     let start = doc.lines.len();
@@ -421,6 +433,9 @@ fn structured_request(
         if recommended == Some(answer.id.as_str()) {
             head.push(text::run("  recommended", theme::fg(theme::GREEN)));
         }
+        if answer.outcome.as_deref() == Some("request_changes") {
+            head.push(text::run("  needs your words", theme::fg(theme::YELLOW)));
+        }
         head.push(text::run(format!("  {}", answer.consequence), theme::dim()));
         let from_line = card.lines.len();
         card.lines(text::wrap(
@@ -439,7 +454,16 @@ fn structured_request(
     }
     card.blank();
     if drafts.editing || drafts.text.is_some_and(|text| !text.is_empty()) {
-        text_box(card, &format!("answer {from}"), drafts, "", inner);
+        let hint = drafts.needs_words.as_ref().map(|label| {
+            format!("what should change? Enter sends it with “{label}” · Esc cancels")
+        });
+        text_box(
+            card,
+            &format!("answer {from}"),
+            drafts,
+            hint.as_deref().unwrap_or(""),
+            inner,
+        );
         card.buttons(&[
             ("enter", "Send the answer", Hit::Enter, theme::ACCENT),
             ("esc", "Cancel", Hit::Escape, theme::OVERLAY1),
@@ -1242,6 +1266,7 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
             cursor: chat.cursor,
             editing: chat.editing,
             answering: None,
+            needs_words: None,
             confirm: None,
             chat: None,
         };

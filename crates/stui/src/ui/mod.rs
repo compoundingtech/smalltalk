@@ -1899,6 +1899,15 @@ impl Ui {
             editing: self.editing,
             confirm: self.confirm,
             answering: self.answering,
+            needs_words: self.changes_answer.as_ref().and_then(|wanted| {
+                self.structured_request().and_then(|(_, request)| {
+                    request
+                        .answers
+                        .iter()
+                        .find(|answer| &answer.id == wanted)
+                        .map(|answer| answer.label.clone())
+                })
+            }),
             chat,
         }
     }
@@ -4690,7 +4699,22 @@ impl Ui {
             _ => None,
         };
         let Some(mut draft) = draft else {
-            self.flash("Write something first");
+            // An answer that asks for changes is sent with the changes in words.
+            let wanted = self.changes_answer.clone().and_then(|wanted| {
+                self.structured_request().and_then(|(_, request)| {
+                    request
+                        .answers
+                        .iter()
+                        .find(|answer| answer.id == wanted)
+                        .map(|answer| answer.label.clone())
+                })
+            });
+            self.flash(match wanted {
+                Some(label) => format!(
+                    "“{label}” needs your words: write what should change, then Enter. Esc cancels"
+                ),
+                None => "Write something first".to_owned(),
+            });
             return;
         };
         // Live, the images go to st with the message, so an agent on any machine can read them
@@ -6674,6 +6698,87 @@ mod tests {
             "{:?}",
             ui.effects
         );
+    }
+
+    #[test]
+    fn an_answer_that_asks_for_changes_says_it_needs_words() {
+        // Nathan, 2026-10-07: "it says I must type something. What does this mean?"
+        let mut world = demo::world();
+        let request = st3_client::StructuredRequest {
+            version: 1,
+            entry_type: "decision".into(),
+            question: "Approve as written?".into(),
+            why_person: "Only you can waive it.".into(),
+            summary: None,
+            reasons: Vec::new(),
+            recommendation: Some(st3_client::RequestRecommendation {
+                answer: "follow".into(),
+                reason: "it keeps the brief".into(),
+            }),
+            subjects: Vec::new(),
+            answers: vec![
+                st3_client::RequestAnswerOption {
+                    id: "follow".into(),
+                    label: "Follow the brief".into(),
+                    consequence: "The author gets your terms.".into(),
+                    outcome: Some("request_changes".into()),
+                    ..Default::default()
+                },
+                st3_client::RequestAnswerOption {
+                    id: "approve".into(),
+                    label: "Approve as written".into(),
+                    consequence: "It is queued.".into(),
+                    outcome: Some("accept".into()),
+                    ..Default::default()
+                },
+            ],
+            custom: false,
+        };
+        let item = Attention {
+            id: "attention/decide".into(),
+            tier: Tier::Stopped,
+            title: "Decide".into(),
+            waiting: None,
+            age: "1m".into(),
+            mission: None,
+            agent: Some("agent/example/cos".into()),
+            kind: AttentionKind::Request {
+                from: "Chief of Staff".into(),
+                from_id: "agent/example/cos".into(),
+                question: request.question.clone(),
+                structured: Some(Box::new(request)),
+            },
+            actions: vec!["work.done".into()],
+            related: Vec::new(),
+            raised_by: None,
+            blocked: None,
+        };
+        if let Load::Ready(items) = &mut world.attention {
+            items.insert(0, item);
+        }
+        let mut ui = Ui::new(world);
+        ui.live = true;
+        ui.tab = 0;
+        let at = ui
+            .listing(60)
+            .ids
+            .iter()
+            .position(|id| id == "attention/decide")
+            .unwrap();
+        ui.select(at);
+        assert!(frame(&ui, 140, 50).join("\n").contains("needs your words"));
+        ui.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let screen = frame(&ui, 140, 50).join("\n");
+        assert!(screen.contains("what should change? Enter sends it with “Follow the brief”"), "{screen}");
+        // Enter with nothing written says what is wanted, not just "Write something first".
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            ui.flash.as_ref().is_some_and(|(text, _)| text.contains("“Follow the brief” needs your words")),
+            "{:?}",
+            ui.flash
+        );
+        assert!(ui.effects.is_empty());
     }
 
     #[test]
