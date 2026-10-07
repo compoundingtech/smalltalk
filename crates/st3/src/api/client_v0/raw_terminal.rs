@@ -242,6 +242,7 @@ pub(crate) async fn splice(
 ) {
     let (mut sink, mut source) = socket.split();
     let (mut reader, mut writer) = transport.into_split();
+    let proof_ready = tokio::sync::Notify::new();
     let upload = async {
         let mut gate = FrameGate::new(mode);
         while let Some(Ok(message)) = source.next().await {
@@ -272,7 +273,11 @@ pub(crate) async fn splice(
                             watcher_epoch,
                             sequence,
                         } if lease.owner_side() && lease_id == lease.binding.lease_id => {
-                            lease.proof(&watcher_epoch, sequence)
+                            let result = lease.proof(&watcher_epoch, sequence);
+                            if result.is_ok() {
+                                proof_ready.notify_one();
+                            }
+                            result
                         }
                         _ => break,
                     };
@@ -313,6 +318,8 @@ pub(crate) async fn splice(
                         break;
                     }
                 }
+                // An accepted first proof enables reads immediately, not at the next heartbeat.
+                () = proof_ready.notified() => {}
                 read = reader.read(&mut bytes), if lease.as_ref().is_none_or(|lease| !lease.owner_side() || lease.has_proof()) => {
                     let Ok(count) = read else { break; };
                     if count == 0 || lease.as_ref().is_some_and(|lease| lease.check().is_err()) { break; }
