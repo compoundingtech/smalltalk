@@ -6,6 +6,6 @@
   "rules": {"status": "none", "detail": "Admission, canonical ordering, authority and checkpoint rules remain unchanged."},
   "compatibility": {"status": "changed", "detail": "Managed WriterGuard transaction begin methods return anyhow::Result to retain prepare failure causes. Finalizer-only installation remains a no-op-prepare convenience."},
   "downtime": {"status": "none", "detail": "No production adapter activation or restart."},
-  "manual": {"status": "changed", "detail": "The single adapter prepares inside the outer transaction before source helpers, checks preexisting capture gaps and clears its managed-scope marker before commit."},
-  "recovery": {"status": "changed", "detail": "Prepare failures roll back their SQL and skip source/finalize work. Uncovered earlier raw commits stay fenced and cannot be relabeled as current transaction input."}
+  "manual": {"status": "changed", "detail": "Library-only paired hook installation is opt-in. A future source adapter must check preexisting gaps and clear its own managed-scope marker; this PR installs no adapter."},
+  "recovery": {"status": "changed", "detail": "Library prepare failures roll back their SQL and skip source/finalize work. Earlier raw commits are not finalized by these hooks; adapter-specific fencing and recovery remain unimplemented here."}
 }
