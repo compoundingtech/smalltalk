@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Reduce cold terminal and runtime list work by resolving only consumed actual-state fields and seeking runtime authority directly.",
+  "replay": {
+    "status": "none",
+    "detail": "Read-side reduction only; no replay or durable claim changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database tables, indexes, triggers or schema version changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint, retention, replication or coordination rule changes."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Runtime and terminal resources retain canonical authority, snapshot membership and the same serialized fields. Full public status responses and claim fences are unchanged. Internal runtime reductions omit discarded harness, provenance, conflicts and actual fields, preserving sparse observations, explicit nulls, state-transition clearing and rival-origin ancestry checks."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional service interruption beyond the normal binary restart."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual action is required after upgrading."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No migration or recovery changes; the previous binary can read the unchanged store."
+  }
+}

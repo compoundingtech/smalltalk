@@ -186,6 +186,7 @@ impl Runtime for SmalltalkRuntime {
         cache.views.clear();
         cache.statuses.clear();
         cache.card_statuses.clear();
+        cache.runtime_statuses.clear();
         drop(cache);
         self.agent_status_cache
             .lock()

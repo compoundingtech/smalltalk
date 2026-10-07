@@ -847,8 +847,9 @@ pub(crate) struct SubjectCache {
     conflicts: u64,
     views: HashMap<String, ViewEntry>,
     statuses: HashMap<String, StatusEntry>,
-    // Summary and full statuses never share entries: their provenance/harness fields differ.
+    // Reduction modes never share entries: their provenance/harness/actual fields differ.
     card_statuses: HashMap<String, StatusEntry>,
+    runtime_statuses: HashMap<String, StatusEntry>,
 }
 
 const AGENT_CARD_STATUS_LIMIT: usize = 4096;
@@ -914,7 +915,7 @@ fn runtime_view_entry(
         return Ok(entry(true));
     }
     let status = |connection: &Connection| -> Result<Option<String>> {
-        Ok(latest_actual_at(connection, subject, Some(store_index))?
+        Ok(latest_actual_fields_at(connection, subject, Some(store_index), &["status"])?
             .as_ref()
             .and_then(|value| value.get("fields").unwrap_or(value).get("status"))
             .and_then(Value::as_str)
@@ -1036,6 +1037,8 @@ enum SubjectStatusMode {
     /// Agent cards replace the harness with observed evidence and never expose desired
     /// conflicts. Provenance is only the last canonical claim, and only without a declaration.
     AgentCard,
+    /// Runtime resources do not serialize harness state, claim provenance or desired conflicts.
+    RuntimeProjection,
 }
 
 /// One subject's status at `at_index`, and the action it asks of its host when it is current and
@@ -1079,7 +1082,11 @@ fn subject_status_at_with_mode(
         .as_ref()
         .and_then(|row| row.member.as_deref())
         .and_then(|value| serde_json::from_str::<crate::model::MemberSpec>(value).ok());
-    let actual = latest_actual_at(connection, subject, at_index)?;
+    let actual = if matches!(mode, SubjectStatusMode::RuntimeProjection) {
+        latest_actual_fields_at(connection, subject, at_index, RUNTIME_PROJECTION_FIELDS)?
+    } else {
+        latest_actual_at(connection, subject, at_index)?
+    };
     let (actual_claim, actual_origin, actual_origin_conflict) = selected_actual_source_at(
         connection,
         subject,
@@ -1092,6 +1099,7 @@ fn subject_status_at_with_mode(
             claim_ids_at(connection, subject, at_index)?,
             desired_conflicts_at(connection, subject, desired.as_ref().map(|row| row.claim_id.as_str()), at_index)?,
         ),
+        SubjectStatusMode::RuntimeProjection => (None, Vec::new(), Vec::new()),
         SubjectStatusMode::AgentCard => {
             let claims = if desired.is_some() {
                 Vec::new()
@@ -10270,8 +10278,10 @@ impl Store {
                 cache.views.clear();
                 cache.statuses.clear();
                 cache.card_statuses.clear();
+                cache.runtime_statuses.clear();
                 cache.conflicts = conflicts;
-            } else if !cache.views.is_empty() || !cache.statuses.is_empty() || !cache.card_statuses.is_empty() {
+            } else if !cache.views.is_empty() || !cache.statuses.is_empty()
+                || !cache.card_statuses.is_empty() || !cache.runtime_statuses.is_empty() {
                 // The subjects and actors of the claims that arrived.
                 let mut statement = connection.prepare_cached(
                     "SELECT subject, actor FROM claims WHERE store_index>?1 AND store_index<=?2",
@@ -10295,6 +10305,7 @@ impl Store {
                     .statuses
                     .retain(|subject, entry| !stale(subject, &entry.owners));
                 cache.card_statuses.retain(|subject, entry| !stale(subject, &entry.owners));
+                cache.runtime_statuses.retain(|subject, entry| !stale(subject, &entry.owners));
             }
             cache.through = store_index;
         }
@@ -10326,6 +10337,7 @@ impl Store {
             let entries = match mode {
                 SubjectStatusMode::Full => &cache.statuses,
                 SubjectStatusMode::AgentCard => &cache.card_statuses,
+                SubjectStatusMode::RuntimeProjection => &cache.runtime_statuses,
             };
             if let Some(entry) = entries.get(subject)
                 .filter(|entry| entry.read_at <= store_index && store_index <= cache.through)
@@ -10352,6 +10364,7 @@ impl Store {
                 let entries = match mode {
                     SubjectStatusMode::Full => &mut cache.statuses,
                     SubjectStatusMode::AgentCard => &mut cache.card_statuses,
+                    SubjectStatusMode::RuntimeProjection => &mut cache.runtime_statuses,
                 };
                 // At capacity, a cold summary remains correct and uncached. Invalidation
                 // frees slots; no growing history map or full-status cache warming is needed.
@@ -10459,6 +10472,38 @@ impl Store {
         for name in names {
             let (status, _) = self.cached_subject_status_with_mode(
                 &connection, &name, index, newest, SubjectStatusMode::AgentCard,
+            )?;
+            if history || status.projection.layer == "current" {
+                subjects.push(status);
+            }
+        }
+        Ok(StatusResponse { store_index: index, subjects, pending_actions: Vec::new() })
+    }
+
+    /// Only fields consumed by runtime/terminal resources, using the shared authority and
+    /// membership reducer without materializing discarded harness or claim history.
+    pub(crate) fn runtime_projection_status_at(
+        &self,
+        owner: Option<&str>,
+        index: u64,
+        history: bool,
+    ) -> Result<StatusResponse> {
+        let connection = self.readers.get();
+        let index = selected_index(current_index(&connection)?, Some(index)).map_err(anyhow::Error::new)?;
+        let names = match owner {
+            Some(owner) => BTreeSet::from([owner.to_owned()]),
+            None => connection.prepare_cached(RUNTIME_SUBJECTS)?
+                .query_map([index], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<BTreeSet<_>>>()?,
+        };
+        let names = if history { names } else {
+            self.current_view_candidates(&connection, names, index, true)?
+        };
+        let newest = self.advance_subject_cache(&connection, index)?;
+        let mut subjects = Vec::with_capacity(names.len());
+        for name in names {
+            let (status, _) = self.cached_subject_status_with_mode(
+                &connection, &name, index, newest, SubjectStatusMode::RuntimeProjection,
             )?;
             if history || status.projection.layer == "current" {
                 subjects.push(status);
@@ -20034,69 +20079,60 @@ fn selected_actual_source_at(
     if subject.starts_with("arrangement/") {
         return Ok((arrangements::arrangement_at(connection, subject, at_index)?.and_then(|v| v["revision"].as_str().map(str::to_owned)), None, false));
     }
-    // Canonical order, not arrival order, so every node holding these claims selects the same
-    // source. Only claims about the subject's actual state can be selected or conflict, so the
-    // read leaves out its harness reports.
-    let mut statement = connection.prepare_cached(&format!(
-        "SELECT claims.id, claims.kind, claims.origin,
-                CASE WHEN claims.kind='runtime.observed' THEN claims.body END
-         FROM claims INDEXED BY claims_subject_kind_index
-         JOIN batches ON batches.id=claims.batch_id
-         WHERE claims.subject=?1 AND {ACTUAL_STATE_CLAIM} AND claims.store_index<=?2
-         ORDER BY {CANONICAL_ORDER}"
+    // Runtime authority selects the canonically newest runtime observation, not the newest
+    // arbitrary actual-state claim. Seek it directly rather than decoding every actual claim.
+    let mut runtime = connection.prepare_cached(&format!(
+        "{} LIMIT 1",
+        newest_claims_of_kind_query("claims.id, claims.origin, claims.body", "runtime.observed"),
     ))?;
-    let rows = statement
-        .query_map(params![subject, at_index], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?
-                    .and_then(|body| serde_json::from_str::<Value>(&body).ok())
-                    .unwrap_or(Value::Null),
-            ))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    let selected = rows
-        .iter()
-        .rev()
-        .find(|(_, kind, _, _)| kind == "runtime.observed")
-        .or_else(|| rows.last());
-    let Some((selected_id, _, selected_origin, selected_body)) = selected else {
-        return Ok((None, None, false));
+    let selected = runtime.query_row(params![subject, at_index], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+    }).optional()?;
+    let Some((selected_id, selected_origin, selected_body)) = selected else {
+        let selected = connection.prepare_cached(&format!(
+            "SELECT claims.id, claims.origin FROM claims INDEXED BY claims_subject_kind_index
+             JOIN batches ON batches.id=claims.batch_id
+             WHERE claims.subject=?1 AND {ACTUAL_STATE_CLAIM} AND claims.store_index<=?2
+             ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1",
+        ))?.query_row(params![subject, at_index], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }).optional()?;
+        return Ok(selected.map_or((None, None, false), |(id, origin)| (Some(id), Some(origin), false)));
     };
-    // An origin's newer runtime observation supersedes its older observations. In particular,
-    // its stop must retire its earlier running claim even when the new owner's intent follows
-    // the desired-state branch rather than descending from that runtime branch.
-    let mut observed_origins = BTreeSet::new();
-    let rivals = rows
-        .iter()
-        .rev()
-        .filter(|(_, kind, origin, _)| {
-            kind == "runtime.observed" && observed_origins.insert(origin.as_str())
-        })
-        .filter(|(id, _, origin, body)| {
-            id != selected_id
-                && origin != selected_origin
-                && !nonowner_terminal_observation(
-                    desired_host,
-                    selected_origin,
-                    selected_body,
-                    origin,
-                    body,
-                )
-        })
-        .map(|(id, _, _, _)| id.as_str())
-        .collect::<Vec<_>>();
-    // Another host's observation conflicts unless the selected claim descends from it. Only then
-    // does the walk need the subject's whole causal history, harness reports included.
-    let runtime_conflict = !rivals.is_empty()
-        && !subject_descends_from_all(connection, subject, at_index, selected_id, &rivals)?;
-    Ok((
-        Some(selected_id.clone()),
-        Some(selected_origin.clone()),
-        runtime_conflict,
-    ))
+    let selected_body = serde_json::from_str::<Value>(&selected_body).unwrap_or(Value::Null);
+    // An origin's newer observation supersedes its older observations. Inspect only each
+    // rival origin's newest runtime body; unrelated kinds cannot affect runtime authority.
+    let origins = connection.prepare_cached(
+        "SELECT DISTINCT origin FROM claims INDEXED BY claims_subject_kind_index
+         WHERE subject=?1 AND kind='runtime.observed' AND store_index<=?2 AND origin<>?3",
+    )?.query_map(params![subject, at_index, selected_origin], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut rivals = Vec::with_capacity(origins.len());
+    if !origins.is_empty() {
+        let mut newest = connection.prepare_cached(&format!(
+            "SELECT claims.id, claims.body FROM claims INDEXED BY claims_subject_kind_accepted_index
+             JOIN batches ON batches.id=claims.batch_id
+             WHERE claims.subject=?1 AND claims.kind='runtime.observed'
+               AND +claims.store_index<=?2 AND claims.origin=?3
+             ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1",
+        ))?;
+        for origin in origins {
+            let (id, body) = newest.query_row(params![subject, at_index, origin], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let body = serde_json::from_str::<Value>(&body).unwrap_or(Value::Null);
+            if !nonowner_terminal_observation(
+                desired_host, &selected_origin, &selected_body, &origin, &body,
+            ) {
+                rivals.push(id);
+            }
+        }
+    }
+    // Only rival runtime origins require the subject's full causal graph.
+    let ancestors = rivals.iter().map(String::as_str).collect::<Vec<_>>();
+    let runtime_conflict = !ancestors.is_empty()
+        && !subject_descends_from_all(connection, subject, at_index, &selected_id, &ancestors)?;
+    Ok((Some(selected_id), Some(selected_origin), runtime_conflict))
 }
 
 /// Whether claim `descendant` of `subject` descends from every claim of `ancestors`, walking the
@@ -20233,6 +20269,64 @@ fn latest_actual_at(
         }
     }
     Ok(Some(Value::Object(merged)))
+}
+
+const RUNTIME_PROJECTION_FIELDS: &[&str] =
+    &["status", "runtime_id", "incarnation_id", "terminal", "reachability", "reason"];
+
+/// The requested actual fields, folded newest first. An explicit null resolves a field, and
+/// a state-transition claim resolves even an omitted declared field by clearing it. Runtime
+/// projections and membership do not need to decode older claims after their fields resolve.
+fn latest_actual_fields_at(
+    connection: &Connection,
+    subject: &str,
+    at_index: Option<u64>,
+    fields: &[&str],
+) -> Result<Option<Value>> {
+    debug_assert!(fields.len() < usize::BITS as usize);
+    let mut statement = connection.prepare_cached(&format!(
+        "SELECT claims.kind, claims.body FROM claims INDEXED BY claims_subject_accepted_index
+         JOIN batches ON batches.id=claims.batch_id
+         WHERE claims.subject=?1 AND {ACTUAL_STATE_CLAIM}
+           AND claims.kind NOT LIKE 'harness.%' AND +claims.store_index<=?2
+         ORDER BY {CANONICAL_ORDER_DESC}",
+    ))?;
+    let mut rows = statement.query(params![subject, at_index.unwrap_or(i64::MAX as u64)])?;
+    let mut actual = serde_json::Map::new();
+    let mut resolved = 0_usize;
+    let complete = (1_usize << fields.len()) - 1;
+    let mut seen = false;
+    let registry = st3_schema::registry();
+    while resolved != complete {
+        let Some(row) = rows.next()? else { break; };
+        seen = true;
+        #[cfg(test)]
+        ACTUAL_FIELD_ROWS.with(|rows| rows.set(rows.get() + 1));
+        let kind: String = row.get(0)?;
+        let body: String = row.get(1)?;
+        let value: Value = serde_json::from_str(&body)?;
+        let Some(incoming) = value.get("fields").unwrap_or(&value).as_object() else { continue; };
+        // Attribution-only resource receipts affect opener identity, none of these fields.
+        if kind == "resource.observed"
+            && incoming.get("kind").and_then(Value::as_str).is_some_and(carries_opener)
+            && incoming.get("attribution_only") == Some(&Value::Bool(true))
+        {
+            continue;
+        }
+        let transition = registry.claim(&kind)
+            .filter(|spec| spec.cardinality == st3_schema::Cardinality::StateTransition);
+        for (index, field) in fields.iter().enumerate() {
+            let bit = 1_usize << index;
+            if resolved & bit != 0 { continue; }
+            if let Some(value) = incoming.get(*field) {
+                actual.insert((*field).into(), value.clone());
+                resolved |= bit;
+            } else if transition.is_some_and(|spec| spec.fields.contains_key(*field)) {
+                resolved |= bit;
+            }
+        }
+    }
+    Ok(seen.then_some(Value::Object(actual)))
 }
 
 /// `columns` of subject `?1`'s claims of one `kind` at or before store index `?2`, newest first
@@ -24678,6 +24772,7 @@ mod fleet_admission_tests {
 #[cfg(test)]
 thread_local! {
     pub(crate) static SUBJECT_REDUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ACTUAL_FIELD_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Steps whose queue, timing and wake a read enriched, so a test can see a read's work.
     pub(crate) static STEPS_ENRICHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -34991,6 +35086,80 @@ mission "card-owner" state="ready" {
     }
 
     #[test]
+    fn runtime_projection_fields_match_sparse_null_and_transition_folds() {
+        let store = Store::open_memory("node").unwrap();
+        let subject = "agent/field-fold";
+        let observations = [
+            ("runtime.observed", json!({"fields": {
+                "status": "running", "runtime_id": "one", "incarnation_id": "first",
+                "terminal": true, "reachability": "reachable", "reason": "initial"
+            }})),
+            ("runtime.observed", json!({"fields": {"status": "idle", "terminal": null}})),
+            ("resource.observed", json!({"fields": {
+                "kind": "vcs.issue", "attribution_only": true, "status": "ignored",
+                "facts": {"opened_by": "person/test"}
+            }})),
+            ("mission-run.state", json!({"fields": {"mode": "eval"}})),
+            ("runtime.observed", json!({"fields": {"status": "running", "reason": null}})),
+            ("resource.observed", json!({"status": "up", "runtime_id": "two"})),
+        ];
+        let mut snapshots = vec![0];
+        for (step, (kind, body)) in observations.into_iter().enumerate() {
+            store.set_write_clock_at(1_800_000_000_000 + step as u128).unwrap();
+            let claim = store.append_claim(&ClaimInput {
+                subject: subject.into(), kind: "runtime.observed".into(), actor: None,
+                fields: BTreeMap::from([("status".into(), json!("running"))]),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+            // Raw reducer fixtures include sparse legacy transitions that current admission
+            // would reject. The forward fold remains the oracle for their snapshot semantics.
+            store.connection.lock().expect("fixture writer connection").execute(
+                "UPDATE claims SET kind=?1, body=?2 WHERE id=?3",
+                params![kind, body.to_string(), claim.id],
+            ).unwrap();
+            snapshots.push(store.index().unwrap());
+        }
+        let connection = store.readers.get();
+        for index in snapshots {
+            for fields in [RUNTIME_PROJECTION_FIELDS, &["status"][..]] {
+                let mut expected = latest_actual_at(&connection, subject, Some(index)).unwrap();
+                if let Some(Value::Object(actual)) = &mut expected {
+                    actual.retain(|field, _| fields.contains(&field.as_str()));
+                }
+                assert_eq!(
+                    latest_actual_fields_at(&connection, subject, Some(index), fields).unwrap(),
+                    expected, "snapshot {index}, fields {fields:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn runtime_projection_stops_decoding_when_its_actual_fields_are_resolved() {
+        let store = Store::open_memory("node").unwrap();
+        let subject = "agent/bounded-runtime-fold";
+        for step in 0..240 {
+            store.set_write_clock_at(1_800_000_000_000 + step).unwrap();
+            store.append_claim(&ClaimInput {
+                subject: subject.into(), kind: "runtime.observed".into(), actor: None,
+                fields: BTreeMap::from([
+                    ("status".into(), json!("running")), ("runtime_id".into(), json!("one")),
+                    ("incarnation_id".into(), json!(format!("epoch-{step}"))), ("terminal".into(), json!(true)),
+                    ("reachability".into(), json!("reachable")), ("reason".into(), Value::Null),
+                ]),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+        }
+        let connection = store.readers.get();
+        ACTUAL_FIELD_ROWS.with(|rows| rows.set(0));
+        let actual = latest_actual_fields_at(
+            &connection, subject, None, RUNTIME_PROJECTION_FIELDS,
+        ).unwrap().unwrap();
+        assert_eq!(actual["incarnation_id"], json!("epoch-239"));
+        assert_eq!(ACTUAL_FIELD_ROWS.with(|rows| rows.get()), 1);
+    }
+
+    #[test]
     fn kept_statuses_match_a_fresh_reduction_as_claims_arrive() {
         let store = Store::open_memory("node").unwrap();
         let mut seed = 0x5eed_u64;
@@ -35037,6 +35206,45 @@ mission "card-owner" state="ready" {
                 continue;
             }
             for history in [false, true] {
+                let index = store.index().unwrap();
+                // Runtime lists must be correct cold, without an agent/full-status read
+                // warming their cache, and must not poison full public status answers.
+                let runtime = store.runtime_projection_status_at(None, index, history).unwrap();
+                let mut full = store.status_for_claim_kind_at("runtime.observed", Some(index), history).unwrap();
+                for subject in &mut full.subjects {
+                    assert!(!subject.claims.is_empty());
+                    subject.harness = None;
+                    subject.claims.clear();
+                    subject.conflicts.clear();
+                    if let Some(Value::Object(actual)) = &mut subject.actual {
+                        actual.retain(|field, _| RUNTIME_PROJECTION_FIELDS.contains(&field.as_str()));
+                    }
+                }
+                assert_eq!(serde_json::to_value(&runtime.subjects).unwrap(),
+                    serde_json::to_value(&full.subjects).unwrap(), "runtime step {step}, history {history}");
+                for subject in &runtime.subjects {
+                    let owner = store.runtime_projection_status_at(Some(&subject.subject), index, history).unwrap();
+                    assert_eq!(serde_json::to_value(&owner.subjects).unwrap(),
+                        serde_json::to_value([subject]).unwrap());
+                }
+                let older_index = index.saturating_sub(3);
+                let older = store.runtime_projection_status_at(None, older_index, history).unwrap();
+                let mut older_full = store.status_for_claim_kind_at("runtime.observed", Some(older_index), history).unwrap();
+                for subject in &mut older_full.subjects {
+                    subject.harness = None;
+                    subject.claims.clear();
+                    subject.conflicts.clear();
+                    if let Some(Value::Object(actual)) = &mut subject.actual {
+                        actual.retain(|field, _| RUNTIME_PROJECTION_FIELDS.contains(&field.as_str()));
+                    }
+                }
+                assert_eq!(serde_json::to_value(&older.subjects).unwrap(),
+                    serde_json::to_value(&older_full.subjects).unwrap(), "older runtime step {step}, history {history}");
+                let warm = store.runtime_projection_status_at(None, index, history).unwrap();
+                store.forget_current_views();
+                let cold = store.runtime_projection_status_at(None, index, history).unwrap();
+                assert_eq!(serde_json::to_value(&warm.subjects).unwrap(),
+                    serde_json::to_value(&cold.subjects).unwrap(), "runtime cache step {step}, history {history}");
                 let view = |store: &Store| {
                     serde_json::to_value(
                         store
@@ -35734,6 +35942,26 @@ version 2
             status.subjects[0].reason.as_deref(),
             Some("concurrent runtime observations have indeterminate authority")
         );
+        let index = left.index().unwrap();
+        for history in [false, true] {
+            let projection = left.runtime_projection_status_at(None, index, history).unwrap();
+            let mut full = left.status_for_claim_kind_at(
+                "runtime.observed", Some(index), history,
+            ).unwrap();
+            for subject in &mut full.subjects {
+                subject.harness = None;
+                subject.claims.clear();
+                subject.conflicts.clear();
+                if let Some(Value::Object(actual)) = &mut subject.actual {
+                    actual.retain(|field, _| RUNTIME_PROJECTION_FIELDS.contains(&field.as_str()));
+                }
+            }
+            assert_eq!(
+                serde_json::to_value(&projection.subjects).unwrap(),
+                serde_json::to_value(&full.subjects).unwrap(),
+                "concurrent origins, history {history}",
+            );
+        }
     }
 
     #[test]
@@ -35770,6 +35998,24 @@ version 2
             let view = right.status(Some(subject)).unwrap().subjects.remove(0);
             assert_eq!(view.actual_claim.as_deref(), Some(selected.id.as_str()));
             assert_eq!(view.reachability, "reachable", "{terminal_status}: {view:?}");
+            let index = right.index().unwrap();
+            let projection = right.runtime_projection_status_at(None, index, true).unwrap();
+            let mut full = right.status_for_claim_kind_at(
+                "runtime.observed", Some(index), true,
+            ).unwrap();
+            for subject in &mut full.subjects {
+                subject.harness = None;
+                subject.claims.clear();
+                subject.conflicts.clear();
+                if let Some(Value::Object(actual)) = &mut subject.actual {
+                    actual.retain(|field, _| RUNTIME_PROJECTION_FIELDS.contains(&field.as_str()));
+                }
+            }
+            assert_eq!(
+                serde_json::to_value(&projection.subjects).unwrap(),
+                serde_json::to_value(&full.subjects).unwrap(),
+                "retired rival origin: {terminal_status}",
+            );
             // A later live rival is not hidden by its previous terminal observation.
             left.set_write_clock_at(1_800_000_000_002).unwrap();
             observe(&left, "running", "left");
