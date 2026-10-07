@@ -57,6 +57,8 @@ struct CollectionSubscription {
     previous: BTreeMap<String, Value>,
     order: Vec<String>,
     has_more: bool,
+    /// Same-snapshot owner projection counter; only owner-wide arrangements use it.
+    owner_revision: Option<u64>,
 }
 
 const COLLECTION_MAX_SUBSCRIPTIONS: usize = 16;
@@ -118,7 +120,7 @@ async fn collection_items(
     session: &ClientSession,
     request: &CollectionSubscribe,
     read_permit: tokio::sync::OwnedSemaphorePermit,
-) -> Result<(ClientSnapshot, Vec<Value>, bool), ApiError> {
+) -> Result<(ClientSnapshot, Vec<Value>, bool, Option<u64>), ApiError> {
     collection_items_with_windows(state, session, request, read_permit, None).await
 }
 
@@ -128,7 +130,7 @@ async fn collection_items_with_windows(
     request: &CollectionSubscribe,
     read_permit: tokio::sync::OwnedSemaphorePermit,
     windows: Option<Arc<collection_windows::Windows>>,
-) -> Result<(ClientSnapshot, Vec<Value>, bool), ApiError> {
+) -> Result<(ClientSnapshot, Vec<Value>, bool, Option<u64>), ApiError> {
     if !matches!(
         request.collection.as_str(),
         "missions" | "attention" | "agents" | "work" | "glasses" | "arrangements"
@@ -207,7 +209,7 @@ async fn collection_items_with_windows(
     let collection = request.collection.clone();
     let custom_forms = session.custom_forms;
     let arrangement_window = collection == "arrangements";
-    let (snapshot, mut items, mut has_more) = super::blocking_store(move || {
+    let (snapshot, mut items, mut has_more, owner_revision) = super::blocking_store(move || {
         crate::profile::task(collection_window_label(&collection), || {
             // Keep the physical read slot even if its awaiting subscription is canceled.
             let _read_permit = read_permit;
@@ -241,6 +243,14 @@ async fn collection_items_with_windows(
                 };
                 let snapshot = client_snapshot_at(&state, index);
                 let at = snapshot.created_at.clone();
+                // Inventory invalidation is owner-scoped, independent of truncation and
+                // cached prefix equality. Read its projection counter under this same fence.
+                let owner_revision = if collection == "arrangements" && subject.is_none() {
+                    Some(store.arrangement_inventory_revision(
+                        person.as_deref().expect("explicit arrangement owner"))?)
+                } else {
+                    None
+                };
                 let compute = || {
                     let mut items = match collection.as_str() {
                         "missions" => {
@@ -315,7 +325,7 @@ async fn collection_items_with_windows(
                     has_more = items.len() > limit;
                     items.truncate(limit);
                 }
-                Ok(Ok((snapshot, items, has_more)))
+                Ok(Ok((snapshot, items, has_more, owner_revision)))
             })
         })
     })
@@ -326,7 +336,7 @@ async fn collection_items_with_windows(
         has_more |= end < items.len();
         items.truncate(end);
     }
-    Ok((snapshot, items, has_more))
+    Ok((snapshot, items, has_more, owner_revision))
 }
 
 fn collection_window_label(collection: &str) -> &'static str {
@@ -367,10 +377,10 @@ enum Refreshed {
 async fn deliver_collection(
     socket: &mut WebSocket,
     subscription: &mut CollectionSubscription,
-    read: Result<(ClientSnapshot, Vec<Value>, bool), ApiError>,
+    read: Result<(ClientSnapshot, Vec<Value>, bool, Option<u64>), ApiError>,
 ) -> Refreshed {
     let request = &subscription.request;
-    let (snapshot, items, has_more) = match read {
+    let (snapshot, items, has_more, owner_revision) = match read {
         Ok(read) => read,
         Err(error) => {
             let retryable = client_error_retryable(error.status, Some(&error.code));
@@ -417,6 +427,7 @@ async fn deliver_collection(
             && removes.is_empty()
             && order == subscription.order
             && has_more == subscription.has_more
+            && owner_revision == subscription.owner_revision
         {
             true
         } else {
@@ -430,6 +441,7 @@ async fn deliver_collection(
     subscription.previous = current;
     subscription.order = order;
     subscription.has_more = has_more;
+    subscription.owner_revision = owner_revision;
     Refreshed::Current
 }
 
@@ -770,7 +782,7 @@ async fn collection_stream_socket_with_reader<F, Fut>(
     read: F,
 ) where
     F: Fn(AppState, ClientSession, CollectionSubscribe, tokio::sync::OwnedSemaphorePermit) -> Fut + Clone + Send + 'static,
-    Fut: Future<Output = Result<(ClientSnapshot, Vec<Value>, bool), ApiError>> + Send,
+    Fut: Future<Output = Result<(ClientSnapshot, Vec<Value>, bool, Option<u64>), ApiError>> + Send,
 {
     // Subscribe before the first snapshot, so a commit while building it wakes
     // the next loop and is reflected in a following change frame.
@@ -869,7 +881,7 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                         }
                         refresh.push(request.id.clone());
                         generation += 1;
-                        subscriptions.insert(request.id.clone(), CollectionSubscription { request, generation, reading: None, dirty: false, delivered: false, previous: BTreeMap::new(), order: Vec::new(), has_more: false });
+                        subscriptions.insert(request.id.clone(), CollectionSubscription { request, generation, reading: None, dirty: false, delivered: false, previous: BTreeMap::new(), order: Vec::new(), has_more: false, owner_revision: None });
 
                     }
                     next = futures_util::FutureExt::now_or_never(socket.recv());
@@ -9867,7 +9879,7 @@ mod tests {
         assert_eq!(terminal_error_close_code("stale-incarnation"), 1008);
     }
 
-    fn assert_collection_frame_conforms(frame: &Value) {
+    pub(super) fn assert_collection_frame_conforms(frame: &Value) {
         let mut schema: Value = serde_json::from_str(include_str!(
             "../../../../docs/st3/client-v0/schemas/client-v0.schema.json"
         ))

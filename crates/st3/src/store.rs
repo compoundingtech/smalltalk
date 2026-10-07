@@ -19873,7 +19873,8 @@ pub(crate) fn append_claim_tx(
         limits::flush_limits(transaction)?;
     }
     if kind == "arrangement.edited" {
-        arrangements::project(transaction, &record)?;
+        let owner = arrangements::project(transaction, &record)?;
+        arrangements::bump_inventory_revisions(transaction, std::iter::once(owner))?;
     }
     normalize_local_projection_timestamps_tx(
         transaction,
@@ -26748,13 +26749,17 @@ fn try_project_simple_replication_tx(
         )
         .map_err(|error| incremental_claim_error(internal(error), claim, "event-insert"))?;
     }
+    let mut arrangement_owners = BTreeSet::new();
     for claim in &claims {
         if claim.kind == "arrangement.edited" {
-            arrangements::project(transaction, claim).map_err(|error| {
+            let owner = arrangements::project(transaction, claim).map_err(|error| {
                 incremental_claim_error(internal(error), claim, "arrangement-project")
             })?;
+            arrangement_owners.insert(owner);
         }
     }
+    arrangements::bump_inventory_revisions(transaction, arrangement_owners)
+        .map_err(internal)?;
     let mut aggregates = BTreeMap::<String, Option<Aggregate>>::new();
     // A claim is left to its aggregate's rebuild when that aggregate is dirty, and left waiting
     // when it is about a run tree that nothing has created yet.

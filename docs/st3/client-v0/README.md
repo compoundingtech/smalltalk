@@ -1479,7 +1479,20 @@ An optional `subject: ArrangementId` selects only that arrangement (zero or one 
 `has_more: false`), so a selected Sidebar cannot fall outside a busy owner's byte/count
 window. Its owner must equal `person`; mismatches are refused. Snapshots, upserts and
 retirement removals retain the ordinary collection semantics. Omitting the filter
-keeps owner-wide prefix windows unchanged.
+keeps owner-wide prefix windows and additionally invalidates the complete owner
+inventory: a changed owner revision sends an existing `changes` frame even if
+`upserts` and `removes` are empty and `order`/`has_more` are unchanged. Its `snapshot`
+names the same read snapshot as that revision and prefix. Create, rename, retire,
+layout edits and replicated materialization are covered, including older admitted claims
+projected after newer local edits. Owner-local counters commit with those projection
+writes; replay/rebuild advances touched owners. Other owners and unrelated routine
+global commits do not send inventory notices. Revisions are compared for inequality,
+so a database reset can cause one extra notice. A notice can retain the previous
+snapshot ID/index when projection changes without a new claim; never discard it on
+that basis. Clients needing complete discovery paginate
+the HTTP list after the initial snapshot and every owner-wide changes frame, including
+empty ones, rather than inferring absence from the prefix. See
+[current collection subscriptions](collections.md) for the exact contract.
 Arrangement list and stream windows also fit a byte budget: the 1,048,576-byte response
 ceiling reserves 128,000 bytes for the envelope. A byte-shortened window sets `has_more`
 and retains full resources, not truncated registers or placements. A replicated full

@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Invalidate owner arrangement inventories when changes fall outside bounded stream windows",
+  "replay": {
+    "status": "none",
+    "detail": "No required replay or backfill. Existing owners without revision metadata start at zero. New owner-local counters commit with local and replicated projection writes, including deferred older arrivals; replay/rebuild bumps each touched owner's counter once per transaction."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "MAINTAINER REVIEW REQUIRED: adds persistent local per-owner inventory revision keys to the existing meta table. No new database table, column, index, trigger or schema version. Cost is one owner upsert per local edit savepoint and one upsert per touched owner per replicated/replay transaction. Existing local batching is retained, so co-committed edit savepoints each upsert. Keys are per owner, with no new shared hot row. Counters are separate from arrangement changed_index admission frontiers."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No retention, checkpoint rule, shared projection digest or sealing transition changes. Owner counters are local metadata, not shared projection contents; replay and checkpoint proofs retain the same arrangement read answers."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Owner-wide arrangements subscriptions can receive existing changes frames with empty upserts/removes and unchanged order/has_more whenever that owner's projection revision changes. Deferred projection, replay or a counter reset can emit a notice with the same snapshot ID/store_index as the preceding frame. Clients must paginate after every owner-wide changes frame, including empty and same-index frames. Revisions are compared for inequality, so reset/rebuild can cause one extra notice. Selected-subject subscriptions stay resource-only. No new frame kind, field, wire schema, generated client API or capability version. Older servers retain the outside-window and deferred-projection notification gaps."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional interruption beyond an ordinary daemon restart. Reconnected subscriptions receive authoritative initial snapshots. Restart timing was not measured."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Upgrade serving daemons normally; no migration or inventory repair is required. Inventory consumers should keep one owner-wide subscription open and coalesce complete paginated rereads on snapshot and changes frames."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No additional database recovery or rollback procedure. Owner counters are expendable local metadata; missing/reset keys read as zero and inequality comparison preserves invalidation. Rolling back leaves these keys harmlessly unused and restores the older missing-invalidation behavior without modifying shared arrangements."
+  }
+}
