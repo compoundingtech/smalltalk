@@ -2020,8 +2020,8 @@ export type ParticipantRefEncoded = typeof ParticipantRef.Encoded
 
 /** Who signed a message a person wrote, and whether the signature checks. Only messages whose sender is a person carry it; an agent's message does not. */
 export const MessageProvenance = /*#__PURE__*/ (() => Schema.Struct({
-  /** The device the key was granted to, by the label it was given when it paired, such as `thinboi (secure enclave)`. Absent for a key with no label. */
-  "device": optionalKey(Schema.String).annotate({ description: "The device the key was granted to, by the label it was given when it paired, such as `thinboi (secure enclave)`. Absent for a key with no label." }),
+  /** The device the key was granted to, by the label it was given when it paired, such as `example phone (secure enclave)`. Absent for a key with no label. */
+  "device": optionalKey(Schema.String).annotate({ description: "The device the key was granted to, by the label it was given when it paired, such as `example phone (secure enclave)`. Absent for a key with no label." }),
   /** The public key that signed (`p256:…` or a bare Ed25519 key). */
   "key": optionalKey(Schema.String).annotate({ description: "The public key that signed (`p256:…` or a bare Ed25519 key)." }),
   /** Why a held or invalid signature is so. */

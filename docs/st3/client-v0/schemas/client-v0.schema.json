@@ -1678,7 +1678,7 @@
         "reason": { "type": "string", "description": "Why a held or invalid signature is so." },
         "signer": { "$ref": "#/$defs/ParticipantRef", "description": "The person who signed, which may be a device that speaks for them." },
         "key": { "type": "string", "description": "The public key that signed (`p256:…` or a bare Ed25519 key)." },
-        "device": { "type": "string", "description": "The device the key was granted to, by the label it was given when it paired, such as `thinboi (secure enclave)`. Absent for a key with no label." }
+        "device": { "type": "string", "description": "The device the key was granted to, by the label it was given when it paired, such as `example phone (secure enclave)`. Absent for a key with no label." }
       }
     },
     "TimelineContentBody": {

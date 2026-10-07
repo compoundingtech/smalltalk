@@ -1410,7 +1410,7 @@ Rust exposes `agent_create`, `terminal_create`, `terminal_end`; TypeScript and S
 A timeline message body whose sender is a person carries `provenance`: the `verdict` every member
 recorded for the message's signature (`verified`, `unsigned`, `held` or `invalid`, with a `reason` for
 the last two), and for a signed one the `signer`, the `key` and the `device` the key was granted to,
-by the label it was given when it paired (`thinboi (secure enclave)`). Clients show it beside the
+by the label it was given when it paired (`example phone (secure enclave)`). Clients show it beside the
 sender; an `unsigned` message is usually just older than signing and shows nothing. An agent's
 message carries none. `GET /v1/messages/read/{id}` (`st conversations read`) and `st subject show`
 for a message give the same object.
