@@ -411,15 +411,20 @@ impl Store {
         )?;
         let durable = (durable.count, durable.first);
         let local = (local.count, local.first, local.last);
-        canonical_hash(&(
-            "st3.native-subject-retention.v1",
-            subject,
-            kind,
-            fence.graph_index,
-            fence.local_position,
-            durable,
-            local,
-        ))
+        // Keyed with the per-store secret: a cursor holder must not enumerate small count
+        // spaces offline to recover retained membership it cannot read.
+        keyed_canonical_hash(
+            &native_sources::cursor_secret(&connection)?,
+            &(
+                "st3.native-subject-retention.v1",
+                subject,
+                kind,
+                fence.graph_index,
+                fence.local_position,
+                durable,
+                local,
+            ),
+        )
     }
 
     /// Family continuations pin retained membership as well as their upper
@@ -461,16 +466,21 @@ impl Store {
             },
         )?
         .count;
-        canonical_hash(&(
-            "st3.native-family-retention.v1",
-            family,
-            ref_prefix,
-            fence.graph_index,
-            fence.local_position,
-            recorded_actor,
-            durable,
-            local,
-        ))
+        // Keyed like the per-subject fingerprint: counts include sources the cursor
+        // holder cannot read, so they must not be guessable offline.
+        keyed_canonical_hash(
+            &native_sources::cursor_secret(&connection)?,
+            &(
+                "st3.native-family-retention.v1",
+                family,
+                ref_prefix,
+                fence.graph_index,
+                fence.local_position,
+                recorded_actor,
+                durable,
+                local,
+            ),
+        )
     }
 
     pub(crate) fn native_admitted_claim_by_id(&self, id: &str) -> Result<Option<ClaimRecord>> {
@@ -885,15 +895,18 @@ mod tests {
                         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                     )
                     .unwrap();
-                let legacy = canonical_hash(&(
-                    "st3.native-subject-retention.v1",
-                    "resource/selected/a",
-                    None::<&str>,
-                    fence.graph_index,
-                    fence.local_position,
-                    durable,
-                    local,
-                ))
+                let legacy = keyed_canonical_hash(
+                    &native_sources::cursor_secret(&connection).unwrap(),
+                    &(
+                        "st3.native-subject-retention.v1",
+                        "resource/selected/a",
+                        None::<&str>,
+                        fence.graph_index,
+                        fence.local_position,
+                        durable,
+                        local,
+                    ),
+                )
                 .unwrap();
                 assert_eq!(
                     store
@@ -915,16 +928,19 @@ mod tests {
                     "SELECT COUNT(*) FROM local_observations WHERE subject>='resource/' AND subject<'resource0'
                      AND after_store_index<=?1 AND id<=?2",
                     params![fence.graph_index,fence.local_position], |row| row.get(0)).unwrap();
-                let legacy_family = canonical_hash(&(
-                    "st3.native-family-retention.v1",
-                    "resource",
-                    None::<&str>,
-                    fence.graph_index,
-                    fence.local_position,
-                    None::<&str>,
-                    durable_count,
-                    local_count,
-                ))
+                let legacy_family = keyed_canonical_hash(
+                    &native_sources::cursor_secret(&connection).unwrap(),
+                    &(
+                        "st3.native-family-retention.v1",
+                        "resource",
+                        None::<&str>,
+                        fence.graph_index,
+                        fence.local_position,
+                        None::<&str>,
+                        durable_count,
+                        local_count,
+                    ),
+                )
                 .unwrap();
                 assert_eq!(
                     store
@@ -976,6 +992,61 @@ mod tests {
             transaction.commit().unwrap();
         }
         assert_membership();
+    }
+
+    #[test]
+    fn cursor_fingerprints_are_keyed_per_store() {
+        let version = |store: &Store| {
+            store.read_snapshot(|_| {
+                let fence = store.native_source_fence()?;
+                store.native_family_retention_version("resource", None, &fence, None)
+            })
+        };
+        let unkeyed = |store: &Store| {
+            let connection = store.readers.get();
+            let durable: u64 = connection
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM claims WHERE subject>='resource/' AND subject<'resource0'
+                         AND {ADMITTED}"
+                    ),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let local: u64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM local_observations WHERE subject>='resource/'
+                     AND subject<'resource0'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let fence = store.native_source_fence().unwrap();
+            canonical_hash(&(
+                "st3.native-family-retention.v1",
+                "resource",
+                None::<&str>,
+                fence.graph_index,
+                fence.local_position,
+                None::<&str>,
+                durable,
+                local,
+            ))
+            .unwrap()
+        };
+        let first = Store::open_memory("node-a").unwrap();
+        claim(&first, "resource/selected/a");
+        let second = Store::open_memory("node-b").unwrap();
+        claim(&second, "resource/selected/a");
+        // Identical claims and fences: only the per-store secret differs.
+        let first_version = version(&first).unwrap();
+        let second_version = version(&second).unwrap();
+        assert_ne!(first_version, second_version);
+        // The fingerprint must not be the offline-guessable unkeyed hash of the same
+        // retained counts, or a cursor holder could enumerate small count spaces.
+        assert_ne!(first_version, unkeyed(&first));
+        assert_ne!(second_version, unkeyed(&second));
     }
 
     #[test]

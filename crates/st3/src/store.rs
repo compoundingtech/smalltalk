@@ -63,7 +63,7 @@ use smallclaims::claim::ReplicaEnvelopePayload;
 use smallclaims::error::internal;
 use smallclaims::hash::{
     batch_header_hash, canonical_hash, canonical_json_text, canonical_json_value,
-    canonical_serialized_json_text, claim_hash,
+    canonical_serialized_json_text, claim_hash, keyed_canonical_hash,
 };
 #[cfg(test)]
 use smallclaims::hash::{

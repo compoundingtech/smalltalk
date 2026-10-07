@@ -4,6 +4,10 @@
 use super::*;
 
 const VERSION_KEY: &str = "native_source_ranges_v1";
+
+// HMAC key for native cursor fingerprints. Retained counts and extrema are private
+// membership; the secret keeps them unguessable offline by readers holding a cursor.
+const CURSOR_SECRET_KEY: &str = "native_cursor_secret";
 const ROOT_LEVEL: u32 = 16;
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS native_source_ranges (
@@ -160,6 +164,19 @@ pub(super) fn open(transaction: &Transaction<'_>) -> Result<()> {
         ),
     ))?;
 
+    let secret: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM meta WHERE key=?1)",
+        [CURSOR_SECRET_KEY],
+        |row| row.get(0),
+    )?;
+    if !secret {
+        let mut bytes = [0_u8; 32];
+        getrandom::fill(&mut bytes)?;
+        transaction.execute(
+            "INSERT INTO meta(key,value) VALUES(?1,?2)",
+            params![CURSOR_SECRET_KEY, hex::encode(bytes)],
+        )?;
+    }
     let filled: bool = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM meta WHERE key=?1)",
         [VERSION_KEY],
@@ -241,6 +258,20 @@ pub(super) fn local_cutoff(connection: &Connection, fence: &NativeSourceFence) -
         |row| row.get(0),
     )?;
     Ok(graph_cutoff.min(fence.local_position))
+}
+
+/// The per-store cursor fingerprint key written by [`open`]. A store whose projections never
+/// opened cannot mint cursors; that is an internal error, not a degraded fingerprint.
+pub(super) fn cursor_secret(connection: &Connection) -> Result<Vec<u8>> {
+    let secret: Option<String> = connection
+        .query_row(
+            "SELECT value FROM meta WHERE key=?1",
+            [CURSOR_SECRET_KEY],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let secret = secret.ok_or_else(|| anyhow::anyhow!("native cursor secret is missing"))?;
+    Ok(hex::decode(secret)?)
 }
 
 fn prefix_nodes(upper: u64, maximum: u64) -> impl Iterator<Item = (u32, u64, u64)> {

@@ -1,6 +1,7 @@
 //! Content hashes: canonical JSON, claim IDs, batch headers, and replica envelopes.
 
 use anyhow::Result;
+use hmac::{Hmac, Mac as _};
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
@@ -8,10 +9,23 @@ use sha2::{Digest as _, Sha256};
 use crate::claim::{ClaimRecord, ReplicaBatch};
 use crate::error::{Error, internal};
 
+type HmacSha256 = Hmac<Sha256>;
+
 pub fn canonical_hash(value: &impl Serialize) -> Result<String> {
     let mut bytes = Vec::new();
     ciborium::into_writer(value, &mut bytes)?;
     Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+/// A canonical hash only the holder of `key` can recompute. Cursor fingerprints encode retained
+/// membership counts and extrema; keying them with a per-store secret keeps a reader from
+/// recovering those counts by enumerating small count spaces offline.
+pub fn keyed_canonical_hash(key: &[u8], value: &impl Serialize) -> Result<String> {
+    let mut bytes = Vec::new();
+    ciborium::into_writer(value, &mut bytes)?;
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts a key of any length");
+    mac.update(&bytes);
+    Ok(hex::encode(mac.finalize().into_bytes()))
 }
 
 pub fn batch_header_hash(
@@ -158,6 +172,17 @@ pub fn verify_replica_batch_header(batch: &ReplicaBatch) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keyed_canonical_hash_depends_on_the_key_not_just_the_value() {
+        let value = ("st3.cursor", 7_u64, None::<u64>);
+        let unkeyed = canonical_hash(&value).expect("unkeyed hash");
+        let left = keyed_canonical_hash(b"secret-a", &value).expect("keyed hash a");
+        let right = keyed_canonical_hash(b"secret-b", &value).expect("keyed hash b");
+        assert_ne!(left, unkeyed);
+        assert_ne!(left, right);
+        assert_eq!(left, keyed_canonical_hash(b"secret-a", &value).unwrap());
+    }
 
     #[test]
     fn claim_hash_does_not_depend_on_json_object_insertion_order() {

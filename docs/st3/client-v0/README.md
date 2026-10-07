@@ -398,7 +398,9 @@ watermark. An indexed graph-position seek therefore intersects the local ID and 
 fences exactly before reading the local range aggregates.
 
 The fingerprint still hashes the original selector/fence-specific retained counts and
-extrema using the existing v1 encoding; rebuilding the read model alone does not invalidate
+extrema over the existing v1 encoding, keyed with a per-store HMAC secret created when
+projections open: a cursor holder cannot enumerate small count spaces offline to recover
+retained membership it cannot read, and rebuilding the read model alone does not invalidate
 an otherwise usable cursor. No request cache, global invalidation generation, replicated
 projection digest, or public source count is introduced. Source-contract tests compare
 the aggregates and cursor hashes with direct fenced source queries across radix
