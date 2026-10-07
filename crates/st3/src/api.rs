@@ -209,7 +209,7 @@ struct ClientPageCursor {
 }
 
 fn signal_changed(state: &AppState) {
-    crate::performance::record_wake("api", None);
+    crate::reconcile_telemetry::record_wake(crate::reconcile_telemetry::WakeCause::Api, None);
     state.notify.notify_one();
     signal_visible_change(state);
 }
@@ -233,7 +233,7 @@ pub(crate) fn signal_message_changed(state: &AppState, kind: &str, work_wake: bo
 
 /// [`signal_changed`] for a claim, counting the wake under the claim's kind.
 fn signal_claim_changed(state: &AppState, kind: &str) {
-    crate::performance::record_wake("api", Some(kind));
+    crate::reconcile_telemetry::record_wake(crate::reconcile_telemetry::WakeCause::Api, Some(kind));
     state.notify.notify_one();
     signal_visible_change(state);
 }
@@ -8279,7 +8279,7 @@ async fn replication_receive(
     .await?;
     if response.changed {
         if reconcile_changed {
-            crate::performance::record_wake("replication receive", None);
+            crate::reconcile_telemetry::record_wake(crate::reconcile_telemetry::WakeCause::ReplicationReceive, None);
             state.notify.notify_one();
         }
         state

@@ -107,8 +107,8 @@ fn histogram_count(point: &Value) -> Option<u64> {
         .or_else(|| point["count"].as_str().and_then(|count| count.parse().ok()))
 }
 
-// Storage instruments live on the st-daemon resource: scopeMetrics -> metric
-// -> histogram or gauge data points.
+// Daemon instruments live on the st-daemon resource: scopeMetrics -> metric
+// -> histogram, gauge or sum data points.
 #[cfg(target_os = "linux")]
 fn metric_points<'a>(request: &'a Value, name: &str) -> Vec<&'a Value> {
     request["resourceMetrics"]
@@ -123,9 +123,23 @@ fn metric_points<'a>(request: &'a Value, name: &str) -> Vec<&'a Value> {
             metric["histogram"]["dataPoints"]
                 .as_array()
                 .or_else(|| metric["gauge"]["dataPoints"].as_array())
+                .or_else(|| metric["sum"]["dataPoints"].as_array())
                 .into_iter()
                 .flatten()
         })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn daemon_spans<'a>(request: &'a Value, name: &str) -> Vec<&'a Value> {
+    request["resourceSpans"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|batch| string_attribute(&batch["resource"], "service.name") == Some("st-daemon"))
+        .flat_map(|batch| batch["scopeSpans"].as_array().into_iter().flatten())
+        .flat_map(|scope| scope["spans"].as_array().into_iter().flatten())
+        .filter(|span| span["name"].as_str() == Some(name))
         .collect()
 }
 
@@ -827,6 +841,129 @@ fn daemon_write_request_exports_storage_metrics() {
                         .is_some_and(|wait| wait >= 0.0)
             })
     });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn daemon_write_exports_independent_reconcile_pass_and_metrics() {
+    let Some(collector) =
+        otelite("daemon_write_exports_independent_reconcile_pass_and_metrics")
+    else {
+        return;
+    };
+    const TRACE_ID: &str = "abcdef0123456789abcdef0123456789";
+    const PARENT_ID: &str = "abcdef0123456789";
+    const WAKE_CAUSES: &[&str] = &[
+        "api",
+        "replication_receive",
+        "deadline",
+        "timer_restart",
+        "timer_step_timeout",
+        "timer_resume_verification",
+        "timer_gate_timeout",
+        "timer_gate_recheck",
+        "timer_gate",
+        "timer_gate_poll",
+        "timer_llm_gate",
+        "file_watch",
+        "reconciler",
+        "recorder_receipts",
+        "startup",
+        "continuation",
+        "other",
+    ];
+    let root = tempfile::tempdir().unwrap();
+    let mut daemon = ExportDaemon::start(&collector, root.path());
+    let traces_path = root.path().join("capture/traces.ndjson");
+    let metrics_path = root.path().join("capture/metrics.ndjson");
+    daemon.write_claim(&format!("00-{TRACE_ID}-{PARENT_ID}-01"));
+    // Prove the write accepted the remote context; a reconcile span accidentally
+    // inheriting this request must fail the root checks below.
+    daemon.await_export(&traces_path, |request| {
+        daemon_spans(request, "POST /v1/claims")
+            .into_iter()
+            .any(|span| {
+                span["traceId"].as_str() == Some(TRACE_ID)
+                    && span["parentSpanId"].as_str() == Some(PARENT_ID)
+                    && int_attribute(span, "http.response.status_code") == Some(200)
+            })
+    });
+    daemon.await_export(&traces_path, |request| {
+        daemon_spans(request, "st.reconcile_pass")
+            .into_iter()
+            .any(|span| string_attribute(span, "st.reconcile.wake_cause") == Some("api"))
+    });
+    let durations = daemon.await_export(&metrics_path, |request| {
+        metric_points(request, "st.reconcile.pass.duration")
+            .into_iter()
+            .any(|point| {
+                string_attribute(point, "task") == Some("pass")
+                    && histogram_count(point).is_some_and(|count| count > 0)
+            })
+    });
+    for metric in durations["resourceMetrics"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|batch| string_attribute(&batch["resource"], "service.name") == Some("st-daemon"))
+        .flat_map(|batch| batch["scopeMetrics"].as_array().into_iter().flatten())
+        .flat_map(|scope| scope["metrics"].as_array().into_iter().flatten())
+        .filter(|metric| metric["name"].as_str() == Some("st.reconcile.pass.duration"))
+    {
+        assert_eq!(metric["unit"].as_str(), Some("s"), "duration unit: {metric}");
+    }
+    let wakes = daemon.await_export(&metrics_path, |request| {
+        metric_points(request, "st.reconcile.wakes")
+            .into_iter()
+            .any(|point| {
+                string_attribute(point, "cause") == Some("api")
+                    && point["asInt"]
+                        .as_u64()
+                        .or_else(|| point["asInt"].as_str().and_then(|value| value.parse().ok()))
+                        .is_some_and(|count| count > 0)
+            })
+    });
+    for point in metric_points(&wakes, "st.reconcile.wakes") {
+        let cause = string_attribute(point, "cause").expect("wake counter cause attribute");
+        assert!(WAKE_CAUSES.contains(&cause), "unbounded wake counter cause: {point}");
+    }
+    daemon.await_export(&metrics_path, |request| {
+        metric_points(request, "st.fifo.depth")
+            .into_iter()
+            .any(|point| {
+                string_attribute(point, "queue").is_some_and(|queue| ["writer", "conversation", "terminal_emulation"].contains(&queue))
+                    && point["asInt"]
+                        .as_u64()
+                        .or_else(|| point["asInt"].as_str().and_then(|value| value.parse().ok()))
+                        .is_some()
+            })
+    });
+    // Stop and drain the collector before checking every pass, including passes
+    // exported in other batches or at shutdown, not just the first API match.
+    drop(daemon);
+    let traces = std::fs::read_to_string(&traces_path).expect("otelite writes reconcile traces");
+    let mut pass_count = 0;
+    let mut api_count = 0;
+    for line in traces.lines() {
+        let request: Value = serde_json::from_str(line).expect("valid OTLP trace request");
+        for span in daemon_spans(&request, "st.reconcile_pass") {
+            pass_count += 1;
+            assert!(
+                span["parentSpanId"].as_str().is_none_or(str::is_empty),
+                "reconcile pass must be a root, not a request child: {span}"
+            );
+            let trace_id = span["traceId"].as_str().expect("reconcile pass trace id");
+            assert_ne!(trace_id, TRACE_ID, "reconcile pass inherited the request trace: {span}");
+            let cause = string_attribute(span, "st.reconcile.wake_cause")
+                .expect("reconcile pass wake cause attribute");
+            assert!(WAKE_CAUSES.contains(&cause), "unbounded reconcile wake cause: {span}");
+            if cause == "api" {
+                api_count += 1;
+            }
+        }
+    }
+    assert!(pass_count > 0, "no reconcile pass exported:\n{traces}");
+    assert!(api_count > 0, "write must export an API-woken reconcile pass:\n{traces}");
 }
 
 #[cfg(target_os = "linux")]
