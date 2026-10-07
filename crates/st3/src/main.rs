@@ -17319,7 +17319,8 @@ fn spawn_st2_provider(
     if push_mailbox_enabled() && driver == "opencode" {
         st_drivers::push_mailbox::register(&paths.agent_dir);
     }
-    tokio::task::spawn_blocking(move || match start {
+    tokio::task::spawn_blocking(move || {
+        let outcome = match start {
         ProviderStart::Launch(
             argv,
             // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
@@ -17415,6 +17416,12 @@ fn spawn_st2_provider(
                 anyhow::bail!("a {driver} driver cannot adopt this provider session: {session:?}")
             }
         },
+        };
+        #[cfg(feature = "test-support")]
+        if env!("CARGO_BIN_NAME") == "st3-fixture" {
+            st3::test_support::hold_provider_completion(&outcome)?;
+        }
+        outcome
     })
 }
 
@@ -17693,6 +17700,10 @@ async fn drive_st2_native(
         )
     });
     loop {
+        #[cfg(feature = "test-support")]
+        fixture_terminal_completion_barrier(
+            &mut observations, client, subject, driver, &mut loop_state.ready, &task,
+        ).await?;
         tokio::select! {
             frame = mailbox.recv() => {
                 let mail_changed = matches!(&frame, Some(st3::mailbox::Frame::Mailbox { .. }));
@@ -18071,6 +18082,54 @@ async fn drive_st2_native(
             }
         }
     }
+}
+
+// Only the separately compiled fixture executable can schedule this control.
+// It holds no production provider, changes no claim or fence, and has a finite deadline.
+#[cfg(feature = "test-support")]
+async fn fixture_terminal_completion_barrier(
+    observations: &mut NativeObservations,
+    client: &Client,
+    subject: &str,
+    driver: &str,
+    ready: &mut bool,
+    task: &tokio::task::JoinHandle<Result<()>>,
+) -> Result<()> {
+    if env!("CARGO_BIN_NAME") != "st3-fixture" || driver != "claude" {
+        return Ok(());
+    }
+    let Some(root) = std::env::var_os("ST3_FIXTURE_TERMINAL_COMPLETION").map(PathBuf::from) else {
+        return Ok(());
+    };
+    if root.join("observation-drained").exists()
+        || !st_drivers::harness_state::read(
+            &st_drivers::harness_state::harness_state_path(&observations.dir), None,
+        ).is_some_and(|state| state.state == st_drivers::harness_state::Activity::Ended)
+    {
+        return Ok(());
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !root.join("provider-return.json").exists() {
+        anyhow::ensure!(tokio::time::Instant::now() < deadline, "fixture provider completion timed out");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    observations.drain(client, subject, driver, ready).await?;
+    fs::write(root.join("observation-drained"), b"drained")?;
+    let after = fs::read_to_string(root.join("order"))? == "after";
+    if after {
+        while !task.is_finished() {
+            anyhow::ensure!(tokio::time::Instant::now() < deadline, "fixture JoinHandle completion timed out");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    } else {
+        anyhow::ensure!(!task.is_finished(), "fixture must retain pending provider JoinHandle");
+    }
+    fs::write(root.join("join-phase"), if after { "finished" } else { "pending" })?;
+    while !root.join("poll-driver").exists() {
+        anyhow::ensure!(tokio::time::Instant::now() < deadline, "fixture driver release timed out");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    Ok(())
 }
 
 fn reject_noninteractive_claude_argv(argv: &[String]) -> Result<()> {
