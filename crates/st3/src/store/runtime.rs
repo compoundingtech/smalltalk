@@ -139,6 +139,8 @@ impl Runtime for SmalltalkRuntime {
         glass_heads::create_schema(connection)?;
         limits::create_limits_schema(connection)?;
         if let Some(views) = &self.ivm_views {
+            // Registered stores run this on every open; each view's schema hook must
+            // be idempotent, including reopen with persisted outputs and event cursors.
             views.create_schema(connection)?;
         }
         Ok(())

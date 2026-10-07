@@ -2576,6 +2576,8 @@ impl Store {
 
     /// Lazily attach the one Store publisher shared by receipt waits and collection
     /// consumers. Registration and journal installation happen when the Store opens.
+    /// Attachment errors are returned on each call until attachment succeeds; failures
+    /// are not cached. A successful attachment is shared by all later callers.
     pub fn ivm_publisher(&self) -> Result<Option<Arc<smallclaims::ivm::events::Publisher>>> {
         if self.smalltalk.ivm_views.is_none() {
             return Ok(None);
