@@ -13,6 +13,12 @@ back on the session it suspended on, holds hour-old mail, and consumes recent ne
 mail exactly once. The Rust wrapper
 `crates/st3/tests/boot_canaries.rs` runs every pair as its own test in the required Linux gate.
 
+The boot, no-st2 and subagent fixtures put their private bin directory first, followed by
+inherited `PATH` entries that neither contain an `st2` executable nor name an `st2` path.
+Provide Bash, Python, `env`, Git, curl and `pty` on the inherited path, plus Node for pi/omp.
+Login shells and stand-in interpreters use discovered absolute executables; conventional
+system bin directories are not required, so these fixtures also run in Nix sandboxes.
+
 The OMP `when-idle` regression uses a separate runner:
 
     ../st3-rollout-binding-canary/run BINARY EVIDENCE_DIR omp when-idle [--omp EXECUTABLE]

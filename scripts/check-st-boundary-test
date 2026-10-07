@@ -1,15 +1,34 @@
 #!/usr/bin/env python3
 """Mutation proofs: each forbidden surface must fail the same guard used by CI/evals."""
+import os
 from pathlib import Path
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 sys.dont_write_bytecode = True
-from st_boundary import fresh_seat_findings, launch_findings
+from st_boundary import fresh_seat_findings, isolated_path, launch_findings
 
 HERE = Path(__file__).resolve().parent
+
+
+class FixturePathCheck(unittest.TestCase):
+    def test_inherited_tools_stay_after_private_bin_without_st2(self):
+        with tempfile.TemporaryDirectory(prefix="fixture-path-") as temporary:
+            root = Path(temporary)
+            private, tools, legacy, named = [root / name for name in
+                                             ("private", "tools", "legacy", "ST2-tools")]
+            for directory in (private, tools, legacy, named):
+                directory.mkdir()
+            (legacy / "st2").write_text("#!/bin/sh\n")
+            (legacy / "st2").chmod(0o755)
+            inherited = os.pathsep.join(["", str(legacy), str(tools), str(named), ""])
+            with patch.dict(os.environ, {"PATH": inherited}):
+                actual = isolated_path(private)
+            self.assertEqual(actual, os.pathsep.join([str(private), str(tools)]))
+            self.assertFalse(list(launch_findings("provider", ["PATH=" + actual])))
 
 
 class BoundaryCheck(unittest.TestCase):

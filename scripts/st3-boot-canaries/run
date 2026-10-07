@@ -35,6 +35,7 @@ import os
 from pathlib import Path
 import shutil
 import signal
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -43,7 +44,7 @@ import time
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 sys.dont_write_bytecode = True
-from st_boundary import fresh_seat_findings, output_findings
+from st_boundary import fresh_seat_findings, isolated_path, output_findings
 
 HARNESSES = ("claude", "codex", "pi", "omp", "opencode")
 SCENARIOS = ("fresh", "restart", "daemon-restart", "reexec", "concurrent", "suspend", "utf8", "idle-hold", "channel-missing", "channel-uninitialized", "channel-parked", "import")
@@ -85,7 +86,10 @@ def install_stub(bin_dir, harness):
     if not interpreter:
         raise SystemExit(f"{harness}'s stand-in needs {'node' if harness in ('pi', 'omp') else 'python3'} on PATH")
     wrapper = bin_dir / harness
-    wrapper.write_text(f'#!/bin/sh\nexec env PYTHONDONTWRITEBYTECODE=1 STUB_HARNESS={harness} "{interpreter}" "{HERE / script}" "$@"\n')
+    shell = shutil.which("bash")
+    if not shell:
+        raise SystemExit("bash must be on PATH")
+    wrapper.write_text(f'#!{shell}\nexport PYTHONDONTWRITEBYTECODE=1 STUB_HARNESS={harness}\nexec {shlex.quote(interpreter)} {shlex.quote(str(HERE / script))} "$@"\n')
     wrapper.chmod(0o755)
 
 
@@ -104,9 +108,12 @@ class Node:
                 raise SystemExit(f"{tool} must be on PATH")
             (root / "bin" / tool).symlink_to(executable)
         install_stub(root / "bin", harness)
-        self.path = f"{root / 'bin'}:/usr/bin:/bin"
+        self.path = isolated_path(root / "bin")
+        shell = shutil.which("bash", path=self.path)
+        if not shell:
+            raise SystemExit("bash must be on the isolated PATH")
         self.endpoint = root / "run/st.sock"
-        self.env = {"PATH": self.path, "HOME": str(root / "home"), "SHELL": "/bin/bash",
+        self.env = {"PATH": self.path, "HOME": str(root / "home"), "SHELL": shell,
                     "USER": os.environ.get("USER", "eval"), "LOGNAME": os.environ.get("USER", "eval"),
                     "LANG": "C.UTF-8", "XDG_STATE_HOME": str(root / "home/.local/state"),
                     "XDG_CONFIG_HOME": str(root / "home/.config"),

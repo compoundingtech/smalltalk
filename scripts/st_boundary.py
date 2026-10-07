@@ -1,4 +1,6 @@
 """CI assertions for fresh st seats; predecessor compatibility and st2 stay independent."""
+import os
+import shutil
 import re
 import sqlite3
 from pathlib import Path
@@ -8,6 +10,15 @@ LEGACY = re.compile("st2", re.IGNORECASE)
 # A stored value names st2 as its own token: a label, schema, path or program. Keys, signatures,
 # nonces and other base64 that st stores hold the letters st2 inside longer runs by chance.
 TOKEN = re.compile(r"(?<![a-z0-9])st2(?![a-z0-9])", re.IGNORECASE)
+
+
+def isolated_path(bin_dir):
+    """Keep inherited tools in hermetic fixtures without exposing the predecessor."""
+    inherited = [
+        entry for entry in os.environ.get("PATH", "").split(os.pathsep)
+        if entry and not LEGACY.search(entry) and not shutil.which("st2", path=entry)
+    ]
+    return os.pathsep.join([str(bin_dir), *inherited])
 
 
 def source_findings(root):
