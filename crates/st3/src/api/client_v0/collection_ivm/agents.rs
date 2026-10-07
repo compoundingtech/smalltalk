@@ -1,0 +1,421 @@
+//! Bounded agents adapter for an explicitly installed, completely certified namespace.
+//! This factory attaches nothing and changes no provider map. The bridge authorizes before
+//! either callback. Both callbacks authenticate the whole live producer boundary, including
+//! silent advances; selected rows or a graph frontier can never establish source completeness.
+use super::*;
+use crate::api::delivery_presence::source::boundary as producer;
+use crate::store::{
+    agent_card_ivm as cards,
+    collection_ivm::{agent_source, scope},
+};
+use anyhow::{Context as _, ensure};
+use rusqlite::Connection;
+use smallclaims::ivm::{
+    SourceCut, Views,
+    install::{Installer, Root},
+};
+
+/// The source owner must capture the namespace certificate with this exact complete manifest.
+/// This binds input eligibility/schema and the compiled full-card dependency/output definition.
+pub(in crate::api::client_v0) fn manifest() -> String {
+    format!(
+        "{};{}",
+        agent_source::capture_fingerprint(),
+        cards::FINGERPRINT
+    )
+}
+
+/// Uses the existing Store-held registry. The source owner supplies its actual Installer and
+/// enables this adapter only after complete namespace publication and producer acknowledgement.
+pub(in crate::api::client_v0) fn factory(
+    store: Arc<Store>,
+    views: Arc<Views>,
+    installer: Arc<Installer>,
+) -> anyhow::Result<Adapter> {
+    ensure!(
+        store
+            .ivm_views()
+            .as_ref()
+            .is_some_and(|registered| Arc::ptr_eq(registered, &views)),
+        "agent adapter registry belongs to another Store"
+    );
+    let expected = Arc::new(manifest());
+    let store = Arc::downgrade(&store);
+    let coverage_views = views.clone();
+    let coverage_installer = installer.clone();
+    let coverage_manifest = expected.clone();
+    Ok(Adapter {
+        view: cards::VIEW,
+        coverage: Arc::new(move |connection| {
+            let Some((root, cut, certificate)) = certified(
+                connection,
+                &coverage_views,
+                &coverage_installer,
+                &coverage_manifest,
+                client_now_ms(),
+            )?
+            else {
+                return Ok(false);
+            };
+            // Mandatory on Silent: never infer producer closure from SQL counts, selected row
+            // certificates, an unchanged semantic key page or an acknowledged old epoch.
+            producer::read_boundary(&certificate, || {
+                unchanged(
+                    connection,
+                    &coverage_views,
+                    &coverage_installer,
+                    &root,
+                    &cut,
+                )?;
+                cards::coverage(connection, &root, &cut, client_now_ms())
+            })
+        }),
+        rows: Arc::new(
+            move |state, _, request, connection, boundary, _, retained| {
+                (|| -> anyhow::Result<_> {
+                    let store = store.upgrade().context("agent adapter Store has closed")?;
+                    ensure!(
+                        Arc::ptr_eq(&state.store, &store),
+                        "agent adapter rows belong to another Store"
+                    );
+                    ensure!(
+                        request.collection == "agents",
+                        "agent adapter used for another collection"
+                    );
+                    let limit = request.limit.unwrap_or(CLIENT_DEFAULT_PAGE_ITEMS);
+                    ensure!(
+                        (1..=cards::WINDOW_LIMIT).contains(&limit),
+                        "invalid agent window limit"
+                    );
+                    let (root, cut, certificate) =
+                        certified(connection, &views, &installer, &expected, client_now_ms())?
+                            .context("complete agent source certificate is pending")?;
+                    ensure!(
+                        cut == boundary.source_cut,
+                        "agent row and collection source cuts differ"
+                    );
+                    let current = events::capture(connection, &views, cards::VIEW)?;
+                    ensure!(
+                        current.identity == boundary.identity
+                            && current.snapshot == boundary.snapshot,
+                        "agent row and collection boundaries differ"
+                    );
+                    let frame_time = client_snapshot_at(state, cut.projected).created_at;
+                    // The fully proved Operator row coverage and the exact root-bound complete
+                    // footprint certificate authenticate all dependencies. No current delivery SQL
+                    // oracle or selected-only footprint is read here. A future materialized row
+                    // certificate API may additionally use read_boundary_rows under this same stamp.
+                    producer::read_boundary(&certificate, || {
+                        unchanged(connection, &views, &installer, &root, &cut)?;
+                        let rows = cards::current_rows(
+                            connection,
+                            &root,
+                            limit,
+                            request.status.as_deref(),
+                            retained,
+                            &frame_time,
+                        )?;
+                        ensure!(
+                            cards::coverage(connection, &root, &cut, client_now_ms())?,
+                            "agent deadline expired during row read"
+                        );
+                        unchanged(connection, &views, &installer, &root, &cut)?;
+                        Ok(rows)
+                    })
+                })()
+                .map_err(ApiError::internal)
+            },
+        ),
+    })
+}
+
+fn certified(
+    connection: &Connection,
+    views: &Views,
+    installer: &Installer,
+    expected_manifest: &str,
+    now: u128,
+) -> anyhow::Result<Option<(Root, SourceCut, producer::Certificate)>> {
+    if !scope::readable(connection)? {
+        return Ok(None);
+    }
+    let Some(cut) = smallclaims::ivm::source_cut(connection)? else {
+        return Ok(None);
+    };
+    if cut.admitted != cut.projected
+        || cut.admitted != smallclaims::store::current_index(connection)?
+    {
+        return Ok(None);
+    }
+    if !matches!(
+        views.readiness(connection, cards::VIEW, cut.epoch)?,
+        Readiness::Ready(_)
+    ) {
+        return Ok(None);
+    }
+    let root = views.installed_root(connection, installer, cards::VIEW)?;
+    if !cards::coverage(connection, &root, &cut, now)? {
+        return Ok(None);
+    }
+    let Some(certificate) =
+        agent_source::boundary::read(connection, &root, &cut, expected_manifest)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((root, cut, certificate)))
+}
+
+fn unchanged(
+    connection: &Connection,
+    views: &Views,
+    installer: &Installer,
+    root: &Root,
+    cut: &SourceCut,
+) -> anyhow::Result<()> {
+    ensure!(scope::readable(connection)?, "agent capture scope changed");
+    ensure!(
+        smallclaims::ivm::source_cut(connection)? == Some(*cut)
+            && cut.admitted == smallclaims::store::current_index(connection)?,
+        "agent source cut changed"
+    );
+    let current = views.installed_root(connection, installer, cards::VIEW)?;
+    ensure!(
+        current.namespace == root.namespace
+            && current.epoch == root.epoch
+            && current.revision == root.revision
+            && current.generation == root.generation
+            && current.status_revision == root.status_revision,
+        "agent installed root changed"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::collection_ivm;
+
+    struct Registered {
+        root: tempfile::TempDir,
+        store: Arc<Store>,
+        views: Arc<Views>,
+        installer: Arc<Installer>,
+    }
+    fn registered() -> Registered {
+        let root = tempfile::tempdir().unwrap();
+        // Exactly one actual card registry per disposable Store; no fabricated View or
+        // Operator, namespace token, source cut, row or complete certificate is installed.
+        let views = Arc::new(Views::new(cards::definitions()).unwrap());
+        let store = Arc::new(
+            Store::open_with_ivm_views(
+                &root.path().join("card.sqlite"),
+                "card-fixture",
+                views.clone(),
+            )
+            .unwrap(),
+        );
+        let installer = Arc::new(Installer::new(vec![]).unwrap());
+        store
+            .connection
+            .batched(|tx| {
+                installer.create_schema(tx)?;
+                agent_source::install_capture(tx, 1)?;
+                Ok::<_, anyhow::Error>(())
+            })
+            .unwrap()
+            .unwrap();
+        let finishing = (views.clone(), installer.clone());
+        store
+            .install_transaction_hooks(scope::prepare, move |tx| {
+                scope::finalize(tx, &finishing.0, &finishing.1, cards::SOURCE, |_, _| {
+                    Ok(scope::Coverage::Complete)
+                })?;
+                Ok(())
+            })
+            .unwrap();
+        store
+            .connection
+            .batched(|tx| {
+                scope::begin_install(tx, &views, &installer, cards::SOURCE, &manifest(), 1)
+            })
+            .unwrap()
+            .unwrap();
+        store
+            .connection
+            .batched(|tx| agent_source::clock::tick(tx, 0, agent_source::clock::Reason::Kernel))
+            .unwrap()
+            .unwrap();
+        Registered {
+            root,
+            store,
+            views,
+            installer,
+        }
+    }
+    fn state(f: &Registered) -> AppState {
+        AppState {
+            store: f.store.clone(),
+            notify: Arc::new(tokio::sync::Notify::new()),
+            event_notify: tokio::sync::watch::channel(0).0,
+            node: "card-fixture".into(),
+            state_dir: f.root.path().into(),
+            pty_root: f.root.path().join("pty"),
+            pty_binary: "pty".into(),
+            fleet_id: None,
+            configured_peers: vec![],
+            client_relay: None,
+            native_session_home: None,
+            planner_default: Default::default(),
+        }
+    }
+    fn request() -> CollectionSubscribe {
+        serde_json::from_value(
+            json!({"kind":"subscribe","id":"cards","collection":"agents","limit":2}),
+        )
+        .unwrap()
+    }
+    async fn pending_read(
+        f: &Registered,
+        sources: Arc<Sources>,
+        adapter: Arc<Adapter>,
+        held: Held,
+    ) -> Candidate {
+        let permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .unwrap();
+        read(
+            state(f),
+            ClientSession::local(Some("person/avery")).unwrap(),
+            request(),
+            permit,
+            sources,
+            adapter,
+            held,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn registered_capture_without_operator_certificate_never_returns_rows_on_initial_or_reconnect()
+     {
+        let f = registered();
+        assert!(scope::readable(&f.store.readers.get()).unwrap());
+        let adapter =
+            Arc::new(factory(f.store.clone(), f.views.clone(), f.installer.clone()).unwrap());
+        assert!(!(adapter.coverage)(&f.store.readers.get()).unwrap());
+        let sources = Sources::from_store(
+            f.store.clone(),
+            BTreeMap::from([("agents".into(), adapter.clone())]),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(Arc::ptr_eq(
+            &f.store.ivm_publisher().unwrap().unwrap(),
+            &f.store.ivm_publisher().unwrap().unwrap()
+        ));
+        let first = pending_read(&f, sources.clone(), adapter.clone(), Held::default()).await;
+        assert!(matches!(first.output, Output::Unavailable));
+        let next = pending_read(
+            &f,
+            sources.clone(),
+            adapter.clone(),
+            Held {
+                cursor: first.delivered,
+                rows: Arc::new(BTreeMap::new()),
+            },
+        )
+        .await;
+        assert!(matches!(next.output, Output::Silent));
+        let reconnect = pending_read(&f, sources, adapter, Held::default()).await;
+        assert!(matches!(reconnect.output, Output::Unavailable));
+        assert!(
+            f.installer
+                .root(&f.store.readers.get(), cards::VIEW)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn raw_same_index_source_mutation_and_later_managed_commit_do_not_restore_coverage() {
+        let f = registered();
+        let adapter = factory(f.store.clone(), f.views.clone(), f.installer.clone()).unwrap();
+        let index = f.store.index().unwrap();
+        f.store
+            .connection
+            .write()
+            .execute(
+                "UPDATE local_agent_card_clock SET at_ms='1',revision=revision+1 WHERE singleton=1",
+                [],
+            )
+            .unwrap();
+        assert_eq!(f.store.index().unwrap(), index);
+        assert!(
+            collection_ivm::status(&f.store.readers.get())
+                .unwrap()
+                .gap
+                .is_some()
+        );
+        assert!(!(adapter.coverage)(&f.store.readers.get()).unwrap());
+        f.store
+            .connection
+            .batched(|tx| {
+                tx.execute(
+                    "INSERT INTO meta(key,value) VALUES('fixture-after-gap','1')",
+                    [],
+                )
+            })
+            .unwrap()
+            .unwrap();
+        assert!(!scope::readable(&f.store.readers.get()).unwrap());
+        assert!(!(adapter.coverage)(&f.store.readers.get()).unwrap());
+    }
+
+    #[test]
+    fn installed_prepare_rollback_preserves_cut_capture_and_pending_rows() {
+        let f = registered();
+        let before = smallclaims::ivm::source_cut(&f.store.readers.get()).unwrap();
+        let result=f.store.connection.batched(|tx|->anyhow::Result<()> {
+            tx.execute("UPDATE local_agent_card_clock SET at_ms='10',revision=revision+1 WHERE singleton=1",[])?;
+            assert!(!collection_ivm::clean(tx)?);
+            anyhow::bail!("rollback captured source before finalization")
+        }).unwrap();
+        assert!(result.is_err());
+        assert_eq!(
+            smallclaims::ivm::source_cut(&f.store.readers.get()).unwrap(),
+            before
+        );
+        assert!(scope::readable(&f.store.readers.get()).unwrap());
+        assert!(collection_ivm::clean(&f.store.readers.get()).unwrap());
+        let adapter = factory(f.store.clone(), f.views.clone(), f.installer.clone()).unwrap();
+        assert!(!(adapter.coverage)(&f.store.readers.get()).unwrap());
+    }
+
+    #[test]
+    fn factory_rejects_other_store_registry_and_does_not_keep_store_alive() {
+        let first = registered();
+        let other = registered();
+        assert!(
+            factory(
+                first.store.clone(),
+                other.views.clone(),
+                other.installer.clone()
+            )
+            .is_err()
+        );
+        let weak = Arc::downgrade(&first.store);
+        let adapter = factory(
+            first.store.clone(),
+            first.views.clone(),
+            first.installer.clone(),
+        )
+        .unwrap();
+        drop(first);
+        assert!(
+            weak.upgrade().is_none(),
+            "factory must not create a retained Store cycle"
+        );
+        drop(adapter);
+    }
+}
