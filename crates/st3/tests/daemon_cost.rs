@@ -1083,6 +1083,12 @@ struct Cost {
     statements: u64,
     /// The answer's size in bytes, or the rows a trim deleted.
     answer: u64,
+    /// How many things the answer returned ([`item_count`]), at least one.
+    items: u64,
+    /// The most times one normalized statement text ran during the request, transaction control
+    /// aside, and that text.
+    max_repeat: u64,
+    top_shape: String,
     error: Option<String>,
 }
 
@@ -1096,6 +1102,13 @@ impl Cost {
             autoindex_rows: least(|cost| cost.autoindex_rows),
             statements: least(|cost| cost.statements),
             answer: samples.iter().map(|cost| cost.answer).max().unwrap_or(0),
+            items: samples.iter().map(|cost| cost.items).max().unwrap_or(0),
+            max_repeat: least(|cost| cost.max_repeat),
+            top_shape: samples
+                .iter()
+                .min_by_key(|cost| cost.max_repeat)
+                .map(|cost| cost.top_shape.clone())
+                .unwrap_or_default(),
             error: samples.iter().find_map(|cost| cost.error.clone()),
         }
     }
@@ -1109,8 +1122,70 @@ impl Cost {
             statements: work.statements,
             answer,
             error,
+            ..Cost::default()
         }
     }
+}
+
+/// How many things an answer returned: the longest array in its first three levels (so a list
+/// inside a client envelope counts), or the steps nested in the elements of such an array when
+/// those are more. At least one.
+fn item_count(value: &Value) -> u64 {
+    fn walk(value: &Value, depth: usize, best: &mut u64) {
+        match value {
+            Value::Array(items) => {
+                *best = (*best).max(items.len() as u64);
+                let nested: u64 = items
+                    .iter()
+                    .filter_map(|item| item.get("steps"))
+                    .filter_map(Value::as_array)
+                    .map(|steps| steps.len() as u64)
+                    .sum();
+                *best = (*best).max(nested);
+                if depth < 3 {
+                    for item in items {
+                        walk(item, depth + 1, best);
+                    }
+                }
+            }
+            Value::Object(map) if depth < 3 => {
+                for value in map.values() {
+                    walk(value, depth + 1, best);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut best = 0;
+    walk(value, 0, &mut best);
+    best.max(1)
+}
+
+/// The statement text that ran most often since the last histogram take, and how many
+/// times. Transaction control and pragmas are not counted: a request opens one transaction.
+fn most_repeated_shape() -> (u64, String) {
+    smallclaims::sqlite::histogram::take()
+        .into_iter()
+        .filter(|(shape, _)| {
+            let shape = shape.trim_start().to_ascii_uppercase();
+            !["BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE", "PRAGMA"]
+                .iter()
+                .any(|control| shape.starts_with(control))
+        })
+        .map(|(shape, counted)| (counted.count, shape))
+        .max()
+        .unwrap_or((0, String::new()))
+}
+
+#[test]
+fn item_count_finds_envelope_lists_and_nested_steps() {
+    assert_eq!(item_count(&json!({"ok": true})), 1);
+    assert_eq!(item_count(&json!([1, 2, 3])), 3);
+    assert_eq!(item_count(&json!({"value": {"items": [1, 2, 3, 4]}})), 4);
+    let runs = json!([{"steps": [1, 2, 3]}, {"steps": [1, 2, 3, 4, 5]}]);
+    assert_eq!(item_count(&runs), 8, "nested steps outnumber the two runs");
+    let deep = json!({"a": {"b": {"c": {"d": [1, 2, 3, 4, 5, 6]}}}});
+    assert_eq!(item_count(&deep), 1, "four levels down is not an item list");
 }
 
 /// Items of the generated store the probes refer to.
@@ -1480,6 +1555,7 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<Value, String>>,
 {
+    smallclaims::sqlite::histogram::take();
     let before = work::total();
     let answer = request().await;
     // Work a request leaves to a background task belongs to it too.
@@ -1502,13 +1578,22 @@ where
             value.to_string().chars().take(400).collect::<String>()
         );
     }
-    match answer {
-        Ok(value) => Cost::from_work(
-            spent,
-            serde_json::to_vec(&value).unwrap().len() as u64,
-            None,
-        ),
-        Err(error) => Cost::from_work(spent, 0, Some(error)),
+    let (max_repeat, top_shape) = most_repeated_shape();
+    let cost = match &answer {
+        Ok(value) => Cost {
+            items: item_count(value),
+            ..Cost::from_work(
+                spent,
+                serde_json::to_vec(value).unwrap().len() as u64,
+                None,
+            )
+        },
+        Err(error) => Cost::from_work(spent, 0, Some(error.clone())),
+    };
+    Cost {
+        max_repeat,
+        top_shape,
+        ..cost
     }
 }
 

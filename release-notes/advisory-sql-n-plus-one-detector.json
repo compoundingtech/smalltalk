@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Count items and repeated statements in the cost check, and add an advisory N+1 report script",
+  "replay": {"status": "none", "detail": "No replay or rebuild. Test-only counting and an offline report script; the daemon is unchanged."},
+  "schema": {"status": "none", "detail": "No tables, columns, indexes or triggers."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged."},
+  "compatibility": {"status": "none", "detail": "No client, wire or harness contract change."},
+  "downtime": {"status": "none", "detail": "None."},
+  "manual": {"status": "none", "detail": "No manual step."},
+  "recovery": {"status": "none", "detail": "Nothing to recover: the statement histogram exists only in test and test-support builds, and the report script is advisory and never fails a build."}
+}
