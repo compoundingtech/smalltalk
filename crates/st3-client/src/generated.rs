@@ -162,6 +162,8 @@ pub struct PageInfo {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Page {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<AttentionHistoryAvailability>,
     pub kind: String,
     pub collection: String,
     #[serde(default)]
@@ -296,6 +298,8 @@ pub struct Operational {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Attention {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<AttentionResolution>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_form: Option<Value>,
     #[serde(default)]
     pub episode: String,
@@ -343,6 +347,28 @@ pub struct Attention {
     pub target_states: Vec<AttentionTargetState>,
     #[serde(default)]
     pub actions: Vec<String>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct AttentionHistoryAvailability {
+    pub complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+/// Durable source closure. Absent fields mean that provenance was not recorded.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct AttentionResolution {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_label: Option<String>,
 }
 /// The mission step that asked and waits for the answer.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

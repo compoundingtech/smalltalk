@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Read recorded closed attention episodes with bounded person-scoped history pages and closure provenance",
+  "replay": {
+    "status": "changed",
+    "detail": "Opening history performs constant schema/state work, with no claim scan, replay or inline reconstruction. An authorized explicit history read enables a resumable daemon worker: each read page examines at most 128 claim metadata rows and reconstructs at most 16 sources outside the write lock. Each source is capped at 256 retained claims and 256 generated rows with a 250 ms reconstruction deadline. Short publication uses a 250 ms SQLite progress deadline and rejects plans after any intervening connection commit, including admission metadata changes at an unchanged claim frontier. Claim writes and GETs never reconstruct history. History-only writes publish no canonical commit notifications or open stream invalidations; idle checks are read-only."
+  },
+  "schema": {
+    "status": "changed",
+    "detail": "Adds four classified disposable local history tables (rows, state, dirty queue and quarantine) and ordered per-person/source cache indexes. No new claim-log index or existing-claim index build. After history enablement, insert/delete/body/actor triggers track relevant exact claim kinds; custom-source triggers require an attention manifest and omit client kinds. Batch origin/replica-sequence metadata changes and replica-record repair/restoration/removal dirty affected sources; normal record inserts and position updates do not look up claims. A claims-delete trigger fences a lower retained frontier after trim. No claim schema, replicated digest or schema-version change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules, shared projection digests and canonical source answer semantics are unchanged."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "GET /v1/client/attention with history=true and state=resolved returns only recorded closed episodes; history=true without state also selects this list. Default, combined Now and stream reads stay open-only. Optional resolution and page history availability fields are generated in Rust, Swift and TypeScript. Every resolution field is optional. Closure actor is a source claim subject, never a device receipt. History is explicitly incomplete: login disappearance, implicit cancellations without a source closure claim and custom sources requiring historical external dependency validity are omitted. Pre-upgrade custom history requires retained facts and an immutable manifest. Authenticated snapshot cursors bind the person, filters and limit; old snapshots may return short or empty pages with a continuation to cap database cost. History cursors expire on daemon restart. Non-person sessions must supply an explicit person filter under existing read.projections authority; global resolved reads return forbidden. Background indexing and quarantined sources supply short server-written incomplete-coverage notes. Cursors pin local cache versions as well as the graph cut and are invalidated by replay/checkpoint renumbering epochs. Sources exceeding 256 retained claims or 256 generated rows, or the reconstruction budget, are omitted with the existing degraded-history coverage note."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "History opening adds no source scan or backfill. The daemon starts serving before bounded background reconstruction, which resumes saved progress. History may initially be empty or partial with complete:false and an indexing note; this does not establish timing for unrelated existing startup migrations."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual migration. Clients use the explicit history query and continue through next_cursor, including short or empty pages. All closed can show the server-supplied coverage note."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "Checkpoint projection clearing/full replay increments a local epoch in constant work, fences old cursors and rebuilds in bounded daemon pages. Canonical store_index renumbering cannot hide untouched cache rows. Actual trim dirties affected sources; a bounded delete trigger also advances the epoch if removing the highest claim lowers the retained claim frontier below the indexed frontier, protecting untouched sources. A failed source is quarantined, its dirty entry cleared and availability marked degraded; claim writes still commit and other sources continue. A subsequent source write retries it. The disposable cache rebuilds only from canonical sources and is never closure authority. Restart loses the signing key; rollback leaves additive caches unused."
+  }
+}

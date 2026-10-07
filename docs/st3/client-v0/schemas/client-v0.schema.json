@@ -271,6 +271,7 @@
             "detail": { "type": "string" },
             "priority": { "enum": ["critical", "high", "normal", "low"] },
             "state": { "enum": ["open", "resolved"] },
+            "resolution": { "$ref": "#/$defs/AttentionResolution", "description": "Recorded source closure; every field is optional when historical provenance is unavailable." },
             "requested_at": { "$ref": "#/$defs/Timestamp" },
             "targets": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
             "target_states": { "type": "array", "items": { "$ref": "#/$defs/AttentionTargetState" } },
@@ -278,6 +279,25 @@
           }
         }
       ]
+    },
+    "AttentionHistoryAvailability": {
+      "type": "object",
+      "required": ["complete"],
+      "properties": {
+        "complete": { "type": "boolean" },
+        "since": { "$ref": "#/$defs/Timestamp" },
+        "note": { "type": "string", "maxLength": 120 }
+      }
+    },
+    "AttentionResolution": {
+      "type": "object",
+      "properties": {
+        "kind": { "enum": ["answered", "withdrawn", "cancelled", "closed"] },
+        "at": { "$ref": "#/$defs/Timestamp" },
+        "by": { "$ref": "#/$defs/Id", "description": "The source claim actor, including delegated agent IDs; never a device receipt." },
+        "reason": { "type": "string" },
+        "answer_label": { "type": "string" }
+      }
     },
     "AttentionBlocked": {
       "type": "object",
@@ -1601,6 +1621,7 @@
         "filters": { "type": "object", "additionalProperties": { "type": "string" } },
         "items": { "type": "array", "items": { "$ref": "#/$defs/Resource" } },
         "page": { "$ref": "#/$defs/PageInfo" },
+        "history": { "$ref": "#/$defs/AttentionHistoryAvailability" },
         "sync": { "$ref": "#/$defs/SyncNotice" },
         "replicated": { "$ref": "#/$defs/ReplicatedNotice" }
       }
