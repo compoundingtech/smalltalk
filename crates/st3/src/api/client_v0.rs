@@ -3156,6 +3156,42 @@ fn operation_resources(state: &AppState, at: &str) -> Result<Vec<Value>, ApiErro
     Ok(values)
 }
 
+struct MissionPageRead {
+    items: Vec<Value>,
+    has_more: bool,
+    after_key: Option<(u128, String)>,
+}
+
+/// Read and materialize only the requested cards plus one continuation identifier.
+/// The caller pins the SQLite snapshot for the whole page.
+fn read_mission_page(
+    store: &Store,
+    history: bool,
+    offset: usize,
+    limit: usize,
+    after_key: Option<&(u128, String)>,
+) -> anyhow::Result<MissionPageRead> {
+    let mut ids =
+        store.mission_collection_page(history, offset, limit.saturating_add(1), after_key)?;
+    let mut has_more = ids.len() > limit;
+    ids.truncate(limit);
+    let mut items = mission_list_cards(
+        store,
+        &ids.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
+    )?;
+    has_more |= bound_mission_cards(&mut items)?;
+    let after_key = items.last().and_then(|item| {
+        ids.iter()
+            .find(|(id, _)| Some(id.as_str()) == item["id"].as_str())
+            .map(|(id, time)| (*time, id.clone()))
+    });
+    Ok(MissionPageRead {
+        items,
+        has_more,
+        after_key,
+    })
+}
+
 pub(super) async fn missions(
     State(state): State<AppState>,
     Extension(snapshot): Extension<ClientSnapshot>,
@@ -3216,25 +3252,8 @@ pub(super) async fn missions(
         let store = reader.store.clone();
         store.read_snapshot(|index| {
             let snapshot = client_snapshot_at(&reader, index);
-            let mut ids = store.mission_collection_page(
-                history,
-                offset,
-                limit.saturating_add(1),
-                after_key.as_ref(),
-            )?;
-            let mut has_more = ids.len() > limit;
-            ids.truncate(limit);
-            let mut items = mission_list_cards(
-                &store,
-                &ids.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
-            )?;
-            has_more |= bound_mission_cards(&mut items)?;
-            let after_key = items.last().and_then(|item| {
-                ids.iter()
-                    .find(|(id, _)| Some(id.as_str()) == item["id"].as_str())
-                    .map(|(id, time)| (*time, id.clone()))
-            });
-            Ok(Some((snapshot, items, has_more, after_key)))
+            let page = read_mission_page(&store, history, offset, limit, after_key.as_ref())?;
+            Ok(Some((snapshot, page.items, page.has_more, page.after_key)))
         })
     })
     .await?;
@@ -9853,6 +9872,69 @@ mod tests {
         assert_eq!(frame["kind"], "snapshot");
         socket.close(None).await.unwrap();
         server.abort();
+    }
+
+    #[test]
+    fn missions_first_page_has_bounded_queries_with_thousands_of_definitions() {
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("large.sqlite");
+        let store = Arc::new(Store::open(&db, "client-v0-baseline").unwrap());
+        let source = "version 2\nmission \"base\" state=\"ready\" { goal \"Page quickly\" }\n";
+        let intent = crate::graph::parse_intent(source, "client-v0-baseline").unwrap();
+        let planned = store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &planned.subject_tokens, "large-page-base")
+            .unwrap();
+        let base = store.mission_definitions().unwrap().remove(0).mission;
+        let claim_id: String = rusqlite::Connection::open(&db)
+            .unwrap()
+            .query_row(
+                "SELECT claim_id FROM mission_definitions WHERE mission_id='base'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut connection = rusqlite::Connection::open(&db).unwrap();
+        crate::store::configure_projection_writer(&connection).unwrap();
+        let transaction = connection.transaction().unwrap();
+        for index in 0..3000 {
+            let id = format!("large-{index:04}");
+            let mut mission = base.clone();
+            mission.id = id.clone();
+            mission.subject = format!("mission/{id}");
+            transaction.execute(
+                "INSERT INTO mission_revisions(mission_id,revision,state,body,claim_id,created_index) VALUES(?1,?2,'ready',?3,?4,1)",
+                rusqlite::params![id, mission.revision, serde_json::to_string(&mission).unwrap(), claim_id],
+            ).unwrap();
+            transaction.execute(
+                "INSERT INTO mission_definitions(mission_id,revision,state,claim_id) VALUES(?1,?2,'ready',?3)",
+                rusqlite::params![id, mission.revision, claim_id],
+            ).unwrap();
+        }
+        transaction.commit().unwrap();
+        // Measure on this thread inside the same read used by the HTTP handler. Other tests'
+        // connections cannot contribute to STATEMENTS_RUN, even under parallel libtest load.
+        let before = crate::store::STATEMENTS_RUN.with(std::cell::Cell::get);
+        let page = store
+            .read_snapshot(|_| read_mission_page(&store, false, 0, 50, None))
+            .unwrap();
+        let statements = crate::store::STATEMENTS_RUN.with(std::cell::Cell::get) - before;
+        assert_eq!(page.items.len(), 50);
+        assert!(page.has_more);
+        assert_eq!(page.after_key.as_ref().unwrap().1, page.items[49]["id"]);
+        // Six overview queries per card, plus the page, attention and snapshot reads.
+        assert!(
+            statements > 0 && statements <= 50 * 6 + 10,
+            "a 50-card page must query only its cards, not all 3001 definitions: {statements} statements"
+        );
     }
 
     #[test]

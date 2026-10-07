@@ -17342,13 +17342,21 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn retention_quick_concurrent_calls_share_the_response() {
         let root = tempfile::tempdir().unwrap();
-        let state = state(root.path());
+        let mut state = state(root.path());
+        // Shared-cache in-memory SQLite returns SQLITE_LOCKED when one caller reads
+        // during another's write. Exercise the daemon's file-backed WAL concurrency.
+        state.store = Arc::new(Store::open(&root.path().join("quick.sqlite"), "node").unwrap());
+        let start = Arc::new(tokio::sync::Barrier::new(12));
         let request = retention_quick_request(root.path());
         let workers = (0..12)
             .map(|_| {
                 let state = state.clone();
                 let request = request.clone();
-                tokio::spawn(async move { quick_agent(&state, request, "codex").await.unwrap() })
+                let start = start.clone();
+                tokio::spawn(async move {
+                    start.wait().await;
+                    quick_agent(&state, request, "codex").await.unwrap()
+                })
             })
             .collect::<Vec<_>>();
         let mut responses = Vec::new();
