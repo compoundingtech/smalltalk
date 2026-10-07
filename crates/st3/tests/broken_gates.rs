@@ -632,7 +632,7 @@ mission "orchid/replay" state="ready" {
 }
 
 #[test]
-fn missions_and_doctor_surface_a_terminal_field_gate_behind_a_pending_gate() {
+fn missions_surface_a_terminal_field_gate_and_doctor_leaves_it_unchecked() {
     if st3::test_support::supervise_test() {
         return;
     }
@@ -694,7 +694,7 @@ mission "orchid/replay" state="ready" {
         root.path().join("running").exists()
     });
     assert!(daemon.run()["stuck_gates"].is_null());
-    assert_eq!(check()["status"], "pass");
+    assert_eq!(check()["status"], "unknown");
     std::fs::write(root.path().join("release"), "go").unwrap();
     wait_for("the terminal exec diagnostic", || {
         daemon.run()["stuck_gates"]
@@ -712,9 +712,9 @@ mission "orchid/replay" state="ready" {
     assert!(stuck.contains("exec/orchid/replay/prepare"), "{stuck}");
     assert!(stuck.contains("exit code 2"), "{stuck}");
     let health = check();
-    assert_eq!(health["status"], "warn", "{health}");
+    assert_eq!(health["status"], "unknown", "{health}");
     assert!(
-        health["message"].as_str().unwrap().contains(stuck),
+        health["message"].as_str().unwrap().contains("evidence incomplete"),
         "{health}"
     );
     let output = st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
@@ -756,7 +756,7 @@ mission "orchid/replay" state="ready" {
         daemon.run()["status"] == "cancelled"
     });
     assert!(daemon.run()["stuck_gates"].is_null());
-    assert_eq!(check()["status"], "pass");
+    assert_eq!(check()["status"], "unknown");
 }
 
 /// The replay mission. `fixed` selects the revised gates; nothing else differs.

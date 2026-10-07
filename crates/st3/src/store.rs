@@ -122,6 +122,7 @@ mod convergence;
 mod document_index_tests;
 mod lanes;
 mod operations;
+pub mod offline_audit;
 mod unread_mail;
 mod agent_messages;
 mod conversation_reads;

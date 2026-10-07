@@ -3023,115 +3023,12 @@ fn machine_resources(
     Ok(machines)
 }
 
-/// How long page reads serve the daemon's last diagnostic report before one of them asks for a
-/// new report.
-const OPERATION_REPORT_REFRESH: Duration = Duration::from_secs(30);
-
-struct OperationReport {
-    store: std::sync::Weak<crate::store::Store>,
-    /// `None` while the first report since the daemon started is being made.
-    checks: Option<Arc<Vec<crate::model::DoctorCheck>>>,
-    at: Instant,
-    refreshing: bool,
-}
-
-/// The daemon's last diagnostic report for each store, which the operations collection lists.
-/// Some checks compare the whole projection with the claim log, seconds of work on a busy host's
-/// store, so page reads serve the last report and a new one is made off the request path.
-static OPERATION_REPORTS: OnceLock<Mutex<BTreeMap<usize, OperationReport>>> = OnceLock::new();
-
-fn operation_reports() -> std::sync::MutexGuard<'static, BTreeMap<usize, OperationReport>> {
-    OPERATION_REPORTS
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// Start the daemon's first diagnostic report off the request path, so no read waits for it. The
-/// daemon calls this as its API starts to listen; until the report is made, the operations
-/// collection says that it is being made.
-pub(super) fn start_operation_report(state: &AppState) {
-    let key = Arc::as_ptr(&state.store) as usize;
-    let mut reports = operation_reports();
-    if reports.get(&key).is_some_and(|report| {
-        report
-            .store
-            .upgrade()
-            .is_some_and(|store| Arc::ptr_eq(&store, &state.store))
-    }) {
-        return;
-    }
-    reports.insert(
-        key,
-        OperationReport {
-            store: Arc::downgrade(&state.store),
-            checks: None,
-            at: Instant::now(),
-            refreshing: true,
-        },
-    );
-    let state = state.clone();
-    std::thread::spawn(move || refresh_operation_report(&state, key));
-}
-
-/// The last diagnostic report, or `None` while the first one since the daemon started is being
-/// made.
+/// Current diagnostic evidence is observed directly. Reads never create a report job or use
+/// an expired whole-store report. Missing maintained invariants remain explicitly unknown.
 fn operation_checks(
     state: &AppState,
 ) -> Result<Option<Arc<Vec<crate::model::DoctorCheck>>>, ApiError> {
-    let key = Arc::as_ptr(&state.store) as usize;
-    {
-        let mut reports = operation_reports();
-        if let Some(report) = reports.get_mut(&key).filter(|report| {
-            report
-                .store
-                .upgrade()
-                .is_some_and(|store| Arc::ptr_eq(&store, &state.store))
-        }) {
-            if report.checks.is_some()
-                && report.at.elapsed() >= OPERATION_REPORT_REFRESH
-                && !report.refreshing
-            {
-                report.refreshing = true;
-                let state = state.clone();
-                std::thread::spawn(move || refresh_operation_report(&state, key));
-            }
-            return Ok(report.checks.clone());
-        }
-    }
-    // A server that did not start a report, such as a test's, makes the first one on its first
-    // read.
-    let checks = Arc::new(doctor_report(state)?.0.checks);
-    operation_reports().insert(
-        key,
-        OperationReport {
-            store: Arc::downgrade(&state.store),
-            checks: Some(checks.clone()),
-            at: Instant::now(),
-            refreshing: false,
-        },
-    );
-    Ok(Some(checks))
-}
-
-fn refresh_operation_report(state: &AppState, key: usize) {
-    let checks = doctor_report(state)
-        .ok()
-        .map(|report| Arc::new(report.0.checks));
-    let mut reports = operation_reports();
-    let Some(report) = reports.get_mut(&key) else {
-        return;
-    };
-    report.refreshing = false;
-    match checks {
-        Some(checks) => {
-            report.checks = Some(checks);
-            report.at = Instant::now();
-        }
-        // The first report failed: the next read makes one and answers with its error.
-        None if report.checks.is_none() => drop(reports.remove(&key)),
-        None => {}
-    }
+    Ok(Some(Arc::new(current_doctor_report(state)?.0.checks)))
 }
 
 fn operation_resources(state: &AppState, at: &str) -> Result<Vec<Value>, ApiError> {
@@ -3139,12 +3036,12 @@ fn operation_resources(state: &AppState, at: &str) -> Result<Vec<Value>, ApiErro
         return Ok(vec![json!({
             "id": "operation/diagnostic-report",
             "kind": "operation",
-            "revision": "diagnostic-report:running",
+            "revision": "diagnostic-report:unknown",
             "updated_at": at,
             "component": "daemon",
-            "severity": "info",
-            "state": "running",
-            "summary": "the daemon is making its first diagnostic report since it started",
+            "severity": "warning",
+            "state": "degraded",
+            "summary": "current diagnostic evidence is incomplete; this read does not start an audit",
             "targets": [],
             "operational": { "layer": "current", "actionable": false, "reasons": ["diagnostic"] }
         })]);
@@ -3159,8 +3056,8 @@ fn operation_resources(state: &AppState, at: &str) -> Result<Vec<Value>, ApiErro
                 "revision": format!("{}:{}", check.name, check.status),
                 "updated_at": at,
                 "component": match check.name.as_str() { "replication" => "transport", "runtime-drift" | "runtime-ownership" | "pty-runtime" | "driver-readiness" => "runtime", _ => "daemon" },
-                "severity": match check.status.as_str() { "fail" => "critical", "warn" => "warning", _ => "info" },
-                "state": match check.status.as_str() { "fail" => "failed", "warn" => "degraded", _ => "healthy" },
+                "severity": match check.status.as_str() { "fail" => "critical", "warn" | "unknown" => "warning", _ => "info" },
+                "state": match check.status.as_str() { "fail" => "failed", "warn" | "unknown" => "degraded", _ => "healthy" },
                 "summary": check.message,
                 "targets": [],
                 "operational": { "layer": "current", "actionable": false, "reasons": ["diagnostic"] }
@@ -12095,63 +11992,35 @@ subscription "watch/source" {
         assert_eq!(statements(40), few.get());
     }
 
-    /// The operations collection answers while the first diagnostic report since a start is
-    /// being made, saying so, and lists the report once it is made.
+    /// A cold operations read must remain truthful without starting diagnostics.
     #[test]
     fn operations_answer_while_the_first_report_is_made() {
         let root = tempfile::tempdir().unwrap();
         let state = test_state(root.path());
-        let key = Arc::as_ptr(&state.store) as usize;
-        // As `start_operation_report` leaves it until its thread has made the report.
-        operation_reports().insert(
-            key,
-            OperationReport {
-                store: Arc::downgrade(&state.store),
-                checks: None,
-                at: Instant::now(),
-                refreshing: true,
-            },
-        );
         crate::store::STATEMENTS_RUN.with(|run| run.set(0));
         let pending = operation_resources(&state, "2026-09-30T00:00:00Z").unwrap();
-        assert_eq!(crate::store::STATEMENTS_RUN.with(std::cell::Cell::get), 0);
-        assert_eq!(pending.len(), 1, "{pending:?}");
-        assert_eq!(pending[0]["kind"], "operation");
-        assert_eq!(pending[0]["component"], "daemon");
-        assert_eq!(pending[0]["severity"], "info");
-        assert_eq!(pending[0]["state"], "running");
-        assert_eq!(pending[0]["updated_at"], "2026-09-30T00:00:00Z");
-        refresh_operation_report(&state, key);
-        let report = operation_resources(&state, "2026-09-30T00:00:00Z").unwrap();
+        assert!(crate::store::STATEMENTS_RUN.with(std::cell::Cell::get) <= 1);
+        assert!(!pending.is_empty());
         assert!(
-            report.iter().all(|item| item["state"] != "running"),
-            "{report:?}"
+            pending.iter().any(|item| item["state"] == "degraded"
+                && item["revision"].as_str().unwrap().ends_with(":unknown")),
+            "{pending:?}"
         );
-        assert!(
-            report
-                .iter()
-                .any(|item| item["revision"] == "claim-store:pass"),
-            "{report:?}"
-        );
-
-        // A started report is made on its own thread, and a second start keeps it.
-        let other = tempfile::tempdir().unwrap();
-        let started = test_state(other.path());
-        start_operation_report(&started);
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while operation_checks(&started).unwrap().is_none() {
-            assert!(
-                Instant::now() < deadline,
-                "the started report was never made"
-            );
-            std::thread::sleep(Duration::from_millis(10));
+        assert!(pending.iter().all(|item| item["state"] != "running"));
+        let mut schema: Value = serde_json::from_str(include_str!(
+            "../../../../docs/st3/client-v0/schemas/client-v0.schema.json"
+        )).unwrap();
+        schema.as_object_mut().unwrap().remove("oneOf");
+        schema["$ref"] = json!("#/$defs/Operation");
+        let validator = jsonschema::options()
+            .with_draft(jsonschema::Draft::Draft202012).build(&schema).unwrap();
+        for item in &pending {
+            let errors = validator.iter_errors(item).map(|error| error.to_string()).collect::<Vec<_>>();
+            assert!(errors.is_empty(), "{item}: {errors:?}");
         }
-        let made = operation_checks(&started).unwrap().unwrap();
-        start_operation_report(&started);
-        assert!(Arc::ptr_eq(
-            &made,
-            &operation_checks(&started).unwrap().unwrap()
-        ));
+        let mut invalid = pending[0].clone();
+        invalid["state"] = json!("unknown");
+        assert!(!validator.is_valid(&invalid), "unknown is outside the published Operation enum");
     }
 
     #[test]
@@ -12922,25 +12791,42 @@ mission "example/looped" state="ready" {
         }
     }
 
-    /// Page reads of the operations collection serve the daemon's last diagnostic report, whose
-    /// checks read the whole store, instead of running every check on every read.
+    /// Repeated and changed-cut reads never infer passing invariants from old reports.
     #[test]
     fn operations_serve_the_last_diagnostic_report() {
         let root = tempfile::tempdir().unwrap();
         let state = test_state_named(root.path(), "operations-node");
-        let first = operation_checks(&state).unwrap().unwrap();
-        let second = operation_checks(&state).unwrap().unwrap();
-        assert!(Arc::ptr_eq(&first, &second));
-        assert!(
-            first
-                .iter()
-                .any(|check| check.name == "operation-projection")
-        );
+        for _ in 0..3 {
+            crate::store::STATEMENTS_RUN.with(|run| run.set(0));
+            let checks = operation_checks(&state).unwrap().unwrap();
+            assert!(crate::store::STATEMENTS_RUN.with(std::cell::Cell::get) <= 1);
+            assert_eq!(
+                checks
+                    .iter()
+                    .find(|check| check.name == "operation-projection")
+                    .unwrap()
+                    .status,
+                "unknown"
+            );
+            assert_eq!(
+                checks
+                    .iter()
+                    .find(|check| check.name == "claim-store")
+                    .unwrap()
+                    .status,
+                "pass"
+            );
+        }
         let other = test_state_named(&root.path().join("other"), "operations-other");
-        assert!(!Arc::ptr_eq(
-            &first,
-            &operation_checks(&other).unwrap().unwrap()
-        ));
+        let checks = operation_checks(&other).unwrap().unwrap();
+        assert_eq!(
+            checks
+                .iter()
+                .find(|check| check.name == "operation-projection")
+                .unwrap()
+                .status,
+            "unknown"
+        );
     }
 
     /// A fleet larger than the tree lists shows the first items and says what it left out, rather
