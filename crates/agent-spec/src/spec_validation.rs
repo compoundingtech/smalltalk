@@ -83,7 +83,7 @@ impl RawTask {
     }
 }
 
-fn parse_task_lifecycle(
+pub(crate) fn parse_task_lifecycle(
     identity: &str,
     location: &str,
     lifecycle: Option<&str>,
@@ -97,7 +97,7 @@ fn parse_task_lifecycle(
     }
 }
 
-fn validate_launch(
+pub(crate) fn validate_launch(
     identity: &str,
     command: Option<&String>,
     argv: Option<&Vec<String>>,

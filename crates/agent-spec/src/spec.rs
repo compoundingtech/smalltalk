@@ -19,7 +19,9 @@ mod spec_validation;
 pub use spec_validation::{
     validate_agent_address, validate_agent_id, validate_desired_state_reason, validate_presentation,
 };
-pub(crate) use spec_validation::lower_desired_state;
+pub(crate) use spec_validation::{
+    lower_desired_state, parse_task_lifecycle, validate_launch,
+};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
