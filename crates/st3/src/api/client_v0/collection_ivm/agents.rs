@@ -9,7 +9,7 @@ use crate::store::{
     collection_ivm::{agent_source, scope},
 };
 use anyhow::{Context as _, ensure};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension as _};
 use smallclaims::ivm::{
     SourceCut, Views,
     install::{Installer, Root},
@@ -96,7 +96,7 @@ pub(in crate::api::client_v0) fn factory(
                             && current.snapshot == boundary.snapshot,
                         "agent row and collection boundaries differ"
                     );
-                    let frame_time = client_snapshot_at(state, cut.projected).created_at;
+                    let frame_time = frame_time(connection, cut.projected)?;
                     // Select only indexed metadata before fetching public bodies. Native row
                     // evidence must belong to the complete namespace footprint; an empty native
                     // selection still authenticates that entire boundary, including silent changes.
@@ -144,6 +144,24 @@ pub(in crate::api::client_v0) fn factory(
             },
         ),
     })
+}
+
+// Presentation time belongs to the same authorized SQL snapshot as the selected cards.
+fn frame_time(connection: &Connection, projected: u64) -> anyhow::Result<String> {
+    let at = if projected == 0 {
+        0
+    } else {
+        connection
+            .query_row(
+                "SELECT accepted_at_unix_ms FROM claims WHERE store_index <= ?1 ORDER BY store_index DESC LIMIT 1",
+                [projected],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|value| value.parse::<u128>().ok())
+            .unwrap_or_default()
+    };
+    Ok(client_timestamp(at))
 }
 
 fn certified(
@@ -211,6 +229,107 @@ fn unchanged(
 mod tests {
     use super::*;
     use crate::store::collection_ivm;
+
+    #[test]
+    fn frame_time_keeps_held_wal_snapshot_through_append_and_same_index_repair() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(&root.path().join("time.sqlite"), "time-fixture").unwrap();
+        let append = || {
+            store
+                .append_claim(&crate::model::ClaimInput {
+                    subject: "agent/time-fixture".into(),
+                    kind: "runtime.observed".into(),
+                    actor: Some("agent/time-fixture".into()),
+                    fields: serde_json::from_value(json!({"status":"running"})).unwrap(),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap()
+        };
+        let first = append();
+        store
+            .connection
+            .batched(|tx| {
+                tx.execute(
+                    "UPDATE claims SET accepted_at_unix_ms='1000' WHERE store_index=?1",
+                    [first.store_index],
+                )
+            })
+            .unwrap()
+            .unwrap();
+        let held = store.readers.get();
+        held.execute_batch("BEGIN DEFERRED").unwrap();
+        assert_eq!(
+            frame_time(&held, first.store_index).unwrap(),
+            client_timestamp(1000)
+        );
+        assert_eq!(frame_time(&held, 0).unwrap(), client_timestamp(0));
+        let later = append();
+        assert!(later.store_index > first.store_index);
+        assert_eq!(
+            frame_time(&held, first.store_index).unwrap(),
+            client_timestamp(1000)
+        );
+        // This manually held transaction is not the bridge's pinned read_snapshot callback.
+        // Its separate pool read demonstrates the isolation provided by the explicit Connection.
+        store
+            .connection
+            .batched(|tx| {
+                tx.execute(
+                    "UPDATE claims SET accepted_at_unix_ms='9000' WHERE store_index=?1",
+                    [first.store_index],
+                )
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(store.projection_time_at(first.store_index).unwrap(), 9000);
+        assert_eq!(
+            frame_time(&held, first.store_index).unwrap(),
+            client_timestamp(1000)
+        );
+        held.execute_batch("COMMIT").unwrap();
+        assert_eq!(
+            frame_time(&held, first.store_index).unwrap(),
+            client_timestamp(9000)
+        );
+        store
+            .read_snapshot(|index| {
+                let connection = store.readers.get();
+                assert_eq!(store.projection_time_at(first.store_index)?, 9000);
+                assert_eq!(
+                    frame_time(&connection, first.store_index)?,
+                    client_timestamp(9000)
+                );
+                std::thread::scope(|writer| {
+                    writer
+                        .spawn(|| {
+                            store
+                                .connection
+                                .batched(|tx| {
+                                    tx.execute(
+                            "UPDATE claims SET accepted_at_unix_ms='12000' WHERE store_index=?1",
+                            [first.store_index],
+                        )
+                                })
+                                .unwrap()
+                                .unwrap();
+                        })
+                        .join()
+                        .unwrap();
+                });
+                // The old implementation is already correct on the real pinned bridge path.
+                assert_eq!(store.projection_time_at(first.store_index)?, 9000);
+                assert_eq!(
+                    frame_time(&connection, first.store_index)?,
+                    client_timestamp(9000)
+                );
+                assert_eq!(store.index()?, index);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(store.projection_time_at(first.store_index).unwrap(), 12000);
+    }
 
     struct Registered {
         root: tempfile::TempDir,
