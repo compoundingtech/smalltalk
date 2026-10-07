@@ -48,8 +48,6 @@ cargo test -p st3 --locked --test integration typed_keys
 cargo test -p st3 --locked --test integration client_only
 cargo build -p st3 --locked
 ST3_PERSON=person/<your-id> python3 crates/stui/tests/pty_smoke.py target/debug/st3
-ST3_PERSON=person/<your-id> python3 crates/stui/tests/interaction_qa.py target/debug/st3 AGENT_NAME
-ST3_PERSON=person/<your-id> python3 crates/stui/tests/attachment_qa.py target/debug/st3 AGENT_NAME
 ```
 
 The PTY smoke test runs with or without a local daemon. It checks first-frame and key-to-redraw
