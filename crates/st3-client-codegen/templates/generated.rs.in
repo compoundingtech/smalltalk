@@ -2730,6 +2730,159 @@ pub enum ActionStatus {
     Unknown,
 }
 
+/// UUID-shaped event, launch or update identifier.
+pub type ClientDiagnosticUuid = String;
+/// Nonnegative JSON-safe integer milliseconds; admission enforces the upper bound.
+pub type ClientDiagnosticMilliseconds = u64;
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ClientDiagnosticSeverity {
+    Info,
+    Warning,
+    Error,
+    Fatal,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClientDiagnosticCaptureSource {
+    Js,
+    NativeMarker,
+    Metrickit,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClientDiagnosticOccurrenceTimeBasis {
+    Exact,
+    MetricIntervalEnd,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClientDiagnosticLaunchIdBasis {
+    Process,
+    MetricInterval,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ClientDiagnosticPlatform {
+    Ios,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClientDiagnosticBreadcrumb {
+    NativeStart,
+    JsStart,
+    RootMounted,
+    Foreground,
+    Background,
+    PreviousLaunchUnclean,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub enum ClientDiagnosticJsErrorName {
+    Error,
+    TypeError,
+    RangeError,
+    ReferenceError,
+    SyntaxError,
+    UnknownError,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClientDiagnosticJsModule {
+    App,
+    ReactNative,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ClientDiagnosticNativeBinary {
+    App,
+    System,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClientDiagnosticJsFrame {
+    pub module: ClientDiagnosticJsModule,
+    pub line: u32,
+    pub column: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClientDiagnosticNativeFrame {
+    pub binary: ClientDiagnosticNativeBinary,
+    pub offset: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum ClientDiagnosticPayload {
+    Launch {
+        breadcrumb: ClientDiagnosticBreadcrumb,
+        inferred: bool,
+    },
+    JsError {
+        name: ClientDiagnosticJsErrorName,
+        fatal: bool,
+        frames: Vec<ClientDiagnosticJsFrame>,
+    },
+    NativeCrash {
+        exception_type: Option<u32>,
+        signal: Option<u32>,
+        frames: Vec<ClientDiagnosticNativeFrame>,
+    },
+    Hang {
+        duration_ms: ClientDiagnosticMilliseconds,
+        frames: Vec<ClientDiagnosticNativeFrame>,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ClientDiagnosticEvent {
+    pub event_id: ClientDiagnosticUuid,
+    pub launch_id: ClientDiagnosticUuid,
+    pub launch_id_basis: ClientDiagnosticLaunchIdBasis,
+    pub sequence: u32,
+    pub occurred_at_unix_ms: ClientDiagnosticMilliseconds,
+    pub occurrence_time_basis: ClientDiagnosticOccurrenceTimeBasis,
+    pub captured_at_unix_ms: ClientDiagnosticMilliseconds,
+    pub app_version: String,
+    pub native_build: String,
+    pub runtime_version: String,
+    pub update_id: String,
+    pub platform: ClientDiagnosticPlatform,
+    pub os_version: String,
+    pub severity: ClientDiagnosticSeverity,
+    pub capture_source: ClientDiagnosticCaptureSource,
+    pub payload: ClientDiagnosticPayload,
+}
+
+/// Version 1, 1–32 events, at most 128 KiB of serialized JSON.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ClientDiagnosticsBatch {
+    pub version: u32,
+    pub events: Vec<ClientDiagnosticEvent>,
+}
+
+/// Acknowledgement means durable ingestion, including already-ingested duplicates.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClientDiagnosticsAck {
+    pub acknowledged_event_ids: Vec<ClientDiagnosticUuid>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct PairingBegin {
     pub api_version: String,

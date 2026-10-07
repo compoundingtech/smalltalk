@@ -9,9 +9,132 @@
     { "$ref": "#/$defs/ActionRequest" },
     { "$ref": "#/$defs/PairingBegin" },
     { "$ref": "#/$defs/PairingComplete" },
-    { "$ref": "#/$defs/PairingAdvertisement" }
+    { "$ref": "#/$defs/PairingAdvertisement" },
+    { "$ref": "#/$defs/ClientDiagnosticsBatch" }
   ],
   "$defs": {
+    "ClientDiagnosticUuid": {
+      "type": "string", "minLength": 36, "maxLength": 36,
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+    },
+    "ClientDiagnosticMilliseconds": {
+      "type": "integer", "minimum": 0, "maximum": 9007199254740991,
+      "description": "Nonnegative JSON-safe integer milliseconds."
+    },
+    "ClientDiagnosticSeverity": {"enum": ["info", "warning", "error", "fatal"]},
+    "ClientDiagnosticCaptureSource": {"enum": ["js", "native-marker", "metrickit"]},
+    "ClientDiagnosticOccurrenceTimeBasis": {
+      "enum": ["exact", "metric-interval-end"],
+      "description": "MetricKit reports an interval end, not an exact diagnostic occurrence time."
+    },
+    "ClientDiagnosticLaunchIdBasis": {
+      "enum": ["process", "metric-interval"],
+      "description": "A MetricKit interval uses a synthetic launch UUID rather than attribution to the receiving process."
+    },
+    "ClientDiagnosticPlatform": {"const": "ios"},
+    "ClientDiagnosticBreadcrumb": {"enum": ["native-start", "js-start", "root-mounted", "foreground", "background", "previous-launch-unclean"]},
+    "ClientDiagnosticJsErrorName": {"enum": ["Error", "TypeError", "RangeError", "ReferenceError", "SyntaxError", "UnknownError"]},
+    "ClientDiagnosticJsModule": {"enum": ["app", "react-native", "unknown"]},
+    "ClientDiagnosticNativeBinary": {"enum": ["app", "system", "unknown"]},
+    "ClientDiagnosticJsFrame": {
+      "type": "object", "additionalProperties": false,
+      "required": ["module", "line", "column"],
+      "properties": {
+        "module": {"$ref": "#/$defs/ClientDiagnosticJsModule"},
+        "line": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+        "column": {"type": "integer", "minimum": 0, "maximum": 4294967295}
+      }
+    },
+    "ClientDiagnosticNativeFrame": {
+      "type": "object", "additionalProperties": false,
+      "required": ["binary", "offset"],
+      "properties": {
+        "binary": {"$ref": "#/$defs/ClientDiagnosticNativeBinary"},
+        "offset": {"type": "string", "minLength": 1, "maxLength": 32, "pattern": "^[0-9a-f]+$"}
+      }
+    },
+    "ClientDiagnosticPayload": {
+      "description": "Bounded privacy-safe diagnostics; no messages, arbitrary strings, symbol names or raw dumps.",
+      "oneOf": [
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["kind", "breadcrumb", "inferred"],
+          "properties": {
+            "kind": {"const": "launch"},
+            "breadcrumb": {"$ref": "#/$defs/ClientDiagnosticBreadcrumb"},
+            "inferred": {"type": "boolean"}
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["kind", "name", "fatal", "frames"],
+          "properties": {
+            "kind": {"const": "js-error"},
+            "name": {"$ref": "#/$defs/ClientDiagnosticJsErrorName"},
+            "fatal": {"type": "boolean"},
+            "frames": {"type": "array", "maxItems": 32, "items": {"$ref": "#/$defs/ClientDiagnosticJsFrame"}}
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["kind", "exception_type", "signal", "frames"],
+          "properties": {
+            "kind": {"const": "native-crash"},
+            "exception_type": {"type": ["integer", "null"], "minimum": 0, "maximum": 4294967295},
+            "signal": {"type": ["integer", "null"], "minimum": 0, "maximum": 4294967295},
+            "frames": {"type": "array", "maxItems": 32, "items": {"$ref": "#/$defs/ClientDiagnosticNativeFrame"}}
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["kind", "duration_ms", "frames"],
+          "properties": {
+            "kind": {"const": "hang"},
+            "duration_ms": {"$ref": "#/$defs/ClientDiagnosticMilliseconds"},
+            "frames": {"type": "array", "maxItems": 32, "items": {"$ref": "#/$defs/ClientDiagnosticNativeFrame"}}
+          }
+        }
+      ]
+    },
+    "ClientDiagnosticEvent": {
+      "type": "object", "additionalProperties": false,
+      "required": ["event_id", "launch_id", "launch_id_basis", "sequence", "occurred_at_unix_ms", "occurrence_time_basis", "captured_at_unix_ms", "app_version", "native_build", "runtime_version", "update_id", "platform", "os_version", "severity", "capture_source", "payload"],
+      "properties": {
+        "event_id": {"$ref": "#/$defs/ClientDiagnosticUuid"},
+        "launch_id": {"$ref": "#/$defs/ClientDiagnosticUuid"},
+        "launch_id_basis": {"$ref": "#/$defs/ClientDiagnosticLaunchIdBasis"},
+        "sequence": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+        "occurred_at_unix_ms": {"$ref": "#/$defs/ClientDiagnosticMilliseconds"},
+        "occurrence_time_basis": {"$ref": "#/$defs/ClientDiagnosticOccurrenceTimeBasis"},
+        "captured_at_unix_ms": {"$ref": "#/$defs/ClientDiagnosticMilliseconds"},
+        "app_version": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"},
+        "native_build": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"},
+        "runtime_version": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"},
+        "update_id": {"oneOf": [{"const": "embedded"}, {"$ref": "#/$defs/ClientDiagnosticUuid"}]},
+        "platform": {"$ref": "#/$defs/ClientDiagnosticPlatform"},
+        "os_version": {"type": "string", "minLength": 1, "maxLength": 32, "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"},
+        "severity": {"$ref": "#/$defs/ClientDiagnosticSeverity"},
+        "capture_source": {"$ref": "#/$defs/ClientDiagnosticCaptureSource"},
+        "payload": {"$ref": "#/$defs/ClientDiagnosticPayload"}
+      }
+    },
+    "ClientDiagnosticsBatch": {
+      "description": "Version 1 diagnostics upload. The HTTP request body is limited to 128 KiB; admission validates this serialized-byte bound.",
+      "type": "object", "additionalProperties": false,
+      "required": ["version", "events"],
+      "properties": {
+        "version": {"const": 1},
+        "events": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"$ref": "#/$defs/ClientDiagnosticEvent"}}
+      }
+    },
+    "ClientDiagnosticsAck": {
+      "description": "Only durably ingested event IDs are acknowledged, including already-ingested duplicates.",
+      "type": "object", "additionalProperties": false,
+      "required": ["acknowledged_event_ids"],
+      "properties": {
+        "acknowledged_event_ids": {"type": "array", "maxItems": 32, "items": {"$ref": "#/$defs/ClientDiagnosticUuid"}}
+      }
+    },
     "PairingAdvertisement": {
       "description": "Static unauthenticated pairing preflight; no envelope, presence update or graph information.",
       "type": "object", "additionalProperties": false,
@@ -154,6 +277,7 @@
             { "$ref": "#/$defs/ConversationSearch" },
             { "$ref": "#/$defs/EventPage" },
             { "$ref": "#/$defs/ActionResult" },
+            { "$ref": "#/$defs/ClientDiagnosticsAck" },
             { "$ref": "#/$defs/PairingChallenge" },
             { "$ref": "#/$defs/PairedSession" },
             { "$ref": "#/$defs/TerminalScreen" },
@@ -2187,7 +2311,7 @@
           "minItems": 1,
           "uniqueItems": true,
           "description": "Narrows the default limited grant. Must not be combined with full_control.",
-          "items": { "type": "string", "enum": ["read.projections", "read.glasses", "control.glasses", "terminal.read", "control.attention", "control.launches"] }
+          "items": { "type": "string", "enum": ["read.projections", "write.client-diagnostics", "read.glasses", "control.glasses", "terminal.read", "control.attention", "control.launches"] }
         }
       }
     },

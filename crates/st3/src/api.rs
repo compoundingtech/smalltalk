@@ -61,6 +61,7 @@ use crate::store::Store;
 mod client_blobs;
 mod client_adapters;
 mod client_presence;
+mod client_diagnostics;
 mod client_v0;
 mod custom;
 mod delivery_presence;
@@ -380,6 +381,7 @@ impl ApiError {
             | "glass-owner-forbidden" => StatusCode::FORBIDDEN,
             "lane-not-found" | "not-found" => StatusCode::NOT_FOUND,
             "database-busy" | "database-locked" => StatusCode::SERVICE_UNAVAILABLE,
+            "client-diagnostics-rate-limit" => StatusCode::TOO_MANY_REQUESTS,
             "read-deadline" => StatusCode::GATEWAY_TIMEOUT,
             "internal" => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::UNPROCESSABLE_ENTITY,
@@ -471,6 +473,11 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
     let app = Router::new()
         .route("/v1/health", get(health))
         .route("/v1/client/capabilities", get(client_capabilities))
+        .route(
+            "/v1/client/diagnostics",
+            post(client_diagnostics::ingest)
+                .layer(DefaultBodyLimit::max(client_diagnostics::MAX_REQUEST_BYTES)),
+        )
         .route("/v1/client/sets", get(owned_sets::list))
         .route("/v1/client/sets/{*id}", get(owned_sets::get))
         .route("/v1/client/arrangements", get(client_v0::arrangements::list))

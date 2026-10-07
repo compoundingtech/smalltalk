@@ -214,11 +214,35 @@ pub fn otlp_logs(node: &str, batch: &[ClaimRecord]) -> Value {
                     json!({ "stringValue": incarnation }),
                 ));
             }
+            let client_diagnostic = matches!(observation.kind.as_str(),
+                "client.launch" | "client.js-error" | "client.native-crash" | "client.hang");
+            let (event_time, severity, severity_number) = if client_diagnostic {
+                // The device occurrence time is separate from durable server acceptance.
+                // MetricKit's interval-end approximation remains explicit in the fields.
+                let occurred = fields["occurred_at_unix_ms"].as_u64()
+                    .map(u128::from).unwrap_or(observation.accepted_at_unix_ms);
+                for name in ["event_id", "launch_id", "paired_device", "app_version", "native_build",
+                    "runtime_version", "update_id", "platform", "os_version", "capture_source",
+                    "occurrence_time_basis", "launch_id_basis"] {
+                    if let Some(value) = fields[name].as_str() {
+                        attributes.push(attribute(&format!("st3.client.{name}"), json!({"stringValue":value})));
+                    }
+                }
+                let (severity, number) = match fields["severity"].as_str() {
+                    Some("warning") => ("WARN", 13),
+                    Some("error") => ("ERROR", 17),
+                    Some("fatal") => ("FATAL", 21),
+                    _ => ("INFO", 9),
+                };
+                (Some((occurred * 1_000_000).to_string()), severity, number)
+            } else {
+                (None, "INFO", 9)
+            };
             let mut record = json!({
-                "timeUnixNano": time,
+                "timeUnixNano": event_time.as_deref().unwrap_or(&time),
                 "observedTimeUnixNano": time,
-                "severityNumber": 9,
-                "severityText": "INFO",
+                "severityNumber": severity_number,
+                "severityText": severity,
                 "eventName": observation.kind,
                 "body": any_value(&fields),
                 "attributes": attributes,

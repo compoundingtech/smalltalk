@@ -702,6 +702,12 @@ fn build_registry() -> Registry {
             false,
         ),
         (
+            "client",
+            "client/DEVICE",
+            "A paired device's server-derived diagnostic identity.",
+            false,
+        ),
+        (
             "custom",
             "custom/NAMESPACE/NAME",
             "An extension subject.",
@@ -1849,6 +1855,10 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             false,
             &[],
         ),
+        ("client.launch", &["client"], WritePolicy::SystemOnly, Cardinality::Append, None, false, &[]),
+        ("client.js-error", &["client"], WritePolicy::SystemOnly, Cardinality::Append, None, false, &[]),
+        ("client.native-crash", &["client"], WritePolicy::SystemOnly, Cardinality::Append, None, false, &[]),
+        ("client.hang", &["client"], WritePolicy::SystemOnly, Cardinality::Append, None, false, &[]),
         (
             "harness.timeline",
             &["agent"],
@@ -2449,6 +2459,7 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
 /// `docs/st3/data-authority.md` for the local observation log.
 fn claim_retention(kind: &str) -> Retention {
     match kind {
+        "client.launch" | "client.js-error" | "client.native-crash" | "client.hang" => Retention::Local,
         // The owner reads a transcript from the harness's own session file, or from this log
         // when there is none. Other nodes relay timeline reads to the owner.
         "harness.timeline" | "harness.telemetry" => Retention::Local,
@@ -2477,6 +2488,27 @@ fn claim_retention(kind: &str) -> Retention {
 
 fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
     let names: &[(&str, FieldSpec)] = match kind {
+        "client.launch" | "client.js-error" | "client.native-crash" | "client.hang" => &[
+            ("event_id", required_string()),
+            ("launch_id", required_string()),
+            ("sequence", required_integer()),
+            ("occurred_at_unix_ms", required_integer()),
+            ("captured_at_unix_ms", required_integer()),
+            ("occurrence_time_basis", required_enum(&["exact", "metric-interval-end"])),
+            ("launch_id_basis", required_enum(&["process", "metric-interval"])),
+            ("app_version", required_string()),
+            ("native_build", required_string()),
+            ("runtime_version", required_string()),
+            ("update_id", required_string()),
+            ("platform", required_enum(&["ios"])),
+            ("os_version", required_string()),
+            ("severity", required_enum(&["info", "warning", "error", "fatal"])),
+            ("capture_source", required_enum(&["js", "native-marker", "metrickit"])),
+            ("payload", required_object()),
+            ("paired_device", required_string()),
+            ("pairing_grant", required_string()),
+            ("person_id", required_string()),
+        ],
         "person.delegation-set" => &[("actions", required_array())],
         "workspace.observed" => &[
             ("host", required_string()),
@@ -3962,6 +3994,7 @@ mod tests {
                 "attention",
                 "checkpoint",
                 "checkpoint-excusal",
+                "client",
                 "custom",
                 "daemon",
                 "doc",
@@ -4045,6 +4078,10 @@ mod tests {
                 "checkpoint.excused",
                 "checkpoint.sealed",
                 "checkpoint.verified",
+                "client.hang",
+                "client.js-error",
+                "client.launch",
+                "client.native-crash",
                 "daemon.diagnostic",
                 "daemon.started",
                 "delivery.hold",
