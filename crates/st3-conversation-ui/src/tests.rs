@@ -1136,3 +1136,32 @@ fn native_window_notice_explains_that_the_remainder_is_not_fetchable() {
     let rendered = crate::adapt::conversation(&[entry], &Default::default());
     assert!(rendered.iter().any(|entry|matches!(&entry.body,crate::Body::Event(text) if text.contains("not fetchable"))));
 }
+
+#[test]
+fn native_window_notice_with_unfetchable_remainder_stays_at_start() {
+    let entry = |index: u64, kind: &str, body: serde_json::Value, at: &str| -> st3_client::TimelineEntry {
+        serde_json::from_value(serde_json::json!({
+            "id": format!("entry/{index}"), "sequence": index, "revision": 1,
+            "timestamp": at, "role": "assistant", "final": true, "type": kind, "body": body
+        }))
+        .unwrap()
+    };
+    let timeline = vec![
+        entry(1, "content", serde_json::json!({"media_type":"text/plain","text":"first words"}), "2026-10-05T10:00:00Z"),
+        entry(2, "content", serde_json::json!({"media_type":"text/plain","text":"last words"}), "2026-10-05T11:00:00Z"),
+        entry(
+            0,
+            "truncation",
+            serde_json::json!({"reason":"the native transcript prefix is outside the bounded read window; not fetchable through this owner read","omitted_from_sequence":0,"omitted_to_sequence":0}),
+            "2026-10-06T09:00:00Z",
+        ),
+    ];
+    let rendered = adapt::conversation(&timeline, &Default::default());
+    let shown = rendered
+        .iter()
+        .map(|entry| serde_json::to_string(&entry.body).unwrap())
+        .collect::<Vec<_>>();
+    assert!(shown[0].contains("Earlier history is not shown"), "{shown:?}");
+    assert!(shown[0].contains("not fetchable"), "{shown:?}");
+    assert!(shown.last().unwrap().contains("last words"), "{shown:?}");
+}
