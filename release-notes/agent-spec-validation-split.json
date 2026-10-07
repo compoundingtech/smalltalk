@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Internal agent-spec validation and lowering refactor; no user-visible or runtime behavior change.",
+  "replay": {"status": "none", "detail": "Internal parser code organization only; runtime replay is unchanged."},
+  "schema": {"status": "none", "detail": "No database schema change."},
+  "rules": {"status": "none", "detail": "No checkpoint rules change."},
+  "compatibility": {"status": "none", "detail": "Public spec paths and agent-spec format behavior remain unchanged."},
+  "downtime": {"status": "none", "detail": "No service interruption introduced."},
+  "manual": {"status": "none", "detail": "No installation or operator steps required."},
+  "recovery": {"status": "none", "detail": "No database or runtime recovery change."}
+}
