@@ -1065,8 +1065,8 @@ export type MissionRunSummary = {
 
 } | null;
   current_steps: Array<{
-  assignee?: (AgentId | null);
-  claimant?: (AgentId | null);
+  assignee?: (MissionWorkActorId | null);
+  claimant?: (MissionWorkActorId | null);
   id: StepRunId;
   since: Timestamp;
   state: WorkState;
@@ -1093,12 +1093,12 @@ export type MissionState = ("draft" | "ready" | "retired" | "running" | "standin
 
 export type MissionStep = {
   agentless?: boolean;
-  assignee?: (AgentId | null);
+  assignee?: (MissionWorkActorId | null);
   attempt: number;
   blocked_reason?: string | null;
   blockers?: Array<Id>;
   claim_expires_at?: (Timestamp | null);
-  claimant?: (AgentId | null);
+  claimant?: (MissionWorkActorId | null);
   constraints?: Array<string>;
   goals?: Array<string>;
   id: Id;
@@ -1124,6 +1124,8 @@ export type MissionWake = {
   incarnation_id: string;
   last_attempt_at?: (Timestamp | null);
 };
+
+export type MissionWorkActorId = string;
 
 export type MustAct = ("you" | "agent" | "system" | "blocked" | "nobody" | string);
 

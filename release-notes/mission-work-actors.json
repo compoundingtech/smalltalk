@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Allow people and agents to perform mission-step work while keeping wake assignments agent-only",
+  "replay": {"status": "none", "detail": "No runtime replay behavior changes."},
+  "schema": {"status": "none", "detail": "No database schema or migration changes; this updates the published client JSON schema."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or coordinated member upgrade changes."},
+  "compatibility": {"status": "changed", "detail": "The client contract now accepts agent or person references for mission-step assignees and claimants, including current-step run summaries. MissionWake remains agent-only. Older strict clients may reject person references in these work fields; mixed client versions were not tested."},
+  "downtime": {"status": "none", "detail": "No additional service interruption introduced."},
+  "manual": {"status": "none", "detail": "No installation or data migration steps required; consumers validating these work fields should use the updated contract."},
+  "recovery": {"status": "none", "detail": "No database or runtime recovery changes; older contract validators can still reject person work references."}
+}
