@@ -26,6 +26,17 @@ pub struct ViewRuntime {
 }
 impl ViewRuntime {
     pub fn new(views: Views) -> Result<Self> {
+        // Repair can precede projection of the original during replicated admission. Until
+        // that schedule has a proved per-view eligibility implementation, this reference
+        // runtime must not later re-admit an original that a replacement already retracted.
+        // Production runtimes retain responsibility for their own admitted input policy.
+        ensure!(
+            views
+                .views
+                .iter()
+                .all(|view| view.repair_policy() == RepairPolicy::RetainOriginal),
+            "IVM reference runtime does not support replacement-repair eligibility"
+        );
         let definitions = views
             .views
             .iter()
@@ -140,6 +151,16 @@ impl Runtime for ViewRuntime {
         repaired: &str,
         replacement: &str,
     ) -> Result<()> {
+        let mut kinds =
+            transaction.prepare_cached("SELECT kind FROM claims WHERE id IN (?1,?2)")?;
+        let relevant = kinds
+            .query_map([repaired, replacement], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .iter()
+            .any(|kind| self.views.reads_kind(kind));
+        if !relevant {
+            return Ok(());
+        }
         let old = record(transaction, repaired)?;
         let new = record(transaction, replacement)?;
         let cut = source_cut(transaction)?.context("IVM source unready")?;
@@ -209,10 +230,17 @@ impl Runtime for ViewRuntime {
             let mut statement = transaction.prepare_cached(
                 "SELECT id,store_index,batch_id,subject,kind,origin,actor,body,predecessors,accepted_at_unix_ms
                  FROM claims WHERE store_index>?1 AND store_index<=?2
-                 ORDER BY store_index",
+                 ORDER BY store_index LIMIT ?3",
             )?;
             let claims = statement
-                .query_map(params![previous.projected, through], claim_from_row)?
+                .query_map(
+                    params![
+                        previous.projected,
+                        through,
+                        crate::store::PROJECTION_CHUNK_CLAIMS + 1
+                    ],
+                    claim_from_row,
+                )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             ensure!(
                 claims.len() <= crate::store::PROJECTION_CHUNK_CLAIMS,

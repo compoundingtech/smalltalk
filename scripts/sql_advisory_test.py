@@ -10,8 +10,11 @@ sys.path.insert(0, os.path.dirname(__file__))
 import sql_advisory as advisory
 
 
-def cost(statements, items, repeat=1, shape="SELECT body FROM claims WHERE subject=?", units=None):
+def cost(statements, items, repeat=1, shape="SELECT body FROM claims WHERE subject=?", units=None, steps=10_000, scans=0, answer=10_000):
     return {
+        "vm_steps": steps,
+        "fullscan_steps": scans,
+        "answer": answer,
         "statements": statements,
         "items": items,
         "item_units": units or [items],
@@ -65,6 +68,40 @@ class Detector(unittest.TestCase):
         report = json.loads(json.dumps(REPORT))
         report["large"]["GET /n-plus-one"]["error"] = "503"
         self.assertFalse([f for f in advisory.findings(report) if f["route"] == "GET /n-plus-one"])
+
+
+class Overfetch(unittest.TestCase):
+    def report(self, **big):
+        routes = {
+            "GET /a": cost(5, 1, steps=20_000, answer=10_000),
+            "GET /b": cost(5, 1, steps=30_000, answer=12_000),
+            "GET /c": cost(5, 1, steps=15_000, answer=8_000),
+        }
+        routes["GET /x"] = cost(5, 1, **big)
+        return {"small": json.loads(json.dumps(routes)), "large": routes}
+
+    def detectors(self, report):
+        return sorted({(f["route"], f["detector"]) for f in advisory.findings(report)} - set())
+
+    def test_a_summary_that_reads_a_million_steps_is_flagged(self):
+        found = self.detectors(self.report(steps=1_000_000, answer=500))
+        self.assertIn(("GET /x", "overfetch-steps"), found)
+
+    def test_a_big_answer_with_proportional_work_is_quiet(self):
+        self.assertEqual(self.detectors(self.report(steps=2_000_000, answer=1_000_000)), [])
+
+    def test_a_keyed_read_is_quiet(self):
+        self.assertEqual(self.detectors(self.report(steps=400, answer=300)), [])
+
+    def test_a_scan_to_find_a_small_answer_is_flagged_and_a_small_scan_is_not(self):
+        flagged = self.detectors(self.report(steps=60_000, scans=500_000, answer=2_000))
+        self.assertIn(("GET /x", "overfetch-scan"), flagged)
+        self.assertEqual(self.detectors(self.report(steps=9_000, scans=15_000, answer=100)), [])
+
+    def test_a_failed_route_is_not_judged_for_overfetch(self):
+        report = self.report(steps=1_000_000, answer=500)
+        report["large"]["GET /x"]["error"] = "503"
+        self.assertEqual(self.detectors(report), [])
 
 
 class Units(unittest.TestCase):

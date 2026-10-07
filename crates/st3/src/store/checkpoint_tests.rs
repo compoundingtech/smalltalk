@@ -343,6 +343,95 @@ fn limits_keep_source_observations_even_when_the_same_seat_publishes_again() {
 }
 
 #[test]
+fn a_sealed_set_read_in_pages_is_the_same_set_whatever_the_page() {
+    // Each page of the read is a read of its own, so the WAL is free between pages. The set must
+    // not depend on how the pages fall: one row to a page, a few, and one page for everything.
+    let store = Store::open_memory("alder").unwrap();
+    store
+        .append_claim_outcome(&input(
+            AGENT,
+            "harness.observed",
+            Some(AGENT),
+            json!({"state": "idle", "incarnation_id": "inc-1"}),
+            "harness",
+        ))
+        .unwrap();
+    let old = now_ms() - 9 * DAY_MS;
+    for n in 0..40_u64 {
+        store
+            .append_claim(&input(
+                AGENT,
+                "harness.usage",
+                Some(AGENT),
+                rollup("claude/aaaa", old + u128::from(n) * DAY_MS / 40, 100 + n),
+                &format!("rollup-{n}"),
+            ))
+            .unwrap();
+    }
+    let cut = now_ms() + 1_000;
+    let whole = store.checkpoint_sealed_set_paged(cut, None, i64::MAX / 4, i64::MAX / 4).unwrap();
+    assert!(whole.claims.len() >= 40, "the fixture should seal its claims: {}", whole.claims.len());
+    for (envelope_page, record_page) in [(1, 1), (3, 5), (7, 2), (1_000, 1_000)] {
+        let paged = store.checkpoint_sealed_set_paged(cut, None, envelope_page, record_page).unwrap();
+        assert_eq!(
+            format!("{:?}", paged.claims),
+            format!("{:?}", whole.claims),
+            "claims differ at pages {envelope_page}/{record_page}"
+        );
+        assert_eq!(format!("{:?}", paged.envelopes), format!("{:?}", whole.envelopes));
+        assert_eq!(paged.seal_rowid, whole.seal_rowid);
+        let identities = store.checkpoint_sealed_identities_paged(cut, None, envelope_page).unwrap();
+        assert_eq!(
+            identities,
+            SealedIdentities::of(&whole),
+            "identities differ at page {envelope_page}"
+        );
+    }
+    // The Rust sort of the pages is the SQL canonical order, on a fixture of many batches.
+    let connection = store.readers.get();
+    let sql_order: Vec<String> = connection
+        .prepare(&canonical_sql(
+            "SELECT claims.id FROM claims
+             JOIN replica_records records ON records.claim_id=claims.id
+             WHERE records.state<>'repaired' ORDER BY CANONICAL_ASC(claims)",
+        ))
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    let paged_order: Vec<String> = whole.claims.iter().map(|sealed| sealed.claim.id.clone()).collect();
+    assert_eq!(paged_order, sql_order, "the pages sort as ORDER BY canonical sorts");
+    // The record page query is driven from replica_records by its rowid range. A plan that
+    // drove from claims would read every claim for every window.
+    let plan: Vec<String> = connection
+        .prepare(&format!("EXPLAIN QUERY PLAN {}", sealed_records_page_sql()))
+        .unwrap()
+        .query_map([0_i64, 1_000_i64], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert!(
+        plan.first().is_some_and(|line| line.contains("records") && line.contains("INTEGER PRIMARY KEY")),
+        "the page query must start from a rowid range of replica_records: {plan:?}"
+    );
+    assert!(
+        !plan.iter().any(|line| line.starts_with("SCAN claims") || line.starts_with("SCAN records")),
+        "the page query must not scan a whole table: {plan:?}"
+    );
+    drop(connection);
+    // The default pages are what the daemon uses.
+    assert_eq!(
+        format!("{:?}", store.checkpoint_sealed_set(cut).unwrap().claims),
+        format!("{:?}", whole.claims)
+    );
+    assert_eq!(
+        store.checkpoint_sealed_identities(cut, None).unwrap(),
+        SealedIdentities::of(&whole)
+    );
+}
+
+#[test]
 fn a_usage_trim_keeps_lifetime_usage_and_the_proof_guards_it() {
     let store = Store::open_memory("alder").unwrap();
     store

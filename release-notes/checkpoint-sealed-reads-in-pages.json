@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Read the checkpoint's sealed set in short pages instead of one long read transaction",
+  "replay": {"status": "none", "detail": "No replay or rebuild, and the sealed set, its digest and the checkpoint plan are unchanged for the same claims."},
+  "schema": {"status": "none", "detail": "No tables, columns, indexes or triggers."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged. The sealed set and the sealed-identities digest are the same values as before; a test compares the paged reads with a single read at several page sizes, and the checkpoint, tombstone and sealed tests pass."},
+  "compatibility": {"status": "none", "detail": "No client, wire or harness contract change."},
+  "downtime": {"status": "none", "detail": "None."},
+  "manual": {"status": "none", "detail": "No manual step."},
+  "recovery": {"status": "changed", "detail": "The sealed-set and sealed-identities reads held one read transaction for the whole scan, 20 to 36 seconds on a large store, which kept the write-ahead log from being checkpointed and let it grow to hundreds of megabytes. Each now reads in pages of 5,000 envelopes and 20,000 records, each page a read of its own, so the log can be checkpointed between pages. The one difference from a single snapshot: a record that changes state (a repair) between two pages of the same call could be read in either state. The plan-and-prove copy (VACUUM INTO) is now listed among the live reads in the checkpoint log line, but it still reads the whole store in one transaction."}
+}

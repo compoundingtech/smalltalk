@@ -268,24 +268,83 @@ impl FleetContext {
             "st3: {reported_by} refused this node ({}): {}; it stops syncing",
             removed.code, removed.message
         );
-        if let Some(state_dir) = &self.state_dir
-            && let Ok(Some(mut file)) = crate::fleet::FleetFile::load(state_dir)
-            && file.removed.is_none()
-        {
-            // The details go beside fleet.toml first, so its removal always has them.
-            let _ = crate::fleet::RemovalNotice {
-                reported_by: reported_by.into(),
-                code: removed.code.clone(),
-                message: removed.message.clone(),
-                learned_at_unix_ms: crate::store::now_ms(),
-            }
-            .save(state_dir);
-            file.removed = Some(crate::fleet::FleetRemoval {
-                reported_by: reported_by.into(),
-                code: removed.code.clone(),
-            });
-            let _ = file.save(state_dir);
+        #[cfg(feature = "test-support")]
+        removal_write_barrier("before-lock");
+        if let Err(error) = self.persist_removal(reported_by, removed) {
+            eprintln!("st3: cannot persist fleet refusal: {error:#}");
         }
+        #[cfg(feature = "test-support")]
+        if let Some(directory) = std::env::var_os("ST3_TEST_REMOVAL_WRITE_BARRIER") {
+            std::fs::write(
+                Path::new(&directory).join("finished"),
+                b"refusal writer finished",
+            )
+            .expect("publish removal writer completion");
+        }
+    }
+
+    fn persist_removal(&self, reported_by: &str, removed: &RemovedFromFleet) -> Result<()> {
+        let Some(state_dir) = &self.state_dir else {
+            return Ok(());
+        };
+        let _lock = FleetFile::lock_settings(state_dir)?;
+        // Load only after acquiring ownership. The CLI may have removed the settings while
+        // this writer waited; absence ends persistence without creating any fleet files.
+        let Some(mut file) = FleetFile::load(state_dir)? else {
+            return Ok(());
+        };
+        if file.removed.is_some() {
+            return Ok(());
+        }
+        // A foreground worker may outlive leave and a new join. Its old signed refusal
+        // cannot end the new local incarnation, even when the fleet and node name match.
+        if let Some(own) = &self.own_key
+            && MemberKey::load(&file.node_key_path(state_dir))?.public() != own
+        {
+            return Ok(());
+        }
+        #[cfg(feature = "test-support")]
+        removal_write_barrier("loaded");
+        // The details go beside fleet.toml first, so its removal always has them. Keep the
+        // lock through both temporary-file renames; acknowledgement is not writer drain.
+        crate::fleet::RemovalNotice {
+            reported_by: reported_by.into(),
+            code: removed.code.clone(),
+            message: removed.message.clone(),
+            learned_at_unix_ms: crate::store::now_ms(),
+        }
+        .save(state_dir)?;
+        file.removed = Some(crate::fleet::FleetRemoval {
+            reported_by: reported_by.into(),
+            code: removed.code.clone(),
+        });
+        file.save(state_dir)
+    }
+}
+
+/// Isolated fleet tests can hold the actual refusal writer across CLI cleanup.
+#[cfg(feature = "test-support")]
+fn removal_write_barrier(stage: &str) {
+    let Some(directory) = std::env::var_os("ST3_TEST_REMOVAL_WRITE_BARRIER") else {
+        return;
+    };
+    let directory = Path::new(&directory);
+    if std::fs::read_to_string(directory.join("stage"))
+        .ok()
+        .as_deref()
+        != Some(stage)
+    {
+        return;
+    }
+    std::fs::write(directory.join("entered"), std::process::id().to_string())
+        .expect("publish removal writer barrier");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !directory.join("release").exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "test did not release removal writer"
+        );
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
