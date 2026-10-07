@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Seek local-observation event frontiers instead of scanning observation history",
+  "replay": {"status": "none", "detail": "No claim replay or projection rebuild is introduced; opening an existing store adds an index over unchanged local observations."},
+  "schema": {"status": "changed", "detail": "Adds local_observations_after_store_index on local_observations(after_store_index) through the existing CREATE INDEX IF NOT EXISTS schema initialization. Numeric schema version stays 16. Existing stores build the index once during open; ordinary reopens reuse it. Schema/index change requires Nathan's review."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or replicated digests change; local observations are local-only."},
+  "compatibility": {"status": "none", "detail": "Event cursor values and client/wire contracts are unchanged. The query still returns the minimum observation ID at or after the claim frontier, including trimmed-ID gaps and no-match cases."},
+  "downtime": {"status": "changed", "detail": "The first store open builds the new index before API serving. On a copied store with 204768 local observations, SQLite index creation took 6.304 seconds under heavy host contention; this is not a measured daemon restart-to-API time and larger stores are unmeasured."},
+  "manual": {"status": "none", "detail": "No manual migration or state reset is required; install the build and restart normally."},
+  "recovery": {"status": "none", "detail": "This additive local index does not change rows or schema version. Older schema-16 binaries can read the same store; binary rollback leaves the extra index in place."}
+}
