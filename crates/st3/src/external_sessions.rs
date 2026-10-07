@@ -4065,43 +4065,64 @@ mod tests {
     }
 
     #[test]
-    fn omp_tool_result_preserves_supplied_timing_without_arguments_or_other_details() {
+    fn pi_and_omp_tool_result_blocks_preserve_native_details_and_source_records() {
+        for driver in [ExternalDriver::Omp, ExternalDriver::Pi] {
+            for details in [
+                json!({"wallTimeMs": 12.75, "timeoutSeconds": 0, "futureTimeNs": 0.125}),
+                json!({"wallTimeMs": 0, "timeoutSeconds": 0.125, "future": {"unit": "ticks", "value": 4.5}}),
+            ] {
+                for nested_kind in [None, Some("toolResult"), Some("tool_result")] {
+                    let mut entry = omp_tool_result_fixture()[1].clone();
+                    entry["message"]["arguments"] = json!({"timeoutSeconds": 999});
+                    if let Some(kind) = nested_kind {
+                        entry["message"].as_object_mut().unwrap().remove("toolCallId");
+                        entry["message"]["content"] = json!([{
+                            "type": kind, "call_id": "nested",
+                            "content": "finished", "details": details
+                        }]);
+                    } else {
+                        entry["message"]["details"] = details.clone();
+                    }
+                    let mut items = Vec::new();
+                    normalize_native_line(driver, &entry, 0, "", &mut items);
+                    let result = items
+                        .iter()
+                        .find(|item| item["type"] == "tool_result")
+                        .unwrap();
+                    assert_eq!(result["body"]["blocks"][0]["kind"], "tool_output");
+                    assert_eq!(result["body"]["blocks"][0]["metadata"], details);
+                    assert!(result["body"].get("metadata").is_none());
+                    let source = items
+                        .iter()
+                        .flat_map(|item| item["body"]["blocks"].as_array().unwrap())
+                        .find(|block| block["kind"] == "source_record")
+                        .unwrap();
+                    assert_eq!(source["payload"]["raw"], entry);
+                    assert!(source.get("metadata").is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_tool_result_details_merge_without_inventing_absent_timing() {
         let mut entry = omp_tool_result_fixture()[1].clone();
-        entry["message"]["details"] = json!({
-            "wallTimeMs": 12.75, "timeoutSeconds": 0.125,
-            "output": "must not become metadata"
-        });
+        entry["message"].as_object_mut().unwrap().remove("details");
         entry["message"]["arguments"] = json!({"timeoutSeconds": 999});
         let mut items = Vec::new();
-        normalize_omp(ExternalDriver::Omp, &entry, 0, "", &mut items);
-        let result = items.iter().find(|item| item["type"] == "tool_result").unwrap();
+        normalize_native_line(ExternalDriver::Omp, &entry, 0, "", &mut items);
+        assert!(items.last().unwrap()["body"]["blocks"][0].get("metadata").is_none());
+        items.last_mut().unwrap()["body"]["blocks"][0]["metadata"] =
+            json!({"existing": true, "wallTimeMs": 999});
+        entry["message"]["details"] =
+            json!({"wallTimeMs": 0, "timeoutSeconds": 0.125, "future": "unchanged"});
+        let source_before = items[0]["body"]["blocks"].clone();
+        preserve_omp_result_timing(&mut items, &entry["message"]);
         assert_eq!(
-            result["body"]["metadata"],
-            json!({"wallTimeMs":12.75,"timeoutSeconds":0.125})
+            items.last().unwrap()["body"]["blocks"][0]["metadata"],
+            json!({"existing": true, "wallTimeMs": 0, "timeoutSeconds": 0.125, "future": "unchanged"})
         );
-
-        entry["message"]["details"] = json!({"wallTimeMs": 0});
-        items.clear();
-        normalize_omp(ExternalDriver::Omp, &entry, 0, "", &mut items);
-        let result = items.iter().find(|item| item["type"] == "tool_result").unwrap();
-        assert_eq!(result["body"]["metadata"], json!({"wallTimeMs":0}));
-
-        entry["message"].as_object_mut().unwrap().remove("details");
-        items.clear();
-        normalize_omp(ExternalDriver::Omp, &entry, 0, "", &mut items);
-        let result = items.iter().find(|item| item["type"] == "tool_result").unwrap();
-        assert!(result["body"].get("metadata").is_none());
-
-        entry["message"]["content"] = json!([{
-            "type": "toolResult", "toolCallId": "nested",
-            "content": "already-authorized",
-            "details": {"wallTimeMs": 4.5, "timeoutSeconds": "secret"}
-        }]);
-        entry["message"].as_object_mut().unwrap().remove("toolCallId");
-        items.clear();
-        normalize_omp(ExternalDriver::Omp, &entry, 0, "", &mut items);
-        let result = items.iter().find(|item| item["type"] == "tool_result").unwrap();
-        assert_eq!(result["body"]["metadata"], json!({"wallTimeMs":4.5}));
+        assert_eq!(items[0]["body"]["blocks"], source_before);
     }
 
     #[test]

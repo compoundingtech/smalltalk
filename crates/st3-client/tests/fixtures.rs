@@ -293,7 +293,7 @@ fn timeline_tool_result_preserves_timing_metadata_and_decodes_legacy_results() {
         "sequence": 1,
         "revision": 1,
         "timestamp": "2026-10-05T12:00:00Z",
-        "role": "assistant",
+        "role": "tool",
         "type": "tool_result",
         "final": true,
         "body": {
@@ -301,31 +301,43 @@ fn timeline_tool_result_preserves_timing_metadata_and_decodes_legacy_results() {
             "status": "success",
             "media_type": "text/plain",
             "content": "finished",
-            "metadata": {
-                "wallTimeMs": 1250.5,
-                "timeoutSeconds": 60
-            }
+            "blocks": [{
+                "id": "tool-timing/0",
+                "kind": "tool_output",
+                "source_type": "tool_result",
+                "payload": {"body_ref": true},
+                "metadata": {
+                    "wallTimeMs": 1250.5,
+                    "timeoutSeconds": 0,
+                    "future": {"unit": "ticks", "value": 0.125}
+                }
+            }]
         }
     });
     let entry: TimelineEntry = serde_json::from_value(wire.clone()).unwrap();
     let TimelineBody::ToolResult(body) = entry.body else {
         panic!("tool result discriminator was not preserved");
     };
-    let metadata = body.metadata.expect("tool result timing metadata was lost");
-    assert_eq!(metadata["wallTimeMs"].as_f64(), Some(1250.5));
-    assert_eq!(metadata["timeoutSeconds"].as_u64(), Some(60));
+    assert_eq!(
+        body.blocks[0].metadata.as_ref(),
+        Some(&wire["body"]["blocks"][0]["metadata"])
+    );
+    assert_eq!(
+        serde_json::to_value(&body).unwrap()["blocks"][0]["metadata"],
+        wire["body"]["blocks"][0]["metadata"]
+    );
 
-    wire["body"]["metadata"] = serde_json::Value::Null;
-    let null_metadata: TimelineEntry = serde_json::from_value(wire.clone()).unwrap();
+    wire["body"]["blocks"][0].as_object_mut().unwrap().remove("metadata");
+    let untimed: TimelineEntry = serde_json::from_value(wire.clone()).unwrap();
     assert!(matches!(
-        null_metadata.body,
-        TimelineBody::ToolResult(body) if body.metadata.is_none()
+        untimed.body,
+        TimelineBody::ToolResult(body) if body.blocks[0].metadata.is_none()
     ));
-    wire["body"].as_object_mut().unwrap().remove("metadata");
+    wire["body"].as_object_mut().unwrap().remove("blocks");
     let legacy: TimelineEntry = serde_json::from_value(wire).unwrap();
     assert!(matches!(
         legacy.body,
-        TimelineBody::ToolResult(body) if body.metadata.is_none()
+        TimelineBody::ToolResult(body) if body.blocks.is_empty()
     ));
 }
 
