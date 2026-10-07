@@ -27,6 +27,6 @@
   },
   "recovery": {
     "status": "none",
-    "detail": "An admitted local harness observation now wakes reconciliation so ready work and idle-unclaimed deadlines are re-evaluated. Existing work selection, permission fences, bounded wake attempts and five-minute diagnostic policy are unchanged."
+    "detail": "A native harness transition now wakes reconciliation once (same-state heartbeats remain quiet) so ready work and idle-unclaimed deadlines are re-evaluated. Existing work selection, permission fences, bounded wake attempts and five-minute diagnostic policy are unchanged."
   }
 }
