@@ -622,7 +622,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/gate-checks/{id}", get(read_gate_check))
         .route("/v1/sets/preview", post(owned_sets::preview))
         .route("/v1/sets/apply", post(owned_sets::apply))
-        .route("/v1/intent/apply", post(apply))
+        .route("/v1/intent/apply", post(apply_with_bound))
         .route("/v1/agents/rename", post(rename_agent))
         .route("/v1/agents/restart", post(restart_agent))
         .route("/v1/agents/rollout", post(rollout_agent))
@@ -10146,6 +10146,22 @@ async fn apply(
     State(state): State<AppState>,
     Json(request): Json<ApplyRequest>,
 ) -> Result<Json<ApplyResponse>, ApiError> {
+    apply_with_authority(state, request, None).await
+}
+
+async fn apply_with_bound(
+    State(state): State<AppState>,
+    bound: Option<Extension<BoundAgent>>,
+    Json(request): Json<ApplyRequest>,
+) -> Result<Json<ApplyResponse>, ApiError> {
+    apply_with_authority(state, request, bound.as_ref().map(|bound| bound.0.0.as_str())).await
+}
+
+async fn apply_with_authority(
+    state: AppState,
+    request: ApplyRequest,
+    bound: Option<&str>,
+) -> Result<Json<ApplyResponse>, ApiError> {
     let actor = request.actor.as_deref().ok_or_else(|| {
         ApiError::bad(St3Error::new(
             "missing-publication-actor",
@@ -10153,6 +10169,12 @@ async fn apply(
         ))
     })?;
     let intent = parse_intent(&request.intent.kdl, &state.node).map_err(ApiError::bad)?;
+    if !intent.direct_message_registrations.is_empty()
+        && bound.is_some_and(|bound| normalized_agent_actor(actor).as_deref() != Some(bound))
+    {
+        return Err(ApiError::bad(St3Error::new("foreign-agent-actor",
+            "a bound harness registers a message subscription only as itself")));
+    }
     for declaration in intent.mission_runs.values() {
         if let Some(creation) = &declaration.creation {
             if creation.requester == "person/requester" {
@@ -17292,6 +17314,49 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
             idempotency_key: key.into(),
             actor: Some(actor.into()),
         }
+    }
+
+    #[tokio::test]
+    async fn main_performance_failures_registration_public_preview_and_apply() {
+        use crate::store::message_subscriptions::{PERFORMANCE_DECLARATIONS, PERFORMANCE_REGISTRATION};
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let declarations = crate::graph::parse_internal_intent(PERFORMANCE_DECLARATIONS, &state.node).unwrap();
+        state.store.apply_internal(&declarations, "workflow-registration-fixture").unwrap();
+        let app = router(state.clone());
+        let (status, preview) = json_request(app.clone(), "/v1/intent/mission", serde_json::json!({
+            "intent": {"kdl": PERFORMANCE_REGISTRATION}
+        })).await;
+        assert_eq!(status, StatusCode::OK, "{preview}");
+        assert_eq!(preview["blockers"], serde_json::json!([]));
+        assert!(!state.store.desired_subjects().unwrap().iter().any(|item| item.kind == "subscription"));
+        let request = apply_request(&state, PERFORMANCE_REGISTRATION, "agent/fleet/fixture-project/speed", "workflow-register");
+        let request = serde_json::to_value(request).unwrap();
+        let (status, first) = json_request(app.clone(), "/v1/intent/apply", request.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        let (status, again) = json_request(app.clone(), "/v1/intent/apply", request).await;
+        assert_eq!(status, StatusCode::OK, "{again}");
+        assert_eq!(first["claim_ids"], again["claim_ids"]);
+        assert!(state.store.active_mission_runs().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn main_performance_failures_registration_rejects_foreign_bound_actor() {
+        use crate::store::message_subscriptions::{PERFORMANCE_DECLARATIONS, PERFORMANCE_REGISTRATION};
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let declarations = crate::graph::parse_internal_intent(PERFORMANCE_DECLARATIONS, &state.node).unwrap();
+        state.store.apply_internal(&declarations, "workflow-registration-fixture").unwrap();
+        let app = router(state.clone());
+        let request = apply_request(&state, PERFORMANCE_REGISTRATION, "agent/foreign", "forged-workflow-register");
+        let response = app.oneshot(Request::builder().method("POST").uri("/v1/intent/apply")
+            .header("content-type", "application/json").extension(BoundAgent("agent/own".into()))
+            .body(Body::from(serde_json::to_vec(&request).unwrap())).unwrap()).await.unwrap();
+        assert_ne!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["code"], "foreign-agent-actor");
+        assert!(!state.store.desired_subjects().unwrap().iter().any(|item| item.kind == "subscription"));
     }
 
     #[tokio::test]

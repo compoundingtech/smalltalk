@@ -28578,6 +28578,45 @@ observer "repo" {
         .expect("the observation finished");
     }
 
+    #[tokio::test]
+    async fn main_performance_failures_subscription_extends_the_existing_observer_request() {
+        struct Capture {
+            calls: Arc<AtomicUsize>,
+            fields: Arc<Mutex<Vec<BTreeSet<String>>>>,
+        }
+        impl ResourceProvider for Capture {
+            fn observe(&self, request: ObservationRequest) -> std::pin::Pin<Box<
+                dyn std::future::Future<Output = Result<crate::resource::ProviderObservation>> + Send + '_
+            >> {
+                self.fields.lock().unwrap().push(request.fields);
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(crate::resource::ProviderObservation {
+                    facts: serde_json::json!({"repository_id": 7, "issues": [], "main_performance_failures": []}),
+                    cursor: Some("workflow-baseline".into()),
+                    next_check_unix_ms: now_ms().saturating_add(60_000),
+                }) })
+            }
+        }
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(&store, &format!(r#"{SCRIPTED_OBSERVER}
+agent "target" {{ workspace "."; command "true" }}
+subscription "performance" {{ observer "observer/repo"; to "agent/node.target"; on "main_performance_failures"; delivery "message" }}
+"#), "subscribe-workflow");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fields = Arc::new(Mutex::new(Vec::new()));
+        let reconciler = Reconciler::new(store.clone(), Arc::new(FakeRuntime::default()),
+            "node".into(), Arc::new(Notify::new()))
+            .with_resource_provider(Arc::new(Capture { calls: calls.clone(), fields: fields.clone() }));
+        observe_now(&reconciler, &calls).await;
+        assert!(fields.lock().unwrap().iter().any(|fields|
+            fields.contains("issues") && fields.contains("main_performance_failures")));
+        let observers = store.desired_subjects().unwrap().into_iter()
+            .filter(|item| item.kind == "observer").collect::<Vec<_>>();
+        assert_eq!(observers.len(), 1);
+        assert_eq!(crate::graph::observer_spec(&observers[0].desired).unwrap().fields, ["issues"]);
+        assert!(store.messages(None, true).unwrap().is_empty());
+    }
+
     fn failure_for_item(
         store: &Store,
         item: &crate::model::AttentionItemView,
