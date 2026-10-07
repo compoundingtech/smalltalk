@@ -26,7 +26,7 @@ Choose a tag from the repository's Releases page, then download the archive for 
 and its `.sha256` file. For example, with GitHub CLI:
 
 ```sh
-tag=v0.3.16 # choose a release and read its Upgrade impact first
+tag=v0.3.16 # example: choose a release and read its Upgrade impact first
 archive=smalltalk-x86_64-unknown-linux-gnu.tar.gz
 # On Apple Silicon: archive=smalltalk-aarch64-apple-darwin.tar.gz
 gh release download "$tag" --repo compoundingtech/smalltalk \

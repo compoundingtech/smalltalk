@@ -37,15 +37,23 @@ Use a healthy current daemon and a separate empty directory. These commands neit
 daemon nor connect the recovered state to your live fleet:
 
 ```sh
-umask 077
-st_recovery_root=$(mktemp -d "${TMPDIR:-/tmp}/st-recovery.XXXXXX")
-st backup create "$st_recovery_root/claims.jsonl"
-mkdir -p "$st_recovery_root/restored"
-st backup restore "$st_recovery_root/claims.jsonl" \
-  --database "$st_recovery_root/restored/claims.sqlite3" --json \
-  > "$st_recovery_root/restore-report.json"
-cat "$st_recovery_root/restore-report.json"
+(
+  set -eu
+  umask 077
+  st_recovery_root=$(mktemp -d "${TMPDIR:-/tmp}/st-recovery.XXXXXX")
+  st backup create "$st_recovery_root/claims.jsonl"
+  mkdir -p "$st_recovery_root/restored"
+  st backup restore "$st_recovery_root/claims.jsonl" \
+    --database "$st_recovery_root/restored/claims.sqlite3" --json \
+    > "$st_recovery_root/restore-report.json"
+  printf 'Private rehearsal files: %s\n' "$st_recovery_root"
+  cat "$st_recovery_root/restore-report.json"
+)
 ```
+
+Always pass `--database` for this rehearsal. Without it, restore selects the configured live
+state directory; that default is not the separate-state procedure. Stop here if export or
+restore fails. The commands run in a subshell so the umask does not change your interactive shell.
 
 Keep the report private. Check the returned `writer`, `envelopes`, `source_graph_digest`,
 `graph_digest`, `log_digest` and `projections_match` against the format rules below. A different projection

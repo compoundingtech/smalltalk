@@ -68,7 +68,8 @@ esac
 
 ### With Nix
 
-Install the same tools from a pinned release source (this can take a while):
+Install the same tools from a pinned release source (this can take a while).
+The command uses v0.3.16 as an example; choose a release after reading its Upgrade impact:
 
 ```sh
 nix --extra-experimental-features 'nix-command flakes' profile install github:compoundingtech/smalltalk/v0.3.16

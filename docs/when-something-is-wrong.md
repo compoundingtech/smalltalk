@@ -124,7 +124,9 @@ Use the bin directory from your chosen archive or Nix route in the daemon user's
 PATH. Open a new terminal after updating your shell profile. Avoid mixing an old archive's
 `st` with a new Nix profile or another PTY install. `doctor` checks the daemon's environment;
 working commands in your current shell alone do not prove the service sees them. Refresh
-service definitions with `st service install` after a changed executable path.
+service definitions with `st service install` after a changed executable path when they are
+manually managed. If Home Manager owns the daemon, update its pinned input and activate that
+configuration instead; follow the [Home Manager upgrade](upgrading-st.md#restart-the-services-and-verify).
 
 Log in to the harness as that same OS user, attach to the affected seat and finish login/trust
 prompts. Check its declared workspace and [account](st3/accounts.md) rather than copying another

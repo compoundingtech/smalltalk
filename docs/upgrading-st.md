@@ -17,23 +17,59 @@ st replication status
 st agents ls
 ```
 
-For a healthy current daemon, make a private [claim backup](st3/backups.md) before installing:
+For a healthy current daemon, preserve a consistent raw database, private keys, fleet files
+and configuration **and** make a [claim backup](st3/backups.md). Keep the previous installed
+archive and its `BUILD.json` separately before changing any install directory; retain its
+checksum and installed-version record too. A version record cannot replace the old executables.
+
+Adjust `st_state_dir` if your configured state directory differs from this default. The SQLite
+backup API includes committed WAL writes; copying only a live `.sqlite3` file does not. If keys
+or configuration can change during capture, coordinate a consistent filesystem snapshot as
+[the founder audit](st3/founder-signing-audit.md#preserve-evidence-before-running-diagnostics)
+describes. The subshell keeps the restrictive umask out of your interactive shell:
 
 ```sh
+st_state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/st3"
 st_backup_dir="$HOME/smalltalk-backups/$(date -u +%Y%m%dT%H%M%SZ)"
-umask 077
-mkdir -p "$st_backup_dir"
-st backup create "$st_backup_dir/before-upgrade.jsonl"
-st --version --json > "$st_backup_dir/installed-version.json"
-st doctor --json > "$st_backup_dir/doctor.json"
+(
+  set -eu
+  umask 077
+  mkdir -p "$HOME/smalltalk-backups"
+  mkdir "$st_backup_dir"
+  python3 - "$st_state_dir/claims.sqlite3" "$st_backup_dir/claims.sqlite3" <<'PYTHON'
+import pathlib, sqlite3, sys
+source_path = pathlib.Path(sys.argv[1]).resolve()
+with sqlite3.connect(source_path.as_uri() + "?mode=ro", uri=True) as source:
+    with sqlite3.connect(sys.argv[2]) as backup:
+        source.backup(backup)
+        assert backup.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+print("Consistent database copy saved")
+PYTHON
+  for directory in keys fleet; do
+    if [ -d "$st_state_dir/$directory" ]; then
+      cp -R "$st_state_dir/$directory" "$st_backup_dir/"
+    fi
+  done
+  st_config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/st3"
+  if [ -d "$st_config_dir" ]; then
+    cp -R "$st_config_dir" "$st_backup_dir/config"
+  fi
+  st backup create "$st_backup_dir/before-upgrade.jsonl"
+  st --version --json > "$st_backup_dir/installed-version.json"
+  st doctor --json > "$st_backup_dir/doctor.json"
+)
 ```
 
-Back up workspace repositories, native harness sessions, private keys and host configuration
-separately using your usual private backup procedure. A claim archive includes shared envelope
-history and referenced documents, but excludes private keys, unsealed pending work and local
-runtime state. It is recovery material, not a file to copy over a running member's database.
-An offline export opens and migrates its input: use a consistent SQLite copy, never the only
-original, as described in the [founder audit](st3/founder-signing-audit.md).
+**Stop the upgrade if this block fails.** If claim export refuses because the graph is stale,
+projections are pending or history is incomplete, recover that condition and retry with a new
+backup directory before installing or restarting. Do not proceed with a partial backup.
+
+Keep both forms private: the raw capture preserves the original database and keys, while the
+claim archive supports verified offline reconstruction under a fresh writer. The archive
+excludes private keys, unsealed pending work and local runtime state; it does not replace the
+raw capture. Preserve workspace repositories and native harness sessions separately. Neither
+backup is a command to overwrite a running member's database. An offline claim export opens
+and migrates its input: use an additional consistent SQLite copy, never the untouched original.
 
 Choose a tag from [releases](https://github.com/compoundingtech/smalltalk/releases). Run this on **each machine**, entering the same tag; it downloads without touching running services:
 
