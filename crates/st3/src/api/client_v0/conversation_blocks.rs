@@ -512,8 +512,7 @@ pub(super) fn prepare_one(
                     session_id,
                     &original,
                 );
-                let encoded =
-                    serde_json::to_vec(&block["payload"]).map_err(ApiError::internal)?;
+                let encoded = serde_json::to_vec(&block["payload"]).map_err(ApiError::internal)?;
                 if encoded.len() > VALUE_BYTES || original["_oversized_bytes"].is_number() {
                     block["continuation"] = continuation(
                         reference(source, basis, session_id, &original, &pointer),
@@ -537,11 +536,9 @@ pub(super) fn prepare_one(
                     reference(source, basis, session_id, &original, &pointer),
                     "application/json",
                     Some(
-                        serde_json::to_vec(
-                            original.pointer(&pointer).expect("native metadata"),
-                        )
-                        .map_err(ApiError::internal)?
-                        .len(),
+                        serde_json::to_vec(original.pointer(&pointer).expect("native metadata"))
+                            .map_err(ApiError::internal)?
+                            .len(),
                     ),
                     "size-limit",
                 );
@@ -1060,7 +1057,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_tool_metadata_fits_full_and_keyset_pages_and_socket_frames_and_fetches_exact_native_values() {
+    async fn open_tool_metadata_fits_full_and_keyset_pages_and_socket_frames_and_fetches_exact_native_values()
+     {
         use futures_util::{SinkExt as _, StreamExt as _};
         let root = tempfile::tempdir().unwrap();
         let details = json!({
@@ -1275,7 +1273,7 @@ mod tests {
 
     #[tokio::test]
     async fn pathological_metadata_replaces_only_its_entry_on_full_and_keyset_pages_and_preserves_owner_fetch()
-    {
+     {
         use axum::body::{Body, to_bytes};
         use axum::http::Request;
         use tower::ServiceExt as _;
