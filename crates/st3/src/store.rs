@@ -32752,13 +32752,24 @@ agent "test/empty" { command "true" }
                 "frontier-ahead" => 999999,
                 _ => frontier,
             };
-            assert_eq!(
-                lines,
-                [format!(
-                    "st: projection full replay phase=startup/project-replication-backlog reason={reason} frontier={expected_frontier} target={target}"
-                )],
-                "{reason}"
+            let replay_line = format!(
+                "st: projection full replay phase=startup/project-replication-backlog reason={reason} frontier={expected_frontier} target={target}"
             );
+            if reason == "incremental-error:internal" {
+                // An incremental failure says what failed before the replay line: its error, the
+                // claim kinds of the range and the range.
+                assert_eq!(lines.len(), 2, "{lines:?}");
+                assert!(
+                    lines[0].starts_with(
+                        "st: projection incremental failed code=internal kinds=intent.desired "
+                    ) && lines[0].contains("message=missing field `subject`"),
+                    "{}",
+                    lines[0]
+                );
+                assert_eq!(lines[1], replay_line);
+            } else {
+                assert_eq!(lines, [replay_line], "{reason}");
+            }
             assert_eq!(
                 FULL_REPLAYS.with(std::cell::Cell::get),
                 2,
