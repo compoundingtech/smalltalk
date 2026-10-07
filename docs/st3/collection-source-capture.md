@@ -9,9 +9,11 @@ key operators in the same source transaction before acknowledging capture.
 Descriptors must cover every source column and the complete primary key. Inserts, updates,
 key reassignment and deletes preserve old/new owner and dependency fields. Blobs retain exact
 bytes through a tagged hex encoding. A key change produces retraction then insertion. Failed
-or ignored inserts create no admitted mutation. Primary-key replacement preserves the old
-row with either SQLite recursive-trigger mode; alternate unique constraints, expression keys
-and virtual tables are explicitly unqualified in this preparation lane.
+or ignored inserts create no admitted mutation. INSERT OR REPLACE and UPDATE OR REPLACE
+preserve overwritten primary-key rows with either recursive-trigger mode. INTEGER rowid
+aliases, generated columns, alternate unique constraints, expression keys and virtual tables
+require another explicit extractor and are rejected here. Exact table descriptors and source
+schema SQL are persisted; changed source sets/schema under the same fingerprint stay fenced.
 
 Capture has a shared limit of 256 rows and 1 MiB, with 64 KiB per replacement payload. Indexed
 pages contain at most 128 captured statements. A quota/payload gap preserves valid source
