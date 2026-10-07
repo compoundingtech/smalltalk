@@ -8680,10 +8680,10 @@ fn filtered_page_hint(page: &ClientPage, command: &str, filter: Option<&str>) ->
 }
 
 fn list_output_parts<'a>(rendered: &'a str, hint: &str, filtered: bool) -> (&'a str, &'a str) {
-    if filtered && !hint.is_empty() {
-        if let Some(rows) = rendered.strip_suffix(hint) {
-            return (rows, &rendered[rows.len()..]);
-        }
+    if filtered && !hint.is_empty()
+        && let Some(rows) = rendered.strip_suffix(hint)
+    {
+        return (rows, &rendered[rows.len()..]);
     }
     (rendered, "")
 }
@@ -10184,10 +10184,10 @@ async fn list_outcomes(
     });
     if json_output {
         print_value(&page, true)?;
-        if filter.filter.is_some() {
-            if let Some(continuation) = continuation.as_deref() {
-                eprintln!("{continuation}");
-            }
+        if filter.filter.is_some()
+            && let Some(continuation) = continuation.as_deref()
+        {
+            eprintln!("{continuation}");
         }
 
         if partial {
@@ -11864,24 +11864,24 @@ async fn run_doc(client: &Client, command: DocCommand, json_output: bool) -> Res
             if json_output {
                 let (partial, shown) = (response.has_more, response.items.len());
                 print_value(&response, true)?;
-                if partial && filter.is_some() {
-                    if let Some(cursor) = response.next_cursor.as_deref() {
-                        eprintln!(
-                            "More document versions are available. Continue with: {}",
-                            list_continuation_command(
-                                &format!(
-                                    "{} --json",
-                                    document_continuation_command(
-                                        name.as_deref(),
-                                        all,
-                                        limit,
-                                        cursor
-                                    )
-                                ),
-                                filter.as_deref(),
-                            )
-                        );
-                    }
+                if partial && filter.is_some()
+                    && let Some(cursor) = response.next_cursor.as_deref()
+                {
+                    eprintln!(
+                        "More document versions are available. Continue with: {}",
+                        list_continuation_command(
+                            &format!(
+                                "{} --json",
+                                document_continuation_command(
+                                    name.as_deref(),
+                                    all,
+                                    limit,
+                                    cursor
+                                )
+                            ),
+                            filter.as_deref(),
+                        )
+                    );
                 }
 
                 if partial {
