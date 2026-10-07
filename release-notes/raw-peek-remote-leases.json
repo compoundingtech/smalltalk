@@ -15,7 +15,7 @@
   },
   "compatibility": {
     "status": "changed",
-    "detail": "Remote PEEK requires both gateway and owner lease support and fails closed after five seconds without fresh signed authority proof. Mixed old/new endpoints fail closed; ATTACH is unchanged."
+    "detail": "Remote PEEK requires both gateway and owner lease support and fails closed after five seconds without fresh signed authority proof. Accepted owner authority proofs enable screen reads immediately without waiting for a heartbeat. Mixed old/new endpoints fail closed; ATTACH is unchanged."
   },
   "downtime": {
     "status": "none",
