@@ -806,7 +806,10 @@ async fn collection_stream_socket(
 ) {
     let windows = collection_windows::Windows::attach(&state.store);
     // Complete source adapters are admitted explicitly, never inferred from partial view IDs.
-    let adapters = BTreeMap::new();
+    let adapters = match collection_ivm::adapters(state.store.clone()) {
+        Ok(adapters)=>adapters,
+        Err(error)=> {tracing::warn!(%error,"collection source adapter construction failed");return;}
+    };
     let sources = if adapters.is_empty() {
         None
     } else {

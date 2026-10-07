@@ -72,7 +72,15 @@ mod tests {
                 .unwrap(),
             2
         );
-        assert_eq!(tx.query_row("SELECT snapshot_index FROM local_agent_card_clock", [], |r| r.get::<_, u64>(0)).unwrap(),1);
+        assert_eq!(
+            tx.query_row(
+                "SELECT snapshot_index FROM local_agent_card_clock",
+                [],
+                |r| r.get::<_, u64>(0)
+            )
+            .unwrap(),
+            1
+        );
         tx.rollback().unwrap();
         assert_eq!(
             connection

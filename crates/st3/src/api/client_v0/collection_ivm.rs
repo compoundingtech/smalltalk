@@ -3,6 +3,7 @@
 //! Registration alone does not select a production adapter.
 use super::*;
 use crate::graph_watch_ivm::{IvmViewBridge, ViewPage};
+use anyhow::Context as _;
 use smallclaims::ivm::{Readiness, events};
 use std::cell::RefCell;
 
@@ -69,6 +70,28 @@ impl Sources {
     pub(super) fn adapter(&self, collection: &str) -> Option<Arc<Adapter>> {
         self.adapters.get(collection).cloned()
     }
+}
+
+/// Only the explicitly attached complete source selects the agents provider. Other collection
+/// families continue through their existing adapters until their own full source is certified.
+pub(super) fn adapters(store: Arc<Store>) -> anyhow::Result<BTreeMap<String, Arc<Adapter>>> {
+    if !store.has_agent_collection_source() {
+        return Ok(BTreeMap::new());
+    }
+    let views = store.ivm_views().context("agent source registry missing")?;
+    let installer = store
+        .ivm_installer()
+        .context("agent source Installer missing")?;
+    let mut adapter = agents::factory(store.clone(), views, installer)?;
+    let coverage = adapter.coverage.clone();
+    let receiver = store.origin().to_string();
+    adapter.coverage = Arc::new(move |connection| {
+        if !crate::store::collection_ivm::agent_source::receiver_readable(connection, &receiver)? {
+            return Ok(false);
+        }
+        coverage(connection)
+    });
+    Ok(BTreeMap::from([("agents".into(), Arc::new(adapter))]))
 }
 
 #[derive(Clone)]

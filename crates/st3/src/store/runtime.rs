@@ -13,6 +13,8 @@ pub struct SmalltalkRuntime {
     /// Exact Installer retained by the explicitly installed collection source.
     /// Presence does not prove source coverage or select a reader.
     pub(crate) ivm_installer: std::sync::OnceLock<Arc<smallclaims::ivm::install::Installer>>,
+    /// Explicit native agent maintenance controller; it holds only a weak Store reference.
+    pub(crate) ivm_agent_service: std::sync::OnceLock<Arc<collection_ivm::agent_source::service::Service>>,
     /// Keep the single process-local producer sink alive with this Store runtime.
     pub(crate) ivm_delivery_source: std::sync::OnceLock<crate::api::delivery_presence::source::Registration<'static>>,
     /// Receipt waits and collection sockets share this one commit observer. Publisher

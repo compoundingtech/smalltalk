@@ -2590,6 +2590,22 @@ impl Store {
         self.smalltalk.ivm_views.clone()
     }
 
+    /// Explicitly install the complete native agent collection source. Default Store opens
+    /// retain the existing readers; registration does not grant rows before certification.
+    pub fn open_with_agent_collections(path: &Path, origin: &str) -> Result<Arc<Self>> {
+        collection_ivm::agent_source::service::open(path, origin)
+    }
+
+    /// Execute one bounded source-maintenance page. No source work runs on socket pings.
+    pub fn maintain_agent_collections(&self) -> Result<bool> {
+        let service=self.smalltalk.ivm_agent_service.get().context("agent source is not installed")?;
+        service.pump()
+    }
+
+    pub fn has_agent_collection_source(&self) -> bool {
+        self.smalltalk.ivm_agent_service.get().is_some()
+    }
+
     /// The exact source Installer for this Store. Registration alone cannot certify a read.
     pub fn ivm_installer(&self) -> Option<Arc<smallclaims::ivm::install::Installer>> {
         self.smalltalk.ivm_installer.get().cloned()

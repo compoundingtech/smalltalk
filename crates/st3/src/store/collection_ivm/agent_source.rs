@@ -4,6 +4,9 @@ pub mod boundary;
 pub mod canonical;
 pub mod clock;
 pub mod extract;
+pub(crate) mod row_changes;
+pub(crate) mod service;
+mod work_progress;
 pub mod shadow;
 
 use super::Table;
@@ -264,6 +267,30 @@ pub fn capture_fingerprint_for(receiver: &str) -> Result<String> {
         capture_fingerprint(),
         hex::encode(Sha256::digest(receiver.as_bytes()))
     ))
+}
+
+/// Mandatory production read gate, independent of Views readiness and producer certificates.
+/// Raw DDL changes invalidate the exact installed source schema before another writer runs.
+pub(crate) fn receiver_readable(connection: &rusqlite::Connection, receiver: &str) -> Result<bool> {
+    use rusqlite::OptionalExtension as _;
+    if !super::scope::readable(connection)?
+        || super::status(connection)?.fingerprint != capture_fingerprint_for(receiver)?
+    {
+        return Ok(false);
+    }
+    let exists:bool=connection.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='st3_agent_source_service')",[],|r|r.get(0))?;
+    if !exists {
+        return Ok(false);
+    }
+    let current: u64 = connection.query_row("PRAGMA schema_version", [], |r| r.get(0))?;
+    let expected: Option<u64> = connection
+        .query_row(
+            "SELECT schema_version FROM st3_agent_source_service WHERE singleton=1 AND receiver=?1",
+            [receiver],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(expected == Some(current))
 }
 
 pub fn install_capture_for(tx: &Transaction<'_>, receiver: &str, epoch: u64) -> Result<()> {
