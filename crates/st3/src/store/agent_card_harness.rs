@@ -654,14 +654,28 @@ fn observed(
     if let Some(view) = view.as_mut() {
         // Since uses the selected claim's stamp first, then the named raw-state run;
         // diagnostics/auth can replace that with the final canonical transition.
-        let event =
-            claim_by_id_tx(connection, &view.claim)?.context("agent source claim unavailable")?;
+        let event: String = connection.query_row(
+            "SELECT event FROM local_agent_card_harness_nodes WHERE namespace=?1 AND claim=?2",
+            params![namespace, view.claim],
+            |row| row.get(0),
+        )?;
+        let event: Event = serde_json::from_str(&event)?;
         if let Some(since) = event
-            .body
-            .pointer("/fields/observed_since_ms")
+            .fields
+            .get("observed_since_ms")
             .and_then(Value::as_u64)
         {
-            view.since_unix_ms = u128::from(since).min(event.accepted_at_unix_ms);
+            // The legacy enrich step only recognizes nested field stamps.
+            if event.nested {
+                view.since_unix_ms = u128::from(since).min(event.accepted);
+            } else if event.kind == "harness.observed"
+                && let Some(run) = named
+                    .raw_run
+                    .as_ref()
+                    .filter(|r| r.last.as_deref() == Some(view.state.as_str()))
+            {
+                view.since_unix_ms = run.since;
+            }
         } else if event.kind == "harness.observed"
             && let Some(run) = named
                 .raw_run
@@ -673,11 +687,12 @@ fn observed(
         let prompts =
             named.diagnostics.contains_key("prompt") || named.diagnostics.contains_key("update");
         let unstamped_auth = event
-            .body
-            .pointer("/fields/provider_auth")
+            .fields
+            .get("provider_auth")
             .and_then(Value::as_bool)
             .is_some()
-            && event.body.pointer("/fields/observed_since_ms").is_none();
+            && event.nested
+            && event.fields.get("observed_since_ms").is_none();
         if prompts || view.state == "needs-login" || unstamped_auth {
             let (state, transition) = named.machine.0[0];
             let state = if state == 0 {
@@ -758,6 +773,37 @@ mod tests {
                 serde_json::to_value(oracle).unwrap()
             );
         }
+    }
+
+    #[test]
+    fn captured_since_never_borrows_a_later_global_claim_image() {
+        let f = Fixture::new();
+        f.append(
+            SEAT,
+            "runtime.observed",
+            json!({"status":"running","incarnation_id":"one"}),
+        );
+        let claim = f.append(
+            SEAT,
+            "harness.observed",
+            json!({"incarnation_id":"one","state":"idle","observed_since_ms":17}),
+        );
+        let captured = observed(&f.store.readers.get(), "live", SEAT).unwrap();
+        assert_eq!(captured.as_ref().unwrap().since_unix_ms, 17);
+        let mut writer = f.store.connection.write();
+        let tx = writer.transaction().unwrap();
+        tx.execute("UPDATE claims SET body=?2 WHERE id=?1",params![claim.id,json!({"fields":{"incarnation_id":"one","state":"blocked","observed_since_ms":999}}).to_string()]).unwrap();
+        assert_eq!(
+            serde_json::to_value(observed(&tx, "live", SEAT).unwrap()).unwrap(),
+            serde_json::to_value(&captured).unwrap()
+        );
+        tx.execute("DELETE FROM claims WHERE id=?1", [&claim.id])
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(observed(&tx, "live", SEAT).unwrap()).unwrap(),
+            serde_json::to_value(&captured).unwrap()
+        );
+        tx.rollback().unwrap();
     }
 
     #[test]
