@@ -96,6 +96,15 @@ pub use smallclaims::store::{
 mod accounts;
 mod adhoc_work;
 mod attention_snapshot;
+// Registration stays opt-in until the shared installer certifies every source family.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "prepared attention operators await certified shared-runtime integration"
+    )
+)]
+pub(crate) mod attention_ivm;
 mod backup;
 mod checkpoint_rules;
 pub(crate) mod delegation;

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Prepare keyed person-step and custom open-attention operators with complete public-row parity; production attention activation remains disabled",
+  "replay": {"status": "none", "detail": "Normal Store open and production attention reads retain their existing computation. No production replay or backfill is introduced. Explicit unpublished operator installation uses bounded source and maintenance pages."},
+  "schema": {"status": "changed", "detail": "The opt-in operator schema adds local_attention_open, local_attention_open_dependencies and local_attention_open_dirty with indexes and source invalidation triggers. Only explicit Views schema installation creates these tables; normal Store schema/open hooks are unchanged. No numeric schema transition."},
+  "rules": {"status": "none", "detail": "No checkpoint rule, shared projection digest or fleet coordination change. These disposable operator tables are not activated in production by this change."},
+  "compatibility": {"status": "none", "detail": "No client, wire, schema-registry or harness contract changes. Existing public attention IDs, actions, recorded episode identity and current-clock/as-of wrappers remain intact. Partial families cannot replace the complete production collection."},
+  "downtime": {"status": "none", "detail": "No additional service interruption or production startup work is introduced."},
+  "manual": {"status": "none", "detail": "Existing installations require no manual action. Shared runtime integration and complete source certification are required before any future activation."},
+  "recovery": {"status": "none", "detail": "Production remains on the existing full reader. Opt-in family output is disposable and never authoritative; unavailable or unflushed families reject reads rather than replaying from a GET or returning partial Ready output."}
+}

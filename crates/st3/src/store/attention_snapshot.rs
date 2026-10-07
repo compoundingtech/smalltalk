@@ -68,90 +68,9 @@ impl Store {
             .query_map([person], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         for subject in subjects {
-            let Some(view) = person_work::step(&connection, &subject)? else {
-                continue;
-            };
-            let ask = person_work::request(&connection, &subject)?;
-            if let Some(ask) = &ask {
-                if !person_work::current(&connection, ask, as_of)? {
-                    continue;
-                }
-            } else if view.status != "ready"
-                || !person_work::run_live(&connection, &view.run, Some(&view.generation), false)?
-            {
-                continue;
+            if let Some(item) = person_attention_item(&connection, &subject, as_of)? {
+                items.push(item);
             }
-            let person = view.assigned_to.as_deref().unwrap_or_default();
-            let episode = ask.as_ref().map(|ask| ask.id.clone()).unwrap_or_else(|| {
-                format!(
-                    "{}:{}:{}",
-                    view.generation, view.attempt, view.readiness_epoch
-                )
-            });
-            let activated: Option<String> = connection.query_row(
-                "SELECT activated_at_unix_ms FROM step_runs WHERE subject=?1",
-                [&subject],
-                |row| row.get(0),
-            )?;
-            let since = ask.as_ref().map_or(
-                activated
-                    .and_then(|at| at.parse().ok())
-                    .unwrap_or(view.created_at_unix_ms),
-                |ask| {
-                    ask.body["fields"]["waiting_since"]
-                        .as_str()
-                        .and_then(|value| value.parse().ok())
-                        .unwrap_or(ask.accepted_at_unix_ms)
-                },
-            );
-            let request = ask
-                .as_ref()
-                .and_then(|ask| ask.body["fields"].get("request"))
-                .filter(|request| request.is_object())
-                .cloned();
-            let (label, response): (&str, &[&str]) =
-                match request.as_ref().and_then(|r| r["type"].as_str()) {
-                    Some("decision" | "choice") => ("done", &["--answer", "ANSWER_ID"]),
-                    // An update clears when the person opens it or presses read.
-                    Some("update") => ("read", &["--answer", "read"]),
-                    Some(_) => ("done", &["--text", "FEEDBACK"]),
-                    None => ("done", &["--summary", "RESPONSE"]),
-                };
-            items.push(AttentionItemView {
-                episode,
-                priority: "normal".into(),
-                kind: "person-step".into(),
-                review_mode: None,
-                subject: subject.clone(),
-                person: person.into(),
-                requester_id: ask.and_then(|ask| ask.actor),
-                launch_id: None,
-                variant_id: None,
-                message_id: None,
-                title: view
-                    .title
-                    .unwrap_or_else(|| "A step needs your response".into()),
-                detail: view.goals.join("\n"),
-                mission: None,
-                mission_run: Some(view.run),
-                step: Some(subject.clone()),
-                targets: vec![subject.clone()],
-                requested_at_unix_ms: since,
-                actions: vec![attention_action(
-                    label,
-                    &[
-                        "st",
-                        "work",
-                        "done",
-                        &subject,
-                        "--as",
-                        person,
-                        response[0],
-                        response[1],
-                    ],
-                )],
-                request,
-            });
         }
         Ok(items)
     }
@@ -1097,4 +1016,104 @@ impl Store {
         }
         Ok(items)
     }
+}
+
+/// Derive one person step using the same source fences as the full reader.
+pub(super) fn person_attention_item(
+    connection: &Connection,
+    subject: &str,
+    as_of: u128,
+) -> Result<Option<AttentionItemView>> {
+    let Some(view) = person_work::step(connection, subject)? else {
+        return Ok(None);
+    };
+    if !matches!(view.status.as_str(), "pending" | "ready")
+        || view
+            .assigned_to
+            .as_deref()
+            .is_none_or(|a| !a.starts_with("person/"))
+    {
+        return Ok(None);
+    }
+    let ask = person_work::request(connection, subject)?;
+    if let Some(ask) = &ask {
+        if !person_work::current(connection, ask, as_of)? {
+            return Ok(None);
+        }
+    } else if view.status != "ready"
+        || !person_work::run_live(connection, &view.run, Some(&view.generation), false)?
+    {
+        return Ok(None);
+    }
+    let person = view.assigned_to.as_deref().unwrap_or_default();
+    let episode = ask.as_ref().map(|ask| ask.id.clone()).unwrap_or_else(|| {
+        format!(
+            "{}:{}:{}",
+            view.generation, view.attempt, view.readiness_epoch
+        )
+    });
+    let activated: Option<String> = connection.query_row(
+        "SELECT activated_at_unix_ms FROM step_runs WHERE subject=?1",
+        [subject],
+        |row| row.get(0),
+    )?;
+    let since = ask.as_ref().map_or(
+        activated
+            .and_then(|at| at.parse().ok())
+            .unwrap_or(view.created_at_unix_ms),
+        |ask| {
+            ask.body["fields"]["waiting_since"]
+                .as_str()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(ask.accepted_at_unix_ms)
+        },
+    );
+    let request = ask
+        .as_ref()
+        .and_then(|ask| ask.body["fields"].get("request"))
+        .filter(|request| request.is_object())
+        .cloned();
+    let (label, response): (&str, &[&str]) = match request.as_ref().and_then(|r| r["type"].as_str())
+    {
+        Some("decision" | "choice") => ("done", &["--answer", "ANSWER_ID"]),
+        // An update clears when the person opens it or presses read.
+        Some("update") => ("read", &["--answer", "read"]),
+        Some(_) => ("done", &["--text", "FEEDBACK"]),
+        None => ("done", &["--summary", "RESPONSE"]),
+    };
+    Ok(Some(AttentionItemView {
+        episode,
+        priority: "normal".into(),
+        kind: "person-step".into(),
+        review_mode: None,
+        subject: subject.to_owned(),
+        person: person.into(),
+        requester_id: ask.and_then(|ask| ask.actor),
+        launch_id: None,
+        variant_id: None,
+        message_id: None,
+        title: view
+            .title
+            .unwrap_or_else(|| "A step needs your response".into()),
+        detail: view.goals.join("\n"),
+        mission: None,
+        mission_run: Some(view.run),
+        step: Some(subject.to_owned()),
+        targets: vec![subject.to_owned()],
+        requested_at_unix_ms: since,
+        actions: vec![attention_action(
+            label,
+            &[
+                "st",
+                "work",
+                "done",
+                subject,
+                "--as",
+                person,
+                response[0],
+                response[1],
+            ],
+        )],
+        request,
+    }))
 }
