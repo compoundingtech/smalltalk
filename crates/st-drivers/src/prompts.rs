@@ -1,5 +1,6 @@
 //! A live native permission invocation. Its socket dies with the invocation; a saved prompt
-//! cannot authorize a successor. Only the daemon supplies the owning person's decision.
+//! cannot authorize a successor. The daemon authorizes person decisions; the private native
+//! socket shares the existing trusted operating-system user boundary.
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -333,8 +334,25 @@ pub fn run_claude(
             return Ok(());
         }
         if crate::message::now_ms() >= invocation.prompt.expires_at_ms {
+            // This is an observed adapter deadline, not a person's answer. Deny the tool
+            // through the supported hook rather than delegating expiry to provider defaults.
+            let result = (|| -> Result<()> {
+                serde_json::to_writer(&mut *output, &json!({"hookSpecificOutput":{
+                    "hookEventName":"PermissionRequest","decision":{
+                        "behavior":"deny",
+                        "message":"The response deadline elapsed without an owning-person decision."
+                    }
+                }}))?;
+                output.write_all(b"\n")?;
+                output.flush()?;
+                Ok(())
+            })();
+            if result.is_err() {
+                invocation.finish("unavailable")?;
+                return result;
+            }
             invocation.prompt.how =
-                Some("The native hook response deadline elapsed; no decision was sent.".into());
+                Some("The native hook response deadline elapsed; a system denial was sent through the hook.".into());
             invocation.finish("timed_out")?;
             return Ok(());
         }
@@ -491,7 +509,7 @@ mod tests {
         }
     }
     #[test]
-    fn deadline_and_disappearance_send_no_native_decision() {
+    fn deadline_denies_without_a_person_answer_and_disappearance_sends_no_decision() {
         let dir = fixture();
         let mut output = Vec::new();
         run_claude(
@@ -503,8 +521,25 @@ mod tests {
             &|| false,
         )
         .unwrap();
-        assert!(output.is_empty());
-        assert_eq!(final_prompt(dir.path()).state, "timed_out");
+        let expired_output: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(expired_output["hookSpecificOutput"]["decision"]["behavior"], "deny");
+        assert!(expired_output["hookSpecificOutput"]["decision"]["message"]
+            .as_str().unwrap().contains("without an owning-person decision"));
+        let expired = final_prompt(dir.path());
+        assert_eq!(expired.state, "timed_out");
+        assert_eq!(expired.disposition.as_deref(), Some("timed_out"));
+        assert!(expired.by.is_none());
+        // A failed output is uncertain delivery, never a fabricated denial or timeout receipt.
+        struct BrokenOutput;
+        impl Write for BrokenOutput {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        assert!(run_claude(dir.path(), "provider-a", &payload(), Duration::ZERO,
+            &mut BrokenOutput, &|| false).is_err());
+        assert_eq!(final_prompt(dir.path()).state, "unavailable");
         let cancelled = Arc::new(AtomicBool::new(false));
         let native_cancelled = cancelled.clone();
         let path = dir.path().to_owned();

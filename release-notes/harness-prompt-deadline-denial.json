@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Deny an unanswered Claude tool request at the native adapter's observed deadline while recording timeout without a person's answer.",
+  "replay": { "status": "none", "detail": "No replicated event or replay changes." },
+  "schema": { "status": "none", "detail": "Existing timed_out and unavailable prompt outcomes describe the native handoff." },
+  "rules": { "status": "changed", "detail": "A positively observed adapter deadline writes a system deny decision; it never attributes that denial to a person. Disappearance sends no fabricated decision, and failed deadline output records unavailable." },
+  "compatibility": { "status": "changed", "detail": "Claude receives the supported PermissionRequest deny output on an unanswered adapter deadline. Optional client prompt fields remain unchanged." },
+  "downtime": { "status": "none", "detail": "No additional migration or downtime requirement." },
+  "manual": { "status": "none", "detail": "No additional manual action beyond installing the updated driver." },
+  "recovery": { "status": "changed", "detail": "An output failure remains uncertain and does not create a denial receipt or authorize replay. Expired episodes cannot accept later answers." }
+}

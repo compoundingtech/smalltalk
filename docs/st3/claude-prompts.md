@@ -81,7 +81,8 @@ exists only while that invocation is alive.
 States are `open`, `answered`, `cancelled`, `timed_out`, `ended`, `unavailable`.
 Writing the native hook output records a response handoff, not provider
 execution or a separate acknowledgement. A hook's own response deadline can
-record `timed_out`; loss of visibility records `unavailable` without inventing
+record `timed_out` and sends a system denial through the hook, with no person
+answer or `by` attribution; failed output records `unavailable`. Loss of visibility records `unavailable` without inventing
 an answer or timeout. Stopping/replacing the requesting runtime records `ended`.
 Terminal states cannot be reopened by a delayed open observation. An uncertain
 transport leaves the answer reserved, preventing another potentially duplicated
