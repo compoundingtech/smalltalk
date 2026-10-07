@@ -17699,11 +17699,19 @@ async fn drive_st2_native(
             st_drivers::subagents::now_ms(),
         )
     });
+    let mut completion_announced = false;
     loop {
         #[cfg(feature = "test-support")]
-        fixture_terminal_completion_barrier(
+        {
+        completion_announced |= fixture_terminal_completion_barrier(
             &mut observations, client, subject, driver, &mut loop_state.ready, &task,
         ).await?;
+        if completion_announced && env!("CARGO_BIN_NAME") == "st3-fixture"
+            && let Some(root) = std::env::var_os("ST3_FIXTURE_TERMINAL_COMPLETION")
+        {
+            fs::write(PathBuf::from(root).join("awaiting-completion"), b"awaiting")?;
+        }
+        }
         tokio::select! {
             frame = mailbox.recv() => {
                 #[cfg(feature = "test-support")]
@@ -17721,13 +17729,14 @@ async fn drive_st2_native(
                     note_driver_tick_failure(subject, error, &mut last_control_warning);
                 }
             }
-            wake = observations.recv() => {
+            wake = observations.recv(), if !completion_announced => {
                 wake?;
-                if let Err(error) = observations.drain(client, subject, driver, &mut loop_state.ready).await {
-                    note_driver_tick_failure(subject, error, &mut last_control_warning);
+                match observations.drain_live(client, subject, driver, &mut loop_state.ready).await {
+                    Ok(ended) => completion_announced |= ended,
+                    Err(error) => note_driver_tick_failure(subject, error, &mut last_control_warning),
                 }
             }
-            result = &mut task, if fixture_completion_task_enabled() => {
+            result = &mut task, if completion_announced || fixture_completion_task_enabled() => {
                 let outcome = result?;
                 if let Some(session) = detached_session(&outcome) {
                     loop_state.delivery_episode = delivery.episode;
@@ -17741,6 +17750,7 @@ async fn drive_st2_native(
                     let _ = replacement.exec(subject, &paths.state_root(), &resume);
                     loop_state = resume.loop_state;
                     task = spawn_st2_provider(driver, &paths, ProviderStart::Adopt(session));
+                    completion_announced = false;
                     continue;
                 }
                 finish_native_exit_report(subject, async {
@@ -17796,7 +17806,7 @@ async fn drive_st2_native(
                 }).await?;
                 return outcome;
             }
-            _ = interval.tick() => {
+            _ = interval.tick(), if !completion_announced => {
                 if driver == "claude" && mailbox.subscription.is_some()
                     && let Err(error) = check_claude_attachment(
                         client, subject, &incarnation, &mailbox, attach_started, &mut loop_state,
@@ -17809,9 +17819,11 @@ async fn drive_st2_native(
                 }
 
                 if observations.retry_pending {
-                    if let Err(error) = observations.drain(client, subject, driver, &mut loop_state.ready).await {
-                        note_driver_tick_failure(subject, error, &mut last_control_warning);
+                    match observations.drain_live(client, subject, driver, &mut loop_state.ready).await {
+                        Ok(ended) => completion_announced |= ended,
+                        Err(error) => note_driver_tick_failure(subject, error, &mut last_control_warning),
                     }
+                    if completion_announced { continue; }
                 }
 
                 if driver == "opencode" && mailbox.subscription.is_some() {
@@ -18075,7 +18087,7 @@ async fn drive_st2_native(
                 }
                 replacement.check();
             }
-            _ = work_interval.tick() => {
+            _ = work_interval.tick(), if !completion_announced => {
                 let tick: Result<()> = async {
                     let minute = unix_minute()?;
                     if renewed_minute != Some(minute) {
@@ -18116,27 +18128,27 @@ async fn fixture_terminal_completion_barrier(
     driver: &str,
     ready: &mut bool,
     task: &tokio::task::JoinHandle<Result<()>>,
-) -> Result<()> {
+) -> Result<bool> {
     if env!("CARGO_BIN_NAME") != "st3-fixture" || driver != "claude" {
-        return Ok(());
+        return Ok(false);
     }
     let Some(root) = std::env::var_os("ST3_FIXTURE_TERMINAL_COMPLETION").map(PathBuf::from) else {
-        return Ok(());
+        return Ok(false);
     };
     if root.join("observation-drained").exists()
         || !st_drivers::harness_state::read(
             &st_drivers::harness_state::harness_state_path(&observations.dir), None,
         ).is_some_and(|state| state.state == st_drivers::harness_state::Activity::Ended)
     {
-        return Ok(());
+        return Ok(false);
     }
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while !root.join("provider-return.json").exists() {
         anyhow::ensure!(tokio::time::Instant::now() < deadline, "fixture provider completion timed out");
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    observations.drain(client, subject, driver, ready).await?;
-    fs::write(root.join("observation-drained"), b"drained")?;
+    let deferred = observations.drain_live(client, subject, driver, ready).await?;
+    fs::write(root.join("observation-drained"), if deferred { "deferred" } else { "published" })?;
     let after = fs::read_to_string(root.join("order"))? == "after";
     if after {
         while !task.is_finished() {
@@ -18151,7 +18163,7 @@ async fn fixture_terminal_completion_barrier(
         anyhow::ensure!(tokio::time::Instant::now() < deadline, "fixture driver release timed out");
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    Ok(())
+    Ok(deferred)
 }
 
 fn reject_noninteractive_claude_argv(argv: &[String]) -> Result<()> {
@@ -18360,6 +18372,17 @@ impl NativeObservations {
         }
         Ok(())
     }
+    async fn drain_live(
+        &mut self,
+        client: &Client,
+        subject: &str,
+        driver: &str,
+        ready: &mut bool,
+    ) -> Result<bool> {
+        self.drain(client, subject, driver, ready).await?;
+        Ok(false)
+    }
+
     async fn drain(
         &mut self,
         client: &Client,

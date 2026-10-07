@@ -214,7 +214,7 @@ read -r _
             Some(owner)
         }
     } else { None };
-    let mut pending_admitted = None;
+    let mut completion_fence = None;
     if let Some(order) = order {
         wait_file(&barrier.join("provider-return.json")).await;
         let outcome: Value = serde_json::from_slice(&std::fs::read(barrier.join("provider-return.json")).unwrap()).unwrap();
@@ -227,11 +227,22 @@ read -r _
         // The real ended observation is already admitted. Store must reject this binding,
         // regardless of whether the provider JoinHandle has finished.
         let fence = title_owner(root.path());
-        pending_admitted = Some(st3::test_support::check_fixture_mailbox(&store, &fence));
+        let deferred = std::fs::read_to_string(barrier.join("observation-drained")).unwrap() == "deferred";
+        if deferred {
+            assert!(st3::test_support::check_fixture_mailbox(&store, &fence).is_ok());
+        } else {
+            assert_eq!(st3::test_support::check_fixture_mailbox(&store, &fence).unwrap_err().code,
+                "stale-mailbox-session");
+        }
+        completion_fence = Some(fence);
         std::fs::write(barrier.join("poll-driver"), b"go").unwrap();
-        wait_file(&barrier.join("fence-received")).await;
-        assert_eq!(std::fs::read_to_string(barrier.join("fence-received")).unwrap(),
-            if order == "after" { "finished" } else { "pending" });
+        if deferred {
+            wait_file(&barrier.join("awaiting-completion")).await;
+        } else {
+            wait_file(&barrier.join("fence-received")).await;
+            assert_eq!(std::fs::read_to_string(barrier.join("fence-received")).unwrap(),
+                if order == "after" { "finished" } else { "pending" });
+        }
         std::fs::write(barrier.join("release-provider"), b"go").unwrap();
     }
     if let Some(owner) = &rejection_fence {
@@ -269,13 +280,18 @@ read -r _
             .contains(&sent.content)
     );
     assert_eq!(notification["params"]["meta"]["messageId"], sent.subject);
-    if let Some(admitted) = pending_admitted {
-        assert_eq!(admitted.unwrap_err().code, "stale-mailbox-session");
+    if let Some(fence) = completion_fence {
+        assert_eq!(st3::test_support::check_fixture_mailbox(&store, &fence).unwrap_err().code,
+            "stale-mailbox-session");
     }
     if let Some(owner) = rejection_fence {
         assert!(shell.try_wait().unwrap().is_none());
-        assert_eq!(st3::test_support::check_fixture_mailbox(&store, &owner).unwrap_err().code,
-            "stale-mailbox-session");
+        if rejection == Some("token") {
+            assert!(st3::test_support::check_fixture_mailbox(&store, &owner).is_ok());
+        } else {
+            assert_eq!(st3::test_support::check_fixture_mailbox(&store, &owner).unwrap_err().code,
+                "stale-mailbox-session");
+        }
         assert!(runtime.actions.lock().unwrap().is_empty());
         std::fs::write(barrier.join("exit-provider"), b"go").unwrap();
         server.abort(); shell.kill().await.unwrap();
