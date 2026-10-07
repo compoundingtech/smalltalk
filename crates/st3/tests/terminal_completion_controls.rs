@@ -325,8 +325,9 @@ read -r _
                 "pending"
             }
         );
-        // The real ended observation is already admitted. Store must reject this binding,
-        // regardless of whether the provider JoinHandle has finished.
+        // Before the fix, ended was already admitted and Store must deny the binding.
+        // With the publication hold, the current binding remains valid until the actual
+        // task result is disposed. Both paths must deny it after final exit publication.
         let fence = title_owner(root.path());
         let deferred =
             std::fs::read_to_string(barrier.join("observation-drained")).unwrap() == "deferred";
