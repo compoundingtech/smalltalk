@@ -79,7 +79,13 @@ const NATIVE_PREFIX_NOTE = "Earlier history is not shown: st reads only the newe
 
 // Harness records that carry no conversation: the transcript's own titles and modes. Unknown
 // records stay visible.
-const BOOKKEEPING_RECORDS = ['last-prompt', 'ai-title', 'mode', 'permission-mode', 'atis-latch', 'pr-link', 'frame-link', 'bridge-session', 'total_tokens_reminder'];
+const BOOKKEEPING_RECORDS = [
+  // Claude's own entries, system records and attachments.
+  'last-prompt', 'ai-title', 'mode', 'permission-mode', 'atis-latch', 'pr-link', 'frame-link', 'bridge-session', 'queue-operation', 'cost-state',
+  'stop_hook_summary', 'turn_duration', 'total_tokens_reminder', 'deferred_tools_record', 'silent_turn_reminder', 'environment', 'date', 'skill_listing', 'command_permissions', 'edited_text_file',
+  // Codex's turn bookkeeping: the messages and calls they mention are entries of their own.
+  'event_msg', 'token_usage_record', 'turn_context', 'world_state',
+];
 
 // A reasoning step whose text the model did not share is bookkeeping too.
 function isBookkeeping(entry: Entry, filters: readonly DisplayFilter[]): boolean {
