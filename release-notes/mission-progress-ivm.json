@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Prepare keyed current-generation mission progress counts",
+  "replay": {"status": "none", "detail": "No startup or read backfill. Populated capture and output installation are explicit bounded writer pages."},
+  "schema": {"status": "changed", "detail": "Explicit View registration creates local step inventory, two-bucket counters, pending runs, progress rows and durable capture cursors. Default production schema is unchanged."},
+  "rules": {"status": "none", "detail": "Raw COUNT and completed SUM semantics are preserved. Effective state, source admission, checkpoint rules and authority remain unchanged."},
+  "compatibility": {"status": "none", "detail": "No public routes, pagination, socket protocol or action changes. Counts alone do not qualify full mission cards."},
+  "downtime": {"status": "none", "detail": "No default registration, source hooks or reader activation."},
+  "manual": {"status": "changed", "detail": "The shared owner must explicitly register, resume populated capture and backfill while fenced, certify complete source projection, drain dirty keys and publish initial availability."},
+  "recovery": {"status": "unknown", "detail": "Rollback and explicit capture resume are controlled; checkpoint/digest/restore participation and production source closure are unqualified."}
+}
