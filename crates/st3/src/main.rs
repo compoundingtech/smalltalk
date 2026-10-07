@@ -2478,6 +2478,15 @@ struct DoctorArgs {
     /// Show only the slowest requests and queries over the last five minutes.
     #[arg(long)]
     performance: bool,
+    /// Fully audit a private database copy offline, without contacting the daemon or network.
+    #[arg(long, value_name = "DATABASE", conflicts_with = "performance")]
+    offline_audit: Option<PathBuf>,
+    /// Filesystem for private audit databases and SQLite temporary files.
+    #[arg(long, requires = "offline_audit", value_name = "DIRECTORY")]
+    audit_scratch_dir: Option<PathBuf>,
+    /// Maximum private audit scratch bytes; the audit refuses insufficient space.
+    #[arg(long, requires = "offline_audit")]
+    audit_max_bytes: Option<u64>,
 }
 
 #[derive(Subcommand)]
@@ -4532,6 +4541,18 @@ fn main() -> ExitCode {
         Err(error) => exit_usage_error(error),
     };
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| exit_usage_error(error));
+    if let Command::Doctor(args) = &cli.command {
+        if args.offline_audit.is_some() {
+            // Full audits run before the async runtime, client, telemetry or networking.
+            return match run_offline_doctor(args, cli.json) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("st: {error:#}");
+                    ExitCode::from(2)
+                }
+            };
+        }
+    }
     if let Command::Up(args) = &cli.command {
         record_daemon_commands(args);
     }
@@ -4548,6 +4569,61 @@ fn main() -> ExitCode {
         }
     }
     run_cli(cli)
+}
+
+fn run_offline_doctor(args: &DoctorArgs, json_output: bool) -> Result<()> {
+    let config = Config::load_unvalidated(None)?;
+    let scratch_root = args
+        .audit_scratch_dir
+        .clone()
+        .unwrap_or_else(|| config.state_dir.join("diagnostic-audits"));
+    std::fs::create_dir_all(&scratch_root)?;
+    extern "C" fn interrupt(_: libc::c_int) {
+        st3::store::offline_audit::AUDIT_INTERRUPTED
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    // SAFETY: this command executes before threads start; the signal callback only sets an
+    // atomic flag. Copy loops and SQLite progress handlers observe it and unwind temp guards.
+    unsafe {
+        libc::signal(libc::SIGINT, interrupt as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, interrupt as libc::sighandler_t);
+    }
+    let scratch = tempfile::Builder::new()
+        .prefix("st3-offline-command-")
+        .tempdir_in(&scratch_root)?;
+    // SAFETY: no thread or SQLite connection has been started by this command.
+    unsafe {
+        std::env::set_var("SQLITE_TMPDIR", scratch.path());
+    }
+    let audit = st3::store::offline_audit::offline_full_audit_in(
+        args.offline_audit
+            .as_deref()
+            .context("offline audit input missing")?,
+        &config.database_path(),
+        scratch.path(),
+        args.audit_max_bytes
+            .unwrap_or(st3::store::offline_audit::DEFAULT_SCRATCH_LIMIT),
+    )?;
+    if json_output {
+        print_value(&audit, true)?;
+    } else {
+        println!(
+            "offline-full-audit\tschema {}\tstore index {:?}",
+            audit.schema_version, audit.store_index
+        );
+        for check in &audit.report.checks {
+            println!("{}\t{}\t{}", check.status, check.name, check.message);
+        }
+    }
+    anyhow::ensure!(
+        audit.report.status != "fail",
+        "offline audit found a failed invariant"
+    );
+    anyhow::ensure!(
+        !args.strict || audit.report.status == "pass",
+        "offline audit evidence is incomplete in strict mode"
+    );
+    Ok(())
 }
 
 /// Export the runtime fence before any provider or runtime worker thread starts. Fresh
@@ -5583,7 +5659,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
     raise_open_file_limit();
     startup.phase("open-store");
     let store = Arc::new(st3::profile::task("startup open-store", || {
-        Store::open(&config.state_dir.join("claims.sqlite3"), &config.node)
+        Store::open(&config.database_path(), &config.node)
     })?);
     if let Some(fleet_id) = &config.fleet_id {
         store.bind_fleet(fleet_id)?;
@@ -5801,9 +5877,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
     let local_socket = config.socket.clone();
     let state_socket = config.state_dir.join("run/st3.sock");
     let client_gateway_socket = config.client_gateway_socket.clone();
-    // The first diagnostic report reads the whole claim log; no read waits for it.
-    st3::api::start_operation_report(&state);
-    // Nor does the first session list wait to read every native transcript's header.
+    // The first session list does not wait to read every native transcript's header.
     st3::api::start_native_session_discovery(&state);
     startup.phase("bind-listeners");
     let bound = std::sync::atomic::AtomicUsize::new(0);
@@ -10972,8 +11046,29 @@ async fn run_replication(
         ReplicationCommand::Checkpoint {
             command: CheckpointCommand::Status,
         } => {
-            let status: st3::store::CheckpointStatusView =
-                client.get("/v1/checkpoint/status").await?;
+            let response = client
+                .get::<st3::store::CheckpointStatusView>("/v1/checkpoint/status")
+                .await;
+            if let Err(error) = &response {
+                if let Some((_, "diagnostic-evidence-incomplete", message, details)) =
+                    st3::client::api_error_parts(error)
+                {
+                    if json_output {
+                        print_value(
+                            &json!({"status":"unknown", "message":message, "details":details}),
+                            true,
+                        )?;
+                    } else {
+                        let comparison = details
+                            .get("comparison_state")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unavailable");
+                        eprintln!("unknown\tcheckpoint-status\t{comparison}: {message}");
+                    }
+                    return Err(CommandExit(2).into());
+                }
+            }
+            let status = response?;
             if json_output {
                 return print_value(&status, true);
             }
@@ -22991,6 +23086,44 @@ mod tests {
     use super::*;
 
     // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
+    #[test]
+    fn offline_doctor_parses_only_explicit_local_audit_options() {
+        let cli = Cli::try_parse_from([
+            "st3",
+            "doctor",
+            "--offline-audit",
+            "/private/evidence.sqlite3",
+            "--audit-scratch-dir",
+            "/private/scratch",
+            "--audit-max-bytes",
+            "2147483648",
+        ])
+        .unwrap();
+        let Command::Doctor(args) = cli.command else {
+            panic!("doctor command");
+        };
+        assert_eq!(
+            args.offline_audit.as_deref(),
+            Some(std::path::Path::new("/private/evidence.sqlite3"))
+        );
+        assert_eq!(args.audit_max_bytes, Some(2147483648));
+        assert!(
+            Cli::try_parse_from(["st3", "doctor", "--audit-scratch-dir", "/private/scratch"])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "st3",
+                "doctor",
+                "--offline-audit",
+                "/private/copy",
+                "--performance"
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["st3", "doctor"]).is_ok());
+    }
+
     #[test]
     fn omp_pending_ask_retry_is_bound_to_the_expected_call_and_sent_once_across_reexec() {
         let mut state = PiChannelResume::default();

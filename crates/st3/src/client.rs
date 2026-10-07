@@ -1252,9 +1252,8 @@ fn request_deadline(path: &str, deadlines: ClientDeadlines) -> Duration {
     } else if path.starts_with("/v1/internal/replication/heal/") {
         // A heal can replay the graph from nothing, 41 seconds on a 2 GB store.
         Duration::from_secs(10 * 60)
-    } else if path.starts_with("/v1/checkpoint/plan") || path.starts_with("/v1/checkpoint/status")
-    {
-        // A dry run copies the store and replays it twice; status reads what is sealed.
+    } else if path.starts_with("/v1/checkpoint/plan") {
+        // An explicit dry run copies the store and replays it twice.
         Duration::from_secs(30 * 60)
     } else if path.starts_with("/v1/events?") && path.contains("wait=true") {
         deadlines.event
@@ -1615,6 +1614,11 @@ mod tests {
             request_deadline("/v1/status", deadlines),
             Duration::from_secs(15)
         );
+        assert_eq!(
+            request_deadline("/v1/checkpoint/status", deadlines),
+            deadlines.request
+        );
+
         assert_eq!(
             request_deadline("/v1/events?wait=true&timeout_ms=30000", deadlines),
             Duration::from_secs(35)

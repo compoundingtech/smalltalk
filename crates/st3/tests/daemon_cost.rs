@@ -66,8 +66,6 @@ const ADAPTER_ACTOR: &str = "agent/bench/cost/adapter";
 const KNOWN_GROWTH: &[(&str, f64)] = &[
     // Attention reads every person ask (11.8x full-scan steps).
     ("GET /v1/attention", 18.0),
-    // Checkpoint status walks the sealed set (9.8x).
-    ("GET /v1/checkpoint/status", 15.0),
     // Runtimes read every runtime observation (3.8x for the list, 9.0x for one runtime).
     ("GET /v1/client/runtimes", 6.0),
     ("GET /v1/client/runtimes/{*id}", 14.0),
@@ -1730,7 +1728,19 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
                         None => client.get::<Value>(&path).await,
                         Some(body) => client.post::<_, Value>(&path, body).await,
                     };
-                    answer.map_err(|error| error.to_string().chars().take(200).collect())
+                    if path == "/v1/checkpoint/status" {
+                        let error = answer
+                            .expect_err("uncertified checkpoint evidence must not look healthy");
+                        let (status, code, message, details) = st3::client::api_error_parts(&error)
+                            .expect("checkpoint status preserves the structured API error");
+                        assert_eq!(status, 503);
+                        assert_eq!(code, "diagnostic-evidence-incomplete");
+                        assert_eq!(details["comparison_state"], "uncomputed");
+                        assert!(message.contains("evidence incomplete"));
+                        Ok(json!({"status":"unknown", "details":details}))
+                    } else {
+                        answer.map_err(|error| error.to_string().chars().take(200).collect())
+                    }
                 })
                 .await
             };

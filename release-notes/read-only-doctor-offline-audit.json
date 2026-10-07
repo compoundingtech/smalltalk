@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Diagnostic reads stop sealing or rebuilding store state; an explicit offline audit inspects private copies.",
+  "replay": {
+    "status": "changed",
+    "detail": "GET doctor and operations no longer run full invariant reducers or start a whole-store diagnostic job. The explicit doctor --offline-audit command can replay on a second private scratch copy, before starting a runtime or client. Startup replay behavior is unchanged. Current invariants remain named unknown until maintained evidence is integrated."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No production table, index, trigger or schema version change. Offline audit neither opens a Store nor migrates caller evidence."
+  },
+  "rules": {
+    "status": "changed",
+    "detail": "Checkpoint rules and digests are unchanged. Sealing formerly reached through diagnostic fleet-membership reads now runs explicitly on the due checkpoint writer path. Peer SealTerms and exchange formats are unchanged; no coordinated rules-version transition is introduced."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "For every client, GET checkpoint/status returns HTTP 503 diagnostic-evidence-incomplete with comparison_state=uncomputed until current maintained comparison evidence exists. The CLI prints unknown and exits 2; old clients see a readable nonzero error. Doctor and operations expose unchecked invariants by name as unknown, and strict doctor cannot pass them. Successful checkpoint-status and peer-wire shapes are unchanged. The offline audit flags are additive."
+  },
+  "downtime": {
+    "status": "unknown",
+    "detail": "No extra restart or recovery phase is added. Restart-to-API and restart-to-health were not measured for this change; operations deploys the binary through the normal service update. The diagnostic checkpoint 503 describes uncertified evidence, not daemon health."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Scripts using checkpoint/status must handle evidence-incomplete as unknown rather than restarting the daemon. Full audit is opt-in: supply a frozen private database copy, including its WAL when present, with doctor --offline-audit DATABASE. Choose --audit-scratch-dir for a filesystem with room; the default scratch cap is 32 GiB. Live-database inode aliases are refused. No manual step is needed for normal diagnostic reads."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "This change introduces no production migration or persistent diagnostic cache. Installing the previous binary restores previous read behavior. Audit scratch is removed on ordinary failure and handled SIGINT/SIGTERM; original evidence is never repaired."
+  }
+}
