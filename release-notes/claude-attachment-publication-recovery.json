@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Resolve uncertain Claude attachment diagnostics before publishing recovery.",
+  "replay": {
+    "status": "none",
+    "detail": "No graph replay change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema or migration change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules, digests or member coordination change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Graceful driver resume state gains optional pending-publication, parked-fault and reconciliation fields. Legacy resume state remains readable. Older images do not retain the new pending-operation safeguard on downgrade; mixed-image native execution is unverified."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional service interruption is required."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No installation or migration action is required."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "Transient diagnostic failures retain and retry the identical operation; known permanent failures park per binding until a replacement is admitted. Pending state transfers only through the existing graceful re-exec file. Abrupt process death can still lose the in-memory pending slot; crash durability and safe replay of that lost operation are not guaranteed."
+  }
+}
