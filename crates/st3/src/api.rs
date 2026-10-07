@@ -3089,7 +3089,27 @@ fn client_attention_resources_at(
     _history: bool,
     at_unix_ms: u128,
 ) -> anyhow::Result<Vec<Value>> {
-    let current = store.attention_snapshot(person, at_unix_ms)?;
+    let current = crate::performance::task("attention_collection/snapshot", || {
+        store.attention_snapshot(person, at_unix_ms)
+    })?;
+    client_attention_resources_from_items(store, current)
+}
+
+fn client_attention_resources_fenced_at(
+    store: &Store,
+    person: Option<&str>,
+    at_unix_ms: u128,
+) -> anyhow::Result<(Vec<Value>, Option<u128>)> {
+    let (current, valid_until) = crate::performance::task("attention_collection/snapshot", || {
+        store.attention_collection_snapshot(person, at_unix_ms)
+    })?;
+    Ok((client_attention_resources_from_items(store, current)?, valid_until))
+}
+
+fn client_attention_resources_from_items(
+    store: &Store,
+    current: Vec<crate::model::AttentionItemView>,
+) -> anyhow::Result<Vec<Value>> {
     let mut resources = Vec::new();
     for item in current {
         let id = client_attention_id(&item.subject, &item.person, &item.episode)?;

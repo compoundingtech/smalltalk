@@ -12542,8 +12542,12 @@ impl Store {
 
     /// Current runs waiting on person steps, human gates or approvals.
     pub fn human_attention_runs(&self) -> Result<BTreeSet<String>> {
+        self.human_attention_runs_at(now_ms())
+    }
+
+    pub(crate) fn human_attention_runs_at(&self, now: u128) -> Result<BTreeSet<String>> {
         let mut items = self.mission_run_attention_items(None)?;
-        items.extend(self.person_attention_items(None, now_ms())?);
+        items.extend(self.person_attention_items(None, now)?);
         Ok(items.into_iter().filter_map(|item| item.mission_run).collect())
     }
 

@@ -29,6 +29,8 @@ struct Revisions {
 struct Cached {
     revision: u64,
     period: u128,
+    valid_from: u128,
+    valid_until: Option<u128>,
     items: Vec<Value>,
     has_more: bool,
 }
@@ -56,7 +58,10 @@ pub(super) struct Prepared {
 
 impl Prepared {
     pub(super) async fn admit(&self) -> tokio::sync::OwnedMutexGuard<()> {
-        self.entry.admission.clone().lock_owned().await
+        let started = Instant::now();
+        let guard = self.entry.admission.clone().lock_owned().await;
+        crate::performance::record_request("collection/admission-wait", None, started.elapsed());
+        guard
     }
 }
 
@@ -263,6 +268,20 @@ impl Windows {
     }
 
     fn key(state: &AppState, session: &ClientSession, request: &CollectionSubscribe) -> String {
+        // These projections have no per-grant data once authority has been revalidated.
+        // Limits are window slicing, not projection inputs. Attention's effective person
+        // and compatibility view are its visibility boundary; missions are fleet-public.
+        if request.collection == "missions" {
+            return json!({"node":state.node, "fleet":state.fleet_id,
+                "collection":"missions"}).to_string();
+        }
+        if request.collection == "attention"
+            && let Ok(person) = person_filter(session, request.person.as_deref())
+        {
+            return json!({"node":state.node, "fleet":state.fleet_id,
+                "collection":"attention", "person":person,
+                "custom_forms":session.custom_forms}).to_string();
+        }
         json!({
             "node":state.node, "fleet":state.fleet_id,
             "actor":session.actor, "authority":session.authority_actor,
@@ -298,7 +317,7 @@ impl Windows {
         session: &ClientSession,
         request: &CollectionSubscribe,
         fence: ReadFence,
-        compute: impl FnOnce() -> anyhow::Result<(Vec<Value>, bool)>,
+        compute: impl FnOnce() -> anyhow::Result<(Vec<Value>, bool, Option<u128>)>,
     ) -> anyhow::Result<(Vec<Value>, bool)> {
         let ReadFence {
             index,
@@ -312,27 +331,26 @@ impl Windows {
             compute()
         };
         let Some(prepared) = prepared else {
-            return compute();
+            return compute().map(|(items, more, _)| (items, more));
         };
         // Authority can change while async admission waits. The current snapshot's key
         // must still match; otherwise this read computes without publishing a cache entry.
         if prepared.key != Self::key(state, session, request) {
-            return compute();
+            return compute().map(|(items, more, _)| (items, more));
         }
         // A commit after this reader began can update local tables without advancing the
         // claim index. Such a snapshot cannot reuse/cache a newer local-state generation.
         if self.commits() != snapshot_commits {
-            return compute();
+            return compute().map(|(items, more, _)| (items, more));
         }
         let Some(revision) =
             self.revision(&state.store, index, &request.collection, snapshot_commits)?
         else {
-            return compute();
+            return compute().map(|(items, more, _)| (items, more));
         };
-        // Attention and mission previews have wall-clock grace/expiry inputs. Agents receive live local overlays
-        // below the cache. The period is shared across sockets, including their initial ticks.
+        // Work uses its selected projection time. Missions and attention use exact
+        // transition fences, not a coarse shared wall-clock bucket.
         let period = match request.collection.as_str() {
-            "attention" | "missions" => now / ATTENTION_CLOCK_INTERVAL.as_millis(),
             // Work's deterministic selected projection time is itself an input, even if a
             // claim kind does not otherwise change its rows (elapsed budgets/lease expiry).
             "work" => state.store.projection_time_at(index)?,
@@ -347,15 +365,19 @@ impl Windows {
         if let Some(cached) = cached
             && cached.revision == revision
             && cached.period == period
+            && now >= cached.valid_from
+            && cached.valid_until.is_none_or(|until| now < until)
         {
             return Ok((cached.items.clone(), cached.has_more));
         }
-        let (items, has_more) = compute()?;
+        let (items, has_more, valid_until) = compute()?;
         // At most 64 bounded responses per Store. Oversized results remain uncached.
         let cached = (serde_json::to_vec(&items)?.len() <= CLIENT_MAX_RESPONSE_BYTES).then(|| {
             Arc::new(Cached {
                 revision,
                 period,
+                valid_from: now,
+                valid_until,
                 items: items.clone(),
                 has_more,
             })
@@ -406,7 +428,7 @@ mod tests {
         state.store.read_snapshot(|index| {
             windows.read(state, session, request, ReadFence { index, now, commits, prepared }, || {
                 let n = count.fetch_add(1, Ordering::SeqCst);
-                Ok((vec![json!({"id":format!("row/{n}"), "authority":session.authority_actor})], false))
+                Ok((vec![json!({"id":format!("row/{n}"), "authority":session.authority_actor})], false, None))
             }).map(|(rows, _)| rows)
         }).unwrap()
     }
@@ -467,7 +489,7 @@ mod tests {
                             builds.fetch_add(1, Ordering::SeqCst);
                             entered.send(()).unwrap();
                             held.recv().unwrap();
-                            Ok((vec![json!({"id":"shared"})], false))
+                            Ok((vec![json!({"id":"shared"})], false, None))
                         },
                     )
                 })
@@ -551,11 +573,12 @@ mod tests {
             read(&windows, &state, &session, &attention, 29_999, &count),
             first
         );
-        assert_ne!(
+        assert_eq!(
             read(&windows, &state, &session, &attention, 30_000, &count),
-            first
+            first,
+            "no graph transition means crossing a timer bucket does not rebuild"
         );
-        assert_eq!(count.load(Ordering::SeqCst), 5);
+        assert_eq!(count.load(Ordering::SeqCst), 4);
     }
 
     #[test]
@@ -651,7 +674,7 @@ mod tests {
         let windows = Windows::attach(&state.store).unwrap();
         let count = AtomicUsize::new(0);
         let session = ClientSession::local(Some("person/ada")).unwrap();
-        let query = request("attention");
+        let query = request("work");
         let first = read(&windows, &state, &session, &query, 0, &count);
         let mut same = query.clone();
         same.id = "another-socket-id".into();
@@ -728,7 +751,7 @@ mod tests {
                         },
                         || {
                             count.fetch_add(1, Ordering::SeqCst);
-                            Ok((vec![json!({"id":"old-snapshot"})], false))
+                            Ok((vec![json!({"id":"old-snapshot"})], false, None))
                         },
                     )?
                     .0;
@@ -749,7 +772,7 @@ mod tests {
         let session = ClientSession::local(None).unwrap();
         let count = AtomicUsize::new(0);
         for limit in 1..=WINDOWS + 2 {
-            let mut query = request("missions");
+            let mut query = request("work");
             query.limit = Some(limit);
             let mut owner = session.clone();
             owner.actor = format!("client/owner/{}", limit / SESSION_WINDOWS);
@@ -1017,7 +1040,10 @@ mod tests {
 
     #[tokio::test]
     async fn shared_windows_recheck_pairing_revocation_scope_and_expiry_before_cached_rows() {
-        for change in ["revoked", "scopes", "expired"] {
+        for (collection, change) in [
+            ("missions", "revoked"), ("missions", "scopes"), ("missions", "expired"),
+            ("attention", "revoked"), ("attention", "scopes"), ("attention", "expired"),
+        ] {
             let root = tempfile::tempdir().unwrap();
             let state = state(root.path());
             let grant = "custom/client/window-reader";
@@ -1043,7 +1069,7 @@ mod tests {
             let session = paired_client_session(&state, &paired, "fabric-loopback", false).unwrap();
             let windows = Windows::attach(&state.store).unwrap();
             let slots = Arc::new(tokio::sync::Semaphore::new(1));
-            let query = request("missions");
+            let query = request(collection);
             let first = collection_items_with_windows(
                 &state,
                 &session,
@@ -1212,5 +1238,255 @@ mod tests {
         })
         .await
         .expect("closed sockets release shared windows and the observer");
+    }
+    fn mission_attention_fixture(state: &AppState, count: usize) {
+        let source = format!("version 2\n{}", (0..count).map(|n| format!(
+            "mission \"shared-{n:03}\" state=\"ready\" {{ goal \"Review fixture\"; step \"review\" {{ assigned-to \"person/ada\"; goal \"Review\"; }} }}\n"
+        )).collect::<String>());
+        let intent = crate::graph::parse_internal_intent(&source, state.store.origin()).unwrap();
+        state.store.apply_internal(&intent, "shared-projection-fixture").unwrap();
+        for n in 0..count {
+            let run = state.store.create_mission_run(&crate::model::MissionRunRequest {
+                mission:format!("shared-{n:03}"), revision:None, workspace:"/tmp".into(),
+                requester:Some("person/ada".into()), mode:Some("run".into()),
+                inputs:BTreeMap::new(), idempotency_key:format!("shared-run-{n}"),
+            }).unwrap();
+            state.store.set_step_state(&run.steps[0].subject, "ready", None).unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mission_attention_subscribers_share_projection_across_grants_and_limits_with_parity() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        mission_attention_fixture(&state, 8);
+        let windows = Windows::attach(&state.store).unwrap();
+        let slots = Arc::new(tokio::sync::Semaphore::new(32));
+        for collection in ["missions", "attention"] {
+            let before = windows.builds();
+            let mut readers = tokio::task::JoinSet::new();
+            let barrier = Arc::new(tokio::sync::Barrier::new(22));
+            for n in 0..22 {
+                let state = state.clone();
+                let windows = windows.clone();
+                let slots = slots.clone();
+                let barrier = barrier.clone();
+                readers.spawn(async move {
+                    let mut session = ClientSession::local(Some("person/ada")).unwrap();
+                    // Independently authenticated subscribers with identical visible data.
+                    session.actor = format!("client/{n}");
+                    session.pairing_grant = Some(format!("custom/client/{n}"));
+                    let mut query = request(collection);
+                    query.limit = Some(n % 8 + 1);
+                    barrier.wait().await;
+                    let (_, items, more) = collection_items_with_windows(&state, &session, &query,
+                        slots.clone().acquire_owned().await.unwrap(), Some(windows)).await.unwrap();
+                    let (_, oracle, oracle_more) = collection_items_with_windows(&state, &session, &query,
+                        slots.acquire_owned().await.unwrap(), None).await.unwrap();
+                    assert_eq!(items, oracle, "{collection} subscriber {n}");
+                    assert_eq!(more, oracle_more);
+                });
+            }
+            while let Some(result) = readers.join_next().await { result.unwrap(); }
+            assert_eq!(windows.builds() - before, 1, "{collection}");
+        }
+        let mut query = request("attention");
+        let ada = ClientSession::local(Some("person/ada")).unwrap();
+        let avery = ClientSession::local(Some("person/avery")).unwrap();
+        let (_, items, _) = collection_items_with_windows(&state, &avery, &query,
+            slots.clone().acquire_owned().await.unwrap(), Some(windows.clone())).await.unwrap();
+        assert!(items.is_empty(), "another person must not receive Ada's rows");
+        query.person = Some("person/ada".into());
+        assert!(collection_items_with_windows(&state, &avery, &query,
+            slots.clone().acquire_owned().await.unwrap(), Some(windows.clone())).await.is_err());
+        query.person = None;
+        let before = windows.builds();
+        let mut compatibility = ada.clone();
+        compatibility.custom_forms = !ada.custom_forms;
+        collection_items_with_windows(&state, &compatibility, &query,
+            slots.acquire_owned().await.unwrap(), Some(windows.clone())).await.unwrap();
+        assert_eq!(windows.builds(), before + 1, "visibility/compatibility keys are separate");
+    }
+
+    #[test]
+    #[ignore = "focused collection timing fixture; run explicitly with --ignored --nocapture"]
+    fn mission_attention_projection_fixture_timing() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        mission_attention_fixture(&state, 70);
+        let windows = Windows::attach(&state.store).unwrap();
+        let session = ClientSession::local(Some("person/ada")).unwrap();
+        let now = client_now_ms();
+        for collection in ["missions", "attention"] {
+            let query = request(collection);
+            let projection = || -> anyhow::Result<(Vec<Value>, bool)> {
+                let mut items = if collection == "missions" {
+                    let ids = state.store.mission_collection_ids(false, 0, CLIENT_MAX_PAGE_ITEMS + 1)?;
+                    mission_list_cards_at(&state.store, &ids, now)?
+                } else {
+                    client_attention_resources_at(&state.store, Some("person/ada"), false, now)?
+                };
+                client_attention_compatibility(&mut items, session.custom_forms);
+                Ok((items, false))
+            };
+            let oracle = state.store.read_snapshot(|_| projection()).unwrap();
+            let measure = |label:&str, f:&dyn Fn()| {
+                let work = smallclaims::sqlite::work::total();
+                let started = Instant::now();
+                f();
+                println!("{collection} fixture {label}: {:.3} ms; sqlite_work={:?}",
+                    started.elapsed().as_secs_f64()*1000.0, smallclaims::sqlite::work::total()-work);
+            };
+            measure("uncached x22", &|| {
+                for _ in 0..22 { assert_eq!(state.store.read_snapshot(|_| projection()).unwrap(), oracle); }
+            });
+            let cached = || {
+                let prepared = windows.prepare(&state, &session, &query);
+                let _admission = prepared.as_ref().map(|p| p.entry.admission.clone().blocking_lock_owned());
+                let commits = windows.commits();
+                state.store.read_snapshot(|index| windows.read(&state, &session, &query,
+                    ReadFence { index, now, commits, prepared }, || {
+                        let (mut items, until) = if collection == "missions" {
+                            let ids = state.store.mission_collection_ids(false, 0, CLIENT_MAX_PAGE_ITEMS + 1)?;
+                            (mission_list_cards_at(&state.store, &ids, now)?,
+                                state.store.mission_collection_valid_until(&ids, now)?)
+                        } else {
+                            client_attention_resources_fenced_at(&state.store, Some("person/ada"), now)?
+                        };
+                        client_attention_compatibility(&mut items, session.custom_forms);
+                        Ok((items, false, until))
+                    })).unwrap()
+            };
+            measure("shared cold", &|| { assert_eq!(cached(), oracle); });
+            measure("shared warm x22", &|| {
+                for _ in 0..22 { assert_eq!(cached(), oracle); }
+            });
+        }
+        println!("fixture stage profile: {}", crate::performance::snapshot());
+    }
+    #[test]
+    fn mission_attention_invalidation_covers_projection_claim_families() {
+        for collection in ["missions", "attention"] {
+            for kind in st3_schema::registry().claims.keys() {
+                let telemetry = matches!(kind.as_str(),
+                    "daemon.diagnostic" | "transport.observed" | "workspace.observed")
+                    || (collection == "missions" && matches!(kind.as_str(),
+                        "harness.observed" | "harness.diagnostic" | "harness.timeline" | "harness.usage"
+                            | "harness.todo.observed" | "harness.session-file"))
+                    || (collection == "attention" && matches!(kind.as_str(),
+                        "harness.timeline" | "harness.usage" | "harness.todo.observed" | "harness.session-file"));
+                assert_eq!(collection_ignores(collection, kind), telemetry, "{collection}: {kind}");
+            }
+            assert!(!collection_ignores(collection, "unknown.future-projection-input"));
+            assert!(!collection_ignores(collection, "harness.future-projection-input"));
+        }
+        for kind in ["harness.observed", "harness.diagnostic", "harness.timeline",
+            "harness.usage", "harness.todo.observed", "harness.session-file"] {
+            assert!(collection_ignores("missions", kind), "{kind}");
+        }
+        for kind in ["harness.observed", "harness.diagnostic"] {
+            assert!(!collection_ignores("attention", kind), "login input {kind}");
+        }
+        for kind in ["harness.timeline", "harness.usage", "harness.todo.observed", "harness.session-file"] {
+            assert!(collection_ignores("attention", kind), "{kind}");
+        }
+    }
+    #[test]
+    fn mission_attention_cache_expires_at_exact_transition_and_rejects_backward_clock() {
+        for collection in ["missions", "attention"] {
+            let root = tempfile::tempdir().unwrap();
+            let state = state(root.path());
+            mission_attention_fixture(&state, 1);
+            let overview = state.store.mission_overview("shared-000", 3).unwrap();
+            let run = overview["newest"][0]["id"].as_str().unwrap();
+            let step = state.store.mission_step_preview(run).unwrap().2[0].subject.clone();
+            {
+                let writer = state.store.connection.lock().unwrap();
+                if collection == "missions" {
+                    writer.execute("UPDATE step_runs SET status='claimed',lease_owner='agent/clock',lease_incarnation='clock',lease_expires_at_unix_ms='30000' WHERE subject=?1", [&step]).unwrap();
+                } else {
+                    writer.execute("UPDATE step_runs SET activated_at_unix_ms='30000' WHERE subject=?1", [&step]).unwrap();
+                }
+            }
+            let windows = Windows::attach(&state.store).unwrap();
+            let session = ClientSession::local(Some("person/ada")).unwrap();
+            let query = request(collection);
+            let projection = |now| {
+                if collection == "missions" {
+                    mission_list_cards_at(&state.store, &["mission/shared-000".into()], now)
+                } else {
+                    client_attention_resources_at(&state.store, Some("person/ada"), false, now)
+                }
+            };
+            let cached = |now| {
+                let prepared = windows.prepare(&state, &session, &query);
+                let _admission = prepared.as_ref().map(|p| p.entry.admission.clone().blocking_lock_owned());
+                let commits = windows.commits();
+                state.store.read_snapshot(|index| windows.read(&state, &session, &query,
+                    ReadFence { index, now, commits, prepared }, || {
+                        let (items, until) = if collection == "missions" {
+                            (projection(now)?, state.store.mission_collection_valid_until(
+                                &["mission/shared-000".into()], now)?)
+                        } else {
+                            client_attention_resources_fenced_at(&state.store, Some("person/ada"), now)?
+                        };
+                        Ok((items, false, until))
+                    })).unwrap().0
+            };
+            let before = cached(29_999);
+            assert_eq!(before, projection(29_999).unwrap());
+            assert_eq!(cached(29_999), before);
+            assert_eq!(windows.builds(), 1, "{collection}");
+            let after = cached(30_000);
+            assert_eq!(after, projection(30_000).unwrap());
+            assert_ne!(after, before, "{collection} changes at the fence, not the next timer bucket");
+            assert_eq!(windows.builds(), 2, "{collection}");
+            assert_eq!(cached(29_999), before, "backward clock must not reuse future rows");
+            assert_eq!(windows.builds(), 3, "{collection}");
+        }
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mission_attention_twenty_two_websockets_build_once_per_visible_cut() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest as _};
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        mission_attention_fixture(&state, 8);
+        let windows = Windows::attach(&state.store).unwrap();
+        let app = axum::Router::new()
+            .route("/stream", axum::routing::get(collection_stream))
+            .with_state(state.clone())
+            .layer(Extension(ClientSession::local(Some("person/ada")).unwrap()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        for collection in ["missions", "attention"] {
+            let before = windows.builds();
+            let barrier = Arc::new(tokio::sync::Barrier::new(22));
+            let mut readers = tokio::task::JoinSet::new();
+            for n in 0..22 {
+                let barrier = barrier.clone();
+                readers.spawn(async move {
+                    let mut handshake = format!("ws://{address}/stream").into_client_request().unwrap();
+                    handshake.headers_mut().insert("sec-websocket-protocol",
+                        COLLECTION_SUBPROTOCOL.parse().unwrap());
+                    let (mut socket, _) = tokio_tungstenite::connect_async(handshake).await.unwrap();
+                    barrier.wait().await;
+                    socket.send(Message::Text(json!({"kind":"subscribe", "id":"visible",
+                        "collection":collection, "limit":n%8+1}).to_string().into())).await.unwrap();
+                    let frame = tokio::time::timeout(Duration::from_secs(10), socket.next())
+                        .await.unwrap().unwrap().unwrap();
+                    let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+                    assert_eq!(frame["kind"], "snapshot", "{frame}");
+                    assert_eq!(frame["items"].as_array().unwrap().len(), n%8+1);
+                    socket
+                });
+            }
+            let mut sockets = Vec::new();
+            while let Some(result) = readers.join_next().await { sockets.push(result.unwrap()); }
+            assert_eq!(windows.builds()-before, 1, "{collection}");
+            for mut socket in sockets { socket.close(None).await.unwrap(); }
+        }
+        server.abort();
     }
 }
