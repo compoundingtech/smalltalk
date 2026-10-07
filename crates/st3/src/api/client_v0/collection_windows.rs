@@ -1519,4 +1519,67 @@ mod tests {
         }
         server.abort();
     }
+    #[test]
+    fn missions_cached_window_expires_recently_ended_membership_at_inclusive_cutoff() {
+        for status in ["failed", "cancelled"] {
+            let root = tempfile::tempdir().unwrap();
+            let state = state(root.path());
+            mission_attention_fixture(&state, 3);
+            {
+                let writer = state.store.connection.lock().expect("fixture writer");
+                for (mission, updated) in [("shared-000", 1_000), ("shared-001", 1_010)] {
+                    writer.execute(
+                        "UPDATE mission_runs SET status=?1,updated_at_unix_ms=?2 WHERE mission_id=?3",
+                        rusqlite::params![status, updated.to_string(), mission],
+                    ).unwrap();
+                }
+            }
+            let index = state.store.index().unwrap();
+            let windows = Windows::attach(&state.store).unwrap();
+            let session = ClientSession::local(Some("person/ada")).unwrap();
+            let query = request("missions");
+            let oldest_last_included = 1_000 + crate::store::RECENTLY_ENDED_MS;
+            let read = |now| {
+                let prepared = windows.prepare(&state, &session, &query);
+                let _admission = prepared.as_ref().map(|p| {
+                    p.entry.admission.clone().blocking_lock_owned()
+                });
+                let commits = windows.commits();
+                state.store.read_snapshot(|index| windows.read(&state, &session, &query,
+                    ReadFence { index, now, commits, prepared },
+                    // Two cards plus lookahead exercise the production projection's
+                    // membership/has_more logic with a small injected-clock fixture.
+                    || mission_collection_projection_at(&state.store, 2, now),
+                )).unwrap()
+            };
+            let before = read(oldest_last_included - 1);
+            assert_eq!(before.0.len(), 2);
+            assert!(before.1, "the older recently-ended mission is the lookahead");
+            assert_eq!(read(oldest_last_included), before, "SQL includes the cutoff millisecond");
+            assert_eq!(windows.builds(), 1);
+            assert!(state.store.mission_collection_ids_at(false, 0, 10, oldest_last_included)
+                .unwrap().contains(&"mission/shared-000".into()));
+
+            let without_lookahead = read(oldest_last_included + 1);
+            assert_eq!(without_lookahead.0, before.0, "only the hidden lookahead expired");
+            assert!(!without_lookahead.1, "a rebuild must recompute has_more");
+            assert_eq!(windows.builds(), 2);
+            assert!(!state.store.mission_collection_ids_at(false, 0, 10, oldest_last_included + 1)
+                .unwrap().contains(&"mission/shared-000".into()));
+
+            let latest_last_included = oldest_last_included + 10;
+            assert_eq!(read(latest_last_included), without_lookahead);
+            assert_eq!(windows.builds(), 2);
+            let after = read(latest_last_included + 1);
+            assert_eq!(after.0.len(), 1, "the visible recently-ended mission must leave too");
+            assert_eq!(after.0[0]["id"], "mission/shared-002");
+            assert!(!after.1);
+            assert_eq!(windows.builds(), 3);
+            assert_eq!(state.store.index().unwrap(), index, "no graph write causes either expiry");
+            let (oracle, more, _) = state.store.read_snapshot(|_| {
+                mission_collection_projection_at(&state.store, 2, latest_last_included + 1)
+            }).unwrap();
+            assert_eq!(after, (oracle, more), "{status} cached/uncached membership parity");
+        }
+    }
 }

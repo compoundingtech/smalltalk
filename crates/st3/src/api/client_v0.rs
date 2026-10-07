@@ -272,15 +272,7 @@ async fn collection_items_with_windows(
                     let mut valid_until = None;
                     let mut items = match collection.as_str() {
                         "missions" => {
-                            let mut ids =
-                                store.mission_collection_ids(false, 0, projection_limit.saturating_add(1))?;
-                            let mut has_more = ids.len() > projection_limit;
-                            ids.truncate(projection_limit);
-                            let mut items = crate::performance::task("mission_collection/cards", || {
-                                mission_list_cards_at(&store, &ids, now)
-                            })?;
-                            has_more |= bound_mission_cards(&mut items)?;
-                            return Ok((items, has_more, store.mission_collection_valid_until(&ids, now)?));
+                            return mission_collection_projection_at(&store, projection_limit, now);
                         }
                         "glasses" => store.glasses(
                             person.as_deref().expect("authenticated glass owner"),
@@ -1918,6 +1910,24 @@ pub(super) fn mission_resources(
     store.read_snapshot(|_| {
         mission_resources_filtered(store, snapshot_index, history, selected_id, None)
     })
+}
+
+fn mission_collection_projection_at(
+    store: &Store,
+    limit: usize,
+    at_unix_ms: u128,
+) -> anyhow::Result<(Vec<Value>, bool, Option<u128>)> {
+    let mut ids = store.mission_collection_ids_at(false, 0, limit.saturating_add(1), at_unix_ms)?;
+    let mut has_more = ids.len() > limit;
+    // The lookahead also determines has_more, so its membership deadline belongs to
+    // this window even though its card is not rendered.
+    let valid_until = store.mission_collection_valid_until(&ids, at_unix_ms)?;
+    ids.truncate(limit);
+    let mut items = crate::performance::task("mission_collection/cards", || {
+        mission_list_cards_at(store, &ids, at_unix_ms)
+    })?;
+    has_more |= bound_mission_cards(&mut items)?;
+    Ok((items, has_more, valid_until))
 }
 
 /// Collection cards keep only three run headers, regardless of a mission's history size.

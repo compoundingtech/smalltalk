@@ -58,11 +58,15 @@ survive later ignored claims. Missions share a bounded 200-card fleet projection
 of subscriber grants and limits; attention shares by effective person visibility and custom-form
 compatibility. Authorization is checked before reuse, including grant expiry and scope loss.
 Their cached projections record the captured clock and the earliest exact output transition,
-including effective mission-preview leases and attention admission times; a backward clock or
-reaching a transition rebuilds. Attention rows do not age out: observer grace, final-step fault
+including effective mission-preview leases, recently-ended mission membership and attention
+admission times; a backward clock or reaching a transition rebuilds. Failed/cancelled missions
+remain current through the inclusive 24-hour cutoff and leave one millisecond later. The
+membership fence includes the page's lookahead so `has_more` is refreshed as well as cards.
+Selection, mission `must_act` and previews share the captured read clock. Attention rows do not
+age out: observer grace, final-step fault
 aging and checkpoint waits already belong to the separate fault projection, not this collection.
 Wake times and execution deadlines affect stored states through graph writes, not these cards'
-read clock. Mission `must_act` and its step previews use one captured time.
+read clock.
 The socket's existing 30-second timer remains the delivery cadence for clock-only changes.
 This cache covers the six collections named above.
 
