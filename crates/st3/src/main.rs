@@ -1810,8 +1810,9 @@ struct MissionRunStartArgs {
     /// published on another host is awaited briefly while it replicates here.
     #[arg(long)]
     revision: Option<String>,
-    /// The full run ID, used as given: `--id release/demo/1` starts `mission-run/release/demo/1`,
-    /// and `--id 1` starts `mission-run/1`. Defaults to MISSION/UUIDv7.
+    /// A bare ID is placed under the mission: for release/demo, `--id 1` starts
+    /// `mission-run/release/demo/1`. IDs containing a path, such as `--id release/demo/1`,
+    /// are used as given. Defaults to MISSION/UUIDv7.
     #[arg(long)]
     id: Option<String>,
     #[arg(long, default_value = ".")]
@@ -6778,10 +6779,7 @@ async fn start_mission_run(
         mission.state == MissionState::Ready,
         "mission `mission/{mission_id}` is not ready"
     );
-    let run_id = args
-        .id
-        .unwrap_or_else(|| format!("{mission_id}/{}", uuid::Uuid::now_v7().simple()));
-    let run_id = run_id.strip_prefix("mission-run/").unwrap_or(&run_id);
+    let run_id = mission_start_run_id(mission_id, args.id.as_deref());
     let workspace = args
         .workspace
         .canonicalize()
@@ -6793,7 +6791,7 @@ async fn start_mission_run(
         .after
         .map(|after| format!("mission-run/{}", after.trim_start_matches("mission-run/")));
     let kdl = mission_run_intent(
-        run_id,
+        &run_id,
         mission_id,
         &mission.revision,
         &workspace,
@@ -6846,6 +6844,20 @@ async fn start_mission_run(
         print!("{}", cli_help::mission_next_steps(&started));
     }
     follow_mission_run(client, started, response.store_index, json_output).await
+}
+
+fn mission_start_run_id(mission_id: &str, requested: Option<&str>) -> String {
+    match requested {
+        None => format!("{mission_id}/{}", uuid::Uuid::now_v7().simple()),
+        Some(requested) => {
+            let id = requested.strip_prefix("mission-run/").unwrap_or(requested);
+            if id.contains('/') {
+                id.to_owned()
+            } else {
+                format!("{mission_id}/{id}")
+            }
+        }
+    }
 }
 
 /// How long `missions start` waits for a mission published on another host to arrive here.
@@ -25985,7 +25997,48 @@ mod tests {
             .render_help()
             .to_string();
         assert!(help.contains("`mission-run/release/demo/1`"), "{help}");
-        assert!(help.contains("`mission-run/1`"), "{help}");
+        assert!(help.contains("A bare ID is placed under the mission"), "{help}");
+        assert!(!help.contains("`mission-run/1`"), "{help}");
+    }
+
+    #[test]
+    fn mission_start_bare_ids_are_scoped_to_each_mission() {
+        for mission in ["fleet/smalltalk/daemon-github-sekrets", "release/demo"] {
+            for requested in ["2026-10-07", "mission-run/2026-10-07"] {
+                let run_id = mission_start_run_id(mission, Some(requested));
+                assert_eq!(run_id, format!("{mission}/2026-10-07"));
+                let kdl = mission_run_intent(
+                    &run_id,
+                    mission,
+                    &"a".repeat(64),
+                    Path::new("/work/demo"),
+                    "agent/operator",
+                    &BTreeMap::new(),
+                    "run",
+                    None,
+                );
+                let intent = st3::graph::parse_intent(&kdl, "node").unwrap();
+                assert!(
+                    intent
+                        .mission_runs
+                        .contains_key(&format!("mission-run/{mission}/2026-10-07"))
+                );
+                assert!(!intent.mission_runs.contains_key("mission-run/2026-10-07"));
+            }
+        }
+    }
+
+    #[test]
+    fn mission_start_explicit_paths_and_default_ids_are_preserved() {
+        for requested in ["release/demo/test", "mission-run/release/demo/test"] {
+            assert_eq!(
+                mission_start_run_id("other/mission", Some(requested)),
+                "release/demo/test"
+            );
+        }
+        let generated = mission_start_run_id("release/demo", None);
+        let suffix = generated.strip_prefix("release/demo/").unwrap();
+        assert!(uuid::Uuid::parse_str(suffix).is_ok());
     }
 
     #[test]
@@ -28698,6 +28751,54 @@ mission "review" state="ready" {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn mission_start_same_bare_id_creates_distinct_runs() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_memory("single").unwrap());
+        let (client, server) = serve_test_store(store.clone(), root.path(), "single").await;
+        for mission in ["fleet/first", "fleet/second"] {
+            publish_text(
+                &client,
+                format!(
+                    "version 2\nmission \"{mission}\" state=\"ready\" {{ goal \"Test run names\"; step \"work\" {{ }} }}\n"
+                ),
+                "test mission".into(),
+                "person/test".into(),
+            )
+            .await
+            .unwrap();
+            start_mission_run(
+                &client,
+                MissionRunStartArgs {
+                    mission: format!("mission/{mission}"),
+                    revision: None,
+                    id: Some("2026-10-07".into()),
+                    workspace: root.path().to_path_buf(),
+                    inputs: Vec::new(),
+                    after: None,
+                    follow: false,
+                    actor: "person/test".into(),
+                    print_kdl: false,
+                },
+                true,
+            )
+            .await
+            .unwrap();
+            let subject = format!("mission-run/{mission}/2026-10-07");
+            assert_eq!(
+                store.mission_run(&subject).unwrap().unwrap().subject,
+                subject
+            );
+        }
+        assert!(
+            store
+                .mission_run("mission-run/2026-10-07")
+                .unwrap()
+                .is_none()
+        );
+        server.abort();
     }
 
     #[tokio::test]
