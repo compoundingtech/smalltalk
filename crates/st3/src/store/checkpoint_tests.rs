@@ -1886,6 +1886,119 @@ fn status_history_survives_checkpoint_trimming_and_reports_the_gap() {
 }
 
 #[test]
+fn status_history_mixed_legacy_and_heartbeat_stamps_survive_both_checkpoint_cuts() {
+    mixed_stamp_checkpoint_history(false, false, false, json!(false));
+}
+
+#[test]
+fn status_history_mixed_stamps_keep_baselines_prompts_auth_and_canonical_ties() {
+    for (ties, channels, older_baseline) in [
+        (true, false, false), (false, true, false),
+        (false, false, true), (true, true, true),
+    ] {
+        mixed_stamp_checkpoint_history(ties, channels, older_baseline, json!(false));
+    }
+}
+
+#[test]
+fn status_history_numeric_zero_heartbeat_is_dropped_without_losing_legacy_transition() {
+    mixed_stamp_checkpoint_history(false, false, false, json!(0));
+}
+
+fn mixed_stamp_checkpoint_history(ties: bool, channels: bool, older_baseline: bool, suppressed_stamp: Value) {
+    let cuts = ["2026-10-04T00:00:00Z", "2026-10-05T00:00:00Z"].map(|cut| {
+        chrono::DateTime::parse_from_rfc3339(cut).unwrap().timestamp_millis() as u128
+    });
+    let store = Store::open_memory("cedar").unwrap();
+    let subject = "agent/cedar";
+    let at = cuts[0] - 1_000;
+    let append = |kind: &str, fields: Value, time: u128| {
+        store.set_write_clock_at(time).unwrap();
+        // Preserve legacy/stamped wire rows verbatim: the current observation producer
+        // deliberately rewrites their transition stamp, so it cannot construct this history.
+        let mut connection = store.connection.write();
+        let transaction = connection.transaction().unwrap();
+        let body = json!({"fields":fields});
+        let claim = if body.pointer("/fields/status_transition").is_some_and(Value::is_number) {
+            // Numeric stamps are not admitted by the current producer/schema. Construct a
+            // pre-existing numeric source through the raw record layer, without relaxing it.
+            let claim = append_claim_record_tx(&transaction, &store.origin, subject, kind,
+                Some(subject), &body, &[], None).unwrap();
+            insert_event(&transaction, claim.store_index, kind, subject, &body).unwrap();
+            claim
+        } else {
+            append_claim_tx(&transaction, &store.origin, subject, kind,
+                Some(subject), &body, &[], None).unwrap()
+        };
+        transaction.commit().unwrap();
+        claim
+    };
+    let baseline = if older_baseline { cuts[0] - seat_status::WINDOW_MS - 100 } else { at };
+    append("runtime.observed", json!({
+        "status":"running", "runtime_id":"native", "incarnation_id":"one"
+    }), baseline);
+    let observations = [
+        ("idle", Some(json!(true))), ("working", Some(suppressed_stamp)), ("working", None),
+        ("idle", Some(json!(true))), ("working", Some(json!(true))), ("idle", Some(json!(true))),
+    ].into_iter().enumerate().map(|(offset, (state, stamp))| {
+        let time = if older_baseline && offset == 0 { baseline + 1 }
+            else if ties { at + 1 } else { at + 1 + offset as u128 * 10 };
+        let mut fields = json!({
+            "state": state, "incarnation_id":"one", "observed_at_ms":time as u64
+        });
+        if let Some(stamp) = stamp {
+            fields["status_transition"] = json!(stamp);
+        }
+        let claim = append("harness.observed", fields, time);
+        if channels && offset == 2 {
+            for (step, code) in [
+                "provider-trust-prompt", "provider-auth-expired", "provider-auth-restored",
+                "provider-update-prompt", "provider-update-restored",
+            ].into_iter().enumerate() {
+                append("harness.diagnostic", json!({
+                    "incarnation_id":"one", "code":code, "severity":"warning"
+                }), if ties { time } else { time + 1 + step as u128 });
+            }
+        }
+        claim
+    }).collect::<Vec<_>>();
+    let legacy = &observations[2];
+    let full_sources = observations.iter().collect::<Vec<_>>();
+    assert!(!seat_status::transition_positions(&full_sources).contains(&2),
+        "the suppressed working heartbeat updates the full reducer before the legacy row");
+
+    // Each cut uses the same fixed canonical source set, not the result of trimming the other cut.
+    for cut in cuts {
+        let before = store.seat_status_history(subject, cut).unwrap();
+        let legacy_time = json!(crate::api::client_timestamp(legacy.accepted_at_unix_ms));
+        assert!(before["items"].as_array().unwrap().iter().any(|item|
+            item["state"] == "working" && item["observed_at"] == legacy_time));
+        let sealed = store.checkpoint_sealed_set(cut).unwrap();
+        let plan = plan_drops(&sealed);
+        let scratch = tempfile::tempdir().unwrap();
+        let copy = scratch.path().join("checkpoint.sqlite3");
+        store.copy_store_to(&copy).unwrap();
+        let proof = prove_on_copy(&copy, &sealed, &plan).unwrap();
+        let mut connection = Connection::open(&copy).unwrap();
+        smallclaims::store::projection_digest::register(&connection).unwrap();
+        let transaction = connection.transaction().unwrap();
+        record_checkpoint_tombstones_tx(&transaction, &checkpoint_name(cut), &plan.envelopes, &plan.claims).unwrap();
+        delete_dropped_rows_tx(&transaction, &plan.envelopes, &plan.claims).unwrap();
+        let after = seat_status::history_at(&transaction, subject, cut, i64::MAX as u64).unwrap();
+        let first_difference = before["items"].as_array().unwrap().iter()
+            .zip(after["items"].as_array().unwrap()).position(|(before, after)| before != after);
+        println!("mixed-stamp proof cut={cut} legacy_source={} legacy_dropped={} first_difference={first_difference:?} before={} after={} mismatches={:?}",
+            legacy.id, dropped(&plan).contains(&legacy.id), before["items"], after["items"], proof.mismatches);
+        assert!(proof.passed, "mixed-stamp reader preservation failed: {:?}", proof.mismatches);
+        assert!(!dropped(&plan).contains(&legacy.id));
+        assert!(dropped(&plan).contains(&observations[1].id),
+            "retaining the visible legacy transition must still drop the redundant stamped heartbeat");
+        assert_eq!(after["items"], before["items"]);
+        transaction.rollback().unwrap();
+    }
+}
+
+#[test]
 fn native_auth_history_survives_checkpoint_trimming_and_runtime_reset() {
     let store = Store::open_memory("cedar").unwrap();
     let append = |kind: &str, fields: Value| {
