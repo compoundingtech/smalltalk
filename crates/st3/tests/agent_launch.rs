@@ -176,7 +176,7 @@ async fn early_exit_cli(code: i32, structured: bool, attach: bool) {
         return;
     }
     let root = tempfile::tempdir().unwrap();
-    let store = Arc::new(Store::open_memory("studio").unwrap());
+    let store = Arc::new(Store::open(&root.path().join("claims.sqlite3"), "studio").unwrap());
     let runtime = Arc::new(Processes::new(root.path(), code));
     let state = state(root.path(), store.clone());
     let reconciler = Arc::new(Reconciler::new(
