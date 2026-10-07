@@ -16896,6 +16896,8 @@ mission "example/zero-run" state="ready" {
             transport: "paired",
             custom_forms: false,
             conversation_blocks: false,
+            conversation_subject: Arc::default(),
+            provided_conversation_subject: None,
             scopes: ["terminal.read".into()].into_iter().collect(),
         };
         let mut remote_request = request.clone();
