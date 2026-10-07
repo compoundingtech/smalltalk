@@ -1483,8 +1483,13 @@ keeps owner-wide prefix windows and additionally invalidates the complete owner
 inventory: a changed owner revision sends an existing `changes` frame even if
 `upserts` and `removes` are empty and `order`/`has_more` are unchanged. Its `snapshot`
 names the same read snapshot as that revision and prefix. Create, rename, retire,
-layout edits and admitted replication are covered; other owners and unrelated global
-commits do not send an inventory notice. Clients needing complete discovery paginate
+layout edits and replicated materialization are covered, including older admitted claims
+projected after newer local edits. Owner-local counters commit with those projection
+writes; replay/rebuild advances touched owners. Other owners and unrelated routine
+global commits do not send inventory notices. Revisions are compared for inequality,
+so a database reset can cause one extra notice. A notice can retain the previous
+snapshot ID/index when projection changes without a new claim; never discard it on
+that basis. Clients needing complete discovery paginate
 the HTTP list after the initial snapshot and every owner-wide changes frame, including
 empty ones, rather than inferring absence from the prefix. See
 [current collection subscriptions](collections.md) for the exact contract.

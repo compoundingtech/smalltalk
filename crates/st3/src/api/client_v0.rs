@@ -57,7 +57,7 @@ struct CollectionSubscription {
     previous: BTreeMap<String, Value>,
     order: Vec<String>,
     has_more: bool,
-    /// Same-snapshot owner arrival frontier; only owner-wide arrangements use it.
+    /// Same-snapshot owner projection counter; only owner-wide arrangements use it.
     owner_revision: Option<u64>,
 }
 
@@ -244,10 +244,10 @@ async fn collection_items_with_windows(
                 let snapshot = client_snapshot_at(&state, index);
                 let at = snapshot.created_at.clone();
                 // Inventory invalidation is owner-scoped, independent of truncation and
-                // cached prefix equality. Read its arrival frontier under this same fence.
+                // cached prefix equality. Read its projection counter under this same fence.
                 let owner_revision = if collection == "arrangements" && subject.is_none() {
                     Some(store.arrangement_inventory_revision(
-                        person.as_deref().expect("explicit arrangement owner"), index)?)
+                        person.as_deref().expect("explicit arrangement owner"))?)
                 } else {
                     None
                 };

@@ -45,12 +45,24 @@ owner inventory, not just the visible prefix. The server reads that owner's inve
 revision in the same SQLite snapshot as the resources and fence. After the initial
 `snapshot`, a changed owner revision sends the existing `changes` frame even when the
 prefix is identical: `upserts: []`, `removes: []`, unchanged `order` and `has_more`,
-and the new `snapshot` (including `id` and `store_index`). The frame retains the
+and the current `snapshot` (including `id` and `store_index`). The frame retains the
 subscription `id` and `collection: "arrangements"`; there is no extra revision field.
-Create, rename, retirement, layout edits and admitted replicated arrivals advance this
-owner revision, including records outside the count/byte window. Multiple changes may
-coalesce into one reread. Another owner's edits and unrelated global commits do not
-send an inventory notice. A selected-subject subscription remains resource-only.
+Create, rename, retirement, layout edits and replicated materialization advance this
+owner revision, including records outside the count/byte window and older admitted
+claims whose projection was deferred behind a newer local edit. The counter is local
+persistent metadata, bumped in the same transaction as the owner's projected heads,
+with one owner upsert per local edit savepoint and one upsert per touched owner per
+replicated/replay transaction. Existing local write batching is retained: co-committed
+edit savepoints each perform their own upsert. Keys are per owner, not one shared hot row.
+Replay/rebuild also bumps the owners whose heads it touches. Multiple changes may
+coalesce into one reread. Another owner's edits and unrelated routine global commits
+do not send an inventory notice. A selected-subject subscription remains resource-only.
+
+The subscription compares revisions for inequality, not monotonic increase: resetting
+or rebuilding the local database can cause one extra owner notice. Deferred projection,
+replay or a reset may change the owner revision **without advancing the claim index**,
+so the frame's `snapshot.id` and `snapshot.store_index` can equal the previous frame's.
+Do not suppress a changes frame merely because its snapshot fields are unchanged.
 
 Clients needing complete owner inventory must paginate the HTTP arrangements list
 after the initial snapshot and every owner-wide `changes` frame, including empty

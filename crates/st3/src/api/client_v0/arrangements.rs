@@ -262,7 +262,7 @@ mod tests {
         }).await.expect("both owner and selected windows must be reread");
     }
 
-    async fn owner_inventory_stream(replicated: bool) {
+    async fn owner_inventory_stream(replicated: bool, deferred: bool) {
         use futures_util::{SinkExt as _, StreamExt as _};
         const FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
         const PREFIX_SECOND: &str = "arrangement/person/ada/019a0000-0000-7000-8000-000000000002";
@@ -286,6 +286,7 @@ mod tests {
         let winner = state.store.arrangement(WINNER, u64::MAX).unwrap().unwrap();
         let remote = Store::open_memory("inventory-source").unwrap();
         remote.bind_fleet(FLEET).unwrap();
+        state.store.project_replication_backlog().unwrap();
         let (completed, mut reads) = tokio::sync::mpsc::unbounded_channel();
         let stream_state = state.clone();
         let app = axum::Router::new().route("/stream", axum::routing::get(
@@ -333,12 +334,15 @@ mod tests {
         assert_eq!(initial["owner"]["has_more"], true);
         assert_eq!(initial["selected"]["items"], json!([winner]));
         let mut previous_index = initial["owner"]["snapshot"]["store_index"].as_u64().unwrap();
+        let mut deferred_snapshot = None;
         for (subject, operations) in [
             (LOWER, json!([{"op":"create","name":"Sidebar"}])),
             (HIGHER, json!([{"op":"create","name":"Sidebar"}])),
             (LOWER, json!([{"op":"rename","name":"Not Sidebar"}])),
             (LOWER, json!([{"op":"retire"}])),
         ] {
+            let revision_before = state.store.arrangement_inventory_revision("person/ada").unwrap();
+            let mut projection_revision = None;
             if replicated {
                 inventory_edit(&remote, subject, operations);
                 let exchange = remote.export_replication_exchange_answering(
@@ -348,6 +352,25 @@ mod tests {
                 let admission = state.store.validate_replication_backlog().unwrap();
                 assert_eq!(admission.invalid, 0);
                 assert_eq!(admission.held, 0);
+                if deferred && previous_index == initial["owner"]["snapshot"]["store_index"].as_u64().unwrap() {
+                    // Admission gave this arrival its index, but its heads are still absent.
+                    assert!(state.store.arrangement(LOWER, u64::MAX).unwrap().is_none());
+                    inventory_edit(&state.store, PREFIX_SECOND,
+                        json!([{"op":"rename","name":"Newer local edit"}]));
+                    let local_index = state.store.index().unwrap();
+                    signal_changed(&state);
+                    inventory_reads(&mut reads, local_index).await;
+                    let local = inventory_frame(&mut socket).await;
+                    assert_eq!(local["id"], "owner");
+                    assert_eq!(local["kind"], "changes");
+                    assert_eq!(local["upserts"], json!([]));
+                    assert_eq!(local["removes"], json!([]));
+                    assert_eq!(local["order"], initial["owner"]["order"]);
+                    assert_eq!(local["has_more"], true);
+                    assert_eq!(local["snapshot"]["store_index"], local_index);
+                    projection_revision = Some(state.store.arrangement_inventory_revision("person/ada").unwrap());
+                    deferred_snapshot = Some(local_index);
+                }
                 assert!(state.store.project_replication_backlog().unwrap());
                 assert_eq!(state.store.arrangement(subject, u64::MAX).unwrap(),
                     remote.arrangement(subject, u64::MAX).unwrap());
@@ -356,8 +379,12 @@ mod tests {
             }
             let index = state.store.index().unwrap();
             assert!(index > previous_index, "arrival must advance the local snapshot");
-            assert_eq!(state.store.arrangement_inventory_revision("person/ada", index).unwrap(),
-                index, "owner frontier must cover the arrival");
+            let revision = state.store.arrangement_inventory_revision("person/ada").unwrap();
+            assert!(revision > revision_before, "owner revision must cover projection");
+            if let Some(before_projection) = projection_revision {
+                assert_eq!(revision, before_projection + 1,
+                    "one revision upsert per projecting transaction per touched owner");
+            }
             signal_changed(&state);
             inventory_reads(&mut reads, index).await;
             let frame = inventory_frame(&mut socket).await;
@@ -371,10 +398,36 @@ mod tests {
             let index = frame["snapshot"]["store_index"].as_u64().unwrap();
             assert!(index > previous_index);
             assert_eq!(index, state.store.index().unwrap());
+            if let Some(delivered_index) = deferred_snapshot.take() {
+                assert_eq!(index, delivered_index,
+                    "deferred projection changes inventory without advancing the claim index");
+            }
             previous_index = index;
             assert_eq!(state.store.arrangement(WINNER, u64::MAX).unwrap().unwrap(), winner);
             assert!(tokio::time::timeout(Duration::from_millis(200), socket.next()).await.is_err(),
                 "selected subject must stay silent, and the owner notice must not repeat");
+        }
+        // Replay and a rebuilt/reset local counter can change the inventory revision
+        // without changing the claim index. Compare revisions for inequality, not >.
+        for reset in [false, true] {
+            if reset {
+                state.store.connection.write().execute(
+                    "DELETE FROM meta WHERE key='arrangement_inventory_revision_v1/person/ada'", []).unwrap();
+            } else {
+                state.store.rebuild_claim_projections().unwrap();
+            }
+            signal_changed(&state);
+            inventory_reads(&mut reads, previous_index).await;
+            let frame = inventory_frame(&mut socket).await;
+            assert_eq!(frame["id"], "owner");
+            assert_eq!(frame["kind"], "changes");
+            assert_eq!(frame["upserts"], json!([]));
+            assert_eq!(frame["removes"], json!([]));
+            assert_eq!(frame["order"], initial["owner"]["order"]);
+            assert_eq!(frame["has_more"], true);
+            assert_eq!(frame["snapshot"]["store_index"], previous_index);
+            assert!(tokio::time::timeout(Duration::from_millis(200), socket.next()).await.is_err(),
+                "replay/reset sends one owner notice, never a selected-subject notice");
         }
         // Positive read completion proves the server examined the unrelated owner's
         // change; silence is not merely failure to schedule a read.
@@ -395,15 +448,19 @@ mod tests {
         socket.close(None).await.unwrap();
         server.abort();
     }
+    #[tokio::test]
+    async fn owner_inventory_stream_notices_deferred_replica_after_delivered_local_edit() {
+        owner_inventory_stream(true, true).await;
+    }
 
     #[tokio::test]
     async fn owner_inventory_stream_notices_outside_byte_window_local_edits() {
-        owner_inventory_stream(false).await;
+        owner_inventory_stream(false, false).await;
     }
 
     #[tokio::test]
     async fn owner_inventory_stream_notices_outside_byte_window_replicated_edits() {
-        owner_inventory_stream(true).await;
+        owner_inventory_stream(true, false).await;
     }
 
     #[tokio::test]

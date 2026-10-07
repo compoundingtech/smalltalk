@@ -3,19 +3,19 @@
   "summary": "Invalidate owner arrangement inventories when changes fall outside bounded stream windows",
   "replay": {
     "status": "none",
-    "detail": "Uses existing admission-time arrangement heads and changed_index values. No replay, backfill or recovery is required."
+    "detail": "No required replay or backfill. Existing owners without revision metadata start at zero. New owner-local counters commit with local and replicated projection writes, including deferred older arrivals; replay/rebuild bumps each touched owner's counter once per transaction."
   },
   "schema": {
     "status": "none",
-    "detail": "No database tables, columns, indexes, triggers or schema version change. Owner revisions use the existing arrangements_owner_changed_index."
+    "detail": "MAINTAINER REVIEW REQUIRED: adds persistent local per-owner inventory revision keys to the existing meta table. No new database table, column, index, trigger or schema version. Cost is one owner upsert per local edit savepoint and one upsert per touched owner per replicated/replay transaction. Existing local batching is retained, so co-committed edit savepoints each upsert. Keys are per owner, with no new shared hot row. Counters are separate from arrangement changed_index admission frontiers."
   },
   "rules": {
     "status": "none",
-    "detail": "No retention, checkpoint rule, projection digest or sealing transition changes. The existing local changed_index frontier remains excluded from shared projection digests."
+    "detail": "No retention, checkpoint rule, shared projection digest or sealing transition changes. Owner counters are local metadata, not shared projection contents; replay and checkpoint proofs retain the same arrangement read answers."
   },
   "compatibility": {
     "status": "changed",
-    "detail": "Owner-wide arrangements subscriptions can now receive existing changes frames with empty upserts and removes, unchanged order and has_more, and a new snapshot fence when that owner's inventory revision changes. Clients needing complete inventories must paginate after every owner-wide changes frame, including empty ones. Selected-subject subscriptions remain resource-only. No new frame kind, field, wire schema, generated client API or capability version is introduced. Older servers can still miss outside-window changes; upgrade serving daemons for the stronger invalidation guarantee."
+    "detail": "Owner-wide arrangements subscriptions can receive existing changes frames with empty upserts/removes and unchanged order/has_more whenever that owner's projection revision changes. Deferred projection, replay or a counter reset can emit a notice with the same snapshot ID/store_index as the preceding frame. Clients must paginate after every owner-wide changes frame, including empty and same-index frames. Revisions are compared for inequality, so reset/rebuild can cause one extra notice. Selected-subject subscriptions stay resource-only. No new frame kind, field, wire schema, generated client API or capability version. Older servers retain the outside-window and deferred-projection notification gaps."
   },
   "downtime": {
     "status": "none",
@@ -27,6 +27,6 @@
   },
   "recovery": {
     "status": "none",
-    "detail": "No additional database recovery or rollback procedure is required. Rolling back restores the previous bounded-prefix-only notification behavior without modifying stored arrangements."
+    "detail": "No additional database recovery or rollback procedure. Owner counters are expendable local metadata; missing/reset keys read as zero and inequality comparison preserves invalidation. Rolling back leaves these keys harmlessly unused and restores the older missing-invalidation behavior without modifying shared arrangements."
   }
 }
