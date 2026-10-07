@@ -1010,8 +1010,57 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
+    fn assert_native_keyset_pages_match_full_read(
+        state: &AppState,
+        native: &ExternalSession,
+        session: &ClientSession,
+        full: &[Value],
+    ) {
+        let snapshot = super::super::new_client_snapshot(state);
+        let mut query = super::super::ClientListQuery {
+            limit: Some(1),
+            ..Default::default()
+        };
+        let mut walked = Vec::new();
+        loop {
+            let page = super::super::native_slice_page(
+                state, &snapshot, session, &native.id, &query, native,
+            )
+            .unwrap()
+            .0;
+            assert!(serde_json::to_vec(&page).unwrap().len() < CLIENT_MAX_RESPONSE_BYTES);
+            walked.extend(page["items"].as_array().unwrap().iter().cloned());
+            query.cursor = page["page"]["next_cursor"].as_str().map(str::to_owned);
+            let Some(cursor) = &query.cursor else {
+                break;
+            };
+            assert!(cursor.starts_with(super::super::NATIVE_PAGE_CURSOR_PREFIX));
+            assert!(walked.len() < full.len());
+        }
+        assert_eq!(walked.len(), full.len());
+        for mut item in walked {
+            let mut expected = full
+                .iter()
+                .find(|expected| expected["id"] == item["id"])
+                .unwrap()
+                .clone();
+            // Owner refs use fresh nonces; compare authenticated locations, not ciphertext.
+            for entry in [&mut item, &mut expected] {
+                if let Some(blocks) = entry["body"]["blocks"].as_array_mut() {
+                    for block in blocks {
+                        if let Some(token) = block["continuation"]["ref"].as_str() {
+                            block["continuation"]["ref"] =
+                                serde_json::to_value(locator(token, &native.id).unwrap()).unwrap();
+                        }
+                    }
+                }
+            }
+            assert_eq!(item, expected);
+        }
+    }
+
     #[tokio::test]
-    async fn open_tool_metadata_fits_pages_and_socket_frames_and_fetches_exact_native_values() {
+    async fn open_tool_metadata_fits_full_and_keyset_pages_and_socket_frames_and_fetches_exact_native_values() {
         use futures_util::{SinkExt as _, StreamExt as _};
         let root = tempfile::tempdir().unwrap();
         let details = json!({
@@ -1030,6 +1079,7 @@ mod tests {
             session.conversation_blocks = negotiated;
             let page = read(&native, &session, &native.id).unwrap();
             assert!(serde_json::to_vec(&page).unwrap().len() < CLIENT_MAX_RESPONSE_BYTES);
+            assert_native_keyset_pages_match_full_read(&state, &native, &session, &page);
             let item = page
                 .iter()
                 .find(|item| item["type"] == "tool_result")
@@ -1224,7 +1274,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pathological_metadata_replaces_only_its_entry_and_preserves_http_page_and_owner_fetch()
+    async fn pathological_metadata_replaces_only_its_entry_on_full_and_keyset_pages_and_preserves_owner_fetch()
     {
         use axum::body::{Body, to_bytes};
         use axum::http::Request;
@@ -1252,6 +1302,10 @@ mod tests {
         state.native_session_home = Some(root.path().to_path_buf());
         let app = super::super::super::router(state.clone());
         for negotiated in [true, false] {
+            let mut session = ClientSession::local(None).unwrap();
+            session.conversation_blocks = negotiated;
+            let full = read(&native, &session, &native.id).unwrap();
+            assert_native_keyset_pages_match_full_read(&state, &native, &session, &full);
             let mut request = Request::builder().uri(format!(
                 "/v1/client/sessions/{}/timeline",
                 native.id.trim_start_matches("session/")
