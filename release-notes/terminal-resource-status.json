@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Avoid discarded harness and claim-history reductions in the terminals collection.",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay or projection recovery changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No schema or index changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint or digest rule change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Terminals list responses retain the existing runtime authority, selected owner, incarnation, access and snapshot fields. Runtime control and full status keep the full reducer."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No setting or store repair required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No persisted cache or migration; normal binary rollback drops process-local reductions."
+  },
+  "downtime": {
+    "status": "unknown",
+    "detail": "Normal daemon restart; duration not measured for this change."
+  }
+}
