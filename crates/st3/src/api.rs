@@ -6160,7 +6160,7 @@ fn current_doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiErro
         },
         Err(error) => DoctorCheck {
             name: "disk-space".into(),
-            status: "unknown".into(),
+            status: "warn".into(),
             message: error.to_string(),
         },
     });

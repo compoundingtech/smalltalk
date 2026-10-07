@@ -1,7 +1,7 @@
 #![cfg(unix)]
 //! A newcomer's first run: a fresh daemon and the first commands from the README, with nothing on
-//! stdin. Signing must add no step and no prompt, and every claim the newcomer's daemon writes
-//! must be signed and verify.
+//! stdin. Key creation must add no step or prompt. Doctor leaves signature coverage unchecked;
+//! signing and verification remain writer work rather than work triggered by this read.
 
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -131,7 +131,7 @@ impl Drop for Newcomer {
 }
 
 #[test]
-fn a_newcomer_gets_signed_claims_with_no_new_step_or_prompt() {
+fn a_newcomer_gets_keys_without_a_prompt_and_private_writer_oracle_verifies_claims() {
     if st3::test_support::supervise_test() {
         return;
     }
@@ -143,7 +143,7 @@ fn a_newcomer_gets_signed_claims_with_no_new_step_or_prompt() {
         eprintln!("skipped: the getting-started test needs pty on PATH");
         return;
     };
-    let newcomer = Newcomer::start(&pty);
+    let mut newcomer = Newcomer::start(&pty);
     for args in [
         &["now"][..],
         &["agents", "ls"],
@@ -199,20 +199,8 @@ fn a_newcomer_gets_signed_claims_with_no_new_step_or_prompt() {
     let audits = newcomer.try_run(&["rules", "audit"]).unwrap();
     assert!(audits.starts_with("no write"), "{audits}");
     let check = newcomer.signatures();
-    assert_eq!(check["status"], "pass", "{check}");
-    let message = check["message"].as_str().unwrap();
-    let verified: u64 = message
-        .split(' ')
-        .next()
-        .and_then(|count| count.parse().ok())
-        .unwrap();
-    assert!(verified > 0, "nothing verified: {message}");
-    assert!(
-        message.contains(" 0 unsigned")
-            && message.contains(" 0 waiting")
-            && message.ends_with(" 0 invalid"),
-        "every claim the newcomer's daemon wrote is signed and verifies: {message}"
-    );
+    assert_eq!(check["status"], "unknown", "{check}");
+    assert!(check["message"].as_str().unwrap().contains("evidence incomplete"), "{check}");
     // The keys are private files in the state directory, made without asking.
     let keys = newcomer.root.path().join("state/keys");
     assert!(keys.join("node.key").exists());
@@ -221,4 +209,26 @@ fn a_newcomer_gets_signed_claims_with_no_new_step_or_prompt() {
         let mode = entry.unwrap().metadata().unwrap().permissions().mode();
         assert_eq!(mode & 0o077, 0);
     }
+    // Preserve the full signing oracle on a frozen private copy. A diagnostic GET must
+    // not seal or judge the daemon's claims to make this assertion pass.
+    newcomer.daemon.kill().unwrap();
+    newcomer.daemon.wait().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let database = scratch.path().join("claims.sqlite3");
+    std::fs::copy(newcomer.root.path().join("state/claims.sqlite3"), &database).unwrap();
+    let source_wal = newcomer.root.path().join("state/claims.sqlite3-wal");
+    if source_wal.exists() {
+        std::fs::copy(source_wal, scratch.path().join("claims.sqlite3-wal")).unwrap();
+    }
+    let writer = st3::store::Store::open(&database, "studio").unwrap();
+    writer.set_node_key(std::sync::Arc::new(
+        st3::fleet::join::standalone_node_key(&newcomer.root.path().join("state")).unwrap(),
+    )).unwrap();
+    writer.use_key_directory(&keys).unwrap();
+    writer.replication_snapshot().unwrap();
+    writer.judge_claims(true).unwrap();
+    let counts = writer.claim_verdict_counts().unwrap();
+    assert!(counts.get("verified").copied().unwrap_or(0) > 0, "{counts:?}");
+    assert!(counts.iter().all(|(verdict, count)| verdict == "verified" || *count == 0), "{counts:?}");
+
 }

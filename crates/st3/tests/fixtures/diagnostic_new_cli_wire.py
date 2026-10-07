@@ -7,10 +7,28 @@ import hashlib, json, os, socket, subprocess, sys, tempfile, threading
 from pathlib import Path
 binary = Path(sys.argv[1]).resolve()
 checks = [{'name': name, 'status': 'unknown', 'message': 'evidence incomplete'} for name in ['claim-signatures', 'operation-projection', 'graph-references', 'replication', 'checkpoint-evidence']]
+computed_warning = {'status': 'warn', 'checks': checks + [{'name': 'disk-space', 'status': 'warn', 'message': 'low disk space'}], 'performance': {}}
+computed_failure = {'status': 'fail', 'checks': checks + [{'name': 'claim-store', 'status': 'fail', 'message': 'store failure'}], 'performance': {}}
+legacy_warning = {'status': 'warn', 'checks': [{'name': 'disk-space', 'status': 'warn', 'message': 'low disk space'}], 'performance': {}}
 unknown = {'status': 'warn', 'checks': checks, 'performance': {}}
 legacy = {'node': 'legacy-node', 'newest_stable': None, 'trimmed': None, 'halted': False, 'pending': None, 'participants': [], 'excused': [], 'left': []}
 incomplete = {'code': 'diagnostic-evidence-incomplete', 'message': 'checkpoint evidence incomplete; the current set is not certified; this read does not start an audit', 'details': {'comparison_state': 'uncomputed'}}
-scenarios = [('checkpoint-incomplete', ['replication', 'checkpoint', 'status'], 503, incomplete, 2), ('checkpoint-old-success', ['--json', 'replication', 'checkpoint', 'status'], 200, legacy, 0), ('strict-doctor-text', ['doctor', '--strict'], 200, unknown, 2), ('strict-doctor-json', ['--json', 'doctor', '--strict'], 200, unknown, 2)]
+scenarios = [
+    ('checkpoint-incomplete', ['replication', 'checkpoint', 'status'], 503, incomplete, 2),
+    ('checkpoint-old-success', ['--json', 'replication', 'checkpoint', 'status'], 200, legacy, 0),
+]
+for json_output in [False, True]:
+    prefix = ['--json'] if json_output else []
+    suffix = 'json' if json_output else 'text'
+    scenarios.extend([
+        ('doctor-unchecked-' + suffix, prefix + ['doctor'], 200, unknown, 0),
+        ('strict-doctor-unchecked-' + suffix, prefix + ['doctor', '--strict'], 200, unknown, 0),
+        ('strict-doctor-warning-' + suffix, prefix + ['doctor', '--strict'], 200, computed_warning, 2),
+        ('doctor-failure-' + suffix, prefix + ['doctor'], 200, computed_failure, 2),
+        ('strict-doctor-failure-' + suffix, prefix + ['doctor', '--strict'], 200, computed_failure, 2),
+        ('strict-doctor-old-warning-' + suffix, prefix + ['doctor', '--strict'], 200, legacy_warning, 2),
+    ])
+
 rows = []
 for name, args, status, value, expected in scenarios:
     with tempfile.TemporaryDirectory(prefix='st3-new-cli-wire-') as tmp:
@@ -59,11 +77,14 @@ for name, args, status, value, expected in scenarios:
                 assert p.stderr.count('uncomputed: checkpoint evidence incomplete') == 1 and (not p.stdout), p
             if name == 'checkpoint-old-success':
                 assert json.loads(p.stdout) == legacy, p
-            if name == 'strict-doctor-text':
-                for check in checks:
-                    assert 'unknown\t' + check['name'] in p.stdout, p
-            if name == 'strict-doctor-json':
-                assert json.loads(p.stdout)['checks'] == checks, p
+            if 'doctor' in name:
+                if name.endswith('json'):
+                    assert json.loads(p.stdout)['checks'] == value['checks'], p
+                else:
+                    for check in value['checks']:
+                        assert check['status'] + '\t' + check['name'] in p.stdout, p
+                if expected == 0:
+                    assert not p.stderr, p
             rows.append({'name': name, 'exit': p.returncode, 'requests': requests, 'stdout': p.stdout, 'stderr': p.stderr})
         finally:
             listener.close()

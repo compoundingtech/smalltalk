@@ -15,7 +15,7 @@
   },
   "compatibility": {
     "status": "changed",
-    "detail": "For every client, GET checkpoint/status returns HTTP 503 diagnostic-evidence-incomplete with comparison_state=uncomputed until current maintained comparison evidence exists. st replication checkpoint status prints unknown and exits 2; old clients see a readable nonzero error. Doctor and operations expose unchecked invariants by name as unknown. Live st doctor --strict always exits 2 until maintained invariant evidence is integrated; unchecked invariants remain in its failure condition. Successful checkpoint-status and peer-wire shapes are unchanged. The offline audit flags are additive."
+    "detail": "For every client, GET checkpoint/status returns HTTP 503 diagnostic-evidence-incomplete with comparison_state=uncomputed until current maintained comparison evidence exists. st replication checkpoint status prints unknown and exits 2; old clients see a readable nonzero error. Doctor and operations expose unchecked invariants by name as unknown. Updated st doctor --strict excludes unchecked invariants from its failure condition, while computed warnings and errors still fail. Unknown checks stay named in text and JSON and the report remains warn; strict success certifies only computed checks. Older CLIs still exit 2 on the aggregate warning. Successful checkpoint-status and peer-wire shapes are unchanged. The offline audit flags are additive."
   },
   "downtime": {
     "status": "unknown",
@@ -23,7 +23,7 @@
   },
   "manual": {
     "status": "changed",
-    "detail": "During this stage, do not require live st doctor --strict to succeed as an upgrade-readiness gate: it always exits 2 on unchecked invariants. Compare st --version --json with the daemon machine_version in st doctor --json and verify peer health to identify the running daemon; these checks do not certify store invariants. Scripts using st replication checkpoint status or GET checkpoint/status must handle evidence-incomplete as unknown rather than restarting the daemon. Full audit is opt-in: supply a frozen private database copy, including its WAL when present, with st doctor --offline-audit DATABASE. Choose --audit-scratch-dir for a filesystem with room; the default scratch cap is 32 GiB. Live-database inode aliases are refused; unsupported audit checks remain unknown."
+    "detail": "Upgrade the CLI along with the daemon before using st doctor --strict as a computed-check upgrade gate: older CLIs still exit 2 on the aggregate warning. Updated strict success excludes named unchecked invariants and cannot certify them. Compare st --version --json with the daemon machine_version in st doctor --json and verify peer health to identify the running daemon; these checks do not certify store invariants. Scripts using st replication checkpoint status or GET checkpoint/status must handle evidence-incomplete as unknown rather than restarting the daemon. Full audit is opt-in: supply a frozen private database copy, including its WAL when present, with st doctor --offline-audit DATABASE. Choose --audit-scratch-dir for a filesystem with room; the default scratch cap is 32 GiB. Live-database inode aliases are refused; unsupported audit checks remain unknown."
   },
   "recovery": {
     "status": "none",

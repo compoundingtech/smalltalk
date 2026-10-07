@@ -140,7 +140,7 @@ fn client_without_runtime_dir_reaches_daemon_with_different_socket() {
 }
 
 #[test]
-fn bare_service_environment_loads_shell_path_and_rechecks_credentials() {
+fn bare_service_environment_does_not_probe_tools_or_credentials_on_doctor() {
     if st3::test_support::supervise_test() {
         return;
     }
@@ -169,24 +169,18 @@ fn bare_service_environment_loads_shell_path_and_rechecks_credentials() {
         .iter()
         .find(|check| check["name"] == "daemon-environment")
         .unwrap();
-    assert_eq!(environment["status"], "pass");
-    assert!(
-        environment["message"]
-            .as_str()
-            .unwrap()
-            .contains(bin.to_str().unwrap())
-    );
+    assert_eq!(environment["status"], "unknown");
     let pty = checks
         .iter()
         .find(|check| check["name"] == "pty-runtime")
         .unwrap();
-    assert_eq!(pty["status"], "pass", "{pty}");
+    assert_eq!(pty["status"], "unknown", "{pty}");
     let auth = checks
         .iter()
         .find(|check| check["name"] == "github-observer-auth")
         .unwrap();
-    assert_eq!(auth["status"], "warn");
-    assert!(auth["message"].as_str().unwrap().contains("gh auth login"));
+    assert_eq!(auth["status"], "unknown");
+    assert!(auth["message"].as_str().unwrap().contains("does not start a platform probe"));
     executable(
         &bin.join("gh"),
         "#!/bin/sh\nprintf 'orchid-test-credential\\n'\n",
@@ -198,12 +192,12 @@ fn bare_service_environment_loads_shell_path_and_rechecks_credentials() {
         .iter()
         .find(|check| check["name"] == "github-observer-auth")
         .unwrap();
-    assert_eq!(auth["status"], "pass");
+    assert_eq!(auth["status"], "unknown");
     assert!(!report.to_string().contains("orchid-test-credential"));
 }
 
 #[test]
-fn doctor_reports_missing_build_tools_and_whether_a_small_crate_links() {
+fn doctor_does_not_link_a_crate_or_probe_missing_build_tools() {
     if st3::test_support::supervise_test() {
         return;
     }
@@ -242,30 +236,16 @@ fn doctor_reports_missing_build_tools_and_whether_a_small_crate_links() {
         )
     };
 
-    let (status, message) = build_tools();
-    assert_eq!(status, "warn", "{message}");
-    assert!(
-        message.contains("missing from the login PATH: nix;"),
-        "{message}"
-    );
-    assert!(!message.contains("did not link"), "{message}");
-
+    let before = build_tools();
+    assert_eq!(before.0, "unknown", "{before:?}");
+    assert!(before.1.contains("does not start a platform probe"), "{before:?}");
     executable(&bin.join("nix"), "#!/bin/sh\nexit 0\n");
-    let (status, message) = build_tools();
-    assert_eq!(status, "pass", "{message}");
-    assert!(message.contains("a small crate links"), "{message}");
+    assert_eq!(build_tools(), before);
+    let marker = root.path().join("unexpected-link-probe");
+    executable(&bin.join("cargo"), &format!("#!/bin/sh\ntouch '{}'\nexit 101\n", marker.display()));
+    assert_eq!(build_tools(), before);
+    assert!(!marker.exists(), "doctor invoked cargo");
 
-    executable(
-        &bin.join("cargo"),
-        "#!/bin/sh\necho 'error: linker `mold` not found' >&2\nexit 101\n",
-    );
-    let (status, message) = build_tools();
-    assert_eq!(status, "warn", "{message}");
-    assert!(
-        message.contains("a small crate did not link")
-            && message.contains("linker `mold` not found"),
-        "{message}"
-    );
 }
 
 /// A deploy restarts the daemon while the machine is busy building, and a login shell that takes
@@ -326,5 +306,5 @@ fn a_login_shell_too_slow_for_the_first_capture_still_lets_the_daemon_start() {
         .iter()
         .find(|check| check["name"] == "daemon-environment")
         .unwrap();
-    assert_eq!(environment["status"], "pass", "{environment}");
+    assert_eq!(environment["status"], "unknown", "{environment}");
 }

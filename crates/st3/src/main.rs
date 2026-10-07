@@ -2473,6 +2473,7 @@ enum TraceCommand {
 
 #[derive(Args)]
 struct DoctorArgs {
+    /// Fail on computed warnings; unchecked invariants remain visible without failing strict.
     #[arg(long)]
     strict: bool,
     /// Show only the slowest requests and queries over the last five minutes.
@@ -10283,10 +10284,13 @@ async fn run_doctor(client: &Client, args: DoctorArgs, json_output: bool) -> Res
         }
         print!("{}", render_performance(&report.performance));
     }
-    anyhow::ensure!(report.status != "fail", "st doctor found a failed check");
     anyhow::ensure!(
-        !args.strict || report.status == "pass",
-        "st doctor found a warning in strict mode"
+        report.status != "fail" && !report.checks.iter().any(|check| check.status == "fail"),
+        "st doctor found a failed check"
+    );
+    anyhow::ensure!(
+        !args.strict || !report.checks.iter().any(|check| check.status == "warn"),
+        "st doctor found a computed warning in strict mode"
     );
     Ok(())
 }

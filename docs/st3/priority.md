@@ -113,10 +113,11 @@ leftovers end when it is stopped while it runs, or while its own record still na
 
 ## Checking a host
 
-`st doctor` reports a `priority` check. On Linux it warns when the daemon's own weights are below
-1000, when the user manager does not delegate io (with the root command above), and when any PTY
-server still shares its harness's scope. On macOS it warns when `taskpolicy` is missing.
-`st doctor --strict` fails on those warnings.
+`st doctor` currently lists `priority` as `unknown`: it does not start platform probes on a
+diagnostic read. Until maintained priority evidence is available, use the commands below to
+check the daemon's weights, io delegation and PTY scopes on Linux, or `taskpolicy` on macOS.
+`st doctor --strict` fails on computed warnings and errors and excludes named unchecked checks;
+strict success does not certify the unknown priority check.
 
 To look by hand:
 

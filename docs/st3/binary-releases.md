@@ -51,11 +51,13 @@ when those definitions already point at the intended binaries. Schedule that res
 `st --version --json` with the daemon's `machine_version` in `st doctor --json`, and verify peer
 health. A reachable doctor response and matching version identify the running daemon; they do
 not certify store invariants. Until maintained invariant evidence is integrated, live doctor
-lists unchecked invariants by name as `unknown`, reports `warn`, and `st doctor --strict`
-always exits 2. Do not use strict success as an upgrade-readiness gate during this stage, or
-interpret the warning as evidence that the API is unavailable. Strict still requires complete
-evidence and fails on computed warnings and errors. An explicit offline audit preserves unknown
-results for unsupported checks and cannot substitute for complete certification.
+lists unchecked invariants by name as `unknown` and reports `warn`. In the updated CLI,
+`st doctor --strict` fails on computed warnings and errors but excludes unchecked invariants
+from its exit condition. A strict success therefore verifies only the computed checks and
+cannot certify the unchecked store invariants. Older CLIs still fail on the aggregate warning;
+upgrade the CLI along with the daemon before using computed-only strict upgrade checks.
+An explicit offline audit preserves unknown results for unsupported checks and cannot
+substitute for complete certification.
 
 `st replication checkpoint status` also exits 2 while checkpoint comparison evidence is
 uncomputed: its HTTP 503 `diagnostic-evidence-incomplete` response describes an uncertified

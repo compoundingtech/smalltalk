@@ -1765,11 +1765,14 @@ async fn cli_reads_preserve_operational_views_after_restart() {
     for _ in 0..2 {
         for command in &commands {
             let output = daemon.cli(PERSON, command).await;
-            assert!(
-                output.status.success(),
-                "{command:?}: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+            if command == &["replication", "checkpoint", "status"] {
+                assert_eq!(output.status.code(), Some(2), "{output:?}");
+                let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(value["status"], "unknown");
+                assert_eq!(value["details"]["comparison_state"], "uncomputed");
+            } else {
+                assert!(output.status.success(), "{command:?}: {}", String::from_utf8_lossy(&output.stderr));
+            }
             assert!(!output.stdout.is_empty(), "{command:?}: no view");
         }
         daemon.restart().await;

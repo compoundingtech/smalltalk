@@ -369,6 +369,9 @@ st repair apply --help
 
 Apply nothing unless the dry-run reports a real, understood plan. Check pass/warn/fail semantics,
 exit status, evidence, remediation, stable repair classes, approval token, and zero-change retry.
+Doctor lists unchecked invariants by name as `unknown` in text and JSON. `--strict` fails on
+computed warnings and errors; it excludes unknown checks until maintained views cover them.
+A strict success therefore certifies only the computed checks.
 
 ### 13. `replication` — prove fleet convergence
 
