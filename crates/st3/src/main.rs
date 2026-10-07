@@ -5750,6 +5750,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
             },
         ));
     }
+    recycle_idle_wal(config.state_dir.join("claims.sqlite3"));
     tokio::spawn(convert_envelope_payloads(store.clone()));
     tokio::spawn(trim_local_observations(
         store.clone(),
@@ -13720,6 +13721,11 @@ fn render_client_agent(
         agent.driver.as_deref().unwrap_or("none"),
         agent.harness_state.as_deref().unwrap_or("unobserved")
     );
+    if agent.blocked_on.as_deref() == Some("human")
+        && agent.ask.as_deref() == Some("permission")
+    {
+        let _ = writeln!(output, "AWAITING     approval");
+    }
     if let Some(todo) = &agent.todo {
         let snapshot = &todo.snapshot;
         let _ = write!(output, "Todo         ");
@@ -20914,9 +20920,17 @@ fn work_incarnation_key(incarnation: Option<&str>) -> String {
 }
 
 async fn renew_claimed_work(client: &Client, subject: &str, minute: u64) -> Result<()> {
+    let work: Vec<StepRunView> = client
+        .get(&format!("/v1/work?actor={}", urlencoding::encode(subject)))
+        .await?;
+    // Most resident seats hold no work. Only a held claim needs the status reduction
+    // that proves its harness incarnation is still live before renewing the lease.
+    if !work.iter().any(|step| work_claim_is_held_by(step, subject)) {
+        return Ok(());
+    }
     let status: StatusResponse = client
         .get(&format!(
-            "/v1/status?subject={}",
+            "/v1/status?subject={}&harness_only=true",
             urlencoding::encode(subject)
         ))
         .await?;
@@ -20925,9 +20939,6 @@ async fn renew_claimed_work(client: &Client, subject: &str, minute: u64) -> Resu
         .iter()
         .find(|candidate| candidate.subject == subject)
         .and_then(|candidate| candidate.harness.as_ref());
-    let work: Vec<StepRunView> = client
-        .get(&format!("/v1/work?actor={}", urlencoding::encode(subject)))
-        .await?;
     let mut failure = None;
     for step in work
         .into_iter()
@@ -21040,15 +21051,19 @@ fn renewal_lost_its_claim(error: &anyhow::Error) -> bool {
     )
 }
 
+fn work_claim_is_held_by(step: &StepRunView, subject: &str) -> bool {
+    matches!(
+        step.status.as_str(),
+        "claimed" | "working" | "verifying" | "blocked"
+    ) && step.claimant.as_deref() == Some(subject)
+}
+
 fn work_claim_has_active_harness(
     step: &StepRunView,
     subject: &str,
     harness: Option<&CurrentHarnessView>,
 ) -> bool {
-    matches!(
-        step.status.as_str(),
-        "claimed" | "working" | "verifying" | "blocked"
-    ) && step.claimant.as_deref() == Some(subject)
+    work_claim_is_held_by(step, subject)
         && harness.is_some_and(|harness| {
             harness.state != "ended"
                 && step.claim_incarnation.as_deref() == Some(harness.incarnation_id.as_str())
@@ -22170,6 +22185,64 @@ async fn enforce_account_limits(store: Arc<Store>, policy: st3::store::LimitsPol
             Err(error) => eprintln!("st3: limits policy stopped: {error}"),
         }
         tokio::time::sleep(LIMITS_INTERVAL).await;
+    }
+}
+
+/// Page copying runs off the writer queue; recycling never waits for a reader or writer lock.
+fn recycle_idle_wal(path: PathBuf) {
+    // Five seconds finds gaps between short readers without polling on every write.
+    const WAL_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
+    const WAL_CHECKPOINT_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+    // Backfill can take tens of seconds even with a zero busy timeout. A detached native
+    // thread owns its connection so Tokio shutdown never waits for this best-effort work
+    // in its blocking pool. Dropping the handle also avoids joining it at process exit.
+    let worker = std::thread::Builder::new()
+        .name("st3-wal-checkpoint".into())
+        .spawn(move || {
+            let mut connection = None;
+            let mut last_error_log: Option<Instant> = None;
+            let mut retry_interval = WAL_CHECKPOINT_INTERVAL;
+            loop {
+                std::thread::sleep(retry_interval);
+                retry_interval = WAL_CHECKPOINT_INTERVAL;
+                // The connection is taken into the attempt and dropped on unwind; no
+                // potentially panic-damaged connection is reused by the next attempt.
+                let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let connection = match connection.take() {
+                        Some(connection) => connection,
+                        None => rusqlite::Connection::open(&path)
+                            .context("open WAL checkpoint connection")?,
+                    };
+                    let result = smallclaims::sqlite::checkpoint_idle_wal(&connection);
+                    Ok::<_, anyhow::Error>((connection, result))
+                }));
+                let result = match attempt {
+                    Ok(Ok((returned, result))) => {
+                        connection = Some(returned);
+                        result.context("recycle idle WAL")
+                    }
+                    Ok(Err(error)) => Err(error),
+                    Err(_) => {
+                        // catch_unwind still invokes the process panic hook. Back off
+                        // its retries too, without changing the hook for other threads.
+                        retry_interval = WAL_CHECKPOINT_ERROR_LOG_INTERVAL;
+                        Err(anyhow::anyhow!("WAL checkpoint panicked; reopening connection"))
+                    }
+                };
+                if let Err(error) = result {
+                    let now = Instant::now();
+                    if last_error_log.is_none_or(|last| {
+                        now.duration_since(last) >= WAL_CHECKPOINT_ERROR_LOG_INTERVAL
+                    }) {
+                        eprintln!("st3: {error:#}");
+                        last_error_log = Some(now);
+                    }
+                }
+            }
+        });
+    if let Err(error) = worker {
+        eprintln!("st3: start WAL checkpoint worker: {error}");
     }
 }
 
@@ -23578,6 +23651,20 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn agent_card_names_a_pending_codex_approval() {
+        let agent: st3_client::Agent = serde_json::from_value(serde_json::json!({
+            "kind": "agent", "id": "agent/approval", "revision": "one",
+            "updated_at": "2026-10-06T12:00:00Z", "name": "Approval",
+            "state": "running", "reachability": "local", "runtime_ids": [],
+            "driver": "codex", "harness_state": "blocked", "blocked_on": "human",
+            "ask": "permission", "reason": "waitingOnApproval"
+        })).unwrap();
+        let card = render_client_agent(&agent, &[], 0);
+        assert!(card.contains("HARNESS      codex · blocked\n"));
+        assert!(card.contains("AWAITING     approval\n"));
+    }
+
     fn subagent_worker() -> serde_json::Value {
         serde_json::json!({
             "kind": "agent", "id": "agent/crew/worker", "revision": "one",
@@ -24806,6 +24893,35 @@ mod tests {
             "agent/node.worker",
             Some(&replacement)
         ));
+        assert!(!work_claim_has_active_harness(
+            &step,
+            "agent/other",
+            Some(&replacement)
+        ));
+        assert!(!work_claim_has_active_harness(
+            &step,
+            "agent/node.worker",
+            None
+        ));
+        let mut ended = replacement.clone();
+        ended.incarnation_id = "worker-one".into();
+        ended.state = "ended".into();
+        assert!(!work_claim_has_active_harness(
+            &step,
+            "agent/node.worker",
+            Some(&ended)
+        ));
+        for state in ["claimed", "working", "verifying", "blocked"] {
+            let mut held = step.clone();
+            held.status = state.into();
+            assert!(work_claim_is_held_by(&held, "agent/node.worker"));
+            assert!(!work_claim_is_held_by(&held, "agent/other"));
+        }
+        for state in ["ready", "pending", "completed", "cancelled", "failed"] {
+            let mut unheld = step.clone();
+            unheld.status = state.into();
+            assert!(!work_claim_is_held_by(&unheld, "agent/node.worker"));
+        }
     }
 
     #[test]

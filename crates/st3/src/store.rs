@@ -193,6 +193,10 @@ WHERE kind IN ('mission-run.state','step-run.state','work.failed')
 CREATE INDEX IF NOT EXISTS claims_terminal_capability_hash_index
 ON claims(json_extract(body, '$.fields.capability_hash'), store_index)
 WHERE kind='custom.client.terminal-attached';
+-- The period usage report reads response rollups only: 8,700 of the 90,000 harness.usage claims
+-- on a real store (the rest are context occupancy and session totals, written every few seconds).
+CREATE INDEX IF NOT EXISTS claims_usage_rollup_index ON claims(store_index)
+WHERE kind='harness.usage' AND json_extract(body,'$.fields.semantics')='response_rollup';
 CREATE INDEX IF NOT EXISTS claims_message_to_index
 ON claims(json_extract(body, '$.fields.to'), subject)
 WHERE kind='message.sent';
@@ -518,6 +522,12 @@ CREATE TABLE IF NOT EXISTS step_runs (
     UNIQUE(generation_id, step_path)
 );
 CREATE INDEX IF NOT EXISTS step_runs_run_index ON step_runs(run_id, generation_id, step_path);
+-- The recursive descendant-runs query joins runs to the steps that started them. Without these two
+-- it scanned every mission run, then built a throwaway index on parent_step_run for each level:
+-- 3.6 to 4.7 ms a call, 1,213 calls in one run-tree rebuild on a real store.
+CREATE INDEX IF NOT EXISTS step_runs_generation_index ON step_runs(generation_id);
+CREATE INDEX IF NOT EXISTS mission_runs_parent_step_index ON mission_runs(parent_step_run)
+WHERE parent_step_run IS NOT NULL;
 CREATE INDEX IF NOT EXISTS step_runs_assignee_index ON step_runs(assignee, status);
 -- The steps a lease holds, a handful of all the steps a fleet has ever run.
 CREATE INDEX IF NOT EXISTS step_runs_lease_index ON step_runs(lease_owner)
@@ -945,6 +955,14 @@ fn runtime_view_entry(
     })
 }
 
+#[derive(Clone, Copy)]
+enum SubjectStatusMode {
+    Full,
+    /// Agent cards replace the harness with observed evidence and never expose desired
+    /// conflicts. Provenance is only the last canonical claim, and only without a declaration.
+    AgentCard,
+}
+
 /// One subject's status at `at_index`, and the action it asks of its host when it is current and
 /// differs from what is declared. With `owner_filter`, a subject another run owns is skipped.
 fn subject_status_at(
@@ -952,6 +970,16 @@ fn subject_status_at(
     subject: &str,
     at_index: Option<u64>,
     owner_filter: Option<&str>,
+) -> Result<Option<(SubjectStatus, Option<PlannedAction>)>> {
+    subject_status_at_with_mode(connection, subject, at_index, owner_filter, SubjectStatusMode::Full)
+}
+
+fn subject_status_at_with_mode(
+    connection: &Connection,
+    subject: &str,
+    at_index: Option<u64>,
+    owner_filter: Option<&str>,
+    mode: SubjectStatusMode,
 ) -> Result<Option<(SubjectStatus, Option<PlannedAction>)>> {
     #[cfg(test)]
     SUBJECT_REDUCTIONS.with(|reductions| reductions.set(reductions.get() + 1));
@@ -983,14 +1011,25 @@ fn subject_status_at(
         at_index,
         member.as_ref().map(|member| member.host.as_str()),
     )?;
-    let harness = current_harness_at(connection, subject, at_index)?;
-    let claims = claim_ids_at(connection, subject, at_index)?;
-    let conflicts = desired_conflicts_at(
-        connection,
-        subject,
-        desired.as_ref().map(|row| row.claim_id.as_str()),
-        at_index,
-    )?;
+    let (harness, claims, conflicts) = match mode {
+        SubjectStatusMode::Full => (
+            current_harness_at(connection, subject, at_index)?,
+            claim_ids_at(connection, subject, at_index)?,
+            desired_conflicts_at(connection, subject, desired.as_ref().map(|row| row.claim_id.as_str()), at_index)?,
+        ),
+        SubjectStatusMode::AgentCard => {
+            let claims = if desired.is_some() {
+                Vec::new()
+            } else {
+                connection.prepare_cached(&canonical_sql(
+                    "SELECT id FROM claims WHERE subject=?1 AND store_index<=?2
+                     ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+                ))?.query_row(params![subject, at_index.unwrap_or(i64::MAX as u64)], |row| row.get::<_, String>(0))
+                    .optional()?.into_iter().collect()
+            };
+            (None, claims, Vec::new())
+        }
+    };
     let kind = desired.as_ref().map(|row| row.kind.clone());
     let owner_run = desired.as_ref().and_then(|row| row.owner_run.clone());
     let owner_generation = desired
@@ -2544,26 +2583,32 @@ impl Store {
         history: bool,
         build: impl FnOnce(Option<(&BTreeSet<String>, &[Value])>) -> Result<Vec<Value>>,
     ) -> Result<Vec<Value>> {
-        let mut cache = self
+        let cache = self
             .smalltalk
             .agent_resources_cache
             .lock()
             .expect("agent resources cache poisoned");
-        if let Some((_, _, items)) = cache
+        if let Some(items) = cache
             .iter()
             .find(|(at, all, _)| *at == index && *all == history)
+            .map(|(_, _, items)| Arc::clone(items))
         {
-            return Ok((**items).clone());
+            drop(cache);
+            return Ok((*items).clone());
         }
         let previous = cache
             .iter()
             .filter(|(at, all, _)| *at < index && *all == history)
-            .max_by_key(|(at, _, _)| *at);
-        let items = if let Some((at, _, previous)) = previous {
-            match self.changed_agent_resources(*at, index)? {
-                Some(changed) if changed.is_empty() => (**previous).clone(),
+            .max_by_key(|(at, _, _)| *at)
+            .map(|(at, _, items)| (*at, Arc::clone(items)));
+        // A caller already holds a SQLite snapshot. Waiting behind another card build here
+        // pins that old WAL read mark for the whole build, starving checkpoints.
+        drop(cache);
+        let items = if let Some((at, previous)) = previous {
+            match self.changed_agent_resources(at, index)? {
+                Some(changed) if changed.is_empty() => (*previous).clone(),
                 Some(changed) => {
-                    let fresh = build(Some((&changed, previous)))?;
+                    let fresh = build(Some((&changed, &previous)))?;
                     let mut items = previous
                         .iter()
                         .filter(|item| !changed.contains(item["id"].as_str().unwrap_or_default()))
@@ -2583,11 +2628,26 @@ impl Store {
         } else {
             build(None)?
         };
-        cache.push_back((index, history, Arc::new(items.clone())));
-        if cache.len() > 8 {
-            cache.pop_front();
-        }
-        Ok(items)
+        let mut cache = self
+            .smalltalk
+            .agent_resources_cache
+            .lock()
+            .expect("agent resources cache poisoned");
+        let (items, evicted) = if let Some((_, _, published)) = cache
+            .iter()
+            .find(|(at, all, _)| *at == index && *all == history)
+        {
+            // Concurrent builds still return one immutable result for this snapshot.
+            (Arc::clone(published), None)
+        } else {
+            let items = Arc::new(items);
+            cache.push_back((index, history, Arc::clone(&items)));
+            let evicted = if cache.len() > 8 { cache.pop_front() } else { None };
+            (items, evicted)
+        };
+        drop(cache);
+        drop(evicted);
+        Ok((*items).clone())
     }
 
     /// Rebuild the operation projection when it no longer matches the claim log, and say
@@ -9495,34 +9555,78 @@ impl Store {
         let chunk = chunk.max(1).min(i64::MAX as usize) as i64;
         let max_per_subject_kind = max_per_subject_kind.max(1).min(i64::MAX as usize) as i64;
         let mut deleted = 0;
+        // The newest observation of a subject and kind always stays. Rows past retention go
+        // through the time index, and a row is "not the newest" when a later id exists for its
+        // subject and kind, one seek in `local_observations_subject_kind_index`. This used to
+        // rank every row of the table with a window function inside the writer's hold, every
+        // chunk of every pass, even when nothing was due.
         loop {
             let connection = self.connection.write();
             let removed = connection.execute(
                 "DELETE FROM local_observations WHERE id IN (
-                    SELECT id FROM (
-                        SELECT id, observed_at_unix_ms,
-                               ROW_NUMBER() OVER (
-                                   PARTITION BY subject, kind ORDER BY id DESC
-                               ) AS newest_rank
-                        FROM local_observations
-                    )
-                    WHERE newest_rank > 1
-                      AND (observed_at_unix_ms < ?1 OR newest_rank > ?2)
-                    ORDER BY id
-                    LIMIT ?3
+                    SELECT id FROM local_observations AS old
+                    WHERE observed_at_unix_ms < ?1
+                      AND EXISTS (SELECT 1 FROM local_observations AS newer
+                                  WHERE newer.subject=old.subject AND newer.kind=old.kind
+                                    AND newer.id>old.id)
+                    ORDER BY observed_at_unix_ms
+                    LIMIT ?2
                  )",
                 params![
                     older_than_unix_ms.min(i64::MAX as u128) as i64,
-                    max_per_subject_kind,
                     chunk
                 ],
             )?;
             drop(connection);
             deleted += removed;
             if (removed as i64) < chunk {
-                return Ok(deleted);
+                break;
             }
         }
+        // The cap: only a subject and kind with more rows than the cap has any. Find them on a
+        // reader, then delete below the cap's id, a few rows at a time.
+        let over_cap = {
+            let connection = self.readers.get();
+            let mut statement = connection.prepare_cached(
+                "SELECT subject, kind FROM local_observations
+                 GROUP BY subject, kind HAVING COUNT(*) > ?1",
+            )?;
+            statement
+                .query_map([max_per_subject_kind], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (subject, kind) in over_cap {
+            loop {
+                let connection = self.connection.write();
+                // The newest id past the cap: rank `cap + 1` from the newest.
+                let boundary: Option<i64> = connection
+                    .query_row(
+                        "SELECT id FROM local_observations WHERE subject=?1 AND kind=?2
+                         ORDER BY id DESC LIMIT 1 OFFSET ?3",
+                        params![subject, kind, max_per_subject_kind],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let Some(boundary) = boundary else {
+                    break;
+                };
+                let removed = connection.execute(
+                    "DELETE FROM local_observations WHERE id IN (
+                        SELECT id FROM local_observations
+                        WHERE subject=?1 AND kind=?2 AND id<=?3 ORDER BY id LIMIT ?4
+                     )",
+                    params![subject, kind, boundary, chunk],
+                )?;
+                drop(connection);
+                deleted += removed;
+                if (removed as i64) < chunk {
+                    break;
+                }
+            }
+        }
+        Ok(deleted)
     }
 
     /// Forget the responses counted before `older_than_unix_ms`, in short transactions of at
@@ -9846,6 +9950,38 @@ impl Store {
         self.status_at_view(selected, selected_owner_run, at_index, false)
     }
 
+    /// Only a seat's current harness, as `status_at` reports it, for the one caller that reads
+    /// nothing else of it: a driver renewing its seat's work leases each minute. The full status
+    /// also returns every claim id of the subject, 18,000 ids (1.2 MB) for the busiest seat.
+    pub fn status_harness_only(&self, subject: &str) -> Result<StatusResponse> {
+        let connection = self.readers.get();
+        let store_index = current_index(&connection)?;
+        let harness = current_harness_at(&connection, subject, None)?;
+        Ok(StatusResponse {
+            store_index,
+            subjects: vec![SubjectStatus {
+                subject: subject.to_owned(),
+                kind: None,
+                desired_token: None,
+                desired_revision: None,
+                desired: None,
+                actual: None,
+                actual_claim: None,
+                actual_origin: None,
+                harness,
+                conflicts: Vec::new(),
+                claims: Vec::new(),
+                owner_run: None,
+                gap: None,
+                reachability: "unknown".into(),
+                reason: None,
+                under: Vec::new(),
+                projection: OperationalAnnotation::default(),
+            }],
+            pending_actions: Vec::new(),
+        })
+    }
+
     pub fn status_history(
         &self,
         selected: Option<&str>,
@@ -10144,6 +10280,36 @@ impl Store {
     #[cfg(test)]
     pub(crate) fn forget_current_views(&self) {
         self.smalltalk.forget_views();
+    }
+
+    /// Only fields consumed by agent cards, retaining the full reducer's membership,
+    /// reachability and operational annotation. Never use this for a public status response.
+    pub(crate) fn agent_card_status_at(
+        &self,
+        names: Option<&BTreeSet<String>>,
+        index: u64,
+        history: bool,
+    ) -> Result<StatusResponse> {
+        let connection = self.readers.get();
+        let index = selected_index(current_index(&connection)?, Some(index)).map_err(anyhow::Error::new)?;
+        let names = match names {
+            Some(names) => names.clone(),
+            None => connection.prepare_cached(RANGE_SUBJECTS)?
+                .query_map(params![index, "agent/", "agent0"], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<BTreeSet<_>>>()?,
+        };
+        let names = if history { names } else {
+            self.current_view_candidates(&connection, names, index, true)?
+        };
+        let mut subjects = Vec::with_capacity(names.len());
+        for name in names {
+            if let Some((status, _)) = subject_status_at_with_mode(
+                &connection, &name, Some(index), None, SubjectStatusMode::AgentCard,
+            )? && (history || status.projection.layer == "current") {
+                subjects.push(status);
+            }
+        }
+        Ok(StatusResponse { store_index: index, subjects, pending_actions: Vec::new() })
     }
 
     pub(crate) fn status_for_subject_names_at(
@@ -11379,6 +11545,41 @@ impl Store {
             },
         );
         Ok(view)
+    }
+
+    /// Provider reply watches read only new native message events through the existing
+    /// sender/store-index range. They never rebuild a recipient's historical mailbox.
+    pub(crate) fn adapter_delivery_page(
+        &self,
+        sender: &str,
+        recipients: &[String],
+        after: u64,
+        through: u64,
+        limit: usize,
+    ) -> Result<(Vec<MessageView>, Option<u64>)> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare_cached(
+            "SELECT subject, store_index FROM claims INDEXED BY claims_message_from_index
+             WHERE kind='message.sent' AND json_extract(body, '$.fields.from')=?1
+               AND store_index>?2 AND store_index<=?3
+               AND json_extract(body, '$.fields.to') IN (SELECT value FROM json_each(?4))
+             ORDER BY store_index LIMIT ?5",
+        )?;
+        let mut subjects = statement.query_map(
+            params![sender, after, through, serde_json::to_string(recipients)?, limit.saturating_add(1)],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?)),
+        )?.collect::<Result<Vec<_>, _>>()?;
+        let more = subjects.len() > limit;
+        subjects.truncate(limit);
+        let next = more.then(|| subjects.last().map(|(_, index)| *index)).flatten();
+        let mut output = Vec::new();
+        for (subject, index) in subjects {
+            let message = self.message_view_cached(&connection, &subject, index)?;
+            if message.from == sender && recipients.contains(&message.to) && message.in_reply_to.is_some() {
+                output.push(message);
+            }
+        }
+        Ok((output, next))
     }
 
     pub fn messages_page(
@@ -14207,7 +14408,8 @@ impl Store {
         }
         let connection = self.readers.get();
         let mut statement = connection.prepare(&canonical_sql(
-            "SELECT subject, store_index, body FROM claims WHERE kind='harness.usage'
+            "SELECT subject, store_index, body FROM claims INDEXED BY claims_usage_rollup_index
+             WHERE kind='harness.usage'
              AND json_extract(body, '$.fields.semantics')='response_rollup'
              ORDER BY CANONICAL_ASC(claims)",
         ))?;
@@ -18245,37 +18447,63 @@ fn publish_changed_harness_state_tx(
     input: &ClaimInput,
     now: u128,
 ) -> Result<Option<ClaimRecord>, St3Error> {
-    fn state_fields<'a>(
-        fields: impl IntoIterator<Item = (&'a String, &'a Value)>,
-    ) -> BTreeMap<&'a str, &'a Value> {
-        fields
-            .into_iter()
-            .filter(|(name, _)| !matches!(name.as_str(), "observed_at_ms" | "observed_since_ms" | "status_transition"))
-            .map(|(name, value)| (name.as_str(), value))
-            .collect()
-    }
     let latest = latest_harness_of_incarnation_tx(
         transaction,
         &input.subject,
         input.fields.get("incarnation_id").and_then(Value::as_str),
     )?;
+    let mut fields = input.fields.clone();
+    if let Some(previous) = latest.as_ref().and_then(|claim| claim.body.get("fields")) {
+        for name in ["blocked_on", "ask"] {
+            if !fields.contains_key(name)
+                && let Some(value) = previous.get(name)
+            {
+                fields.insert(name.into(), value.clone());
+            }
+        }
+        if fields.get("provider_auth").is_none_or(Value::is_null)
+            && let Some(value) = previous.get("provider_auth").filter(|value| value.is_boolean())
+        {
+            fields.insert("provider_auth".into(), value.clone());
+        }
+    }
+    if matches!(fields.get("state").and_then(Value::as_str), Some("ended" | "indeterminate")) {
+        fields.insert("blocked_on".into(), Value::Null);
+        fields.insert("ask".into(), Value::Null);
+    }
     let unchanged = latest.as_ref().is_some_and(|claim| {
         claim
             .body
             .get("fields")
             .and_then(Value::as_object)
-            .is_some_and(|fields| state_fields(fields) == state_fields(&input.fields))
+            .is_some_and(|previous| {
+                fields.iter().all(|(name, value)| {
+                    matches!(name.as_str(), "observed_at_ms" | "observed_since_ms" | "status_transition")
+                        || previous.get(name) == Some(value)
+                })
+            })
     });
     // Refresh remote freshness at most once a minute, without manufacturing transitions.
     if unchanged && latest.as_ref().is_some_and(|claim| now.saturating_sub(claim.accepted_at_unix_ms) < 60_000) {
         return Ok(None);
     }
-    let mut fields = input.fields.clone();
     let observed_at = fields.get("observed_at_ms").and_then(Value::as_u64)
         .map_or(now, u128::from).min(now);
     let same_state = latest.as_ref().is_some_and(|claim| {
+        let previous = &claim.body["fields"];
+        let carried = |name: &str| fields.get(name).or_else(|| previous.get(name));
         claim.body["fields"]["state"] == fields["state"]
-            && claim.body["fields"].get("provider_auth") == fields.get("provider_auth")
+            && (seat_status::permission_blocked(
+                previous["state"].as_str(),
+                previous["blocked_on"].as_str(),
+                previous["ask"].as_str(),
+            ) == seat_status::permission_blocked(
+                fields["state"].as_str(),
+                carried("blocked_on").and_then(Value::as_str),
+                carried("ask").and_then(Value::as_str),
+            ))
+            && previous.get("provider_auth").and_then(Value::as_bool)
+                == carried("provider_auth").and_then(Value::as_bool)
             && claim.body["fields"].get("incarnation_id") == fields.get("incarnation_id")
     });
     let since = if same_state {
@@ -20436,6 +20664,10 @@ fn current_harness_fold_at(
         {
             current = Some((state.to_owned(), claim, observed_at_unix_ms, key));
         }
+        if matches!(fields.get("state").and_then(Value::as_str), Some("ended" | "indeterminate")) {
+            optional.entry("blocked_on").or_insert(None);
+            optional.entry("ask").or_insert(None);
+        }
         for name in [
             "driver",
             "transport",
@@ -20486,6 +20718,11 @@ fn current_harness_fold_at(
     if let Some((claim, _store_index, observed_at_unix_ms, key)) = work_activity
         && include_work_activity
         && key > runtime_key
+        && !seat_status::permission_blocked(
+            current.as_ref().map(|(state, _, _, _)| state.as_str()),
+            optional.get("blocked_on").and_then(|v| v.as_deref()),
+            optional.get("ask").and_then(|v| v.as_deref()),
+        )
         && current
             .as_ref()
             .is_none_or(|(_, _, _, harness_key)| key > *harness_key)
@@ -20508,6 +20745,16 @@ fn current_harness_fold_at(
     let Some((mut state, claim, observed_at_unix_ms, _)) = current else {
         return Ok(None);
     };
+    if seat_status::permission_blocked(
+        Some(state.as_str()),
+        optional.get("blocked_on").and_then(|v| v.as_deref()),
+        optional.get("ask").and_then(|v| v.as_deref()),
+    ) {
+        state = "blocked".into();
+    } else if matches!(state.as_str(), "ended" | "indeterminate") {
+        optional.insert("blocked_on", None);
+        optional.insert("ask", None);
+    }
     if optional.get("reason").and_then(|r| r.as_deref()) == Some("providerAuth") {
         if auth_restored {
             // Sparse successful reports must not inherit an older credential-refusal reason.
@@ -30561,6 +30808,49 @@ mod tests {
     use proptest::prelude::*;
 
     const TEST_FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+
+    #[test]
+    fn an_agent_card_build_does_not_hold_other_read_snapshots_at_the_cache_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(&directory.path().join("graph.db"), "node").unwrap());
+        store
+            .cached_agent_resources(0, true, |_| Ok(vec![json!({"id": "agent/cached"})]))
+            .unwrap();
+        let (entered, building) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let slow = store.clone();
+        let builder = std::thread::spawn(move || {
+            slow.read_snapshot(|_| {
+                slow.cached_agent_resources(1, false, |_| {
+                    entered.send(()).unwrap();
+                    released.recv().unwrap();
+                    Ok(vec![json!({"id": "agent/slow"})])
+                })
+            })
+            .unwrap()
+        });
+        building.recv().unwrap();
+        let (finished, result) = std::sync::mpsc::channel();
+        let reader = store.clone();
+        let other = std::thread::spawn(move || {
+            finished
+                .send(reader.read_snapshot(|_| {
+                    reader.cached_agent_resources(0, true, |_| panic!("cached snapshot was lost"))
+                }))
+                .unwrap();
+        });
+        let completed = result.recv_timeout(std::time::Duration::from_secs(1));
+        let published = completed.as_ref().ok().map(|_| {
+            store
+                .cached_agent_resources(1, false, |_| Ok(vec![json!({"id": "agent/published"})]))
+                .unwrap()
+        });
+        release.send(()).unwrap();
+        let resumed = builder.join().unwrap();
+        other.join().unwrap();
+        assert_eq!(completed.unwrap().unwrap()[0]["id"], "agent/cached");
+        assert_eq!(resumed, published.unwrap());
+    }
 
     #[test]
     fn terminal_capability_lookup_fences_the_subject_head_after_reopen() {
@@ -44145,6 +44435,79 @@ mission "nested-work" state="ready" {
         );
     }
 
+    #[test]
+    fn the_per_subject_cap_trims_every_subject_over_it_and_only_those() {
+        let store = Store::open_memory("node").unwrap();
+        for (subject, entries) in [("agent/node.a", 7), ("agent/node.b", 5), ("agent/node.c", 2)] {
+            for entry in 0..entries {
+                store
+                    .append_claim(&timeline_observation(subject, "inc", &format!("entry-{entry}")))
+                    .unwrap();
+            }
+        }
+        let remaining = |store: &Store| {
+            store
+                .local_observations_after(0, 100)
+                .unwrap()
+                .iter()
+                .map(|record| (record.subject.clone(), local_observation_position(record).unwrap()))
+                .collect::<Vec<_>>()
+        };
+        // Nothing is old; the cap alone applies, two rows to a chunk, to a and b but not c.
+        assert_eq!(store.trim_local_observations(0, 3, 2).unwrap(), 4 + 2);
+        let kept = remaining(&store);
+        let of = |name: &str| {
+            kept.iter()
+                .filter(|(subject, _)| subject == name)
+                .map(|(_, position)| *position)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(of("agent/node.a"), [5, 6, 7], "the three newest of seven");
+        assert_eq!(of("agent/node.b"), [10, 11, 12], "the three newest of five");
+        assert_eq!(of("agent/node.c"), [13, 14], "a subject under the cap is untouched");
+        assert_eq!(store.trim_local_observations(0, 3, 2).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_planning_rebuild_leaves_the_operations_alone() {
+        let store = Store::open_memory("alder").unwrap();
+        for index in 0..5 {
+            store
+                .append_claim(&ClaimInput {
+                    subject: format!("custom/pin/{index}"),
+                    kind: "custom.drift.note".into(),
+                    actor: Some("person/tester".into()),
+                    fields: BTreeMap::new(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("pin-{index}")),
+                })
+                .unwrap();
+        }
+        let count = |store: &Store| -> i64 {
+            store
+                .readers
+                .get()
+                .query_row("SELECT COUNT(*) FROM operations", [], |row| row.get(0))
+                .unwrap()
+        };
+        let rows = count(&store);
+        assert!(rows >= 5, "each claim with an idempotency key registers an operation");
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM operations", [])
+            .unwrap();
+        // A planning write rebuilds the planning tables only: it must not re-derive operations
+        // (241,000 rows, 19 s on a real store).
+        store.rebuild_planning_projection().unwrap();
+        assert_eq!(count(&store), 0);
+        // The full rebuild does, which is what the planning path used to run on every write.
+        store.rebuild_claim_projections().unwrap();
+        assert_eq!(count(&store), rows);
+    }
+
     fn harness_state(subject: &str, state: &str, observed_at_ms: u64) -> ClaimInput {
         ClaimInput {
             subject: subject.into(),
@@ -49242,6 +49605,19 @@ message "human-attention" {
             "new"
         );
         harness(Some("new"), "harness-new");
+        // The harness-only status a driver renews its leases from answers what the full one does,
+        // without the seat's claim ids; the fence's newest-claim seek names the last claim.
+        let only = store.status_harness_only(subject).unwrap();
+        assert_eq!(only.subjects.len(), 1);
+        assert!(only.subjects[0].claims.is_empty());
+        assert_eq!(
+            only.subjects[0].harness.as_ref().map(|harness| harness.incarnation_id.clone()),
+            store.current_harness(subject).unwrap().map(|harness| harness.incarnation_id)
+        );
+        assert_eq!(
+            store.latest_claim_id(subject).unwrap(),
+            store.claims_for(subject, None).unwrap().last().map(|claim| claim.id.clone())
+        );
         store
             .append_claim(&ClaimInput {
                 subject: subject.into(),

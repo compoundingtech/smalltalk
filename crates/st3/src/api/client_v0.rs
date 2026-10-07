@@ -7449,21 +7449,62 @@ fn validate_message_session(
     session_id: &str,
 ) -> Result<(), ApiError> {
     let recipient = normalize_message_party(recipient);
-    let current_session = client_agent_resources(
-        &state.store,
-        false,
-        &snapshot.created_at,
-        snapshot.store_index,
-    )
-    .map_err(ApiError::internal)?
-    .into_iter()
-    .find(|agent| agent["id"] == recipient)
-    .and_then(|agent| agent["current_session_id"].as_str().map(str::to_owned))
-    .ok_or_else(|| {
-        validation(format!(
-            "message recipient `{recipient}` has no current normalized session"
-        ))
-    })?;
+    // Match the card's current-session fence without building cards, work queues, usage,
+    // todo lists or delivery overlays for the fleet.
+    let status = state
+        .store
+        .status_for_subject_names_at(
+            BTreeSet::from([recipient.clone()]),
+            snapshot.store_index,
+            false,
+        )
+        .map_err(ApiError::internal)?;
+    let current_session = status
+        .subjects
+        .into_iter()
+        .find(|subject| {
+            subject.subject == recipient
+                && subject.subject.starts_with("agent/")
+                && subject.projection.layer == "current"
+        })
+        .map(|subject| -> anyhow::Result<Option<String>> {
+            let moving = subject
+                .desired_token
+                .as_deref()
+                .map(|token| {
+                    crate::placement::handoff(
+                        &state.store,
+                        &subject.subject,
+                        token,
+                        snapshot.store_index,
+                    )
+                })
+                .transpose()?
+                .flatten()
+                .is_some_and(|handoff| handoff.phase != "running");
+            let fields = subject
+                .actual
+                .as_ref()
+                .map(|actual| actual.get("fields").unwrap_or(actual));
+            let incarnation = fields
+                .filter(|_| !moving)
+                .and_then(|fields| fields.get("incarnation_id"))
+                .and_then(Value::as_str);
+            let runtime = fields
+                .and_then(|fields| fields.get("runtime_id"))
+                .and_then(Value::as_str);
+            Ok(incarnation
+                .or(runtime)
+                .map(|identity| managed_session_id(&subject.subject, identity)))
+        })
+        .transpose()
+        .map_err(ApiError::internal)?
+        .flatten()
+        .ok_or_else(|| {
+            validation(format!(
+                "message recipient `{recipient}` has no current normalized session"
+            ))
+        })?;
     if current_session != session_id {
         return Err(stale(format!(
             "session `{session_id}` is not the current session for `{recipient}`"
@@ -7726,6 +7767,16 @@ fn validate_launch_fence(state: &AppState, target: &str, fence: &Fence) -> Resul
     Ok(())
 }
 
+/// Raw and key input to a terminal: the keys a person types, which no screen they did not see can
+/// make unsafe to send, unlike a whole line with its Enter.
+fn terminal_keys_unfenced(request: &ActionRequest) -> bool {
+    request.action_type == "terminal.input"
+        && matches!(
+            request.parameters.get("mode").and_then(Value::as_str),
+            Some("raw" | "key")
+        )
+}
+
 fn validate_fence(state: &AppState, fence: &Fence) -> Result<(), ApiError> {
     let parsed = fence
         .snapshot_id
@@ -7764,12 +7815,12 @@ fn validate_fence(state: &AppState, fence: &Fence) -> Result<(), ApiError> {
                 .map_err(import_lookup_error)?
                 .map(|session| session.revision)
         } else {
+            // The newest claim's id, by a seek: reading and sorting every claim of the subject
+            // was 0.4 s for a busy seat (4.4 s cold) on every fenced action.
             state
                 .store
-                .claims_for(subject, None)
+                .latest_claim_id(subject)
                 .map_err(ApiError::internal)?
-                .last()
-                .map(|claim| claim.id.clone())
         };
         if current.as_deref() != Some(revision) {
             return Err(stale(format!(
@@ -9160,14 +9211,36 @@ pub(super) async fn action(
             remote_terminal_live_session(&state, &terminal_subject(&terminal_id), incarnation)?;
         if live.owner_host_id != client_host_id(&state.node) {
             validate_fence(&state, &request.fence)?;
-            let expected_sequence = request
-                .fence
-                .terminal_sequence
-                .ok_or_else(|| validation("terminal control requires a sequence fence"))?;
             let relay = state
                 .client_relay
                 .as_ref()
                 .ok_or_else(|| remote_unavailable_for_owner(&state, &live.owner_host_id))?;
+            // Typing keys needs no screen fence (see the local case below). The owner still wants
+            // a sequence, so one is read from it now: there is no stale window to lose.
+            let expected_sequence = if terminal_keys_unfenced(&request) {
+                let screen = relay
+                    .read(
+                        &live.owner_host_id,
+                        &crate::peer::ClientReadRequest {
+                            authority_actor: session.authority_actor.clone(),
+                            relay: None,
+                            request: crate::peer::ClientReadOperation::TerminalScreen {
+                                terminal_id: client_detail_id("terminal", &terminal_id),
+                                facts: false,
+                            },
+                        },
+                    )
+                    .await
+                    .map_err(|error| remote_read_error(&live.owner_host_id, error))?;
+                screen["next_sequence"]
+                    .as_u64()
+                    .ok_or_else(|| validation("the terminal gave no sequence"))?
+            } else {
+                request
+                    .fence
+                    .terminal_sequence
+                    .ok_or_else(|| validation("terminal control requires a sequence fence"))?
+            };
             let mut value = relay
                 .read(
                     &live.owner_host_id,
@@ -9201,10 +9274,22 @@ pub(super) async fn action(
             .runtime_incarnation
             .as_deref()
             .ok_or_else(|| validation("terminal control requires an incarnation fence"))?;
-        let expected = request
-            .fence
-            .terminal_sequence
-            .ok_or_else(|| validation("terminal control requires a sequence fence"))?;
+        // Typing keys into a terminal whose screen moves on its own (an agent's spinner, a log)
+        // can never match the sequence a client read a moment before: the screen changes between
+        // the read and the key. The incarnation fence is what keeps keys from reaching a
+        // restarted program, so raw and key input need no sequence; a line sent with Enter and a
+        // resize still do (Nathan, 2026-10-06: the phone could not type into an attached terminal).
+        let unfenced = terminal_keys_unfenced(&request);
+        let expected = if unfenced {
+            request.fence.terminal_sequence
+        } else {
+            Some(
+                request
+                    .fence
+                    .terminal_sequence
+                    .ok_or_else(|| validation("terminal control requires a sequence fence"))?,
+            )
+        };
         let screen = terminal_screen_value(
             &state,
             &terminal_id,
@@ -9213,7 +9298,7 @@ pub(super) async fn action(
             Duration::ZERO,
         )
         .await?;
-        if screen["next_sequence"].as_u64() != Some(expected) {
+        if !unfenced && screen["next_sequence"].as_u64() != expected {
             return Err(stale("the terminal sequence fence is stale"));
         }
     }
@@ -13307,6 +13392,78 @@ mission "example/zero-run" state="ready" {
         assert_eq!(gap.code, "cursor-gap");
     }
 
+    #[test]
+    fn message_session_validation_reads_only_the_recipient_and_preserves_session_fences() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "session-point-node");
+        for (subject, incarnation) in [
+            ("agent/session-point-owner", Some("point-runtime:i2")),
+            ("agent/session-point-legacy", None),
+            ("agent/session-point-empty", None),
+        ] {
+            let mut fields = BTreeMap::from([
+                ("status".into(), json!("running")),
+                ("terminal".into(), json!(false)),
+            ]);
+            if subject != "agent/session-point-empty" {
+                fields.insert("runtime_id".into(), json!("point-runtime"));
+            }
+            if let Some(incarnation) = incarnation {
+                fields.insert("incarnation_id".into(), json!(incarnation));
+            }
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "runtime.observed".into(),
+                    actor: Some(subject.into()),
+                    fields,
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(subject.into()),
+                })
+                .unwrap();
+        }
+        let snapshot = new_client_snapshot(&state);
+        // The old fleet-card path would decode this unrelated card's invalid harness overlay.
+        state
+            .store
+            .cached_agent_resources(snapshot.store_index, false, |_| {
+                Ok(vec![json!({"id":"agent/unrelated", "_status_source":true})])
+            })
+            .unwrap();
+        let owner_session = managed_session_id("agent/session-point-owner", "point-runtime:i2");
+        validate_message_session(&state, &snapshot, "session-point-owner", &owner_session).unwrap();
+        let legacy_session = managed_session_id("agent/session-point-legacy", "point-runtime");
+        validate_message_session(
+            &state,
+            &snapshot,
+            "agent/session-point-legacy",
+            &legacy_session,
+        )
+        .unwrap();
+        let wrong_runtime = managed_session_id("agent/session-point-owner", "point-runtime");
+        assert_eq!(
+            validate_message_session(
+                &state,
+                &snapshot,
+                "agent/session-point-owner",
+                &wrong_runtime
+            )
+            .unwrap_err()
+            .code,
+            "stale-fence"
+        );
+        for subject in ["agent/session-point-empty", "agent/missing", "person/alex"] {
+            assert_eq!(
+                validate_message_session(&state, &snapshot, subject, &owner_session)
+                    .unwrap_err()
+                    .code,
+                "validation-failed"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn current_agent_session_fences_composer_messages_and_timeline_history() {
         let root = tempfile::tempdir().unwrap();
@@ -15369,6 +15526,26 @@ mission "example/zero-run" state="ready" {
             .await
             .unwrap_err();
             assert_eq!(error.code, "stale-fence");
+        }
+        // Typed keys need no screen fence: the screen has moved on since `fence` read it, yet raw
+        // keys land, with the sequence or without it. A line with its Enter still needs it.
+        for (key, fence) in [
+            ("fence-raw", fence.clone()),
+            ("fence-raw-no-sequence", Fence { terminal_sequence: None, ..fence.clone() }),
+        ] {
+            let _ = action(
+                State(state.clone()),
+                Extension(snapshot.clone()),
+                Extension(session.clone()),
+                Json(request(
+                    "terminal.input",
+                    key,
+                    fence,
+                    json!({"terminal_id":"terminal/agent/fence-test","mode":"raw","value":"aw=="}),
+                )),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("raw input must not need a screen fence: {error:?}"));
         }
         let mut foreign = fence.clone();
         foreign.snapshot_id = foreign.snapshot_id.replacen(&state.node, "another-host", 1);

@@ -34038,7 +34038,7 @@ agent "plain" {{ workspace {:?}; harness "claude" {{}} }}
     }
 
     #[test]
-    fn a_new_desired_revision_that_becomes_ready_resolves_the_codex_crash_loop_alert() {
+    fn a_new_revision_resolves_a_codex_normalized_model_mismatch_crash_loop() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let workspace = tempfile::tempdir().unwrap();
         let source = |model: &str| {
@@ -34059,8 +34059,17 @@ agent "plain" {{ workspace {:?}; harness "claude" {{}} }}
             Arc::new(Notify::new()),
         );
         reconciler
-            .raise_codex_crash_loop("agent/node.worker", &token_a, "the start failed")
+            .raise_codex_crash_loop(
+                "agent/node.worker",
+                &token_a,
+                "declared gpt-6.1-sol but resume returned gpt-6.1-sol-2026-10-06",
+            )
             .unwrap();
+        assert!(
+            reconciler
+                .codex_crash_loop_raised("agent/node.worker", &token_a)
+                .unwrap()
+        );
         assert_eq!(store.fault_items(Some("person/alex")).unwrap().len(), 1);
 
         // A person revises the declaration, and the new revision's incarnation becomes ready.

@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Wait for complete managed-agent color snapshots before asserting their environment values in integration tests.",
+  "replay": {
+    "status": "none",
+    "detail": "Integration fixture and release metadata only; no runtime replay, affected store state or upgrade trigger changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database tables, indexes, triggers or schema versions change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules, digests or fleet coordination changes."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Production Agent Spec, NO_COLOR handling, client, protocol and harness contracts are unchanged; only the integration fixture's snapshot completion check changes."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "The fixture change introduces no service restart or additional runtime interruption."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No installation steps or intermediate version transitions are required by this fixture-only change."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No binary swap-back, database recovery or roll-forward behavior changes."
+  }
+}
