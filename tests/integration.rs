@@ -5,6 +5,10 @@
 //! The files that are test targets of their own set process-wide environment variables:
 //! `cargo test` runs a binary's tests as threads of one process, where they would leak.
 
+#[macro_use]
+#[path = "../scripts/ci-test-paths.rs"]
+mod ci_test_paths;
+
 mod support;
 
 mod agent_address;
@@ -57,7 +61,7 @@ mod vrs_ledger;
 fn every_test_file_is_built() {
     let modules = include_str!("integration.rs");
     let manifest = include_str!("../Cargo.toml");
-    let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let directory = std::path::Path::new(test_env!("CARGO_MANIFEST_DIR")).join("tests");
     let mut unbuilt = Vec::new();
     for entry in std::fs::read_dir(&directory).unwrap() {
         let path = entry.unwrap().path();

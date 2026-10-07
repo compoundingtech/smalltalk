@@ -11,7 +11,7 @@ fn pin_hooks(mut command: Command, hooks_root: &Path) -> Command {
 }
 
 fn command(hooks_root: &Path) -> Command {
-    pin_hooks(Command::new(env!("CARGO_BIN_EXE_st2")), hooks_root)
+    pin_hooks(Command::new(test_env!("CARGO_BIN_EXE_st2")), hooks_root)
 }
 
 fn write_executable(path: &Path, body: &str) {
@@ -127,7 +127,7 @@ fn fixture_pin_overrides_an_inherited_hooks_root_without_escape() {
     let tmp = tempfile::tempdir().unwrap();
     let inherited = tmp.path().join("inherited-live-shaped-root");
     let fixture = tmp.path().join("fixture-hooks");
-    let mut inherited_command = Command::new(env!("CARGO_BIN_EXE_st2"));
+    let mut inherited_command = Command::new(test_env!("CARGO_BIN_EXE_st2"));
     inherited_command.env("ST_HOOKS", &inherited);
 
     let output = pin_hooks(inherited_command, &fixture)

@@ -1131,10 +1131,7 @@ mod tests {
     fn demo_profile(class: ProfileClass) -> ResourceProfile {
         ResourceProfile::wasm(
             AGENT_GOAL_SCHEME,
-            concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/tests/fixtures/demo_resolver.wasm"
-            ),
+            test_env!("CARGO_MANIFEST_DIR", "/tests/fixtures/demo_resolver.wasm"),
             class,
         )
     }

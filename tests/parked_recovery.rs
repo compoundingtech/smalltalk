@@ -45,7 +45,7 @@ impl Drop for Fleet {
 
 impl Fleet {
     fn st2(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_st2"));
+        let mut command = Command::new(test_env!("CARGO_BIN_EXE_st2"));
         command
             .arg("--catalog")
             .arg(&self.catalog)
@@ -191,7 +191,7 @@ fn a_real_supervisor_parks_a_crash_looper_and_unpark_recovers_only_that_task() {
         ),
     );
 
-    let supervisor = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let supervisor = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .arg("--catalog")
         .arg(&catalog)
         .args(["up", "--host", HOST, "--interval", "1"])

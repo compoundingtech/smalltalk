@@ -94,12 +94,19 @@ failure, cancellation or skipping either shard fails the gate. Each shard retain
 durations in its logs, and the primary saves `ci-logs/test-partitions.json` with the tested SHA
 and all three inventories.
 
-Both shards keep their own checkouts and builds because many tests embed build-time source and
-executable paths. Namespace's second shard restores the same main-seeded Cargo and Nix cache
-keys as the primary. Moving portable archives between runners remains a follow-up after those
-tests support relocation. Building selected targets before installing hooks removes the earlier
-standalone `cargo run -p st2` build. Local and macOS runs use the complete selection unless
-`CI_TEST_PARTITION` is explicitly set to `hash:1/2` or `hash:2/2`.
+The Linux `linux-test-build` job compiles the existing two selected Cargo groups once and
+publishes nextest archives. Both shards, the zero-retry mail job and isolation VM require that
+successful producer and download its exact artifact ID. They check the manifest SHA, source/tree,
+run/attempt, architecture, nextest/rustc versions and each archive digest before extracting. Cargo
+target caches remain on the producer; consumers restore only runtime/Nix fixtures. The primary
+still separately checks the standalone conversation-model feature boundary.
+
+Tests resolve archived executables through nextest's runtime binary paths. Manifest/fixture paths
+map each compiled package beneath the recorded producer root to the consumer checkout, including
+library fixtures launched by another package. Outside archives the original compiled path remains
+the fallback. Archive mode rejects missing or mismatched roots/binaries. Tests, assertions,
+partitions, retries, eight test threads, real VM checks and required contexts are unchanged.
+Local and macOS runs still use the existing build selection unless `CI_TEST_PARTITION` is set.
 
 Main upkeep probes the exact Cargo and Nix cache keys for each stage before provisioning Nix
 or restoring build archives. When both entries exist it stops after the probes. A miss is flagged

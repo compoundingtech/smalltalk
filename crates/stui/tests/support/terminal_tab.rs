@@ -7,10 +7,7 @@ use std::path::PathBuf;
 #[test]
 fn terminal_tab_protocols() {
     let output = std::process::Command::new("python3")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/terminal_tab_probe.py"
-        ))
+        .arg(test_env!("CARGO_MANIFEST_DIR", "/tests/terminal_tab_probe.py"))
         .arg("--worker")
         .arg(std::env::current_exe().unwrap())
         .arg("--check")

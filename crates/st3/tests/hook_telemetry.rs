@@ -64,7 +64,7 @@ fn seat(root: &Path) -> std::path::PathBuf {
 }
 
 fn hook(root: &Path, event: &str, collector: &str) -> tokio::process::Command {
-    let mut command = st3::test_support::async_command(env!("CARGO_BIN_EXE_st3-fixture"));
+    let mut command = st3::test_support::async_command(test_env!("CARGO_BIN_EXE_st3-fixture"));
     command
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
@@ -155,7 +155,7 @@ async fn an_undeclared_application_and_the_status_line_create_no_hook_count_or_e
             .status
             .success()
     );
-    let mut status_line = st3::test_support::async_command(env!("CARGO_BIN_EXE_st3-fixture"));
+    let mut status_line = st3::test_support::async_command(test_env!("CARGO_BIN_EXE_st3-fixture"));
     status_line
         .env_clear()
         .env("HOME", root.path())

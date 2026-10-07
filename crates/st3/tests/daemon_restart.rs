@@ -626,7 +626,7 @@ time.sleep(300)
             .env("ST_AGENT", seat)
             .env("ST3_MAILBOX_TRANSPORT", "push")
             .args(["driver", "claude", "--subject", seat, "--", "python3", "-c", provider,
-                env!("CARGO_BIN_EXE_st3-fixture")])
+                test_env!("CARGO_BIN_EXE_st3-fixture")])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())

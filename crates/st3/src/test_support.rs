@@ -92,7 +92,7 @@ pub fn supervise_test() -> bool {
             return false;
         }
         let script =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/st3_test_process.py");
+            Path::new(test_env!("CARGO_MANIFEST_DIR")).join("../../scripts/st3_test_process.py");
         let output = Command::new("python3")
             .arg(script)
             .args(["--owner", &std::process::id().to_string(), "--"])

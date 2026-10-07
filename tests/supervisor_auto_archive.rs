@@ -116,7 +116,7 @@ fn ledger_at(root: &Path, path: &str) -> Option<serde_json::Value> {
 fn up_once(root: &Path, bin: &Path) -> Output {
     let home = root.parent().unwrap().join("home");
     fs::create_dir_all(&home).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let output = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args(["up", "--catalog", root.to_str().unwrap()])
         .args(["--host", "h", "--once"])
         .env("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()))
@@ -703,7 +703,7 @@ fn direct_actor(root: &Path, identity: &str) {
 
 fn st2(root: &Path, bin: &Path, args: &[&str]) -> Output {
     let home = root.parent().unwrap().join("home");
-    Command::new(env!("CARGO_BIN_EXE_st2"))
+    Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args(["--catalog", root.to_str().unwrap()])
         .args(args)
         .env("PATH", bin)

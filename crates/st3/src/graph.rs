@@ -5551,7 +5551,7 @@ agent "dotfiles/steward" {
 
     #[test]
     fn every_st3_eval_uses_the_current_graph_grammar() {
-        let evals = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        let evals = std::path::Path::new(test_env!("CARGO_MANIFEST_DIR"))
             .join("../..")
             .join("evals/st3");
         let mut parsed = 0;
@@ -5585,7 +5585,7 @@ agent "dotfiles/steward" {
 
     #[test]
     fn work_wake_revision_fixtures_use_the_current_graph_grammar() {
-        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        let fixtures = std::path::Path::new(test_env!("CARGO_MANIFEST_DIR"))
             .join("../..")
             .join("evals/st3/work-wake-reliability/fixtures");
         for name in ["revisable-v1.kdl", "revisable-v2.kdl", "revisable-v3.kdl"] {
