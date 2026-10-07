@@ -21,6 +21,7 @@ use sha2::{Digest as _, Sha256};
 use crate::fleet::{MemberKey, Sender, verify_signature};
 
 mod backend;
+pub mod telemetry;
 mod worker;
 
 pub use backend::{Backend, Local, redemption_answer};

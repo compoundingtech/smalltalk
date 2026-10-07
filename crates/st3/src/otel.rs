@@ -510,6 +510,9 @@ impl Telemetry {
             installed && telemetry.tracer_provider.is_some(),
             Ordering::Relaxed,
         );
+        if matches!(unit, Unit::ReplicationWorker) {
+            smallclaims::sync::telemetry::init(export_enabled(), crate::otel::metrics_enabled());
+        }
         telemetry
     }
 
@@ -521,6 +524,7 @@ impl Telemetry {
     pub fn shutdown(&mut self) {
         EXPORT_ENABLED.store(false, Ordering::Relaxed);
         METRICS_ENABLED.store(false, Ordering::Relaxed);
+        smallclaims::sync::telemetry::init(false, false);
         let tracer = self.tracer_provider.take();
         let meter = self.meter_provider.take();
         let logger = self.logger_provider.take();

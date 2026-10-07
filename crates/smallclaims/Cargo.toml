@@ -17,7 +17,7 @@ getrandom = { version = "0.3", features = ["std"] }
 hex = "0.4"
 hmac = "0.12"
 libc = "0.2"
-opentelemetry = { version = "0.30", default-features = false, features = ["metrics"] }
+opentelemetry = { version = "0.30", default-features = false, features = ["metrics", "trace"] }
 parking_lot = "0.12"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 ring = "0.17"
