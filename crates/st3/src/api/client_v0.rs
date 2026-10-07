@@ -377,14 +377,13 @@ fn conversation_owner_host(
     subject: Option<&str>,
 ) -> Result<Option<String>, ApiError> {
     let index = state.store.index().map_err(ApiError::internal)?;
-    let managed = match subject {
-        Some(subject) => super::managed_session_owner_for_subject_at(
-            &state.store, index, session_id, subject,
-        ),
-        None => super::managed_session_owner_at(&state.store, index, session_id),
-    };
+    let managed = super::managed_session_owner_at_with_hint(
+        &state.store, index, session_id, subject.or(session.conversation_subject_hint()),
+    ).map_err(ApiError::internal)?;
+    if let Some((owner, _, _)) = &managed {
+        let _ = session.conversation_subject.set(owner.clone());
+    }
     let remote = managed
-        .map_err(ApiError::internal)?
         .and_then(|(_, _, origin)| origin)
         .filter(|origin| origin != state.store.origin())
         .map(|origin| client_host_id(&origin));
@@ -438,7 +437,7 @@ async fn conversation_page(
             .as_ref()
             .ok_or_else(|| conversation_blocks::availability(remote_unavailable_for_owner(state, owner)))?;
         return relay
-            .read(
+            .read_with_subject_hint(
                 owner,
                 &crate::peer::ClientReadRequest {
                     authority_actor: session.authority_actor.clone(),
@@ -449,6 +448,7 @@ async fn conversation_page(
                         cursor: None,
                     },
                 },
+                session.conversation_subject_hint(),
             )
             .await
             .map(|mut value| {
@@ -490,7 +490,7 @@ async fn conversation_changes_value(
             .as_ref()
             .ok_or_else(|| conversation_blocks::availability(remote_unavailable_for_owner(state, owner)))?;
         return relay
-            .read(
+            .read_with_subject_hint(
                 owner,
                 &crate::peer::ClientReadRequest {
                     authority_actor: session.authority_actor.clone(),
@@ -501,6 +501,7 @@ async fn conversation_changes_value(
                         wait_ms,
                     },
                 },
+                session.conversation_subject_hint(),
             )
             .await
             .map(|mut value| {
@@ -763,6 +764,10 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                         if request.collection == "conversation" {
                             let (state, session, outbox, admit) =
                                 (state.clone(), session.clone(), conversation_outbox.clone(), admit.clone());
+                            // A subscription owns its context independently of the socket and
+                            // sibling subscriptions; clones inside admission/follow share it.
+                            let mut session = session;
+                            session.conversation_subject = Arc::default();
                             let subscription_id = request.id.clone();
                             let id = subscription_id.clone();
                             let admission_slots = admission_slots.clone();
@@ -1376,10 +1381,23 @@ pub(super) struct ClientSession {
     pub(super) transport: &'static str,
     pub(super) custom_forms: bool,
     pub(super) conversation_blocks: bool,
+    /// Shared only by clones of this request/subscription; never an authority grant.
+    conversation_subject: Arc<std::sync::OnceLock<String>>,
+    /// Unvalidated transport metadata is superseded by a discovered owner.
+    provided_conversation_subject: Option<String>,
     scopes: std::collections::BTreeSet<String>,
 }
 
 impl ClientSession {
+    pub(super) fn conversation_subject_hint(&self) -> Option<&str> {
+        self.conversation_subject.get().map(String::as_str)
+            .or(self.provided_conversation_subject.as_deref())
+    }
+    pub(super) fn remember_conversation_subject(&self, subject: String) {
+        let _ = self.conversation_subject.set(subject);
+    }
+
+
     #[cfg(test)]
     pub(super) fn for_tests(actor: &str, authority_actor: &str, transport: &'static str) -> Self {
         Self {
@@ -1389,6 +1407,8 @@ impl ClientSession {
             transport,
             custom_forms: true,
             conversation_blocks: false,
+            conversation_subject: Arc::default(),
+            provided_conversation_subject: None,
             scopes: std::collections::BTreeSet::new(),
         }
     }
@@ -1411,6 +1431,8 @@ impl ClientSession {
                 transport: "unix",
                 custom_forms,
                 conversation_blocks: false,
+                conversation_subject: Arc::default(),
+                provided_conversation_subject: None,
                 scopes: ["read.projections", "terminal.read"]
                     .into_iter()
                     .map(str::to_owned)
@@ -1426,6 +1448,8 @@ impl ClientSession {
             transport: "unix",
             custom_forms,
             conversation_blocks: false,
+            conversation_subject: Arc::default(),
+            provided_conversation_subject: None,
             scopes: ALL_SCOPES.iter().map(|scope| (*scope).to_owned()).collect(),
         })
     }
@@ -1438,6 +1462,8 @@ impl ClientSession {
             transport: "fabric-loopback",
             custom_forms: false,
             conversation_blocks: false,
+            conversation_subject: Arc::default(),
+            provided_conversation_subject: None,
             scopes: std::collections::BTreeSet::new(),
         }
     }
@@ -1541,6 +1567,11 @@ pub(super) fn authenticate(
     request: &Request<Body>,
     transport: &'static str,
 ) -> Result<ClientSession, ApiError> {
+    let subject_hint = request.headers()
+        .get(crate::peer::CLIENT_READ_SUBJECT_HINT_HEADER)
+        .filter(|value| value.as_bytes().len() <= 512)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| value.starts_with("agent/"));
     let custom_forms = request
         .headers()
         .get("x-st3-features")
@@ -1566,6 +1597,7 @@ pub(super) fn authenticate(
             let mut session = ClientSession::local(person)?;
             session.custom_forms = custom_forms;
             session.conversation_blocks = conversation_blocks;
+            session.provided_conversation_subject = subject_hint.map(str::to_owned);
             return Ok(session);
         }
         let pairing_completion = request.method() == axum::http::Method::POST
@@ -1599,6 +1631,7 @@ pub(super) fn authenticate(
     };
     let mut session = paired_client_session(state, paired, transport, custom_forms)?;
     session.conversation_blocks = conversation_blocks;
+    session.provided_conversation_subject = subject_hint.map(str::to_owned);
     if request.method() == axum::http::Method::GET {
         let scope = if request
             .uri()
@@ -1652,6 +1685,8 @@ fn paired_client_session(
         transport,
         custom_forms,
         conversation_blocks: false,
+        conversation_subject: Arc::default(),
+        provided_conversation_subject: None,
         scopes,
     })
 }
@@ -3991,12 +4026,13 @@ fn session_message_body(state: &AppState, claim: &ClaimRecord) -> Value {
 fn native_timeline_page(
     state: &AppState,
     snapshot: &ClientSnapshot,
+    session: &ClientSession,
     session_id: &str,
     query: &ClientListQuery,
     mut items: Vec<Value>,
 ) -> Result<Json<Value>, ApiError> {
     if let Some((owner, incarnation, _)) =
-        super::managed_session_owner_at(&state.store, snapshot.store_index, session_id)
+        super::managed_session_owner_at_with_hint(&state.store, snapshot.store_index, session_id, session.conversation_subject_hint())
             .map_err(ApiError::internal)?
     {
         for claim in session_messages(
@@ -4440,8 +4476,11 @@ pub(super) fn timeline_value(
             "page": page.page
         })));
     }
-    let managed = super::managed_session_owner_at(&state.store, snapshot.store_index, &session_id)
+    let managed = super::managed_session_owner_at_with_hint(&state.store, snapshot.store_index, &session_id, session.conversation_subject_hint())
         .map_err(ApiError::internal)?;
+    if let Some((owner, _, _)) = &managed {
+        session.remember_conversation_subject(owner.clone());
+    }
     let Some((owner, incarnation, _)) = managed else {
         let conversation = crate::external_sessions::find_conversation(
             state.native_session_home.as_deref(),
@@ -4454,7 +4493,7 @@ pub(super) fn timeline_value(
             }
             other => external_conversation_items(other, &session_id)?,
         };
-        return native_timeline_page(state, snapshot, &session_id, query, items);
+        return native_timeline_page(state, snapshot, session, &session_id, query, items);
     };
     let owner = owner.as_str();
     let incarnation = incarnation.as_deref();
@@ -4473,7 +4512,7 @@ pub(super) fn timeline_value(
             Err(missing) => Err(missing.reason.clone()),
         };
         match read {
-            Ok(items) => return native_timeline_page(state, snapshot, &session_id, query, items),
+            Ok(items) => return native_timeline_page(state, snapshot, session, &session_id, query, items),
             Err(reason) => {
                 transcript_notice_entry = Some(transcript_notice(&session_id, &managed, &reason));
             }
@@ -5042,7 +5081,7 @@ fn conversation_read_now(
     let mut message_indexes = BTreeSet::new();
     let mut retention_changed = false;
     if let Some((store_index, local_position, _)) = position {
-        let owner = super::managed_session_owner_at(&state.store, snapshot.store_index, session_id)
+        let owner = super::managed_session_owner_at_with_hint(&state.store, snapshot.store_index, session_id, session.conversation_subject_hint())
             .map_err(ApiError::internal)?
             .map(|managed| managed.0);
         if let Some(owner) = owner.as_deref() {
@@ -5254,10 +5293,13 @@ fn transcript_seen(path: Option<&std::path::Path>) -> Option<(u64, std::time::Sy
 }
 
 impl ConversationMark {
-    fn new(state: &AppState, session_id: &str) -> Result<Self, ApiError> {
+    fn new(state: &AppState, session: &ClientSession, session_id: &str) -> Result<Self, ApiError> {
         let index = state.store.index().map_err(ApiError::internal)?;
-        let managed = super::managed_session_owner_at(&state.store, index, session_id)
+        let managed = super::managed_session_owner_at_with_hint(&state.store, index, session_id, session.conversation_subject_hint())
             .map_err(ApiError::internal)?;
+        if let Some((owner, _, _)) = &managed {
+            session.remember_conversation_subject(owner.clone());
+        }
         let (owner, incarnation) = managed
             .map(|(owner, incarnation, _)| (Some(owner), incarnation))
             .unwrap_or_default();
@@ -5345,7 +5387,7 @@ async fn conversation_changes_local(
 ) -> Result<Value, ApiError> {
     let mut changed = state.event_notify.subscribe();
     let deadline = tokio::time::Instant::now() + Duration::from_millis(wait_ms.min(30_000));
-    let mut mark = ConversationMark::new(state, session_id)?;
+    let mut mark = ConversationMark::new(state, session, session_id)?;
     // A cursor this member gave out, with nothing that concerns the conversation changed since:
     // there is nothing to read yet, so wait without rebuilding the timeline.
     let mut quiet = None;
@@ -5413,6 +5455,39 @@ async fn conversation_changes_local(
     }
 }
 
+/// Trusted Unix transport supplies authority, never the optimization hint.
+pub(super) async fn client_read_owner(
+    State(state): State<AppState>,
+    Extension(snapshot): Extension<ClientSnapshot>,
+    Extension(mut session): Extension<ClientSession>,
+    Json(owner): Json<crate::peer::ClientReadOwnerRequest>,
+) -> Result<Json<Value>, ApiError> {
+    if session.transport != "unix" {
+        return Err(forbidden("owner reads require trusted Unix transport"));
+    }
+    if owner.request.authority_actor != session.authority_actor {
+        return Err(forbidden("owner read authority must match the authenticated session"));
+    }
+    require_scope(&session, "read.projections")?;
+    // Match the existing typed peer client's feature negotiation, not its authority.
+    session.conversation_blocks = true;
+    session.custom_forms = true;
+    if owner.subject_hint.len() <= 512 && owner.subject_hint.starts_with("agent/") {
+        session.provided_conversation_subject = Some(owner.subject_hint);
+    }
+    match owner.request.request {
+        crate::peer::ClientReadOperation::Timeline { session_id, limit, cursor } =>
+            timeline_value(&state, &snapshot, &session, &session_id, &ClientListQuery {
+                limit: Some(limit), cursor, ..Default::default()
+            }),
+        crate::peer::ClientReadOperation::ConversationChanges { session_id, after, wait_ms } =>
+            conversation_changes_local(&state, &session, &session_id, after.as_deref(), wait_ms).await.map(Json),
+        crate::peer::ClientReadOperation::ConversationContent { session_id, reference, offset } =>
+            conversation_blocks::chunk_local(&state, &session, &session_id, &reference, offset).await.map(Json),
+        _ => Err(validation("this operation is not an owner conversation read")),
+    }
+}
+
 pub(super) async fn conversation_changes(
     State(state): State<AppState>,
     Extension(session): Extension<ClientSession>,
@@ -5421,52 +5496,13 @@ pub(super) async fn conversation_changes(
 ) -> Result<Json<Value>, ApiError> {
     require_scope(&session, "read.projections")?;
     let session_id = conversation_session_id(&state, &id)?;
-    let snapshot = new_client_snapshot(&state);
-    if let Some((_, _, Some(origin))) =
-        super::managed_session_owner_at(&state.store, snapshot.store_index, &session_id)
-            .map_err(ApiError::internal)?
-    {
-        if origin != state.store.origin() {
-            if !acting_party(&session) {
-                return Err(forbidden(
-                    "remote conversation changes require a concrete person or agent",
-                ));
-            }
-            let owner = client_host_id(&origin);
-            let relay = state
-                .client_relay
-                .as_ref()
-                .ok_or_else(|| conversation_blocks::availability(remote_unavailable_for_owner(&state, &owner)))?;
-            let mut value = relay
-                .read(
-                    &owner,
-                    &crate::peer::ClientReadRequest {
-                        authority_actor: session.authority_actor.clone(),
-                        relay: None,
-                        request: crate::peer::ClientReadOperation::ConversationChanges {
-                            session_id,
-                            after: query.after,
-                            wait_ms: query.wait_ms.unwrap_or(0).min(30_000),
-                        },
-                    },
-                )
-                .await
-                .map_err(|error| {
-                    conversation_blocks::availability(remote_read_error(&owner, error))
-                })?;
-            conversation_blocks::legacy(&mut value, &session);
-            return Ok(Json(value));
-        }
-    }
-    conversation_changes_local(
-        &state,
-        &session,
-        &session_id,
-        query.after.as_deref(),
-        query.wait_ms.unwrap_or(0),
-    )
-    .await
-    .map(Json)
+    let remote = conversation_owner_host(
+        &state, &session, &session_id, id.starts_with("agent/").then_some(id.as_str()),
+    )?;
+    conversation_changes_value(
+        &state, &session, &session_id, remote.as_deref(),
+        query.after.as_deref(), query.wait_ms.unwrap_or(0),
+    ).await.map(Json)
 }
 
 pub(super) async fn conversation_stream(
@@ -5492,26 +5528,10 @@ pub(super) async fn conversation_stream(
         ));
     }
     let session_id = conversation_session_id(&state, &id)?;
-    let snapshot = new_client_snapshot(&state);
-    let remote = super::managed_session_owner_at(&state.store, snapshot.store_index, &session_id)
-        .map_err(ApiError::internal)?
-        .and_then(|(_, _, origin)| origin)
-        .filter(|origin| origin != state.store.origin())
-        .map(|origin| client_host_id(&origin));
-    if remote.is_some() && !acting_party(&session) {
-        return Err(forbidden(
-            "remote conversation stream requires a concrete person or agent",
-        ));
-    }
-    if let Some(owner) = &remote {
-        if state
-            .client_relay
-            .as_ref()
-            .is_none_or(|relay| !relay.reaches(owner))
-        {
-            return Err(conversation_blocks::availability(remote_unavailable_for_owner(&state, owner)));
-        }
-    } else {
+    let remote = conversation_owner_host(
+        &state, &session, &session_id, id.starts_with("agent/").then_some(id.as_str()),
+    )?;
+    if remote.is_none() {
         conversation_read_now(&state, &session, &session_id, query.after.as_deref())?;
     }
     let presence = super::client_presence::open_stream(&state.node, &session, &headers, super::client_now_ms());
@@ -13930,6 +13950,117 @@ mission "example/zero-run" state="ready" {
         assert_eq!(conversation_session_id(&state, "agent/missing").unwrap_err().status, StatusCode::NOT_FOUND);
         append("agent/no-session", json!({"status":"stopped"}));
         assert_eq!(conversation_session_id(&state, "agent/no-session").unwrap_err().code, "validation-failed");
+    }
+
+    #[test]
+    fn conversation_subject_hint_metadata_is_bounded_and_grants_no_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        for hint in ["agent/hinted".to_owned(), "person/forged".to_owned(),
+            format!("agent/{}", "x".repeat(512))] {
+            let request = Request::builder().uri("/v1/client/capabilities")
+                .header(crate::peer::CLIENT_READ_SUBJECT_HINT_HEADER, &hint)
+                .body(Body::empty()).unwrap();
+            let session = authenticate(&state, &request, "unix").unwrap();
+            assert_eq!(session.authority_actor, "client/local/read-only");
+            assert!(!acting_party(&session));
+            assert!(!session.allows("write.claims"));
+            assert_eq!(session.conversation_subject_hint(),
+                (hint == "agent/hinted").then_some("agent/hinted"));
+        }
+    }
+
+    #[test]
+    fn conversation_subject_hint_matches_roster_snapshots_and_fences_stale_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let mut snapshots = Vec::new();
+        for incarnation in ["first", "second"] {
+            let claim = state.store.append_claim(&ClaimInput {
+                subject: "agent/hinted".into(), kind: "runtime.observed".into(),
+                actor: Some("agent/hinted".into()),
+                fields: serde_json::from_value(json!({
+                    "status":"running", "runtime_id":"runtime", "incarnation_id":incarnation
+                })).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+            snapshots.push((claim.store_index, managed_session_id("agent/hinted", incarnation)));
+        }
+        for (index, id) in &snapshots {
+            let roster = super::super::managed_session_owner_at(&state.store, *index, id).unwrap();
+            assert_eq!(roster.as_ref().unwrap().0, "agent/hinted");
+            for hint in [Some("agent/hinted"), Some("agent/forged"), Some("person/forged"), None] {
+                assert_eq!(super::super::managed_session_owner_at_with_hint(
+                    &state.store, *index, id, hint,
+                ).unwrap(), roster);
+            }
+        }
+        let current = snapshots[1].0;
+        assert!(super::super::managed_session_owner_at_with_hint(
+            &state.store, current, &snapshots[0].1, Some("agent/hinted"),
+        ).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn conversation_subject_hint_owner_route_enforces_transport_actor_and_scope() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let request = || crate::peer::ClientReadOwnerRequest {
+            request: crate::peer::ClientReadRequest {
+                authority_actor: "person/example".into(), relay: None,
+                request: crate::peer::ClientReadOperation::Timeline {
+                    session_id: "session/missing".into(), limit: 10, cursor: None,
+                },
+            },
+            subject_hint: "agent/forged".into(),
+        };
+        for session in [
+            ClientSession::for_tests("person/example", "person/example", "fabric-loopback"),
+            ClientSession::local(Some("person/other")).unwrap(),
+            ClientSession::for_tests("person/example", "person/example", "unix"),
+        ] {
+            let error = client_read_owner(State(state.clone()),
+                Extension(new_client_snapshot(&state)), Extension(session), Json(request()))
+                .await.unwrap_err();
+            assert_eq!(error.status, StatusCode::FORBIDDEN);
+        }
+        let session = ClientSession::local(Some("person/example")).unwrap();
+        let expected = timeline_value(&state, &new_client_snapshot(&state), &session,
+            "session/missing", &ClientListQuery { limit: Some(10), ..Default::default() });
+        let actual = client_read_owner(State(state.clone()),
+            Extension(new_client_snapshot(&state)), Extension(session), Json(request())).await;
+        assert_eq!(actual.unwrap_err().code, expected.unwrap_err().code);
+    }
+
+    #[tokio::test]
+    async fn conversation_subject_hint_local_admission_retains_subject_for_downstream_reads() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        state.store.append_claim(&ClaimInput {
+            subject: "agent/hinted".into(), kind: "runtime.observed".into(),
+            actor: Some("agent/hinted".into()),
+            fields: serde_json::from_value(json!({"status":"running", "incarnation_id":"first"})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let id = conversation_session_id(&state, "agent/hinted").unwrap();
+        for target in ["agent/hinted", id.as_str()] {
+            let session = ClientSession::local(Some("agent/hinted")).unwrap();
+            assert_eq!(conversation_owner_host(&state, &session, &id,
+                target.starts_with("agent/").then_some(target)).unwrap(), None);
+            assert_eq!(session.conversation_subject_hint(), Some("agent/hinted"));
+            let follower = session.clone();
+            let mark = ConversationMark::new(&state, &follower, &id).unwrap();
+            assert_eq!(mark.owner.as_deref(), Some("agent/hinted"));
+            let page = conversation_page(&state, &follower, &id, None).await.unwrap();
+            assert_eq!(page["session_id"], id);
+            let changes = conversation_changes_value(&state, &follower, &id, None, None, 0).await.unwrap();
+            assert_eq!(changes["session_id"], id);
+        }
+        // An old gateway supplies no metadata; ordinary owner reads still discover ownership.
+        let session = ClientSession::local(Some("person/example")).unwrap();
+        timeline_value(&state, &new_client_snapshot(&state), &session, &id,
+            &ClientListQuery::default()).unwrap();
+        assert_eq!(session.conversation_subject_hint(), Some("agent/hinted"));
     }
 
     #[test]
