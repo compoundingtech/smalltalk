@@ -7086,7 +7086,6 @@ impl<R: RuntimeControl> Reconciler<R> {
             let admitted = flat.iter().filter(|step| !step.spec.finally).any(|step| {
                 views.get(step.spec.path.as_str()).is_some_and(|view| {
                     view.attempt > 1
-                        || (view.agentless && view.execution_is_active())
                         || matches!(
                             view.status.as_str(),
                             "ready"
@@ -7531,20 +7530,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         }
                     }
                     if !self.step_declarations_hold(&view.subject)? {
-                        if view.agentless {
-                            changed |= self.store.set_step_state(
-                                &view.subject,
-                                "blocked",
-                                Some(crate::model::DECLARATIONS_PENDING),
-                            )?;
-                        }
                         return Ok(changed);
-                    }
-                    if view.agentless
-                        && view.status == "blocked"
-                        && view.blocked_reason.as_deref() == Some(crate::model::DECLARATIONS_PENDING)
-                    {
-                        changed |= self.store.set_step_state(&view.subject, "working", None)?;
                     }
                     if !view.agentless && !view.worker_reported {
                         return Ok(changed);
@@ -7653,7 +7639,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             if step_changed == Some(false)
                 && run.phase == "final-cancelled"
                 && view.agentless
-                && view.execution_is_active()
+                && view.status == "working"
                 && step.spec.nested_mission.as_ref().is_none_or(|nested| {
                     let prefix = format!("{}/{}/", step.spec.path, nested.id);
                     views
@@ -11151,7 +11137,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         if elapsed >= timeout as u128 {
             return Ok(true);
         }
-        if !view.execution_is_active()
+        if !matches!(view.status.as_str(), "claimed" | "working")
             || view.execution_started_at_unix_ms.is_none()
         {
             return Ok(false);
@@ -24429,7 +24415,12 @@ mission "declaration-reminder" state="ready" {{
         for _ in 0..3 { reconciler.reconcile_once().unwrap(); }
         let waiting = store.mission_run(&run).unwrap().unwrap().steps.remove(0);
         assert_eq!(waiting.status, "blocked");
-        assert_eq!(waiting.blocked_reason.as_deref(), Some(crate::model::DECLARATIONS_PENDING));
+        let reason = waiting.blocked_reason.as_deref().unwrap();
+        assert!(reason.contains("waiting for declared message `message/reminder/"), "{reason}");
+        assert!(reason.contains("to be delivered"), "{reason}");
+        let runtime_view = store.mission_run_for_reconcile(&run).unwrap().unwrap();
+        assert_eq!(runtime_view.steps[0].status, "working");
+        assert_eq!(runtime_view.steps[0].blocked_reason, None);
         assert!(waiting.execution_started_at_unix_ms.is_some());
         let message = store.desired_subjects_for_owner_step(&waiting.subject).unwrap().remove(0);
         assert_eq!(message.kind, "message");

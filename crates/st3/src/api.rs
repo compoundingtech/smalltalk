@@ -17591,7 +17591,7 @@ mission "receipt-wait" state="ready" {
             inputs: BTreeMap::new(), idempotency_key: "receipt-wait-run".into(),
         }).unwrap();
         let step = &run.steps[0].subject;
-        state.store.set_step_state(step, "blocked", Some(crate::model::DECLARATIONS_PENDING)).unwrap();
+        state.store.set_step_state(step, "working", None).unwrap();
         let app = router(state.clone());
         for generic in [false, true] {
             let id = if generic { "declared-generic" } else { "declared-lifecycle" };

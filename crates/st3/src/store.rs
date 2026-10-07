@@ -29862,7 +29862,7 @@ fn enrich_step_queue_at(
         &view.subject,
         view.attempt,
         snapshot_unix_ms,
-        view.execution_is_active(),
+        matches!(view.status.as_str(), "claimed" | "working"),
     )?;
     view.execution_started_at_unix_ms = execution_started_at_unix_ms;
     view.execution_elapsed_ms = execution_elapsed_ms;
@@ -29872,7 +29872,46 @@ fn enrich_step_queue_at(
     enrich_step_wake_at(connection, view, snapshot_unix_ms)?;
     enrich_step_definition(connection, view)?;
     adhoc_work::enrich_handoff(connection, view, snapshot_unix_ms)?;
-    person_work::enrich_responses(connection, view)
+    person_work::enrich_responses(connection, view)?;
+    enrich_declaration_wait(connection, view, snapshot_unix_ms)
+}
+
+/// A missing receipt is a presentation wait, not a new canonical step state.
+/// Keep reconciliation and the shared timing fold on the persisted working state.
+fn enrich_declaration_wait(
+    connection: &Connection,
+    view: &mut StepRunView,
+    snapshot_unix_ms: u128,
+) -> rusqlite::Result<()> {
+    if !view.agentless || view.status != "working" {
+        return Ok(());
+    }
+    let mut statement = connection.prepare_cached(
+        "SELECT desired.subject, claims.accepted_at_unix_ms FROM desired
+         JOIN claims ON claims.id=desired.claim_id
+         WHERE desired.owner_step=?1 AND desired.kind='message' ORDER BY desired.subject",
+    )?;
+    let messages = statement.query_map([&view.subject], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?.collect::<rusqlite::Result<Vec<_>>>()?;
+    for (subject, accepted) in messages {
+        let actual = latest_actual(connection, &subject).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                0, rusqlite::types::Type::Text,
+                Box::new(std::io::Error::other(error.to_string())),
+            )
+        })?;
+        let status = actual.as_ref().and_then(|actual| actual.get("status")).and_then(Value::as_str);
+        if !matches!(status, Some("delivered" | "read" | "closed")) {
+            let age = snapshot_unix_ms.saturating_sub(accepted.parse().unwrap_or(snapshot_unix_ms));
+            view.status = "blocked".into();
+            view.blocked_reason = Some(format!(
+                "waiting for declared message `{subject}` to be delivered (waiting {age} ms)"
+            ));
+            return Ok(());
+        }
+    }
+    Ok(())
 }
 
 /// Copies the worker's latest progress summary and its completion summary for the
@@ -30388,11 +30427,9 @@ pub(crate) fn fold_step_timing(
             lease_expires = None;
         }
 
-        let declarations_pending = fields.get("status").and_then(Value::as_str) == Some("blocked")
-            && fields.get("reason").and_then(Value::as_str) == Some(crate::model::DECLARATIONS_PENDING);
         match kind.as_str() {
             "step-run.state"
-                if declarations_pending || fields
+                if fields
                     .get("status")
                     .and_then(Value::as_str)
                     .is_some_and(|status| matches!(status, "claimed" | "working")) =>
@@ -30448,7 +30485,7 @@ pub(crate) fn fold_step_timing(
                 lease_expires = None;
             }
             "step-run.state"
-                if !declarations_pending && fields
+                if fields
                     .get("status")
                     .and_then(Value::as_str)
                     .is_some_and(|status| !matches!(status, "claimed" | "working")) =>
@@ -31487,7 +31524,7 @@ fn mission_run_view_with_enrichment_tx(
                 &step.subject,
                 step.attempt,
                 now_ms(),
-                step.execution_is_active(),
+                matches!(step.status.as_str(), "claimed" | "working"),
             )?;
             step.execution_started_at_unix_ms = started;
             step.execution_elapsed_ms = elapsed;
@@ -44167,7 +44204,16 @@ mission "declaration-timing" state="ready" {
         }).unwrap();
         let step = &run.steps[0].subject;
         store.set_step_state(step, "working", None).unwrap();
-        store.set_step_state(step, "blocked", Some(crate::model::DECLARATIONS_PENDING)).unwrap();
+        let mut declaration = crate::graph::parse_test_intent(r#"version 2
+message "timing-reminder" { from "person/test"; to "person/test"; content "Resume." }
+"#, "source").unwrap();
+        let message = declaration.subjects.values_mut().next().unwrap();
+        message.owner_step = Some(step.clone());
+        message.owner_run = Some(run.subject.clone());
+        message.owner_generation = Some(run.generation.clone());
+        store.apply_internal(&declaration, "timing-reminder").unwrap();
+        let before_read = graph_digest_of(&store);
+        let before_index = store.index().unwrap();
         let cut = now_ms() + 1_000;
         let original = {
             let connection = store.readers.get();
@@ -44176,6 +44222,10 @@ mission "declaration-timing" state="ready" {
             view
         };
         assert_eq!(original.status, "blocked");
+        assert!(original.blocked_reason.as_ref().unwrap().contains("message/timing-reminder"));
+        assert_eq!(store.index().unwrap(), before_index);
+        assert_eq!(graph_digest_of(&store), before_read);
+        assert_eq!(step_run_row_tx(&store.readers.get(), step).unwrap().unwrap().status, "working");
         assert!(original.execution_started_at_unix_ms.is_some());
         assert!(original.execution_elapsed_ms >= 1_000);
         let root = tempfile::tempdir().unwrap();
@@ -44193,14 +44243,14 @@ mission "declaration-timing" state="ready" {
         assert_eq!(restored.execution_started_at_unix_ms, original.execution_started_at_unix_ms);
         assert_eq!(restored.execution_elapsed_ms, original.execution_elapsed_ms);
         assert_eq!(graph_digest_of(&store), projection_digest::root(&projection_digest::tables(&connection).unwrap()));
-        // Ordinary worker blockers still close their interval; only the explicit
-        // reconciler-owned declaration wait keeps consuming time.
+        // Ordinary durable blockers still close their interval. Read-time waits
+        // leave the existing canonical timing fold unchanged.
         let events = vec![
             ("step-run.state".into(), json!({"fields":{"status":"working"}}), 100),
             ("step-run.state".into(), json!({"fields":{"status":"blocked","reason":"provider approval"}}), 200),
         ];
         assert_eq!(fold_step_timing(&events, 1, 500, false), (None, 100));
-        assert_eq!(RULES_VERSION, 13);
+        assert_eq!(RULES_VERSION, 12);
     }
 
     #[test]

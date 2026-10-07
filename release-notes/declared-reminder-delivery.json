@@ -10,14 +10,8 @@
     "detail": "No schema change."
   },
   "rules": {
-    "status": "changed",
-    "transitions": [
-      [
-        12,
-        13
-      ]
-    ],
-    "detail": "Rules version 13 gives blocked declaration waits their active execution-budget semantics in the shared checkpoint timing fold. Nodes with the older digest do not agree on a new checkpoint under the changed rules."
+    "status": "none",
+    "detail": "The canonical step states, timing fold and checkpoint rules remain unchanged. Missing delivery evidence is exposed as a read-time blocked status with the selected declaration admission age."
   },
   "compatibility": {
     "status": "none",
