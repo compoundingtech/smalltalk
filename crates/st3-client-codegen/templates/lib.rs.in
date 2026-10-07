@@ -190,6 +190,60 @@ impl std::fmt::Debug for RawTerminalAttachment {
     }
 }
 
+/// Raw PTY bytes and a separate, explicit foreground-selection renewal handle.
+///
+/// Keep `activity` alongside the selected terminal's byte connector. Dropping `stream`
+/// cancels the bridge even under backpressure; retaining activity clones does not keep it alive.
+pub struct RawTerminalStream {
+    pub stream: tokio::net::UnixStream,
+    pub activity: RawTerminalActivity,
+}
+
+/// Explicit foreground use of a raw terminal, never an automatic heartbeat.
+///
+/// Only call `selected_use` while this terminal is selected in the foreground. PTY I/O,
+/// background observation, and retaining this handle do not renew a lease. PEEK leases
+/// expire after 60 seconds idle or 300 seconds absolute even with selected-use renewals.
+/// On EOF or expiry, obtain a fresh capability and check readiness through the existing APIs.
+#[derive(Clone)]
+pub struct RawTerminalActivity {
+    controls: tokio::sync::mpsc::Sender<RawTerminalActivityRequest>,
+    selected_use_supported: bool,
+}
+
+impl RawTerminalActivity {
+    /// Send a monotonically sequenced WebSocket text control, separate from PTY bytes.
+    ///
+    /// The bounded queue applies backpressure. Success means the socket send completed,
+    /// not that the server acknowledged renewal. Closed bridges fail rather than renew locally.
+    /// ATTACH streams reject renewal locally without changing their PTY connection.
+    pub async fn selected_use(&self) -> Result<(), ClientError> {
+        if !self.selected_use_supported {
+            return Err(ClientError::Protocol(
+                "selected-use renewal is only supported for PEEK streams".into(),
+            ));
+        }
+        let (sent, receipt) = tokio::sync::oneshot::channel();
+        self.controls
+            .send(RawTerminalActivityRequest { sent })
+            .await
+            .map_err(|_| ClientError::Transport("raw terminal stream is closed".into()))?;
+        receipt
+            .await
+            .map_err(|_| ClientError::Transport("raw terminal stream is closed".into()))?
+    }
+}
+
+struct RawTerminalActivityRequest {
+    sent: tokio::sync::oneshot::Sender<Result<(), ClientError>>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+enum RawTerminalControl {
+    SelectedUse { sequence: u64 },
+}
+
 /// An open terminal stream. Each message is a whole screen that replaces every earlier one.
 pub struct TerminalStream {
     socket: TerminalSocket,
@@ -1290,15 +1344,28 @@ impl Client {
         .map(|response| response.value)
     }
 
-    /// Consume a capability and return a PTY-compatible Unix connector.
+    /// Consume a capability and return PTY bytes without any lease renewal.
     ///
     /// The caller writes its own ATTACH or PEEK frame. This transport neither parses nor
-    /// synthesizes PTY protocol frames. Dropping the returned stream cancels the bounded
-    /// bridge, including while either direction is backpressured.
+    /// synthesizes PTY frames. PEEK expires after 60 seconds idle or 300 seconds absolute;
+    /// use `raw_terminal_stream_controlled` for explicit foreground-selected renewal.
+    /// Dropping the returned stream cancels the bridge even under backpressure.
     pub async fn raw_terminal_stream(
         &self,
         attachment: &RawTerminalAttachment,
     ) -> Result<tokio::net::UnixStream, ClientError> {
+        Ok(self.raw_terminal_stream_controlled(attachment).await?.stream)
+    }
+
+    /// Consume a capability and return unchanged PTY bytes plus explicit selected-use control.
+    ///
+    /// Renewal is WebSocket text, never injected into the PTY byte stream. There is no
+    /// automatic renewal. Server close/error text becomes EOF, not PTY bytes. Dropping the
+    /// byte connector cancels the bridge regardless of retained activity clones or backpressure.
+    pub async fn raw_terminal_stream_controlled(
+        &self,
+        attachment: &RawTerminalAttachment,
+    ) -> Result<RawTerminalStream, ClientError> {
         let path = format!(
             "/v1/client/terminals/{}/raw-stream?incarnation={}&mode={}",
             percent_encode_segment(attachment.terminal_id.trim_start_matches("terminal/")),
@@ -1350,7 +1417,7 @@ impl Client {
                 })?
                 .map_err(|error| ClientError::Transport(error.to_string()))?;
                 validate_raw_terminal_subprotocol(&response)?;
-                raw_terminal_connector(websocket)
+                raw_terminal_connector(websocket, attachment.mode == RawTerminalMode::Peek)
             }
             Endpoint::FabricLoopback(base) => {
                 let websocket_base = if let Some(base) = base.strip_prefix("https://") {
@@ -1375,7 +1442,7 @@ impl Client {
                 })?
                 .map_err(|error| ClientError::Transport(error.to_string()))?;
                 validate_raw_terminal_subprotocol(&response)?;
-                raw_terminal_connector(websocket)
+                raw_terminal_connector(websocket, attachment.mode == RawTerminalMode::Peek)
             }
         }
     }
@@ -1959,7 +2026,8 @@ fn validate_raw_terminal_subprotocol(
 
 fn raw_terminal_connector<S>(
     websocket: WebSocketStream<S>,
-) -> Result<tokio::net::UnixStream, ClientError>
+    selected_use_supported: bool,
+) -> Result<RawTerminalStream, ClientError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -1976,12 +2044,14 @@ where
         .map_err(|error| ClientError::Transport(error.to_string()))?;
     let bridge = tokio::net::UnixStream::from_std(bridge)
         .map_err(|error| ClientError::Transport(error.to_string()))?;
+    let (controls, mut control_requests) = tokio::sync::mpsc::channel::<RawTerminalActivityRequest>(16);
     tokio::spawn(async move {
         let (mut outgoing, mut incoming) = websocket.split();
         let (mut reader, mut writer) = bridge.into_split();
         let flush = tokio::sync::Notify::new();
         let to_gateway = async {
             let mut bytes = [0_u8; RAW_TERMINAL_CHUNK_BYTES];
+            let mut sequence = 0_u64;
             loop {
                 tokio::select! {
                     read = reader.read(&mut bytes) => {
@@ -1994,6 +2064,29 @@ where
                         )).await.is_err() {
                             return;
                         }
+                    }
+                    Some(control) = control_requests.recv() => {
+                        let Some(next) = sequence.checked_add(1) else {
+                            let _ = control.sent.send(Err(ClientError::Protocol(
+                                "raw terminal selected-use sequence exhausted".into(),
+                            )));
+                            return;
+                        };
+                        sequence = next;
+                        let text = match serde_json::to_string(
+                            &RawTerminalControl::SelectedUse { sequence },
+                        ) {
+                            Ok(text) => text,
+                            Err(error) => {
+                                let _ = control.sent.send(Err(ClientError::Protocol(error.to_string())));
+                                return;
+                            }
+                        };
+                        if let Err(error) = outgoing.send(WsMessage::Text(text.into())).await {
+                            let _ = control.sent.send(Err(ClientError::Transport(error.to_string())));
+                            return;
+                        }
+                        let _ = control.sent.send(Ok(()));
                     }
                     () = flush.notified() => {
                         if outgoing.flush().await.is_err() {
@@ -2039,7 +2132,10 @@ where
         // All pumps live in this task. Canceling either direction drops both socket halves
         // and the monitor, so no separately spawned task can retain the remote attachment.
     });
-    Ok(consumer)
+    Ok(RawTerminalStream {
+        stream: consumer,
+        activity: RawTerminalActivity { controls, selected_use_supported },
+    })
 }
 
 fn validate_terminal_subprotocol(

@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Expose explicit selected-use activity for controlled raw terminal observations",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay behavior changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "RULES_VERSION remains11; no checkpoint rule changes."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Client controlled streams expose an activity handle for explicit foreground-selected renewal. Byte-only streams remain idle-expiring; successful control send is not renewal acknowledgement."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional service interruption beyond a normal daemon upgrade."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Update consumers to renew only foreground-selected observations and stop controls on deselection/backgrounding. Rotate/reacquire with fresh readiness at expiry or EOF."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No data rewrite or destructive migration; existing binary swap-back behavior is unchanged. Older builds retain their older observation enforcement."
+  }
+}
