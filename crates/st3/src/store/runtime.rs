@@ -185,6 +185,7 @@ impl Runtime for SmalltalkRuntime {
             .unwrap_or_else(PoisonError::into_inner);
         cache.views.clear();
         cache.statuses.clear();
+        cache.card_statuses.clear();
         drop(cache);
         self.agent_status_cache
             .lock()
