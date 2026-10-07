@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "stui marks web addresses as clickable hyperlinks in terminals that draw images (kitty, iTerm2, WezTerm, Ghostty)",
+  "replay": {
+    "status": "none",
+    "detail": "No replay or rebuild."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, columns, indexes or triggers."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules and digests are unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No client, wire or harness contract change. Only stui terminal output changes, and only in terminals that report image support."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "None."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual step."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Nothing to recover."
+  }
+}

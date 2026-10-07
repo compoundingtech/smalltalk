@@ -17,6 +17,7 @@ pub mod doc;
 mod edit;
 mod glass;
 mod hover;
+mod hyperlinks;
 #[cfg(test)]
 #[path = "../../tests/support/terminal_tab.rs"]
 mod terminal_tab;
