@@ -465,3 +465,134 @@ fn pending_work_seek_cursor_reaches_later_keys_and_rollback_restores_continuatio
     );
     tx.rollback().unwrap();
 }
+
+#[test]
+fn native_request_classifier_finds_unmaterialized_card_from_normal_store_declaration() {
+    let store = seed();
+    let source = "version 2\nagent \"amber\" { workspace \"/work\"; harness \"codex\" {} }\n";
+    let intent = crate::graph::parse_test_intent(source, "node").unwrap();
+    let plan = store
+        .mission(
+            &intent,
+            crate::model::IntentInput {
+                kdl: source.into(),
+                source_name: None,
+            },
+        )
+        .unwrap();
+    store
+        .apply(&intent, &plan.subject_tokens, "native-request-control")
+        .unwrap();
+    append(
+        &store,
+        "harness.observed",
+        json!({"incarnation_id":"one","state":"idle","driver":"codex"}),
+    );
+    let ns = context(&store);
+    let at = clock(&store);
+    let kernel = Kernel::new("node");
+    for inputs in capture(&store).chunks(WORK) {
+        let mut w = store.connection.write();
+        let tx = w.transaction().unwrap();
+        kernel.apply(&tx, &ns, inputs).unwrap();
+        tx.commit().unwrap();
+    }
+    for _ in 0..32 {
+        let mut w = store.connection.write();
+        let tx = w.transaction().unwrap();
+        kernel.apply(&tx, &ns, &[]).unwrap();
+        tx.commit().unwrap();
+    }
+    let c = store.readers.get();
+    assert_eq!(
+        producer_requests(&c, &ns, "current-epoch", at.try_into().unwrap(), 128).unwrap(),
+        [("agent/node.amber".into(), "codex".into())]
+    );
+    assert!(
+        rows(&store, &ns, at).is_empty(),
+        "missing native input must not produce a partial public card"
+    );
+    assert!(footprint(&c, &ns, "node").is_err());
+}
+
+#[test]
+fn native_requests_reject_foreign_epoch_expired_and_missing_inputs_with_shared_bound() {
+    let store = seed();
+    let ns = context(&store);
+    let mut w = store.connection.write();
+    let tx = w.transaction().unwrap();
+    // Private classifier controls only: these values never pass a live producer guard,
+    // stamp source coverage, or publish an Installer root.
+    let certificate = |recipient: &str, epoch: &str, deadline: u64| {
+        serde_json::from_value::<DeliveryCertificate>(json!({"recipient":recipient,"driver":"codex","epoch":epoch,"revision":1,"evaluation_time_ms":10,"next_deadline_ms":deadline,"watermark_ns":1,"deadline_ns":2,"follows":null})).unwrap()
+    };
+    for n in 0..512 {
+        let agent = format!("agent/ready/{n:03}");
+        native_binding(
+            &tx,
+            &ns,
+            &agent,
+            Some("codex"),
+            Some(&certificate(&agent, "current", 100)),
+        )
+        .unwrap();
+    }
+    native_binding(&tx, &ns, "agent/missing", Some("codex"), None).unwrap();
+    native_binding(
+        &tx,
+        &ns,
+        "agent/old",
+        Some("codex"),
+        Some(&certificate("agent/old", "before", 100)),
+    )
+    .unwrap();
+    native_binding(
+        &tx,
+        &ns,
+        "agent/replaced",
+        Some("codex"),
+        Some(&certificate("agent/replaced", "later", 100)),
+    )
+    .unwrap();
+    native_binding(
+        &tx,
+        &ns,
+        "agent/expired",
+        Some("codex"),
+        Some(&certificate("agent/expired", "current", 20)),
+    )
+    .unwrap();
+    let expected = BTreeSet::from([
+        ("agent/missing".into(), "codex".into()),
+        ("agent/old".into(), "codex".into()),
+        ("agent/replaced".into(), "codex".into()),
+        ("agent/expired".into(), "codex".into()),
+    ]);
+    assert_eq!(
+        producer_requests(&tx, &ns, "current", 20, 128)
+            .unwrap()
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+        expected
+    );
+    assert_eq!(
+        producer_requests(&tx, &ns, "current", 20, 1).unwrap(),
+        [("agent/missing".into(), "codex".into())]
+    );
+    assert!(producer_requests(&tx, &ns, "current", 20, 129).is_err());
+    assert!(producer_requests(&tx, &ns, "", 20, 128).is_err());
+    for agent in [
+        "agent/missing",
+        "agent/old",
+        "agent/replaced",
+        "agent/expired",
+    ] {
+        native_binding(&tx, &ns, agent, None, None).unwrap();
+    }
+    assert!(
+        producer_requests(&tx, &ns, "current", 20, 128)
+            .unwrap()
+            .is_empty()
+    );
+    tx.rollback().unwrap();
+}

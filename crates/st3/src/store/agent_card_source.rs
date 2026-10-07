@@ -8,7 +8,7 @@ use crate::api::delivery_presence::source::{
 };
 use smallclaims::ivm::install::{Mutation, Namespace, Operator, SourcePosition};
 
-pub(crate) const FINGERPRINT: &str = "st3.agent-card.complete.v2;namespace-v2;physical-source-v3;registry-unfiltered-admission;canonical-decimal-time;original-sql-body;harness-v3-captured-since;authority-v2-parent-identity;owned-v2-relevant-members128-sets64-lineage64-claims100k-captured64m;unmanaged-leaves128-body256k;queue-v1-labels-path1024-preview5;usage-v2-f64-groups128-slots128;rollout-field-heads-v1;launch-v1-physical-ties-bounds128;aux-v1-appear64-open256-record64k;native-global-v1-files64;clock-v1;shared-work128-seek-cursors-public-queue-ack;window200;public-card-v0;current-state-only";
+pub(crate) const FINGERPRINT: &str = "st3.agent-card.complete.v2;namespace-v2;physical-source-v3;registry-unfiltered-admission;canonical-decimal-time;original-sql-body;harness-v3-captured-since;authority-v2-parent-identity;owned-v2-relevant-members128-sets64-lineage64-claims100k-captured64m;unmanaged-leaves128-body256k;queue-v1-labels-path1024-preview5;usage-v2-f64-groups128-slots128;rollout-field-heads-v1;launch-v1-physical-ties-bounds128;aux-v1-appear64-open256-record64k;native-global-v1-files64-indexed-requests;clock-v1;shared-work128-seek-cursors-public-queue-ack;window200;public-card-v0;current-state-only";
 pub(crate) fn complete_manifest() -> String {
     format!(
         "{FINGERPRINT};source={}",
@@ -27,6 +27,10 @@ CREATE TABLE IF NOT EXISTS local_agent_card_source_work(namespace TEXT NOT NULL,
 CREATE TABLE IF NOT EXISTS local_agent_card_source_cards(namespace TEXT NOT NULL,agent TEXT NOT NULL,deadline BLOB,files TEXT NOT NULL,mono_deadline INTEGER,certificate TEXT,PRIMARY KEY(namespace,agent));
 CREATE INDEX IF NOT EXISTS local_agent_card_source_deadline ON local_agent_card_source_cards(namespace,deadline,agent) WHERE deadline IS NOT NULL;
 CREATE INDEX IF NOT EXISTS local_agent_card_source_mono ON local_agent_card_source_cards(namespace,mono_deadline,agent) WHERE mono_deadline IS NOT NULL;
+CREATE TABLE IF NOT EXISTS local_agent_card_source_native(namespace TEXT NOT NULL,agent TEXT NOT NULL,driver TEXT NOT NULL,epoch TEXT NOT NULL,deadline BLOB,needed INTEGER NOT NULL CHECK(needed IN (0,1)),PRIMARY KEY(namespace,agent));
+CREATE INDEX IF NOT EXISTS local_agent_card_source_native_needed ON local_agent_card_source_native(namespace,needed,agent,driver);
+CREATE INDEX IF NOT EXISTS local_agent_card_source_native_epoch ON local_agent_card_source_native(namespace,needed,epoch,agent,driver);
+CREATE INDEX IF NOT EXISTS local_agent_card_source_native_deadline ON local_agent_card_source_native(namespace,needed,deadline,agent,driver) WHERE deadline IS NOT NULL;
 CREATE TABLE IF NOT EXISTS local_agent_card_source_files(namespace TEXT NOT NULL,path TEXT NOT NULL,identity TEXT NOT NULL,count INTEGER NOT NULL CHECK(count>0),PRIMARY KEY(namespace,path,identity));
 CREATE TABLE IF NOT EXISTS local_agent_card_source_reclaim(namespace TEXT PRIMARY KEY,phase INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS local_agent_card_source_clock(namespace TEXT PRIMARY KEY,at TEXT NOT NULL,revision INTEGER NOT NULL,phase INTEGER NOT NULL,authority_agent TEXT NOT NULL,authority_id TEXT NOT NULL,lifecycle_after TEXT NOT NULL);
@@ -678,6 +682,7 @@ impl Kernel {
                 "DELETE FROM local_agent_card_source_cards WHERE namespace=?1 AND agent=?2",
                 params![ns.as_str(), agent],
             )?;
+            native_binding(tx, ns, agent, None, None)?;
             ack(tx, ns, "card", agent)?;
             agent_queue::acknowledge(tx, ns, &[agent.into()])?;
             return Ok(changed);
@@ -784,11 +789,20 @@ impl Kernel {
         // Captured assessment is required conservatively for each local native card. This
         // closure is stronger than the formatter's live-state requirement and is explicit.
         let delivery = if native_local {
-            let Some(d) = self.delivery(tx, ns, agent, driver.as_deref().unwrap(), at)? else {
+            let captured = self.delivery(tx, ns, agent, driver.as_deref().unwrap(), at)?;
+            native_binding(
+                tx,
+                ns,
+                agent,
+                driver.as_deref(),
+                captured.as_ref().map(|(_, cert)| cert),
+            )?;
+            let Some(d) = captured else {
                 return Ok(false);
             };
             Some(d)
         } else {
+            native_binding(tx, ns, agent, None, None)?;
             None
         };
         let parts = crate::api::agent_card::CardParts {
@@ -1352,6 +1366,7 @@ fn reclaim_remaining(tx: &Transaction<'_>, ns: &Namespace, limit: usize) -> Resu
         "DELETE FROM local_agent_card_source_cursor WHERE namespace=?1 AND rowid IN (SELECT rowid FROM local_agent_card_source_cursor WHERE namespace=?1 LIMIT ?2)",
         "DELETE FROM local_agent_card_source_work WHERE namespace=?1 AND rowid IN (SELECT rowid FROM local_agent_card_source_work WHERE namespace=?1 LIMIT ?2)",
         "DELETE FROM local_agent_card_source_cards WHERE namespace=?1 AND rowid IN (SELECT rowid FROM local_agent_card_source_cards WHERE namespace=?1 LIMIT ?2)",
+        "DELETE FROM local_agent_card_source_native WHERE namespace=?1 AND rowid IN (SELECT rowid FROM local_agent_card_source_native WHERE namespace=?1 LIMIT ?2)",
         "DELETE FROM local_agent_card_source_files WHERE namespace=?1 AND rowid IN (SELECT rowid FROM local_agent_card_source_files WHERE namespace=?1 LIMIT ?2)",
         "DELETE FROM local_agent_card_source_clock WHERE namespace=?1 AND rowid IN (SELECT rowid FROM local_agent_card_source_clock WHERE namespace=?1 LIMIT ?2)",
     ];
@@ -1361,6 +1376,81 @@ fn reclaim_remaining(tx: &Transaction<'_>, ns: &Namespace, limit: usize) -> Resu
         }
     }
     Ok(true)
+}
+
+fn native_binding(
+    tx: &Transaction<'_>,
+    ns: &Namespace,
+    agent: &str,
+    driver: Option<&str>,
+    cert: Option<&DeliveryCertificate>,
+) -> Result<()> {
+    if let Some(driver) = driver {
+        anyhow::ensure!(
+            collection_ivm::delivery::DRIVERS.contains(&driver),
+            "unknown native source driver"
+        );
+        if let Some(cert) = cert {
+            anyhow::ensure!(
+                cert.recipient == agent && cert.driver == driver,
+                "native source classifier certificate binding"
+            );
+        }
+        tx.execute("INSERT INTO local_agent_card_source_native VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(namespace,agent) DO UPDATE SET driver=excluded.driver,epoch=excluded.epoch,deadline=excluded.deadline,needed=excluded.needed",params![ns.as_str(),agent,driver,cert.map(|c|c.epoch.as_str()).unwrap_or(""),cert.map(|c|u128::from(c.next_deadline_ms).to_be_bytes().to_vec()),cert.is_none()])?;
+    } else {
+        tx.execute(
+            "DELETE FROM local_agent_card_source_native WHERE namespace=?1 AND agent=?2",
+            params![ns.as_str(), agent],
+        )?;
+    }
+    Ok(())
+}
+
+/// Requests come from the repaired namespace classifier before public-row creation. Each
+/// indexed range consumes a shared candidate budget, including duplicate candidates. The
+/// source owner captures all five drivers outside the writer and journals their full rows.
+/// An empty request page is neither dependency closure nor a live producer certificate:
+/// same-epoch live fences/revisions must also be checked by the source owner.
+pub(crate) fn producer_requests(
+    c: &Connection,
+    ns: &Namespace,
+    current_producer_epoch: &str,
+    at: u64,
+    limit: usize,
+) -> Result<Vec<(String, String)>> {
+    anyhow::ensure!((1..=WORK).contains(&limit), "native source request bound");
+    anyhow::ensure!(
+        !current_producer_epoch.is_empty() && current_producer_epoch.len() <= 256,
+        "native source request epoch"
+    );
+    let queries = [
+        "SELECT agent,driver FROM local_agent_card_source_native INDEXED BY local_agent_card_source_native_needed WHERE namespace=?1 AND needed=1 ORDER BY agent,driver LIMIT ?4",
+        "SELECT agent,driver FROM local_agent_card_source_native INDEXED BY local_agent_card_source_native_epoch WHERE namespace=?1 AND needed=0 AND epoch<?2 ORDER BY epoch,agent,driver LIMIT ?4",
+        "SELECT agent,driver FROM local_agent_card_source_native INDEXED BY local_agent_card_source_native_epoch WHERE namespace=?1 AND needed=0 AND epoch>?2 ORDER BY epoch,agent,driver LIMIT ?4",
+        "SELECT agent,driver FROM local_agent_card_source_native INDEXED BY local_agent_card_source_native_deadline WHERE namespace=?1 AND needed=0 AND deadline<=?3 ORDER BY deadline,agent,driver LIMIT ?4",
+    ];
+    let mut used = 0;
+    let mut requested = BTreeSet::new();
+    for sql in queries {
+        if used == limit {
+            break;
+        }
+        let page = c
+            .prepare_cached(sql)?
+            .query_map(
+                params![
+                    ns.as_str(),
+                    current_producer_epoch,
+                    u128::from(at).to_be_bytes().as_slice(),
+                    limit - used
+                ],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        used += page.len();
+        requested.extend(page);
+    }
+    Ok(requested.into_iter().collect())
 }
 
 /// Private row certificates for an already authorized bounded public selection. The caller
