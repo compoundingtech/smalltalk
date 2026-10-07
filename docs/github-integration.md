@@ -53,6 +53,54 @@ complete cached body and pagination link after a 304. Response status and rate-l
 remain available to the caller. Credential invalidation changes future authentication;
 it does not retry any of these HTTP requests.
 
+## Main Performance failure messages
+
+A direct message subscription on `main_performance_failures` adds that field to an existing
+`github.repository` observer's scheduled request. No second observer or polling loop is needed:
+
+```kdl
+version 2
+subscription "main-performance-p0" {
+  observer "observer/github/acme/garden"
+  on "main_performance_failures"
+  to "agent/example/speed"
+  delivery "message"
+}
+```
+
+The existing observer and agent recipient must already be declared, and the observer must be
+live. This simple direct-message declaration supports standalone `st apply --dry-run` and
+`st apply --as RECIPIENT` when the declared agent recipient publishes as itself. An agent-bound
+client must publish as itself; another actor cannot subscribe the recipient. The public event field
+is limited to `main_performance_failures`, and an existing registration can only be re-registered
+by its original author with the same spec. This path cannot create an observer, start a mission, batch
+delivery or publish unrelated top-level runtime declarations. Publish only this subscription;
+leave existing declarations and owned sets intact. This narrow field reads workflow-run metadata for
+`perf.yml`, branch `main`, event `push`, then verifies the workflow name `Performance`, path
+`.github/workflows/perf.yml`, status `completed` and conclusion `failure`. Other events, branches,
+workflows, successes, cancellations and timeouts produce no P0 delivery. It fetches no logs or
+artifacts and never dispatches a workflow.
+
+Each message has a P0 title and tag, and JSON content with `priority`, `repository`, `run_id`,
+`run_attempt`, `head_sha`, `workflow`, `workflow_path`, `url` and the selected status/event/branch.
+One message names one failed run attempt. The first successful snapshot for each recipient and
+repository establishes a baseline without sending old failures, including when the first listing
+is empty. Later attempts and heads have separate delivery keys;
+metadata edits, repeated reads, restarts and replacement subscriptions to the same recipient do
+not send the same repository/run/attempt/head again. The repository ID keeps that identity across
+renames; a missing ID falls back to the name. Re-adding the field after an observation gap
+re-baselines the current listing and suppresses failures first observed during that gap.
+Baseline and delivery receipts are graph resources committed atomically with the observation and message, using existing checkpoint rules.
+
+This field uses the observer's normal schedule and conditional HTTP cache, including paginated
+304 reuse. It reads at most ten pages of 100 runs and fails rather than silently truncates a larger
+listing. The shared repository observation must succeed, including any other selected fields;
+an existing GraphQL or authentication failure prevents delivery. Deploy supporting daemon source
+before registration, then check the observer's successful field observation and message receipts.
+An installed subscription alone does not prove healthy delivery. Upgrade participating readers
+before enabling this field: older schemas quarantine the new fact field. Removing the subscription
+does not erase its historical claims for a later downgrade.
+
 ## Prepare finite review and triage work
 
 These examples record results in the graph and leave publication to a later decision. Their goals describe completed results; instructions live in a brief:

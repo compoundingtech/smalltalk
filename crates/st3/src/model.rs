@@ -755,6 +755,10 @@ fn default_human_gate_mode() -> String {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct NormalizedIntent {
+    /// Local parser provenance for the public existing-observer registration route.
+    /// Never trusted from a serialized client intent; APIs reparse authored KDL.
+    #[serde(skip)]
+    pub(crate) direct_message_registrations: BTreeSet<String>,
     pub schema: String,
     pub source_hash: String,
     pub subjects: BTreeMap<String, DesiredSubject>,

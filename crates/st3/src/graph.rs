@@ -313,6 +313,10 @@ fn parse_intent_with_owner(
     let normalized = json!({ "version": 2, "declarations": normalized_nodes });
     let source_hash = hash_json(&normalized);
     Ok(NormalizedIntent {
+        direct_message_registrations: declarations.iter()
+            .filter(|node| !allow_execution_root && public_message_subscription(node))
+            .map(|node| namespaced("subscription", &one_string_with_children(node).expect("validated subscription")))
+            .collect(),
         schema: "st3.v1".into(),
         source_hash,
         subjects: context.subjects,
@@ -420,6 +424,7 @@ fn parse_desired_node(
             .is_some();
     if !context.allow_execution_root
         && !owned_terminal
+        && !public_message_subscription(node)
         && matches!(
             kind,
             "exec" | "pty" | "lane" | "observer" | "subscription"
@@ -448,6 +453,26 @@ fn parse_desired_node(
         "stop" => parse_stop(node, context),
         _ => parse_structure(node, kind, context),
     }
+}
+
+/// Public registration may attach a simple message delivery to an existing observer.
+/// Observer/recipient existence and actor authority are checked at preview/publication.
+/// Execution, batching, missions and new observers stay on their existing runtime routes.
+fn public_message_subscription(node: &KdlNode) -> bool {
+    if node.name().value() != "subscription" { return false }
+    let Some(body) = node.children() else { return false };
+    if body.nodes().iter().any(|child| !matches!(child.name().value(), "observer" | "on" | "to" | "delivery")) {
+        return false;
+    }
+    if body.nodes().iter().filter(|child| child.name().value() == "on").count() != 1
+        || !body.nodes().iter().find(|child| child.name().value() == "on")
+        .is_some_and(|field| field.children().is_none()
+            && one_string(field).ok().as_deref() == Some(crate::resource::github_workflows::PERFORMANCE_FAILURES_FIELD)) {
+        return false;
+    }
+    body.nodes().iter().find(|child| child.name().value() == "delivery")
+        .is_some_and(|delivery| delivery.children().is_none()
+            && one_string(delivery).ok().as_deref() == Some("message"))
 }
 
 fn parse_mission_run_declaration(

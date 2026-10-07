@@ -11,6 +11,8 @@ pub mod owned_sets;
 #[cfg(test)]
 mod owned_sets_tests;
 mod resources;
+mod github_workflow_failures;
+pub(crate) mod message_subscriptions;
 mod rollouts;
 mod seat_status;
 
@@ -7853,6 +7855,9 @@ impl Store {
         let mut actions = Vec::new();
         let mut blockers = Vec::new();
         let mut warnings = Vec::new();
+        if let Err(error) = message_subscriptions::validate(&connection, intent, store_index) {
+            blockers.push(format!("{}: {}", error.code, error.message));
+        }
         if let Err(error) = crate::provenance::validate_publication(&connection, intent) {
             blockers.push(format!("{}: {}", error.code, error.message));
         }
@@ -8393,6 +8398,7 @@ impl Store {
     ) -> Result<ApplyResponse, St3Error> {
         self.connection
             .batched(|transaction| -> Result<ApplyResponse, St3Error> {
+                message_subscriptions::validate_publisher(transaction, intent, actor)?;
                 if let Some(options) = owned {
                     let digest = canonical_hash(&(intent, options, actor)).map_err(internal)?;
                     let cache_key = opaque_cache_key(&format!("owned-set-request:{idempotency_key}"));
@@ -8408,6 +8414,7 @@ impl Store {
                         serde_json::from_str(&response).map_err(internal)?,local_receipt,idempotency_key);
                 }
                 crate::provenance::validate_publication(transaction, intent)?;
+                message_subscriptions::validate(transaction, intent, current_index_tx(transaction).map_err(internal)?)?;
                 let owned_plan = owned.map(|options| owned_sets::plan_tx(transaction, intent, options)).transpose()?;
                 let mut one_shot_sets = BTreeMap::new();
                 if let (Some(plan), Some(options)) = (&owned_plan, owned) {
@@ -10934,6 +10941,7 @@ impl Store {
         desired.set_display_name(name)?;
         let normalized = json!({ "agent": subject, "display_name": name });
         let intent = NormalizedIntent {
+            direct_message_registrations: BTreeSet::new(),
             schema: "st3.v1".into(),
             source_hash: canonical_hash(&normalized).map_err(internal)?,
             subjects: BTreeMap::from([(subject.to_owned(), desired)]),
@@ -11119,6 +11127,7 @@ impl Store {
         };
         let normalized = json!({ "agent": subject, "start": ended.token });
         let intent = NormalizedIntent {
+            direct_message_registrations: BTreeSet::new(),
             schema: "st3.v1".into(),
             source_hash: canonical_hash(&normalized).map_err(internal)?,
             subjects: BTreeMap::from([(subject.to_owned(), declaration)]),
@@ -13383,6 +13392,37 @@ impl Store {
                     }
                 }
                 let mut message_subjects = Vec::new();
+                // Workflow failure deliveries share this observation transaction. Their keys
+                // survive observer/subscription replacement and checkpointing as resources.
+                if let Some(failures) = current_object
+                    .get(crate::resource::github_workflows::PERFORMANCE_FAILURES_FIELD)
+                    .and_then(Value::as_array)
+                {
+                    let workflow_baseline = previous_object.is_none_or(|previous| {
+                        !previous.contains_key(crate::resource::github_workflows::PERFORMANCE_FAILURES_FIELD)
+                    });
+                    for (subject, subscription) in &active_subscriptions {
+                        if subscription.delivery != "message"
+                            || subscription.batch_every_ms.is_some()
+                            || subscription.watch.is_some()
+                            || !subscription.fields.iter().any(|field| field == crate::resource::github_workflows::PERFORMANCE_FAILURES_FIELD)
+                            || subscription.condition.as_ref().is_some_and(|condition| {
+                                !subscription_condition_matches(condition, &repository_facts)
+                            })
+                        {
+                            continue;
+                        }
+                        if !workflow_baseline && !available_subscriptions.contains(subject) {
+                            continue;
+                        }
+                        message_subjects.extend(github_workflow_failures::deliver_tx(
+                            transaction, &self.origin, &batch_id, observer, resource,
+                            subject, &subscription.to,
+                            current_object.get("repository_id").unwrap_or(&Value::Null),
+                            failures, workflow_baseline,
+                        )?);
+                    }
+                }
                 // Each watch on an item this observation changed hears the comments and reviews it
                 // did not know, a move of the required checks into pass or fail, and the close
                 // that ends it, each as one wake. The baseline tells no watch anything.
@@ -13503,6 +13543,7 @@ impl Store {
                         }
                         let selected = changed_fields
                             .iter()
+                            .filter(|field| field.as_str() != crate::resource::github_workflows::PERFORMANCE_FAILURES_FIELD)
                             .filter(|field| subscription.fields.contains(field))
                             .cloned()
                             .collect::<Vec<_>>();
@@ -27145,6 +27186,7 @@ fn select_replicated_desired(
     if !select {
         return Ok(());
     }
+    message_subscriptions::validate_replicated(transaction, claim, desired)?;
     transaction
         .execute(
             "INSERT INTO desired(subject, kind, revision, claim_id, body, member, owner_run, owner_generation, owner_step) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
