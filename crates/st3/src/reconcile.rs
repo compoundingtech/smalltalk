@@ -3945,10 +3945,9 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .collect::<Vec<_>>();
             attempts.sort_by_key(|(at, _)| *at);
             let acknowledged = work_wake_acknowledged(&attempts, harness.as_ref());
-            let idle_unclaimed_deadline = acknowledged
-                .then(|| harness.as_ref())
-                .flatten()
-                .filter(|harness| matches!(harness.state.as_str(), "ready" | "idle"))
+            let idle_unclaimed_deadline = harness
+                .as_ref()
+                .filter(|harness| acknowledged && matches!(harness.state.as_str(), "ready" | "idle"))
                 .and_then(|_| attempts.last())
                 .map(|(last, _)| last.saturating_add(WORK_WAKE_EXHAUST_GRACE_MS));
             if acknowledged && idle_unclaimed_deadline.is_none_or(|due| now < due) {
@@ -36142,7 +36141,36 @@ mission "gated" state="ready" {
         assert_eq!(ready.status, "ready");
         assert_eq!(ready.readiness_epoch, old.readiness_epoch + 1);
         assert!(ready.claimant.is_none());
+        let renewal_count = seat
+            .store
+            .claims_for(&subject, Some("work.renewed"))
+            .unwrap()
+            .len();
+        assert_eq!(
+            seat.work(&subject, "renew", "expired-holder-late-renewal")
+                .unwrap_err()
+                .code,
+            "work-not-claimed",
+            "old holder cannot renew its expired lease"
+        );
+        assert_eq!(
+            seat.store
+                .claims_for(&subject, Some("work.renewed"))
+                .unwrap()
+                .len(),
+            renewal_count,
+            "the rejected request must not append an old-epoch renewal"
+        );
         seat.reconciler.reconcile_once().unwrap();
+        assert_eq!(
+            seat.store
+                .step_run(&subject)
+                .unwrap()
+                .unwrap()
+                .readiness_epoch,
+            ready.readiness_epoch,
+            "durable repair must not advance the epoch twice"
+        );
         let messages = seat.store.messages(Some(SEAT), true).unwrap();
         let fresh = messages
             .iter()

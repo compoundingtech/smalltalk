@@ -29587,7 +29587,6 @@ fn apply_effective_step_state(
         // consumed wakes must not acknowledge this newly unclaimed work. A claim
         // persists this effective epoch, so later expiries advance it once more.
         view.readiness_epoch = view.readiness_epoch.saturating_add(1);
-        view.updated_at_unix_ms = view.claim_expires_at_unix_ms.unwrap();
         view.claimant = None;
         view.claim_incarnation = None;
         view.claim_expires_at_unix_ms = None;
