@@ -65,22 +65,28 @@ recovery stub.
 Native exceptional assistant stop metadata is retained independently of content, including empty
 turns. Routine `stop` and `toolUse` do not add redundant completion/waiting entries.
 `length` produces `native_output_truncated`: hitting an output limit means the answer may be
-incomplete, not that the assistant is waiting. Provider failures and aborts produce typed error
-entries carrying `stopReason`, numeric `errorStatus`/`errorId`, and `outcome`.
-Replay reports a provider error's retry outcome as `unknown`: `willContinue` belongs to the live
-`agent_end` event, not persisted assistant messages. An abort does not imply a user cancellation.
+incomplete, not that the assistant is waiting. Provider failures (`native_provider_error`),
+aborts (`native_turn_aborted`) and unsupported stops (`native_stop_unknown`) use the existing
+error entry with an `error` block whose `{body_ref:true}` payload refers to its body.
+The body's `details` retains exact native `stopReason`, `errorMessage`, `errorStatus`, `errorId`
+and `retryRecovery` values whenever supplied, including future values and structured fields.
+The error body's `message` is the provider's exact `errorMessage` string when present; otherwise
+it is a structural explanation. Replay does not infer retry success or terminal failure:
+`willContinue` belongs to the live `agent_end` event, not persisted assistant messages.
+An abort does not imply a user cancellation.
 
-Diagnostics use safe structural text, matching the live provider-error boundary. Native
-`errorMessage` prose is withheld with `diagnostic_availability: withheld` and
-`diagnostic_reason: provider_text_not_authorized`; it is neither copied nor hashed.
-Unsupported free-form stop values are explicitly withheld rather than exported.
+Every native `custom/session_exit` checkpoint uses a status entry with a `status` block and
+`{body_ref:true}`. Its body has `status: completed` (the native process has exited) and `detail`
+containing the complete native `data` serialized as JSON, including exact `kind`, `reason`,
+pending-tool arguments/intent and future fields. Fatal and unfamiliar exits retain this same
+shape so a presentation view can classify them without changing the native data. A process exit
+proves neither user cancellation, tool completion nor the outcome of the next process.
 
-Native `custom/session_exit` checkpoints preserve the closed exit kind and recognized signal/exit
-reason, plus at most 16 bounded, nonempty pending-tool identities. Recognized normal exits and
-`sigterm` stops produce status entries, not errors; fatal or unknown exits remain
-`native_process_exit` diagnostics. Unknown reasons and pending-tool arguments/intent are withheld;
-clipped identity sets are explicitly marked. A process exit proves neither user cancellation,
-tool completion nor the outcome of the next process.
+The normalizer does not withhold or truncate diagnostics or pending-tool values. Parsed records
+also retain the complete native record in an internal `source_record` block; malformed input
+retains its original bytes as `raw_text`. Transport size limits and owner continuations bound
+responses, not native values. Content filtering belongs to shared renderers' explicit default
+presentation filters; show-everything mode exposes the unchanged normalized data.
 
 ## Interrupted ask bridge
 

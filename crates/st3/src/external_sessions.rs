@@ -3222,17 +3222,18 @@ fn push_omp_stop(
     timestamp: &str,
     message: &Value,
 ) {
-    let Some(stop) = message.get("stopReason").and_then(Value::as_str) else { return };
-    let mut details = json!({"stopReason": stop});
+    let Some(native_stop) = message.get("stopReason") else { return };
+    let stop = native_stop.as_str().unwrap_or_default();
+    let mut details = json!({"stopReason": native_stop});
+    for key in ["errorMessage", "errorStatus", "errorId", "retryRecovery"] {
+        if let Some(value) = message.get(key) {
+            details[key] = value.clone();
+        }
+    }
     let (code, diagnostic) = match stop {
         "error" => {
             // Continuation belongs to the live agent_end event, not persisted assistant messages.
             details["outcome"] = json!("unknown");
-            for key in ["errorStatus", "errorId"] {
-                if let Some(value) = message.get(key).filter(|value| value.is_u64()) {
-                    details[key] = value.clone();
-                }
-            }
             details["retry_outcome_known"] = json!(false);
             ("native_provider_error", "The provider reported an error; retry outcome is unknown.")
         }
@@ -3247,68 +3248,23 @@ fn push_omp_stop(
             ("native_output_truncated", "The native assistant reached its output limit; its response may be incomplete.")
         }
         _ => {
-            // Unknown/free-form stop values are not newly authorized diagnostic text.
-            details = json!({"stopReason":"unknown","stop_reason_withheld":true,"outcome":"unknown"});
+            details["outcome"] = json!("unknown");
             ("native_stop_unknown", "The native assistant stopped with an unsupported reason.")
         }
     };
-    if message.get("errorMessage").is_some() {
-        // Match live error policy: retain a safe structural diagnostic, never raw provider prose.
-        // Do not digest the withheld text into permanent metadata.
-        details["diagnostic_availability"] = json!("withheld");
-        details["diagnostic_reason"] = json!("provider_text_not_authorized");
-    }
+    let diagnostic = message.get("errorMessage").and_then(Value::as_str).unwrap_or(diagnostic);
     items.push(timeline_item(sequence, timestamp, "system", "error", json!({
         "code":code,"message":diagnostic,"retryable":false,"details":details,
     })));
 }
 
 fn push_omp_exit(items: &mut Vec<Value>, sequence: u64, timestamp: &str, data: &Value) {
-    let mut details = json!({"outcome":"process_exit"});
-    let kind = data.get("kind").and_then(Value::as_str)
-        .filter(|kind| matches!(*kind, "normal" | "signal" | "fatal" | "process_exit"))
-        .unwrap_or("unknown");
-    details["kind"] = json!(kind);
-    let reason = data.get("reason").and_then(Value::as_str)
-        .filter(|reason| matches!(*reason, "exit" | "normal" | "sighup" | "sigint" | "sigterm" | "sigquit" | "process_exit"));
-    if let Some(reason) = reason {
-        details["reason"] = json!(reason);
-    } else if data.get("reason").is_some() {
-        details["reason_availability"] = json!("withheld");
-    }
-    if let Some(pending) = data.get("pendingToolCalls").and_then(Value::as_array) {
-        let mut retained = Vec::new();
-        // Bound the entire checkpoint rather than carrying pending arguments or arbitrary prose.
-        for call in pending.iter().take(16) {
-            let mut identity = json!({});
-            for key in ["toolCallId", "toolName"] {
-                if let Some(value) = call.get(key).and_then(Value::as_str).filter(|value| {
-                    !value.is_empty() && value.len() <= 128 && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"/:._-".contains(&byte))
-                }) {
-                    identity[key] = json!(value);
-                }
-            }
-            if identity.as_object().is_some_and(|identity| !identity.is_empty()) {
-                retained.push(identity);
-            }
-        }
-        details["pendingToolCalls"] = json!(retained);
-        details["pending_tools_truncated"] = json!(pending.len() > 16);
-        details["pending_tool_payloads"] = json!("withheld");
-    }
-    if matches!(kind, "normal" | "signal" | "process_exit")
-        && matches!(reason, Some("sigterm" | "normal" | "exit" | "process_exit"))
-    {
-        items.push(timeline_item(sequence, timestamp, "system", "status", json!({
-            "status":"completed",
-            "detail":serde_json::to_string(&details).expect("native exit metadata serializes"),
-        })));
-        return;
-    }
-    items.push(timeline_item(sequence, timestamp, "system", "error", json!({
-        "code":"native_process_exit",
-        "message":"The native process exited; this is not evidence of user cancellation or tool completion.",
-        "retryable":false,"details":details,
+    // A checkpoint describes the native process, not the outcome of its turn or pending tools.
+    // Keep every native value in the known status body's JSON detail; a later display view can
+    // classify kind/reason without changing this entry or its status block.
+    items.push(timeline_item(sequence, timestamp, "system", "status", json!({
+        "status":"completed",
+        "detail":serde_json::to_string(data).expect("native exit metadata serializes"),
     })));
 }
 
@@ -4146,76 +4102,109 @@ mod tests {
     }
 
     #[test]
-    fn omp_managed_stop_fixture_is_a_status_without_pending_arguments() {
+    fn omp_managed_stop_fixture_preserves_the_complete_checkpoint() {
         let mut items = Vec::new();
+        let mut checkpoint = Value::Null;
         for (offset, line) in include_str!("../fixtures/omp-resume/managed-stop-cancelled.jsonl")
             .lines().enumerate()
         {
             let entry: Value = serde_json::from_str(line).unwrap();
+            if entry["customType"] == "session_exit" {
+                checkpoint = entry["data"].clone();
+            }
             normalize_omp(ExternalDriver::Omp, &entry, offset as u64 * 16, "", &mut items);
         }
         assert!(!items.iter().any(|item| item["body"]["code"] == "native_process_exit"));
         let status = items.iter().find(|item| item["type"] == "status").unwrap();
         assert_eq!(status["body"]["status"], "completed");
         let details: Value = serde_json::from_str(status["body"]["detail"].as_str().unwrap()).unwrap();
-        assert_eq!(details["outcome"], "process_exit");
-        assert_eq!(details["kind"], "signal");
-        assert_eq!(details["reason"], "sigterm");
-        assert_eq!(details["pendingToolCalls"], json!([{
-            "toolCallId":"toolu_0179rsQAbpQmnqiZKiU8WRaA","toolName":"ask"
-        }]));
-        assert!(details["pendingToolCalls"][0].get("args").is_none());
+        assert_eq!(details, checkpoint);
+        assert_eq!(details["pendingToolCalls"][0]["args"]["questions"][0]["question"], "Heal canary: which color?");
         assert!(items.windows(2).all(|pair| pair[0]["sequence"].as_u64() < pair[1]["sequence"].as_u64()));
     }
 
     #[test]
-    fn omp_exit_checkpoint_bounds_and_withholds_unsupported_diagnostics() {
-        let mut items = Vec::new();
-        push_omp_exit(&mut items, 0, "", &json!({
-            "kind":"fatal","reason":"Bearer planted-secret",
+    fn omp_exit_checkpoint_preserves_open_native_values_without_normalizer_bounds() {
+        let data = json!({
+            "kind":"future-kind","reason":"Bearer planted-secret\n\u{1b}",
             "pendingToolCalls": (0..20).map(|_| json!({
-                "toolCallId":"x".repeat(128), "toolName":"y".repeat(128),
-                "intent":"planted-secret"
+                "toolCallId":99, "toolName":null, "args":{"intent":"x".repeat(32_768)}
             })).collect::<Vec<_>>(),
-        }));
-        let details = &items[0]["body"]["details"];
-        assert_eq!(details["pendingToolCalls"].as_array().unwrap().len(), 16);
-        assert_eq!(details["pending_tools_truncated"], true);
-        assert_eq!(details["reason_availability"], "withheld");
-        let encoded = serde_json::to_string(&items[0]).unwrap();
-        assert!(encoded.len() < MAX_TIMELINE_VALUE_BYTES);
-        assert!(!encoded.contains("planted-secret"));
-    }
-
-    #[test]
-    fn omp_exit_checkpoint_omits_invalid_or_empty_pending_identities() {
+            "future":{"native":true},
+        });
         let mut items = Vec::new();
-        push_omp_exit(&mut items, 0, "", &json!({
-            "kind":"fatal","reason":"unknown",
-            "pendingToolCalls":[
-                {"toolCallId":"","toolName":"Bearer secret"},
-                {"toolCallId":99,"toolName":null},
-                {"toolCallId":"call-valid","toolName":"Bearer secret"}
-            ]
-        }));
-        assert_eq!(items[0]["type"], "error");
-        assert_eq!(items[0]["body"]["details"]["pendingToolCalls"], json!([{"toolCallId":"call-valid"}]));
+        normalize_omp(ExternalDriver::Omp, &json!({
+            "type":"custom","customType":"session_exit","data":data
+        }), 0, "", &mut items);
+        assert_eq!(items[0]["type"], "status");
+        let detail: Value = serde_json::from_str(items[0]["body"]["detail"].as_str().unwrap()).unwrap();
+        assert_eq!(detail, data);
+        assert_eq!(items[0]["body"]["blocks"][0]["kind"], "status");
+        assert_eq!(items[0]["body"]["blocks"][0]["payload"], json!({"body_ref":true}));
     }
 
     #[test]
-    fn omp_exit_checkpoint_normal_reasons_are_status_but_fatal_and_unknown_are_errors() {
-        for (kind, reason, expected) in [
-            ("normal", "normal", "status"),
-            ("process_exit", "exit", "status"),
-            ("signal", "sigterm", "status"),
-            ("fatal", "sigterm", "error"),
-            ("signal", "sighup", "error"),
-            ("unknown", "exit", "error"),
-            ("normal", "unknown", "error"),
+    fn omp_assistant_outcomes_preserve_exact_diagnostics_and_retry_recovery() {
+        for (stop, code) in [
+            ("error", "native_provider_error"),
+            ("aborted", "native_turn_aborted"),
+            ("length", "native_output_truncated"),
+            ("future native stop\n\u{1b}", "native_stop_unknown"),
         ] {
+            let message = json!({
+                "role":"assistant","content":[],
+                "stopReason":stop,"errorMessage":format!("provider\n\u{1b}{}", "x".repeat(32_768)),
+                "errorStatus":"future-status","errorId":{"provider":99},
+                "retryRecovery":{"attempt":2,"future":[false,null,"unchanged"]},
+            });
             let mut items = Vec::new();
-            push_omp_exit(&mut items, 0, "", &json!({"kind":kind,"reason":reason}));
-            assert_eq!(items[0]["type"], expected, "{kind}/{reason}");
+            normalize_omp(ExternalDriver::Omp, &json!({
+                "type":"message","message":message
+            }), 0, "", &mut items);
+            let error = items.iter().find(|entry| entry["type"] == "error").unwrap();
+            assert_eq!(error["body"]["code"], code);
+            assert_eq!(error["body"]["message"], message["errorMessage"]);
+            for key in ["stopReason", "errorMessage", "errorStatus", "errorId", "retryRecovery"] {
+                assert_eq!(error["body"]["details"][key], message[key], "{stop}/{key}");
+            }
+            assert_eq!(error["body"]["blocks"][0]["kind"], "error");
+            assert_eq!(error["body"]["blocks"][0]["payload"], json!({"body_ref":true}));
+        }
+    }
+
+    #[test]
+    fn omp_outcome_owner_reads_preserve_full_native_records_and_values() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("outcomes.jsonl");
+        let records = [
+            json!({"type":"message","message":{
+                "role":"assistant","content":[],"stopReason":"error",
+                "errorMessage":"provider diagnostic\n".repeat(4096),
+                "errorStatus":429,"errorId":"native-id",
+                "retryRecovery":{"attempt":2,"reason":"recorded retry"}
+            },"future":"record metadata"}),
+            json!({"type":"custom","customType":"session_exit","data":{
+                "kind":"fatal","reason":"native process reason\n".repeat(4096),
+                "pendingToolCalls":[{"toolCallId":"","args":{"future":true}}]
+            }}),
+        ];
+        fs::write(&path, format!("{}\n{}\n", records[0], records[1])).unwrap();
+        let session = transcript_session(ExternalDriver::Omp, &path);
+        let timeline = normalized_timeline(&session).unwrap();
+        for record in &records {
+            assert!(timeline.iter().flat_map(|entry| entry["body"]["blocks"]
+                .as_array().into_iter().flatten()).any(|block|
+                block["kind"] == "source_record" && block["payload"]["raw"] == *record));
+        }
+        let error = timeline.iter().find(|entry| entry["type"] == "error").unwrap();
+        assert_eq!(error["body"]["message"], records[0]["message"]["errorMessage"]);
+        let status = timeline.iter().find(|entry| entry["type"] == "status").unwrap();
+        let detail: Value = serde_json::from_str(status["body"]["detail"].as_str().unwrap()).unwrap();
+        assert_eq!(detail, records[1]["data"]);
+        for entry in [error, status] {
+            let locator = serde_json::from_value(entry["_source"].clone()).unwrap();
+            let fetched = normalized_record(&session, &locator).unwrap();
+            assert!(fetched.iter().any(|item| item["id"] == entry["id"] && item["body"] == entry["body"]));
         }
     }
 
