@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Add an invented signed grouped-envelope fixture through the Smalltalk runtime for source compatibility controls.",
+  "replay": {
+    "status": "none",
+    "detail": "Example only; no startup path or replay behavior changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No schema, metadata, index or migration change in this example-only delta."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Uses actual current checkpoint drop planning on invented message history; changes no checkpoint rule or version."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "The example exercises the existing new writer, signer, exporter and message projection. A source-built unchanged 2cc34bce Smalltalk runtime receives and verifies the grouped fixture, matches canonical order and projected messages, and rejects signature and payload tampering. This is not a deployed binary, native ABI, fleet-wide or daemon/checkpoint exchange qualification."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No runtime activation; shared appends remain default-off."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Run emit_shared_st3_fixture with a new output path to produce bounded invented positive and tampered fixtures; no daemon, provider, production store or network required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Example-only delta supplies no operator repair or recovery procedure."
+  }
+}
