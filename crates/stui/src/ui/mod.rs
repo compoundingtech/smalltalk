@@ -7,6 +7,7 @@
 
 pub mod adapt;
 mod attach;
+mod context;
 #[cfg(test)]
 mod contract;
 pub mod conversation;
@@ -77,12 +78,16 @@ struct FramePane {
     top: usize,
     total: usize,
     lines: Rc<Vec<Line<'static>>>,
+    entries: Vec<(String, usize)>,
+    layer: usize,
 }
 
 #[derive(Default)]
 struct FrameInfo {
     area: Rect,
     hits: Vec<(Rect, Hit)>,
+    /// List rows with their subject and drawing layer, independent of the current focus.
+    context_rows: Vec<(Rect, String, usize)>,
     /// Opaque layers and the first hit painted on each layer.
     covers: Vec<(Rect, usize)>,
     /// The unobscured focused terminal that retains ownership of program motion.
@@ -182,6 +187,8 @@ pub enum Effect {
     Send {
         agent: String,
         text: String,
+        /// A canonical message this conversation draft replies to, using the existing API.
+        in_reply_to: Option<String>,
         /// st's message tags, such as `dictated`.
         tags: Vec<String>,
         /// Images to upload to st and attach (from a paste, a drop or the clipboard).
@@ -337,6 +344,10 @@ pub struct Ui {
     system: bool,
     frame: RefCell<FrameInfo>,
     hover: hover::Hover,
+    /// Reply context follows the conversation draft through navigation.
+    replies: HashMap<String, String>,
+    /// A menu owns its press through release, even after an action closes it.
+    context_button: Option<MouseButton>,
     dragging: bool,
     demo: Option<Demo>,
     quit: bool,
@@ -486,6 +497,8 @@ impl Ui {
             system: false,
             frame: RefCell::new(FrameInfo::default()),
             hover: hover::Hover::default(),
+            replies: HashMap::new(),
+            context_button: None,
             dragging: false,
             demo: None,
             quit: false,
@@ -1158,6 +1171,7 @@ impl Ui {
         if let Some(subject) = &self.popover {
             self.draw_popover(buf, area, subject);
         }
+        self.draw_context_menu(buf, area);
         if self.help {
             self.draw_help(buf, area);
         }
@@ -1776,6 +1790,11 @@ impl Ui {
             buf.set_line(list.x + 1, y, line, list.width.saturating_sub(1));
             if let Some(index) = index {
                 self.hit(row, hit(*index));
+                if let Some(subject) = listing.ids.get(*index) {
+                    let mut info = self.frame.borrow_mut();
+                    let layer = info.covers.len();
+                    info.context_rows.push((row, subject.clone(), layer));
+                }
             }
         }
         if rows.len() > height {
@@ -2368,6 +2387,7 @@ impl Ui {
 
     /// Draw a document into a scrolling pane, registering its click targets.
     fn pane(&self, buf: &mut Buffer, key: &str, area: Rect, doc: Doc, follow_default: bool) {
+        let layer = self.frame.borrow().covers.len();
         let height = area.height as usize;
         let total = doc.lines.len();
         let state = {
@@ -2536,6 +2556,8 @@ impl Ui {
             top,
             total,
             lines,
+            entries: doc.entries,
+            layer,
         });
     }
 
@@ -2662,18 +2684,22 @@ impl Ui {
                 self.terminal_body.set(Some(body));
             }
             native.fit(body.height, body.width);
+            let layer = self.frame.borrow().covers.len();
             self.frame.borrow_mut().panes.push(FramePane {
                 key: Pane::Terminal(agent.to_owned()).key(),
                 rect: body,
                 top: scrolled,
                 total: usize::from(body.height) + scrolled,
                 lines: Rc::new(Vec::new()),
+                entries: Vec::new(),
+                layer,
             });
             // The person's own cursor only where nothing is drawn over the terminal.
             let real = self.terminal_focused()
                 && self.focused_pane() == Some(Pane::Terminal(agent.to_owned()))
                 && !self.help
                 && self.popover.is_none()
+                && self.context.is_none()
                 && !self.palette_open();
             let cursor = native.draw(buf, body, real);
             if real {
@@ -2816,6 +2842,15 @@ impl Ui {
             })
             .unwrap_or_default();
         let mut lines = self.composer_text(agent, width, editing, &draft);
+        if let Some(message) = self.replies.get(&agent.id) {
+            lines.insert(
+                0,
+                Line::from(Span::styled(
+                    text::truncate(&format!("  Reply to {message}"), width),
+                    theme::dim(),
+                )),
+            );
+        }
         if !chips.is_empty() {
             lines.splice(0..0, chips);
         }
@@ -2992,6 +3027,11 @@ impl Ui {
             "lists and cards",
             &[
                 ("↑↓ j k or click", "select"),
+                ("F10", "top bar actions; ↑↓ and Enter choose"),
+                (
+                    "shift+F10 or Menu",
+                    "the selected subject's actions; ↑↓ and Enter choose",
+                ),
                 ("t", "Agents, Missions: the path tree or the groups"),
                 ("x", "Missions: show st's own missions"),
                 ("n", "Agents: a new agent; Missions: a new mission"),
@@ -3364,6 +3404,24 @@ impl Ui {
         if self.answer_key(key) {
             return;
         }
+        if self.context_key(key) {
+            return;
+        }
+        if let Some(action) = self.confirm {
+            // Confirmation owns the keys even when a sidebar or terminal is behind the menu.
+            // Ctrl+C retains its existing second-press confirmation of an interrupt.
+            if key.code == KeyCode::Char('y')
+                || (action == 's'
+                    && key.code == KeyCode::Char('c')
+                    && key.modifiers.contains(KeyModifiers::CONTROL))
+            {
+                self.confirm = None;
+                self.act(action);
+            } else {
+                self.confirm = None;
+            }
+            return;
+        }
         if self.glass_key(key) {
             return;
         }
@@ -3605,18 +3663,6 @@ impl Ui {
                         .or_default();
                     edit::edit(draft, &self.cursor, &key_id, key);
                 }
-            }
-            return;
-        }
-        if let Some(action) = self.confirm {
-            match key.code {
-                // Only y confirms. Enter is how a message is sent, so it never confirms anything
-                // that acts for the person: stopping, approving, closing, cancelling, revoking.
-                KeyCode::Char('y') => {
-                    self.confirm = None;
-                    self.act(action);
-                }
-                _ => self.confirm = None,
             }
             return;
         }
@@ -4572,6 +4618,7 @@ impl Ui {
             let effect = match self.tab {
                 1 => Some(Effect::Send {
                     agent: id.clone(),
+                    in_reply_to: self.replies.remove(&id),
                     tags: if self.dictated.remove(&id) {
                         vec!["dictated".into()]
                     } else {
@@ -4656,6 +4703,7 @@ impl Ui {
         }
         match self.tab {
             1 => {
+                self.replies.remove(&id);
                 let name = self
                     .world
                     .agents
@@ -4740,12 +4788,8 @@ impl Ui {
                 self.confirm = Some('A');
             }
             ('i', None) => {
-                if self.live {
-                    self.effects.push(Effect::StopAgent { agent });
-                    self.flash("Interrupting…");
-                } else {
-                    self.flash("Interrupted · demo: nothing was sent");
-                }
+                self.open(&agent);
+                self.action_key('S');
             }
             ('t', None) => {
                 self.open(&agent);
@@ -4940,6 +4984,17 @@ impl Ui {
             MouseEventKind::Up(_) => self.hover.pressed.set(false),
             _ => {}
         }
+        if let Some(button) = self.context_button {
+            match mouse.kind {
+                MouseEventKind::Up(released) if released == button => {
+                    self.context_button = None;
+                    return;
+                }
+                MouseEventKind::Drag(dragged) if dragged == button => return,
+                MouseEventKind::Down(_) => self.context_button = None,
+                _ => {}
+            }
+        }
         self.sync_terminal_slot();
         if self.help {
             if matches!(mouse.kind, MouseEventKind::Down(_)) {
@@ -4949,21 +5004,48 @@ impl Ui {
         }
         // The right-click menu takes the next press: a row acts, anywhere else only closes it.
         if self.context.is_some() && matches!(mouse.kind, MouseEventKind::Down(_)) {
-            let inside = self
-                .frame
-                .borrow()
-                .menu
-                .is_some_and(|rect| contains(rect, mouse.column, mouse.row));
-            if !inside || !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-                self.context = None;
-                return;
+            if let MouseEventKind::Down(button) = mouse.kind {
+                self.context_button = Some(button);
             }
+            let action = if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                self.frame
+                    .borrow()
+                    .hits
+                    .iter()
+                    .rev()
+                    .find_map(|(rect, hit)| match hit {
+                        Hit::Menu(action) if contains(*rect, mouse.column, mouse.row) => {
+                            Some(action.clone())
+                        }
+                        _ => None,
+                    })
+            } else {
+                None
+            };
+            self.context = None;
+            if let Some(action) = action {
+                self.run_menu_action(action);
+            }
+            return;
+        }
+        if let Some(menu) = &mut self.context {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => menu.selected = menu.selected.saturating_sub(1),
+                MouseEventKind::ScrollDown => {
+                    menu.selected = (menu.selected + 1).min(menu.items.len().saturating_sub(1));
+                }
+                _ => {}
+            }
+            return;
         }
         if self.terminal_mouse(mouse) {
             return;
         }
-        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) && self.glasses.is_some() {
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) {
             self.open_context_menu(mouse.column, mouse.row);
+            if self.context.is_some() {
+                self.context_button = Some(MouseButton::Right);
+            }
             return;
         }
         // A tab dragged to another place or a split's edge.
@@ -5319,6 +5401,7 @@ impl Ui {
                     *focus = (*focus + 1) % 4;
                 }
             }
+            Hit::Key('s') if self.glasses.is_none() => self.sidebar = !self.sidebar,
             Hit::Key(key) => {
                 if key == 'y' {
                     if let Some(action) = self.confirm.take() {

@@ -2079,6 +2079,7 @@ async fn perform(
         Effect::Send {
             agent,
             mut text,
+            in_reply_to,
             tags,
             images,
         } => {
@@ -2130,7 +2131,7 @@ async fn perform(
                 &agent,
                 text,
                 None,
-                None,
+                in_reply_to,
                 session,
                 tags,
                 attachments,
@@ -2319,6 +2320,7 @@ mod tests {
         std::fs::write(&image, b"\x89PNG\r\n\x1a\nproof").unwrap();
         let sent = Mutex::new(None);
         let send = Effect::Send {
+            in_reply_to: None,
             agent: "agent/example/worker".into(),
             text: "Copper proof".into(),
             tags: vec![],
@@ -2364,6 +2366,43 @@ mod tests {
         .unwrap();
         assert_eq!(replay.as_deref(), Some(message.as_str()));
         assert_eq!(store.index().unwrap(), index);
+        let reply_sent = Mutex::new(None);
+        let reply = Effect::Send {
+            agent: "agent/example/worker".into(),
+            text: "Thanks for the copper proof.".into(),
+            in_reply_to: Some(message.clone()),
+            tags: vec![],
+            images: vec![],
+        };
+        let (_, replied) = perform(
+            &client,
+            "person/avery",
+            &model,
+            reply.clone(),
+            Some(&reply_sent),
+        )
+        .await
+        .unwrap();
+        let replied = replied.unwrap();
+        assert_eq!(
+            store
+                .message(&replied)
+                .unwrap()
+                .unwrap()
+                .in_reply_to
+                .as_deref(),
+            Some(message.as_str())
+        );
+        let reply_index = store.index().unwrap();
+        let (_, repeated) = perform(&client, "person/avery", &model, reply, Some(&reply_sent))
+            .await
+            .unwrap();
+        assert_eq!(repeated.as_deref(), Some(replied.as_str()));
+        assert_eq!(
+            store.index().unwrap(),
+            reply_index,
+            "threaded replies keep the same retry receipt"
+        );
         for effect in [
             Effect::Discuss {
                 to: "agent/example/worker".into(),
@@ -2966,6 +3005,7 @@ mod tests {
             failed: None,
             unconfirmed: false,
             effect: Effect::Send {
+                in_reply_to: None,
                 agent: "agent/example/cos".into(),
                 text: "hello".into(),
                 tags: Vec::new(),

@@ -2216,7 +2216,7 @@
         "crates/stui/src/ui/live.rs::live_sends_retries_discussions_and_creation_survive_daemon_restarts",
         "crates/st3/tests/action_coverage.rs::messages_survive_stale_fences_and_restarts"
       ],
-      "verification": "live UI adapter plus daemon restart"
+      "verification": "live UI adapter plus daemon restart; conversation thread replies preserve in_reply_to and retry receipts"
     },
     {
       "effect": "CancelRun",

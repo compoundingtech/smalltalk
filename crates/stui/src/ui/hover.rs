@@ -148,8 +148,12 @@ pub(super) fn poll_input(
             let input = event::read()?;
             let motion =
                 matches!(&input, Event::Mouse(mouse) if mouse.kind == MouseEventKind::Moved);
+            // Keys (including menu shortcuts and scrolling) and presses paint their new
+            // hit map before another click can use it.
+            let press = matches!(&input, Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Down(_)))
+                || matches!(&input, Event::Key(_));
             let redraw = handle(input);
-            if motion && redraw {
+            if (motion || press) && redraw {
                 return Ok(());
             }
             changed |= redraw;
@@ -296,7 +300,7 @@ mod tests {
         ));
         assert_eq!(
             terminal.backend().buffer()[(menu.x, menu.y + 1)].bg,
-            theme::hover_background(theme::MANTLE)
+            theme::hover_background(theme::ROW_SELECTED)
         );
         ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         terminal.draw(|frame| ui.render(frame)).unwrap();
