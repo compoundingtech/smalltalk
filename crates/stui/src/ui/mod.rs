@@ -1150,7 +1150,7 @@ impl Ui {
 
     fn listing_for(&self, tab: usize, width: usize) -> Listing {
         match tab {
-            0 => screens::home_list(&self.world, &self.snoozed),
+            0 => screens::home_list(&self.world, &self.snoozed, &self.closed),
             1 if self.tree => screens::agents_tree(&self.world, self.spinner(), width),
             1 => screens::agents_list(&self.world, self.spinner(), width),
             2 if self.tree => screens::missions_tree(&self.world, self.spinner(), self.system),
@@ -6960,7 +6960,10 @@ mod tests {
         assert!(listing.ids.contains(&gone), "it stays");
         assert!(!listing.ids.contains(&acted), "what the person acted on goes");
         ui.select(listing.ids.iter().position(|id| *id == gone).unwrap());
-        assert!(frame(&ui, 140, 50).join("\n").contains("closed elsewhere"));
+        let shown = frame(&ui, 140, 50).join("\n");
+        assert!(shown.contains("closed elsewhere"));
+        // It sits under its own heading, apart from what needs the person.
+        assert!(shown.contains("closed elsewhere: x clears each"), "{shown}");
         // It survives later updates, and only x clears it.
         ui.set_world(next.clone());
         assert!(ui.listing(60).ids.contains(&gone));
