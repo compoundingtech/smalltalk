@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Route configured daemon GitHub HTTP through sekrets authorized requests without holding the token",
+  "replay": {
+    "status": "none",
+    "detail": "No persisted observer cursors or delivery receipts change; existing conditional-response caches are preserved."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database or graph schema changes. Uses the independently owned gateway authorized-request protocol and existing Config.github.sekrets_profile."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules, digest or coordinated member upgrade."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "github.sekrets_profile now selects gateway authorized-request for every daemon GitHub HTTP caller and direct GitHub gate CLI, passing full Config for node identity. The profile branch contains no token, never resolves file/env/gh credentials and never falls back. Request method/body, status and all headers remain available; no redirect follow or HTTP replay. Unconfigured GH_TOKEN > GITHUB_TOKEN > gh auth token cache and explicit token_file behavior remain unchanged. The caller independently validates https/api.github.com/no-userinfo/default-port and refuses its own Authorization, streamed request bodies or buffered requests above16MiB. It checks the64MiB RPC response-body cap before constructing the response."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No replay/migration. Profile configuration no longer rejects startup as unsupported; unavailable gateway or denied identity/grant/URL fail the request without fallback. Restart-to-health and production performance are not measured."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Deploy the authorized-request gateway/client dependency and caller source before configuring github.sekrets_profile. Register the existing node key and grant OWNER/NAME to host/NODE with github-api; the daemon and CLI pass their loaded Config. Configure ST_SEKRETS_SOCKET or the default gateway socket. Only https://api.github.com is allowed, so alternate API base overrides are refused in profile mode. token_file and profile remain mutually exclusive. See docs/github-integration.md and docs/st3/sekrets.md."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "If the gateway is unavailable, restore its service or explicitly remove the profile configuration to choose the ordinary local source. There is no automatic fallback. Before downgrading to the independent fallback-only build, remove sekrets_profile because it rejects that configuration; no database recovery required."
+  }
+}

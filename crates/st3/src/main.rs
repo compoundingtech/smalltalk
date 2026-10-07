@@ -5061,7 +5061,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Driver(args) => run_driver(&immediate, args, cli.catalog.as_deref()).await,
         Command::Gate { command } => {
             if matches!(&command, GateCommand::Merged { .. } | GateCommand::CiPassed { .. }) {
-                st3::resource::configure_github(&config.github)?;
+                st3::resource::configure_github(&config)?;
             }
             run_gate(command).await
         },
@@ -5579,7 +5579,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
     }
     config.apply_fleet_file()?;
     config.validate()?;
-    st3::resource::configure_github(&config.github)?;
+    st3::resource::configure_github(&config)?;
     validate_unix_socket_path(&config.socket, "--socket")?;
     validate_unix_socket_path(&config.client_gateway_socket, "--client-gateway-socket")?;
     fs::create_dir_all(&config.state_dir)?;

@@ -30,11 +30,35 @@ credential acquisition, caches the contents, and reloads when the mtime changes.
 replacement is detected even when the mtime is preserved. An unreadable, unsafe or malformed
 file fails authentication rather than selecting another source.
 
-`github.sekrets_profile` is reserved for the pending authorized-request gateway client.
-Setting it currently fails with an explicit unsupported-configuration error, before any
-file, environment or `gh` credential lookup. Setting it together with `github.token_file`
-is a configuration error. Configured gateway routing is not delivered by this change.
-With neither option set, the existing environment/CLI source precedence applies.
+## Gateway-authorized configuration
+
+To keep the GitHub token at the sekrets gateway, configure the daemon:
+
+```toml
+[github]
+sekrets_profile = "owner/daemon-gh"
+```
+
+Grant the profile to the daemon's node with the `github-api` preset (see
+[sekrets](st3/sekrets.md)). The gateway client reads the daemon or gate CLI's Config and
+existing node key; no initializer or token handoff is needed. Every daemon GitHub HTTP
+request uses the gateway's authorized-request operation, including GraphQL, pagination,
+conditional reads and comment/review mutations. The profile path never resolves local
+files, exported tokens or `gh auth token`; it never receives the profile token.
+
+A missing gateway, identity, grant or refused URL errors without selecting another source.
+The gateway authorizes only `https://api.github.com`, rejects a request's own Authorization,
+and adds the profile credential there. It follows no redirect and retries no request. The
+client runs off the async worker threads and returns the original status, headers and body,
+including 3xx, 401, ETag, Link, rate limits and Retry-After. HTTP errors remain responses;
+transport and policy errors remain failures. Request/response limits are 16 MiB/64 MiB,
+with the gateway's 60-second HTTP timeout. Local API overrides pointing elsewhere are
+refused in profile mode. The caller also rejects foreign origins, userinfo, non-default ports
+and an Authorization header before the RPC. It refuses streamed bodies and buffered request
+bodies above 16 MiB, and checks the 64 MiB response bound before constructing its HTTP response.
+
+Setting `github.sekrets_profile` together with `github.token_file` is a configuration error.
+With neither option set, the existing environment/CLI source precedence and cache apply.
 
 ## Daemon GitHub callers
 
