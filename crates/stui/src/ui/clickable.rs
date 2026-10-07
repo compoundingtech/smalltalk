@@ -68,8 +68,6 @@ impl Ui {
             Hit::PaletteSection(2) => "missions [Ctrl+3]".into(),
             Hit::PaletteSection(3) => "fleet [Ctrl+4]".into(),
             Hit::PaletteSection(_) => format!("open {label}"),
-            Hit::NewAgent => "new agent [Ctrl+N]".into(),
-            Hit::Repository(_) => "choose repository".into(),
             Hit::Home => "show/hide Now [Ctrl+H]".into(),
             Hit::Link(_) => "copy link".into(),
             Hit::Split(true) => "split right [Ctrl+V]".into(),

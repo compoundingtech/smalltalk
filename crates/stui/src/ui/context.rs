@@ -311,7 +311,6 @@ impl Ui {
             Hit::PaletteSection(2) => "Open missions [Ctrl+3]",
             Hit::PaletteSection(3) => "Open fleet [Ctrl+4]",
             Hit::GlassMenu => "Open spaces [Ctrl+G]",
-            Hit::NewAgent => "New agent [Ctrl+N]",
             Hit::NewTerminal => "New terminal",
             Hit::Split(true) => "Split right [Ctrl+V]",
             Hit::Split(false) => "Split below [Ctrl+X]",
@@ -441,7 +440,6 @@ impl Ui {
             && !self.palette_open()
             && self.confirm.is_none()
             && self.find.is_none()
-            && !self.agent_form
             && self.new_mission.is_none()
         {
             if bar_key {
