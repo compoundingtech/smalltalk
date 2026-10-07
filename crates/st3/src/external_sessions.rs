@@ -3383,7 +3383,11 @@ fn preserve_omp_result_timing(items: &mut [Value], native_result: &Value) {
             .or_insert_with(|| json!({}))
             .as_object_mut()
             .expect("block metadata is an object");
-        metadata.extend(details.iter().map(|(key, value)| (key.clone(), value.clone())));
+        metadata.extend(
+            details
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
     }
 }
 
@@ -4075,7 +4079,10 @@ mod tests {
                     let mut entry = omp_tool_result_fixture()[1].clone();
                     entry["message"]["arguments"] = json!({"timeoutSeconds": 999});
                     if let Some(kind) = nested_kind {
-                        entry["message"].as_object_mut().unwrap().remove("toolCallId");
+                        entry["message"]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("toolCallId");
                         entry["message"]["content"] = json!([{
                             "type": kind, "call_id": "nested",
                             "content": "finished", "details": details
@@ -4111,7 +4118,11 @@ mod tests {
         entry["message"]["arguments"] = json!({"timeoutSeconds": 999});
         let mut items = Vec::new();
         normalize_native_line(ExternalDriver::Omp, &entry, 0, "", &mut items);
-        assert!(items.last().unwrap()["body"]["blocks"][0].get("metadata").is_none());
+        assert!(
+            items.last().unwrap()["body"]["blocks"][0]
+                .get("metadata")
+                .is_none()
+        );
         items.last_mut().unwrap()["body"]["blocks"][0]["metadata"] =
             json!({"existing": true, "wallTimeMs": 999});
         entry["message"]["details"] =
