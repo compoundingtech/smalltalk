@@ -15,7 +15,7 @@
   },
   "compatibility": {
     "status": "changed",
-    "detail": "Open-pull GraphQL pages start at 20 instead of 100, retaining all existing nested selections. A query execution refusal retries the identical cursor and identity batch with half as many pulls, down to one. Each successful continuation page doubles the next page size back toward 20; new observations start at 20. All pages are folded before publishing; the existing 1,000-open-pull bound is independent of page size. A 200-call observation cap includes retries and empty advancing pages; exhausting it fails without caching partial facts. Other refusals still fail immediately."
+    "detail": "Open-pull GraphQL pages start at 20 instead of 100, retaining all existing nested selections. A query execution refusal retries the identical cursor and identity batch with half as many pulls, down to one. Each successful continuation page doubles the next page size toward 20 but strictly below any size refused in that observation; new observations start at 20 without a refusal ceiling. All pages are folded before publishing; the existing 1,000-open-pull bound is independent of page size. A 200-call observation cap includes retries and empty advancing pages; exhausting it fails without caching partial facts. Other refusals still fail immediately."
   },
   "downtime": {
     "status": "none",

@@ -1460,6 +1460,7 @@ async fn open_pull_requests(
     let mut after = Value::Null;
     let mut identities_read = 0;
     let mut page_size = PULL_REQUEST_PAGE_SIZE;
+    let mut failed_size_ceiling = PULL_REQUEST_PAGE_SIZE + 1;
     let mut calls = 0;
     loop {
         anyhow::ensure!(
@@ -1490,6 +1491,7 @@ async fn open_pull_requests(
                     ) =>
             {
                 let failed_page_size = page_size;
+                failed_size_ceiling = failed_size_ceiling.min(failed_page_size);
                 page_size /= 2;
                 tracing::warn!(
                     owner, repository, failed_page_size, page_size,
@@ -1533,7 +1535,9 @@ async fn open_pull_requests(
             .filter(|cursor| cursor.is_string() && **cursor != after)
             .context("the GitHub pull request page has no advancing cursor")?;
         after = next.clone();
-        page_size = (page_size * 2).min(PULL_REQUEST_PAGE_SIZE);
+        page_size = (page_size * 2)
+            .min(PULL_REQUEST_PAGE_SIZE)
+            .min(failed_size_ceiling - 1);
     }
     let mut required = BTreeMap::<String, Option<Vec<RequiredCheck>>>::new();
     for node in &nodes {
@@ -1702,6 +1706,7 @@ mod tests {
         refused: Arc<Mutex<HashMap<String, String>>>,
         graphql: Arc<Mutex<String>>,
         graphql_pages: Arc<Mutex<std::collections::VecDeque<Value>>>,
+        graphql_pulls: Arc<Mutex<Option<(Vec<Value>, usize)>>>,
         graphql_requests: Arc<Mutex<Vec<Value>>>,
         requests: Arc<Mutex<Vec<String>>>,
     }
@@ -1764,17 +1769,31 @@ mod tests {
                             )
                         };
                         let response = if target.starts_with("POST /graphql ") {
-                            server.graphql_requests.lock().push(
+                            let request: Value =
                                 serde_json::from_slice(&request[header_end..header_end + length])
-                                    .unwrap(),
-                            );
-                            let body = server
-                                .graphql_pages.lock()
-                                .pop_front()
-                                .map_or_else(
-                                    || server.graphql.lock().clone(),
-                                    |page| page.to_string(),
-                                );
+                                    .unwrap();
+                            let body = if let Some((pulls, max_size)) = server.graphql_pulls.lock().as_ref() {
+                                let first = request["variables"]["first"].as_u64().unwrap() as usize;
+                                if first > *max_size {
+                                    json!({"errors": [{
+                                        "message": "Something went wrong while executing your query",
+                                    }]}).to_string()
+                                } else {
+                                    let after = request["variables"]["after"].as_str()
+                                        .map_or(0, |cursor| cursor.parse::<usize>().unwrap());
+                                    let end = (after + first).min(pulls.len());
+                                    let cursor = end.to_string();
+                                    pull_page(
+                                        json!(pulls[after..end]),
+                                        (end < pulls.len()).then_some(cursor.as_str()), json!([]),
+                                    ).to_string()
+                                }
+                            } else {
+                                server.graphql_pages.lock().pop_front().map_or_else(
+                                    || server.graphql.lock().clone(), |page| page.to_string(),
+                                )
+                            };
+                            server.graphql_requests.lock().push(request);
                             respond("200 OK", None, &body)
                         } else {
                             let path = target.split(' ').nth(1).unwrap().to_owned();
@@ -1978,7 +1997,7 @@ mod tests {
         assert_eq!(details.open[2]["number"], 3);
         let requests = github.graphql_requests.lock();
         assert_eq!(requests.iter().map(|request| request["variables"]["first"].as_u64().unwrap())
-            .collect::<Vec<_>>(), [20, 20, 10, 20]);
+            .collect::<Vec<_>>(), [20, 20, 10, 19]);
         assert_eq!(requests[1]["variables"]["after"], "next");
         assert_eq!(requests[2]["variables"]["after"], "next");
         assert_eq!(requests[1]["variables"]["ids"], requests[2]["variables"]["ids"]);
@@ -1986,7 +2005,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successful_pages_recover_from_one_pull_to_the_default_page_size() {
+    async fn successful_pages_never_reprobe_a_refused_page_size() {
         let (github, base) = FakeGithub::start().await;
         let mut pages = github.graphql_pages.lock();
         for _ in 0..4 {
@@ -2006,9 +2025,32 @@ mod tests {
         assert_eq!(details.open.len(), 6);
         let requests = github.graphql_requests.lock();
         assert_eq!(requests.iter().map(|request| request["variables"]["first"].as_u64().unwrap())
-            .collect::<Vec<_>>(), [20, 10, 5, 2, 1, 2, 4, 8, 16, 20]);
+            .collect::<Vec<_>>(), [20, 10, 5, 2, 1, 1, 1, 1, 1, 1]);
         assert!(requests[..5].iter().all(|request| request["variables"]["after"].is_null()));
         assert_eq!(requests[5]["variables"]["after"], "page-1");
+    }
+
+    #[tokio::test]
+    async fn six_hundred_pulls_complete_when_only_five_per_page_are_accepted() {
+        let (github, base) = FakeGithub::start().await;
+        *github.graphql_pulls.lock() = Some((
+            (1..=600).map(|number| open_pull(number, "head", "SUCCESS")).collect(),
+            5,
+        ));
+        let details = read_pull_pages(&base, &[]).await.unwrap();
+        assert_eq!(details.open.len(), 600);
+        assert_eq!(details.open.first().unwrap()["number"], 1);
+        assert_eq!(details.open.last().unwrap()["number"], 600);
+        let requests = github.graphql_requests.lock();
+        assert_eq!(requests.len(), 128);
+        let refused = requests.iter()
+            .map(|request| request["variables"]["first"].as_u64().unwrap())
+            .filter(|first| *first > 5)
+            .collect::<Vec<_>>();
+        assert_eq!(refused, [20, 10, 9, 8, 7, 6]);
+        assert!(pull_request_checks().lock().unwrap_or_else(PoisonError::into_inner).contains_key(
+            &format!("{base} github/acme/garden"),
+        ));
     }
 
     #[tokio::test]
