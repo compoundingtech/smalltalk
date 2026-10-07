@@ -37474,6 +37474,38 @@ version 2
     }
 
     #[test]
+    fn a_local_claim_sorting_before_a_projected_peer_claim_still_rebuilds_its_run_tree() {
+        let (controller, worker, step) = replicated_step_pair();
+        // The peer's clock runs ahead: its claim is dated ten minutes from now.
+        controller
+            .set_write_clock_at(now_ms() + 600_000)
+            .unwrap();
+        controller
+            .set_step_state(&step, "blocked", Some("the peer blocks it"))
+            .unwrap();
+        assert!(!projection_replayed(&worker, "controller", &controller));
+        assert_eq!(worker.step_run(&step).unwrap().unwrap().status, "blocked");
+        // The worker then writes by its own, earlier clock: its claim sorts before the peer's, so
+        // a replay ends with the step blocked while the write path left it ready. The pass that
+        // sees only this local claim must still rebuild the tree to agree with the replay.
+        worker.set_write_clock_at(now_ms()).unwrap();
+        worker
+            .set_step_state(&step, "ready", Some("the worker unblocks it"))
+            .unwrap();
+        RUN_TREE_REBUILDS.with(|rebuilds| rebuilds.set(0));
+        worker.project_replication_backlog().unwrap();
+        assert!(
+            RUN_TREE_REBUILDS.with(std::cell::Cell::get) >= 1,
+            "a local claim that sorts before a projected peer claim marks its tree dirty"
+        );
+        let incremental = graph_digest_of(&worker);
+        let projected = worker.step_run(&step).unwrap().unwrap().status;
+        worker.replay_replication_graph().unwrap();
+        assert_eq!(incremental, graph_digest_of(&worker));
+        assert_eq!(projected, worker.step_run(&step).unwrap().unwrap().status);
+    }
+
+    #[test]
     fn a_peer_claim_older_than_a_local_lease_claim_rebuilds_its_run_tree() {
         let (controller, worker, step) = replicated_step_pair();
         controller
