@@ -23,6 +23,8 @@ pub struct SmalltalkRuntime {
     pub(crate) message_cache: Mutex<HashMap<String, MessageCacheEntry>>,
     pub(crate) agent_status_cache: Mutex<VecDeque<AgentStatusEntry>>,
     pub(crate) agent_resources_cache: Mutex<VecDeque<AgentResourcesEntry>>,
+    /// Ordering and queue metadata for lazy HTTP pages, shared at the same graph cuts.
+    pub(crate) agent_page_refs_cache: Mutex<VecDeque<AgentResourcesEntry>>,
     /// Acquire before opening a SQLite snapshot, never while pinning a WAL read mark.
     pub(crate) agent_resources_admission: Arc<tokio::sync::Mutex<()>>,
     #[cfg(test)]
@@ -281,6 +283,10 @@ impl Runtime for SmalltalkRuntime {
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
         self.agent_resources_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        self.agent_page_refs_cache
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();

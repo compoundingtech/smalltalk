@@ -2186,6 +2186,10 @@ fn client_agent_resources_cached(
 // Freeze membership, ordering and the inexpensive declaration/queue metadata. The expensive
 // status, usage, fault and activity reductions are needed only for the returned page.
 fn client_agent_page_refs(store: &Store, history: bool, index: u64) -> anyhow::Result<Vec<Value>> {
+    store.cached_agent_page_refs(index, history, || client_agent_page_refs_uncached(store, history, index))
+}
+
+fn client_agent_page_refs_uncached(store: &Store, history: bool, index: u64) -> anyhow::Result<Vec<Value>> {
     let connection = store.readers.get();
     let mut subjects = connection
         .prepare_cached(crate::store::RANGE_SUBJECTS)?
@@ -15588,6 +15592,133 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         assert_eq!(state.store.agent_resources_builds_for_test(), builds + 1);
         client_agent_cards_for_page(&state.store, false, index, &refs[1..2], "cut").unwrap();
         assert_eq!(state.store.agent_resources_builds_for_test(), builds + 1);
+    }
+
+    #[test]
+    fn agent_page_refs_reuse_warm_metadata_and_rebuild_for_new_membership() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let append = |subject: &str| state.store.append_claim(&ClaimInput {
+            subject: subject.into(), kind: "runtime.observed".into(), actor: None,
+            fields: serde_json::from_value(json!({"status":"running", "runtime_id":subject,
+                "incarnation_id":"one"})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        append("agent/refs-first");
+        let index = state.store.index().unwrap();
+        let refs = client_agent_page_refs(&state.store, false, index).unwrap();
+        assert_eq!(refs, client_agent_page_refs_uncached(&state.store, false, index).unwrap());
+        let work = smallclaims::sqlite::work::total();
+        assert_eq!(client_agent_page_refs(&state.store, false, index).unwrap(), refs);
+        assert_eq!((smallclaims::sqlite::work::total() - work).statements, 0);
+        // A repeated live status has the same result; runtime changes still rebuild shallow refs.
+        append("agent/refs-first");
+        let index = state.store.index().unwrap();
+        assert_eq!(client_agent_page_refs(&state.store, false, index).unwrap(), refs);
+        append("agent/refs-second");
+        let index = state.store.index().unwrap();
+        let added = client_agent_page_refs(&state.store, false, index).unwrap();
+        assert_eq!(added.len(), 2);
+        assert_eq!(added, client_agent_page_refs_uncached(&state.store, false, index).unwrap());
+        state.store.forget_current_views();
+        assert_eq!(added, client_agent_page_refs(&state.store, false, index).unwrap());
+        state.store.append_claim(&ClaimInput {
+            subject: "agent/refs-second".into(), kind: "runtime.observed".into(), actor: None,
+            fields: serde_json::from_value(json!({"status":"stopped", "runtime_id":"agent/refs-second",
+                "incarnation_id":"one"})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let index = state.store.index().unwrap();
+        let removed = client_agent_page_refs(&state.store, false, index).unwrap();
+        assert_eq!(removed.len(), 1, "a stopped undeclared runtime moves to history");
+        assert_eq!(removed, client_agent_page_refs_uncached(&state.store, false, index).unwrap());
+    }
+
+    #[test]
+    fn agent_page_refs_rebuild_for_work_desired_membership_and_order_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = &state.store;
+        let source = |command: &str, extra: &str| format!(r#"version 2
+agent "amber" {{ command "{command}"; name "Amber" }}
+{extra}
+mission "refs-work" state="ready" {{
+  concurrent-runs max=2
+  goal "Exercise roster reference invalidation."
+  step "work" {{ assigned-to "agent/node.amber" }}
+}}
+"#);
+        let apply = |source: String, key: &str| {
+            let intent = crate::graph::parse_test_intent(&source, "node").unwrap();
+            let plan = store.mission(&intent, crate::model::IntentInput {
+                kdl: source, source_name: None,
+            }).unwrap();
+            store.apply(&intent, &plan.subject_tokens, key).unwrap();
+        };
+        apply(source("true", ""), "refs-original");
+        let builds = std::cell::Cell::new(0_usize);
+        let read = |rebuild: bool| {
+            let index = store.index().unwrap();
+            let before = builds.get();
+            let refs = store.cached_agent_page_refs(index, false, || {
+                builds.set(builds.get() + 1);
+                client_agent_page_refs_uncached(store, false, index)
+            }).unwrap();
+            assert_eq!(builds.get(), before + usize::from(rebuild));
+            assert_eq!(refs, client_agent_page_refs_uncached(store, false, index).unwrap());
+            refs
+        };
+        read(true);
+        read(false);
+        store.append_claim(&ClaimInput {
+            subject: "agent/node.amber".into(), kind: "harness.observed".into(),
+            actor: Some("agent/node.amber".into()),
+            fields: BTreeMap::from([("state".into(), Value::String("working".into()))]),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        read(false);
+        let new_run = |key: &str| {
+            let run = store.create_mission_run(&MissionRunRequest {
+                mission: "refs-work".into(), revision: None, workspace: "/tmp".into(),
+                requester: Some("person/test".into()), mode: Some("run".into()),
+                inputs: BTreeMap::new(), idempotency_key: key.into(),
+            }).unwrap();
+            store.set_step_state(&run.steps[0].subject, "ready", None).unwrap();
+            run
+        };
+        let first = new_run("refs-first-work");
+        let refs = read(true);
+        assert_eq!(refs[0]["next_work_id"], first.steps[0].subject);
+        let second = new_run("refs-second-work");
+        read(true);
+        // Queue ordering is a separate claim on the existing agent, not an observation.
+        store.move_seat_queue_run(&crate::model::SeatQueueMoveRequest {
+            agent: "agent/node.amber".into(), run: second.id.clone(), placement: "top".into(),
+            anchor: None, reason: None, actor: "person/test".into(),
+            idempotency_key: "refs-reorder".into(),
+        }).unwrap();
+        let refs = read(true);
+        assert_eq!(refs[0]["next_work_id"], second.steps[0].subject);
+        let action = |name: &str| store.work_action(&second.steps[0].subject, name, &WorkRequest {
+            actor: Some("agent/node.amber".into()), incarnation: Some("refs-runtime".into()),
+            summary: Some("Complete fixture work.".into()), reason: None, evidence: Vec::new(),
+            idempotency_key: format!("refs-{name}"),
+        }).unwrap();
+        action("claim");
+        let refs = read(true);
+        assert_eq!(refs[0]["current_work_ids"], json!([second.steps[0].subject]));
+        action("complete");
+        let refs = read(true);
+        assert_eq!(refs[0]["next_work_id"], first.steps[0].subject);
+        apply(source("false", ""), "refs-desired-change");
+        read(true);
+        apply(source("false", r#"agent "beta" { command "true"; name "Beta" }"#), "refs-new-agent");
+        let refs = read(true);
+        assert_eq!(refs.len(), 2);
+        store.rename_agent("agent/node.amber", Some("Zeta"), "refs-name-order").unwrap();
+        let refs = read(true);
+        assert_eq!(refs.iter().map(|item| item["name"].as_str().unwrap()).collect::<Vec<_>>(),
+            ["Beta", "Zeta"]);
     }
 
     #[test]

@@ -2662,6 +2662,31 @@ impl Store {
         Ok(Some(subjects))
     }
 
+    /// An allow-list for shallow refs, narrower than card-local invalidation: runtime status
+    /// can move an undeclared or stopped agent into history, so runtime.observed is not safe.
+    fn agent_page_refs_unchanged(&self, after: u64, through: u64, refs: &[Value]) -> Result<bool> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare_cached(
+            "SELECT subject, kind FROM claims WHERE store_index>?1 AND store_index<=?2",
+        )?;
+        for row in statement.query_map(params![after, through], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })? {
+            let (subject, kind) = row?;
+            let unchanged = match kind.as_str() {
+                "daemon.diagnostic" => true,
+                "harness.observed" | "harness.diagnostic" | "harness.timeline"
+                    | "harness.todo.observed" | "harness.session-file" | "harness.usage" => {
+                    subject.starts_with("agent/")
+                        && refs.iter().any(|item| item["id"].as_str() == Some(subject.as_str()))
+                }
+                _ => false,
+            };
+            if !unchanged { return Ok(false); }
+        }
+        Ok(true)
+    }
+
     /// The last claim that can change an agent's status: one about an agent, or about the run
     /// or generation that owns it, whose row decides the agent's projection layer. Steps,
     /// gates, subscriptions and diagnostics commit far more often and change no agent status.
@@ -2700,6 +2725,39 @@ impl Store {
         build: impl FnOnce(Option<(&BTreeSet<String>, &[Value])>) -> Result<Vec<Value>>,
     ) -> Result<Vec<Value>> {
         self.cached_agent_resources_for(index, history, None, build)
+    }
+
+    /// Membership/order/queue refs contain no local timeline data. Reuse them for unchanged
+    /// graph cuts and agent-only observations, so a warm HTTP page does not scan fleet work.
+    pub(crate) fn cached_agent_page_refs(
+        &self,
+        index: u64,
+        history: bool,
+        build: impl FnOnce() -> Result<Vec<Value>>,
+    ) -> Result<Vec<Value>> {
+        let cache = self.smalltalk.agent_page_refs_cache.lock()
+            .expect("agent page refs cache poisoned");
+        if let Some(entry) = cache.iter().find(|entry| entry.index == index && entry.history == history) {
+            let items = Arc::clone(&entry.items);
+            drop(cache);
+            return Ok((*items).clone());
+        }
+        let previous = cache.iter().filter(|entry| entry.index < index && entry.history == history)
+            .max_by_key(|entry| entry.index).cloned();
+        drop(cache);
+        let items = match previous {
+            Some(previous) if self.agent_page_refs_unchanged(previous.index, index, &previous.items)? => previous.items,
+            _ => Arc::new(build()?),
+        };
+        let mut cache = self.smalltalk.agent_page_refs_cache.lock()
+            .expect("agent page refs cache poisoned");
+        cache.push_back(runtime::AgentResourcesEntry {
+            index, local: 0, history, covered: None, items: Arc::clone(&items),
+        });
+        let evicted = if cache.len() > 8 { cache.pop_front() } else { None };
+        drop(cache);
+        drop(evicted);
+        Ok((*items).clone())
     }
 
     /// Bounded immutable projections shared by pages and streams. Pages fill only missing

@@ -152,6 +152,11 @@ the same projection used by the complete WS roster, without reducing unrelated c
 agent observations update only affected cards; daemon diagnostics reuse rows; other claims
 conservatively invalidate the projection. Authorization is checked before reuse, and local
 delivery presence stays a per-read overlay rather than graph-cached authority.
+The shallow HTTP membership/order/queue refs have the same bounded graph-cut retention.
+Warm pages reuse those refs rather than scanning all fleet work. An explicit allow-list of
+existing-agent harness observations and daemon diagnostics leaves them valid; every other
+claim rebuilds them. Runtime status can move an undeclared or stopped agent into history,
+so even an existing agent's `runtime.observed` rebuilds shallow refs.
 
 The local-observation frontier is read by an indexed seek inside the same SQLite snapshot.
 A same-index local transcript append updates the affected card's `last_activity_at` for both
