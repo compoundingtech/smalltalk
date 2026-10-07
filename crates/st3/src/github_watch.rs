@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
+use crate::github_http::GithubAuth;
 use smallclaims::hash::canonical_hash;
 
 use crate::model::{MessageView, ObserverSpec, St3Error, WatchSpec};
@@ -652,7 +653,7 @@ pub fn quote(text: &str) -> Option<String> {
 /// body is described by its first inline comment.
 async fn read_excerpt(
     api_base: &str,
-    token: &str,
+    token: &GithubAuth,
     locator: &str,
     kind: &str,
     id: u64,
@@ -662,12 +663,11 @@ async fn read_excerpt(
     let get = |url: String| {
         let client = client.clone();
         async move {
-            let response = client
+            let request = client
                 .get(url)
                 .header("Accept", "application/vnd.github+json")
-                .header("X-GitHub-Api-Version", "2022-11-28")
-                .bearer_auth(token)
-                .send()
+                .header("X-GitHub-Api-Version", "2022-11-28");
+            let response = crate::github_http::send(request, token)
                 .await
                 .ok()?
                 .error_for_status()
@@ -738,7 +738,7 @@ pub async fn add_excerpts(messages: &mut [MessageView]) {
             .collect::<Vec<_>>()
     };
     if !missing.is_empty() {
-        let token = crate::resource::github_token().await.ok();
+        let token = crate::resource::github_auth().await.ok();
         let api_base = crate::resource::github_api_base();
         let reads = missing.iter().map(|(locator, kind, id, number)| {
             let token = token.clone();
