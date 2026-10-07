@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Export SQLite writer, read pool and WAL measurements.",
+  "replay": {
+    "status": "none",
+    "detail": "Telemetry only; existing claims are not replayed."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema or persisted claim format changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or fleet coordination changes."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No required client, protocol or harness compatibility changes."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No new service interruption requirements beyond the normal binary upgrade."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No new required manual steps; telemetry export remains opt-in."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Telemetry-only changes add no new rollback or roll-forward requirements."
+  }
+}

@@ -4198,6 +4198,8 @@ dependencies = [
  "hex",
  "hmac",
  "libc",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "proptest",
  "reqwest",
  "ring",

@@ -2153,6 +2153,7 @@ fn a_write_queued_during_sealing_runs_before_the_backlog_finishes() {
             }),
             profile: None,
             wait: None,
+            enqueued: std::time::Instant::now(),
             done: done.clone(),
         },
     ));

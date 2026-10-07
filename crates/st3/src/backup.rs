@@ -311,7 +311,10 @@ pub fn restore(source: &Path, destination: &Path) -> Result<RestoreReport> {
     drop(store);
     // Store closes/checkpoints its writer before publication; never publish WAL-dependent data.
     let connection = rusqlite::Connection::open(&staged_path)?;
-    connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+    let checkpoint_started = std::time::Instant::now();
+    let checkpoint = connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+    smallclaims::sqlite::telemetry::checkpoint_finished(checkpoint_started.elapsed());
+    checkpoint?;
     drop(connection);
     #[cfg(unix)]
     {

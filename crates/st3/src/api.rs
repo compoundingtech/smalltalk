@@ -1117,6 +1117,10 @@ async fn response_envelope_unbounded(
                 drop(handler_queue);
                 let queue_ms = handler_enqueued.elapsed().as_millis() as i64;
                 let _server = server_trace.as_ref().map(|span| span.enter());
+                let writer_wait = server_trace.as_ref().map(|_| {
+                    Arc::new(smallclaims::sqlite::telemetry::WriterWait::default())
+                });
+                let _writer_scope = smallclaims::sqlite::telemetry::enter_request(writer_wait.clone());
                 if let Some(profile) = &handler_profile {
                     profile.queued();
                 }
@@ -1157,6 +1161,11 @@ async fn response_envelope_unbounded(
                         "st.handler.duration_ms",
                         handler_started.elapsed().as_millis() as i64,
                     );
+                    if let Some(writer_wait) = writer_wait.as_ref() {
+                        let (wait_ms, ops) = writer_wait.totals();
+                        server.record("st.writer.wait_ms", wait_ms);
+                        server.record("st.writer.ops", i64::try_from(ops).unwrap_or(i64::MAX));
+                    }
                 }
                 response
             })
@@ -1342,6 +1351,8 @@ fn request_trace(
         "st.admission.snapshot_ms" = tracing::field::Empty,
         "st.handler.queue_ms" = tracing::field::Empty,
         "st.handler.duration_ms" = tracing::field::Empty,
+        "st.writer.wait_ms" = tracing::field::Empty,
+        "st.writer.ops" = tracing::field::Empty,
     );
     let remote = crate::otel::extract_remote_context(headers);
     let parent = remote.span();
@@ -5705,7 +5716,9 @@ where
 {
     let profile = crate::profile::current();
     let cpu_kind = crate::performance::current();
+    let writer_wait = smallclaims::sqlite::telemetry::current_request();
     crate::api::read_deadline::spawn_blocking(move || {
+        let _writer_scope = smallclaims::sqlite::telemetry::enter_request(writer_wait);
         let _entered = crate::profile::enter(profile.as_ref());
         crate::performance::with_charged(cpu_kind, operation)
     })
@@ -5721,7 +5734,9 @@ where
 {
     let profile = crate::profile::current();
     let cpu_kind = crate::performance::current();
+    let writer_wait = smallclaims::sqlite::telemetry::current_request();
     crate::api::read_deadline::spawn_blocking(move || {
+        let _writer_scope = smallclaims::sqlite::telemetry::enter_request(writer_wait);
         let _entered = crate::profile::enter(profile.as_ref());
         crate::performance::with_charged(cpu_kind, operation)
     })
@@ -5739,7 +5754,9 @@ where
 {
     let profile = crate::profile::current();
     let cpu_kind = crate::performance::current();
+    let writer_wait = smallclaims::sqlite::telemetry::current_request();
     crate::api::read_deadline::spawn_blocking(move || {
+        let _writer_scope = smallclaims::sqlite::telemetry::enter_request(writer_wait);
         let _entered = crate::profile::enter(profile.as_ref());
         crate::performance::with_charged(cpu_kind, operation)
     })
@@ -6510,7 +6527,11 @@ async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, Api
         st_runtime::priority_report(&observations)
     });
     let token = crate::resource::github_auth().await;
+    let writer_wait = smallclaims::sqlite::telemetry::current_request();
     let mut report = crate::api::read_deadline::spawn_blocking(move || {
+        // Sealing this node's batches writes through the store's writer, so the request's
+        // writer accounting must follow the job off the runtime thread.
+        let _writer_scope = smallclaims::sqlite::telemetry::enter_request(writer_wait);
         // This node's claims are signed as their batches are sealed; seal and judge them so
         // the signature counts cover everything written so far.
         state.store.replication_snapshot().map_err(ApiError::internal)?;
