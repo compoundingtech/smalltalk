@@ -20,6 +20,8 @@ Use these documents for implementation details:
 - [Typed custom subjects](custom-subjects.md) defines immutable registrations, generic reads and replies, and derived-state freshness,
   and the decision-tree manifest.
 - [Data authority](data-authority.md) separates durable facts from projections and caches.
+- [0.x compatibility](compatibility.md) states upgrade baselines, independent contracts and current platform proof.
+- [Install/upgrade troubleshooting and support](../when-something-is-wrong.md) provides the diagnostic entry point and sanitized issue path.
 - [Claim backups](backups.md) explains live snapshots, offline restore, and recovered writer identities.
 - [Founder signing audit](founder-signing-audit.md) explains read-only capture, preserved unsealed
   upgrades, and the remaining warnings for already-sealed unsigned delegations.
