@@ -117,10 +117,15 @@ mutex behind another request's disk reads.
 
 Runtime and terminal resources use the shared status authority and membership reducer but
 do not materialize the harness state, full claim-id history or desired conflicts that their
-responses omit. Their per-subject cache is separate from full status answers and follows the
-same subject/actor and owner-generation invalidation. Cold terminal reads therefore do not
-depend on an agent listing warming full status first. Public status responses still carry
-their complete provenance.
+responses omit. Their actual-state fold walks canonical order newest first and stops once
+the six consumed fields resolve; membership resolves only status. Explicit nulls and
+state-transition field clearing retain the forward fold's semantics. Runtime source selection
+seeks the latest runtime observation and each rival origin's latest observation, reading the
+whole causal graph only when a rival requires an ancestry check.
+
+Their per-subject cache is separate from full status answers and follows the same subject/actor
+and owner-generation invalidation. Cold terminal reads do not depend on an agent listing
+warming full status first. Public status responses still carry their complete provenance.
 
 Every five seconds a dedicated native thread attempts a passive WAL checkpoint outside the
 writer queue. Once every frame is backfilled, it attempts `TRUNCATE` with zero busy timeout.

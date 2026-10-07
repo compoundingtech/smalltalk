@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "summary": "Keep terminal and runtime list reads within their latency budget without relying on an earlier agent list to warm full status history.",
+  "summary": "Reduce cold terminal and runtime list work by resolving only consumed actual-state fields and seeking runtime authority directly.",
   "replay": {
     "status": "none",
     "detail": "Read-side reduction only; no replay or durable claim changes."
@@ -15,7 +15,7 @@
   },
   "compatibility": {
     "status": "none",
-    "detail": "Runtime and terminal resources retain the shared canonical authority and membership reducer and the same serialized fields. Full public status responses and claim fences are unchanged; internal runtime caches omit only harness state, claim provenance and desired conflicts that these resources never expose."
+    "detail": "Runtime and terminal resources retain canonical authority, snapshot membership and the same serialized fields. Full public status responses and claim fences are unchanged. Internal runtime reductions omit discarded harness, provenance, conflicts and actual fields, preserving sparse observations, explicit nulls, state-transition clearing and rival-origin ancestry checks."
   },
   "downtime": {
     "status": "none",
