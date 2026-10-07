@@ -724,3 +724,37 @@ fn namespace_scope_cannot_leak_an_unpublished_shadow_or_another_owner_row() {
         Readiness::Ready(_)
     ));
 }
+
+#[test]
+fn runtime_digest_binds_installed_source_and_preserves_legacy_bytes() {
+    use smallclaims::{ivm::runtime::ViewRuntime, store::Runtime};
+    struct Mode(Option<&'static str>);
+    impl View for Mode {
+        fn definition(&self) -> Definition {
+            Cards.definition()
+        }
+        fn installed_source(&self) -> Option<&'static str> {
+            self.0
+        }
+        fn contributions(
+            &self,
+            _: &smallclaims::ClaimRecord,
+            _: &smallclaims::store::canonical::ClaimKey,
+        ) -> Result<Vec<ivm::Contribution>> {
+            Ok(vec![])
+        }
+    }
+    let digest = |source| {
+        ViewRuntime::new(Views::new(vec![Box::new(Mode(source))]).unwrap())
+            .unwrap()
+            .schema_digest()
+    };
+    let legacy = digest(None);
+    assert_eq!(
+        legacy,
+        "8b8dad7b5f0948e06d0f36c6831c28917fc64545bc6fb831c48b650e28328739"
+    );
+    let installed = digest(Some(SOURCE));
+    assert_ne!(legacy, installed);
+    assert_ne!(installed, digest(Some("different-source")));
+}
