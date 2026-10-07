@@ -2709,39 +2709,67 @@ fn managed_session_id(owner: &str, identity: &str) -> String {
     format!("session/{}", &digest[..24])
 }
 
+type ManagedSessionOwner = (String, Option<String>, Option<String>);
+
 fn managed_session_owner_at(
     store: &Store,
     snapshot_index: u64,
     session_id: &str,
-) -> anyhow::Result<Option<(String, Option<String>, Option<String>)>> {
-    let status = store.status_for_subject_prefix_at("agent/", Some(snapshot_index), true)?;
-    for subject in status.subjects {
-        if !subject.subject.starts_with("agent/") && subject.kind.as_deref() != Some("agent") {
+) -> anyhow::Result<Option<ManagedSessionOwner>> {
+    // The session ID hashes its owner and identity. Reverse only the small identity inventory,
+    // then reduce the matching subject, never every agent's complete status and history.
+    for (owner, identity) in store.agent_session_identity_candidates_at(snapshot_index)? {
+        if managed_session_id(&owner, &identity) != session_id {
             continue;
         }
-        let fields = subject
-            .actual
-            .as_ref()
-            .map(|actual| actual.get("fields").unwrap_or(actual));
-        let incarnation = fields
-            .and_then(|fields| fields.get("incarnation_id"))
-            .and_then(Value::as_str)
-            .or(subject.projection.runtime_incarnation.as_deref());
-        let runtime = fields
-            .and_then(|fields| fields.get("runtime_id"))
-            .and_then(Value::as_str);
-        let Some(identity) = incarnation.or(runtime) else {
-            continue;
-        };
-        if managed_session_id(&subject.subject, identity) == session_id {
-            return Ok(Some((
-                subject.subject,
-                incarnation.map(str::to_owned),
-                subject.actual_origin,
-            )));
+        if let Some(managed) =
+            managed_session_owner_for_subject_at(store, snapshot_index, session_id, &owner)?
+        {
+            return Ok(Some(managed));
         }
     }
     Ok(None)
+}
+
+fn managed_session_owner_for_subject_at(
+    store: &Store,
+    snapshot_index: u64,
+    session_id: &str,
+    owner: &str,
+) -> anyhow::Result<Option<ManagedSessionOwner>> {
+    let Some(subject) = store
+        .status_history(Some(owner), None, Some(snapshot_index))?
+        .subjects
+        .into_iter()
+        .next()
+    else {
+        return Ok(None);
+    };
+    if !subject.subject.starts_with("agent/") && subject.kind.as_deref() != Some("agent") {
+        return Ok(None);
+    }
+    let fields = subject
+        .actual
+        .as_ref()
+        .map(|actual| actual.get("fields").unwrap_or(actual));
+    let incarnation = fields
+        .and_then(|fields| fields.get("incarnation_id"))
+        .and_then(Value::as_str)
+        .or(subject.projection.runtime_incarnation.as_deref());
+    let runtime = fields
+        .and_then(|fields| fields.get("runtime_id"))
+        .and_then(Value::as_str);
+    let Some(identity) = incarnation.or(runtime) else {
+        return Ok(None);
+    };
+    if managed_session_id(&subject.subject, identity) != session_id {
+        return Ok(None);
+    }
+    Ok(Some((
+        subject.subject,
+        incarnation.map(str::to_owned),
+        subject.actual_origin,
+    )))
 }
 
 /// How many of a subject's claims, oldest first, date its session in the session list.

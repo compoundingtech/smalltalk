@@ -231,6 +231,19 @@ WHERE kind='subagent.renewed';
 CREATE INDEX IF NOT EXISTS claims_timeline_incarnation_index
 ON claims(subject, kind, json_extract(body, '$.fields.incarnation_id'), store_index)
 WHERE kind='harness.timeline';
+-- Opaque managed-session IDs can only be reversed through identity candidates. Keep that
+-- inventory separate from the full status/history reducer, including legacy runtime IDs.
+CREATE INDEX IF NOT EXISTS claims_agent_session_identity_index ON claims(
+    subject,
+    json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
+        THEN '$.incarnation_id' ELSE '$.fields.incarnation_id' END),
+    json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
+        THEN '$.runtime_id' ELSE '$.fields.runtime_id' END),
+    store_index
+)
+WHERE subject>='agent/' AND subject<'agent0'
+  AND (kind<'harness.' OR kind>='harness/') AND kind NOT LIKE 'harness.%'
+  AND kind NOT IN ('intent.desired', 'runtime.readiness-deadline-reached', 'reconcile.fault');
 CREATE INDEX IF NOT EXISTS claims_subscription_finished_request_index
 ON claims(subject, json_extract(body, '$.fields.request'))
 WHERE kind IN (
@@ -10123,6 +10136,49 @@ impl Store {
         self.status_at_view(selected, selected_owner_run, at_index, true)
     }
 
+    /// Identity candidates for reversing an opaque managed-session ID. These are not authority:
+    /// the caller must validate a matching candidate against that subject's status at the snapshot.
+    pub(crate) fn agent_session_identity_candidates_at(
+        &self,
+        index: u64,
+    ) -> Result<BTreeSet<(String, String)>> {
+        let connection = self.readers.get();
+        let index = selected_index(current_index(&connection)?, Some(index)).map_err(anyhow::Error::new)?;
+        let mut statement = connection.prepare_cached(
+            "SELECT DISTINCT subject,
+                CASE WHEN typeof(json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
+                    THEN '$.incarnation_id' ELSE '$.fields.incarnation_id' END))='text'
+                    THEN json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
+                    THEN '$.incarnation_id' ELSE '$.fields.incarnation_id' END) END,
+                CASE WHEN typeof(json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
+                    THEN '$.runtime_id' ELSE '$.fields.runtime_id' END))='text'
+                    THEN json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
+                    THEN '$.runtime_id' ELSE '$.fields.runtime_id' END) END
+             FROM claims INDEXED BY claims_agent_session_identity_index
+             WHERE subject>='agent/' AND subject<'agent0'
+               AND (kind<'harness.' OR kind>='harness/') AND kind NOT LIKE 'harness.%'
+               AND kind NOT IN ('intent.desired', 'runtime.readiness-deadline-reached', 'reconcile.fault')
+               AND store_index<=?1",
+        )?;
+        let mut candidates = BTreeSet::new();
+        for row in statement.query_map([index], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, Option<String>>(2)?))
+        })? {
+            let (subject, incarnation, runtime) = row?;
+            match (incarnation, runtime) {
+                (Some(incarnation), Some(runtime)) => {
+                    candidates.insert((subject.clone(), incarnation));
+                    candidates.insert((subject, runtime));
+                }
+                (Some(identity), None) | (None, Some(identity)) => {
+                    candidates.insert((subject, identity));
+                }
+                (None, None) => {}
+            }
+        }
+        Ok(candidates)
+    }
+
     /// Reduce only subjects whose IDs begin with `prefix`.
     ///
     /// Product projections use this instead of reducing every subject in the graph and filtering
@@ -10134,15 +10190,14 @@ impl Store {
         at_index: Option<u64>,
         include_history: bool,
     ) -> Result<StatusResponse> {
-        // Agent listings are expensive on large graphs. Hold this lock while building the
-        // snapshot so concurrent callers share one reduction, then serve clones at the same
-        // store index. A later index always rebuilds, preserving snapshot semantics.
+        // Keep cached snapshots, but never hold the cache mutex while reducing a roster.
+        // Concurrent misses may compute independently; neither blocks exact-subject reads.
         if prefix == "agent/" {
             // What this thread's reads can see, as every snapshot read checks: a read pinned to
             // a snapshot can see a commit a moment before the writer publishes its index.
             let current = current_index(&self.readers.get())?;
             let index = selected_index(current, at_index).map_err(anyhow::Error::new)?;
-            let mut cache = self
+            let cache = self
                 .smalltalk
                 .agent_status_cache
                 .lock()
@@ -10154,7 +10209,13 @@ impl Store {
                 result.store_index = index;
                 return Ok(result);
             }
+            drop(cache);
             let projection_index = self.agent_status_index(index)?;
+            let mut cache = self
+                .smalltalk
+                .agent_status_cache
+                .lock()
+                .expect("agent status cache poisoned");
             if let Some((cached_index, _, _, status)) =
                 cache.iter_mut().find(|(_, cached_projection, history, _)| {
                     *cached_projection == projection_index && *history == include_history
@@ -10165,8 +10226,14 @@ impl Store {
                 result.store_index = index;
                 return Ok(result);
             }
+            drop(cache);
             let status =
                 self.status_for_subject_prefix_uncached(prefix, Some(index), include_history)?;
+            let mut cache = self
+                .smalltalk
+                .agent_status_cache
+                .lock()
+                .expect("agent status cache poisoned");
             cache.push_back((
                 index,
                 projection_index,
