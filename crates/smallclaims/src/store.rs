@@ -4770,12 +4770,15 @@ impl Store {
         appended
     }
 
+    #[track_caller]
     pub fn read_snapshot<T>(&self, read: impl FnOnce(u64) -> Result<T>) -> Result<T> {
         let key = self.readers.key();
         if PINNED_READER.with(|slot| slot.borrow().as_ref().is_some_and(|(pool, _)| *pool == key)) {
             let index = current_index(&self.readers.get())?;
             return read(index);
         }
+        // The snapshot's own entry: the guard below is lent out and dropped at once.
+        let _live = crate::sqlite::register_live_read(true);
         let mut guard = self.readers.get();
         // Declared first so it drops last: on every exit it ends the transaction, releases the
         // pin, and returns the connection to the pool.

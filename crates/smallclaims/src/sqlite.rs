@@ -690,11 +690,88 @@ pub struct ReaderUsage {
     pub opened: u64,
 }
 
+/// Reads checked out right now, so a pinned WAL can be traced to its holder. SQLite keeps no
+/// list of who holds a snapshot, and the profile only records a read after it ends.
+static LIVE_READS: Mutex<std::collections::BTreeMap<u64, LiveRead>> =
+    Mutex::new(std::collections::BTreeMap::new());
+static NEXT_LIVE_READ: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy)]
+struct LiveRead {
+    started: std::time::Instant,
+    at: &'static std::panic::Location<'static>,
+    /// A `Store::read_snapshot`: one read transaction held open for the whole closure. Any other
+    /// checkout is a pooled connection lent out, which pins only while a statement is mid-step.
+    snapshot: bool,
+}
+
+/// Ends the live-read entry on every exit path.
+pub struct LiveReadToken(u64);
+
+impl Drop for LiveReadToken {
+    fn drop(&mut self) {
+        LIVE_READS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.0);
+    }
+}
+
+/// Note a read starting at the caller's location.
+#[track_caller]
+pub fn register_live_read(snapshot: bool) -> LiveReadToken {
+    let id = NEXT_LIVE_READ.fetch_add(1, Ordering::Relaxed);
+    LIVE_READS.lock().unwrap_or_else(PoisonError::into_inner).insert(
+        id,
+        LiveRead {
+            started: std::time::Instant::now(),
+            at: std::panic::Location::caller(),
+            snapshot,
+        },
+    );
+    LiveReadToken(id)
+}
+
+/// The longest-running read checked out now, and how many there are.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OldestLiveRead {
+    pub age_ms: u128,
+    pub snapshot: bool,
+    pub at: String,
+    pub live: usize,
+}
+
+pub fn oldest_live_read() -> Option<OldestLiveRead> {
+    let reads = LIVE_READS.lock().unwrap_or_else(PoisonError::into_inner);
+    let live = reads.len();
+    let oldest = reads.values().min_by_key(|read| read.started)?;
+    Some(OldestLiveRead {
+        age_ms: oldest.started.elapsed().as_millis(),
+        snapshot: oldest.snapshot,
+        at: format!("{}:{}", oldest.at.file(), oldest.at.line()),
+        live,
+    })
+}
+
+/// Every live read as (location, is_snapshot), for tests that look for their own entry.
+#[cfg(any(test, feature = "test-support"))]
+pub fn live_read_locations() -> Vec<(String, bool)> {
+    LIVE_READS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .values()
+        .map(|read| (format!("{}:{}", read.at.file(), read.at.line()), read.snapshot))
+        .collect()
+}
+
 pub struct ReadGuard<'a> {
     pub pool: &'a ReadPool,
     pub connection: Option<ReadConnection>,
     /// The connection `Store::read_snapshot` pinned for this thread, shared by every read in it.
     pub pinned: Option<Rc<ReadConnection>>,
+    /// Declared last, so it ends after the connection is returned. `None` for a read inside a
+    /// pinned snapshot, which `Store::read_snapshot` already registers.
+    live: Option<LiveReadToken>,
 }
 
 thread_local! {
@@ -775,6 +852,7 @@ impl ReadPool {
         }
     }
 
+    #[track_caller]
     pub fn get(&self) -> ReadGuard<'_> {
         let pinned = PINNED_READER.with(|slot| {
             slot.borrow()
@@ -787,6 +865,7 @@ impl ReadPool {
                 pool: self,
                 connection: None,
                 pinned,
+                live: None,
             };
         }
         let waiting = crate::profile::enabled().then(std::time::Instant::now);
@@ -824,6 +903,7 @@ impl ReadPool {
             pool: self,
             connection: Some(connection),
             pinned: None,
+            live: Some(register_live_read(false)),
         }
     }
 
