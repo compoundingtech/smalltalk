@@ -6669,12 +6669,19 @@ impl<R: RuntimeControl> Reconciler<R> {
         {
             // A minute of stable process lifetime resets the consecutive-failure delay.
             // Explicit restart and revision replacement bypass this automatic path.
-            let exit = self
+            let exits = self
                 .store
-                .latest_observation(&subject.subject, "runtime.observed")?;
-            let observed_at = exit
-                .as_ref()
-                .filter(|claim| claim_incarnation(claim) == Some(incarnation))
+                .launch_observations(&subject.subject, "runtime.observed")?
+                .0;
+            let observed_at = exits
+                .iter()
+                .find(|claim| {
+                    claim_incarnation(claim) == Some(incarnation)
+                        && matches!(
+                            claim.body["fields"]["status"].as_str(),
+                            Some("exited" | "vanished")
+                        )
+                })
                 .map_or(now, |claim| claim.accepted_at_unix_ms);
             if observed_at.saturating_sub(last.accepted_at_unix_ms) >= 60_000 {
                 self.record_once(

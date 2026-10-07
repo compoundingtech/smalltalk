@@ -194,3 +194,43 @@ fn automatic_crash_delay_preserves_a_longer_declared_restart_delay() {
         matches!(reconciler.restart_decision(&desired, &member, &observation).unwrap(), RestartDecision::Wait {until,..} if until == now + 20_100)
     );
 }
+
+#[test]
+fn another_runtime_state_does_not_move_the_first_observed_exit_deadline() {
+    let _clock = Clock;
+    let now = 1_800_000_000_000;
+    let (store, reconciler, desired) = fixture(now);
+    let member = desired.member.as_ref().unwrap();
+    launch(&store, &reconciler, &desired, "first-exit");
+    at(&store, now + 100);
+    let observation = RuntimeObservation {
+        runtime_id: member.runtime_id.clone(),
+        terminal: true,
+        status: "exited".into(),
+        exit_code: Some(1),
+        incarnation_id: Some("first-exit".into()),
+    };
+    reconciler
+        .record_member(&desired, &observation, false)
+        .unwrap();
+    let RestartDecision::Wait { until, .. } = reconciler
+        .restart_decision(&desired, member, &observation)
+        .unwrap()
+    else {
+        panic!("missing initial delay")
+    };
+    at(&store, now + 1_100);
+    reconciler
+        .record_once(
+            &desired.subject,
+            "runtime.observed",
+            BTreeMap::from([("status".into(), Value::String("unknown".into()))]),
+        )
+        .unwrap();
+    reconciler
+        .record_member(&desired, &observation, false)
+        .unwrap();
+    assert!(
+        matches!(reconciler.restart_decision(&desired, member, &observation).unwrap(), RestartDecision::Wait {until:again,..} if again == until)
+    );
+}

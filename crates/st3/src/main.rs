@@ -13046,9 +13046,11 @@ async fn run_agent_new(
                 urlencoding::encode(&subject),
                 urlencoding::encode(&token)
             );
-            if let Ok(status) = launch_client
-                .get::<st3::agent_launch::LaunchStatus>(&path)
-                .await
+            if let Ok(Ok(status)) = tokio::time::timeout(
+                LOCAL_ATTACH_CONSULT,
+                launch_client.get::<st3::agent_launch::LaunchStatus>(&path),
+            )
+            .await
                 && status.stage == "exited"
             {
                 return Err(agent_launch_exit(&subject, &status));
@@ -13322,7 +13324,7 @@ async fn attach_new_agent(
     subject: &str,
     expected: &str,
 ) -> Result<()> {
-    match tokio::time::timeout(Duration::from_secs(10), consult_attach(client, subject))
+    match tokio::time::timeout(LOCAL_ATTACH_CONSULT, consult_attach(client, subject))
         .await
         .context("timed out at attaching while consulting the requested launch")?
     {
