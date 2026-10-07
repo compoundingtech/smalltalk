@@ -1,4 +1,4 @@
-//! An explicit writer-owned callback immediately before SQLite commits.
+//! Explicit writer-owned prepare/finalize callbacks inside a managed transaction.
 //!
 //! This is a transaction boundary, not source-coverage or authorization evidence. The
 //! adapter must capture complete old/new facts in the source transaction and bound its work.
@@ -9,36 +9,62 @@ use std::sync::{Arc, OnceLock};
 use anyhow::{Result, ensure};
 use rusqlite::{Savepoint, Transaction};
 
-type Finalizer = Arc<dyn Fn(&Transaction<'_>) -> Result<()> + Send + Sync>;
+type TransactionCallback = Arc<dyn Fn(&Transaction<'_>) -> Result<()> + Send + Sync>;
+
+struct TransactionHooks {
+    prepare: TransactionCallback,
+    finalize: TransactionCallback,
+}
 
 #[derive(Default)]
 pub(super) struct TransactionFinalizers {
-    callback: OnceLock<Finalizer>,
+    hooks: OnceLock<TransactionHooks>,
 }
 
 impl TransactionFinalizers {
     pub(super) fn install(
         &self,
-        callback: impl Fn(&Transaction<'_>) -> Result<()> + Send + Sync + 'static,
+        prepare: impl Fn(&Transaction<'_>) -> Result<()> + Send + Sync + 'static,
+        finalize: impl Fn(&Transaction<'_>) -> Result<()> + Send + Sync + 'static,
     ) -> Result<()> {
         ensure!(
-            self.callback.set(Arc::new(callback)).is_ok(),
-            "a transaction finalizer is already installed"
+            self.hooks
+                .set(TransactionHooks {
+                    prepare: Arc::new(prepare),
+                    finalize: Arc::new(finalize),
+                })
+                .is_ok(),
+            "transaction hooks are already installed"
         );
         Ok(())
     }
 
+    pub(super) fn prepare(&self, transaction: &Transaction<'_>) -> Result<()> {
+        if let Some(hooks) = self.hooks.get() {
+            Self::invoke(&hooks.prepare, transaction, "prepare")?;
+        }
+        Ok(())
+    }
+
     pub(super) fn run(&self, transaction: &Transaction<'_>) -> Result<()> {
-        let Some(callback) = self.callback.get() else {
-            return Ok(());
-        };
+        if let Some(hooks) = self.hooks.get() {
+            Self::invoke(&hooks.finalize, transaction, "finalizer")?;
+        }
+        Ok(())
+    }
+
+    fn invoke(
+        callback: &TransactionCallback,
+        transaction: &Transaction<'_>,
+        phase: &str,
+    ) -> Result<()> {
         // A callback failure must undo its source transaction without killing the writer or
         // letting queued callers acknowledge a write whose derived maintenance failed.
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(transaction)))
-            .map_err(|_| anyhow::anyhow!("transaction finalizer panicked"))??;
+            .map_err(|_| anyhow::anyhow!("transaction {phase} panicked"))??;
         ensure!(
             !transaction.is_autocommit(),
-            "transaction finalizer must not end the source transaction"
+            "transaction {phase} must not end the source transaction"
         );
         Ok(())
     }
@@ -429,16 +455,274 @@ mod tests {
         }
         assert_eq!(count(&writer, "delta"), 1);
         assert_eq!(count(&writer, "output"), 0);
-        let mut guard = writer.write();
-        let tx = guard.transaction().unwrap();
-        tx.commit().unwrap();
-        assert_eq!(tx_count(&guard, "delta"), 0);
     }
 
     fn tx_count(connection: &Connection, table: &str) -> i64 {
         connection
             .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
             .unwrap()
+    }
+
+    fn scope_schema(writer: &WriterConnection) {
+        writer.write().execute_batch(
+            "CREATE TABLE managed_scope(active INTEGER NOT NULL,gap INTEGER NOT NULL,fenced INTEGER NOT NULL);
+             INSERT INTO managed_scope VALUES(0,0,0);
+             DROP TRIGGER source_insert;
+             CREATE TRIGGER source_insert AFTER INSERT ON source BEGIN
+               INSERT INTO delta(id,new) VALUES(NEW.id,NEW.value);
+               UPDATE managed_scope SET gap=1 WHERE active=0;
+             END;",
+        ).unwrap();
+    }
+
+    fn prepare_scope(tx: &Transaction<'_>) -> Result<()> {
+        tx.execute(
+            "UPDATE managed_scope SET active=1,fenced=MAX(fenced,gap)",
+            [],
+        )?;
+        Ok(())
+    }
+
+    fn finish_scope(tx: &Transaction<'_>) -> Result<()> {
+        let gap: bool = tx.query_row("SELECT gap FROM managed_scope", [], |r| r.get(0))?;
+        if !gap {
+            drain(tx)?;
+        }
+        tx.execute("UPDATE managed_scope SET active=0", [])?;
+        Ok(())
+    }
+
+    #[test]
+    fn prepare_is_inside_lent_transaction_before_free_source_helper() {
+        let writer = writer();
+        scope_schema(&writer);
+        writer
+            .install_transaction_hooks(prepare_scope, finish_scope)
+            .unwrap();
+        {
+            let mut guard = writer.write();
+            let tx = guard.transaction().unwrap();
+            assert_eq!(
+                tx.query_row("SELECT active FROM managed_scope", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+            free_write(&tx, 1, "managed").unwrap();
+            tx.commit().unwrap();
+            assert_eq!(
+                guard
+                    .query_row("SELECT active FROM managed_scope", [], |r| r
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
+        assert_eq!(count(&writer, "output"), 1);
+        assert_eq!(count(&writer, "delta"), 0);
+        assert_eq!(
+            writer
+                .write()
+                .query_row("SELECT gap FROM managed_scope", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn paired_hooks_do_not_relabel_prior_raw_commits_as_current_transaction_capture() {
+        let writer = writer();
+        scope_schema(&writer);
+        writer
+            .install_transaction_hooks(prepare_scope, finish_scope)
+            .unwrap();
+        writer
+            .batched(|tx| free_write(tx, 1, "certified transaction"))
+            .unwrap()
+            .unwrap();
+        {
+            let guard = writer.write();
+            guard
+                .execute("INSERT INTO source VALUES(2,'prior raw commit')", [])
+                .unwrap();
+            assert_eq!(
+                guard
+                    .query_row("SELECT active FROM managed_scope", [], |r| r
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                guard
+                    .query_row("SELECT gap FROM managed_scope", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+        }
+        // The adapter fences rather than adopting prior committed capture. Later valid source
+        // input still commits, but neither it nor the historical raw capture becomes output.
+        writer
+            .batched(|tx| free_write(tx, 3, "admitted while fenced"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(count(&writer, "source"), 3);
+        assert_eq!(count(&writer, "output"), 1);
+        assert_eq!(count(&writer, "delta"), 2);
+        assert_eq!(
+            writer
+                .write()
+                .query_row("SELECT fenced FROM managed_scope", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            writer
+                .write()
+                .query_row("SELECT active FROM managed_scope", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn queued_prepare_runs_once_before_every_job_and_finalizer_sees_surviving_jobs() {
+        let writer = writer();
+        scope_schema(&writer);
+        let prepares = Arc::new(AtomicU64::new(0));
+        let prepared = prepares.clone();
+        writer
+            .install_transaction_hooks(
+                move |tx| {
+                    prepared.fetch_add(1, Ordering::Relaxed);
+                    prepare_scope(tx)
+                },
+                finish_scope,
+            )
+            .unwrap();
+        let guard = writer.write();
+        let mut answers = Vec::new();
+        for (id, success) in [(1, true), (2, false), (3, true)] {
+            let (done, answer) = mpsc::sync_channel(1);
+            writer.send(WriterJob::Batched {
+                run: Box::new(move |tx| {
+                    assert_eq!(
+                        tx.query_row("SELECT active FROM managed_scope", [], |r| r
+                            .get::<_, i64>(0))
+                            .unwrap(),
+                        1
+                    );
+                    free_write(tx, id, "inside prepared batch").unwrap();
+                    success
+                }),
+                profile: None,
+                wait: None,
+                done,
+            });
+            answers.push(answer);
+        }
+        drop(guard);
+        for answer in answers {
+            assert!(answer.recv().unwrap().is_ok());
+        }
+        assert_eq!(prepares.load(Ordering::Relaxed), 1);
+        assert_eq!(count(&writer, "output"), 2);
+        assert_eq!(count(&writer, "delta"), 0);
+        assert_eq!(
+            writer
+                .write()
+                .query_row("SELECT active FROM managed_scope", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn prepare_failure_rolls_back_prepare_sql_and_never_runs_source_or_finalize() {
+        let writer = writer();
+        scope_schema(&writer);
+        let finalized = Arc::new(AtomicU64::new(0));
+        let called = finalized.clone();
+        writer
+            .install_transaction_hooks(
+                |tx| {
+                    prepare_scope(tx)?;
+                    tx.execute("INSERT INTO absent_prepare_table VALUES(1)", [])?;
+                    Ok(())
+                },
+                move |_| {
+                    called.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let ran = Arc::new(AtomicU64::new(0));
+        let source = ran.clone();
+        assert!(
+            writer
+                .batched(move |tx| {
+                    source.fetch_add(1, Ordering::Relaxed);
+                    free_write(tx, 1, "must not run")
+                })
+                .is_err()
+        );
+        assert_eq!(ran.load(Ordering::Relaxed), 0);
+        assert_eq!(finalized.load(Ordering::Relaxed), 0);
+        let mut guard = writer.write();
+        let error = match guard.transaction() {
+            Ok(_) => panic!("prepare should fail"),
+            Err(error) => error,
+        };
+        assert!(error.downcast_ref::<rusqlite::Error>().is_some());
+        assert_eq!(
+            guard
+                .query_row("SELECT active FROM managed_scope", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(tx_count(&guard, "source"), 0);
+    }
+
+    #[test]
+    fn prepare_panic_rolls_back_and_writer_can_prepare_the_next_batch() {
+        let writer = writer();
+        scope_schema(&writer);
+        let calls = Arc::new(AtomicU64::new(0));
+        let called = calls.clone();
+        writer
+            .install_transaction_hooks(
+                move |tx| {
+                    prepare_scope(tx)?;
+                    if called.fetch_add(1, Ordering::Relaxed) == 0 {
+                        panic!("prepare fixture panic");
+                    }
+                    Ok(())
+                },
+                finish_scope,
+            )
+            .unwrap();
+        assert!(
+            writer
+                .batched(|tx| free_write(tx, 1, "failed prepare"))
+                .unwrap_err()
+                .contains("prepare panicked")
+        );
+        assert_eq!(
+            writer
+                .write()
+                .query_row("SELECT active FROM managed_scope", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        writer
+            .batched(|tx| free_write(tx, 2, "next batch"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(count(&writer, "output"), 1);
     }
 
     use rusqlite::OptionalExtension;

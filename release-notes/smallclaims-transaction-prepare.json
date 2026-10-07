@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Paired transaction prepare and finalize hooks distinguish managed source capture from earlier raw commits",
+  "replay": {"status": "none", "detail": "No historical capture adoption or automatic recovery/backfill."},
+  "schema": {"status": "none", "detail": "The foundation adds no tables or capture triggers; markers and gap state belong to the source adapter."},
+  "rules": {"status": "none", "detail": "Admission, canonical ordering, authority and checkpoint rules remain unchanged."},
+  "compatibility": {"status": "changed", "detail": "Managed WriterGuard transaction begin methods return anyhow::Result to retain prepare failure causes. Finalizer-only installation remains a no-op-prepare convenience."},
+  "downtime": {"status": "none", "detail": "No production adapter activation or restart."},
+  "manual": {"status": "changed", "detail": "The single adapter prepares inside the outer transaction before source helpers, checks preexisting capture gaps and clears its managed-scope marker before commit."},
+  "recovery": {"status": "changed", "detail": "Prepare failures roll back their SQL and skip source/finalize work. Uncovered earlier raw commits stay fenced and cannot be relabeled as current transaction input."}
+}

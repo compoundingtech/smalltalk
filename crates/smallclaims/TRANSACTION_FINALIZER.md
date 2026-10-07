@@ -1,8 +1,13 @@
 # Transaction-owned source maintenance
 
-`Store::install_transaction_finalizer` explicitly installs one callback on the Store's
-writer. The callback runs before SQLite commits, with the same `&Transaction` as the
-source writes. It can call existing `Views::change`, `Views::repair`,
+`Store::install_transaction_hooks` explicitly installs one paired adapter on the Store's
+writer. Prepare runs inside each new managed outer transaction, before any source job or
+helper executes. Finalize runs before SQLite commits, in that same `&Transaction`.
+Prepare can detect preexisting committed raw capture and set the adapter's managed-scope
+marker; finalize must not reinterpret earlier source commits as its current transaction.
+The adapter clears its marker before commit, and rollback removes uncommitted markers.
+`install_transaction_finalizer` remains a convenience with a no-op prepare; it provides
+no transaction-start capture proof. It can call existing `Views::change`, `Views::repair`,
 `Views::local_change` or `Installer::record` using old/new facts captured by its adapter.
 This does not install an IVM runtime, populate a view, or certify source coverage.
 
@@ -16,30 +21,33 @@ and jobs. An adapter maintaining both representations must fence both; neither A
 publishes a new certified cut, re-enables Ready or initiates recovery.
 
 ```rust,ignore
-store.install_transaction_finalizer(move |transaction| {
-    // Read only a bounded set of captured, admitted source changes. The adapter must
-    // include every old/new dependency, local source change and same-index mutation.
-    shared_source_adapter.finalize(transaction)
-})?;
+let preparing = shared_source_adapter.clone();
+store.install_transaction_hooks(
+    move |transaction| preparing.prepare_scope(transaction),
+    move |transaction| shared_source_adapter.finalize(transaction),
+)?;
 ```
 
 Install before attesting source registration. Installation acquires the existing writer,
-so earlier queued/lent work finishes first. Installing a second callback fails; there is
+so earlier queued/lent work finishes first. Installing a second hook pair or convenience finalizer fails; there is
 one writer-held adapter for its lifetime. Keep source registry and Views ownership shared.
 The callback must not acquire the writer, end the transaction, or capture a strong Store
 reference that creates an ownership cycle. Source adapters must bound their SQL and CPU;
 the callback is synchronous and is not preempted.
 
-For queued writes, the finalizer runs once after their per-job savepoints have resolved,
+For queued writes, prepare runs once before their first job; finalize runs once after
+their per-job savepoints have resolved,
 then the outer transaction commits. A failed job's captured mutations are rolled back
 with its savepoint. A finalizer error rolls back the entire batch and every caller gets a
-failed commit acknowledgement. Storage errors and callback panics propagate as failures;
+failed commit acknowledgement. Prepare failures skip source jobs/helpers; prepare writes roll back too.
+Storage errors and callback panics propagate as failures;
 a caught panic does not kill the writer. Operators should use the existing derived-state
 fencing APIs for logical coverage failures that must preserve valid source admission;
 returning an error deliberately aborts the source transaction.
 
-For lent writes, `WriterGuard::transaction()` and `transaction_with_behavior()` return
-`WriterTransaction`. It dereferences to the ordinary `rusqlite::Transaction`, so free
+For lent writes, `WriterGuard::transaction()` and `transaction_with_behavior()` run
+prepare before returning `WriterTransaction`; beginning can fail with the original prepare
+error cause. Both begin methods return `anyhow::Result<WriterTransaction>`. It dereferences to the ordinary `rusqlite::Transaction`, so free
 helpers taking `&Transaction` keep working. Explicit `commit()` runs the finalizer and
 returns `anyhow::Result<()>`, preserving the original SQLite error for downcasting. Drop
 and `rollback()` roll back without finalizing. Nested savepoints finalize only at the

@@ -772,6 +772,17 @@ impl Store {
         self.connection.install_transaction_finalizer(callback)
     }
 
+    /// Attach one paired source adapter. Prepare runs inside the new outer transaction before
+    /// any managed source write; finalize runs before commit. Raw bypass coverage remains the
+    /// adapter's responsibility. See WriterConnection::install_transaction_hooks.
+    pub fn install_transaction_hooks(
+        &self,
+        prepare: impl Fn(&Transaction<'_>) -> Result<()> + Send + Sync + 'static,
+        finalize: impl Fn(&Transaction<'_>) -> Result<()> + Send + Sync + 'static,
+    ) -> Result<()> {
+        self.connection.install_transaction_hooks(prepare, finalize)
+    }
+
     /// Open the store at `path`, creating it when it does not exist, with `runtime`'s tables
     /// and projections beside the graph's.
     pub fn open(path: &Path, origin: impl Into<String>, runtime: Arc<dyn Runtime>) -> Result<Self> {

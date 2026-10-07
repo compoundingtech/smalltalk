@@ -407,8 +407,21 @@ impl WriterConnection {
         &self,
         callback: impl Fn(&Transaction<'_>) -> Result<()> + Send + Sync + 'static,
     ) -> Result<()> {
+        self.install_transaction_hooks(|_| Ok(()), callback)
+    }
+
+    /// Install one paired adapter. Prepare runs INSIDE the newly begun outer transaction
+    /// before any managed source job/helper; finalize runs before its commit. An adapter can
+    /// reject/fence preexisting raw capture and set/clear its transaction-owned scope marker.
+    /// Both phases share source rollback; failure/panic does not acknowledge a successful write.
+    /// The same coverage, work bounds and lifetime restrictions as the finalizer apply.
+    pub fn install_transaction_hooks(
+        &self,
+        prepare: impl Fn(&Transaction<'_>) -> Result<()> + Send + Sync + 'static,
+        finalize: impl Fn(&Transaction<'_>) -> Result<()> + Send + Sync + 'static,
+    ) -> Result<()> {
         let _writer = self.write();
-        self.finalizers.install(callback)
+        self.finalizers.install(prepare, finalize)
     }
 
     pub fn send(&self, job: WriterJob) {
@@ -611,8 +624,11 @@ fn run_write_batch(
     let (transaction, mut failure) =
         match connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate) {
             Ok(transaction) => (Some(transaction), None),
-            Err(error) => (None, Some(error)),
+            Err(error) => (None, Some(anyhow::Error::from(error))),
         };
+    if let Some(transaction) = &transaction {
+        failure = finalizers.prepare(transaction).err();
+    }
     let mut job = Some(first);
     while let Some(current) = job.take() {
         let WriterJob::Batched {
@@ -641,7 +657,7 @@ fn run_write_batch(
                     }
                 })();
                 crate::profile::writer_released(acquired);
-                failure = savepoint.err();
+                failure = savepoint.err().map(anyhow::Error::from);
             }
             // A batch that failed to begin answers its first write with the error.
             _ => drop(run),
@@ -661,7 +677,7 @@ fn run_write_batch(
             .run(&transaction)
             .and_then(|()| transaction.commit().map_err(anyhow::Error::from)),
         // Dropping the transaction rolls back every write in the batch.
-        (_, Some(error)) => Err(anyhow::Error::from(error)),
+        (_, Some(error)) => Err(error),
         (None, None) => unreachable!("a batch without a transaction failed to begin"),
     };
     if let Ok(index) = current_index(connection) {
@@ -681,20 +697,23 @@ fn run_write_batch(
 }
 
 impl WriterGuard<'_> {
-    /// Begin a managed transaction. Existing helpers accepting &Transaction can use this
-    /// wrapper through dereference; its commit invokes the opt-in finalizer before COMMIT.
-    pub fn transaction(&mut self) -> rusqlite::Result<WriterTransaction<'_>> {
+    /// Begin a managed transaction and run prepare before returning it. Existing helpers
+    /// accepting &Transaction can use the wrapper through dereference; commit finalizes
+    /// before COMMIT. Prepare failure rolls back and retains its original error cause.
+    pub fn transaction(&mut self) -> Result<WriterTransaction<'_>> {
         let finalizers = self.finalizers.clone();
         let transaction = self.deref_mut().transaction()?;
+        finalizers.prepare(&transaction)?;
         Ok(WriterTransaction::new(transaction, finalizers))
     }
 
     pub fn transaction_with_behavior(
         &mut self,
         behavior: rusqlite::TransactionBehavior,
-    ) -> rusqlite::Result<WriterTransaction<'_>> {
+    ) -> Result<WriterTransaction<'_>> {
         let finalizers = self.finalizers.clone();
         let transaction = self.deref_mut().transaction_with_behavior(behavior)?;
+        finalizers.prepare(&transaction)?;
         Ok(WriterTransaction::new(transaction, finalizers))
     }
 }
