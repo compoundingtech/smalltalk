@@ -241,8 +241,12 @@ pub fn checkpoint_wal_report(connection: &Connection) -> Result<WalCheckpointRep
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?;
     Ok(WalCheckpointReport {
-        frames, backfilled, passive_ms: started.elapsed().as_millis(),
-        writer_wait_ms: 0, truncate_ms: None, recycled: false,
+        frames,
+        backfilled,
+        passive_ms: started.elapsed().as_millis(),
+        writer_wait_ms: 0,
+        truncate_ms: None,
+        recycled: false,
     })
 }
 
@@ -250,7 +254,8 @@ pub fn checkpoint_wal_report(connection: &Connection) -> Result<WalCheckpointRep
 /// the daemon calls this only while it has borrowed the Store's sole writer from its queue.
 pub fn truncate_idle_wal(connection: &Connection) -> Result<bool> {
     connection.busy_timeout(std::time::Duration::ZERO)?;
-    let busy: i32 = connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+    let busy: i32 =
+        connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
     Ok(busy == 0)
 }
 
@@ -260,6 +265,7 @@ pub fn truncate_idle_wal(connection: &Connection) -> Result<bool> {
 /// after that commit. `write` lends the connection itself to its caller until the guard drops,
 /// for writes that manage their own transactions. Nothing else ever takes SQLite's write lock.
 pub struct WriterConnection {
+    shared_appends: AtomicBool,
     pub jobs: Mutex<Option<std::sync::mpsc::Sender<WriterJob>>>,
     pub thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     pub committed_index: Arc<AtomicU64>,
@@ -276,6 +282,7 @@ pub enum WriterJob {
     /// is declared first, so it drops before `done` wakes its caller.
     Batched {
         run: Box<dyn FnOnce(&Transaction<'_>) -> bool + Send>,
+        append_policy: Option<crate::append_group::AppendPolicy>,
         profile: Option<crate::profile::Op>,
         /// When profiling, when its caller began to wait and who held the writer then.
         wait: Option<crate::profile::WriterWait>,
@@ -342,9 +349,19 @@ impl WriterConnection {
         let observed = observers.clone();
         let thread = std::thread::Builder::new()
             .name("st3-writer".into())
-            .spawn(move || write_queue(connection, queue, &index, &counted, &observed, mutations.as_ref()))
+            .spawn(move || {
+                write_queue(
+                    connection,
+                    queue,
+                    &index,
+                    &counted,
+                    &observed,
+                    mutations.as_ref(),
+                )
+            })
             .expect("the writer thread starts");
         Ok(Self {
+            shared_appends: AtomicBool::new(false),
             jobs: Mutex::new(Some(jobs)),
             thread: Mutex::new(Some(thread)),
             committed_index,
@@ -388,6 +405,9 @@ impl WriterConnection {
     /// The writer connection itself, lent until the guard drops, after every write queued before
     /// this one. A panic while it is lent rolls back the open transaction as it unwinds and still
     /// gives the connection back, so it cannot disable the store.
+    /// The dispatcher owns row/authorizer callbacks. Borrowers must not replace them; an
+    /// observed replacement fences missed mutations at resolution before the next writer job.
+    /// Observers resolve before the returning guard hands the connection to the writer thread.
     pub fn write(&self) -> WriterGuard<'_> {
         debug_assert_no_pinned_read();
         let wait = crate::profile::writer_waiting();
@@ -414,6 +434,33 @@ impl WriterConnection {
     /// the batch.
     pub fn batched<'job, T: Send + 'job, E: Send + 'job>(
         &self,
+        job: impl FnOnce(&Transaction<'_>) -> std::result::Result<T, E> + Send + 'job,
+    ) -> std::result::Result<std::result::Result<T, E>, String> {
+        self.batched_with_policy(None, job)
+    }
+
+    /// Experimental grouping of replica envelopes. Disabled by default; changes the IDs of new
+    /// claims. The runtime supplies an explicit retention eligibility policy.
+    pub fn set_shared_appends(&self, enabled: bool) {
+        self.shared_appends.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn batched_append<'job, T: Send + 'job, E: Send + 'job>(
+        &self,
+        policy: crate::append_group::AppendPolicy,
+        job: impl FnOnce(&Transaction<'_>) -> std::result::Result<T, E> + Send + 'job,
+    ) -> std::result::Result<std::result::Result<T, E>, String> {
+        self.batched_with_policy(
+            self.shared_appends
+                .load(Ordering::Relaxed)
+                .then_some(policy),
+            job,
+        )
+    }
+
+    fn batched_with_policy<'job, T: Send + 'job, E: Send + 'job>(
+        &self,
+        append_policy: Option<crate::append_group::AppendPolicy>,
         job: impl FnOnce(&Transaction<'_>) -> std::result::Result<T, E> + Send + 'job,
     ) -> std::result::Result<std::result::Result<T, E>, String> {
         debug_assert_no_pinned_read();
@@ -454,6 +501,7 @@ impl WriterConnection {
         let (done, done_here) = std::sync::mpsc::sync_channel(1);
         self.send(WriterJob::Batched {
             run,
+            append_policy,
             profile: crate::profile::current(),
             wait: crate::profile::writer_waiting(),
             done,
@@ -567,18 +615,68 @@ fn run_write_batch(
     observers: &CommitObservers,
     mutation_observer: Option<&Arc<writer_observer::MutationState>>,
 ) -> Option<WriterJob> {
+    let profile = crate::profile::Op::start("sqlite/write-batch", None);
+    let held = profile
+        .as_ref()
+        .map(|profile| profile.wall_span("sqlite/writer-held"));
+    let next = run_write_batch_inner(
+        connection,
+        first,
+        queue,
+        committed_index,
+        batches,
+        profile.as_ref(),
+        observers,
+        mutation_observer,
+    );
+    drop(held);
+    if let Some(profile) = profile {
+        profile.finish();
+    }
+    next
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_write_batch_inner(
+    connection: &mut Connection,
+    first: WriterJob,
+    queue: &std::sync::mpsc::Receiver<WriterJob>,
+    committed_index: &AtomicU64,
+    batches: &(AtomicU64, AtomicU64),
+    profile: Option<&crate::profile::Op>,
+    observers: &CommitObservers,
+    mutation_observer: Option<&Arc<writer_observer::MutationState>>,
+) -> Option<WriterJob> {
+    // A lender can replace the diagnostic profile callback. Opt-in transactions restore our
+    // completed-SQL invalidator before BEGIN; generic-first transactions do not share replica
+    // state. No caller can replace the callback through the borrowed Transaction handle.
+    let sharing = matches!(
+        &first,
+        WriterJob::Batched {
+            append_policy: Some(_),
+            ..
+        }
+    );
+    if sharing {
+        observe(connection);
+    }
     let started = std::time::Instant::now();
     let mut answers = Vec::new();
     let mut lend = None;
-    let (transaction, mut failure) =
+    let (transaction, mut failure) = {
+        let _entered = crate::profile::enter(profile);
         match connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate) {
             Ok(transaction) => (Some(transaction), None),
             Err(error) => (None, Some(error)),
-        };
+        }
+    };
+    let mut shared_scope = None;
+    let mut attempted_scope = false;
     let mut job = Some(first);
     while let Some(current) = job.take() {
         let WriterJob::Batched {
             run,
+            append_policy,
             profile,
             wait,
             done,
@@ -593,15 +691,40 @@ fn run_write_batch(
                 // runs, and shares the commit below with the rest of the batch.
                 let _entered = crate::profile::enter(profile.as_ref());
                 let acquired = crate::profile::writer_acquired(wait);
+                // A one-job transaction keeps the old serial path and installs no row hook.
+                if sharing && !attempted_scope && !answers.is_empty() && append_policy.is_some() {
+                    attempted_scope = true;
+                    match crate::append_group::Scope::begin_observed(
+                        transaction,
+                        mutation_observer.cloned(),
+                    ) {
+                        Ok(scope) => shared_scope = scope,
+                        Err(error) => {
+                            // Setup/cleanup failure cannot leave provisional temp state alive
+                            // after a successful ACK: roll back the whole real transaction.
+                            failure = Some(error);
+                            crate::profile::writer_released(acquired);
+                            drop(run);
+                            answers.push(done);
+                            break;
+                        }
+                    }
+                }
+                crate::append_group::start_job(append_policy);
+                let mut succeeded = false;
                 let savepoint = (|| {
                     transaction.execute_batch("SAVEPOINT batched_write")?;
-                    if run(transaction) {
+                    succeeded = run(transaction);
+                    if succeeded {
                         transaction.execute_batch("RELEASE batched_write")
                     } else {
                         transaction
                             .execute_batch("ROLLBACK TO batched_write; RELEASE batched_write")
                     }
                 })();
+                // Only released savepoints publish reusable state. Rollback clears provisional
+                // state, including a header created before a failed claim or projection.
+                crate::append_group::finish_job(transaction, succeeded && savepoint.is_ok());
                 crate::profile::writer_released(acquired);
                 failure = savepoint.err();
             }
@@ -618,12 +741,21 @@ fn run_write_batch(
     }
     batches.0.fetch_add(1, Ordering::Relaxed);
     batches.1.fetch_add(answers.len() as u64, Ordering::Relaxed);
+    let _entered = crate::profile::enter(profile);
+    let commit_span = crate::profile::span("sqlite/commit");
+    if let Some(scope) = shared_scope.take()
+        && let Err(error) = scope.close()
+    {
+        failure = failure.or(Some(error));
+    }
+    drop(shared_scope);
     let committed = match (transaction, failure) {
         (Some(transaction), None) => transaction.commit(),
         // Dropping the transaction rolls back every write in the batch.
         (_, Some(error)) => Err(error),
         (None, None) => unreachable!("a batch without a transaction failed to begin"),
     };
+    drop(commit_span);
     if let Ok(index) = current_index(connection) {
         committed_index.store(index, Ordering::Release);
     }
@@ -988,6 +1120,7 @@ pub static SQLITE_COMMITS: AtomicU64 = AtomicU64::new(0);
 pub static SQLITE_COMMIT_NANOS: AtomicU64 = AtomicU64::new(0);
 
 pub fn record_sqlite_time(statement: &str, duration: std::time::Duration) {
+    crate::append_group::sql_boundary(statement);
     #[cfg(any(test, feature = "test-support"))]
     STATEMENTS_RUN.with(|run| run.set(run.get() + 1));
     crate::profile::sql(statement, duration);
@@ -1273,7 +1406,10 @@ mod tests {
 
         // A busy TRUNCATE neither blocks the next commit nor changes the pinned snapshot.
         writer
-            .execute("INSERT INTO payload VALUES (1, 'committed while pinned')", [])
+            .execute(
+                "INSERT INTO payload VALUES (1, 'committed while pinned')",
+                [],
+            )
             .unwrap();
         assert_eq!(wal_payload_values(&reader), ["original"]);
         assert_eq!(
@@ -1375,7 +1511,6 @@ mod tests {
             assert_eq!(wal_payload_values(&writer), VALUES);
         });
     }
-
 
     #[test]
     fn repeated_bursts_of_reads_reuse_connections_instead_of_opening_new_ones() {
@@ -1495,6 +1630,7 @@ mod commit_observer_tests {
                     .unwrap();
                 true
             }),
+            append_policy: None,
             profile: None,
             wait: None,
             done,

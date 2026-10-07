@@ -5,6 +5,191 @@ use proptest::prelude::*;
 
 const CUT: u128 = 20 * DAY_MS;
 
+#[test]
+fn shared_retained_messages_do_not_keep_droppable_neighbours_or_increase_checkpoint_bytes() {
+    use smallclaims::sqlite::WriterJob;
+    use std::sync::{Arc, Mutex, mpsc};
+
+    fn history(shared: bool) -> (usize, usize) {
+        let store = Store::open_memory("sample").unwrap();
+        store.bind_fleet("fleet/test").unwrap();
+        store.set_write_clock_at(T).unwrap();
+        let member = Arc::new(smallclaims::fleet::MemberKey::generate().unwrap().0);
+        store.pin_fleet_anchor(member.public()).unwrap();
+        store.set_member_key(Some(member.clone())).unwrap();
+        store.append_claim(&input("host/sample","fleet.member-admitted",None,
+            json!({"fleet_id":"fleet/test","member_key":member.public(),"via":"anchor","mode":"listening"}),"member-admission")).unwrap();
+        store.ensure_principal_key("agent/sample/writer").unwrap();
+        let old = store
+            .export_replication_exchange("fleet/test", &ReplicationInventory::default())
+            .unwrap();
+
+        let held = store.connection.write();
+        let claims = Arc::new(Mutex::new(Vec::new()));
+        let mut replies = Vec::new();
+        for n in 0..16 {
+            let claims = claims.clone();
+            let (done, reply) = mpsc::sync_channel(1);
+            store.connection.send(WriterJob::Batched {
+                run: Box::new(move |tx| {
+                    let claim = append_claim_tx(tx,"sample",&format!("message/sample-{n}"),
+                        "message.sent",Some("agent/sample/writer"),&json!({"fields":{"from":"agent/sample/writer",
+                            "to":"agent/sample/reader","status":"sent","content":format!("Invented message {n}")},"evidence":[]}),&[],None).unwrap();
+                    claims.lock().unwrap().push(claim);true
+                }),
+                append_policy: shared.then_some(checkpoint_rules::shared_append_class as smallclaims::append_group::AppendPolicy),
+                profile:None,wait:None,done,
+            });
+            replies.push(reply);
+        }
+        drop(held);
+        drop(store.connection.write());
+        for reply in replies {
+            reply.recv().unwrap().unwrap();
+        }
+        let claims = claims.lock().unwrap();
+        if shared {
+            assert!(
+                claims
+                    .windows(2)
+                    .any(|pair| pair[0].batch_id == pair[1].batch_id)
+            );
+        } else {
+            assert!(
+                claims
+                    .windows(2)
+                    .all(|pair| pair[0].batch_id != pair[1].batch_id)
+            );
+        }
+        let retained_neighbour = if shared {
+            claims
+                .windows(2)
+                .find(|pair| pair[0].batch_id == pair[1].batch_id)
+                .unwrap()[0]
+                .id
+                .clone()
+        } else {
+            claims[1].id.clone()
+        };
+        drop(claims);
+        let mut diagnostics = Vec::new();
+        for n in 0..3 {
+            store.set_write_clock_at(T + n + 1).unwrap();
+            diagnostics.push(store.append_claim(&input("daemon/sample","daemon.diagnostic",None,
+                json!({"code":"sample","severity":"warning","reason":format!("Invented diagnostic {n}")}),&format!("diagnostic-{n}"))).unwrap());
+        }
+        assert!(
+            diagnostics
+                .windows(2)
+                .all(|pair| pair[0].batch_id != pair[1].batch_id)
+        );
+        store.set_write_clock_at(T + 10).unwrap();
+        let mut citing = input(
+            "message/pinned-sample",
+            "message.sent",
+            None,
+            json!({"from":"agent/sample/writer","to":"agent/sample/reader","status":"sent","content":"Invented evidence"}),
+            "citing-message",
+        );
+        citing.evidence = vec![diagnostics[0].id.clone(), retained_neighbour];
+        store.append_claim(&citing).unwrap();
+        store.seal_local_batches().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let (plan, proof) = store.plan_checkpoint(CUT, scratch.path()).unwrap();
+        assert!(proof.passed, "{proof:?}");
+        let drops = dropped(&plan);
+        assert!(
+            drops.contains(&diagnostics[1].id),
+            "uncited droppable neighbour remains droppable"
+        );
+        assert!(
+            !drops.contains(&diagnostics[0].id),
+            "cited claim remains retained"
+        );
+        assert!(plan.claims.iter().all(|claim| claim.kind != "message.sent"));
+        let inventory = smallclaims::replication::ReplicationInventory::default();
+        let exchange = store
+            .export_replication_exchange("fleet/test", &inventory)
+            .unwrap();
+        for envelope in &old.envelopes {
+            let surviving = exchange
+                .envelopes
+                .iter()
+                .find(|candidate| {
+                    candidate.writer == envelope.writer
+                        && candidate.sequence == envelope.sequence
+                        && candidate.hash == envelope.hash
+                })
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(envelope).unwrap(),
+                serde_json::to_value(surviving).unwrap(),
+                "old signed history changed"
+            );
+        }
+        let dropped_envelopes = plan
+            .envelopes
+            .iter()
+            .map(|envelope| {
+                (
+                    envelope.writer.as_str(),
+                    envelope.sequence,
+                    envelope.envelope_hash.as_str(),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        let mut payload_bytes = 0;
+        let mut wire_bytes = 0;
+        for envelope in &exchange.envelopes {
+            if !dropped_envelopes.contains(&(
+                envelope.writer.as_str(),
+                envelope.sequence,
+                envelope.hash.as_str(),
+            )) {
+                let bytes = envelope.payload.bytes().unwrap().len();
+                assert!(bytes <= smallclaims::append_group::REPLICA_BATCH_BYTES);
+                payload_bytes += bytes;
+                wire_bytes += serde_json::to_vec(envelope).unwrap().len();
+            }
+        }
+        (payload_bytes, wire_bytes)
+    }
+    let serial = history(false);
+    let shared = history(true);
+    println!(
+        "retained bytes: serial_payload={} serial_wire={} shared_payload={} shared_wire={}",
+        serial.0, serial.1, shared.0, shared.1
+    );
+    assert!(
+        shared.0 <= serial.0,
+        "retained payload bytes increased: serial={serial:?} shared={shared:?}"
+    );
+    assert!(
+        shared.1 <= serial.1,
+        "retained signed wire bytes increased: serial={serial:?} shared={shared:?}"
+    );
+}
+
+#[test]
+fn every_groupable_kind_survives_actual_checkpoint_drop_planning() {
+    let mut sealed = Sealed::default();
+    let mut old_ids = BTreeSet::new();
+    for kind in checkpoint_rules::SHARED_APPEND_KINDS {
+        for offset in 0..3 {
+            old_ids.insert(sealed.add(
+                "sample",
+                T + offset,
+                draft(kind, "sample/history", json!({"sample":offset})),
+            ));
+        }
+    }
+    let plan = plan_drops(&sealed.build());
+    assert!(
+        old_ids.is_disjoint(&dropped(&plan)),
+        "a groupable historical kind became droppable: {plan:?}"
+    );
+}
+
 /// Builds a sealed set by hand: each claim in its own envelope unless grouped, in canonical
 /// order. Every writer also gets a newest envelope that no rule drops, so the newest-envelope
 /// guard stays out of the way unless a test wants it.
@@ -1602,6 +1787,7 @@ fn a_write_queued_during_sealing_runs_before_the_backlog_finishes() {
     *QUEUED_WRITE.lock().unwrap() = Some((
         jobs,
         WriterJob::Batched {
+            append_policy: None,
             run: Box::new(move |tx| {
                 let count: i64 = tx
                     .query_row("SELECT COUNT(*) FROM replica_envelopes", [], |row| {

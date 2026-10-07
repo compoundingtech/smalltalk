@@ -9,6 +9,7 @@
 //! what a checkpoint may drop. Members sync by exchanging envelopes ([`replication`]); fleet
 //! membership decides whose envelopes a member admits ([`fleet`]).
 
+pub mod append_group;
 pub mod claim;
 pub mod error;
 pub mod fleet;
@@ -20,6 +21,7 @@ pub mod principal;
 pub mod profile;
 pub mod replication;
 pub mod rules;
+pub mod shared_append_fault;
 pub mod sqlite;
 pub mod store;
 pub mod sync;

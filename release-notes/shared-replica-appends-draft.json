@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Prepare experimental default-off shared replica appends with savepoint isolation, current-rule eligibility and writer diagnostics.",
+  "replay": {
+    "status": "none",
+    "detail": "Existing Store construction leaves shared replica appends disabled; no startup replay or projection repair is activated."
+  },
+  "schema": {
+    "status": "changed",
+    "detail": "No stored schema, indexes, migrations or user_version changes. Only opt-in multi-job transactions install temporary row triggers and a temporary witness table for WITHOUT ROWID writes; these are removed before COMMIT, with cleanup failure rolling back the transaction."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules and RULES_VERSION remain unchanged. The exact eligibility allowlist is checked against the current drop-rule selector. Grouped signed envelopes retain all neighbours if future rules make an admitted kind droppable."
+  },
+  "compatibility": {
+    "status": "unknown",
+    "detail": "Default-off experimental opt-in changes new batch/claim IDs and hashes; old stored history and replication payload format are unchanged. Source-built previous-smallclaims component controls do not qualify deployed daemon artifacts or platforms. Every fleet member must run a build that passed the old-node gate before enabling; encoded size, fault persistence, native compatibility and performance gates remain open."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No upgrade pause or coordinated restart is introduced while grouping remains disabled. Standard restart procedure applies; no outage or throughput measurements are claimed."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Keep shared replica grouping disabled. Enabling requires the documented correctness, old-node, retention, encoded-cap and measured single/concurrent latency gates; this draft is not activation guidance."
+  },
+  "recovery": {
+    "status": "unknown",
+    "detail": "Old history is not rewritten. If an experimental grouped batch has already been created, turning grouping off cannot restore its serial IDs. Persistent typed sealing-fault lifecycle and the encoded payload bound are unfinished; do not enable this draft on existing installations."
+  }
+}
