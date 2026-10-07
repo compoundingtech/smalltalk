@@ -15,6 +15,7 @@ SOURCES = {
     "705e2333ec6078589445438cf8d77fe3a1568c72",
     "58358162bbad1781c7e5111eacc57749d59a0915",
     "7fbd853ed3c5a2c81a29144ca6fffa36ab88a705",
+    "1e20c15d11328b633b8ced9b1ccbb052db65ba32",
 }
 BASE = ["cargo", "test", "--release", "-p", "st3", "--features", "perf-load",
         "--test", "perf_load", "--locked"]
