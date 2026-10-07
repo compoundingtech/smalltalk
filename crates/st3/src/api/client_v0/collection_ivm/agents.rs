@@ -36,10 +36,12 @@ pub(in crate::api::client_v0) fn factory(
         "agent adapter registry belongs to another Store"
     );
     let expected = Arc::new(manifest());
+    let expected_source = Arc::new(agent_source::capture_fingerprint_for(store.origin())?);
     let store = Arc::downgrade(&store);
     let coverage_views = views.clone();
     let coverage_installer = installer.clone();
     let coverage_manifest = expected.clone();
+    let coverage_source = expected_source.clone();
     Ok(Adapter {
         view: cards::VIEW,
         coverage: Arc::new(move |connection| {
@@ -48,6 +50,7 @@ pub(in crate::api::client_v0) fn factory(
                 &coverage_views,
                 &coverage_installer,
                 &coverage_manifest,
+                &coverage_source,
                 client_now_ms(),
             )?
             else {
@@ -83,9 +86,15 @@ pub(in crate::api::client_v0) fn factory(
                         (1..=cards::WINDOW_LIMIT).contains(&limit),
                         "invalid agent window limit"
                     );
-                    let (root, cut, certificate) =
-                        certified(connection, &views, &installer, &expected, client_now_ms())?
-                            .context("complete agent source certificate is pending")?;
+                    let (root, cut, certificate) = certified(
+                        connection,
+                        &views,
+                        &installer,
+                        &expected,
+                        &expected_source,
+                        client_now_ms(),
+                    )?
+                    .context("complete agent source certificate is pending")?;
                     ensure!(
                         cut == boundary.source_cut,
                         "agent row and collection source cuts differ"
@@ -169,9 +178,13 @@ fn certified(
     views: &Views,
     installer: &Installer,
     expected_manifest: &str,
+    expected_source: &str,
     now: u128,
 ) -> anyhow::Result<Option<(Root, SourceCut, producer::Certificate)>> {
     if !scope::readable(connection)? {
+        return Ok(None);
+    }
+    if !source_bound(connection, installer, expected_source)? {
         return Ok(None);
     }
     let Some(cut) = smallclaims::ivm::source_cut(connection)? else {
@@ -198,6 +211,19 @@ fn certified(
         return Ok(None);
     };
     Ok(Some((root, cut, certificate)))
+}
+
+fn source_bound(
+    connection: &Connection,
+    installer: &Installer,
+    expected: &str,
+) -> anyhow::Result<bool> {
+    let captured = crate::store::collection_ivm::status(connection)?;
+    if captured.fingerprint != expected {
+        return Ok(false);
+    }
+    let installed = installer.position(connection, cards::SOURCE)?;
+    Ok(installed.fingerprint == expected && installed.epoch == captured.epoch)
 }
 
 fn unchanged(
@@ -338,6 +364,9 @@ mod tests {
         installer: Arc<Installer>,
     }
     fn registered() -> Registered {
+        registered_for(Some("card-fixture"))
+    }
+    fn registered_for(receiver: Option<&str>) -> Registered {
         let root = tempfile::tempdir().unwrap();
         // Exactly one actual card registry per disposable Store; no fabricated View or
         // Operator, namespace token, source cut, row or complete certificate is installed.
@@ -355,7 +384,10 @@ mod tests {
             .connection
             .batched(|tx| {
                 installer.create_schema(tx)?;
-                agent_source::install_capture(tx, 1)?;
+                match receiver {
+                    Some(receiver) => agent_source::install_capture_for(tx, receiver, 1)?,
+                    None => agent_source::install_capture(tx, 1)?,
+                };
                 Ok::<_, anyhow::Error>(())
             })
             .unwrap()
@@ -372,7 +404,11 @@ mod tests {
         store
             .connection
             .batched(|tx| {
-                scope::begin_install(tx, &views, &installer, cards::SOURCE, &manifest(), 1)
+                let fingerprint = match receiver {
+                    Some(receiver) => agent_source::capture_fingerprint_for(receiver)?,
+                    None => agent_source::capture_fingerprint(),
+                };
+                scope::begin_install(tx, &views, &installer, cards::SOURCE, &fingerprint, 1)
             })
             .unwrap()
             .unwrap();
@@ -403,6 +439,65 @@ mod tests {
             native_session_home: None,
             planner_default: Default::default(),
         }
+    }
+
+    #[test]
+    fn silent_coverage_refuses_unbound_other_origin_and_mismatched_installer_source() {
+        let expected = agent_source::capture_fingerprint_for("card-fixture").unwrap();
+        let bound = registered();
+        assert!(scope::readable(&bound.store.readers.get()).unwrap());
+        assert!(source_bound(&bound.store.readers.get(), &bound.installer, &expected).unwrap());
+        assert!(
+            !source_bound(
+                &bound.store.readers.get(),
+                &bound.installer,
+                &agent_source::capture_fingerprint_for("other-origin").unwrap()
+            )
+            .unwrap()
+        );
+        let unbound = registered_for(None);
+        let foreign = registered_for(Some("other-origin"));
+        for fixture in [&unbound, &foreign] {
+            let connection = fixture.store.readers.get();
+            assert!(scope::readable(&connection).unwrap());
+            assert!(!source_bound(&connection, &fixture.installer, &expected).unwrap());
+            let adapter = factory(
+                fixture.store.clone(),
+                fixture.views.clone(),
+                fixture.installer.clone(),
+            )
+            .unwrap();
+            // Coverage is called independently of selected rows, including Silent advances.
+            assert!(!(adapter.coverage)(&connection).unwrap());
+        }
+        bound
+            .store
+            .connection
+            .batched(|tx| {
+                tx.execute(
+                    "UPDATE ivm_install_sources SET fingerprint=?1 WHERE name=?2",
+                    rusqlite::params![
+                        agent_source::capture_fingerprint_for("other-origin").unwrap(),
+                        cards::SOURCE
+                    ],
+                )
+            })
+            .unwrap()
+            .unwrap();
+        let connection = bound.store.readers.get();
+        assert!(scope::readable(&connection).unwrap());
+        assert_eq!(
+            collection_ivm::status(&connection).unwrap().fingerprint,
+            expected
+        );
+        assert!(!source_bound(&connection, &bound.installer, &expected).unwrap());
+        let adapter = factory(
+            bound.store.clone(),
+            bound.views.clone(),
+            bound.installer.clone(),
+        )
+        .unwrap();
+        assert!(!(adapter.coverage)(&connection).unwrap());
     }
     fn request() -> CollectionSubscribe {
         serde_json::from_value(
