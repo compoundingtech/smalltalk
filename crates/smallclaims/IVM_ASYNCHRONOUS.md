@@ -40,10 +40,13 @@ No read, repair or startup fallback rebuild is supplied.
 ## Prefix and availability
 
 The durable queue contains every admitted input above the committed source prefix. A page
-processes its ordered prefix and atomically publishes output, contributions, dependencies,
+processes its prefix ordered by local `store_index` and atomically publishes output, contributions, dependencies,
 generations, per-view completeness evidence, source cut and queue reclamation. Storage
 errors roll back the page and propagate. Operator errors roll back that operator's
 savepoint and persist an unavailable view, without rejecting valid source admission.
+Queue order is not canonical claim order: a late replicated claim can have an earlier
+canonical rank. `Views::change` applies the canonical rank key just as synchronous
+maintenance does; the shuffled-replication oracle controls check this schedule.
 
 `applied_prefix(connection, views, view, epoch)` returns the certified source prefix only
 for a compatible view whose completeness certificate has never been broken. It returns
@@ -68,6 +71,26 @@ between pages. Progress is available through a watch receiver. `stop().await` fi
 owned page and leaves committed progress resumable; dropping signals stop. Database errors,
 quota failures and publisher closure terminate rather than retrying forever. The receiver
 must belong to this Store. No startup/GET automatically schedules this work.
+Receiver/Store matching is a caller precondition; `Worker::start` does not verify it.
+Share the one Store-owned Publisher across worker subscriptions, receipt waits and sockets.
+
+There is no implemented recovery API for quota overflow, missing capture, source mutation
+or an input larger than `page_bytes`. One input over the default 256 KiB page cap stops
+catch-up without skipping it. More than 4,096 queued rows, including one large replication
+batch arriving before catch-up, can permanently disable this async source. Restarting the
+worker or reopening the Store does not repair either condition. References to explicit
+recovery name a required future installation/recovery contract, not a supplied procedure;
+production adoption requires that contract or admission/startup bounds that prevent these
+conditions. Directly resetting SQL metadata cannot certify missing work.
+
+An operator panic rolls back its whole page and ends the worker with an error, available
+through `stop().await` or closure of the progress channel. It does not persist a new
+panic-specific availability reason; the queued input remains unprocessed and current reads
+remain unavailable. A deterministic poison input can fail on every restart. `stop().await`
+has no built-in timeout and cannot preempt an operator that never returns. Dropping the
+worker signals stop but discards its final error; an owner needing diagnostics must retain
+progress and join via `stop`. Panic fencing and bounded shutdown need an explicit production
+adapter contract before adoption.
 
 Use `after_write::write` and `after_write::wait` for read-your-writes. Receipt mapping,
 source prefix, view readiness, output and authorization are captured in one short snapshot;
@@ -76,6 +99,12 @@ complete dependencies; later effects need a fresh fence. Async page commits use 
 key invalidations and independent availability stream. Availability becoming Ready requires
 an authorized bounded-window refresh even when that client's key page is empty. Those
 invalidations do not witness every historical transition.
+Readiness requires the global admitted prefix, so sustained writes can keep receipt waits
+pending even after their own input was processed. This API promises no bounded wait under
+that load. A permanently unavailable async source is represented as `SourcePending` with
+an error in availability; `after_write::wait` keeps waiting until deadline/cancellation
+rather than returning a separate unavailable outcome. Consumers that need fail-fast errors
+must inspect availability themselves in an authoritative snapshot.
 
 ## Consumer interfaces and readiness examples
 
@@ -104,8 +133,9 @@ production runtime with it would lose that runtime's admission policy. A populat
 or captured-time adapter must supply its own explicit installation and complete coverage
 proof before activation. The worker never installs such an adapter implicitly.
 
-`ivm_async_lifecycle` tests stop during an owned page, resumable pending input, worker
-drop while idle and Publisher closure while idle. Stop completes the current page before
+`ivm_async_lifecycle` tests stop with an interleaved writer during an owned page, resumable
+pending input, worker drop during a page and while idle, Publisher closure while idle,
+lagged notices and repeated poison-input panic rollback. Stop completes the current page before
 returning; the next queued input stays durable and unavailable until a later explicit page.
 
 ```sh
