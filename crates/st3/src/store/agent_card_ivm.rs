@@ -11,7 +11,7 @@ use smallclaims::ivm::{Definition, View};
 
 pub(crate) const VIEW: &str = "st3.agents.cards.v1";
 pub(crate) const SOURCE: &str = "st3.agent-card-source.v1";
-pub(crate) const FINGERPRINT: &str = "agent-cards.v1;namespace-v1;ordered-harness-v2;current-authority-v1;queue-v1;usage-v1;lifecycle-v1;local-clock-v1;public-card-v0";
+pub(crate) const FINGERPRINT: &str = super::agent_card_source::FINGERPRINT;
 pub(crate) const WINDOW_LIMIT: usize = 200;
 
 struct CardView;
