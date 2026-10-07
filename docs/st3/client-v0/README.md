@@ -630,6 +630,20 @@ the normalized `tool_output` block's optional open `metadata`, preserving `wallT
 `source_record` block. Legacy tool-result blocks inside message content remain supported and
 use the same block metadata shape.
 
+Native block `view` and `metadata` (including assistant text/reasoning metadata) use
+the same bounded open-value display convention on full reads and native keyset pages:
+the outer object and its keys survive, oversized strings gain the visible
+`[st truncated this native timeline value: size limit; … bytes]` marker, and oversized
+nested objects or arrays may become marked JSON-preview strings. A clipped `view`
+keeps its `type` discriminator; clients must check field shapes before rendering
+collections, as the Rust and TypeScript conversation renderers do. These are display
+previews, not lossless native values. A size-limit block `continuation` fetches the
+original `/body/blocks/{index}/view` or `/body/blocks/{index}/metadata` subtree when it
+is the only remainder; if the payload or another open field also needs a continuation,
+the same ref fetches the complete original `/body`, including its unbounded blocks.
+The final per-entry size guard remains authoritative and can replace an entry with a
+`native-entry-too-large` error whose continuation fetches its original body.
+
 External process sessions remain listed even when st cannot identify a native transcript.
 Opening their timeline returns a non-retryable `unsupported-capability` error with
 `details.reason: native-session-unidentified` and `details.session_id`, explaining that the

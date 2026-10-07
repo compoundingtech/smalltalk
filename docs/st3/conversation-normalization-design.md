@@ -25,8 +25,8 @@ preserve supplied parent/activity links; an historical ask is never a live picke
 Errors also have a known `error` block with `{body_ref:true}`, so native stop/exit
 notices from #1478 need no new kind. Optional `block.metadata` is an open JSON
 object for source-supplied timing (including `wallTimeMs` and `timeoutSeconds`),
-preserving original names, units, values and future fields. #1458 will populate
-that shape after rebasing; this PR does not duplicate its timing extraction.
+preserving original names, units, values and future fields. Native tool-result details
+and assistant text/reasoning metadata use that same shape.
 Unknown uses `payload: {raw: <original JSON>}` and retains the native type and role
 when supplied. Future fields and full structured tool arguments survive; unknown
 blocks have a readable JSON view. A `source_record` block with the `internal`
@@ -98,6 +98,18 @@ stays available for every record, `view` is computed per record and deterministi
 and the fold caches it with the entry. Generated Rust, Swift and TypeScript clients
 carry `view` and the header below as loose JSON values (`Option<Value>`, `JSONValue?`,
 `unknown`), so no client decoder gains closed cases.
+
+`conversation_blocks::prepare_one` bounds both `view` and `metadata` after enriching
+child-session links, for full reads and native keyset pages alike. Their outer object
+and keys (including `view.type`) survive; long strings carry the visible size-limit
+marker, and oversized nested objects/arrays may become marked JSON-preview strings.
+Generated clients retain these as loose JSON, and both conversation renderers check
+string/array/object shapes rather than assuming a closed view. A single clipped open
+subtree uses a continuation to `/body/blocks/{index}/view` or `/metadata`; if another
+remainder already needs that block's continuation, it instead points to the whole
+original `/body` so owner fetch recovers every exact subtree. Clients inspect the
+returned JSON accordingly. The final entry-size guard still runs after all display
+bounding and can replace an over-budget entry with a fetchable error notice.
 
 On `tool_call` blocks, parsed from the native arguments (OMP field `i` becomes
 `intent`; every tool_call view also has `tool`, the native tool name):
