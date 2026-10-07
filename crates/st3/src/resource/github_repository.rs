@@ -580,9 +580,8 @@ fn listed_comment(comment: &Value, fields: &BTreeSet<String>) -> Option<Item> {
     })
 }
 
-const OPEN_PULL_REQUESTS: &str =
-    "query($owner: String!, $name: String!, $after: String, $ids: [ID!]!, $pulls: Boolean!) {
-  repository(owner: $owner, name: $name) @include(if: $pulls) {
+const OPEN_PULL_REQUESTS: &str = "query($owner: String!, $name: String!, $after: String) {
+  repository(owner: $owner, name: $name) {
     pullRequests(states: OPEN, first: 100, after: $after) {
       pageInfo { hasNextPage endCursor }
       nodes {
@@ -602,6 +601,11 @@ const OPEN_PULL_REQUESTS: &str =
       }
     }
   }
+}";
+
+// GitHub can reject the combined query even when each 100-item read succeeds separately.
+// Keep closure/transfer lookups out of the expensive PR review and check-rollup query.
+const RESOLVED_ITEMS: &str = "query($ids: [ID!]!) {
   nodes(ids: $ids) {
     id
     ... on Issue {
@@ -1451,22 +1455,36 @@ async fn open_pull_requests(
             "the repository has more than {} open pull requests",
             PULL_REQUEST_PAGES * 100
         );
-        let data = github_graphql(
-            client,
-            api_base,
-            token,
-            OPEN_PULL_REQUESTS,
-            json!({"owner": owner, "name": repository, "after": after,
-                "pulls": emit_pulls, "ids": identities.iter().skip(page * 100).take(100).collect::<Vec<_>>() }),
-        )
-        .await?;
-        resolved.extend(
-            data.get("nodes")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .cloned(),
-        );
+        let data = if emit_pulls {
+            github_graphql(
+                client,
+                api_base,
+                token,
+                OPEN_PULL_REQUESTS,
+                json!({"owner": owner, "name": repository, "after": after}),
+            )
+            .await?
+        } else {
+            Value::Null
+        };
+        let ids = identities
+            .iter()
+            .skip(page * 100)
+            .take(100)
+            .collect::<Vec<_>>();
+        if !ids.is_empty() {
+            let resolved_data =
+                github_graphql(client, api_base, token, RESOLVED_ITEMS, json!({"ids": ids}))
+                    .await?;
+            resolved.extend(
+                resolved_data
+                    .get("nodes")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .cloned(),
+            );
+        }
         identities_read = identities.len().min((page + 1) * 100);
         if !emit_pulls {
             break;
@@ -1654,6 +1672,7 @@ mod tests {
         routes: Arc<Mutex<HashMap<String, (String, String)>>>,
         refused: Arc<Mutex<HashMap<String, String>>>,
         graphql: Arc<Mutex<String>>,
+        reject_combined_details: Arc<Mutex<bool>>,
         graphql_requests: Arc<Mutex<Vec<Value>>>,
         requests: Arc<Mutex<Vec<String>>>,
     }
@@ -1713,11 +1732,22 @@ mod tests {
                             )
                         };
                         let response = if target.starts_with("POST /graphql ") {
-                            server.graphql_requests.lock().unwrap().push(
+                            let query: Value =
                                 serde_json::from_slice(&request[header_end..header_end + length])
-                                    .unwrap(),
-                            );
-                            respond("200 OK", None, &server.graphql.lock().unwrap())
+                                    .unwrap();
+                            let combined = query["query"].as_str().is_some_and(|query| {
+                                query.contains("pullRequests(") && query.contains("nodes(ids:")
+                            });
+                            server.graphql_requests.lock().unwrap().push(query);
+                            if combined && *server.reject_combined_details.lock().unwrap() {
+                                respond(
+                                    "200 OK",
+                                    None,
+                                    r#"{"errors":[{"message":"Something went wrong while executing your query"}]}"#,
+                                )
+                            } else {
+                                respond("200 OK", None, &server.graphql.lock().unwrap())
+                            }
                         } else {
                             let path = target.split(' ').nth(1).unwrap().to_owned();
                             let route = server.routes.lock().unwrap().get(&path).cloned();
@@ -1941,8 +1971,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolution_details_share_the_gated_query_and_survive_etags() {
+    async fn separate_resolution_and_pr_queries_survive_etags_and_combined_query_failure() {
         let (github, base) = FakeGithub::start().await;
+        *github.reject_combined_details.lock().unwrap() = true;
         github.route(
             "/repos/acme/garden",
             json!({"id": 7, "node_id": "R_orchid", "full_name": "acme/garden"}),
@@ -1980,16 +2011,29 @@ mod tests {
             "PR_orchid"
         );
         let queries = github.graphql_requests.lock().unwrap().clone();
-        assert_eq!(queries.len(), 1);
-        assert_eq!(
-            queries[0]["variables"]["ids"],
-            json!(["I_orchid", "PR_orchid"])
-        );
+        assert_eq!(queries.len(), 2);
         assert!(
             queries[0]["query"]
                 .as_str()
                 .unwrap()
+                .contains("pullRequests(")
+        );
+        assert!(queries[0]["variables"].get("ids").is_none());
+        assert_eq!(
+            queries[1]["variables"]["ids"],
+            json!(["I_orchid", "PR_orchid"])
+        );
+        assert!(
+            queries[1]["query"]
+                .as_str()
+                .unwrap()
                 .contains("itemTypes: [CLOSED_EVENT]")
+        );
+        assert!(
+            !queries[1]["query"]
+                .as_str()
+                .unwrap()
+                .contains("pullRequests(")
         );
         github.take_requests();
         github.route("/repos/acme/garden/issues?state=all&sort=updated&direction=asc&since=2026-09-10T00:00:00Z&per_page=100", json!([
@@ -2063,7 +2107,7 @@ mod tests {
                 .iter()
                 .filter(|request| request.starts_with("POST"))
                 .count(),
-            1
+            2
         );
         let quiet = observe_at(
             request(
@@ -2181,7 +2225,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let first_query = github.graphql_requests.lock().unwrap()[0].clone();
+        let first_query = github.graphql_requests.lock().unwrap()[1].clone();
         assert_eq!(
             first_query["variables"]["ids"].as_array().unwrap().len(),
             100
@@ -2194,7 +2238,7 @@ mod tests {
                 .iter()
                 .filter(|request| request.starts_with("POST"))
                 .count(),
-            1
+            2
         );
         github.route("/repos/acme/garden/issues?state=all&sort=updated&direction=asc&since=2026-09-10T00:00:00Z&per_page=100", json!([]));
         age_pull_request_check(&base, SETTLED_PULL_REQUEST_CHECK);
@@ -2209,7 +2253,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let next_query = github.graphql_requests.lock().unwrap()[1].clone();
+        let next_query = github.graphql_requests.lock().unwrap()[3].clone();
         assert_eq!(next_query["variables"]["ids"][0], "I_100");
         assert_eq!(next_query["variables"]["ids"][1], "I_000");
         assert_eq!(
@@ -2218,7 +2262,7 @@ mod tests {
                 .iter()
                 .filter(|request| request.starts_with("POST"))
                 .count(),
-            1
+            2
         );
     }
 
