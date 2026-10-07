@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Internal documentation plan for stream request retirement and ring-bound measurement",
+  "replay": {
+    "status": "none",
+    "detail": "Documentation only; no runtime replay behavior changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Documentation only; no database schema changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Documentation only; no checkpoint rules or digest changes."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Internal documentation only; no client, wire, or harness contract changes."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Documentation only; no service interruption."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Internal documentation only; no installation or operator action required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Documentation only; no recovery procedure changes."
+  }
+}
