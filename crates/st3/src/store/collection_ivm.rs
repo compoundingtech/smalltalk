@@ -8,6 +8,8 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::Value;
 use smallclaims::ivm::install::Mutation;
 
+pub mod agent_source;
+pub(crate) mod delivery;
 pub mod scope;
 
 const MAX_TABLES: usize = 32;
@@ -94,7 +96,7 @@ fn row(table: &Table, prefix: &str) -> Result<String> {
     }
     Ok(format!("json_object({})", fields.join(",")))
 }
-fn validate(connection: &Connection, table: &Table) -> Result<()> {
+fn validate(connection: &Connection, table: &Table, recursive: bool) -> Result<()> {
     identifier(table.name)?;
     ensure!(
         !table.name.starts_with("st3_ivm_")
@@ -150,7 +152,8 @@ fn validate(connection: &Connection, table: &Table) -> Result<()> {
         .collect::<Vec<_>>();
     primary.sort_by_key(|(_, position, _, _)| *position);
     ensure!(
-        primary.len() != 1
+        recursive
+            || primary.len() != 1
             || !primary[0].2.eq_ignore_ascii_case("INTEGER")
             || sql.to_ascii_uppercase().contains("WITHOUT ROWID"),
         "rowid alias source keys require explicit post-insert extraction"
@@ -175,9 +178,10 @@ fn validate(connection: &Connection, table: &Table) -> Result<()> {
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     ensure!(
-        indexes
-            .iter()
-            .all(|(_, unique, origin)| !unique || origin == "pk"),
+        recursive
+            || indexes
+                .iter()
+                .all(|(_, unique, origin)| !unique || origin == "pk"),
         "alternate unique conflicts require explicit old-row extraction"
     );
     Ok(())
@@ -191,6 +195,33 @@ pub fn install(
     fingerprint: &str,
     epoch: u64,
 ) -> Result<()> {
+    install_policy(tx, tables, fingerprint, epoch, false)
+}
+
+/// Explicit agent source capture with SQLite recursive replacement deletion enabled.
+/// Actual AFTER rows carry generated rowid identities; DELETE captures every displaced
+/// unique/partial-unique conflict. A later writer disabling recursive triggers fences the
+/// source in its mutation transaction instead of publishing an incomplete replacement.
+pub fn install_recursive(
+    tx: &Transaction<'_>,
+    tables: &[Table],
+    fingerprint: &str,
+    epoch: u64,
+) -> Result<()> {
+    ensure!(
+        tx.query_row("PRAGMA recursive_triggers", [], |row| row.get::<_, bool>(0))?,
+        "recursive source capture requires registered recursive writer"
+    );
+    install_policy(tx, tables, fingerprint, epoch, true)
+}
+
+fn install_policy(
+    tx: &Transaction<'_>,
+    tables: &[Table],
+    fingerprint: &str,
+    epoch: u64,
+    recursive: bool,
+) -> Result<()> {
     ensure!(
         (1..=MAX_TABLES).contains(&tables.len())
             && !fingerprint.is_empty()
@@ -201,7 +232,7 @@ pub fn install(
     let mut names = std::collections::BTreeSet::new();
     for table in tables {
         ensure!(names.insert(table.name), "duplicate source table");
-        validate(tx, table)?;
+        validate(tx, table, recursive)?;
     }
     tx.execute_batch(SCHEMA)?;
     // Explicit installations from the staging-only schema retain their gap and queue.
@@ -224,8 +255,9 @@ pub fn install(
     if !has_descriptor {
         tx.execute_batch("ALTER TABLE st3_ivm_capture_state ADD COLUMN descriptor TEXT")?;
     }
-    let descriptor = serde_json::to_string(
-        &tables
+    let descriptor = serde_json::to_string(&(
+        recursive,
+        tables
             .iter()
             .map(|table| {
                 let sql: String = tx.query_row(
@@ -233,10 +265,55 @@ pub fn install(
                     [table.name],
                     |r| r.get(0),
                 )?;
-                Ok((table.name, table.columns, table.key, sql))
+                let indexes = tx
+                    .prepare(&format!("PRAGMA index_list({})", identifier(table.name)?))?
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(1)?,
+                            r.get::<_, bool>(2)?,
+                            r.get::<_, bool>(4)?,
+                        ))
+                    })?
+                    .take(129)
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                ensure!(
+                    indexes.len() <= 128,
+                    "source index descriptor bound exceeded"
+                );
+                let mut unique = Vec::new();
+                for (name, is_unique, partial) in indexes {
+                    if !is_unique {
+                        continue;
+                    }
+                    let index_sql: Option<String> = tx.query_row(
+                        "SELECT sql FROM sqlite_schema WHERE type='index' AND name=?1",
+                        [&name],
+                        |r| r.get(0),
+                    )?;
+                    let columns = tx
+                        .prepare(&format!("PRAGMA index_xinfo({})", identifier(&name)?))?
+                        .query_map([], |r| {
+                            Ok((
+                                r.get::<_, i64>(1)?,
+                                r.get::<_, Option<String>>(2)?,
+                                r.get::<_, bool>(3)?,
+                                r.get::<_, String>(4)?,
+                                r.get::<_, bool>(5)?,
+                            ))
+                        })?
+                        .take(129)
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    ensure!(
+                        columns.len() <= 128,
+                        "source index column descriptor bound exceeded"
+                    );
+                    unique.push((name, partial, index_sql, columns));
+                }
+                unique.sort_by(|a, b| a.0.cmp(&b.0));
+                Ok((table.name, table.columns, table.key, sql, unique))
             })
             .collect::<Result<Vec<_>>>()?,
-    )?;
+    ))?;
     let existing = tx
         .query_row(
             "SELECT fingerprint,epoch,descriptor FROM st3_ivm_capture_state WHERE singleton=1",
@@ -284,7 +361,11 @@ pub fn install(
         }
     }
     for table in tables {
-        triggers(tx, table)?;
+        if recursive {
+            recursive_triggers(tx, table)?;
+        } else {
+            triggers(tx, table)?;
+        }
     }
     Ok(())
 }
@@ -317,6 +398,41 @@ fn enqueue(
         name = table.name
     )
 }
+fn recursive_triggers(tx: &Transaction<'_>, table: &Table) -> Result<()> {
+    let name = identifier(table.name)?;
+    let old_key = key(table, "OLD")?;
+    let old = row(table, "OLD")?;
+    let new_key = key(table, "NEW")?;
+    let new = row(table, "NEW")?;
+    let null_key = table
+        .key
+        .iter()
+        .map(|column| Ok(format!("NEW.{} IS NULL", identifier(column)?)))
+        .collect::<Result<Vec<_>>>()?
+        .join(" OR ");
+    let inserted = enqueue(table, "NULL", "NULL", &new_key, &new, "1");
+    let updated = enqueue(table, &old_key, &old, &new_key, &new, "1");
+    let deleted = enqueue(table, &old_key, &old, "NULL", "NULL", "1");
+    let guard = "UPDATE st3_ivm_capture_state SET gap=COALESCE(gap,'recursive source deletion capture disabled') WHERE singleton=1 AND (SELECT recursive_triggers FROM pragma_recursive_triggers)=0;";
+    tx.execute_batch(&format!(r#"
+ CREATE TRIGGER IF NOT EXISTS st3_ivm_{table_name}_insert AFTER INSERT ON {name} BEGIN
+ {guard}
+ UPDATE st3_ivm_capture_state SET gap=COALESCE(gap,'null primary source key') WHERE singleton=1 AND ({null_key});
+ {inserted}
+ END;
+ CREATE TRIGGER IF NOT EXISTS st3_ivm_{table_name}_update AFTER UPDATE ON {name} BEGIN
+ {guard}
+ UPDATE st3_ivm_capture_state SET gap=COALESCE(gap,'null primary source key') WHERE singleton=1 AND ({null_key});
+ {updated}
+ END;
+ CREATE TRIGGER IF NOT EXISTS st3_ivm_{table_name}_delete AFTER DELETE ON {name} BEGIN
+ {guard}
+ {deleted}
+ END;
+ "#, table_name=table.name))?;
+    Ok(())
+}
+
 fn triggers(tx: &Transaction<'_>, table: &Table) -> Result<()> {
     let name = identifier(table.name)?;
     let old_key = key(table, "OLD")?;
@@ -757,6 +873,124 @@ mod tests {
             })
             .unwrap()
             .unwrap();
+    }
+    #[test]
+    fn recursive_capture_keeps_generated_rowids_and_all_unique_displacements() {
+        let store = crate::store::Store::open_memory("alder").unwrap();
+        store.connection.batched(|tx| {
+            tx.execute_batch("PRAGMA recursive_triggers=ON; CREATE TABLE alias_source(id INTEGER PRIMARY KEY AUTOINCREMENT,stable TEXT UNIQUE,optional TEXT,owner TEXT); CREATE UNIQUE INDEX alias_optional ON alias_source(optional) WHERE optional IS NOT NULL")?;
+            let tables = [Table {name: "alias_source", columns: &["id","stable","optional","owner"], key: &["id"]}];
+            install_recursive(tx, &tables, "fixture.recursive.v1", 1)?;
+            tx.execute("INSERT INTO alias_source VALUES(-1,'minus',NULL,'person/avery')", [])?;
+            ack(tx, &page(tx, 128)?)?;
+            tx.execute("INSERT INTO alias_source(stable,optional,owner) VALUES('one',NULL,'person/avery')", [])?;
+            let inserted = page(tx, 128)?;
+            assert_eq!(inserted.len(), 1);
+            assert!(inserted[0].replacements[0].old.is_none());
+            assert_eq!(inserted[0].replacements[0].new.as_ref().unwrap()["id"], 1);
+            ack(tx, &inserted)?;
+            tx.execute("INSERT INTO alias_source(stable,optional,owner) VALUES('two','unique','person/intruder')", [])?;
+            ack(tx, &page(tx, 128)?)?;
+            tx.execute("INSERT OR IGNORE INTO alias_source(stable,optional,owner) VALUES('one','unique','person/intruder')", [])?;
+            assert!(page(tx, 128)?.is_empty());
+            tx.execute("INSERT OR REPLACE INTO alias_source(stable,optional,owner) VALUES('one','unique','person/avery')", [])?;
+            let captured = page(tx, 128)?;
+            let changes = captured.iter().flat_map(|row| &row.replacements).collect::<Vec<_>>();
+            assert_eq!(changes.len(), 3);
+            let old_ids = changes.iter().filter_map(|change| change.old.as_ref().map(|row| row["id"].as_i64().unwrap())).collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(old_ids, [1,2].into_iter().collect());
+            assert_eq!(changes.iter().filter_map(|change| change.new.as_ref()).next().unwrap()["id"], 4);
+            // Ignored AUTOINCREMENT attempts still consume an allocation under SQLite.
+            ack(tx, &captured)?;
+            tx.execute("INSERT INTO alias_source VALUES(8,'eight','other','person/intruder')", [])?;
+            ack(tx, &page(tx, 128)?)?;
+            tx.execute("UPDATE OR REPLACE alias_source SET id=8 WHERE stable='one'", [])?;
+            let captured = page(tx, 128)?;
+            let changes = captured.iter().flat_map(|row| &row.replacements).collect::<Vec<_>>();
+            assert_eq!(changes.len(), 3);
+            assert_eq!(changes.iter().filter_map(|change| change.old.as_ref().map(|row| row["id"].as_i64().unwrap())).collect::<std::collections::BTreeSet<_>>(), [4,8].into_iter().collect());
+            assert_eq!(changes.iter().filter_map(|change| change.new.as_ref()).next().unwrap()["id"], 8);
+            ack(tx, &captured)?;
+            tx.execute("INSERT OR REPLACE INTO alias_source VALUES(-1,'new-minus',NULL,'person/intruder')", [])?;
+            let captured = page(tx, 128)?;
+            assert_eq!(captured.len(), 2);
+            assert_eq!(captured[0].replacements[0].old.as_ref().unwrap()["id"], -1);
+            assert_eq!(captured[1].replacements[0].new.as_ref().unwrap()["id"], -1);
+            Ok::<_, anyhow::Error>(())
+        }).unwrap().unwrap();
+    }
+    #[test]
+    fn recursive_writer_disable_fences_in_source_transaction_and_preserves_admission() {
+        use smallclaims::ivm::{Definition, Readiness, View, Views, events};
+        struct Empty;
+        impl View for Empty {
+            fn definition(&self) -> Definition {
+                Definition {
+                    name: "fixture.recursive",
+                    fingerprint: "fixture.recursive.v1",
+                    kinds: &[],
+                    local_kinds: &[],
+                    max_contributions: 1,
+                }
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let views = Arc::new(Views::new(vec![Box::new(Empty)]).unwrap());
+        let store = crate::store::Store::open_with_ivm_views(
+            &directory.path().join("capture.sqlite"),
+            "alder",
+            views.clone(),
+        )
+        .unwrap();
+        store.connection.batched(|tx| {
+            tx.execute_batch("PRAGMA recursive_triggers=ON; CREATE TABLE alias_source(id INTEGER PRIMARY KEY AUTOINCREMENT,stable TEXT UNIQUE)")?;
+            install_recursive(tx, &[Table{name:"alias_source",columns:&["id","stable"],key:&["id"]}], "fixture.recursive.v1",1)?;
+            views.install_gap_trigger(tx,"st3_ivm_capture_state","gap")?;
+            Ok::<_,anyhow::Error>(())
+        }).unwrap().unwrap();
+        let publisher = store.ivm_publisher().unwrap().unwrap();
+        let mut notices = publisher.subscribe();
+        let before = store
+            .read_snapshot(|_| events::capture(&store.readers.get(), &views, "fixture.recursive"))
+            .unwrap();
+        {
+            let writer = store.connection.write();
+            writer
+                .execute_batch("PRAGMA recursive_triggers=OFF")
+                .unwrap();
+            writer
+                .execute("INSERT INTO alias_source(stable) VALUES('accepted')", [])
+                .unwrap();
+        }
+        assert!(notices.try_recv().is_ok());
+        let after = store
+            .read_snapshot(|_| events::capture(&store.readers.get(), &views, "fixture.recursive"))
+            .unwrap();
+        assert!(matches!(after.availability.readiness, Readiness::Fenced));
+        assert_eq!(after.source_cut, before.source_cut);
+        assert_eq!(after.keys, before.keys);
+        let connection = store.readers.get();
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM alias_source", [], |r| r
+                    .get::<_, usize>(0))
+                .unwrap(),
+            1
+        );
+        assert!(page(&connection, 128).is_err());
+    }
+    #[test]
+    fn recursive_unique_index_definition_change_requires_new_source_identity() {
+        let store = crate::store::Store::open_memory("alder").unwrap();
+        store.connection.batched(|tx| {
+            tx.execute_batch("PRAGMA recursive_triggers=ON; CREATE TABLE alias_source(id TEXT PRIMARY KEY,owner TEXT)")?;
+            let tables=[Table{name:"alias_source",columns:&["id","owner"],key:&["id"]}];
+            install_recursive(tx,&tables,"fixture.recursive.v1",1)?;
+            tx.execute_batch("CREATE UNIQUE INDEX alias_owner ON alias_source(owner)")?;
+            install_recursive(tx,&tables,"fixture.recursive.v1",1)?;
+            assert!(status(tx)?.gap.is_some());
+            Ok::<_,anyhow::Error>(())
+        }).unwrap().unwrap();
     }
     #[test]
     fn quota_gap_preserves_source_admission_and_cannot_be_cleared_by_ack() {

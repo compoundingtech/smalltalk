@@ -470,7 +470,7 @@ mod tests {
         let mut connection = f.store.connection.write();
         let tx = connection.transaction().unwrap();
         let mut replacement = old.clone();
-        replacement.body = json!({"fields":{"from":OTHER,"to":"person/alice"}});
+        replacement.body = json!({"fields":{"from":OTHER,"to":"person/avery"}});
         apply(&tx, "staging", None, Some((&replacement, &key))).unwrap();
         let dirty = apply(&tx, "staging", None, Some((&old, &key))).unwrap();
         assert_eq!(dirty, BTreeSet::from([AGENT.to_owned(), OTHER.to_owned()]));

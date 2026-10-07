@@ -59,3 +59,42 @@ metadata/table removal and absent triggers remain unqualified production paths. 
 gap trigger alone does not fence Installer roots; namespace readers must independently gate
 source capture, and managed finalize must call Installer::source_gap. Trigger uninstall
 before capture/IVM schema removal is required to avoid rejecting valid source writes.
+
+The agent integration uses explicit `install_recursive` on the native writer, which must
+keep `recursive_triggers=ON`. AFTER triggers capture actual generated row IDs and every
+displaced unique-key row; disabling recursion fences the source in that transaction.
+Exact table/unique-index descriptors are persisted and rechecked on installation. The
+default simple-table installer still refuses rowid/alternate unique aliases. Generated
+columns, virtual tables, DDL/schema removal and source restore remain unqualified.
+
+`scope::begin_install` begins a new source lifetime after managed hooks are attached.
+It discards bounded pre-registration staging as installation history, registers the
+source through the existing foundation Installer, and keeps shared Views fenced until
+indexed extraction and namespace publication complete. It cannot reset a guarded source
+or accept a changed descriptor, identity or quota gap. Discarded staging is never dispatched
+as a current transaction or counted as proof of a projected prefix.
+
+`agent_source` declares fifteen physical inputs, including the private normalized local
+delivery table. Its fingerprint binds the default st3 claim registry/projection digest and
+the current admitted-claim eligibility domain, which does not consult mutable verdict
+caches. Changing that policy requires a new complete descriptor/binding; signatures and
+verdicts are not asserted immutable. Primary-key extraction pages capture source position,
+cursor and complete SQL rows together, cap128 rows/1MiB, and finish only after all declared
+tables have been covered. Namespace dirty queues, membership, source-prefix, authority,
+local source and deadline closure remain independent publication requirements.
+
+The NEW canonical helper uses an indexed replica-record lookup capped at128 records and
+a finite indexed legacy prefix capped at1024. It refuses larger closures instead of doing
+an unbounded COUNT. It supplies complete physical input, canonical tuple and repair status;
+family reducers decide whether originals remain eligible. OLD canonical/dependency input
+must be retained in the namespace and cannot be reconstructed from a later live lookup.
+
+The delivery sink captures outside all Store writer callbacks, then commits assessment
+and exact private producer certificate together. The runtime must retain the exclusive
+registration; its callback holds only Weak<Store>. Five native driver keys are explicit.
+An indexed deadline page supplies finite clock work, including second-changing public
+ages. SQL deadline checks alone do not certify live state: authorized reads must also
+verify the complete namespace producer boundary and selected certificates before/after
+the snapshot. A SQL notice can precede producer acknowledgement; the existing dirty
+collection retry must observe the later acknowledgement without another Publisher.
+These integration helpers are not a complete-card activation certificate.

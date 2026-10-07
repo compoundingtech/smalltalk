@@ -63,7 +63,7 @@ mod client_adapters;
 mod client_presence;
 mod client_v0;
 mod custom;
-mod delivery_presence;
+pub(crate) mod delivery_presence;
 mod delivery_probes;
 mod github_watch;
 mod harness_events;

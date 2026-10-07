@@ -19,7 +19,11 @@ type RowReader = dyn Fn(
     + Send
     + Sync;
 
+type CoverageReader = dyn Fn(&rusqlite::Connection) -> anyhow::Result<bool> + Send + Sync;
+
 pub(super) struct Adapter {
+    // Mandatory independent source coverage check even when an unchanged key page skips rows.
+    pub(super) coverage: Arc<CoverageReader>,
     pub(super) view: &'static str,
     // Keys are hints, never proof that other retained rows are current. The adapter
     // selects bounded authorized IDs first and verifies every reused row's generation
@@ -153,10 +157,17 @@ pub(super) async fn read(
                 *current.borrow_mut() = Some(session);
                 // Check even silent key pages; a missed durable source write cannot be
                 // acknowledged merely because the registry still reports Ready.
+                let coverage = (adapter.coverage)(connection)?;
                 let index = smallclaims::store::current_index(connection)?;
                 let cut = smallclaims::ivm::source_cut(connection)?;
-                anyhow::ensure!(cut.is_some_and(|cut|cut.admitted == index),
-                    "collection source admission coverage is pending");
+                if !coverage || !cut.is_some_and(|cut| cut.admitted == index) {
+                    let views = state.store.ivm_views().ok_or_else(|| anyhow::anyhow!("collection registry is missing"))?;
+                    let boundary = events::capture(connection, &views, adapter.view)?;
+                    // A fenced registry may still deliver/acknowledge its availability page.
+                    // Ready cannot mask an uncaptured durable/local write, even on silence.
+                    anyhow::ensure!(!matches!(boundary.availability.readiness, Readiness::Ready(_)),
+                        "collection source capture or admission coverage is pending");
+                }
                 Ok(())
             }
             Err(error) => {
@@ -175,7 +186,14 @@ pub(super) async fn read(
                 && boundary.source_cut.admitted == index, "collection source prefix is pending");
             let empty = BTreeMap::new();
             let reusable = previous.as_ref().is_some_and(|previous|
-                previous.authority == authority(session)) && keys.len() < 256;
+                previous.authority == authority(session)
+                && matches!(previous.boundary.availability.readiness, Readiness::Ready(_))
+                && previous.boundary.identity.fingerprint == boundary.identity.fingerprint
+                && previous.boundary.identity.epoch == boundary.identity.epoch
+                && (!keys.is_empty()
+                    || (previous.boundary.snapshot.semantic_generation == boundary.snapshot.semantic_generation
+                        && previous.boundary.snapshot.availability.view_sequence == boundary.snapshot.availability.view_sequence)))
+                && keys.len() < 256;
             let retained = if reusable { previous_rows.as_ref() } else { &empty };
             match (adapter.rows)(&state, session, &request, connection, boundary, keys, retained) {
                 Ok((items, has_more)) => Ok((
@@ -204,6 +222,8 @@ pub(super) async fn read(
                         // Shared source-cut notices on unrelated writes advance cursors without
                         // reading rows. A Ready transition or authority change still refreshes.
                         let changed = !keys.is_empty()
+                            || boundary.snapshot.semantic_generation != previous.boundary.snapshot.semantic_generation
+                            || boundary.snapshot.availability.view_sequence != previous.boundary.snapshot.availability.view_sequence
                             || !matches!(
                                 previous.boundary.availability.readiness,
                                 Readiness::Ready(_)
@@ -405,9 +425,15 @@ mod tests {
         replace(&store, &views, "row/b", 2, Some("b1"));
         let rows = Arc::new(AtomicUsize::new(0));
         let observed = rows.clone();
+        let retained_counts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let retained = retained_counts.clone();
+        let acknowledged = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let committed = acknowledged.clone();
         let adapter = Arc::new(Adapter {
             view: "fixture.socket",
-            rows: Arc::new(move |_, session, request, conn, _, _, _| {
+            coverage: Arc::new(move |_| Ok(committed.load(Ordering::SeqCst))),
+            rows: Arc::new(move |_, session, request, conn, _, _, previous| {
+                retained.lock().unwrap().push(previous.len());
                 rows.fetch_add(1, Ordering::SeqCst);
                 let mut stmt=conn.prepare("SELECT id,value FROM fixture_rows WHERE owner=?1 ORDER BY rank,id LIMIT ?2").map_err(ApiError::internal)?;
                 let items=stmt.query_map(rusqlite::params![session.authority_actor,request.limit.unwrap_or(2)+1],|row| Ok(json!({"id":row.get::<_,String>(0)?,"value":row.get::<_,String>(1)?}))).map_err(ApiError::internal)?.collect::<Result<Vec<_>,_>>().map_err(ApiError::internal)?;
@@ -525,12 +551,72 @@ mod tests {
         })
         .await
         .unwrap();
+        assert_eq!(retained_counts.lock().unwrap().last(), Some(&0));
         // Ready with no changed key refreshes; identical rows still produce no delta.
         assert!(
             tokio::time::timeout(Duration::from_millis(150), socket.next())
                 .await
                 .is_err()
         );
+        // Ready-to-Ready full refresh changes this view's version/status, with no key page.
+        // This is the transport vocabulary emitted by installed Changed::Refresh.
+        let key_before = events::capture(&store.readers.get(), &views, "fixture.socket")
+            .unwrap()
+            .keys;
+        store.connection.batched(|tx| {
+            tx.execute("UPDATE fixture_rows SET value='refreshed' WHERE id='row/a'",[])?;
+            tx.execute("UPDATE ivm_views SET generation=generation+1 WHERE name='fixture.socket'",[])?;
+            tx.execute("UPDATE ivm_status_frontier SET sequence=sequence+1 WHERE singleton=1",[])?;
+            tx.execute("INSERT INTO ivm_view_status(view,sequence) SELECT 'fixture.socket',sequence FROM ivm_status_frontier WHERE singleton=1 ON CONFLICT(view) DO UPDATE SET sequence=excluded.sequence",[])?;
+            Ok::<_,anyhow::Error>(())
+        }).unwrap().unwrap();
+        let refresh = frame(&mut socket).await;
+        assert_eq!(
+            refresh["upserts"],
+            json!([{"id":"row/a","value":"refreshed"}])
+        );
+        assert_eq!(
+            events::capture(&store.readers.get(), &views, "fixture.socket")
+                .unwrap()
+                .keys,
+            key_before
+        );
+        assert_eq!(retained_counts.lock().unwrap().last(), Some(&0));
+        // A SQL wake can arrive before an external producer acknowledges its certificate.
+        // Refuse the pending source, retain the cursor, then recover by bounded retry alone.
+        let publisher = store.ivm_publisher().unwrap().unwrap();
+        acknowledged.store(false, Ordering::SeqCst);
+        let before_ack = observed.load(Ordering::SeqCst);
+        replace(&store, &views, "row/a", 3, Some("acknowledged"));
+        let pending = frame(&mut socket).await;
+        assert_eq!(pending["kind"], "resync");
+        assert_eq!(pending["retryable"], true);
+        assert_eq!(observed.load(Ordering::SeqCst), before_ack);
+        acknowledged.store(true, Ordering::SeqCst);
+        let recovered = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let next = frame(&mut socket).await;
+                if next["kind"] == "changes" {
+                    break next;
+                }
+                // A retry may already have captured pending evidence before the first frame
+                // reached the peer. Those refused reads do not advance the held cursor.
+                assert_eq!(next["kind"], "resync");
+                assert_eq!(next["retryable"], true);
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(recovered["kind"], "changes");
+        assert_eq!(
+            recovered["upserts"],
+            json!([{"id":"row/a","value":"acknowledged"}])
+        );
+        assert_eq!(observed.load(Ordering::SeqCst), before_ack + 1);
+        assert!(Arc::ptr_eq(
+            &publisher,
+            &store.ivm_publisher().unwrap().unwrap()
+        ));
         store
             .connection
             .batched(|tx| {
@@ -548,9 +634,121 @@ mod tests {
         let snapshot = frame(&mut socket).await;
         assert_eq!(snapshot["kind"], "snapshot");
         assert_eq!(snapshot["order"], json!(["row/c", "row/a"]));
+        let burst_before = observed.load(Ordering::SeqCst);
+        for n in 0..20 {
+            replace(&store, &views, "row/a", 3, Some(&format!("burst{n}")));
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        loop {
+            let change = frame(&mut socket).await;
+            assert_eq!(change["kind"], "changes");
+            if change["upserts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["value"] == "burst19")
+            {
+                break;
+            }
+        }
+        assert!(
+            observed.load(Ordering::SeqCst) - burst_before <= 4,
+            "committed bursts must coalesce window callbacks"
+        );
         socket.close(None).await.unwrap();
         server.abort();
     }
+    #[tokio::test]
+    async fn independent_same_index_coverage_blocks_silent_ack_but_delivers_fenced_status() {
+        let root = tempfile::tempdir().unwrap();
+        let views = Arc::new(Views::new(vec![Box::new(FixtureView)]).unwrap());
+        let mut state = super::super::tests::test_state_named(root.path(), "alder");
+        state.store = Arc::new(
+            Store::open_with_ivm_views(
+                &root.path().join("coverage.sqlite"),
+                "alder",
+                views.clone(),
+            )
+            .unwrap(),
+        );
+        let covered = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let check = covered.clone();
+        let rows = Arc::new(AtomicUsize::new(0));
+        let count = rows.clone();
+        let adapter = Arc::new(Adapter {
+            view: "fixture.socket",
+            coverage: Arc::new(move |_| Ok(check.load(Ordering::SeqCst))),
+            rows: Arc::new(move |_, _, _, _, _, _, _| {
+                count.fetch_add(1, Ordering::SeqCst);
+                Ok((vec![], false))
+            }),
+        });
+        let sources = Sources::from_store(
+            state.store.clone(),
+            BTreeMap::from([("agents".into(), adapter.clone())]),
+        )
+        .unwrap()
+        .unwrap();
+        let session = ClientSession::local(Some("person/avery")).unwrap();
+        let request: CollectionSubscribe =
+            serde_json::from_value(json!({"kind":"subscribe","id":"agents","collection":"agents"}))
+                .unwrap();
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let first = read(
+            state.clone(),
+            session.clone(),
+            request.clone(),
+            slots.clone().acquire_owned().await.unwrap(),
+            sources.clone(),
+            adapter.clone(),
+            Held::default(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(first.output, Output::Window(_)));
+        let held = first.delivered;
+        assert_eq!(rows.load(Ordering::SeqCst), 1);
+        covered.store(false, Ordering::SeqCst);
+        let refusal = read(
+            state.clone(),
+            session.clone(),
+            request.clone(),
+            slots.clone().acquire_owned().await.unwrap(),
+            sources.clone(),
+            adapter.clone(),
+            Held {
+                cursor: held.clone(),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(refusal.is_err());
+        assert_eq!(rows.load(Ordering::SeqCst), 1);
+        state
+            .store
+            .connection
+            .batched(|tx| views.fence_all(tx, "uncovered local source"))
+            .unwrap()
+            .unwrap();
+        let unavailable = read(
+            state,
+            session,
+            request,
+            slots.acquire_owned().await.unwrap(),
+            sources,
+            adapter,
+            Held {
+                cursor: held,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(unavailable.output, Output::Unavailable));
+        assert!(unavailable.delivered.is_some());
+        assert_eq!(rows.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn source_admission_gap_and_person_refusal_never_read_rows() {
         let root = tempfile::tempdir().unwrap();
@@ -564,6 +762,7 @@ mod tests {
         let rows = count.clone();
         let adapter = Arc::new(Adapter {
             view: "fixture.socket",
+            coverage: Arc::new(|_| Ok(true)),
             rows: Arc::new(move |_, _, _, _, _, _, _| {
                 rows.fetch_add(1, Ordering::SeqCst);
                 Ok((vec![], false))
@@ -623,7 +822,7 @@ mod tests {
             Held::default(),
         )
         .await;
-        assert!(result.is_err());
+        assert!(matches!(result.unwrap().output, Output::Unavailable));
         assert_eq!(count.load(Ordering::SeqCst), 0);
     }
 }

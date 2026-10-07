@@ -23,6 +23,60 @@ pub fn activate(tx: &Transaction<'_>, views: &Views) -> Result<()> {
     Ok(())
 }
 
+/// Begin a NEW explicit Installer source lifetime on an existing Store. This attests future
+/// mutation capture only; the bounded extractor/namespace catch-up must still cover all old
+/// source rows. It cannot reset an already guarded/registered lifetime or restore view Ready.
+/// Earlier staging input is discarded as pre-registration history, never dispatched as a
+/// current transaction. Source owners must supply the complete, versioned descriptor closure.
+pub fn begin_install(
+    tx: &Transaction<'_>,
+    views: &Views,
+    installer: &Installer,
+    source: &str,
+    fingerprint: &str,
+    epoch: u64,
+) -> Result<()> {
+    let state = status(tx)?;
+    ensure!(
+        state.gap.as_deref().is_none_or(|reason| matches!(
+            reason,
+            "populated source requires explicit bounded installation"
+                | "source capture predates managed transaction"
+        )),
+        "incompatible or exhausted capture requires explicit source replacement"
+    );
+    let (guarded, managed): (bool, bool) = tx.query_row(
+        "SELECT guarded,managed FROM st3_ivm_capture_state WHERE singleton=1",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    ensure!(
+        !guarded && managed && state.epoch == epoch,
+        "new source installation requires unguarded matching managed lifetime"
+    );
+    let oversized: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM st3_ivm_capture LIMIT 1 OFFSET 256)",
+        [],
+        |r| r.get(0),
+    )?;
+    ensure!(!oversized, "staging capture exceeds initial discard bound");
+    // register_source refuses an existing name; neither capture nor namespace recovery occurs.
+    installer.register_source(tx, source, fingerprint, epoch)?;
+    views.fence_all(
+        tx,
+        "initial source extraction and namespace publication pending",
+    )?;
+    tx.execute("DELETE FROM st3_ivm_capture WHERE sequence IN (SELECT sequence FROM st3_ivm_capture ORDER BY sequence LIMIT 256)", [])?;
+    tx.execute("DELETE FROM st3_ivm_insert_before", [])?;
+    tx.execute("DELETE FROM st3_ivm_update_before", [])?;
+    tx.execute(
+        "UPDATE st3_ivm_capture_state SET gap=NULL,guarded=1 WHERE singleton=1",
+        [],
+    )?;
+    views.install_gap_trigger(tx, "st3_ivm_capture_state", "gap")?;
+    Ok(())
+}
+
 /// Run inside the newly begun outer transaction, before any job/helper source mutation.
 /// Earlier committed capture is fenced, never adopted as this transaction's input.
 pub fn prepare(tx: &Transaction<'_>) -> Result<()> {
@@ -245,6 +299,119 @@ mod tests {
             .read_snapshot(|_| events::capture(&f.store.readers.get(), &f.views, "fixture.scope"))
             .unwrap()
     }
+    #[test]
+    fn populated_new_source_registration_keeps_views_fenced_and_captures_only_future_mutations() {
+        let directory = tempfile::tempdir().unwrap();
+        let views = Arc::new(Views::new(vec![Box::new(Empty)]).unwrap());
+        let store = Store::open_with_ivm_views(
+            &directory.path().join("scope.sqlite"),
+            "alder",
+            views.clone(),
+        )
+        .unwrap();
+        let installer = Arc::new(Installer::new(vec![]).unwrap());
+        store.connection.batched(|tx| {
+            tx.execute_batch("CREATE TABLE fixture_source(id TEXT PRIMARY KEY,owner TEXT NOT NULL); INSERT INTO fixture_source VALUES('agent/existing','person/avery')")?;
+            installer.create_schema(tx)?;
+            collection_ivm::install(tx, TABLES, "fixture.capture.v1", 1)?;
+            assert!(status(tx)?.gap.is_some());
+            Ok::<_,anyhow::Error>(())
+        }).unwrap().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let finishing = (views.clone(), installer.clone(), calls.clone());
+        store
+            .install_transaction_hooks(prepare, move |tx| {
+                finalize(
+                    tx,
+                    &finishing.0,
+                    &finishing.1,
+                    "fixture.initial.source",
+                    |_, rows| {
+                        assert_eq!(rows.len(), 1);
+                        assert_eq!(
+                            rows[0].replacements[0].new.as_ref().unwrap()["id"],
+                            "agent/future"
+                        );
+                        finishing.2.fetch_add(1, Ordering::Relaxed);
+                        Ok(Coverage::Complete)
+                    },
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        store
+            .connection
+            .batched(|tx| {
+                begin_install(
+                    tx,
+                    &views,
+                    &installer,
+                    "fixture.initial.source",
+                    "fixture.initial.v1",
+                    1,
+                )
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            installer
+                .position(&store.readers.get(), "fixture.initial.source")
+                .unwrap()
+                .revision,
+            0
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert!(readable(&store.readers.get()).unwrap());
+        assert!(matches!(
+            store
+                .read_snapshot(|_| events::capture(&store.readers.get(), &views, "fixture.scope"))
+                .unwrap()
+                .availability
+                .readiness,
+            Readiness::Fenced
+        ));
+        store
+            .connection
+            .batched(|tx| {
+                tx.execute(
+                    "INSERT INTO fixture_source VALUES('agent/future','person/avery')",
+                    [],
+                )
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            installer
+                .position(&store.readers.get(), "fixture.initial.source")
+                .unwrap()
+                .revision,
+            1
+        );
+        assert!(matches!(
+            store
+                .read_snapshot(|_| events::capture(&store.readers.get(), &views, "fixture.scope"))
+                .unwrap()
+                .availability
+                .readiness,
+            Readiness::Fenced
+        ));
+        let mut writer = store.connection.write();
+        let tx = writer.transaction().unwrap();
+        assert!(
+            begin_install(
+                &tx,
+                &views,
+                &installer,
+                "fixture.initial.source",
+                "fixture.initial.v1",
+                1
+            )
+            .is_err()
+        );
+        tx.rollback().unwrap();
+    }
+
     #[test]
     fn paired_scope_records_current_replacements_and_rolls_back_with_source() {
         let f = fixture(false);
