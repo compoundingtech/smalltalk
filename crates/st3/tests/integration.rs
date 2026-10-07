@@ -22,6 +22,7 @@ mod completion_shells;
 mod convergence;
 mod daemon_bench;
 mod daemon_cost;
+mod daemon_history;
 mod daemon_load;
 mod daemon_environment;
 mod daemon_restart;
