@@ -388,10 +388,10 @@ fn structured_request(
             card.lines(text::wrap(
                 &[
                     text::run(subject.label.clone(), theme::text()),
-                    text::run(format!("  {target}"), theme::fg(theme::ACCENT)),
+                    text::run(format!("  {target}"), theme::dim()),
                 ],
                 inner,
-                &[text::run(" ↗ ", theme::fg(theme::ACCENT))],
+                &[text::run("   ", theme::dim())],
                 &[text::run("   ", theme::dim())],
                 None,
             ));
@@ -785,11 +785,19 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
             ));
             card.card(subject, theme::OVERLAY1, false, preview, inner);
             if let Some(link) = link {
+                let url = link.starts_with("http://") || link.starts_with("https://");
                 card.line(Line::from(vec![
-                    span("open  ", theme::dim()),
+                    span(
+                        if url { "copy link  " } else { "reference  " },
+                        theme::dim(),
+                    ),
                     span(
                         link.clone(),
-                        theme::fg(theme::BLUE).add_modifier(Modifier::UNDERLINED),
+                        if url {
+                            theme::fg(theme::BLUE).add_modifier(Modifier::UNDERLINED)
+                        } else {
+                            theme::dim()
+                        },
                     ),
                 ]));
             }
@@ -1132,10 +1140,10 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
                 card.lines(text::wrap(
                     &[
                         text::run(label, theme::text()),
-                        text::run(format!("  {target}"), theme::fg(theme::ACCENT)),
+                        text::run(format!("  {target}"), theme::dim()),
                     ],
                     inner,
-                    &[text::run(" ↗ ", theme::fg(theme::ACCENT))],
+                    &[text::run("   ", theme::dim())],
                     &[text::run("   ", theme::dim())],
                     None,
                 ));

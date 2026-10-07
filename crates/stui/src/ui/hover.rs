@@ -128,6 +128,9 @@ impl Ui {
                 }
             }
         }
+        if let Some(point) = self.hover.pointer.get() {
+            self.draw_click_hint(buf, target.rect, &info.hits[target.index].1, point);
+        }
     }
 }
 
