@@ -70,9 +70,27 @@ function stripInternalMarkup(input: string, markup = true): string {
 }
 
 /** What a message says once the markup harnesses and st add for the model is gone. */
-export type DisplayFilter = 'harness-markup' | 'context-blocks' | 'control-characters' | 'internal-blocks' | 'excerpts';
-export const DEFAULT_FILTERS: readonly DisplayFilter[] = ['harness-markup', 'context-blocks', 'control-characters', 'internal-blocks', 'excerpts'];
+export type DisplayFilter = 'harness-markup' | 'context-blocks' | 'control-characters' | 'internal-blocks' | 'excerpts' | 'bookkeeping';
+export const DEFAULT_FILTERS: readonly DisplayFilter[] = ['harness-markup', 'context-blocks', 'control-characters', 'internal-blocks', 'excerpts', 'bookkeeping'];
 export const SHOW_EVERYTHING: readonly DisplayFilter[] = [];
+
+// Said once at the start of a conversation st read only the newest part of.
+const NATIVE_PREFIX_NOTE = "Earlier history is not shown: st reads only the newest part of this agent's transcript";
+
+// Harness records that carry no conversation: the transcript's own titles and modes. Unknown
+// records stay visible.
+const BOOKKEEPING_RECORDS = ['last-prompt', 'ai-title', 'mode', 'permission-mode', 'atis-latch', 'pr-link', 'frame-link', 'bridge-session', 'total_tokens_reminder'];
+
+// A reasoning step whose text the model did not share is bookkeeping too.
+function isBookkeeping(entry: Entry, filters: readonly DisplayFilter[]): boolean {
+  if (!filters.includes('bookkeeping') || entry.type !== 'content') return false;
+  const body = record(entry.body);
+  const shown = (Array.isArray(body.blocks) ? body.blocks : []).map(record).filter(block => !['internal', 'hidden-by-harness'].includes(str(block.visibility) ?? ''));
+  if (!shown.length) return false;
+  if (entry.role === 'assistant') return shown.every(block => block.kind === 'reasoning' && !(str(record(block.payload).text) ?? '').trim());
+  if (entry.role === 'system') return shown.every(block => block.kind === 'unknown' && BOOKKEEPING_RECORDS.includes(str(block.source_type) ?? ''));
+  return false;
+}
 
 export function cleanMessageText(raw: string, filters: readonly DisplayFilter[] = DEFAULT_FILTERS): string {
   if (!filters.length) return raw;
@@ -284,7 +302,11 @@ export function toolOutput(content: unknown): string[] {
   else if (Array.isArray(content)) text = content.map(item => str(record(item).text) ?? str(item)).filter((part): part is string => part !== undefined).join('\n');
   else if (content == null) text = '';
   else text = str(record(content).text) ?? JSON.stringify(content);
-  return text ? text.split('\n').slice(0, 400) : [];
+  // As st3-conversation-ui: no blank lines around the output.
+  const lines = text.split('\n');
+  while (lines.length && !lines[0].trim()) lines.shift();
+  while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+  return lines.slice(0, 400);
 }
 
 function contentText(body: unknown): string {
@@ -375,6 +397,7 @@ export function conversationEntries(timeline: Entry[], names: Names, filters: re
   const push = (entry: Entry, id: string, body: Body) => stamped.push({ id, at: clock(entry.timestamp), timestamp: entry.timestamp, body });
   // Entries arrive in st's order (applyConversation keeps them by time, then sequence).
   for (const entry of timeline) {
+    if (!mail && isBookkeeping(entry, filters)) continue;
     const body = record(entry.body);
     if (entry.type === 'message') {
       if (Array.isArray(body.blocks)) for (const block of body.blocks.filter(block => record(block).kind === 'raw_text')) push(entry, str(record(block).id) ?? entry.id, {kind:'event',tone:'quiet',text:`[unreadable message]\n${cleanMessageText(str(record(record(block).payload).text) ?? '', filters)}`});
@@ -456,7 +479,7 @@ export function conversationEntries(timeline: Entry[], names: Names, filters: re
       case 'redaction': push(entry, entry.id, { kind: 'event', tone: 'quiet', text: `withheld: ${str(body.reason) ?? 'redacted'}` }); break;
       // Older entries were left out: it heads the conversation whatever time st stamped it with
       // (the time it was read, which sorted it among the newest).
-      case 'truncation': stamped.push({ id: entry.id, at: '', timestamp: '', body: { kind: 'event', tone: 'quiet', text: (str(body.reason) ?? '').includes('not fetchable') ? 'older entries are not shown; not fetchable through this read' : 'older entries are not shown' } }); break;
+      case 'truncation': stamped.push({ id: entry.id, at: '', timestamp: '', body: { kind: 'event', tone: 'quiet', text: (str(body.reason) ?? '').includes('native transcript prefix') ? NATIVE_PREFIX_NOTE + ((str(body.reason) ?? '').includes('not fetchable') ? '; earlier history is not fetchable through this read' : '') : (str(body.reason) ?? '').includes('not fetchable') ? 'older entries are not shown; not fetchable through this read' : 'older entries are not shown' } }); break;
       case 'status':
       case 'usage': break;
       default: {

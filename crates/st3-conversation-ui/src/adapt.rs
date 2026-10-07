@@ -125,6 +125,9 @@ pub fn conversation_with_filters(
         })
         .collect::<BTreeSet<_>>();
     for entry in timeline {
+        if mail.is_none() && is_bookkeeping(entry, filters) {
+            continue;
+        }
         let at = clock(&entry.timestamp);
         if let TimelineBody::Message(message) = &entry.body {
             for block in message
@@ -525,6 +528,54 @@ fn usage_line(usage: &st3_client::TimelineUsageBody) -> String {
         }
     }
     line
+}
+
+/// Harness records that carry no conversation: the transcript's own titles and modes, and a
+/// reasoning step whose text the model did not share. Unknown records stay visible.
+const BOOKKEEPING_RECORDS: &[&str] = &[
+    "last-prompt",
+    "ai-title",
+    "mode",
+    "permission-mode",
+    "atis-latch",
+    "pr-link",
+    "frame-link",
+    "bridge-session",
+    "total_tokens_reminder",
+];
+
+fn is_bookkeeping(entry: &TimelineEntry, filters: &[crate::DisplayFilter]) -> bool {
+    let TimelineBody::Content(content) = &entry.body else {
+        return false;
+    };
+    if !filters.contains(&crate::DisplayFilter::Bookkeeping) || content.blocks.is_empty() {
+        return false;
+    }
+    let shown = content.blocks.iter().filter(|block| {
+        !matches!(
+            block.visibility.as_deref(),
+            Some("internal" | "hidden-by-harness")
+        )
+    });
+    match entry.role {
+        TimelineRole::Assistant => {
+            shown.clone().next().is_some()
+                && shown.into_iter().all(|block| {
+                    block.kind == "reasoning"
+                        && block.payload["text"]
+                            .as_str()
+                            .is_none_or(|text| text.trim().is_empty())
+                })
+        }
+        TimelineRole::System => {
+            shown.clone().next().is_some()
+                && shown.into_iter().all(|block| {
+                    block.kind == "unknown"
+                        && BOOKKEEPING_RECORDS.contains(&block.source_type.as_str())
+                })
+        }
+        _ => false,
+    }
 }
 
 fn filtered_entry(entry: &TimelineEntry, filters: &[crate::DisplayFilter]) -> TimelineEntry {
