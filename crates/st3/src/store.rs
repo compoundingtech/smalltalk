@@ -33334,6 +33334,7 @@ mission "summary-root" state="ready" {
 }
 mission "summary-child" state="ready" {
   goal "Preserve effective states and summaries."
+  concurrent-runs max=2
   queue "investigations" {
     assigned-to "agent/tree/worker"
     step "work" { }

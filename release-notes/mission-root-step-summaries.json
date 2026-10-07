@@ -1,9 +1,6 @@
 {
   "version": 1,
   "summary": "Keep mission-root tree state, summaries and queue order without full work presentation enrichment",
-  "commits": [
-    "4473603b01a2bf12897a51029a475e5c348b2c0b"
-  ],
   "replay": {
     "status": "none",
     "detail": "This changes a read-only mission-root query. It adds no replay, rehydration or read-triggered repair, and no recovery wait."
