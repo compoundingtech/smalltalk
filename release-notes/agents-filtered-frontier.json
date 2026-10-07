@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Keep status-filtered agent lists fast after messages and fresh after local observations",
+  "replay": {"status": "none", "detail": "Only in-memory agent-card cache dependencies change; no replay is requested."},
+  "schema": {"status": "none", "detail": "No database tables, indexes, triggers or schema version change."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or digest change; coordinated member upgrades are not required."},
+  "compatibility": {"status": "none", "detail": "No client-v0, CLI or replication contract change. Filtering still precedes pagination, and existing cursors keep their original cards."},
+  "downtime": {"status": "none", "detail": "No additional interruption beyond the normal binary restart; restart timing has not been measured for this change."},
+  "manual": {"status": "none", "detail": "Existing installations need no store migration or manual action; identity and stored claims are unchanged."},
+  "recovery": {"status": "none", "detail": "No persistent-state change; swapping back to the prior binary retains its prior cache behavior without a data migration."}
+}

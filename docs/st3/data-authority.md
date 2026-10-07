@@ -36,6 +36,12 @@ semantics, a compaction or model change, a reading at least five minutes after t
 one while the harness works, and any reading while it does not. The newest pending reading
 replicates when the harness stops working.
 
+Status-filtered agent lists cache cards by both the claim index and the local-observation
+frontier visible in their SQLite snapshot. Local harness, runtime, todo, usage and timeline
+observations refresh the affected seats even when no replicated claim is appended. Sending a
+message refreshes its sender and recipient's activity without rebuilding every seat. Filtering
+still precedes pagination; continuation cursors retain the first page's frozen cards.
+
 A node can also send every local observation to an OpenTelemetry collector. The exporter is off
 unless the config names a collector:
 

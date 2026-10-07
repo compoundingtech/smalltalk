@@ -2521,23 +2521,36 @@ impl Store {
         append_latest_observation(&self.graph, input, now)
     }
 
-    /// Agent-local observations change only their subject's card. Other claims can change
-    /// membership, owners, queues or labels and conservatively require a full rebuild.
+    /// Observations change their seat's card; messages change their sender and recipient.
+    /// Other claims can change membership, owners, queues or labels and require a full rebuild.
     fn changed_agent_resources(
         &self,
         after: u64,
         through: u64,
+        after_local: u64,
+        through_local: u64,
     ) -> Result<Option<BTreeSet<String>>> {
         let connection = self.readers.get();
         let mut statement = connection.prepare_cached(
-            "SELECT subject, kind FROM claims WHERE store_index>?1 AND store_index<=?2",
+            "SELECT subject, kind,
+                    CASE WHEN kind='message.sent' THEN json_extract(body, '$.fields.from') END,
+                    CASE WHEN kind='message.sent' THEN json_extract(body, '$.fields.to') END
+             FROM claims WHERE store_index>?1 AND store_index<=?2
+             UNION ALL
+             SELECT subject, kind, NULL, NULL FROM local_observations
+             WHERE id>?3 AND id<=?4 AND after_store_index<=?2",
         )?;
         let mut subjects = BTreeSet::new();
-        for row in statement.query_map(params![after, through], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        for row in statement.query_map(params![after, through, after_local, through_local], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?, row.get::<_, Option<String>>(3)?))
         })? {
-            let (subject, kind) = row?;
+            let (subject, kind, from, to) = row?;
             if kind == "daemon.diagnostic" {
+                continue;
+            }
+            if kind == "message.sent" {
+                subjects.extend(from.into_iter().chain(to).filter(|party| party.starts_with("agent/")));
                 continue;
             }
             if subject.starts_with("agent/")
@@ -2583,6 +2596,13 @@ impl Store {
         history: bool,
         build: impl FnOnce(Option<(&BTreeSet<String>, &[Value])>) -> Result<Vec<Value>>,
     ) -> Result<Vec<Value>> {
+        // Read the local frontier from the same pinned reader as the cards, never from a
+        // writer-side counter: two SQLite snapshots can share a claim index but not local rows.
+        let local = self.readers.get().query_row(
+            "SELECT COALESCE((SELECT id FROM local_observations
+             WHERE after_store_index<=?1 ORDER BY id DESC LIMIT 1), 0)",
+            [index], |row| row.get::<_, u64>(0),
+        )?;
         let cache = self
             .smalltalk
             .agent_resources_cache
@@ -2590,22 +2610,24 @@ impl Store {
             .expect("agent resources cache poisoned");
         if let Some(items) = cache
             .iter()
-            .find(|(at, all, _)| *at == index && *all == history)
-            .map(|(_, _, items)| Arc::clone(items))
+            .find(|(at, observed, all, _)| *at == index && *observed == local && *all == history)
+            .map(|(_, _, _, items)| Arc::clone(items))
         {
             drop(cache);
             return Ok((*items).clone());
         }
         let previous = cache
             .iter()
-            .filter(|(at, all, _)| *at < index && *all == history)
-            .max_by_key(|(at, _, _)| *at)
-            .map(|(at, _, items)| (*at, Arc::clone(items)));
+            .filter(|(at, observed, all, _)| {
+                *at <= index && *observed <= local && (*at < index || *observed < local) && *all == history
+            })
+            .max_by_key(|(at, observed, _, _)| (*at, *observed))
+            .map(|(at, observed, _, items)| (*at, *observed, Arc::clone(items)));
         // A caller already holds a SQLite snapshot. Waiting behind another card build here
         // pins that old WAL read mark for the whole build, starving checkpoints.
         drop(cache);
-        let items = if let Some((at, previous)) = previous {
-            match self.changed_agent_resources(at, index)? {
+        let items = if let Some((at, observed, previous)) = previous {
+            match self.changed_agent_resources(at, index, observed, local)? {
                 Some(changed) if changed.is_empty() => (*previous).clone(),
                 Some(changed) => {
                     let fresh = build(Some((&changed, &previous)))?;
@@ -2633,15 +2655,15 @@ impl Store {
             .agent_resources_cache
             .lock()
             .expect("agent resources cache poisoned");
-        let (items, evicted) = if let Some((_, _, published)) = cache
+        let (items, evicted) = if let Some((_, _, _, published)) = cache
             .iter()
-            .find(|(at, all, _)| *at == index && *all == history)
+            .find(|(at, observed, all, _)| *at == index && *observed == local && *all == history)
         {
             // Concurrent builds still return one immutable result for this snapshot.
             (Arc::clone(published), None)
         } else {
             let items = Arc::new(items);
-            cache.push_back((index, history, Arc::clone(&items)));
+            cache.push_back((index, local, history, Arc::clone(&items)));
             let evicted = if cache.len() > 8 { cache.pop_front() } else { None };
             (items, evicted)
         };

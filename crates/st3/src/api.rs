@@ -15117,7 +15117,7 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
     }
 
     #[test]
-    fn repeated_agent_list_does_not_wait_for_busy_read_connections() {
+    fn repeated_agent_list_reuses_cards_in_a_pinned_read_snapshot() {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
         let index = state.store.index().unwrap();
@@ -15143,28 +15143,16 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
             .unwrap()
             .store_index;
         client_agent_resources(&state.store, false, "after diagnostic", index).unwrap();
-        let (ready_send, ready_recv) = std::sync::mpsc::channel();
-        let (release_send, release_recv) = std::sync::mpsc::channel();
-        let holder = state.store.clone();
-        let held = std::thread::spawn(move || {
-            holder.hold_read_connections_for_test(|| {
-                ready_send.send(()).unwrap();
-                release_recv.recv().unwrap();
-            });
-        });
-        ready_recv.recv().unwrap();
-        let store = state.store.clone();
-        let (result_send, result_recv) = std::sync::mpsc::channel();
-        let read = std::thread::spawn(move || {
-            result_send
-                .send(client_agent_resources(&store, false, "second", index))
-                .unwrap();
-        });
-        let result = result_recv.recv_timeout(Duration::from_millis(250));
-        release_send.send(()).unwrap();
-        held.join().unwrap();
-        read.join().unwrap();
-        assert!(result.unwrap().unwrap().is_empty());
+        state.store.read_snapshot(|_| {
+            let first = client_agent_resources(&state.store, false, "first", index)?;
+            let second = state.store.cached_agent_resources(index, false, |_| {
+                panic!("an unchanged snapshot must not rebuild cards")
+            })?;
+            let mut second = second;
+            overlay_agent_resources(&state.store, &mut second, "first")?;
+            assert_eq!(first, second);
+            Ok(())
+        }).unwrap();
     }
 
     #[tokio::test]
@@ -16796,7 +16784,7 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
         assert_eq!(body["status"], "verifying");
     }
 
-    async fn get_request(app: Router, path: &str) -> (StatusCode, Value) {
+    pub(super) async fn get_request(app: Router, path: &str) -> (StatusCode, Value) {
         let response = app
             .oneshot(
                 Request::builder()
@@ -23129,3 +23117,9 @@ agent "seat" { workspace "/tmp"; command "true" }
 
 #[cfg(test)]
 mod work_incarnation_tests;
+
+#[cfg(test)]
+mod agent_resources_bench;
+
+#[cfg(test)]
+mod agent_resources_tests;
