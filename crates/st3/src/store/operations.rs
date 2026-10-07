@@ -105,6 +105,14 @@ impl Store {
 
     /// A run card's progress counts cover every step; only its first twenty steps are hydrated.
     pub fn mission_step_preview(&self, run: &str) -> Result<(u64, u64, Vec<StepRunView>)> {
+        self.mission_step_preview_at(run, now_ms())
+    }
+
+    pub(crate) fn mission_step_preview_at(
+        &self,
+        run: &str,
+        at_unix_ms: u128,
+    ) -> Result<(u64, u64, Vec<StepRunView>)> {
         let run = run.trim_start_matches("mission-run/");
         let connection = self.readers.get();
         let (total, done) = connection.query_row(
@@ -123,7 +131,9 @@ impl Store {
         let mut steps = statement
             .query_map([run], step_run_from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        apply_step_states_tx(&connection, &mut steps, false)?;
+        for step in &mut steps {
+            apply_effective_step_state(&connection, step, at_unix_ms)?;
+        }
         Ok((total, done, steps))
     }
 

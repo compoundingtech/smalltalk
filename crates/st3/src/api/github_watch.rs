@@ -1,5 +1,6 @@
 //! `st gh`: a seat's watches on GitHub issues and pull requests.
 
+use crate::github_http::GithubAuth;
 use super::*;
 use crate::github_watch::ThreadRef;
 
@@ -81,10 +82,10 @@ fn deadline(until: Option<&str>) -> Result<Option<u128>, ApiError> {
 /// What GitHub says of a thread now: its title, link and state. A thread that does not exist,
 /// or that this daemon's token cannot read, cannot be watched.
 async fn read_thread(thread: &ThreadRef) -> Result<Value, ApiError> {
-    let token = crate::resource::github_token().await.map_err(|_| {
+    let token = crate::resource::github_auth().await.map_err(|error| {
         bad(
             "github-unauthenticated",
-            crate::resource::GITHUB_AUTH_REMEDY,
+            error.to_string(),
         )
     })?;
     read_thread_at(&crate::resource::github_api_base(), &token, thread).await
@@ -92,19 +93,18 @@ async fn read_thread(thread: &ThreadRef) -> Result<Value, ApiError> {
 
 async fn read_thread_at(
     api_base: &str,
-    token: &str,
+    token: &GithubAuth,
     thread: &ThreadRef,
 ) -> Result<Value, ApiError> {
-    let response = crate::resource::github_api_client()
+    let request = crate::resource::github_api_client()
         .get(format!(
             "{api_base}/repos/{}/issues/{}",
             thread.locator(),
             thread.number
         ))
         .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .bearer_auth(token)
-        .send()
+        .header("X-GitHub-Api-Version", "2022-11-28");
+    let response = crate::github_http::send(request, token)
         .await
         .map_err(|error| {
             bad(
@@ -217,14 +217,13 @@ fn posted(kind: &'static str, answer: &Value) -> Result<Posted, ApiError> {
 
 async fn github_send(
     request: reqwest::RequestBuilder,
-    token: &str,
+    token: &GithubAuth,
     what: &str,
 ) -> Result<Value, ApiError> {
-    let response = request
+    let request = request
         .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .bearer_auth(token)
-        .send()
+        .header("X-GitHub-Api-Version", "2022-11-28");
+    let response = crate::github_http::send(request, token)
         .await
         .map_err(|error| {
             bad(
@@ -254,7 +253,7 @@ async fn github_send(
 /// Post a comment, or a review of a pull request, and return what GitHub created.
 async fn post_at(
     api_base: &str,
-    token: &str,
+    token: &GithubAuth,
     thread: &ThreadRef,
     body: &str,
     review: Option<&str>,
@@ -324,7 +323,7 @@ fn object_of(url: &str) -> Result<(ThreadRef, &'static str, u64), ApiError> {
 /// Read a comment or review by its ID, and the login this daemon's token posts as.
 async fn read_object_at(
     api_base: &str,
-    token: &str,
+    token: &GithubAuth,
     thread: &ThreadRef,
     kind: &'static str,
     id: u64,
@@ -363,10 +362,10 @@ pub(super) async fn comment(
     if request.body.trim().is_empty() {
         return Err(bad("empty-github-comment", "the comment has no text"));
     }
-    let token = crate::resource::github_token().await.map_err(|_| {
+    let token = crate::resource::github_auth().await.map_err(|error| {
         bad(
             "github-unauthenticated",
-            crate::resource::GITHUB_AUTH_REMEDY,
+            error.to_string(),
         )
     })?;
     // The seat's wakes on this thread wait until st knows the new comment's ID.
@@ -418,10 +417,10 @@ pub(super) async fn own(
         ));
     }
     let (thread, kind, id) = object_of(&request.url)?;
-    let token = crate::resource::github_token().await.map_err(|_| {
+    let token = crate::resource::github_auth().await.map_err(|error| {
         bad(
             "github-unauthenticated",
-            crate::resource::GITHUB_AUTH_REMEDY,
+            error.to_string(),
         )
     })?;
     let (object, login) = read_object_at(
@@ -598,7 +597,7 @@ mod tests {
         let thread = ThreadRef::parse("acme/garden#12").unwrap();
         let comment = post_at(
             &github,
-            "orchid-token",
+            &GithubAuth::test("orchid-token"),
             &thread,
             "The seed list is ready.",
             None,
@@ -609,7 +608,7 @@ mod tests {
         assert_eq!(comment.login, "fleet-login");
         let review = post_at(
             &github,
-            "orchid-token",
+            &GithubAuth::test("orchid-token"),
             &thread,
             "Two fixes.",
             Some("request-changes"),
@@ -618,7 +617,7 @@ mod tests {
         .unwrap();
         assert_eq!((review.kind, review.id), ("review", 7001));
         assert_eq!(
-            post_at(&github, "orchid-token", &thread, "x", Some("maybe"))
+            post_at(&github, &GithubAuth::test("orchid-token"), &thread, "x", Some("maybe"))
                 .await
                 .unwrap_err()
                 .code,
@@ -627,7 +626,7 @@ mod tests {
 
         let (thread, kind, id) =
             object_of("https://github.com/acme/garden/issues/12#issuecomment-502").unwrap();
-        let (object, login) = read_object_at(&github, "orchid-token", &thread, kind, id)
+        let (object, login) = read_object_at(&github, &GithubAuth::test("orchid-token"), &thread, kind, id)
             .await
             .unwrap();
         assert_eq!(
@@ -636,7 +635,7 @@ mod tests {
         );
         let (thread, kind, id) =
             object_of("https://github.com/acme/garden/issues/12#issuecomment-503").unwrap();
-        let (object, login) = read_object_at(&github, "orchid-token", &thread, kind, id)
+        let (object, login) = read_object_at(&github, &GithubAuth::test("orchid-token"), &thread, kind, id)
             .await
             .unwrap();
         assert!(object.login.eq_ignore_ascii_case(&login));
@@ -658,12 +657,12 @@ mod tests {
     async fn only_an_open_thread_that_github_shows_can_be_watched() {
         let github = fake_github().await;
         let open = ThreadRef::parse("acme/garden#12").unwrap();
-        let answer = read_thread_at(&github, "orchid-token", &open)
+        let answer = read_thread_at(&github, &GithubAuth::test("orchid-token"), &open)
             .await
             .unwrap();
         assert!(watchable(&open, &answer).is_ok());
         let closed = ThreadRef::parse("acme/garden#14").unwrap();
-        let answer = read_thread_at(&github, "orchid-token", &closed)
+        let answer = read_thread_at(&github, &GithubAuth::test("orchid-token"), &closed)
             .await
             .unwrap();
         assert_eq!(
@@ -672,7 +671,7 @@ mod tests {
         );
         let missing = ThreadRef::parse("acme/garden#99").unwrap();
         assert_eq!(
-            read_thread_at(&github, "orchid-token", &missing)
+            read_thread_at(&github, &GithubAuth::test("orchid-token"), &missing)
                 .await
                 .unwrap_err()
                 .code,

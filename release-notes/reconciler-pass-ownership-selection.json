@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Select reconciler ownership candidates once per pass and filter remote workspace work early",
+  "replay": {
+    "status": "none",
+    "detail": "No replay, rebuild or durable projection change. The pass uses a short read snapshot to select candidates and freshly rechecks authority before guarded effects and cached-wake result reporting."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No schema, index or trigger changes. Selection uses the existing staged-subject predicate and lets SQLite select the index."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules, canonical ranking and retained authority history are unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No wire, client or harness contract change. Remote placement-away and stops remain in the full candidate roster; newly eligible subjects can wait until the next pass."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional interruption beyond the normal binary upgrade."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No migration or operator action is required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No persistent format changes. Existing effect fences remain; ownership selection is process-local and recomputed for each pass. Unexpected ownership read failures fence work and produce a shared bounded diagnostic."
+  }
+}

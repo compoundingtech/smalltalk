@@ -42,6 +42,9 @@ impl std::error::Error for Error {}
 /// Keep SQLite BUSY/LOCKED typed; other unexpected failures remain `internal`.
 /// Never infer contention from text: schema errors and user messages can say "locked" too.
 pub fn internal(error: impl fmt::Display + 'static) -> Error {
+    if let Err(cancelled) = crate::read_budget::check() {
+        return cancelled;
+    }
     let source = &error as &dyn Any;
     let sqlite = source.downcast_ref::<rusqlite::Error>().or_else(|| {
         source

@@ -885,6 +885,73 @@ fn member_context(
     FleetContext::member(store, own, bootstrap, config_peers, legacy)
 }
 
+#[test]
+fn a_stale_worker_refusal_does_not_remove_a_new_local_member_key() {
+    let root = tempfile::tempdir().unwrap();
+    let state_dir = root.path();
+    let file = FleetFile {
+        fleet_id: "3b241101-e2bb-4255-8caf-4136c566a962".into(),
+        node: Some("birch".into()),
+        ..FleetFile::default()
+    };
+    file.save(state_dir).unwrap();
+    let current = MemberKey::load_or_create(&file.node_key_path(state_dir)).unwrap();
+    let old = MemberKey::generate().unwrap().0;
+    let store = plain_memory("birch").unwrap();
+    let mut worker = FleetContext::member(&store, &old, &[], &[], false);
+    worker.state_dir = Some(state_dir.to_path_buf());
+    worker.mark_removed(
+        "alder",
+        &RemovedFromFleet {
+            code: "member-left".into(),
+            message: "the previous birch incarnation left".into(),
+        },
+    );
+    assert!(worker.is_removed(), "the old worker still stops syncing");
+    assert_eq!(FleetFile::load(state_dir).unwrap().unwrap(), file);
+    assert!(!crate::fleet::RemovalNotice::path(state_dir).exists());
+    assert_eq!(
+        MemberKey::load(&file.node_key_path(state_dir))
+            .unwrap()
+            .public(),
+        current.public()
+    );
+}
+
+#[test]
+fn a_current_worker_refusal_keeps_its_notice_and_settings_durable() {
+    let root = tempfile::tempdir().unwrap();
+    let state_dir = root.path();
+    let file = FleetFile {
+        fleet_id: "3b241101-e2bb-4255-8caf-4136c566a962".into(),
+        ..FleetFile::default()
+    };
+    file.save(state_dir).unwrap();
+    let own = MemberKey::load_or_create(&file.node_key_path(state_dir)).unwrap();
+    let store = plain_memory("birch").unwrap();
+    let mut worker = FleetContext::member(&store, &own, &[], &[], false);
+    worker.state_dir = Some(state_dir.to_path_buf());
+    worker.mark_removed(
+        "alder",
+        &RemovedFromFleet {
+            code: "member-left".into(),
+            message: "birch left the fleet".into(),
+        },
+    );
+    let notice = crate::fleet::RemovalNotice::load(state_dir).unwrap();
+    assert_eq!(notice.reported_by, "alder");
+    assert_eq!(notice.code, "member-left");
+    assert_eq!(notice.message, "birch left the fleet");
+    assert!(notice.learned_at_unix_ms > 0);
+    assert!(
+        FleetFile::load(state_dir)
+            .unwrap()
+            .unwrap()
+            .removed
+            .is_some()
+    );
+}
+
 #[tokio::test]
 async fn members_exchange_with_signatures_and_a_removed_member_is_refused() {
     let fleet = "3b241101-e2bb-4255-8caf-4136c566a962";

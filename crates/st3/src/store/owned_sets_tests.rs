@@ -65,6 +65,319 @@ fn share(from: &Store, to: &Store) {
         .unwrap();
 }
 
+fn assert_pass_candidates_match_effect_guards(store: &Store, desired: &[DesiredSubject]) {
+    let (expected, effect_reads) = smallclaims::touched::record(|| {
+        desired
+            .iter()
+            .filter(|subject| store.owned_desired_guard(subject).is_ok())
+            .map(|subject| subject.subject.clone())
+            .collect::<BTreeSet<_>>()
+    });
+    let (actual, pass_reads) =
+        smallclaims::touched::record(|| store.owned_desired_subjects(desired).unwrap());
+    assert_eq!(actual, expected);
+    assert!(effect_reads.is_subset(&pass_reads));
+}
+
+#[test]
+fn empty_ownership_pass_cost_does_not_grow_with_the_roster_or_unrelated_history() {
+    let store = Store::open_memory("amber").unwrap();
+    let source = format!(
+        "version 2\n{}",
+        (0..64)
+            .map(|index| format!(
+                "agent \"remote/{index}\" {{ host \"cobalt\"; command \"true\" }}\n"
+            ))
+            .collect::<String>()
+    );
+    direct(
+        &store,
+        &parse_intent(&source, "amber").unwrap(),
+        "remote-roster",
+    )
+    .unwrap();
+    let desired = store.desired_subjects().unwrap();
+    assert_eq!(desired.len(), 64);
+    assert!(store.owned_sets().unwrap().is_empty());
+    let ask = |desired: &[DesiredSubject]| {
+        let before = STATEMENTS_RUN.with(std::cell::Cell::get);
+        let candidates = store.owned_desired_subjects(desired).unwrap();
+        let spent = STATEMENTS_RUN.with(std::cell::Cell::get) - before;
+        (candidates, spent)
+    };
+    // Warm pooled readers before counting; this measures executed SQL, not wall time.
+    ask(&desired);
+    let (_, single_cost) = ask(&desired[..1]);
+    let (candidates, roster_cost) = ask(&desired);
+    assert_eq!(candidates.len(), desired.len());
+    assert_eq!(roster_cost, single_cost);
+    let before = STATEMENTS_RUN.with(std::cell::Cell::get);
+    for _ in 0..3 {
+        for subject in &desired {
+            store.owned_desired_guard(subject).unwrap();
+        }
+    }
+    let legacy_cost = STATEMENTS_RUN.with(std::cell::Cell::get) - before;
+    assert!(
+        legacy_cost > 8 * roster_cost,
+        "legacy={legacy_cost}, pass={roster_cost}"
+    );
+    for index in 0..512 {
+        store
+            .append_claim(&ClaimInput {
+                subject: "agent/unrelated-history".into(),
+                kind: "harness.usage".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("driver".into(), json!("codex")),
+                    ("semantics".into(), json!("session_cumulative")),
+                    ("incarnation_id".into(), json!("unrelated-incarnation")),
+                    ("input_tokens".into(), json!(index)),
+                ]),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+    }
+    let (after, history_cost) = ask(&desired);
+    assert_eq!(after, candidates);
+    assert_eq!(history_cost, roster_cost);
+}
+
+#[test]
+fn pass_candidates_preserve_snapshot_authority_but_do_not_authorize_later_effects() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(&directory.path().join("amber.sqlite3"), "amber").unwrap();
+    apply(&store, &bundle("first", true), 10);
+    let old = store.desired_subjects().unwrap();
+    assert_pass_candidates_match_effect_guards(&store, &old);
+    let candidates = store.owned_desired_subjects(&old).unwrap();
+    store
+        .read_snapshot(|_| {
+            assert_eq!(store.owned_desired_subjects(&old).unwrap(), candidates);
+            std::thread::scope(|scope| {
+                scope.spawn(|| apply(&store, &bundle("second", true), 20));
+            });
+            assert_eq!(store.owned_desired_subjects(&old).unwrap(), candidates);
+            Ok(())
+        })
+        .unwrap();
+    // A saved pass result is deliberately insufficient to authorize a later effect.
+    assert!(candidates.contains("agent/garden/orchard"));
+    let orchard = old
+        .iter()
+        .find(|subject| subject.subject == "agent/garden/orchard")
+        .unwrap();
+    assert!(store.owned_desired_guard(orchard).is_err());
+    assert_pass_candidates_match_effect_guards(&store, &old);
+    assert_pass_candidates_match_effect_guards(&store, &store.desired_subjects().unwrap());
+}
+
+#[test]
+fn missing_staged_subject_index_does_not_fence_valid_candidates() {
+    let store = Store::open_memory("amber").unwrap();
+    direct(&store, &bundle("unowned", false), "initial").unwrap();
+    let desired = store.desired_subjects().unwrap();
+    let before = store.owned_desired_subjects(&desired).unwrap();
+    store
+        .connection
+        .write()
+        .execute_batch("DROP INDEX claims_owned_set_subject_index")
+        .unwrap();
+    assert_eq!(store.owned_desired_subjects(&desired).unwrap(), before);
+    assert_pass_candidates_match_effect_guards(&store, &desired);
+}
+
+#[test]
+fn conflicting_owners_fence_the_same_candidates_as_individual_guards() {
+    let store = Store::open_memory("amber").unwrap();
+    apply(&store, &bundle("owned", false), 10);
+    let desired = store.desired_subjects().unwrap();
+    let receipt = store.owned_sets().unwrap().remove(0).receipt;
+    store
+        .append_claim(&ClaimInput {
+            subject: "owned-set/other".into(),
+            kind: "owned-set.revised".into(),
+            actor: None,
+            fields: serde_json::from_value(
+                json!({"revision": canonical_hash(&receipt).unwrap(), "body": receipt}),
+            )
+            .unwrap(),
+            evidence: vec![],
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+    assert_eq!(
+        store.owned_desired_guard(&desired[0]).unwrap_err().code,
+        "owned-set-conflict"
+    );
+    assert!(store.owned_desired_subjects(&desired).unwrap().is_empty());
+    assert_pass_candidates_match_effect_guards(&store, &desired);
+}
+
+#[test]
+fn nonempty_ownership_batches_reduce_statements_without_claiming_bounded_history_cost() {
+    let store = Store::open_memory("amber").unwrap();
+    for sequence in [10, 20, 30, 40] {
+        apply(&store, &bundle(&format!("echo {sequence}"), true), sequence);
+    }
+    let desired = store.desired_subjects().unwrap();
+    assert_eq!(store.owned_set_history("garden").unwrap().len(), 4);
+    let before = STATEMENTS_RUN.with(std::cell::Cell::get);
+    for _ in 0..3 {
+        for subject in &desired {
+            store.owned_desired_guard(subject).unwrap();
+        }
+    }
+    let legacy_cost = STATEMENTS_RUN.with(std::cell::Cell::get) - before;
+    let before = STATEMENTS_RUN.with(std::cell::Cell::get);
+    let candidates = store.owned_desired_subjects(&desired).unwrap();
+    let batch_cost = STATEMENTS_RUN.with(std::cell::Cell::get) - before;
+    assert_eq!(candidates.len(), desired.len());
+    assert!(
+        batch_cost < legacy_cost,
+        "batch={batch_cost}, legacy={legacy_cost}"
+    );
+    assert_pass_candidates_match_effect_guards(&store, &desired);
+    // Parsing/hashing these receipts is still work even if the query count stays the same.
+    apply(&store, &bundle("new authority", true), 50);
+    assert!(
+        !store
+            .owned_desired_subjects(&desired)
+            .unwrap()
+            .contains("agent/garden/orchard")
+    );
+    assert_pass_candidates_match_effect_guards(&store, &desired);
+    assert_pass_candidates_match_effect_guards(&store, &store.desired_subjects().unwrap());
+}
+
+#[test]
+fn staged_ownership_is_invisible_after_rollback_and_fences_after_commit() {
+    let store = Store::open_memory("amber").unwrap();
+    direct(&store, &bundle("unowned", false), "initial").unwrap();
+    let desired = store.desired_subjects().unwrap();
+    let initial = store.owned_desired_subjects(&desired).unwrap();
+    let mut staged = serde_json::to_value(&desired[0]).unwrap();
+    staged["owned_set"] = json!("owned-set/garden");
+    let index = store.index().unwrap();
+    for commit in [false, true] {
+        let mut writer = store.connection.write();
+        let transaction = writer.transaction().unwrap();
+        append_claim_tx(
+            &transaction,
+            "amber",
+            &desired[0].subject,
+            "intent.desired",
+            Some("person/operator"),
+            &staged,
+            &[],
+            None,
+        )
+        .unwrap();
+        if commit {
+            transaction.commit().unwrap();
+        } else {
+            transaction.rollback().unwrap();
+        }
+        drop(writer);
+        if commit {
+            assert!(store.owned_desired_subjects(&desired).unwrap().is_empty());
+            assert_eq!(
+                store.owned_desired_guard(&desired[0]).unwrap_err().code,
+                "owned-set-pending"
+            );
+        } else {
+            assert_eq!(store.index().unwrap(), index);
+            assert_eq!(store.owned_desired_subjects(&desired).unwrap(), initial);
+        }
+        assert_pass_candidates_match_effect_guards(&store, &desired);
+    }
+}
+
+#[test]
+fn receipt_read_errors_do_not_turn_into_eligible_candidates() {
+    let store = Store::open_memory("amber").unwrap();
+    apply(&store, &bundle("owned", false), 10);
+    let unowned = parse_intent(
+        "version 2\nagent \"unmanaged\" { command \"true\" }",
+        "amber",
+    )
+    .unwrap();
+    direct(&store, &unowned, "unmanaged").unwrap();
+    let desired = store.desired_subjects().unwrap();
+    assert_eq!(store.owned_desired_subjects(&desired).unwrap().len(), 2);
+    let receipt = store.owned_sets().unwrap().remove(0);
+    // Inject a receipt decoding failure after declarations were captured, in this test only.
+    store
+        .connection
+        .write()
+        .execute(
+            "UPDATE claims SET accepted_at_unix_ms='invalid' WHERE id=?1",
+            [&receipt.claim],
+        )
+        .unwrap();
+    assert!(store.owned_desired_subjects(&desired).is_err());
+    for declaration in desired {
+        assert!(store.owned_desired_guard(&declaration).is_err());
+    }
+}
+
+#[test]
+fn repaired_receipt_eligibility_is_rechecked_between_passes() {
+    let source = Store::open_memory("amber").unwrap();
+    let target = Store::open_memory("cobalt").unwrap();
+    apply(&source, &bundle("first", false), 10);
+    let first = source.owned_sets().unwrap().remove(0);
+    let old = source.desired_subjects().unwrap();
+    apply(&source, &bundle("second", false), 20);
+    let second = source.owned_sets().unwrap().remove(0);
+    let new = source.desired_subjects().unwrap();
+    // Repair addresses envelope records, which the legacy claim-only transport does not create.
+    super::tests::receive_and_project(
+        &target,
+        &source.origin,
+        &super::tests::exchange_from(&source, &target.replication_inventory().unwrap()),
+    );
+    assert!(target.owned_desired_subjects(&old).unwrap().is_empty());
+    assert_pass_candidates_match_effect_guards(&target, &new);
+    let record = target
+        .replica_records(false)
+        .unwrap()
+        .into_iter()
+        .find(|record| record.claim_id.as_deref() == Some(second.claim.as_str()))
+        .unwrap();
+    // Model the existing version-skew repair path: the receiver now rejects this receipt.
+    target
+        .connection
+        .write()
+        .execute(
+            "UPDATE replica_records SET state='invalid' WHERE record_ref=?1",
+            [&record.record_ref],
+        )
+        .unwrap();
+    target
+        .repair_replica_record(
+            &record.record_ref,
+            &first.claim,
+            "receiver rejects this receipt after an upgrade",
+            "person/operator",
+            "repair-receipt",
+        )
+        .unwrap();
+    assert_eq!(target.owned_sets().unwrap()[0].claim, first.claim);
+    assert!(target.owned_desired_subjects(&new).unwrap().is_empty());
+    assert!(
+        target
+            .owned_desired_subjects(&old)
+            .unwrap()
+            .contains(&old[0].subject)
+    );
+    assert_pass_candidates_match_effect_guards(&target, &old);
+    assert_pass_candidates_match_effect_guards(&target, &new);
+}
+
 #[test]
 fn receipt_reuse_keeps_historical_bounds_and_ends_with_the_read_snapshot() {
     let directory = tempfile::tempdir().unwrap();
@@ -167,6 +480,12 @@ fn one_shot_set_retirement_is_fenced_to_the_member_and_its_runtime_host() {
         .unwrap()
         .remove(0);
     assert!(amber.owned_desired_guard(&stopped).is_ok());
+    assert!(
+        amber
+            .owned_desired_subjects(std::slice::from_ref(&stopped))
+            .unwrap()
+            .contains(&stopped.subject)
+    );
     assert_eq!(
         amber
             .declaration_ended_by_stop(subject)
@@ -371,6 +690,12 @@ fn pruning_requires_exact_preview_confirmation_and_retains_ownership() {
         .find(|s| s.subject == "agent/garden/meadow")
         .unwrap();
     assert_eq!(stopped.kind, "stop");
+    assert!(
+        store
+            .owned_desired_subjects(std::slice::from_ref(&stopped))
+            .unwrap()
+            .contains(&stopped.subject)
+    );
     assert!(
         store.owned_sets().unwrap()[0]
             .receipt
@@ -906,6 +1231,9 @@ fn incomplete_highest_set_holds_member_effects_until_dependencies_arrive() {
         })
         .unwrap();
     assert!(!amber.owned_sets().unwrap()[0].blockers.is_empty());
+    let pending = amber.desired_subjects().unwrap();
+    assert!(amber.owned_desired_subjects(&pending).unwrap().is_empty());
+    assert_pass_candidates_match_effect_guards(&amber, &pending);
     assert_eq!(
         amber
             .owned_member_guard("agent/garden/orchard")
@@ -921,6 +1249,7 @@ fn incomplete_highest_set_holds_member_effects_until_dependencies_arrive() {
     );
     share(&cobalt, &amber);
     assert!(amber.owned_sets().unwrap()[0].blockers.is_empty());
+    assert_pass_candidates_match_effect_guards(&amber, &amber.desired_subjects().unwrap());
     assert_eq!(
         amber
             .selected_desired_token("agent/garden/orchard")
@@ -966,12 +1295,22 @@ fn a_render_prepared_from_a_superseded_set_cannot_overwrite_selected_files() {
     };
     let old = source("old");
     apply(&store, &old, 10);
+    let stale = &old.subjects["agent/garden/orchard"];
+    let candidates = store
+        .owned_desired_subjects(std::slice::from_ref(stale))
+        .unwrap();
+    assert!(candidates.contains(&stale.subject));
     let new = source("new");
     apply(&store, &new, 20);
     let subject = "agent/garden/orchard";
     let selected = &new.subjects[subject];
     assert!(crate::render::apply_all(&store, &[selected], "amber")[subject].is_ok());
-    let stale = &old.subjects[subject];
+    assert!(
+        store
+            .owned_desired_subjects(std::slice::from_ref(stale))
+            .unwrap()
+            .is_empty()
+    );
     assert!(crate::render::apply_all(&store, &[stale], "amber")[subject].is_err());
     assert_eq!(
         std::fs::read_to_string(workspace.path().join("configuration.txt")).unwrap(),
@@ -1000,6 +1339,12 @@ fn a_member_added_only_on_a_losing_partition_retires_through_the_winning_set() {
             .0;
         assert_eq!(stopped.kind, "stop");
         assert!(store.owned_desired_guard(&stopped).is_ok());
+        assert!(
+            store
+                .owned_desired_subjects(std::slice::from_ref(&stopped))
+                .unwrap()
+                .contains(&stopped.subject)
+        );
         assert_eq!(
             direct(store, &bundle("revive", true), "bypass")
                 .unwrap_err()
@@ -1060,6 +1405,14 @@ fn equal_source_content_conflicts_hold_effects_until_a_higher_source_resolves_th
     signed_share(cobalt, ivory);
     assert!(ivory.owned_member_guard("agent/garden/orchard").is_err());
     assert!(!ivory.owned_sets().unwrap()[0].blockers.is_empty());
+    let conflicted = ivory.desired_subjects().unwrap();
+    assert!(
+        ivory
+            .owned_desired_subjects(&conflicted)
+            .unwrap()
+            .is_empty()
+    );
+    assert_pass_candidates_match_effect_guards(ivory, &conflicted);
     apply(ivory, &bundle("settled", false), 30);
     signed_share(ivory, amber);
     signed_share(ivory, cobalt);
@@ -1068,6 +1421,7 @@ fn equal_source_content_conflicts_hold_effects_until_a_higher_source_resolves_th
         assert_eq!(view.receipt.source.sequence, 30);
         assert!(view.blockers.is_empty());
         assert!(store.owned_member_guard("agent/garden/orchard").is_ok());
+        assert_pass_candidates_match_effect_guards(store, &store.desired_subjects().unwrap());
     }
 }
 
@@ -1076,46 +1430,101 @@ fn rollout_signed_partition_heal_keeps_the_winning_owner_operation_and_status() 
     let stores = signed_fleet();
     for from in &stores {
         from.append_claim(&ClaimInput {
-            subject: format!("daemon/{}", from.origin), kind: "daemon.started".into(), actor: None,
-            fields: serde_json::from_value(json!({"status":"running","features":{"owned_sets":1,"seat_rollout":1}})).unwrap(),
-            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
-        }).unwrap();
-        for to in &stores { signed_share(from, to); }
+            subject: format!("daemon/{}", from.origin),
+            kind: "daemon.started".into(),
+            actor: None,
+            fields: serde_json::from_value(
+                json!({"status":"running","features":{"owned_sets":1,"seat_rollout":1}}),
+            )
+            .unwrap(),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+        for to in &stores {
+            signed_share(from, to);
+        }
     }
     let (amber, cobalt, ivory) = (&stores[0], &stores[1], &stores[2]);
-    let native = |model: &str| crate::graph::parse_owned_set_intent(&format!(
-        "version 2\nagent \"garden/orchard\" {{ host \"amber\"; workspace \".\"; harness \"claude\" {{ model {model:?}; }} }}"), "amber").unwrap();
+    let native = |model: &str| {
+        crate::graph::parse_owned_set_intent(&format!(
+        "version 2\nagent \"garden/orchard\" {{ host \"amber\"; workspace \".\"; harness \"claude\" {{ model {model:?}; }} }}"), "amber").unwrap()
+    };
     apply(amber, &native("initial"), 10);
-    let old = amber.desired_subjects_named(&["agent/garden/orchard".into()]).unwrap().remove(0).member.unwrap();
+    let old = amber
+        .desired_subjects_named(&["agent/garden/orchard".into()])
+        .unwrap()
+        .remove(0)
+        .member
+        .unwrap();
     amber.append_claim(&ClaimInput {
         subject: "agent/garden/orchard".into(), kind: "runtime.observed".into(), actor: Some("person/operator".into()),
         fields: serde_json::from_value(json!({"status":"running","host":"amber","runtime_id":old.runtime_id,"incarnation_id":"original-one"})).unwrap(),
         evidence: Vec::new(), expected_subject: None, idempotency_key: None,
     }).unwrap();
-    signed_share(amber, cobalt); signed_share(amber, ivory);
+    signed_share(amber, cobalt);
+    signed_share(amber, ivory);
     let policy = crate::rollout::Policy::when_idle(1_800_000, false);
     for (store, sequence, model) in [(amber, 30, "winner"), (cobalt, 20, "stale")] {
-        let mut opts = options(store, sequence); opts.rollout = Some(policy.clone());
+        let mut opts = options(store, sequence);
+        opts.rollout = Some(policy.clone());
         let input = native(model);
         let preview = store.owned_set_preview(&input, &opts).unwrap();
         assert!(preview.blockers.is_empty(), "{:?}", preview.blockers);
         opts.expected_subjects = preview.expected_subjects;
-        store.apply_owned_set(&input, &opts, &format!("partition-{sequence}"), "person/operator").unwrap();
+        store
+            .apply_owned_set(
+                &input,
+                &opts,
+                &format!("partition-{sequence}"),
+                "person/operator",
+            )
+            .unwrap();
     }
-    let token = amber.selected_desired_token("agent/garden/orchard").unwrap().unwrap();
-    let request = amber.request_rollout("agent/garden/orchard", &token, &old, "original-one", "person/operator", &policy, "winner-operation").unwrap();
+    let token = amber
+        .selected_desired_token("agent/garden/orchard")
+        .unwrap()
+        .unwrap();
+    let request = amber
+        .request_rollout(
+            "agent/garden/orchard",
+            &token,
+            &old,
+            "original-one",
+            "person/operator",
+            &policy,
+            "winner-operation",
+        )
+        .unwrap();
     let operation = amber.rollout("agent/garden/orchard").unwrap().unwrap();
-    crate::rollout::phase(amber, "agent/garden/orchard", &operation, "held", Some("busy at deadline"), &["claimed-work".into()]).unwrap();
-    signed_share(cobalt, ivory); signed_share(amber, ivory);
-    signed_share(cobalt, amber); signed_share(amber, cobalt);
+    crate::rollout::phase(
+        amber,
+        "agent/garden/orchard",
+        &operation,
+        "held",
+        Some("busy at deadline"),
+        &["claimed-work".into()],
+    )
+    .unwrap();
+    signed_share(cobalt, ivory);
+    signed_share(amber, ivory);
+    signed_share(cobalt, amber);
+    signed_share(amber, cobalt);
     for store in &stores {
-        let selected = store.rollout_selection("agent/garden/orchard").unwrap().unwrap();
+        let selected = store
+            .rollout_selection("agent/garden/orchard")
+            .unwrap()
+            .unwrap();
         let operation = store.rollout("agent/garden/orchard").unwrap().unwrap();
         assert_eq!(selected.source.sequence, 30);
         assert_eq!(operation.id, request.id);
         assert_eq!(operation.phase, "held");
         assert_eq!(operation.old_incarnation, "original-one");
-        assert_eq!(operation.deadline_unix_ms, operation.requested_at_unix_ms + 1_800_000);
+        assert_eq!(
+            operation.deadline_unix_ms,
+            operation.requested_at_unix_ms + 1_800_000
+        );
         assert_eq!(operation.blocking, vec!["claimed-work"]);
     }
 }
@@ -1186,5 +1595,27 @@ fn manual_rollout_policy_requires_each_active_daemon_and_is_in_the_receipt_diges
             .any(|b| b.contains("typed native harness")),
         "{:?}",
         preview.blockers
+    );
+}
+
+#[test]
+fn pass_staged_subject_selection_uses_the_partial_index() {
+    let store = Store::open_memory("amber").unwrap();
+    let connection = store.readers.get();
+    let plans = connection
+        .prepare(&format!(
+            "EXPLAIN QUERY PLAN {}",
+            super::owned_sets::STAGED_SUBJECTS_QUERY
+        ))
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert!(
+        plans
+            .iter()
+            .any(|plan| plan.contains("claims_owned_set_subject_index")),
+        "{plans:?}"
     );
 }

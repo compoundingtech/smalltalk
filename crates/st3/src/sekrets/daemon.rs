@@ -18,6 +18,10 @@ pub static PERSON: OnceLock<String> = OnceLock::new();
 
 /// The seat a scope belongs to, from the terminal registry.
 pub fn seat_for_scope(pty_root: &Path, scope: &str) -> Result<Option<String>, St3Error> {
+    if let Some(found) = seat_from_registry_file(pty_root, scope) {
+        return Ok(Some(found));
+    }
+    // A scope whose name does not lead to its terminal's file: read the whole registry.
     let observations = st_runtime::PtyRuntime::new(pty_root.to_path_buf())
         .snapshot()
         .map_err(|error| St3Error::new("sekrets-attestation", format!("{error:#}")))?;
@@ -28,6 +32,69 @@ pub fn seat_for_scope(pty_root: &Path, scope: &str) -> Result<Option<String>, St
             observation.tags.get("st3.scope-unit").map(String::as_str) == Some(scope)
         })
         .and_then(|observation| observation.tags.get("st3.subject").cloned()))
+}
+
+/// The seat whose terminal st started in `scope`, read from that one terminal's registry file.
+/// st names a terminal's scope `st3-ID-PID-SEQ.scope` after the terminal's ID, so a busy host
+/// with hundreds of terminals answers without reading them all. The file must name this scope,
+/// and its PTY daemon must still be alive.
+fn seat_from_registry_file(pty_root: &Path, scope: &str) -> Option<String> {
+    let inner = scope.strip_prefix("st3-")?.strip_suffix(".scope")?;
+    let mut parts = inner.rsplitn(3, '-');
+    let (_sequence, _pid, id) = (parts.next()?, parts.next()?, parts.next()?);
+    if id.is_empty() || id.contains('/') || id.starts_with('.') {
+        return None;
+    }
+    let text = std::fs::read_to_string(pty_root.join(format!("{id}.json"))).ok()?;
+    let session: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let tags = session.get("tags")?;
+    if tags.get("st3.scope-unit")?.as_str()? != scope {
+        return None;
+    }
+    let daemon = i32::try_from(session.get("daemonPid")?.as_u64()?).ok()?;
+    let alive = unsafe { libc::kill(daemon, 0) } == 0
+        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    if !alive {
+        return None;
+    }
+    tags.get("st3.subject")?.as_str().map(str::to_owned)
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+
+    #[test]
+    fn a_scope_leads_to_its_terminals_file() {
+        let root = tempfile::tempdir().unwrap();
+        let scope = "st3-fleet.example.web-builder.0123abcd-4242-7.scope";
+        let write = |daemon: u32, scope_tag: &str| {
+            std::fs::write(
+                root.path().join("fleet.example.web-builder.0123abcd.json"),
+                serde_json::json!({
+                    "daemonPid": daemon,
+                    "tags": {"st3.scope-unit": scope_tag, "st3.subject": "agent/fleet/fixture-web/builder"},
+                })
+                .to_string(),
+            )
+            .unwrap();
+        };
+        write(std::process::id(), scope);
+        assert_eq!(
+            seat_from_registry_file(root.path(), scope).as_deref(),
+            Some("agent/fleet/fixture-web/builder")
+        );
+        // A file for another scope, or a dead PTY daemon, names no seat.
+        write(std::process::id(), "st3-other-1-1.scope");
+        assert_eq!(seat_from_registry_file(root.path(), scope), None);
+        write(u32::MAX - 1, scope);
+        assert_eq!(seat_from_registry_file(root.path(), scope), None);
+        assert_eq!(
+            seat_from_registry_file(root.path(), "st3-../x-1-1.scope"),
+            None
+        );
+        assert_eq!(seat_from_registry_file(root.path(), "app-foo.scope"), None);
+    }
 }
 
 /// This node and the public key it signs attestations with.
@@ -262,7 +329,9 @@ fn import_entries(
     cursor: &mut i64,
     mut append: impl FnMut(&smallclaims::ClaimInput) -> Result<(), St3Error>,
 ) -> anyhow::Result<()> {
-    let Some(last) = entries.last().map(|entry| entry.seq) else { return Ok(()) };
+    let Some(last) = entries.last().map(|entry| entry.seq) else {
+        return Ok(());
+    };
     for entry in entries {
         if let Some(claim) = claim_for(node, person, entry) {
             match append(&claim) {
@@ -270,7 +339,10 @@ fn import_entries(
                 Err(error) if error.code == "internal" || error.is_sqlite_contention() => {
                     return Err(error.into());
                 }
-                Err(error) => eprintln!("st3: sekrets: skipped gateway log entry {}: {error:#}", entry.seq),
+                Err(error) => eprintln!(
+                    "st3: sekrets: skipped gateway log entry {}: {error:#}",
+                    entry.seq
+                ),
             }
         }
     }
@@ -303,28 +375,44 @@ mod tests {
     #[test]
     fn busy_gateway_append_keeps_cursor_and_retries_the_same_entry() {
         for code in [rusqlite::ffi::SQLITE_BUSY, rusqlite::ffi::SQLITE_LOCKED] {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cursor");
-        std::fs::write(&path, "6\n").unwrap();
-        let entries = vec![entry("call", "person/ada", json!({"argv":["fixture"]}))];
-        let mut cursor = 6;
-        let mut attempts = Vec::new();
-        let first = import_entries(&entries, "example", "person/ada", &path, &mut cursor, |claim| {
-            attempts.push(claim.idempotency_key.clone());
-            Err(smallclaims::error::internal(rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(code), None)))
-        });
-        assert!(first.is_err());
-        assert_eq!(cursor, 6);
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "6\n");
-        import_entries(&entries, "example", "person/ada", &path, &mut cursor, |claim| {
-            attempts.push(claim.idempotency_key.clone());
-            Ok(())
-        }).unwrap();
-        assert_eq!(attempts.len(), 2);
-        assert_eq!(attempts[0], attempts[1]);
-        assert_eq!(cursor, 7);
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "7\n");
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("cursor");
+            std::fs::write(&path, "6\n").unwrap();
+            let entries = vec![entry("call", "person/ada", json!({"argv":["fixture"]}))];
+            let mut cursor = 6;
+            let mut attempts = Vec::new();
+            let first = import_entries(
+                &entries,
+                "example",
+                "person/ada",
+                &path,
+                &mut cursor,
+                |claim| {
+                    attempts.push(claim.idempotency_key.clone());
+                    Err(smallclaims::error::internal(
+                        rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None),
+                    ))
+                },
+            );
+            assert!(first.is_err());
+            assert_eq!(cursor, 6);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "6\n");
+            import_entries(
+                &entries,
+                "example",
+                "person/ada",
+                &path,
+                &mut cursor,
+                |claim| {
+                    attempts.push(claim.idempotency_key.clone());
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(attempts.len(), 2);
+            assert_eq!(attempts[0], attempts[1]);
+            assert_eq!(cursor, 7);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "7\n");
         }
     }
     #[test]
@@ -333,13 +421,29 @@ mod tests {
         let path = dir.path().join("cursor");
         let entries = vec![entry("call", "person/ada", json!({"argv":["fixture"]}))];
         let mut cursor = 6;
-        import_entries(&entries, "example", "person/ada", &path, &mut cursor,
-            |_| Err(St3Error::new("rule-denied", "fixture refusal"))).unwrap();
+        import_entries(
+            &entries,
+            "example",
+            "person/ada",
+            &path,
+            &mut cursor,
+            |_| Err(St3Error::new("rule-denied", "fixture refusal")),
+        )
+        .unwrap();
         assert_eq!(cursor, 7);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "7\n");
         cursor = 6;
-        assert!(import_entries(&entries, "example", "person/ada", dir.path(), &mut cursor,
-            |_| Ok(())).is_err());
+        assert!(
+            import_entries(
+                &entries,
+                "example",
+                "person/ada",
+                dir.path(),
+                &mut cursor,
+                |_| Ok(())
+            )
+            .is_err()
+        );
         assert_eq!(cursor, 6);
     }
     #[test]

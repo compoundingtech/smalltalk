@@ -514,6 +514,7 @@ impl Store {
         sealed: &SealedIdentities,
         plan: Option<&DropPlan>,
     ) -> Result<()> {
+        self.runtime.checkpoint_preflight()?;
         let connection = self.connection.write();
         connection.execute(
             "INSERT INTO checkpoints(id, cut_unix_ms, state, seal_rowid, sealed_digest,
@@ -544,6 +545,7 @@ impl Store {
         fields: BTreeMap<String, Value>,
         key: String,
     ) -> Result<()> {
+        self.runtime.checkpoint_preflight()?;
         self.append_claim(&ClaimInput {
             subject: checkpoint.to_owned(),
             kind: kind.to_owned(),
@@ -621,6 +623,7 @@ impl Store {
     /// what it holds before the cut is still changing. Call it after exchanges and every few
     /// minutes. The proof copies the store and replays it, so run it off the request path.
     pub fn checkpoint_step(&self, context: &CheckpointContext) -> Result<Vec<CheckpointAction>> {
+        self.runtime.checkpoint_preflight()?;
         let mut actions = Vec::new();
         if self.replication_catching_up() {
             return Ok(actions);
@@ -706,6 +709,7 @@ impl Store {
         context: &CheckpointContext,
         actions: &mut Vec<CheckpointAction>,
     ) -> Result<()> {
+        self.runtime.checkpoint_preflight()?;
         let (sealed, plan, proof) =
             self.plan_checkpoint_through(terms.cut_unix_ms, Some(seal_rowid), &context.scratch)?;
         if plan.sealed_digest != terms.sealed_digest {
@@ -777,6 +781,7 @@ impl Store {
     /// A person looked at a trim that stopped because the graph would change. The rows stay
     /// as they are, and checkpoints go on from the next one.
     pub fn resume_checkpoints(&self, actor: &str, reason: &str) -> Result<(), St3Error> {
+        self.runtime.checkpoint_preflight().map_err(internal)?;
         let actor = normalize_actor(actor, "person");
         if !actor.starts_with("person/") || reason.trim().is_empty() {
             return Err(St3Error::new(
@@ -804,6 +809,7 @@ impl Store {
         now_unix_ms: u128,
         configured_peers: &[String],
     ) -> Result<CheckpointStatusView> {
+        self.runtime.checkpoint_preflight()?;
         let claims = self.checkpoint_claims()?;
         let stable = stable_checkpoints(&claims);
         let newest_stable = stable

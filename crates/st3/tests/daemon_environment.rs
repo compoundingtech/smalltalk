@@ -160,7 +160,8 @@ fn bare_service_environment_loads_shell_path_and_rechecks_credentials() {
         &bin.join("pty"),
         "#!/bin/sh\n[ \"$ORCHID_CONTROL\" = from-shell ] || exit 9\nprintf '[]\\n'\n",
     );
-    executable(&bin.join("gh"), "#!/bin/sh\nexit 1\n");
+    let calls = root.path().join("gh-calls");
+    executable(&bin.join("gh"), &format!("#!/bin/sh\nprintf x >> '{}'\nexit 1\n", calls.display()));
     let (_service, socket) = start_service(root.path(), &home, &root.path().join("state"));
     let doctor = || doctor_report(&home, &socket);
     let report = doctor();
@@ -189,8 +190,18 @@ fn bare_service_environment_loads_shell_path_and_rechecks_credentials() {
     assert!(auth["message"].as_str().unwrap().contains("gh auth login"));
     executable(
         &bin.join("gh"),
-        "#!/bin/sh\nprintf 'orchid-test-credential\\n'\n",
+        &format!("#!/bin/sh\nprintf x >> '{}'\nprintf 'orchid-test-credential\\n'\n", calls.display()),
     );
+    // A failed lookup backs off rather than spawning gh for every doctor request.
+    let retry = doctor();
+    let retry_auth = retry["checks"].as_array().unwrap().iter()
+        .find(|check| check["name"] == "github-observer-auth").unwrap();
+    assert_eq!(retry_auth["status"], "warn");
+    assert_eq!(std::fs::read(&calls).unwrap().len(), 1);
+    // A login changing gh's credential file clears the backoff for the next caller.
+    let gh_config = root.path().join("config/gh");
+    std::fs::create_dir_all(&gh_config).unwrap();
+    std::fs::write(gh_config.join("hosts.yml"), "fixture credential metadata changed\n").unwrap();
     let report = doctor();
     let auth = report["checks"]
         .as_array()
@@ -200,6 +211,8 @@ fn bare_service_environment_loads_shell_path_and_rechecks_credentials() {
         .unwrap();
     assert_eq!(auth["status"], "pass");
     assert!(!report.to_string().contains("orchid-test-credential"));
+    doctor();
+    assert_eq!(std::fs::read(&calls).unwrap().len(), 2);
 }
 
 #[test]

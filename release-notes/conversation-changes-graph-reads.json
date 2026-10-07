@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Narrow conversation owner, runtime and message reads so changed conversations avoid fleet history reductions",
+  "replay": {
+    "status": "none",
+    "detail": "The existing message window, cursor and timeline data remain in use; no stored conversation content is added."
+  },
+  "schema": {
+    "status": "changed",
+    "detail": "Adds two partial endpoint indexes for legacy root-body message sends at store open. Schema version, projected data and digests are unchanged; older builds ignore these indexes. The volatile identity cache is rebuilt from claims."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No claim kind, checkpoint rule, digest or retention change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No client contract, generated file, scope or wire shape changes."
+  },
+  "downtime": {
+    "status": "changed",
+    "detail": "First open builds the two legacy indexes over retained message sends before serving; later opens reuse them. Normal rolling deployment applies."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No action is required on existing installations."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "The identity cache is in memory and rebuilds from existing claims after restart or projection repair."
+  }
+}

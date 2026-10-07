@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Bound owner-local PEEK observation by explicit selected-use and revocable leases",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay behavior changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "RULES_VERSION remains11; no checkpoint rule changes."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "PEEK expires after60seconds idle or300seconds absolute. Output is not renewal. Authority revocation cancels observations before writer acknowledgement. Lease fences share folded runtime authority with live terminal admission, preserving omitted fields and rejecting explicit nulls or rival authority. ATTACH is unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional service interruption beyond a normal daemon upgrade."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Consumers must renew only foreground-selected PEEK observations, rotate with fresh acquisition and GEOMETRY plus SCREEN readiness, and reacquire after EOF."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No data rewrite or destructive migration; existing binary swap-back behavior is unchanged. Older builds retain their older observation enforcement."
+  }
+}

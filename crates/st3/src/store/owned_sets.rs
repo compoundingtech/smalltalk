@@ -4,6 +4,9 @@ use crate::model::MemberSpec;
 use serde::Deserialize;
 use std::cell::RefCell;
 
+pub(super) const STAGED_SUBJECTS_QUERY: &str =
+    "SELECT DISTINCT subject FROM claims WHERE json_extract(body,'$.owned_set') IS NOT NULL";
+
 struct SnapshotRows {
     connection: usize,
     rows: BTreeMap<Option<u64>, Vec<View>>,
@@ -943,7 +946,9 @@ pub(super) fn plan_tx(
     let declaration_diffs = declarations::diffs(
         transaction,
         &intent,
-        changes.iter().filter(|(_, change)| change.as_str() != "unchanged")
+        changes
+            .iter()
+            .filter(|(_, change)| change.as_str() != "unchanged")
             .map(|(subject, _)| subject.as_str()),
         Some(current_index(transaction).map_err(internal)?),
     )?;
@@ -1263,6 +1268,82 @@ impl Store {
     pub fn owned_member_guard(&self, s: &str) -> Result<(), St3Error> {
         guard_member(&self.readers.get(), s)
     }
+    /// Select a pass's candidates from one authority snapshot. This is not an effect fence:
+    /// callers must still check current authority before workspace, render or runtime effects.
+    pub(crate) fn owned_desired_subjects(
+        &self,
+        desired: &[DesiredSubject],
+    ) -> Result<BTreeSet<String>, St3Error> {
+        if desired.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        self.read_snapshot(|_| {
+            self.with_owned_set_snapshot_reads(|| {
+                let connection = self.readers.get();
+                let history = rows(&connection, None)?;
+                let mut owners = BTreeMap::<String, BTreeSet<String>>::new();
+                for view in &history {
+                    for subject in view
+                        .receipt
+                        .members
+                        .keys()
+                        .chain(view.receipt.retired.keys())
+                    {
+                        owners
+                            .entry(subject.clone())
+                            .or_default()
+                            .insert(view.id.clone());
+                    }
+                }
+                // The partial index created at open contains only staged owned declarations.
+                // Let the planner choose: a missing index must not fence otherwise valid work.
+                // Empty ownership uses one receipt and one staged-subject query for any roster;
+                // statement count alone does not bound rows or CPU for nonempty history.
+                let staged = connection
+                    .prepare(STAGED_SUBJECTS_QUERY)
+                    .map_err(internal)?
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .map_err(internal)?
+                    .collect::<Result<BTreeSet<_>, _>>()
+                    .map_err(internal)?;
+                // Keep failures local to owned candidates, as the individual guard does.
+                // An unowned subject does not depend on selected/effective membership.
+                let selected = selected(&connection, None);
+                let members = selected
+                    .as_ref()
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .filter(|view| view.blockers.is_empty())
+                    .map(|view| (view.id.clone(), effective_members(&connection, view, None)))
+                    .collect::<BTreeMap<_, _>>();
+                let eligible = desired
+                    .iter()
+                    .filter(|declaration| {
+                        let Some(sets) = owners.get(&declaration.subject) else {
+                            return !staged.contains(&declaration.subject);
+                        };
+                        if sets.len() != 1 {
+                            return false;
+                        }
+                        let set = sets.first().expect("one owner");
+                        members.get(set).is_some_and(|members| {
+                            members.as_ref().is_ok_and(|members| {
+                                members
+                                    .get(&declaration.subject)
+                                    .is_some_and(|(member, _, _)| {
+                                        member.revision == desired_revision(declaration)
+                                    })
+                            })
+                        })
+                    })
+                    .map(|declaration| declaration.subject.clone())
+                    .collect();
+                Ok(eligible)
+            })
+        })
+        .map_err(internal)
+    }
     /// Fence an external effect prepared from a declaration against the selected set.
     pub fn owned_desired_guard(&self, desired: &DesiredSubject) -> Result<(), St3Error> {
         let connection = self.readers.get();
@@ -1297,6 +1378,7 @@ impl Store {
             &key,
             Some(actor),
             Some(options),
+            None,
         )
     }
 }

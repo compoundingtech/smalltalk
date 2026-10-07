@@ -17,7 +17,7 @@
       "branch": "agent"
     },
     {
-      "name": "agent/example/fox🦊kit",
+      "name": "agent/example/fox\ud83e\udd8akit",
       "branch": "fox-kit"
     },
     {
@@ -25,102 +25,10 @@
       "branch": "head"
     }
   ],
-  "launches": [
-    {
-      "form": {
-        "name": "keen-otter",
-        "message": "  Check the build  ",
-        "harness": "claude",
-        "model": "default",
-        "effort": "default"
-      },
-      "parameters": {
-        "name": "keen-otter",
-        "harness": "claude",
-        "message": "Check the build"
-      }
-    },
-    {
-      "form": {
-        "name": "willow.keen-otter",
-        "message": "",
-        "harness": "codex",
-        "model": "gpt-6-sol",
-        "effort": "high",
-        "host": "host/willow",
-        "repository": " /srv/example/atlas "
-      },
-      "parameters": {
-        "name": "willow.keen-otter",
-        "harness": "codex",
-        "model": "gpt-6-sol",
-        "effort": "high",
-        "host": "host/willow",
-        "repo": "/srv/example/atlas",
-        "branch": "keen-otter",
-        "base": "origin/main"
-      }
-    },
-    {
-      "form": {
-        "name": "keen-otter",
-        "message": "",
-        "harness": "claude",
-        "model": "default",
-        "effort": "default",
-        "repository": "/srv/example/atlas",
-        "branch": "fix/login",
-        "base": "origin/develop",
-        "workspace": " /srv/example/login "
-      },
-      "parameters": {
-        "name": "keen-otter",
-        "harness": "claude",
-        "repo": "/srv/example/atlas",
-        "branch": "fix/login",
-        "base": "origin/develop",
-        "workspace": "/srv/example/login"
-      }
-    },
-    {
-      "form": {
-        "name": "keen-otter",
-        "message": "",
-        "harness": "pi",
-        "model": "default",
-        "effort": "default",
-        "workspace": "/srv/example/scratch",
-        "branch": "ignored",
-        "base": "ignored"
-      },
-      "parameters": {
-        "name": "keen-otter",
-        "harness": "pi",
-        "workspace": "/srv/example/scratch"
-      }
-    },
-    {
-      "form": {
-        "name": "HEAD",
-        "message": "",
-        "harness": "claude",
-        "model": "default",
-        "effort": "default",
-        "repository": "/srv/example/atlas"
-      },
-      "parameters": {
-        "name": "HEAD",
-        "harness": "claude",
-        "repo": "/srv/example/atlas",
-        "branch": "head",
-        "base": "origin/main"
-      }
-    }
-  ],
   "checkout": {
     "repository": "/srv/example/atlas",
     "branch": "fix/login",
     "base": "origin/develop"
   },
-  "checkout_label": "worktree · branch fix/login · /srv/example/atlas"
+  "checkout_label": "worktree \u00b7 branch fix/login \u00b7 /srv/example/atlas"
 }
