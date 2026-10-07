@@ -1,6 +1,13 @@
 # When something is wrong
 
-Start with the smallest question: is the daemon reachable, is the seat ready, or is the work waiting on a dependency? These commands are read-only and use the invented garden from [getting started](getting-started.md):
+If a populated v0.3.4 store may have unsigned delegation grants, preserve raw state and keys
+and follow the [founder signing audit](st3/founder-signing-audit.md) **before** doctor, restart or
+export. Doctor can seal pending work; these diagnostics are not the initial read-only capture
+for that affected history.
+
+For other stores, start with the smallest question: is the daemon reachable, is the seat ready,
+or is the work waiting on a dependency? These checks use the invented garden from
+[getting started](getting-started.md):
 
 ```sh
 st doctor
