@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "summary": "#1501: native channel starting handshake",
+  "commits": ["13e1e91af8828482fa497c0e9154092e5151191e"],
+  "replay": {"status": "none", "detail": "No new projection invalidation or startup replay trigger in the merged native channel starting handshake change."},
+  "schema": {"status": "none", "detail": "No database table, index, trigger or migration change in native channel starting handshake; SQLite user_version is unchanged."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digest/drop policy are unchanged; this change adds no sealing coordination requirement."},
+  "compatibility": {"status": "changed", "detail": "Fresh push-mode pi-family channels publish incarnation-specific starting before native hello, using the existing harness handshake. Ownership waits until that incarnation is running; stopped incarnations remain fenced. Existing channel re-execution retains its saved state."},
+  "downtime": {"status": "none", "detail": "No additional upgrade service stop or measured outage introduced by native channel starting handshake; the standard daemon/client restart procedure still applies."},
+  "manual": {"status": "none", "detail": "No data repair or configuration conversion required for existing installations by native channel starting handshake."},
+  "recovery": {"status": "none", "detail": "No additional recovery procedure introduced by this change. Preserve graph state, keys and configuration and follow the standard roll-forward guidance; this note does not qualify binary-only downgrade of the whole release."}
+}
