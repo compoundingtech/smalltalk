@@ -77,6 +77,15 @@ complete cached body and pagination link after a 304. Response status and rate-l
 remain available to the caller. Credential invalidation changes future authentication;
 it does not retry any of these HTTP requests.
 
+Repository pull-request GraphQL reads start with 20 open pulls per cursor page and preserve
+the existing nested review, check and merge-queue selections. GitHub's “Something went wrong
+while executing your query” refusal retries the same cursor with half as many pulls, down to
+one, and keeps that smaller size for the remaining pages. Debug logs record each page size;
+retry warnings record the failed and reduced sizes. Other failures, or an execution refusal
+at one pull, fail the observation without caching any partial result. The complete listing
+remains bounded at 1,000 open pulls regardless of page size; exceeding it or receiving a
+non-advancing continuation cursor fails rather than silently truncating facts.
+
 ## Main Performance failure messages
 
 A direct message subscription on `main_performance_failures` adds that field to an existing
