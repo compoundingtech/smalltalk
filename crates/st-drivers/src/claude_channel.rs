@@ -575,8 +575,18 @@ fn install_st3_with_claude(marketplace: &Path) -> Result<()> {
         .args(["plugin", "disable", "--help"])
         .output()
         .context("check Claude plugin disable support")?;
-    anyhow::ensure!(disable_help.status.success(),
-        "Claude must support `plugin disable` before installing st-channel; update Claude first");
+    let help = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&disable_help.stdout),
+        String::from_utf8_lossy(&disable_help.stderr)
+    );
+    anyhow::ensure!(
+        disable_help.status.success()
+            && help.lines().any(|line| {
+                line.trim_start().starts_with("Usage:") && line.contains("plugin disable")
+            }),
+        "Claude must support `plugin disable` before installing st-channel; update Claude first"
+    );
     match st3_marketplace_registration()? {
         Some(entry) if marketplace_entry_matches(&entry, marketplace) => {
             run_claude(&["plugin", "marketplace", "update", ST3_MARKETPLACE])?;

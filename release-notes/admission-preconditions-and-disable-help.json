@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Reject invalid fleet admission before service stop and verify Claude plugin-disable usage before installation.",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay or history rewriting."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Read-only migration binding preflight; no database schema changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Existing locked admission still checks membership and store binding before writing."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Create rejects existing membership and invalid member names before service inspection; migration rejects membership, invalid names and unbound/mismatched stores before service stop. Claude disable preflight requires a matching Usage line, including when unsupported commands return successful generic help."
+  },
+  "downtime": {
+    "status": "changed",
+    "detail": "Cheap admission errors leave running services alone. Errors after services stop still leave them stopped for inspection."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Inspect an admission failure before restarting stopped services. Unsupported Claude versions must be updated before installation."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "Interrupted create/migrate after membership save but before pin publication has no checkpoint resume; retain state/keys/membership/pin and use documented operator recovery. Saved join checkpoint resume is unchanged. Corrupt databases can also block pinned fleet controls through restored-writer inspection."
+  }
+}

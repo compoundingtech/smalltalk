@@ -594,14 +594,22 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
     match command {
         FleetCommand::Create(args) => {
             anyhow::ensure!(
+                st3::config::FleetFile::load(&config.state_dir)?.is_none(),
+                "this machine is already in a fleet"
+            );
+            anyhow::ensure!(
                 config.fleet_id.is_none(),
                 "config.toml already configures a fleet with config peers; move it to membership with st fleet migrate"
             );
             st3::node_identity::resolve(&mut config)?;
+            let node = args.name.unwrap_or_else(|| config.node.clone());
+            anyhow::ensure!(
+                st3::store::valid_fleet_node_name(&node),
+                "`{node}` cannot name a fleet member; use --name"
+            );
             let services = !args.no_service && services_installed();
             let state_identity =
                 lock_fleet_admission(&client, &config, services, "founds a fleet").await?;
-            let node = args.name.unwrap_or_else(|| config.node.clone());
             let founded =
                 st3::fleet::join::found(&config.state_dir, &node, &args.member.settings())?;
             state_identity.record_fleet_found(&founded)?;
@@ -761,7 +769,8 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
                 }
             };
             let use_services = !args.no_service && services_installed();
-            let state_identity = lock_fleet_admission(&client, &config, use_services, "joins").await?;
+            let state_identity =
+                lock_fleet_admission(&client, &config, use_services, "joins").await?;
             let joined = st3::fleet::join::join(&st3::fleet::join::JoinOptions {
                 state_dir: config.state_dir.clone(),
                 configured_node: config.node.clone(),
@@ -1493,10 +1502,45 @@ async fn run_fleet_migrate(client: &Client, config: &Config, args: FleetMigrateA
         }
         return Ok(());
     }
+    anyhow::ensure!(
+        st3::config::FleetFile::load(&config.state_dir)?.is_none(),
+        "this machine already has fleet membership settings"
+    );
+    anyhow::ensure!(
+        st3::store::valid_fleet_node_name(&config.node),
+        "`{}` cannot name a fleet member",
+        config.node
+    );
     let fleet_id = config
         .fleet_id
         .clone()
         .context("this machine has no config-peer fleet to migrate; use st fleet join")?;
+    // Read only while the daemon may still be running; the locked migration rechecks
+    // its store before writing. Invalid admission must not stop healthy services.
+    {
+        use rusqlite::OptionalExtension as _;
+        let database = config.state_dir.join("claims.sqlite3");
+        anyhow::ensure!(
+            database.exists(),
+            "this store is not bound to a fleet yet; start st3 once first"
+        );
+        let connection = rusqlite::Connection::open_with_flags(
+            database,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let bound: Option<String> = connection
+            .query_row("SELECT value FROM meta WHERE key='fleet_id'", [], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        match bound {
+            Some(bound) => anyhow::ensure!(
+                bound == fleet_id,
+                "this store belongs to fleet {bound}, not the configured {fleet_id}"
+            ),
+            None => anyhow::bail!("this store is not bound to a fleet yet; start st3 once first"),
+        }
+    }
     // fleet.toml resolves a relative path under STATE/fleet, and --finish removes the
     // config.toml override, so record the secret file's absolute path now.
     let configured_secret = config

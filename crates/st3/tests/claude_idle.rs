@@ -84,7 +84,7 @@ fn channel_installer_leaves_user_plugin_disabled_and_local_settings_intact() {
     let bin = root.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
     let claude = bin.join("claude");
-    std::fs::write(&claude, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CLAUDE_FIXTURE_LOG\"\ncase \"$*\" in\n*--json*) printf '[]\\n';;\nesac\n").unwrap();
+    std::fs::write(&claude, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CLAUDE_FIXTURE_LOG\"\ncase \"$*\" in\n\"plugin disable --help\") printf 'Usage: claude plugin disable [options] [plugin]\\n';;\n*--json*) printf '[]\\n';;\nesac\n").unwrap();
     std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o700)).unwrap();
     let local = root.path().join("seat/.claude/settings.local.json");
     std::fs::create_dir_all(local.parent().unwrap()).unwrap();
@@ -149,33 +149,38 @@ fn unsupported_provider_cannot_enable_the_plugin_before_disable_support_is_check
     if st3::test_support::supervise_test() {
         return;
     }
-    let root = tempfile::tempdir().unwrap();
-    let bin = root.path().join("bin");
-    std::fs::create_dir(&bin).unwrap();
-    let claude = bin.join("claude");
-    std::fs::write(
-        &claude,
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CLAUDE_FIXTURE_LOG\"\nexit 2\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let log = root.path().join("commands");
-    let output = st3::test_support::command(env!("CARGO_BIN_EXE_st3"))
-        .env("HOME", root.path())
-        .env("XDG_DATA_HOME", root.path().join("data"))
-        .env(
-            "PATH",
-            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+    for response in [
+        "exit 2\n",
+        "printf 'Usage: claude plugin [options] [command]\\nCommands: plugin disable\\n'\nexit 0\n",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let claude = bin.join("claude");
+        std::fs::write(
+            &claude,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CLAUDE_FIXTURE_LOG\"\n{response}"),
         )
-        .env("CLAUDE_FIXTURE_LOG", &log)
-        .current_dir(root.path())
-        .args(["claude-channel", "install", "--no-policy"])
-        .output()
         .unwrap();
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("update Claude first"));
-    assert_eq!(
-        std::fs::read_to_string(log).unwrap(),
-        "plugin disable --help\n"
-    );
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let log = root.path().join("commands");
+        let output = st3::test_support::command(env!("CARGO_BIN_EXE_st3"))
+            .env("HOME", root.path())
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("CLAUDE_FIXTURE_LOG", &log)
+            .current_dir(root.path())
+            .args(["claude-channel", "install", "--no-policy"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("update Claude first"));
+        assert_eq!(
+            std::fs::read_to_string(log).unwrap(),
+            "plugin disable --help\n"
+        );
+    }
 }

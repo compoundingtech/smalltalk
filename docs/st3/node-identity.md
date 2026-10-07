@@ -46,6 +46,14 @@ saved but its pin write was interrupted. Local checkpoint/config files belong to
 matching them is a consistency check, not authentication against an owner who can edit them.
 Changing fleet.toml alone still refuses a conflicting identity at ordinary startup.
 
+Create and migration check existing membership, valid member names and migration's store
+binding before stopping services. An error after a valid admission has stopped services
+leaves them stopped; inspect the error before restarting. If create or migration saved
+membership but failed to record the pin, repeating that command cannot resume it. Keep the
+state, keys, membership and pin intact and use the operator recovery branch above; only a
+saved join has checkpoint resume. A corrupt database can also block pinned fleet controls
+because they inspect its restored-writer marker before resolving identity.
+
 Restore claim backups into a fresh state directory, including no existing identity pin, and
 configure the new restored writer. A restored database under another writer's existing pin
 refuses startup with this instruction. Do not clone a live state directory and start the copy
