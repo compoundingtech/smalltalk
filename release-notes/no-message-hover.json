@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Messages and tool rows no longer light up under the pointer, and stui keeps a panic log",
+  "replay": {
+    "status": "none",
+    "detail": "No runtime replay change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Display only; the log is a local file under the cache directory."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional service interruption introduced."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual upgrade step."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No database or runtime recovery change."
+  }
+}

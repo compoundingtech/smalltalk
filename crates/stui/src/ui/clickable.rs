@@ -473,4 +473,26 @@ mod tests {
         }
         panic!("missing reference");
     }
+
+    #[test]
+    fn sweeping_the_pointer_over_every_cell_of_a_busy_conversation_never_panics() {
+        // Nathan, 2026-10-07: hovering messages seemed to crash stui.
+        for (width, height) in [(60, 20), (100, 30), (160, 48)] {
+            let mut ui = Ui::new(demo::world());
+            ui.glasses = Some(super::glass::Glasses::open(None, None));
+            ui.live = true;
+            ui.open_in_glass(
+                Pane::Agent(Some("agent/example/atlas/builder".to_owned())),
+                super::glass::Open::Tab,
+            );
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| ui.render(frame)).unwrap();
+            for y in 0..height {
+                for x in 0..width {
+                    pointer(&mut ui, MouseEventKind::Moved, x, y);
+                    terminal.draw(|frame| ui.render(frame)).unwrap();
+                }
+            }
+        }
+    }
 }
