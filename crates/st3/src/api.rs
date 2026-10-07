@@ -1675,14 +1675,8 @@ where
         let page = client_page(state, &snapshot, collection, Vec::new(), query)?;
         return Ok((Extension(snapshot), Json(page)));
     }
-    let roster_admission = if collection == "agents" {
-        Some(state.store.admit_agent_resources().await)
-    } else {
-        None
-    };
     let reader = state.clone();
     let (snapshot, items) = blocking_store(move || {
-        let _roster_admission = roster_admission;
         reader.store.clone().read_snapshot(|index| {
             let snapshot = client_snapshot_at(&reader, index);
             let items = reader
@@ -2281,7 +2275,7 @@ fn client_agent_cards_for_page(
         .iter()
         .filter_map(|r| r["id"].as_str().map(str::to_owned))
         .collect::<BTreeSet<_>>();
-    let mut cards = store.cached_agent_resources_for(index, history, Some(&selected), |changed| {
+    let cards = store.cached_agent_resources_for(index, history, Some(&selected), |changed| {
         let (subjects, _) = changed.expect("a selected page always names its missing cards");
         // Pagination refs are frozen response metadata, never shared projection inputs.
         // Reuse the independently time-fenced current refs to avoid a second fleet queue scan.
@@ -2292,6 +2286,15 @@ fn client_agent_cards_for_page(
         add_agent_todos(store, &mut cards, index)?;
         Ok(cards)
     }).map_err(ApiError::internal)?;
+    client_agent_cards_from_cached(store, cards, refs, at)
+}
+
+fn client_agent_cards_from_cached(
+    store: &Store,
+    mut cards: Vec<Value>,
+    refs: &[Value],
+    at: &str,
+) -> Result<Vec<Value>, ApiError> {
     if cards.len() != refs.len() {
         return Err(client_page_expired(
             "agent page membership is no longer available; restart pagination",
@@ -4177,57 +4180,95 @@ async fn client_agents(
     Extension(snapshot): Extension<ClientSnapshot>,
     Query(query): Query<ClientListQuery>,
 ) -> Result<ClientPageResponse, ApiError> {
-    let history = query.history;
-    let status = query.status.clone();
-    let page = client_snapshot_page(
-        &state,
-        snapshot,
-        "agents",
-        &query,
-        move |state, snapshot| {
-            let mut items = if status.is_some() {
-                client_agent_resources(
-                    &state.store,
-                    history,
-                    &snapshot.created_at,
-                    snapshot.store_index,
-                )?
-            } else {
-                client_agent_page_refs(&state.store, history, snapshot.store_index)?
-            };
-            if let Some(status) = status.as_deref() {
-                items.retain(|item| item.get("state").and_then(Value::as_str) == Some(status));
-            }
-            Ok(items)
-        },
-    )
-    .await?;
-    if query.status.is_some() {
-        return Ok(page);
+    // A warm request never queues behind a cold projection. Drop the probe's SQLite
+    // snapshot before waiting, then recheck all cache fences in the admitted snapshot.
+    for admitted in [false, true] {
+        let admission = if admitted {
+            Some(state.store.admit_agent_resources().await)
+        } else {
+            None
+        };
+        let reader = state.clone();
+        let snapshot = snapshot.clone();
+        let query = query.clone();
+        let result = blocking_store(move || {
+            let _admission = admission;
+            reader.store.clone().read_snapshot(|index| {
+                let snapshot = if query.cursor.is_some() {
+                    snapshot
+                } else {
+                    client_snapshot_at(&reader, index)
+                };
+                Ok(reader.store.with_owned_set_snapshot_reads(|| {
+                    client_agents_page_at(&reader, snapshot, &query, admitted)
+                }))
+            })
+        }).await??;
+        if let Some(page) = result {
+            return Ok(page);
+        }
     }
-    // Name/id ordering is independent of the live overlays. Only the returned page needs them.
-    let store = state.store.clone();
-    let roster_admission = store.admit_agent_resources().await;
-    blocking_store(move || {
-        let _roster_admission = roster_admission;
-        let (Extension(snapshot), Json(mut page)) = page;
-        let items = store.read_snapshot(|_| {
-            Ok(store.with_owned_set_snapshot_reads(|| {
-                client_agent_cards_for_page(
-                    &store,
-                    history,
-                    snapshot.store_index,
-                    &page.items,
-                    &snapshot.created_at,
-                )
-            }))
-        })?;
-        Ok(items.map(|items| {
-            page.items = items;
-            (Extension(snapshot), Json(page))
-        }))
-    })
-    .await?
+    unreachable!("an admitted roster read always builds missing cards")
+}
+
+fn client_agents_page_at(
+    state: &AppState,
+    snapshot: ClientSnapshot,
+    query: &ClientListQuery,
+    admitted: bool,
+) -> Result<Option<ClientPageResponse>, ApiError> {
+    let store = &state.store;
+    let index = snapshot.store_index;
+    let mut items = if query.cursor.is_some() {
+        Vec::new()
+    } else if query.status.is_some() {
+        let mut cards = if admitted {
+            client_agent_resources_cached(store, query.history, index).map_err(ApiError::internal)?
+        } else {
+            let Some(cards) = store.agent_resources_cached_at(index, query.history, None)
+                .map_err(ApiError::internal)? else { return Ok(None) };
+            (*cards).clone()
+        };
+        overlay_agent_resources(store, &mut cards, &snapshot.created_at)
+            .map_err(ApiError::internal)?;
+        cards
+    } else if admitted {
+        client_agent_page_refs(store, query.history, index).map_err(ApiError::internal)?
+    } else {
+        let Some(refs) = store.agent_page_refs_cached_at(index, query.history) else {
+            return Ok(None);
+        };
+        (*refs).clone()
+    };
+    if let Some(status) = query.status.as_deref() {
+        items.retain(|item| item["state"].as_str() == Some(status));
+    }
+    // On a first-page probe, determine coverage before publishing pagination metadata.
+    let cached_cards = if !admitted && query.status.is_none() {
+        let refs = if query.cursor.is_some() {
+            client_page_read(state, &snapshot, "agents", Vec::new(), query, true)?.items
+        } else {
+            items.iter().take(query.limit.unwrap_or(CLIENT_DEFAULT_PAGE_ITEMS)
+                .clamp(1, CLIENT_MAX_PAGE_ITEMS)).cloned().collect()
+        };
+        let selected = refs.iter().filter_map(|r| r["id"].as_str().map(str::to_owned))
+            .collect::<BTreeSet<_>>();
+        let Some(cards) = store.agent_resources_cached_at(index, query.history, Some(&selected))
+            .map_err(ApiError::internal)? else { return Ok(None) };
+        Some(cards.iter().filter(|card| card["id"].as_str()
+            .is_some_and(|id| selected.contains(id))).cloned().collect())
+    } else {
+        None
+    };
+    let mut page = client_page_read(state, &snapshot, "agents", items, query, true)?;
+    if query.status.is_none() {
+        page.items = if let Some(cards) = cached_cards {
+            client_agent_cards_from_cached(store, cards, &page.items, &snapshot.created_at)?
+        } else {
+            client_agent_cards_for_page(store, query.history, index, &page.items, &snapshot.created_at)?
+        };
+    }
+    Ok(Some((Extension(snapshot), Json(page))))
 }
 
 async fn client_agents_detail(
@@ -21794,6 +21835,159 @@ mission "wake" state="ready" {
             client_agent_resources_uncached(store, history, index).unwrap()
         );
         cached
+    }
+
+    fn roster_followup_store() -> Store {
+        let store = Store::open_memory("node").unwrap();
+        let source =
+            "version 2\nagent \"amber\" { command \"true\" }\nagent \"cobalt\" { command \"true\" }\n";
+        let intent = crate::graph::parse_test_intent(source, "node").unwrap();
+        let plan = store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store.apply(&intent, &plan.subject_tokens, "roster-followup").unwrap();
+        store.append_claim(&roster_local_observation(
+            "harness.observed",
+            json!({"state":"idle", "driver":"codex", "incarnation_id":"amber-1",
+                "observed_at_ms":1}),
+        )).unwrap();
+        store
+    }
+
+    fn roster_local_observation(kind: &str, fields: Value) -> ClaimInput {
+        ClaimInput {
+            subject: "agent/node.amber".into(),
+            kind: kind.into(),
+            actor: Some("agent/node.amber".into()),
+            fields: serde_json::from_value(fields).unwrap(),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        }
+    }
+
+    fn roster_local_timeline() -> ClaimInput {
+        roster_local_observation("harness.timeline", json!({
+            "operation":"append", "entry_id":"local-activity", "source_id":"fixture/local-activity",
+            "sequence":1, "revision":1, "role":"assistant", "entry_type":"content",
+            "final":true, "driver":"codex", "incarnation_id":"amber-1",
+            "observed_at_unix_ms":1_900_000_000_000_u64, "body":{"text":"local activity"},
+        }))
+    }
+
+    #[test]
+    fn agent_roster_cached_projection_matches_uncached_after_local_timeline() {
+        let store = roster_followup_store();
+        let index = store.index().unwrap();
+        let before = [false, true].map(|history| checked_agent_cache(&store, history, index));
+        store.append_local_observations_for_test(&[roster_local_timeline()]);
+        assert_eq!(store.index().unwrap(), index, "local activity must preserve the graph cut");
+        for (history, original) in [false, true].into_iter().zip(before) {
+            let updated = checked_agent_cache(&store, history, index);
+            let card = |cards: &[Value], subject: &str| {
+                cards.iter().find(|card| card["id"] == subject).unwrap().clone()
+            };
+            assert_ne!(
+                card(&updated, "agent/node.amber")["last_activity_at"],
+                card(&original, "agent/node.amber")["last_activity_at"],
+            );
+            assert_eq!(
+                card(&updated, "agent/node.cobalt"),
+                card(&original, "agent/node.cobalt"),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn warm_agent_http_page_bypasses_unrelated_cold_roster_admission() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let source = "version 2\nagent \"warm\" { command \"true\" }\n";
+        let intent = crate::graph::parse_test_intent(source, "node").unwrap();
+        let plan = state.store.mission(&intent, crate::model::IntentInput {
+            kdl: source.into(), source_name: None,
+        }).unwrap();
+        state.store.apply(&intent, &plan.subject_tokens, "warm-admission").unwrap();
+        let (_, Json(cold)) = client_agents(
+            State(state.clone()), Extension(new_client_snapshot(&state)),
+            Query(ClientListQuery::default()),
+        ).await.unwrap();
+        assert_eq!(cold.items.len(), 1);
+        let admission = state.store.admit_agent_resources().await;
+        let started = Instant::now();
+        let (_, Json(warm)) = tokio::time::timeout(
+            Duration::from_secs(2),
+            client_agents(
+                State(state.clone()), Extension(new_client_snapshot(&state)),
+                Query(ClientListQuery::default()),
+            ),
+        ).await.expect("warm HTTP page must not wait for an unrelated cold builder").unwrap();
+        assert_eq!(warm.items, cold.items);
+        println!("roster warm HTTP fixture: held_cold_admission=true elapsed_ms={:.3}",
+            started.elapsed().as_secs_f64() * 1000.0);
+        drop(admission);
+    }
+
+    #[test]
+    fn agent_roster_heartbeat_only_local_stream_hit_rate() {
+        let store = roster_followup_store();
+        let index = store.index().unwrap();
+        let selected = BTreeSet::from(["agent/node.amber".to_string()]);
+        let pinned = [false, true].map(|history| {
+            checked_agent_cache(&store, history, index);
+            store.read_snapshot(|_| {
+                Ok(store.agent_resources_cached_at(index, history, None)?.unwrap())
+            }).unwrap()
+        });
+        const APPENDS: usize = 64;
+        let started = Instant::now();
+        let mut hits = 0;
+        for n in 0..APPENDS {
+            store.append_local_observations_for_test(&[roster_local_observation(
+                "harness.observed",
+                json!({"state":"idle", "driver":"codex", "incarnation_id":"amber-1",
+                    "observed_at_ms":300_001 + n as u64}),
+            )]);
+            assert_eq!(store.index().unwrap(), index);
+            for (history, original) in [false, true].into_iter().zip(&pinned) {
+                store.read_snapshot(|_| {
+                    let hit = store.agent_resources_cached_at(index, history, Some(&selected))?;
+                    let hit = hit.expect("heartbeat-only append must reuse the roster");
+                    assert!(Arc::ptr_eq(&hit, original), "read-only hits must pin the same rows");
+                    assert_eq!(hit.len(), 2, "selected coverage must not filter the pinned Arc");
+                    hits += 1;
+                    Ok(())
+                }).unwrap();
+            }
+        }
+        let probes = APPENDS * pinned.len();
+        println!(
+            "roster heartbeat fixture: appends={APPENDS} probes={probes} hits={hits} hit_rate={:.1}% elapsed_ms={:.3}",
+            100.0 * hits as f64 / probes as f64,
+            started.elapsed().as_secs_f64() * 1000.0,
+        );
+        assert_eq!(hits, probes);
+        store.append_local_observations_for_test(&[roster_local_timeline()]);
+        assert_eq!(store.index().unwrap(), index);
+        for history in [false, true] {
+            store.read_snapshot(|_| {
+                assert!(store.agent_resources_cached_at(index, history, None)?.is_none(),
+                    "timeline activity must miss even at the same graph cut");
+                Ok(())
+            }).unwrap();
+            checked_agent_cache(&store, history, index);
+            store.read_snapshot(|_| {
+                assert!(store.agent_resources_cached_at(index, history, None)?.is_some(),
+                    "the rebuilt timeline cut must become reusable");
+                Ok(())
+            }).unwrap();
+        }
     }
 
     #[test]

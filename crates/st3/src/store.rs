@@ -621,6 +621,13 @@ ON local_observations(dedupe_key) WHERE dedupe_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS local_observations_timeline_index
 ON local_observations(subject, json_extract(body, '$.fields.incarnation_id'), id)
 WHERE kind='harness.timeline';
+-- The roster cache's local frontier: the newest agent timeline row a graph cut can see. Only
+-- an agent's timeline rows can change a roster card, so this partial covering index bounds the
+-- frontier lookup by newer agent timeline rows alone; heartbeats, telemetry and every other
+-- subject's observations never enter it, and the scan reads no table row.
+CREATE INDEX IF NOT EXISTS local_observations_roster_frontier_index
+ON local_observations(id, after_store_index)
+WHERE kind='harness.timeline' AND subject LIKE 'agent/%';
 -- A mission capacity retry is scheduling state owned by this reconciler. Replicating every
 -- backoff attempt makes every peer reconcile even though only this node can retry it.
 CREATE TABLE IF NOT EXISTS local_subscription_mission_deferrals (
@@ -2581,6 +2588,48 @@ pub fn runtime() -> Arc<dyn smallclaims::Runtime> {
     Arc::new(SmalltalkRuntime::default())
 }
 
+/// The local rows a roster card can read: timeline entries an agent subject made, which date its
+/// activity and its managed session. Heartbeat and telemetry observations never change a card —
+/// the harness fold, working episodes, usage summaries and todos all read replicated claims —
+/// and neither do `Latest` observations, which reach cards only through the claims written when
+/// their state changes. So the frontier is the newest agent timeline row at or before the cut,
+/// an exact `MAX(id)`: it never assumes observation ids and graph cuts rise together, which
+/// repair and trim can break.
+const ROSTER_LOCAL_FRONTIER: &str = "SELECT COALESCE((SELECT id FROM local_observations
+ WHERE kind='harness.timeline' AND subject LIKE 'agent/%' AND after_store_index<=?1
+ ORDER BY id DESC LIMIT 1), 0)";
+
+/// One frontier read, inside the caller's SQLite snapshot when it holds one: the reader pool
+/// lends pinned reads the same connection. The partial frontier index keeps an old cut from
+/// walking newer heartbeat rows.
+fn roster_local_frontier(connection: &Connection, index: u64) -> Result<u64> {
+    Ok(connection.query_row(ROSTER_LOCAL_FRONTIER, [index], |row| row.get::<_, u64>(0))?)
+}
+
+/// The exact cache-hit contract shared by the building path and the read-only warm pin: one
+/// graph cut, one roster-relevant local frontier, one history mode, a queue lease window that
+/// has not ended, and coverage of every requested subject.
+fn agent_resources_entry_hits(
+    entry: &runtime::AgentResourcesEntry,
+    now: u128,
+    index: u64,
+    local: u64,
+    history: bool,
+    selected: Option<&BTreeSet<String>>,
+) -> bool {
+    entry.index == index
+        && entry.local == local
+        && entry.history == history
+        && entry.valid_until_unix_ms.is_none_or(|expiry| now < expiry)
+        && match selected {
+            None => entry.covered.is_none(),
+            Some(names) => entry
+                .covered
+                .as_ref()
+                .is_none_or(|covered| names.is_subset(covered)),
+        }
+}
+
 impl Store {
     pub fn open(path: &Path, origin: impl Into<String>) -> Result<Self> {
         let smalltalk = Arc::new(SmalltalkRuntime::default());
@@ -2799,8 +2848,9 @@ impl Store {
     }
 
     /// Bounded immutable projections shared by pages and streams. Pages fill only missing
-    /// subjects; a complete stream projection subsumes them. Local observations advance only
-    /// affected cards, and historical cuts never borrow newer rows.
+    /// subjects; a complete stream projection subsumes them. Local agent timeline rows advance
+    /// only affected cards — heartbeats never move the frontier — and historical cuts never
+    /// borrow newer rows.
     pub(crate) fn cached_agent_resources_for(
         &self,
         index: u64,
@@ -2812,30 +2862,20 @@ impl Store {
         let valid = |entry: &&runtime::AgentResourcesEntry| {
             entry.valid_until_unix_ms.is_none_or(|expiry| now < expiry)
         };
-        // Local timeline rows do not advance the graph index, but do change last_activity.
-        // Read their frontier inside the caller's SQLite snapshot, never from a future atomic
-        // generation that could race this cut. The ordinary warm read is one primary-key seek.
-        let local = crate::performance::task("roster/frontier-read", || -> Result<u64> {
-            let connection = self.readers.get();
-            let local = connection.query_row(
-                "SELECT COALESCE((SELECT id FROM local_observations WHERE after_store_index<=?1
-                 ORDER BY id DESC LIMIT 1), 0)", [index], |row| row.get::<_, u64>(0),
-            )?;
-            drop(connection);
-            Ok(local)
+        // Local agent timeline rows do not advance the graph index, but do change cards; the
+        // frontier ignores heartbeats and every other local kind, none of which a card reads.
+        // Read it inside the caller's SQLite snapshot, never from a future atomic generation
+        // that could race this cut.
+        let local = crate::performance::task("roster/frontier-read", || {
+            roster_local_frontier(&self.readers.get(), index)
         })?;
         let select = |items: &[Value]| items.iter().filter(|item| {
             selected.is_none_or(|names| names.contains(item["id"].as_str().unwrap_or_default()))
         }).cloned().collect::<Vec<_>>();
         let cache = self.smalltalk.agent_resources_cache.lock()
             .expect("agent resources cache poisoned");
-        let satisfies = |entry: &runtime::AgentResourcesEntry| {
-            entry.covered.as_ref().is_none_or(|covered| {
-                selected.is_some_and(|names| names.is_subset(covered))
-            })
-        };
         if let Some(entry) = cache.iter().filter(valid).find(|entry| {
-            entry.index == index && entry.local == local && entry.history == history && satisfies(entry)
+            agent_resources_entry_hits(entry, now, index, local, history, selected)
         }) {
             let items = Arc::clone(&entry.items);
             drop(cache);
@@ -2853,7 +2893,7 @@ impl Store {
                 .map(|changed| (entry, changed)),
             None => None,
         };
-        let (mut items, covered, valid_until_unix_ms) = match previous {
+        match previous {
             Some((previous, mut changed)) => {
                 if previous.local != local {
                     let connection = self.readers.get();
@@ -2883,37 +2923,52 @@ impl Store {
                         None
                     }
                 };
+                // Coverage gaps join `changed`, so an empty set means no card this cut can see
+                // moved at all: the previous rows already are this cut's projection, and the
+                // heartbeat or fleet-only claim between two reads costs no clone, sort or build.
+                if changed.is_empty() {
+                    return Ok(runtime::AgentResourcesEntry {
+                        index, local, history, covered,
+                        valid_until_unix_ms: previous.valid_until_unix_ms,
+                        items: Arc::clone(&previous.items),
+                    });
+                }
+                #[cfg(test)]
+                self.smalltalk.agent_resources_builds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let mut items = previous.items.iter()
                     .filter(|item| !changed.contains(item["id"].as_str().unwrap_or_default()))
                     .cloned().collect::<Vec<_>>();
-                if !changed.is_empty() {
-                    #[cfg(test)]
-                    self.smalltalk.agent_resources_builds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    items.extend(crate::performance::task("roster/card-projection",
-                        || build(Some((&changed, &previous.items))))?);
-                }
-                (items, covered, previous.valid_until_unix_ms)
+                items.extend(crate::performance::task("roster/card-projection",
+                    || build(Some((&changed, &previous.items))))?);
+                items.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str())
+                    .then_with(|| a["id"].as_str().cmp(&b["id"].as_str())));
+                Ok(runtime::AgentResourcesEntry {
+                    index, local, history, covered,
+                    valid_until_unix_ms: previous.valid_until_unix_ms,
+                    items: Arc::new(items),
+                })
             }
-            _ => {
+            None => {
                 #[cfg(test)]
                 self.smalltalk.agent_resources_builds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                (crate::performance::task("roster/card-projection",
-                    || build(selected.map(|names| (names, &[][..]))))?, selected.cloned(),
-                    self.agent_queue_valid_until(now)?)
+                let mut items = crate::performance::task("roster/card-projection",
+                    || build(selected.map(|names| (names, &[][..]))))?;
+                items.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str())
+                    .then_with(|| a["id"].as_str().cmp(&b["id"].as_str())));
+                Ok(runtime::AgentResourcesEntry {
+                    index, local, history, covered: selected.cloned(),
+                    valid_until_unix_ms: self.agent_queue_valid_until(now)?,
+                    items: Arc::new(items),
+                })
             }
-        };
-        items.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str())
-            .then_with(|| a["id"].as_str().cmp(&b["id"].as_str())));
-        Ok(runtime::AgentResourcesEntry {
-            index, local, history, covered, valid_until_unix_ms, items: Arc::new(items),
-        })
+        }
         })?;
         let mut cache = self.smalltalk.agent_resources_cache.lock()
             .expect("agent resources cache poisoned");
         // All endpoint callers hold admission. Direct internal readers may still race; never
         // replace a complete published projection with a partial one.
         let published = cache.iter().filter(valid).find(|entry| {
-            entry.index == index && entry.local == local && entry.history == history && satisfies(entry)
+            agent_resources_entry_hits(entry, now, index, local, history, selected)
         }).map(|entry| Arc::clone(&entry.items));
         let items = if let Some(published) = published { published } else {
             cache.retain(|entry| entry.index != index || entry.local != local || entry.history != history);
@@ -2924,6 +2979,47 @@ impl Store {
         };
         drop(cache);
         Ok(select(&items))
+    }
+
+    /// The warm pin a shared roster read checks before it admits a builder: the exact cached
+    /// rows for this graph cut, roster-relevant local frontier, history mode and selected
+    /// coverage, or `None` when only a build can answer. Never builds; a miss must drop its
+    /// SQLite snapshot before waiting for admission. The rows are the complete unfiltered
+    /// projection at the cut, so a page still selects its own subjects from them.
+    pub(crate) fn agent_resources_cached_at(
+        &self,
+        index: u64,
+        history: bool,
+        selected: Option<&BTreeSet<String>>,
+    ) -> Result<Option<Arc<Vec<Value>>>> {
+        let now = now_ms();
+        let local = crate::performance::task("roster/frontier-read", || {
+            roster_local_frontier(&self.readers.get(), index)
+        })?;
+        let cache = self.smalltalk.agent_resources_cache.lock()
+            .expect("agent resources cache poisoned");
+        let hit = cache.iter()
+            .find(|entry| agent_resources_entry_hits(entry, now, index, local, history, selected))
+            .map(|entry| Arc::clone(&entry.items));
+        drop(cache);
+        Ok(hit.map(|hit| crate::performance::task("roster/cache-hit", || hit)))
+    }
+
+    /// The matching warm pin for page refs: membership, ordering and queue metadata for exactly
+    /// this graph cut and history mode while the queue lease window still holds, or `None`.
+    /// Refs carry no local timeline data, so no frontier is read. Never builds.
+    pub(crate) fn agent_page_refs_cached_at(
+        &self,
+        index: u64,
+        history: bool,
+    ) -> Option<Arc<Vec<Value>>> {
+        let now = now_ms();
+        self.smalltalk.agent_page_refs_cache.lock()
+            .expect("agent page refs cache poisoned")
+            .iter()
+            .find(|entry| entry.index == index && entry.history == history
+                && entry.valid_until_unix_ms.is_none_or(|expiry| now < expiry))
+            .map(|entry| Arc::clone(&entry.items))
     }
 
     /// Rebuild the operation projection when it no longer matches the claim log, and say
@@ -31855,6 +31951,246 @@ mod tests {
         other.join().unwrap();
         assert_eq!(completed.unwrap().unwrap()[0]["id"], "agent/cached");
         assert_eq!(resumed, published.unwrap());
+    }
+
+    fn roster_cache_store() -> Store {
+        let store = Store::open_memory("node").unwrap();
+        let source = "version 2\nagent \"amber\" { command \"true\" }\n";
+        let intent = parse_intent(source, "node").unwrap();
+        let plan = store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store.apply(&intent, &plan.subject_tokens, "roster-cache").unwrap();
+        store
+    }
+
+    fn local_observation_for_test(kind: &str, fields: Value) -> ClaimInput {
+        ClaimInput {
+            subject: "agent/node.amber".into(),
+            kind: kind.into(),
+            actor: Some("agent/node.amber".into()),
+            fields: serde_json::from_value(fields).unwrap(),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        }
+    }
+
+    fn local_timeline_observation_for_test() -> ClaimInput {
+        local_observation_for_test("harness.timeline", json!({
+            "operation":"append", "entry_id":"local-activity", "source_id":"fixture/local-activity",
+            "sequence":1, "revision":1, "role":"assistant", "entry_type":"content", "final":true,
+            "driver":"codex", "incarnation_id":"amber-1",
+            "observed_at_unix_ms":1_900_000_000_000_u64, "body":{"text":"local activity"},
+        }))
+    }
+
+    /// A heartbeat moves no card, so heartbeat-only local deltas keep pinning the same roster
+    /// rows; an agent timeline row is the local delta a card reads.
+    #[test]
+    fn heartbeat_local_deltas_pin_the_same_roster_rows() {
+        let store = roster_cache_store();
+        let index = store.index().unwrap();
+        let card = json!({"id": "agent/node.amber", "name": "amber"});
+        store
+            .cached_agent_resources(index, false, |_| Ok(vec![card.clone()]))
+            .unwrap();
+        let pinned = store
+            .agent_resources_cached_at(index, false, None)
+            .unwrap()
+            .unwrap();
+        for n in 0..8 {
+            store.append_local_observations_for_test(&[local_observation_for_test(
+                "harness.observed",
+                json!({"state":"idle", "driver":"codex", "incarnation_id":"amber-1",
+                    "observed_at_ms":300_001 + n}),
+            )]);
+            assert_eq!(
+                store.index().unwrap(),
+                index,
+                "a local observation keeps the graph cut"
+            );
+            let hit = store
+                .agent_resources_cached_at(index, false, None)
+                .unwrap()
+                .expect("a heartbeat moves no card, so the pinned rows still answer");
+            assert!(Arc::ptr_eq(&hit, &pinned), "heartbeat deltas must reuse the roster rows");
+        }
+        assert_eq!(store.agent_resources_builds_for_test(), 1);
+        store.append_local_observations_for_test(&[local_timeline_observation_for_test()]);
+        assert_eq!(store.index().unwrap(), index);
+        assert!(
+            store
+                .agent_resources_cached_at(index, false, None)
+                .unwrap()
+                .is_none(),
+            "an agent timeline row is the local delta a card reads",
+        );
+        store
+            .cached_agent_resources(index, false, |_| Ok(vec![card]))
+            .unwrap();
+        assert!(
+            store
+                .agent_resources_cached_at(index, false, None)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(store.agent_resources_builds_for_test(), 2);
+    }
+
+    /// A page that already covered every agent at the cut upgrades to the complete window by
+    /// reusing the pinned rows: no clone, no sort, no build.
+    #[test]
+    fn a_covered_page_upgrade_reuses_the_pinned_roster_rows() {
+        let store = roster_cache_store();
+        let index = store.index().unwrap();
+        let selected = BTreeSet::from(["agent/node.amber".to_string()]);
+        store
+            .cached_agent_resources_for(index, false, Some(&selected), |_| {
+                Ok(vec![json!({"id": "agent/node.amber", "name": "amber"})])
+            })
+            .unwrap();
+        let partial = store
+            .agent_resources_cached_at(index, false, Some(&selected))
+            .unwrap()
+            .unwrap();
+        store
+            .cached_agent_resources_for(index, false, None, |changed| {
+                panic!("nothing moved and nothing is uncovered, so no card is built: {changed:?}")
+            })
+            .unwrap();
+        let complete = store
+            .agent_resources_cached_at(index, false, None)
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&complete, &partial));
+        assert_eq!(store.agent_resources_builds_for_test(), 1);
+    }
+
+    /// The frontier answers an old cut exactly — its newest agent timeline row — from the
+    /// partial frontier index, with VM work that newer heartbeats never grow; the pre-followup
+    /// lookup read every newer local row of every kind. Focused fixture: run it explicitly and
+    /// alone, with --ignored --nocapture, because its counters are process-wide.
+    #[test]
+    #[ignore = "focused roster frontier fixture; run explicitly with --ignored --nocapture"]
+    fn the_roster_frontier_old_cut_seek_skips_newer_heartbeats() {
+        let store = roster_cache_store();
+        let cut = store.index().unwrap();
+        store
+            .append_local_observations_for_test(&[local_timeline_observation_for_test()]);
+        let relevant_id = store
+            .readers
+            .get()
+            .query_row(
+                "SELECT id FROM local_observations ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get::<_, u64>(0),
+            )
+            .unwrap();
+
+        let later = insert_raw_claims(&store, &[("host/one", "transport.observed")]);
+        let insert_newer = |heartbeats: usize, irrelevant: usize, usage: usize| {
+            let connection = store.connection.lock().unwrap();
+            let mut statement = connection
+                .prepare(
+                    "INSERT INTO local_observations(after_store_index, subject, kind, body,
+                                                        observed_at_unix_ms)
+                     VALUES (?1, ?2, ?3, '{}', 1)",
+                )
+                .unwrap();
+            for _ in 0..heartbeats {
+                statement
+                    .execute(params![later, "agent/node.amber", "harness.observed"])
+                    .unwrap();
+            }
+            for _ in 0..irrelevant {
+                statement
+                    .execute(params![later, "mission-run/x", "harness.timeline"])
+                    .unwrap();
+            }
+            for _ in 0..usage {
+                statement
+                    .execute(params![later, "agent/node.amber", "harness.timeline"])
+                    .unwrap();
+            }
+        };
+        insert_newer(4_000, 500, 200);
+
+        let frontier = |at: u64| {
+            store
+                .readers
+                .get()
+                .query_row(ROSTER_LOCAL_FRONTIER, [at], |row| row.get::<_, u64>(0))
+                .unwrap()
+        };
+        assert_eq!(
+            frontier(cut),
+            relevant_id,
+            "an old cut sees exactly its newest agent timeline row"
+        );
+        let usage_frontier = store
+            .readers
+            .get()
+            .query_row(
+                "SELECT id FROM local_observations WHERE subject='agent/node.amber'
+                 AND kind='harness.timeline' ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get::<_, u64>(0),
+            )
+            .unwrap();
+        assert_eq!(
+            frontier(later),
+            usage_frontier,
+            "the later cut sees the newest agent timeline row, of any entry type"
+        );
+
+        let plan = query_plan(&store, ROSTER_LOCAL_FRONTIER, params![cut]);
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("local_observations_roster_frontier_index")),
+            "{plan:?}"
+        );
+        assert!(plan.iter().all(|step| !step.contains("TEMP B-TREE")), "{plan:?}");
+
+        let pre_followup = "SELECT COALESCE((SELECT id FROM local_observations
+             WHERE after_store_index<=?1 ORDER BY id DESC LIMIT 1), 0)";
+        let vm_steps = |sql: &str, at: u64| {
+            let connection = store.connection.lock().unwrap();
+            let _: u64 = connection.query_row(sql, [at], |row| row.get(0)).unwrap();
+            let before = smallclaims::sqlite::work::total().vm_steps;
+            let _: u64 = connection.query_row(sql, [at], |row| row.get(0)).unwrap();
+            drop(connection);
+            smallclaims::sqlite::work::total().vm_steps - before
+        };
+        let old_before = vm_steps(pre_followup, cut);
+        let new_before = vm_steps(ROSTER_LOCAL_FRONTIER, cut);
+        insert_newer(4_000, 0, 0);
+        let old_after = vm_steps(pre_followup, cut);
+        let new_after = vm_steps(ROSTER_LOCAL_FRONTIER, cut);
+        println!(
+            "roster frontier fixture: heartbeats=4000..8000 irrelevant_timeline=500 \
+             agent_usage_timeline=200 vm_old_cut_before={old_before} \
+             vm_new_cut_before={new_before} vm_old_cut_after={old_after} \
+             vm_new_cut_after={new_after}"
+        );
+        assert_eq!(
+            new_after, new_before,
+            "the frontier seek's work cannot grow with newer heartbeat rows"
+        );
+        assert!(
+            old_after > old_before,
+            "the pre-followup lookup read every newer row of every kind"
+        );
+        assert!(
+            new_before < old_before,
+            "the frontier index bounds the old-cut lookup"
+        );
     }
 
     #[test]
