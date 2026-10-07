@@ -841,9 +841,11 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                         conversations.stop(&request.id);
                         if request.collection == "conversation" {
                             let target = request.conversation.as_deref().unwrap_or_default();
-                            let opened = conversation_session_id(&state, target).and_then(|session_id| {
-                                let remote = conversation_owner_host(&state, &session, &session_id)?;
-                                Ok((session_id, remote))
+                            let opened = crate::performance::task("conversation/admission", || {
+                                conversation_session_id(&state, target).and_then(|session_id| {
+                                    let remote = conversation_owner_host(&state, &session, &session_id)?;
+                                    Ok((session_id, remote))
+                                })
                             });
                             match opened {
                                 Ok((session_id, remote)) => {
@@ -4516,6 +4518,18 @@ pub(super) fn timeline_value(
             "page": page.page
         })));
     }
+    crate::performance::task("conversation/first-page", || {
+        timeline_first_page(state, snapshot, session, session_id, query)
+    })
+}
+
+fn timeline_first_page(
+    state: &AppState,
+    snapshot: &ClientSnapshot,
+    session: &ClientSession,
+    session_id: String,
+    query: &ClientListQuery,
+) -> Result<Json<Value>, ApiError> {
     let managed = super::managed_session_owner_at(&state.store, snapshot.store_index, &session_id)
         .map_err(ApiError::internal)?;
     let Some((owner, incarnation, _)) = managed else {

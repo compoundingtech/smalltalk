@@ -2759,16 +2759,18 @@ fn managed_session_owner_at(
     snapshot_index: u64,
     session_id: &str,
 ) -> anyhow::Result<Option<(String, Option<String>, Option<String>)>> {
-    let owners = store.conversation_owners_at(snapshot_index)?;
-    for owner in owners.values() {
-        let Some(identity) = owner.incarnation.as_deref().or(owner.runtime.as_deref()) else {
-            continue;
-        };
-        if managed_session_id(&owner.subject, identity) == session_id {
-            return Ok(Some((owner.subject.clone(), owner.incarnation.clone(), owner.origin.clone())));
+    crate::performance::task("conversation/owner", || {
+        let owners = store.conversation_owners_at(snapshot_index)?;
+        for owner in owners.values() {
+            let Some(identity) = owner.incarnation.as_deref().or(owner.runtime.as_deref()) else {
+                continue;
+            };
+            if managed_session_id(&owner.subject, identity) == session_id {
+                return Ok(Some((owner.subject.clone(), owner.incarnation.clone(), owner.origin.clone())));
+            }
         }
-    }
-    Ok(None)
+        Ok(None)
+    })
 }
 
 /// How many of a subject's claims, oldest first, date its session in the session list.
