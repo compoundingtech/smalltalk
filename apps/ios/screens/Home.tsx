@@ -28,6 +28,7 @@ export function HomeScreen() {
   // Start something, as stui's launcher does: a shell or a mission.
   useLayoutEffect(() => {
     navigation.setOptions({
+      unstable_headerLeftItems: () => [{ type: 'button', label: 'Resources', icon: { type: 'sfSymbol', name: 'sidebar.left' }, onPress: () => navigation.navigate('Sidebar') }],
       unstable_headerRightItems: () => [{
         type: 'menu', label: 'New', icon: { type: 'sfSymbol', name: 'plus' },
         menu: { items: [

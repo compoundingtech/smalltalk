@@ -66,6 +66,8 @@ pub enum Window {
     /// A handful of counts (needs you, working agents, active missions, machines), followed when
     /// st grants it: what the top bar says without following the whole missions window.
     Summary,
+    /// The selected person’s sidebar organization, when supported.
+    Arrangements,
 }
 
 impl Window {
@@ -78,27 +80,25 @@ impl Window {
             Self::Agents => "agents",
             Self::Glasses => "glasses",
             Self::Summary => "summary",
+            Self::Arrangements => "arrangements",
         }
     }
 
     fn from_id(id: &str) -> Option<Self> {
         Self::ALL
             .into_iter()
-            .chain([Self::Glasses, Self::Summary])
+            .chain([Self::Glasses, Self::Summary, Self::Arrangements])
             .find(|window| window.id() == id)
     }
 
     /// How many items to follow: every glass a person may keep, a page of anything else.
     fn limit(self) -> usize {
         match self {
-            Self::Glasses => GLASSES,
+            Self::Glasses | Self::Arrangements => GLASSES,
             _ => WINDOW,
         }
     }
 }
-
-/// The glasses capability version whose glasses are splits of tab groups.
-const GLASSES_VERSION: u32 = 1;
 
 /// The most glasses st keeps live for one person.
 const GLASSES: usize = 100;
@@ -196,8 +196,8 @@ pub enum Command {
     },
 }
 
-/// The most conversations followed at once. A socket holds eight subscriptions: three windows,
-/// glasses and a terminal leave three.
+/// Three conversations remain live alongside collection windows, glasses and a terminal.
+/// Optional arrangements require the advertised sixteen-subscription socket capacity.
 pub const MAX_CONVERSATIONS: usize = 3;
 
 /// A conversation being shown, on its own subscription.
@@ -252,6 +252,19 @@ pub async fn run_members_with(
     glasses: bool,
     missions: bool,
     updates: mpsc::Sender<Update>,
+    commands: channel::UnboundedReceiver<Command>,
+) {
+    run_members_with_sidebar(clients, remote, glasses, missions, None, updates, commands).await;
+}
+
+/// Follow an optional explicit person's sidebar without reducing live conversation capacity.
+pub async fn run_members_with_sidebar(
+    clients: Vec<Client>,
+    remote: bool,
+    glasses: bool,
+    missions: bool,
+    person: Option<String>,
+    updates: mpsc::Sender<Update>,
     mut commands: channel::UnboundedReceiver<Command>,
 ) {
     if clients.is_empty() {
@@ -289,6 +302,7 @@ pub async fn run_members_with(
                 client,
                 remote,
                 glasses,
+                person.as_deref(),
                 &mut stream,
                 &updates,
                 &mut commands,
@@ -442,6 +456,7 @@ async fn connected(
     client: &Client,
     remote: bool,
     glasses: bool,
+    person: Option<&str>,
     stream: &mut CollectionStream,
     updates: &mpsc::Sender<Update>,
     commands: &mut channel::UnboundedReceiver<Command>,
@@ -479,13 +494,20 @@ async fn connected(
     } else {
         None
     };
-    // The summary exists only where st grants it; an older member has no such collection.
-    let summary = capabilities.as_ref().is_some_and(|capabilities| {
-        capabilities.value.capabilities.iter().any(|capability| {
-            capability.id == "summary"
-                && capability.version >= 1
-                && capability.state == CapabilityState::Granted
+    let supports = |id: &str| {
+        capabilities.as_ref().is_some_and(|capabilities| {
+            capabilities.value.capabilities.iter().any(|capability| {
+                capability.id == id
+                    && capability.version >= 1
+                    && capability.state == CapabilityState::Granted
+            })
         })
+    };
+    // The summary exists only where st grants it; an older member has no such collection.
+    let summary = supports("summary");
+    // Older sockets are already full with glasses, a terminal and three conversations.
+    let sidebar_person = person.filter(|person| {
+        person.starts_with("person/") && supports("arrangements") && supports("collections")
     });
     // From version 2 a glass's splits keep their sizes in st.
     if let Some(version) = version
@@ -506,6 +528,10 @@ async fn connected(
         {
             return Ended::Dropped(error.to_string());
         }
+    }
+    if let Some(person) = sidebar_person
+        && let Err(error) = stream.subscribe_arrangements("arrangements", person, GLASSES, None).await {
+        return Ended::Dropped(error.to_string());
     }
     for current in conversing.iter_mut() {
         if let Err(error) = converse(stream, current).await {
@@ -778,7 +804,15 @@ async fn connected(
                     if window == Window::Missions && !*missions {
                         continue;
                     }
-                    if let Err(error) = stream.subscribe(window.id(), window.id(), window.limit(), None, None).await {
+                    let result = if window == Window::Arrangements {
+                        match sidebar_person {
+                            Some(person) => stream.subscribe_arrangements(window.id(), person, window.limit(), None).await,
+                            None => continue,
+                        }
+                    } else {
+                        stream.subscribe(window.id(), window.id(), window.limit(), None, None).await
+                    };
+                    if let Err(error) = result {
                         return Ended::Dropped(error.to_string());
                     }
                 }
@@ -1396,6 +1430,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sidebar_arrangements_follow_the_explicit_person_and_remote_register_updates() {
+        use serde_json::json;
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("sidebar.sock");
+        let state = test_state(root.path());
+        let app = st3::api::router(state.clone());
+        let server_socket = socket.clone();
+        let server = tokio::spawn(async move { st3::api::serve_unix(&server_socket, app).await });
+        let client = Client::unix_as(&socket, "person/avery");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while client.capabilities().await.is_err() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let (tx, rx) = mpsc::channel();
+        let (commands, command_receiver) = channel::unbounded_channel();
+        let feed = tokio::spawn(run_members_with_sidebar(
+            vec![client],
+            false,
+            true,
+            Some("person/avery".into()),
+            tx,
+            command_receiver,
+        ));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut pending = std::collections::BTreeSet::from([
+                Window::Attention,
+                Window::Missions,
+                Window::Agents,
+                Window::Glasses,
+                Window::Arrangements,
+            ]);
+            while !pending.is_empty() {
+                match rx.try_recv() {
+                    Ok(Update::Window { window, items, .. }) if pending.remove(&window) => {
+                        assert!(items.is_empty())
+                    }
+                    Ok(Update::WindowFailed(window, error)) => {
+                        panic!("{window:?} refused: {error}")
+                    }
+                    Ok(_) => {}
+                    Err(mpsc::TryRecvError::Empty) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => panic!("feed stopped"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let subject = "arrangement/person/avery/019a0000-0000-7000-8000-000000000001";
+        let append = |operations| {
+            state
+                .store
+                .append_client_claim(&st3::model::ClaimInput {
+                    subject: subject.into(),
+                    kind: "arrangement.edited".into(),
+                    actor: Some("person/avery".into()),
+                    fields: serde_json::from_value(
+                        json!({"owner":"person/avery", "operations":operations}),
+                    )
+                    .unwrap(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+            state
+                .event_notify
+                .send_replace(state.store.index().unwrap());
+        };
+        append(
+            json!([{"op":"create","name":"Sidebar"}, {"op":"folder.create","id":"019a0000-0000-7000-8000-000000000010","name":"Builds","parent":null,"key":"a0"}]),
+        );
+        let items = next_window(&rx, Window::Arrangements).await;
+        assert!(
+            matches!(&items[0], Resource::Arrangement(a) if a.owner == "person/avery" && a.body.folders.values().next().unwrap().name.value == "Builds")
+        );
+        append(
+            json!([{"op":"folder.rename","id":"019a0000-0000-7000-8000-000000000010","name":"Renamed"}]),
+        );
+        let items = next_window(&rx, Window::Arrangements).await;
+        assert!(
+            matches!(&items[0], Resource::Arrangement(a) if a.body.folders.values().next().unwrap().name.value == "Renamed")
+        );
+        append(json!([{"op":"retire"}]));
+        assert!(next_window(&rx, Window::Arrangements).await.is_empty());
+        drop(commands);
+        tokio::time::timeout(Duration::from_secs(5), feed)
+            .await
+            .unwrap()
+            .unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn an_unreachable_member_falls_back_and_announces_glasses_before_their_window() {
         let root = tempfile::tempdir().unwrap();
         let socket = root.path().join("live.sock");
@@ -1439,7 +1571,7 @@ mod tests {
                         window: Window::Glasses,
                         ..
                     }) => {
-                        assert!(version.is_some_and(|value| value >= GLASSES_VERSION));
+                        assert!(version.is_some_and(|value| value >= 1));
                         break;
                     }
                     Ok(Update::Offline(reason)) => panic!("live member was available: {reason}"),
