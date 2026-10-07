@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Show declaration-driven agent relaunch as restarting until the replacement harness is ready",
+  "replay": {
+    "status": "none",
+    "detail": "No replay fallback, history reconstruction, read-triggered repair or recovery wait is added."
+  },
+  "schema": {
+    "status": "changed",
+    "detail": "The claim registry adds optional runtime.observed restarting_from (retired incarnation). No SQLite table, index, trigger, schema version or migration changes. The registry and replication compatibility digests change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint, canonical selection, membership, admission authority or launch decision rule changes."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Client agent state can be restarting during an existing declaration-driven shutdown and replacement-readiness interval. AgentState already permits arbitrary strings. First starts remain starting; current human blocks, faults, moves, suspension and terminal failures retain their existing presentation. Older receiver registries do not recognize the added observation field; upgrade fleet members together before relying on this status. Mixed-version runtime acceptance and older UI rendering have not been validated."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No added stop, relaunch, daemon downtime or startup recovery is introduced. Candidate restart-to-API and restart-to-health times have not been measured."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No data or identity conversion is required. Consumers of the open agent-state string should display restarting during declaration cutover."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "Use matching receiver registries for observations containing the optional field. This change does not establish swap-back compatibility to a build whose registry lacks that field, or change existing launch failure recovery."
+  }
+}

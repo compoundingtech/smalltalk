@@ -2661,6 +2661,23 @@ fn client_agent_resources_from_status(
                 _ if subject.desired.is_some() => "desired",
                 _ => "stopped",
             };
+            // A declaration replacement carries the incarnation it is retiring. Keep
+            // that shutdown and the new harness readiness interval distinct from a first start.
+            let restarting_from = fields
+                .and_then(|fields| fields.get("restarting_from"))
+                .and_then(Value::as_str);
+            let restarting = restarting_from.is_some_and(|from| {
+                subject.reachability == "reachable"
+                    && (state == "starting"
+                        || (fields
+                            .and_then(|fields| fields.get("incarnation_id"))
+                            .and_then(Value::as_str) == Some(from)
+                            && matches!(
+                                observed,
+                                Some("running" | "exited" | "vanished" | "stopped")
+                            )))
+            });
+            let state = if restarting { "restarting" } else { state };
             let handoff = subject.desired_token.as_deref()
                 .map(|token| crate::placement::handoff(store, &subject.subject, token, snapshot_index))
                 .transpose()?.flatten();
@@ -22436,6 +22453,116 @@ mission "labelled" state="ready" {
         assert_eq!(cards[0]["next_work"], *next);
         store.set_step_state(&first, "working", None).unwrap();
         checked_agent_cache(&store, false, store.index().unwrap());
+    }
+
+    #[test]
+    fn declaration_relaunch_is_restarting_until_replacement_harness_is_ready() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = state.store.clone();
+        let intent = parse_intent(
+            r#"version 2
+agent "example/relaunch" { workspace "/tmp"; harness "codex" {} }
+"#,
+            "node",
+        )
+        .unwrap();
+        store
+            .apply_internal(&intent, "relaunch-declaration")
+            .unwrap();
+        let subject = "agent/example/relaunch";
+        let append = |kind: &str, fields: Value| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: kind.into(),
+                    actor: None,
+                    fields: serde_json::from_value(fields).unwrap(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        };
+        let state_at = |index| checked_agent_cache(&store, false, index)[0]["state"].clone();
+        append(
+            "runtime.observed",
+            json!({"status":"running","incarnation_id":"old","runtime_id":"example.relaunch"}),
+        );
+        assert_eq!(
+            state_at(store.index().unwrap()),
+            "starting",
+            "first launch has no replacement"
+        );
+        append(
+            "harness.observed",
+            json!({"state":"idle","driver":"codex","incarnation_id":"old"}),
+        );
+        let ready_cut = store.index().unwrap();
+        assert_eq!(state_at(ready_cut), "running");
+        append(
+            "runtime.observed",
+            json!({"status":"running","incarnation_id":"old","runtime_id":"example.relaunch","restarting_from":"old"}),
+        );
+        let restart_cut = store.index().unwrap();
+        assert_eq!(state_at(restart_cut), "restarting");
+        assert_eq!(
+            state_at(ready_cut),
+            "running",
+            "snapshot before cutover stays unchanged"
+        );
+        append(
+            "runtime.observed",
+            json!({"status":"exited","incarnation_id":"old","runtime_id":"example.relaunch","restarting_from":"old"}),
+        );
+        assert_eq!(state_at(store.index().unwrap()), "restarting");
+        append(
+            "runtime.observed",
+            json!({"status":"starting","runtime_id":"example.relaunch","restarting_from":"old"}),
+        );
+        assert_eq!(state_at(store.index().unwrap()), "restarting");
+        append(
+            "runtime.observed",
+            json!({"status":"running","incarnation_id":"new","runtime_id":"example.relaunch","restarting_from":"old"}),
+        );
+        assert_eq!(
+            state_at(store.index().unwrap()),
+            "restarting",
+            "a new wrapper is not ready"
+        );
+        append(
+            "harness.observed",
+            json!({"state":"blocked","blocked_on":"human","ask":"permission","driver":"codex","incarnation_id":"new"}),
+        );
+        assert_eq!(
+            state_at(store.index().unwrap()),
+            "waiting",
+            "human blocks remain visible"
+        );
+        append(
+            "harness.observed",
+            json!({"state":"idle","blocked_on":null,"ask":null,"driver":"codex","incarnation_id":"new"}),
+        );
+        assert_eq!(state_at(store.index().unwrap()), "running");
+        assert_eq!(
+            state_at(restart_cut),
+            "restarting",
+            "replacement readiness cannot rewrite history"
+        );
+        append(
+            "runtime.observed",
+            json!({"status":"stopped","incarnation_id":"new","runtime_id":"example.relaunch"}),
+        );
+        assert_eq!(
+            state_at(store.index().unwrap()),
+            "stopped",
+            "explicit stop has no restart marker"
+        );
+        append(
+            "runtime.observed",
+            json!({"status":"failed","runtime_id":"example.relaunch"}),
+        );
+        assert_eq!(state_at(store.index().unwrap()), "failed");
     }
 
     #[test]

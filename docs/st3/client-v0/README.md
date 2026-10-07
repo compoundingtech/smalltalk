@@ -58,6 +58,12 @@ Clients can render `round N/M · wakes in …` without reading claim envelopes.
 
 ### Agent activity and human blocking
 
+A declaration-driven relaunch reports `state: "restarting"` while the previous runtime stops
+and its replacement waits for current-incarnation harness readiness. A first launch remains
+`starting`. Current human blocking, faults, moves, suspension and failures retain their existing
+states. Runtime observation status still records the actual process state; `restarting` is the
+client presentation of the replacement interval.
+
 An agent's `harness_state` describes activity independently of its optional `blocked_on`, `ask`,
 and diagnostic `reason`. A current `blocked_on: "human"` observation with ready, working, or idle
 activity makes the canonical agent `state: "waiting"`; clients present that combination as needing
