@@ -11547,6 +11547,41 @@ impl Store {
         Ok(view)
     }
 
+    /// Provider reply watches read only new native message events through the existing
+    /// sender/store-index range. They never rebuild a recipient's historical mailbox.
+    pub(crate) fn adapter_delivery_page(
+        &self,
+        sender: &str,
+        recipients: &[String],
+        after: u64,
+        through: u64,
+        limit: usize,
+    ) -> Result<(Vec<MessageView>, Option<u64>)> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare_cached(
+            "SELECT subject, store_index FROM claims INDEXED BY claims_message_from_index
+             WHERE kind='message.sent' AND json_extract(body, '$.fields.from')=?1
+               AND store_index>?2 AND store_index<=?3
+               AND json_extract(body, '$.fields.to') IN (SELECT value FROM json_each(?4))
+             ORDER BY store_index LIMIT ?5",
+        )?;
+        let mut subjects = statement.query_map(
+            params![sender, after, through, serde_json::to_string(recipients)?, limit.saturating_add(1)],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?)),
+        )?.collect::<Result<Vec<_>, _>>()?;
+        let more = subjects.len() > limit;
+        subjects.truncate(limit);
+        let next = more.then(|| subjects.last().map(|(_, index)| *index)).flatten();
+        let mut output = Vec::new();
+        for (subject, index) in subjects {
+            let message = self.message_view_cached(&connection, &subject, index)?;
+            if message.from == sender && recipients.contains(&message.to) && message.in_reply_to.is_some() {
+                output.push(message);
+            }
+        }
+        Ok((output, next))
+    }
+
     pub fn messages_page(
         &self,
         recipient: Option<&str>,
