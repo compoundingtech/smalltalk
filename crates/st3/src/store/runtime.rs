@@ -38,6 +38,8 @@ pub(crate) struct AgentResourcesEntry {
     pub(crate) history: bool,
     /// None certifies the whole roster; Some records the lazily materialized page subjects.
     pub(crate) covered: Option<BTreeSet<String>>,
+    /// Earliest wall-clock boundary in queue metadata; absent means no expiring work lease.
+    pub(crate) valid_until_unix_ms: Option<u128>,
     pub(crate) items: Arc<Vec<Value>>,
 }
 

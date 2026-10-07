@@ -15721,6 +15721,60 @@ mission "refs-work" state="ready" {{
             ["Beta", "Zeta"]);
     }
 
+    #[tokio::test]
+    async fn agent_page_queue_refreshes_at_lease_expiry_without_a_new_claim() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = &state.store;
+        let source = r#"version 2
+agent "amber" { command "true" }
+mission "expiring-work" state="ready" {
+  goal "Refresh queue state at its lease boundary."
+  step "work" { assigned-to "agent/node.amber" }
+}
+"#;
+        let intent = crate::graph::parse_test_intent(source, "node").unwrap();
+        let plan = store.mission(&intent, crate::model::IntentInput {
+            kdl: source.into(), source_name: None,
+        }).unwrap();
+        store.apply(&intent, &plan.subject_tokens, "lease-fence-fixture").unwrap();
+        let run = store.create_mission_run(&MissionRunRequest {
+            mission: "expiring-work".into(), revision: None, workspace: "/tmp".into(),
+            requester: Some("person/test".into()), mode: Some("run".into()),
+            inputs: BTreeMap::new(), idempotency_key: "lease-fence-run".into(),
+        }).unwrap();
+        let step = &run.steps[0].subject;
+        store.set_step_state(step, "ready", None).unwrap();
+        store.work_action(step, "claim", &WorkRequest {
+            actor: Some("agent/node.amber".into()), incarnation: Some("fixture-runtime".into()),
+            summary: None, reason: None, evidence: Vec::new(), idempotency_key: "lease-fence-claim".into(),
+        }).unwrap();
+        // Shorten this fixture's lease before any cache is built; no claims are changed.
+        let expires = client_now_ms() + 1_000;
+        store.connection.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute(
+            "UPDATE step_runs SET lease_expires_at_unix_ms=?1 WHERE subject=?2",
+            rusqlite::params![expires.to_string(), step],
+        ).unwrap();
+        let index = store.index().unwrap();
+        let (status, claimed) = get_request(app(state.clone()), "/v1/client/agents").await;
+        assert_eq!(status, StatusCode::OK, "{claimed}");
+        assert_eq!(claimed["items"][0]["current_work_ids"], json!([step]));
+        let full = client_agent_resources_cached(store, false, index).unwrap();
+        assert_eq!(full[0]["current_work_ids"], json!([step]));
+        // Wait for the actual captured lease boundary, not an arbitrary settling interval.
+        tokio::time::sleep(Duration::from_millis(
+            u64::try_from(expires.saturating_sub(client_now_ms()) + 1).unwrap(),
+        )).await;
+        assert_eq!(store.index().unwrap(), index, "lease expiry must not append a claim");
+        let (status, ready) = get_request(app(state.clone()), "/v1/client/agents").await;
+        assert_eq!(status, StatusCode::OK, "{ready}");
+        assert_eq!(ready["items"][0]["current_work_ids"], json!([]));
+        assert_eq!(ready["items"][0]["next_work_id"], step.as_str());
+        let full = client_agent_resources_cached(store, false, index).unwrap();
+        assert_eq!(full[0]["current_work_ids"], json!([]), "WS full-card cache also expires");
+        assert_eq!(full[0]["next_work_id"], step.as_str());
+    }
+
     #[test]
     fn message_delivery_distinguishes_pending_acceptance_and_recipient_read() {
         let to = "agent/remote/message-delivery-test";

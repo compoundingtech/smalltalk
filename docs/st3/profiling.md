@@ -157,6 +157,10 @@ Warm pages reuse those refs rather than scanning all fleet work. An explicit all
 existing-agent harness observations and daemon diagnostics leaves them valid; every other
 claim rebuilds them. Runtime status can move an undeclared or stopped agent into history,
 so even an existing agent's `runtime.observed` rebuilds shallow refs.
+Both shallow refs and the full-card projection also expire at the earliest current-generation
+work-lease deadline. Expired work becomes ready (or disappears from a revision-draining queue)
+without a new claim; an expired entry must rebuild, not advance incrementally from stale queues.
+The deadline scan runs only on cache misses and reads unfinished steps, adding no warm-hit SQL.
 
 The local-observation frontier is read by an indexed seek inside the same SQLite snapshot.
 A same-index local transcript append updates the affected card's `last_activity_at` for both
