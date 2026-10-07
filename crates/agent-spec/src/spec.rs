@@ -15,6 +15,7 @@
 //! TOML/JSON (serde). Every spec is a `service` — `type = batch` is retired; evals run through the
 //! native `st2 eval` path (`eval_spec`/`eval_run`), which has its own model.
 
+#[path = "spec_validation.rs"]
 mod spec_validation;
 pub use spec_validation::{
     validate_agent_address, validate_agent_id, validate_desired_state_reason, validate_presentation,
