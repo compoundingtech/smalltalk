@@ -6,6 +6,12 @@ They are constructed contract fixtures with invented contents, not live transcri
 They keep harness-specific types and nested message/response shapes instead of
 crossing unrelated types, roles and display flags between harnesses.
 
+`omp-parity.jsonl` is entirely synthetic. It covers every typed OMP tool call/output
+family, extension and bookkeeping view, hidden extensions, and assistant usage/context
+metadata. Field shapes follow native OMP records; no live conversation text is copied.
+Pi exercises the same normalizer and fixture. The task output names `ParityChild`
+for owner-local child-conversation linking.
+
 The coverage test also reads the existing redacted OMP native resume/tool-result
 captures (Pi shares that JSONL session format), and extracts actual message `info`
 and native `part` objects from the installed OpenCode 1.18.34 admission capture in

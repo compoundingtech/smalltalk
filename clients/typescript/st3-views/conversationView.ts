@@ -16,6 +16,18 @@ export type Body =
   | { kind: 'event'; text: string; tone: 'quiet' | 'warning' | 'fault' };
 export type ConversationEntry = { id: string; at: string; timestamp: string; body: Body };
 
+// ------------------------------------------------------------ typed views (OMP parity)
+
+/** A typed view on a block: the discriminator is `type`; parsed fields only, the native data
+ * stays in the block's `payload` (contract: OMP parity, stacked on #1574). */
+export type BlockView = { type: string } & Record<string, unknown>;
+export type SubagentSummary = { id: string; agent?: string; status: string; task?: string; duration_ms?: number; tokens?: number; cost_usd?: number; requests?: number; tool_count?: number; conversation?: { session_id: string } };
+export type JobSummary = { id: string; name?: string; type?: string; state: string; exit_code?: number; started_at?: string; ended_at?: string; duration_ms?: number; output_bytes?: number };
+/** One field of the conversation header: its value, whether the live register (`register`) or
+ * the transcript window (`transcript`) holds it, and when that was true. */
+export type HeaderField = { value: unknown; source: string; as_of: string };
+export type ConversationHeader = Partial<Record<'model' | 'context' | 'cost' | 'todos' | 'jobs' | 'subagents' | 'ask' | 'working', HeaderField>>;
+
 type Entry = Pick<TimelineEntry, 'id' | 'role' | 'timestamp'> & { type: string; body: unknown };
 type Names = ReadonlyMap<string, string>;
 
@@ -24,6 +36,17 @@ function record(value: unknown): Record<string, unknown> {
 }
 function str(value: unknown): string | undefined {
   return typeof value === 'string' ? value : undefined;
+}
+
+/** The typed view on the first block of `kind`, when it has one. */
+function blockView(blocks: unknown, kind: string): BlockView | undefined {
+  if (!Array.isArray(blocks)) return undefined;
+  for (const block of blocks) {
+    if (record(block).kind !== kind) continue;
+    const view = record(record(block).view);
+    if (typeof view.type === 'string') return view as BlockView;
+  }
+  return undefined;
 }
 
 /** Local `HH:MM` of an RFC 3339 timestamp, or nothing when it does not parse. */
@@ -292,6 +315,216 @@ function contentText(body: unknown): string {
   return str(record(body).text) ?? '';
 }
 
+// ------------------------------------------------------------ typed rows (OMP parity)
+// The rows a typed view becomes, mirroring st3-conversation-ui exactly: same titles, same
+// lines, so the phone and stui read one conversation the same way (fixtures/clients/transcripts).
+
+/** The title of a tool call its typed view names: `$ command`, `edit path`, `write path · N bytes`,
+ * `read path:range`, `engine pattern query path`, `todo op`, `ask`, `task · N agents`,
+ * `hub op name target`, `eval language · title`, or the generic tool's name. */
+function viewTitle(view: BlockView, tool: string, args: unknown): string {
+  const tasks = Array.isArray(view.tasks) ? view.tasks.length : undefined;
+  const bytes = typeof view.bytes === 'number' ? view.bytes : undefined;
+  const title: string | undefined = (() => {
+    switch (view.type) {
+      case 'bash': return str(view.command) !== undefined ? `$ ${str(view.command)}` : undefined;
+      case 'edit': return str(view.path) !== undefined ? `edit ${str(view.path)}` : undefined;
+      case 'write': return `write ${str(view.path) ?? ''}${bytes !== undefined ? ` · ${bytes} bytes` : ''}`.trim();
+      case 'read': return `read ${str(view.path) ?? ''}${str(view.range) ? `:${str(view.range)}` : ''}`.trim();
+      case 'search': return [str(view.engine), str(view.pattern) ?? str(view.query), str(view.path)].filter(Boolean).join(' ');
+      case 'todo': return `todo ${str(view.op) ?? ''}`.trim();
+      case 'ask': return 'ask';
+      case 'task': return `task · ${tasks ?? 0} agents`;
+      case 'hub': return `hub ${[str(view.op), str(view.name), str(view.target)].filter(Boolean).join(' ')}`.trim();
+      case 'eval': return `eval ${str(view.language) ?? ''}${str(view.title) ? ` · ${str(view.title)}` : ''}`.trim();
+      case 'generic': return str(view.name);
+      default: return undefined;
+    }
+  })();
+  return title || toolTitle(tool, args);
+}
+
+/** One background job as a person reads it: `name · state · exit N · Nms`. */
+function jobLine(job: unknown): string {
+  const value = record(job);
+  const exit = typeof value.exit_code === 'number' ? `exit ${value.exit_code}` : undefined;
+  const took = typeof value.duration_ms === 'number' ? `${value.duration_ms}ms` : undefined;
+  return [str(value.name) ?? str(value.id), str(value.state), exit, took].filter(Boolean).join(' · ');
+}
+
+const todoMark = (status: string | undefined) => status === 'completed' ? '[x]' : status === 'in_progress' ? '[~]' : status === 'pending' ? '[ ]' : '[-]';
+
+/** A todo list as lines: each phase's name, then its items as `[x] content`. */
+function todoLines(view: BlockView): string[] {
+  const lines: string[] = [];
+  for (const phase of Array.isArray(view.phases) ? view.phases : []) {
+    const named = str(record(phase).name);
+    if (named) lines.push(named);
+    const items = record(phase).items;
+    for (const item of Array.isArray(items) ? items : []) lines.push(`${todoMark(str(record(item).status))} ${str(record(item).content) ?? ''}`);
+  }
+  return lines;
+}
+
+/** Answers to an ask as lines: each question, then what was selected, typed, or noted. */
+function askLines(view: BlockView): string[] {
+  const lines: string[] = [];
+  for (const answer of Array.isArray(view.answers) ? view.answers : []) {
+    const value = record(answer);
+    if (str(value.question)) lines.push(str(value.question)!);
+    const selected = Array.isArray(value.selected) ? value.selected.filter((part): part is string => typeof part === 'string') : [];
+    if (selected.length) lines.push(`  selected: ${selected.join(', ')}`);
+    if (str(value.custom)) lines.push(`  custom: ${str(value.custom)}`);
+    if (str(value.note)) lines.push(`  note: ${str(value.note)}`);
+  }
+  return lines;
+}
+
+/** What a bash outcome says on one line: `exit 0 · 12ms`, `timed out after 30s`. */
+function bashLine(view: BlockView): string | undefined {
+  const parts: string[] = [];
+  if (typeof view.exit_code === 'number') parts.push(`exit ${view.exit_code}`);
+  if (typeof view.wall_ms === 'number') parts.push(`${view.wall_ms}ms`);
+  if (view.timed_out === true) parts.push(typeof view.timeout_s === 'number' ? `timed out after ${view.timeout_s}s` : 'timed out');
+  return parts.length ? parts.join(' · ') : undefined;
+}
+
+/** The lines a tool's typed output view shows, replacing the raw result text; `undefined` keeps
+ * the raw text (views that add nothing, or a type this app does not know). */
+function viewOutput(view: BlockView, content: unknown): string[] | undefined {
+  switch (view.type) {
+    case 'bash': {
+      const line = bashLine(view);
+      return line ? [...toolOutput(content), line] : toolOutput(content);
+    }
+    case 'edit': return str(view.diff) !== undefined ? str(view.diff)!.split('\n') : toolOutput(content);
+    case 'todo': return Array.isArray(view.phases) ? todoLines(view) : undefined;
+    case 'ask': return Array.isArray(view.answers) ? askLines(view) : undefined;
+    case 'task': return [];
+    case 'hub': return Array.isArray(view.jobs) ? view.jobs.map(jobLine) : undefined;
+    default: return undefined;
+  }
+}
+
+/** A finished subagent as its own card: `agent · status`, its task, what it used, and the
+ * conversation it opens (`open session/…`) when the child transcript exists. */
+function subagentCard(agent: unknown, state: ToolState): { id: string; title: string; output: string[] } {
+  const value = record(agent);
+  const lines: string[] = [];
+  const task = str(value.task);
+  if (task) lines.push(task.split('\n')[0]);
+  if (typeof value.duration_ms === 'number') lines.push(`duration ${value.duration_ms}ms`);
+  if (typeof value.tokens === 'number') lines.push(`tokens ${value.tokens}`);
+  if (typeof value.cost_usd === 'number') lines.push(`cost $${value.cost_usd.toFixed(2)}`);
+  const session = str(record(value.conversation).session_id);
+  if (session) lines.push(`open ${session}`);
+  return { id: str(value.id) ?? '', title: [str(value.agent) ?? str(value.id), str(value.status)].filter(Boolean).join(' · '), output: lines };
+}
+
+/** The child conversation a subagent card opens, when it has one. */
+export function subagentSession(output: readonly string[]): string | undefined {
+  for (const line of output) {
+    const session = /^open (\S+)$/.exec(line.trim())?.[1];
+    if (session) return session;
+  }
+  return undefined;
+}
+
+/** The one line a status block's view becomes; `undefined` when the view says nothing this app
+ * knows, `null` when it must not be drawn at all (`tool_start` belongs to its call). */
+function statusLine(view: BlockView): string | null | undefined {
+  switch (view.type) {
+    case 'tool_start': return null;
+    case 'compaction': {
+      const before = typeof view.tokens_before === 'number' ? view.tokens_before : undefined;
+      const after = typeof view.tokens_after === 'number' ? view.tokens_after : undefined;
+      return ['compaction', str(view.method), before !== undefined && after !== undefined ? `${before} → ${after} tokens` : undefined].filter(Boolean).join(' · ');
+    }
+    case 'model_change': return ['model', str(view.model)].filter(Boolean).join(' · ');
+    case 'thinking_level': return ['thinking', str(view.level)].filter(Boolean).join(' · ');
+    case 'reset_boundary': return 'session reset';
+    case 'credential_pin': return ['credential pin', str(view.provider)].filter(Boolean).join(' · ');
+    case 'title': return ['title', str(view.title)].filter(Boolean).join(' · ');
+    case 'session_exit': return ['session exit', str(view.kind), str(view.reason)].filter(Boolean).join(' · ');
+    case 'skill': return ['skill', str(view.name), str(view.path)].filter(Boolean).join(' · ');
+    default: return undefined;
+  }
+}
+
+/** What the extension blocks (#1574 kinds `irc`, `job`, `status`) draw, role aside: a recognized
+ * view replaces the entry's text fallback entirely. `skip` says draw nothing (`tool_start`). */
+function extensionBodies(blocks: unknown): Body[] | 'skip' | undefined {
+  if (!Array.isArray(blocks)) return undefined;
+  const bodies: Body[] = [];
+  let skip = false;
+  for (const block of blocks) {
+    const value = record(block);
+    const view = record(value.view);
+    if (typeof view.type !== 'string') continue;
+    if (value.kind === 'irc' && view.type === 'irc') {
+      // An incoming IRC message is mail like a delivery's: sent (✓), not a graph receipt (✓✓).
+      bodies.push({ kind: 'mail', from: str(view.from) ?? 'someone', to: '', subject: '', text: str(view.message) ?? '', delivered: false });
+    } else if (value.kind === 'job' && view.type === 'job' && Array.isArray(view.jobs)) {
+      for (const job of view.jobs) bodies.push({ kind: 'event', tone: 'quiet', text: jobLine(job) });
+    } else if (value.kind === 'status') {
+      const line = statusLine(view as BlockView);
+      if (line === null) skip = true;
+      else if (line !== undefined && line !== '') bodies.push({ kind: 'event', tone: 'quiet', text: line });
+    }
+  }
+  return bodies.length ? bodies : skip ? 'skip' : undefined;
+}
+
+/** How long ago `as_of` was, as a person reads it: `0s`, `5m`, `3h`, `2d`. */
+function headerAge(asOf: string, now: string): string | undefined {
+  const at = Date.parse(asOf), current = Date.parse(now);
+  if (!Number.isFinite(at) || !Number.isFinite(current)) return undefined;
+  const seconds = Math.max(0, Math.floor((current - at) / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor((seconds + 30) / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor((seconds + 1800) / 3600);
+  return hours < 24 ? `${hours}h` : `${Math.floor((seconds + 43200) / 86400)}d`;
+}
+
+/** The conversation header as one compact line: each field with where it came from and how old
+ * that is (`model gpt-5 [register · 2m] · cost $1.20 [transcript · 2m] · working [register · 2m]`),
+ * as stui draws it. Nothing when the header is empty. */
+export function headerLine(header: ConversationHeader | undefined, now: string): string | null {
+  if (!header) return null;
+  const marked = (label: string, field: HeaderField): string | undefined => {
+    if (field === undefined) return undefined;
+    const age = headerAge(field.as_of, now);
+    return `${label.trim()} [${field.source}${age ? ` · ${age}` : ''}]`;
+  };
+  const parts: string[] = [];
+  const model = str(header.model?.value) ? marked(`model ${str(header.model?.value)}`, header.model!) : undefined;
+  if (model) parts.push(model);
+  const tokens = record(header.context?.value).tokens;
+  const context = typeof tokens === 'number' ? marked(`context ${tokens} tokens`, header.context!) : undefined;
+  if (context) parts.push(context);
+  const usd = record(header.cost?.value).usd;
+  const cost = typeof usd === 'number' ? marked(`cost $${usd.toFixed(2)}`, header.cost!) : undefined;
+  if (cost) parts.push(cost);
+  const items = Array.isArray(header.todos?.value) ? header.todos!.value.flatMap(phase => Array.isArray(record(phase).items) ? record(phase).items : []) : [];
+  if (items.length || header.todos !== undefined) {
+    const done = items.filter(item => record(item).status === 'completed').length;
+    const todo = marked(`todo ${done}/${items.length}`, header.todos!);
+    if (todo) parts.push(todo);
+  }
+  const jobs = Array.isArray(header.jobs?.value) ? marked(`jobs ${header.jobs!.value.length}`, header.jobs!) : undefined;
+  if (jobs) parts.push(jobs);
+  const subagents = Array.isArray(header.subagents?.value) ? marked(`agents ${header.subagents!.value.length}`, header.subagents!) : undefined;
+  if (subagents) parts.push(subagents);
+  const pending = record(header.ask?.value);
+  const question = Array.isArray(pending.questions) ? str(pending.questions.map(record).find(question => str(question.question) !== undefined)?.question) : undefined;
+  const ask = question !== undefined ? marked(`ask ${question}`, header.ask!) : undefined;
+  if (ask) parts.push(ask);
+  const working = typeof header.working?.value === 'boolean' ? marked(header.working.value ? 'working' : 'idle', header.working!) : undefined;
+  if (working) parts.push(working);
+  return parts.length ? parts.join(' · ') : null;
+}
+
 // ------------------------------------------------------------------ entries
 
 /** Which timeline entries a conversation keeps: everything but heartbeats and usage. */
@@ -349,14 +582,24 @@ function mailImages(message: Record<string, unknown>): MailImage[] {
 
 export function conversationEntries(timeline: Entry[], names: Names, filters: readonly DisplayFilter[] = DEFAULT_FILTERS): ConversationEntry[] {
   if (!filters.length) return timeline.map(entry => ({id: entry.id, at: clock(entry.timestamp), timestamp: entry.timestamp, body: {kind: 'user', text: JSON.stringify(entry, null, 2)}}));
+  // Provenance alone does not hide visible prose; only internal content has no row.
+  if (filters.includes('internal-blocks')) timeline = timeline.filter(entry => {
+    const blocks = record(entry.body).blocks;
+    return !Array.isArray(blocks)
+      || !blocks.some(block => record(block).kind !== 'source_record')
+      || !blocks.every(block => record(block).kind === 'source_record' || ['internal', 'hidden-by-harness'].includes(str(record(block).visibility) ?? ''));
+  });
   timeline = timeline.map(entry => {
     if (entry.body === null || typeof entry.body !== 'object' || Array.isArray(entry.body)) return entry;
     const body = {...record(entry.body)};
     if (filters.includes('internal-blocks') && Array.isArray(body.blocks)) body.blocks = body.blocks.filter(block => !['internal', 'hidden-by-harness'].includes(str(record(block).visibility) ?? ''));
+    // #1574 exposes native data as blocks (reasoning text, raw JSON, tool output); where it does,
+    // the text is that data and the markup cleanup must not eat it. stui cleans the same nothing.
+    const native = Array.isArray(body.blocks) && body.blocks.some(block => record(block).kind !== 'text');
     if (typeof body.text === 'string') {
       const text = {value: body.text};
-      if (filters.includes('context-blocks') && !['user','system'].includes(entry.role)) filterContextBlocks(text);
-      if (!['user','system'].includes(entry.role)) text.value = cleanMessageText(text.value, filters);
+      if (!native && filters.includes('context-blocks') && !['user','system'].includes(entry.role)) filterContextBlocks(text);
+      if (!native && !['user','system'].includes(entry.role)) text.value = cleanMessageText(text.value, filters);
       if (filters.includes('excerpts') && body.text.startsWith('[unrecognized ') && [...text.value].length > 512) text.value = [...text.value].slice(0,512).join('') + '…';
       body.text = text.value;
     }
@@ -414,8 +657,18 @@ export function conversationEntries(timeline: Entry[], names: Names, filters: re
       case 'content': {
         const raw = contentText(entry.body);
         const nativeBlocks = Array.isArray(body.blocks) && body.blocks.some(block => record(block).kind !== 'text');
+        // Typed extension blocks (irc, job, status) replace the entry's text fallback, role
+        // aside; `tool_start` belongs to its call and is never drawn alone.
+        const extension = extensionBodies(body.blocks);
+        if (extension === 'skip') break;
+        if (extension) {
+          extension.forEach((part, index) => push(entry, extension.length === 1 ? entry.id : `${entry.id}#${index}`, part));
+          break;
+        }
         if ((entry.role === 'user' || entry.role === 'system') && (nativeBlocks || raw.startsWith('[unrecognized '))) {
-          push(entry, entry.id, entry.role === 'user' ? {kind:'user',text:cleanMessageText(raw,filters)} : {kind:'event',tone:'quiet',text:cleanMessageText(raw,filters)});
+          // A native entry's text is data #1574 exposed; it is shown as it arrived.
+          const shown = nativeBlocks ? raw : cleanMessageText(raw, filters);
+          push(entry, entry.id, entry.role === 'user' ? {kind:'user',text:shown} : {kind:'event',tone:'quiet',text:shown});
         } else if (entry.role === 'user' || entry.role === 'system') {
           // Mail read from a delivery is named as the stream names it, as stui does.
           fromHarness(entry.role === 'user', raw, shown, delivered, filters).forEach((part, index) => push(entry, `${entry.id}#${index}`, part.kind === 'mail' ? { ...part, from: name(part.from), to: name(part.to) } : part));
@@ -431,16 +684,25 @@ export function conversationEntries(timeline: Entry[], names: Names, filters: re
       case 'tool_call': {
         const call = str(body.call_id);
         if (call) tools.set(call, stamped.length);
-        push(entry, entry.id, { kind: 'tool', title: toolTitle(str(body.name) ?? 'tool', body.arguments), state: 'running', output: [] });
+        const view = blockView(body.blocks, 'tool_call');
+        push(entry, entry.id, { kind: 'tool', title: view ? viewTitle(view, str(body.name) ?? 'tool', body.arguments) : toolTitle(str(body.name) ?? 'tool', body.arguments), state: 'running', output: [] });
         break;
       }
       case 'tool_result': {
-        const output = toolOutput(body.content);
-        const state: ToolState = body.status === 'error' ? 'failed' : 'ok';
+        const view = blockView(body.blocks, 'tool_output');
+        const output = view ? viewOutput(view, body.content) ?? toolOutput(body.content) : toolOutput(body.content);
+        const state: ToolState = body.status === 'error' || view?.is_error === true || view?.timed_out === true ? 'failed' : 'ok';
         const index = tools.get(str(body.call_id) ?? '');
         const call = index === undefined ? undefined : stamped[index];
-        if (call?.body.kind === 'tool') { call.body = { ...call.body, state, output }; break; }
-        push(entry, entry.id, { kind: 'tool', title: 'tool result', state, output });
+        if (call?.body.kind === 'tool') call.body = { ...call.body, state, output };
+        else push(entry, entry.id, { kind: 'tool', title: 'tool result', state, output });
+        // Each finished subagent is its own card, opening its child conversation when it has one.
+        if (view?.type === 'task' && Array.isArray(view.agents)) {
+          for (const agent of view.agents) {
+            const card = subagentCard(agent, state);
+            push(entry, `${entry.id}#${card.id}`, { kind: 'tool', title: card.title, state, output: card.output });
+          }
+        }
         break;
       }
       case 'error': {

@@ -6,6 +6,7 @@
     { "file": "resources.json", "definition": "GoldenResourceSet" },
     { "file": "conversation-search.json", "definition": "Envelope" },
     { "file": "timeline.json", "definition": "Envelope" },
+    { "file": "timeline-views.json", "definition": "Envelope" },
     { "file": "normalized-conversation-legacy.json", "definition": "Envelope" },
     { "file": "events.json", "definition": "Envelope" },
     { "file": "action.json", "definition": "ActionRequest" },

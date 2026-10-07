@@ -68,7 +68,12 @@ pub(super) fn source(state: &AppState, session_id: &str) -> Result<ExternalSessi
         Some(ExternalConversation::Unavailable(_)) => Err(transcript_unavailable(
             "the native session could not be identified",
         )),
-        None => Err(ApiError::not_found("the session does not exist")),
+        None => crate::subagent_sessions::resolve_child(
+            state.native_session_home.as_deref(),
+            session_id,
+        )
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("the session does not exist")),
     }
 }
 
@@ -480,18 +485,24 @@ pub(super) fn prepare_one(
         .ok_or_else(|| ApiError::internal("native body is not an object"))?;
     if let Some(blocks) = body.get_mut("blocks").and_then(Value::as_array_mut) {
         for (index, block) in blocks.iter_mut().enumerate() {
-            let body_ref = block["payload"] == json!({"body_ref":true});
+            // A fold may sit the full native record beside the marker (`raw`); the marker
+            // key decides, so that sibling survives the expansion below.
+            let body_ref = block["payload"].get("body_ref") == Some(&Value::Bool(true));
             let pointer = if body_ref {
                 "/body".to_owned()
             } else {
                 format!("/body/blocks/{index}/payload")
             };
             if body_ref {
+                // Keep the native record beside the expanded display body within the same
+                // size bound; exact-marker payloads can still collapse back to body_ref.
+                let raw = block["payload"].get("raw").cloned();
                 block["payload"] = original["body"].clone();
-                block["payload"]
-                    .as_object_mut()
-                    .expect("native body")
-                    .remove("blocks");
+                let payload = block["payload"].as_object_mut().expect("native body");
+                payload.remove("blocks");
+                if let Some(raw) = raw {
+                    payload.insert("raw".into(), raw);
+                }
             }
             if block["kind"] == "image" && external_image(&block["payload"]) {
                 block["kind"] = json!("image_link");
@@ -542,6 +553,47 @@ pub(super) fn prepare_one(
                     ),
                     "size-limit",
                 );
+            }
+        }
+    }
+    // A task's agents link to their own conversations when those transcripts exist
+    // (contract §1b q2); prepare_one applies this to first and keyset continuation pages.
+    if session.conversation_blocks
+        && let Some(blocks) = body.get_mut("blocks").and_then(Value::as_array_mut)
+    {
+        for block in blocks
+            .iter_mut()
+            .filter(|block| block["kind"] == "tool_output" && block["view"]["type"] == "task")
+        {
+            let Some(agents) = block
+                .get_mut("view")
+                .and_then(|view| view.get_mut("agents"))
+                .and_then(Value::as_array_mut)
+            else {
+                continue;
+            };
+            for agent in agents {
+                let Some(task_id) = agent.get("id").and_then(Value::as_str).map(str::to_owned)
+                else {
+                    continue;
+                };
+                let Some(agent) = agent.as_object_mut() else {
+                    continue;
+                };
+                match crate::subagent_sessions::child_transcript(source, &task_id) {
+                    Some(_) => {
+                        agent.insert(
+                            "conversation".into(),
+                            json!({"session_id": crate::subagent_sessions::child_session_id(
+                                source,
+                                &task_id,
+                            )}),
+                        );
+                    }
+                    None => {
+                        agent.remove("conversation");
+                    }
+                }
             }
         }
     }
@@ -676,6 +728,9 @@ pub(in crate::api) fn legacy(value: &mut Value, session: &ClientSession) {
                 body.remove("blocks");
             }
         }
+    }
+    if let Some(value) = value.as_object_mut() {
+        value.remove("header");
     }
 }
 
@@ -2218,5 +2273,159 @@ mod tests {
             located_value(&native, &location).unwrap()["source_role"],
             "future-role-token"
         );
+    }
+
+    #[test]
+    fn task_views_link_agents_only_to_existing_child_transcripts() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = fixture(root.path(), json!([{"type":"text","text":"parent"}]));
+        let child_directory = parent.transcript.with_extension("");
+        std::fs::create_dir_all(&child_directory).unwrap();
+        std::fs::write(
+            child_directory.join("sub-lived.jsonl"),
+            "{\"type\":\"session\",\"id\":\"child\",\"cwd\":\"/work/example\",\"timestamp\":\"2026-10-06T12:01:00Z\"}\n",
+        )
+        .unwrap();
+        let items = vec![json!({
+            "id": "timeline-entry/native-9",
+            "sequence": 9,
+            "revision": 1,
+            "timestamp": "2026-10-06T12:00:09Z",
+            "role": "tool",
+            "type": "tool_result",
+            "final": true,
+            "body": {
+                "call_id": "call-task",
+                "status": "success",
+                "media_type": "application/json",
+                "content": {},
+                "blocks": [{
+                    "id": "native-9/0",
+                    "kind": "tool_output",
+                    "source_type": "tool_result",
+                    "payload": {"body_ref": true},
+                    "view": {"type": "task", "async": true, "agents": [
+                        {"id": "sub-lived", "agent": "scout", "status": "running"},
+                        {"id": "sub-vanished", "agent": "task", "status": "running"},
+                    ]},
+                }],
+            },
+        })];
+        let mut session = ClientSession::local(Some("person/example")).unwrap();
+        session.conversation_blocks = true;
+        let prepared = prepare(&parent, &session, &parent.id, items).unwrap();
+        let agents = prepared[0]["body"]["blocks"][0]["view"]["agents"]
+            .as_array()
+            .unwrap();
+        let linked = agents[0]["conversation"]["session_id"].as_str().unwrap();
+        assert_eq!(
+            linked,
+            crate::subagent_sessions::child_session_id(&parent, "sub-lived")
+        );
+        assert!(linked.starts_with("session/external-child-"));
+        assert!(agents[1].get("conversation").is_none());
+    }
+
+    #[tokio::test]
+    async fn child_session_ids_open_their_own_timeline_and_header_follows_negotiation() {
+        use axum::body::{Body, to_bytes};
+        use axum::http::Request;
+        use tower::ServiceExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let parent = fixture(root.path(), json!([{"type":"text","text":"parent only"}]));
+        let child_directory = parent.transcript.with_extension("");
+        std::fs::create_dir_all(&child_directory).unwrap();
+        // Enough entries to page: the continuation must carry the same window's header.
+        let mut child = String::from(
+            "{\"type\":\"session\",\"id\":\"child\",\"cwd\":\"/work/example\",\"timestamp\":\"2026-10-06T12:01:00Z\"}\n",
+        );
+        for index in 0..12 {
+            child.push_str(&format!(
+                "{{\"type\":\"message\",\"id\":\"child-{index}\",\"timestamp\":\"2026-10-06T12:01:{index:02}Z\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"child line {index}\"}}]}}}}\n",
+            ));
+        }
+        child.push_str(
+            "{\"type\":\"message\",\"id\":\"child-model\",\"timestamp\":\"2026-10-06T12:01:12Z\",\"message\":{\"role\":\"assistant\",\"model\":\"anthropic/claude-opus-5-5\",\"usage\":{\"cost\":{\"total\":0.25}},\"contextSnapshot\":{\"promptTokens\":179053},\"content\":[{\"type\":\"text\",\"text\":\"child line with model\"}]}}\n",
+        );
+        std::fs::write(child_directory.join("sub-1.jsonl"), child).unwrap();
+        let mut state = super::super::tests::test_state_named(root.path(), "child-owner-test");
+        state.native_session_home = Some(root.path().to_path_buf());
+        let app = super::super::super::router(state.clone());
+        let request = |uri: String, blocks: bool| {
+            let app = app.clone();
+            async move {
+                let mut request = Request::builder().uri(uri);
+                if blocks {
+                    request = request.header("x-st3-features", "conversation-blocks.v1");
+                }
+                let response = app
+                    .oneshot(request.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let bytes = to_bytes(response.into_body(), CLIENT_MAX_RESPONSE_BYTES)
+                    .await
+                    .unwrap();
+                (status, serde_json::from_slice::<Value>(&bytes).unwrap())
+            }
+        };
+        let child_id = crate::subagent_sessions::child_session_id(&parent, "sub-1");
+        let leaf = child_id.trim_start_matches("session/");
+        // Negotiated: the child's own window, with a header describing it.
+        let (status, page) =
+            request(format!("/v1/client/sessions/{leaf}/timeline?limit=5"), true).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        let items = page["value"]["items"].as_array().unwrap();
+        assert!(items.iter().any(|item| {
+            item["body"]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("child line")
+        }));
+        assert!(
+            items
+                .iter()
+                .all(|item| item["body"]["text"] != "parent only")
+        );
+        let header = page["value"]["header"].clone();
+        assert!(header.is_object(), "{page}");
+        assert_eq!(header["model"]["value"], "anthropic/claude-opus-5-5");
+        assert_eq!(page["value"]["page"]["has_more"], json!(true));
+        // Keyset continuations derive the same bounded newest head while the source is unchanged.
+        let cursor = page["value"]["page"]["next_cursor"].as_str().unwrap();
+        let (status, older) = request(
+            // The cursor is `page/native/` plus base64url, so it needs no percent-encoding.
+            format!("/v1/client/sessions/{leaf}/timeline?limit=5&cursor={cursor}"),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{older}");
+        assert_eq!(older["value"]["header"], header);
+        // Without negotiation: the same conversation, but no header and no blocks.
+        let (status, legacy) = request(
+            format!("/v1/client/sessions/{leaf}/timeline?limit=5"),
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{legacy}");
+        assert!(legacy["value"].get("header").is_none());
+        assert!(
+            legacy["value"]["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["body"].get("blocks").is_none())
+        );
+        // A child id whose transcript never existed names no conversation.
+        let missing = crate::subagent_sessions::child_session_id(&parent, "never-ran");
+        let (status, absent) = request(
+            format!(
+                "/v1/client/sessions/{}/timeline",
+                missing.trim_start_matches("session/")
+            ),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{absent}");
     }
 }

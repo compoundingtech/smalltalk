@@ -1499,6 +1499,21 @@ without secret or token filtering. Without the feature, the server returns known
 text/tool/status bodies with visible size-limit notices. Old clients can read those
 fallbacks but do not fetch images or expand a chunked remainder.
 
+A block MAY also carry `view: {type, ...}`, a parsed typed projection discriminated by
+the open `type` string. The schema defines one closed definition per known type
+(`TimelineView*` under `TimelineView`, including `SubagentSummary` and `JobSummary`)
+and a fallback branch for any other type; a renderer that does not know a type renders
+the block as without a view, and the full native arguments or output stay in `payload`.
+The block kinds add `irc` for `custom_message` `irc:incoming` records, and assistant
+`text`/`reasoning` blocks may carry `model`, `provider`, `usage`, `context_tokens`,
+`stop_reason`, `ttft_ms` and `duration_ms` in `metadata`. Timeline pages, conversation
+changes and timeline deltas MAY carry a `header` object whose fields are each
+`{value, source: register|transcript, as_of}`; a field is absent when neither source
+has it, and `working` comes only from the register. The full mapping tables live in
+[conversation normalization design](../conversation-normalization-design.md). Generated
+clients model `view` and `header` as optional loose JSON; `timeline-views.json` is the
+wire fixture.
+
 `read.projections` authorizes **raw native conversation content**, including full
 arguments, output, reasoning shown by the harness, unknown JSON and images. It is
 the existing scope for pages, deltas and owner forwarding, and also governs

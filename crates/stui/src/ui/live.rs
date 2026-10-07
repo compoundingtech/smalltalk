@@ -154,6 +154,7 @@ enum Fetched {
     Notice(String),
     /// Harness sessions st did not start, found on this machine.
     Sessions(Collection),
+    Session(String, Result<st3_client::Session, String>),
     /// The Fleet tab's machines and paired devices.
     Machines(Collection),
     Repositories(String, Load<Vec<String>>),
@@ -269,6 +270,7 @@ pub fn run(context: Context) -> Result<()> {
     let mut conversing: Vec<String> = Vec::new();
     // The session each conversation was last subscribed again for, so it is asked once.
     let mut resubscribed: BTreeMap<String, String> = BTreeMap::new();
+    let mut sessions_requested = HashSet::new();
     let mut preview_requested: HashSet<String> = HashSet::new();
     let mut body_requested: HashSet<String> = HashSet::new();
     let mut read_receipts = ReadReceipts::default();
@@ -375,6 +377,7 @@ pub fn run(context: Context) -> Result<()> {
                     extras.live = false;
                     attached = None;
                     shown_tab = usize::MAX;
+                    sessions_requested.clear();
                     preview_requested.clear();
                     body_requested.clear();
                     changed = true;
@@ -431,12 +434,17 @@ pub fn run(context: Context) -> Result<()> {
                     replace,
                     has_more,
                     items,
+                    header,
                 } => {
                     failed.remove(&target);
                     if replace && !timelines.get(&target).is_some_and(|timeline| timeline.older.paged) {
                         filled.remove(&target);
                     }
                     ui.conversation_updated(&target);
+                    if let Some(header) = &header {
+                        ui.conversation_headers
+                            .insert(target.clone(), header.clone());
+                    }
                     timelines
                         .entry(target)
                         .or_default()
@@ -445,6 +453,7 @@ pub fn run(context: Context) -> Result<()> {
                             has_more,
                             items,
                             session_id: Some(session_id),
+                            header,
                         });
                     // A message sent from here is done once st shows it in the conversation.
                     pending.retain(|pending| {
@@ -568,6 +577,15 @@ pub fn run(context: Context) -> Result<()> {
                 Fetched::Notice(notice) => ui.flash(notice),
                 Fetched::Sessions(native) => {
                     model.sessions = native;
+                }
+                Fetched::Session(id, outcome) => {
+                    match outcome {
+                        Ok(session) => model.add_opened_session(session),
+                        Err(message) => {
+                            ui.flash(format!("Could not open {id}: {message}"));
+                            failed.insert(id, message);
+                        }
+                    }
                 }
                 Fetched::Machines(machines) => model.machines = machines,
                 Fetched::Repositories(host, load) => {
@@ -860,6 +878,22 @@ pub fn run(context: Context) -> Result<()> {
         // Every conversation on screen rides the feed's socket (the focused one first): st
         // pushes each change, so nothing here reads one again on a timer.
         let wanted = ui.live_conversations();
+        for id in &wanted {
+            if id.starts_with("session/")
+                && !model.opened_sessions.contains_key(id)
+                && sessions_requested.insert(id.clone())
+            {
+                let client = client.clone();
+                let tx = fetched_tx.clone();
+                let id = id.clone();
+                runtime.spawn(async move {
+                    let outcome = Model::read_session(&client, &id)
+                        .await
+                        .map_err(|error| error.to_string());
+                    let _ = tx.send(Fetched::Session(id, outcome));
+                });
+            }
+        }
         if wanted != conversing {
             let _ = commands.send(Command::Converse {
                 targets: wanted.clone(),

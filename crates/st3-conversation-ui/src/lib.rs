@@ -10,6 +10,7 @@ pub mod adapt;
 #[cfg(feature = "ratatui")]
 pub mod ansi;
 mod clean;
+pub mod header;
 #[cfg(feature = "ratatui")]
 pub mod conversation;
 #[cfg(feature = "ratatui")]

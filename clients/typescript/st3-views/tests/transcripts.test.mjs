@@ -25,3 +25,12 @@ for (const name of ['claude', 'codex', 'deliveries']) {
   const phone = conversationEntries(fixture(`${name}.json`), new Map()).map(entry => ({ body: asStui(entry.body), id: entry.id }));
   assert.deepEqual(phone, expected, `${name}: the phone reads this transcript differently from stui`);
 }
+
+// The OMP parity contract (typed views on #1574 blocks) renders to the same rows as Rust's
+// renderer; its timeline arrives as a page object holding the conversation header too.
+{
+  const expected = fixture('omp-parity.expected.json');
+  const page = fixture('omp-parity.json');
+  const phone = conversationEntries(page.items, new Map()).map(entry => ({ body: asStui(entry.body), id: entry.id }));
+  assert.deepEqual(phone, expected, 'omp-parity: the phone reads this transcript differently from stui');
+}

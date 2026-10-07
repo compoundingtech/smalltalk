@@ -585,6 +585,7 @@ export type CollectionFrame = ({
 } | {
   collection: "conversation";
   has_more?: boolean;
+  header?: ConversationHeader;
   id: string;
   items: Array<TimelineEntry>;
   kind: "conversation";
@@ -609,6 +610,7 @@ export type CollectionFrame = ({
 export type CollectionName = "missions" | "attention" | "agents" | "work" | "glasses" | "arrangements";
 
 export type ConversationChanges = {
+  header?: unknown;
   items: Array<TimelineEntry>;
   kind: "conversation-changes";
   next_cursor: Cursor;
@@ -630,6 +632,23 @@ export type ConversationContentRef = {
   reason?: string;
   ref: string;
   size?: number;
+};
+
+export type ConversationHeader = {
+  ask?: ConversationHeaderField;
+  context?: ConversationHeaderField;
+  cost?: ConversationHeaderField;
+  jobs?: ConversationHeaderField;
+  model?: ConversationHeaderField;
+  subagents?: ConversationHeaderField;
+  todos?: ConversationHeaderField;
+  working?: ConversationHeaderField;
+};
+
+export type ConversationHeaderField = {
+  as_of: Timestamp;
+  source: "register" | "transcript";
+  value: unknown;
 };
 
 export type ConversationSearch = {
@@ -845,6 +864,18 @@ export type HostRepositories = {
 };
 
 export type Id = string;
+
+export type JobSummary = {
+  duration_ms?: number;
+  ended_at?: Timestamp;
+  exit_code?: number;
+  id: string;
+  name?: string;
+  output_bytes?: number;
+  started_at?: Timestamp;
+  state: string;
+  type?: string;
+};
 
 export type Lane = ResourceHeader & {
   approver_id: (Id | null);
@@ -1482,6 +1513,21 @@ export type StructuredRequest = {
   why_person: string;
 };
 
+export type SubagentSummary = {
+  agent?: string;
+  conversation?: {
+  session_id: Id;
+};
+  cost_usd?: number;
+  duration_ms?: number;
+  id: string;
+  requests?: number;
+  status: string;
+  task?: string;
+  tokens?: number;
+  tool_count?: number;
+};
+
 export type SubjectDefinition = {
   conflicts: Array<string>;
   desired: CanonicalNode;
@@ -1651,6 +1697,23 @@ export type TerminalScreen = {
   truncated: boolean;
 };
 
+export type TimelineAskAnswer = {
+  custom?: string;
+  note?: string;
+  question: string;
+  selected: Array<string>;
+};
+
+export type TimelineAskQuestion = {
+  id: string;
+  multi: boolean;
+  options: Array<{
+  label: string;
+}>;
+  question: string;
+  recommended?: number;
+};
+
 export type TimelineBlock = {
   continuation?: ConversationContentRef;
   id: string;
@@ -1660,6 +1723,7 @@ export type TimelineBlock = {
 };
   payload: unknown;
   source_type: string;
+  view?: unknown;
   visibility?: string;
 };
 
@@ -1668,6 +1732,7 @@ export type TimelineContentBody = (unknown | unknown);
 export type TimelineDelta = {
   entry?: TimelineEntry;
   entry_id: Id;
+  header?: unknown;
   operation: "append" | "replace" | "finalize";
   revision: number;
 };
@@ -1710,6 +1775,7 @@ export type TimelineMessageBody = {
 };
 
 export type TimelinePage = {
+  header?: unknown;
   items: Array<TimelineEntry>;
   kind: "timeline-page";
   page: PageInfo;
@@ -1729,6 +1795,11 @@ export type TimelineStatusBody = {
   blocks?: Array<TimelineBlock>;
   detail?: string;
   status: TimelineStatus;
+};
+
+export type TimelineTodoItem = {
+  content: string;
+  status: string;
 };
 
 export type TimelineToolCallBody = {
@@ -1779,6 +1850,211 @@ export type TimelineUsageBody = {
   semantics: "context_occupancy" | "session_cumulative" | "response";
   total_tokens?: number;
   turn_id?: string;
+};
+
+export type TimelineView = (TimelineViewBash | TimelineViewEdit | TimelineViewWrite | TimelineViewRead | TimelineViewSearch | TimelineViewTodo | TimelineViewAsk | TimelineViewTask | TimelineViewHub | TimelineViewEval | TimelineViewGeneric | TimelineViewIrc | TimelineViewJob | TimelineViewSkill | TimelineViewCompaction | TimelineViewModelChange | TimelineViewThinkingLevel | TimelineViewTitle | TimelineViewSessionExit | TimelineViewToolStart | TimelineViewResetBoundary | TimelineViewCredentialPin | {
+  type: string;
+});
+
+export type TimelineViewAsk = {
+  answers?: Array<TimelineAskAnswer>;
+  call_id?: string;
+  intent?: string;
+  is_error?: boolean;
+  questions?: Array<TimelineAskQuestion>;
+  tool: string;
+  type: "ask";
+};
+
+export type TimelineViewBash = {
+  background?: boolean;
+  call_id?: string;
+  command?: string;
+  cwd?: string;
+  env_keys?: Array<string>;
+  exit_code?: number;
+  intent?: string;
+  is_error?: boolean;
+  timed_out?: boolean;
+  timeout_s?: number;
+  tool: string;
+  type: "bash";
+  wall_ms?: number;
+};
+
+export type TimelineViewCompaction = {
+  method?: string;
+  short_summary?: string;
+  tokens_after?: number;
+  tokens_before?: number;
+  type: "compaction";
+};
+
+export type TimelineViewCredentialPin = {
+  provider: string;
+  type: "credential_pin";
+};
+
+export type TimelineViewEdit = {
+  call_id?: string;
+  diff?: string;
+  first_changed_line?: number;
+  input_bytes?: number;
+  intent?: string;
+  is_error?: boolean;
+  ops?: number;
+  path?: string;
+  tool: string;
+  type: "edit";
+};
+
+export type TimelineViewEval = {
+  code_bytes: number;
+  intent?: string;
+  language: string;
+  title?: string;
+  tool: string;
+  type: "eval";
+};
+
+export type TimelineViewGeneric = {
+  call_id?: string;
+  intent?: string;
+  is_error?: boolean;
+  name?: string;
+  tool: string;
+  type: "generic";
+  wall_ms?: number;
+};
+
+export type TimelineViewHub = {
+  call_id?: string;
+  intent?: string;
+  is_error?: boolean;
+  jobs?: Array<JobSummary>;
+  name?: string;
+  op: string;
+  state?: string;
+  target?: string;
+  timed_out?: boolean;
+  timeout_s?: number;
+  tool: string;
+  type: "hub";
+};
+
+export type TimelineViewIrc = {
+  from: string;
+  message: string;
+  message_id: string;
+  reply_to?: string;
+  type: "irc";
+};
+
+export type TimelineViewJob = {
+  jobs: Array<JobSummary>;
+  type: "job";
+};
+
+export type TimelineViewModelChange = {
+  fallback?: boolean;
+  model: string;
+  role?: string;
+  type: "model_change";
+};
+
+export type TimelineViewRead = {
+  intent?: string;
+  path: string;
+  range?: string;
+  tool: string;
+  type: "read";
+};
+
+export type TimelineViewResetBoundary = {
+  type: "reset_boundary";
+};
+
+export type TimelineViewSearch = {
+  engine: "grep" | "glob" | "web";
+  intent?: string;
+  path?: string;
+  pattern?: string;
+  query?: string;
+  tool: string;
+  type: "search";
+};
+
+export type TimelineViewSessionExit = {
+  kind: string;
+  reason: string;
+  type: "session_exit";
+};
+
+export type TimelineViewSkill = {
+  args?: unknown;
+  name: string;
+  path?: string;
+  type: "skill";
+};
+
+export type TimelineViewTask = {
+  agents?: Array<SubagentSummary>;
+  async?: boolean;
+  call_id?: string;
+  intent?: string;
+  is_error?: boolean;
+  tasks?: Array<{
+  agent?: string;
+  name?: string;
+  task: string;
+}>;
+  tool: string;
+  total_ms?: number;
+  type: "task";
+};
+
+export type TimelineViewThinkingLevel = {
+  configured?: boolean;
+  level: string;
+  type: "thinking_level";
+};
+
+export type TimelineViewTitle = {
+  previous?: string;
+  source?: string;
+  title: string;
+  type: "title";
+};
+
+export type TimelineViewTodo = {
+  call_id?: string;
+  intent?: string;
+  is_error?: boolean;
+  items?: Array<TimelineTodoItem>;
+  op?: string;
+  phase?: string;
+  phases?: Array<{
+  items: Array<TimelineTodoItem>;
+  name: string;
+}>;
+  task?: string;
+  tool: string;
+  type: "todo";
+};
+
+export type TimelineViewToolStart = {
+  call_id: string;
+  started_at: Timestamp;
+  tool: string;
+  type: "tool_start";
+};
+
+export type TimelineViewWrite = {
+  bytes: number;
+  intent?: string;
+  path: string;
+  tool: string;
+  type: "write";
 };
 
 export type Timestamp = string;

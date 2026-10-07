@@ -64,8 +64,9 @@ direct owner reads. Fixture provenance is in `crates/st3/fixtures/native-records
 | Claude `progress`, `file-history-snapshot`, `file-history-delta`, `queue-operation`, `permission-mode`, `mode`, `atis-latch`, `last-prompt`, `ai-title`, `custom-title`, `cost-state`, `agent-name`, `tag`, `pr-link`, `bridge-session`, `fork-context-ref` | Retain raw; no demonstrated generic harness-hidden rule. |
 | Claude attachments other than queued commands and system records without text | Retain raw; queued prompts and textual notices keep their known display shape. |
 | Pi/OMP `session` | Omit the native session setup header. |
+| OMP `reset_boundary`, `credential_pin`, `title` | Retain raw plus typed status views; reset/title are quiet events, credential pins are internal bookkeeping hidden by default. |
 | Pi/OMP `custom_message` with explicit `display: false` | Omit because the native extension explicitly marks it hidden from its terminal. |
-| Pi/OMP `custom`, `label`, `session_info`, `credential_pin`, `title`, model/thinking changes and summary records without text | Retain raw; summaries with text remain readable native notes. |
+| Pi/OMP `custom`, `label`, `session_info`, model/thinking changes and summary records without text | Retain raw; summaries with text remain readable native notes. |
 | OpenCode `snapshot` | Retain raw; visibility is not established across releases. |
 | Claude documents | Retain the complete document payload, with a readable document fallback. |
 | Malformed/partial/unknown-encoding input | Retain exact bytes as a `raw_text` block; never silently skip a tail line. |
@@ -82,6 +83,96 @@ Start in `crates/st3/src/external_sessions.rs`; use the same normalizer for owne
 side-input updates, reads and follow. Remove deliberate visible-reasoning exclusions, image
 withholding from the data. A 512-character unknown excerpt is a UI preference only. No sanitized-text payload class
 or second durable transcript is needed. Native transcript formats remain authoritative.
+
+## Typed views and conversation header
+
+Everything here is additive and optional, on top of the #1574 block contract, so an
+old client ignores the new fields and keeps the existing text fallback. A block MAY
+carry `view: {type: <string>, ...}`; `type` is an open discriminator, and the client-v0
+schema encodes one closed definition per known `view.type` (`TimelineView*` in
+`docs/st3/client-v0/schemas/client-v0.schema.json`) plus a `TimelineView` fallback
+branch that accepts any other type string. A renderer that does not know a type
+renders the block as it does a block without a view. `view` holds parsed fields only;
+the full native arguments or output stay in `payload`, exactly as in #1574. Raw JSON
+stays available for every record, `view` is computed per record and deterministic,
+and the fold caches it with the entry. Generated Rust, Swift and TypeScript clients
+carry `view` and the header below as loose JSON values (`Option<Value>`, `JSONValue?`,
+`unknown`), so no client decoder gains closed cases.
+
+On `tool_call` blocks, parsed from the native arguments (OMP field `i` becomes
+`intent`; every tool_call view also has `tool`, the native tool name):
+
+| view.type | fields | OMP source |
+| --- | --- | --- |
+| `bash` | command, cwd?, timeout_s?, env_keys?: string[], background: bool | tool `bash` {command,cwd,timeout,env,async} |
+| `edit` | path?, ops: number, input_bytes | tool `edit` {input} (hashline patch; path = first `[PATH#TAG]` header) |
+| `write` | path, bytes | tool `write` {path,content} |
+| `read` | path, range?: string | tool `read` {path} (suffix after `:` = range) |
+| `search` | engine: "grep"\|"glob"\|"web", pattern?, path?, query? | tools `grep`, `glob`, `web_search` |
+| `todo` | op, items?: [{content, status}], phase?, task? | tool `todo` |
+| `ask` | questions: [{id, question, options: [{label}], multi: bool, recommended?: number}] | tool `ask` |
+| `task` | tasks: [{name?, agent?, task}] | tool `task` |
+| `hub` | op, name?, target?, timeout_s? | tool `hub` |
+| `eval` | language, title?, code_bytes | tool `eval` |
+| `generic` | name | any other tool |
+
+On `tool_output` blocks, parsed from the OMP toolResult `details`; all of these also
+have `tool`, `call_id` and `is_error`:
+
+| view.type | fields |
+| --- | --- |
+| `bash` | exit_code?, wall_ms?, timeout_s?, timed_out?: bool |
+| `edit` | path?, first_changed_line?, diff?: string (unified diff as given) |
+| `todo` | phases: [{name, items: [{content, status}]}] |
+| `ask` | answers: [{question, selected: string[], custom?: string, note?: string}] |
+| `task` | async: bool, total_ms?, agents: [SubagentSummary] |
+| `hub` | op, timed_out?: bool, jobs?: [JobSummary], state? |
+| `generic` | is_error: bool, wall_ms? |
+
+`SubagentSummary` = `{id, agent?, status, task?, duration_ms?, tokens?, cost_usd?,
+requests?, tool_count?, conversation?: {session_id}}`. The owner fills
+`conversation.session_id` only when the child transcript exists at
+`<parent transcript without .jsonl>/<id>.jsonl` and is readable; that session id opens
+through the normal conversation routes (same fold, paging and refs), which is how a
+subagent card links to the child transcript as its own conversation.
+`JobSummary` = `{id, name?, type?, state, exit_code?, started_at?, ended_at?,
+duration_ms?, output_bytes?}`.
+
+Extension and bookkeeping records become blocks as follows; anything not listed keeps
+its #1574 shape (other `custom_message` records with display != false stay `text`):
+
+| OMP record | block kind | view |
+| --- | --- | --- |
+| custom_message `irc:incoming` | `irc` (new kind) | `{type:"irc", from, message, reply_to?, message_id}` |
+| custom_message `launch-completion` | `job` | `{type:"job", jobs: [JobSummary]}` (from details.daemons) |
+| custom_message `async-result` | `job` | `{type:"job", jobs: [JobSummary]}` (from details.jobs) |
+| custom_message `skill-prompt` | `status` | `{type:"skill", name, path?, args?}` |
+| `compaction` / `branch_summary` | `status` | `{type:"compaction", method?, tokens_before?, tokens_after?, short_summary?}`; summary text stays as today |
+| `model_change` | `status` | `{type:"model_change", model, role?, fallback?: bool}` |
+| `thinking_level_change` | `status` | `{type:"thinking_level", level, configured?}` |
+| `title_change` / `title` | `status` | `{type:"title", title, previous?, source?}` (`previous` only on title changes) |
+| `reset_boundary` | `status` | `{type:"reset_boundary"}`; quiet event `session reset` |
+| `credential_pin` | `status`, visibility `internal` | `{type:"credential_pin", provider}`; hidden by default; hash remains only in raw payload/source record |
+| custom `session_exit` | `status` | `{type:"session_exit", kind, reason}` |
+| custom `tool_execution_start` | `status`, visibility `internal` | `{type:"tool_start", call_id, tool, started_at}`; renderers attach it to the call row and do not draw it alone |
+| assistant message metadata | on its `text`/`reasoning` blocks | `metadata.model`, `metadata.provider`, `metadata.usage` {input, output, cache_read, cache_write, total, cost_usd}, `metadata.context_tokens`, `metadata.stop_reason`, `metadata.ttft_ms`, `metadata.duration_ms`; no view |
+
+Timeline pages and delta responses (when `conversation-blocks.v1` is negotiated) MAY
+carry a `header` object. Each field is `{value, source: register|transcript, as_of}`:
+`model` (model id), `context` ({tokens, window}), `cost` ({usd}, with `window: true`
+when the fold window is truncated), `todos`, `jobs` ([JobSummary]), `subagents`
+([SubagentSummary]), `ask` (the last ask call without a matching result, or null) and
+`working` (bool). `source` is `register` for the live latest-wins value from #1583 or
+`transcript` for a value derived from the fold window; a field is absent when neither
+source has it, `working` comes only from the register, and the register wins over the
+transcript once it is live. The register adapter is one function that returns `None`
+until #1583 lands. Transcript derivation: model = last assistant `model`; context =
+last `contextSnapshot.promptTokens`; cost = sum of `usage.cost.total` in the window;
+todos = last todo tool_output view, else the last todo call; jobs = latest state per
+job id from job blocks and hub outputs, keeping non-terminal ones; subagents = task
+outputs whose status is not terminal; ask = the last ask call without a matching
+result. `docs/st3/client-v0/fixtures/timeline-views.json` fixes the wire shape with a
+synthetic page that carries views, an `irc` block and a full header.
 
 ## UI filters and show-everything mode
 
