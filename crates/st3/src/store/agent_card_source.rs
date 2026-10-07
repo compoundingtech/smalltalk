@@ -1538,3 +1538,7 @@ pub(crate) fn selected_certificates(
 #[cfg(test)]
 #[path = "agent_card_source/tests.rs"]
 pub(crate) mod tests;
+
+#[cfg(test)]
+#[path = "agent_card_source/queue_controls.rs"]
+mod queue_controls;

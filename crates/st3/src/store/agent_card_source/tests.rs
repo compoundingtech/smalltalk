@@ -2,22 +2,29 @@ use super::*;
 use smallclaims::ivm::install::{Installer, Limits, Root, ScanPage};
 
 pub(crate) fn context(store: &Store) -> Namespace {
-    struct Context(Arc<std::sync::Mutex<Option<Namespace>>>);
+    context_for(store, "fixture.agent-card.context")
+}
+
+pub(crate) fn context_for(store: &Store, name: &'static str) -> Namespace {
+    struct Context {
+        slot: Arc<std::sync::Mutex<Option<Namespace>>>,
+        name: &'static str,
+    }
     impl Operator for Context {
         fn name(&self) -> &'static str {
-            "fixture.agent-card.context"
+            self.name
         }
         fn fingerprint(&self) -> &'static str {
             "fixture.only.no.publication"
         }
         fn source(&self) -> &'static str {
-            "fixture.agent-card.context"
+            self.name
         }
         fn create_schema(&self, c: &Connection) -> Result<()> {
             Kernel::new("node").create_schema(c)
         }
         fn apply(&self, _: &Transaction<'_>, ns: &Namespace, _: &[Mutation]) -> Result<bool> {
-            *self.0.lock().unwrap() = Some(ns.clone());
+            *self.slot.lock().unwrap() = Some(ns.clone());
             Ok(false)
         }
         fn validate_publication(&self, _: &Transaction<'_>, _: &Namespace) -> Result<()> {
@@ -28,24 +35,25 @@ pub(crate) fn context(store: &Store) -> Namespace {
         }
     }
     let slot = Arc::new(std::sync::Mutex::new(None));
-    let installer = Installer::new(vec![Box::new(Context(slot.clone()))]).unwrap();
+    let installer = Installer::new(vec![Box::new(Context {
+        slot: slot.clone(),
+        name,
+    })])
+    .unwrap();
     let mut writer = store.connection.write();
     installer.create_schema(&writer).unwrap();
     collection_ivm::delivery::create_schema(&writer).unwrap();
     agent_source::clock::create_schema(&writer).unwrap();
     let tx = writer.transaction().unwrap();
-    if installer
-        .position(&tx, "fixture.agent-card.context")
-        .is_err()
-    {
+    if installer.position(&tx, name).is_err() {
         installer
-            .register_source(&tx, "fixture.agent-card.context", "fixture.no.ready", 1)
+            .register_source(&tx, name, "fixture.no.ready", 1)
             .unwrap();
     }
     let job = installer
         .start(
             &tx,
-            "fixture.agent-card.context",
+            name,
             Limits {
                 page_rows: 128,
                 page_bytes: 1024 * 1024,
@@ -65,16 +73,14 @@ pub(crate) fn context(store: &Store) -> Namespace {
                 job: job.clone(),
                 expected_cursor: vec![],
                 next_cursor: vec![1],
-                position: installer
-                    .position(&tx, "fixture.agent-card.context")
-                    .unwrap(),
+                position: installer.position(&tx, name).unwrap(),
                 rows: vec![],
                 finished: true,
             },
             0,
         )
         .unwrap();
-    assert!(installer.root(&tx, "fixture.agent-card.context").is_err());
+    assert!(installer.root(&tx, name).is_err());
     tx.commit().unwrap();
     slot.lock().unwrap().clone().unwrap()
 }

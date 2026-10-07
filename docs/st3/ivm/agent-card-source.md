@@ -1,10 +1,13 @@
 # Agent card activation contract
 
 The public view and install operator are `st3.agents.cards.v1`. The source is
-`st3.agent-card-source.v1`. The compiled operator fingerprint is
-`agent-cards.v1;namespace-v1;ordered-harness-v2;current-authority-v1;queue-v1;usage-v1;lifecycle-v1;local-clock-v1;public-card-v0`.
-This identifies the intended implementation; it does **not** attest that the
-unfinished source families below are complete.
+`st3.agent-card-source.v1`. The compiled operator fingerprint is the authoritative
+`agent_card_source::FINGERPRINT` constant (`st3.agent-card.complete.v2`).
+`complete_manifest()` binds that definition to the physical capture schema;
+actual installation and reads separately require the receiver-bound
+`capture_fingerprint_for(Store::origin())` source identity and source epoch.
+These identifiers describe compatible code and inputs; they do not establish
+complete source coverage or authorize publication.
 
 Publication selects an Installer namespace. Every operator-owned primary key,
 secondary index, read, write and reclamation predicate includes that namespace.
@@ -51,7 +54,7 @@ dependent claims, rather than only keys from new claim insertions.
 | local_mailbox_owners | subject, component | none | incarnation, epoch |
 | local_mailbox_bindings | token | none | subject, component, incarnation, epoch |
 | local_agent_delivery_presence | recipient, driver | none | complete captured assessment and live producer certificate; source-owner schema |
-| local_agent_card_clock | singleton | none | captured unsigned evaluation time, monotone revision and finite maintenance reason |
+| local_agent_card_clock | singleton | none | captured unsigned evaluation time, monotone revision, finite maintenance reason and same-transaction snapshot_index |
 
 Claim extraction must include all same-agent intermediate claims for causal
 authority, not only runtime heads. A claim affecting another agent through its
@@ -63,7 +66,7 @@ limits fence rather than silently truncate. Page cursors use stable source PKs,
 not public ranked windows. Any additional table discovered by a lifecycle
 producer expands this manifest and fingerprint before qualification.
 
-## Remaining producer inputs
+## Complete card dependencies
 
 The six card families are desired/current membership; actual authority and
 operational ownership; observed harness/activity/working episode; work queue and
@@ -76,6 +79,12 @@ rollup slots per group; exceeding either bound refuses publication.
 Activity retains the existing
 replica-local arrival selector and must be refreshed on prefix promotion and
 checkpoint renumbering; canonical claim rank is not an equivalent substitute.
+Local observations qualify only when `after_store_index <=` the captured clock's
+`snapshot_index`. A namespaced eligibility flag and indexed category heads keep
+future anchors out of current reads. Position changes schedule indexed ranges
+with a durable `(after_store_index, observation_id)` cursor; equal-anchor groups
+may span multiple pages. Extraction before the clock page starts with a zero
+admission position, rather than admitting unknown future observations.
 
 Canonical owner status/mode heads preserve the snapshot-index membership rule;
 projected queue generation selection is a separate dependency. Owner and operation
@@ -84,9 +93,15 @@ field heads, including sticky forced/start flags and explicit reason/block clear
 before one published row is written. Literal nested `fields.fields` actual inputs
 are outside the fixed-head compatibility domain and refuse publication.
 
-Delivery presence is currently in memory and includes monotonic time and
-followed executable file identity. It requires a committed, versioned local
-source sink plus deadline dispatch. A SQL capture trigger cannot cover it.
+Delivery presence includes monotonic time and followed executable file identity.
+The retained producer registration supplies a committed, versioned local SQL
+sink and captures all five drivers for each requested recipient. Its live,
+namespace-wide certificate must cover the complete file footprint, with at most
+64 distinct files. Both row reads and silent advances validate the live producer
+boundary; selected SQL row certificates alone never establish closure. Producer
+requests use indexed missing/epoch/expiry ranges, sharing a 128-candidate budget.
+The source controller supplies deadline dispatch and acknowledgement after the
+SQL commit. A SQL capture trigger alone cannot cover this producer.
 Harness freshness (strictly more than 90 seconds), native presence expiry,
 startup grace, subagent expiry and inclusive work lease boundaries are captured
 clock inputs. Client grants are revalidated in the same authorized snapshot;
@@ -101,7 +116,13 @@ owned declarations and queue moves exclude repaired originals, while actual,
 harness, activity, usage and provenance retain the original admitted facts.
 
 Clock/deferred repair work enters through captured maintenance replacements and
-`Operator::apply`; direct Installer generation updates are forbidden. Incomplete
+`Operator::apply`; direct Installer generation updates are forbidden. Physical
+normalization, reverse fanout, family repairs, deadline work and card writes
+share one 128-item maintenance budget. Durable seek cursors let later keys make
+progress. Computed queue cleanliness and committed public-card acknowledgements
+are separate: removal or certified absence acknowledges queue dirtiness in the
+same transaction as output. Namespace reclamation processes one family per
+callback and charges final continuation deletion to its own remaining budget. Incomplete
 bounded repair/producer acknowledgements temporarily refuse independent coverage.
 Unsupported semantics, missing manifest coverage and raw write gaps permanently
 fence the source and view until a qualified replacement namespace is installed.
