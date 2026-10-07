@@ -33417,15 +33417,6 @@ mission "summary-child" state="ready" {
             .set_mission_run_state(&grandchild.id, "completed", "terminal", None)
             .unwrap();
         store
-            .set_mission_run_outcome(
-                &grandchild.id,
-                "failed",
-                "person/test",
-                "preserved outcome",
-                "summary-outcome",
-            )
-            .unwrap();
-        store
             .append_claim(&ClaimInput {
                 subject: root.subject.clone(),
                 kind: "reconcile.fault".into(),
@@ -33494,16 +33485,6 @@ mission "summary-child" state="ready" {
             step.completion_summary.as_deref(),
             Some("selected completion")
         );
-        assert_eq!(
-            tree.iter()
-                .find(|run| run.subject == grandchild.subject)
-                .unwrap()
-                .outcome
-                .as_ref()
-                .unwrap()
-                .reason,
-            "preserved outcome"
-        );
         // Compare the old reader's observable tree fields and ordering. Only
         // work-presentation fields deliberately omitted by the summary reader differ.
         let connection = store.readers.get();
@@ -33537,6 +33518,30 @@ mission "summary-child" state="ready" {
             value
         };
         assert_eq!(tree_fields(&tree), tree_fields(&full));
+
+        // Only a finished root accepts a user-set outcome. Exercise that separately
+        // after checking active descendants and their expired leases above.
+        store
+            .set_mission_run_state(&root.id, "completed", "terminal", None)
+            .unwrap();
+        store
+            .set_mission_run_outcome(
+                &root.id,
+                "failed",
+                "person/test",
+                "preserved outcome",
+                "summary-outcome",
+            )
+            .unwrap();
+        let index = store.index().unwrap();
+        let finished_tree = store.mission_runs_for_root(&root.id).unwrap();
+        assert_eq!(store.index().unwrap(), index);
+        let finished = finished_tree.iter().find(|run| run.id == root.id).unwrap();
+        assert_eq!(finished.outcome.as_ref().unwrap().reason, "preserved outcome");
+        assert_eq!(
+            finished.outcome,
+            store.mission_run(&root.id).unwrap().unwrap().outcome
+        );
     }
 
     #[test]
