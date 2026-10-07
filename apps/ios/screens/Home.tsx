@@ -10,6 +10,7 @@ import { agentName } from '../agentsView';
 import { attentionActionLabel, attentionKindLabel, blockedLine } from '../presentation';
 import { missionTitle } from '../missionsView';
 import { useStore } from '../store';
+import { PromptCard } from '../PromptCard';
 import { randomName } from '../launcher';
 import { theme } from '../theme';
 import { Button, Legend, ListRow, Markdown, Note, Screen, SectionHeader, T } from '../ui';
@@ -145,7 +146,7 @@ export function AttentionScreen({ route, navigation }: RootScreen<'Attention'>) 
       <Banners />
       <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ padding: 12, gap: 8, paddingBottom: 32 }}>
         <T><T bold color={theme[row.color]}>{row.glyph} prompt</T><T dim>  {item.prompt.kind ?? 'harness'} · waited {row.age}</T></T>
-        <PromptView item={item} prompt={item.prompt} from={agent ? agentName(agent) : item.prompt.seat_id?.replace(/^agent\//, '') ?? 'A harness'} onAnswered={() => navigation.goBack()} />
+        <PromptCard item={item} from={agent ? agentName(agent) : item.prompt.seat_id?.replace(/^agent\//, '') ?? 'A harness'} onAnswered={() => navigation.goBack()} />
         {agentId ? <Button label={`chat with ${agent ? agentName(agent) : agentId}`} onPress={() => navigation.navigate('Conversation', { target: agentId, title: agent ? agentName(agent) : agentId })} /> : null}
         <T dim selectable>{item.id}</T>
       </ScrollView>
@@ -222,30 +223,6 @@ function StructuredRequestView({ item, request, from, onAnswered }: { item: Para
     </Pressable>)}
     {request.custom ? <Button label="Answer in words" disabled={disabled} onPress={words} /> : null}
     {request.why_person ? <T dim>Why you: {request.why_person}</T> : null}
-  </View>;
-}
-
-// A prompt a harness is waiting on: what it asks and its choices while it can be answered here;
-// once it ended, or where nothing can be answered, how it ended and what to do instead, never a button.
-function PromptView({ item, prompt, from, onAnswered }: { item: Parameters<ReturnType<typeof useStore>['actions']['respondPrompt']>[0]; prompt: NonNullable<Parameters<ReturnType<typeof useStore>['actions']['respondPrompt']>[0]['prompt']>; from: string; onAnswered: () => void }) {
-  const { busy, status, actions } = useStore();
-  const open = !prompt.state || prompt.state === 'open';
-  const answerable = open && prompt.can_answer !== false && item.actions.includes('prompt.respond');
-  const disabled = busy || status !== 'online';
-  const send = (choice: { id: string; label: string }) => Alert.alert(`Answer ${from} “${choice.label}”`, undefined, [
-    { text: 'Cancel', style: 'cancel' },
-    { text: 'Send', onPress: () => void actions.respondPrompt(item, choice.id).then(done => { if (done) onAnswered(); }) },
-  ]);
-  return <View style={{ gap: 8 }}>
-    <RequestQuestion text={prompt.content || item.detail || item.title} />
-    {answerable ? <T bold color={theme.person}>{from} is waiting on you.</T> : null}
-    {answerable ? prompt.choices?.map(choice => <Pressable key={choice.id} disabled={disabled} onPress={() => send(choice)}
-      style={{ borderLeftWidth: 2, borderLeftColor: theme.surface1, paddingLeft: 8, paddingVertical: 4, opacity: disabled ? 0.5 : 1 }}>
-      <T bold color={theme.accent}>{choice.label}</T>
-      <T dim>{choice.consequence}</T>
-    </Pressable>) : null}
-    {prompt.next_action ? <T color={theme.yellow}>{prompt.next_action}</T> : null}
-    {!open ? <T dim>This prompt {prompt.state?.replace(/_/g, ' ')}{prompt.how ? `: ${prompt.how}` : ''}.</T> : null}
   </View>;
 }
 

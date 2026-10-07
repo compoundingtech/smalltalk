@@ -11,7 +11,8 @@ import { agentGlyph, agentModel, agentName, agentState, agentWord, harnessColor,
 import { Banners } from '../chrome';
 import rules from '../../../fixtures/clients/conversation-style.json';
 import { tokenColor, type ConversationRules } from '../conversationStyle';
-import { COLLAPSED_TOOL_LINES, conversationEntries, staleLine, entryMatches, entryText, folds, shownToolLines, unreadableTranscript, type ConversationEntry, type MailImage, simplify, type SimpleRow, sessionPerson, applyConversation, applyOlderPage, isUnresolved, olderFailed, olderLoading, olderNote, type Conversation } from '@smalltalk/st3-views';
+import { PromptCard } from '../PromptCard';
+import { COLLAPSED_TOOL_LINES, conversationEntries, staleLine, entryMatches, entryText, folds, shownToolLines, unreadableTranscript, type ConversationEntry, type MailImage, simplify, type SimpleRow, sessionPerson, applyConversation, applyOlderPage, openPromptFor, isUnresolved, olderFailed, olderLoading, olderNote, type Conversation } from '@smalltalk/st3-views';
 import { addImages, fromDataUri, MAX_IMAGES, megabytes, picked, type Picked } from '../images';
 import { rememberBounded } from '../boundedCache';
 import { dictationAvailable, startDictation } from '../modules/st-dictation';
@@ -43,6 +44,8 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
   const agent = data.agents.find(candidate => candidate.id === target)
     ?? (session?.state === 'running' && session.managed !== false ? data.agents.find(candidate => candidate.id === session.owner_id) : undefined);
   const unresolved = session ? isUnresolved(session) : false;
+  // A prompt the harness is waiting on sits above the message box, answered here as on Home.
+  const openPrompt = agent ? openPromptFor(data.attention, agent.id) : undefined;
   const title = route.params.title ?? (agent ? agentName(agent) : session?.driver ?? target.split('/').pop() ?? target);
   const [timeline, setTimeline] = useState<Conversation<TimelineEntry>>(() => conversationCache.current.get(target) ?? empty);
   const timelineNow = useRef(timeline);
@@ -321,6 +324,7 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
       contentContainerStyle={{ paddingVertical: 8 }}
     />
     {away ? <Pressable accessibilityRole="button" accessibilityLabel="Scroll to latest" style={styles.latest} onPress={() => list.current?.scrollToOffset({ offset: 0, animated: true })}><T bold color={theme.accent}>↓ latest</T></Pressable> : null}
+    {agent && openPrompt ? <View style={styles.promptCard}><T bold color={theme.person}>◆ prompt</T><PromptCard item={openPrompt} from={title} /></View> : null}
     {agent && listening ? <View style={[styles.composer, { paddingBottom: bottom, flexDirection: 'column', alignItems: 'stretch' }]}>
       <Waveform levels={levels} />
       <T color={heard ? theme.text : theme.overlay0}>{heard || 'Listening…'}</T>
@@ -528,6 +532,7 @@ const styles = StyleSheet.create({
   tool: { marginHorizontal: 8, marginVertical: 4, paddingHorizontal: 8, paddingVertical: 4, borderLeftWidth: 2 },
   toolLine: { fontSize: 12, lineHeight: 17, paddingLeft: 18 },
   call: { marginHorizontal: 8, marginVertical: 2, paddingHorizontal: 8, paddingVertical: 3, borderLeftWidth: 2 },
+  promptCard: { gap: 6, paddingHorizontal: 12, paddingVertical: 8, borderTopColor: theme.person, borderTopWidth: 2, backgroundColor: theme.mantle },
   composer: { flexDirection: 'row', alignItems: 'flex-end', gap: 6, paddingHorizontal: 10, paddingTop: 6, borderTopColor: theme.surface0, borderTopWidth: StyleSheet.hairlineWidth * 2, backgroundColor: theme.mantle },
   prompt: { paddingBottom: 9, fontFamily: fonts.bold },
   // The box grows with its text up to maxHeight. No flex here: inside the column that holds the
