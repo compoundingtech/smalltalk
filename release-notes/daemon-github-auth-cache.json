@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Configure a daemon GitHub token file and reuse default credentials until HTTP 401",
+  "replay": {
+    "status": "none",
+    "detail": "No persisted observer cursor or replay behavior changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database tables, indexes, triggers or schema version changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or digest changes; no coordinated member upgrade required."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Adds optional [github] token_file configuration, ahead of existing GH_TOKEN, GITHUB_TOKEN, gh auth token default precedence. token_file and reserved sekrets_profile are mutually exclusive; sekrets_profile fails with an unsupported-config error pending the authorized-request gateway client and never falls back to local credentials. Accepted default credentials persist until a 401, observed credential-source change or restart; failed lookup and 401 refresh back off for 30 seconds. No daemon API or wire protocol changes."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No startup replay or migration is added. An explicitly configured token file is checked at startup; unsafe or missing files, conflicting sources, and the reserved unsupported sekrets_profile stop startup with a clear error until configuration is corrected. Restart-to-API and restart-to-health timings have not been measured; no performance claim is made."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "For token_file, use a regular single-token UTF-8 file owned by the daemon account with no group/other permission bits (chmod 600), no symlink at the final path component and trusted parent directories; permissions and ownership are checked at startup and every acquisition. Mtime changes and atomic replacements reload credentials. Remove the new [github] options before running older builds whose deny_unknown_fields configuration parsing rejects them. Exported token changes are detected through the existing 60-second login-environment snapshot refresh; gh hosts.yml metadata changes refresh the cached token. A keychain-only update that leaves that file unchanged requires a 401 or daemon restart. See docs/github-integration.md."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No database recovery is required to swap binaries. Remove new [github] configuration options before swapping back to older builds; credentials and caches do not change persisted graph state."
+  }
+}

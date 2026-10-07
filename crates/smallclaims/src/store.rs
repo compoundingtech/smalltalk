@@ -39,6 +39,8 @@ use crate::sqlite::{
 #[cfg(test)]
 mod projection_busy_tests;
 mod binary_payloads;
+pub mod events;
+pub mod idempotency;
 mod inventory_generation;
 pub use binary_payloads::PayloadConversion;
 pub mod canonical;
@@ -504,13 +506,6 @@ CREATE TABLE IF NOT EXISTS idempotency (
     response TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS events (
-    store_index INTEGER PRIMARY KEY,
-    kind TEXT NOT NULL,
-    subject TEXT NOT NULL,
-    body TEXT NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS peer_cursors (
     peer TEXT PRIMARY KEY,
     accepted_through INTEGER NOT NULL
@@ -683,7 +678,7 @@ ON checkpoint_claims(operation_id) WHERE operation_id IS NOT NULL;
 "#;
 
 /// The store's schema version, set once the graph's and the runtime's tables exist.
-pub const SCHEMA_VERSION: &str = "PRAGMA user_version = 16;";
+pub const SCHEMA_VERSION: &str = "PRAGMA user_version = 17;";
 
 /// The graph half of a store. A runtime's store wraps it and derefs to it, so the runtime's
 /// projections read and write through the same connections.
@@ -850,13 +845,15 @@ impl Store {
         runtime.migrate_schema(connection)?;
         connection.execute_batch(SCHEMA)?;
         connection.execute_batch(&fleet_generation_schema())?;
+        idempotency::initialize(connection)?;
+        events::initialize(connection)?;
         inventory_generation::initialize(connection)?;
         connection.execute_batch(principals::PRINCIPAL_SCHEMA)?;
         runtime.create_schema(connection)?;
         // Reassigning user_version dirties the database header even when it is unchanged.
         // Upgrade once, then let ordinary reopens avoid that write and its durable commit.
         let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version != 16 {
+        if version != 17 {
             connection.execute_batch(SCHEMA_VERSION)?;
         }
         document_index::initialize(connection)?;
@@ -1453,11 +1450,11 @@ pub fn reject_old_schema(connection: &Connection) -> Result<()> {
         |row| row.get(0),
     )?;
     anyhow::ensure!(
-        table_count == 0 || matches!(version, 10..=16),
+        table_count == 0 || matches!(version, 10..=17),
         "this database uses an unsupported st schema; start with a new state directory"
     );
     anyhow::ensure!(
-        matches!(version, 0 | 10 | 11 | 12 | 13 | 14 | 15 | 16),
+        matches!(version, 0 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17),
         "this database uses unsupported st schema version {version}"
     );
     Ok(())
@@ -4805,6 +4802,47 @@ impl Store {
         read(index)
     }
 
+    /// Move one bounded chunk of old event payloads to the position index.
+    pub fn migrate_event_payloads(&self) -> Result<usize> {
+        // Maintenance owns one bounded transaction. Lending preserves numeric SQLite errors
+        // from BEGIN and COMMIT too; the batched API reports outer failures as strings.
+        let mut writer = self.connection.write();
+        let transaction = writer.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let moved = events::migrate_chunk_tx(&transaction)?;
+        transaction.commit()?;
+        Ok(moved)
+    }
+
+    /// The oldest new receipt's expiry deadline for the cleanup scheduler.
+    pub fn next_idempotency_expiry(&self) -> Result<Option<i64>> {
+        idempotency::next_expiry(&self.readers.get())
+    }
+
+    pub fn idempotency_clock_limit(&self) -> Result<Option<i64>> {
+        idempotency::clock_limit(&self.readers.get())
+    }
+
+    /// Remove one indexed chunk of expired local responses. Claims, operations, and checkpoint
+    /// tombstones are unaffected. A live runtime generation extends the response's window.
+    pub fn cleanup_idempotency(&self, now_unix_ms: i64) -> Result<idempotency::Cleanup> {
+        let mut writer = self.connection.write();
+        let transaction = writer.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let Some(clock_limit) = idempotency::clock_limit(&transaction)? else {
+            return Ok(idempotency::Cleanup::default());
+        };
+        let cleaned = idempotency::cleanup_tx(
+            &transaction,
+            now_unix_ms.min(clock_limit),
+            idempotency::CLEANUP_CHUNK,
+            |connection, response| {
+                self.runtime
+                    .idempotency_response_in_use(connection, response)
+            },
+        )?;
+        transaction.commit()?;
+        Ok(cleaned)
+    }
+
     pub fn put_document(
         &self,
         name: &str,
@@ -4849,6 +4887,24 @@ impl Store {
                 {
                     return serde_json::from_str(&response).map_err(internal);
                 }
+                if let Some(claim_id) = idempotency::original_claim(transaction, idempotency_key).map_err(internal)? {
+                    let original = transaction.query_row(
+                        "SELECT id,store_index,batch_id,subject,kind,origin,actor,body,predecessors,accepted_at_unix_ms
+                         FROM claims WHERE id=?1 AND kind='doc.bound'", [&claim_id], claim_from_row,
+                    ).optional().map_err(internal)?;
+                    if let Some(record) = original {
+                        return Ok(DocumentVersion {
+                            name: record.body["name"].as_str().ok_or_else(|| St3Error::new("internal","document claim has no name"))?.into(),
+                            hash: record.body["hash"].as_str().ok_or_else(|| St3Error::new("internal","document claim has no hash"))?.into(),
+                            size: record.body["size"].as_u64().ok_or_else(|| St3Error::new("internal","document claim has no size"))?,
+                            created_index: record.store_index, latest: true,
+                            binding_claim_id: record.id, created_at_unix_ms: record.accepted_at_unix_ms,
+                            owner: record.actor.or(Some(record.origin)),
+                        });
+                    }
+                    return Err(St3Error::new("idempotency-key-expired","this request was already committed and its claim was checkpointed")
+                        .with_detail("idempotency_key",idempotency_key.to_owned()).with_detail("claim_id",claim_id));
+                }
                 if let Some(version) = find_document(transaction, name, &hash).map_err(internal)? {
                     return Ok(version);
                 }
@@ -4878,7 +4934,8 @@ impl Store {
                     principals::rules_gate_tx(transaction, &self.origin, writer, "doc.bound", name)
                         .map_err(crate::error::typed)?;
                 }
-                let body = json!({ "name": name, "hash": hash, "size": bytes.len() });
+                let mut body = json!({ "name": name, "hash": hash, "size": bytes.len() });
+                idempotency::attach(&mut body, idempotency_key).map_err(internal)?;
                 let record = self.runtime.append_claim_tx(
                     transaction,
                     &self.origin,
@@ -4890,6 +4947,7 @@ impl Store {
                     None,
                 )
                 .map_err(internal)?;
+                register_operation_tx(transaction, &record).map_err(internal)?;
                 select_replicated_document(transaction, &record, record.store_index)?;
                 self.runtime.after_projection(transaction)?;
                 let version = DocumentVersion {

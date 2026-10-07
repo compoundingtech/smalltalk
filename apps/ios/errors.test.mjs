@@ -24,3 +24,9 @@ assert.equal(tries, 3);
 tries = 0;
 await assert.rejects(retryTransient(5, async () => { tries++; throw refused('forbidden'); }, notApplied));
 assert.equal(tries, 1);
+
+assert.equal(isTransient(refused('idempotency-key-expired')), false);
+assert.equal(notApplied(refused('idempotency-key-expired')), false);
+let expiredTries = 0;
+await assert.rejects(retryTransient(8, async () => { expiredTries++; throw refused('idempotency-key-expired'); }));
+assert.equal(expiredTries, 1, 'an expired committed request must never be retried with a fresh key');

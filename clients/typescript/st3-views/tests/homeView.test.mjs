@@ -56,6 +56,8 @@ assert.deepEqual(withUpdate.map(row => row.color), ['person', 'green']);
   const rows = homeRows(kept, undefined, Date.parse('2026-10-07T07:05:00Z'));
   assert.equal(rows.length, 2, 'a resolved copy is replaced by the open one that was shown');
   assert.match(rows[0].waiting, /closed elsewhere/);
+  const sections = homeSections(homeRows([open('attention/open'), ...kept], undefined, Date.parse('2026-10-07T07:05:00Z')));
+  assert.deepEqual(sections.map(section => [section.title, section.count]), [['when there is time', 1], ['closed elsewhere: clear each', 2]], 'closed items have a section of their own');
   // Again, with the marked ones as the previous list: they stay.
   assert.equal(keepClosed(kept, next, new Set()).length, 2);
   // An item that was never open on Home is not invented.

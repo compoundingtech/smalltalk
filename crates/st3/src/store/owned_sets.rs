@@ -1378,6 +1378,7 @@ impl Store {
             &key,
             Some(actor),
             Some(options),
+            None,
         )
     }
 }

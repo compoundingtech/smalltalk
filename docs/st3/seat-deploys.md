@@ -5,6 +5,32 @@ new one such as a new Nix store path. The daemon adopts every running seat; it d
 This document explains how each seat's message path follows the new binary without ending the
 provider session, and how st reports a seat whose message path did not.
 
+## Local response and event storage upgrade
+
+Schema 17 is a one-way database upgrade. Capture a supported backup before restarting with the
+matching daemon; rolling back requires restoring that pre-upgrade backup, because older binaries
+reject the upgraded store. Durable claims and checkpoint rules remain authoritative.
+
+Existing local response rows remain untouched in this release: their historical claims lack the
+caller-key association. Operations records the deployment timestamp and the fixed cohort's
+deployment-plus-30-day removal date in [issue 1741](https://github.com/compoundingtech/smalltalk/issues/1741).
+New receipts expire after seven days; durable effect claims recognise later retries and either
+rebuild the original response or return terminal `idempotency-key-expired`. Response cleanup
+subscribes to committed writes before its first rowid deadline read, reads deadlines outside the
+writer, and examines at most 64 responses per transaction while protecting active runs. No
+indexes are added, dropped or changed. Event payload
+copies drain in transactions of at most 64 positions; operations must use the measured writer-held
+and total migration evidence for the exact release, rather than treating a row limit as a latency
+bound. No fixed migration duration is assumed. Transient busy/locked errors retry with backoff;
+permanent errors stop the worker visibly.
+
+Converting a legacy event table seeds a floor at the current frontier. A caught-up follower resumes
+normally; a lagging follower receives HTTP 410 with the floor/frontier and must explicitly resync
+once. Raw trace/history followers stop and report the gap. Projection clients use one bounded
+replacement and establish a fresh cursor; they must not repeatedly request the rejected cursor.
+Upgrade the CLI with the daemon for owner-filtered or subject-filtered migration traversal. A new
+CLI stops before requesting history from a daemon that lacks bounded continuation support.
+
 ## Harness admission at the next launch
 
 Before starting an unseen installed omp or OpenCode build, st measures its native delivery
