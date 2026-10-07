@@ -44,11 +44,22 @@ st2-maintained encoding and would no longer be opaque launch argv.
 
 ## Decision
 
-Linux scope launches use this exact outer argument order:
+Linux scope launches on systemd v254+ use this exact outer argument order:
 
 ```text
-systemd-run --user --scope --collect --quiet --unit=<unit> --expand-environment=no -- <program> <arg>...
+systemd-run --user --scope --collect --quiet --no-ask-password --unit=<unit> --expand-environment=no -- <program> <arg>...
 ```
+
+On systemd v236–253, omit only `--expand-environment=no`. These versions
+execute scope arguments directly and do not support that option. The version
+probe must succeed, and the user manager must answer before selecting scope
+isolation. Unknown or unsupported versions keep degraded isolation.
+
+The [systemd v249 scope implementation](https://github.com/systemd/systemd/blob/v249/src/run/run.c)
+passes `arg_cmdline` directly to `execvpe`; neither percent nor dollar bytes
+need escaping. Doubling either byte would corrupt literal arguments. The
+[systemd v254 implementation](https://github.com/systemd/systemd/blob/v254/src/run/run.c)
+introduces the expansion option, so newer launches explicitly disable it.
 
 `--expand-environment=no` is passed as a `systemd-run` option before the `--`
 separator. st2 appends the program and each argument after the separator as the
@@ -61,8 +72,8 @@ pass-throughs.
 - Dollar-bearing literals, including `$HOME`, `${UNSET}`, and `$$`, reach PTY
   and exec tasks byte-for-byte in scope mode.
 - The systemd option sequence is part of the tested wrapper contract; the only
-  addition to the prior shape is the expansion-disable option before the
-  separator.
+  version-dependent option is the expansion-disable option before the
+  separator. All launches disable password prompting.
 - macOS and Linux hosts without usable user scopes keep the existing direct
   program-and-argv path.
 - Scope lifetime and I/O behavior are unchanged. The supporting live evidence

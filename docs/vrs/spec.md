@@ -907,10 +907,15 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   command order is:
 
   ```text
-  systemd-run --user --scope --collect --quiet --unit=<unit> --expand-environment=no -- <program> <arg>...
+  systemd-run --user --scope --collect --quiet --no-ask-password --unit=<unit> --expand-environment=no -- <program> <arg>...
   ```
 
-  `--expand-environment=no` is an outer `systemd-run` option immediately before
+  On systemd v236–253, omit `--expand-environment=no`: those versions execute
+  scope argv directly and do not implement the option. Unknown or older
+  versions, or an unavailable user manager, select degraded isolation. Literal
+  percent and dollar bytes remain unchanged on both paths.
+
+  On v254+, `--expand-environment=no` is an outer `systemd-run` option immediately before
   the `--` separator. `<program>` and every `<arg>` are appended as their
   original OS strings, without shell rendering, dollar escaping, or
   environment substitution. Detached and degraded-detached modes remain
