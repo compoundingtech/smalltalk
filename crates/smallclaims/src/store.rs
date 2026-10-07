@@ -80,7 +80,9 @@ pub struct ProjectionProgress {
 }
 
 /// Why an incremental projection failed, on one bounded line: the error code and message (240
-/// characters), the first kinds of claim in the range, and the range.
+/// characters), the first kinds of claim in the range, and the range. The message can carry a
+/// subject or claim id from the error; that is acceptable in the daemon log, and it is never copied
+/// into a claim or a profile note (the profile note keeps the code alone).
 fn incremental_failure_log_line(
     code: &str,
     message: &str,
