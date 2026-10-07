@@ -90,6 +90,7 @@ fn delta_preserves_older_history_until_an_older_page_reaches_the_start() {
         has_more: Some(true),
         items: vec![item("c", 3, 1, "c")],
         session_id: Some("session/a".into()),
+        header: None,
     });
     timeline.apply(Frame {
         items: vec![item("d", 4, 1, "d")],
@@ -152,6 +153,7 @@ fn earlier_pages_go_above_the_window_and_survive_a_new_window_that_meets_them() 
         has_more: Some(has_more),
         items,
         session_id: Some("session/a".into()),
+        header: None,
     };
     let mut timeline = Timeline::default();
     timeline.apply(window(
@@ -205,6 +207,7 @@ fn projection_notices_do_not_connect_disconnected_history_windows() {
         has_more: Some(true),
         items,
         session_id: Some("session/a".into()),
+        header: None,
     };
     let mut timeline = Timeline::default();
     timeline.apply(window(vec![
@@ -257,6 +260,7 @@ fn projection_notice_is_removed_from_preserved_older_prefix() {
     })).unwrap();
     let window = |items| Frame {
         replace: true, has_more: Some(true), items, session_id: Some("session/a".into()),
+        header: None,
     };
     let mut timeline = Timeline::default();
     timeline.apply(window(vec![
@@ -286,6 +290,7 @@ fn an_earlier_page_from_another_session_is_dropped_and_a_new_session_starts_over
         has_more: Some(true),
         items: vec![item("c", 3, 1, "c")],
         session_id: Some("session/a".into()),
+        header: None,
     });
     timeline.older_page("session/b", vec![item("b", 2, 1, "b")], true, None);
     assert_eq!(ids(&timeline), ["c"]);
@@ -298,6 +303,7 @@ fn an_earlier_page_from_another_session_is_dropped_and_a_new_session_starts_over
         has_more: Some(false),
         items: vec![item("n", 1, 1, "n")],
         session_id: Some("session/b".into()),
+        header: None,
     });
     assert_eq!(ids(&timeline), ["n"]);
     assert!(!timeline.older.paged && timeline.older.failed.is_none());
@@ -552,8 +558,22 @@ fn shared_transcripts_match_without_a_renderer() {
             include_str!("../../../fixtures/clients/transcripts/native-omp-run.json"),
             include_str!("../../../fixtures/clients/transcripts/native-omp-run.expected.json"),
         ),
+        (
+            include_str!("../../../fixtures/clients/transcripts/omp-parity.json"),
+            include_str!("../../../fixtures/clients/transcripts/omp-parity.expected.json"),
+        ),
     ] {
-        let items = serde_json::from_str::<Vec<st3_client::TimelineEntry>>(input).unwrap();
+        // A page also carries its conversation header; the rows are its items.
+        let input = serde_json::from_str::<serde_json::Value>(input).unwrap();
+        let items = match input {
+            serde_json::Value::Object(page) => {
+                serde_json::from_value::<Vec<st3_client::TimelineEntry>>(
+                    page.get("items").cloned().unwrap_or(serde_json::Value::Null),
+                )
+            }
+            entries => serde_json::from_value::<Vec<st3_client::TimelineEntry>>(entries),
+        }
+        .unwrap();
         let mut entries =
             serde_json::to_value(adapt::conversation(&items, &Default::default())).unwrap();
         // The local display time depends on the host's time zone, not the conversation model.
@@ -591,6 +611,100 @@ fn omp_bookkeeping_custom_entries_hide_and_other_custom_entries_stay() {
         }
     }
     assert!(text(&adapt::conversation(&other, &Default::default())).contains("unrecognized omp entry"));
+}
+
+#[test]
+fn omp_parity_header_renders_one_line_with_source_and_age() {
+    let page: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../fixtures/clients/transcripts/omp-parity.json"
+    ))
+    .unwrap();
+    let line = header::line(&page["header"], "2026-10-06T12:00:00Z");
+    assert!(
+        line.starts_with("model synthetic/model [transcript · 0s]"),
+        "{line}"
+    );
+    assert!(line.contains("ask Continue? [transcript · 0s]"), "{line}");
+    assert!(line.ends_with("working [register · 0s]"), "{line}");
+}
+
+#[test]
+#[cfg(feature = "ratatui")]
+fn a_subagent_card_opens_its_child_conversation() {
+    let entries = parity_entries();
+    let card = entries
+        .iter()
+        .find(|entry| entry.id == "parity-18#child")
+        .expect("one card per subagent");
+    let Body::Tool { title, state, output } = &card.body else {
+        panic!("{card:?}");
+    };
+    assert_eq!((title.as_str(), *state), ("reviewer · completed", ToolState::Ok));
+    assert_eq!(
+        output.as_slice(),
+        [
+            "Review synthetic code",
+            "duration 1200ms",
+            "tokens 80",
+            "cost $0.02",
+            "open session/child"
+        ]
+    );
+    assert_eq!(header::open_session(output), Some("session/child"));
+    let doc = Cache::default().render(
+        std::slice::from_ref(card),
+        40,
+        &HashSet::new(),
+        "*",
+        &theme(),
+    );
+    assert!(
+        doc.targets
+            .iter()
+            .any(|target| matches!(&target.hit, PaneIntent::Open(id) if id == "session/child")),
+        "{:?}",
+        doc.targets
+    );
+    assert!(
+        doc.lines
+            .iter()
+            .any(|line| text::plain(line).contains("open session/child"))
+    );
+}
+
+#[test]
+#[cfg(feature = "ratatui")]
+fn typed_calls_bundle_in_the_simplified_conversation() {
+    let entries = parity_entries();
+    let doc = Cache::default().render_as(
+        &entries,
+        60,
+        &HashSet::new(),
+        "*",
+        &theme(),
+        Density::Simple,
+    );
+    let shown = doc
+        .lines
+        .iter()
+        .map(|line| text::plain(line))
+        .collect::<Vec<_>>();
+    assert!(
+        // The thirteen typed calls and the subagent card form one run.
+        shown.iter().any(|line| line.contains("14 tool calls")),
+        "{shown:?}"
+    );
+}
+
+/// The omp-parity page's entries, as the shared transcript test reads them.
+fn parity_entries() -> Vec<Entry> {
+    let page: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../fixtures/clients/transcripts/omp-parity.json"
+    ))
+    .unwrap();
+    let items = serde_json::from_value::<Vec<st3_client::TimelineEntry>>(page["items"].clone())
+        .unwrap();
+    adapt::conversation(&items, &Default::default())
 }
 
 #[test]

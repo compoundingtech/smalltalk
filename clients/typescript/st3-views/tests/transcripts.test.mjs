@@ -43,3 +43,12 @@ for (const name of ['claude', 'codex', 'deliveries', 'native-claude-run', 'nativ
   assert.ok(JSON.stringify(conversationEntries(timeline, new Map(), without)).includes('total_tokens_reminder'));
   assert.equal(conversationEntries(timeline, new Map(), SHOW_EVERYTHING).length, timeline.length);
 }
+
+// The OMP parity contract (typed views on #1574 blocks) renders to the same rows as Rust's
+// renderer; its timeline arrives as a page object holding the conversation header too.
+{
+  const expected = fixture('omp-parity.expected.json');
+  const page = fixture('omp-parity.json');
+  const phone = conversationEntries(page.items, new Map()).map(entry => ({ body: asStui(entry.body), id: entry.id }));
+  assert.deepEqual(phone, expected, 'omp-parity: the phone reads this transcript differently from stui');
+}

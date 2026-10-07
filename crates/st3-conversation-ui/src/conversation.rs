@@ -426,8 +426,12 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
                 Span::styled(title, title_style),
             ]));
             // Every row the output takes once wrapped; collapsed, a call shows its last few.
+            // A subagent card's `open <session>` row also opens that child conversation.
             let mut rows = Vec::new();
+            let mut open_row = None;
             for line in output {
+                let opens = line.starts_with("open ") && open_row.is_none();
+                let before = rows.len();
                 let line = text::sanitize(line);
                 let style = if line.starts_with('+') {
                     fg(rules.added, theme)
@@ -448,6 +452,9 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
                     &[edge(), run("  ", style)],
                     None,
                 ));
+                if opens {
+                    open_row = Some(before);
+                }
             }
             let total = rows.len();
             let hidden = if open {
@@ -466,6 +473,17 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
                 control(&mut doc, rules.collapse.text.into());
             }
             doc.lines(rows.into_iter().skip(hidden));
+            if let (Some(row), Some(session)) = (
+                open_row.filter(|row| *row >= hidden),
+                crate::header::open_session(output),
+            ) {
+                doc.targets.push(Target {
+                    line: row - hidden + 1,
+                    column: 0,
+                    width: width as u16,
+                    hit: PaneIntent::Open(session.to_owned()),
+                });
+            }
             if open && total > COLLAPSED_TOOL_LINES {
                 control(&mut doc, rules.collapse.text.into());
             }

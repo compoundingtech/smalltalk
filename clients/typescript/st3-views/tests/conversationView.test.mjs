@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { unreadableTranscript, cleanMessageText, conversationEntries, entryMatches, foldDeliveryFlaps, fromHarness, shownToolLines, toolTitle, DEFAULT_FILTERS, SHOW_EVERYTHING } from '@smalltalk/st3-views/conversationView';
+import { unreadableTranscript, cleanMessageText, conversationEntries, entryMatches, foldDeliveryFlaps, fromHarness, headerLine, shownToolLines, subagentSession, toolTitle, DEFAULT_FILTERS, SHOW_EVERYTHING } from '@smalltalk/st3-views/conversationView';
 
 let sequence = 0;
 const at = minute => `2026-09-30T12:${String(minute).padStart(2, '0')}:00Z`;
@@ -223,3 +223,44 @@ assert.equal(conversationEntries([rawEntry], names, DEFAULT_FILTERS)[0].body.tex
 assert.deepEqual(JSON.parse(conversationEntries([rawEntry], names, SHOW_EVERYTHING)[0].body.text), original);
 assert.deepEqual(rawEntry, original);
 assert.equal(cleanMessageText(rawText, SHOW_EVERYTHING), rawText);
+
+// Blocks that expose native data (#1574) are data: the markup cleanup must not eat reasoning
+// text or raw JSON, while plain prose without them is still cleaned, as stui does.
+{
+  const base = { id: 'r', timestamp: '2026-10-06T12:00:00Z', role: 'assistant', type: 'content', final: true, sequence: 1 };
+  const reasoning = conversationEntries([{ ...base, body: { media_type: 'text/plain', text: '<thinking>the plan: check the fixtures</thinking>', blocks: [{ id: 'b', kind: 'reasoning', source_type: 'synthetic', payload: {} }] } }], new Map());
+  assert.equal(reasoning[0].body.text, '<thinking>the plan: check the fixtures</thinking>', 'reasoning text arrives as data');
+  const prose = conversationEntries([{ ...base, body: { media_type: 'text/plain', text: '<thinking>private</thinking>visible' } }], new Map());
+  assert.equal(prose[0].body.text, 'visible', 'prose without data blocks is still cleaned');
+  const raw = conversationEntries([{ ...base, role: 'system', body: { media_type: 'text/plain', text: '<tool_result>{"output":1}</tool_result>', blocks: [{ id: 'b', kind: 'unknown', source_type: 'synthetic', payload: {} }] } }], new Map());
+  assert.equal(raw[0].body.text, '<tool_result>{"output":1}</tool_result>', 'unknown raw JSON arrives as data');
+}
+
+// A subagent card's `open session/…` line is the link to that conversation (q2).
+{
+  assert.equal(subagentSession(['Review synthetic code', 'duration 1200ms', 'open session/child']), 'session/child');
+  assert.equal(subagentSession(['open session/child', 'open session/other']), 'session/child', 'the first link wins');
+  assert.equal(subagentSession(['reviewed, nothing to open']), undefined);
+}
+
+// The conversation header reads as one compact line, each field with its source and its age.
+{
+  const asOf = '2026-10-06T12:00:00Z';
+  const field = (value, source = 'transcript') => ({ value, source, as_of: asOf });
+  assert.equal(headerLine({
+    model: field('synthetic/model'),
+    context: field({ tokens: 50, window: null }),
+    cost: field({ usd: 0.02 }),
+    todos: field([{ phase: 'Render', items: [{ content: 'Render cards', status: 'completed' }] }]),
+    jobs: field([{ id: 'job-2', state: 'running' }]),
+    subagents: field([{ id: 'child-live', status: 'running' }]),
+    ask: field({ call_id: 'active', questions: [{ question: 'Continue?', options: [], multi: false }] }),
+    working: field(true, 'register'),
+  }, asOf), 'model synthetic/model [transcript · 0s] · context 50 tokens [transcript · 0s] · cost $0.02 [transcript · 0s] · todo 1/1 [transcript · 0s] · jobs 1 [transcript · 0s] · agents 1 [transcript · 0s] · ask Continue? [transcript · 0s] · working [register · 0s]');
+  assert.equal(headerLine({ cost: { value: { usd: 3 }, source: 'register', as_of: '2026-10-06T11:30:00Z' } }, asOf), 'cost $3.00 [register · 30m]');
+  assert.equal(headerLine({ model: field('synthetic/model ') }, '2026-10-06T12:59:30Z'), 'model synthetic/model [transcript · 1h]', 'rounded minutes promote to hours without extra spaces');
+  assert.equal(headerLine({ working: field(false, 'register') }, '2026-10-07T11:30:00Z'), 'idle [register · 1d]', 'rounded hours promote to days');
+  assert.equal(headerLine({ working: field(false, 'register') }, asOf), 'idle [register · 0s]');
+  assert.equal(headerLine({ ask: field(null) }, asOf), null, 'a header with nothing to say says nothing');
+  assert.equal(headerLine(undefined, asOf), null);
+}

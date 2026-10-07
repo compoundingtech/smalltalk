@@ -1,4 +1,5 @@
 import { applyWindow, isTransientCode, plainError, plainMessage, type Agent, type Attention, type CollectionFrame, type Glass, type CollectionName, type CollectionStream, type CollectionWindow, type Mission, type Snapshot, type St3Client, type TerminalScreen, type TimelineEntry } from '../../clients/typescript/st3-client';
+import type { ConversationHeader, HeaderField } from '@smalltalk/st3-views';
 import { TERMINAL_RESTARTED, withFreshTerminalFence, type Foreground, type TerminalFollowHandlers } from './terminalControls';
 
 // The app holds three windows on one collections socket. It needs no work window: missions carry
@@ -34,7 +35,7 @@ export type GlassesHandlers = {
   onIssue: (issue: string) => void;
 };
 
-export type ConversationFrame = { replace: boolean; items: TimelineEntry[]; hasMore: boolean; sessionId?: string };
+export type ConversationFrame = { replace: boolean; items: TimelineEntry[]; hasMore: boolean; sessionId?: string; header?: ConversationHeader };
 export type ConversationHandlers = {
   /** `replace` carries the newest page; otherwise the entries changed since the last frame. */
   onEntries: (frame: ConversationFrame) => void;
@@ -65,6 +66,26 @@ function errorMessage(error: unknown): string {
 const transient = (code: string | undefined) => code !== undefined && isTransientCode(code);
 /** Whether a refused conversation may load if asked again: all but st's word that it keeps no
  * start for the transcript (`timeline-history-incomplete`). */
+
+const HEADER_FIELDS: Record<string, true> = { model: true, context: true, cost: true, todos: true, jobs: true, subagents: true, ask: true, working: true };
+
+const isHeaderField = (value: unknown): value is HeaderField =>
+  typeof value === 'object' && value !== null && 'value' in value
+  && 'source' in value && typeof value.source === 'string'
+  && 'as_of' in value && typeof value.as_of === 'string';
+
+/** The conversation header a conversation frame carries when `conversation-blocks.v1` is
+ * negotiated. The generated frame type does not name the field yet, so it is read without
+ * assuming, and each field kept only when it says where it came from and when. */
+function conversationHeader(frame: CollectionFrame): ConversationHeader | undefined {
+  if (!('header' in frame) || typeof frame.header !== 'object' || frame.header === null) return undefined;
+  const header: ConversationHeader = {};
+  let kept = false;
+  for (const [name, field] of Object.entries(frame.header)) {
+    if (HEADER_FIELDS[name] && isHeaderField(field)) { header[name as keyof ConversationHeader] = field; kept = true; }
+  }
+  return kept ? header : undefined;
+}
 export const conversationMayClear = (code: string | undefined) => code !== 'timeline-history-incomplete';
 
 // One collections socket per paired gateway and credential. It holds the app's windows, at most one
@@ -342,7 +363,7 @@ export class Feed {
         this.conversation.failures = 0;
         this.conversation.handlers.onIssue('');
         this.handlers.onConversationFrame?.(frame.items.length, frame.replace);
-        this.conversation.handlers.onEntries({ replace: frame.replace, items: frame.items, hasMore: !!frame.has_more, sessionId: frame.session_id });
+        this.conversation.handlers.onEntries({ replace: frame.replace, items: frame.items, hasMore: !!frame.has_more, sessionId: frame.session_id, header: conversationHeader(frame) });
       }
     } else if (frame.kind === 'error') {
       if (id === TERMINAL) this.terminal?.failed(frame.code, frame.message);

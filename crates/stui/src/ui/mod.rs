@@ -310,6 +310,8 @@ pub struct Ui {
     /// the selection; only a new selection brings it back.
     list_follows: RefCell<[Option<usize>; 6]>,
     conversation_state: st3_conversation_ui::State,
+    /// Each conversation's header (contract §3) as st last sent it, drawn above its entries.
+    pub(crate) conversation_headers: std::collections::BTreeMap<String, serde_json::Value>,
     cache: conversation::Cache,
     editing: bool,
     confirm: Option<char>,
@@ -391,6 +393,8 @@ pub struct Ui {
     /// `stui --glasses`: named glasses of tabs and split panes, and a palette, in place of the
     /// sidebar layout.
     pub(crate) glasses: Option<glass::Glasses>,
+    /// A directly opened session in the sidebar layout, independent of its agent list.
+    session_focus: Option<String>,
     /// The footer names this build (version, revision, age); off in tests, whose screens must
     /// not change with every commit.
     pub(crate) build: bool,
@@ -518,6 +522,7 @@ impl Ui {
             list_top: RefCell::new([0; 6]),
             list_follows: RefCell::new([None; 6]),
             conversation_state: st3_conversation_ui::State::default(),
+            conversation_headers: std::collections::BTreeMap::new(),
             cache: conversation::Cache::default(),
             editing: false,
             confirm: None,
@@ -564,6 +569,7 @@ impl Ui {
             revoke: None,
             snoozed: HashSet::new(),
             glasses: None,
+            session_focus: None,
             build: false,
             details_here: HashSet::new(),
             find: None,
@@ -1233,6 +1239,9 @@ impl Ui {
     }
 
     fn selected_id(&self) -> Option<String> {
+        if self.tab == 1 && self.glasses.is_none() && self.session_focus.is_some() {
+            return self.session_focus.clone();
+        }
         let ids = self.ids();
         ids.get(self.selected[self.tab].min(ids.len().saturating_sub(1)))
             .cloned()
@@ -2123,9 +2132,13 @@ impl Ui {
                 .iter()
                 .find(|agent| agent.id == id)
         }) else {
-            let message = match self.world.agents {
-                Load::Loading => format!("{} Loading agents…", self.spinner()),
-                _ => "Select an agent.".into(),
+            let message = if id.is_some_and(|id| id.starts_with("session/")) {
+                "Loading conversation…".into()
+            } else {
+                match self.world.agents {
+                    Load::Loading => format!("{} Loading agents…", self.spinner()),
+                    _ => "Select an agent.".into(),
+                }
             };
             buf.set_stringn(area.x, area.y + 1, message, width, theme::dim());
             return;
@@ -2312,6 +2325,20 @@ impl Ui {
                     }));
                 }
                 let mut doc = Doc::new();
+                // The conversation header (q3) sits above the entries, each field saying
+                // where it came from and how old it is.
+                if let Some(header) = self.conversation_headers.get(&agent.id) {
+                    let line = st3_conversation_ui::header::line(
+                        header,
+                        &chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    );
+                    if !line.is_empty() {
+                        doc.line(Line::from(Span::styled(
+                            format!(" {line} "),
+                            theme::dim(),
+                        )));
+                    }
+                }
                 doc.blank();
                 doc.append(
                     self.cache
@@ -3339,6 +3366,7 @@ impl Ui {
     }
 
     fn select(&mut self, index: usize) {
+        self.session_focus = None;
         self.answering = None;
         let count = self.ids().len();
         if count == 0 {
@@ -3352,6 +3380,7 @@ impl Ui {
     }
 
     fn switch_tab(&mut self, tab: usize) {
+        self.session_focus = None;
         self.answering = None;
         self.tab = tab.min(TABS.len() - 1);
         self.editing = false;
@@ -3380,6 +3409,10 @@ impl Ui {
             1
         };
         self.switch_tab(tab);
+        if id.starts_with("session/") {
+            self.session_focus = Some(id.to_owned());
+            return;
+        }
         if let Some(index) = self.ids().iter().position(|candidate| candidate == id) {
             self.select(index);
         }

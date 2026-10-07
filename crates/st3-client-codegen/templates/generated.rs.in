@@ -1753,6 +1753,8 @@ pub struct ConversationChanges {
     pub session_id: String,
     pub items: Vec<TimelineEntry>,
     pub next_cursor: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -1761,6 +1763,8 @@ pub struct TimelinePage {
     pub session_id: String,
     pub items: Vec<TimelineEntry>,
     pub page: PageInfo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -3028,6 +3032,8 @@ pub struct TimelineBlock {
     pub visibility: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<Value>,
     pub payload: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuation: Option<ConversationContentRef>,

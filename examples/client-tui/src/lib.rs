@@ -149,12 +149,14 @@ impl App {
                 replace,
                 has_more,
                 items,
+                header,
             } if self.selected.as_ref() == Some(&target) => {
                 self.timeline.apply(st3_conversation_ui::Frame {
                     replace,
                     has_more,
                     items,
                     session_id: Some(session_id),
+                    header,
                 });
                 self.conversation_status = if self.timeline.more_before() {
                     "Recent conversation · earlier history omitted"

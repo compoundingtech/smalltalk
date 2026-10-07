@@ -335,3 +335,19 @@ assert.equal(shouldProbe(1_000, 11_000), true);
   feed.close();
 }
 
+{
+  // A conversation frame carries the header when st sends one (`conversation-blocks.v1`);
+  // without it there is none, and nothing assumes the field.
+  const { client, sockets } = fakeClient();
+  const { handlers } = watch();
+  const feed = new Feed(client, handlers, new ForegroundGate('active'), () => 'action/test', [5]);
+  await settle();
+  const frames = [];
+  feed.followConversation('agent/example/worker', { onEntries: frame => frames.push(frame), onIssue: () => {} });
+  const header = { model: { value: 'synthetic/model', source: 'transcript', as_of: '2026-10-06T12:00:00Z' }, working: { value: true, source: 'register', as_of: '2026-10-06T12:00:00Z' } };
+  sockets[0].frame({ kind: 'conversation', id: 'conversation', collection: 'conversation', session_id: 'session/one', replace: true, items: [{ id: 'entry/1' }], has_more: false, header });
+  sockets[0].frame({ kind: 'conversation', id: 'conversation', collection: 'conversation', session_id: 'session/one', replace: false, items: [] });
+  sockets[0].frame({ kind: 'conversation', id: 'conversation', collection: 'conversation', session_id: 'session/one', replace: true, items: [], header: { model: { value: 'x', source: 'register', as_of: '2026-10-06T12:00:00Z' } } });
+  assert.deepEqual(frames.map(frame => frame.header), [header, undefined, { model: { value: 'x', source: 'register', as_of: '2026-10-06T12:00:00Z' } }]);
+  feed.close();
+}

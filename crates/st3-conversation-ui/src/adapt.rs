@@ -91,7 +91,7 @@ pub fn conversation_with_filters(
     }
     let displayed = timeline
         .iter()
-        .map(|entry| filtered_entry(entry, filters))
+        .filter_map(|entry| filtered_entry(entry, filters))
         .collect::<Vec<_>>();
     let timeline = &displayed;
     let name = |id: &str| -> String {
@@ -230,6 +230,30 @@ pub fn conversation_with_filters(
             ));
             continue;
         }
+        // A typed extension view (contract §2) replaces the text fallback for this entry.
+        if let TimelineBody::Content(content) = &entry.body
+            && let Some(bodies) = typed_content(content)
+        {
+            let single = bodies.len() == 1;
+            for (index, mut body) in bodies.into_iter().enumerate() {
+                if let Body::Mail { from, .. } = &mut body {
+                    *from = name(from);
+                }
+                stamped.push((
+                    entry.timestamp.clone(),
+                    Entry {
+                        id: if single {
+                            entry.id.clone()
+                        } else {
+                            format!("{}#{index}", entry.id)
+                        },
+                        at: at.clone(),
+                        body,
+                    },
+                ));
+            }
+            continue;
+        }
         let body = match (&entry.role, &entry.body) {
             (TimelineRole::User | TimelineRole::System, TimelineBody::Content(content)) => {
                 let raw = content.text.as_deref().unwrap_or("");
@@ -315,19 +339,53 @@ pub fn conversation_with_filters(
                         stamped.len(),
                     ));
                 }
+                let (title, output) = typed_call(&call.blocks, &call.name, &call.arguments);
                 Body::Tool {
-                    title: tool_title(&call.name, &call.arguments),
+                    title,
                     state: ToolState::Running,
-                    output: vec![],
+                    output,
                 }
             }
             (_, TimelineBody::ToolResult(result)) => {
-                let (output, command_failed) = tool_output(&result.content);
-                let state = match result.status {
+                let view = block_view(&result.blocks);
+                // A finished task is its agents' cards (q2), one per subagent, not one row.
+                if view.is_some_and(|view| view.get("type").and_then(Value::as_str) == Some("task")) {
+                    let view = view.unwrap();
+                    if let Some(index) = tools.get(&result.call_id).copied()
+                        && let Some((_, call)) = stamped.get_mut(index)
+                        && let Body::Tool { state, .. } = &mut call.body
+                    {
+                        *state = match result.status {
+                            TimelineToolStatus::Error => ToolState::Failed,
+                            _ => ToolState::Ok,
+                        };
+                    }
+                    for agent in view.get("agents").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]) {
+                        stamped.push((
+                            entry.timestamp.clone(),
+                            Entry {
+                                id: format!("{}#{}", entry.id, agent_id(agent)),
+                                at: at.clone(),
+                                body: agent_card(agent),
+                            },
+                        ));
+                    }
+                    continue;
+                }
+                let (mut output, command_failed) = tool_output(&result.content);
+                let forced;
+                if let Some(view) = view {
+                    let rows = typed_result(view, output);
+                    output = rows.0;
+                    forced = rows.1;
+                } else {
+                    forced = None;
+                }
+                let state = forced.unwrap_or_else(|| match result.status {
                     TimelineToolStatus::Error => ToolState::Failed,
                     _ if command_failed => ToolState::Failed,
                     _ => ToolState::Ok,
-                };
+                });
                 if let Some(index) = tools.get(&result.call_id).copied()
                     && let Some((
                         _,
@@ -619,13 +677,28 @@ fn is_bookkeeping(entry: &TimelineEntry, filters: &[crate::DisplayFilter]) -> bo
     }
 }
 
-fn filtered_entry(entry: &TimelineEntry, filters: &[crate::DisplayFilter]) -> TimelineEntry {
+fn filtered_entry(entry: &TimelineEntry, filters: &[crate::DisplayFilter]) -> Option<TimelineEntry> {
     use crate::DisplayFilter;
     let mut value = serde_json::to_value(entry).expect("timeline JSON");
     let body = &mut value["body"];
     if filters.contains(&DisplayFilter::InternalBlocks)
         && let Some(blocks) = body.get_mut("blocks").and_then(Value::as_array_mut)
     {
+        // Provenance alone does not hide visible prose; only internal content has no row.
+        let mut content_blocks = blocks
+            .iter()
+            .filter(|block| block["kind"] != "source_record")
+            .peekable();
+        if content_blocks.peek().is_some()
+            && content_blocks.all(|block| {
+                matches!(
+                    block["visibility"].as_str(),
+                    Some("internal" | "hidden-by-harness")
+                )
+            })
+        {
+            return None;
+        }
         blocks.retain(|block| {
             !matches!(
                 block["visibility"].as_str(),
@@ -674,7 +747,7 @@ fn filtered_entry(entry: &TimelineEntry, filters: &[crate::DisplayFilter]) -> Ti
             ));
         }
     }
-    serde_json::from_value(value).expect("display copy retains timeline shape")
+    Some(serde_json::from_value(value).expect("display copy retains timeline shape"))
 }
 
 // Context wrappers may mention their own closing tag in inline code.
@@ -1221,6 +1294,397 @@ fn tool_title(name: &str, arguments: &Value) -> String {
         (_, Some(detail)) => format!("{name} {}", first_line(detail)),
         _ => name.to_owned(),
     }
+}
+
+/// The typed view a block carries (contract §1): the first block with one wins.
+fn block_view(blocks: &[st3_client::TimelineBlock]) -> Option<&Value> {
+    blocks.iter().find_map(|block| block.view.as_ref())
+}
+
+/// A call's title and opening rows from its typed view, when it has one; otherwise the title
+/// today's rendering would draw.
+fn typed_call(
+    blocks: &[st3_client::TimelineBlock],
+    name: &str,
+    arguments: &Value,
+) -> (String, Vec<String>) {
+    let Some(view) = block_view(blocks) else {
+        return (tool_title(name, arguments), Vec::new());
+    };
+    let string = |field: &str| view.get(field).and_then(Value::as_str).unwrap_or("");
+    let kind = view.get("type").and_then(Value::as_str).unwrap_or("");
+    let title = match kind {
+        "bash" => format!("$ {}", first_line(string("command"))),
+        "edit" => match string("path") {
+            "" => "edit".into(),
+            path => format!("edit {path}"),
+        },
+        "write" => format!(
+            "write {} · {} bytes",
+            string("path"),
+            view.get("bytes").and_then(Value::as_u64).unwrap_or(0)
+        ),
+        "read" => match string("range") {
+            "" => format!("read {}", string("path")),
+            range => format!("read {}:{range}", string("path")),
+        },
+        "search" => {
+            let needle = {
+                let pattern = string("pattern");
+                if pattern.is_empty() {
+                    string("query")
+                } else {
+                    pattern
+                }
+            };
+            match string("path") {
+                "" => format!("{} {}", string("engine"), first_line(needle)),
+                path => format!("{} {} {path}", string("engine"), first_line(needle)),
+            }
+        }
+        "todo" => match string("op") {
+            "" => "todo".into(),
+            op => format!("todo {op}"),
+        },
+        "ask" => "ask".into(),
+        "task" => match view.get("tasks").and_then(Value::as_array) {
+            Some(tasks) if !tasks.is_empty() => format!("task · {} agents", tasks.len()),
+            _ => "task".into(),
+        },
+        "hub" => {
+            let who = {
+                let name = string("name");
+                if name.is_empty() {
+                    string("target")
+                } else {
+                    name
+                }
+            };
+            match who {
+                "" => format!("hub {}", string("op")),
+                who => format!("hub {} {who}", string("op")),
+            }
+        }
+        "eval" => match string("title") {
+            "" => format!("eval {}", string("language")),
+            title => format!("eval {} · {title}", string("language")),
+        },
+        "generic" => match string("name") {
+            "" => name.to_owned(),
+            found => found.to_owned(),
+        },
+        _ => return (tool_title(name, arguments), Vec::new()),
+    };
+    let output = match kind {
+        "todo" => view
+            .get("items")
+            .and_then(Value::as_array)
+            .map(|items| items.iter().map(todo_row).collect())
+            .unwrap_or_default(),
+        "ask" => view
+            .get("questions")
+            .and_then(Value::as_array)
+            .map(|questions| questions.iter().flat_map(question_rows).collect())
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    (title, output)
+}
+
+/// A result's rows from its typed view, and a forced outcome when the view settles it.
+fn typed_result(view: &Value, fallback: Vec<String>) -> (Vec<String>, Option<ToolState>) {
+    match view.get("type").and_then(Value::as_str).unwrap_or("") {
+        "bash" => {
+            let mut rows = fallback;
+            let mut exit = Vec::new();
+            if let Some(code) = view.get("exit_code").and_then(Value::as_i64) {
+                exit.push(format!("exit {code}"));
+            }
+            if let Some(ms) = view.get("wall_ms").and_then(Value::as_u64) {
+                exit.push(format!("{ms}ms"));
+            }
+            if !exit.is_empty() {
+                rows.push(exit.join(" · "));
+            }
+            let timed_out = view.get("timed_out").and_then(Value::as_bool) == Some(true);
+            if timed_out {
+                rows.push(match view.get("timeout_s").and_then(Value::as_u64) {
+                    Some(seconds) => format!("timed out after {seconds}s"),
+                    None => "timed out".into(),
+                });
+            }
+            let failed = timed_out
+                || view
+                    .get("exit_code")
+                    .and_then(Value::as_i64)
+                    .is_some_and(|code| code != 0);
+            (rows, failed.then_some(ToolState::Failed))
+        }
+        "edit" => match view.get("diff").and_then(Value::as_str) {
+            Some(diff) => (diff.lines().map(str::to_owned).collect(), None),
+            None => (fallback, None),
+        },
+        "todo" => {
+            let mut rows = Vec::new();
+            for phase in view
+                .get("phases")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or(&[])
+            {
+                let name = phase.get("name").and_then(Value::as_str).unwrap_or("");
+                if !name.is_empty() {
+                    rows.push(name.to_owned());
+                }
+                for item in phase
+                    .get("items")
+                    .and_then(Value::as_array)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[])
+                {
+                    rows.push(todo_row(item));
+                }
+            }
+            (rows, None)
+        }
+        "ask" => {
+            let mut rows = Vec::new();
+            for answer in view
+                .get("answers")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or(&[])
+            {
+                rows.push(
+                    answer
+                        .get("question")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                );
+                let selected = answer
+                    .get("selected")
+                    .and_then(Value::as_array)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                if !selected.is_empty() {
+                    let labels = selected.iter().filter_map(Value::as_str).collect::<Vec<_>>();
+                    rows.push(format!("  selected: {}", labels.join(", ")));
+                }
+                if let Some(custom) = answer.get("custom").and_then(Value::as_str) {
+                    rows.push(format!("  custom: {custom}"));
+                }
+                if let Some(note) = answer.get("note").and_then(Value::as_str) {
+                    rows.push(format!("  note: {note}"));
+                }
+            }
+            (rows, None)
+        }
+        "hub" => {
+            let rows = view
+                .get("jobs")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or(&[])
+                .iter()
+                .map(job_line)
+                .collect();
+            (rows, None)
+        }
+        _ => (fallback, None),
+    }
+}
+
+/// The rows a typed extension view (contract §2) draws, when a block carries one; `None`
+/// keeps today's rendering. `tool_start` draws nothing: it belongs to its call.
+fn typed_content(content: &st3_client::TimelineContentBody) -> Option<Vec<Body>> {
+    let view = content
+        .blocks
+        .iter()
+        .find_map(|block| block.view.as_ref())?;
+    let string = |field: &str| view.get(field).and_then(Value::as_str).unwrap_or("");
+    let event = |parts: Vec<String>| {
+        Some(vec![Body::Event(
+            parts.into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join(" · "),
+        )])
+    };
+    match view.get("type").and_then(Value::as_str).unwrap_or("") {
+        "irc" => Some(vec![Body::Mail {
+            from: string("from").to_owned(),
+            to: String::new(),
+            subject: String::new(),
+            body: string("message").to_owned(),
+            delivered: true,
+            dictated: false,
+            images: Vec::new(),
+        }]),
+        "job" => Some(
+            view.get("jobs")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or(&[])
+                .iter()
+                .map(|job| Body::Event(job_line(job)))
+                .collect(),
+        ),
+        "compaction" => {
+            let mut parts = vec!["compaction".to_owned(), string("method").to_owned()];
+            if let (Some(before), Some(after)) = (
+                view.get("tokens_before").and_then(Value::as_u64),
+                view.get("tokens_after").and_then(Value::as_u64),
+            ) {
+                parts.push(format!("{before} → {after} tokens"));
+            }
+            event(parts)
+        }
+        "model_change" => {
+            let mut parts = vec!["model".to_owned(), string("model").to_owned()];
+            if !string("role").is_empty() {
+                parts.push(string("role").to_owned());
+            }
+            if view.get("fallback").and_then(Value::as_bool) == Some(true) {
+                parts.push("fallback".into());
+            }
+            event(parts)
+        }
+        "thinking_level" => {
+            let mut parts = vec!["thinking".to_owned(), string("level").to_owned()];
+            if view.get("configured").and_then(Value::as_bool) == Some(true) {
+                parts.push("configured".into());
+            }
+            event(parts)
+        }
+        "reset_boundary" => event(vec!["session reset".into()]),
+        "credential_pin" => event(vec!["credential pin".into(), string("provider").into()]),
+        "title" => event(vec!["title".into(), string("title").into()]),
+        "session_exit" => event(vec![
+            "session exit".into(),
+            string("kind").into(),
+            string("reason").into(),
+        ]),
+        "skill" => event(vec!["skill".into(), string("name").into()]),
+        "tool_start" => Some(Vec::new()),
+        _ => None,
+    }
+}
+
+fn todo_row(item: &Value) -> String {
+    let status = item.get("status").and_then(Value::as_str).unwrap_or("");
+    format!(
+        "{} {}",
+        todo_mark(status),
+        item.get("content").and_then(Value::as_str).unwrap_or_default()
+    )
+}
+
+fn todo_mark(status: &str) -> &'static str {
+    match status {
+        "completed" => "[x]",
+        "in_progress" => "[~]",
+        "pending" => "[ ]",
+        _ => "[-]",
+    }
+}
+
+fn question_rows(question: &Value) -> Vec<String> {
+    let mut rows = vec![
+        question
+            .get("question")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+    ];
+    for (index, option) in question
+        .get("options")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+        .iter()
+        .enumerate()
+    {
+        rows.push(format!(
+            "  {}. {}",
+            index + 1,
+            option.get("label").and_then(Value::as_str).unwrap_or_default()
+        ));
+    }
+    rows
+}
+
+fn job_line(job: &Value) -> String {
+    let who = job
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .or_else(|| job.get("id").and_then(Value::as_str))
+        .unwrap_or_default();
+    let mut line = format!(
+        "{} · {}",
+        who,
+        job.get("state").and_then(Value::as_str).unwrap_or_default()
+    );
+    if let Some(code) = job.get("exit_code").and_then(Value::as_i64) {
+        line.push_str(&format!(" · exit {code}"));
+    }
+    if let Some(ms) = job.get("duration_ms").and_then(Value::as_u64) {
+        line.push_str(&format!(" · {ms}ms"));
+    }
+    line
+}
+
+/// One subagent's card (q2): who ran, how it went, and the row that opens its transcript.
+fn agent_card(agent: &Value) -> Body {
+    let string = |field: &str| agent.get(field).and_then(Value::as_str).unwrap_or("");
+    let named = {
+        let agent_name = string("agent");
+        if agent_name.is_empty() {
+            string("name")
+        } else {
+            agent_name
+        }
+    };
+    let who = if named.is_empty() {
+        string("id")
+    } else {
+        named
+    };
+    let status = string("status");
+    let mut output = Vec::new();
+    if let Some(task) = agent.get("task").and_then(Value::as_str) {
+        output.push(first_line(task).to_owned());
+    }
+    if let Some(ms) = agent.get("duration_ms").and_then(Value::as_u64) {
+        output.push(format!("duration {ms}ms"));
+    }
+    if let Some(tokens) = agent.get("tokens").and_then(Value::as_u64) {
+        output.push(format!("tokens {tokens}"));
+    }
+    if let Some(cost) = agent.get("cost_usd").and_then(Value::as_f64) {
+        output.push(format!("cost ${cost:.2}"));
+    }
+    if let Some(session) = agent.pointer("/conversation/session_id").and_then(Value::as_str) {
+        output.push(format!("open {session}"));
+    }
+    let state = if status.contains("fail") {
+        ToolState::Failed
+    } else if status.contains("run") || status.contains("work") {
+        ToolState::Running
+    } else {
+        ToolState::Ok
+    };
+    Body::Tool {
+        title: format!("{who} · {status}"),
+        state,
+        output,
+    }
+}
+
+fn agent_id(agent: &Value) -> String {
+    agent
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
 }
 
 fn first_line(text: &str) -> &str {

@@ -683,9 +683,8 @@ impl Ui {
         (palette.naming.is_none() && query.chars().count() >= 3).then(|| query.to_owned())
     }
 
-    /// st's search results for `query` as palette rows; a hit without an agent stui can open is
-    /// left out. When st says its index is refreshing or missed conversations, the first row
-    /// says so, so a missing match is not read as "never said".
+    /// st's search results for `query` as palette rows, including saved native sessions.
+    /// When the index is refreshing or missed conversations, the first row says so.
     fn said_choices(&self, query: &str) -> Vec<Choice> {
         let Some((asked, outcome)) = &self.said else {
             return Vec::new();
@@ -706,8 +705,8 @@ impl Ui {
         found
             .items
             .iter()
-            .filter_map(|hit| {
-                let agent = hit.agent_id.clone()?;
+            .map(|hit| {
+                let agent = hit.agent_id.clone().unwrap_or_else(|| hit.conversation_id.clone());
                 let name = self
                     .world
                     .agents
@@ -720,7 +719,7 @@ impl Ui {
                     );
                 let excerpt =
                     text::sanitize(&hit.excerpt.split_whitespace().collect::<Vec<_>>().join(" "));
-                Some((agent, name, excerpt, hit.timestamp.clone()))
+                (agent, name, excerpt, hit.timestamp.clone())
             })
             .take(12)
             .enumerate()
@@ -758,6 +757,16 @@ impl Ui {
                 action: Action::Open(pane),
             });
         };
+        let id = query.trim();
+        if id.starts_with("session/") && id.len() > "session/".len() {
+            open(
+                1,
+                ("❝", theme::SUBTEXT0),
+                id.to_owned(),
+                "Open saved conversation".into(),
+                Pane::Agent(Some(id.to_owned())),
+            );
+        }
         for item in self.world.attention.items() {
             if !self.snoozed.contains(&item.id) {
                 open(
@@ -2599,6 +2608,8 @@ impl Ui {
             {
                 self.take_back_undelivered()
             }
+            // Ctrl+K (or ⌘K), paste session/... then Enter opens its transcript.
+            // Ctrl+T opens a tab; Ctrl+V / Ctrl+X opens a right / below split.
             KeyCode::Char('k') if control || command => self.open_palette(None, Open::Here),
             KeyCode::Char('s') if control => self.toggle_sidebar(),
             // Home over the glass, and away again; in a text box Ctrl+H stays backspace.
@@ -3870,7 +3881,7 @@ pub(crate) fn pane_for(id: &str) -> Option<Pane> {
         Some(Pane::Home(Some(id)))
     } else if id.starts_with("mission/") {
         Some(Pane::Mission(Some(id)))
-    } else if id.starts_with("agent/") {
+    } else if id.starts_with("agent/") || id.starts_with("session/") {
         Some(Pane::Agent(Some(id)))
     } else if id.starts_with("machine/") {
         Some(Pane::Machine(Some(id)))
@@ -5926,6 +5937,24 @@ mod tests {
             ui.effects
         );
     }
+    #[test]
+    fn a_child_open_intent_opens_its_own_live_conversation() {
+        let mut ui = glass();
+        ui.click(Hit::Pane(st3_conversation_ui::PaneIntent::Open("session/child".into())));
+        assert_eq!(ui.focused_pane(), Some(Pane::Agent(Some("session/child".into()))));
+        assert!(ui.live_conversations().contains(&"session/child".to_owned()));
+    }
+
+    #[test]
+    fn a_pasted_session_id_opens_even_when_not_in_the_agent_list() {
+        let mut ui = glass();
+        ctrl(&mut ui, 'k');
+        assert!(ui.paste_into_palette("session/saved-omp"));
+        press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(ui.focused_pane(), Some(Pane::Agent(Some("session/saved-omp".into()))));
+        assert!(ui.live_conversations().contains(&"session/saved-omp".to_owned()));
+    }
+
 
     #[test]
     fn home_floats_clear_of_the_edges() {
@@ -5996,9 +6025,31 @@ mod tests {
                 .is_some_and(|find| find.agent == agent.id && find.query == "harbor keys")
         );
         // An answer to another query is not shown.
+        // The find bar owns editing keys until Esc; leave it before reopening the palette.
+        press(&mut ui, KeyCode::Esc, KeyModifiers::NONE);
         ctrl(&mut ui, 'k');
         typed(&mut ui, "atlas");
+        assert_eq!(ui.said_wanted().as_deref(), Some("atlas"));
         assert!(!screen(&ui).contains("said in conversations"));
+        // A saved conversation need not have an agent: open its session directly.
+        ctrl(&mut ui, 'u');
+        typed(&mut ui, "harbor keys");
+        if let Some((_, Ok(found))) = ui.said.as_mut() {
+            found.items[0].agent_id = None;
+        }
+        let said = ui
+            .matches(ui.glasses.as_ref().unwrap().palette.as_ref().unwrap())
+            .into_iter()
+            .position(|choice| matches!(choice.action, Action::Said { .. }))
+            .unwrap();
+        ui.open_choice(Some(said), Open::Tab);
+        assert_eq!(ui.focused_pane(), Some(Pane::Agent(Some("session/one".into()))));
+        assert!(ui.live_conversations().contains(&"session/one".to_owned()));
+        assert!(
+            ui.find.as_ref().is_some_and(|find| {
+                find.agent == "session/one" && find.query == "harbor keys"
+            })
+        );
     }
 
     #[test]
