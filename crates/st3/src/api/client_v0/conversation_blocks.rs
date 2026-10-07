@@ -632,7 +632,7 @@ pub(in crate::api) fn legacy(value: &mut Value, session: &ClientSession) {
 
 #[derive(Default, Deserialize)]
 pub(in crate::api) struct ChunkQuery {
-    offset: Option<u64>,
+    pub(super) offset: Option<u64>,
 }
 
 pub(in crate::api) async fn chunk(

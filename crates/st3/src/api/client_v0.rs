@@ -5491,15 +5491,25 @@ pub(super) async fn client_read_owner(
     if owner.subject_hint.len() <= 512 && owner.subject_hint.starts_with("agent/") {
         session.provided_conversation_subject = Some(owner.subject_hint);
     }
+    // Reuse ordinary handlers so a changed origin retains forwarding and authorization checks.
     match owner.request.request {
-        crate::peer::ClientReadOperation::Timeline { session_id, limit, cursor } =>
-            timeline_value(&state, &snapshot, &session, &session_id, &ClientListQuery {
-                limit: Some(limit), cursor, ..Default::default()
-            }),
+        crate::peer::ClientReadOperation::Timeline { mut session_id, limit, cursor } => {
+            session_id.push_str("/timeline");
+            super::client_sessions_detail(
+                State(state), Extension(snapshot), Extension(session), AxumPath(session_id),
+                Query(ClientListQuery { limit: Some(limit), cursor, ..Default::default() }),
+            ).await
+        },
         crate::peer::ClientReadOperation::ConversationChanges { session_id, after, wait_ms } =>
-            conversation_changes_local(&state, &session, &session_id, after.as_deref(), wait_ms).await.map(Json),
+            conversation_changes(
+                State(state), Extension(session), AxumPath(session_id),
+                Query(ConversationQuery { after, wait_ms: Some(wait_ms) }),
+            ).await,
         crate::peer::ClientReadOperation::ConversationContent { session_id, reference, offset } =>
-            conversation_blocks::chunk_local(&state, &session, &session_id, &reference, offset).await.map(Json),
+            conversation_blocks::chunk(
+                State(state), Extension(session), AxumPath((session_id, reference)),
+                Query(conversation_blocks::ChunkQuery { offset: Some(offset) }),
+            ).await,
         _ => Err(validation("this operation is not an owner conversation read")),
     }
 }
@@ -14046,6 +14056,65 @@ mission "example/zero-run" state="ready" {
         let actual = client_read_owner(State(state.clone()),
             Extension(new_client_snapshot(&state)), Extension(session), Json(request())).await;
         assert_eq!(actual.unwrap_err().code, expected.unwrap_err().code);
+    }
+
+    #[tokio::test]
+    async fn conversation_subject_hint_owner_route_preserves_remote_origin_checks() {
+        let owner_root = tempfile::tempdir().unwrap();
+        let stale_root = tempfile::tempdir().unwrap();
+        let owner = test_state_named(owner_root.path(), "current-owner");
+        let state = test_state_named(stale_root.path(), "previous-owner");
+        let subject = "agent/hinted";
+        owner.store.append_claim(&ClaimInput {
+            subject: subject.into(), kind: "runtime.observed".into(), actor: Some(subject.into()),
+            fields: serde_json::from_value(json!({"status":"running", "incarnation_id":"first"})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        state.store.import_replication("current-owner", &owner.store.export_replication(0).unwrap()).unwrap();
+        let session_id = managed_session_id(subject, "first");
+        let before = super::super::managed_session_roster_lookup_count(&state.store);
+        for operation in [
+            crate::peer::ClientReadOperation::Timeline { session_id: session_id.clone(), limit: 10, cursor: None },
+            crate::peer::ClientReadOperation::ConversationChanges { session_id: session_id.clone(), after: None, wait_ms: 0 },
+            crate::peer::ClientReadOperation::ConversationContent {
+                session_id: session_id.clone(), reference: "0".repeat(64), offset: 0,
+            },
+        ] {
+            let mut session = ClientSession::local(Some("person/example")).unwrap();
+            session.provided_conversation_subject = Some(subject.into());
+            let expected = match operation.clone() {
+                crate::peer::ClientReadOperation::Timeline { session_id, limit, cursor } =>
+                    super::super::client_sessions_detail(
+                        State(state.clone()), Extension(new_client_snapshot(&state)), Extension(session.clone()),
+                        AxumPath(format!("{session_id}/timeline")),
+                        Query(ClientListQuery { limit: Some(limit), cursor, ..Default::default() }),
+                    ).await.unwrap_err(),
+                crate::peer::ClientReadOperation::ConversationChanges { session_id, after, wait_ms } =>
+                    conversation_changes(
+                        State(state.clone()), Extension(session.clone()), AxumPath(session_id),
+                        Query(ConversationQuery { after, wait_ms: Some(wait_ms) }),
+                    ).await.unwrap_err(),
+                crate::peer::ClientReadOperation::ConversationContent { session_id, reference, offset } =>
+                    conversation_blocks::chunk(
+                        State(state.clone()), Extension(session.clone()), AxumPath((session_id, reference)),
+                        Query(conversation_blocks::ChunkQuery { offset: Some(offset) }),
+                    ).await.unwrap_err(),
+                _ => unreachable!(),
+            };
+            let actual = client_read_owner(
+                State(state.clone()), Extension(new_client_snapshot(&state)), Extension(session),
+                Json(crate::peer::ClientReadOwnerRequest {
+                    request: crate::peer::ClientReadRequest {
+                        authority_actor: "person/example".into(), relay: None, request: operation,
+                    },
+                    subject_hint: subject.into(),
+                }),
+            ).await.unwrap_err();
+            assert_eq!(actual.status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(actual.status, expected.status);
+            assert_eq!(actual.code, expected.code);
+        }
+        assert_eq!(super::super::managed_session_roster_lookup_count(&state.store), before);
     }
 
     #[tokio::test]
