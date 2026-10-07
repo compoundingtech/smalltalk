@@ -77,6 +77,37 @@ key invalidations and independent availability stream. Availability becoming Rea
 an authorized bounded-window refresh even when that client's key page is empty. Those
 invalidations do not witness every historical transition.
 
+## Consumer interfaces and readiness examples
+
+| Consumer | Interface | Required same-snapshot evidence |
+| --- | --- | --- |
+| Agent rows | `Views::readiness`, then the bounded keyed output query | Complete source prefix, compatible definition/epoch, current actor/owner/incarnation and all row dependencies |
+| Mission and attention rows | The same readiness check plus the consumer's captured-time/local-source certificate | Complete claim and captured-time coverage, current generation/blocks/deadlines and all dependencies; the reference async constructor refuses these local-source definitions |
+| Row delta bridge | One Store-owned `Publisher`, `events::capture`, `events::keys` and `events::availability` | Subscribe before snapshot, authorized bounded window, current readiness and retained cursor/identity; an availability change can require a refresh even without changed keys |
+| Write response | `after_write::write`, then `after_write::wait` with `Target::Local` or explicit `Target::Replicated` | Receipt mapped in this database, complete source prefix, ready view and authorization inside the output callback |
+
+For example, with admitted input 12 and certified prefix 10, a page can have committed
+some output for input 10 while the current view remains `SourcePending`. A receipt for
+input 10 also remains pending: neither that partial row nor its largest applied index
+permits a current read. Once all captured inputs through 12 commit, an intact compatible
+view can become `Ready`; a dependency/operator fence still prevents readiness at that
+same prefix. A raw `ready=1` update cannot restore a broken completeness certificate.
+
+An unknown-kind input advances the certified common prefix without changing output
+generation. An accepted unsupported repair fences affected views while retaining raw
+admission. Source remap or missing capture stops certification and requires explicit
+recovery. None of those states authorizes serving a cached or recomputed current answer.
+
+Production consumers keep their existing admission runtime. `ViewRuntime::asynchronous`
+is a reference claims-only runtime, not a wrapper around another runtime; replacing a
+production runtime with it would lose that runtime's admission policy. A populated-store
+or captured-time adapter must supply its own explicit installation and complete coverage
+proof before activation. The worker never installs such an adapter implicitly.
+
+`ivm_async_lifecycle` tests stop during an owned page, resumable pending input, worker
+drop while idle and Publisher closure while idle. Stop completes the current page before
+returning; the next queued input stays durable and unavailable until a later explicit page.
+
 ```sh
 cargo run --locked -p smallclaims --example ivm_asynchronous
 cargo test --locked -p smallclaims --test ivm_async
