@@ -140,7 +140,8 @@ pub fn scope_unit(task_id: &str) -> String {
 /// Build the OUTER launch [`Command`] for the inner `program` + `args`, isolated under `unit`.
 ///
 /// In [`Isolation::Scope`] this is `systemd-run --user --scope --collect --quiet --unit=<unit>
-/// --expand-environment=no -- <program> <args>`; otherwise it is `<program> <args>` verbatim.
+/// -- <program> <args>`, adding `--expand-environment=no` before `--` on v254+;
+/// otherwise it is `<program> <args>` verbatim.
 /// v254+ adds the expansion-disable option; older scopes already exec argv directly. This keeps
 /// every inner argv element opaque, including dollar-bearing literals. Either way the caller applies env / cwd / stdio / `pre_exec` to the
 /// returned Command and they reach the task — for `--scope`, scope mode runs the command in the
