@@ -86,7 +86,10 @@ fn insert_sql(
         let closed = if level == ROOT_LEVEL {
             "true".to_owned()
         } else {
-            format!("({position} >> {shift}) < ({} >> {shift})", maximum(source, ""))
+            format!(
+                "({position} >> {shift}) < ({} >> {shift})",
+                maximum(source, "")
+            )
         };
         for (actor_scope, actor, kind, predicate) in &scopes {
             sql.push_str(&format!(
@@ -296,7 +299,6 @@ fn install_triggers(transaction: &Transaction<'_>) -> Result<()> {
 }
 
 pub(super) fn open(transaction: &Transaction<'_>) -> Result<()> {
-
     let secret: bool = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM meta WHERE key=?1)",
         [CURSOR_SECRET_KEY],
@@ -487,21 +489,30 @@ pub(super) fn membership(
     let mut statement = connection.prepare_cached(query)?;
     for (level, first, last) in prefix_nodes(upper, maximum) {
         if level == 0 {
-            let (table, position) = source_table(source);
             // Force the primary-position seek: other selector indexes must not
             // turn this bounded tail into a scan of the selected subject's history.
-            let query = format!(
-                "SELECT COUNT(*),MIN(record.{position}),MAX(record.{position})
-                 FROM {table} record NOT INDEXED
-                 WHERE record.{position} BETWEEN ?1 AND ?2
+            let query = if source == 0 {
+                "SELECT COUNT(*),MIN(record.store_index),MAX(record.store_index)
+                 FROM claims record NOT INDEXED
+                 WHERE record.store_index BETWEEN ?1 AND ?2
                    AND (?3 IS NULL OR record.subject=?3)
-                   AND record.subject>=?4 AND record.subject<?5
+                   AND (?3 IS NOT NULL OR (record.subject>=?4 AND record.subject<?5))
                    AND (?6 IS NULL OR record.kind=?6)
                    AND (?7 IS NULL OR record.actor=?7)
-                   AND (?6 IS NULL OR ?7 IS NULL) AND {}",
-                admitted(source, "record")
-            );
-            membership.include(connection.prepare_cached(&query)?.query_row(
+                   AND (?6 IS NULL OR ?7 IS NULL)
+                   AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims repaired
+                                  WHERE repaired.id=record.id)"
+            } else {
+                "SELECT COUNT(*),MIN(record.id),MAX(record.id)
+                 FROM local_observations record NOT INDEXED
+                 WHERE record.id BETWEEN ?1 AND ?2
+                   AND (?3 IS NULL OR record.subject=?3)
+                   AND (?3 IS NOT NULL OR (record.subject>=?4 AND record.subject<?5))
+                   AND (?6 IS NULL OR record.kind=?6)
+                   AND (?7 IS NULL OR record.actor=?7)
+                   AND (?6 IS NULL OR ?7 IS NULL)"
+            };
+            membership.include(connection.prepare_cached(query)?.query_row(
                 params![first, last, subject, lower, end, kind, recorded_actor],
                 |row| {
                     Ok(Membership {
@@ -589,13 +600,27 @@ mod tests {
     }
 
     fn insert(connection: &Connection, position: u64) {
-        let subject = if position % 2 == 0 { "resource/selected/a" } else { "resource/selected/z" };
-        let kind = if position % 3 == 0 { "resource.observed" } else { "other.kind" };
-        let actor = (position % 5 != 0).then_some(if position % 2 == 0 { "person/a" } else { "person/z" });
-        connection.execute(
-            "INSERT INTO claims(store_index,id,subject,kind,actor) VALUES(?1,?2,?3,?4,?5)",
-            params![position, format!("claim-{position}"), subject, kind, actor],
-        ).unwrap();
+        let subject = if position % 2 == 0 {
+            "resource/selected/a"
+        } else {
+            "resource/selected/z"
+        };
+        let kind = if position % 3 == 0 {
+            "resource.observed"
+        } else {
+            "other.kind"
+        };
+        let actor = (position % 5 != 0).then_some(if position % 2 == 0 {
+            "person/a"
+        } else {
+            "person/z"
+        });
+        connection
+            .execute(
+                "INSERT INTO claims(store_index,id,subject,kind,actor) VALUES(?1,?2,?3,?4,?5)",
+                params![position, format!("claim-{position}"), subject, kind, actor],
+            )
+            .unwrap();
         connection.execute(
             "INSERT INTO local_observations(id,after_store_index,subject,kind,actor) VALUES(?1,?1,?2,?3,?4)",
             params![position, subject, kind, actor],
@@ -605,32 +630,76 @@ mod tests {
     fn assert_direct_membership(connection: &Connection) {
         for source in 0..=1 {
             let (table, position) = source_table(source);
-            for upper in [0, 1, 14, 15, 16, 17, 254, 255, 256, 269, 499,
-                (1_u64 << 40)-1, 1_u64 << 40, (1_u64 << 40)+1,
-                i64::MAX as u64 - 1, i64::MAX as u64] {
-                for subject in [None, Some("resource/selected/a"), Some("resource/selected/z"), Some("resource/missing")] {
+            for upper in [
+                0,
+                1,
+                14,
+                15,
+                16,
+                17,
+                254,
+                255,
+                256,
+                269,
+                499,
+                (1_u64 << 40) - 1,
+                1_u64 << 40,
+                (1_u64 << 40) + 1,
+                i64::MAX as u64 - 1,
+                i64::MAX as u64,
+            ] {
+                for subject in [
+                    None,
+                    Some("resource/selected/a"),
+                    Some("resource/selected/z"),
+                    Some("resource/missing"),
+                ] {
                     for (kind, recorded_actor) in [
-                        (None, None), (Some("resource.observed"), None),
-                        (Some("missing.kind"), None), (None, Some("person/a")),
-                        (None, Some("person/z")), (None, Some("person/missing")),
+                        (None, None),
+                        (Some("resource.observed"), None),
+                        (Some("missing.kind"), None),
+                        (None, Some("person/a")),
+                        (None, Some("person/z")),
+                        (None, Some("person/missing")),
                     ] {
-                        let expected = connection.query_row(
-                            &format!(
-                                "SELECT COUNT(*),MIN(record.{position}),MAX(record.{position})
+                        let expected = connection
+                            .query_row(
+                                &format!(
+                                    "SELECT COUNT(*),MIN(record.{position}),MAX(record.{position})
                                  FROM {table} record WHERE record.{position}<=?1
                                    AND record.subject>='resource/' AND record.subject<'resource0'
                                    AND (?2 IS NULL OR record.subject=?2)
                                    AND (?3 IS NULL OR record.kind=?3)
                                    AND (?4 IS NULL OR record.actor=?4) AND {}",
-                                admitted(source, "record")
-                            ),
-                            params![upper, subject, kind, recorded_actor],
-                            |row| Ok(Membership { count: row.get(0)?, first: row.get(1)?, last: row.get(2)? }),
-                        ).unwrap();
-                        let actual = membership(connection, source, upper, &SourceSelection {
-                            subject, kind, lower: "resource/", end: "resource0", recorded_actor,
-                        }).unwrap();
-                        assert_eq!(actual, expected, "source={source} fence={upper} subject={subject:?} kind={kind:?} actor={recorded_actor:?}");
+                                    admitted(source, "record")
+                                ),
+                                params![upper, subject, kind, recorded_actor],
+                                |row| {
+                                    Ok(Membership {
+                                        count: row.get(0)?,
+                                        first: row.get(1)?,
+                                        last: row.get(2)?,
+                                    })
+                                },
+                            )
+                            .unwrap();
+                        let actual = membership(
+                            connection,
+                            source,
+                            upper,
+                            &SourceSelection {
+                                subject,
+                                kind,
+                                lower: if subject.is_some() { "" } else { "resource/" },
+                                end: if subject.is_some() { "" } else { "resource0" },
+                                recorded_actor,
+                            },
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            actual, expected,
+                            "source={source} fence={upper} subject={subject:?} kind={kind:?} actor={recorded_actor:?}"
+                        );
                     }
                 }
             }
@@ -644,36 +713,64 @@ mod tests {
         for position in 1..=270 {
             insert(&connection, position);
         }
-        for position in [1_u64 << 40, (1_u64 << 40)+1, i64::MAX as u64] {
+        for position in [1_u64 << 40, (1_u64 << 40) + 1, i64::MAX as u64] {
             insert(&connection, position);
         }
         assert_direct_membership(&connection);
         // Removing both a complete node boundary and the newest open-tail row
         // must keep every old fence and all three selector scopes exact.
         for position in [1, 15, 16, 255, 269, i64::MAX as u64] {
-            connection.execute("DELETE FROM claims WHERE store_index=?1", [position]).unwrap();
-            connection.execute("DELETE FROM local_observations WHERE id=?1", [position]).unwrap();
+            connection
+                .execute("DELETE FROM claims WHERE store_index=?1", [position])
+                .unwrap();
+            connection
+                .execute("DELETE FROM local_observations WHERE id=?1", [position])
+                .unwrap();
         }
         assert_direct_membership(&connection);
-        for position in [17, 256, (1_u64 << 40)+1] {
-            connection.execute("INSERT INTO projection_digest_repaired_claims(id) VALUES(?1)",
-                [format!("claim-{position}")]).unwrap();
+        for position in [17, 256, (1_u64 << 40) + 1] {
+            connection
+                .execute(
+                    "INSERT INTO projection_digest_repaired_claims(id) VALUES(?1)",
+                    [format!("claim-{position}")],
+                )
+                .unwrap();
         }
         assert_direct_membership(&connection);
-        for position in [(1_u64 << 40)+1, 256, 17] {
-            connection.execute("DELETE FROM projection_digest_repaired_claims WHERE id=?1",
-                [format!("claim-{position}")]).unwrap();
+        for position in [(1_u64 << 40) + 1, 256, 17] {
+            connection
+                .execute(
+                    "DELETE FROM projection_digest_repaired_claims WHERE id=?1",
+                    [format!("claim-{position}")],
+                )
+                .unwrap();
         }
         assert_direct_membership(&connection);
-        connection.execute("INSERT INTO projection_digest_repaired_claims(id) VALUES('claim-14')", []).unwrap();
-        connection.execute("DELETE FROM claims WHERE store_index=14", []).unwrap();
+        connection
+            .execute(
+                "INSERT INTO projection_digest_repaired_claims(id) VALUES('claim-14')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute("DELETE FROM claims WHERE store_index=14", [])
+            .unwrap();
         assert_direct_membership(&connection);
-        connection.execute("DELETE FROM local_observations", []).unwrap();
+        connection
+            .execute("DELETE FROM local_observations", [])
+            .unwrap();
         assert_direct_membership(&connection);
-        let roots: u64 = connection.query_row(
-            "SELECT COUNT(*) FROM native_source_ranges_v2 WHERE source=1 AND level=16", [], |row| row.get(0),
-        ).unwrap();
-        assert_eq!(roots, 0, "clearing local authority leaves no enumerated ghost");
+        let roots: u64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM native_source_ranges_v2 WHERE source=1 AND level=16",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            roots, 0,
+            "clearing local authority leaves no enumerated ghost"
+        );
     }
 
     #[test]
@@ -684,22 +781,65 @@ mod tests {
             let before = connection.total_changes();
             insert(&connection, position);
             let scope_count = if position % 5 == 0 { 2 } else { 3 };
-            assert_eq!(connection.total_changes()-before, 2 * (1 + scope_count),
-                "two source rows and only their root selectors are written");
+            assert_eq!(
+                connection.total_changes() - before,
+                2 * (1 + scope_count),
+                "two source rows and only their root selectors are written"
+            );
         }
-        let leaf_rows: u64 = connection.query_row(
-            "SELECT COUNT(*) FROM native_source_ranges_v2 WHERE level<16", [], |row| row.get(0),
-        ).unwrap();
-        assert_eq!(leaf_rows, 0, "an open block has no eagerly updated ancestors");
+        let leaf_rows: u64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM native_source_ranges_v2 WHERE level<16",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            leaf_rows, 0,
+            "an open block has no eagerly updated ancestors"
+        );
         insert(&connection, 15);
         insert(&connection, 16);
-        let sealed: u64 = connection.query_row(
-            "SELECT SUM(count) FROM native_source_ranges_v2
+        let sealed: u64 = connection
+            .query_row(
+                "SELECT SUM(count) FROM native_source_ranges_v2
              WHERE source=0 AND actor_scope=0 AND actor='' AND kind='' AND level=1 AND node=0",
-            [], |row| row.get(0),
-        ).unwrap();
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(sealed, 15, "positions start at one, not zero");
         assert_direct_membership(&connection);
+    }
+
+    #[test]
+    fn unrelated_append_keeps_exact_subject_membership_when_root_becomes_an_old_fence() {
+        let mut connection = source_connection();
+        initialize(&mut connection);
+        for position in 1..=17 {
+            insert(&connection, position);
+        }
+        let selection = SourceSelection {
+            subject: Some("resource/selected/z"),
+            kind: None,
+            lower: "",
+            end: "",
+            recorded_actor: None,
+        };
+        let before = [
+            membership(&connection, 0, 17, &selection).unwrap(),
+            membership(&connection, 1, 17, &selection).unwrap(),
+        ];
+        // Position 18 belongs to a different subject. The pinned membership
+        // now reads closed block zero plus raw positions 16..17, not the root.
+        insert(&connection, 18);
+        assert_eq!(
+            before,
+            [
+                membership(&connection, 0, 17, &selection).unwrap(),
+                membership(&connection, 1, 17, &selection).unwrap(),
+            ]
+        );
     }
 
     #[test]
@@ -709,9 +849,18 @@ mod tests {
             for position in 1..=270 {
                 insert(&connection, position);
             }
-            connection.execute("INSERT INTO projection_digest_repaired_claims(id) VALUES('claim-256')", []).unwrap();
-            connection.execute("INSERT INTO meta(key,value) VALUES('native_cursor_secret',?1)",
-                ["ab".repeat(32)]).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO projection_digest_repaired_claims(id) VALUES('claim-256')",
+                    [],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO meta(key,value) VALUES('native_cursor_secret',?1)",
+                    ["ab".repeat(32)],
+                )
+                .unwrap();
             if predecessor {
                 // Exact predecessor layout, populated from authority at every
                 // level; its live trigger names must all be removed on cutover.
@@ -739,12 +888,28 @@ mod tests {
                     }
                 }
                 for (name, table, event) in [
-                    ("native_source_claims_insert","claims","INSERT"),
-                    ("native_source_claims_delete","claims","DELETE"),
-                    ("native_source_local_observations_insert","local_observations","INSERT"),
-                    ("native_source_local_observations_delete","local_observations","DELETE"),
-                    ("native_source_repair_insert","projection_digest_repaired_claims","INSERT"),
-                    ("native_source_repair_delete","projection_digest_repaired_claims","DELETE"),
+                    ("native_source_claims_insert", "claims", "INSERT"),
+                    ("native_source_claims_delete", "claims", "DELETE"),
+                    (
+                        "native_source_local_observations_insert",
+                        "local_observations",
+                        "INSERT",
+                    ),
+                    (
+                        "native_source_local_observations_delete",
+                        "local_observations",
+                        "DELETE",
+                    ),
+                    (
+                        "native_source_repair_insert",
+                        "projection_digest_repaired_claims",
+                        "INSERT",
+                    ),
+                    (
+                        "native_source_repair_delete",
+                        "projection_digest_repaired_claims",
+                        "DELETE",
+                    ),
                 ] {
                     connection.execute_batch(&format!(
                         "CREATE TRIGGER {name} AFTER {event} ON {table} BEGIN SELECT count FROM native_source_ranges; END;",
@@ -767,7 +932,12 @@ mod tests {
             for position in 1..=270 {
                 insert(&fresh, position);
             }
-            fresh.execute("INSERT INTO projection_digest_repaired_claims(id) VALUES('claim-256')", []).unwrap();
+            fresh
+                .execute(
+                    "INSERT INTO projection_digest_repaired_claims(id) VALUES('claim-256')",
+                    [],
+                )
+                .unwrap();
             let rows = |connection: &Connection| {
                 connection.prepare(
                     "SELECT source,actor_scope,actor,kind,level,node,subject,count,first_position,last_position
@@ -780,7 +950,9 @@ mod tests {
             };
             assert_eq!(rows(&connection), rows(&fresh), "predecessor={predecessor}");
             // Rebuild is deterministic and does not churn the fingerprint key.
-            connection.execute("DELETE FROM meta WHERE key=?1", [VERSION_KEY]).unwrap();
+            connection
+                .execute("DELETE FROM meta WHERE key=?1", [VERSION_KEY])
+                .unwrap();
             initialize(&mut connection);
             assert_eq!(rows(&connection), rows(&fresh));
             assert_eq!(cursor_secret(&connection).unwrap(), vec![0xab; 32]);

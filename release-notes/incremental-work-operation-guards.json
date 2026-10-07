@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Project supported work operations without replay based on their operation ID prefix, and identify guarded claims in bounded diagnostics.",
+  "replay": {
+    "status": "changed",
+    "detail": "Known work transitions with well-formed operation metadata use existing canonical incremental ordering and affected-tree repair regardless of operation ID prefix. Unsupported kinds, malformed metadata and operation digest/state conflicts retain canonical replay. No startup replay or full-store repair is requested."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No schema, index or migration changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No claim vocabulary, admission, operation digest, checkpoint or deletion rule changes."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "The previous build b3ec817f rejects all work operation metadata; #1710 adds durable cache/ receipts and an allowance for updated receivers. A newer sender can therefore force old receivers to replay each exchange. This follow-up removes the remaining prefix-only restriction for supported work kinds. It cannot change an already-running old binary or support unknown future work kinds. Matching forward fleet upgrades remain necessary; mixed-build validation remains separate."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No setting or canonical-history rewrite. Follow the normal forward rollout; schema17 rollback still requires the documented matching backup."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "Claim-based unsupported/malformed guards emit one bounded JSON detail before replay, naming kind, claim, subject and operation where known. Existing per-Store 16-key plus overflow 60-second limiter and suppression counts apply; identifiers/kind are truncated to256 characters with explicit flags. No new payload query or automatic retry. Original exception text may still quote input fragments; global storage context stays unknown."
+  },
+  "downtime": {
+    "status": "unknown",
+    "detail": "Normal binary restart. Live trigger IDs and replay phase durations were not captured; no production timing or storm-closure claim from focused tests."
+  }
+}

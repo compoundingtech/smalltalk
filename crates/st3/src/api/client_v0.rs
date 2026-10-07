@@ -65,7 +65,7 @@ struct CollectionSubscription {
     has_more: bool,
 }
 
-const COLLECTION_MAX_SUBSCRIPTIONS: usize = 8;
+const COLLECTION_MAX_SUBSCRIPTIONS: usize = 16;
 /// The least time between two rereads of a socket's held windows. A window read can take a
 /// few hundred milliseconds and the fleet commits about once a second, so rereading on every
 /// commit kept a daemon busy for as long as a client stayed connected. Commits in between are
@@ -1642,6 +1642,7 @@ pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
             })
         })
         .collect::<Vec<_>>();
+    capabilities.push(json!({"id":"collections", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"custom-subjects", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"owned-sets", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"glasses", "version":2, "state":if glass_person(session, false).is_ok() && glass_person(session, true).is_ok() { "granted" } else { "ungranted" }}));
@@ -6021,50 +6022,67 @@ pub(super) async fn events(
 ) -> Result<Json<Value>, ApiError> {
     require_scope(&session, "read.projections")?;
     let limit = query.limit.unwrap_or(100).clamp(1, 500);
-    let (oldest, newest) = super::read_deadline::query(&state.store, "/v1/client/events", || {
-        state.store.event_bounds().map_err(ApiError::internal)
-    })?;
+    // Registration precedes both the floor/frontier and empty-page reads.
+    let mut changed = state.event_notify.subscribe();
     let after = decode_event_cursor(&state.node, query.after.as_deref())?;
-    validate_event_cursor(
-        &state.node,
-        query.after.is_some(),
-        after.claim,
-        oldest,
-        newest,
-    )?;
     let deadline =
         tokio::time::Instant::now() + Duration::from_millis(query.wait_ms.unwrap_or(0).min(30_000));
     // Subscribe before the first store read. An event between reading an empty
     // page and subscribing must wake this long poll, not wait for another event.
-    let mut changed = state.event_notify.subscribe();
-    let records = loop {
-        let records = super::read_deadline::query(&state.store, "/v1/client/events", || {
-            if query.after.is_some() {
-                feed_events_after(&state.store, after, limit.saturating_add(1))
-            } else {
-                feed_events_tail(&state.store, limit)
-            }.map_err(ApiError::internal)
-        })?;
+    let (records, oldest, newest) = loop {
+        let (records, oldest, newest) =
+            super::read_deadline::query(&state.store, "/v1/client/events", || {
+                state
+                    .store
+                    .read_snapshot(|_| {
+                        let (oldest, newest) = state.store.event_bounds()?;
+                        if let Err(error) = validate_event_cursor(
+                            &state.node,
+                            query.after.is_some(),
+                            after.claim,
+                            oldest,
+                            newest,
+                        ) {
+                            return Ok(Err(error));
+                        }
+                        let records = if query.after.is_some() {
+                            feed_events_after(&state.store, after, limit.saturating_add(1))?
+                        } else {
+                            feed_events_tail(&state.store, limit)?
+                        };
+                        Ok(Ok((records, oldest, newest)))
+                    })
+                    .map_err(ApiError::internal)?
+            })?;
         if !records.is_empty() || tokio::time::Instant::now() >= deadline {
-            break records;
+            break (records, oldest, newest);
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if !matches!(
             tokio::time::timeout(remaining, changed.changed()).await,
             Ok(Ok(()))
         ) {
-            break Vec::new();
+            // Read the current floor again at timeout; migration may not emit a normal event.
+            continue;
         }
     };
     let has_more = query.after.is_some() && records.len() > limit;
     let records = records.into_iter().take(limit).collect::<Vec<_>>();
-    let resume = records
+    let mut resume = records
         .last()
         .map(|(record, local)| EventCursor {
             claim: record.store_index,
             local: *local,
         })
         .unwrap_or(after);
+    if query.after.is_none() && resume.claim < newest {
+        // A bounded replacement at resync may show the latest retained activity, but its next
+        // request must start at the observed current frontier, not below the new upgrade floor.
+        resume = EventCursor {
+            claim: newest,
+            local: None,
+        };
+    }
     let items = records
         .into_iter()
         .map(|(record, local)| {
@@ -9957,6 +9975,87 @@ mod tests {
     use std::os::unix::fs::MetadataExt as _;
     use std::sync::Barrier;
 
+    #[tokio::test]
+    async fn collections_socket_keeps_sixteen_windows_and_refuses_the_seventeenth() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        assert!(
+            capabilities(&ClientSession::local(None).unwrap())
+                .iter()
+                .any(|capability| {
+                    capability["id"] == "collections"
+                        && capability["version"] == 1
+                        && capability["state"] == "granted"
+                })
+        );
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let app = axum::Router::new().route(
+            "/stream",
+            axum::routing::get(move |upgrade: WebSocketUpgrade| {
+                let state = state.clone();
+                async move {
+                    upgrade.on_upgrade(move |socket| {
+                        collection_stream_socket_with_reader(
+                            socket,
+                            state,
+                            ClientSession::local(None).unwrap(),
+                            None,
+                            |state, session, request, permit| async move {
+                                collection_items(&state, &session, &request, permit).await
+                            },
+                        )
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream"))
+            .await
+            .unwrap();
+        for index in 0..17 {
+            let id = format!("window-{index}");
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    json!({"kind":"subscribe","id":id,"collection":"work","limit":2})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            assert_eq!(frame["id"], id);
+            assert_eq!(frame["kind"], if index < 16 { "snapshot" } else { "error" });
+        }
+        // A refusal leaves existing windows alive and replacements admissible at capacity.
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({"kind":"subscribe","id":"window-0","collection":"missions","limit":2})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(frame["id"], "window-0");
+        assert_eq!(frame["kind"], "snapshot");
+        socket.close(None).await.unwrap();
+        server.abort();
+    }
+
     #[test]
     fn canceled_native_subscription_keeps_its_queued_physical_read_slot() {
         let root = tempfile::tempdir().unwrap();
@@ -11131,7 +11230,7 @@ mod tests {
             .await
             .unwrap();
         // A conversation outbox frame positively confirms command/frame dispatch is live
-        // while all eight physical workers are held; no wall-clock negative wait.
+        // while all sixteen physical workers are held; no wall-clock negative wait.
         socket.send(tokio_tungstenite::tungstenite::Message::Text(
             json!({"kind":"subscribe","id":"admission","collection":"conversation","conversation":"session/missing"}).to_string().into(),
         )).await.unwrap();
@@ -14405,6 +14504,7 @@ mission "example/zero-run" state="ready" {
             Extension(session.clone()),
         )
         .await
+        .unwrap()
         .0;
         let expected = format!("event-cursor/retention-node/{floor}");
         assert_eq!(capabilities["oldest_event_cursor"], expected);
@@ -14438,6 +14538,73 @@ mission "example/zero-run" state="ready" {
         .0;
         assert_eq!(page["oldest_cursor"], expected);
         assert!(!serde_json::to_string(&page).unwrap().contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn event_resync_replacement_produces_one_valid_frontier_cursor() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "resync-node");
+        let record = state
+            .store
+            .append_claim(&ClaimInput {
+                subject: "custom/test/resync".into(),
+                kind: "custom.test.recorded".into(),
+                actor: None,
+                fields: BTreeMap::new(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        state
+            .store
+            .prune_events_before(record.store_index + 1)
+            .unwrap();
+        let session = ClientSession::local(None).unwrap();
+        let gap = events(
+            State(state.clone()),
+            Extension(session.clone()),
+            Query(EventsQuery {
+                after: Some("event-cursor/resync-node/0".into()),
+                limit: Some(3),
+                wait_ms: None,
+            }),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(gap.code, "cursor-gap");
+        let replacement = events(
+            State(state.clone()),
+            Extension(session.clone()),
+            Query(EventsQuery {
+                after: None,
+                limit: Some(3),
+                wait_ms: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(replacement["items"].as_array().unwrap().is_empty());
+        let cursor = replacement["resume_cursor"].as_str().unwrap().to_owned();
+        assert_eq!(
+            cursor,
+            format!("event-cursor/resync-node/{}", record.store_index)
+        );
+        let resumed = events(
+            State(state),
+            Extension(session),
+            Query(EventsQuery {
+                after: Some(cursor),
+                limit: Some(3),
+                wait_ms: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(resumed["items"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]

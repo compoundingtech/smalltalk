@@ -1043,6 +1043,7 @@ mod tests {
             }],
             planner: crate::model::PlannerSpec::default(),
             observations: crate::config::ObservationsConfig::default(),
+            github: crate::config::GithubConfig::default(),
             checkpoint: crate::config::CheckpointConfig::default(),
             limits: crate::config::LimitsConfig::default(),
             fleet: None,

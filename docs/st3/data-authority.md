@@ -166,7 +166,9 @@ order from the same admitted claims.
 | `operations` | Projection | Claim `_operation` metadata |
 | `documents` | Projection | `doc.bound` claims and blobs |
 | `desired` | Projection | Selected `intent.desired` heads |
-| `events` | Projection | Effective accepted claims |
+| `events` | Read-only view | Claim payloads joined through the local eligibility index |
+| `event_positions` | Local admission membership index | Effective-at-acceptance positions and indexed subject routing; stores no claim payload |
+| `local_event_payloads` | Temporary local migration source | Legacy duplicate payloads, drained in bounded schema-17 migration transactions |
 | `resource_observations` | Shared projection | Latest canonical `resource.observed` claim per resource subject; indexed by resource kind and opener |
 | `local_resource_projection_pending` | Local projection work queue | Resource subjects whose admitted observations changed in the current transaction; flushed before commit |
 | `mission_revisions` | Projection | `mission.published` claims |
@@ -184,7 +186,7 @@ order from the same admitted claims.
 | `planning_sessions` | Projection | `planning-session.*` claims |
 | `planning_candidates` | Projection | `planning-session.candidate-submitted` claims |
 | `planning_previews` | Projection | `planning-session.previewed` claims |
-| `idempotency` | Opaque response cache | Hashed caller keys and derived responses |
+| `idempotency` | Local completed response receipts | Hashed caller keys and derived responses; new receipts expire after seven days in bounded rowid order, active work extends retention, and the fixed legacy cohort remains until the deployment-plus-30-day follow-up |
 | `mission_run_requests` | Opaque validation cache | Hashed caller keys and request digests |
 | `capabilities` | Local short-lived authority | Dedicated API issuance; capabilities do not replicate |
 | `replica_envelopes` | Replicated authority | Authenticated outer envelopes and their exact payloads |

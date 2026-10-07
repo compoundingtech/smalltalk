@@ -410,6 +410,10 @@ CREATE TABLE IF NOT EXISTS mission_run_requests (
     operation_id TEXT PRIMARY KEY,
     request_hash TEXT NOT NULL
 );
+CREATE TRIGGER IF NOT EXISTS mission_run_request_expiry AFTER DELETE ON idempotency
+BEGIN
+    DELETE FROM mission_run_requests WHERE operation_id=OLD.operation_id;
+END;
 
 -- Every message this node holds claims for: its first claim's store index, and whether a claim
 -- closed it. The claim log alone decides it, through the triggers below, so listing the open
@@ -1567,7 +1571,13 @@ fn stale_pull_request_request_tx(
 
 fn migrate_schema(connection: &Connection) -> Result<()> {
     let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version == 0 || version == 13 || version == 14 || version == 15 || version == 16 {
+    if version == 0
+        || version == 13
+        || version == 14
+        || version == 15
+        || version == 16
+        || version == 17
+    {
         return Ok(());
     }
     if version == 12 {
@@ -2943,19 +2953,13 @@ impl Store {
         &self,
         key: &str,
     ) -> Result<Option<T>> {
-        let connection = self.readers.get();
-        connection
-            .query_row(
-                "SELECT response FROM idempotency WHERE operation_id=?1",
-                [opaque_cache_key(key)],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
+        smallclaims::store::idempotency::cached_response(&self.readers.get(), key)?
             .map(|response| serde_json::from_str(&response))
             .transpose()
             .map_err(Into::into)
     }
 
+    #[cfg(test)]
     pub(crate) fn cache_idempotency_response<T: Serialize>(
         &self,
         key: &str,
@@ -2965,7 +2969,7 @@ impl Store {
         self.connection
             .batched(|transaction| {
                 transaction.execute(
-                    "INSERT OR IGNORE INTO idempotency(operation_id, response) VALUES (?1, ?2)",
+                    "INSERT OR IGNORE INTO idempotency(operation_id, response,replay_safe) VALUES (?1, ?2,1)",
                     params![opaque_cache_key(key), response],
                 )
             })
@@ -3737,6 +3741,7 @@ impl Store {
         {
             return mission_run_view_tx(&connection, &run).map_err(internal);
         }
+        smallclaims::store::idempotency::cached_response(&connection, &request.idempotency_key)?;
         if let Some((response, stored_hash)) = connection
             .query_row(
                 "SELECT i.response, r.request_hash FROM idempotency i JOIN mission_run_requests r ON r.operation_id=i.operation_id WHERE i.operation_id=?1",
@@ -3925,7 +3930,7 @@ impl Store {
                 "deadline_at_unix_ms": deadline_at_unix_ms,
             }
         });
-        append_claim_tx(
+        append_receipt_claim_tx(
             &transaction,
             &self.origin,
             &subject,
@@ -3934,6 +3939,7 @@ impl Store {
             &body,
             &[],
             None,
+            &request.idempotency_key,
         )
         .map_err(internal)?;
         append_claim_tx(
@@ -3986,14 +3992,7 @@ impl Store {
         let now = now_ms();
         self.connection
             .batched(|transaction| -> Result<MissionOutputView, St3Error> {
-                if let Some(response) = transaction
-                    .query_row(
-                        "SELECT response FROM idempotency WHERE operation_id=?1",
-                        [opaque_cache_key(idempotency_key)],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .optional()
-                    .map_err(internal)?
+                if let Some(response) = smallclaims::store::idempotency::cached_response(transaction, idempotency_key)?
                 {
                     return serde_json::from_str(&response).map_err(internal);
                 }
@@ -4062,7 +4061,7 @@ impl Store {
                     ("attempt".into(), Value::from(current.attempt)),
                 ]);
                 let body = json!({"fields": fields});
-                let claim = append_claim_tx(
+                let claim = append_receipt_claim_tx(
                     transaction,
                     &self.origin,
                     &subject,
@@ -4071,6 +4070,7 @@ impl Store {
                     &body,
                     &[],
                     None,
+                    idempotency_key,
                 )
                 .map_err(internal)?;
                 let output = MissionOutputView {
@@ -4335,7 +4335,7 @@ impl Store {
     ) -> Result<RevisionProposalView, St3Error> {
         if let Some(response) = self
             .cached_idempotency_response(idempotency_key)
-            .map_err(internal)?
+            .map_err(smallclaims::error::typed)?
         {
             return Ok(response);
         }
@@ -4419,14 +4419,8 @@ impl Store {
         ));
         let now = now_ms();
         let mut connection = self.connection.write();
-        if let Some(response) = connection
-            .query_row(
-                "SELECT response FROM idempotency WHERE operation_id=?1",
-                [opaque_cache_key(idempotency_key)],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(internal)?
+        if let Some(response) =
+            smallclaims::store::idempotency::cached_response(&connection, idempotency_key)?
         {
             return serde_json::from_str(&response).map_err(internal);
         }
@@ -4475,7 +4469,7 @@ impl Store {
                 .map_err(internal)?;
         }
         let subject = format!("revision-proposal/{proposal_id}");
-        let record = append_claim_tx(
+        let record = append_receipt_claim_tx(
             &transaction,
             &self.origin,
             &subject,
@@ -4494,6 +4488,7 @@ impl Store {
             }}),
             &[],
             None,
+            idempotency_key,
         )
         .map_err(internal)?;
         if status == "draining" {
@@ -4531,14 +4526,8 @@ impl Store {
             .unwrap_or(proposal);
         let actor = normalize_actor(actor, "person");
         let mut connection = self.connection.write();
-        if let Some(response) = connection
-            .query_row(
-                "SELECT response FROM idempotency WHERE operation_id=?1",
-                [opaque_cache_key(idempotency_key)],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(internal)?
+        if let Some(response) =
+            smallclaims::store::idempotency::cached_response(&connection, idempotency_key)?
         {
             return serde_json::from_str(&response).map_err(internal);
         }
@@ -4577,6 +4566,7 @@ impl Store {
                     ],
                 )
                 .map_err(internal)?;
+            mark_replay_safe_receipt_tx(&transaction, idempotency_key).map_err(internal)?;
             transaction.commit().map_err(internal)?;
             return Ok(response);
         }
@@ -4646,7 +4636,7 @@ impl Store {
                 )
                 .map_err(internal)?;
         }
-        let record = append_claim_tx(
+        let record = append_receipt_claim_tx(
             &transaction,
             &self.origin,
             &proposal.subject,
@@ -4655,6 +4645,7 @@ impl Store {
             &json!({"fields": {"reviewer": actor, "preview_hash": preview_hash, "all_approved": all_approved}}),
             &[],
             None,
+            idempotency_key,
         )
         .map_err(internal)?;
         if status == "draining" {
@@ -4672,6 +4663,7 @@ impl Store {
                 .map_err(internal)?;
         }
 
+        mark_replay_safe_receipt_tx(&transaction, idempotency_key).map_err(internal)?;
         transaction.commit().map_err(internal)?;
         drop(connection);
 
@@ -4751,14 +4743,8 @@ impl Store {
             },
         );
         let mut connection = self.connection.write();
-        if let Some(response) = connection
-            .query_row(
-                "SELECT response FROM idempotency WHERE operation_id=?1",
-                [opaque_cache_key(idempotency_key)],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(internal)?
+        if let Some(response) =
+            smallclaims::store::idempotency::cached_response(&connection, idempotency_key)?
         {
             return serde_json::from_str(&response).map_err(internal);
         }
@@ -4800,7 +4786,7 @@ impl Store {
                 params![run_id, now.to_string()],
             )
             .map_err(internal)?;
-        let record = append_claim_tx(
+        let record = append_receipt_claim_tx(
             &transaction,
             &self.origin,
             &current.subject,
@@ -4809,6 +4795,7 @@ impl Store {
             &json!({"fields": {"status": "cancelled", "reason": reason}}),
             &[],
             None,
+            idempotency_key,
         )
         .map_err(internal)?;
         if phase_changed > 0 {
@@ -5070,11 +5057,12 @@ impl Store {
         reason: &str,
         idempotency_key: &str,
     ) -> Result<MissionRunView, St3Error> {
-        if let Some(response) = self
-            .cached_idempotency_response(idempotency_key)
-            .map_err(internal)?
+        // Hold the writer from the dedupe lookup through the transition and receipt commit.
+        let mut connection = self.connection.write();
+        if let Some(response) =
+            smallclaims::store::idempotency::cached_response(&connection, idempotency_key)?
         {
-            return Ok(response);
+            return serde_json::from_str(&response).map_err(internal);
         }
         let subject = normalize_step_run(subject);
         let step = self.step_run(&subject).map_err(internal)?.ok_or_else(|| {
@@ -5130,6 +5118,7 @@ impl Store {
                     ),
                 ));
             }
+            drop(connection);
             return self.adopt_mission_revision_inner(
                 &current.id,
                 &mission,
@@ -5161,21 +5150,34 @@ impl Store {
                 ),
             ));
         }
-        if !self
-            .retry_step_as(&subject, Some(actor), reason, 0)
-            .map_err(internal)?
+        let transaction = connection.transaction().map_err(internal)?;
+        if !retry_step_tx(
+            &transaction,
+            &self.origin,
+            &subject,
+            Some(actor),
+            reason,
+            0,
+            Some(idempotency_key),
+        )
+        .map_err(internal)?
         {
             return Err(St3Error::new(
                 "work-not-retryable",
                 format!("step run `{subject}` changed before the retry"),
             ));
         }
-        let view = self
-            .mission_run(&current.id)
-            .map_err(internal)?
-            .expect("the retried mission run exists");
-        self.cache_idempotency_response(idempotency_key, &view)
+        let view = mission_run_view_tx(&transaction, &current.id).map_err(internal)?;
+        transaction
+            .execute(
+                "INSERT INTO idempotency(operation_id,response) VALUES(?1,?2)",
+                params![
+                    opaque_cache_key(idempotency_key),
+                    serde_json::to_string(&view).map_err(internal)?
+                ],
+            )
             .map_err(internal)?;
+        transaction.commit().map_err(internal)?;
         Ok(view)
     }
 
@@ -5192,7 +5194,7 @@ impl Store {
     ) -> Result<MissionRunView, St3Error> {
         if let Some(response) = self
             .cached_idempotency_response(idempotency_key)
-            .map_err(internal)?
+            .map_err(smallclaims::error::typed)?
         {
             return Ok(response);
         }
@@ -5213,6 +5215,9 @@ impl Store {
         let run_id = run.strip_prefix("mission-run/").unwrap_or(run);
         let mut connection = self.connection.write();
         let transaction = connection.transaction().map_err(internal)?;
+        if let Some(response) = smallclaims::store::idempotency::cached_response(&transaction,idempotency_key)? {
+            return serde_json::from_str(&response).map_err(internal);
+        }
         let current = mission_run_header_tx(&transaction, run_id)
             .optional()
             .map_err(internal)?
@@ -5271,7 +5276,7 @@ impl Store {
             .map_err(internal)?;
         // A terminal state that follows a terminal state is an outcome someone set; the
         // reconciler never writes one.
-        append_claim_tx(
+        append_receipt_claim_tx(
             &transaction,
             &self.origin,
             &current.subject,
@@ -5285,6 +5290,7 @@ impl Store {
             }}),
             &[],
             None,
+            idempotency_key,
         )
         .map_err(internal)?;
         append_claim_tx(
@@ -5324,7 +5330,7 @@ impl Store {
     ) -> Result<MissionSpec, St3Error> {
         if let Some(response) = self
             .cached_idempotency_response(idempotency_key)
-            .map_err(internal)?
+            .map_err(smallclaims::error::typed)?
         {
             return Ok(response);
         }
@@ -5348,6 +5354,9 @@ impl Store {
         let retired = crate::mission::retired_mission(current)?;
         let mut connection = self.connection.write();
         let transaction = connection.transaction().map_err(internal)?;
+        if let Some(response) = smallclaims::store::idempotency::cached_response(&transaction,idempotency_key)? {
+            return serde_json::from_str(&response).map_err(internal);
+        }
         owned_sets::refuse_unmanaged(&transaction, &format!("mission/{mission_id}"))?;
         let active = transaction
             .query_row(
@@ -5370,7 +5379,7 @@ impl Store {
         let predecessors =
             mission_definition_token_tx(&transaction, mission_id).map_err(internal)?;
         let body = serde_json::to_value(&retired).map_err(internal)?;
-        let claim = append_claim_tx(
+        let claim = append_receipt_claim_tx(
             &transaction,
             &self.origin,
             &retired.subject,
@@ -5379,6 +5388,7 @@ impl Store {
             &body,
             &predecessors,
             None,
+            idempotency_key,
         )
         .map_err(internal)?;
         transaction
@@ -5422,7 +5432,7 @@ impl Store {
     ) -> Result<MissionRunView, St3Error> {
         if let Some(response) = self
             .cached_idempotency_response(idempotency_key)
-            .map_err(internal)?
+            .map_err(smallclaims::error::typed)?
         {
             return Ok(response);
         }
@@ -5530,14 +5540,8 @@ impl Store {
         flatten_steps(mission, None, &[], &mut new_steps);
 
         let mut connection = self.connection.write();
-        if let Some(response) = connection
-            .query_row(
-                "SELECT response FROM idempotency WHERE operation_id=?1",
-                [opaque_cache_key(idempotency_key)],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(internal)?
+        if let Some(response) =
+            smallclaims::store::idempotency::cached_response(&connection, idempotency_key)?
         {
             return serde_json::from_str(&response).map_err(internal);
         }
@@ -5658,7 +5662,7 @@ impl Store {
                 params![run_id, generation_id, now.to_string()],
             )
             .map_err(internal)?;
-        append_claim_tx(
+        append_receipt_claim_tx(
             &transaction,
             &self.origin,
             &predecessor_subject,
@@ -5667,6 +5671,7 @@ impl Store {
             &json!({"fields": {"status": "superseded", "successor": generation_subject, "reason": reason}}),
             &[],
             None,
+            idempotency_key,
         )
         .map_err(internal)?;
         terminalize_generation_steps_tx(
@@ -7294,14 +7299,7 @@ impl Store {
         // One work action in a savepoint of the writer's next batch, answered once that batch commits.
         self.connection
             .batched(|transaction| -> Result<StepRunView, St3Error> {
-                if let Some(response) = transaction
-                    .query_row(
-                        "SELECT response FROM idempotency WHERE operation_id=?1",
-                        [opaque_cache_key(&request.idempotency_key)],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .optional()
-                    .map_err(internal)?
+                if let Some(response) = smallclaims::store::idempotency::cached_response(transaction, &request.idempotency_key)?
                 {
                     if let Some(input) = handoff {
                         adhoc_work::validate_retry(transaction, &subject, input)?;
@@ -7655,7 +7653,7 @@ impl Store {
                 let publish = !quiet_renewal
                     || last_replicated_expiry.is_none_or(|expiry| expiry <= now.saturating_add(300_000));
                 if publish {
-                    append_claim_tx(
+                    append_receipt_claim_tx(
                         transaction,
                         &self.origin,
                         &subject,
@@ -7664,6 +7662,7 @@ impl Store {
                         &body,
                         &request.evidence,
                         None,
+                        &request.idempotency_key,
                     )
                     .map_err(claim_append_error)?;
                     transaction
@@ -7701,6 +7700,9 @@ impl Store {
                         ],
                     )
                     .map_err(internal)?;
+                if !publish {
+                    mark_replay_safe_receipt_tx(transaction, &request.idempotency_key).map_err(internal)?;
+                }
                 Ok(view)
             })
             .map_err(|error| St3Error::new("internal", error))?
@@ -7804,74 +7806,16 @@ impl Store {
     ) -> Result<bool> {
         let subject = normalize_step_run(subject);
         self.connection
-            .batched(|transaction| -> Result<bool> {
-                let current: Option<StepRetryRow> = transaction
-                    .query_row(
-                        "SELECT step_runs.status, step_runs.attempt,
-                                step_runs.generation_id=mission_runs.current_generation_id,
-                                mission_runs.status, mission_runs.phase, run_generations.status,
-                                root_runs.status, root_runs.phase
-                         FROM step_runs JOIN mission_runs ON mission_runs.id=step_runs.run_id
-                         JOIN mission_runs root_runs ON root_runs.id=mission_runs.root_run_id
-                         JOIN run_generations ON run_generations.id=step_runs.generation_id
-                         WHERE step_runs.subject=?1",
-                        [&subject],
-                        |row| {
-                            Ok((
-                                row.get(0)?,
-                                row.get(1)?,
-                                row.get(2)?,
-                                row.get(3)?,
-                                row.get(4)?,
-                                row.get(5)?,
-                                row.get(6)?,
-                                row.get(7)?,
-                            ))
-                        },
-                    )
-                    .optional()?;
-                let Some((
-                    status,
-                    attempt,
-                    is_current,
-                    run_status,
-                    run_phase,
-                    generation_status,
-                    root_status,
-                    root_phase,
-                )) = current
-                else {
-                    return Ok(false);
-                };
-                if !is_current
-                    || status != "failed"
-                    || is_terminal_run_state(&run_status)
-                    || run_phase == "terminal"
-                    || is_terminal_generation_state(&generation_status)
-                    || is_terminal_run_state(&root_status)
-                    || root_phase == "terminal"
-                {
-                    return Ok(false);
-                }
-                let now = now_ms();
-                let not_before = now.saturating_add(backoff_ms as u128);
-                transaction.execute(
-                    "UPDATE step_runs SET status='pending', attempt=?2, worker_reported=0, lease_owner=NULL,
-                            lease_incarnation=NULL, lease_expires_at_unix_ms=NULL, blocked_reason=?3,
-                            not_before_unix_ms=?4, activated_at_unix_ms=NULL, updated_at_unix_ms=?5 WHERE subject=?1",
-                    params![subject, attempt.saturating_add(1), reason, not_before.to_string(), now.to_string()])?;
-                let body = json!({"fields": {"status": "pending", "attempt": attempt.saturating_add(1), "reason": reason, "not_before_unix_ms": not_before}});
-                append_claim_tx(
+            .batched(|transaction| {
+                retry_step_tx(
                     transaction,
                     &self.origin,
                     &subject,
-                    "step-run.retried",
                     actor,
-                    &body,
-                    &[],
+                    reason,
+                    backoff_ms,
                     None,
-                )?;
-                Ok(true)
+                )
             })
             .map_err(anyhow::Error::msg)?
     }
@@ -8521,7 +8465,28 @@ impl Store {
         idempotency_key: &str,
         actor: Option<&str>,
     ) -> Result<ApplyResponse, St3Error> {
-        self.apply_as_impl(intent, expected, idempotency_key, actor, None)
+        self.apply_as_impl(intent, expected, idempotency_key, actor, None, None)
+    }
+
+    /// Atomically commit the declaration and its caller-facing completed response. Exact retries
+    /// also repair the old split-response window without publishing another declaration.
+    pub(crate) fn apply_with_local_receipt<T: Serialize>(
+        &self,
+        intent: &NormalizedIntent,
+        expected: &BTreeMap<String, Vec<String>>,
+        key: &str,
+        response_key: &str,
+        response: &T,
+    ) -> Result<ApplyResponse, St3Error> {
+        let value = serde_json::to_value(response).map_err(internal)?;
+        self.apply_as_impl(
+            intent,
+            expected,
+            key,
+            None,
+            None,
+            Some((response_key, &value)),
+        )
     }
 
     fn apply_as_impl(
@@ -8531,6 +8496,7 @@ impl Store {
         idempotency_key: &str,
         actor: Option<&str>,
         owned: Option<&owned_sets::Options>,
+        local_receipt: Option<(&str, &Value)>,
     ) -> Result<ApplyResponse, St3Error> {
         self.connection
             .batched(|transaction| -> Result<ApplyResponse, St3Error> {
@@ -8543,16 +8509,10 @@ impl Store {
                     }
                     transaction.execute("INSERT OR IGNORE INTO idempotency(operation_id,response) VALUES (?1,?2)", params![cache_key,digest]).map_err(internal)?;
                 }
-                if let Some(response) = transaction
-                    .query_row(
-                        "SELECT response FROM idempotency WHERE operation_id = ?1",
-                        [opaque_cache_key(idempotency_key)],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .optional()
-                    .map_err(internal)?
+                if let Some(response) = smallclaims::store::idempotency::cached_response(transaction, idempotency_key)?
                 {
-                    return serde_json::from_str(&response).map_err(internal);
+                    return cache_local_apply_receipt_tx(transaction,
+                        serde_json::from_str(&response).map_err(internal)?,local_receipt,idempotency_key);
                 }
                 crate::provenance::validate_publication(transaction, intent)?;
                 let owned_plan = owned.map(|options| owned_sets::plan_tx(transaction, intent, options)).transpose()?;
@@ -8560,11 +8520,11 @@ impl Store {
                 if let (Some(plan), Some(options)) = (&owned_plan, owned) {
                     owned_sets::validate_apply(plan, options)?;
                     if plan.preview.noop {
-                        return Ok(ApplyResponse {
+                        return cache_local_apply_receipt_tx(transaction,ApplyResponse {
                             changed: false, store_index: current_index_tx(transaction).map_err(internal)?,
                             batch_id: None, claim_ids: Vec::new(), subject_tokens: BTreeMap::new(),
                             reconcile_subjects: Vec::new(), resolved_kdl: String::new(), operations: Vec::new(),
-                        });
+                        },local_receipt,idempotency_key);
                     }
                 } else {
                     for subject in intent.subjects.keys().chain(intent.missions.values().map(|m| &m.subject)) {
@@ -8929,7 +8889,7 @@ impl Store {
                             ],
                         )
                         .map_err(internal)?;
-                    return Ok(response);
+                    return cache_local_apply_receipt_tx(transaction,response,local_receipt,idempotency_key);
                 }
                 let now = write_time(transaction, &self.origin).map_err(internal)?;
                 let sequence = next_replica_sequence(transaction, &self.origin).map_err(internal)?;
@@ -8944,6 +8904,7 @@ impl Store {
                     )
                     .map_err(internal)?;
 
+                let mut receipt_attached = false;
                 let mut claim_ids = Vec::new();
                 let mut tokens = BTreeMap::new();
                 let mut reconcile_subjects = Vec::new();
@@ -8963,6 +8924,10 @@ impl Store {
                     let mut body = serde_json::to_value(desired).map_err(internal)?;
                     if let Some(plan) = &owned_plan { body["owned_set"] = json!(plan.preview.set); }
                     if let Some(set) = one_shot_sets.get(subject) { body["owned_set"] = json!(set); }
+                    if !receipt_attached {
+                        smallclaims::store::idempotency::attach(&mut body,idempotency_key).map_err(internal)?;
+                        receipt_attached = true;
+                    }
                     // The claim records its writer as its actor.
                     let claim_id = claim_hash(
                         &batch_id,
@@ -9038,6 +9003,10 @@ impl Store {
                     if let Some(provenance) = intent.mission_provenance.get(&mission.id)
                         && let Some(claim) = crate::provenance::record(transaction, &self.origin, mission, provenance, actor, &batch_id)? {
                         claim_ids.push(claim.id);
+                    }
+                    if !receipt_attached {
+                        smallclaims::store::idempotency::attach(&mut body,idempotency_key).map_err(internal)?;
+                        receipt_attached = true;
                     }
                     // The publication records its publisher, as a declaration records its writer.
                     let claim_id = claim_hash(
@@ -9354,6 +9323,7 @@ impl Store {
                     tokens.insert(plan.preview.set.clone(), vec![receipt.id.clone()]);
                     claim_ids.push(receipt.id);
                 }
+                if receipt_attached { repair_operations_tx(transaction,&[opaque_cache_key(idempotency_key)]).map_err(internal)?; }
                 owned_sets::project_tx(transaction)?;
                 let store_index = current_index_tx(transaction).map_err(internal)?;
                 let response = ApplyResponse {
@@ -9375,7 +9345,7 @@ impl Store {
                         ],
                     )
                     .map_err(internal)?;
-                Ok(response)
+                cache_local_apply_receipt_tx(transaction,response,local_receipt,idempotency_key)
             })
             .map_err(|error| St3Error::new("internal", error))?
     }
@@ -10808,6 +10778,62 @@ impl Store {
         })
     }
 
+    /// One keyset page at the caller's pinned snapshot. Owner filtering never expands the
+    /// indexed scan; the continuation records the last inspected event even for an empty answer.
+    /// Both subject and owner filters run after the bounded global membership scan.
+    pub fn events_page(
+        &self,
+        after: u64,
+        subject: Option<&str>,
+        owner_run: Option<&str>,
+        limit: usize,
+    ) -> Result<(Vec<EventRecord>, Option<u64>, bool)> {
+        let limit = limit.clamp(1, 200);
+        let connection = self.readers.get();
+        // Keep the global last-scanned-event contract without adding a subject index.
+        let sql = "SELECT store_index,kind,subject,body FROM events
+             WHERE store_index>?1 ORDER BY store_index LIMIT ?2";
+        let raw = connection
+            .prepare_cached(sql)?
+            .query_map(params![after, limit.saturating_add(1)], |row| {
+                let body = row.get::<_, String>(3)?;
+                Ok(EventRecord {
+                    store_index: row.get(0)?,
+                    kind: row.get(1)?,
+                    subject: row.get(2)?,
+                    body: serde_json::from_str(&body).unwrap_or(Value::Null),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let has_more = raw.len() > limit;
+        let next_after = raw
+            .iter()
+            .take(limit)
+            .next_back()
+            .map(|event| event.store_index);
+        let items = raw
+            .into_iter()
+            .take(limit)
+            .filter(|event| {
+                subject.is_none_or(|subject| event.subject == subject)
+                    && owner_run
+                        .is_none_or(|run| subject_owned_by(&connection, &event.subject, run))
+            })
+            .collect();
+        Ok((items, next_after, has_more))
+    }
+
+    pub fn event_payload_migration_pending(&self) -> Result<bool> {
+        self.readers
+            .get()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='local_event_payloads')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
     pub fn events_after(&self, after: u64, subject: Option<&str>) -> Result<Vec<EventRecord>> {
         self.events_after_filtered(after, subject, None)
     }
@@ -10833,12 +10859,10 @@ impl Store {
 
     pub fn events_tail_bounded(&self, limit: usize) -> Result<Vec<EventRecord>> {
         let connection = self.readers.get();
-        let mut statement = connection.prepare(
-            "SELECT store_index, kind, subject, body FROM (
-                 SELECT store_index, kind, subject, body FROM events
-                 ORDER BY store_index DESC LIMIT ?1
-             ) ORDER BY store_index",
-        )?;
+        // Bound membership before fetching bodies. Ordering the joined view can make SQLite
+        // visit every canonical claim, even when the response has a LIMIT.
+        let sql = event_tail_sql(self.event_payload_migration_pending()?);
+        let mut statement = connection.prepare(sql)?;
         let rows = statement.query_map([limit.min(i64::MAX as usize) as i64], |row| {
             let body = row.get::<_, String>(3)?;
             Ok(EventRecord {
@@ -10852,25 +10876,23 @@ impl Store {
     }
 
     pub fn event_bounds(&self) -> Result<(u64, u64)> {
-        let connection = self.readers.get();
-        // Two subqueries: SQLite finds a lone MIN or MAX from the index, but reads the whole table
-        // for both in one aggregate.
-        connection
-            .query_row(
-                "SELECT COALESCE((SELECT MIN(store_index) FROM events), 0),
-                        COALESCE((SELECT MAX(store_index) FROM events), 0)",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .map_err(Into::into)
+        smallclaims::store::events::bounds(&self.readers.get())
     }
 
     #[cfg(test)]
     pub(crate) fn prune_events_before(&self, retain_from: u64) -> Result<usize> {
-        let connection = self.connection.write();
-        connection
-            .execute("DELETE FROM events WHERE store_index < ?1", [retain_from])
-            .map_err(Into::into)
+        let mut connection = self.connection.write();
+        let transaction = connection.transaction()?;
+        smallclaims::store::events::raise_resume_floor_tx(
+            &transaction,
+            retain_from.saturating_sub(1),
+        )?;
+        let removed = transaction.execute(
+            "DELETE FROM event_positions WHERE store_index < ?1",
+            [retain_from],
+        )?;
+        transaction.commit()?;
+        Ok(removed)
     }
 
     /// Return the acceptance time that deterministically names a projection at `store_index`.
@@ -13156,14 +13178,7 @@ impl Store {
             .batched(|transaction| -> Result<ResourceObservationOutcome, St3Error> {
                 check_observer_completion(transaction, observer, desired_revision, current)?;
                 let outcome = (|| {
-                if let Some(response) = transaction
-                    .query_row(
-                        "SELECT response FROM idempotency WHERE operation_id=?1",
-                        [opaque_cache_key(&idempotency_key)],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .optional()
-                    .map_err(internal)?
+                if let Some(response) = smallclaims::store::idempotency::cached_response(transaction, &idempotency_key)?
                 {
                     return serde_json::from_str(&response).map_err(internal);
                 }
@@ -13365,12 +13380,13 @@ impl Store {
                         ],
                     )
                     .map_err(internal)?;
+                let mut receipt_key = Some(idempotency_key.as_str());
                 let observer_predecessors = latest_claim_id_tx(transaction, observer)
                     .map_err(internal)?
                     .into_iter()
                     .collect::<Vec<_>>();
                 if !observer_health_is_current {
-                    append_claim_tx(
+                    append_first_receipt_claim_tx(
                         transaction,
                         &self.origin,
                         observer,
@@ -13382,6 +13398,7 @@ impl Store {
                         }}),
                         &observer_predecessors,
                         Some(&batch_id),
+                        &mut receipt_key,
                     )
                     .map_err(internal)?;
                 }
@@ -13402,7 +13419,7 @@ impl Store {
                             .expect("observer fields are an object")
                             .insert("attempt".into(), Value::String(attempt.into()));
                     }
-                    append_claim_tx(
+                    append_first_receipt_claim_tx(
                         transaction,
                         &self.origin,
                         observer,
@@ -13411,6 +13428,7 @@ impl Store {
                         &json!({"fields": observer_fields}),
                         &observer_predecessors,
                         Some(&batch_id),
+                        &mut receipt_key,
                     )
                     .map_err(internal)?;
                 }
@@ -13425,7 +13443,7 @@ impl Store {
                         .into_iter()
                         .collect::<Vec<_>>();
                     Some(
-                        append_claim_tx(
+                        append_first_receipt_claim_tx(
                             transaction,
                             &self.origin,
                             resource,
@@ -13440,6 +13458,7 @@ impl Store {
                             }}),
                             &predecessors,
                             Some(&batch_id),
+                            &mut receipt_key,
                         )
                         .map_err(internal)?,
                     )
@@ -13500,7 +13519,7 @@ impl Store {
                         .as_ref()
                         .map(|claim| vec![claim.id.clone()])
                         .unwrap_or_default();
-                    let claim = append_claim_tx(
+                    let claim = append_first_receipt_claim_tx(
                         transaction,
                         &self.origin,
                         &subject,
@@ -13515,6 +13534,7 @@ impl Store {
                         }, "evidence": evidence}),
                         &predecessors,
                         Some(&batch_id),
+                        &mut receipt_key,
                     )
                     .map_err(internal)?;
                     if !data_types.is_empty() {
@@ -13545,7 +13565,7 @@ impl Store {
                             .map_err(internal)?
                             .into_iter()
                             .collect::<Vec<_>>();
-                        append_claim_tx(
+                        append_first_receipt_claim_tx(
                             transaction,
                             &self.origin,
                             subscription_subject,
@@ -13557,6 +13577,7 @@ impl Store {
                             }}),
                             &predecessors,
                             Some(&batch_id),
+                            &mut receipt_key,
                         )
                         .map_err(internal)?;
                     }
@@ -13633,7 +13654,7 @@ impl Store {
                                 .map_err(internal)?
                                 .is_none()
                             {
-                                append_claim_tx(
+                                append_first_receipt_claim_tx(
                                     transaction,
                                     &self.origin,
                                     &wake.subject,
@@ -13649,6 +13670,7 @@ impl Store {
                                     }, "evidence": [item_claim]}),
                                     &[],
                                     Some(&batch_id),
+                                    &mut receipt_key,
                                 )
                                 .map_err(claim_append_error)?;
                                 message_subjects.push(wake.subject.clone());
@@ -13763,7 +13785,7 @@ impl Store {
                                 .map_err(internal)?
                                 .is_some();
                             if !recorded {
-                                append_claim_tx(
+                                append_first_receipt_claim_tx(
                                     transaction,
                                     &self.origin,
                                     subscription_subject,
@@ -13775,6 +13797,7 @@ impl Store {
                                     }, "evidence": entries.iter().map(|(_, claim, _)| claim).collect::<Vec<_>>()}),
                                     &[],
                                     Some(&batch_id),
+                                    &mut receipt_key,
                                 )
                                 .map_err(claim_append_error)?;
                             }
@@ -13867,7 +13890,7 @@ impl Store {
                             if let Some(requester) = subscription.requester.as_deref() {
                                 request_fields["requester"] = Value::String(requester.into());
                             }
-                            append_claim_tx(
+                            append_first_receipt_claim_tx(
                                 transaction,
                                 &self.origin,
                                 subscription_subject,
@@ -13879,6 +13902,7 @@ impl Store {
                                     .collect::<Vec<_>>()}),
                                 &[],
                                 Some(&batch_id),
+                                &mut receipt_key,
                             )
                             .map_err(claim_append_error)?;
                             continue;
@@ -14017,7 +14041,7 @@ impl Store {
                                 } else {
                                     evidence.clone()
                                 };
-                                append_claim_tx(
+                                append_first_receipt_claim_tx(
                                     transaction,
                                     &self.origin,
                                     subscription_subject,
@@ -14026,6 +14050,7 @@ impl Store {
                                     &json!({"fields": request_fields, "evidence": evidence}),
                                     &[],
                                     Some(&batch_id),
+                                    &mut receipt_key,
                                 )
                                 .map_err(claim_append_error)?;
                             }
@@ -14063,7 +14088,7 @@ impl Store {
                                     .map(|(_, _, claim, _)| claim.clone()),
                             )
                             .collect::<Vec<_>>();
-                        append_claim_tx(
+                        append_first_receipt_claim_tx(
                             transaction,
                             &self.origin,
                             &message_subject,
@@ -14079,6 +14104,7 @@ impl Store {
                             }, "evidence": evidence}),
                             &[],
                             Some(&batch_id),
+                            &mut receipt_key,
                         )
                         .map_err(claim_append_error)?;
                         message_subjects.push(message_subject);
@@ -20116,6 +20142,72 @@ pub(crate) fn append_claim_tx(
     Ok(record)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn append_receipt_claim_tx(
+    transaction: &Transaction<'_>,
+    origin: &str,
+    subject: &str,
+    kind: &str,
+    actor: Option<&str>,
+    body: &Value,
+    predecessors: &[String],
+    forced_batch: Option<&str>,
+    key: &str,
+) -> Result<ClaimRecord> {
+    let mut body = body.clone();
+    smallclaims::store::idempotency::attach(&mut body, key)?;
+    let record = append_claim_tx(
+        transaction,
+        origin,
+        subject,
+        kind,
+        actor,
+        &body,
+        predecessors,
+        forced_batch,
+    )?;
+    register_operation_tx(transaction, &record)?;
+    Ok(record)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_first_receipt_claim_tx(
+    transaction: &Transaction<'_>,
+    origin: &str,
+    subject: &str,
+    kind: &str,
+    actor: Option<&str>,
+    body: &Value,
+    predecessors: &[String],
+    forced_batch: Option<&str>,
+    key: &mut Option<&str>,
+) -> Result<ClaimRecord> {
+    if let Some(key) = key.take() {
+        append_receipt_claim_tx(
+            transaction,
+            origin,
+            subject,
+            kind,
+            actor,
+            body,
+            predecessors,
+            forced_batch,
+            key,
+        )
+    } else {
+        append_claim_tx(
+            transaction,
+            origin,
+            subject,
+            kind,
+            actor,
+            body,
+            predecessors,
+            forced_batch,
+        )
+    }
+}
+
 fn mission_run_creation_time(fields: &Value, accepted_at: u128) -> u128 {
     fields
         .get("deadline_at_unix_ms")
@@ -20252,23 +20344,162 @@ fn schema_fields_for_body(kind: &str, body: &Value) -> Result<BTreeMap<String, V
         .as_object()
         .context("a claim body must be an object")?
         .iter()
+        .filter(|(name, _)| name.as_str() != "_operation")
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect())
+}
+
+fn cache_local_apply_receipt_tx(
+    transaction: &Transaction<'_>,
+    response: ApplyResponse,
+    local_receipt: Option<(&str, &Value)>,
+    primary_key: &str,
+) -> Result<ApplyResponse, St3Error> {
+    if let Some((key, template)) = local_receipt {
+        let mut receipt = template.clone();
+        receipt["event_cursor"] = json!(response.store_index);
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO idempotency(operation_id,response) VALUES(?1,?2)",
+                params![
+                    opaque_cache_key(key),
+                    serde_json::to_string(&receipt).map_err(internal)?
+                ],
+            )
+            .map_err(internal)?;
+    }
+    mark_replay_safe_receipt_tx(transaction, primary_key).map_err(internal)?;
+    mark_replay_safe_receipt_tx(transaction, &format!("owned-set-request:{primary_key}"))
+        .map_err(internal)?;
+    if let Some((key, _)) = local_receipt {
+        mark_replay_safe_receipt_tx(transaction, key).map_err(internal)?;
+    }
+    Ok(response)
+}
+
+fn mark_replay_safe_receipt_tx(transaction: &Transaction<'_>, key: &str) -> Result<()> {
+    transaction.execute(
+        "UPDATE idempotency SET replay_safe=1 WHERE operation_id=?1",
+        [opaque_cache_key(key)],
+    )?;
+    Ok(())
+}
+
+fn retry_step_tx(
+    transaction: &Transaction<'_>,
+    origin: &str,
+    subject: &str,
+    actor: Option<&str>,
+    reason: &str,
+    backoff_ms: u64,
+    receipt_key: Option<&str>,
+) -> Result<bool> {
+    let current: Option<StepRetryRow> = transaction
+        .query_row(
+            "SELECT step_runs.status, step_runs.attempt,
+                    step_runs.generation_id=mission_runs.current_generation_id,
+                    mission_runs.status, mission_runs.phase, run_generations.status,
+                    root_runs.status, root_runs.phase
+             FROM step_runs JOIN mission_runs ON mission_runs.id=step_runs.run_id
+             JOIN mission_runs root_runs ON root_runs.id=mission_runs.root_run_id
+             JOIN run_generations ON run_generations.id=step_runs.generation_id
+             WHERE step_runs.subject=?1",
+            [&subject],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        status,
+        attempt,
+        is_current,
+        run_status,
+        run_phase,
+        generation_status,
+        root_status,
+        root_phase,
+    )) = current
+    else {
+        return Ok(false);
+    };
+    if !is_current
+        || status != "failed"
+        || is_terminal_run_state(&run_status)
+        || run_phase == "terminal"
+        || is_terminal_generation_state(&generation_status)
+        || is_terminal_run_state(&root_status)
+        || root_phase == "terminal"
+    {
+        return Ok(false);
+    }
+    let now = now_ms();
+    let not_before = now.saturating_add(backoff_ms as u128);
+    transaction.execute(
+        "UPDATE step_runs SET status='pending', attempt=?2, worker_reported=0, lease_owner=NULL,
+                lease_incarnation=NULL, lease_expires_at_unix_ms=NULL, blocked_reason=?3,
+                not_before_unix_ms=?4, activated_at_unix_ms=NULL, updated_at_unix_ms=?5 WHERE subject=?1",
+        params![subject, attempt.saturating_add(1), reason, not_before.to_string(), now.to_string()])?;
+    let mut body = json!({"fields": {"status": "pending", "attempt": attempt.saturating_add(1), "reason": reason, "not_before_unix_ms": not_before}});
+    if let Some(key) = receipt_key {
+        smallclaims::store::idempotency::attach(&mut body, key)?;
+    }
+    let record = append_claim_tx(
+        transaction,
+        origin,
+        subject,
+        "step-run.retried",
+        actor,
+        &body,
+        &[],
+        None,
+    )?;
+    if receipt_key.is_some() {
+        register_operation_tx(transaction, &record)?;
+    }
+    Ok(true)
+}
+
+fn event_tail_sql(migrating: bool) -> &'static str {
+    if migrating {
+        "SELECT p.store_index,c.kind,p.subject,c.body FROM (
+                 SELECT store_index,subject FROM (
+                     SELECT store_index,subject FROM event_positions ORDER BY store_index DESC LIMIT ?1
+                 ) UNION ALL SELECT store_index,subject FROM (
+                     SELECT store_index,subject FROM local_event_payloads
+                     ORDER BY store_index DESC LIMIT ?1
+                 ) legacy WHERE NOT EXISTS(SELECT 1 FROM event_positions n WHERE n.store_index=legacy.store_index)
+                 ORDER BY store_index DESC LIMIT ?1
+             ) p CROSS JOIN claims c ON c.store_index=p.store_index ORDER BY p.store_index"
+    } else {
+        "SELECT p.store_index,c.kind,p.subject,c.body FROM (
+                 SELECT store_index,subject FROM event_positions ORDER BY store_index DESC LIMIT ?1
+             ) p CROSS JOIN claims c ON c.store_index=p.store_index ORDER BY p.store_index"
+    }
 }
 
 fn insert_event(
     transaction: &Transaction<'_>,
     store_index: u64,
-    kind: &str,
+    _kind: &str,
     subject: &str,
-    body: &Value,
+    _body: &Value,
 ) -> Result<()> {
     if subject.starts_with("glass/") {
         return Ok(());
     }
     transaction.execute(
-        "INSERT OR IGNORE INTO events(store_index, kind, subject, body) VALUES (?1, ?2, ?3, ?4)",
-        params![store_index, kind, subject, canonical_json_text(body)?],
+        "INSERT OR IGNORE INTO event_positions(store_index, subject) VALUES (?1, ?2)",
+        params![store_index, subject],
     )?;
     Ok(())
 }
@@ -26409,7 +26640,7 @@ fn rebuild_base_aggregate_tx(
 /// Identify the claim being processed, without copying its fields, payload or authority data.
 fn incremental_claim_error(error: St3Error, claim: &ClaimRecord, stage: &'static str) -> St3Error {
     let operation = operation_parts(&claim.body).map(|(operation, _)| operation);
-    let truncated = [&claim.id, &claim.subject]
+    let truncated = [&claim.id, &claim.subject, &claim.kind]
         .into_iter()
         .any(|value| value.chars().take(257).count() > 256)
         || operation.is_some_and(|value| value.chars().take(257).count() > 256);
@@ -26418,6 +26649,7 @@ fn incremental_claim_error(error: St3Error, claim: &ClaimRecord, stage: &'static
         .with_detail("projection_stage", stage)
         .with_detail("projection_claim_id", bounded(&claim.id))
         .with_detail("projection_subject", bounded(&claim.subject))
+        .with_detail("projection_claim_kind", bounded(&claim.kind))
         .with_detail("projection_context_truncated", truncated);
     match operation {
         Some(operation) => error.with_detail("projection_operation_id", bounded(operation)),
@@ -26559,6 +26791,10 @@ fn try_project_simple_replication_tx(
     }
     for claim in &claims {
         let has_operation = claim.body.get("_operation").is_some();
+        // Supported work transitions already share canonical ordering and affected-tree
+        // repair with replay. An operation identity alone changes neither the work fields
+        // nor that ordering. Validate its shape here and its digest/state in the registry
+        // below; do not force a full-store replay based on the identity's prefix.
         if claim.kind.starts_with("planning-session.") {
             rebuild_planning = true;
         }
@@ -26585,19 +26821,22 @@ fn try_project_simple_replication_tx(
                     | "step-run.state"
                     | "step-run.retried"
             )
-            || (has_operation
-                && (claim.kind.starts_with("work.") || operation_parts(&claim.body).is_none()))
+            || (has_operation && operation_parts(&claim.body).is_none())
         {
-            let reason = if !Store::simple_replication_kind(&claim.kind) && !has_operation {
-                "non-incremental-kind"
-            } else if claim.kind.starts_with("work.") && has_operation {
-                "work-operation"
-            } else if operation_parts(&claim.body).is_none() && has_operation {
+            let reason = if operation_parts(&claim.body).is_none() && has_operation {
                 "malformed-operation"
             } else {
                 "non-incremental-kind"
             };
-            return Ok(replay_needed(reason));
+            crate::profile::note(&format!("replay: {reason}"));
+            return Ok(IncrementalProjection::ReplayWithContext {
+                reason,
+                details: incremental_claim_error(
+                    St3Error::new(reason, "claim requires canonical replay"),
+                    claim,
+                    "incremental-guard",
+                ).details,
+            });
         }
         // Person asks add steps (and sometimes a whole run) in their own claim. Their response
         // also resumes an originating step. Rebuild the affected tree so a response received
@@ -33696,7 +33935,6 @@ agent "test/empty" { command "true" }
             "unhealthy-projection",
             "frontier-ahead",
             "non-incremental-kind",
-            "work-operation",
             "malformed-operation",
             "operation-conflict",
             "incremental-error:internal",
@@ -33713,9 +33951,7 @@ agent "test/empty" { command "true" }
                 let operation = json!({"id":"op/replay-test", "request_digest":"digest-a"});
                 let (kind, body) = match reason {
                     "non-incremental-kind" => ("work.unknown", json!({"fields":{}})),
-                    "work-operation" => {
-                        ("work.claimed", json!({"fields":{}, "_operation":operation}))
-                    }
+
                     "malformed-operation" => (
                         "harness.observed",
                         json!({"fields":{"state":"ready"}, "_operation":{"id":"op/malformed"}}),
@@ -33799,7 +34035,8 @@ agent "test/empty" { command "true" }
                 .filter_map(|line| line.strip_prefix("st: projection failure detail "))
                 .map(|line| serde_json::from_str::<Value>(line).unwrap())
                 .collect::<Vec<_>>();
-            if reason == "incremental-error:internal" || reason == "operation-conflict" {
+            if matches!(reason, "incremental-error:internal" | "operation-conflict"
+                | "malformed-operation" | "non-incremental-kind") {
                 assert_eq!(details.len(), 1, "{reason}");
                 assert_eq!(details[0]["subject"], "agent/node.test");
                 assert!(
@@ -33810,19 +34047,27 @@ agent "test/empty" { command "true" }
                 assert_eq!(details[0]["error_truncated"], false);
                 if reason == "operation-conflict" {
                     assert_eq!(details[0]["operation_id"], "op/replay-test");
-                    assert!(
-                        details[0]["error"]
-                            .as_str()
-                            .unwrap()
-                            .contains("digest_matches=false")
-                    );
-                } else {
+                    assert!(details[0]["error"].as_str().unwrap().contains("digest_matches=false"));
+                } else if reason == "incremental-error:internal" {
                     assert!(
                         details[0]["error"]
                             .as_str()
                             .unwrap()
                             .contains("missing field")
                     );
+                } else {
+                    assert_eq!(details[0]["stage"], "incremental-guard");
+                    assert_eq!(details[0]["code"], reason);
+                    let expected_kind = match reason {
+                        "malformed-operation" => "harness.observed",
+                        _ => "work.unknown",
+                    };
+                    assert_eq!(details[0]["claim_kind"], expected_kind);
+                    let detail_position = lines.iter().position(|line|
+                        line.starts_with("st: projection failure detail ")).unwrap();
+                    let replay_position = lines.iter().position(|line|
+                        line.starts_with("st: projection full replay ")).unwrap();
+                    assert!(detail_position < replay_position);
                 }
             } else {
                 assert!(details.is_empty(), "{reason}");
@@ -38435,6 +38680,173 @@ version 2
     }
 
     #[test]
+    fn cache_receipt_work_progress_and_complete_do_not_replay_either_node() {
+        let (controller, worker, step) = replicated_step_pair();
+        for action in ["claim", "progress", "complete"] {
+            worker_work(
+                &worker,
+                &step,
+                action,
+                Some("the invented work advances"),
+                &format!("cache-receipt-{action}"),
+            );
+            let claim = worker
+                .claims_for(&step, None)
+                .unwrap()
+                .into_iter()
+                .max_by_key(|claim| claim.store_index)
+                .unwrap();
+            assert!(
+                operation_parts(&claim.body)
+                    .is_some_and(|(id, _)| id.starts_with("cache/")),
+                "the actual work endpoint must attach its durable receipt association"
+            );
+
+            FULL_REPLAYS.with(|count| count.set(0));
+            assert!(worker.project_replication_backlog().unwrap());
+            assert_eq!(FULL_REPLAYS.with(std::cell::Cell::get), 0, "local {action}");
+            assert!(
+                !projection_replayed(&controller, "worker", &worker),
+                "follower {action}"
+            );
+            assert_eq!(
+                graph_digest_of(&worker),
+                graph_digest_of(&controller),
+                "both nodes must project the same actual work transition"
+            );
+        }
+        assert_eq!(worker.step_run(&step).unwrap().unwrap().status, "verifying");
+        assert_eq!(
+            controller.step_run(&step).unwrap().unwrap().status,
+            "verifying"
+        );
+    }
+
+    #[test]
+    fn supported_work_operations_do_not_require_a_cache_prefix() {
+        for operation in ["op/invented-work", "cache/invented-work"] {
+            let (controller, worker, step) = replicated_step_pair();
+            worker_work(&worker, &step, "claim", None, "work-operation-source");
+            let original = worker
+                .claims_for(&step, Some("work.claimed"))
+                .unwrap()
+                .pop()
+                .unwrap();
+            let mut body = original.body.clone();
+            body["_operation"] = json!({"id": operation, "request_digest": "invented-digest"});
+            {
+                let mut connection = controller.connection.lock().unwrap();
+                let transaction = connection.transaction().unwrap();
+                // Historical admitted input with the actual endpoint's transition fields;
+                // changing metadata here is not a production admission bypass.
+                append_claim_record_tx(
+                    &transaction,
+                    "worker",
+                    &step,
+                    "work.claimed",
+                    original.actor.as_deref(),
+                    &body,
+                    &[],
+                    None,
+                )
+                .unwrap();
+                transaction.commit().unwrap();
+            }
+            FULL_REPLAYS.with(|count| count.set(0));
+            assert!(controller.project_replication_backlog().unwrap());
+            assert_eq!(FULL_REPLAYS.with(std::cell::Cell::get), 0, "{operation}");
+            assert_eq!(
+                controller.step_run(&step).unwrap().unwrap().status,
+                "claimed"
+            );
+            assert!(controller.operation_projection_drift().unwrap().is_empty());
+            let incremental = graph_digest_of(&controller);
+            controller.replay_replication_graph().unwrap();
+            assert_eq!(incremental, graph_digest_of(&controller), "{operation}");
+
+            // A conflicting identity still requires canonical replay and names its work claim.
+            body["_operation"]["request_digest"] = json!("different-digest");
+            let incoming = {
+                let mut connection = controller.connection.lock().unwrap();
+                let transaction = connection.transaction().unwrap();
+                let claim = append_claim_record_tx(
+                    &transaction,
+                    "worker",
+                    &step,
+                    "work.claimed",
+                    original.actor.as_deref(),
+                    &body,
+                    &[],
+                    None,
+                )
+                .unwrap();
+                transaction.commit().unwrap();
+                claim
+            };
+            FULL_REPLAYS.with(|count| count.set(0));
+            let mut lines = Vec::new();
+            assert!(
+                controller
+                    .project_replication_backlog_with_log("test", |line| lines.push(line.to_owned()))
+                    .unwrap()
+            );
+            assert_eq!(FULL_REPLAYS.with(std::cell::Cell::get), 1);
+            let detail: Value = serde_json::from_str(
+                lines
+                    .iter()
+                    .find_map(|line| line.strip_prefix("st: projection failure detail "))
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(detail["code"], "operation-conflict");
+            assert_eq!(detail["claim_kind"], "work.claimed");
+            assert_eq!(detail["claim_id"], incoming.id);
+            assert_eq!(detail["operation_id"], operation);
+            assert!(controller.operation_projection_drift().unwrap().is_empty());
+            let conflicted = graph_digest_of(&controller);
+            controller.replay_replication_graph().unwrap();
+            assert_eq!(conflicted, graph_digest_of(&controller));
+        }
+    }
+
+    #[test]
+    fn cache_receipt_work_lifecycle_matches_replay_on_updated_peers() {
+        for action in ["renew", "progress", "release", "fail", "complete"] {
+            let (controller, worker, step) = replicated_step_pair();
+            worker_work(&worker, &step, "claim", None, "receipt-claim");
+            assert!(!projection_replayed(&controller, "worker", &worker));
+            worker_work(
+                &worker,
+                &step,
+                action,
+                Some("invented lifecycle"),
+                "receipt-action",
+            );
+            assert!(
+                !projection_replayed(&worker, "controller", &controller),
+                "local {action}"
+            );
+            assert!(
+                !projection_replayed(&controller, "worker", &worker),
+                "remote {action}"
+            );
+            let incremental = graph_digest_of(&controller);
+            assert_eq!(
+                incremental,
+                graph_digest_of(&worker),
+                "peer parity {action}"
+            );
+            controller.replay_replication_graph().unwrap();
+            assert_eq!(
+                incremental,
+                graph_digest_of(&controller),
+                "canonical parity {action}"
+            );
+            assert!(controller.operation_projection_drift().unwrap().is_empty());
+        }
+    }
+
+    #[test]
     fn work_extensions_project_locally_and_remotely_without_full_replay() {
         let (controller, worker, step) = replicated_step_pair();
         worker_work(&worker, &step, "claim", None, "extension-claim");
@@ -42216,7 +42628,7 @@ version 2
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
                 .unwrap(),
-            16
+            17
         );
         assert_eq!(
             connection
@@ -42290,7 +42702,7 @@ version 2
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
                 .unwrap(),
-            16
+            17
         );
     }
 
@@ -42323,7 +42735,7 @@ version 2
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 16);
+        assert_eq!(version, 17);
         assert_eq!(planner_column, 1);
     }
 
@@ -46835,6 +47247,550 @@ mission "takeover" state="ready" {
             ("failed", "terminal")
         );
         run
+    }
+
+    #[test]
+    fn retention_event_tail_work_is_bounded_during_and_after_migration() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE claims(store_index INTEGER PRIMARY KEY,kind TEXT,body TEXT);
+             CREATE TABLE event_positions(store_index INTEGER PRIMARY KEY,subject TEXT);
+             CREATE TABLE local_event_payloads(store_index INTEGER PRIMARY KEY,subject TEXT);",
+            )
+            .unwrap();
+        for count in [1_000, 10_000, 100_000] {
+            connection.execute_batch(&format!(
+                "DELETE FROM claims; DELETE FROM event_positions; DELETE FROM local_event_payloads;
+                 WITH RECURSIVE numbers(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM numbers WHERE n<{count})
+                 INSERT INTO claims SELECT n,'custom.test.recorded','{{}}' FROM numbers;
+                 INSERT INTO event_positions SELECT store_index,'custom/test/tail' FROM claims WHERE store_index%2=0;
+                 INSERT INTO local_event_payloads SELECT store_index,'custom/test/tail' FROM claims WHERE store_index%2=1;"
+            )).unwrap();
+            for migrating in [true, false] {
+                let mut statement = connection.prepare(event_tail_sql(migrating)).unwrap();
+                let indices = statement
+                    .query_map([3], |row| row.get::<_, u64>(0))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                let expected = if migrating {
+                    vec![count - 2, count - 1, count]
+                } else {
+                    vec![count - 4, count - 2, count]
+                };
+                assert_eq!(indices, expected);
+                assert!(
+                    statement.get_status(rusqlite::StatementStatus::VmStep) < 1_000,
+                    "{count} rows, migrating={migrating}"
+                );
+                assert!(
+                    statement.get_status(rusqlite::StatementStatus::FullscanStep) <= 12,
+                    "only bounded membership and result steps"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn retention_event_publication_bodies_match_the_old_payload_contract() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claims.sqlite");
+        let store = Store::open(&path, "node").unwrap();
+        let source = format!(
+            "{TAKEOVER_SOURCE}\nagent \"payload-worker\" {{ workspace \"/tmp\"; command \"true\" }}\n"
+        );
+        let intent = parse_intent(&source, "node").unwrap();
+        let planned = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source,
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &planned.subject_tokens, "retention-event-payload")
+            .unwrap();
+        let admitted = store.events_after(0, None).unwrap();
+        let mut old_payloads = Vec::new();
+        {
+            let connection = store.connection.write();
+            // Restore the actual schema-16 payload table. Populate it with the inputs used by
+            // the old insert_event, independently of the new join's payload results.
+            connection
+                .execute_batch(
+                    "DROP VIEW events; DROP TABLE event_positions;
+                 CREATE TABLE events (
+                     store_index INTEGER PRIMARY KEY, kind TEXT NOT NULL,
+                     subject TEXT NOT NULL, body TEXT NOT NULL
+                 ); PRAGMA user_version=16;",
+                )
+                .unwrap();
+            for (subject, kind, mut old_body) in [
+                (
+                    "agent/node.payload-worker",
+                    "intent.desired",
+                    serde_json::to_value(&intent.subjects["agent/node.payload-worker"]).unwrap(),
+                ),
+                (
+                    "mission/takeover",
+                    "mission.published",
+                    serde_json::to_value(&intent.missions["takeover"]).unwrap(),
+                ),
+            ] {
+                let event = admitted
+                    .iter()
+                    .find(|event| event.subject == subject && event.kind == kind)
+                    .unwrap();
+                if let Some(operation) = event.body.get("_operation") {
+                    old_body["_operation"] = operation.clone();
+                }
+                // This is schema-16 insert_event's INSERT and canonicalization, rather than
+                // an INSERT SELECT from claims or the new view.
+                connection.execute(
+                    "INSERT OR IGNORE INTO events(store_index, kind, subject, body) VALUES (?1, ?2, ?3, ?4)",
+                    params![event.store_index, kind, subject, canonical_json_text(&old_body).unwrap()],
+                ).unwrap();
+            }
+            let mut statement = connection
+                .prepare("SELECT store_index,kind,subject,body FROM events ORDER BY store_index")
+                .unwrap();
+            old_payloads.extend(
+                statement
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, u64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap(),
+            );
+            assert_eq!(old_payloads.len(), 2);
+        }
+        drop(store);
+        let store = Store::open(&path, "node").unwrap();
+        let read_payloads = || {
+            let connection = store.readers.get();
+            let mut statement = connection
+                .prepare("SELECT store_index,kind,subject,body FROM events ORDER BY store_index")
+                .unwrap();
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, u64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert!(store.event_payload_migration_pending().unwrap());
+        assert_eq!(
+            read_payloads(),
+            old_payloads,
+            "upgrade view must match old stored bytes"
+        );
+        assert_eq!(store.migrate_event_payloads().unwrap(), 2);
+        assert!(!store.event_payload_migration_pending().unwrap());
+        assert_eq!(
+            read_payloads(),
+            old_payloads,
+            "completed payload-free view must match old stored bytes"
+        );
+    }
+
+    fn retention_failed_active_step(store: &Store) -> (MissionRunView, String) {
+        publish_takeover(store, TAKEOVER_SOURCE, "retention-mission");
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "takeover".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/requester".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "retention-run".into(),
+            })
+            .unwrap();
+        let subject = takeover_step(&run, "deploy-check").subject.clone();
+        store
+            .set_step_state(&subject, "failed", Some("fixture failure"))
+            .unwrap();
+        (run, subject)
+    }
+
+    #[test]
+    fn retention_expired_step_retry_refuses_before_any_second_effect() {
+        let store = Store::open_memory("node").unwrap();
+        let (run, subject) = retention_failed_active_step(&store);
+        store
+            .retry_failed_step(&subject, "person/operator", "retry", "expired-retry")
+            .unwrap();
+        // Finish the generation, so the active-response pin no longer postpones expiry.
+        store
+            .set_mission_run_state(&run.id, "failed", "terminal", None)
+            .unwrap();
+        store
+            .connection
+            .write()
+            .execute(
+                "DELETE FROM idempotency WHERE operation_id<>?1",
+                [opaque_cache_key("expired-retry")],
+            )
+            .unwrap();
+        store
+            .connection
+            .write()
+            .execute("UPDATE idempotency SET expires_at_unix_ms=0", [])
+            .unwrap();
+        assert_eq!(store.cleanup_idempotency(0).unwrap().deleted, 1);
+        let before = store.index().unwrap();
+        for _ in 0..2 {
+            let error = store
+                .retry_failed_step(&subject, "person/operator", "retry", "expired-retry")
+                .unwrap_err();
+            assert_eq!(error.code, "idempotency-key-expired");
+            assert!(error.details.get("claim_id").is_some());
+        }
+        assert_eq!(store.index().unwrap(), before);
+        assert_eq!(store.step_run(&subject).unwrap().unwrap().attempt, 2);
+    }
+
+    #[test]
+    fn retention_expired_quiet_renewal_cannot_extend_a_released_lease() {
+        let (_controller, worker, step) = replicated_step_pair();
+        worker_work(&worker, &step, "claim", None, "renew-claim");
+        let before = worker.index().unwrap();
+        worker_work(&worker, &step, "renew", None, "expired-quiet-renew");
+        assert_eq!(
+            worker.index().unwrap(),
+            before,
+            "quiet renewals stay claimless"
+        );
+        worker_work(&worker, &step, "release", None, "renew-release");
+        let released = worker.step_run(&step).unwrap().unwrap();
+        worker
+            .set_mission_run_state(&released.run, "cancelled", "terminal", None)
+            .unwrap();
+        worker
+            .connection
+            .write()
+            .execute(
+                "DELETE FROM idempotency WHERE operation_id<>?1",
+                [opaque_cache_key("expired-quiet-renew")],
+            )
+            .unwrap();
+        worker
+            .connection
+            .write()
+            .execute("UPDATE idempotency SET expires_at_unix_ms=0", [])
+            .unwrap();
+        assert_eq!(worker.cleanup_idempotency(0).unwrap().deleted, 1);
+        let before = worker.index().unwrap();
+        let error = worker
+            .work_action(
+                &step,
+                "renew",
+                &WorkRequest {
+                    actor: Some("agent/worker.one".into()),
+                    incarnation: Some("worker-generation".into()),
+                    summary: None,
+                    reason: None,
+                    evidence: Vec::new(),
+                    idempotency_key: "expired-quiet-renew".into(),
+                },
+            )
+            .unwrap_err();
+        assert_ne!(
+            error.code, "idempotency-key-expired",
+            "the normal ownership/state fence decides a claimless retry"
+        );
+        assert_eq!(worker.index().unwrap(), before);
+        let after = worker.step_run(&step).unwrap().unwrap();
+        assert_eq!(after.claimant, None);
+        assert_eq!(after.claim_expires_at_unix_ms, None);
+    }
+
+    #[test]
+    fn retention_expired_compound_apply_uses_existing_operation_identities() {
+        let store = Store::open_memory("node").unwrap();
+        let declaration = crate::graph::parse_execution_intent(r#"version 2
+resource "receipt/file" { kind "filesystem.file" }
+observer "receipt/file" { resource "resource/receipt/file"; provider "local.file"; locator "/tmp/receipt-file"; field "status" }
+"#,"node","receipt-run").unwrap();
+        store
+            .apply_internal(&declaration, "receipt-declaration")
+            .unwrap();
+        let source = r#"version 2
+resource "receipt/file" {
+    refresh "first" { timeout "1s" }
+    refresh "second" { timeout "1s" }
+}
+"#;
+        let intent = crate::graph::parse_intent(source, "node").unwrap();
+        let planned = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        let first = store
+            .apply_as(
+                &intent,
+                &planned.subject_tokens,
+                "expired-compound",
+                Some("person/operator"),
+            )
+            .unwrap();
+        assert!(first.changed);
+        let operations = store
+            .connection
+            .write()
+            .query_row("SELECT COUNT(*) FROM operations", [], |row| {
+                row.get::<_, u64>(0)
+            })
+            .unwrap();
+        store
+            .connection
+            .write()
+            .execute(
+                "DELETE FROM idempotency WHERE operation_id<>?1",
+                [opaque_cache_key("expired-compound")],
+            )
+            .unwrap();
+        store
+            .connection
+            .write()
+            .execute("UPDATE idempotency SET expires_at_unix_ms=0", [])
+            .unwrap();
+        assert_eq!(store.cleanup_idempotency(0).unwrap().deleted, 1);
+        let before = store.index().unwrap();
+        let current = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        let repeat = store
+            .apply_as(
+                &intent,
+                &current.subject_tokens,
+                "expired-compound",
+                Some("person/operator"),
+            )
+            .unwrap();
+        assert!(!repeat.changed);
+        assert_eq!(store.index().unwrap(), before);
+        assert_eq!(
+            store
+                .connection
+                .write()
+                .query_row("SELECT COUNT(*) FROM operations", [], |row| row
+                    .get::<_, u64>(0))
+                .unwrap(),
+            operations
+        );
+    }
+
+    #[test]
+    fn retention_retry_response_failure_rolls_back_the_transition() {
+        let store = Store::open_memory("node").unwrap();
+        let (_, subject) = retention_failed_active_step(&store);
+        let before = store.index().unwrap();
+        store
+            .connection
+            .write()
+            .execute_batch(
+                "CREATE TRIGGER retention_receipt_failure BEFORE INSERT ON idempotency
+             BEGIN SELECT RAISE(ABORT,'injected lost receipt'); END;",
+            )
+            .unwrap();
+        assert!(
+            store
+                .retry_failed_step(&subject, "person/operator", "retry", "retention-retry")
+                .is_err()
+        );
+        let unchanged = store.step_run(&subject).unwrap().unwrap();
+        assert_eq!(
+            (unchanged.status.as_str(), unchanged.attempt),
+            ("failed", 1)
+        );
+        assert_eq!(store.index().unwrap(), before);
+        store
+            .connection
+            .write()
+            .execute_batch("DROP TRIGGER retention_receipt_failure")
+            .unwrap();
+        let result = store
+            .retry_failed_step(&subject, "person/operator", "retry", "retention-retry")
+            .unwrap();
+        assert_eq!(takeover_step(&result, "deploy-check").attempt, 2);
+    }
+
+    #[test]
+    fn retention_concurrent_retry_commits_once_and_returns_one_response() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let (_, subject) = retention_failed_active_step(&store);
+        let barrier = Arc::new(std::sync::Barrier::new(12));
+        let workers = (0..12)
+            .map(|_| {
+                let store = store.clone();
+                let barrier = barrier.clone();
+                let subject = subject.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store
+                        .retry_failed_step(&subject, "person/operator", "retry", "retention-retry")
+                        .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        let first = serde_json::to_value(&results[0]).unwrap();
+        assert!(
+            results
+                .iter()
+                .all(|result| serde_json::to_value(result).unwrap() == first)
+        );
+        assert_eq!(
+            store
+                .claims_for(&subject, Some("step-run.retried"))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(store.step_run(&subject).unwrap().unwrap().attempt, 2);
+    }
+
+    #[test]
+    fn retention_retry_survives_restart_and_active_generation_expiry() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claims.sqlite");
+        let store = Store::open(&path, "node").unwrap();
+        let (_, subject) = retention_failed_active_step(&store);
+        let response = store
+            .retry_failed_step(&subject, "person/operator", "retry", "retention-retry")
+            .unwrap();
+        drop(store);
+        let store = Store::open(&path, "node").unwrap();
+        let repeated = store
+            .retry_failed_step(&subject, "person/operator", "retry", "retention-retry")
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&repeated).unwrap(),
+            serde_json::to_value(&response).unwrap()
+        );
+        store
+            .connection
+            .write()
+            .execute(
+                "DELETE FROM idempotency WHERE operation_id<>?1",
+                [opaque_cache_key("retention-retry")],
+            )
+            .unwrap();
+        store
+            .connection
+            .write()
+            .execute(
+                "UPDATE idempotency SET expires_at_unix_ms=0 WHERE operation_id=?1",
+                [opaque_cache_key("retention-retry")],
+            )
+            .unwrap();
+        let cleanup = store.cleanup_idempotency(0).unwrap();
+        assert_eq!(cleanup.extended, 1);
+        assert_eq!(cleanup.deleted, 0);
+        assert!(
+            store
+                .cached_idempotency_response::<MissionRunView>("retention-retry")
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            store
+                .claims_for(&subject, Some("step-run.retried"))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn retention_active_response_shapes_remain_pinned_until_the_run_finishes() {
+        let store = Store::open_memory("node").unwrap();
+        let (run, _) = retention_failed_active_step(&store);
+        store
+            .connection
+            .write()
+            .execute("DELETE FROM idempotency", [])
+            .unwrap();
+        let responses = [
+            serde_json::to_value(&run).unwrap(),
+            json!({"mission_run": run}),
+            json!({"mission_run": run.subject, "generation": run.generation}),
+            json!({"mission_run": run.subject}),
+            json!({"mission_run": null, "source_generation": run.generation}),
+            json!({"subject_tokens": BTreeMap::from([(run.subject.clone(), Vec::<String>::new())])}),
+        ];
+        let keys = (0..responses.len())
+            .map(|index| format!("retention-shape-{index}"))
+            .collect::<Vec<_>>();
+        for (key, response) in keys.iter().zip(&responses) {
+            store.cache_idempotency_response(key, response).unwrap();
+            store
+                .connection
+                .write()
+                .execute(
+                    "UPDATE idempotency SET expires_at_unix_ms=0 WHERE operation_id=?1",
+                    [opaque_cache_key(key)],
+                )
+                .unwrap();
+        }
+        let cleanup = store.cleanup_idempotency(0).unwrap();
+        assert_eq!(cleanup.extended, responses.len());
+        assert_eq!(cleanup.deleted, 0);
+        for (key, response) in keys.iter().zip(&responses) {
+            assert_eq!(
+                store
+                    .cached_idempotency_response::<Value>(key)
+                    .unwrap()
+                    .as_ref(),
+                Some(response)
+            );
+        }
+        store
+            .set_mission_run_state(&run.id, "failed", "terminal", Some("fixture finished"))
+            .unwrap();
+        for key in &keys {
+            store
+                .connection
+                .write()
+                .execute(
+                    "UPDATE idempotency SET expires_at_unix_ms=0 WHERE operation_id=?1",
+                    [opaque_cache_key(key)],
+                )
+                .unwrap();
+        }
+        let cleanup = store.cleanup_idempotency(0).unwrap();
+        assert_eq!(cleanup.deleted, responses.len());
+        assert_eq!(cleanup.extended, 0);
     }
 
     #[test]

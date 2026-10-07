@@ -385,6 +385,8 @@ export function conversationEntries(timeline: Entry[], names: Names, filters: re
       const text = {value: body.text};
       if (filters.includes('context-blocks') && !['user','system'].includes(entry.role)) filterContextBlocks(text);
       if (!['user','system'].includes(entry.role)) text.value = cleanMessageText(text.value, filters);
+      // The harness's label for a reasoning step is not part of what it said (as in st3-conversation-ui).
+      if (filters.includes('bookkeeping') && entry.role === 'assistant' && body.text.startsWith('[reasoning]')) text.value = `Thinking · ${body.text.slice('[reasoning]'.length).trim()}`;
       if (filters.includes('excerpts') && body.text.startsWith('[unrecognized ') && [...text.value].length > 512) text.value = [...text.value].slice(0,512).join('') + '…';
       body.text = text.value;
     }

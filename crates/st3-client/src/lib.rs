@@ -122,6 +122,105 @@ fn client_name() -> Option<&'static str> {
     CLIENT_NAME.get().map(String::as_str)
 }
 
+/// One thing the client did, timed, for a test utility that asked to see them with
+/// [`set_observer`]. It names the route without its query, the status, the sizes and the
+/// durations, and never a body, a header or a credential. Observing sends nothing to st.
+#[derive(Clone, Debug)]
+pub enum Observation<'a> {
+    /// An HTTP request: its method, route, how it ended, its status when one came, and how long
+    /// it ran. A request its caller stopped waiting for is reported once, as `Cancelled`, with
+    /// the time it had run; those ages are censored and never a completion time.
+    Request {
+        method: &'a str,
+        route: &'a str,
+        outcome: RequestOutcome,
+        status: Option<u16>,
+        took: Duration,
+    },
+    /// A collections-stream frame: the subscription, the frame kind, its size, and for the
+    /// first frame of a subscription how long after the subscribe command it arrived.
+    Frame {
+        id: &'a str,
+        kind: &'a str,
+        bytes: usize,
+        since_subscribe: Option<Duration>,
+    },
+}
+
+/// How an observed request ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestOutcome {
+    /// A response came, whatever its status.
+    Completed,
+    /// The client's own request deadline passed.
+    TransportTimeout,
+    /// The transport failed before a response.
+    Failed,
+    /// The caller dropped the request (an outer timeout or a cancelled task) before it ended.
+    Cancelled,
+}
+
+/// Reports one request when it ends or is dropped, so a request the caller stopped waiting for
+/// still leaves its age. Created only while observed.
+struct RequestGuard {
+    method: Method,
+    route: String,
+    began: std::time::Instant,
+    reported: bool,
+}
+
+impl RequestGuard {
+    /// `None` unless an observer was set: nothing is timed or copied otherwise.
+    fn begin(method: &Method, path: &str) -> Option<Self> {
+        OBSERVER.get().is_some().then(|| RequestGuard {
+            method: method.clone(),
+            route: path.split('?').next().unwrap_or(path).to_owned(),
+            began: std::time::Instant::now(),
+            reported: false,
+        })
+    }
+
+    fn finish(mut self, outcome: RequestOutcome, status: Option<u16>) {
+        self.reported = true;
+        observe(Observation::Request {
+            method: self.method.as_str(),
+            route: &self.route,
+            outcome,
+            status,
+            took: self.began.elapsed(),
+        });
+    }
+}
+
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        if !self.reported {
+            observe(Observation::Request {
+                method: self.method.as_str(),
+                route: &self.route,
+                outcome: RequestOutcome::Cancelled,
+                status: None,
+                took: self.began.elapsed(),
+            });
+        }
+    }
+}
+
+type ObserverFn = Box<dyn Fn(&Observation<'_>) + Send + Sync>;
+static OBSERVER: std::sync::OnceLock<ObserverFn> = std::sync::OnceLock::new();
+
+/// Report each request and collections frame of this process to `observer`, once; later calls
+/// are ignored. Without it nothing is measured and nothing is allocated.
+pub fn set_observer(observer: impl Fn(&Observation<'_>) + Send + Sync + 'static) {
+    let _ = OBSERVER.set(Box::new(observer));
+}
+
+fn observe(observation: Observation<'_>) {
+    if let Some(observer) = OBSERVER.get() {
+        observer(&observation);
+    }
+}
+
 #[derive(Clone)]
 pub struct Client {
     endpoint: Endpoint,
@@ -190,6 +289,60 @@ impl std::fmt::Debug for RawTerminalAttachment {
     }
 }
 
+/// Raw PTY bytes and a separate, explicit foreground-selection renewal handle.
+///
+/// Keep `activity` alongside the selected terminal's byte connector. Dropping `stream`
+/// cancels the bridge even under backpressure; retaining activity clones does not keep it alive.
+pub struct RawTerminalStream {
+    pub stream: tokio::net::UnixStream,
+    pub activity: RawTerminalActivity,
+}
+
+/// Explicit foreground use of a raw terminal, never an automatic heartbeat.
+///
+/// Only call `selected_use` while this terminal is selected in the foreground. PTY I/O,
+/// background observation, and retaining this handle do not renew a lease. PEEK leases
+/// expire after 60 seconds idle or 300 seconds absolute even with selected-use renewals.
+/// On EOF or expiry, obtain a fresh capability and check readiness through the existing APIs.
+#[derive(Clone)]
+pub struct RawTerminalActivity {
+    controls: tokio::sync::mpsc::Sender<RawTerminalActivityRequest>,
+    selected_use_supported: bool,
+}
+
+impl RawTerminalActivity {
+    /// Send a monotonically sequenced WebSocket text control, separate from PTY bytes.
+    ///
+    /// The bounded queue applies backpressure. Success means the socket send completed,
+    /// not that the server acknowledged renewal. Closed bridges fail rather than renew locally.
+    /// ATTACH streams reject renewal locally without changing their PTY connection.
+    pub async fn selected_use(&self) -> Result<(), ClientError> {
+        if !self.selected_use_supported {
+            return Err(ClientError::Protocol(
+                "selected-use renewal is only supported for PEEK streams".into(),
+            ));
+        }
+        let (sent, receipt) = tokio::sync::oneshot::channel();
+        self.controls
+            .send(RawTerminalActivityRequest { sent })
+            .await
+            .map_err(|_| ClientError::Transport("raw terminal stream is closed".into()))?;
+        receipt
+            .await
+            .map_err(|_| ClientError::Transport("raw terminal stream is closed".into()))?
+    }
+}
+
+struct RawTerminalActivityRequest {
+    sent: tokio::sync::oneshot::Sender<Result<(), ClientError>>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+enum RawTerminalControl {
+    SelectedUse { sequence: u64 },
+}
+
 /// An open terminal stream. Each message is a whole screen that replaces every earlier one.
 pub struct TerminalStream {
     socket: TerminalSocket,
@@ -202,11 +355,16 @@ pub struct ConversationStream {
     limit: usize,
 }
 
+/// The most first-frame timers one stream keeps: a socket holds eight subscriptions.
+const OBSERVED_SUBSCRIPTIONS: usize = 8;
+
 /// Multiplexed current-collection subscriptions on one connection.
 pub struct CollectionStream {
     socket: TerminalSocket,
     limit: usize,
     heard: Heard,
+    /// When each subscription was asked for, until its first frame; kept only when observed.
+    subscribed: std::collections::HashMap<String, std::time::Instant>,
 }
 
 /// Native family window or one exact native ref; the two selectors cannot be combined.
@@ -331,11 +489,32 @@ impl CollectionStream {
     async fn send(&mut self, command: &serde_json::Value) -> Result<(), ClientError> {
         let payload = serde_json::to_string(command)
             .map_err(|error| ClientError::Protocol(error.to_string()))?;
-        match &mut self.socket {
+        let observed_id = (OBSERVER.get().is_some())
+            .then(|| command["id"].as_str().map(str::to_owned))
+            .flatten();
+        let sent = match &mut self.socket {
             TerminalSocket::Unix(socket) => socket.send(WsMessage::Text(payload.into())).await,
             TerminalSocket::Remote(socket) => socket.send(WsMessage::Text(payload.into())).await,
         }
-        .map_err(|error| ClientError::Transport(error.to_string()))
+        .map_err(|error| ClientError::Transport(error.to_string()));
+        // Pending first-frame timers follow the subscriptions: a replacement restarts one, an
+        // unsubscribe or a failed send drops it, and no more are kept than a socket allows.
+        if let Some(id) = observed_id {
+            match (command["kind"].as_str(), &sent) {
+                (Some("subscribe"), Ok(())) => {
+                    if self.subscribed.contains_key(&id)
+                        || self.subscribed.len() < OBSERVED_SUBSCRIPTIONS
+                    {
+                        self.subscribed.insert(id, std::time::Instant::now());
+                    }
+                }
+                (Some("subscribe"), Err(_)) | (Some("unsubscribe"), _) => {
+                    self.subscribed.remove(&id);
+                }
+                _ => {}
+            }
+        }
+        sent
     }
     pub async fn next(&mut self) -> Result<Option<serde_json::Value>, ClientError> {
         let heard = self.heard.clone();
@@ -347,12 +526,31 @@ impl CollectionStream {
                 next_websocket_payload_noting(socket, self.limit, &heard).await?
             }
         };
-        payload
+        let frame = payload
+            .as_ref()
             .map(|bytes| {
-                serde_json::from_slice(&bytes)
+                serde_json::from_slice::<serde_json::Value>(bytes)
                     .map_err(|error| ClientError::Protocol(error.to_string()))
             })
-            .transpose()
+            .transpose()?;
+        if let (Some(frame), Some(bytes)) = (&frame, &payload)
+            && OBSERVER.get().is_some()
+        {
+            let id = frame["id"].as_str().unwrap_or("");
+            let since_subscribe = self.subscribed.remove(id).map(|at| at.elapsed());
+            observe(Observation::Frame {
+                id,
+                kind: frame["kind"].as_str().unwrap_or(""),
+                bytes: bytes.len(),
+                since_subscribe,
+            });
+        }
+        Ok(frame)
+    }
+    /// How many subscriptions are waiting for their first frame to be timed; for tests.
+    #[doc(hidden)]
+    pub fn observed_pending(&self) -> usize {
+        self.subscribed.len()
     }
     /// Where the stream last heard anything: a clone to read while the stream is being waited on.
     pub fn heard(&self) -> Heard {
@@ -2588,15 +2786,31 @@ impl Client {
         .map(|response| response.value)
     }
 
-    /// Consume a capability and return a PTY-compatible Unix connector.
+    /// Consume a capability and return PTY bytes without any lease renewal.
     ///
     /// The caller writes its own ATTACH or PEEK frame. This transport neither parses nor
-    /// synthesizes PTY protocol frames. Dropping the returned stream cancels the bounded
-    /// bridge, including while either direction is backpressured.
+    /// synthesizes PTY frames. PEEK expires after 60 seconds idle or 300 seconds absolute;
+    /// use `raw_terminal_stream_controlled` for explicit foreground-selected renewal.
+    /// Dropping the returned stream cancels the bridge even under backpressure.
     pub async fn raw_terminal_stream(
         &self,
         attachment: &RawTerminalAttachment,
     ) -> Result<tokio::net::UnixStream, ClientError> {
+        Ok(self
+            .raw_terminal_stream_controlled(attachment)
+            .await?
+            .stream)
+    }
+
+    /// Consume a capability and return unchanged PTY bytes plus explicit selected-use control.
+    ///
+    /// Renewal is WebSocket text, never injected into the PTY byte stream. There is no
+    /// automatic renewal. Server close/error text becomes EOF, not PTY bytes. Dropping the
+    /// byte connector cancels the bridge regardless of retained activity clones or backpressure.
+    pub async fn raw_terminal_stream_controlled(
+        &self,
+        attachment: &RawTerminalAttachment,
+    ) -> Result<RawTerminalStream, ClientError> {
         let path = format!(
             "/v1/client/terminals/{}/raw-stream?incarnation={}&mode={}",
             percent_encode_segment(attachment.terminal_id.trim_start_matches("terminal/")),
@@ -2648,7 +2862,7 @@ impl Client {
                 })?
                 .map_err(|error| ClientError::Transport(error.to_string()))?;
                 validate_raw_terminal_subprotocol(&response)?;
-                raw_terminal_connector(websocket)
+                raw_terminal_connector(websocket, attachment.mode == RawTerminalMode::Peek)
             }
             Endpoint::FabricLoopback(base) => {
                 let websocket_base = if let Some(base) = base.strip_prefix("https://") {
@@ -2670,7 +2884,7 @@ impl Client {
                 })?
                 .map_err(|error| ClientError::Transport(error.to_string()))?;
                 validate_raw_terminal_subprotocol(&response)?;
-                raw_terminal_connector(websocket)
+                raw_terminal_connector(websocket, attachment.mode == RawTerminalMode::Peek)
             }
         }
     }
@@ -2820,6 +3034,7 @@ impl Client {
             socket,
             limit: self.response_limit(),
             heard,
+            subscribed: std::collections::HashMap::new(),
         })
     }
 
@@ -3022,6 +3237,8 @@ impl Client {
         content_type: &str,
     ) -> Result<T, ClientError> {
         let limit = self.response_limit();
+        // Measured only when someone asked: no timer and no copy otherwise.
+        let guard = RequestGuard::begin(&method, path);
         let request = async {
             match &self.endpoint {
                 Endpoint::Unix(socket) => {
@@ -3076,9 +3293,18 @@ impl Client {
                 }
             }
         };
-        let (status, bytes) = tokio::time::timeout(REQUEST_DEADLINE, request)
-            .await
-            .map_err(|_| ClientError::Transport("client-v0 request deadline exceeded".into()))??;
+        let outcome = tokio::time::timeout(REQUEST_DEADLINE, request).await;
+        if let Some(guard) = guard {
+            match &outcome {
+                Ok(Ok((status, _))) => guard.finish(RequestOutcome::Completed, Some(*status)),
+                Ok(Err(_)) => guard.finish(RequestOutcome::Failed, None),
+                Err(_) => guard.finish(RequestOutcome::TransportTimeout, None),
+            }
+        }
+        let outcome = outcome
+            .map_err(|_| ClientError::Transport("client-v0 request deadline exceeded".into()))
+            .and_then(|result| result);
+        let (status, bytes) = outcome?;
         if !(200..300).contains(&status) {
             if status == 404 && bytes.is_empty() && path.starts_with("/v1/client/launches/") {
                 let error = ErrorEnvelope {
@@ -3293,7 +3519,8 @@ fn validate_raw_terminal_subprotocol(
 
 fn raw_terminal_connector<S>(
     websocket: WebSocketStream<S>,
-) -> Result<tokio::net::UnixStream, ClientError>
+    selected_use_supported: bool,
+) -> Result<RawTerminalStream, ClientError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -3310,12 +3537,15 @@ where
         .map_err(|error| ClientError::Transport(error.to_string()))?;
     let bridge = tokio::net::UnixStream::from_std(bridge)
         .map_err(|error| ClientError::Transport(error.to_string()))?;
+    let (controls, mut control_requests) =
+        tokio::sync::mpsc::channel::<RawTerminalActivityRequest>(16);
     tokio::spawn(async move {
         let (mut outgoing, mut incoming) = websocket.split();
         let (mut reader, mut writer) = bridge.into_split();
         let flush = tokio::sync::Notify::new();
         let to_gateway = async {
             let mut bytes = [0_u8; RAW_TERMINAL_CHUNK_BYTES];
+            let mut sequence = 0_u64;
             loop {
                 tokio::select! {
                     read = reader.read(&mut bytes) => {
@@ -3328,6 +3558,29 @@ where
                         )).await.is_err() {
                             return;
                         }
+                    }
+                    Some(control) = control_requests.recv() => {
+                        let Some(next) = sequence.checked_add(1) else {
+                            let _ = control.sent.send(Err(ClientError::Protocol(
+                                "raw terminal selected-use sequence exhausted".into(),
+                            )));
+                            return;
+                        };
+                        sequence = next;
+                        let text = match serde_json::to_string(
+                            &RawTerminalControl::SelectedUse { sequence },
+                        ) {
+                            Ok(text) => text,
+                            Err(error) => {
+                                let _ = control.sent.send(Err(ClientError::Protocol(error.to_string())));
+                                return;
+                            }
+                        };
+                        if let Err(error) = outgoing.send(WsMessage::Text(text.into())).await {
+                            let _ = control.sent.send(Err(ClientError::Transport(error.to_string())));
+                            return;
+                        }
+                        let _ = control.sent.send(Ok(()));
                     }
                     () = flush.notified() => {
                         if outgoing.flush().await.is_err() {
@@ -3373,7 +3626,13 @@ where
         // All pumps live in this task. Canceling either direction drops both socket halves
         // and the monitor, so no separately spawned task can retain the remote attachment.
     });
-    Ok(consumer)
+    Ok(RawTerminalStream {
+        stream: consumer,
+        activity: RawTerminalActivity {
+            controls,
+            selected_use_supported,
+        },
+    })
 }
 
 fn validate_terminal_subprotocol(
@@ -4132,5 +4391,17 @@ mod device_stream_policy_tests {
                 assert!(!error.contains("stream-bearer-never-sent"));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod observer_tests {
+    use super::*;
+
+    // This test binary never sets an observer, so it sees the disabled path.
+    #[test]
+    fn without_an_observer_a_request_keeps_no_timing_state() {
+        assert!(OBSERVER.get().is_none());
+        assert!(RequestGuard::begin(&Method::GET, "/v1/client/usage?since_ms=1").is_none());
     }
 }

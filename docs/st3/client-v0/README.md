@@ -763,7 +763,7 @@ fields are:
 
 - `id`: a client-generated stable action ID;
 - `type`: the action discriminator;
-- `idempotency_key`: unique within the paired session for at least 30 days;
+- `idempotency_key`: unique within the paired session; never reuse it for another request;
 - `fence`: the snapshot and exact mutable identities the user acted on;
 - `parameters`: the type-specific body.
 
@@ -775,6 +775,131 @@ exact original request. A snapshot fence proves the host and an index no newer t
 store; unrelated commits do not stale an action. Stale generation, subject revision, incarnation,
 preview or terminal screen fences return `stale-fence` without a partial mutation.
 Multi-subject actions commit atomically or have no effect.
+
+New completed local response receipts last at least **7 days**. Clients must never reuse a
+key for another request. After reclamation, a late retry cannot execute the original effect
+twice: the daemon seeks its primary effect claim through the existing operation index,
+including existing checkpoint operation tombstones. Document writes recover the original
+binding response, even if a retry supplies different bytes and a current binding token. Other
+associated writes return HTTP 409 `idempotency-key-expired`, with the key and original claim id,
+when the saved response cannot be rebuilt. This is terminal (`retryable: false`), not a silent
+success; inspect the committed outcome before deliberately starting a new action with a fresh key.
+
+Seven days covers the phone's eight retries with backoff and normal retries within seconds to
+minutes, including a daemon restart. Exact saved-response replay is supported for seven days;
+durable recognition continues afterward. Receipts already present at the schema-17 upgrade
+are grandfathered: their older claims do not contain the caller-key association. This PR never
+expires those rows or rewrites those claims. A separate follow-up deletes the fixed legacy
+cohort **30 days after actual deployment**, outside realistic client retry horizons. Operations
+must record the deployment timestamp and due date in
+[the legacy cleanup follow-up](https://github.com/compoundingtech/smalltalk/issues/1741).
+That future deletion is an explicit legacy exception, not an indefinite dedupe guarantee.
+
+Cleanup adds, drops and changes **no indexes**. It seeks the first rowid above a persisted legacy
+watermark and examines at most 64 response rows in completion order. It stops at the first young
+row; nonmonotonic completion deadlines can delay later expiry. Active-run receipts move to the
+tail with a renewed deadline using UPDATE, preserving their companion rows. A future writer
+that has neither a durable association nor an explicitly safe retry classification fails closed
+and retains its response. The commit callback only signals a coalesced notification; pooled
+reader deadline checks and the bounded writer transactions run off the request path, pausing
+20 ms between chunks. UTC cleanup is capped by the newest committed claim time plus five
+minutes through the existing accepted-time index. No claim clock means cleanup defers; a bad
+RTC alone cannot reclaim recent receipts. Retries do not refresh expiry.
+The clock anchor includes replicated claims, so a fast-clock peer can advance it. A pre-NTP boot
+clock followed by a forward correction can shorten saved-response retention; durable operation
+recognition still prevents a second effect, but byte-identical response replay can end early.
+The expiry trigger's `unixepoch('subsec')` requires SQLite 3.42+ (bundled SQLite is 3.46).
+Busy/locked failures retry with 200 ms to 5 s backoff; permanent errors stop visibly.
+These response rows and their legacy watermark are local SQLite state, not replicated claims
+or checkpoint authority. Existing canonical claims and checkpoint rules are unchanged.
+
+| Local-response operation | Retry after the response expires |
+| --- | --- |
+| Document binding | Recover the original binding from its `doc.bound` operation claim; refuse terminally if only the checkpoint tombstone remains. |
+| Mission/free-work start, mission output | Recognise the primary creation/output claim and refuse terminally if its response cannot be rebuilt. Deterministic run identity also prevents duplicate creation. |
+| Revision proposal create/adopt/cancel, effectful approve | Recognise the primary proposal/generation claim; terminal refusal prevents repeating its effect. Already-approved no-op responses may be checked again. |
+| Failed-step retry, run outcome, mission retirement | Recognise the primary effect claim and refuse terminally before another attempt, outcome or publication. Effect and response commit atomically. |
+| Work claim/progress/complete/fail/release/extend/handoff, published renewal | Recognise the actual work claim and refuse terminally before another transition. |
+| Quiet work renewal | No new claim: retry under current generation, attempt, actor/incarnation and lease checks. Extending a still-held lease is naturally idempotent; a released/expired lease cannot be renewed. |
+| Declarative/owned-set apply, quick agent creation | Direct declarations carry a primary caller association. Compound publication operations retain their existing durable operation ids; identical retries are no-ops. Claimless unchanged apply is safe to recompute. A compound-only apply with different bytes and a reused key after expiry is a new apply, so clients must never reuse keys. Declaration and quick-agent response commit together. |
+| Resource observation completion | Recognise the primary actual observation/state/delivery claim and refuse terminally before another delivery. A completion with no recorded change has no receipt/effect to repeat. |
+
+Asks, attention actions, message sends and held effects are not pinned by this local-response
+rule: their existing deterministic durable claim identities and action receipts provide dedupe.
+Client actions keep their durable `custom.client.action-result` receipt; normal claim append
+uses its existing operation identity and checkpoint tombstones. Cleanup never deletes these
+claims. Rust SDK/CLI and stui use the client's transient-error classification; unknown codes
+follow `retryable`, and this new code is terminal. TypeScript/phone `isTransient` and
+`retryTransient` likewise stop on this code; the phone's fresh-fence `notApplied` retry list
+contains only stale-fence/rate-limited. Swift preserves unknown codes and `retryable: false`.
+
+Caller keys have one namespace across actors and nodes that share these claims. Use a fresh,
+globally unique key for each new request; keys are not an authorization boundary. Reusing
+another caller's key can return a terminal refusal identifying their original claim. Actor-scoped
+keys would require a compatible namespace migration and are a separate follow-up.
+Revision approval currently commits its approval before cutover and response storage; a crash
+or concurrent retry in that interval can receive the same terminal refusal before seven days.
+Inspect the proposal's current state rather than retrying its effect with a fresh key.
+Compound publication receipts use existing operation identities. Checkpoint rules version 11
+has no drop rule for `publication.operation`, so those claims remain available to rebuild the
+operation registry; this release does not change that rule.
+
+Claim event positions keep their local store index through schema-17 migration. Converting an
+existing event table seeds its resume floor once at the current store frontier: older checkpoints
+did not record enough position information to prove earlier cursors continuous. Lagging followers
+receive one explicit HTTP 410 and must resync; a cursor equal to the upgrade frontier continues.
+Fresh stores keep floor zero, and ordinary excluded-claim gaps never raise it. Event payloads are
+read from claims; a local membership index records which accepted claims were eligible for the
+feed. The temporary legacy payload table drains in transactions of at most 64 rows. Schema 17
+requires the matching daemon on that node; an older binary refuses the upgraded database. Older
+peers keep their own local event cursors and continue replicating the same claim vocabulary.
+Schema 17 is a one-way database upgrade: take a supported backup before upgrade; downgrade
+requires restoring that backup. The legacy migration window ends when the 64-row worker drains
+`local_event_payloads`; its duration depends on existing rows and writer competition. No fixed
+duration or throughput is promised before copied-store measurements.
+
+Live claim bodies and positions do not change in place: local admission inserts them and replication
+uses `INSERT OR IGNORE`, with checkpoint tombstones refusing dropped claims. Live checkpoint
+deletion removes event membership and raises its floor before deleting the claim, in the same
+transaction. Checkpoint proof renumbers positions only on its proof copy, after clearing local
+projections, and rebuilds membership before comparing reader answers. Repair/replay also clears
+and rebuilds membership; it does not update a live claim body behind an existing event pointer.
+Projection tail reads bound membership before joining bodies, including during legacy migration.
+
+`GET /v1/events/page` scans at most 201 eligible rows for a page limit of 1 through 200. Its
+`items`, `next_after`, `has_more`, and `frontier` fields separate visible results from scan
+progress. An owner filter can return no items while `next_after` still advances. Subject and owner filtering
+always happen after the bounded global scan, including after migration; no subject index is added. With `wait=true`, an empty
+page that advances the cursor waits 250 ms before returning, capped by the remaining requested
+timeout. This paces following clients during migration without discarding eligible events or
+scanning additional pages inside the request. Matching pages return promptly; `wait=false`
+remains an explicit bounded catch-up read. Following clients, including the CLI, use `wait=true`.
+The server deadline envelope adds the clamped requested wait (10 ms through 30 seconds) to
+its ordinary 15-second read budget only when paged wait mode is enabled. Each bounded store
+query retains the ordinary query budget; waiting and pacing do not extend its SQL work budget.
+Trace follow
+uses this continuation and registers its wake before reading the frontier. The legacy
+`GET /v1/events` keeps its array shape, returns at most 200 rows, and reports continuation in
+`X-ST-Next-After`, `X-ST-Has-More`, and `X-ST-Frontier`; owner filters and subject filters
+during migration require the page endpoint. CLI condition, restart, and harness waits use pages.
+A new CLI probes that route once. On a bare missing-route 404, it negotiates only a legacy daemon
+that explicitly advertises `features.bounded_legacy_events=1`; otherwise it stops with daemon
+upgrade guidance before requesting legacy history. Typed refusals, errors and HTTP 410 never
+activate negotiation.
+A cursor before the recorded checkpoint deletion floor receives HTTP 410 `cursor-gap` with
+`full_resync=true`, `resume_floor`, and `frontier`. Refresh projections and establish a new
+cursor explicitly; do not silently reset or keep retrying the old cursor. Client-v0 event feeds
+continue returning their existing `oldest_cursor` and `newest_cursor` resync details. A bounded
+replacement without an old cursor returns a continuation at least at the current frontier, so the
+next request cannot loop on the upgrade floor. Raw event consumers exit with status 6 on
+`cursor-gap` and print the floor/frontier. Trace followers also print an explicit
+`st trace show ... --after-index FRONTIER --follow` continuation command on the same endpoint.
+Inspect retained claims before opting into that continuation: the reported gap is never replayed.
+Without `--after-index`, trace displays its bounded history then starts following at the observed
+global frontier, even if that subject has no claims or its newest claim predates the floor.
+Capabilities read their event cursor and floor together and advertise that observed frontier.
+Replacing a
+projection does not pretend to replay missed durable transitions.
 
 The v0 action discriminators are:
 
