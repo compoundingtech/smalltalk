@@ -2134,12 +2134,14 @@ fn runtime_resources_for_owner(
             BTreeSet::from([owner.to_owned()]),
             snapshot.store_index,
             history,
+            crate::store::ClaimsReduction::Summary,
         )?
     } else {
         state.store.status_for_claim_kind_at(
             "runtime.observed",
             Some(snapshot.store_index),
             history,
+            crate::store::ClaimsReduction::Summary,
         )?
     };
     // Each runtime's declaration and observation time, in one statement apiece for the list.
@@ -2569,10 +2571,12 @@ fn machine_resources(
         .collect::<BTreeSet<_>>();
     host_ids.extend(configured_hosts.iter().cloned());
     host_ids.extend(host_runtime_ids.keys().cloned());
-    let status =
-        state
-            .store
-            .status_for_subject_prefix_at("host/", Some(snapshot.store_index), history)?;
+    let status = state.store.status_for_subject_prefix_at(
+        "host/",
+        Some(snapshot.store_index),
+        history,
+        crate::store::ClaimsReduction::Summary,
+    )?;
     let mut host_statuses = status
         .subjects
         .into_iter()
@@ -4711,7 +4715,7 @@ pub(super) fn conversation_session_id(state: &AppState, id: &str) -> Result<Stri
     if id.starts_with("agent/") {
         let status = state
             .store
-            .status_for_subject_prefix_at("agent/", None, true)
+            .status_for_subject_prefix_at("agent/", None, true, crate::store::ClaimsReduction::Summary)
             .map_err(ApiError::internal)?;
         let subject = status
             .subjects

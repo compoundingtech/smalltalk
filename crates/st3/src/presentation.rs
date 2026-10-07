@@ -1510,6 +1510,7 @@ mod tests {
             harness: None,
             conflicts: Vec::new(),
             claims: vec!["claim/actual".into()],
+            claims_summary: Default::default(),
             owner_run: Some("mission-run/test/run".into()),
             gap: None,
             reachability: "reachable".into(),
