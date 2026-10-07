@@ -394,3 +394,178 @@ fn a_profile_configured_gate_uses_the_gateway_and_node_identity_without_local_cr
     }
     gateway.join().unwrap();
 }
+
+#[test]
+fn doctor_for_non_developers_does_not_warn_about_missing_source_tools() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let bin = home.join("studio-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::os::unix::fs::symlink(
+        st_runtime::resolve_executable("env", &std::env::vars().collect()).unwrap(),
+        bin.join("env"),
+    )
+    .unwrap();
+    std::fs::write(
+        home.join(".bash_profile"),
+        format!("export PATH='{}'\n", bin.display()),
+    )
+    .unwrap();
+    // The daemon needs its PTY runtime even when no source-build tools are installed.
+    executable(&bin.join("pty"), "#!/bin/sh\nprintf '[]\\n'\n");
+    let (_service, socket) = start_service(root.path(), &home, &root.path().join("state"));
+    let report = doctor_report(&home, &socket);
+    let checks = report["checks"].as_array().unwrap();
+    for name in ["build-tools", "github-observer-auth"] {
+        let check = checks.iter().find(|check| check["name"] == name).unwrap();
+        assert_eq!(check["status"], "unknown", "{report}");
+        assert!(
+            !check["message"].as_str().unwrap().contains("install"),
+            "{check}"
+        );
+    }
+    assert!(
+        !checks.iter().any(|check| {
+            matches!(check["status"].as_str(), Some("warn" | "fail"))
+                && ["cargo", "rustc", "mold", "sccache", "gh auth", "nix"]
+                    .iter()
+                    .any(|tool| check["message"].as_str().unwrap().contains(tool))
+        }),
+        "{report}"
+    );
+}
+
+#[test]
+fn doctor_outage_advice_is_for_people_and_preserves_json_and_agent_exit_status() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    for identity in [
+        None,
+        Some("ST_AGENT"),
+        Some("ST_MISSION_RUN"),
+        Some("ST3_INCARNATION"),
+    ] {
+        let agent = identity.is_some();
+        for json in [false, true] {
+            let mut command =
+                st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"));
+            command
+                .env_clear()
+                .env("HOME", root.path())
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("ST3_DAEMON_WAIT", "0")
+                .arg("--endpoint")
+                .arg(root.path().join("missing.sock"))
+                .arg("doctor");
+            if let Some(identity) = identity {
+                command.env(identity, "fixture-identity");
+            }
+            if json {
+                command.arg("--json");
+            }
+            let output = command.output().unwrap();
+            assert_eq!(output.status.code(), Some(5), "{output:?}");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if agent {
+                assert!(
+                    !stderr.contains("Run `st`") && !stderr.contains("st setup"),
+                    "{stderr}"
+                );
+                assert!(stderr.contains("may be restarting"), "{stderr}");
+            } else {
+                assert!(
+                    stderr.contains("Run `st`") && stderr.contains("st setup"),
+                    "{stderr}"
+                );
+                assert!(!stderr.contains("may be restarting"), "{stderr}");
+            }
+            if json {
+                let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(report["status"], "fail");
+                assert_eq!(report["checks"][0]["name"], "daemon");
+                let message = report["checks"][0]["message"].as_str().unwrap();
+                assert_eq!(message.contains("st setup"), !agent, "{report}");
+            }
+        }
+    }
+}
+
+#[test]
+fn developer_doctor_is_explicit_local_and_never_runs_cargo_or_gh() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let bin = home.join("studio-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::os::unix::fs::symlink(
+        st_runtime::resolve_executable("env", &std::env::vars().collect()).unwrap(),
+        bin.join("env"),
+    )
+    .unwrap();
+    std::fs::write(
+        home.join(".bash_profile"),
+        format!("export PATH='{}'\n", bin.display()),
+    )
+    .unwrap();
+    let run = || {
+        st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
+            .env_clear()
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .arg("--endpoint")
+            .arg(root.path().join("missing.sock"))
+            .args(["doctor", "--developer", "--strict", "--json"])
+            .output()
+            .unwrap()
+    };
+    let output = run();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["status"], "warn");
+    assert_eq!(report["scope"], "local developer tools");
+    let message = report["checks"][0]["message"].as_str().unwrap();
+    for tool in ["cargo", "rustc", "sccache", "git", "nix"] {
+        assert!(message.contains(tool), "{report}");
+    }
+    assert!(!message.contains("gh"), "{report}");
+    let calls = root.path().join("tool-calls");
+    for tool in ["cargo", "rustc", "mold", "sccache", "git", "nix", "gh"] {
+        executable(
+            &bin.join(tool),
+            &format!("#!/bin/sh\nprintf x >> '{}'\nexit 9\n", calls.display()),
+        );
+    }
+    let output = run();
+    assert!(output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["status"], "pass");
+    assert!(
+        !calls.exists(),
+        "developer checks must not invoke source tools"
+    );
+    assert!(!root.path().join("missing.sock").exists());
+}
+
+#[test]
+fn developer_doctor_cannot_be_combined_with_offline_audit_or_performance() {
+    for other in ["--offline-audit", "--performance"] {
+        let mut command = st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"));
+        command.args(["doctor", "--developer", other]);
+        if other == "--offline-audit" {
+            command.arg("fixture.sqlite3");
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("cannot be used"),
+            "{output:?}"
+        );
+    }
+}

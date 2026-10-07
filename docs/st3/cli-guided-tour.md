@@ -361,11 +361,19 @@ converge known contradictions without rewriting history.
 st doctor --help
 st doctor
 st doctor --strict
+st doctor --developer
 st repair --help
 st repair dry-run --help
 st repair dry-run
 st repair apply --help
 ```
+
+Ordinary doctor reads do not require source-build tools or the GitHub CLI. Unchecked
+platform evidence stays named `unknown`; strict mode fails only on computed warnings
+or failures. `--developer` separately checks this account's login PATH for source-build
+tools, without contacting the daemon, compiling a crate, or looking up credentials.
+Use `--developer --strict` to fail when a source-build tool is absent. It cannot be
+combined with `--performance` or `--offline-audit`.
 
 Apply nothing unless the dry-run reports a real, understood plan. Check pass/warn/fail semantics,
 exit status, evidence, remediation, stable repair classes, approval token, and zero-change retry.
