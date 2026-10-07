@@ -32,8 +32,8 @@ use crate::hash::{
 };
 use crate::replication::*;
 use crate::sqlite::{
-    PINNED_READER, PinnedRead, ReadPool, SQLITE_COMMIT_NANOS, SQLITE_COMMITS, SQLITE_NANOS,
-    STATEMENT_CACHE_CAPACITY, WriterConnection,
+    CommitObserver, PINNED_READER, PinnedRead, ReadPool, SQLITE_COMMIT_NANOS, SQLITE_COMMITS,
+    SQLITE_NANOS, STATEMENT_CACHE_CAPACITY, WriterConnection,
 };
 
 #[cfg(test)]
@@ -746,6 +746,22 @@ pub struct Store {
 }
 
 impl Store {
+    /// Observe committed authority before writes acknowledge success. The callback reads through
+    /// the supplied writer connection and must not acquire the writer itself. Keep the returned
+    /// handle for the authorization's lifetime; dropping it unregisters and waits for a callback
+    /// running on another thread. Self-drop is safe. Register before rechecking current authority
+    /// outside a pinned snapshot, because registration does not report a commit whose observer
+    /// snapshot was already taken.
+    ///
+    /// Callbacks must fail closed on read errors, must not panic, and should capture owners weakly
+    /// to avoid cycles. See [`WriterConnection::observe_commits`].
+    pub fn observe_commits(
+        &self,
+        callback: impl Fn(&Connection) + Send + Sync + 'static,
+    ) -> CommitObserver {
+        self.connection.observe_commits(callback)
+    }
+
     /// Open the store at `path`, creating it when it does not exist, with `runtime`'s tables
     /// and projections beside the graph's.
     pub fn open(path: &Path, origin: impl Into<String>, runtime: Arc<dyn Runtime>) -> Result<Self> {
