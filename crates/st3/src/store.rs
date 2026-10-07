@@ -10018,28 +10018,36 @@ impl Store {
     /// The fields used by live terminal fences, with the same authority decisions as `status`.
     pub(crate) fn runtime_authority(&self, subject: &str) -> Result<Option<RuntimeAuthority>> {
         smallclaims::touched::note_read(|| subject.to_owned());
-        if subject.starts_with("glass/") || subject.starts_with("arrangement/") {
-            return Ok(None);
-        }
         let connection = self.readers.get();
         // Eligibility, inherited fields and unknown claims must share one snapshot: a rival
         // arriving between SELECTs must not be paired with the earlier single origin.
         let connection = connection.unchecked_transaction()?;
-        let desired = desired_row_at(&connection, subject, None)?;
-        let (actual, actual_origin, conflict) = match runtime_only_authority(&connection, subject)? {
+        Self::runtime_authority_on(&connection, subject)
+    }
+
+    /// Runtime fences inside an existing read or committed-write snapshot.
+    pub(crate) fn runtime_authority_on(
+        connection: &Connection,
+        subject: &str,
+    ) -> Result<Option<RuntimeAuthority>> {
+        if subject.starts_with("glass/") || subject.starts_with("arrangement/") {
+            return Ok(None);
+        }
+        let desired = desired_row_at(connection, subject, None)?;
+        let (actual, actual_origin, conflict) = match runtime_only_authority(connection, subject)? {
             Some((actual, origin)) => (Some(actual), Some(origin), false),
             None => {
                 let member = desired.as_ref()
                     .and_then(|row| row.member.as_deref())
                     .and_then(|value| serde_json::from_str::<crate::model::MemberSpec>(value).ok());
-                let actual = latest_actual_at(&connection, subject, None)?;
+                let actual = latest_actual_at(connection, subject, None)?;
                 let (_, origin, conflict) = selected_actual_source_at(
-                    &connection, subject, None, member.as_ref().map(|member| member.host.as_str()),
+                    connection, subject, None, member.as_ref().map(|member| member.host.as_str()),
                 )?;
                 (actual, origin, conflict)
             }
         };
-        let reachability = if conflict || has_unknown_claim_at(&connection, subject, None)?.is_some() {
+        let reachability = if conflict || has_unknown_claim_at(connection, subject, None)?.is_some() {
             "indeterminate"
         } else {
             actual.as_ref()
