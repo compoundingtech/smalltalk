@@ -182,7 +182,7 @@ class Discord:
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
         try:
             # Anonymous CDN download: never send the bot credential to an attachment URL.
-            with opener.open(urllib.request.Request(url), timeout=15) as response:
+            with opener.open(urllib.request.Request(url, headers={'User-Agent': 'DiscordBot (https://github.com/compoundingtech/smalltalk, 0.1)'}), timeout=15) as response:
                 data = response.read(IMAGE_LIMIT + 1)
         except (OSError, urllib.error.URLError):
             raise Later('Discord image download did not complete; import remains queued.') from None
