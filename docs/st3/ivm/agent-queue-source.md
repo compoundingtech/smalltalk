@@ -74,8 +74,9 @@ Local controls: nine ordered-component tests cover canonical ties, future-clock
 joins, ignored moves, late prerequisites, bounded suffix rollback/reopen,
 namespace isolation, actual query plans, one-node append/no-op duplicates,
 permuted real replication, randomized full replay parity and explicit key
-exhaustion. Seven real Store queue controls cover populated seven-run counts and
+exhaustion. Nine real Store queue controls cover populated seven-run counts and
 five-item previews, selected label parity, terminal membership, nested selectors,
 inclusive native claim expiry, generation replacement/carried priority, source
 rollback/unsupported shapes, two-namespace total deletion budgets, preview query
-plans and label-only public-key invalidation.
+plans, label-only public-key invalidation, ordered/permuted/duplicate populated
+replication, and real Store reopening with pending writer work.

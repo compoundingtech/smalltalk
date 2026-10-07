@@ -646,3 +646,104 @@ fn captured_label_only_replacement_invalidates_public_agent_without_queue_delta(
         Some("Revised sample title")
     );
 }
+
+#[test]
+fn populated_queue_and_labels_match_ordered_permuted_duplicate_replication() {
+    use crate::store::tests::{exchange_from, receive_and_project};
+    let (store, _, runs, agents) = fixture();
+    let agent = runs[0].steps[0].assigned_to.as_ref().unwrap();
+    store
+        .move_seat_queue_run(&SeatQueueMoveRequest {
+            agent: agent.clone(),
+            run: runs[5].subject.clone(),
+            placement: "top".into(),
+            anchor: None,
+            reason: Some("invented fixture".into()),
+            actor: "person/avery".into(),
+            idempotency_key: "replicated-move".into(),
+        })
+        .unwrap();
+    let subject = store.agent_work_queues().unwrap()[agent]
+        .next_work_id
+        .clone()
+        .unwrap();
+    store
+        .work_action(
+            &subject,
+            "claim",
+            &WorkRequest {
+                actor: Some(agent.clone()),
+                incarnation: Some("replicated-sample".into()),
+                summary: None,
+                reason: None,
+                evidence: vec![],
+                idempotency_key: "replicated-claim".into(),
+            },
+        )
+        .unwrap();
+    let exchange = exchange_from(&store, &ReplicationInventory::default());
+    let at = now_ms();
+    for reverse in [false, true] {
+        let target = Store::open_memory("birch").unwrap();
+        let mut exchange = exchange.clone();
+        if reverse {
+            exchange.envelopes.reverse();
+        }
+        receive_and_project(&target, "cedar", &exchange);
+        let ns = {
+            let mut writer = target.connection.write();
+            namespace(&mut writer)
+        };
+        let mut source = Source::default();
+        source.capture(&target, &ns);
+        source.settle(&target, &ns, at, 2);
+        source.parity(&target, &ns, at, &agents);
+        assert_eq!(
+            rows(&target.readers.get(), &ns, &agents, at).unwrap(),
+            store.agent_work_queues().unwrap()
+        );
+        receive_and_project(&target, "cedar", &exchange);
+        source.capture(&target, &ns);
+        assert_eq!(source.settle(&target, &ns, at, 2), 0);
+        source.parity(&target, &ns, at, &agents);
+    }
+}
+
+#[test]
+fn real_store_reopen_preserves_pending_component_and_requires_writer_resume() {
+    use crate::store::tests::{exchange_from, receive_and_project};
+    let (store, _, _, agents) = fixture();
+    let exchange = exchange_from(&store, &ReplicationInventory::default());
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("queue.sqlite3");
+    let target = Store::open(&path, "birch").unwrap();
+    receive_and_project(&target, "cedar", &exchange);
+    let ns = {
+        let mut writer = target.connection.write();
+        namespace(&mut writer)
+    };
+    let mut source = Source::default();
+    source.capture(&target, &ns);
+    let at = now_ms();
+    {
+        let mut writer = target.connection.write();
+        let tx = writer.transaction().unwrap();
+        let page = drain(&tx, &ns, at, 1).unwrap();
+        assert_eq!(page.processed, 1);
+        assert!(!page.clean);
+        tx.commit().unwrap();
+    }
+    assert!(rows(&target.readers.get(), &ns, &agents, at).is_err());
+    drop(target);
+    let target = Store::open(&path, "birch").unwrap();
+    assert!(rows(&target.readers.get(), &ns, &agents, at).is_err());
+    assert!(!clean(&target.readers.get(), &ns, at).unwrap());
+    source.settle(&target, &ns, at, 1);
+    source.parity(&target, &ns, at, &agents);
+    assert!(
+        rows(&target.readers.get(), &ns, &agents, at)
+            .unwrap()
+            .values()
+            .all(|queue| queue.queued_work_count == 7)
+    );
+}

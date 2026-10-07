@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Extend agent queue dependency controls for populated replication and interrupted reopen",
+  "replay": {
+    "status": "none",
+    "detail": "Tests and qualification documentation only; no production runtime, source certification, schema, protocol, activation or recovery behavior changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Tests and qualification documentation only; no production runtime, source certification, schema, protocol, activation or recovery behavior changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Tests and qualification documentation only; no production runtime, source certification, schema, protocol, activation or recovery behavior changes."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Tests and qualification documentation only; no production runtime, source certification, schema, protocol, activation or recovery behavior changes."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Tests and qualification documentation only; no production runtime, source certification, schema, protocol, activation or recovery behavior changes."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Tests and qualification documentation only; no production runtime, source certification, schema, protocol, activation or recovery behavior changes."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Tests and qualification documentation only; no production runtime, source certification, schema, protocol, activation or recovery behavior changes."
+  }
+}
