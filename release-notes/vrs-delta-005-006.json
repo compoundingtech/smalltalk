@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "VRS documentation updates for harness-context cost scope and delivery-state deletion readiness.",
+  "replay": {"status": "none", "detail": "Documentation-only changes; runtime replay behavior is unchanged."},
+  "schema": {"status": "none", "detail": "No database or persisted record schema change."},
+  "rules": {"status": "none", "detail": "No checkpoint rules change."},
+  "compatibility": {"status": "none", "detail": "Documentation-only/internal VRS updates; no client, wire, or harness contract is changed by this PR."},
+  "downtime": {"status": "none", "detail": "No service interruption introduced."},
+  "manual": {"status": "none", "detail": "No manual upgrade steps; HC-R16 wording is explicitly an unratified proposal pending Johannes's confirmation."},
+  "recovery": {"status": "none", "detail": "No runtime recovery change; DELTA-006 records that migration deletion is not currently safe."}
+}
