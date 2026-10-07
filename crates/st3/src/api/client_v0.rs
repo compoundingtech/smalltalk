@@ -7383,8 +7383,12 @@ async fn close_terminal_stream_with_error(socket: &mut WebSocket, error: &ApiErr
     let envelope = terminal_stream_error(error);
     let _ = send_terminal_stream_value(socket, &envelope).await;
     let code = envelope["code"].as_str().unwrap_or("internal").to_owned();
-    let close = if code == "internal" { 1011 } else { 1008 };
+    let close = terminal_error_close_code(&code);
     close_terminal_stream(socket, close, &code).await;
+}
+
+fn terminal_error_close_code(code: &str) -> u16 {
+    if matches!(code, "internal" | "database-busy" | "database-locked") { 1011 } else { 1008 }
 }
 
 /// Hold an owner-local terminal stream open. The first message is the current screen; every
@@ -9584,6 +9588,18 @@ mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt as _;
     use std::sync::Barrier;
+
+    #[test]
+    fn terminal_contention_preserves_retryable_code_and_service_close() {
+        for code in ["database-busy", "database-locked"] {
+            let envelope = terminal_stream_error(&ApiError::bad(St3Error::new(code, "fixture contention")));
+            assert_eq!(envelope["code"], code);
+            assert_eq!(envelope["retryable"], true);
+            assert_eq!(terminal_error_close_code(envelope["code"].as_str().unwrap()), 1011);
+        }
+        assert_eq!(terminal_error_close_code("internal"), 1011);
+        assert_eq!(terminal_error_close_code("stale-incarnation"), 1008);
+    }
 
     fn assert_collection_frame_conforms(frame: &Value) {
         let mut schema: Value = serde_json::from_str(include_str!(

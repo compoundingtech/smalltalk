@@ -11475,6 +11475,16 @@ impl<R: RuntimeControl> Reconciler<R> {
     /// for a lasting reason is failed so the schedule can fire again. A request that waits for
     /// something this host has not received yet stays pending, and the schedule records why.
     fn reconcile_schedule_work(&self, schedule: &DesiredSubject) -> Result<()> {
+        self.reconcile_schedule_work_with_start(schedule, |request, parent, schedule, occurrence| {
+            self.store.create_scheduled_mission_run(request, parent, schedule, occurrence)
+        })
+    }
+
+    fn reconcile_schedule_work_with_start(
+        &self, schedule: &DesiredSubject,
+        mut start: impl FnMut(&MissionRunRequest, Option<&MissionRunView>, &str, u64)
+            -> Result<MissionRunView, crate::model::St3Error>,
+    ) -> Result<()> {
         self.store
             .owned_desired_guard(schedule)
             .map_err(anyhow::Error::new)?;
@@ -11616,7 +11626,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             } else {
                 match &schedule.owner_run {
                     Some(owner) => match self.store.mission_run(owner)? {
-                        Some(parent) => self.store.create_scheduled_mission_run(
+                        Some(parent) => start(
                             &request_value,
                             Some(&parent),
                             &schedule.subject,
@@ -11630,7 +11640,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                             continue;
                         }
                     },
-                    None => self.store.create_scheduled_mission_run(
+                    None => start(
                         &request_value,
                         None,
                         &schedule.subject,
@@ -11735,6 +11745,17 @@ impl<R: RuntimeControl> Reconciler<R> {
         &self,
         item: &DesiredSubject,
         held: &[crate::model::AttentionRequestView],
+    ) -> Result<()> {
+        self.reconcile_subscription_mission_with_start(item, held,
+            |request, parent, subscription, resource, discovery| {
+                self.store.create_subscription_mission_run(request, parent, subscription, resource, discovery)
+            })
+    }
+
+    fn reconcile_subscription_mission_with_start(
+        &self, item: &DesiredSubject, held: &[crate::model::AttentionRequestView],
+        mut start: impl FnMut(&MissionRunRequest, Option<&MissionRunView>, &str, &str, &str)
+            -> Result<MissionRunView, crate::model::St3Error>,
     ) -> Result<()> {
         let Some(spec) = crate::graph::subscription_spec(&item.desired) else {
             return Ok(());
@@ -11952,7 +11973,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 },
                 None => None,
             };
-            let created = self.store.create_subscription_mission_run(&request_value, parent.as_ref(), &item.subject, resource, discovery);
+            let created = start(&request_value, parent.as_ref(), &item.subject, resource, discovery);
             let run = match created {
                 Ok(run) => run,
                 Err(error) if matches!(error.code, "stale-ref-head" | "stale-pull-request" | "completed-subscription-snapshot") => {
@@ -14374,12 +14395,12 @@ fn step_path_of_subject(subject: &str) -> Option<&str> {
 
 /// Whether a mission run could not start only because this host lacks a claim that replication
 /// can still deliver, such as a mission revision, an owner run, or an input's claim published on
-/// another host.
+/// another host, or because transient SQLite contention prevented the start.
 fn start_waits_for_replication(error: &crate::model::St3Error) -> bool {
     matches!(
         error.code,
         "missing-mission" | "missing-mission-run" | "missing-resource-input-version" | "internal"
-    )
+    ) || error.is_sqlite_contention()
 }
 
 /// Run `item`, turning a panic into an error so one item cannot end the reconciler task.
@@ -21892,6 +21913,96 @@ mission "scheduled-cycle" state="ready" {
             .unwrap()
             .revision
     }
+    #[test]
+    fn scheduled_start_contention_waits_without_durable_failure_then_starts() {
+        use serde_json::json;
+        for code in [rusqlite::ffi::SQLITE_BUSY, rusqlite::ffi::SQLITE_LOCKED] {
+            let root = tempfile::tempdir().unwrap();
+            let store = Arc::new(Store::open_memory("node").unwrap());
+            let revision = scheduled_mission_revision(&store);
+            apply_source(&store, &format!(r#"version 2
+schedule "cycle" {{ every "7d"; anchor "2030-01-01T00:00:00Z"
+  work {{ mission "scheduled-cycle@{revision}"; workspace "{}" }}
+}}"#, root.path().display()), "cycle");
+            let request = store.append_claim(&ClaimInput {
+                subject: "schedule/cycle".into(), kind: "schedule.work-requested".into(), actor: None,
+                fields: BTreeMap::from([
+                    ("revision".into(), json!("node")), ("occurrence".into(), json!(4)),
+                    ("mission".into(), json!("mission/scheduled-cycle")),
+                    ("mission_revision".into(), json!(revision)),
+                    ("workspace".into(), json!(root.path().to_string_lossy())), ("inputs".into(), json!({})),
+                ]), evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+            let reconciler = Reconciler::new(store.clone(), Arc::new(FakeRuntime::default()), "node".into(), Arc::new(Notify::new()));
+            let schedule = store.desired_subjects().unwrap().into_iter().find(|s| s.subject == "schedule/cycle").unwrap();
+            let mut called = 0;
+            assert!(reconciler.reconcile_schedule_work_with_start(&schedule, |_, _, _, _| {
+                called += 1;
+                Err(smallclaims::error::internal(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None)))
+            }).is_err());
+            assert_eq!(called, 1);
+            assert!(store.claims_for(&schedule.subject, Some("schedule.work-failed")).unwrap().is_empty());
+            assert!(store.claims_for(&schedule.subject, Some("schedule.work-started")).unwrap().is_empty());
+            assert_eq!(store.pending_schedule_work_requests(&schedule.subject).unwrap()[0].id, request.id);
+            reconciler.reconcile_schedule_work(&schedule).unwrap();
+            let starts = store.claims_for(&schedule.subject, Some("schedule.work-started")).unwrap();
+            assert_eq!(starts.len(), 1);
+            assert_eq!(starts[0].body["fields"]["request"], request.id);
+            assert!(store.claims_for(&schedule.subject, Some("schedule.work-failed")).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn subscription_start_contention_waits_without_durable_failure_then_starts() {
+        use serde_json::json;
+        for code in [rusqlite::ffi::SQLITE_BUSY, rusqlite::ffi::SQLITE_LOCKED] {
+            let root = tempfile::tempdir().unwrap();
+            let store = Arc::new(Store::open_memory("node").unwrap());
+            apply_source(&store, r#"version 2
+mission "review" state="ready" {
+  input "source" kind="resource"
+  completion { when "all-steps-exhausted" }
+  goal "Review one item."
+  step "review" { agentless }
+}"#, "review");
+            let revision = store.mission_spec("review", None).unwrap().unwrap().revision;
+            apply_source(&store, &format!(r#"version 2
+resource "repo" {{ kind "vcs.repository" }}
+observer "repo" {{ resource "resource/repo"; provider "github.repository"; locator "example/repo"; field "issues" }}
+subscription "reviews" {{ observer "observer/repo"; on "issues"
+ delivery "mission" {{ mission "review@{revision}"; resource "source"; workspace "{}" }}
+}}"#, root.path().display()), "subscription");
+            let discovery = store.append_claim(&ClaimInput {
+                subject: "resource/repo".into(), kind: "resource.observed".into(), actor: None,
+                fields: BTreeMap::from([("kind".into(), json!("vcs.repository"))]), evidence: Vec::new(),
+                expected_subject: None, idempotency_key: None,
+            }).unwrap();
+            let request = store.append_claim(&ClaimInput {
+                subject: "subscription/reviews".into(), kind: "subscription.mission-requested".into(), actor: None,
+                fields: BTreeMap::from([
+                    ("mission".into(), json!("mission/review")), ("mission_revision".into(), json!(revision)),
+                    ("resource".into(), json!("resource/repo")), ("resource_input".into(), json!("source")),
+                    ("workspace".into(), json!(root.path().to_string_lossy())), ("discovery".into(), json!(discovery.id)),
+                ]), evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+            let reconciler = Reconciler::new(store.clone(), Arc::new(FakeRuntime::default()), "node".into(), Arc::new(Notify::new()));
+            let item = store.desired_subjects().unwrap().into_iter().find(|s| s.subject == "subscription/reviews").unwrap();
+            let mut called = 0;
+            assert!(reconciler.reconcile_subscription_mission_with_start(&item, &[], |_, _, _, _, _| {
+                called += 1;
+                Err(smallclaims::error::internal(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None)))
+            }).is_err());
+            assert_eq!(called, 1);
+            assert!(store.claims_for(&item.subject, Some("subscription.mission-failed")).unwrap().is_empty());
+            assert_eq!(store.pending_subscription_mission_requests(&item.subject).unwrap()[0].id, request.id);
+            reconciler.reconcile_subscription_mission(&item, &[]).unwrap();
+            let starts = store.claims_for(&item.subject, Some("subscription.mission-started")).unwrap();
+            assert_eq!(starts.len(), 1);
+            assert_eq!(starts[0].body["fields"]["request"], request.id);
+            assert!(store.claims_for(&item.subject, Some("subscription.mission-failed")).unwrap().is_empty());
+        }
+    }
+
     #[test]
     fn scheduled_work_requests_on_two_members_converge() {
         let root = tempfile::tempdir().unwrap();
