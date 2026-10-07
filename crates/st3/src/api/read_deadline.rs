@@ -565,7 +565,7 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(
                 serde_json::to_vec(&crate::peer::ClientReadRequest {
-                    authority_actor: "person/invented".into(),
+                    authority_actor: "person/fixture".into(),
                     relay: None,
                     request: crate::peer::ClientReadOperation::ConversationChanges {
                         session_id: "invented".into(),
@@ -624,7 +624,7 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(
                 serde_json::to_vec(&crate::peer::ClientReadRequest {
-                    authority_actor: "person/invented".into(),
+                    authority_actor: "person/fixture".into(),
                     relay: None,
                     request: crate::peer::ClientReadOperation::Timeline {
                         session_id: "invented".into(),
@@ -680,7 +680,7 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(
                 serde_json::to_vec(&crate::peer::ClientReadRequest {
-                    authority_actor: "person/invented".into(),
+                    authority_actor: "person/fixture".into(),
                     relay: None,
                     request: crate::peer::ClientReadOperation::TerminalControl {
                         action_id: "invented".into(),
@@ -815,7 +815,7 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(
                 serde_json::to_vec(&ClientReadRequest {
-                    authority_actor: "person/invented".into(),
+                    authority_actor: "person/fixture".into(),
                     relay: Some(ClientReadRoute {
                         target: "host/far".into(),
                         path: vec!["near".into()],
@@ -835,7 +835,7 @@ mod tests {
         server.abort();
         let _ = server.await;
         let seen = seen_rx.await.unwrap();
-        assert_eq!(seen.authority_actor, "person/invented");
+        assert_eq!(seen.authority_actor, "person/fixture");
         assert!(
             seen.relay.is_none(),
             "the last hop reaches the owner directly"
