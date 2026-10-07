@@ -15751,12 +15751,12 @@ mission "expiring-work" state="ready" {
         }).unwrap();
         // Shorten this fixture's lease before any cache is built; no claims are changed.
         let expires = client_now_ms() + 1_000;
-        store.connection.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute(
+        store.connection.lock().expect("fixture writer").execute(
             "UPDATE step_runs SET lease_expires_at_unix_ms=?1 WHERE subject=?2",
             rusqlite::params![expires.to_string(), step],
         ).unwrap();
         let index = store.index().unwrap();
-        let (status, claimed) = get_request(app(state.clone()), "/v1/client/agents").await;
+        let (status, claimed) = get_request(router(state.clone()), "/v1/client/agents").await;
         assert_eq!(status, StatusCode::OK, "{claimed}");
         assert_eq!(claimed["items"][0]["current_work_ids"], json!([step]));
         let full = client_agent_resources_cached(store, false, index).unwrap();
@@ -15766,7 +15766,7 @@ mission "expiring-work" state="ready" {
             u64::try_from(expires.saturating_sub(client_now_ms()) + 1).unwrap(),
         )).await;
         assert_eq!(store.index().unwrap(), index, "lease expiry must not append a claim");
-        let (status, ready) = get_request(app(state.clone()), "/v1/client/agents").await;
+        let (status, ready) = get_request(router(state.clone()), "/v1/client/agents").await;
         assert_eq!(status, StatusCode::OK, "{ready}");
         assert_eq!(ready["items"][0]["current_work_ids"], json!([]));
         assert_eq!(ready["items"][0]["next_work_id"], step.as_str());
