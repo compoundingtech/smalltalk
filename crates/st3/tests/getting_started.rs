@@ -280,22 +280,23 @@ fn offline_strict_checks_computed_evidence_without_contacting_a_daemon() {
     drop(store);
     let listener = std::os::unix::net::UnixListener::bind(root.path().join("run/st.sock")).unwrap();
     listener.set_nonblocking(true).unwrap();
-    let run = || {
-        Newcomer::command(root.path())
-            .args([
-                "doctor",
-                "--offline-audit",
-                input.to_str().unwrap(),
-                "--audit-scratch-dir",
-                root.path().join("scratch").to_str().unwrap(),
-                "--strict",
-                "--json",
-            ])
-            .output()
-            .unwrap()
+    let run = |strict| {
+        let mut command = Newcomer::command(root.path());
+        command.args([
+            "doctor",
+            "--offline-audit",
+            input.to_str().unwrap(),
+            "--audit-scratch-dir",
+            root.path().join("scratch").to_str().unwrap(),
+            "--json",
+        ]);
+        if strict {
+            command.arg("--strict");
+        }
+        command.output().unwrap()
     };
     let before = std::fs::read(&input).unwrap();
-    let healthy = run();
+    let healthy = run(true);
     assert!(
         healthy.status.success(),
         "{}",
@@ -319,11 +320,39 @@ fn offline_strict_checks_computed_evidence_without_contacting_a_daemon() {
     );
     assert_eq!(std::fs::read(&input).unwrap(), before);
     let connection = rusqlite::Connection::open(&input).unwrap();
+    // An unsupported schema identifier prevents a computed digest audit from finishing.
+    connection
+        .execute_batch("ALTER TABLE operations ADD COLUMN \"unsupported name\" TEXT")
+        .unwrap();
+    drop(connection);
+    let warning = run(true);
+    assert_eq!(warning.status.code(), Some(2));
+    let report: Value = serde_json::from_slice(&warning.stdout).unwrap();
+    assert!(
+        report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| check["status"] == "warn")
+    );
+    assert!(
+        !report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| check["status"] == "fail"),
+        "{report}"
+    );
+    assert!(
+        run(false).status.success(),
+        "ordinary offline audit permits computed warnings"
+    );
+    let connection = rusqlite::Connection::open(&input).unwrap();
     connection
         .execute("UPDATE operations SET state='conflict'", [])
         .unwrap();
     drop(connection);
-    let corrupted = run();
+    let corrupted = run(true);
     assert_eq!(corrupted.status.code(), Some(2));
     let report: Value = serde_json::from_slice(&corrupted.stdout).unwrap();
     assert!(

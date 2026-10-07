@@ -744,7 +744,7 @@ mod tests {
                 .to_string_lossy()
                 .starts_with("st3-offline-audit-")
         }));
-        // SIGINT/SIGTERM set this same cancellation flag in the single-threaded CLI. This
+        // SIGINT/SIGTERM/SIGHUP set this same cancellation flag in the single-threaded CLI. This
         // fixture proves cancellation unwinds scratch files; actual signal wiring needs the CLI unit.
         cancelled.store(true, Ordering::Relaxed);
         let interrupted = offline_full_audit_with_limits(
@@ -766,7 +766,16 @@ mod tests {
                 .starts_with("st3-offline-audit-")
         }));
         std::fs::write(&copy, b"not a sqlite database").unwrap();
-        assert!(offline_full_audit(&copy, &live).is_err());
+        let corrupt = offline_full_audit(&copy, &live).unwrap();
+        assert!(
+            corrupt
+                .report
+                .checks
+                .iter()
+                .any(|check| check.name == "sqlite-integrity" && check.status == "fail")
+        );
+        assert_eq!(corrupt.report.exit_status(true), 2);
+        assert_eq!(std::fs::read(&copy).unwrap(), b"not a sqlite database");
         assert!(!std::fs::read_dir(root.path()).unwrap().any(|entry| {
             entry
                 .unwrap()
