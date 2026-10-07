@@ -472,6 +472,20 @@ fn structured_request(
             buttons.push(("c", "Answer in words", Hit::Key('c'), theme::ACCENT));
         }
         card.buttons(&buttons);
+        // x cannot close a question that needs one of its answers; say so and what does.
+        let declining = request
+            .answers
+            .iter()
+            .find(|answer| answer.outcome.as_deref() == Some("decline"))
+            .map(|answer| format!("“{}” declines it", answer.label))
+            .unwrap_or_else(|| "pick the answer that says no".to_owned());
+        card.wrap(
+            &text::inline(
+                &format!("x cannot dismiss this: it needs one of its answers ({declining})."),
+                theme::dim(),
+            ),
+            inner,
+        );
     }
     if !request.why_person.is_empty() {
         card.blank();

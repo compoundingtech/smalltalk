@@ -6703,6 +6703,7 @@ mod tests {
             "Read it",
             "Clears this item.",
             "Why you: You asked for a summary.",
+            "x cannot dismiss this: it needs one of its answers",
         ] {
             assert!(screen.contains(shown), "{shown}: {screen}");
         }
