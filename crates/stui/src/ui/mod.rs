@@ -604,7 +604,13 @@ impl Ui {
             self.tab = index;
             chosen.push(self.selected_id());
         }
-        let before = self.world.attention.items().to_vec();
+        // Only what was on screen from a live reading can have closed under the person's eyes;
+        // a stored copy, or a reading before the first live one, is just replaced.
+        let before = if matches!(self.world.link, Link::Live) {
+            self.world.attention.items().to_vec()
+        } else {
+            Vec::new()
+        };
         self.world = world;
         self.keep_closed_attention(before);
         for (index, id) in chosen.into_iter().enumerate() {
