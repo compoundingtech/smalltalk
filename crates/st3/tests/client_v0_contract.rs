@@ -249,22 +249,80 @@ fn family_references_reject_cross_family_and_malformed_ids() {
     }
     for (definition, allowed, rejected) in [
         (
+            "MissionWorkAssigneeId",
+            &["agent/example", "person/example"][..],
+            "daemon/example",
+        ),
+        (
             "ActorRef",
-            ["agent/example", "daemon/example", "person/example"],
+            &["agent/example", "daemon/example", "person/example"][..],
             "step/example",
         ),
         (
             "ParticipantRef",
-            ["agent/example", "person/example", "step/example"],
+            &["agent/example", "person/example", "step/example"][..],
             "daemon/example",
         ),
     ] {
         for validator in [consumer_validator(definition), contract_validator(definition)] {
-            for valid in &allowed {
+            for valid in allowed {
                 assert_conforms(&validator, definition, &Value::String((*valid).into()));
             }
             assert!(!validator.is_valid(&Value::String(rejected.into())));
         }
+    }
+    for validator in [consumer_validator("MissionStep"), contract_validator("MissionStep")] {
+        let step = serde_json::json!({
+            "id": "step/example", "path": "step", "title": null, "state": "ready",
+            "attempt": 0, "assignee": "person/example", "claimant": "agent/example",
+            "agentless": false, "since": "2026-10-07T00:00:00.000Z",
+            "last_progress": null, "blocked_reason": null, "blockers": [],
+            "goals": [], "constraints": [], "loop_round": null,
+            "loop_max_rounds": null, "loop_reason": null, "next_wake_at": null,
+            "wake_reason": null, "wake": null, "claim_expires_at": null
+        });
+        assert_conforms(&validator, "person-assigned mission step", &step);
+        let mut daemon_step = step.clone();
+        daemon_step["assignee"] = Value::String("daemon/example".into());
+        assert!(!validator.is_valid(&daemon_step), "mission step must reject daemons");
+        let mut person_claimed_step = step.clone();
+        person_claimed_step["claimant"] = Value::String("person/example".into());
+        assert!(
+            !validator.is_valid(&person_claimed_step),
+            "mission step claimants must remain agent-only"
+        );
+    }
+    for validator in [
+        consumer_validator("MissionRunSummary"),
+        contract_validator("MissionRunSummary"),
+    ] {
+        let mut summary = serde_json::json!({
+            "id": "mission-run/example", "requester": "person/example",
+            "status": "running", "phase": "work", "progress": {"done": 0, "total": 1},
+            "current_steps": [{
+                "id": "step-run/example", "title": null, "state": "ready",
+                "since": "2026-10-07T00:00:00.000Z",
+                "assignee": "person/example", "claimant": "agent/example"
+            }],
+            "must_act": "you", "state_since": "2026-10-07T00:00:00.000Z"
+        });
+        assert_conforms(&validator, "person-assigned current step summary", &summary);
+        summary["current_steps"][0]["claimant"] = Value::String("person/example".into());
+        assert!(
+            !validator.is_valid(&summary),
+            "current step claimants must remain agent-only"
+        );
+    }
+    for validator in [consumer_validator("MissionWake"), contract_validator("MissionWake")] {
+        let wake = serde_json::json!({
+            "assignee": "agent/example", "assignee_state": "running",
+            "incarnation_id": "i1", "attempts": 0, "last_attempt_at": null,
+            "acknowledged_by": null, "failure": null
+        });
+        assert_conforms(&validator, "agent mission wake", &wake);
+        let mut person_wake = wake.clone();
+        person_wake["assignee"] = Value::String("person/example".into());
+        assert!(!validator.is_valid(&person_wake), "MissionWake must remain agent-only");
     }
 }
 
@@ -3075,6 +3133,74 @@ async fn operational_lists_share_one_versioned_paginated_shape() {
     assert_conforms(&validator, "retained agents page", &continued);
     assert_eq!(first["snapshot"]["id"], continued["snapshot"]["id"]);
     assert_eq!(second["value"]["items"], continued["value"]["items"]);
+}
+
+#[tokio::test]
+async fn person_assigned_ready_steps_decode_without_harness_wakes() {
+    let root = tempfile::tempdir().unwrap();
+    let state = test_state(root.path());
+    let source = r#"version 2
+mission "person-assignee" state="ready" {
+  goal "Perform person-assigned work."
+  step "review" { assigned-to "person/example" }
+}
+"#;
+    let intent = st3::graph::parse_intent(source, state.store.origin()).unwrap();
+    let planned = state
+        .store
+        .mission(
+            &intent,
+            st3::model::IntentInput {
+                kdl: source.into(),
+                source_name: None,
+            },
+        )
+        .unwrap();
+    state
+        .store
+        .apply(&intent, &planned.subject_tokens, "person-assignee-definition")
+        .unwrap();
+    let run = state
+        .store
+        .create_mission_run(&st3::model::MissionRunRequest {
+            mission: "person-assignee".into(),
+            revision: None,
+            workspace: root.path().display().to_string(),
+            requester: Some("person/example".into()),
+            mode: Some("run".into()),
+            inputs: Default::default(),
+            idempotency_key: "person-assignee-run".into(),
+        })
+        .unwrap();
+    state
+        .store
+        .set_step_state(&run.steps[0].subject, "ready", None)
+        .unwrap();
+    let app = st3::api::router(state);
+    for path in [
+        "/v1/client/missions",
+        "/v1/client/missions/person-assignee",
+    ] {
+        let (status, response) = client_json(app.clone(), path).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_conforms(&consumer_validator("Envelope"), path, &response);
+        assert_conforms(&contract_validator("Envelope"), path, &response);
+        let mission = if path.ends_with("person-assignee") {
+            response["value"].clone()
+        } else {
+            response["value"]["items"][0].clone()
+        };
+        let mission: st3_client::Mission = serde_json::from_value(mission).unwrap();
+        let detail = &mission.run_details[0];
+        let step = &detail.steps.as_ref().unwrap()[0];
+        assert_eq!(step.state, "ready");
+        assert_eq!(step.assignee.as_deref(), Some("person/example"));
+        assert!(step.wake.is_none(), "person assignees have no harness to wake");
+        assert_eq!(
+            detail.current_steps[0]["assignee"].as_str(),
+            Some("person/example")
+        );
+    }
 }
 
 #[tokio::test]
