@@ -387,6 +387,39 @@ fn a_sealed_set_read_in_pages_is_the_same_set_whatever_the_page() {
             "identities differ at page {envelope_page}"
         );
     }
+    // The Rust sort of the pages is the SQL canonical order, on a fixture of many batches.
+    let connection = store.readers.get();
+    let sql_order: Vec<String> = connection
+        .prepare(&canonical_sql(
+            "SELECT claims.id FROM claims
+             JOIN replica_records records ON records.claim_id=claims.id
+             WHERE records.state<>'repaired' ORDER BY CANONICAL_ASC(claims)",
+        ))
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    let paged_order: Vec<String> = whole.claims.iter().map(|sealed| sealed.claim.id.clone()).collect();
+    assert_eq!(paged_order, sql_order, "the pages sort as ORDER BY canonical sorts");
+    // The record page query is driven from replica_records by its rowid range. A plan that
+    // drove from claims would read every claim for every window.
+    let plan: Vec<String> = connection
+        .prepare(&format!("EXPLAIN QUERY PLAN {}", sealed_records_page_sql()))
+        .unwrap()
+        .query_map([0_i64, 1_000_i64], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert!(
+        plan.first().is_some_and(|line| line.contains("records") && line.contains("INTEGER PRIMARY KEY")),
+        "the page query must start from a rowid range of replica_records: {plan:?}"
+    );
+    assert!(
+        !plan.iter().any(|line| line.starts_with("SCAN claims") || line.starts_with("SCAN records")),
+        "the page query must not scan a whole table: {plan:?}"
+    );
+    drop(connection);
     // The default pages are what the daemon uses.
     assert_eq!(
         format!("{:?}", store.checkpoint_sealed_set(cut).unwrap().claims),

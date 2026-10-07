@@ -578,6 +578,22 @@ pub fn prove_on_copy(
     Ok(proof)
 }
 
+/// The query for one window of records in the sealed-set read: the claim columns, the record's
+/// identity and state, and the canonical order's components as columns 14 to 20 (so the pages
+/// can be sorted together in Rust as `ORDER BY canonical` sorted them), then the record's
+/// position as column 21. It must be driven from `replica_records` by its rowid range; a plan
+/// that drives from `claims` would read every claim for every window.
+pub fn sealed_records_page_sql() -> String {
+    let order = super::canonical::components("claims").join(", ");
+    format!(
+        "SELECT {CLAIM_COLUMNS}, records.writer, records.sequence, records.envelope_hash,
+                records.state, {order}, records.position
+         FROM claims JOIN batches ON batches.id=claims.batch_id
+         JOIN replica_records records ON records.claim_id=claims.id
+         WHERE records.rowid > ?1 AND records.rowid <= ?2 AND records.state<>'repaired'"
+    )
+}
+
 impl Store {
     /// The envelopes this node holds from before `cut_unix_ms`, and their admitted claims in
     /// canonical order. An envelope with any claim dated at or after the cut is not before it.
@@ -661,37 +677,14 @@ impl Store {
             after = upto;
         }
         envelopes.retain(|envelope| envelope.accepted_at_unix_ms < cut_unix_ms);
-        let connection = self.readers.get();
-        let protected = connection
-            .prepare(
-                "SELECT claim_id FROM desired WHERE claim_id IS NOT NULL
-                 UNION SELECT claim_id FROM mission_definitions
-                 UNION SELECT claim_id FROM mission_revisions
-                 UNION SELECT binding_claim_id FROM documents WHERE binding_claim_id IS NOT NULL
-                 UNION SELECT json_extract(body, '$.fields.replacement') FROM claims
-                     WHERE kind='record.repaired'
-                 UNION SELECT replacement_claim_id FROM replica_records
-                     WHERE replacement_claim_id IS NOT NULL",
-            )?
-            .query_map([], |row| row.get::<_, Option<String>>(0))?
-            .filter_map(|row| row.transpose())
-            .collect::<rusqlite::Result<BTreeSet<_>>>()?;
         // A repaired original is left out, as projections leave it out: a node holds its row
         // only when it admitted the original before the repair arrived, so including it would
         // make the set, and every digest of it, differ between nodes that hold the same
         // envelopes.
-        drop(connection);
         // Read the records a window at a time, each window on a read of its own, with the
         // canonical order's components as columns so the pages sort together here exactly as
         // `ORDER BY canonical` sorted them in SQL (binary text, then integers, NULL first).
-        let order = super::canonical::components("claims").join(", ");
-        let records_sql = format!(
-            "SELECT {CLAIM_COLUMNS}, records.writer, records.sequence, records.envelope_hash,
-                    records.state, {order}
-             FROM claims JOIN batches ON batches.id=claims.batch_id
-             JOIN replica_records records ON records.claim_id=claims.id
-             WHERE records.rowid > ?1 AND records.rowid <= ?2 AND records.state<>'repaired'"
-        );
+        let records_sql = sealed_records_page_sql();
         let (first, last): (i64, i64) = {
             let connection = self.readers.get();
             connection.query_row(
@@ -700,7 +693,9 @@ impl Store {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )?
         };
-        type OrderKey = (i64, String, Option<String>, Option<i64>, String, i64, String);
+        // The canonical order, then the record's own identity, so a claim held by two records
+        // (the same claim admitted from two envelopes) orders the same way every time.
+        type OrderKey = (i64, String, Option<String>, Option<i64>, String, i64, String, String, i64, String, i64);
         let mut keyed: Vec<(OrderKey, ClaimRecord, EnvelopeKey, bool)> = Vec::new();
         let mut after = first.saturating_sub(1);
         while after < last {
@@ -718,6 +713,10 @@ impl Store {
                             row.get(18)?,
                             row.get(19)?,
                             row.get(20)?,
+                            row.get(10)?,
+                            row.get(11)?,
+                            row.get(12)?,
+                            row.get(21)?,
                         ),
                         claim_from_row(row)?,
                         EnvelopeKey {
@@ -737,6 +736,23 @@ impl Store {
             .into_iter()
             .map(|(_, claim, envelope, valid)| (claim, envelope, valid))
             .collect();
+        // Read after the record pages, so it is at least as new as the claims: a claim that became
+        // protected while the pages were read is protected here, and the set errs toward keeping.
+        let connection = self.readers.get();
+        let protected = connection
+            .prepare(
+                "SELECT claim_id FROM desired WHERE claim_id IS NOT NULL
+                 UNION SELECT claim_id FROM mission_definitions
+                 UNION SELECT claim_id FROM mission_revisions
+                 UNION SELECT binding_claim_id FROM documents WHERE binding_claim_id IS NOT NULL
+                 UNION SELECT json_extract(body, '$.fields.replacement') FROM claims
+                     WHERE kind='record.repaired'
+                 UNION SELECT replacement_claim_id FROM replica_records
+                     WHERE replacement_claim_id IS NOT NULL",
+            )?
+            .query_map([], |row| row.get::<_, Option<String>>(0))?
+            .filter_map(|row| row.transpose())
+            .collect::<rusqlite::Result<BTreeSet<_>>>()?;
         let connection = self.readers.get();
         let mut late = BTreeSet::new();
         for (claim, envelope, _) in &claims {
