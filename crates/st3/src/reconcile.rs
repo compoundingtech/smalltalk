@@ -3945,17 +3945,34 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .collect::<Vec<_>>();
             attempts.sort_by_key(|(at, _)| *at);
             let acknowledged = work_wake_acknowledged(&attempts, harness.as_ref());
-            if acknowledged {
+            let idle_unclaimed_deadline = harness
+                .as_ref()
+                .filter(|harness| acknowledged && matches!(harness.state.as_str(), "ready" | "idle"))
+                .and_then(|_| attempts.last())
+                .map(|(last, _)| last.saturating_add(WORK_WAKE_EXHAUST_GRACE_MS));
+            if acknowledged && idle_unclaimed_deadline.is_none_or(|due| now < due) {
+                if let Some(due) = idle_unclaimed_deadline {
+                    smallclaims::touched::note_due(due);
+                }
                 continue;
             }
             let attempt_count = u32::try_from(attempts.len()).unwrap_or(u32::MAX);
-            match work_wake_decision(
-                attempt_count,
-                attempts.last().map(|(last, _)| *last),
-                attempts.first().map(|(first, _)| *first),
-                acknowledged,
-                now_ms(),
-            ) {
+            let decision = if acknowledged {
+                // A consumed wake is delivery proof, not a held work lease. Do not
+                // interrupt a working turn, but surface ready work left unclaimed
+                // after the assignee has returned idle. One fenced diagnostic;
+                // no repeated wake or unbounded retry is introduced here.
+                WorkWakeDecision::Exhaust
+            } else {
+                work_wake_decision(
+                    attempt_count,
+                    attempts.last().map(|(last, _)| *last),
+                    attempts.first().map(|(first, _)| *first),
+                    false,
+                    now,
+                )
+            };
+            match decision {
                 WorkWakeDecision::Request(wake_attempt) => {
                     append_work_wake_message(
                         &self.store,
@@ -3971,10 +3988,11 @@ impl<R: RuntimeControl> Reconciler<R> {
                     self.signal_changed();
                 }
                 WorkWakeDecision::Exhaust => {
-                    let reason = format!(
-                        "`{agent}` did not start a turn or claim `{}` after {attempt_count} supported driver wake attempts",
-                        step.subject
-                    );
+                    let reason = if acknowledged {
+                        format!("`{agent}` consumed a supported work wake but is idle with `{}` still unclaimed after the readiness grace", step.subject)
+                    } else {
+                        format!("`{agent}` did not start a turn or claim `{}` after {attempt_count} supported driver wake attempts", step.subject)
+                    };
                     let diagnostic_key =
                         format!("work-wake-exhausted:{agent}:{tag_value}:{attempt_count}");
                     if self.store.operation_claim(&diagnostic_key)?.is_none() {
@@ -14703,12 +14721,14 @@ fn work_wake_deadline(
         })
         .filter(|wake| {
             matches!(wake.assignee_state.as_str(), "ready" | "working" | "idle")
-                && wake.acknowledged_by.is_none()
+                && (wake.acknowledged_by.is_none()
+                    || matches!(wake.assignee_state.as_str(), "ready" | "idle"))
                 && wake.failure.is_none()
                 && wake.attempts <= WORK_WAKE_MAX_ATTEMPTS
         })
         .map(|wake| {
-            let delay = if wake.attempts == WORK_WAKE_MAX_ATTEMPTS {
+            let delay = if wake.acknowledged_by.is_some()
+                || wake.attempts == WORK_WAKE_MAX_ATTEMPTS {
                 // Reconcile once more after startup grace to record a genuine
                 // exhaustion even when no other graph event arrives.
                 WORK_WAKE_EXHAUST_GRACE_MS
@@ -35587,6 +35607,20 @@ agent "worker" { workspace "/tmp"; command "true"; restart "never" }
             ),
             Some(1_000 + WORK_WAKE_RETRY_MS)
         );
+        let mut consumed = work[0].clone();
+        consumed.wake.as_mut().unwrap().acknowledged_by = Some("consumed".into());
+        assert_eq!(work_wake_deadline(&[consumed.clone()],
+            &BTreeSet::from(["agent/remote.worker".into()]), &BTreeMap::new(), 2_000),
+            Some(1_000 + WORK_WAKE_EXHAUST_GRACE_MS),
+            "a consumed wake cannot silently leave ready work on an idle seat");
+        consumed.wake.as_mut().unwrap().assignee_state = "working".into();
+        assert_eq!(work_wake_deadline(&[consumed.clone()],
+            &BTreeSet::from(["agent/remote.worker".into()]), &BTreeMap::new(), 2_000), None,
+            "do not interrupt a live working turn");
+        consumed.wake.as_mut().unwrap().assignee_state = "idle".into();
+        consumed.wake.as_mut().unwrap().failure = Some("already reported".into());
+        assert_eq!(work_wake_deadline(&[consumed],
+            &BTreeSet::from(["agent/remote.worker".into()]), &BTreeMap::new(), 2_000), None);
         let mut exhausted = work[0].clone();
         exhausted.wake.as_mut().unwrap().attempts = WORK_WAKE_MAX_ATTEMPTS;
         assert_eq!(
@@ -35908,7 +35942,10 @@ mission "gated" state="ready" {
 
     impl SeatQueueFixture {
         fn new() -> Self {
-            let store = Arc::new(Store::open_memory("node").unwrap());
+            Self::with_store(Arc::new(Store::open_memory("node").unwrap()))
+        }
+
+        fn with_store(store: Arc<Store>) -> Self {
             apply_source(&store, SEAT_QUEUE_SOURCE, "seat-queue-missions");
             let desired = store
                 .desired_subjects()
@@ -36059,6 +36096,194 @@ mission "gated" state="ready" {
                 )
                 .map(|_| ())
         }
+    }
+
+    #[test]
+    fn expired_lease_rearms_consumed_wake_in_the_same_incarnation() {
+        let seat = SeatQueueFixture::new();
+        let run = seat.start("queued", "expired-consumed-wake-run");
+        let subject = SeatQueueFixture::step(&run, "work");
+        let old = seat.store.step_run(&subject).unwrap().unwrap();
+        let wake = seat.store.messages(Some(SEAT), false).unwrap().remove(0);
+        for (kind, status) in [
+            ("message.delivered", "delivered"),
+            ("message.read", "read"),
+            ("message.closed", "closed"),
+        ] {
+            seat.store
+                .append_claim(&ClaimInput {
+                    subject: wake.subject.clone(),
+                    kind: kind.into(),
+                    actor: Some(SEAT.into()),
+                    fields: BTreeMap::from([("status".into(), Value::String(status.into()))]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("expired-consumed-wake-{status}")),
+                })
+                .unwrap();
+        }
+        seat.work(&subject, "claim", "expiry-first-claim").unwrap();
+        // Reuse the Store's canonical expired-renewal fixture: a normal append
+        // re-applies the local live lease overlay, so it cannot model expiry.
+        crate::store::expire_work_lease_by_claim(&seat.store, &subject, SEAT, "seat-one");
+        let ready = seat.store.step_run(&subject).unwrap().unwrap();
+        assert_eq!(ready.status, "ready");
+        assert_eq!(ready.readiness_epoch, old.readiness_epoch + 1);
+        assert!(ready.claimant.is_none());
+        let renewal_count = seat
+            .store
+            .claims_for(&subject, Some("work.renewed"))
+            .unwrap()
+            .len();
+        assert_eq!(
+            seat.work(&subject, "renew", "expired-holder-late-renewal")
+                .unwrap_err()
+                .code,
+            "work-not-claimed",
+            "old holder cannot renew its expired lease"
+        );
+        assert_eq!(
+            seat.store
+                .claims_for(&subject, Some("work.renewed"))
+                .unwrap()
+                .len(),
+            renewal_count,
+            "the rejected request must not append an old-epoch renewal"
+        );
+        seat.reconciler.reconcile_once().unwrap();
+        assert_eq!(
+            seat.store
+                .step_run(&subject)
+                .unwrap()
+                .unwrap()
+                .readiness_epoch,
+            ready.readiness_epoch,
+            "durable repair must not advance the epoch twice"
+        );
+        let messages = seat.store.messages(Some(SEAT), true).unwrap();
+        let fresh = messages
+            .iter()
+            .filter(|message| {
+                work_message_target(message).is_some_and(|(step, _, epoch, _)| {
+                    step == subject && epoch == ready.readiness_epoch
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            fresh.len(),
+            1,
+            "old consumed wake must not suppress recovery"
+        );
+        seat.reconciler.reconcile_once().unwrap();
+        assert_eq!(
+            seat.store.messages(Some(SEAT), true).unwrap().len(),
+            messages.len()
+        );
+        seat.work(&subject, "claim", "expiry-reclaim").unwrap();
+        let reclaimed = seat.store.step_run(&subject).unwrap().unwrap();
+        assert_eq!(reclaimed.readiness_epoch, ready.readiness_epoch);
+        assert_eq!(reclaimed.claim_incarnation.as_deref(), Some("seat-one"));
+    }
+
+    #[test]
+    fn consumed_wake_with_idle_unclaimed_work_raises_one_diagnostic() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("idle-unclaimed.sqlite");
+        let seat = SeatQueueFixture::with_store(Arc::new(Store::open(&database, "node").unwrap()));
+        let run = seat.start("queued", "idle-unclaimed-run");
+        let subject = SeatQueueFixture::step(&run, "work");
+        let wake = seat.store.messages(Some(SEAT), false).unwrap().remove(0);
+        for (kind, status) in [
+            ("message.delivered", "delivered"),
+            ("message.read", "read"),
+            ("message.closed", "closed"),
+        ] {
+            seat.store
+                .append_claim(&ClaimInput {
+                    subject: wake.subject.clone(),
+                    kind: kind.into(),
+                    actor: Some(SEAT.into()),
+                    fields: BTreeMap::from([("status".into(), Value::String(status.into()))]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("idle-unclaimed-{status}")),
+                })
+                .unwrap();
+        }
+        // Age only this isolated fixture's wake. No wall-clock sleep is needed
+        // to exercise the actual reconciliation and diagnostic path.
+        let sent = seat
+            .store
+            .latest_claim(&wake.subject, Some("message.sent"))
+            .unwrap()
+            .unwrap();
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        crate::store::configure_projection_writer(&connection).unwrap();
+        connection
+            .execute(
+                "UPDATE claims SET accepted_at_unix_ms=?1 WHERE id=?2",
+                rusqlite::params![
+                    (now_ms() - WORK_WAKE_EXHAUST_GRACE_MS - 1).to_string(),
+                    sent.id
+                ],
+            )
+            .unwrap();
+        let observe = |state: &str| {
+            seat.store
+                .append_claim(&ClaimInput {
+                    subject: SEAT.into(),
+                    kind: "harness.observed".into(),
+                    actor: Some(SEAT.into()),
+                    fields: BTreeMap::from([
+                        ("state".into(), Value::String(state.into())),
+                        ("driver".into(), Value::String("codex".into())),
+                        ("incarnation_id".into(), Value::String("seat-one".into())),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("idle-unclaimed-{state}")),
+                })
+                .unwrap();
+        };
+        let faults = || {
+            seat.store
+                .claims_for(SEAT, Some("harness.diagnostic"))
+                .unwrap()
+                .into_iter()
+                .filter(|claim| {
+                    claim.body["fields"]["code"].as_str() == Some("work-wake-exhausted")
+                })
+                .collect::<Vec<_>>()
+        };
+        observe("working");
+        seat.reconciler
+            .reconcile_work_messages(SEAT, "seat-one", None)
+            .unwrap();
+        assert!(faults().is_empty(), "do not interrupt a working turn");
+        observe("idle");
+        seat.reconciler
+            .reconcile_work_messages(SEAT, "seat-one", None)
+            .unwrap();
+        let first = faults();
+        assert_eq!(first.len(), 1);
+        assert_eq!(
+            first[0].body["fields"]["step_run"].as_str(),
+            Some(subject.as_str())
+        );
+        assert_eq!(first[0].body["evidence"], serde_json::json!([sent.id]));
+        seat.reconciler
+            .reconcile_work_messages(SEAT, "seat-one", None)
+            .unwrap();
+        assert_eq!(faults().len(), 1, "one diagnostic per readiness episode");
+        assert_eq!(
+            seat.store.messages(Some(SEAT), true).unwrap().len(),
+            1,
+            "consumption is delivery proof; do not resend it indefinitely"
+        );
+        assert_eq!(
+            seat.store.step_run(&subject).unwrap().unwrap().status,
+            "ready"
+        );
     }
 
     #[test]

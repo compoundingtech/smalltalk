@@ -29729,6 +29729,10 @@ fn apply_effective_step_state(
     {
         view.status = "ready".into();
         view.blocked_reason = Some("the worker lease expired".into());
+        // Expiry is a new readiness episode even before a repair writes it. Old
+        // consumed wakes must not acknowledge this newly unclaimed work. A claim
+        // persists this effective epoch, so later expiries advance it once more.
+        view.readiness_epoch = view.readiness_epoch.saturating_add(1);
         view.claimant = None;
         view.claim_incarnation = None;
         view.claim_expires_at_unix_ms = None;
@@ -31055,6 +31059,34 @@ fn step_generation_is_current(
         |row| row.get(0),
     )?;
     Ok(generation_id_from_subject(&step.generation) == current)
+}
+
+#[cfg(test)]
+pub(crate) fn expire_work_lease_by_claim(store: &Store, subject: &str, actor: &str, incarnation: &str) {
+    let current = store.step_run(subject).unwrap().unwrap();
+    let mut connection = store.connection.lock().unwrap();
+    let transaction = connection.transaction().unwrap();
+    let claim = append_claim_tx(
+        &transaction,
+        &store.origin,
+        subject,
+        "work.renewed",
+        Some(actor),
+        &json!({"fields": {
+            "attempt": current.attempt,
+            "status": current.status,
+            "worker_reported": current.worker_reported,
+            "claimant": actor,
+            "claim_incarnation": incarnation,
+            "claim_expires_at_unix_ms": 0,
+            "readiness_epoch": current.readiness_epoch,
+        }}),
+        &[],
+        None,
+    )
+    .unwrap();
+    project_mission_run_update(&transaction, &claim).unwrap();
+    transaction.commit().unwrap();
 }
 
 #[cfg(test)]
@@ -33189,30 +33221,7 @@ agent "test/empty" { command "true" }
     }
 
     fn expire_work_lease_by_claim(store: &Store, subject: &str, actor: &str, incarnation: &str) {
-        let current = store.step_run(subject).unwrap().unwrap();
-        let mut connection = store.connection.lock().unwrap();
-        let transaction = connection.transaction().unwrap();
-        let claim = append_claim_tx(
-            &transaction,
-            &store.origin,
-            subject,
-            "work.renewed",
-            Some(actor),
-            &json!({"fields": {
-                "attempt": current.attempt,
-                "status": current.status,
-                "worker_reported": current.worker_reported,
-                "claimant": actor,
-                "claim_incarnation": incarnation,
-                "claim_expires_at_unix_ms": 0,
-                "readiness_epoch": current.readiness_epoch,
-            }}),
-            &[],
-            None,
-        )
-        .unwrap();
-        project_mission_run_update(&transaction, &claim).unwrap();
-        transaction.commit().unwrap();
+        super::expire_work_lease_by_claim(store, subject, actor, incarnation);
     }
 
     fn simple(command: &str) -> NormalizedIntent {
