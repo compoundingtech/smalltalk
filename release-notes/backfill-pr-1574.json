@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "summary": "#1574: negotiated native conversation blocks and owner content reads",
+  "commits": [
+    "eb7e7d7d500fef63fc87819581229cfeb15e0549"
+  ],
+  "replay": {
+    "status": "none",
+    "detail": "No startup replay trigger or graph projection invalidation is added by the native conversation normalizer and owner-read routes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No SQLite migration, new stored transcript class or stored image copy is introduced. Native transcripts remain owner-local source files; graph database schema is unchanged."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No new claim kind, checkpoint rule or sealing coordination requirement is introduced."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Conversation entries gain optional typed body.blocks negotiated with conversation-blocks.v1; unnegotiated clients retain known entry shapes and fallbacks. New access-checked owner content chunk reads require read.projections and upgraded serving/owner members; older peers and clients do not provide this content. Four expensive owner timeline/chunk reads run concurrently; excess attempts return HTTP 429, so clients must back off and retry. Existing read.projections grants authorize full native content, including raw records and secrets the harness saw; UI filters affect presentation only. Current stui/phone show references and markers; native image/clipped-block loading and interactive raw controls are follow-up work."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional upgrade service stop or measured outage is introduced. Normal member/client restarts apply. Owner-unavailable and transcript-unavailable reads are distinct runtime availability states, not migration downtime."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No data repair, grant conversion or required configuration change is needed. Clients opt in to normalized blocks; upgrade the serving/owner members and supporting clients to use the new reads. This change performs no stored-history or outbox cleanup."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No additional graph recovery procedure is introduced. Edited/replaced source records, changed bindings and owner restarts invalidate old content references; fetch a fresh timeline/reference. Preserve graph state, keys, configuration and native transcripts, and follow roll-forward guidance; this note does not qualify binary-only downgrade of the whole release."
+  }
+}
