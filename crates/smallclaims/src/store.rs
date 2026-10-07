@@ -7686,7 +7686,7 @@ mod replay_log_tests {
     #[test]
     fn an_incremental_failure_line_is_one_bounded_line_with_the_cause() {
         let kinds = (0..8).map(|n| format!("kind.{n}\n")).collect::<Vec<_>>();
-        let line = incremental_failure_log_line(
+        let line = super::incremental_failure_log_line(
             "internal",
             &format!("constraint failed\nat {}", "x".repeat(10_000)),
             &kinds,
