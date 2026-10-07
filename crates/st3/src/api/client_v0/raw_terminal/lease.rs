@@ -717,6 +717,23 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn partial_runtime_reports_preserve_leases_but_explicit_nulls_revoke() {
+        for null_fields in [
+            json!({"status":null}),
+            json!({"incarnation_id":null}),
+        ] {
+            let (_root, state, session) = fixture();
+            let existing = acquire(&state, &session);
+            claim(&state, "agent/shell", "runtime.observed", json!({"reason":"partial report"}));
+            assert!(existing.check().is_ok(), "omitted runtime fields must retain authority");
+            let replacement = acquire(&state, &session);
+            claim(&state, "agent/shell", "runtime.observed", null_fields);
+            assert!(existing.check().is_err(), "explicit null must revoke the old lease");
+            assert!(replacement.check().is_err(), "explicit null must revoke the new lease");
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn idle_expires_at_sixty_seconds_despite_authority_proofs() {
         let (_root, state, session) = fixture();
