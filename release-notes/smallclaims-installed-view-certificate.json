@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Explicit namespace publication and read certificates connect Installer operators to the existing view event registry",
+  "replay": {"status": "none", "detail": "No automatic scan, startup/read rebuild, source replay or read migration. Existing explicit bounded Installer jobs remain owner-initiated."},
+  "schema": {"status": "changed", "detail": "Explicit namespace registration creates one local binding table; ordinary views create no bridge schema. No shared layout/rules version change."},
+  "rules": {"status": "none", "detail": "Source admission, authority, canonical order and checkpoint rules are unchanged."},
+  "compatibility": {"status": "changed", "detail": "Namespace-aware views opt into a separate fingerprint and require matching Installer operator/source definitions. Ordinary view fingerprints and default callbacks remain unchanged."},
+  "downtime": {"status": "none", "detail": "No production activation, deployment or restart is included."},
+  "manual": {"status": "changed", "detail": "Library adopters register a binding, explicitly complete a namespace job and synchronize live semantic keys with independent source and graph certificates."},
+  "recovery": {"status": "changed", "detail": "A later fence cannot be cleared by an older root or live synchronization. A fresh completed namespace may recover compatible state; incompatible identities require separately reviewed lifecycle handling."}
+}

@@ -250,6 +250,25 @@ impl Installer {
         Ok(result)
     }
 
+    pub(super) fn binding_definition(&self, view: &str) -> Result<(&str, &str, &str)> {
+        let operator = self
+            .operators
+            .get(view)
+            .context("unknown installation operator")?;
+        Ok((
+            operator.source(),
+            operator.fingerprint(),
+            &self.fingerprints[view],
+        ))
+    }
+
+    pub(super) fn expected_fingerprint(view: &str, source: &str, raw: &str) -> Result<String> {
+        use sha2::{Digest, Sha256};
+        Ok(hex::encode(Sha256::digest(serde_json::to_vec(&(
+            LAYOUT, view, source, raw,
+        ))?)))
+    }
+
     pub fn create_schema(&self, connection: &Connection) -> Result<()> {
         connection.execute_batch(SCHEMA)?;
         for operator in self.operators.values() {
