@@ -1787,7 +1787,7 @@ impl ClaudeChannelFixture {
             .env("ST_CLAUDE_SESSION_SEQ", "1");
         command
     }
-    async fn open(
+    fn spawn(
         &self,
         root: &Path,
         daemon: &Daemon,
@@ -1805,7 +1805,7 @@ impl ClaudeChannelFixture {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let mut input = channel.stdin.take().unwrap();
+        let input = channel.stdin.take().unwrap();
         let (sender, received) = std::sync::mpsc::channel::<Value>();
         let output = channel.stdout.take().unwrap();
         std::thread::spawn(move || {
@@ -1816,6 +1816,19 @@ impl ClaudeChannelFixture {
                 }
             }
         });
+        (channel, input, received)
+    }
+    async fn open(
+        &self,
+        root: &Path,
+        daemon: &Daemon,
+        wrapper: &str,
+    ) -> (
+        Child,
+        std::process::ChildStdin,
+        std::sync::mpsc::Receiver<Value>,
+    ) {
+        let (channel, mut input, received) = self.spawn(root, daemon, wrapper);
         writeln!(
             input,
             "{}",
@@ -1858,6 +1871,356 @@ impl ClaudeChannelFixture {
         record["sessionId"] = json!("019fae17-c215-7882-a4d9-5f247168ffce");
         record["cwd"] = json!(root.join("workspace"));
         writeln!(file, "{record}").unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_mcp_initializes_offline_then_attaches_and_reconnects_without_restarting() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let mut daemon = Daemon::new(root);
+    declare_claude(&daemon, "agent/quartz");
+    daemon.observe_running("agent/quartz", "wrapper-offline");
+    let fixture = ClaudeChannelFixture::new(root, &daemon, "wrapper-offline");
+    let (mut channel, mut input, received) = fixture.spawn(root, &daemon, "wrapper-offline");
+    writeln!(
+        input,
+        "{}",
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize"})
+    )
+    .unwrap();
+    input.flush().unwrap();
+    // Claude has a bounded startup timeout. The handshake cannot wait for a daemon or
+    // runtime projection, even though neither mail nor readiness is authorized offline.
+    assert_eq!(
+        received
+            .recv_timeout(Duration::from_secs(5))
+            .expect("MCP initialization waited for the daemon")["id"],
+        1
+    );
+    writeln!(
+        input,
+        "{}",
+        json!({"jsonrpc":"2.0","method":"notifications/initialized"})
+    )
+    .unwrap();
+    input.flush().unwrap();
+    assert!(
+        daemon
+            .store
+            .claims_for("agent/quartz", Some("harness.observed"))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        received.try_recv().is_err(),
+        "offline initialization offered mail"
+    );
+    daemon.start_isolated().await;
+    daemon.send(
+        "message/quartz-offline",
+        "agent/quartz",
+        "OFFLINE START PROBE",
+    );
+    let notice = received
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the same channel did not attach after daemon startup");
+    assert_eq!(notice["method"], "notifications/claude/channel");
+    let envelope = notice["params"]["content"].as_str().unwrap();
+    fixture.append(
+        root,
+        json!({"type":"user","isMeta":true,"message":{"role":"user","content":envelope}}),
+    );
+    wait_until(
+        "offline-start mail has native receipts",
+        Duration::from_secs(10),
+        || {
+            daemon
+                .store
+                .latest_claim("message/quartz-offline", Some("message.read"))
+                .unwrap()
+                .is_some()
+        },
+    )
+    .await;
+    // A later daemon outage preserves the initialized stdio connection and its owner.
+    daemon.stop().await;
+    daemon.send(
+        "message/quartz-reconnected",
+        "agent/quartz",
+        "RECONNECT PROBE",
+    );
+    assert_alive(
+        &mut channel,
+        "the initialized Claude channel during an outage",
+    );
+    daemon.start_isolated().await;
+    let notice = received
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the initialized channel did not reconnect");
+    assert!(
+        notice["params"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("message/quartz-reconnected")
+    );
+    fixture.append(root, json!({"type":"user","isMeta":true,"message":{"role":"user","content":notice["params"]["content"]}}));
+    wait_until(
+        "reconnected mail has native receipts",
+        Duration::from_secs(10),
+        || {
+            daemon
+                .store
+                .latest_claim("message/quartz-reconnected", Some("message.read"))
+                .unwrap()
+                .is_some()
+        },
+    )
+    .await;
+    for message in ["message/quartz-offline", "message/quartz-reconnected"] {
+        for kind in ["message.staged", "message.delivered", "message.read"] {
+            assert_eq!(
+                daemon.store.claims_for(message, Some(kind)).unwrap().len(),
+                1,
+                "{message} {kind}"
+            );
+        }
+    }
+    assert_alive(&mut channel, "the same Claude channel after reconnection");
+    assert!(
+        received.try_recv().is_err(),
+        "reconnection duplicated a native offer"
+    );
+    drop(input);
+    wait_until(
+        "Claude EOF ends the channel",
+        Duration::from_secs(5),
+        || channel.try_wait().unwrap().is_some(),
+    )
+    .await;
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_mcp_answers_during_binding_retries_and_eof_cancels_attachment() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let mut daemon = Daemon::new(root);
+    declare_claude(&daemon, "agent/quartz");
+    daemon.observe_running("agent/quartz", "wrapper-binding");
+    let binding_seen = Arc::new(AtomicBool::new(false));
+    let seen = binding_seen.clone();
+    let app = st3::api::router(daemon.state()).layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let seen = seen.clone();
+            async move {
+                if request.uri().path() == "/v1/mailbox/bind" {
+                    seen.store(true, Ordering::SeqCst);
+                    return axum::response::IntoResponse::into_response((
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        "runtime ownership is not available yet",
+                    ));
+                }
+                next.run(request).await
+            }
+        },
+    ));
+    daemon.start_isolated_app(app).await;
+    let fixture = ClaudeChannelFixture::new(root, &daemon, "wrapper-binding");
+    let (mut channel, mut input, received) = fixture.spawn(root, &daemon, "wrapper-binding");
+    writeln!(
+        input,
+        "{}",
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize"})
+    )
+    .unwrap();
+    input.flush().unwrap();
+    assert_eq!(
+        received
+            .recv_timeout(Duration::from_secs(5))
+            .expect("MCP initialization waited for binding")["id"],
+        1
+    );
+    writeln!(
+        input,
+        "{}",
+        json!({"jsonrpc":"2.0","method":"notifications/initialized"})
+    )
+    .unwrap();
+    input.flush().unwrap();
+    wait_until(
+        "the channel retries mailbox binding",
+        Duration::from_secs(5),
+        || binding_seen.load(Ordering::SeqCst),
+    )
+    .await;
+    writeln!(
+        input,
+        "{}",
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/list"})
+    )
+    .unwrap();
+    input.flush().unwrap();
+    assert_eq!(
+        received
+            .recv_timeout(Duration::from_secs(5))
+            .expect("MCP metadata waited for binding")["id"],
+        2
+    );
+    assert!(
+        daemon
+            .store
+            .claims_for("agent/quartz", Some("harness.observed"))
+            .unwrap()
+            .is_empty(),
+        "unbound MCP initialization reported readiness"
+    );
+    drop(input);
+    wait_until(
+        "EOF cancels the unbound channel",
+        Duration::from_secs(5),
+        || channel.try_wait().unwrap().is_some(),
+    )
+    .await;
+    assert!(channel.try_wait().unwrap().unwrap().success());
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_mcp_retries_readiness_without_blocking_requests_or_eof() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    // The second POST either succeeds, or remains pending until EOF cancels the child.
+    // Exercise the actual channel loop, rather than manually calling the POST twice.
+    for recover in [true, false] {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        let mut daemon = Daemon::new(root);
+        declare_claude(&daemon, "agent/quartz");
+        daemon.observe_running("agent/quartz", "wrapper-readiness");
+        let attempts = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let captured = attempts.clone();
+        let app = st3::api::router(daemon.state()).layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let captured = captured.clone();
+                async move {
+                    if request.method() != axum::http::Method::POST
+                        || request.uri().path() != "/v1/claims"
+                    {
+                        return next.run(request).await;
+                    }
+                    let (parts, body) = request.into_parts();
+                    let bytes = axum::body::to_bytes(body, 1024 * 1024).await.unwrap();
+                    let input: Value = serde_json::from_slice(&bytes).unwrap();
+                    if input["kind"] == "harness.observed"
+                        && input["fields"]["transport"] == "claude-channel"
+                        && input["fields"]["state"] == "ready"
+                    {
+                        let count = {
+                            let mut attempts = captured.lock().unwrap();
+                            attempts.push(input);
+                            attempts.len()
+                        };
+                        if count == 1 {
+                            return axum::response::IntoResponse::into_response((
+                                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                                "readiness publication temporarily unavailable",
+                            ));
+                        }
+                        if !recover {
+                            std::future::pending::<()>().await;
+                        }
+                    }
+                    next.run(axum::extract::Request::from_parts(
+                        parts,
+                        axum::body::Body::from(bytes),
+                    ))
+                    .await
+                }
+            },
+        ));
+        daemon.start_isolated_app(app).await;
+        let fixture = ClaudeChannelFixture::new(root, &daemon, "wrapper-readiness");
+        let (mut channel, mut input, received) =
+            fixture.open(root, &daemon, "wrapper-readiness").await;
+        wait_until(
+            "the failed readiness POST retries",
+            Duration::from_secs(5),
+            || attempts.lock().unwrap().len() >= 2,
+        )
+        .await;
+        writeln!(
+            input,
+            "{}",
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/list"})
+        )
+        .unwrap();
+        input.flush().unwrap();
+        assert_eq!(
+            received
+                .recv_timeout(Duration::from_secs(5))
+                .expect("readiness POST blocked MCP metadata")["id"],
+            2
+        );
+        if recover {
+            wait_until(
+                "the retry publishes durable readiness",
+                Duration::from_secs(5),
+                || {
+                    !daemon
+                        .store
+                        .claims_for("agent/quartz", Some("harness.observed"))
+                        .unwrap()
+                        .is_empty()
+                },
+            )
+            .await;
+            // Acknowledged readiness stops posting on subsequent ordinary ticks.
+            tokio::time::sleep(Duration::from_millis(2200)).await;
+            let claims = daemon
+                .store
+                .claims_for("agent/quartz", Some("harness.observed"))
+                .unwrap();
+            assert_eq!(claims.len(), 1);
+            assert_eq!(claims[0].body["fields"]["state"], "ready");
+        } else {
+            assert!(
+                daemon
+                    .store
+                    .claims_for("agent/quartz", Some("harness.observed"))
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        {
+            let attempts = attempts.lock().unwrap();
+            assert_eq!(
+                attempts.len(),
+                2,
+                "readiness retried after success or while a POST was still pending"
+            );
+            assert_eq!(
+                attempts[0], attempts[1],
+                "readiness retry mutated the claim or idempotency key"
+            );
+        }
+        drop(input);
+        wait_until(
+            "EOF cancels readiness publication",
+            Duration::from_secs(5),
+            || channel.try_wait().unwrap().is_some(),
+        )
+        .await;
+        assert!(channel.try_wait().unwrap().unwrap().success());
+        daemon.stop().await;
     }
 }
 

@@ -20599,6 +20599,7 @@ fn check_mailbox_incarnation(
     let describes_another = fields.get("incarnation_id").and_then(Value::as_str)
         != Some(fence.incarnation.as_str());
     if !live
+        && fence.epoch == 0
         && (describes_another
             || matches!(
                 fields.get("status").and_then(Value::as_str),
@@ -20617,11 +20618,14 @@ fn check_mailbox_incarnation(
         if let Some(harness) = harness {
             let harness: Value = serde_json::from_str(&harness).map_err(internal)?;
             let fields = harness.get("fields").unwrap_or(&harness);
-            if fields.get("state").and_then(Value::as_str) == Some("starting")
+            if matches!(
+                fields.get("state").and_then(Value::as_str),
+                Some("starting" | "ready" | "idle" | "working" | "blocked" | "indeterminate")
+            )
                 && fields.get("incarnation_id").and_then(Value::as_str) == Some(&fence.incarnation)
             {
                 // The new driver can start while the graph still describes its predecessor,
-                // before reconciliation publishes this incarnation's runtime.running.
+                // and its hooks can advance before reconciliation publishes runtime.running.
                 // Retry without allocating ownership or authorizing any mailbox reads/receipts.
                 // An exited observation for this same incarnation remains terminal.
                 return Err(St3Error::new(

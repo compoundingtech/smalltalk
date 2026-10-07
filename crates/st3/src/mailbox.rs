@@ -395,6 +395,77 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn startup_hook_activity_waits_for_runtime_evidence_without_allocating_ownership() {
+        for state in [
+            "starting",
+            "ready",
+            "idle",
+            "working",
+            "blocked",
+            "indeterminate",
+        ] {
+            let store = Store::open_memory("node").unwrap();
+            ready(&store, "previous");
+            let previous = store
+                .bind_mailbox(&Fence::new("agent/eval.worker", "previous", "delivery"))
+                .unwrap();
+            store
+                .append_claim(&claim(
+                    "agent/eval.worker",
+                    "harness.observed",
+                    json!({"state":state,"driver":"claude","incarnation_id":"replacement"}),
+                    "replacement-hook",
+                ))
+                .unwrap();
+            let replacement = Fence::new("agent/eval.worker", "replacement", "delivery");
+            assert_eq!(
+                store.bind_mailbox(&replacement).unwrap_err().code,
+                "mailbox-session-starting",
+                "{state}"
+            );
+            assert_eq!(
+                store
+                    .bind_mailbox(&Fence::new("agent/eval.worker", "foreign", "delivery"))
+                    .unwrap_err()
+                    .code,
+                "stale-mailbox-session"
+            );
+            let mut already_bound = replacement.clone();
+            already_bound.epoch = 1;
+            assert_eq!(
+                store.bind_mailbox(&already_bound).unwrap_err().code,
+                "stale-mailbox-session",
+                "a bound owner is never a pending startup"
+            );
+            store
+                .append_claim(&claim(
+                    "agent/eval.worker",
+                    "harness.observed",
+                    json!({"state":"ended","driver":"claude","incarnation_id":"replacement"}),
+                    "replacement-ended",
+                ))
+                .unwrap();
+            assert_eq!(
+                store.bind_mailbox(&replacement).unwrap_err().code,
+                "stale-mailbox-session"
+            );
+            ready(&store, "replacement");
+            let bound = store.bind_mailbox(&replacement).unwrap();
+            assert_eq!(bound.epoch, 2, "hook activity never allocated an owner");
+            assert_eq!(
+                store.check_mailbox(&previous).unwrap_err().code,
+                "stale-mailbox-session"
+            );
+            store.append_claim(&claim("agent/eval.worker", "runtime.observed",
+                    json!({"status":"exited","runtime_id":"eval.worker","incarnation_id":"replacement"}), "replacement-exited")).unwrap();
+            assert_eq!(
+                store.bind_mailbox(&bound).unwrap_err().code,
+                "stale-mailbox-session"
+            );
+        }
+    }
+
+    #[test]
     fn replacement_mailbox_waits_while_the_graph_still_describes_its_predecessor() {
         for status in ["running", "exited", "vanished"] {
             let store = Store::open_memory("node").unwrap();

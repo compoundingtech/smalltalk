@@ -40,7 +40,7 @@ priority = 100
 # A boot canary's race or a fresh-seat boundary violation must not disappear behind a retry.
 # Start these early too: five seats launch together in one case.
 [[profile.ci.overrides]]
-filter = 'package(st3) and (test(/^boot_canaries::/) or test(/^no_st2_seat::/) or test(/^codex_bootstrap::delayed_delivery_control_holds_visible_native_input_and_recovers_once$/))'
+filter = 'package(st3) and (test(/^boot_canaries::/) or test(/^no_st2_seat::/) or test(/^daemon_restart::claude_mcp_/) or test(/^codex_bootstrap::delayed_delivery_control_holds_visible_native_input_and_recovers_once$/))'
 retries = 0
 priority = 100
 
