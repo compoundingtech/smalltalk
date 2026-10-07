@@ -2264,11 +2264,10 @@ fn client_agent_cards_for_page(
         .filter_map(|r| r["id"].as_str().map(str::to_owned))
         .collect::<BTreeSet<_>>();
     let mut cards = store.cached_agent_resources_for(index, history, Some(&selected), |changed| {
-        let (subjects, previous) = changed.expect("a selected page always names its missing cards");
-        // Continuations retain the first page's queue metadata, not today's mutable queue.
-        let metadata = refs.iter().chain(previous.iter().filter(|item| {
-            !selected.contains(item["id"].as_str().unwrap_or_default())
-        })).cloned().collect::<Vec<_>>();
+        let (subjects, _) = changed.expect("a selected page always names its missing cards");
+        // Pagination refs are frozen response metadata, never shared projection inputs.
+        // Reuse the independently time-fenced current refs to avoid a second fleet queue scan.
+        let metadata = client_agent_page_refs(store, history, index)?;
         let mut cards = client_agent_resources_selected(
             store, history, index, Some((subjects, &metadata)),
         )?;
@@ -15722,15 +15721,16 @@ mission "refs-work" state="ready" {{
     }
 
     #[tokio::test]
-    async fn agent_page_queue_refreshes_at_lease_expiry_without_a_new_claim() {
+    async fn agent_page_continuation_does_not_seed_frozen_queues_into_the_shared_roster() {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
         let store = &state.store;
         let source = r#"version 2
 agent "amber" { command "true" }
+agent "zeta" { command "true" }
 mission "expiring-work" state="ready" {
   goal "Refresh queue state at its lease boundary."
-  step "work" { assigned-to "agent/node.amber" }
+  step "work" { assigned-to "agent/node.zeta" }
 }
 "#;
         let intent = crate::graph::parse_test_intent(source, "node").unwrap();
@@ -15746,7 +15746,7 @@ mission "expiring-work" state="ready" {
         let step = &run.steps[0].subject;
         store.set_step_state(step, "ready", None).unwrap();
         store.work_action(step, "claim", &WorkRequest {
-            actor: Some("agent/node.amber".into()), incarnation: Some("fixture-runtime".into()),
+            actor: Some("agent/node.zeta".into()), incarnation: Some("fixture-runtime".into()),
             summary: None, reason: None, evidence: Vec::new(), idempotency_key: "lease-fence-claim".into(),
         }).unwrap();
         // Shorten this fixture's lease before any cache is built; no claims are changed.
@@ -15758,22 +15758,32 @@ mission "expiring-work" state="ready" {
         let index = store.index().unwrap();
         let (status, claimed) = get_request(router(state.clone()), "/v1/client/agents").await;
         assert_eq!(status, StatusCode::OK, "{claimed}");
-        assert_eq!(claimed["items"][0]["current_work_ids"], json!([step]));
+        assert_eq!(claimed["items"][1]["current_work_ids"], json!([step]));
         let full = client_agent_resources_cached(store, false, index).unwrap();
-        assert_eq!(full[0]["current_work_ids"], json!([step]));
+        assert_eq!(full[1]["current_work_ids"], json!([step]));
         assert_eq!(store.agent_roster_valid_until(index), Some(expires));
+        let (status, first) = get_request(router(state.clone()), "/v1/client/agents?limit=1").await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        assert_eq!(first["items"][0]["id"], "agent/node.amber");
+        let cursor = first["page"]["next_cursor"].as_str().unwrap();
         // Wait for the actual captured lease boundary, not an arbitrary settling interval.
         tokio::time::sleep(Duration::from_millis(
             u64::try_from(expires.saturating_sub(client_now_ms()) + 1).unwrap(),
         )).await;
         assert_eq!(store.index().unwrap(), index, "lease expiry must not append a claim");
+        let continuation = format!("/v1/client/agents?limit=1&cursor={}", urlencoding::encode(cursor));
+        let (status, second) = get_request(router(state.clone()), &continuation).await;
+        assert_eq!(status, StatusCode::OK, "{second}");
+        assert_eq!(second["items"][0]["id"], "agent/node.zeta");
+        assert_eq!(second["items"][0]["current_work_ids"], json!([step]),
+            "the continuation must preserve the first page's frozen queue cut");
+        let full = client_agent_resources_cached(store, false, index).unwrap();
+        assert_eq!(full[1]["current_work_ids"], json!([]), "frozen queues must not poison WS cards");
+        assert_eq!(full[1]["next_work_id"], step.as_str());
         let (status, ready) = get_request(router(state.clone()), "/v1/client/agents").await;
         assert_eq!(status, StatusCode::OK, "{ready}");
-        assert_eq!(ready["items"][0]["current_work_ids"], json!([]));
-        assert_eq!(ready["items"][0]["next_work_id"], step.as_str());
-        let full = client_agent_resources_cached(store, false, index).unwrap();
-        assert_eq!(full[0]["current_work_ids"], json!([]), "WS full-card cache also expires");
-        assert_eq!(full[0]["next_work_id"], step.as_str());
+        assert_eq!(ready["items"][1]["current_work_ids"], json!([]));
+        assert_eq!(ready["items"][1]["next_work_id"], step.as_str());
         assert_eq!(store.agent_roster_valid_until(index), None);
     }
 

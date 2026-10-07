@@ -152,6 +152,9 @@ the same projection used by the complete WS roster, without reducing unrelated c
 agent observations update only affected cards; daemon diagnostics reuse rows; other claims
 conservatively invalidate the projection. Authorization is checked before reuse, and local
 delivery presence stays a per-read overlay rather than graph-cached authority.
+Shared cards are built only from current, independently time-fenced queue metadata. A
+pagination continuation applies its frozen ordering/host/queue refs to the response clone
+after reading the shared cards; frozen pagination cuts must never seed the shared projection.
 The shallow HTTP membership/order/queue refs have the same bounded graph-cut retention.
 Warm pages reuse those refs rather than scanning all fleet work. An explicit allow-list of
 existing-agent harness observations and daemon diagnostics leaves them valid; every other
