@@ -61,7 +61,11 @@ impl Store {
         let connection = self.readers.get();
         let mut items = Vec::new();
         let mut query = connection.prepare(
-            "SELECT subject FROM step_runs WHERE assignee LIKE 'person/%'
+            // A range on the assignee index, not `LIKE 'person/%'`: SQLite does not use an index
+            // for a case-insensitive LIKE, so that read every step run in the store. Assignees
+            // are written in lower case; the range also drops an upper-case `Person/` spelling
+            // that LIKE would have matched.
+            "SELECT subject FROM step_runs WHERE assignee>='person/' AND assignee<'person0'
             AND status IN ('ready','pending') AND (?1 IS NULL OR assignee=?1) ORDER BY subject",
         )?;
         let subjects = query
