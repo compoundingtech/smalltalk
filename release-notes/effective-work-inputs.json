@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Share effective work state calculation with lazy dependency providers",
+  "replay": {"status": "none", "detail": "Existing Store readers use the same SQL sources and evaluation order. No replay, backfill or source registration is introduced."},
+  "schema": {"status": "none", "detail": "No schema, index, trigger or derived table changes."},
+  "rules": {"status": "none", "detail": "Owner, generation, root, person request, blocker and lease semantics are preserved in one shared calculator. No action, admission or checkpoint rule changes."},
+  "compatibility": {"status": "none", "detail": "Public work presentation and effect fencing are unchanged. The internal input trait lets future keyed consumers reuse the calculation after certifying their sources."},
+  "downtime": {"status": "none", "detail": "No restart or startup recovery work is added."},
+  "manual": {"status": "none", "detail": "No operator action required. Future alternative input providers must explicitly reject unknown dependency coverage before evaluation."},
+  "recovery": {"status": "none", "detail": "Existing recovery and rollback behavior is unchanged; no persisted state is added."}
+}

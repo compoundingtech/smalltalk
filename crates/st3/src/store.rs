@@ -101,6 +101,7 @@ mod checkpoint_rules;
 pub(crate) mod delegation;
 mod limits;
 mod person_work;
+pub(crate) mod effective_work;
 mod subagents;
 mod watches;
 pub use checkpoint_rules::{RULES_VERSION, plan_drops, rules_digest};
@@ -30172,114 +30173,7 @@ fn apply_effective_step_state(
     view: &mut StepRunView,
     snapshot_unix_ms: u128,
 ) -> rusqlite::Result<()> {
-    let owner = connection
-        .query_row(
-            "SELECT mission_runs.status, mission_runs.phase,
-                    mission_runs.current_generation_id, run_generations.status,
-                    root_runs.status, root_runs.phase
-             FROM mission_runs JOIN run_generations
-               ON run_generations.id=?2 AND run_generations.run_id=mission_runs.id
-             JOIN mission_runs root_runs ON root_runs.id=mission_runs.root_run_id
-             WHERE mission_runs.id=?1",
-            params![
-                view.run.strip_prefix("mission-run/").unwrap_or(&view.run),
-                generation_id_from_subject(&view.generation),
-            ],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                ))
-            },
-        )
-        .optional()?;
-    let Some((
-        run_status,
-        run_phase,
-        current_generation,
-        generation_status,
-        root_status,
-        root_phase,
-    )) = owner
-    else {
-        return Ok(());
-    };
-    if view
-        .assigned_to
-        .as_deref()
-        .is_some_and(|person| person.starts_with("person/"))
-    {
-        if let Some(ask) = person_work::request(connection, &view.subject)
-            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?
-        {
-            if matches!(view.status.as_str(), "ready" | "pending")
-                && !person_work::current(connection, &ask, snapshot_unix_ms)
-                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?
-            {
-                view.status = "cancelled".into();
-                view.blocked_reason =
-                    Some("the requester, originating attempt or owning run ended".into());
-            }
-        }
-    }
-    let generation_id = generation_id_from_subject(&view.generation);
-    if is_terminal_run_state(&run_status)
-        || run_phase == "terminal"
-        || is_terminal_generation_state(&generation_status)
-        || generation_id != current_generation
-        || is_terminal_run_state(&root_status)
-        || root_phase == "terminal"
-    {
-        if !matches!(view.status.as_str(), "completed" | "failed" | "cancelled") {
-            view.status = "cancelled".into();
-            view.blocked_reason = Some("the owning mission run or generation is terminal".into());
-        }
-        view.claimant = None;
-        view.claim_incarnation = None;
-        view.claim_expires_at_unix_ms = None;
-        return Ok(());
-    }
-    if matches!(
-        view.status.as_str(),
-        "claimed" | "working" | "verifying" | "blocked"
-    ) && view
-        .claim_expires_at_unix_ms
-        .is_some_and(|expiry| expiry <= snapshot_unix_ms)
-    {
-        view.status = "ready".into();
-        view.blocked_reason = Some("the worker lease expired".into());
-        // Expiry is a new readiness episode even before a repair writes it. Old
-        // consumed wakes must not acknowledge this newly unclaimed work. A claim
-        // persists this effective epoch, so later expiries advance it once more.
-        view.readiness_epoch = view.readiness_epoch.saturating_add(1);
-        view.claimant = None;
-        view.claim_incarnation = None;
-        view.claim_expires_at_unix_ms = None;
-    }
-    if view.status == "waiting-person" {
-        view.blockers = active_step_blockers_tx(connection, &view.subject, snapshot_unix_ms)?;
-        if view.blockers.is_empty() {
-            view.status = "ready".into();
-            view.blocked_reason = None;
-            view.readiness_epoch += 1;
-        }
-    }
-    if view.status == "ready" && view.blocked_reason.is_some() {
-        view.blockers = active_step_blockers_tx(connection, &view.subject, snapshot_unix_ms)?;
-        if view.blockers.is_empty() {
-            view.blocked_reason = None;
-        } else {
-            view.status = "blocked".into();
-            view.claimant = None;
-            view.claim_incarnation = None;
-            view.claim_expires_at_unix_ms = None;
-        }
-    }
-    Ok(())
+    effective_work::apply(view, snapshot_unix_ms, &mut effective_work::SqlInputs(connection))
 }
 
 fn active_step_blockers_tx(
