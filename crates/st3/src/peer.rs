@@ -158,7 +158,7 @@ pub struct ClientReadRoute {
 
 impl ClientReadOperation {
     /// How long the owner may hold this read open before it answers.
-    fn wait(&self) -> Duration {
+    pub(crate) fn wait(&self) -> Duration {
         match self {
             Self::ConversationChanges { wait_ms, .. }
             | Self::TerminalScreenChange { wait_ms, .. } => {

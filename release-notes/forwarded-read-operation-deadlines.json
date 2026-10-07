@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Bound ordinary forwarded client reads and stop their timed-out relay futures.",
+  "replay": {
+    "status": "none",
+    "detail": "No replay, heal or projection-health behavior change. Heal-next is a mutating protocol step, not an ordinary read."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No table, index, schema version or claim vocabulary change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rule or authority change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Forwarded read envelopes use15s including body/queue/relay/response work, plus only the supported operation long-poll wait (capped10s), rather than120s bulk. Timeout drops the blocking handler-owned relay future and returns typed504/read-deadline through gateways. Terminal actions keep mutation acknowledgement semantics; public30s long-poll and120s bulk/doctor budgets remain."
+  },
+  "downtime": {
+    "status": "unknown",
+    "detail": "Normal daemon rollout required; restart and mixed-version behavior not independently qualified."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No settings or data repair required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Rollback restores the previous forwarding budget; no data migration."
+  }
+}
