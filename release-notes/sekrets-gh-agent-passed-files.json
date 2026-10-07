@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Sekrets: a gh-agent preset, files passed to commands by descriptor, and a faster seat check.",
+  "replay": {
+    "status": "none",
+    "detail": "No claim, projection or replay change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No st store change. The gateway's own SQLite store is unchanged; policies stored before keep working."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rule change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "A run request may now carry passed files (a new `files` count and more descriptors). A newer `st sekrets` client talking to a gateway installed before this refuses a command that passes a file (--body-file, --input, -F @file) with a descriptor-count error; every other command works. Presets expand in the client, so `--preset gh-agent` works with any gateway."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "The st daemon restarts as for any deploy; the sekrets gateway is unaffected until it is reinstalled, which restarts only st-sekrets.service (about a second, not measured)."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Hosts running the sekrets gateway (hetz) re-run `st sekrets setup --person PERSON > s.sh && sudo sh s.sh` to give the gateway this build, which passed files need. Optional: move agent grants to `--preset gh-agent`."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Reinstalling the previous binary (and re-running setup for the gateway) restores the previous behaviour; nothing is migrated."
+  }
+}
