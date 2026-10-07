@@ -1,0 +1,72 @@
+{
+  "version": "2.1.293 (Claude Code)",
+  "cases": [
+    {
+      "case": "inline-development",
+      "argv": [
+        "claude",
+        "--debug-file",
+        "/home/ada/results/inline-development-debug.txt",
+        "--settings",
+        "{\"apiKeyHelper\": \"python3 /opt/spike/key_helper.py\", \"autoUpdatesChannel\": \"stable\", \"includeCoAuthoredBy\": false}",
+        "--model",
+        "sonnet",
+        "--dangerously-skip-permissions",
+        "--plugin-dir=/opt/fixture/st-channel",
+        "--dangerously-load-development-channels",
+        "plugin:st-channel@inline"
+      ],
+      "answers": [
+        "permissions"
+      ],
+      "sent": true,
+      "ack": null
+    },
+    {
+      "case": "inline-development-retry",
+      "argv": [
+        "claude",
+        "--debug-file",
+        "/home/ada/results/inline-development-retry-debug.txt",
+        "--settings",
+        "{\"apiKeyHelper\": \"python3 /opt/spike/key_helper.py\", \"autoUpdatesChannel\": \"stable\", \"includeCoAuthoredBy\": false}",
+        "--model",
+        "sonnet",
+        "--dangerously-skip-permissions",
+        "--plugin-dir=/opt/fixture/st-channel",
+        "--dangerously-load-development-channels",
+        "plugin:st-channel@inline"
+      ],
+      "answers": [
+        "development"
+      ],
+      "sent": true,
+      "ack": "CHANNEL_SPIKE_ACK"
+    },
+    {
+      "case": "server-fallback",
+      "argv": [
+        "claude",
+        "--debug-file",
+        "/home/ada/results/server-fallback-debug.txt",
+        "--settings",
+        "{\"apiKeyHelper\": \"python3 /opt/spike/key_helper.py\", \"autoUpdatesChannel\": \"stable\", \"includeCoAuthoredBy\": false}",
+        "--model",
+        "sonnet",
+        "--dangerously-skip-permissions",
+        "--mcp-config={\"mcpServers\": {\"st3\": {\"command\": \"python3\", \"args\": [\"/opt/spike/mcp.py\"]}}}",
+        "--dangerously-load-development-channels=server:st3"
+      ],
+      "answers": [
+        "permissions",
+        "development"
+      ],
+      "sent": true,
+      "ack": "CHANNEL_SPIKE_ACK"
+    }
+  ],
+  "policy_files": [],
+  "cpus": 2,
+  "memory_bytes": 3221225472,
+  "host_mounts": []
+}

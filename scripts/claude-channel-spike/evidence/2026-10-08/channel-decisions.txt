@@ -1,0 +1,8 @@
+primary 2026-10-07T23:41:57.408Z [DEBUG] MCP server "plugin:st-channel:st": Channel notifications skipped: plugin st-channel@st is not on the approved channels allowlist (use --dangerously-load-development-channels for local dev)
+primary 2026-10-07T23:42:58.352Z [DEBUG] MCP server "plugin:st-channel:st": Channel notifications registered
+primary 2026-10-07T23:43:08.707Z [DEBUG] MCP server "plugin:st-channel:st": Channel notifications skipped: server plugin:st-channel:st not in --channels list for this session
+primary 2026-10-07T23:44:11.431Z [DEBUG] MCP server "plugin:st-channel:st": Channel notifications skipped: you asked for plugin:st-channel@st but the installed plugin is st-channel@inline
+primary 2026-10-07T23:45:11.177Z [DEBUG] MCP server "st3": Channel notifications skipped: channels feature is not currently available
+inline 2026-10-07T23:46:42.235Z [DEBUG] MCP server "plugin:st-channel:st": Channel notifications skipped: channels feature is not currently available
+inline 2026-10-07T23:46:52.423Z [DEBUG] MCP server "plugin:st-channel:st": Channel notifications registered
+inline 2026-10-07T23:47:03.974Z [DEBUG] MCP server "st3": Channel notifications registered
