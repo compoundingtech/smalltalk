@@ -38,15 +38,23 @@ pub fn line(header: &Value, now: &str) -> String {
     let mut common_count = 0;
     for (_, field) in &parts {
         let source = field["source"].as_str().unwrap_or_default();
-        let count = parts.iter().filter(|(_, other)| other["source"].as_str().unwrap_or_default() == source).count();
+        let count = parts
+            .iter()
+            .filter(|(_, other)| other["source"].as_str().unwrap_or_default() == source)
+            .count();
         if !source.is_empty() && count > common_count {
             common = source;
             common_count = count;
         }
     }
-    let oldest = parts.iter()
+    let oldest = parts
+        .iter()
         .filter(|(_, field)| field["source"].as_str() == Some(common))
-        .min_by_key(|(_, field)| field["as_of"].as_str().and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok()))
+        .min_by_key(|(_, field)| {
+            field["as_of"]
+                .as_str()
+                .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+        })
         .map(|(_, field)| *field);
     let mut rendered = String::new();
     for (value, field) in &parts {
@@ -122,7 +130,12 @@ fn todos(_: &str, value: &Value) -> Option<String> {
     let mut total = 0;
     let mut done = 0;
     for phase in value.as_array()? {
-        for item in phase.get("items").and_then(Value::as_array).into_iter().flatten() {
+        for item in phase
+            .get("items")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
             total += 1;
             if item.get("status").and_then(Value::as_str) == Some("completed") {
                 done += 1;
@@ -210,7 +223,10 @@ mod tests {
             "model m · context 50 tokens · cost $0.02 [register · 30m ago] · transcript · 1h ago"
         );
         assert_eq!(
-            line(&json!({"todos": {"value": [], "source": "transcript", "as_of": "2026-10-06T12:00:00Z"}}), "2026-10-06T12:00:00Z"),
+            line(
+                &json!({"todos": {"value": [], "source": "transcript", "as_of": "2026-10-06T12:00:00Z"}}),
+                "2026-10-06T12:00:00Z"
+            ),
             "todo 0/0 · transcript · 0s ago"
         );
     }
