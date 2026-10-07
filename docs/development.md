@@ -51,6 +51,15 @@ the macOS 26.5 and 27 SDKs.
 The script builds and installs `st3`, `stui`, and `st3-migrate`, and makes `st` a symlink to
 the installed `st3`. `st` is never a separate build. On macOS, both tools live in a fixed app bundle; see [macOS installation and signing](st3/macos-installation.md). A source install also needs [`pty`](https://github.com/compoundingtech/pty-rust) on `PATH`.
 
+## Web development
+
+Enter `nix develop .#web` for the pinned pnpm, Node, Bun and Buck2 toolchain.
+Run `bash scripts/ci-fractal-web` for the frozen root workspace install, Buck
+typecheck, measurement contract tests and production/development bundle-exclusion
+proof. The measurement module has no package dependencies; its tests run directly
+with Node and its compile-time instrumentation boundary is checked with Bun.
+The generated Workspace workflow runs these lanes only for web-relevant changes.
+
 ## Continuous integration
 
 Workspace CI runs on pull requests and merge groups. The five required checks are `linux-gate`,
