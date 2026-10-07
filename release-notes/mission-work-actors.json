@@ -4,7 +4,7 @@
   "replay": {"status": "none", "detail": "No runtime replay behavior changes."},
   "schema": {"status": "none", "detail": "No database schema or migration changes; this updates the published client JSON schema."},
   "rules": {"status": "none", "detail": "No checkpoint rules or coordinated member upgrade changes."},
-  "compatibility": {"status": "changed", "detail": "Person assignees decode for mission steps and current-step run summaries. Claimants remain agent-only, as do MissionWake assignments; no claim-path change. Older strict clients may reject person assignee references; mixed client versions were not tested."},
+  "compatibility": {"status": "changed", "detail": "Person assignees decode for mission steps and current-step run summaries. Non-agent assignees receive no harness wake enrichment. Claimants remain agent-only, as do MissionWake assignments; no claim-path change. Older strict clients may reject person assignee references; mixed client versions were not tested."},
   "downtime": {"status": "none", "detail": "No additional service interruption introduced."},
   "manual": {"status": "none", "detail": "No installation or data migration steps required; consumers validating mission-step assignees should use the updated contract."},
   "recovery": {"status": "none", "detail": "No database or runtime recovery changes; older contract validators can still reject person assignee references."}

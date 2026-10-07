@@ -29284,6 +29284,9 @@ fn enrich_step_wake_at(
     let Some(assignee) = view.assigned_to.as_deref() else {
         return Ok(());
     };
+    if !assignee.starts_with("agent/") {
+        return Ok(());
+    }
     let harness = current_harness_at(connection, assignee, None).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(
             0,

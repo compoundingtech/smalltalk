@@ -3136,6 +3136,74 @@ async fn operational_lists_share_one_versioned_paginated_shape() {
 }
 
 #[tokio::test]
+async fn person_assigned_ready_steps_decode_without_harness_wakes() {
+    let root = tempfile::tempdir().unwrap();
+    let state = test_state(root.path());
+    let source = r#"version 2
+mission "person-assignee" state="ready" {
+  goal "Perform person-assigned work."
+  step "review" { assigned-to "person/example" }
+}
+"#;
+    let intent = st3::graph::parse_intent(source, state.store.origin()).unwrap();
+    let planned = state
+        .store
+        .mission(
+            &intent,
+            st3::model::IntentInput {
+                kdl: source.into(),
+                source_name: None,
+            },
+        )
+        .unwrap();
+    state
+        .store
+        .apply(&intent, &planned.subject_tokens, "person-assignee-definition")
+        .unwrap();
+    let run = state
+        .store
+        .create_mission_run(&st3::model::MissionRunRequest {
+            mission: "person-assignee".into(),
+            revision: None,
+            workspace: root.path().display().to_string(),
+            requester: Some("person/example".into()),
+            mode: Some("run".into()),
+            inputs: Default::default(),
+            idempotency_key: "person-assignee-run".into(),
+        })
+        .unwrap();
+    state
+        .store
+        .set_step_state(&run.steps[0].subject, "ready", None)
+        .unwrap();
+    let app = st3::api::router(state);
+    for path in [
+        "/v1/client/missions",
+        "/v1/client/missions/person-assignee",
+    ] {
+        let (status, response) = client_json(app.clone(), path).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_conforms(&consumer_validator("Envelope"), path, &response);
+        assert_conforms(&contract_validator("Envelope"), path, &response);
+        let mission = if path.ends_with("person-assignee") {
+            response["value"].clone()
+        } else {
+            response["value"]["items"][0].clone()
+        };
+        let mission: st3_client::Mission = serde_json::from_value(mission).unwrap();
+        let detail = &mission.run_details[0];
+        let step = &detail.steps.as_ref().unwrap()[0];
+        assert_eq!(step.state, "ready");
+        assert_eq!(step.assignee.as_deref(), Some("person/example"));
+        assert!(step.wake.is_none(), "person assignees have no harness to wake");
+        assert_eq!(
+            detail.current_steps[0]["assignee"].as_str(),
+            Some("person/example")
+        );
+    }
+}
+
+#[tokio::test]
 async fn step_states_in_every_client_projection_belong_to_the_contract() {
     let validator = contract_validator("Envelope");
     let root = tempfile::tempdir().unwrap();
