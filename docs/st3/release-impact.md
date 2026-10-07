@@ -56,7 +56,7 @@ unchanged numeric schema version does not mean no database changes or safe rollb
 Reproduce the PR check against an effective merge tree (a PR head merged with its base):
 
 ```sh
-python3 scripts/check-release-impact --base BASE_COMMIT --source MERGE_COMMIT --pr-number PR_NUMBER
+python3 scripts/check-release-impact --base "$(git rev-parse MERGE_COMMIT^1)" --source MERGE_COMMIT --pr-number PR_NUMBER
 ```
 
 Without an event identity (`--pr-number` or `--queue-ref`), the local check is strict and
