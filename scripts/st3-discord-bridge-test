@@ -458,6 +458,7 @@ class TransportScenarios(unittest.TestCase):
             self.assertEqual(client.image(item, '303'), PNG)
             request = factory.return_value.open.call_args.args[0]
             self.assertFalse(request.has_header('Authorization'))
+            self.assertEqual(request.get_header('User-agent'), 'DiscordBot (https://github.com/compoundingtech/smalltalk, 0.1)')
         for url in ('http://cdn.discordapp.com/attachments/303/505/a.png',
                     'https://localhost/attachments/303/505/a.png',
                     'https://cdn.discordapp.com/attachments/999/505/a.png',
