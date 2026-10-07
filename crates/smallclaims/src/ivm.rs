@@ -20,6 +20,7 @@ use serde_json::Value;
 use crate::{ClaimRecord, store::canonical};
 
 pub mod claim_source;
+pub mod events;
 pub mod install;
 pub mod runtime;
 
@@ -837,6 +838,12 @@ impl Views {
                 Err(error) => {
                     transaction
                         .execute_batch("ROLLBACK TO ivm_view_change; RELEASE ivm_view_change")?;
+                    // Storage/transaction failures must reach the owning transaction. They
+                    // are not operator evidence and cannot turn a transient failure into a
+                    // persistent unavailable view while acknowledging the source write.
+                    if error.chain().any(|cause| cause.is::<rusqlite::Error>()) {
+                        return Err(error);
+                    }
                     fence_error(transaction, d.name, &error)?;
                     transaction.execute("UPDATE ivm_views SET deferred_claim_index=MAX(deferred_claim_index,?2) WHERE name=?1",params![d.name,new.map(|(c,_)|c.store_index).unwrap_or(0)])?;
                     changes.deferred.insert(d.name.to_owned());
@@ -923,6 +930,9 @@ impl Views {
                         transaction.execute_batch(
                             "ROLLBACK TO ivm_local_view_change; RELEASE ivm_local_view_change",
                         )?;
+                        if error.chain().any(|cause| cause.is::<rusqlite::Error>()) {
+                            return Err(error);
+                        }
                         fence_error(transaction, d.name, &error)?;
                         transaction.execute("UPDATE ivm_views SET deferred_local_generation=MAX(deferred_local_generation,?2) WHERE name=?1",params![d.name,cut.local_generation])?;
                         changes.deferred.insert(d.name.to_owned());
