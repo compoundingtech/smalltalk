@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Propose client v0 composer support for steer or queue delivery, discoverable commands, and message-associated model selection.",
+  "replay": {
+    "status": "none",
+    "detail": "Documentation only; no runtime or upgrade behavior changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Proposed contract only; no schema or generated client changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Documentation only; no coordination requirements change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Documentation only; existing client behavior is unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Documentation only; no runtime or upgrade behavior changes."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Documentation only; no manual upgrade action."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Documentation only; no recovery behavior changes."
+  }
+}

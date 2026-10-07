@@ -6,6 +6,8 @@ in [`schemas`](schemas) and [`fixtures`](fixtures) are the normative wire exampl
 clients consume the same JSON; no client parses CLI output, Markdown, KDL, claim envelopes, or
 harness transcript files.
 
+Proposed composer extensions (not implemented): [delivery, commands, and model selection](composer-design.md).
+
 The reusable Rust package is [`crates/st3-client`](../../../crates/st3-client) and supports both the
 local Unix socket and authenticated paired HTTP over Tailscale or optional Fabric. The Swift package is
 [`clients/swift/St3Client`](../../../clients/swift/St3Client). The Expo TypeScript client is
