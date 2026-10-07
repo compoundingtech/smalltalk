@@ -311,6 +311,10 @@ pub struct CheckpointItemSource {
 pub type CheckpointAnswerSources = BTreeMap<String, Vec<CheckpointItemSource>>;
 type ProofSources = BTreeMap<(String, String), Vec<CheckpointItemSource>>;
 
+// Reuse the existing bounded 60-second diagnostic limiter with one fixed stage/code bucket.
+// No source/subject IDs are keys, and suppressed failures have no flush, queue or retry.
+static CHECKPOINT_DIAGNOSTICS: std::sync::OnceLock<std::sync::Mutex<super::ProjectionDiagnosticState>> = std::sync::OnceLock::new();
+
 /// Record the tombstones of a checkpoint's drop. Recording them again changes nothing.
 pub fn record_checkpoint_tombstones_tx(
     transaction: &Transaction<'_>,
@@ -692,8 +696,18 @@ pub fn prove_on_copy(
         mismatches,
     };
     if !proof.passed {
-        for diagnostic in status_history_mismatch_diagnostics(sealed, plan, &before, &after, &before_sources, &after_sources) {
-            eprintln!("st3: checkpoint reader mismatch {diagnostic}");
+        let diagnostics = status_history_mismatch_diagnostics(sealed, plan, &before, &after, &before_sources, &after_sources);
+        if !diagnostics.is_empty() {
+            let emission = CHECKPOINT_DIAGNOSTICS.get_or_init(Default::default).lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .observe("checkpoint", "status-history-mismatch", std::time::Instant::now());
+            if let Some(emission) = emission {
+                for mut diagnostic in diagnostics {
+                    diagnostic["suppressed_proof_logs"] = json!(emission.suppressed);
+                    diagnostic["rate_bucket_overflow"] = json!(emission.overflow);
+                    eprintln!("st3: checkpoint reader mismatch {diagnostic}");
+                }
+            }
         }
     }
     transaction.rollback()?;

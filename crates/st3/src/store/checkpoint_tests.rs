@@ -1887,7 +1887,7 @@ fn status_history_survives_checkpoint_trimming_and_reports_the_gap() {
 
 #[test]
 fn status_history_mixed_legacy_and_heartbeat_stamps_survive_both_checkpoint_cuts() {
-    mixed_stamp_checkpoint_history(false, false, false);
+    mixed_stamp_checkpoint_history(false, false, false, json!(false));
 }
 
 #[test]
@@ -1896,11 +1896,16 @@ fn status_history_mixed_stamps_keep_baselines_prompts_auth_and_canonical_ties() 
         (true, false, false), (false, true, false),
         (false, false, true), (true, true, true),
     ] {
-        mixed_stamp_checkpoint_history(ties, channels, older_baseline);
+        mixed_stamp_checkpoint_history(ties, channels, older_baseline, json!(false));
     }
 }
 
-fn mixed_stamp_checkpoint_history(ties: bool, channels: bool, older_baseline: bool) {
+#[test]
+fn status_history_numeric_zero_heartbeat_is_dropped_without_losing_legacy_transition() {
+    mixed_stamp_checkpoint_history(false, false, false, json!(0));
+}
+
+fn mixed_stamp_checkpoint_history(ties: bool, channels: bool, older_baseline: bool, suppressed_stamp: Value) {
     let cuts = ["2026-10-04T00:00:00Z", "2026-10-05T00:00:00Z"].map(|cut| {
         chrono::DateTime::parse_from_rfc3339(cut).unwrap().timestamp_millis() as u128
     });
@@ -1913,8 +1918,18 @@ fn mixed_stamp_checkpoint_history(ties: bool, channels: bool, older_baseline: bo
         // deliberately rewrites their transition stamp, so it cannot construct this history.
         let mut connection = store.connection.write();
         let transaction = connection.transaction().unwrap();
-        let claim = append_claim_tx(&transaction, &store.origin, subject, kind,
-            Some(subject), &json!({"fields":fields}), &[], None).unwrap();
+        let body = json!({"fields":fields});
+        let claim = if body.pointer("/fields/status_transition").is_some_and(Value::is_number) {
+            // Numeric stamps are not admitted by the current producer/schema. Construct a
+            // pre-existing numeric source through the raw record layer, without relaxing it.
+            let claim = append_claim_record_tx(&transaction, &store.origin, subject, kind,
+                Some(subject), &body, &[], None).unwrap();
+            insert_event(&transaction, claim.store_index, kind, subject, &body).unwrap();
+            claim
+        } else {
+            append_claim_tx(&transaction, &store.origin, subject, kind,
+                Some(subject), &body, &[], None).unwrap()
+        };
         transaction.commit().unwrap();
         claim
     };
@@ -1923,8 +1938,8 @@ fn mixed_stamp_checkpoint_history(ties: bool, channels: bool, older_baseline: bo
         "status":"running", "runtime_id":"native", "incarnation_id":"one"
     }), baseline);
     let observations = [
-        ("idle", Some(true)), ("working", Some(false)), ("working", None),
-        ("idle", Some(true)), ("working", Some(true)), ("idle", Some(true)),
+        ("idle", Some(json!(true))), ("working", Some(suppressed_stamp)), ("working", None),
+        ("idle", Some(json!(true))), ("working", Some(json!(true))), ("idle", Some(json!(true))),
     ].into_iter().enumerate().map(|(offset, (state, stamp))| {
         let time = if older_baseline && offset == 0 { baseline + 1 }
             else if ties { at + 1 } else { at + 1 + offset as u128 * 10 };
@@ -1976,6 +1991,8 @@ fn mixed_stamp_checkpoint_history(ties: bool, channels: bool, older_baseline: bo
             legacy.id, dropped(&plan).contains(&legacy.id), before["items"], after["items"], proof.mismatches);
         assert!(proof.passed, "mixed-stamp reader preservation failed: {:?}", proof.mismatches);
         assert!(!dropped(&plan).contains(&legacy.id));
+        assert!(dropped(&plan).contains(&observations[1].id),
+            "retaining the visible legacy transition must still drop the redundant stamped heartbeat");
         assert_eq!(after["items"], before["items"]);
         transaction.rollback().unwrap();
     }

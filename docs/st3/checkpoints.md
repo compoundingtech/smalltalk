@@ -75,6 +75,10 @@ index, and at most three items on each side for at most three subjects. Item met
 the source claim, canonical position, state, incarnation, observation time and reset/drop status.
 It excludes content and stays outside reader answers and certificate digests. No additional copy
 or proof pass is made to collect it.
+Failure logging uses the existing bounded diagnostic limiter with a fixed stage/code bucket;
+repeated proofs within 60 seconds suppress output and report the suppressed count on the next
+allowed failure, with no scheduled flush or retry. Canonical source keys are cloned only for the
+reader's bounded history items during the proof and discarded afterward.
 
 **Stable.** A checkpoint is stable when every participant has published a verification that names
 the same participants and carries identical digests. Stability is a pure function of claims, like

@@ -479,7 +479,9 @@ mod tests {
         let mut claim = observe(&store, "one", "idle", now_ms(), "ready");
         let connection = Connection::open_in_memory().unwrap();
         for stamp in [None, Some(json!(false)), Some(json!(true)), Some(Value::Null),
-            Some(json!(0)), Some(json!(0.0)), Some(json!("0")), Some(json!("false"))]
+            Some(json!(0)), Some(json!(0.0)), Some(serde_json::from_str::<Value>("-0").unwrap()),
+            Some(serde_json::from_str::<Value>("0e0").unwrap()), Some(serde_json::from_str::<Value>("1e-400").unwrap()),
+            Some(json!("0")), Some(json!("false"))]
         {
             claim.body = json!({"fields":{"state":"idle", "incarnation_id":"one"}});
             if let Some(stamp) = stamp { claim.body["fields"]["status_transition"] = stamp; }
