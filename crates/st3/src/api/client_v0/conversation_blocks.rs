@@ -1078,54 +1078,213 @@ mod tests {
         }
     }
 
-    #[test]
-    fn status_and_error_fallbacks_remain_typed_and_bounded_for_both_negotiations() {
-        let root = tempfile::tempdir().unwrap();
-        let native = fixture(
-            root.path(),
-            json!([{"type":"text", "text":"native fixture"}]),
-        );
-        // #1478 supplies these fallback bodies. Exercise the shared preparation
-        // contract independently of that stacked PR's native extraction.
-        for kind in ["status", "error"] {
-            for negotiated in [true, false] {
-                let mut session = ClientSession::local(None).unwrap();
-                session.conversation_blocks = negotiated;
-                let mut item = crate::external_sessions::normalized_timeline(&native)
-                    .unwrap()
-                    .remove(0);
-                item["type"] = json!(kind);
-                item["body"] = json!({
-                    "code":"native-stop", "retryable":false,
-                    "message":"m".repeat(600 * 1024),
-                    "details":{"errorMessage":"d".repeat(600 * 1024), "future":42},
-                    "detail":"e".repeat(600 * 1024),
-                    "blocks":[{"id":"notice", "kind":kind, "source_type":"native-stop", "payload":{"body_ref":true}}]
-                });
-                let prepared = prepare(&native, &session, &native.id, vec![item]).unwrap();
-                assert!(serde_json::to_vec(&prepared).unwrap().len() < CLIENT_MAX_RESPONSE_BYTES);
-                let body = &prepared[0]["body"];
-                for value in [
-                    &body["message"],
-                    &body["details"]["errorMessage"],
-                    &body["detail"],
-                ] {
-                    assert!(value.as_str().unwrap().contains("size limit; 614400 bytes"));
+    #[tokio::test]
+    async fn native_omp_outcomes_are_bounded_on_http_and_socket_and_reconstruct_exact_bodies() {
+        use axum::body::{Body, to_bytes};
+        use axum::http::Request;
+        use futures_util::{SinkExt as _, StreamExt as _};
+        use tower::ServiceExt as _;
+
+        fn assert_bounded_outcomes(items: &[Value], negotiated: bool) -> Vec<&Value> {
+            let mut outcomes = Vec::new();
+            for (entry_type, code) in [
+                ("error", Some("native_provider_error")),
+                ("status", None),
+                ("error", Some("native_session_exit_fatal")),
+                ("error", Some("native_session_exit_unknown")),
+            ] {
+                let item = items
+                    .iter()
+                    .find(|item| {
+                        item["type"] == entry_type
+                            && code.is_none_or(|code| item["body"]["code"] == code)
+                    })
+                    .unwrap();
+                assert_eq!(item["role"], "system");
+                assert!(serde_json::to_vec(item).unwrap().len() < CLIENT_MAX_RESPONSE_BYTES);
+                let body = &item["body"];
+                if code == Some("native_provider_error") {
+                    for value in [&body["message"], &body["details"]["errorMessage"]] {
+                        assert!(
+                            value.as_str().unwrap().contains(
+                                "[st truncated this native timeline value: size limit; 614400 bytes]"
+                            )
+                        );
+                    }
+                    assert_eq!(body["details"]["errorStatus"], 429);
+                } else {
+                    let detail = if code.is_some() {
+                        &body["details"]["pendingToolCalls"]
+                    } else {
+                        assert_eq!(body["status"], "completed");
+                        &body["detail"]
+                    };
+                    assert!(detail.as_str().unwrap().contains("size limit"));
+                    assert!(detail.as_str().unwrap().contains("[st truncated"));
                 }
-                assert_eq!(body["details"]["future"], 42);
                 if negotiated {
-                    let block = &body["blocks"][0];
+                    let block = body["blocks"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|block| block["kind"] == entry_type)
+                        .unwrap();
                     assert_eq!(block["continuation"]["reason"], "size-limit");
-                    assert_eq!(
-                        locator(block["continuation"]["ref"].as_str().unwrap(), &native.id)
-                            .unwrap()
-                            .pointer,
-                        "/body"
-                    );
                 } else {
                     assert!(body.get("blocks").is_none());
                 }
+                outcomes.push(item);
             }
+            let _: Vec<st3_client::TimelineEntry> =
+                serde_json::from_value(json!(items)).unwrap();
+            outcomes
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let native = fixture(root.path(), json!([]));
+        let provider_message = json!({
+            "role":"assistant","content":[],"stopReason":"error",
+            "errorMessage":"p".repeat(600 * 1024),"errorStatus":429,
+            "errorId":{"native":"provider-error"},
+            "retryRecovery":{"attempt":2,"future":[false,null,42]},
+        });
+        let pending = json!((0..20).map(|index| json!({
+            "toolCallId":format!("pending-{index}"),"toolName":"shell",
+            "args":{"command":"x".repeat(32_768)},"intent":"native intent",
+        })).collect::<Vec<_>>());
+        let exits = [
+            json!({"kind":"signal","reason":"sigterm","pendingToolCalls":pending,"future":42}),
+            json!({"kind":"fatal","reason":"uncaught_exception","pendingToolCalls":pending,"future":42}),
+            json!({"kind":"future-kind","reason":"unknown","pendingToolCalls":pending,"future":42}),
+        ];
+        let records = [
+            json!({"type":"session","id":"native-test","cwd":"/work/example","timestamp":"2026-10-06T12:00:00Z"}),
+            json!({"type":"message","id":"provider","timestamp":"2026-10-06T12:00:01Z","message":provider_message}),
+            json!({"type":"custom","id":"signal","timestamp":"2026-10-06T12:00:02Z","customType":"session_exit","data":exits[0]}),
+            json!({"type":"custom","id":"fatal","timestamp":"2026-10-06T12:00:03Z","customType":"session_exit","data":exits[1]}),
+            json!({"type":"custom","id":"unknown","timestamp":"2026-10-06T12:00:04Z","customType":"session_exit","data":exits[2]}),
+        ];
+        std::fs::write(
+            &native.transcript,
+            records.iter().map(|record| format!("{record}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let original = crate::external_sessions::normalized_timeline(&native).unwrap();
+        let mut state = super::super::tests::test_state_named(root.path(), "outcomes-owner");
+        state.native_session_home = Some(root.path().to_path_buf());
+        let app = super::super::super::router(state.clone());
+        for negotiated in [true, false] {
+            let mut request = Request::builder().uri(format!(
+                "/v1/client/sessions/{}/timeline",
+                native.id.trim_start_matches("session/")
+            ));
+            if negotiated {
+                request = request.header("x-st3-features", "conversation-blocks.v1");
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), CLIENT_MAX_RESPONSE_BYTES)
+                .await
+                .unwrap();
+            assert!(bytes.len() < CLIENT_MAX_RESPONSE_BYTES);
+            let page: Value = serde_json::from_slice(&bytes).unwrap();
+            let items = page["value"]["items"].as_array().unwrap();
+            let outcomes = assert_bounded_outcomes(items, negotiated);
+            if negotiated {
+                for (index, item) in outcomes.iter().enumerate() {
+                    let block = item["body"]["blocks"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|block| block["kind"] == item["type"])
+                        .unwrap();
+                    let token = block["continuation"]["ref"].as_str().unwrap();
+                    assert_eq!(locator(token, &native.id).unwrap().pointer, "/body");
+                    let full = fetch_json_chunks(&state, &native, token).await;
+                    let source = original.iter().find(|source| source["id"] == item["id"]).unwrap();
+                    assert_eq!(full, source["body"]);
+                    match index {
+                        0 => {
+                            assert_eq!(full["message"], provider_message["errorMessage"]);
+                            assert_eq!(full["details"]["errorMessage"], provider_message["errorMessage"]);
+                            assert_eq!(full["details"]["retryRecovery"], provider_message["retryRecovery"]);
+                        }
+                        1 => {
+                            let detail: Value = serde_json::from_str(full["detail"].as_str().unwrap()).unwrap();
+                            assert_eq!(detail, exits[0]);
+                        }
+                        _ => assert_eq!(full["details"], exits[index - 1]),
+                    }
+                }
+            }
+            let mut session = ClientSession::local(None).unwrap();
+            session.conversation_blocks = negotiated;
+            let socket_state = state.clone();
+            let socket_app = axum::Router::new().route(
+                "/stream",
+                axum::routing::get(move |upgrade: WebSocketUpgrade| {
+                    let (state, session) = (socket_state.clone(), session.clone());
+                    async move {
+                        upgrade.on_upgrade(move |socket| {
+                            super::super::collection_stream_socket_with_reader(
+                                socket,
+                                state,
+                                session,
+                                None,
+                                |state, session, request, permit| async move {
+                                    super::super::collection_items(
+                                        &state, &session, &request, permit,
+                                    )
+                                    .await
+                                },
+                            )
+                        })
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, socket_app).await.unwrap();
+            });
+            let (mut socket, _) =
+                tokio_tungstenite::connect_async(format!("ws://{address}/stream"))
+                    .await
+                    .unwrap();
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    json!({
+                        "kind":"subscribe","id":"outcomes","collection":"conversation",
+                        "conversation":native.id
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let tokio_tungstenite::tungstenite::Message::Text(text) = frame else {
+                panic!("expected bounded conversation snapshot, got {frame:?}");
+            };
+            assert!(text.len() < CLIENT_MAX_RESPONSE_BYTES);
+            let frame: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(frame["kind"], "conversation");
+            assert_eq!(frame["replace"], true);
+            let socket_outcomes =
+                assert_bounded_outcomes(frame["items"].as_array().unwrap(), negotiated);
+            for (socket_item, http_item) in socket_outcomes.iter().zip(&outcomes) {
+                assert_eq!(socket_item["body"], http_item["body"]);
+            }
+            socket.close(None).await.unwrap();
+            server.abort();
         }
     }
 
