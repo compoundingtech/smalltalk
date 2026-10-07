@@ -15634,6 +15634,7 @@ mod tests {
     mod incremental_deadlines;
     mod ownership_guard_tests;
     mod pull_request_run_tests;
+    mod ready_idle_wake;
     mod ref_watch_tests;
     mod rollout_tests;
     #[test]
