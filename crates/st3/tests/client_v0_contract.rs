@@ -249,7 +249,7 @@ fn family_references_reject_cross_family_and_malformed_ids() {
     }
     for (definition, allowed, rejected) in [
         (
-            "MissionWorkActorId",
+            "MissionWorkAssigneeId",
             &["agent/example", "person/example"][..],
             "daemon/example",
         ),
@@ -285,6 +285,33 @@ fn family_references_reject_cross_family_and_malformed_ids() {
         let mut daemon_step = step.clone();
         daemon_step["assignee"] = Value::String("daemon/example".into());
         assert!(!validator.is_valid(&daemon_step), "mission step must reject daemons");
+        let mut person_claimed_step = step.clone();
+        person_claimed_step["claimant"] = Value::String("person/example".into());
+        assert!(
+            !validator.is_valid(&person_claimed_step),
+            "mission step claimants must remain agent-only"
+        );
+    }
+    for validator in [
+        consumer_validator("MissionRunSummary"),
+        contract_validator("MissionRunSummary"),
+    ] {
+        let mut summary = serde_json::json!({
+            "id": "mission-run/example", "requester": "person/example",
+            "status": "running", "phase": "work", "progress": {"done": 0, "total": 1},
+            "current_steps": [{
+                "id": "step-run/example", "title": null, "state": "ready",
+                "since": "2026-10-07T00:00:00.000Z",
+                "assignee": "person/example", "claimant": "agent/example"
+            }],
+            "must_act": "you", "state_since": "2026-10-07T00:00:00.000Z"
+        });
+        assert_conforms(&validator, "person-assigned current step summary", &summary);
+        summary["current_steps"][0]["claimant"] = Value::String("person/example".into());
+        assert!(
+            !validator.is_valid(&summary),
+            "current step claimants must remain agent-only"
+        );
     }
     for validator in [consumer_validator("MissionWake"), contract_validator("MissionWake")] {
         let wake = serde_json::json!({
