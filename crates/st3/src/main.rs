@@ -13234,7 +13234,9 @@ async fn wait_for_agent_harness(
             replicated = true;
         }
         if status.incarnation_id.is_some()
-            && !stages.iter().any(|stage| stage["stage"] == "launched")
+            && !stages
+                .iter()
+                .any(|stage| stage["stage"] == "launched" && stage["state"] == "completed")
         {
             launch_progress(
                 subject,
@@ -13260,11 +13262,23 @@ async fn wait_for_agent_harness(
                 _ => "observing requested launch",
             });
         if reported != status.stage || last_report.elapsed() >= Duration::from_secs(5) {
+            let local_launch_pending = status.stage == "replicated"
+                && stages
+                    .iter()
+                    .any(|stage| stage["stage"] == "replicated" && stage["state"] == "skipped");
             launch_progress(
                 subject,
                 host,
-                &status.stage,
-                "observed",
+                if local_launch_pending {
+                    "launched"
+                } else {
+                    &status.stage
+                },
+                if local_launch_pending {
+                    "pending"
+                } else {
+                    "observed"
+                },
                 reason,
                 started,
                 json_output,

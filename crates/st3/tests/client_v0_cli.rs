@@ -3576,7 +3576,17 @@ async fn serve_creation_api(
                     && response.status().is_success()
                     && let Some(harness_state) = harness_state
                 {
+                    let token = store
+                        .selected_desired_token("agent/client-v0-cli.demo")
+                        .unwrap()
+                        .expect("the fake launch must follow its accepted declaration");
                     for (kind, fields) in [
+                        (
+                            "runtime.action.succeeded",
+                            serde_json::json!({
+                                "action":"start", "desired_token":token, "incarnation_id":"demo:1"
+                            }),
+                        ),
                         (
                             "runtime.observed",
                             serde_json::json!({
@@ -3940,7 +3950,22 @@ async fn new_agent_explains_ready_starting_and_waiting_states_and_preserves_json
         )
         .await;
         if json {
-            let response = value(&output);
+            let mut response = value(&output);
+            let stages = response.as_object_mut().unwrap().remove("stages").unwrap();
+            assert!(
+                stages
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|stage| stage["stage"] == "replicated" && stage["state"] == "skipped")
+            );
+            assert!(
+                stages
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|stage| stage["stage"] == "harness-ready")
+            );
             assert_eq!(
                 response,
                 serde_json::json!({
@@ -3949,8 +3974,12 @@ async fn new_agent_explains_ready_starting_and_waiting_states_and_preserves_json
                 })
             );
         } else {
-            let rendered = String::from_utf8(output.stdout).unwrap();
             let progress = String::from_utf8(output.stderr).unwrap();
+            let rendered = if output.status.success() {
+                String::from_utf8(output.stdout).unwrap()
+            } else {
+                progress.clone()
+            };
             assert!(!progress.contains("unobserved"), "{progress}");
             let expected = match harness {
                 None => "Still starting — waiting for the agent process to appear.",
