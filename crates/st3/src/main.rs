@@ -22090,6 +22090,12 @@ impl NativeMailbox {
                 Ok(())
             }
             Some(st3::mailbox::Frame::Seat { seat }) => {
+                #[cfg(feature = "test-support")]
+                if env!("CARGO_BIN_NAME") == "st3-fixture"
+                    && let Some(root) = std::env::var_os("ST3_FIXTURE_TERMINAL_COMPLETION")
+                {
+                    fs::write(PathBuf::from(root).join("title-stream-admitted"), b"seat")?;
+                }
                 if let Err(error) = update_native_title(&seat, runtime_id) {
                     let now = Instant::now();
                     if self.last_title_warning.is_none_or(|prior| {

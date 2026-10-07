@@ -124,6 +124,7 @@ read -r _
     command.env("FIXTURE_PROVIDER_EXIT", exit.to_string());
     if rejection.is_some() {
         command.env("FIXTURE_EXIT_GATE", barrier.join("exit-provider"));
+        command.env("ST3_FIXTURE_TERMINAL_COMPLETION", &barrier);
     }
     let mut shell = command.spawn().unwrap();
     let physical = format!("{}:created", shell.id().unwrap());
@@ -192,6 +193,8 @@ read -r _
         .unwrap();
     let rejection_fence = if rejection.is_some() {
         wait_file(&received).await;
+        // Reject an established stream, rather than racing its initial HTTP admission.
+        wait_file(&barrier.join("title-stream-admitted")).await;
         let owner = title_owner(root.path());
         assert!(st3::test_support::check_fixture_mailbox(&store, &owner).is_ok());
         // This allocates a genuine successor token/epoch, not a synthetic Fenced frame.
@@ -221,8 +224,8 @@ read -r _
         if order == "after" { std::fs::write(barrier.join("release-provider"), b"go").unwrap(); }
         wait_file(&barrier.join("join-phase")).await;
         assert_eq!(std::fs::read_to_string(barrier.join("join-phase")).unwrap(), if order == "after" { "finished" } else { "pending" });
-        // An ended observation has been drained, but the driver has not disposed its result.
-        // Admission must remain valid until that result is handled; no synthetic ready write.
+        // The real ended observation is already admitted. Store must reject this binding,
+        // regardless of whether the provider JoinHandle has finished.
         let fence = title_owner(root.path());
         pending_admitted = Some(st3::test_support::check_fixture_mailbox(&store, &fence));
         std::fs::write(barrier.join("release-provider"), b"go").unwrap();
@@ -252,7 +255,9 @@ read -r _
             .contains(&sent.content)
     );
     assert_eq!(notification["params"]["meta"]["messageId"], sent.subject);
-    if let Some(admitted) = pending_admitted { assert!(admitted.is_ok(), "completion publication fenced its own unfinished disposition: {admitted:?}"); }
+    if let Some(admitted) = pending_admitted {
+        assert_eq!(admitted.unwrap_err().code, "stale-mailbox-session");
+    }
     if let Some(owner) = rejection_fence {
         assert!(shell.try_wait().unwrap().is_none());
         if rejection == Some("token") {
