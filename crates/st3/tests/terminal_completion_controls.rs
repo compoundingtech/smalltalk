@@ -3,8 +3,12 @@ use super::*;
 
 async fn wait_file(path: &std::path::Path) {
     tokio::time::timeout(Duration::from_secs(15), async {
-        while !path.exists() { tokio::time::sleep(Duration::from_millis(5)).await; }
-    }).await.unwrap_or_else(|_| panic!("missing control barrier {}", path.display()));
+        while !path.exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("missing control barrier {}", path.display()));
 }
 
 fn title_owner(root: &std::path::Path) -> st3::mailbox::Fence {
@@ -17,13 +21,95 @@ fn title_owner(root: &std::path::Path) -> st3::mailbox::Fence {
         })).unwrap()
 }
 
-#[tokio::test] async fn provider_success_before_join_finish() { completion_control(Some("before"), 0, None).await; }
-#[tokio::test] async fn provider_success_after_join_finish() { completion_control(Some("after"), 0, None).await; }
-#[tokio::test] async fn provider_failure_before_join_finish() { completion_control(Some("before"), 7, None).await; }
-#[tokio::test] async fn provider_failure_after_join_finish() { completion_control(Some("after"), 7, None).await; }
-#[tokio::test] async fn real_runtime_exit_remains_fenced() { completion_control(None, 0, Some("runtime")).await; }
-#[tokio::test] async fn real_token_replacement_remains_fenced() { completion_control(None, 0, Some("token")).await; }
-#[tokio::test] async fn real_invocation_replacement_remains_fenced() { completion_control(None, 0, Some("replacement")).await; }
+#[tokio::test]
+async fn provider_success_before_join_finish() {
+    completion_control(Some("before"), 0, None).await;
+}
+#[tokio::test]
+async fn provider_success_after_join_finish() {
+    completion_control(Some("after"), 0, None).await;
+}
+#[tokio::test]
+async fn provider_failure_before_join_finish() {
+    completion_control(Some("before"), 7, None).await;
+}
+#[tokio::test]
+async fn provider_failure_after_join_finish() {
+    completion_control(Some("after"), 7, None).await;
+}
+#[tokio::test]
+async fn real_runtime_exit_remains_fenced() {
+    completion_control(None, 0, Some("runtime")).await;
+}
+#[tokio::test]
+async fn real_token_replacement_remains_fenced() {
+    completion_control(None, 0, Some("token")).await;
+}
+#[tokio::test]
+async fn real_invocation_replacement_remains_fenced() {
+    completion_control(None, 0, Some("replacement")).await;
+}
+
+#[tokio::test]
+async fn foreign_runtime_after_terminal_receipt_remains_fenced() {
+    completion_control(Some("before"), 0, Some("runtime")).await;
+}
+#[tokio::test]
+async fn foreign_token_after_terminal_receipt_remains_fenced() {
+    completion_control(Some("before"), 0, Some("token")).await;
+}
+#[tokio::test]
+async fn foreign_invocation_after_terminal_receipt_remains_fenced() {
+    completion_control(Some("before"), 0, Some("replacement")).await;
+}
+
+fn reject_binding(
+    store: &Arc<Store>,
+    runtime: &Arc<Runtime>,
+    root: &std::path::Path,
+    physical: &str,
+    incarnation: &str,
+    rejection: &str,
+) -> st3::mailbox::Fence {
+    let owner = title_owner(root);
+    assert!(st3::test_support::check_fixture_mailbox(store, &owner).is_ok());
+    if rejection == "token" {
+        let request = st3::mailbox::Fence::new(SEAT, incarnation, "title");
+        let successor = st3::test_support::bind_fixture_mailbox(store, &request).unwrap();
+        assert_eq!(
+            st3::test_support::check_fixture_mailbox(store, &owner)
+                .unwrap_err()
+                .code,
+            "stale-mailbox-session"
+        );
+        assert!(st3::test_support::check_fixture_mailbox(store, &successor).is_ok());
+        successor
+    } else {
+        if rejection == "runtime" {
+            claim(
+                store,
+                "runtime.observed",
+                json!({"status":"exited", "incarnation_id":incarnation}),
+            );
+        } else {
+            apply(
+                store,
+                &source(NEXT).replace("shell:created", physical),
+                Some("person/avery"),
+                "replace",
+            )
+            .unwrap();
+            reconcile(store, runtime);
+        }
+        assert_eq!(
+            st3::test_support::check_fixture_mailbox(store, &owner)
+                .unwrap_err()
+                .code,
+            "stale-mailbox-session"
+        );
+        owner
+    }
+}
 
 async fn completion_control(order: Option<&str>, exit: u8, rejection: Option<&str>) {
     if st3::test_support::supervise_test() {
@@ -122,7 +208,7 @@ read -r _
         command.env("ST3_FIXTURE_TERMINAL_COMPLETION", &barrier);
     }
     command.env("FIXTURE_PROVIDER_EXIT", exit.to_string());
-    if rejection.is_some() {
+    if rejection.is_some() && order.is_none() {
         command.env("FIXTURE_EXIT_GATE", barrier.join("exit-provider"));
         command.env("ST3_FIXTURE_TERMINAL_COMPLETION", &barrier);
     }
@@ -191,65 +277,109 @@ read -r _
         )
         .await
         .unwrap();
-    let rejection_fence = if rejection.is_some() {
+    let mut rejection_fence = if let Some(rejection) = rejection.filter(|_| order.is_none()) {
         wait_file(&received).await;
         // Reject an established stream, rather than racing its initial HTTP admission.
         wait_file(&barrier.join("title-stream-admitted")).await;
-        let owner = title_owner(root.path());
-        assert!(st3::test_support::check_fixture_mailbox(&store, &owner).is_ok());
-        // This allocates a genuine successor token/epoch, not a synthetic Fenced frame.
-        if rejection == Some("token") {
-            let request = st3::mailbox::Fence::new(SEAT, &agent_incarnation, "title");
-            let successor = st3::test_support::bind_fixture_mailbox(&store, &request).unwrap();
-            assert_eq!(st3::test_support::check_fixture_mailbox(&store, &owner).unwrap_err().code, "stale-mailbox-session");
-            Some(successor)
-        } else {
-            if rejection == Some("runtime") {
-                claim(&store, "runtime.observed", json!({"status":"exited", "incarnation_id":agent_incarnation}));
-            } else {
-                apply(&store, &source(NEXT).replace("shell:created", &physical), Some("person/avery"), "replace").unwrap();
-                reconcile(&store, &runtime);
-            }
-            assert_eq!(st3::test_support::check_fixture_mailbox(&store, &owner).unwrap_err().code, "stale-mailbox-session");
-            Some(owner)
-        }
-    } else { None };
+        Some(reject_binding(
+            &store,
+            &runtime,
+            root.path(),
+            &physical,
+            &agent_incarnation,
+            rejection,
+        ))
+    } else {
+        None
+    };
     let mut completion_fence = None;
     if let Some(order) = order {
         wait_file(&barrier.join("provider-return.json")).await;
-        let outcome: Value = serde_json::from_slice(&std::fs::read(barrier.join("provider-return.json")).unwrap()).unwrap();
-        assert_eq!(outcome["ok"], exit == 0, "actual provider result: {outcome}");
-        if exit != 0 { assert!(outcome["error"].as_str().unwrap().contains("exit status: 7"), "{outcome}"); }
+        let outcome: Value =
+            serde_json::from_slice(&std::fs::read(barrier.join("provider-return.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            outcome["ok"],
+            exit == 0,
+            "actual provider result: {outcome}"
+        );
+        if exit != 0 {
+            assert!(
+                outcome["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("exit status: 7"),
+                "{outcome}"
+            );
+        }
         wait_file(&barrier.join("observation-drained")).await;
-        if order == "after" { std::fs::write(barrier.join("release-provider"), b"go").unwrap(); }
+        if order == "after" {
+            std::fs::write(barrier.join("release-provider"), b"go").unwrap();
+        }
         wait_file(&barrier.join("join-phase")).await;
-        assert_eq!(std::fs::read_to_string(barrier.join("join-phase")).unwrap(), if order == "after" { "finished" } else { "pending" });
+        assert_eq!(
+            std::fs::read_to_string(barrier.join("join-phase")).unwrap(),
+            if order == "after" {
+                "finished"
+            } else {
+                "pending"
+            }
+        );
         // The real ended observation is already admitted. Store must reject this binding,
         // regardless of whether the provider JoinHandle has finished.
         let fence = title_owner(root.path());
-        let deferred = std::fs::read_to_string(barrier.join("observation-drained")).unwrap() == "deferred";
+        let deferred =
+            std::fs::read_to_string(barrier.join("observation-drained")).unwrap() == "deferred";
         if deferred {
             assert!(st3::test_support::check_fixture_mailbox(&store, &fence).is_ok());
         } else {
-            assert_eq!(st3::test_support::check_fixture_mailbox(&store, &fence).unwrap_err().code,
-                "stale-mailbox-session");
+            assert_eq!(
+                st3::test_support::check_fixture_mailbox(&store, &fence)
+                    .unwrap_err()
+                    .code,
+                "stale-mailbox-session"
+            );
         }
         completion_fence = Some(fence);
+        if let Some(rejection) = rejection {
+            assert!(
+                deferred,
+                "foreign fence control requires the terminal publication hold"
+            );
+            wait_file(&barrier.join("title-stream-admitted")).await;
+            rejection_fence = Some(reject_binding(
+                &store,
+                &runtime,
+                root.path(),
+                &physical,
+                &agent_incarnation,
+                rejection,
+            ));
+        }
         std::fs::write(barrier.join("poll-driver"), b"go").unwrap();
-        if deferred {
+        if deferred && rejection.is_none() {
             wait_file(&barrier.join("awaiting-completion")).await;
         } else {
             wait_file(&barrier.join("fence-received")).await;
-            assert_eq!(std::fs::read_to_string(barrier.join("fence-received")).unwrap(),
-                if order == "after" { "finished" } else { "pending" });
+            assert_eq!(
+                std::fs::read_to_string(barrier.join("fence-received")).unwrap(),
+                if order == "after" {
+                    "finished"
+                } else {
+                    "pending"
+                }
+            );
         }
         std::fs::write(barrier.join("release-provider"), b"go").unwrap();
     }
-    if let Some(owner) = &rejection_fence {
+    if let Some(owner) = rejection_fence.as_ref().filter(|_| order.is_none()) {
         // The real rejection is accepted while the provider is still alive. Tokio waits
         // for a blocking provider worker on shutdown, so release it only after that proof.
         wait_file(&barrier.join("fence-received")).await;
-        assert_eq!(std::fs::read_to_string(barrier.join("fence-received")).unwrap(), "pending");
+        assert_eq!(
+            std::fs::read_to_string(barrier.join("fence-received")).unwrap(),
+            "pending"
+        );
         if rejection == Some("token") {
             assert!(st3::test_support::check_fixture_mailbox(&store, owner).is_ok());
         }
@@ -262,7 +392,11 @@ read -r _
         .await
         .unwrap()
         .unwrap();
-    let expected = if exit == 0 && rejection.is_none() { 0 } else { 2 };
+    let expected = if exit == 0 && rejection.is_none() {
+        0
+    } else {
+        2
+    };
     if line != format!("driver-exit={expected} shell-still-alive\n") {
         shell.kill().await.unwrap();
         let logs = diagnostics.await.unwrap();
@@ -281,20 +415,29 @@ read -r _
     );
     assert_eq!(notification["params"]["meta"]["messageId"], sent.subject);
     if let Some(fence) = completion_fence {
-        assert_eq!(st3::test_support::check_fixture_mailbox(&store, &fence).unwrap_err().code,
-            "stale-mailbox-session");
+        assert_eq!(
+            st3::test_support::check_fixture_mailbox(&store, &fence)
+                .unwrap_err()
+                .code,
+            "stale-mailbox-session"
+        );
     }
     if let Some(owner) = rejection_fence {
         assert!(shell.try_wait().unwrap().is_none());
         if rejection == Some("token") {
             assert!(st3::test_support::check_fixture_mailbox(&store, &owner).is_ok());
         } else {
-            assert_eq!(st3::test_support::check_fixture_mailbox(&store, &owner).unwrap_err().code,
-                "stale-mailbox-session");
+            assert_eq!(
+                st3::test_support::check_fixture_mailbox(&store, &owner)
+                    .unwrap_err()
+                    .code,
+                "stale-mailbox-session"
+            );
         }
         assert!(runtime.actions.lock().unwrap().is_empty());
         std::fs::write(barrier.join("exit-provider"), b"go").unwrap();
-        server.abort(); shell.kill().await.unwrap();
+        server.abort();
+        shell.kill().await.unwrap();
         return;
     }
     // The wrapper reports its own exit under the bound invocation fence.

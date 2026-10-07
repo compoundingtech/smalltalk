@@ -17703,14 +17703,14 @@ async fn drive_st2_native(
     loop {
         #[cfg(feature = "test-support")]
         {
-        completion_announced |= fixture_terminal_completion_barrier(
-            &mut observations, client, subject, driver, &mut loop_state.ready, &task,
-        ).await?;
-        if completion_announced && env!("CARGO_BIN_NAME") == "st3-fixture"
-            && let Some(root) = std::env::var_os("ST3_FIXTURE_TERMINAL_COMPLETION")
-        {
-            fs::write(PathBuf::from(root).join("awaiting-completion"), b"awaiting")?;
-        }
+            completion_announced |= fixture_terminal_completion_barrier(
+                &mut observations, client, subject, driver, &mut loop_state.ready, &task,
+            ).await?;
+            if completion_announced && env!("CARGO_BIN_NAME") == "st3-fixture"
+                && let Some(root) = std::env::var_os("ST3_FIXTURE_TERMINAL_COMPLETION")
+            {
+                fs::write(PathBuf::from(root).join("awaiting-completion"), b"awaiting")?;
+            }
         }
         tokio::select! {
             frame = mailbox.recv() => {
@@ -18389,7 +18389,9 @@ impl NativeObservations {
         driver: &str,
         ready: &mut bool,
     ) -> Result<()> {
-        self.drain_events(client, subject, driver, ready, false).await.map(|_| ())
+        self.drain_events(client, subject, driver, ready, false)
+            .await
+            .map(|_| ())
     }
 
     async fn drain_events(
