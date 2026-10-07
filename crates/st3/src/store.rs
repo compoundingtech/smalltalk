@@ -15363,7 +15363,7 @@ impl Store {
             if !person_work::declaration_live(&self.readers.get(), &desired.subject)? {
                 continue;
             }
-            let Some(harness) = self.current_harness(&desired.subject)? else {
+            let Some(harness) = self.current_harness_for_login(&desired.subject)? else {
                 continue;
             };
             if harness.state != "needs-login" {
@@ -15535,6 +15535,22 @@ impl Store {
         smallclaims::touched::note_read(|| format!("actor:{subject}"));
         let connection = self.readers.get();
         current_harness_at(&connection, subject, None)
+    }
+
+    /// The seat's harness for the one question the login attention item asks: does it need a
+    /// login? A seat that does not returns without the observation fold, which is what a
+    /// full `current_harness` costs, so an attention read no longer folds every seat that ever
+    /// had a login problem. The view a seat that does need one gets is `current_harness`'s,
+    /// except that its `since` is not refined (attention reads the state, incarnation and
+    /// observation time).
+    pub(crate) fn current_harness_for_login(
+        &self,
+        subject: &str,
+    ) -> Result<Option<crate::model::CurrentHarnessView>> {
+        smallclaims::touched::note_read(|| subject.to_owned());
+        smallclaims::touched::note_read(|| format!("actor:{subject}"));
+        let connection = self.readers.get();
+        current_harness_fold_at(&connection, subject, None, true, true)
     }
 
     /// Positive attachment proof under the indexed current-incarnation diagnostic fence.
@@ -20503,7 +20519,7 @@ fn current_harness_at(
     subject: &str,
     at_index: Option<u64>,
 ) -> Result<Option<crate::model::CurrentHarnessView>> {
-    let mut view = current_harness_fold_at(connection, subject, at_index, true)?;
+    let mut view = current_harness_fold_at(connection, subject, at_index, true, false)?;
     if let Some(harness) = view.as_mut() {
         seat_status::enrich_harness(connection, subject, at_index, harness)?;
     }
@@ -20557,11 +20573,55 @@ fn claude_attachment_fence(
     }))
 }
 
+/// Whether any observation of this runtime epoch of `subject` carries the reason `providerAuth`:
+/// those that name `incarnation_id`, and those that name no incarnation as text and were accepted
+/// no earlier than the runtime observation (`runtime_accepted_at`), the same two sets the
+/// observation fold reads. The seat's login evidence sits in `claims_harness_login_candidate_index`,
+/// so this reads that partial index, not every observation the seat ever made.
+fn provider_auth_reason_in_epoch(
+    connection: &Connection,
+    subject: &str,
+    at_index: u64,
+    incarnation_id: &str,
+    runtime_accepted_at: &str,
+) -> Result<bool> {
+    let reason = "json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
+                            THEN '$.reason' ELSE '$.fields.reason' END)";
+    let sql = format!(
+        "SELECT EXISTS(SELECT 1 FROM claims INDEXED BY claims_harness_login_candidate_index
+           WHERE claims.subject=?1 AND (
+             (kind='harness.observed' AND (
+               json_type(body, '$.fields.provider_auth')='false'
+               OR json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
+                   THEN '$.reason' ELSE '$.fields.reason' END)='providerAuth'
+               OR json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
+                   THEN '$.state' ELSE '$.fields.state' END)='needs-login'))
+             OR (kind='harness.diagnostic'
+               AND json_extract(body, '$.fields.code')='provider-auth-expired'))
+           AND kind='harness.observed' AND store_index<=?2 AND {reason}='providerAuth'
+           AND ({INCARNATION_OF_CLAIM}=?3
+                OR (({INCARNATION_OF_CLAIM} IS NULL OR typeof({INCARNATION_OF_CLAIM})!='text')
+                    AND (length(claims.accepted_at_unix_ms)>length(?4)
+                         OR (length(claims.accepted_at_unix_ms)=length(?4)
+                             AND claims.accepted_at_unix_ms>=?4)))))"
+    );
+    Ok(connection
+        .prepare_cached(&sql)?
+        .query_row(params![subject, at_index, incarnation_id, runtime_accepted_at], |row| {
+            row.get(0)
+        })?)
+}
+
+/// `login_only` answers only whether the seat needs a login: it returns as soon as the cheap
+/// fences have spoken and no observation of this runtime epoch says `providerAuth`, which is the
+/// one thing the observation fold below can add to them. Every other view it returns is the one
+/// the full fold would return, and the view it skips is never `needs-login`.
 fn current_harness_fold_at(
     connection: &Connection,
     subject: &str,
     at_index: Option<u64>,
     include_work_activity: bool,
+    login_only: bool,
 ) -> Result<Option<crate::model::CurrentHarnessView>> {
     let at_index = at_index.unwrap_or(i64::MAX as u64);
     let runtime = connection
@@ -20715,6 +20775,12 @@ fn current_harness_fold_at(
 
     if let Some(harness) = claude_attachment_fence(connection, subject, incarnation_id, at_index)? {
         return Ok(Some(harness));
+    }
+
+    if login_only
+        && !provider_auth_reason_in_epoch(connection, subject, at_index, incarnation_id, &runtime_key.0.to_string())?
+    {
+        return Ok(None);
     }
 
     // The observations of this runtime epoch, newest first in canonical order, so every node that
