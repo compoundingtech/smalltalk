@@ -80,7 +80,7 @@ Reads take an idle connection or open another when all retained connections are 
 pool retains up to 128 idle connections by default; `SMALLCLAIMS_MAX_IDLE_READ_CONNECTIONS`
 overrides that retention ceiling. It does not cap concurrent connections or make reads wait
 for an available slot. Nested reads and pinned snapshots keep their existing behavior.
-Each reader requests a fixed 2 MiB page-cache target by default. Set
+Each reader requests a fixed 8 MiB page-cache target by default. Set
 `SMALLCLAIMS_READ_CACHE_KIB` in the **daemon's** environment to override it in KiB; positive
 integers through 2,147,483,647 are accepted, and invalid or zero values use the default.
 The value is read once per process. Retention still defaults to 128, preserving schema and
@@ -133,9 +133,12 @@ cross-thread pinned snapshot dependencies (#1381).
 
 The doctor planning envelope uses the larger of current open readers and idle retention,
 multiplied by the per-reader target, plus the writer's 32 MiB target and a 512 MiB reserve for
-schema/statements, projections, tasks and allocator overhead. At defaults this is 800 MiB,
-leaving 224 MiB beyond that reserve under a 1 GiB service cap. The reserve is a planning
-allowance, not an enforced limit or a guarantee for every graph or workload. On Linux, doctor
+schema/statements, projections, tasks and allocator overhead. At defaults this is 1,568 MiB:
+1 GiB for 128 retained reader caches, 32 MiB for the writer and the 512 MiB reserve. This
+exceeds a 1 GiB service cap; set `SMALLCLAIMS_READ_CACHE_KIB=2048` to restore the 800 MiB
+planning envelope on memory-constrained installations, or adjust the service limit.
+The reserve is a planning allowance, not an enforced limit or a guarantee for every graph
+or workload. On Linux, doctor
 locates the daemon's own cgroup v2 mount and checks `memory.max` and `memory.events` in that
 cgroup and its visible ancestors. It warns when the tightest limit is below the planning
 envelope, any `max` counter records pressure, or the files cannot be inspected. Ancestor
