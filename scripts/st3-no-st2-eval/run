@@ -17,6 +17,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import shlex
 import signal
 import sqlite3
 import sys
@@ -64,7 +65,7 @@ class Node:
                     "XDG_RUNTIME_DIR": str(root / "run"), "ST3_ENDPOINT": str(self.endpoint),
                     "ST3_DAEMON_WAIT": "0"}
         # The daemon rebuilds PATH from a login shell; pin it to the isolated one.
-        profile = f"export PATH='{self.path}'\n"
+        profile = f"export PATH={shlex.quote(self.path)}\n"
         for name in (".profile", ".bash_profile", ".bashrc", ".zprofile", ".zshenv"):
             (root / "home" / name).write_text(profile)
         (root / "config.toml").write_text(f'''node = "native"
