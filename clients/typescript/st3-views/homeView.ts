@@ -71,18 +71,23 @@ export type KeptAttention = Attention & { closedElsewhere?: boolean };
 /**
  * What stays on Home when st's list changes: nothing leaves by itself (Nathan, 2026-10-07).
  * An item shown before that st no longer lists as open, and that the person did not act on from
- * here, is kept, marked closed elsewhere, with no actions, until the person clears it.
+ * here, is kept, marked closed, with no actions, until the person clears it.
  */
+export const RECENTLY_CLOSED = 5;
+
 export function keepClosed(previous: readonly KeptAttention[], next: readonly Attention[], acted: ReadonlySet<string>, actor?: string): KeptAttention[] {
   const kept: KeptAttention[] = [...next];
   const open = new Set(next.filter(item => onHome(item, actor)).map(item => item.id));
-  for (const old of previous) {
+  // Items kept before go first, so the newly closed sit after them and the oldest drops first.
+  for (const old of [...previous.filter(item => item.closedElsewhere), ...previous.filter(item => !item.closedElsewhere)]) {
     if (open.has(old.id) || acted.has(old.id) || !onHome(old, actor)) continue;
     const marked: KeptAttention = old.closedElsewhere ? old : { ...old, closedElsewhere: true, actions: [] };
     const at = kept.findIndex(item => item.id === old.id);
     if (at >= 0) kept[at] = marked; else kept.push(marked);
   }
-  return kept;
+  // Home lists only the latest few closed items under "Recently closed".
+  let over = kept.filter(item => item.closedElsewhere).length - RECENTLY_CLOSED;
+  return over > 0 ? kept.filter(item => !(item.closedElsewhere && over-- > 0)) : kept;
 }
 
 export function homeRows(items: KeptAttention[], actor: string | undefined, now = Date.now()): HomeRow[] {
@@ -90,7 +95,7 @@ export function homeRows(items: KeptAttention[], actor: string | undefined, now 
     const place = homeKind(item);
     if (!place) return [];
     const step = item.step_run_id?.split('/').pop();
-    return [{ item, ...place, ...kindGlyph(place.kind), title: cleanTitle(item.title), waiting: item.closedElsewhere ? 'closed elsewhere; stays until you clear it' : step ? `step ${step}` : null, age: ago(item.requested_at, now) }];
+    return [{ item, ...place, ...kindGlyph(place.kind), title: cleanTitle(item.title), waiting: item.closedElsewhere ? 'closed; stays until you clear it' : step ? `step ${step}` : null, age: ago(item.requested_at, now) }];
   });
   // A stable sort by tier keeps st's order within each tier; what st closed sits last, apart.
   const rank = (row: HomeRow) => (row.item.closedElsewhere ? TIERS.length : 0) + TIERS.indexOf(row.tier);
@@ -107,7 +112,7 @@ export function homeSections(rows: HomeRow[]): HomeSection[] {
     // what needs the person (Nathan, 2026-10-07: "2 need you", 4 listed).
     if (closed) {
       if (last?.closed) { last.rows.push(row); last.count++; }
-      else sections.push({ tier: row.tier, title: 'closed elsewhere: clear each', count: 1, rows: [row], closed: true });
+      else sections.push({ tier: row.tier, title: 'Recently closed: clear each', count: 1, rows: [row], closed: true });
     } else if (last?.tier === row.tier && !last.closed) { last.rows.push(row); last.count++; }
     else sections.push({ tier: row.tier, title: tierTitle(row.tier), count: 1, rows: [row] });
   }

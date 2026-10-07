@@ -313,6 +313,10 @@ fn parse_intent_with_owner(
     let normalized = json!({ "version": 2, "declarations": normalized_nodes });
     let source_hash = hash_json(&normalized);
     Ok(NormalizedIntent {
+        direct_message_registrations: declarations.iter()
+            .filter(|node| !allow_execution_root && public_message_subscription(node))
+            .map(|node| namespaced("subscription", &one_string_with_children(node).expect("validated subscription")))
+            .collect(),
         schema: "st3.v1".into(),
         source_hash,
         subjects: context.subjects,
@@ -420,6 +424,7 @@ fn parse_desired_node(
             .is_some();
     if !context.allow_execution_root
         && !owned_terminal
+        && !public_message_subscription(node)
         && matches!(
             kind,
             "exec" | "pty" | "lane" | "observer" | "subscription"
@@ -448,6 +453,26 @@ fn parse_desired_node(
         "stop" => parse_stop(node, context),
         _ => parse_structure(node, kind, context),
     }
+}
+
+/// Public registration may attach a simple message delivery to an existing observer.
+/// Observer/recipient existence and actor authority are checked at preview/publication.
+/// Execution, batching, missions and new observers stay on their existing runtime routes.
+fn public_message_subscription(node: &KdlNode) -> bool {
+    if node.name().value() != "subscription" { return false }
+    let Some(body) = node.children() else { return false };
+    if body.nodes().iter().any(|child| !matches!(child.name().value(), "observer" | "on" | "to" | "delivery")) {
+        return false;
+    }
+    if body.nodes().iter().filter(|child| child.name().value() == "on").count() != 1
+        || !body.nodes().iter().find(|child| child.name().value() == "on")
+        .is_some_and(|field| field.children().is_none()
+            && one_string(field).ok().as_deref() == Some(crate::resource::github_workflows::PERFORMANCE_FAILURES_FIELD)) {
+        return false;
+    }
+    body.nodes().iter().find(|child| child.name().value() == "delivery")
+        .is_some_and(|delivery| delivery.children().is_none()
+            && one_string(delivery).ok().as_deref() == Some("message"))
 }
 
 fn parse_mission_run_declaration(
@@ -1338,12 +1363,72 @@ fn parse_agent(
             tags: BTreeMap::new(),
             display_name: display_name.clone(),
             lifecycle: lifecycle.clone(),
+            terminal_binding: None,
             one_shot: false,
             restart: restart.clone(),
             restart_intensity: restart_intensity.clone(),
             shutdown_timeout_ms,
             driver: None,
             terminal_size: None,
+        });
+    }
+
+    if let Some(binding) = unique_child(children, "bind-terminal")? {
+        if context.owner_run.is_some()
+            || driver_nodes.is_empty()
+            || [
+                "checkout",
+                "render",
+                "fresh-context",
+                "one-shot",
+                "pty",
+                "exec",
+                "rollout",
+            ]
+            .iter()
+            .any(|name| children.nodes().iter().any(|n| n.name().value() == *name))
+        {
+            return Err(St3Error::new(
+                "invalid-terminal-binding",
+                "bind-terminal requires a top-level harness seat without managed side effects",
+            ));
+        }
+        ensure_only_properties(binding, &["incarnation", "id", "runtime-id"])?;
+        let terminal = one_string(binding)?;
+        if st3_schema::owned_terminals::owner(&terminal)
+            .map_err(|e| St3Error::new(e.code, e.message))?
+            .is_none_or(|owner| !owner.starts_with("person/"))
+        {
+            return Err(St3Error::new(
+                "invalid-terminal-binding",
+                "bind-terminal needs a person's terminal subject",
+            ));
+        }
+        let incarnation = property_string(binding, "incarnation")?
+            .filter(|s| !s.is_empty() && s.len() <= 256)
+            .ok_or_else(|| {
+                St3Error::new(
+                    "invalid-terminal-binding",
+                    "bind-terminal needs its PTY incarnation",
+                )
+            })?;
+        let id = property_string(binding, "id")?
+            .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+            .ok_or_else(|| {
+                St3Error::new(
+                    "invalid-terminal-binding",
+                    "bind-terminal needs a unique invocation UUID",
+                )
+            })?;
+        let member = primary.as_mut().expect("a bound seat has a harness");
+        member.runtime_id =
+            property_string(binding, "runtime-id")?.unwrap_or_else(|| terminal.replace('/', "."));
+        member.lifecycle = MemberLifecycle::TerminalBound;
+        member.restart = RestartType::Never;
+        member.terminal_binding = Some(crate::model::TerminalBinding {
+            subject: terminal,
+            incarnation,
+            id,
         });
     }
 
@@ -2507,6 +2592,7 @@ fn driver_member(
         tags: BTreeMap::from([("st3.subject".into(), subject.into())]),
         display_name,
         lifecycle,
+        terminal_binding: None,
         one_shot: false,
         restart,
         restart_intensity,
@@ -2598,6 +2684,7 @@ fn task_member(
         tags: parse_tags(body)?,
         display_name: None,
         lifecycle,
+        terminal_binding: None,
         one_shot: false,
         restart,
         restart_intensity,
@@ -2721,6 +2808,7 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "render",
         "harness",
         "fresh-context",
+        "bind-terminal",
         "one-shot",
         "handles-faults",
         "mission-authority",
@@ -2761,6 +2849,7 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "render",
         "harness",
         "fresh-context",
+        "bind-terminal",
         "one-shot",
         "handles-faults",
         "mission-authority",

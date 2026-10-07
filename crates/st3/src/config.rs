@@ -34,7 +34,7 @@ pub struct Config {
     pub planner: PlannerSpec,
     /// The local observation log of this node.
     pub observations: ObservationsConfig,
-    /// Daemon GitHub HTTP authentication. Omitted unless a sekrets profile is configured.
+    /// Daemon GitHub HTTP authentication. Omitted unless an explicit credential source is configured.
     #[serde(skip_serializing_if = "GithubConfig::is_default")]
     pub github: GithubConfig,
     /// Checkpoints that trim replicated history. Written only when it differs from the
@@ -49,7 +49,7 @@ pub struct Config {
     pub fleet: Option<FleetFile>,
 }
 
-/// `[github]`: an explicit token file, or a reserved sekrets profile configuration.
+/// `[github]`: an explicit token file, or gateway-authorized requests with a sekrets profile.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GithubConfig {

@@ -112,7 +112,7 @@ export function AttentionScreen({ route, navigation }: RootScreen<'Attention'>) 
         <T><T bold color={theme[row.color]}>{row.glyph} {row.kind}</T><T dim>  {row.age} ago</T></T>
         <T bold selectable>{row.title}</T>
         {item.detail ? <Markdown text={item.detail} color={theme.subtext0} /> : null}
-        <T dim>This was closed elsewhere. It stays until you clear it.</T>
+        <T dim>This was closed. It stays under Recently closed until you clear it.</T>
         <Button label="clear from Home" onPress={() => { actions.clearClosed(item.id); navigation.goBack(); }} />
         <T dim selectable>{item.id}</T>
       </ScrollView>
@@ -131,7 +131,7 @@ export function AttentionScreen({ route, navigation }: RootScreen<'Attention'>) 
         {item.update.subjects?.map((subject, index) => subject.url
           ? <Pressable key={index} onPress={() => void Linking.openURL(subject.url!)}><T color={theme.accent}>↗ {subject.label}</T></Pressable>
           : <T key={index} dim>↗ {subject.label}  {subject.ref ?? ''}</T>)}
-        <T dim>{item.closedElsewhere ? 'This was closed elsewhere. It stays until you clear it.' : 'Nothing waits on this. It stays on Home until you mark it read.'}</T>
+        <T dim>{item.closedElsewhere ? 'This was closed. It stays under Recently closed until you clear it.' : 'Nothing waits on this. It stays on Home until you mark it read.'}</T>
         {item.closedElsewhere
           ? <Button label="clear from Home" onPress={() => { actions.clearClosed(item.id); navigation.goBack(); }} />
           : item.actions.includes('work.done') ? <Button label="mark read" disabled={busy || status !== 'online'} onPress={() => void actions.done(item, 'Read', 'read').then(done => { if (done) navigation.goBack(); })} /> : null}

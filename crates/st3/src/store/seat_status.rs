@@ -25,6 +25,18 @@ pub(super) fn observation_time(claim: &ClaimRecord) -> u128 {
         .min(claim.accepted_at_unix_ms)
 }
 
+/// Match history_at's SQL `status_transition IS NOT 0` selection before reducing sources.
+/// A suppressed heartbeat can still change reducer state; feeding it only to the drop planner
+/// would hide a later legacy transition that the published history reader exposes.
+pub(super) fn history_source(claim: &ClaimRecord) -> bool {
+    if claim.kind != "harness.observed" {
+        return true;
+    }
+    !claim.body.pointer("/fields/status_transition").is_some_and(|stamp| {
+        matches!(stamp, Value::Bool(false)) || stamp.as_f64() == Some(0.0)
+    })
+}
+
 /// Canonical source positions of transitions and incarnation resets. Heartbeats and changes
 /// to display details do not become transitions. Shared by the read and checkpoint rules.
 pub(super) fn transition_positions(claims: &[&ClaimRecord]) -> Vec<usize> {
@@ -326,6 +338,16 @@ pub(super) fn history_at(
     now: u128,
     index: u64,
 ) -> Result<Value> {
+    history_at_inner(connection, subject, now, index, None)
+}
+
+pub(super) fn history_at_with_sources(connection: &Connection, subject: &str, now: u128, index: u64) -> Result<(Value, Vec<smallclaims::store::checkpoint::CheckpointItemSource>)> {
+    let mut sources = Vec::new();
+    let history = history_at_inner(connection, subject, now, index, Some(&mut sources))?;
+    Ok((history, sources))
+}
+
+fn history_at_inner(connection: &Connection, subject: &str, now: u128, index: u64, mut sources: Option<&mut Vec<smallclaims::store::checkpoint::CheckpointItemSource>>) -> Result<Value> {
     let cutoff = now.saturating_sub(WINDOW_MS);
     // Seek each kind by acceptance time. Read a single older baseline per prompt channel, rather
     // than decoding a seat's lifetime observations on every history request.
@@ -403,18 +425,17 @@ pub(super) fn history_at(
     keyed.sort_by(|a, b| a.0.cmp(&b.0));
     keyed.dedup_by(|a, b| a.1.id == b.1.id);
     let claims = keyed
-        .into_iter()
+        .iter()
         .map(|(_, claim)| claim)
         .collect::<Vec<_>>();
-    let refs = claims.iter().collect::<Vec<_>>();
-    let entries = transitions(&refs);
+    let entries = transitions(&claims);
     let tombstoned: bool = connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM checkpoint_claims WHERE subject=?1 AND kind IN ('harness.observed','runtime.observed'))",
             [subject], |row| row.get(0)
         )?;
     let eligible = entries
         .iter()
-        .filter(|entry| observation_time(&claims[entry.0]) >= cutoff)
+        .filter(|entry| observation_time(claims[entry.0]) >= cutoff)
         .collect::<Vec<_>>();
     let legacy = claims.iter().any(|claim| {
         claim.kind == "harness.observed"
@@ -431,7 +452,12 @@ pub(super) fn history_at(
         || eligible.len() > MAX_TRANSITIONS;
     let start = eligible.len().saturating_sub(MAX_TRANSITIONS);
     let items = eligible[start..].iter().map(|entry| {
-        let claim = &claims[entry.0];
+        let claim = claims[entry.0];
+        if let Some(sources) = sources.as_mut() {
+            sources.push(smallclaims::store::checkpoint::CheckpointItemSource {
+                claim: claim.id.clone(), order: keyed[entry.0].0.clone(),
+            });
+        }
         let fields = claim.body.get("fields").unwrap_or(&claim.body);
         json!({
             "seat": subject, "runtime_incarnation": fields["incarnation_id"],
@@ -448,6 +474,31 @@ pub(super) fn history_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_source_selection_matches_sql_for_legacy_transition_stamps() {
+        let store = Store::open_memory("cedar").unwrap();
+        let mut claim = observe(&store, "one", "idle", now_ms(), "ready");
+        let connection = Connection::open_in_memory().unwrap();
+        for stamp in [None, Some(json!(false)), Some(json!(true)), Some(Value::Null),
+            Some(json!(0)), Some(json!(0.0)), Some(serde_json::from_str::<Value>("-0").unwrap()),
+            Some(serde_json::from_str::<Value>("0e0").unwrap()), Some(serde_json::from_str::<Value>("1e-400").unwrap()),
+            Some(json!("0")), Some(json!("false"))]
+        {
+            claim.body = json!({"fields":{"state":"idle", "incarnation_id":"one"}});
+            if let Some(stamp) = stamp { claim.body["fields"]["status_transition"] = stamp; }
+            let selected: bool = connection.query_row(
+                "SELECT json_extract(?1, '$.fields.status_transition') IS NOT 0",
+                [claim.body.to_string()], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(history_source(&claim), selected, "{}", claim.body);
+        }
+        claim.body = json!({"status_transition":false});
+        assert!(history_source(&claim), "a legacy raw body has no $.fields stamp");
+        claim.kind = "runtime.observed".into();
+        claim.body = json!({"fields":{"status_transition":false}});
+        assert!(history_source(&claim));
+    }
 
     /// `current_harness`, after checking that the login-only fold, which the attention read
     /// uses, reaches the same answer to "does this seat need a login?" for the same claims.

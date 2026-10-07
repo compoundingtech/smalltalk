@@ -564,18 +564,56 @@ fn services_installed() -> bool {
         .unwrap_or(false)
 }
 
+async fn lock_fleet_admission(
+    client: &Client,
+    config: &Config,
+    services: bool,
+    verb: &str,
+) -> Result<st3::node_identity::StateLock> {
+    if client.get::<Value>("/v1/health").await.is_ok() {
+        anyhow::ensure!(
+            services,
+            "stop the running st3 daemon first: nothing may write while this machine {verb}"
+        );
+        st3::service::stop()?;
+        st3::node_identity::lock_after_stop(&config.state_dir).await
+    } else {
+        st3::node_identity::lock(&config.state_dir)
+    }
+}
+
 async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool) -> Result<()> {
-    let config = Config::load_unvalidated(None)?;
+    let mut config = Config::load_unvalidated(None)?;
+    // Explicit admissions can repair a pin after their prior attempt saved membership.
+    // Other controls must use the daemon's resolved identity, including leave's runtime check.
+    if !matches!(&command, FleetCommand::Join(_) | FleetCommand::Create(_)) {
+        config.apply_fleet_file()?;
+        st3::node_identity::resolve(&mut config)?;
+    }
     let client = Client::new(endpoint.clone());
     match command {
         FleetCommand::Create(args) => {
             anyhow::ensure!(
+                st3::config::FleetFile::load(&config.state_dir)?.is_none(),
+                "this machine is already in a fleet"
+            );
+            anyhow::ensure!(
                 config.fleet_id.is_none(),
                 "config.toml already configures a fleet with config peers; move it to membership with st fleet migrate"
             );
+            st3::node_identity::resolve(&mut config)?;
             let node = args.name.unwrap_or_else(|| config.node.clone());
+            anyhow::ensure!(
+                st3::store::valid_fleet_node_name(&node),
+                "`{node}` cannot name a fleet member; use --name"
+            );
+            let services = !args.no_service && services_installed();
+            let state_identity =
+                lock_fleet_admission(&client, &config, services, "founds a fleet").await?;
             let founded =
                 st3::fleet::join::found(&config.state_dir, &node, &args.member.settings())?;
+            state_identity.record_fleet_found(&founded)?;
+            drop(state_identity);
             if json_output {
                 return print_value(&founded, true);
             }
@@ -583,7 +621,6 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
                 "Created fleet {} with {} as its first member.",
                 founded.fleet_id, founded.node
             );
-            let services = !args.no_service && services_installed();
             if services {
                 st3::service::install(Config::load_with_fleet(None)?)?;
             }
@@ -732,13 +769,8 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
                 }
             };
             let use_services = !args.no_service && services_installed();
-            if client.get::<Value>("/v1/health").await.is_ok() {
-                anyhow::ensure!(
-                    use_services,
-                    "stop the running st3 daemon first: nothing may write while this machine joins"
-                );
-                st3::service::stop()?;
-            }
+            let state_identity =
+                lock_fleet_admission(&client, &config, use_services, "joins").await?;
             let joined = st3::fleet::join::join(&st3::fleet::join::JoinOptions {
                 state_dir: config.state_dir.clone(),
                 configured_node: config.node.clone(),
@@ -752,6 +784,8 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
                 version: env!("CARGO_PKG_VERSION").into(),
             })
             .await?;
+            state_identity.record_fleet_join(&joined)?;
+            drop(state_identity);
             if let Some(path) = code_path {
                 let _ = fs::remove_file(path);
             }
@@ -1468,10 +1502,45 @@ async fn run_fleet_migrate(client: &Client, config: &Config, args: FleetMigrateA
         }
         return Ok(());
     }
+    anyhow::ensure!(
+        st3::config::FleetFile::load(&config.state_dir)?.is_none(),
+        "this machine already has fleet membership settings"
+    );
+    anyhow::ensure!(
+        st3::store::valid_fleet_node_name(&config.node),
+        "`{}` cannot name a fleet member",
+        config.node
+    );
     let fleet_id = config
         .fleet_id
         .clone()
         .context("this machine has no config-peer fleet to migrate; use st fleet join")?;
+    // Read only while the daemon may still be running; the locked migration rechecks
+    // its store before writing. Invalid admission must not stop healthy services.
+    {
+        use rusqlite::OptionalExtension as _;
+        let database = config.state_dir.join("claims.sqlite3");
+        anyhow::ensure!(
+            database.exists(),
+            "this store is not bound to a fleet yet; start st3 once first"
+        );
+        let connection = rusqlite::Connection::open_with_flags(
+            database,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let bound: Option<String> = connection
+            .query_row("SELECT value FROM meta WHERE key='fleet_id'", [], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        match bound {
+            Some(bound) => anyhow::ensure!(
+                bound == fleet_id,
+                "this store belongs to fleet {bound}, not the configured {fleet_id}"
+            ),
+            None => anyhow::bail!("this store is not bound to a fleet yet; start st3 once first"),
+        }
+    }
     // fleet.toml resolves a relative path under STATE/fleet, and --finish removes the
     // config.toml override, so record the secret file's absolute path now.
     let configured_secret = config
@@ -1485,13 +1554,7 @@ async fn run_fleet_migrate(client: &Client, config: &Config, args: FleetMigrateA
         )
     })?;
     let use_services = !args.no_service && services_installed();
-    if client.get::<Value>("/v1/health").await.is_ok() {
-        anyhow::ensure!(
-            use_services,
-            "stop the running st3 daemon first: nothing may write while this machine migrates"
-        );
-        st3::service::stop()?;
-    }
+    let state_identity = lock_fleet_admission(client, config, use_services, "migrates").await?;
     let settings = migration_settings(&args.member, config);
     if args.anchor {
         let founded = st3::fleet::join::migrate_anchor(
@@ -1503,6 +1566,7 @@ async fn run_fleet_migrate(client: &Client, config: &Config, args: FleetMigrateA
             args.fabric_protocol.clone(),
             st3::store::runtime(),
         )?;
+        state_identity.record_fleet_found(&founded)?;
         println!(
             "{} is the anchor of fleet {}. It admits itself and signs its history when st3 starts.",
             founded.node, founded.fleet_id
@@ -1541,6 +1605,7 @@ async fn run_fleet_migrate(client: &Client, config: &Config, args: FleetMigrateA
             joined.migrate,
             "that code is a join code; use st fleet join"
         );
+        state_identity.record_fleet_join(&joined)?;
         if let Some(path) = code_path {
             let _ = fs::remove_file(path);
         }
@@ -1549,6 +1614,7 @@ async fn run_fleet_migrate(client: &Client, config: &Config, args: FleetMigrateA
             joined.name, joined.fleet_id, joined.sponsor
         );
     }
+    drop(state_identity);
     if use_services {
         st3::service::install(Config::load_with_fleet(None)?)?;
         println!(
@@ -2539,9 +2605,9 @@ enum ServiceCommand {
 
 #[derive(Subcommand)]
 enum ClaudeChannelCommand {
-    /// Install or update the user plugin and its machine approval policy.
+    /// Install channel assets and approval policy; activate only in st seats.
     Install {
-        /// Install only the user plugin. An administrator will manage the machine policy.
+        /// Install only plugin assets. An administrator will manage the machine policy.
         #[arg(long)]
         no_policy: bool,
     },
@@ -4561,10 +4627,23 @@ fn driver_environment_incarnation(cli: &Cli) -> Result<Option<String>> {
     let Command::Driver(args) = &cli.command else {
         return Ok(None);
     };
-    let subject = args
-        .subject
-        .clone()
-        .or_else(|| args.identity.as_deref().map(normalize_agent_subject));
+    let subject = args.subject.clone().or_else(|| {
+        (args.driver != "claude-mcp")
+            .then(|| args.identity.as_deref().map(normalize_agent_subject))
+            .flatten()
+    });
+    if args.driver == "claude-mcp" {
+        let scoped = subject
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+            || std::env::var("ST3_SUBJECT")
+                .ok()
+                .is_some_and(|value| !value.trim().is_empty());
+        anyhow::ensure!(
+            scoped || args.identity.is_none(),
+            "the Claude channel identity requires a subject"
+        );
+    }
     let Some(subject) = subject.as_deref() else {
         return Ok(None);
     };
@@ -4894,6 +4973,7 @@ async fn run(cli: Cli) -> Result<()> {
             config.peers = args.peer;
         }
         config.apply_fleet_file()?;
+        st3::node_identity::resolve(&mut config)?;
         return st3::peer::run_worker(config).await;
     }
     let config = Config::load_unvalidated(None)?;
@@ -5065,7 +5145,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Driver(args) => run_driver(&immediate, args, cli.catalog.as_deref()).await,
         Command::Gate { command } => {
             if matches!(&command, GateCommand::Merged { .. } | GateCommand::CiPassed { .. }) {
-                st3::resource::configure_github(&config.github)?;
+                st3::resource::configure_github(&config)?;
             }
             run_gate(command).await
         },
@@ -5582,8 +5662,9 @@ async fn run_up(args: UpArgs) -> Result<()> {
         config.peers = args.peer;
     }
     config.apply_fleet_file()?;
+    let _state_identity = st3::node_identity::acquire(&mut config)?;
     config.validate()?;
-    st3::resource::configure_github(&config.github)?;
+    st3::resource::configure_github(&config)?;
     validate_unix_socket_path(&config.socket, "--socket")?;
     validate_unix_socket_path(&config.client_gateway_socket, "--client-gateway-socket")?;
     fs::create_dir_all(&config.state_dir)?;
@@ -15612,6 +15693,44 @@ fn current_local_pty_incarnation(actor: &str) -> Result<Option<String>> {
     Ok(pty_observation_incarnation(actor, &observations))
 }
 
+async fn current_local_agent_incarnation(client: &Client, actor: &str) -> Result<Option<String>> {
+    let status: StatusResponse = client
+        .get(&format!(
+            "/v1/status?subject={}",
+            urlencoding::encode(actor)
+        ))
+        .await?;
+    let binding = status
+        .subjects
+        .first()
+        .and_then(|s| s.desired.as_ref())
+        .map(st3::terminal_binding::from_desired)
+        .transpose()?
+        .flatten();
+    let Some(binding) = binding else {
+        return current_local_pty_incarnation(actor);
+    };
+    let Some(root) = std::env::var_os("PTY_ROOT").filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let observations = st_runtime::PtyRuntime::new(PathBuf::from(root)).snapshot()?;
+    Ok(bound_pty_incarnation(&binding, &observations))
+}
+
+fn bound_pty_incarnation(
+    binding: &st3::model::TerminalBinding,
+    observations: &[st_runtime::PtyObservation],
+) -> Option<String> {
+    let matched = observations.iter().any(|o| {
+        o.status == "running"
+            && o.tags.get("st3.subject") == Some(&binding.subject)
+            && o.pid
+                .zip(o.created_at.as_deref())
+                .is_some_and(|(pid, created)| format!("{pid}:{created}") == binding.incarnation)
+    });
+    matched.then(|| binding.agent_incarnation())
+}
+
 fn has_local_pty_registry() -> bool {
     std::env::var_os("PTY_ROOT").is_some_and(|value| !value.is_empty())
 }
@@ -15632,27 +15751,26 @@ async fn wait_for_agent_incarnation_from(
         // observation. Reading the graph immediately would then bind this new driver to the old
         // incarnation forever. The local registry already contains the process executing us and
         // is the exact source from which the reconciler will derive the graph incarnation.
-        if use_local_pty_registry {
-            if let Some(incarnation) = current_local_pty_incarnation(actor)? {
-                return Ok(incarnation);
-            }
+        let lookup = if use_local_pty_registry {
+            current_local_agent_incarnation(client, actor).await
         } else {
-            match current_agent_incarnation(client, actor).await {
-                Ok(Some(incarnation)) => return Ok(incarnation),
-                Ok(None) => {}
-                // A restarting daemon cannot answer yet; its outage does not use up the wait.
-                Err(error) if st3::client::daemon_unreachable(&error).is_some() => {
-                    if !outage_logged {
-                        let _ = write_driver_log(
-                            actor,
-                            "waiting for the runtime incarnation while the daemon restarts",
-                        );
-                        outage_logged = true;
-                    }
-                    deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+            current_agent_incarnation(client, actor).await
+        };
+        match lookup {
+            Ok(Some(incarnation)) => return Ok(incarnation),
+            Ok(None) => {}
+            // A restarting daemon cannot answer yet; its outage does not use up the wait.
+            Err(error) if st3::client::daemon_unreachable(&error).is_some() => {
+                if !outage_logged {
+                    let _ = write_driver_log(
+                        actor,
+                        "waiting for the runtime incarnation while the daemon restarts",
+                    );
+                    outage_logged = true;
                 }
-                Err(error) => return Err(error),
+                deadline = tokio::time::Instant::now() + Duration::from_secs(15);
             }
+            Err(error) => return Err(error),
         }
         if tokio::time::Instant::now() >= deadline {
             anyhow::bail!(
@@ -16826,10 +16944,19 @@ async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -
             args.argv.is_empty(),
             "the Claude channel takes no provider argv"
         );
-        let subject = args
+        let fallback_subject = std::env::var("ST3_SUBJECT").ok();
+        let Some(subject) = args
             .subject
             .as_deref()
-            .context("the Claude channel has no subject")?;
+            .or(fallback_subject.as_deref())
+            .filter(|subject| !subject.trim().is_empty())
+        else {
+            anyhow::ensure!(
+                args.identity.is_none(),
+                "the Claude channel identity requires a subject"
+            );
+            return st3::claude_channel::run_idle().await;
+        };
         let identity = subject.strip_prefix("agent/").unwrap_or(subject);
         let paths = match st_drivers::driver_paths::Paths::from_environment(identity, &|name| {
             std::env::var(name).ok()
@@ -27375,6 +27502,38 @@ mod tests {
             pty_observation_incarnation("agent/run/other", &observations),
             None
         );
+    }
+
+    #[test]
+    fn native_driver_binds_the_terminal_tag_only_under_its_declared_invocation() {
+        let binding = st3::model::TerminalBinding {
+            subject: "pty/person/avery/019a0000-0000-7000-8000-000000000001".into(),
+            incarnation: "42:created".into(),
+            id: "019a0000-0000-7000-8000-000000000002".into(),
+        };
+        let mut observation = st_runtime::PtyObservation {
+            name: "fixture".into(),
+            status: "running".into(),
+            exit_code: None,
+            pid: Some(42),
+            created_at: Some("created".into()),
+            display_name: None,
+            tags: BTreeMap::from([("st3.subject".into(), binding.subject.clone())]),
+        };
+        assert_eq!(
+            bound_pty_incarnation(&binding, &[observation.clone()]),
+            Some(binding.agent_incarnation())
+        );
+        observation.pid = Some(43);
+        assert_eq!(
+            bound_pty_incarnation(&binding, &[observation.clone()]),
+            None
+        );
+        observation.pid = Some(42);
+        observation
+            .tags
+            .insert("st3.subject".into(), "agent/example/other".into());
+        assert_eq!(bound_pty_incarnation(&binding, &[observation]), None);
     }
 
     #[test]

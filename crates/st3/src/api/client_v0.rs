@@ -73,6 +73,8 @@ const COLLECTION_MAX_SUBSCRIPTIONS: usize = 16;
 const COLLECTION_REREAD_INTERVAL: Duration = Duration::from_millis(1_500);
 // Observer grace periods and checkpoint waits can enter attention without a new claim.
 const ATTENTION_CLOCK_INTERVAL: Duration = Duration::from_secs(30);
+const COLLECTION_PING_INTERVAL: Duration = Duration::from_secs(8);
+const COLLECTION_SEND_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Claims that no collection window shows: rereading for them only costs.
 fn collection_ignores(collection: &str, kind: &str) -> bool {
@@ -390,7 +392,14 @@ async fn send_collection(socket: &mut WebSocket, value: Value) -> bool {
     if payload.len() > CLIENT_MAX_RESPONSE_BYTES {
         return false;
     }
-    socket.send(WsMessage::Text(payload.into())).await.is_ok()
+    send_collection_message(socket, WsMessage::Text(payload.into())).await
+}
+
+async fn send_collection_message(socket: &mut WebSocket, message: WsMessage) -> bool {
+    matches!(
+        tokio::time::timeout(COLLECTION_SEND_TIMEOUT, socket.send(message)).await,
+        Ok(Ok(()))
+    )
 }
 
 enum Refreshed {
@@ -828,8 +837,16 @@ async fn collection_stream_socket_with_reader<F, Fut>(
     let (conversation_outbox, mut conversation_frames) =
         tokio::sync::mpsc::unbounded_channel::<(String, Value)>();
     // The commits already weighed for a reread, whether one is due, and when the last ran.
-    let mut attention_clock = tokio::time::interval(ATTENTION_CLOCK_INTERVAL);
+    let mut attention_clock = tokio::time::interval_at(
+        tokio::time::Instant::now() + ATTENTION_CLOCK_INTERVAL,
+        ATTENTION_CLOCK_INTERVAL,
+    );
     attention_clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut ping_clock = tokio::time::interval_at(
+        tokio::time::Instant::now() + COLLECTION_PING_INTERVAL,
+        COLLECTION_PING_INTERVAL,
+    );
+    ping_clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut weighed = state.store.index().unwrap_or_default();
     let mut reread_due = false;
     let mut last_reread = tokio::time::Instant::now() - COLLECTION_REREAD_INTERVAL;
@@ -854,6 +871,9 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                         let Some(Ok(message)) = incoming else { return; };
                         let WsMessage::Text(payload) = message else {
                             if matches!(message, WsMessage::Close(_)) { return; }
+                            if let WsMessage::Ping(payload) = message
+                                && !send_collection_message(&mut socket, WsMessage::Pong(payload)).await
+                            { return; }
                             break 'command;
                         };
                         let Ok(request) = serde_json::from_str::<CollectionSubscribe>(&payload) else {
@@ -989,6 +1009,11 @@ async fn collection_stream_socket_with_reader<F, Fut>(
             }
             () = tokio::time::sleep(subjects::expiry_delay(&session)), if !command_waiting && subscriptions.values().any(|s| s.request.collection == "subjects") => {
                 refresh.extend(subscriptions.iter().filter(|(_, s)| s.request.collection == "subjects").map(|(id, _)| id.clone()));
+            }
+            _ = ping_clock.tick() => {
+                // Protocol liveness never schedules an authorized window read.
+                if !send_collection_message(&mut socket, WsMessage::Ping(Vec::new().into())).await { return; }
+                continue;
             }
             Some((id, frame)) = conversation_frames.recv(), if !command_waiting => {
                 // A follower stopped by unsubscribe may still have had a frame on the way.
@@ -3260,6 +3285,42 @@ fn operation_resources(state: &AppState, at: &str) -> Result<Vec<Value>, ApiErro
     Ok(values)
 }
 
+struct MissionPageRead {
+    items: Vec<Value>,
+    has_more: bool,
+    after_key: Option<(u128, String)>,
+}
+
+/// Read and materialize only the requested cards plus one continuation identifier.
+/// The caller pins the SQLite snapshot for the whole page.
+fn read_mission_page(
+    store: &Store,
+    history: bool,
+    offset: usize,
+    limit: usize,
+    after_key: Option<&(u128, String)>,
+) -> anyhow::Result<MissionPageRead> {
+    let mut ids =
+        store.mission_collection_page(history, offset, limit.saturating_add(1), after_key)?;
+    let mut has_more = ids.len() > limit;
+    ids.truncate(limit);
+    let mut items = mission_list_cards(
+        store,
+        &ids.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
+    )?;
+    has_more |= bound_mission_cards(&mut items)?;
+    let after_key = items.last().and_then(|item| {
+        ids.iter()
+            .find(|(id, _)| Some(id.as_str()) == item["id"].as_str())
+            .map(|(id, time)| (*time, id.clone()))
+    });
+    Ok(MissionPageRead {
+        items,
+        has_more,
+        after_key,
+    })
+}
+
 pub(super) async fn missions(
     State(state): State<AppState>,
     Extension(snapshot): Extension<ClientSnapshot>,
@@ -3320,25 +3381,8 @@ pub(super) async fn missions(
         let store = reader.store.clone();
         store.read_snapshot(|index| {
             let snapshot = client_snapshot_at(&reader, index);
-            let mut ids = store.mission_collection_page(
-                history,
-                offset,
-                limit.saturating_add(1),
-                after_key.as_ref(),
-            )?;
-            let mut has_more = ids.len() > limit;
-            ids.truncate(limit);
-            let mut items = mission_list_cards(
-                &store,
-                &ids.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
-            )?;
-            has_more |= bound_mission_cards(&mut items)?;
-            let after_key = items.last().and_then(|item| {
-                ids.iter()
-                    .find(|(id, _)| Some(id.as_str()) == item["id"].as_str())
-                    .map(|(id, time)| (*time, id.clone()))
-            });
-            Ok(Some((snapshot, items, has_more, after_key)))
+            let page = read_mission_page(&store, history, offset, limit, after_key.as_ref())?;
+            Ok(Some((snapshot, page.items, page.has_more, page.after_key)))
         })
     })
     .await?;
@@ -7532,7 +7576,6 @@ fn consume_terminal_attachment(
     capability: Option<&str>,
 ) -> Result<(), ApiError> {
     consume_terminal_attachment_mode(state, session, terminal_id, incarnation, capability, None)
-        .map(|_| ())
 }
 
 fn consume_terminal_attachment_mode(
@@ -7542,7 +7585,7 @@ fn consume_terminal_attachment_mode(
     incarnation: &str,
     capability: Option<&str>,
     raw_mode: Option<&str>,
-) -> Result<Option<String>, ApiError> {
+) -> Result<(), ApiError> {
     let lookup_span = crate::profile::span("terminal/capability-lookup");
     let capability = capability
         .filter(|value| !value.is_empty())
@@ -7565,9 +7608,7 @@ fn consume_terminal_attachment_mode(
         && raw_mode.is_none_or(|_| {
             field("person_id").and_then(Value::as_str) == Some(session.authority_actor.as_str())
         })
-        && (raw_mode != Some("peek")
-            || field("raw_authorization_epoch").and_then(Value::as_str)
-                == Some(raw_terminal::authorization_epoch(state, session)?.as_str()))
+        && raw_mode != Some("peek")
         && raw_live.as_ref().is_none_or(|live| {
             field("owner_host_id").and_then(Value::as_str) == Some(live.owner_host_id.as_str())
                 && field("runtime_id").and_then(Value::as_str) == Some(live.runtime_id.as_str())
@@ -7594,7 +7635,7 @@ fn consume_terminal_attachment_mode(
     }
     if raw_mode.is_none() {
         // A projected-screen capability is a lease and stays valid for more streams.
-        return Ok(None);
+        return Ok(());
     }
     let _span = crate::profile::span("terminal/capability-consume");
     state
@@ -7615,9 +7656,7 @@ fn consume_terminal_attachment_mode(
         })
         .map_err(|_| forbidden("the terminal stream capability was already consumed"))?;
     signal_changed(state);
-    Ok(field("raw_authorization_epoch")
-        .and_then(Value::as_str)
-        .map(str::to_owned))
+    Ok(())
 }
 
 fn detach_terminal_attachment(
@@ -9976,6 +10015,73 @@ mod tests {
     use std::sync::Barrier;
 
     #[tokio::test]
+    async fn collections_socket_ping_pong_does_not_read_held_windows() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let reads = Arc::new(AtomicUsize::new(0));
+        let observed = reads.clone();
+        let app = axum::Router::new().route(
+            "/stream",
+            axum::routing::get(move |upgrade: WebSocketUpgrade| {
+                let (state, reads) = (state.clone(), reads.clone());
+                async move {
+                    upgrade.on_upgrade(move |socket| {
+                        collection_stream_socket_with_reader(
+                            socket,
+                            state,
+                            ClientSession::local(None).unwrap(),
+                            None,
+                            move |state, session, request, permit| {
+                                reads.fetch_add(1, Ordering::SeqCst);
+                                async move {
+                                    collection_items(&state, &session, &request, permit).await
+                                }
+                            },
+                        )
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream"))
+            .await
+            .unwrap();
+        socket.send(Message::Text(json!({
+            "kind":"subscribe", "id":"held", "collection":"work", "limit":2
+        }).to_string().into())).await.unwrap();
+        let snapshot = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await.unwrap().unwrap().unwrap();
+        let snapshot: Value = serde_json::from_str(snapshot.to_text().unwrap()).unwrap();
+        assert_eq!(snapshot["kind"], "snapshot");
+        assert_eq!(observed.load(Ordering::SeqCst), 1);
+
+        let payload = b"idle-window".to_vec();
+        socket.send(Message::Ping(payload.clone().into())).await.unwrap();
+        let pong = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await.unwrap().unwrap().unwrap();
+        assert_eq!(pong, Message::Pong(payload.clone().into()));
+        let ping = tokio::time::timeout(Duration::from_secs(10), socket.next())
+            .await.unwrap().unwrap().unwrap();
+        assert!(matches!(ping, Message::Ping(_)), "{ping:?}");
+        socket.flush().await.unwrap();
+        // A second client probe proves the server handled our automatic Pong and kept
+        // receiving commands after its own ping, without rebuilding the held window.
+        socket.send(Message::Ping(payload.clone().into())).await.unwrap();
+        let pong = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await.unwrap().unwrap().unwrap();
+        assert_eq!(pong, Message::Pong(payload.into()));
+        assert_eq!(observed.load(Ordering::SeqCst), 1);
+        socket.close(None).await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn collections_socket_keeps_sixteen_windows_and_refuses_the_seventeenth() {
         use futures_util::{SinkExt as _, StreamExt as _};
         assert!(
@@ -10504,6 +10610,69 @@ mod tests {
         assert!(frame.get("items").is_none());
         socket.close(None).await.unwrap();
         server.abort();
+    }
+
+    #[test]
+    fn missions_first_page_has_bounded_queries_with_thousands_of_definitions() {
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("large.sqlite");
+        let store = Arc::new(Store::open(&db, "client-v0-baseline").unwrap());
+        let source = "version 2\nmission \"base\" state=\"ready\" { goal \"Page quickly\" }\n";
+        let intent = crate::graph::parse_intent(source, "client-v0-baseline").unwrap();
+        let planned = store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &planned.subject_tokens, "large-page-base")
+            .unwrap();
+        let base = store.mission_definitions().unwrap().remove(0).mission;
+        let claim_id: String = rusqlite::Connection::open(&db)
+            .unwrap()
+            .query_row(
+                "SELECT claim_id FROM mission_definitions WHERE mission_id='base'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut connection = rusqlite::Connection::open(&db).unwrap();
+        crate::store::configure_projection_writer(&connection).unwrap();
+        let transaction = connection.transaction().unwrap();
+        for index in 0..3000 {
+            let id = format!("large-{index:04}");
+            let mut mission = base.clone();
+            mission.id = id.clone();
+            mission.subject = format!("mission/{id}");
+            transaction.execute(
+                "INSERT INTO mission_revisions(mission_id,revision,state,body,claim_id,created_index) VALUES(?1,?2,'ready',?3,?4,1)",
+                rusqlite::params![id, mission.revision, serde_json::to_string(&mission).unwrap(), claim_id],
+            ).unwrap();
+            transaction.execute(
+                "INSERT INTO mission_definitions(mission_id,revision,state,claim_id) VALUES(?1,?2,'ready',?3)",
+                rusqlite::params![id, mission.revision, claim_id],
+            ).unwrap();
+        }
+        transaction.commit().unwrap();
+        // Measure on this thread inside the same read used by the HTTP handler. Other tests'
+        // connections cannot contribute to STATEMENTS_RUN, even under parallel libtest load.
+        let before = crate::store::STATEMENTS_RUN.with(std::cell::Cell::get);
+        let page = store
+            .read_snapshot(|_| read_mission_page(&store, false, 0, 50, None))
+            .unwrap();
+        let statements = crate::store::STATEMENTS_RUN.with(std::cell::Cell::get) - before;
+        assert_eq!(page.items.len(), 50);
+        assert!(page.has_more);
+        assert_eq!(page.after_key.as_ref().unwrap().1, page.items[49]["id"]);
+        // Six overview queries per card, plus the page, attention and snapshot reads.
+        assert!(
+            statements > 0 && statements <= 50 * 6 + 10,
+            "a 50-card page must query only its cards, not all 3001 definitions: {statements} statements"
+        );
     }
 
     #[test]

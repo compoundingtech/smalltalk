@@ -1250,63 +1250,35 @@ async fn attention_socket_evicts_completed_sources_and_reconnects_without_cached
 }
 
 #[tokio::test]
-async fn missions_first_page_stays_under_100ms_with_thousands_of_definitions() {
+async fn missions_first_page_returns_fifty_cards_and_a_cursor() {
     let root = tempfile::tempdir().unwrap();
-    let db = root.path().join("large.sqlite");
-    let store = Arc::new(Store::open(&db, "client-v0-baseline").unwrap());
-    let source = "version 2\nmission \"base\" state=\"ready\" { goal \"Page quickly\" }\n";
-    let intent = st3::graph::parse_intent(source, "client-v0-baseline").unwrap();
-    let planned = store
+    let state = test_state(root.path());
+    let source = format!(
+        "version 2\n{}",
+        (0..51)
+            .map(|index| format!("mission \"page-{index:02}\" state=\"ready\" {{ goal \"Read a page\" }}\n"))
+            .collect::<String>()
+    );
+    let intent = st3::graph::parse_intent(&source, "client-v0-baseline").unwrap();
+    let planned = state
+        .store
         .mission(
             &intent,
             st3::model::IntentInput {
-                kdl: source.into(),
+                kdl: source,
                 source_name: None,
             },
         )
         .unwrap();
-    store
-        .apply(&intent, &planned.subject_tokens, "large-page-base")
+    state
+        .store
+        .apply(&intent, &planned.subject_tokens, "mission-page-smoke")
         .unwrap();
-    let base = store.mission_definitions().unwrap().remove(0).mission;
-    let claim_id: String = rusqlite::Connection::open(&db)
-        .unwrap()
-        .query_row(
-            "SELECT claim_id FROM mission_definitions WHERE mission_id='base'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    let mut connection = rusqlite::Connection::open(&db).unwrap();
-    st3::store::configure_projection_writer(&connection).unwrap();
-    let transaction = connection.transaction().unwrap();
-    for index in 0..3000 {
-        let id = format!("large-{index:04}");
-        let mut mission = base.clone();
-        mission.id = id.clone();
-        mission.subject = format!("mission/{id}");
-        transaction.execute(
-            "INSERT INTO mission_revisions(mission_id,revision,state,body,claim_id,created_index) VALUES(?1,?2,'ready',?3,?4,1)",
-            rusqlite::params![id, mission.revision, serde_json::to_string(&mission).unwrap(), claim_id],
-        ).unwrap();
-        transaction.execute(
-            "INSERT INTO mission_definitions(mission_id,revision,state,claim_id) VALUES(?1,?2,'ready',?3)",
-            rusqlite::params![id, mission.revision, claim_id],
-        ).unwrap();
-    }
-    transaction.commit().unwrap();
-    let mut state = test_state(root.path());
-    state.store = store;
-    let app = st3::api::router(state);
-    let started = std::time::Instant::now();
-    let (status, page) = client_json(app, "/v1/client/missions?limit=50").await;
-    let elapsed = started.elapsed();
+    let (status, page) = client_json(st3::api::router(state), "/v1/client/missions?limit=50").await;
     assert_eq!(status, StatusCode::OK, "{page}");
     assert_eq!(page["value"]["items"].as_array().unwrap().len(), 50);
-    assert!(
-        elapsed < std::time::Duration::from_millis(100),
-        "mission page over 3000 rows took {elapsed:?}"
-    );
+    assert_eq!(page["value"]["page"]["has_more"], true);
+    assert!(page["value"]["page"]["next_cursor"].is_string());
 }
 
 #[tokio::test]

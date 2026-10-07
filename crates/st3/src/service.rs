@@ -133,6 +133,7 @@ impl ServiceSpec {
 }
 
 pub fn install(mut config: Config) -> Result<()> {
+    crate::node_identity::resolve(&mut config)?;
     #[cfg(target_os = "linux")]
     anyhow::ensure!(
         st_runtime::isolation_mode() != st_runtime::Isolation::DegradedDetached,

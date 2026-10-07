@@ -194,7 +194,7 @@ pub fn home_list(
                 .count();
             items.push(Item::Header {
                 title: if is_closed {
-                    "closed elsewhere: x clears each".into()
+                    "Recently closed: x clears each".into()
                 } else {
                     item.tier.title().into()
                 },

@@ -291,6 +291,8 @@ struct ChatState {
 }
 
 /// How long a second Ctrl+T may follow the first and leave the terminal.
+/// How many closed items Home keeps listed under "Recently closed".
+const RECENTLY_CLOSED: usize = 5;
 const LEAVE_TAP: Duration = Duration::from_millis(400);
 
 pub struct Ui {
@@ -517,7 +519,7 @@ impl Ui {
     }
 
     /// Replace the world, keeping each tab's selection on the same item.
-    /// Note what the person did to an item from here, so its closing is not "closed elsewhere".
+    /// Note what the person did to an item from here, so its closing is not listed under Recently closed.
     pub(crate) fn note_acted(&mut self, effect: &Effect) {
         match effect {
             Effect::Attention { id, .. }
@@ -531,10 +533,13 @@ impl Ui {
 
     /// An item st stopped listing stays on Home, marked, unless the person acted on it: another
     /// device, an agent or st itself closed it, and it must not go while it is being read.
-    fn keep_closed_attention(&mut self, before: Vec<view::Attention>) {
+    fn keep_closed_attention(&mut self, mut before: Vec<view::Attention>) {
         let Load::Ready(items) = &mut self.world.attention else {
             return;
         };
+        // Items already kept go first, so the newly closed ones sit after them and the oldest
+        // closed item is the first to drop off.
+        before.sort_by_key(|old| !self.closed.contains(&old.id));
         for old in before {
             if let Some(now) = items.iter().find(|item| item.id == old.id) {
                 if !self.closed.contains(&now.id) {
@@ -550,12 +555,25 @@ impl Ui {
             let mut kept = old;
             if self.closed.insert(kept.id.clone()) {
                 kept.waiting = Some(match kept.waiting.take() {
-                    Some(who) => format!("closed elsewhere, x clears it · {who}"),
-                    None => "closed elsewhere, x clears it".into(),
+                    Some(who) => format!("closed, x clears it · {who}"),
+                    None => "closed, x clears it".into(),
                 });
                 kept.actions.clear();
             }
             items.push(kept);
+        }
+        // Home lists only the latest few closed items; the rest drop off, oldest first.
+        let mut over = self.closed.len().saturating_sub(RECENTLY_CLOSED);
+        if over > 0 {
+            let closed = &mut self.closed;
+            items.retain(|item| {
+                if over > 0 && closed.contains(&item.id) {
+                    closed.remove(&item.id);
+                    over -= 1;
+                    return false;
+                }
+                true
+            });
         }
     }
 
@@ -3950,7 +3968,7 @@ impl Ui {
                         let index = self.selected[self.tab];
                         self.select(index);
                     } else {
-                        self.flash("This was closed elsewhere and stays until you clear it with x");
+                        self.flash("This was closed and stays under Recently closed until you clear it with x");
                     }
                     return;
                 }
@@ -6656,9 +6674,9 @@ mod tests {
         assert!(!listing.ids.contains(&acted), "what the person acted on goes");
         ui.select(listing.ids.iter().position(|id| *id == gone).unwrap());
         let shown = frame(&ui, 140, 50).join("\n");
-        assert!(shown.contains("closed elsewhere"));
+        assert!(!shown.contains("elsewhere"), "{shown}");
         // It sits under its own heading, apart from what needs the person.
-        assert!(shown.contains("closed elsewhere: x clears each"), "{shown}");
+        assert!(shown.contains("Recently closed: x clears each"), "{shown}");
         // It survives later updates, and only x clears it.
         ui.set_world(next.clone());
         assert!(ui.listing(60).ids.contains(&gone));
@@ -6669,6 +6687,38 @@ mod tests {
         assert!(ui.effects.is_empty(), "nothing sent for an item already closed");
         ui.set_world(next);
         assert!(!ui.listing(60).ids.contains(&gone));
+    }
+
+    #[test]
+    fn recently_closed_lists_only_the_latest_few() {
+        let mut world = demo::world();
+        if let Load::Ready(items) = &mut world.attention {
+            let template = items[0].clone();
+            items.clear();
+            for n in 0..RECENTLY_CLOSED + 3 {
+                items.push(Attention { id: format!("attention/n{n}"), ..template.clone() });
+            }
+        }
+        let mut ui = Ui::new(world.clone());
+        ui.live = true;
+        let ids: Vec<String> = ui.world.attention.items().iter().map(|a| a.id.clone()).collect();
+        // One closes per reading, oldest first.
+        let mut next = world;
+        for id in ids.iter().take(RECENTLY_CLOSED + 2) {
+            if let Load::Ready(items) = &mut next.attention {
+                items.retain(|item| item.id != *id);
+            }
+            ui.set_world(next.clone());
+        }
+        let shown: Vec<&String> = ui.closed.iter().collect();
+        assert_eq!(shown.len(), RECENTLY_CLOSED, "{shown:?}");
+        for old in ids.iter().take(2) {
+            assert!(!ui.closed.contains(old), "closed {old}: {:?}", ui.closed);
+            assert!(!ui.listing(60).ids.contains(old), "listed {old}");
+        }
+        for recent in ids.iter().skip(2).take(RECENTLY_CLOSED) {
+            assert!(ui.closed.contains(recent), "{recent}");
+        }
     }
 
     #[test]
