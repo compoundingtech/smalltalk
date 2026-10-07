@@ -101,6 +101,7 @@ mod checkpoint_rules;
 pub(crate) mod delegation;
 mod limits;
 mod person_work;
+pub(crate) mod work_summaries_ivm;
 mod subagents;
 mod watches;
 pub use checkpoint_rules::{RULES_VERSION, plan_drops, rules_digest};
