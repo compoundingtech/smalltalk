@@ -2423,6 +2423,18 @@ fn client_agent_resources_uncached(
     client_agent_resources_from_status(store, history, snapshot_index, None, status)
 }
 
+#[cfg(test)]
+pub(crate) fn agent_card_source_oracle(
+    store: &Store,
+    index: u64,
+    at: &str,
+) -> anyhow::Result<Vec<Value>> {
+    let mut items = client_agent_resources_uncached(store, true, index)?;
+    add_agent_todos(store, &mut items, index)?;
+    overlay_agent_resources(store, &mut items, at)?;
+    Ok(items)
+}
+
 fn client_agent_resources_selected(
     store: &Store,
     history: bool,

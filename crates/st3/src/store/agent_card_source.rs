@@ -1298,3 +1298,7 @@ pub(crate) fn selected_certificates(
         .map(|s| serde_json::from_str(&s).map_err(Into::into))
         .collect()
 }
+
+#[cfg(test)]
+#[path = "agent_card_source/tests.rs"]
+pub(crate) mod tests;
