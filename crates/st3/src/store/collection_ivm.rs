@@ -16,7 +16,7 @@ const MAX_PAYLOAD: u64 = 64 * 1024;
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS st3_ivm_capture_state (
  singleton INTEGER PRIMARY KEY CHECK(singleton=1), fingerprint TEXT NOT NULL,
- epoch INTEGER NOT NULL, gap TEXT, rows INTEGER NOT NULL DEFAULT 0,
+ epoch INTEGER NOT NULL, descriptor TEXT, gap TEXT, rows INTEGER NOT NULL DEFAULT 0,
  bytes INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS st3_ivm_capture (
@@ -24,6 +24,9 @@ CREATE TABLE IF NOT EXISTS st3_ivm_capture (
  payload TEXT NOT NULL, bytes INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS st3_ivm_insert_before (
+ source_table TEXT PRIMARY KEY, old_key TEXT, old_row TEXT
+);
+CREATE TABLE IF NOT EXISTS st3_ivm_update_before (
  source_table TEXT PRIMARY KEY, old_key TEXT, old_row TEXT
 );
 CREATE TRIGGER IF NOT EXISTS st3_ivm_capture_removed AFTER DELETE ON st3_ivm_capture BEGIN
@@ -108,12 +111,21 @@ fn validate(connection: &Connection, table: &Table) -> Result<()> {
         "virtual source tables require another extractor"
     );
     let mut stmt =
-        connection.prepare(&format!("PRAGMA table_info({})", identifier(table.name)?))?;
+        connection.prepare(&format!("PRAGMA table_xinfo({})", identifier(table.name)?))?;
     let fields = stmt
         .query_map([], |row| {
-            Ok((row.get::<_, String>(1)?, row.get::<_, usize>(5)?))
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, usize>(5)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, usize>(6)?,
+            ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    ensure!(
+        fields.iter().all(|(_, _, _, hidden)| *hidden == 0),
+        "generated source columns require another extractor"
+    );
     let declared = table
         .columns
         .iter()
@@ -123,20 +135,26 @@ fn validate(connection: &Connection, table: &Table) -> Result<()> {
         declared.len() == table.columns.len()
             && fields
                 .iter()
-                .map(|(name, _)| name.clone())
+                .map(|(name, _, _, _)| name.clone())
                 .collect::<std::collections::BTreeSet<_>>()
                 == declared,
         "capture must include every source column exactly once"
     );
     let mut primary = fields
         .into_iter()
-        .filter(|(_, position)| *position > 0)
+        .filter(|(_, position, _, _)| *position > 0)
         .collect::<Vec<_>>();
-    primary.sort_by_key(|(_, position)| *position);
+    primary.sort_by_key(|(_, position, _, _)| *position);
+    ensure!(
+        primary.len() != 1
+            || !primary[0].2.eq_ignore_ascii_case("INTEGER")
+            || sql.to_ascii_uppercase().contains("WITHOUT ROWID"),
+        "rowid alias source keys require explicit post-insert extraction"
+    );
     ensure!(
         primary
             .iter()
-            .map(|(name, _)| name.as_str())
+            .map(|(name, _, _, _)| name.as_str())
             .collect::<Vec<_>>()
             == table.key,
         "capture key must be the complete primary key"
@@ -182,25 +200,56 @@ pub fn install(
         validate(tx, table)?;
     }
     tx.execute_batch(SCHEMA)?;
+    let has_descriptor = tx
+        .prepare("PRAGMA table_xinfo(st3_ivm_capture_state)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .iter()
+        .any(|name| name == "descriptor");
+    if !has_descriptor {
+        tx.execute_batch("ALTER TABLE st3_ivm_capture_state ADD COLUMN descriptor TEXT")?;
+    }
+    let descriptor = serde_json::to_string(
+        &tables
+            .iter()
+            .map(|table| {
+                let sql: String = tx.query_row(
+                    "SELECT sql FROM sqlite_schema WHERE type='table' AND name=?1",
+                    [table.name],
+                    |r| r.get(0),
+                )?;
+                Ok((table.name, table.columns, table.key, sql))
+            })
+            .collect::<Result<Vec<_>>>()?,
+    )?;
     let existing = tx
         .query_row(
-            "SELECT fingerprint,epoch FROM st3_ivm_capture_state WHERE singleton=1",
+            "SELECT fingerprint,epoch,descriptor FROM st3_ivm_capture_state WHERE singleton=1",
             [],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
         )
         .optional()?;
-    if let Some((stored, stored_epoch)) = existing {
-        if stored != fingerprint || stored_epoch != epoch {
+    if let Some((stored, stored_epoch, stored_descriptor)) = existing {
+        if stored != fingerprint
+            || stored_epoch != epoch
+            || stored_descriptor.as_deref() != Some(descriptor.as_str())
+        {
             gap(
                 tx,
-                "capture identity changed; explicit replacement required",
+                "capture identity or source descriptor changed; explicit replacement required",
             )?;
             return Ok(());
         }
     } else {
         tx.execute(
-            "INSERT INTO st3_ivm_capture_state(singleton,fingerprint,epoch) VALUES(1,?1,?2)",
-            params![fingerprint, epoch],
+            "INSERT INTO st3_ivm_capture_state(singleton,fingerprint,epoch,descriptor) VALUES(1,?1,?2,?3)",
+            params![fingerprint, epoch, descriptor],
         )?;
         for table in tables {
             let populated: bool = tx.query_row(
@@ -225,21 +274,28 @@ pub fn install(
     Ok(())
 }
 
-fn enqueue(table: &Table, old_key: &str, old: &str, new_key: &str, new: &str) -> String {
+fn enqueue(
+    table: &Table,
+    old_key: &str,
+    old: &str,
+    new_key: &str,
+    new: &str,
+    condition: &str,
+) -> String {
     let payload = format!(
         "json_object('old_key',json({old_key}),'old',json({old}),'new_key',json({new_key}),'new',json({new}))"
     );
     format!(
         r#"
  UPDATE st3_ivm_capture_state SET gap=COALESCE(gap,'source capture quota exceeded')
- WHERE singleton=1 AND (rows>={MAX_ROWS} OR length(CAST({payload} AS BLOB))>{MAX_PAYLOAD}
+ WHERE singleton=1 AND ({condition}) AND (rows>={MAX_ROWS} OR length(CAST({payload} AS BLOB))>{MAX_PAYLOAD}
  OR bytes+length(CAST({payload} AS BLOB))>{MAX_BYTES});
  INSERT INTO st3_ivm_capture(source_table,payload,bytes)
  SELECT '{name}',{payload},length(CAST({payload} AS BLOB))
- WHERE (SELECT gap FROM st3_ivm_capture_state WHERE singleton=1) IS NULL
+ WHERE ({condition}) AND (SELECT gap FROM st3_ivm_capture_state WHERE singleton=1) IS NULL
  ON CONFLICT DO NOTHING;
  UPDATE st3_ivm_capture_state SET rows=rows+1,bytes=bytes+length(CAST({payload} AS BLOB))
- WHERE singleton=1 AND gap IS NULL;
+ WHERE singleton=1 AND gap IS NULL AND ({condition});
  "#,
         name = table.name
     )
@@ -276,10 +332,17 @@ fn triggers(tx: &Transaction<'_>, table: &Table) -> Result<()> {
         "(SELECT old_row FROM st3_ivm_insert_before WHERE source_table='SOURCE_TABLE')",
         &new_key,
         &new,
+        "1",
     )
     .replace("SOURCE_TABLE", table.name);
-    let updated = enqueue(table, &old_key, &old, &new_key, &new);
-    let deleted = enqueue(table, &old_key, &old, "NULL", "NULL");
+    let updated = enqueue(table, &old_key, &old, &new_key, &new, "1");
+    let deleted = enqueue(table, &old_key, &old, "NULL", "NULL", "1");
+    let collision_match = format!("({matching}) AND {before_key} IS NOT {old_key}");
+    let overwritten = enqueue(table,
+        "(SELECT old_key FROM st3_ivm_update_before WHERE source_table='SOURCE_TABLE')",
+        "(SELECT old_row FROM st3_ivm_update_before WHERE source_table='SOURCE_TABLE')",
+        "NULL", "NULL", "EXISTS(SELECT 1 FROM st3_ivm_update_before WHERE source_table='SOURCE_TABLE' AND old_key IS NOT NULL)")
+        .replace("SOURCE_TABLE", table.name);
     // BEFORE captures the conflicting primary-key row for OR REPLACE even when SQLite's
     // recursive DELETE triggers are disabled. AFTER excludes failed/ignored INSERT attempts.
     tx.execute_batch(&format!(r#"
@@ -296,13 +359,24 @@ fn triggers(tx: &Transaction<'_>, table: &Table) -> Result<()> {
  {inserted}
  DELETE FROM st3_ivm_insert_before WHERE source_table='{table_name}';
  END;
+ CREATE TRIGGER IF NOT EXISTS st3_ivm_{table_name}_before_update BEFORE UPDATE ON {name} BEGIN
+  UPDATE st3_ivm_capture_state SET gap=COALESCE(gap,'source capture payload exceeded') WHERE singleton=1
+   AND COALESCE((SELECT length(CAST({before} AS BLOB)) FROM {name} before WHERE {collision_match}),0)>{MAX_PAYLOAD};
+  INSERT INTO st3_ivm_update_before(source_table,old_key,old_row)
+  VALUES('{table_name}',(SELECT {before_key} FROM {name} before WHERE {collision_match} AND (SELECT gap FROM st3_ivm_capture_state WHERE singleton=1) IS NULL),
+   (SELECT {before} FROM {name} before WHERE {collision_match} AND (SELECT gap FROM st3_ivm_capture_state WHERE singleton=1) IS NULL))
+  ON CONFLICT(source_table) DO UPDATE SET old_key=excluded.old_key,old_row=excluded.old_row;
+ END;
  CREATE TRIGGER IF NOT EXISTS st3_ivm_{table_name}_update AFTER UPDATE ON {name} BEGIN
   UPDATE st3_ivm_capture_state SET gap=COALESCE(gap,'null primary source key') WHERE singleton=1 AND ({null_key});
+ {overwritten}
  {updated}
+ DELETE FROM st3_ivm_update_before WHERE source_table='{table_name}';
  END;
  CREATE TRIGGER IF NOT EXISTS st3_ivm_{table_name}_delete AFTER DELETE ON {name} BEGIN
  {deleted}
  DELETE FROM st3_ivm_insert_before WHERE source_table='{table_name}' AND old_key={old_key};
+ DELETE FROM st3_ivm_update_before WHERE source_table='{table_name}' AND old_key={old_key};
  END;
  "#,table_name=table.name))?;
     Ok(())
@@ -342,7 +416,7 @@ pub fn clean(connection: &Connection) -> Result<bool> {
 pub fn page(connection: &Connection, limit: usize) -> Result<Vec<Captured>> {
     ensure!(
         (1..=128).contains(&limit),
-        "capture page limit must be1..=128"
+        "capture page limit must be 1..=128"
     );
     ensure!(
         status(connection)?.gap.is_none(),
@@ -426,6 +500,7 @@ pub fn ack(tx: &Transaction<'_>, page: &[Captured]) -> Result<()> {
         )?;
     }
     tx.execute("DELETE FROM st3_ivm_insert_before", [])?;
+    tx.execute("DELETE FROM st3_ivm_update_before", [])?;
     Ok(())
 }
 
@@ -575,6 +650,96 @@ mod tests {
         assert!(captured[1].replacements[0].old.is_none());
         assert!(captured[1].replacements[0].new.is_some());
         tx.commit().unwrap();
+    }
+    #[test]
+    fn update_replace_retracts_overwritten_key_in_both_recursive_modes() {
+        for recursive in ["OFF", "ON"] {
+            let store = fixture();
+            let mut writer = store.connection.write();
+            writer
+                .execute_batch(&format!("PRAGMA recursive_triggers={recursive}"))
+                .unwrap();
+            let tx = writer.transaction().unwrap();
+            tx.execute(
+                "INSERT INTO fixture_source VALUES('row/a','person/avery',1,NULL)",
+                [],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO fixture_source VALUES('row/b','person/intruder',2,NULL)",
+                [],
+            )
+            .unwrap();
+            ack(&tx, &page(&tx, 128).unwrap()).unwrap();
+            tx.execute(
+                "UPDATE OR IGNORE fixture_source SET id='row/b' WHERE id='row/a'",
+                [],
+            )
+            .unwrap();
+            assert!(page(&tx, 128).unwrap().is_empty());
+            tx.execute(
+                "UPDATE OR REPLACE fixture_source SET id='row/b' WHERE id='row/a'",
+                [],
+            )
+            .unwrap();
+            let captured = page(&tx, 128).unwrap();
+            let changes = captured
+                .iter()
+                .flat_map(|change| &change.replacements)
+                .collect::<Vec<_>>();
+            assert_eq!(changes.len(), 3);
+            assert_eq!(changes[0].old.as_ref().unwrap()["owner"], "person/intruder");
+            assert!(changes[0].new.is_none());
+            assert_eq!(changes[1].old.as_ref().unwrap()["owner"], "person/avery");
+            assert!(changes[1].new.is_none());
+            assert!(changes[2].old.is_none());
+            assert_eq!(changes[2].new.as_ref().unwrap()["owner"], "person/avery");
+            tx.commit().unwrap();
+        }
+    }
+    #[test]
+    fn rowid_alias_and_generated_columns_require_explicit_other_extraction() {
+        let store = crate::store::Store::open_memory("alder").unwrap();
+        store.connection.batched(|tx| {
+            tx.execute_batch("CREATE TABLE alias(id INTEGER PRIMARY KEY,owner TEXT); INSERT INTO alias VALUES(-1,'person/avery'); CREATE TABLE generated(id TEXT PRIMARY KEY,value TEXT,folded TEXT GENERATED ALWAYS AS (lower(value)) STORED)")?;
+            assert!(install(tx, &[Table {name: "alias", columns: &["id","owner"], key: &["id"]}], "alias", 1).is_err());
+            assert!(install(tx, &[Table {name: "generated", columns: &["id","value"], key: &["id"]}], "generated", 1).is_err());
+            assert!(install(tx, &[Table {name: "generated", columns: &["id","value","folded"], key: &["id"]}], "generated", 1).is_err());
+            // A rejected extractor never installs triggers that retract row-1 on omitted-id insert.
+            tx.execute("INSERT INTO alias(owner) VALUES('person/intruder')", [])?;
+            assert_eq!(tx.query_row("SELECT owner FROM alias WHERE id=-1", [], |r| r.get::<_,String>(0))?, "person/avery");
+            Ok::<_, anyhow::Error>(())
+        }).unwrap().unwrap();
+    }
+    #[test]
+    fn same_fingerprint_cannot_adopt_changed_source_set_or_schema() {
+        let store = fixture();
+        store.connection.batched(|tx| {
+            install(tx, TABLES, "fixture.capture.v1", 1)?;
+            assert!(clean(tx)?);
+            tx.execute_batch("CREATE TABLE extra(id TEXT PRIMARY KEY,value TEXT); INSERT INTO extra VALUES('row/populated','existing')")?;
+            let tables = [Table { name: "fixture_source", columns: &["id","owner","sample","payload"], key: &["id"] }, Table {name: "extra", columns: &["id","value"], key: &["id"]}];
+            install(tx, &tables, "fixture.capture.v1", 1)?;
+            assert!(status(tx)?.gap.is_some());
+            assert_eq!(tx.query_row("SELECT count(*) FROM sqlite_schema WHERE type='trigger' AND name LIKE 'st3_ivm_extra_%'", [], |r| r.get::<_,usize>(0))?, 0);
+            Ok::<_,anyhow::Error>(())
+        }).unwrap().unwrap();
+        let store = fixture();
+        store
+            .connection
+            .batched(|tx| {
+                tx.execute_batch("ALTER TABLE fixture_source ADD COLUMN dependency TEXT")?;
+                let updated = Table {
+                    name: "fixture_source",
+                    columns: &["id", "owner", "sample", "payload", "dependency"],
+                    key: &["id"],
+                };
+                install(tx, &[updated], "fixture.capture.v1", 1)?;
+                assert!(status(tx)?.gap.is_some());
+                Ok::<_, anyhow::Error>(())
+            })
+            .unwrap()
+            .unwrap();
     }
     #[test]
     fn quota_gap_preserves_source_admission_and_cannot_be_cleared_by_ack() {
