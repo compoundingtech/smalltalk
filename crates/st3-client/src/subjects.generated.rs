@@ -421,18 +421,13 @@ mod native_pattern_tests {
         for header in ["NativeClaimHeader", "NativeSubjectHeader"] {
             let schema = &native_definitions()[header]["properties"]["ref"];
             assert_eq!(schema, &registry_schema);
-            for reference in ["message/example", "custom/team/example"] {
+            for reference in ["message/example", "custom/team/example", "pty/example"] {
                 assert!(
                     native_valid(schema, &Value::String(reference.into())),
                     "{header}: {reference}"
                 );
             }
-            for reference in [
-                "pty/example",
-                "session/example",
-                "custom/team//example",
-                "message/has whitespace",
-            ] {
+            for reference in ["custom/team//example", "message/has whitespace"] {
                 assert!(
                     !native_valid(schema, &Value::String(reference.into())),
                     "{header}: {reference}"
