@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Invalidate owner arrangement inventories when changes fall outside bounded stream windows",
+  "replay": {
+    "status": "none",
+    "detail": "Uses existing admission-time arrangement heads and changed_index values. No replay, backfill or recovery is required."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database tables, columns, indexes, triggers or schema version change. Owner revisions use the existing arrangements_owner_changed_index."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No retention, checkpoint rule, projection digest or sealing transition changes. The existing local changed_index frontier remains excluded from shared projection digests."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Owner-wide arrangements subscriptions can now receive existing changes frames with empty upserts and removes, unchanged order and has_more, and a new snapshot fence when that owner's inventory revision changes. Clients needing complete inventories must paginate after every owner-wide changes frame, including empty ones. Selected-subject subscriptions remain resource-only. No new frame kind, field, wire schema, generated client API or capability version is introduced. Older servers can still miss outside-window changes; upgrade serving daemons for the stronger invalidation guarantee."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional interruption beyond an ordinary daemon restart. Reconnected subscriptions receive authoritative initial snapshots. Restart timing was not measured."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Upgrade serving daemons normally; no migration or inventory repair is required. Inventory consumers should keep one owner-wide subscription open and coalesce complete paginated rereads on snapshot and changes frames."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No additional database recovery or rollback procedure is required. Rolling back restores the previous bounded-prefix-only notification behavior without modifying stored arrangements."
+  }
+}

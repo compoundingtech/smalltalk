@@ -137,9 +137,13 @@ fn resource(subject: &str, owner: &str, revision: &str, time: u128, heads: &BTre
         "body":{"version":1,"name":register(heads.get("name").context("created arrangement name")?),"folders":folders,"placements":placements},"resolved":resolved(heads),
         "updated_at":chrono::DateTime::from_timestamp_millis(i64::try_from(time).unwrap_or(i64::MAX)).unwrap_or(chrono::DateTime::UNIX_EPOCH).to_rfc3339_opts(chrono::SecondsFormat::Millis,true)}))
 }
-pub(super) fn arrangements_at(connection: &Connection, person: &str, through: u64) -> Result<Vec<Value>> {
+fn inventory_revision_at(connection: &Connection, person: &str, through: u64) -> Result<u64> {
     let changed: u64 = connection.query_row("SELECT COALESCE(MAX(changed_index),0) FROM arrangements WHERE owner=?1", [person], |row| row.get(0))?;
     anyhow::ensure!(changed <= through, "arrangement collection snapshot frontier is stale; read current heads in a read snapshot");
+    Ok(changed)
+}
+pub(super) fn arrangements_at(connection: &Connection, person: &str, through: u64) -> Result<Vec<Value>> {
+    inventory_revision_at(connection, person, through)?;
     let mut statement = connection.prepare_cached("SELECT subject FROM arrangements WHERE owner=?1 AND created=1 AND retired=0 ORDER BY subject")?;
     let subjects = statement.query_map([person], |row| row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
     subjects.into_iter().filter_map(|subject| arrangement_at(connection,&subject,through).transpose()).collect()
@@ -222,6 +226,11 @@ pub(super) fn rebuild(transaction: &Transaction<'_>) -> Result<()> {
 impl Store {
     pub fn arrangements(&self, person: &str, through: u64) -> Result<Vec<Value>> {
         self.read_snapshot(|_| arrangements_at(&self.readers.get(),person,through))
+    }
+    /// Owner-local arrival frontier, including retired and not-yet-created heads.
+    /// Read alongside the bounded inventory inside the caller's read snapshot.
+    pub(crate) fn arrangement_inventory_revision(&self, person: &str, through: u64) -> Result<u64> {
+        self.read_snapshot(|_| inventory_revision_at(&self.readers.get(), person, through))
     }
     pub fn arrangement(&self, subject: &str, through: u64) -> Result<Option<Value>> {
         self.read_snapshot(|_| arrangement_at(&self.readers.get(),subject,through))

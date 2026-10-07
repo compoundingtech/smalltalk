@@ -228,6 +228,179 @@ mod tests {
         assert!(!error.retryable);
     }
 
+    fn inventory_edit(store: &Store, subject: &str, operations: Value) {
+        let owner = st3_schema::arrangements::owner(subject).unwrap();
+        store.append_claim(&ClaimInput {
+            subject:subject.into(), kind:"arrangement.edited".into(), actor:Some(owner.into()),
+            fields:serde_json::from_value(json!({"owner":owner,"operations":operations})).unwrap(),
+            evidence:vec![], expected_subject:None, idempotency_key:None,
+        }).unwrap();
+    }
+
+    type InventorySocket = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+    async fn inventory_frame(socket: &mut InventorySocket) -> Value {
+        use futures_util::StreamExt as _;
+        let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await.expect("owner inventory change must produce a frame").unwrap().unwrap();
+        let value: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        super::super::tests::assert_collection_frame_conforms(&value);
+        value
+    }
+
+    async fn inventory_reads(reads: &mut tokio::sync::mpsc::UnboundedReceiver<String>) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut completed = BTreeSet::new();
+            while completed.len() < 2 {
+                completed.insert(reads.recv().await.unwrap());
+            }
+        }).await.expect("both owner and selected windows must be reread");
+    }
+
+    async fn owner_inventory_stream(replicated: bool) {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        const FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+        const PREFIX_SECOND: &str = "arrangement/person/ada/019a0000-0000-7000-8000-000000000002";
+        const LOWER: &str = "arrangement/person/ada/019a0000-0000-7000-8000-000000000003";
+        const WINNER: &str = "arrangement/person/ada/019a0000-0000-7000-8000-000000000004";
+        const HIGHER: &str = "arrangement/person/ada/019a0000-0000-7000-8000-000000000005";
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "inventory-stream");
+        state.store.bind_fleet(FLEET).unwrap();
+        // Two large unrelated resources force the byte window to stop before either
+        // Sidebar, even with limit 100 and after retirement of the lower candidate.
+        for subject in [SUBJECT, PREFIX_SECOND] {
+            let mut operations = vec![json!({"op":"create","name":"Unrelated"})];
+            operations.extend((0..480).map(|id| json!({
+                "op":"subject.place","subject":format!("agent/{id}/{}", "x".repeat(430)),
+                "folder":null,"key":"a0"
+            })));
+            inventory_edit(&state.store, subject, json!(operations));
+        }
+        inventory_edit(&state.store, WINNER, json!([{"op":"create","name":"Sidebar"}]));
+        let winner = state.store.arrangement(WINNER, u64::MAX).unwrap().unwrap();
+        let remote = Store::open_memory("inventory-source").unwrap();
+        remote.bind_fleet(FLEET).unwrap();
+        let (completed, mut reads) = tokio::sync::mpsc::unbounded_channel();
+        let stream_state = state.clone();
+        let app = axum::Router::new().route("/stream", axum::routing::get(
+            move |upgrade: WebSocketUpgrade| {
+                let state = stream_state.clone();
+                let completed = completed.clone();
+                async move {
+                    upgrade.on_upgrade(move |socket| {
+                        let windows = collection_windows::Windows::attach(&state.store);
+                        collection_stream_socket_with_reader(
+                            socket, state, ClientSession::local(Some("person/ada")).unwrap(), None,
+                            move |state, session, request, permit| {
+                                let windows = windows.clone();
+                                let completed = completed.clone();
+                                async move {
+                                    let result = collection_items_with_windows(
+                                        &state, &session, &request, permit, windows).await;
+                                    completed.send(request.id).unwrap();
+                                    result
+                                }
+                            },
+                        )
+                    })
+                }
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream")).await.unwrap();
+        for (id, subject) in [("owner", None), ("selected", Some(WINNER))] {
+            socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({
+                "kind":"subscribe","id":id,"collection":"arrangements","person":"person/ada",
+                "subject":subject,"limit":100
+            }).to_string().into())).await.unwrap();
+        }
+        let mut initial = BTreeMap::new();
+        for _ in 0..2 {
+            let frame = inventory_frame(&mut socket).await;
+            initial.insert(frame["id"].as_str().unwrap().to_owned(), frame);
+        }
+        inventory_reads(&mut reads).await;
+        assert_eq!(initial["owner"]["order"], json!([SUBJECT]));
+        assert_eq!(initial["owner"]["has_more"], true);
+        assert_eq!(initial["selected"]["items"], json!([winner]));
+        let mut previous_index = initial["owner"]["snapshot"]["store_index"].as_u64().unwrap();
+        for (subject, operations) in [
+            (LOWER, json!([{"op":"create","name":"Sidebar"}])),
+            (HIGHER, json!([{"op":"create","name":"Sidebar"}])),
+            (LOWER, json!([{"op":"rename","name":"Not Sidebar"}])),
+            (LOWER, json!([{"op":"retire"}])),
+        ] {
+            if replicated {
+                inventory_edit(&remote, subject, operations);
+                let exchange = remote.export_replication_exchange_answering(
+                    FLEET, &state.store.replication_inventory().unwrap(),
+                    &state.store.replication_signature_requests().unwrap()).unwrap();
+                state.store.receive_replication_exchange("inventory-source", FLEET, &exchange).unwrap();
+                let admission = state.store.validate_replication_backlog().unwrap();
+                assert_eq!(admission.invalid, 0);
+                assert_eq!(admission.held, 0);
+                assert!(state.store.project_replication_backlog().unwrap());
+                assert_eq!(state.store.arrangement(subject, u64::MAX).unwrap(),
+                    remote.arrangement(subject, u64::MAX).unwrap());
+            } else {
+                inventory_edit(&state.store, subject, operations);
+            }
+            let index = state.store.index().unwrap();
+            assert!(index > previous_index, "arrival must advance the local snapshot");
+            assert_eq!(state.store.arrangement_inventory_revision("person/ada", index).unwrap(),
+                index, "owner frontier must cover the arrival");
+            signal_changed(&state);
+            inventory_reads(&mut reads).await;
+            let frame = inventory_frame(&mut socket).await;
+            assert_eq!(frame["kind"], "changes");
+            assert_eq!(frame["id"], "owner");
+            assert_eq!(frame["collection"], "arrangements");
+            assert_eq!(frame["upserts"], json!([]));
+            assert_eq!(frame["removes"], json!([]));
+            assert_eq!(frame["order"], initial["owner"]["order"]);
+            assert_eq!(frame["has_more"], true);
+            let index = frame["snapshot"]["store_index"].as_u64().unwrap();
+            assert!(index > previous_index);
+            assert_eq!(index, state.store.index().unwrap());
+            previous_index = index;
+            assert_eq!(state.store.arrangement(WINNER, u64::MAX).unwrap().unwrap(), winner);
+            assert!(tokio::time::timeout(Duration::from_millis(200), socket.next()).await.is_err(),
+                "selected subject must stay silent, and the owner notice must not repeat");
+        }
+        // Positive read completion proves the server examined the unrelated owner's
+        // change; silence is not merely failure to schedule a read.
+        inventory_edit(&state.store,
+            "arrangement/person/other/019a0000-0000-7000-8000-000000000001",
+            json!([{"op":"create","name":"Sidebar"}]));
+        signal_changed(&state);
+        inventory_reads(&mut reads).await;
+        assert!(tokio::time::timeout(Duration::from_millis(200), socket.next()).await.is_err());
+        state.store.append_claim(&ClaimInput {
+            subject:"resource/inventory-noise".into(), kind:"resource.observed".into(), actor:None,
+            fields:serde_json::from_value(json!({"kind":"custom.test.inventory"})).unwrap(),
+            evidence:vec![], expected_subject:None, idempotency_key:None,
+        }).unwrap();
+        signal_changed(&state);
+        assert!(tokio::time::timeout(COLLECTION_REREAD_INTERVAL * 2, socket.next()).await.is_err(),
+            "global commits must not invalidate the owner inventory");
+        socket.close(None).await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn owner_inventory_stream_notices_outside_byte_window_local_edits() {
+        owner_inventory_stream(false).await;
+    }
+
+    #[tokio::test]
+    async fn owner_inventory_stream_notices_outside_byte_window_replicated_edits() {
+        owner_inventory_stream(true).await;
+    }
+
     #[tokio::test]
     async fn selected_arrangement_survives_byte_window_edits_and_retirement() {
         let root = tempfile::tempdir().unwrap();
@@ -250,18 +423,18 @@ mod tests {
         let mut subscription: CollectionSubscribe = serde_json::from_value(json!({
             "kind":"subscribe","id":"sidebar","collection":"arrangements","person":"person/ada","limit":100
         })).unwrap();
-        let (_, prefix, has_more) = collection_items(&state, &session, &subscription, read_slots.clone().acquire_owned().await.unwrap()).await.unwrap();
+        let (_, prefix, has_more, _) = collection_items(&state, &session, &subscription, read_slots.clone().acquire_owned().await.unwrap()).await.unwrap();
         assert_eq!(prefix.iter().map(|item| item["id"].as_str().unwrap()).collect::<Vec<_>>(), [SUBJECT]);
         assert!(has_more);
         subscription.subject = Some(sidebar.into());
-        let (_, selected, has_more) = collection_items(&state, &session, &subscription, read_slots.clone().acquire_owned().await.unwrap()).await.unwrap();
+        let (_, selected, has_more, _) = collection_items(&state, &session, &subscription, read_slots.clone().acquire_owned().await.unwrap()).await.unwrap();
         assert_eq!(selected.iter().map(|item| item["id"].as_str().unwrap()).collect::<Vec<_>>(), [sidebar]);
         assert!(!has_more);
         assert_eq!(selected[0]["body"]["name"]["value"], "Sidebar");
         let mut rename = request(&state, "selected-rename", json!([{"op":"rename","name":"Selected edit"}]));
         rename.parameters["subject"] = json!(sidebar);
         edit(&state, &session, &rename).await.unwrap();
-        let (_, updated, has_more) = collection_items(&state, &session, &subscription, read_slots.clone().acquire_owned().await.unwrap()).await.unwrap();
+        let (_, updated, has_more, _) = collection_items(&state, &session, &subscription, read_slots.clone().acquire_owned().await.unwrap()).await.unwrap();
         assert_eq!(updated[0]["body"]["name"]["value"], "Selected edit");
         assert_ne!(updated[0]["revision"], selected[0]["revision"]);
         assert!(!has_more);
@@ -271,11 +444,11 @@ mod tests {
         let mut retire = request(&state, "selected-retire", json!([{"op":"retire"}]));
         retire.parameters["subject"] = json!(sidebar);
         edit(&state, &session, &retire).await.unwrap();
-        let (_, removed, has_more) = collection_items(&state, &session, &subscription, read_slots.clone().acquire_owned().await.unwrap()).await.unwrap();
+        let (_, removed, has_more, _) = collection_items(&state, &session, &subscription, read_slots.clone().acquire_owned().await.unwrap()).await.unwrap();
         assert!(removed.is_empty());
         assert!(!has_more);
         subscription.subject = None;
-        let (_, unfiltered, has_more) = collection_items(&state, &session, &subscription, read_slots.clone().acquire_owned().await.unwrap()).await.unwrap();
+        let (_, unfiltered, has_more, _) = collection_items(&state, &session, &subscription, read_slots.clone().acquire_owned().await.unwrap()).await.unwrap();
         assert_eq!(unfiltered, prefix);
         assert!(!has_more);
     }
@@ -402,7 +575,7 @@ mod tests {
         let subscription: CollectionSubscribe = serde_json::from_value(json!({
             "kind":"subscribe","id":"sidebar","collection":"arrangements","person":"person/ada","limit":10
         })).unwrap();
-        let (_, before, _) = collection_items(&state, &agent, &subscription, read_slots.clone().acquire_owned().await.unwrap()).await.unwrap();
+        let (_, before, _, _) = collection_items(&state, &agent, &subscription, read_slots.clone().acquire_owned().await.unwrap()).await.unwrap();
         assert_eq!(before[0]["id"], SUBJECT);
         let mut omitted = subscription.clone();
         omitted.person = None;
@@ -412,7 +585,7 @@ mod tests {
         assert_eq!(person(&ClientSession::local(None).unwrap(), Some("person/ada"), false).unwrap_err().code, "forbidden");
         let _ = action(State(state.clone()), Extension(new_client_snapshot(&state)), Extension(agent.clone()),
             Json(request(&state, "retire", json!([{"op":"retire"}])))).await.unwrap();
-        let (_, after, _) = collection_items(&state, &agent, &subscription, read_slots.clone().acquire_owned().await.unwrap()).await.unwrap();
+        let (_, after, _, _) = collection_items(&state, &agent, &subscription, read_slots.clone().acquire_owned().await.unwrap()).await.unwrap();
         assert!(after.is_empty());
         let response = app.oneshot(Request::builder()
             .uri("/v1/client/arrangements/ada/019a0000-0000-7000-8000-000000000001")

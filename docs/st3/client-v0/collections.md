@@ -39,6 +39,26 @@ subject starts empty. Individual resource byte bounds still apply. Omitting
 Arrangement snapshots and changes carry full typed arrangement resources. Folder or
 placement changes are full resource upserts; retirement sends the arrangement ID in
 `removes`. Glass privacy and its person-only selection are unchanged.
+
+An owner-wide arrangements subscription (no `subject`) also invalidates the complete
+owner inventory, not just the visible prefix. The server reads that owner's inventory
+revision in the same SQLite snapshot as the resources and fence. After the initial
+`snapshot`, a changed owner revision sends the existing `changes` frame even when the
+prefix is identical: `upserts: []`, `removes: []`, unchanged `order` and `has_more`,
+and the new `snapshot` (including `id` and `store_index`). The frame retains the
+subscription `id` and `collection: "arrangements"`; there is no extra revision field.
+Create, rename, retirement, layout edits and admitted replicated arrivals advance this
+owner revision, including records outside the count/byte window. Multiple changes may
+coalesce into one reread. Another owner's edits and unrelated global commits do not
+send an inventory notice. A selected-subject subscription remains resource-only.
+
+Clients needing complete owner inventory must paginate the HTTP arrangements list
+after the initial snapshot and every owner-wide `changes` frame, including empty
+ones. Pin each complete read to its page snapshot/cursors; restart an expired read.
+Keep the subscription open while reading and coalesce concurrent invalidations into
+a follow-up complete read. Bounded prefix contents cannot prove absence or select a
+winner across the full inventory. Reconnect/resync handling remains unchanged.
+
 A window contains 1–200 current items. History remains on the
 corresponding paged HTTP reads. Send `{"kind":"unsubscribe","id":"missions-tab"}`
 to remove a subscription. IDs are chosen by the client and unique on the socket.
