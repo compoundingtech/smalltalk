@@ -1263,6 +1263,7 @@ fn client_error_code(code: Option<&str>) -> String {
         | "unsupported-capability"
         | "validation-failed"
         | "idempotency-conflict"
+        | "issuer-required"
         | "arrangement-exists"
         | "arrangement-folder-exists"
         | "arrangement-retired"

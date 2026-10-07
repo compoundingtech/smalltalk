@@ -1307,6 +1307,9 @@ pub(super) struct ClientSession {
     pub(super) actor: String,
     /// The concrete graph person whose explicitly delegated authority is exercised.
     pub(super) authority_actor: String,
+    /// The exact pairing grant that authenticated this session. Two pairings of the same
+    /// person and device key share an actor, so only this subject names the exact grant.
+    pub(super) pairing_grant: Option<String>,
     pub(super) transport: &'static str,
     pub(super) custom_forms: bool,
     pub(super) conversation_blocks: bool,
@@ -1319,6 +1322,7 @@ impl ClientSession {
         Self {
             actor: actor.into(),
             authority_actor: authority_actor.into(),
+            pairing_grant: None,
             transport,
             custom_forms: true,
             conversation_blocks: false,
@@ -1340,6 +1344,7 @@ impl ClientSession {
             return Ok(Self {
                 actor: "client/local/read-only".into(),
                 authority_actor: "client/local/read-only".into(),
+                pairing_grant: None,
                 transport: "unix",
                 custom_forms,
                 conversation_blocks: false,
@@ -1354,6 +1359,7 @@ impl ClientSession {
         Ok(Self {
             actor: person.into(),
             authority_actor: person.into(),
+            pairing_grant: None,
             transport: "unix",
             custom_forms,
             conversation_blocks: false,
@@ -1365,6 +1371,7 @@ impl ClientSession {
         Self {
             actor: "client/pairing/completion".into(),
             authority_actor: "client/pairing/completion".into(),
+            pairing_grant: None,
             transport: "fabric-loopback",
             custom_forms: false,
             conversation_blocks: false,
@@ -1578,6 +1585,7 @@ fn paired_client_session(
     Ok(ClientSession {
         actor: actor.into(),
         authority_actor: authority_actor.into(),
+        pairing_grant: Some(paired.subject.clone()),
         transport,
         custom_forms,
         conversation_blocks: false,
@@ -1591,23 +1599,14 @@ fn revalidate_session(state: &AppState, session: &ClientSession) -> Result<Clien
     if session.transport == "unix" && acting_party(session) {
         return Ok(session.clone());
     }
-    let pairings = state
-        .store
-        .claims_for_kind_at("custom.client.pairing-completed", None, true, 10_000)
-        .map_err(ApiError::internal)?;
-    let paired = pairings
-        .claims
-        .iter()
-        .find(|claim| {
-            claim
-                .body
-                .pointer("/fields/session_actor")
-                .and_then(Value::as_str)
-                == Some(session.actor.as_str())
-        })
-        .ok_or_else(|| forbidden("the client session grant is absent"))?;
-    let mut current =
-        paired_client_session(state, paired, session.transport, session.custom_forms)?;
+    let pairings = state.store.claims_for_kind_at(
+        "custom.client.pairing-completed", None, true, 10_000,
+    ).map_err(ApiError::internal)?;
+    let paired = pairings.claims.iter().find(|claim| match session.pairing_grant.as_deref() {
+        Some(subject) => claim.subject.as_str() == subject,
+        None => claim.body.pointer("/fields/session_actor").and_then(Value::as_str) == Some(session.actor.as_str()),
+    }).ok_or_else(|| forbidden("the client session grant is absent"))?;
+    let mut current = paired_client_session(state, paired, session.transport, session.custom_forms)?;
     current.conversation_blocks = session.conversation_blocks;
     if current.authority_actor != session.authority_actor {
         return Err(forbidden("the client session authority changed"));
@@ -7182,6 +7181,7 @@ fn consume_terminal_attachment(
     capability: Option<&str>,
 ) -> Result<(), ApiError> {
     consume_terminal_attachment_mode(state, session, terminal_id, incarnation, capability, None)
+        .map(|_| ())
 }
 
 fn consume_terminal_attachment_mode(
@@ -7191,7 +7191,7 @@ fn consume_terminal_attachment_mode(
     incarnation: &str,
     capability: Option<&str>,
     raw_mode: Option<&str>,
-) -> Result<(), ApiError> {
+) -> Result<Option<String>, ApiError> {
     let lookup_span = crate::profile::span("terminal/capability-lookup");
     let capability = capability
         .filter(|value| !value.is_empty())
@@ -7214,6 +7214,9 @@ fn consume_terminal_attachment_mode(
         && raw_mode.is_none_or(|_| {
             field("person_id").and_then(Value::as_str) == Some(session.authority_actor.as_str())
         })
+        && (raw_mode != Some("peek")
+            || field("raw_authorization_epoch").and_then(Value::as_str)
+                == Some(raw_terminal::authorization_epoch(state, session)?.as_str()))
         && raw_live.as_ref().is_none_or(|live| {
             field("owner_host_id").and_then(Value::as_str) == Some(live.owner_host_id.as_str())
                 && field("runtime_id").and_then(Value::as_str) == Some(live.runtime_id.as_str())
@@ -7240,7 +7243,7 @@ fn consume_terminal_attachment_mode(
     }
     if raw_mode.is_none() {
         // A projected-screen capability is a lease and stays valid for more streams.
-        return Ok(());
+        return Ok(None);
     }
     let _span = crate::profile::span("terminal/capability-consume");
     state
@@ -7261,7 +7264,9 @@ fn consume_terminal_attachment_mode(
         })
         .map_err(|_| forbidden("the terminal stream capability was already consumed"))?;
     signal_changed(state);
-    Ok(())
+    Ok(field("raw_authorization_epoch")
+        .and_then(Value::as_str)
+        .map(str::to_owned))
 }
 
 fn detach_terminal_attachment(
@@ -9153,6 +9158,20 @@ async fn dispatch_action(
                 .ok_or_else(|| {
                     ApiError::not_found(format!("paired device `{device}` does not exist"))
                 })?;
+            if paired.origin != state.node {
+                let issuer = client_host_id(&paired.origin);
+                return Err(ApiError {
+                    status: StatusCode::CONFLICT,
+                    code: "issuer-required".into(),
+                    message: format!(
+                        "pairing revocation must run on its authoritative issuer {issuer}"
+                    ),
+                    details: Box::new(serde_json::Map::from_iter([(
+                        "issuer_host_id".into(),
+                        Value::String(issuer),
+                    )])),
+                });
+            }
             state
                 .store
                 .append_claim(&ClaimInput {
@@ -16152,6 +16171,7 @@ mission "example/zero-run" state="ready" {
         let paired = ClientSession {
             actor: "person/alex/session/device-one".into(),
             authority_actor: "person/alex".into(),
+            pairing_grant: None,
             transport: "paired",
             custom_forms: false,
             conversation_blocks: false,

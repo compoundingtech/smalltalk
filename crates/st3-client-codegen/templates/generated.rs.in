@@ -65,6 +65,7 @@ pub enum ErrorCode {
     InvalidSubjectReference,
     ValidationFailed,
     IdempotencyConflict,
+    IssuerRequired,
     StaleFence,
     CursorGap,
     PageCursorExpired,
