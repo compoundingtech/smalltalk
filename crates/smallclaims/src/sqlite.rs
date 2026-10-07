@@ -11,6 +11,9 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
 use anyhow::{Context as _, Result};
 use rusqlite::{Connection, OpenFlags, Transaction};
 
+pub(crate) mod writer_observer;
+pub use writer_observer::WriterObserver;
+
 use crate::store::current_index;
 
 /// Read connections a store keeps between reads; more open while more reads run at once.
@@ -261,6 +264,7 @@ pub struct WriterConnection {
     pub thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     pub committed_index: Arc<AtomicU64>,
     observers: Arc<CommitObservers>,
+    mutation_observer: Option<Arc<writer_observer::MutationState>>,
     /// Transactions the writer committed for batched writes, and the batched writes in them.
     /// Tests read them; `st replication status` counts every commit.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -296,6 +300,7 @@ pub struct WriterGuard<'a> {
     pub give_back: std::sync::mpsc::SyncSender<Connection>,
     pub committed_index: &'a AtomicU64,
     observers: &'a CommitObservers,
+    mutation_observer: Option<&'a Arc<writer_observer::MutationState>>,
     /// When profiling, when this thread took the writer.
     pub acquired: Option<std::time::Instant>,
     /// The connection's changed-row count when it was lent, so the rows this thread changed are
@@ -305,6 +310,30 @@ pub struct WriterGuard<'a> {
 
 impl WriterConnection {
     pub fn new(connection: Connection, committed_index: Arc<AtomicU64>) -> Self {
+        Self::new_inner(connection, committed_index, None)
+            .expect("writer without an observer needs no schema check")
+    }
+
+    /// Install a row observer before handing the connection to the writer queue. Its callbacks
+    /// own the update/authorizer hooks and resolve committed state before acknowledgements.
+    /// Observers must not write, borrow the writer, panic, or retain a strong owner cycle.
+    pub fn new_with_observer(
+        connection: Connection,
+        committed_index: Arc<AtomicU64>,
+        observer: Arc<dyn WriterObserver>,
+    ) -> Result<Self> {
+        Self::new_inner(connection, committed_index, Some(observer))
+    }
+
+    fn new_inner(
+        connection: Connection,
+        committed_index: Arc<AtomicU64>,
+        observer: Option<Arc<dyn WriterObserver>>,
+    ) -> Result<Self> {
+        let mutation_observer = observer
+            .map(|observer| writer_observer::MutationState::new(&connection, observer))
+            .transpose()?;
+        let mutations = mutation_observer.clone();
         let (jobs, queue) = std::sync::mpsc::channel::<WriterJob>();
         let index = committed_index.clone();
         let batches = Arc::new((AtomicU64::new(0), AtomicU64::new(0)));
@@ -313,15 +342,16 @@ impl WriterConnection {
         let observed = observers.clone();
         let thread = std::thread::Builder::new()
             .name("st3-writer".into())
-            .spawn(move || write_queue(connection, queue, &index, &counted, &observed))
+            .spawn(move || write_queue(connection, queue, &index, &counted, &observed, mutations.as_ref()))
             .expect("the writer thread starts");
-        Self {
+        Ok(Self {
             jobs: Mutex::new(Some(jobs)),
             thread: Mutex::new(Some(thread)),
             committed_index,
             observers,
+            mutation_observer,
             batches,
-        }
+        })
     }
 
     /// Observe every successfully committed batch and every returned lent writer, synchronously
@@ -373,6 +403,7 @@ impl WriterConnection {
             give_back,
             committed_index: &self.committed_index,
             observers: &self.observers,
+            mutation_observer: self.mutation_observer.as_ref(),
             acquired: crate::profile::writer_acquired(wait),
         }
     }
@@ -485,6 +516,7 @@ fn write_queue(
     committed_index: &AtomicU64,
     batches: &(AtomicU64, AtomicU64),
     observers: &CommitObservers,
+    mutation_observer: Option<&Arc<writer_observer::MutationState>>,
 ) {
     let mut next = None;
     loop {
@@ -515,6 +547,7 @@ fn write_queue(
                     committed_index,
                     batches,
                     observers,
+                    mutation_observer,
                 );
             }
         }
@@ -532,6 +565,7 @@ fn run_write_batch(
     committed_index: &AtomicU64,
     batches: &(AtomicU64, AtomicU64),
     observers: &CommitObservers,
+    mutation_observer: Option<&Arc<writer_observer::MutationState>>,
 ) -> Option<WriterJob> {
     let started = std::time::Instant::now();
     let mut answers = Vec::new();
@@ -593,6 +627,9 @@ fn run_write_batch(
     if let Ok(index) = current_index(connection) {
         committed_index.store(index, Ordering::Release);
     }
+    if let Some(observer) = mutation_observer {
+        observer.resolved(connection);
+    }
     if committed.is_ok() {
         observers.notify(connection);
     }
@@ -628,6 +665,9 @@ impl Drop for WriterGuard<'_> {
         };
         if let Ok(index) = current_index(&connection) {
             self.committed_index.store(index, Ordering::Release);
+        }
+        if let Some(observer) = self.mutation_observer {
+            observer.resolved(&connection);
         }
         self.observers.notify(&connection);
         crate::touched::note_writes(
