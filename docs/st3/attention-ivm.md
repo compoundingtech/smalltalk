@@ -69,6 +69,9 @@ The real Store tests compare complete family rows against
 `client_attention_resources_at`, including actions, ordering, captured times,
 answer/cancellation, custom reply and missing document recovery, actor isolation,
 reassignment, concurrent creation and replication order, run closure/reopen, and
-transaction rollback of output and event cursors. Their installation helper is
+transaction rollback of output and event cursors, persisted reopen, and explicit full
+projection replay. Checkpoint trimming preserves canonical episodes while fencing the
+registry: reads and maintenance remain unavailable until the shared installer certifies
+a replacement lifetime. Their installation helper is
 test-only and cannot serve as production source certification. Full collection
 activation and deployed cost measurements remain separate required work.

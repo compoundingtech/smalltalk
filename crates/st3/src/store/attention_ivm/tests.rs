@@ -589,3 +589,145 @@ fn concurrent_custom_creation_ties_converge_under_permuted_replication() {
         boundary.keys
     );
 }
+
+#[test]
+fn persisted_families_reopen_and_replay_preserve_public_rows_and_key_cursors() {
+    let (source, _, request) = person_work::tests::fixture();
+    source.ask_person(&request).unwrap();
+    custom(
+        &source,
+        "custom/garden/review/v1/persisted",
+        "person/lichen",
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("attention.sqlite3");
+    let target = Store::open(&path, "birch").unwrap();
+    target
+        .import_replication(&source.origin, &source.export_replication(0).unwrap())
+        .unwrap();
+    let registry = views(&target);
+    install(&target, &registry);
+    let people = [
+        (PERSON_VIEW, "person/avery"),
+        (CUSTOM_VIEW, "person/lichen"),
+    ];
+    let before: Vec<_> = people
+        .iter()
+        .map(|(view, person)| {
+            (
+                parity(&target, &registry, view, person, u128::MAX),
+                events::capture(&target.readers.get(), &registry, view).unwrap(),
+            )
+        })
+        .collect();
+    assert!(before.iter().all(|(rows, _)| !rows.is_empty()));
+    drop(registry);
+    drop(target);
+    let target = Store::open(&path, "birch").unwrap();
+    let registry = views(&target);
+    maintain(&target, &registry);
+    for ((view, person), (rows, boundary)) in people.iter().zip(&before) {
+        assert_eq!(parity(&target, &registry, view, person, u128::MAX), *rows);
+        let after = events::capture(&target.readers.get(), &registry, view).unwrap();
+        assert_eq!(after.identity, boundary.identity);
+        assert_eq!(after.keys, boundary.keys);
+    }
+    target
+        .connection
+        .batched(replay_graph_from_nothing_tx)
+        .unwrap()
+        .unwrap();
+    assert!(!clean(&target.readers.get(), None).unwrap());
+    for (view, person) in people {
+        assert!(
+            window(
+                &target.readers.get(),
+                &registry,
+                view,
+                person,
+                u128::MAX,
+                501
+            )
+            .is_err()
+        );
+    }
+    maintain(&target, &registry);
+    for ((view, person), (rows, boundary)) in people.iter().zip(&before) {
+        assert_eq!(parity(&target, &registry, view, person, u128::MAX), *rows);
+        assert_eq!(
+            events::capture(&target.readers.get(), &registry, view)
+                .unwrap()
+                .keys,
+            boundary.keys
+        );
+    }
+}
+
+#[test]
+fn checkpoint_trim_preserves_canonical_custom_episode_and_fences_indexed_reads() {
+    let store = Store::open_memory("alder").unwrap();
+    let registry = views(&store);
+    let subject = "custom/garden/review/v1/checkpoint";
+    custom(&store, subject, "person/lichen");
+    // Give checkpoint rules a superseded disposable observation to trim.
+    for number in 0..3 {
+        let mut observation = input(
+            "resource/garden/checkpoint",
+            "resource.observed",
+            "daemon/runtime",
+            json!({"kind":"custom.garden.checkpoint","observer":"observer/garden","facts":{"number":number}}),
+        );
+        observation.actor = None;
+        store.append_claim(&observation).unwrap();
+    }
+    install(&store, &registry);
+    let before = parity(&store, &registry, CUSTOM_VIEW, "person/lichen", u128::MAX);
+    let boundary = events::capture(&store.readers.get(), &registry, CUSTOM_VIEW).unwrap();
+    let plan = checkpoint_rules::plan_drops(&store.checkpoint_sealed_set(now_ms() + 1000).unwrap());
+    assert!(!plan.claims.is_empty());
+    let source_ids: BTreeSet<_> = store
+        .claims_for(subject, None)
+        .unwrap()
+        .into_iter()
+        .map(|c| c.id)
+        .collect();
+    assert!(plan.claims.iter().all(|c| !source_ids.contains(&c.id)));
+    store
+        .apply_checkpoint_drop("checkpoint/garden-attention", &plan.envelopes, &plan.claims)
+        .unwrap();
+    store
+        .connection
+        .batched(replay_graph_from_nothing_tx)
+        .unwrap()
+        .unwrap();
+    assert!(
+        window(
+            &store.readers.get(),
+            &registry,
+            CUSTOM_VIEW,
+            "person/lichen",
+            u128::MAX,
+            501
+        )
+        .is_err()
+    );
+    // Retention intentionally fences the primitive's finite registry. A surviving row does
+    // not authorize flushing or reusing a serving lifetime; the installer owns replacement.
+    let mut writer = store.connection.write();
+    let tx = writer.transaction().unwrap();
+    assert!(matches!(
+        registry.readiness(&tx, CUSTOM_VIEW, 1).unwrap(),
+        Readiness::Fenced
+    ));
+    assert!(!flush(&tx, &registry, u128::MAX, 128).unwrap());
+    tx.commit().unwrap();
+    drop(writer);
+    let canonical =
+        crate::api::client_attention_resources_at(&store, Some("person/lichen"), false, u128::MAX)
+            .unwrap();
+    assert_eq!(canonical, before);
+    let after = events::capture(&store.readers.get(), &registry, CUSTOM_VIEW).unwrap();
+    assert_eq!(after.keys, boundary.keys);
+    assert!(after.status.sequence > boundary.status.sequence);
+    assert!(matches!(after.availability.readiness, Readiness::Fenced));
+}
