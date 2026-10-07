@@ -1,4 +1,14 @@
+use crate::DisplayFilter;
+
 pub fn clean_message_text(raw: &str) -> String {
+    clean_message_text_with_filters(raw, crate::DEFAULT_FILTERS)
+}
+
+pub fn clean_message_text_with_filters(raw: &str, filters: &[DisplayFilter]) -> String {
+    if filters.is_empty() {
+        return raw.to_owned();
+    }
+    let markup = filters.contains(&DisplayFilter::HarnessMarkup);
     let normalized = raw.replace("\r\n", "\n");
     // st keeps 8 KB of a transcript value and says so in its own words.
     let (normalized, cut) =
@@ -12,7 +22,7 @@ pub fn clean_message_text(raw: &str) -> String {
     for line in normalized.split_inclusive('\n') {
         if line.trim_start().starts_with("```") {
             if !code {
-                output.push_str(&strip_internal_markup(&plain));
+                output.push_str(&strip_internal_markup(&plain, markup));
                 plain.clear();
             }
             output.push_str(line);
@@ -23,10 +33,15 @@ pub fn clean_message_text(raw: &str) -> String {
             plain.push_str(line);
         }
     }
-    output.push_str(&strip_internal_markup(&plain));
+    output.push_str(&strip_internal_markup(&plain, markup));
     let safe = output
         .chars()
-        .filter(|character| *character == '\n' || *character == '\t' || !character.is_control())
+        .filter(|character| {
+            !filters.contains(&DisplayFilter::ControlCharacters)
+                || *character == '\n'
+                || *character == '\t'
+                || !character.is_control()
+        })
         .collect::<String>();
     let text = safe
         .trim()
@@ -46,7 +61,10 @@ pub fn clean_message_text(raw: &str) -> String {
         text
     }
 }
-fn strip_internal_markup(input: &str) -> String {
+fn strip_internal_markup(input: &str, markup: bool) -> String {
+    if !markup {
+        return input.to_owned();
+    }
     let mut in_st3_channel = false;
     let mut text = input
         .lines()
@@ -148,7 +166,7 @@ fn strip_internal_markup(input: &str) -> String {
     text
 }
 /// Whether `at` falls inside a `code span` on its line.
-fn in_inline_code(text: &str, at: usize) -> bool {
+pub(crate) fn in_inline_code(text: &str, at: usize) -> bool {
     let line_start = text[..at].rfind('\n').map_or(0, |index| index + 1);
     text[line_start..at].matches('`').count() % 2 == 1
 }

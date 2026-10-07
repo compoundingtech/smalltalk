@@ -3,12 +3,19 @@ import type { Fence, TerminalScreen } from '../../clients/typescript/st3-client/
 
 const FENCE_ATTEMPTS = 8;
 
-type TerminalFence = Fence & Required<Pick<Fence, 'runtime_incarnation' | 'terminal_sequence'>>;
+export type TerminalFence = Fence & Required<Pick<Fence, 'runtime_incarnation' | 'terminal_sequence'>>;
 
 function isStaleFence(error: unknown): boolean {
   return !!error && typeof error === 'object' && 'response' in error
     && !!error.response && typeof error.response === 'object'
     && 'code' in error.response && error.response.code === 'stale-fence';
+}
+
+/** An st that predates unfenced typing refuses a key without the screen's sequence, and says so. */
+export function wantsScreenSequence(error: unknown): boolean {
+  const message = !!error && typeof error === 'object' && 'response' in error && !!error.response && typeof error.response === 'object' && 'message' in error.response
+    ? String(error.response.message) : '';
+  return message.includes('requires a sequence fence');
 }
 
 // A terminal action changes the global store index. Never reuse a runtime-list

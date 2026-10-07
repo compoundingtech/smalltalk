@@ -12,7 +12,7 @@ export type Body =
   | { kind: 'assistant'; text: string }
   | { kind: 'tool'; title: string; state: ToolState; output: string[] }
   /** `delivered`: the recipient's harness has it, seen in the agent's own transcript. */
-  | { kind: 'mail'; from: string; to: string; subject: string; text: string; delivered?: boolean; dictated?: boolean; images?: MailImage[] }
+  | { kind: 'mail'; from: string; to: string; subject: string; text: string; delivered?: boolean; dictated?: boolean; signed?: string; images?: MailImage[] }
   | { kind: 'event'; text: string; tone: 'quiet' | 'warning' | 'fault' };
 export type ConversationEntry = { id: string; at: string; timestamp: string; body: Body };
 
@@ -41,7 +41,8 @@ function short(id: string): string {
 
 const HIDDEN_TAGS = ['analysis', 'thinking', 'think', 'internal', 'system-reminder', 'function_calls', 'tool_result'];
 
-function stripInternalMarkup(input: string): string {
+function stripInternalMarkup(input: string, markup = true): string {
+  if (!markup) return input;
   let inChannel = false;
   let text = input.split('\n').filter(line => {
     const trimmed = line.trim();
@@ -50,41 +51,92 @@ function stripInternalMarkup(input: string): string {
     return !(trimmed.startsWith('[st3-delivery:') && trimmed.endsWith('.md]'));
   }).join('\n');
   for (const tag of HIDDEN_TAGS) {
+    let from = 0;
     for (;;) {
-      const lower = text.toLowerCase();
-      const start = lower.indexOf(`<${tag}`);
+      const lower = text.toLowerCase(), open = `<${tag}`;
+      const start = lower.indexOf(open, from);
       if (start < 0) break;
-      const openEnd = lower.indexOf('>', start);
-      if (openEnd < 0) { text = text.slice(0, start); break; }
-      const close = lower.indexOf(`</${tag}>`, openEnd + 1);
-      if (close < 0) { text = text.slice(0, start); break; }
-      text = text.slice(0, start) + text.slice(close + tag.length + 3);
+      const lineStart = text.lastIndexOf('\n', start - 1) + 1;
+      const named = !/^[> /\n]/.test(lower.slice(start + open.length)) || (text.slice(lineStart,start).split('`').length - 1) % 2 === 1;
+      const block = !text.slice(lineStart, start).trim();
+      const openEnd = lower.indexOf('>', start), close = openEnd < 0 ? -1 : lower.indexOf(`</${tag}>`, openEnd + 1);
+      if (named) from = start + open.length;
+      else if (close >= 0) text = text.slice(0,start) + text.slice(close + tag.length + 3);
+      else if (block) { text = text.slice(0,start); break; }
+      else from = start + open.length;
     }
   }
   return text;
 }
 
 /** What a message says once the markup harnesses and st add for the model is gone. */
-export function cleanMessageText(raw: string): string {
+export type DisplayFilter = 'harness-markup' | 'context-blocks' | 'control-characters' | 'internal-blocks' | 'excerpts' | 'bookkeeping';
+export const DEFAULT_FILTERS: readonly DisplayFilter[] = ['harness-markup', 'context-blocks', 'control-characters', 'internal-blocks', 'excerpts', 'bookkeeping'];
+export const SHOW_EVERYTHING: readonly DisplayFilter[] = [];
+
+// Said once at the start of a conversation st read only the newest part of.
+const NATIVE_PREFIX_NOTE = "Earlier history is not shown: st reads only the newest part of this agent's transcript";
+
+// Harness records that carry no conversation: the transcript's own titles and modes. Unknown
+// records stay visible.
+const BOOKKEEPING_RECORDS = [
+  // Claude's own entries, system records and attachments.
+  'last-prompt', 'ai-title', 'mode', 'permission-mode', 'atis-latch', 'pr-link', 'frame-link', 'bridge-session', 'queue-operation', 'cost-state',
+  'stop_hook_summary', 'turn_duration', 'total_tokens_reminder', 'deferred_tools_record', 'silent_turn_reminder', 'environment', 'date', 'skill_listing', 'command_permissions', 'edited_text_file',
+  // Codex's turn bookkeeping: the messages and calls they mention are entries of their own.
+  'event_msg', 'token_usage_record', 'turn_context', 'world_state',
+];
+
+// A reasoning step whose text the model did not share is bookkeeping too.
+function isBookkeeping(entry: Entry, filters: readonly DisplayFilter[]): boolean {
+  if (!filters.includes('bookkeeping') || entry.type !== 'content') return false;
+  const body = record(entry.body);
+  const shown = (Array.isArray(body.blocks) ? body.blocks : []).map(record).filter(block => !['internal', 'hidden-by-harness'].includes(str(block.visibility) ?? ''));
+  if (!shown.length) return false;
+  if (entry.role === 'assistant') return shown.every(block => block.kind === 'reasoning' && !(str(record(block.payload).text) ?? '').trim());
+  if (entry.role === 'system') return shown.every(block => block.kind === 'unknown' && BOOKKEEPING_RECORDS.includes(str(block.source_type) ?? ''));
+  return false;
+}
+
+export function cleanMessageText(raw: string, filters: readonly DisplayFilter[] = DEFAULT_FILTERS): string {
+  if (!filters.length) return raw;
+  const markup = filters.includes('harness-markup');
   const normalized = raw.replace(/\r\n/g, '\n');
   let output = '', plain = '', code = false;
   for (const line of normalized.split(/(?<=\n)/)) {
     if (line.trimStart().startsWith('```')) {
-      if (!code) { output += stripInternalMarkup(plain); plain = ''; }
+      if (!code) { output += stripInternalMarkup(plain, markup); plain = ''; }
       output += line;
       code = !code;
     } else if (code) output += line;
     else plain += line;
   }
-  output += stripInternalMarkup(plain);
+  output += stripInternalMarkup(plain, markup);
   // eslint-disable-next-line no-control-regex
-  const safe = output.replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, '').trim();
+  const safe = (filters.includes('control-characters') ? output.replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, '') : output).trim();
   const text = (safe.startsWith('[PING] ?') ? safe.slice('[PING] ?'.length) : safe).trim();
   const reference = text.lastIndexOf(' [id:message/');
   return reference >= 0 && text.endsWith(']') ? text.slice(0, reference).trimEnd() : text;
 }
 
 const CONTEXT_BLOCKS = ['system-reminder', 'local-command-caveat', 'environment_context', 'permissions', 'collaboration_mode', 'multi_agent_mode', 'apps_instructions', 'plugins_instructions', 'skills_instructions', 'user_instructions', 'developer_instructions', 'command-message', 'command-args'];
+
+function filterContextBlocks(text: {value:string}): void {
+  const inCode = (at:number) => (text.value.slice(text.value.lastIndexOf('\n',at-1)+1,at).split('`').length-1)%2 === 1;
+  for (const tag of CONTEXT_BLOCKS) {
+    const open = `<${tag}`, close = `</${tag}>`; let from = 0;
+    for (;;) {
+      const start = text.value.indexOf(open,from);
+      if (start < 0) break;
+      if (inCode(start) || !/^[> /\n]/.test(text.value.slice(start+open.length))) { from = start+open.length; continue; }
+      const headEnd = text.value.indexOf('>',start);
+      if (headEnd < 0) { text.value = text.value.slice(0,start); break; }
+      let end = text.value.indexOf(close,headEnd+1);
+      while (end >= 0 && inCode(end)) end = text.value.indexOf(close,end+close.length);
+      text.value = text.value.slice(0,start) + (end < 0 ? '' : text.value.slice(end+close.length)); from = start;
+    }
+  }
+}
 
 /** Take every `<tag …>…</tag>` block out of `text`; a block that never closes runs to the end. */
 function takeBlocks(text: { value: string }, tag: string): string[] {
@@ -133,13 +185,30 @@ function pingId(text: string): string | undefined {
  * A delivery of mail the stream already shows (`shown`) is not announced again: its id goes in
  * `delivered`, and the mail itself says it arrived.
  */
+/**
+ * How a message's signature reads beside its sender: the device that signed it and whether that
+ * checks ("✓ example phone (secure enclave)"). A message with no signature is usually just old, so it
+ * says nothing. The same words as stui's `signature_mark`.
+ */
+export function signatureMark(provenance: unknown): string | undefined {
+  if (!provenance || typeof provenance !== 'object') return undefined;
+  const p = provenance as { verdict?: string; reason?: string; signer?: string; device?: string };
+  const who = p.device ?? p.signer ?? '';
+  switch (p.verdict) {
+    case 'verified': return `✓ ${who}`.trimEnd();
+    case 'held': return `⚠ ${p.reason ? `signature held: ${p.reason}` : 'signature held'}`;
+    case 'invalid': return `✕ ${p.reason ? `signature invalid: ${p.reason}` : 'signature invalid'}`;
+    default: return undefined;
+  }
+}
+
 /** The lines st adds beside a delivery for the agent (st-drivers `ding`). */
 const ST_DELIVERY_NOTES = [
   "The person reads replies in st, not in the agent's session.",
   '(dictated by voice; it may contain transcription mistakes)',
 ];
 
-export function fromHarness(isUser: boolean, raw: string, shown: ReadonlySet<string> = new Set(), delivered: Set<string> = new Set()): Body[] {
+export function fromHarness(isUser: boolean, raw: string, shown: ReadonlySet<string> = new Set(), delivered: Set<string> = new Set(), filters: readonly DisplayFilter[] = DEFAULT_FILTERS): Body[] {
   // A harness that ran out of context continues from a summary written as the person's turn: the
   // agent's own notes, kilobytes long. One folded line that opens like a tool call, as stui shows it.
   if (isUser && raw.includes('This session is being continued from a previous conversation')) {
@@ -160,7 +229,7 @@ export function fromHarness(isUser: boolean, raw: string, shown: ReadonlySet<str
     const graph = attribute(head, 'graph');
     if (graph) enveloped.add(graph);
     if (graph && shown.has(graph)) { delivered.add(graph); return; }
-    bodies.push({ kind: 'mail', from: attribute(head, 'from') ?? 'someone', to: attribute(head, 'to') ?? '', subject: attribute(head, 'subject') ?? '', text: cleanMessageText(unescapeXml(block)).trim() });
+    bodies.push({ kind: 'mail', from: attribute(head, 'from') ?? 'someone', to: attribute(head, 'to') ?? '', subject: attribute(head, 'subject') ?? '', text: cleanMessageText(unescapeXml(block), filters).trim() });
   });
   const channelHeads = [...text.value.matchAll(/<channel\b[^>]*>/g)].map(match => match[0]);
   const senders = channelHeads.map(head => attribute(head, 'from') ?? 'someone');
@@ -176,10 +245,10 @@ export function fromHarness(isUser: boolean, raw: string, shown: ReadonlySet<str
     // (Nathan, 2026-10-03: "delivered to the agent: The person reads replies in st…").
     if (envelope) {
       const inner = takeBlocks({ value: block }, 'smalltalk-message')[0] ?? '';
-      bodies.push({ kind: 'mail', from: attribute(envelope, 'from') ?? senders[index] ?? 'someone', to: attribute(envelope, 'to') ?? '', subject: attribute(envelope, 'subject') ?? '', text: cleanMessageText(unescapeXml(inner)).trim() });
+      bodies.push({ kind: 'mail', from: attribute(envelope, 'from') ?? senders[index] ?? 'someone', to: attribute(envelope, 'to') ?? '', subject: attribute(envelope, 'subject') ?? '', text: cleanMessageText(unescapeXml(inner), filters).trim() });
       return;
     }
-    const subject = block.split('\n').map(line => line.trim()).find(line => line.startsWith('Subject:'))?.slice('Subject:'.length).trim() ?? shorten(cleanMessageText(block), 70);
+    const subject = block.split('\n').map(line => line.trim()).find(line => line.startsWith('Subject:'))?.slice('Subject:'.length).trim() ?? shorten(cleanMessageText(block, filters), 70);
     bodies.push({ kind: 'event', tone: 'quiet', text: `delivered to the agent: ${shorten(subject, 80)} · from ${senders[index] ?? 'someone'}` });
   });
   // `[PING from st3] message/ID from SENDER: TITLE` announces mail on its own line: mail the
@@ -209,11 +278,15 @@ export function fromHarness(isUser: boolean, raw: string, shown: ReadonlySet<str
     } catch { /* not JSON: nothing to show */ }
     if (answers.length) bodies.push({ kind: 'user', text: answers.join('\n') });
   }
-  for (const tag of CONTEXT_BLOCKS) takeBlocks(text, tag);
+  if (raw.includes("<command-name")) takeBlocks(text, "command-args"); // displayed with the parsed command
   // st's own notes beside a delivery tell the agent something; the person never typed them.
   text.value = text.value.split('\n').filter(line => !ST_DELIVERY_NOTES.includes(line.trim())).join('\n');
-  const rest = cleanMessageText(text.value);
-  if (isUser && rest) bodies.unshift({ kind: 'user', text: rest });
+  if (filters.includes('context-blocks')) filterContextBlocks(text);
+  const rest = cleanMessageText(text.value, filters);
+  if (rest) {
+    if (isUser) bodies.unshift({ kind: 'user', text: rest });
+    else bodies.push({kind:'event',tone:'quiet',text:rest});
+  }
   return bodies;
 }
 
@@ -235,7 +308,11 @@ export function toolOutput(content: unknown): string[] {
   else if (Array.isArray(content)) text = content.map(item => str(record(item).text) ?? str(item)).filter((part): part is string => part !== undefined).join('\n');
   else if (content == null) text = '';
   else text = str(record(content).text) ?? JSON.stringify(content);
-  return text ? text.split('\n').slice(0, 400) : [];
+  // As st3-conversation-ui: no blank lines around the output.
+  const lines = text.split('\n');
+  while (lines.length && !lines[0].trim()) lines.shift();
+  while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+  return lines.slice(0, 400);
 }
 
 function contentText(body: unknown): string {
@@ -298,7 +375,25 @@ function mailImages(message: Record<string, unknown>): MailImage[] {
   });
 }
 
-export function conversationEntries(timeline: Entry[], names: Names): ConversationEntry[] {
+export function conversationEntries(timeline: Entry[], names: Names, filters: readonly DisplayFilter[] = DEFAULT_FILTERS): ConversationEntry[] {
+  if (!filters.length) return timeline.map(entry => ({id: entry.id, at: clock(entry.timestamp), timestamp: entry.timestamp, body: {kind: 'user', text: JSON.stringify(entry, null, 2)}}));
+  timeline = timeline.map(entry => {
+    if (entry.body === null || typeof entry.body !== 'object' || Array.isArray(entry.body)) return entry;
+    const body = {...record(entry.body)};
+    if (filters.includes('internal-blocks') && Array.isArray(body.blocks)) body.blocks = body.blocks.filter(block => !['internal', 'hidden-by-harness'].includes(str(record(block).visibility) ?? ''));
+    if (typeof body.text === 'string') {
+      const text = {value: body.text};
+      if (filters.includes('context-blocks') && !['user','system'].includes(entry.role)) filterContextBlocks(text);
+      if (!['user','system'].includes(entry.role)) text.value = cleanMessageText(text.value, filters);
+      if (filters.includes('excerpts') && body.text.startsWith('[unrecognized ') && [...text.value].length > 512) text.value = [...text.value].slice(0,512).join('') + '…';
+      body.text = text.value;
+    }
+    if (entry.type === 'error' && Array.isArray(body.blocks)) {
+      const raw = body.blocks.filter(block => record(block).kind === 'raw_text').map(block => str(record(record(block).payload).text) ?? '').join('\n');
+      if (raw) body.message = `${str(body.message) ?? ''}\n${cleanMessageText(raw, filters)}`;
+    }
+    return {...entry, body} as Entry;
+  });
   const name = (id: string): string => names.get(id) ?? (id === 'daemon/runtime' ? 'st' : id.startsWith('person/') ? id.slice('person/'.length) : short(id));
   const stamped: ConversationEntry[] = [];
   const tools = new Map<string, number>();
@@ -308,8 +403,10 @@ export function conversationEntries(timeline: Entry[], names: Names): Conversati
   const push = (entry: Entry, id: string, body: Body) => stamped.push({ id, at: clock(entry.timestamp), timestamp: entry.timestamp, body });
   // Entries arrive in st's order (applyConversation keeps them by time, then sequence).
   for (const entry of timeline) {
+    if (!mail && isBookkeeping(entry, filters)) continue;
     const body = record(entry.body);
     if (entry.type === 'message') {
+      if (Array.isArray(body.blocks)) for (const block of body.blocks.filter(block => record(block).kind === 'raw_text')) push(entry, str(record(block).id) ?? entry.id, {kind:'event',tone:'quiet',text:`[unreadable message]\n${cleanMessageText(str(record(record(block).payload).text) ?? '', filters)}`});
       // A Small Talk message is two entries: who wrote to whom, then what they wrote. Only a
       // graph message, `message/…`, is Small Talk; a transcript heads its own turns this way too.
       mail = (str(body.message_id) ?? '').startsWith('message/') ? body : undefined;
@@ -318,7 +415,7 @@ export function conversationEntries(timeline: Entry[], names: Names): Conversati
     if (mail && entry.type === 'content') {
       const message = mail;
       mail = undefined;
-      const text = cleanMessageText(contentText(entry.body));
+      const text = cleanMessageText(contentText(entry.body), filters);
       const from = str(message.from) ?? '';
       if (from === 'daemon/runtime') {
         // Step-ready pings are graph events, not conversation.
@@ -335,6 +432,7 @@ export function conversationEntries(timeline: Entry[], names: Names): Conversati
           text: text || (images.length ? '' : '(notification)'),
           // Spoken, then transcribed: marked so a reader allows for transcription mistakes.
           ...(Array.isArray(message.tags) && message.tags.includes('dictated') ? { dictated: true } : {}),
+          ...(signatureMark(message.provenance) ? { signed: signatureMark(message.provenance)! } : {}),
           ...(images.length ? { images } : {}),
         });
       }
@@ -344,15 +442,18 @@ export function conversationEntries(timeline: Entry[], names: Names): Conversati
     switch (entry.type) {
       case 'content': {
         const raw = contentText(entry.body);
-        if (entry.role === 'user' || entry.role === 'system') {
+        const nativeBlocks = Array.isArray(body.blocks) && body.blocks.some(block => record(block).kind !== 'text');
+        if ((entry.role === 'user' || entry.role === 'system') && (nativeBlocks || raw.startsWith('[unrecognized '))) {
+          push(entry, entry.id, entry.role === 'user' ? {kind:'user',text:cleanMessageText(raw,filters)} : {kind:'event',tone:'quiet',text:cleanMessageText(raw,filters)});
+        } else if (entry.role === 'user' || entry.role === 'system') {
           // Mail read from a delivery is named as the stream names it, as stui does.
-          fromHarness(entry.role === 'user', raw, shown, delivered).forEach((part, index) => push(entry, `${entry.id}#${index}`, part.kind === 'mail' ? { ...part, from: name(part.from), to: name(part.to) } : part));
+          fromHarness(entry.role === 'user', raw, shown, delivered, filters).forEach((part, index) => push(entry, `${entry.id}#${index}`, part.kind === 'mail' ? { ...part, from: name(part.from), to: name(part.to) } : part));
         } else if (entry.role === 'tool') {
-          const lines = cleanMessageText(raw).split('\n');
+          const lines = raw.split('\n');
           if (lines.join('').trim()) push(entry, entry.id, { kind: 'tool', title: lines[0], state: 'ok', output: lines.slice(1) });
         } else {
-          const text = cleanMessageText(raw);
-          if (text) push(entry, entry.id, { kind: 'assistant', text });
+          const text = raw;
+          if (text.trim()) push(entry, entry.id, entry.role === 'assistant' ? { kind: 'assistant', text } : {kind:'event',tone:'quiet',text:`[unknown role]\n${text}`});
         }
         break;
       }
@@ -384,7 +485,7 @@ export function conversationEntries(timeline: Entry[], names: Names): Conversati
       case 'redaction': push(entry, entry.id, { kind: 'event', tone: 'quiet', text: `withheld: ${str(body.reason) ?? 'redacted'}` }); break;
       // Older entries were left out: it heads the conversation whatever time st stamped it with
       // (the time it was read, which sorted it among the newest).
-      case 'truncation': stamped.push({ id: entry.id, at: '', timestamp: '', body: { kind: 'event', tone: 'quiet', text: 'older entries are not shown' } }); break;
+      case 'truncation': stamped.push({ id: entry.id, at: '', timestamp: '', body: { kind: 'event', tone: 'quiet', text: (str(body.reason) ?? '').includes('native transcript prefix') ? NATIVE_PREFIX_NOTE + ((str(body.reason) ?? '').includes('not fetchable') ? '; earlier history is not fetchable through this read' : '') : (str(body.reason) ?? '').includes('not fetchable') ? 'older entries are not shown; not fetchable through this read' : 'older entries are not shown' } }); break;
       case 'status':
       case 'usage': break;
       default: {

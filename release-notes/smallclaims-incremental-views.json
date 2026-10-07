@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Opt-in transactional incremental views in smallclaims, with application-shaped correctness fixtures",
+  "replay": {
+    "status": "none",
+    "detail": "Existing daemon and Plain runtimes retain their behavior. The new opt-in ViewRuntime performs no open/read/repair history replay and leaves missing populated views unavailable. Installer pages require explicit caller initiation; this PR starts no migrations."
+  },
+  "schema": {
+    "status": "changed",
+    "detail": "No production schema version change or migration. Explicitly selecting the new ViewRuntime creates local ivm_* derived tables/indexes/triggers and versioned fingerprints. Missing/incompatible derived state is fenced. Existing runtimes do not create these tables."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Existing checkpoint rules versions/digests and fleet participation are unchanged. The new opt-in reference runtime declares its own checkpoint-unavailable digest and refuses checkpoint operations; production fleet participation requires a later reviewed capability/retention contract."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Adds Rust library APIs with no daemon client/wire/harness switch. The claims-only reference runtime is a distinct schema/admission contract and is not certified as a substitute for existing application runtimes or mixed-build fleet members. Canonical order is preserved."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No production runtime activation or additional service interruption is introduced. Opt-in installation timing has not been qualified for production stores."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Existing daemon installations require no steps. Library adopters must explicitly choose/register their runtime and complete source policy; follow crates/smallclaims/IVM.md and its installer guides. No migration or adoption is performed by this PR."
+  },
+  "recovery": {
+    "status": "unknown",
+    "detail": "Existing production stores are unchanged. Rollback/cross-runtime restore of opt-in derived state is not certified: reference runtime requires exclusive file ownership and incompatible source coverage remains unavailable until explicit bounded reinstall. Replacing binaries must not be treated as undoing local derived schemas."
+  }
+}

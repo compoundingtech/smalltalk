@@ -7,6 +7,7 @@ pub(super) mod raw_terminal;
 pub(super) mod resources;
 pub(super) mod search;
 pub(super) mod arrangements;
+pub(super) mod conversation_blocks;
 
 const TERMINAL_SUBPROTOCOL: &str = "st3.client.terminal.v0";
 const CONVERSATION_SUBPROTOCOL: &str = "st3.client.conversation.v0";
@@ -338,7 +339,7 @@ async fn open_terminal_subscription(
         let session = session.clone();
         let incarnation = request.incarnation.clone();
         let capability = request.capability.clone();
-        tokio::task::spawn_blocking(move || {
+        crate::api::read_deadline::spawn_blocking(move || {
             prepare_terminal_follow(
                 &state,
                 &session,
@@ -382,7 +383,7 @@ fn conversation_owner_host(
             .as_ref()
             .is_none_or(|relay| !relay.reaches(owner))
         {
-            return Err(remote_unavailable_for_owner(state, owner));
+            return Err(conversation_blocks::availability(remote_unavailable_for_owner(state, owner)));
         }
     }
     Ok(remote)
@@ -400,7 +401,7 @@ async fn conversation_page(
         let relay = state
             .client_relay
             .as_ref()
-            .ok_or_else(|| remote_unavailable_for_owner(state, owner))?;
+            .ok_or_else(|| conversation_blocks::availability(remote_unavailable_for_owner(state, owner)))?;
         return relay
             .read(
                 owner,
@@ -415,10 +416,14 @@ async fn conversation_page(
                 },
             )
             .await
-            .map_err(|error| remote_read_error(owner, error));
+            .map(|mut value| {
+                conversation_blocks::legacy(&mut value, session);
+                value
+            })
+            .map_err(|error| conversation_blocks::availability(remote_read_error(owner, error)));
     }
     let (state, session, session_id) = (state.clone(), session.clone(), session_id.to_owned());
-    tokio::task::spawn_blocking(move || {
+    crate::api::read_deadline::spawn_blocking(move || {
         timeline_value(
             &state,
             &new_client_snapshot(&state),
@@ -448,7 +453,7 @@ async fn conversation_changes_value(
         let relay = state
             .client_relay
             .as_ref()
-            .ok_or_else(|| remote_unavailable_for_owner(state, owner))?;
+            .ok_or_else(|| conversation_blocks::availability(remote_unavailable_for_owner(state, owner)))?;
         return relay
             .read(
                 owner,
@@ -463,7 +468,11 @@ async fn conversation_changes_value(
                 },
             )
             .await
-            .map_err(|error| remote_read_error(owner, error));
+            .map(|mut value| {
+                conversation_blocks::legacy(&mut value, session);
+                value
+            })
+            .map_err(|error| conversation_blocks::availability(remote_read_error(owner, error)));
     }
     conversation_changes_local(state, session, session_id, after, wait_ms).await
 }
@@ -1303,6 +1312,7 @@ pub(super) struct ClientSession {
     pub(super) pairing_grant: Option<String>,
     pub(super) transport: &'static str,
     pub(super) custom_forms: bool,
+    pub(super) conversation_blocks: bool,
     scopes: std::collections::BTreeSet<String>,
 }
 
@@ -1315,6 +1325,7 @@ impl ClientSession {
             pairing_grant: None,
             transport,
             custom_forms: true,
+            conversation_blocks: false,
             scopes: std::collections::BTreeSet::new(),
         }
     }
@@ -1336,6 +1347,7 @@ impl ClientSession {
                 pairing_grant: None,
                 transport: "unix",
                 custom_forms,
+                conversation_blocks: false,
                 scopes: ["read.projections", "terminal.read"]
                     .into_iter()
                     .map(str::to_owned)
@@ -1350,6 +1362,7 @@ impl ClientSession {
             pairing_grant: None,
             transport: "unix",
             custom_forms,
+            conversation_blocks: false,
             scopes: ALL_SCOPES.iter().map(|scope| (*scope).to_owned()).collect(),
         })
     }
@@ -1361,6 +1374,7 @@ impl ClientSession {
             pairing_grant: None,
             transport: "fabric-loopback",
             custom_forms: false,
+            conversation_blocks: false,
             scopes: std::collections::BTreeSet::new(),
         }
     }
@@ -1420,6 +1434,7 @@ pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
         json!({ "id": action, "version": 0, "state": state })
     }));
     capabilities.push(json!({"id":"device-key-proofs", "version":1, "state":"granted"}));
+    capabilities.push(json!({"id":"conversation-blocks", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities
 }
 
@@ -1470,6 +1485,15 @@ pub(super) fn authenticate(
         .is_some_and(|value| {
             value.split(',').any(|feature| feature.trim() == "custom-subjects.v1")
         });
+    let conversation_blocks = request
+        .headers()
+        .get("x-st3-features")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|features| {
+            features
+                .split(',')
+                .any(|feature| feature.trim() == "conversation-blocks.v1")
+        });
     let Some(value) = request.headers().get(AUTHORIZATION) else {
         if transport == "unix" {
             let person = request
@@ -1478,6 +1502,7 @@ pub(super) fn authenticate(
                 .and_then(|value| value.to_str().ok());
             let mut session = ClientSession::local(person)?;
             session.custom_forms = custom_forms;
+            session.conversation_blocks = conversation_blocks;
             return Ok(session);
         }
         let pairing_completion = request.method() == axum::http::Method::POST
@@ -1509,7 +1534,8 @@ pub(super) fn authenticate(
     let Some(paired) = paired else {
         return Err(forbidden("the client credential is unknown or expired"));
     };
-    let session = paired_client_session(state, paired, transport, custom_forms)?;
+    let mut session = paired_client_session(state, paired, transport, custom_forms)?;
+    session.conversation_blocks = conversation_blocks;
     if request.method() == axum::http::Method::GET {
         let scope = if request
             .uri()
@@ -1547,10 +1573,24 @@ fn paired_client_session(
     let authority_actor = paired.body.pointer("/fields/person_id").and_then(Value::as_str)
         .filter(|actor| actor.starts_with("person/") && actor.matches('/').count() == 1)
         .ok_or_else(|| ApiError::internal("a paired client has no concrete delegated person"))?;
-    let scopes = paired.body.pointer("/fields/scopes").and_then(Value::as_array)
-        .into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect();
-    Ok(ClientSession { actor: actor.into(), authority_actor: authority_actor.into(),
-        pairing_grant: Some(paired.subject.clone()), transport, custom_forms, scopes })
+    let scopes = paired
+        .body
+        .pointer("/fields/scopes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect();
+    Ok(ClientSession {
+        actor: actor.into(),
+        authority_actor: authority_actor.into(),
+        pairing_grant: Some(paired.subject.clone()),
+        transport,
+        custom_forms,
+        conversation_blocks: false,
+        scopes,
+    })
 }
 
 /// Held collection sockets carry no bearer secret. Re-resolve their session grant at each
@@ -1566,7 +1606,8 @@ fn revalidate_session(state: &AppState, session: &ClientSession) -> Result<Clien
         Some(subject) => claim.subject.as_str() == subject,
         None => claim.body.pointer("/fields/session_actor").and_then(Value::as_str) == Some(session.actor.as_str()),
     }).ok_or_else(|| forbidden("the client session grant is absent"))?;
-    let current = paired_client_session(state, paired, session.transport, session.custom_forms)?;
+    let mut current = paired_client_session(state, paired, session.transport, session.custom_forms)?;
+    current.conversation_blocks = session.conversation_blocks;
     if current.authority_actor != session.authority_actor {
         return Err(forbidden("the client session authority changed"));
     }
@@ -2151,6 +2192,28 @@ fn runtime_resources_for_owner(
             history,
         )?
     };
+    runtime_resources_from_status(state, snapshot, session, status)
+}
+
+fn terminal_resources_for_owner(
+    state: &AppState,
+    history: bool,
+    snapshot: &ClientSnapshot,
+    session: &ClientSession,
+    owner: Option<&str>,
+) -> anyhow::Result<Vec<Value>> {
+    let status = state
+        .store
+        .terminal_resource_status_at(owner, snapshot.store_index, history)?;
+    runtime_resources_from_status(state, snapshot, session, status)
+}
+
+fn runtime_resources_from_status(
+    state: &AppState,
+    snapshot: &ClientSnapshot,
+    session: &ClientSession,
+    status: crate::model::StatusResponse,
+) -> anyhow::Result<Vec<Value>> {
     // Each runtime's declaration and observation time, in one statement apiece for the list.
     let desired_tokens = state.store.selected_desired_tokens(
         &status
@@ -3322,7 +3385,7 @@ pub(super) async fn terminals(
         "terminals",
         &query,
         move |state, snapshot| {
-            let mut items = runtime_resources_for_owner(
+            let mut items = terminal_resources_for_owner(
                 state,
                 history,
                 snapshot,
@@ -3734,41 +3797,13 @@ fn session_messages(
     incarnation: Option<&str>,
     before: Option<u64>,
 ) -> Result<Vec<ClaimRecord>, ApiError> {
-    // The incarnation's life: from its first runtime observation to the next incarnation's.
-    let (mut started, mut ended) = (None::<u128>, None::<u128>);
-    if let Some(incarnation) = incarnation {
-        let observed = state
-            .store
-            .claims_for(owner, Some("runtime.observed"))
-            .map_err(ApiError::internal)?;
-        let of = |claim: &ClaimRecord| {
-            claim
-                .body
-                .pointer("/fields/incarnation_id")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        };
-        started = observed
-            .iter()
-            .filter(|claim| of(claim).as_deref() == Some(incarnation))
-            .map(|claim| claim.accepted_at_unix_ms)
-            .min();
-        if let Some(started) = started {
-            ended = observed
-                .iter()
-                .filter(|claim| {
-                    claim.accepted_at_unix_ms > started
-                        && of(claim).is_some_and(|other| other != incarnation)
-                })
-                .map(|claim| claim.accepted_at_unix_ms)
-                .min();
-        }
-    }
-    let mut messages = state
-        .store
-        .claims_for_kind_at("message.sent", before, true, 10_000)
-        .map_err(ApiError::internal)?
-        .claims;
+    let (started, ended) = match incarnation {
+        Some(incarnation) => state.store.conversation_runtime_span(owner, incarnation)
+            .map_err(ApiError::internal)?,
+        None => (None, None),
+    };
+    let mut messages = state.store.conversation_messages_at(owner, before, 0)
+        .map_err(ApiError::internal)?;
     messages.retain(|claim| {
         let fields = claim.body.get("fields").unwrap_or(&claim.body);
         let from = fields.get("from").and_then(Value::as_str);
@@ -3789,7 +3824,50 @@ fn session_messages(
 
 /// A message's timeline body: who wrote to whom, about what, so a client can draw Small Talk
 /// apart from the harness's own turns.
-fn session_message_body(claim: &ClaimRecord) -> Value {
+/// Who signed a message a person wrote and whether it checks: the verdict st recorded, and the
+/// device the signing key was granted to, by the label the person gave it when it paired. A
+/// message an agent wrote carries none: its key is the node's, and only people's words need
+/// their provenance shown.
+pub(super) fn message_provenance(state: &AppState, claim: &ClaimRecord) -> Option<Value> {
+    let fields = claim.body.get("fields").unwrap_or(&claim.body);
+    if !fields
+        .get("from")
+        .and_then(Value::as_str)?
+        .starts_with("person/")
+    {
+        return None;
+    }
+    let verdict = state.store.claim_verdict(&claim.id).ok()?;
+    let mut provenance = json!({"verdict": verdict.name()});
+    if let smallclaims::principal::Verdict::Held(reason)
+    | smallclaims::principal::Verdict::Invalid(reason) = &verdict
+    {
+        provenance["reason"] = json!(reason);
+    }
+    if let Some(signature) = state.store.claim_signature(&claim.id).ok().flatten() {
+        provenance["signer"] = json!(signature.signer);
+        provenance["key"] = json!(signature.key);
+        let label = signature
+            .chain
+            .first()
+            .and_then(|grant| state.store.claim_by_id(grant).ok().flatten())
+            .and_then(|grant| key_grant_label(&grant.body));
+        if let Some(label) = label {
+            provenance["device"] = json!(label);
+        }
+    }
+    Some(provenance)
+}
+
+/// The label a device gave its key when it paired, from the grant claim's body.
+fn key_grant_label(body: &Value) -> Option<String> {
+    body.pointer("/fields/label")
+        .and_then(Value::as_str)
+        .filter(|label| !label.trim().is_empty())
+        .map(str::to_owned)
+}
+
+fn session_message_body(state: &AppState, claim: &ClaimRecord) -> Value {
     let fields = claim.body.get("fields").unwrap_or(&claim.body);
     let mut body = json!({
         "message_id": claim.subject,
@@ -3799,6 +3877,9 @@ fn session_message_body(claim: &ClaimRecord) -> Value {
     });
     if let Some(title) = fields.get("title").and_then(Value::as_str) {
         body["title"] = Value::String(title.to_owned());
+    }
+    if let Some(provenance) = message_provenance(state, claim) {
+        body["provenance"] = provenance;
     }
     if let Some(tags) = fields.get("tags").and_then(Value::as_array)
         && !tags.is_empty()
@@ -3844,7 +3925,7 @@ fn native_timeline_page(
             let stamp = client_timestamp(claim.accepted_at_unix_ms);
             let digest = hex::encode(Sha256::digest(claim.id.as_bytes()));
             let base = claim.store_index.saturating_mul(4);
-            items.push(json!({"id":format!("timeline-entry/{}/{}-message", session_id.trim_start_matches("session/"), &digest[..16]), "sequence":base, "revision":1, "timestamp":stamp, "role":role, "type":"message", "final":true, "body":session_message_body(&claim)}));
+            items.push(json!({"id":format!("timeline-entry/{}/{}-message", session_id.trim_start_matches("session/"), &digest[..16]), "sequence":base, "revision":1, "timestamp":stamp, "role":role, "type":"message", "final":true, "body":session_message_body(state, &claim)}));
             items.push(json!({"id":format!("timeline-entry/{}/{}-content", session_id.trim_start_matches("session/"), &digest[..16]), "sequence":base+1, "revision":1, "timestamp":stamp, "role":role, "type":"content", "final":true, "body":{"media_type":"text/plain","text":fields.get("content").and_then(Value::as_str).unwrap_or_default()}}));
         }
         items.sort_by(|a, b| {
@@ -3971,7 +4052,7 @@ fn managed_transcript(
 /// but could not read it, the entry names the file, so the failure can be reported.
 fn transcript_notice(session_id: &str, managed: &ManagedTranscript, reason: &str) -> Value {
     let anchor = &managed.anchor;
-    let mut details = json!({ "driver": managed.driver, "claim_id": anchor.id });
+    let mut details = json!({ "driver": managed.driver, "claim_id": anchor.id, "availability":"transcript-unavailable" });
     match &managed.transcript {
         Ok(external) => {
             details["transcript"] = Value::String(external.transcript.display().to_string());
@@ -4255,6 +4336,11 @@ pub(super) fn timeline_value(
             Vec::new(),
             query,
         )?;
+        for item in &mut page.items {
+            if !session.conversation_blocks && let Some(body) = item["body"].as_object_mut() {
+                body.remove("blocks");
+            }
+        }
         page.items.reverse();
         return Ok(Json(json!({
             "kind": "timeline-page",
@@ -4271,7 +4357,12 @@ pub(super) fn timeline_value(
             &session_id,
         )
         .map_err(ApiError::internal)?;
-        let items = external_conversation_items(conversation, &session_id)?;
+        let items = match conversation {
+            Some(crate::external_sessions::ExternalConversation::Readable(external)) => {
+                conversation_blocks::read(&external, session, &session_id)?
+            }
+            other => external_conversation_items(other, &session_id)?,
+        };
         return native_timeline_page(state, snapshot, &session_id, query, items);
     };
     let owner = owner.as_str();
@@ -4282,14 +4373,14 @@ pub(super) fn timeline_value(
     if let Some(incarnation) = incarnation
         && let Some(managed) = managed_transcript(state, owner, incarnation)?
     {
-        let read = managed
-            .transcript
-            .as_ref()
-            .map_err(|missing| missing.reason.clone())
-            .and_then(|external| {
-                crate::external_sessions::normalized_timeline(external)
-                    .map_err(|error| format!("the transcript could not be read: {error:#}"))
-            });
+        let read = match managed.transcript.as_ref() {
+            Ok(external) => match conversation_blocks::read(external, session, &session_id) {
+                Ok(items) => Ok(items),
+                Err(error) if error.status == StatusCode::TOO_MANY_REQUESTS => return Err(error),
+                Err(error) => Err(format!("the transcript could not be read: {}", error.message)),
+            },
+            Err(missing) => Err(missing.reason.clone()),
+        };
         match read {
             Ok(items) => return native_timeline_page(state, snapshot, &session_id, query, items),
             Err(reason) => {
@@ -4621,7 +4712,7 @@ pub(super) fn timeline_value(
             items.push(json!({
                 "id": entry_id(&claim, "message"), "sequence": base_sequence,
                 "revision": 1, "timestamp": timestamp, "role": role, "type": "message",
-                "final": true, "body": session_message_body(&claim)
+                "final": true, "body": session_message_body(state, &claim)
             }));
             items.push(json!({
                 "id": entry_id(&claim, "content"), "sequence": base_sequence + 1,
@@ -4718,28 +4809,11 @@ fn conversation_cursor(
 
 pub(super) fn conversation_session_id(state: &AppState, id: &str) -> Result<String, ApiError> {
     if id.starts_with("agent/") {
-        let status = state
-            .store
-            .status_for_subject_prefix_at("agent/", None, true)
-            .map_err(ApiError::internal)?;
-        let subject = status
-            .subjects
-            .into_iter()
-            .find(|subject| subject.subject == id)
+        let frontier = state.store.index().map_err(ApiError::internal)?;
+        let owners = state.store.conversation_owners_at(frontier).map_err(ApiError::internal)?;
+        let owner = owners.get(id)
             .ok_or_else(|| ApiError::not_found(format!("agent `{id}` does not exist")))?;
-        let fields = subject
-            .actual
-            .as_ref()
-            .map(|actual| actual.get("fields").unwrap_or(actual));
-        let incarnation = fields
-            .and_then(|fields| fields.get("incarnation_id"))
-            .and_then(Value::as_str)
-            .or(subject.projection.runtime_incarnation.as_deref())
-            .or_else(|| {
-                fields
-                    .and_then(|fields| fields.get("runtime_id"))
-                    .and_then(Value::as_str)
-            })
+        let incarnation = owner.incarnation.as_deref().or(owner.runtime.as_deref())
             .ok_or_else(|| validation("the agent has no current session"))?;
         return Ok(client_session_id(id, incarnation));
     }
@@ -4794,6 +4868,17 @@ fn conversation_position(
 }
 
 fn conversation_read_now(
+    state: &AppState,
+    session: &ClientSession,
+    session_id: &str,
+    after: Option<&str>,
+) -> Result<Value, ApiError> {
+    super::read_deadline::query(&state.store, "/v1/client/conversations/{id}/changes", || {
+        conversation_read_now_unbounded(state, session, session_id, after)
+    })
+}
+
+fn conversation_read_now_unbounded(
     state: &AppState,
     session: &ClientSession,
     session_id: &str,
@@ -4883,23 +4968,12 @@ fn conversation_read_now(
                 }
             }
         }
-        for claim in state
-            .store
-            .claims_for_kind_at("message.sent", None, true, 10_000)
-            .map_err(ApiError::internal)?
-            .claims
-        {
+        for claim in owner.as_deref().map(|owner| {
+            state.store.conversation_messages_at(owner, snapshot.store_index.checked_add(1), store_index)
+        }).transpose().map_err(ApiError::internal)?.unwrap_or_default() {
             let fields = claim.body.get("fields").unwrap_or(&claim.body);
-            if claim.store_index > store_index
-                && fields
-                    .get("session_id")
-                    .and_then(Value::as_str)
-                    .is_none_or(|message_session| message_session == session_id)
-                && owner.as_deref().is_some_and(|owner| {
-                    fields.get("from").and_then(Value::as_str) == Some(owner)
-                        || fields.get("to").and_then(Value::as_str) == Some(owner)
-                })
-            {
+            if fields.get("session_id").and_then(Value::as_str)
+                .is_none_or(|message_session| message_session == session_id) {
                 changed_indexes.insert(claim.store_index);
                 message_indexes.insert(claim.store_index);
             }
@@ -5072,6 +5146,12 @@ fn transcript_seen(path: Option<&std::path::Path>) -> Option<(u64, std::time::Sy
 
 impl ConversationMark {
     fn new(state: &AppState, session_id: &str) -> Result<Self, ApiError> {
+        super::read_deadline::query(&state.store, "/v1/client/conversations/{id}/changes", || {
+            Self::new_unbounded(state, session_id)
+        })
+    }
+
+    fn new_unbounded(state: &AppState, session_id: &str) -> Result<Self, ApiError> {
         let index = state.store.index().map_err(ApiError::internal)?;
         let managed = super::managed_session_owner_at(&state.store, index, session_id)
             .map_err(ApiError::internal)?;
@@ -5097,6 +5177,12 @@ impl ConversationMark {
 
     /// Whether anything that concerns the conversation changed since the last look.
     fn changed(&mut self, state: &AppState) -> Result<bool, ApiError> {
+        super::read_deadline::query(&state.store, "/v1/client/conversations/{id}/changes", || {
+            self.changed_unbounded(state)
+        })
+    }
+
+    fn changed_unbounded(&mut self, state: &AppState) -> Result<bool, ApiError> {
         let mut changed = false;
         let index = state.store.index().map_err(ApiError::internal)?;
         if index > self.store_index {
@@ -5253,12 +5339,12 @@ pub(super) async fn conversation_changes(
             let relay = state
                 .client_relay
                 .as_ref()
-                .ok_or_else(|| remote_unavailable_for_owner(&state, &owner))?;
-            let value = relay
+                .ok_or_else(|| conversation_blocks::availability(remote_unavailable_for_owner(&state, &owner)))?;
+            let mut value = relay
                 .read(
                     &owner,
                     &crate::peer::ClientReadRequest {
-                        authority_actor: session.authority_actor,
+                        authority_actor: session.authority_actor.clone(),
                         relay: None,
                         request: crate::peer::ClientReadOperation::ConversationChanges {
                             session_id,
@@ -5268,7 +5354,10 @@ pub(super) async fn conversation_changes(
                     },
                 )
                 .await
-                .map_err(|error| remote_read_error(&owner, error))?;
+                .map_err(|error| {
+                    conversation_blocks::availability(remote_read_error(&owner, error))
+                })?;
+            conversation_blocks::legacy(&mut value, &session);
             return Ok(Json(value));
         }
     }
@@ -5323,7 +5412,7 @@ pub(super) async fn conversation_stream(
             .as_ref()
             .is_none_or(|relay| !relay.reaches(owner))
         {
-            return Err(remote_unavailable_for_owner(&state, owner));
+            return Err(conversation_blocks::availability(remote_unavailable_for_owner(&state, owner)));
         }
     } else {
         conversation_read_now(&state, &session, &session_id, query.after.as_deref())?;
@@ -5353,7 +5442,7 @@ async fn conversation_stream_socket(
                 let relay = state
                     .client_relay
                     .as_ref()
-                    .ok_or_else(|| remote_unavailable_for_owner(&state, owner))?;
+                    .ok_or_else(|| conversation_blocks::availability(remote_unavailable_for_owner(&state, owner)))?;
                 relay
                     .read(
                         owner,
@@ -5368,7 +5457,9 @@ async fn conversation_stream_socket(
                         },
                     )
                     .await
-                    .map_err(|error| remote_read_error(owner, error))
+                    .map_err(|error| {
+                        conversation_blocks::availability(remote_read_error(owner, error))
+                    })
             } else {
                 conversation_changes_local(
                     &state,
@@ -5382,13 +5473,14 @@ async fn conversation_stream_socket(
         };
         tokio::pin!(read);
         let value = tokio::select! { value = &mut read => value, message = socket.recv() => { if matches!(message, None | Some(Err(_)) | Some(Ok(WsMessage::Close(_)))) { return; } else { continue; } } };
-        let value = match value {
+        let mut value = match value {
             Ok(value) => value,
             Err(error) => {
                 close_terminal_stream_with_error(&mut socket, &error).await;
                 return;
             }
         };
+        conversation_blocks::legacy(&mut value, &session);
         let next = value["next_cursor"].as_str().map(str::to_owned);
         if after.is_none()
             || value["items"]
@@ -5603,7 +5695,9 @@ pub(super) async fn events(
 ) -> Result<Json<Value>, ApiError> {
     require_scope(&session, "read.projections")?;
     let limit = query.limit.unwrap_or(100).clamp(1, 500);
-    let (oldest, newest) = state.store.event_bounds().map_err(ApiError::internal)?;
+    let (oldest, newest) = super::read_deadline::query(&state.store, "/v1/client/events", || {
+        state.store.event_bounds().map_err(ApiError::internal)
+    })?;
     let after = decode_event_cursor(&state.node, query.after.as_deref())?;
     validate_event_cursor(
         &state.node,
@@ -5618,12 +5712,13 @@ pub(super) async fn events(
     // page and subscribing must wake this long poll, not wait for another event.
     let mut changed = state.event_notify.subscribe();
     let records = loop {
-        let records = if query.after.is_some() {
-            feed_events_after(&state.store, after, limit.saturating_add(1))
-        } else {
-            feed_events_tail(&state.store, limit)
-        }
-        .map_err(ApiError::internal)?;
+        let records = super::read_deadline::query(&state.store, "/v1/client/events", || {
+            if query.after.is_some() {
+                feed_events_after(&state.store, after, limit.saturating_add(1))
+            } else {
+                feed_events_tail(&state.store, limit)
+            }.map_err(ApiError::internal)
+        })?;
         if !records.is_empty() || tokio::time::Instant::now() >= deadline {
             break records;
         }
@@ -6207,13 +6302,7 @@ fn remote_terminal_live_session(
     expected_incarnation: &str,
 ) -> Result<LiveSession, ApiError> {
     let _span = crate::profile::span("terminal/live-fence");
-    let status = state
-        .store
-        .status(Some(subject))
-        .map_err(ApiError::internal)?;
-    let selected = status
-        .subjects
-        .first()
+    let selected = state.store.runtime_authority(subject).map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found(format!("subject `{subject}` has no live session")))?;
     if !matches!(selected.reachability.as_str(), "reachable" | "local") {
         return Err(terminal_unavailable("the terminal owner is not reachable"));
@@ -6355,7 +6444,7 @@ const TERMINAL_FACTS_TIMEOUT: Duration = Duration::from_secs(1);
 async fn terminal_facts(state: &AppState, id: &str) -> Option<Value> {
     let live = terminal_live_session(state, &terminal_subject(id), None).ok()?;
     let root = state.pty_root.clone();
-    tokio::task::spawn_blocking(move || {
+    crate::api::read_deadline::spawn_blocking(move || {
         let stats = pty_client::stats::query_stats_in_with_timeout(
             &root,
             &live.runtime_id,
@@ -7285,8 +7374,12 @@ async fn close_terminal_stream_with_error(socket: &mut WebSocket, error: &ApiErr
     let envelope = terminal_stream_error(error);
     let _ = send_terminal_stream_value(socket, &envelope).await;
     let code = envelope["code"].as_str().unwrap_or("internal").to_owned();
-    let close = if code == "internal" { 1011 } else { 1008 };
+    let close = terminal_error_close_code(&code);
     close_terminal_stream(socket, close, &code).await;
+}
+
+fn terminal_error_close_code(code: &str) -> u16 {
+    if matches!(code, "internal" | "database-busy" | "database-locked") { 1011 } else { 1008 }
 }
 
 /// Hold an owner-local terminal stream open. The first message is the current screen; every
@@ -7464,21 +7557,62 @@ fn validate_message_session(
     session_id: &str,
 ) -> Result<(), ApiError> {
     let recipient = normalize_message_party(recipient);
-    let current_session = client_agent_resources(
-        &state.store,
-        false,
-        &snapshot.created_at,
-        snapshot.store_index,
-    )
-    .map_err(ApiError::internal)?
-    .into_iter()
-    .find(|agent| agent["id"] == recipient)
-    .and_then(|agent| agent["current_session_id"].as_str().map(str::to_owned))
-    .ok_or_else(|| {
-        validation(format!(
-            "message recipient `{recipient}` has no current normalized session"
-        ))
-    })?;
+    // Match the card's current-session fence without building cards, work queues, usage,
+    // todo lists or delivery overlays for the fleet.
+    let status = state
+        .store
+        .status_for_subject_names_at(
+            BTreeSet::from([recipient.clone()]),
+            snapshot.store_index,
+            false,
+        )
+        .map_err(ApiError::internal)?;
+    let current_session = status
+        .subjects
+        .into_iter()
+        .find(|subject| {
+            subject.subject == recipient
+                && subject.subject.starts_with("agent/")
+                && subject.projection.layer == "current"
+        })
+        .map(|subject| -> anyhow::Result<Option<String>> {
+            let moving = subject
+                .desired_token
+                .as_deref()
+                .map(|token| {
+                    crate::placement::handoff(
+                        &state.store,
+                        &subject.subject,
+                        token,
+                        snapshot.store_index,
+                    )
+                })
+                .transpose()?
+                .flatten()
+                .is_some_and(|handoff| handoff.phase != "running");
+            let fields = subject
+                .actual
+                .as_ref()
+                .map(|actual| actual.get("fields").unwrap_or(actual));
+            let incarnation = fields
+                .filter(|_| !moving)
+                .and_then(|fields| fields.get("incarnation_id"))
+                .and_then(Value::as_str);
+            let runtime = fields
+                .and_then(|fields| fields.get("runtime_id"))
+                .and_then(Value::as_str);
+            Ok(incarnation
+                .or(runtime)
+                .map(|identity| managed_session_id(&subject.subject, identity)))
+        })
+        .transpose()
+        .map_err(ApiError::internal)?
+        .flatten()
+        .ok_or_else(|| {
+            validation(format!(
+                "message recipient `{recipient}` has no current normalized session"
+            ))
+        })?;
     if current_session != session_id {
         return Err(stale(format!(
             "session `{session_id}` is not the current session for `{recipient}`"
@@ -7556,7 +7690,7 @@ async fn import_external_session_action(
     // until the exact native process has stopped, so two harnesses never own one native session.
     if let Some(process) = external.process.clone() {
         let driver = external.driver;
-        tokio::task::spawn_blocking(move || {
+        crate::api::read_deadline::spawn_blocking(move || {
             crate::external_sessions::terminate_exact_process(driver, &process)
         })
         .await
@@ -7741,6 +7875,16 @@ fn validate_launch_fence(state: &AppState, target: &str, fence: &Fence) -> Resul
     Ok(())
 }
 
+/// Raw and key input to a terminal: the keys a person types, which no screen they did not see can
+/// make unsafe to send, unlike a whole line with its Enter.
+fn terminal_keys_unfenced(request: &ActionRequest) -> bool {
+    request.action_type == "terminal.input"
+        && matches!(
+            request.parameters.get("mode").and_then(Value::as_str),
+            Some("raw" | "key")
+        )
+}
+
 fn validate_fence(state: &AppState, fence: &Fence) -> Result<(), ApiError> {
     let parsed = fence
         .snapshot_id
@@ -7779,12 +7923,12 @@ fn validate_fence(state: &AppState, fence: &Fence) -> Result<(), ApiError> {
                 .map_err(import_lookup_error)?
                 .map(|session| session.revision)
         } else {
+            // The newest claim's id, by a seek: reading and sorting every claim of the subject
+            // was 0.4 s for a busy seat (4.4 s cold) on every fenced action.
             state
                 .store
-                .claims_for(subject, None)
+                .latest_claim_id(subject)
                 .map_err(ApiError::internal)?
-                .last()
-                .map(|claim| claim.id.clone())
         };
         if current.as_deref() != Some(revision) {
             return Err(stale(format!(
@@ -8669,7 +8813,7 @@ async fn dispatch_action(
             }
             let socket = state.pty_root.join(format!("{}.sock", live.runtime_id));
             let runtime_id = live.runtime_id.clone();
-            tokio::task::spawn_blocking(move || {
+            crate::api::read_deadline::spawn_blocking(move || {
                 let stream = std::os::unix::net::UnixStream::connect(&socket)?;
                 let mut connection = pty_client::SessionConnection::attach_over(
                     stream,
@@ -9189,14 +9333,36 @@ pub(super) async fn action(
             remote_terminal_live_session(&state, &terminal_subject(&terminal_id), incarnation)?;
         if live.owner_host_id != client_host_id(&state.node) {
             validate_fence(&state, &request.fence)?;
-            let expected_sequence = request
-                .fence
-                .terminal_sequence
-                .ok_or_else(|| validation("terminal control requires a sequence fence"))?;
             let relay = state
                 .client_relay
                 .as_ref()
                 .ok_or_else(|| remote_unavailable_for_owner(&state, &live.owner_host_id))?;
+            // Typing keys needs no screen fence (see the local case below). The owner still wants
+            // a sequence, so one is read from it now: there is no stale window to lose.
+            let expected_sequence = if terminal_keys_unfenced(&request) {
+                let screen = relay
+                    .read(
+                        &live.owner_host_id,
+                        &crate::peer::ClientReadRequest {
+                            authority_actor: session.authority_actor.clone(),
+                            relay: None,
+                            request: crate::peer::ClientReadOperation::TerminalScreen {
+                                terminal_id: client_detail_id("terminal", &terminal_id),
+                                facts: false,
+                            },
+                        },
+                    )
+                    .await
+                    .map_err(|error| remote_read_error(&live.owner_host_id, error))?;
+                screen["next_sequence"]
+                    .as_u64()
+                    .ok_or_else(|| validation("the terminal gave no sequence"))?
+            } else {
+                request
+                    .fence
+                    .terminal_sequence
+                    .ok_or_else(|| validation("terminal control requires a sequence fence"))?
+            };
             let mut value = relay
                 .read(
                     &live.owner_host_id,
@@ -9230,10 +9396,22 @@ pub(super) async fn action(
             .runtime_incarnation
             .as_deref()
             .ok_or_else(|| validation("terminal control requires an incarnation fence"))?;
-        let expected = request
-            .fence
-            .terminal_sequence
-            .ok_or_else(|| validation("terminal control requires a sequence fence"))?;
+        // Typing keys into a terminal whose screen moves on its own (an agent's spinner, a log)
+        // can never match the sequence a client read a moment before: the screen changes between
+        // the read and the key. The incarnation fence is what keeps keys from reaching a
+        // restarted program, so raw and key input need no sequence; a line sent with Enter and a
+        // resize still do (Nathan, 2026-10-06: the phone could not type into an attached terminal).
+        let unfenced = terminal_keys_unfenced(&request);
+        let expected = if unfenced {
+            request.fence.terminal_sequence
+        } else {
+            Some(
+                request
+                    .fence
+                    .terminal_sequence
+                    .ok_or_else(|| validation("terminal control requires a sequence fence"))?,
+            )
+        };
         let screen = terminal_screen_value(
             &state,
             &terminal_id,
@@ -9242,7 +9420,7 @@ pub(super) async fn action(
             Duration::ZERO,
         )
         .await?;
-        if screen["next_sequence"].as_u64() != Some(expected) {
+        if !unfenced && screen["next_sequence"].as_u64() != expected {
             return Err(stale("the terminal sequence fence is stale"));
         }
     }
@@ -9415,6 +9593,18 @@ mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt as _;
     use std::sync::Barrier;
+
+    #[test]
+    fn terminal_contention_preserves_retryable_code_and_service_close() {
+        for code in ["database-busy", "database-locked"] {
+            let envelope = terminal_stream_error(&ApiError::bad(St3Error::new(code, "fixture contention")));
+            assert_eq!(envelope["code"], code);
+            assert_eq!(envelope["retryable"], true);
+            assert_eq!(terminal_error_close_code(envelope["code"].as_str().unwrap()), 1011);
+        }
+        assert_eq!(terminal_error_close_code("internal"), 1011);
+        assert_eq!(terminal_error_close_code("stale-incarnation"), 1008);
+    }
 
     fn assert_collection_frame_conforms(frame: &Value) {
         let mut schema: Value = serde_json::from_str(include_str!(
@@ -9592,7 +9782,7 @@ mod tests {
                                         let (sender, receiver) = tokio::sync::oneshot::channel();
                                         tokio::spawn(async move { let _ = receiver.await; let _ = dropped.send(()); });
                                         let _dropped = Dropped(Some(sender));
-                                        tokio::task::spawn_blocking(move || {
+                                        crate::api::read_deadline::spawn_blocking(move || {
                                             entered.send(()).unwrap();
                                             let _ = tokio::runtime::Handle::current().block_on(held.wait_for(|released| *released));
                                             completed.send(()).unwrap();
@@ -9830,7 +10020,7 @@ mod tests {
                             move |state, session, request, permit| {
                                 let (mut gate, started) = (gate.clone(), started.clone());
                                 async move {
-                                    let permit = tokio::task::spawn_blocking(move || {
+                                    let permit = crate::api::read_deadline::spawn_blocking(move || {
                                         started.send(permit.semaphore().clone()).unwrap();
                                         let _ = tokio::runtime::Handle::current().block_on(gate.wait_for(|released| *released));
                                         permit
@@ -10147,7 +10337,7 @@ mod tests {
             .claims_for(&sent.subject, Some("message.sent"))
             .unwrap()
             .remove(0);
-        let body = session_message_body(&claim);
+        let body = session_message_body(&state, &claim);
         assert_eq!(
             body["attachments"],
             json!([{
@@ -10180,7 +10370,30 @@ mod tests {
             .claims_for(&plain.subject, Some("message.sent"))
             .unwrap()
             .remove(0);
-        assert!(session_message_body(&claim).get("attachments").is_none());
+        assert!(session_message_body(&state, &claim).get("attachments").is_none());
+        // What a person wrote carries its provenance (here no signature: the fixture seals
+        // nothing); what an agent wrote carries none.
+        let provenance = session_message_body(&state, &claim)["provenance"].clone();
+        assert_eq!(provenance["verdict"], "unsigned", "{provenance}");
+        assert!(provenance.get("signer").is_none());
+        let agent_claim = state
+            .store
+            .claims_for(&plain.subject, Some("message.sent"))
+            .unwrap()
+            .remove(0);
+        let mut agent_claim = agent_claim;
+        agent_claim.body["fields"]["from"] = json!("agent/terminal-test.seat");
+        assert!(session_message_body(&state, &agent_claim).get("provenance").is_none());
+    }
+
+    #[test]
+    fn a_devices_label_is_read_from_its_key_grant() {
+        assert_eq!(
+            key_grant_label(&json!({"fields": {"label": "example phone (secure enclave)", "role": "device"}})).as_deref(),
+            Some("example phone (secure enclave)")
+        );
+        assert_eq!(key_grant_label(&json!({"fields": {"role": "device"}})), None);
+        assert_eq!(key_grant_label(&json!({"fields": {"label": "  "}})), None);
     }
 
     #[tokio::test]
@@ -10734,6 +10947,14 @@ subscription "watch/source" {
         assert_eq!(checkout.base, "main");
         assert_eq!(checkout.branch, "example/parser");
         assert!(checkout.remove_at_run_end);
+        let projected =
+            client_agent_resources(&state.store, false, "now", state.store.index().unwrap())
+                .unwrap();
+        assert_eq!(projected[0]["workspace"], "/work/parser");
+        assert_eq!(
+            projected[0]["checkout"],
+            json!({"repository":"/work/repo", "base":"main", "branch":"example/parser"})
+        );
         let read = host_repositories(
             State(state.clone()),
             Extension(session.clone()),
@@ -11286,6 +11507,157 @@ subscription "watch/source" {
             observe(number);
         }
         assert_eq!(statements(40), few);
+    }
+
+    #[test]
+    fn terminal_resource_summary_matches_full_status_at_current_and_old_cuts() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let session = ClientSession::local(Some("person/alex")).unwrap();
+        let intent = crate::graph::parse_intent(
+            "version 2\nagent \"declared-terminal\" { command \"true\" }\n",
+            state.store.origin(),
+        )
+        .unwrap();
+        let planned = state
+            .store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: String::new(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(
+                &intent,
+                &planned.subject_tokens,
+                "terminal-summary-declaration",
+            )
+            .unwrap();
+        let subjects = [
+            "agent/declared-terminal",
+            "exec/undeclared-terminal",
+            "agent/nonterminal",
+        ];
+        let mut snapshots = vec![new_client_snapshot(&state)];
+        for (status, incarnation) in [
+            ("running", "first"),
+            ("stopped", "first"),
+            ("running", "second"),
+        ] {
+            for subject in subjects {
+                state
+                    .store
+                    .append_claim(&ClaimInput {
+                        subject: subject.into(),
+                        kind: "runtime.observed".into(),
+                        actor: Some(subject.into()),
+                        fields: serde_json::from_value(json!({
+                            "status": status, "runtime_id": subject, "incarnation_id": incarnation,
+                            "terminal": subject != "agent/nonterminal",
+                        }))
+                        .unwrap(),
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: None,
+                    })
+                    .unwrap();
+                if subject.starts_with("agent/") {
+                    state
+                        .store
+                        .append_claim(&ClaimInput {
+                            subject: subject.into(),
+                            kind: "harness.observed".into(),
+                            actor: Some(subject.into()),
+                            fields: serde_json::from_value(json!({
+                                "state": "idle", "incarnation_id": incarnation, "driver": "claude",
+                            }))
+                            .unwrap(),
+                            evidence: Vec::new(),
+                            expected_subject: None,
+                            idempotency_key: None,
+                        })
+                        .unwrap();
+                }
+            }
+            snapshots.push(new_client_snapshot(&state));
+        }
+        // Read newest first, then older cuts: a cached new incarnation cannot leak backwards.
+        for snapshot in snapshots.iter().rev() {
+            for history in [false, true] {
+                for owner in [
+                    None,
+                    Some(subjects[0]),
+                    Some(subjects[1]),
+                    Some("agent/missing"),
+                    Some("glass/missing"),
+                ] {
+                    let lean =
+                        terminal_resources_for_owner(&state, history, snapshot, &session, owner)
+                            .unwrap();
+                    let full =
+                        runtime_resources_for_owner(&state, history, snapshot, &session, owner)
+                            .unwrap();
+                    assert_eq!(
+                        lean, full,
+                        "cut={} history={history} owner={owner:?}",
+                        snapshot.store_index
+                    );
+                    state.store.forget_current_views();
+                    assert_eq!(
+                        terminal_resources_for_owner(&state, history, snapshot, &session, owner)
+                            .unwrap(),
+                        full
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_resource_summary_reuses_status_without_full_cache_warming() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let session = ClientSession::local(Some("person/alex")).unwrap();
+        let statements = |count: usize| {
+            let snapshot = new_client_snapshot(&state);
+            // Only the terminals reduction warms this read; no runtime or machine read.
+            let first =
+                terminal_resources_for_owner(&state, false, &snapshot, &session, None).unwrap();
+            assert_eq!(first.len(), count);
+            crate::store::STATEMENTS_RUN.with(|run| run.set(0));
+            let again =
+                terminal_resources_for_owner(&state, false, &snapshot, &session, None).unwrap();
+            assert_eq!(again, first);
+            crate::store::STATEMENTS_RUN.with(std::cell::Cell::get)
+        };
+        let few = std::cell::Cell::new(0);
+        for number in 0..40 {
+            let subject = format!("exec/terminal-summary/{number}");
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: subject.clone(),
+                    kind: "runtime.observed".into(),
+                    actor: Some(subject),
+                    fields: serde_json::from_value(json!({
+                        "status": "running", "runtime_id": format!("summary-{number}"),
+                        "incarnation_id": "first", "terminal": true,
+                    }))
+                    .unwrap(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+            if number == 2 {
+                few.set(statements(3));
+            }
+        }
+        assert_eq!(statements(40), few.get());
     }
 
     /// The operations collection answers while the first diagnostic report since a start is
@@ -13200,6 +13572,10 @@ mission "example/zero-run" state="ready" {
             .unwrap();
         let session_id = managed_session_id(agent, incarnation);
         assert_eq!(conversation_session_id(&owner, agent).unwrap(), session_id);
+        let before_alias = crate::store::STATEMENTS_RUN.with(std::cell::Cell::get);
+        assert_eq!(conversation_session_id(&owner, agent).unwrap(), session_id);
+        let alias_queries = crate::store::STATEMENTS_RUN.with(std::cell::Cell::get) - before_alias;
+        assert!(alias_queries <= 3, "a warm agent alias must not reduce fleet history: {alias_queries}");
         let session = ClientSession::local(Some("person/example")).unwrap();
         let origin = super::super::managed_session_owner_at(
             &follower.store,
@@ -13326,6 +13702,78 @@ mission "example/zero-run" state="ready" {
         }
         let gap = conversation_read_now(&owner, &session, &session_id, Some(&cursor)).unwrap_err();
         assert_eq!(gap.code, "cursor-gap");
+    }
+
+    #[test]
+    fn message_session_validation_reads_only_the_recipient_and_preserves_session_fences() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "session-point-node");
+        for (subject, incarnation) in [
+            ("agent/session-point-owner", Some("point-runtime:i2")),
+            ("agent/session-point-legacy", None),
+            ("agent/session-point-empty", None),
+        ] {
+            let mut fields = BTreeMap::from([
+                ("status".into(), json!("running")),
+                ("terminal".into(), json!(false)),
+            ]);
+            if subject != "agent/session-point-empty" {
+                fields.insert("runtime_id".into(), json!("point-runtime"));
+            }
+            if let Some(incarnation) = incarnation {
+                fields.insert("incarnation_id".into(), json!(incarnation));
+            }
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "runtime.observed".into(),
+                    actor: Some(subject.into()),
+                    fields,
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(subject.into()),
+                })
+                .unwrap();
+        }
+        let snapshot = new_client_snapshot(&state);
+        // The old fleet-card path would decode this unrelated card's invalid harness overlay.
+        state
+            .store
+            .cached_agent_resources(snapshot.store_index, false, |_| {
+                Ok(vec![json!({"id":"agent/unrelated", "_status_source":true})])
+            })
+            .unwrap();
+        let owner_session = managed_session_id("agent/session-point-owner", "point-runtime:i2");
+        validate_message_session(&state, &snapshot, "session-point-owner", &owner_session).unwrap();
+        let legacy_session = managed_session_id("agent/session-point-legacy", "point-runtime");
+        validate_message_session(
+            &state,
+            &snapshot,
+            "agent/session-point-legacy",
+            &legacy_session,
+        )
+        .unwrap();
+        let wrong_runtime = managed_session_id("agent/session-point-owner", "point-runtime");
+        assert_eq!(
+            validate_message_session(
+                &state,
+                &snapshot,
+                "agent/session-point-owner",
+                &wrong_runtime
+            )
+            .unwrap_err()
+            .code,
+            "stale-fence"
+        );
+        for subject in ["agent/session-point-empty", "agent/missing", "person/alex"] {
+            assert_eq!(
+                validate_message_session(&state, &snapshot, subject, &owner_session)
+                    .unwrap_err()
+                    .code,
+                "validation-failed"
+            );
+        }
     }
 
     #[tokio::test]
@@ -15246,7 +15694,7 @@ mission "example/zero-run" state="ready" {
         }
         let _cleanup = Cleanup(runtime.clone());
         let pty_root = state.pty_root.clone();
-        let output = tokio::task::spawn_blocking(move || std::process::Command::new(pty)
+        let output = crate::api::read_deadline::spawn_blocking(move || std::process::Command::new(pty)
             .env("PTY_ROOT", pty_root)
             .args(["run", "-d", "--force", "--id", "fence-test", "--tag", "keep=true", "--", "/bin/sh", "-c", "stty -echo; printf ready; while IFS= read -r line; do printf '\\r\\naccepted:%s' \"$line\"; done"])
             .output().unwrap()).await.unwrap();
@@ -15390,6 +15838,26 @@ mission "example/zero-run" state="ready" {
             .await
             .unwrap_err();
             assert_eq!(error.code, "stale-fence");
+        }
+        // Typed keys need no screen fence: the screen has moved on since `fence` read it, yet raw
+        // keys land, with the sequence or without it. A line with its Enter still needs it.
+        for (key, fence) in [
+            ("fence-raw", fence.clone()),
+            ("fence-raw-no-sequence", Fence { terminal_sequence: None, ..fence.clone() }),
+        ] {
+            let _ = action(
+                State(state.clone()),
+                Extension(snapshot.clone()),
+                Extension(session.clone()),
+                Json(request(
+                    "terminal.input",
+                    key,
+                    fence,
+                    json!({"terminal_id":"terminal/agent/fence-test","mode":"raw","value":"aw=="}),
+                )),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("raw input must not need a screen fence: {error:?}"));
         }
         let mut foreign = fence.clone();
         foreign.snapshot_id = foreign.snapshot_id.replacen(&state.node, "another-host", 1);
@@ -15535,6 +16003,147 @@ mission "example/zero-run" state="ready" {
         assert!(!stored.contains("stream_capability"));
     }
 
+    #[test]
+    fn terminal_live_fence_refusal_matrix() {
+        let subject = "agent/fence-matrix";
+        for (label, fields, expected, message) in [
+            ("running", json!({"status":"running","runtime_id":"r","incarnation_id":"i","terminal":true}), None, None),
+            ("stale", json!({"status":"running","runtime_id":"r","incarnation_id":"old","terminal":true}), Some("stale-fence"), Some("subject `agent/fence-matrix` changed incarnation")),
+            ("exited", json!({"status":"exited","runtime_id":"r","incarnation_id":"i","terminal":true}), Some("not-found"), Some("subject `agent/fence-matrix` has no running session")),
+            ("unreachable", json!({"status":"running","runtime_id":"r","incarnation_id":"i","terminal":true,"reachability":"unreachable"}), Some("terminal-unavailable"), Some("the terminal owner is not reachable")),
+            ("no-runtime", json!({"status":"running","incarnation_id":"i","terminal":true}), Some("not-found"), Some("subject `agent/fence-matrix` has no runtime")),
+            ("no-incarnation", json!({"status":"running","runtime_id":"r","terminal":true}), Some("not-found"), Some("subject `agent/fence-matrix` has no incarnation")),
+            ("no-kind", json!({"status":"running","runtime_id":"r","incarnation_id":"i"}), Some("not-found"), Some("subject `agent/fence-matrix` has no runtime kind")),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let state = test_state_named(root.path(), "matrix-owner");
+            state.store.append_claim(&ClaimInput {
+                subject: subject.into(), kind: "runtime.observed".into(),
+                actor: Some(subject.into()), fields: serde_json::from_value(fields).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+            let result = remote_terminal_live_session(&state, subject, "i");
+            if let Some(code) = expected {
+                let error = result.unwrap_err();
+                assert_eq!(error.code, code, "{label}");
+                assert_eq!(error.message, message.unwrap(), "{label}");
+            } else {
+                let live = result.unwrap();
+                assert_eq!(live.runtime_id, "r");
+                assert_eq!(live.incarnation_id, "i");
+                assert!(live.terminal);
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "matrix-owner");
+        let error = remote_terminal_live_session(&state, subject, "i").unwrap_err();
+        assert_eq!(error.code, "terminal-unavailable");
+        assert_eq!(error.message, "the terminal owner is not reachable");
+
+        let runtime = ClaimInput {
+            subject: subject.into(), kind: "runtime.observed".into(),
+            actor: Some(subject.into()),
+            fields: serde_json::from_value(json!({"status":"running","runtime_id":"r","incarnation_id":"i","terminal":true})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        };
+        state.store.append_claim(&runtime).unwrap();
+        let rival_root = tempfile::tempdir().unwrap();
+        let rival = test_state_named(rival_root.path(), "matrix-rival");
+        rival.store.append_claim(&runtime).unwrap();
+        state.store.import_replication("matrix-rival", &rival.store.export_replication(0).unwrap()).unwrap();
+        let error = remote_terminal_live_session(&state, subject, "i").unwrap_err();
+        assert_eq!(error.code, "terminal-unavailable");
+        assert_eq!(error.message, "the terminal owner is not reachable");
+        assert_eq!(terminal_live_session(&state, subject, Some("i")).unwrap_err().code, "runtime-authority-indeterminate");
+
+        let gateway_root = tempfile::tempdir().unwrap();
+        let gateway = test_state_named(gateway_root.path(), "matrix-gateway");
+        gateway.store.import_replication("matrix-rival", &rival.store.export_replication(0).unwrap()).unwrap();
+        let error = remote_terminal_live_session(&gateway, subject, "i").unwrap_err();
+        assert_eq!(error.code, "remote-unavailable");
+        assert_eq!(terminal_live_session(&gateway, subject, Some("i")).unwrap_err().code, "runtime-not-local");
+    }
+
+    #[test]
+    fn remote_terminal_live_fence_refusal_matrix() {
+        let subject = "agent/remote-fence-matrix";
+        for (fields, code, message) in [
+            (json!({"status":"exited","runtime_id":"r","incarnation_id":"i","terminal":true}), "not-found", "the terminal is not running"),
+            (json!({"status":"running","runtime_id":"r","terminal":true}), "not-found", "the terminal has no incarnation"),
+            (json!({"status":"running","runtime_id":"r","incarnation_id":"old","terminal":true}), "stale-fence", "the terminal incarnation fence is stale"),
+            (json!({"status":"running","incarnation_id":"i","terminal":true}), "not-found", "the terminal has no runtime ID"),
+        ] {
+            let owner_root = tempfile::tempdir().unwrap();
+            let gateway_root = tempfile::tempdir().unwrap();
+            let owner = test_state_named(owner_root.path(), "matrix-remote-owner");
+            let mut gateway = test_state_named(gateway_root.path(), "matrix-remote-gateway");
+            let secret = gateway_root.path().join("fleet-secret");
+            std::fs::write(&secret, [7_u8; 32]).unwrap();
+            std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
+            gateway.client_relay = crate::peer::ClientRelay::from_config(&crate::config::Config {
+                node: "matrix-remote-gateway".into(),
+                fleet_id: Some("fleet-test".into()), shared_secret_file: Some(secret),
+                peers: vec![crate::config::PeerConfig {
+                    name: "matrix-remote-owner".into(), url: "http://127.0.0.1:9".into(),
+                }],
+                ..Default::default()
+            }).unwrap();
+            owner.store.append_claim(&ClaimInput {
+                subject: subject.into(), kind: "runtime.observed".into(),
+                actor: Some(subject.into()), fields: serde_json::from_value(fields).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+            gateway.store.import_replication("matrix-remote-owner", &owner.store.export_replication(0).unwrap()).unwrap();
+            let error = remote_terminal_live_session(&gateway, subject, "i").unwrap_err();
+            assert_eq!(error.code, code);
+            assert_eq!(error.message, message);
+        }
+    }
+
+    #[test]
+    fn raw_capability_refuses_changed_selected_owner_or_runtime() {
+        for (bound_owner, bound_runtime) in [("host/another-owner", "r"), ("host/matrix-owner", "old")] {
+            let root = tempfile::tempdir().unwrap();
+            let mut state = test_state_named(root.path(), "matrix-owner");
+            let secret = root.path().join("fleet-secret");
+            std::fs::write(&secret, [7_u8; 32]).unwrap();
+            std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
+            state.client_relay = crate::peer::ClientRelay::from_config(&crate::config::Config {
+                node: "matrix-owner".into(),
+                fleet_id: Some("fleet-test".into()), shared_secret_file: Some(secret),
+                peers: vec![crate::config::PeerConfig {
+                    name: "another-owner".into(), url: "http://127.0.0.1:9".into(),
+                }],
+                ..Default::default()
+            }).unwrap();
+            let session = ClientSession::local(Some("person/alex")).unwrap();
+            state.store.append_claim(&ClaimInput {
+                subject: "agent/fence-matrix".into(), kind: "runtime.observed".into(),
+                actor: None, fields: serde_json::from_value(json!({"status":"running","runtime_id":"r","incarnation_id":"i","terminal":true})).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+            let capability = "matrix-capability";
+            state.store.append_claim(&ClaimInput {
+                subject: terminal_attachment_subject("terminal-attachment/matrix").unwrap(),
+                kind: "custom.client.terminal-attached".into(),
+                actor: Some(session_claim_actor(&session)),
+                fields: serde_json::from_value(json!({
+                    "attachment_id":"terminal-attachment/matrix", "terminal_id":"terminal/agent/fence-matrix",
+                    "runtime_incarnation":"i", "runtime_id":bound_runtime, "owner_host_id":bound_owner,
+                    "session_actor":session.actor, "person_id":session.authority_actor, "raw_mode":"peek",
+                    "capability_hash":credential_digest(capability), "expires_at_unix_ms":client_now_ms()+60_000,
+                })).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+            let before = state.store.status(Some("terminal-attachment/matrix")).unwrap().store_index;
+            let error = consume_terminal_attachment_mode(
+                &state, &session, "terminal/agent/fence-matrix", "i", Some(capability), Some("peek"),
+            ).unwrap_err();
+            assert_eq!(error.code, "forbidden");
+            assert_eq!(state.store.status(Some("terminal-attachment/matrix")).unwrap().store_index, before);
+        }
+    }
+
     /// A member one build behind still routes to a terminal on a newer member whose seat reports
     /// a claim kind it does not know yet (`harness.limits`): the valid runtime observation
     /// decides, and the unknown claim waits for an upgrade.
@@ -15595,6 +16204,12 @@ mission "example/zero-run" state="ready" {
             .unwrap();
         let status = follower.store.status(Some(subject)).unwrap();
         assert_eq!(status.subjects[0].reachability, "reachable");
+        let session = ClientSession::local(Some("person/alex")).unwrap();
+        let snapshot = new_client_snapshot(&follower);
+        assert_eq!(
+            terminal_resources_for_owner(&follower, true, &snapshot, &session, Some(subject)).unwrap(),
+            runtime_resources_for_owner(&follower, true, &snapshot, &session, Some(subject)).unwrap(),
+        );
         let live = remote_terminal_live_session(&follower, subject, "same-runtime-id:i1")
             .unwrap_or_else(|error| panic!("{}: {}", error.code, error.message));
         assert_eq!(live.owner_host_id, "host/owner-node");
@@ -15712,6 +16327,7 @@ mission "example/zero-run" state="ready" {
             pairing_grant: None,
             transport: "paired",
             custom_forms: false,
+            conversation_blocks: false,
             scopes: ["terminal.read".into()].into_iter().collect(),
         };
         let mut remote_request = request.clone();
@@ -15805,6 +16421,11 @@ mission "example/zero-run" state="ready" {
         assert_eq!(indeterminate["state"], "unreachable");
         assert_eq!(indeterminate["terminal_access"]["read"], "unavailable");
         assert_eq!(indeterminate["operational"]["actionable"], false);
+        let snapshot = new_client_snapshot(&owner);
+        let lean = terminal_resources_for_owner(&owner, true, &snapshot, &session, Some(subject)).unwrap();
+        assert_eq!(lean, runtime_resources_for_owner(&owner, true, &snapshot, &session, Some(subject)).unwrap());
+        assert_eq!(lean[0]["state"], "unreachable");
+        assert_eq!(lean[0]["terminal_access"]["read"], "unavailable");
     }
     #[test]
     fn status_freshness_uses_cached_card_time_without_resetting_since() {

@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "summary": "Use an explicit bot User-Agent for anonymous Discord image downloads",
+  "replay": {
+    "status": "none",
+    "detail": "No native projection or replay behavior changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rule changes."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No client protocol or replication compatibility changes."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional daemon interruption."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No persistent state or migration changes."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Restart an existing optional Discord bridge process to pick up the explicit DiscordBot image download User-Agent; preserve its delivery checkpoints and pending receipts. A bridge paused for an unrelated incident stays paused until that incident is cleared."
+  },
+  "commits": [
+    "57ca355e79d999ffc1c4c80ef1b34e7ebf45bb2a"
+  ]
+}

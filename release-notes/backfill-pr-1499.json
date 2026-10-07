@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "summary": "#1499: conversation delivery-markup filtering",
+  "commits": ["b9efaf67ab76bfde2738d2a0e2a03c2492e9096b"],
+  "replay": {"status": "none", "detail": "No new projection invalidation or startup replay trigger in the merged conversation delivery-markup filtering change."},
+  "schema": {"status": "none", "detail": "No database table, index, trigger or migration change in conversation delivery-markup filtering; SQLite user_version is unchanged."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digest/drop policy are unchanged; this change adds no sealing coordination requirement."},
+  "compatibility": {"status": "none", "detail": "Conversation delivery-markup filtering changes presentation or UI interaction only; stored claims and daemon wire contracts are unchanged."},
+  "downtime": {"status": "none", "detail": "No additional upgrade service stop or measured outage introduced by conversation delivery-markup filtering; the standard daemon/client restart procedure still applies."},
+  "manual": {"status": "none", "detail": "No data repair or configuration conversion required for existing installations by conversation delivery-markup filtering."},
+  "recovery": {"status": "none", "detail": "No additional recovery procedure introduced by this change. Preserve graph state, keys and configuration and follow the standard roll-forward guidance; this note does not qualify binary-only downgrade of the whole release."}
+}

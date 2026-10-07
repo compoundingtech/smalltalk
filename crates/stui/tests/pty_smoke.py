@@ -25,7 +25,7 @@ import threading
 import time
 
 
-FIRST_FRAME = "\u2261 st".encode()  # spaces' top bar
+FIRST_FRAME = b" working"  # The status bar's count is present even before st connects.
 
 
 def plain(output: bytes) -> bytes:
@@ -84,7 +84,13 @@ def run_case(binary: str, ending: str, endpoint: str | None = None) -> None:
                     break
         return bytes(output), time.monotonic() - started
 
-    initial, first_frame = wait_for(b"\x1b[?1049h" if ending == "panic" else FIRST_FRAME, 2)
+    marker = b"\x1b[?1049h" if ending == "panic" else FIRST_FRAME
+    initial, first_frame = wait_for(marker, 2)
+    # wait_for returns its elapsed time whether or not the marker came, so a stale marker would
+    # read as a slow first frame (as it did when the top bar lost its label); say what is missing.
+    assert marker in (initial if marker.startswith(b"\x1b") else plain(initial)), (
+        f"first frame marker {marker!r} was not seen in 2 s"
+    )
     assert first_frame < 1, f"first frame took {first_frame:.3f}s"
     if ending != "panic":
         assert b"\x1b[?1000h" in captured, "mouse capture was not enabled"
@@ -224,14 +230,76 @@ def tmux_hangup_case(binary: str) -> None:
             pass
 
 
+def shifted_keys_case(binary: str) -> None:
+    """A terminal that reports every key as an escape code sends Shift+i as `i` with Shift.
+    Play one: answer the keyboard-protocol query, check what stui asks for, and type shifted keys
+    into the palette's search box, as such a terminal would send them."""
+    master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
+    env = os.environ.copy()
+    env["TERM"] = "xterm-256color"
+    proc = subprocess.Popen([binary], stdin=slave, stdout=slave, stderr=slave, env=env)
+    os.close(slave)
+    captured = bytearray()
+
+    def collect(seconds: float) -> None:
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([master], [], [], 0.05)
+            if not ready:
+                continue
+            try:
+                chunk = os.read(master, 65536)
+            except OSError:
+                return
+            captured.extend(chunk)
+            if b"\x1b[?u" in chunk:
+                os.write(master, b"\x1b[?0u")  # Supports the keyboard protocol.
+            if b"\x1b[c" in chunk:
+                os.write(master, b"\x1b[?62;c")
+
+    try:
+        collect(1.5)
+        pushed = re.findall(rb"\x1b\[>(\d+)u", bytes(captured))
+        assert pushed, "stui did not ask the terminal for the keyboard protocol"
+        flags = int(pushed[-1])
+        assert flags & 4, f"stui did not ask for alternate keys (flags {flags})"
+        os.write(master, b"\x0b")  # Ctrl+K: the palette and its search box.
+        collect(0.5)
+        # Shift+i and Shift+; with the layout's character given, then Shift+j with none given.
+        # The screen is redrawn in part, so each key is checked as the cell it newly wrote,
+        # followed by the box's cursor.
+        for sequence, typed in ((b"\x1b[105:73;2u", "I"), (b"\x1b[59:58;2u", ":"), (b"\x1b[106;2u", "J")):
+            captured.clear()
+            os.write(master, sequence)
+            collect(0.5)
+            text = plain(bytes(captured)).decode("utf-8", "replace")
+            assert typed + "\u258f" in text, f"{sequence!r} did not type {typed!r} ({text[-120:]!r})"
+        os.write(master, b"\x1b")
+        collect(0.3)
+        os.write(master, b"\x11")
+        collect(0.5)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+        os.close(master)
+    print("shifted keys: capitals and symbols typed from raw escape codes")
+
+
 if __name__ == "__main__":
     binary = sys.argv[1] if len(sys.argv) > 1 else "target/debug/stui"
     skip_panic = "--no-panic" in sys.argv[2:]
+    if "--only-shifted-keys" in sys.argv[2:]:
+        # The one case `cargo test` runs (tests/typed_keys.rs): keys as a terminal sends them.
+        shifted_keys_case(binary)
+        sys.exit(0)
     for case in ("normal", "signal", "panic"):
         if case == "panic" and skip_panic:
             print("panic: skipped (release binary has no debug panic hook)")
             continue
         run_case(binary, case)
+    shifted_keys_case(binary)
     delayed_getter_case(binary)
     hangup_case(binary)
     tmux_hangup_case(binary)

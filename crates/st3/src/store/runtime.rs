@@ -14,6 +14,7 @@ pub struct SmalltalkRuntime {
     /// Simulate different build registries on isolated nodes in compatibility tests.
     #[cfg(test)]
     pub(crate) claim_registry: std::sync::OnceLock<st3_schema::Registry>,
+    pub(crate) conversation_owners: Mutex<VecDeque<(u64, Arc<conversation_reads::Owners>)>>,
     pub(crate) actual_cache: Mutex<HashMap<String, (u64, Option<Value>)>>,
     /// Immutable placement ancestry, keyed by the selected declaration claim.
     pub(crate) placement_cache: Mutex<HashMap<String, Option<Arc<crate::placement::Fence>>>>,
@@ -48,7 +49,8 @@ impl Runtime for SmalltalkRuntime {
         resources::create_schema(connection)?;
         custom::create_schema(connection)?;
         agent_messages::create_schema(connection)?;
-        glass_heads::create_schema(connection)
+        glass_heads::create_schema(connection)?;
+        limits::create_limits_schema(connection)
     }
 
     fn open_projections(&self, transaction: &Transaction<'_>, shared_memory: bool) -> Result<()> {
@@ -57,6 +59,7 @@ impl Runtime for SmalltalkRuntime {
         glass_heads::open(transaction)?;
         agent_messages::open(transaction)?;
         arrangements::open(transaction)?;
+        limits::open_limits(transaction)?;
         if shared_memory {
             rebuild_operations_tx(transaction)?;
             rebuild_planning_tx(transaction)?;
@@ -172,6 +175,7 @@ impl Runtime for SmalltalkRuntime {
         resources::flush(transaction).map_err(internal)?;
         glass_heads::flush(transaction).map_err(internal)?;
         agent_messages::flush(transaction).map_err(internal)?;
+        limits::flush_limits(transaction).map_err(internal)?;
         reapply_local_work_lease_renewals_tx(transaction)
     }
 
@@ -182,7 +186,9 @@ impl Runtime for SmalltalkRuntime {
             .unwrap_or_else(PoisonError::into_inner);
         cache.views.clear();
         cache.statuses.clear();
+        cache.card_statuses.clear();
         drop(cache);
+        self.conversation_owners.lock().unwrap_or_else(PoisonError::into_inner).clear();
         self.agent_status_cache
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

@@ -477,6 +477,7 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
             body,
             delivered,
             dictated,
+            signed,
             images,
         } => {
             // Mail the person is part of leads; mail between others stays in the background
@@ -550,6 +551,14 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
                     run(format!("  {}", entry.at), on(theme.dim())),
                     // Spoken, then transcribed: a reader allows for transcription mistakes.
                     run(if *dictated { "  🎤" } else { "" }, on(theme.dim())),
+                    // Who signed it and whether that checks, for what a person wrote.
+                    run(
+                        signed
+                            .as_deref()
+                            .map(|signed| format!("  {signed}"))
+                            .unwrap_or_default(),
+                        on(theme.dim()),
+                    ),
                     run(progress.text, on(progress.style)),
                 ],
                 inner,
@@ -774,6 +783,7 @@ mod tests {
                     body: "The keys rotated.\n\nThree hosts still read the old ones.".into(),
                     delivered: false,
                     dictated: false,
+                    signed: None,
                     images: Vec::new(),
                 },
             )
@@ -959,6 +969,7 @@ mod tests {
                     body: "ship the harbor fix".into(),
                     delivered: true,
                     dictated,
+                    signed: None,
                     images: Vec::new(),
                 },
             )
@@ -995,6 +1006,7 @@ mod tests {
                 body: String::new(),
                 delivered: false,
                 dictated: false,
+                signed: None,
                 images: vec![image.clone()],
             },
         );
@@ -1030,6 +1042,7 @@ mod tests {
                     body: body.clone(),
                     delivered: false,
                     dictated: false,
+                    signed: None,
                     images: Vec::new(),
                 },
             )

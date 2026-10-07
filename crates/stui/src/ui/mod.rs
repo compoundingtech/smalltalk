@@ -7,6 +7,8 @@
 
 pub mod adapt;
 mod attach;
+mod clickable;
+mod context;
 #[cfg(test)]
 mod contract;
 pub mod conversation;
@@ -14,6 +16,7 @@ pub mod demo;
 pub mod doc;
 mod edit;
 mod glass;
+mod hover;
 #[cfg(test)]
 #[path = "../../tests/support/terminal_tab.rs"]
 mod terminal_tab;
@@ -76,11 +79,20 @@ struct FramePane {
     top: usize,
     total: usize,
     lines: Rc<Vec<Line<'static>>>,
+    entries: Vec<(String, usize)>,
+    layer: usize,
 }
 
 #[derive(Default)]
 struct FrameInfo {
+    area: Rect,
     hits: Vec<(Rect, Hit)>,
+    /// List rows with their subject and drawing layer, independent of the current focus.
+    context_rows: Vec<(Rect, String, usize)>,
+    /// Opaque layers and the first hit painted on each layer.
+    covers: Vec<(Rect, usize)>,
+    /// The unobscured focused terminal that retains ownership of program motion.
+    terminal_motion: Option<Rect>,
     panes: Vec<FramePane>,
     sidebar: Rect,
     sidebar_lines: usize,
@@ -104,6 +116,13 @@ struct FrameInfo {
     menu: Option<Rect>,
 }
 
+/// The palette remains reachable from a focused terminal. Other space shortcuts
+/// keep the terminal's established ownership until the person detaches.
+fn terminal_space_key(key: KeyEvent) -> bool {
+    key.code == KeyCode::Char('k')
+        && (key.modifiers == KeyModifiers::CONTROL || key.modifiers == KeyModifiers::SUPER)
+}
+
 struct Demo {
     started: Instant,
     loaded: bool,
@@ -114,9 +133,6 @@ struct Demo {
     cos_seen: Option<Instant>,
     harbor_seen: Option<Instant>,
 }
-
-/// How long an update stays open on Home before it counts as read.
-const UPDATE_READ_AFTER: Duration = Duration::from_secs(3);
 
 /// A request the live loop sends to st. The demo never produces these.
 /// What the agent actions menu does to a seat; each is st's own agent action.
@@ -169,6 +185,8 @@ pub enum Effect {
     Send {
         agent: String,
         text: String,
+        /// A canonical message this conversation draft replies to, using the existing API.
+        in_reply_to: Option<String>,
         /// st's message tags, such as `dictated`.
         tags: Vec<String>,
         /// Images to upload to st and attach (from a paste, a drop or the clipboard).
@@ -221,6 +239,10 @@ pub enum Effect {
         effort: Option<String>,
         host: Option<String>,
         message: Option<String>,
+        repo: Option<String>,
+        branch: Option<String>,
+        base: Option<String>,
+        workspace: Option<String>,
     },
     /// Send a failed or unconfirmed message again, as the same request.
     Resend {
@@ -230,6 +252,25 @@ pub enum Effect {
     Forget {
         entry: String,
     },
+}
+
+pub(crate) fn agent_parameters(
+    form: &screens::AgentForm,
+    host: Option<String>,
+) -> st3_client::AgentCreateParameters {
+    st3_client::AgentCreateParameters {
+        name: form.name.trim().to_owned(),
+        harness: form.harness().to_owned(),
+        host,
+        model: form.model().map(str::to_owned),
+        effort: form.effort().map(str::to_owned),
+        message: (!form.task.trim().is_empty()).then(|| form.task.trim().to_owned()),
+        repo: (!form.repository.trim().is_empty()).then(|| form.repository.trim().to_owned()),
+        branch: (!form.repository.trim().is_empty()).then(|| form.branch()),
+        base: (!form.repository.trim().is_empty()).then(|| form.base().to_owned()),
+        workspace: (!form.workspace.trim().is_empty()).then(|| form.workspace.trim().to_owned()),
+        ..Default::default()
+    }
 }
 
 /// An agent's live terminal screen, drawn in place of its conversation.
@@ -280,6 +321,9 @@ struct ChatState {
     editing: bool,
 }
 
+/// How long a second Ctrl+T may follow the first and leave the terminal.
+const LEAVE_TAP: Duration = Duration::from_millis(400);
+
 pub struct Ui {
     world: World,
     tab: usize,
@@ -300,16 +344,24 @@ pub struct Ui {
     sidebar: bool,
     system: bool,
     frame: RefCell<FrameInfo>,
+    hover: hover::Hover,
+    /// Reply context follows the conversation draft through navigation.
+    replies: HashMap<String, String>,
+    /// A menu owns its press through release, even after an action closes it.
+    context_button: Option<MouseButton>,
     dragging: bool,
     demo: Option<Demo>,
     quit: bool,
     /// Live: actions become `effects` for the live loop instead of demo edits.
     live: bool,
     effects: Vec<Effect>,
-    /// The update open on Home and since when: one left open a moment counts as read.
-    update_open: Option<(String, Instant)>,
     /// Updates marked read from here, so each is sent once.
     updates_read: HashSet<String>,
+    /// Attention items the person acted on from here: st closing them is their doing.
+    acted: HashSet<String>,
+    /// Attention items st no longer lists that nobody here acted on. Nothing leaves Home by
+    /// itself (Nathan, 2026-10-07): they stay, marked, until `x` clears them.
+    closed: HashSet<String>,
     /// Conversations scrolled up to their oldest entry since the last frame: each asks st for
     /// the page before it.
     older_wanted: RefCell<BTreeSet<String>>,
@@ -346,6 +398,8 @@ pub struct Ui {
     pub(crate) context: Option<glass::ContextMenu>,
     /// A Ctrl-C or Ctrl-D pressed once in a terminal, waiting for its confirming second press.
     terminal_confirm: Option<(KeyCode, Instant)>,
+    /// A Ctrl+T held back from an attached terminal: a second press soon leaves it.
+    terminal_hold: Option<(KeyEvent, Instant)>,
     /// The New mission form: title, request, mission id, workspace; and the focused field.
     new_mission: Option<([String; 4], usize)>,
     /// A device awaiting a confirmed revoke.
@@ -365,6 +419,8 @@ pub struct Ui {
     find: Option<Find>,
     /// The new agent form, kept while the person looks elsewhere.
     new_agent: Option<screens::AgentForm>,
+    agent_repositories: Option<(String, view::Load<Vec<String>>)>,
+    agent_form_focus: Cell<Option<usize>>,
     /// The Agents tab shows the new agent form rather than the selected agent.
     agent_form: bool,
     /// An agent just started from here, to select once st lists it.
@@ -384,6 +440,7 @@ pub struct Ui {
     terminal_cursor: Cell<Option<pty::Cursor>>,
     /// Whether a drag is selecting in the attached terminal.
     terminal_selecting: bool,
+    terminal_selection_mode: bool,
     /// The last press in the attached terminal, where and when, and how many in a row: a
     /// second selects a word, a third a line.
     terminal_press: Option<(Instant, u16, u16, u8)>,
@@ -445,13 +502,17 @@ impl Ui {
             sidebar: true,
             system: false,
             frame: RefCell::new(FrameInfo::default()),
+            hover: hover::Hover::default(),
+            replies: HashMap::new(),
+            context_button: None,
             dragging: false,
             demo: None,
             quit: false,
             live: false,
             effects: Vec::new(),
-            update_open: None,
             updates_read: HashSet::new(),
+            acted: HashSet::new(),
+            closed: HashSet::new(),
             older_wanted: RefCell::default(),
             popover: None,
             chat: None,
@@ -470,6 +531,7 @@ impl Ui {
             simple: false,
             terminal: None,
             terminal_confirm: None,
+            terminal_hold: None,
             new_mission: None,
             revoke: None,
             snoozed: HashSet::new(),
@@ -478,6 +540,8 @@ impl Ui {
             details_here: HashSet::new(),
             find: None,
             new_agent: None,
+            agent_repositories: None,
+            agent_form_focus: Cell::new(None),
             agent_form: false,
             started: None,
             attachments: HashMap::new(),
@@ -486,6 +550,7 @@ impl Ui {
             terminal_body: Cell::new(None),
             terminal_cursor: Cell::new(None),
             terminal_selecting: false,
+            terminal_selection_mode: false,
             terminal_press: None,
             anchors: RefCell::new(HashMap::new()),
             picker: None,
@@ -496,6 +561,48 @@ impl Ui {
     }
 
     /// Replace the world, keeping each tab's selection on the same item.
+    /// Note what the person did to an item from here, so its closing is not "closed elsewhere".
+    pub(crate) fn note_acted(&mut self, effect: &Effect) {
+        match effect {
+            Effect::Attention { id, .. }
+            | Effect::LaunchRevise { id, .. }
+            | Effect::Reply { id, .. } => {
+                self.acted.insert(id.clone());
+            }
+            _ => {}
+        }
+    }
+
+    /// An item st stopped listing stays on Home, marked, unless the person acted on it: another
+    /// device, an agent or st itself closed it, and it must not go while it is being read.
+    fn keep_closed_attention(&mut self, before: Vec<view::Attention>) {
+        let Load::Ready(items) = &mut self.world.attention else {
+            return;
+        };
+        for old in before {
+            if let Some(now) = items.iter().find(|item| item.id == old.id) {
+                if !self.closed.contains(&now.id) {
+                    continue;
+                }
+                self.closed.remove(&old.id);
+                continue;
+            }
+            if self.acted.contains(&old.id) {
+                self.closed.remove(&old.id);
+                continue;
+            }
+            let mut kept = old;
+            if self.closed.insert(kept.id.clone()) {
+                kept.waiting = Some(match kept.waiting.take() {
+                    Some(who) => format!("closed elsewhere, x clears it · {who}"),
+                    None => "closed elsewhere, x clears it".into(),
+                });
+                kept.actions.clear();
+            }
+            items.push(kept);
+        }
+    }
+
     pub fn set_world(&mut self, world: World) {
         let tab = self.tab;
         let mut chosen = Vec::new();
@@ -503,7 +610,15 @@ impl Ui {
             self.tab = index;
             chosen.push(self.selected_id());
         }
+        // Only what was on screen from a live reading can have closed under the person's eyes;
+        // a stored copy, or a reading before the first live one, is just replaced.
+        let before = if matches!(self.world.link, Link::Live) {
+            self.world.attention.items().to_vec()
+        } else {
+            Vec::new()
+        };
         self.world = world;
+        self.keep_closed_attention(before);
         for (index, id) in chosen.into_iter().enumerate() {
             self.tab = index;
             if let Some(id) = id
@@ -839,6 +954,27 @@ impl Ui {
         if self.paste_into_palette(&first) {
             return;
         }
+        if self.agent_form
+            && self.tab == 1
+            && let Some(form) = self.new_agent.as_mut()
+        {
+            let (value, input) = match form.focus {
+                0 => (&mut form.task, "agent:task"),
+                1 => (&mut form.name, "agent:name"),
+                6 => (&mut form.repository, "agent:repository"),
+                7 => (&mut form.branch, "agent:branch"),
+                8 => (&mut form.base, "agent:base"),
+                9 => (&mut form.workspace, "agent:workspace"),
+                _ => return,
+            };
+            edit::insert(
+                value,
+                &self.cursor,
+                input,
+                if form.focus == 0 { &text } else { &first },
+            );
+            return;
+        }
         if self.mission_form_focused()
             && let Some((fields, focus)) = self.new_mission.as_mut()
         {
@@ -1052,7 +1188,10 @@ impl Ui {
     pub fn render(&self, frame: &mut ratatui::Frame<'_>) {
         let area = frame.area();
         let buf = frame.buffer_mut();
-        *self.frame.borrow_mut() = FrameInfo::default();
+        *self.frame.borrow_mut() = FrameInfo {
+            area,
+            ..FrameInfo::default()
+        };
         self.terminal_cursor.set(None);
         buf.set_style(area, Style::default().bg(theme::BASE).fg(theme::TEXT));
         if area.width < 20 || area.height < 6 {
@@ -1069,11 +1208,12 @@ impl Ui {
             self.render_glass(buf, area);
         } else {
             self.top_bar(buf, Rect { height: 1, ..area });
+            self.top_bar_border(buf, area);
             self.draw_body(
                 buf,
                 Rect {
-                    y: area.y + 1,
-                    height: area.height - 2,
+                    y: area.y + 2,
+                    height: area.height - 3,
                     ..area
                 },
             );
@@ -1089,8 +1229,22 @@ impl Ui {
         if let Some(subject) = &self.popover {
             self.draw_popover(buf, area, subject);
         }
+        self.draw_context_menu(buf, area);
         if self.help {
             self.draw_help(buf, area);
+        }
+        self.draw_hover(buf);
+        for view in self.terminal.iter().chain(self.parked.iter()) {
+            if let Some(native) = &view.native
+                && (!self
+                .frame
+                .borrow()
+                .panes
+                .iter()
+                .any(|pane| pane.key == Pane::Terminal(view.agent.clone()).key()))
+            {
+                native.hide_graphics();
+            }
         }
         if let Some(cursor) = self.terminal_cursor.get() {
             frame.set_cursor_position((cursor.x, cursor.y));
@@ -1143,6 +1297,15 @@ impl Ui {
 
     fn hit(&self, rect: Rect, hit: Hit) {
         self.frame.borrow_mut().hits.push((rect, hit));
+    }
+
+    /// A soft, single-row edge between the top bar and the content in either layout.
+    fn top_bar_border(&self, buf: &mut Buffer, area: Rect) {
+        for x in area.x..area.right() {
+            buf[(x, area.y + 1)]
+                .set_symbol("─")
+                .set_style(theme::fg(theme::OVERLAY0).bg(theme::BASE));
+        }
     }
 
     fn top_bar(&self, buf: &mut Buffer, area: Rect) {
@@ -1275,10 +1438,10 @@ impl Ui {
             self.hit(
                 Rect {
                     x: start,
-                    width,
+                    width: text::width(&format!("{glyph} {word}")) as u16,
                     ..area
                 },
-                Hit::Help,
+                Hit::Connection,
             );
         }
     }
@@ -1308,11 +1471,32 @@ impl Ui {
                 ("ctrl+k", "find"),
             ]
         } else if self.terminal_focused() {
-            vec![
-                ("ctrl+\\", "back to stui"),
-                ("keys", "go to the terminal"),
-                ("ctrl-c twice", "interrupt"),
-            ]
+            if self.native_terminal().is_some_and(|native| {
+                native
+                    .mode()
+                    .intersects(alacritty_terminal::term::TermMode::MOUSE_MODE)
+            }) || self.terminal_selection_mode
+            {
+                vec![
+                    ("ctrl+\\", "back"),
+                    ("alt+drag", "copy"),
+                    (
+                        "ctrl+alt+s",
+                        if self.terminal_selection_mode {
+                            "program mouse"
+                        } else {
+                            "select"
+                        },
+                    ),
+                    ("ctrl+alt+r", "reset modes"),
+                ]
+            } else {
+                vec![
+                    ("ctrl+\\", "back to stui"),
+                    ("drag", "copy"),
+                    ("ctrl+alt+r", "reset modes"),
+                ]
+            }
         } else if self.new_mission.is_some() && self.tab == 2 {
             vec![
                 ("tab", "next field"),
@@ -1366,6 +1550,14 @@ impl Ui {
             .as_deref()
             .map_or(0, |build| text::width(build) as u16 + 1);
         let mut x = area.x + 1;
+        buf.set_stringn(
+            x,
+            area.y,
+            "Keys: ",
+            area.width.saturating_sub(2) as usize,
+            theme::dim().bg(theme::CRUST),
+        );
+        x += 6;
         for (key, label) in hints {
             let key_text = format!("{key} ");
             let label_text = format!("{label}   ");
@@ -1664,6 +1856,11 @@ impl Ui {
             buf.set_line(list.x + 1, y, line, list.width.saturating_sub(1));
             if let Some(index) = index {
                 self.hit(row, hit(*index));
+                if let Some(subject) = listing.ids.get(*index) {
+                    let mut info = self.frame.borrow_mut();
+                    let layer = info.covers.len();
+                    info.context_rows.push((row, subject.clone(), layer));
+                }
             }
         }
         if rows.len() > height {
@@ -1753,6 +1950,15 @@ impl Ui {
             editing: self.editing,
             confirm: self.confirm,
             answering: self.answering,
+            needs_words: self.changes_answer.as_ref().and_then(|wanted| {
+                self.structured_request().and_then(|(_, request)| {
+                    request
+                        .answers
+                        .iter()
+                        .find(|answer| &answer.id == wanted)
+                        .map(|answer| answer.label.clone())
+                })
+            }),
             chat,
         }
     }
@@ -1818,7 +2024,16 @@ impl Ui {
                     [
                         self.cursor.at("agent:task", &form.task),
                         self.cursor.at("agent:name", &form.name),
+                        self.cursor.at("agent:repository", &form.repository),
+                        self.cursor.at("agent:branch", &form.branch),
+                        self.cursor.at("agent:base", &form.base),
+                        self.cursor.at("agent:workspace", &form.workspace),
                     ],
+                    self.agent_repositories
+                        .as_ref()
+                        .filter(|(host, _)| Some(host) == self.agent_repository_host().as_ref())
+                        .map(|(_, load)| load)
+                        .unwrap_or(&view::Load::Loading),
                     width,
                 )
             }
@@ -2247,6 +2462,7 @@ impl Ui {
 
     /// Draw a document into a scrolling pane, registering its click targets.
     fn pane(&self, buf: &mut Buffer, key: &str, area: Rect, doc: Doc, follow_default: bool) {
+        let layer = self.frame.borrow().covers.len();
         let height = area.height as usize;
         let total = doc.lines.len();
         let state = {
@@ -2268,6 +2484,29 @@ impl Ui {
                 state.top = start.saturating_add_signed(anchor.offset);
             }
             state.reconcile(total, height);
+            if key == Pane::NewAgent.key()
+                && let Some(form) = &self.new_agent
+                && self.agent_form_focus.replace(Some(form.focus)) != Some(form.focus)
+            {
+                let mut lines = doc
+                    .targets
+                    .iter()
+                    .filter(|target| target.hit == Hit::Field(form.focus))
+                    .map(|target| target.line);
+                if let Some(first) = lines.next() {
+                    let last = lines
+                        .next_back()
+                        .unwrap_or(first)
+                        .min(first + height.saturating_sub(1));
+                    if first < state.top {
+                        state.top = first;
+                    }
+                    if last >= state.top + height {
+                        state.top = last.saturating_sub(height.saturating_sub(1));
+                    }
+                    state.follow = false;
+                }
+            }
             // The note about earlier entries stays first while they load above it, so the
             // place is kept by the first entry read instead.
             let entries = || {
@@ -2297,6 +2536,37 @@ impl Ui {
             *state
         };
         let top = state.top;
+        if matches!(
+            Pane::parse(key),
+            Some(Pane::Home(Some(_)) | Pane::Mission(Some(_)) | Pane::Declaration(Some(_)))
+        ) {
+            self.hit(
+                Rect {
+                    height: total.saturating_sub(top).min(height) as u16,
+                    width: area.width.saturating_sub(1),
+                    ..area
+                },
+                Hit::Subject,
+            );
+        }
+        if key.starts_with("chat:") {
+            for (index, (id, start)) in doc.entries.iter().enumerate() {
+                let end = doc.entries.get(index + 1).map_or(total, |(_, line)| *line);
+                let first = (*start).max(top);
+                let last = end.min(top + height);
+                if first < last && id != live::HISTORY_NOTE {
+                    self.hit(
+                        Rect {
+                            x: area.x,
+                            y: area.y + (first - top) as u16,
+                            width: area.width.saturating_sub(1),
+                            height: (last - first) as u16,
+                        },
+                        Hit::Message,
+                    );
+                }
+            }
+        }
         if area.width > 1 && height > 0 {
             self.frame.borrow_mut().read_messages.extend(
                 doc.messages
@@ -2392,6 +2662,8 @@ impl Ui {
             top,
             total,
             lines,
+            entries: doc.entries,
+            layer,
         });
     }
 
@@ -2429,11 +2701,13 @@ impl Ui {
         };
         // Everything outside the card closes it.
         self.hit(area, Hit::Escape);
+        self.cover(area);
         buf.set_style(rect, Style::default().bg(theme::MANTLE));
         for (offset, line) in doc.lines.iter().take(height as usize).enumerate() {
             buf.set_line(rect.x, rect.y + offset as u16, line, rect.width);
         }
         self.hit(rect, Hit::Peek(subject.to_owned()));
+        self.links(buf, rect);
         for target in &doc.targets {
             if (target.line as u16) < height {
                 self.hit(
@@ -2463,9 +2737,25 @@ impl Ui {
         if let Some(native) = view.native.as_ref() {
             // One line for where this is and how to leave; the PTY gets the rest of the pane.
             let scrolled = native.scrolled();
+            let selection_here = self.terminal_selection_mode
+                && self
+                    .terminal
+                    .as_ref()
+                    .is_some_and(|view| view.agent == agent);
             let status = match (native.ended(), native.attached(), scrolled) {
                 (Some(reason), _, _) => format!("ended: {reason}"),
                 (None, false, _) => "attaching…".into(),
+                (None, true, 0) if selection_here => {
+                    "selection on · drag copies · ctrl+alt+s resumes program mouse".into()
+                }
+                (None, true, 0)
+                    if native
+                        .mode()
+                        .intersects(alacritty_terminal::term::TermMode::MOUSE_MODE) =>
+                {
+                    "program mouse · alt+drag copies · ctrl+alt+s selects · ctrl+alt+r resets"
+                        .into()
+                }
                 (None, true, 0) if self.shell_focused() => {
                     "drag selects and copies · wheel or shift+pgup scrolls back".into()
                 }
@@ -2501,13 +2791,30 @@ impl Ui {
                 self.terminal_body.set(Some(body));
             }
             native.fit(body.height, body.width);
+            let layer = self.frame.borrow().covers.len();
+            self.frame.borrow_mut().panes.push(FramePane {
+                key: Pane::Terminal(agent.to_owned()).key(),
+                rect: body,
+                top: scrolled,
+                total: usize::from(body.height) + scrolled,
+                lines: Rc::new(Vec::new()),
+                entries: Vec::new(),
+                layer,
+            });
             // The person's own cursor only where nothing is drawn over the terminal.
             let real = self.terminal_focused()
                 && self.focused_pane() == Some(Pane::Terminal(agent.to_owned()))
                 && !self.help
                 && self.popover.is_none()
+                && self.context.is_none()
                 && !self.palette_open();
-            self.terminal_cursor.set(native.draw(buf, body, real));
+            let cursor = native.draw(buf, body, real);
+            if real {
+                self.terminal_cursor.set(cursor);
+            }
+            if let Some(picker) = &self.picker {
+                native.draw_graphics(buf, body, picker);
+            }
             return;
         }
         let header = format!(" ← Return · Ctrl+\\   {}", view.title);
@@ -2568,9 +2875,7 @@ impl Ui {
     fn terminal_key(&mut self, key: KeyEvent) {
         match self.native_terminal() {
             Some(native) => {
-                if let Some(bytes) = pty::key_bytes(key, native.mode()) {
-                    native.write(bytes);
-                }
+                native.key(key);
             }
             None => self.effects.push(Effect::TerminalKey(key)),
         }
@@ -2644,6 +2949,15 @@ impl Ui {
             })
             .unwrap_or_default();
         let mut lines = self.composer_text(agent, width, editing, &draft);
+        if let Some(message) = self.replies.get(&agent.id) {
+            lines.insert(
+                0,
+                Line::from(Span::styled(
+                    text::truncate(&format!("  Reply to {message}"), width),
+                    theme::dim(),
+                )),
+            );
+        }
         if !chips.is_empty() {
             lines.splice(0..0, chips);
         }
@@ -2820,6 +3134,11 @@ impl Ui {
             "lists and cards",
             &[
                 ("↑↓ j k or click", "select"),
+                ("F10", "top bar actions; ↑↓ and Enter choose"),
+                (
+                    "shift+F10 or Menu",
+                    "the selected subject's actions; ↑↓ and Enter choose",
+                ),
                 ("t", "Agents, Missions: the path tree or the groups"),
                 ("x", "Missions: show st's own missions"),
                 ("n", "Agents: a new agent; Missions: a new mission"),
@@ -2853,7 +3172,7 @@ impl Ui {
                     "this agent's details beside it (ctrl+i too, where the terminal tells it from tab)",
                 ),
                 ("drag", "select text in one pane; release copies it"),
-                ("ctrl+]  ctrl+\\", "attach the agent's terminal; leave it"),
+                ("ctrl+]  ctrl+\\  ctrl+t ctrl+t", "attach the agent's terminal; leave it (or Ctrl+T twice)"),
                 (
                     "ctrl+r  backspace",
                     "a message that was not sent: send it again; take it back to change",
@@ -2902,7 +3221,7 @@ impl Ui {
         }
         let mut doc = Doc::new();
         doc.card(
-            "help · any key closes",
+            "help · any key or click closes",
             theme::ACCENT,
             false,
             inner,
@@ -3034,6 +3353,8 @@ impl Ui {
             0
         } else if id.starts_with("mission/") {
             2
+        } else if id.starts_with("machine/") {
+            3
         } else {
             1
         };
@@ -3088,20 +3409,131 @@ impl Ui {
     }
 
     /// Dispatch the outer terminal's decoded input, shared by the live and demo loops.
-    fn input_event(&mut self, event: Event) {
+    fn input_event(&mut self, event: Event) -> bool {
+        if let Event::Mouse(mouse) = event
+            && mouse.kind == MouseEventKind::Moved
+        {
+            return self.mouse_moved(mouse);
+        }
+        if event == Event::FocusLost {
+            self.hover.clear();
+            self.hover.pressed.set(false);
+            self.dragging = false;
+            self.terminal_selecting = false;
+            self.cancel_drag();
+        }
+        let focused = self.input_terminal();
         match event {
-            Event::Key(key) => self.key(key),
+            Event::Key(key) => self.key(shifted(key)),
             Event::Paste(text) => {
                 self.sync_terminal_slot();
                 self.paste(text)
             }
             Event::Mouse(mouse) => self.mouse(mouse),
+            Event::FocusGained | Event::FocusLost if focused.is_some() => {
+                if let Some(native) = self.native_terminal() {
+                    native.focus(matches!(event, Event::FocusGained));
+                }
+            }
             _ => {}
+        }
+        self.sync_terminal_slot();
+        let now = self.input_terminal();
+        if focused != now {
+            for (agent, gained) in [(focused, false), (now, true)] {
+                if let Some(agent) = agent
+                    && let Some(native) = self
+                        .terminal_view(&agent)
+                        .and_then(|view| view.native.as_ref())
+                {
+                    native.focus(gained);
+                }
+            }
+        }
+        true
+    }
+
+    fn input_terminal(&self) -> Option<String> {
+        (self.terminal_focused()
+            && !self.palette_open()
+            && !self.help
+            && self.popover.is_none()
+            && self.voice.is_none()
+            && self.context.is_none())
+        .then(|| match self.focused_pane() {
+            Some(Pane::Terminal(agent)) => Some(agent),
+            _ => self.terminal.as_ref().map(|view| view.agent.clone()),
+        })
+        .flatten()
+    }
+
+    /// Leave the attached terminal: an agent's tab turns back into its conversation; a shell's
+    /// tab stays a shell, detached.
+    fn leave_terminal(&mut self) {
+        self.terminal_selection_mode = false;
+        self.terminal_selecting = false;
+        self.terminal_hold = None;
+        if let Some(Pane::Terminal(agent)) = self.focused_pane()
+            && agent.starts_with("agent/")
+        {
+            self.swap_focused_pane(Pane::Agent(Some(agent)));
+            self.terminal = None;
+        }
+        self.effects.push(Effect::CloseTerminal);
+    }
+
+    /// A Ctrl+T held back goes to the program once no second press came to leave with.
+    pub(crate) fn step_terminal_hold(&mut self) {
+        if let Some((key, at)) = self.terminal_hold
+            && at.elapsed() >= LEAVE_TAP
+        {
+            self.terminal_hold = None;
+            if self.terminal_focused() {
+                self.terminal_key(key);
+            }
         }
     }
 
     pub fn key(&mut self, key: KeyEvent) {
+        let ctrl_t = key.code == KeyCode::Char('t') && key.modifiers == KeyModifiers::CONTROL;
+        if self.terminal_hold.is_some() {
+            if ctrl_t && key.kind != KeyEventKind::Press {
+                // The held press's own repeat or release goes with it.
+                return;
+            }
+            if !ctrl_t {
+                // Anything else first lets the held key go, so the program sees them in order.
+                if let Some((held, _)) = self.terminal_hold.take()
+                    && self.terminal_focused()
+                {
+                    self.terminal_key(held);
+                }
+            }
+        }
         if key.kind != KeyEventKind::Press {
+            // Repeats and releases belong to the child, never to stui shortcuts or confirmations.
+            if self.terminal_focused()
+                && !self.palette_open()
+                && !self.help
+                && self.popover.is_none()
+                && self.voice.is_none()
+                && self.context.is_none()
+                && !terminal_space_key(key)
+                && !matches!(key.code, KeyCode::Char('\\' | '4') if key.modifiers.contains(KeyModifiers::CONTROL))
+                && !matches!(key.code, KeyCode::Char('s' | 'S' | 'r' | 'R') if key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::ALT))
+                && !matches!(key.code, KeyCode::PageUp | KeyCode::PageDown if key.modifiers.contains(KeyModifiers::SHIFT))
+                && !matches!(key.code, KeyCode::Char('c' | 'd') if key.modifiers.contains(KeyModifiers::CONTROL) && !self.shell_focused())
+            {
+                self.terminal_key(key);
+            }
+            return;
+        }
+        // Ctrl+\ always leaves the attached tab, including through palette overlays.
+        if self.terminal_focused()
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('\\' | '4'))
+        {
+            self.leave_terminal();
             return;
         }
         self.sync_terminal_slot();
@@ -3113,6 +3545,24 @@ impl Ui {
         if self.answer_key(key) {
             return;
         }
+        if self.context_key(key) {
+            return;
+        }
+        if let Some(action) = self.confirm {
+            // Confirmation owns the keys even when a sidebar or terminal is behind the menu.
+            // Ctrl+C retains its existing second-press confirmation of an interrupt.
+            if key.code == KeyCode::Char('y')
+                || (action == 's'
+                    && key.code == KeyCode::Char('c')
+                    && key.modifiers.contains(KeyModifiers::CONTROL))
+            {
+                self.confirm = None;
+                self.act(action);
+            } else {
+                self.confirm = None;
+            }
+            return;
+        }
         if self.glass_key(key) {
             return;
         }
@@ -3120,17 +3570,42 @@ impl Ui {
         if self.terminal_focused() {
             let control = key.modifiers.contains(KeyModifiers::CONTROL);
             match key.code {
-                // Terminals send Ctrl+\\ as 0x1c, which crossterm reports as Ctrl+4.
-                KeyCode::Char('\\' | '4') if control => {
-                    // In glasses an agent's tab turns back into its conversation; a shell's tab
-                    // stays a shell, detached.
-                    if let Some(Pane::Terminal(agent)) = self.focused_pane()
-                        && agent.starts_with("agent/")
-                    {
-                        self.swap_focused_pane(Pane::Agent(Some(agent)));
-                        self.terminal = None;
+                KeyCode::Char('s' | 'S')
+                    if key
+                        .modifiers
+                        .contains(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    self.terminal_selection_mode = !self.terminal_selection_mode;
+                    self.flash(if self.terminal_selection_mode {
+                        "Selection on · drag copies · Ctrl+Alt+S resumes program mouse"
+                    } else {
+                        "Program mouse restored"
+                    });
+                }
+                KeyCode::Char('r' | 'R')
+                    if key
+                        .modifiers
+                        .contains(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    if let Some(native) = self.native_terminal() {
+                        native.reset_modes();
                     }
-                    self.effects.push(Effect::CloseTerminal);
+                    self.terminal_selection_mode = false;
+                    self.terminal_selecting = false;
+                    self.terminal_confirm = None;
+                    self.flash("Terminal input modes reset");
+                }
+                // Ctrl+T twice leaves the terminal. The first press is held back a moment, and
+                // the program gets it if no second one comes (a shell swaps two characters).
+                KeyCode::Char('t') if key.modifiers == KeyModifiers::CONTROL => {
+                    if self
+                        .terminal_hold
+                        .is_some_and(|(_, at)| at.elapsed() < LEAVE_TAP)
+                    {
+                        self.leave_terminal();
+                    } else {
+                        self.terminal_hold = Some((key, Instant::now()));
+                    }
                 }
                 // An agent's terminal asks twice before Ctrl-C or Ctrl-D reach it, so a reflex
                 // never stops an agent; a shell gets them at once, as in any terminal.
@@ -3344,18 +3819,6 @@ impl Ui {
             }
             return;
         }
-        if let Some(action) = self.confirm {
-            match key.code {
-                // Only y confirms. Enter is how a message is sent, so it never confirms anything
-                // that acts for the person: stopping, approving, closing, cancelling, revoking.
-                KeyCode::Char('y') => {
-                    self.confirm = None;
-                    self.act(action);
-                }
-                _ => self.confirm = None,
-            }
-            return;
-        }
         match key.code {
             KeyCode::Char('q') => self.quit = true,
             // Ctrl+H is Home; in a text box it stays backspace.
@@ -3499,30 +3962,6 @@ impl Ui {
         }
     }
 
-    /// An update opened on Home is read once the person leaves it, after it was open for a
-    /// moment: marking it read closes it, and it must stay put while it is being read (Nathan,
-    /// 2026-10-05: updates vanished mid-read). Passing over it with the arrows does not count,
-    /// and `x` still reads it at once.
-    pub(crate) fn read_open_update(&mut self) {
-        let open = self
-            .attention_focus()
-            .filter(|_| !self.help && self.popover.is_none())
-            .filter(|_| self.current_kind() == Some("update"));
-        if let Some((shown, since)) = &self.update_open
-            && open.as_ref() != Some(shown)
-            && since.elapsed() >= UPDATE_READ_AFTER
-        {
-            let shown = shown.clone();
-            self.update_open = None;
-            self.read_update_id(shown);
-        }
-        match (open, &self.update_open) {
-            (None, _) => self.update_open = None,
-            (Some(id), Some((shown, _))) if *shown == id => {}
-            (Some(id), _) => self.update_open = Some((id, Instant::now())),
-        }
-    }
-
     fn current_kind(&self) -> Option<&'static str> {
         let id = self.attention_focus()?;
         self.world
@@ -3581,6 +4020,22 @@ impl Ui {
                 if self.current_item().is_some_and(|item| item.actions.iter().any(|a| a == "custom.reply"))
                     && matches!(key, 'y' | 'n' | 'r' | 'x') {
                     self.flash("Reply with c using this source's declared fields");
+                    return;
+                }
+                if let Some(id) = self.attention_focus()
+                    && self.closed.contains(&id)
+                {
+                    if key == 'x' {
+                        self.closed.remove(&id);
+                        self.acted.insert(id.clone());
+                        if let Load::Ready(items) = &mut self.world.attention {
+                            items.retain(|item| item.id != id);
+                        }
+                        let index = self.selected[self.tab];
+                        self.select(index);
+                    } else {
+                        self.flash("This was closed elsewhere and stays until you clear it with x");
+                    }
                     return;
                 }
                 match (kind, key) {
@@ -3794,6 +4249,21 @@ impl Ui {
             if let Some(old) = self.terminal.replace(wanted) {
                 self.parked.push(old);
             }
+            self.terminal_selection_mode = false;
+            self.terminal_selecting = false;
+            self.terminal_press = None;
+            if let Some(body) = self
+                .frame
+                .borrow()
+                .panes
+                .iter()
+                .find(|pane| pane.key == Pane::Terminal(agent.clone()).key())
+                .map(|pane| pane.rect)
+            {
+                self.terminal_body.set(Some(body));
+                self.terminal_size
+                    .set((body.height.max(1), body.width.max(1)));
+            }
         }
     }
 
@@ -3874,6 +4344,7 @@ impl Ui {
     /// Open the new agent form: in a new tab of the focused split in a glass, on the Agents
     /// tab otherwise. `task` fills in what it should do.
     pub(crate) fn open_new_agent(&mut self, task: Option<String>) {
+        self.agent_form_focus.set(None);
         match self.new_agent.as_mut() {
             Some(form) => {
                 if let Some(task) = task {
@@ -3899,7 +4370,29 @@ impl Ui {
         }
     }
 
+    fn agent_repository_host(&self) -> Option<String> {
+        let form = self.new_agent.as_ref()?;
+        Some(
+            form.host
+                .checked_sub(1)
+                .and_then(|index| self.other_hosts().get(index).cloned())
+                .unwrap_or_else(|| {
+                    if self.world.host == "this machine" {
+                        "local".into()
+                    } else {
+                        self.world.host.clone()
+                    }
+                }),
+        )
+    }
+
     fn agent_form_key(&mut self, key: KeyEvent) {
+        let suggestions = self
+            .agent_repositories
+            .as_ref()
+            .filter(|(host, _)| Some(host) == self.agent_repository_host().as_ref())
+            .map(|(_, load)| load.items().to_vec())
+            .unwrap_or_default();
         let hosts = self.other_hosts().len();
         let Some(form) = self.new_agent.as_mut() else {
             return;
@@ -3909,14 +4402,36 @@ impl Ui {
             .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT);
         match key.code {
             KeyCode::Esc => self.cancel_agent_form(),
-            KeyCode::Tab | KeyCode::Down if form.focus >= 2 || key.code == KeyCode::Tab => {
+            KeyCode::Char(choice @ ('n' | 'p'))
+                if form.focus == 6 && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                if !suggestions.is_empty() {
+                    let index = suggestions
+                        .iter()
+                        .position(|path| path == &form.repository)
+                        .map(|index| {
+                            if choice == 'n' {
+                                (index + 1) % suggestions.len()
+                            } else {
+                                (index + suggestions.len() - 1) % suggestions.len()
+                            }
+                        })
+                        .unwrap_or(if choice == 'n' {
+                            0
+                        } else {
+                            suggestions.len() - 1
+                        });
+                    form.repository = suggestions[index].clone();
+                }
+            }
+            KeyCode::Tab | KeyCode::Down if form.choice() || key.code == KeyCode::Tab => {
                 form.focus = (form.focus + 1) % screens::AgentForm::FIELDS;
             }
-            KeyCode::BackTab | KeyCode::Up if form.focus >= 2 || key.code == KeyCode::BackTab => {
+            KeyCode::BackTab | KeyCode::Up if form.choice() || key.code == KeyCode::BackTab => {
                 form.focus =
                     (form.focus + screens::AgentForm::FIELDS - 1) % screens::AgentForm::FIELDS;
             }
-            KeyCode::Left | KeyCode::Right if form.focus >= 2 => {
+            KeyCode::Left | KeyCode::Right if form.choice() => {
                 form.cycle(key.code == KeyCode::Right, hosts);
             }
             KeyCode::Enter if shifted && form.focus == 0 => {
@@ -3937,6 +4452,18 @@ impl Ui {
                     }
                     edit::edit(&mut form.name, &self.cursor, "agent:name", key);
                 }
+                6 => {
+                    edit::edit(&mut form.repository, &self.cursor, "agent:repository", key);
+                }
+                7 => {
+                    edit::edit(&mut form.branch, &self.cursor, "agent:branch", key);
+                }
+                8 => {
+                    edit::edit(&mut form.base, &self.cursor, "agent:base", key);
+                }
+                9 => {
+                    edit::edit(&mut form.workspace, &self.cursor, "agent:workspace", key);
+                }
                 _ => {}
             },
         }
@@ -3954,19 +4481,23 @@ impl Ui {
             self.flash("Give it a name");
             return;
         }
-        let message = Some(form.task.trim().to_owned()).filter(|task| !task.is_empty());
         let host = form
             .host
             .checked_sub(1)
             .and_then(|index| hosts.get(index).cloned());
         if self.live {
+            let parameters = agent_parameters(&form, host);
             self.effects.push(Effect::CreateAgent {
-                name: form.name.trim().to_owned(),
-                harness: form.harness().to_owned(),
-                model: form.model().map(str::to_owned),
-                effort: form.effort().map(str::to_owned),
-                host,
-                message,
+                name: parameters.name,
+                harness: parameters.harness,
+                model: parameters.model,
+                effort: parameters.effort,
+                host: parameters.host,
+                message: parameters.message,
+                repo: parameters.repo,
+                branch: parameters.branch,
+                base: parameters.base,
+                workspace: parameters.workspace,
             });
             self.flash(format!("Starting {}…", form.name.trim()));
         } else {
@@ -4175,6 +4706,7 @@ impl Ui {
                     body: text,
                     delivered: false,
                     dictated: false,
+                    signed: None,
                     images: Vec::new(),
                 },
             });
@@ -4188,6 +4720,7 @@ impl Ui {
                     body: "Good question. Here is what I know, and what I would need from you to go on. (demo reply)".into(),
                     delivered: false,
                     dictated: false,
+                    signed: None,
                     images: Vec::new(),
                 },
             });
@@ -4209,7 +4742,22 @@ impl Ui {
             _ => None,
         };
         let Some(mut draft) = draft else {
-            self.flash("Write something first");
+            // An answer that asks for changes is sent with the changes in words.
+            let wanted = self.changes_answer.clone().and_then(|wanted| {
+                self.structured_request().and_then(|(_, request)| {
+                    request
+                        .answers
+                        .iter()
+                        .find(|answer| answer.id == wanted)
+                        .map(|answer| answer.label.clone())
+                })
+            });
+            self.flash(match wanted {
+                Some(label) => format!(
+                    "“{label}” needs your words: write what should change, then Enter. Esc cancels"
+                ),
+                None => "Write something first".to_owned(),
+            });
             return;
         };
         // Live, the images go to st with the message, so an agent on any machine can read them
@@ -4230,6 +4778,7 @@ impl Ui {
             let effect = match self.tab {
                 1 => Some(Effect::Send {
                     agent: id.clone(),
+                    in_reply_to: self.replies.remove(&id),
                     tags: if self.dictated.remove(&id) {
                         vec!["dictated".into()]
                     } else {
@@ -4314,6 +4863,7 @@ impl Ui {
         }
         match self.tab {
             1 => {
+                self.replies.remove(&id);
                 let name = self
                     .world
                     .agents
@@ -4333,6 +4883,7 @@ impl Ui {
                             body: draft,
                             delivered: false,
                             dictated: false,
+                            signed: None,
                             images: Vec::new(),
                         },
                     });
@@ -4397,12 +4948,8 @@ impl Ui {
                 self.confirm = Some('A');
             }
             ('i', None) => {
-                if self.live {
-                    self.effects.push(Effect::StopAgent { agent });
-                    self.flash("Interrupting…");
-                } else {
-                    self.flash("Interrupted · demo: nothing was sent");
-                }
+                self.open(&agent);
+                self.action_key('S');
             }
             ('t', None) => {
                 self.open(&agent);
@@ -4585,6 +5132,29 @@ impl Ui {
     }
 
     pub fn mouse(&mut self, mouse: MouseEvent) {
+        if mouse.kind == MouseEventKind::Moved {
+            self.mouse_moved(mouse);
+            return;
+        }
+        match mouse.kind {
+            MouseEventKind::Down(_) | MouseEventKind::Drag(_) => {
+                self.hover.pressed.set(true);
+                self.hover.clear();
+            }
+            MouseEventKind::Up(_) => self.hover.pressed.set(false),
+            _ => {}
+        }
+        if let Some(button) = self.context_button {
+            match mouse.kind {
+                MouseEventKind::Up(released) if released == button => {
+                    self.context_button = None;
+                    return;
+                }
+                MouseEventKind::Drag(dragged) if dragged == button => return,
+                MouseEventKind::Down(_) => self.context_button = None,
+                _ => {}
+            }
+        }
         self.sync_terminal_slot();
         if self.help {
             if matches!(mouse.kind, MouseEventKind::Down(_)) {
@@ -4594,21 +5164,48 @@ impl Ui {
         }
         // The right-click menu takes the next press: a row acts, anywhere else only closes it.
         if self.context.is_some() && matches!(mouse.kind, MouseEventKind::Down(_)) {
-            let inside = self
-                .frame
-                .borrow()
-                .menu
-                .is_some_and(|rect| contains(rect, mouse.column, mouse.row));
-            if !inside || !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-                self.context = None;
-                return;
+            if let MouseEventKind::Down(button) = mouse.kind {
+                self.context_button = Some(button);
             }
+            let action = if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                self.frame
+                    .borrow()
+                    .hits
+                    .iter()
+                    .rev()
+                    .find_map(|(rect, hit)| match hit {
+                        Hit::Menu(action) if contains(*rect, mouse.column, mouse.row) => {
+                            Some(action.clone())
+                        }
+                        _ => None,
+                    })
+            } else {
+                None
+            };
+            self.context = None;
+            if let Some(action) = action {
+                self.run_menu_action(action);
+            }
+            return;
+        }
+        if let Some(menu) = &mut self.context {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => menu.selected = menu.selected.saturating_sub(1),
+                MouseEventKind::ScrollDown => {
+                    menu.selected = (menu.selected + 1).min(menu.items.len().saturating_sub(1));
+                }
+                _ => {}
+            }
+            return;
         }
         if self.terminal_mouse(mouse) {
             return;
         }
-        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) && self.glasses.is_some() {
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) {
             self.open_context_menu(mouse.column, mouse.row);
+            if self.context.is_some() {
+                self.context_button = Some(MouseButton::Right);
+            }
             return;
         }
         // A tab dragged to another place or a split's edge.
@@ -4629,7 +5226,7 @@ impl Ui {
                         .map(|(_, hit)| hit.clone())
                 };
                 self.conversation_state.selection = None;
-                if let Some(hit) = hit {
+                if let Some(hit) = hit.filter(|hit| !matches!(hit, Hit::Message | Hit::Subject)) {
                     self.click(hit);
                     return;
                 }
@@ -4699,8 +5296,14 @@ impl Ui {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown if self.palette_open() => {
                 self.scroll_palette(matches!(mouse.kind, MouseEventKind::ScrollUp));
             }
-            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-                let delta = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+            MouseEventKind::ScrollUp
+            | MouseEventKind::ScrollDown
+            | MouseEventKind::ScrollLeft
+            | MouseEventKind::ScrollRight => {
+                let delta = if matches!(
+                    mouse.kind,
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollLeft
+                ) {
                     -3
                 } else {
                     3
@@ -4723,7 +5326,12 @@ impl Ui {
                             .map(|pane| pane.key.clone()),
                     )
                 };
-                if in_sidebar {
+                if in_sidebar
+                    && !matches!(
+                        mouse.kind,
+                        MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight
+                    )
+                {
                     let (lines, height, tab) = {
                         let info = self.frame.borrow();
                         (info.sidebar_lines, info.sidebar_height, info.sidebar_tab)
@@ -4734,15 +5342,44 @@ impl Ui {
                         as usize;
                 } else if let Some(key) = pane {
                     // An attached terminal scrolls its own history (or tells its program).
-                    match self.native_terminal() {
-                        Some(native)
-                            if self.terminal.as_ref().is_some_and(|view| {
-                                key == Pane::Terminal(view.agent.clone()).key()
-                            }) =>
-                        {
-                            native.wheel(-(delta as i32));
+                    let target = self
+                        .terminal
+                        .iter()
+                        .chain(self.parked.iter())
+                        .find(|view| key == Pane::Terminal(view.agent.clone()).key());
+                    match target.and_then(|view| view.native.as_ref()) {
+                        Some(native) => {
+                            if let Some(body) = self
+                                .frame
+                                .borrow()
+                                .panes
+                                .iter()
+                                .find(|pane| pane.key == key)
+                                .map(|pane| pane.rect)
+                            {
+                                native.wheel(
+                                    -(delta as i32),
+                                    mouse,
+                                    mouse.column.saturating_sub(body.x),
+                                    mouse.row.saturating_sub(body.y),
+                                    (self.terminal_selection_mode
+                                        && self.terminal.as_ref().is_some_and(|view| {
+                                            key == Pane::Terminal(view.agent.clone()).key()
+                                        }))
+                                        || mouse
+                                            .modifiers
+                                            .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT),
+                                );
+                            }
                         }
-                        _ => self.scroll_pane(&key, delta),
+                        _ if !matches!(
+                            mouse.kind,
+                            MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight
+                        ) =>
+                        {
+                            self.scroll_pane(&key, delta)
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -4752,7 +5389,8 @@ impl Ui {
 
     /// The mouse in the focused terminal, as a terminal takes it: a program that asked for the
     /// mouse gets it, and otherwise a drag selects and copies on release. Shift selects even
-    /// while the program has the mouse. Whether the terminal took it.
+    /// while the program has the mouse; Alt/Option and selection mode work when kitty owns Shift.
+    /// Whether the terminal took it.
     fn terminal_mouse(&mut self, mouse: MouseEvent) -> bool {
         if !self.terminal_focused() {
             return false;
@@ -4766,11 +5404,34 @@ impl Ui {
             i32::from(mouse.row) - i32::from(body.y),
         );
         if inside
-            && !self.terminal_selecting
-            && !mouse.modifiers.contains(KeyModifiers::SHIFT)
-            && let Some(bytes) = pty::mouse_bytes(mouse, column as u16, row as u16, native.mode())
+            && mouse
+                .modifiers
+                .contains(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && let Some(link) = native.hyperlink(column as u16, row as u16)
         {
-            native.write(bytes);
+            copy(&link);
+            self.flash("Copied link destination");
+            return true;
+        }
+        if inside
+            && !self.terminal_selecting
+            && !self.terminal_selection_mode
+            && !mouse
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+            && !matches!(
+                mouse.kind,
+                MouseEventKind::ScrollUp
+                    | MouseEventKind::ScrollDown
+                    | MouseEventKind::ScrollLeft
+                    | MouseEventKind::ScrollRight
+            )
+            && native
+                .mode()
+                .intersects(alacritty_terminal::term::TermMode::MOUSE_MODE)
+        {
+            native.mouse(mouse, column as u16, row as u16);
             return true;
         }
         match mouse.kind {
@@ -4831,6 +5492,7 @@ impl Ui {
 
     fn click(&mut self, hit: Hit) {
         match hit {
+            Hit::Message | Hit::Subject | Hit::Resize => {}
             Hit::GlassMenu => self.open_palette(Some(4), glass::Open::Here),
             Hit::PaletteSection(section) => self.open_palette(Some(section), glass::Open::Here),
             Hit::NewAgent => self.open_new_agent(None),
@@ -4900,6 +5562,7 @@ impl Ui {
                     *focus = (*focus + 1) % 4;
                 }
             }
+            Hit::Key('s') if self.glasses.is_none() => self.sidebar = !self.sidebar,
             Hit::Key(key) => {
                 if key == 'y' {
                     if let Some(action) = self.confirm.take() {
@@ -4977,6 +5640,12 @@ impl Ui {
                 self.start_voice();
             }
             Hit::Open(id) => self.open(&id),
+            Hit::Repository(path) => {
+                if let Some(form) = self.new_agent.as_mut() {
+                    form.repository = path;
+                    form.focus = 6;
+                }
+            }
             Hit::Field(index) if self.agent_form => {
                 if let Some(form) = self.new_agent.as_mut() {
                     form.focus = index;
@@ -5158,6 +5827,19 @@ impl Ui {
 }
 
 /// Editing at the text's end, for an input without a cursor of its own (the palette's query).
+/// A terminal that reports every key as an escape code may send Shift+i as `i` with Shift, and
+/// a terminal that does not give the layout's own character leaves that to us: a letter at least.
+fn shifted(mut key: KeyEvent) -> KeyEvent {
+    if let KeyCode::Char(letter) = key.code
+        && key.modifiers.contains(KeyModifiers::SHIFT)
+        && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        && letter.is_ascii_lowercase()
+    {
+        key.code = KeyCode::Char(letter.to_ascii_uppercase());
+    }
+    key
+}
+
 fn edit_text(text: &mut String, key: KeyEvent) -> bool {
     edit::edit(text, &edit::Cursor::default(), "", key)
 }
@@ -5312,7 +5994,8 @@ impl Guard {
             io::stdout(),
             EnterAlternateScreen,
             EnableMouseCapture,
-            crossterm::event::EnableBracketedPaste
+            crossterm::event::EnableBracketedPaste,
+            crossterm::event::EnableFocusChange
         )?;
         let enhanced = keys && crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
         if enhanced {
@@ -5320,6 +6003,11 @@ impl Guard {
                 io::stdout(),
                 crossterm::event::PushKeyboardEnhancementFlags(
                     crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                        | crossterm::event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                        | crossterm::event::KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+                        // With every key an escape code, Shift+; arrives as `;` plus Shift. This
+                        // asks the terminal to say what the layout makes of it: `:`.
+                        | crossterm::event::KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
                 )
             )?;
         }
@@ -5336,6 +6024,7 @@ impl Drop for Guard {
             io::stdout(),
             crossterm::cursor::SetCursorStyle::DefaultUserShape,
             crossterm::event::DisableBracketedPaste,
+            crossterm::event::DisableFocusChange,
             DisableMouseCapture,
             LeaveAlternateScreen
         );
@@ -5412,16 +6101,9 @@ pub fn run_demo(args: &[String]) -> Result<()> {
         execute!(io::stdout(), BeginSynchronizedUpdate)?;
         terminal.draw(|frame| ui.render(frame))?;
         execute!(io::stdout(), EndSynchronizedUpdate)?;
-        if event::poll(Duration::from_millis(80))? {
-            // Drain everything queued so a fast wheel does not lag behind. crossterm's read never
-            // returns on a closed terminal, so check for one before each read.
-            while !stopping.load(std::sync::atomic::Ordering::Relaxed) && !crate::stdin_hung_up() {
-                ui.input_event(event::read()?);
-                if !event::poll(Duration::ZERO)? {
-                    break;
-                }
-            }
-        }
+        hover::poll_input(Duration::from_millis(80), &stopping, |input| {
+            ui.input_event(input)
+        })?;
     }
     Ok(())
 }
@@ -5595,6 +6277,14 @@ mod tests {
         assert_eq!(text, "look ", "a control key never types its letter");
         edit_text(&mut text, key(KeyCode::Char('X'), KeyModifiers::SHIFT));
         assert_eq!(text, "look X");
+        // A terminal that reports Shift+i as `i` with Shift still types a capital.
+        edit_text(&mut text, shifted(key(KeyCode::Char('i'), KeyModifiers::SHIFT)));
+        assert_eq!(text, "look XI");
+        assert_eq!(
+            shifted(key(KeyCode::Char('c'), KeyModifiers::CONTROL | KeyModifiers::SHIFT)).code,
+            KeyCode::Char('c'),
+            "a chord keeps its key"
+        );
         let mut lines = "first\nsecond line".to_owned();
         edit_text(&mut lines, key(KeyCode::Char('u'), KeyModifiers::CONTROL));
         assert_eq!(lines, "first\n");
@@ -5615,6 +6305,64 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    #[test]
+    fn the_top_bar_border_keeps_controls_above_the_body_in_both_layouts() {
+        for spaces in [false, true] {
+            for (width, height) in [(20, 6), (80, 12), (140, 40)] {
+                let mut ui = Ui::new(demo::world());
+                if spaces {
+                    ui.glasses = Some(glass::Glasses::open(None, None));
+                }
+                ui.world.link = Link::Offline("Connection unavailable".into());
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal.draw(|frame| ui.render(frame)).unwrap();
+                let buffer = terminal.backend().buffer();
+                for x in 0..width {
+                    let cell = &buffer[(x, 1)];
+                    assert_eq!(cell.symbol(), "─");
+                    assert_eq!(cell.fg, theme::OVERLAY0);
+                    assert_eq!(cell.bg, theme::BASE);
+                }
+                assert!(ui.frame.borrow().panes.iter().all(|pane| pane.rect.y >= 2));
+                assert!(
+                    ui.frame
+                        .borrow()
+                        .hits
+                        .iter()
+                        .all(|(rect, _)| !contains(*rect, 1, 1))
+                );
+                let target = if spaces { Hit::Connection } else { Hit::Tab(1) };
+                let rect = ui
+                    .frame
+                    .borrow()
+                    .hits
+                    .iter()
+                    .find(|(_, hit)| *hit == target)
+                    .map(|(rect, _)| *rect)
+                    .unwrap();
+                assert_eq!(rect.y, 0);
+                assert_eq!(rect.height, 1);
+                if rect.x < width {
+                    ui.mouse(MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: rect.x,
+                        row: 0,
+                        modifiers: KeyModifiers::NONE,
+                    });
+                    if spaces {
+                        assert!(
+                            ui.flash
+                                .as_ref()
+                                .is_some_and(|(text, _)| text.contains("Connection unavailable"))
+                        );
+                    } else {
+                        assert_eq!(ui.tab, 1);
+                    }
+                }
+            }
+        }
     }
 
     /// A feedback gate offers approve and request-changes, an approval gate approve and reject.
@@ -5996,6 +6744,87 @@ mod tests {
     }
 
     #[test]
+    fn an_answer_that_asks_for_changes_says_it_needs_words() {
+        // Nathan, 2026-10-07: "it says I must type something. What does this mean?"
+        let mut world = demo::world();
+        let request = st3_client::StructuredRequest {
+            version: 1,
+            entry_type: "decision".into(),
+            question: "Approve as written?".into(),
+            why_person: "Only you can waive it.".into(),
+            summary: None,
+            reasons: Vec::new(),
+            recommendation: Some(st3_client::RequestRecommendation {
+                answer: "follow".into(),
+                reason: "it keeps the brief".into(),
+            }),
+            subjects: Vec::new(),
+            answers: vec![
+                st3_client::RequestAnswerOption {
+                    id: "follow".into(),
+                    label: "Follow the brief".into(),
+                    consequence: "The author gets your terms.".into(),
+                    outcome: Some("request_changes".into()),
+                    ..Default::default()
+                },
+                st3_client::RequestAnswerOption {
+                    id: "approve".into(),
+                    label: "Approve as written".into(),
+                    consequence: "It is queued.".into(),
+                    outcome: Some("accept".into()),
+                    ..Default::default()
+                },
+            ],
+            custom: false,
+        };
+        let item = Attention {
+            id: "attention/decide".into(),
+            tier: Tier::Stopped,
+            title: "Decide".into(),
+            waiting: None,
+            age: "1m".into(),
+            mission: None,
+            agent: Some("agent/example/cos".into()),
+            kind: AttentionKind::Request {
+                from: "Chief of Staff".into(),
+                from_id: "agent/example/cos".into(),
+                question: request.question.clone(),
+                structured: Some(Box::new(request)),
+            },
+            actions: vec!["work.done".into()],
+            related: Vec::new(),
+            raised_by: None,
+            blocked: None,
+        };
+        if let Load::Ready(items) = &mut world.attention {
+            items.insert(0, item);
+        }
+        let mut ui = Ui::new(world);
+        ui.live = true;
+        ui.tab = 0;
+        let at = ui
+            .listing(60)
+            .ids
+            .iter()
+            .position(|id| id == "attention/decide")
+            .unwrap();
+        ui.select(at);
+        assert!(frame(&ui, 140, 50).join("\n").contains("needs your words"));
+        ui.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let screen = frame(&ui, 140, 50).join("\n");
+        assert!(screen.contains("what should change? Enter sends it with “Follow the brief”"), "{screen}");
+        // Enter with nothing written says what is wanted, not just "Write something first".
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            ui.flash.as_ref().is_some_and(|(text, _)| text.contains("“Follow the brief” needs your words")),
+            "{:?}",
+            ui.flash
+        );
+        assert!(ui.effects.is_empty());
+    }
+
+    #[test]
     fn a_mission_backed_ask_names_its_mission_and_the_step_that_waits() {
         // Nathan, 2026-10-05: a request a mission step made lost its mission link.
         let mut world = demo::world();
@@ -6090,9 +6919,6 @@ mod tests {
         ] {
             assert!(screen.contains(shown), "{shown}: {screen}");
         }
-        // Open, but only just: not read yet.
-        ui.read_open_update();
-        assert!(ui.effects.is_empty());
         // x dismisses it: it is read, once.
         ui.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
         ui.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
@@ -6102,26 +6928,49 @@ mod tests {
             "{:?}",
             ui.effects
         );
-        // Left open a good while, it stays: it is read only once the person moves off it.
+        // Left open, or moved off, it stays: only x or r reads an update.
         ui.effects.clear();
         ui.updates_read.clear();
-        ui.update_open = Some((
-            "attention/update".into(),
-            Instant::now() - UPDATE_READ_AFTER * 10,
-        ));
-        ui.read_open_update();
-        assert!(ui.effects.is_empty(), "still being read: {:?}", ui.effects);
-        assert!(ui.updates_read.is_empty());
-        // Moving off it (here, to nothing) after it was open a moment reads it.
         ui.select(0);
-        ui.read_open_update();
-        assert_eq!(ui.effects.len(), 1, "{:?}", ui.effects);
-        // Moving off one that was only passed over does not.
-        ui.effects.clear();
-        ui.updates_read.clear();
-        ui.update_open = Some(("attention/update".into(), Instant::now()));
-        ui.read_open_update();
         assert!(ui.effects.is_empty(), "{:?}", ui.effects);
+    }
+
+    #[test]
+    fn an_item_st_stops_listing_stays_on_home_until_x_clears_it() {
+        let world = demo::world();
+        let mut ui = Ui::new(world.clone());
+        ui.live = true;
+        ui.tab = 0;
+        let ids = ui.listing(60).ids.clone();
+        let (gone, acted) = (ids[0].clone(), ids[1].clone());
+        ui.select(0);
+        // Another device closes the first; the person answers the second here.
+        ui.note_acted(&Effect::Attention {
+            id: acted.clone(),
+            action: "work.done".into(),
+            reason: None,
+            answer: None,
+        });
+        let mut next = world;
+        if let Load::Ready(items) = &mut next.attention {
+            items.retain(|item| item.id != gone && item.id != acted);
+        }
+        ui.set_world(next.clone());
+        let listing = ui.listing(60);
+        assert!(listing.ids.contains(&gone), "it stays");
+        assert!(!listing.ids.contains(&acted), "what the person acted on goes");
+        ui.select(listing.ids.iter().position(|id| *id == gone).unwrap());
+        assert!(frame(&ui, 140, 50).join("\n").contains("closed elsewhere"));
+        // It survives later updates, and only x clears it.
+        ui.set_world(next.clone());
+        assert!(ui.listing(60).ids.contains(&gone));
+        ui.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(ui.listing(60).ids.contains(&gone), "other keys leave it");
+        ui.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(!ui.listing(60).ids.contains(&gone));
+        assert!(ui.effects.is_empty(), "nothing sent for an item already closed");
+        ui.set_world(next);
+        assert!(!ui.listing(60).ids.contains(&gone));
     }
 
     #[test]
@@ -6818,6 +7667,47 @@ mod tests {
         ui.switch_tab(2);
         let listed = frame(&ui, 150, 40).join("\n");
         assert!(listed.contains("Tests pass; opening the PR"), "{listed}");
+    }
+
+    #[test]
+    fn voice_that_never_answers_cannot_hold_the_keys() {
+        // Nathan, 2026-10-06: keys stopped working, Ctrl+Q did not quit, until the
+        // terminal tab was closed.
+        let mut ui = Ui::new(demo::world());
+        ui.switch_tab(1);
+        let input = ui.draft_key().expect("a conversation is open");
+        let mut waiting = voice::VoiceState::stand_in(&input);
+        waiting.started = Instant::now() - Duration::from_secs(30);
+        ui.voice = Some(waiting);
+        ui.step_voice();
+        assert!(ui.voice.is_none(), "a helper silent for 30 s is given up");
+        assert!(
+            ui.flash.as_ref().is_some_and(|(text, _)| text.contains("keys work again")),
+            "{:?}",
+            ui.flash
+        );
+        // While it listens, a chord is not swallowed: Ctrl+Q quits.
+        ui.voice = Some(voice::VoiceState::stand_in(&input));
+        ui.key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+        assert!(ui.voice.is_none());
+        assert!(ui.quit, "Ctrl+Q went through");
+        // Plain typing still waits (it must not mix into the words) and Esc drops them.
+        let mut ui = Ui::new(demo::world());
+        ui.switch_tab(1);
+        let input = ui.draft_key().unwrap();
+        let mut heard = voice::VoiceState::stand_in(&input);
+        heard.device = "Built-in microphone".into();
+        ui.voice = Some(heard);
+        ui.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(ui.voice.is_some());
+        ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(ui.voice.is_none());
+        // Leaving its conversation ends it.
+        let mut away = voice::VoiceState::stand_in("agent/example/someone-else");
+        away.device = "Built-in microphone".into();
+        ui.voice = Some(away);
+        ui.step_voice();
+        assert!(ui.voice.is_none());
     }
 
     #[test]

@@ -1,9 +1,9 @@
 import type { Agent, Attention, Device, Launch, Mission } from '../../clients/typescript/st3-client';
-import type { SessionView } from '@smalltalk/st3-views';
+import type { KeptAttention, SessionView } from '@smalltalk/st3-views';
 
 export type MachineView = { id: string; kind: 'machine'; name: string; state: string; occupancy: { running_runtimes: number }; capacity: { state: string }; transports: Array<{ protocol: string; status: string }> };
 // The three windows the collections socket holds, and the lists a tab loads when it opens.
-export type Data = { attention: Attention[]; agents: Agent[]; missions: Mission[]; launches: Launch[]; machines: MachineView[]; devices: Device[]; sessions: SessionView[] };
+export type Data = { attention: KeptAttention[]; agents: Agent[]; missions: Mission[]; launches: Launch[]; machines: MachineView[]; devices: Device[]; sessions: SessionView[] };
 export const emptyData: Data = { attention: [], agents: [], missions: [], launches: [], machines: [], devices: [], sessions: [] };
 export const PROJECTION_CACHE_KEY = 'st3.projection.v1';
 

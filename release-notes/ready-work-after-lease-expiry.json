@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Rearm ready-work delivery after worker lease expiry and surface consumed wakes left idle and unclaimed",
+  "replay": {
+    "status": "none",
+    "detail": "No full-history replay or projection fallback change. Effective expired work views advance their readiness epoch; a new claim persists that epoch."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, indexes, schema versions or durable field shapes change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules, digests or claim authority changes."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Existing wake tags and work fields are retained. An expired lease presents a fresh readiness epoch so a consumed wake from the prior lease does not suppress recovery. Older daemons retain their prior behavior."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No added service interruption beyond the normal daemon deployment."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "No lease length or harness configuration change is required. A consumed automatic wake left ready and unclaimed while the assignee is idle or ready raises the existing work-wake-exhausted diagnostic after five minutes from the last automatic wake; working turns and held work are excluded."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "Expired work can receive a fresh bounded automatic wake episode in the same harness incarnation. Consumed but still unclaimed idle work raises one fenced diagnostic per episode rather than unlimited wake retries. This does not identify the underlying API timeout cause or recover an unavailable daemon."
+  }
+}
