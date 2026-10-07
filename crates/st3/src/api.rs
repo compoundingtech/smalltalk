@@ -2107,8 +2107,12 @@ fn client_agent_cards_for_page(
         .iter()
         .filter_map(|r| r["id"].as_str().map(str::to_owned))
         .collect::<BTreeSet<_>>();
-    let mut cards = client_agent_resources_selected(store, history, index, Some((&selected, refs)))
-        .map_err(ApiError::internal)?;
+    let previous = refs.iter().collect::<Vec<_>>();
+    let mut cards = client_agent_resources_selected(store, history, index, Some(AgentResourceDelta {
+        subjects: &selected,
+        previous: &previous,
+        activity_only: false,
+    })).map_err(ApiError::internal)?;
     if cards.len() != refs.len() {
         return Err(client_page_expired(
             "agent page membership is no longer available; restart pagination",

@@ -648,3 +648,35 @@ mission "finished-deadline" state="ready" timeout="1s" {
     assert_eq!(card(&cards, "agent/node.amber")["queued_work_count"], 0);
     assert_eq!(store.agent_resources_full_fills(), fills);
 }
+
+#[test]
+fn concurrent_agent_card_fills_return_the_first_immutable_snapshot() {
+    let root = tempfile::tempdir().unwrap();
+    let state = state(root.path());
+    let store = &state.store;
+    declare(store, &["amber", "birch"]);
+    store.project_replication_backlog().unwrap();
+    let index = store.index().unwrap();
+    let expected = project(store, false, index, None).unwrap();
+    let (entered, building) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let slow = Arc::clone(store);
+    let pending = std::thread::spawn(move || {
+        slow.cached_agent_resources_snapshot(index, false, |changed| {
+            let cards = project(&slow, false, index, changed)?;
+            entered.send(()).unwrap();
+            released.recv().unwrap();
+            Ok(cards)
+        }).unwrap()
+    });
+    building.recv().unwrap();
+    let first_published = store.cached_agent_resources_snapshot(index, false, |changed| {
+        project(store, false, index, changed)
+    });
+    release.send(()).unwrap();
+    let second_returned = pending.join().unwrap();
+    let first_published = first_published.unwrap();
+    assert!(Arc::ptr_eq(&first_published, &second_returned));
+    assert_eq!(first_published.values(), expected);
+    assert_eq!(second_returned.values(), expected);
+}

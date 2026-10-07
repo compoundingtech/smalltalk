@@ -18,19 +18,20 @@ impl AgentResourcesCache {
     }
 }
 
-struct AgentResourcesEntry {
+pub(crate) struct AgentResourcesEntry {
     store_index: u64,
     agent_status_index: u64,
     local_observation_index: u64,
     reducer_version: usize,
     history: bool,
+    epoch: usize,
     time_invalidations: BTreeSet<(u128, String)>,
     rows: BTreeMap<String, Arc<Value>>,
     order: BTreeSet<(String, String)>,
 }
 
 impl AgentResourcesEntry {
-    fn values(&self) -> Vec<Value> {
+    pub(crate) fn values(&self) -> Vec<Value> {
         self.order.iter().map(|(_, id)| (*self.rows[id]).clone()).collect()
     }
 
@@ -328,6 +329,15 @@ impl Store {
         history: bool,
         build: impl FnOnce(Option<AgentResourceDelta<'_>>) -> Result<Vec<Value>>,
     ) -> Result<Vec<Value>> {
+        Ok(self.cached_agent_resources_snapshot(index, history, build)?.values())
+    }
+
+    pub(crate) fn cached_agent_resources_snapshot(
+        &self,
+        index: u64,
+        history: bool,
+        build: impl FnOnce(Option<AgentResourceDelta<'_>>) -> Result<Vec<Value>>,
+    ) -> Result<Arc<AgentResourcesEntry>> {
         let version = self.agent_resources_reducer_version();
         let reduced_at = now_ms();
         let local_index = self.readers.get().query_row(
@@ -347,7 +357,7 @@ impl Store {
         if let Some(entry) = previous.as_ref().filter(|entry|
             entry.store_index == index && entry.local_observation_index == local_index
                 && expired.is_empty()) {
-            return Ok(entry.values());
+            return Ok(Arc::clone(entry));
         }
         let status_index = self.agent_status_index(index)?;
         let changes = previous.as_ref().map(|previous| self.changed_agent_resources(previous, index, local_index))
@@ -362,7 +372,7 @@ impl Store {
                 || previous.as_ref().is_some_and(|previous| previous.agent_status_index == status_index));
         let mut entry = AgentResourcesEntry {
             store_index: index, agent_status_index: status_index, local_observation_index: local_index,
-            reducer_version: version, history,
+            reducer_version: version, history, epoch,
             rows: BTreeMap::new(), order: BTreeSet::new(), time_invalidations: BTreeSet::new(),
         };
         if let (Some(previous), Some(changes)) = (previous, changes) {
@@ -385,16 +395,33 @@ impl Store {
             for value in build(None)? { entry.insert(value); }
         }
         let entry = Arc::new(entry);
-        {
+        let (entry, evicted) = {
             let mut cache = self.smalltalk.agent_resources_cache.lock().expect("agent resources cache poisoned");
             // Repair/replay can invalidate views during reduction. Never publish the
             // pre-repair result into the new cache epoch.
             if cache.epoch == epoch && self.agent_resources_reducer_version() == version {
-                cache.entries.retain(|old| old.store_index != index || old.history != history);
-                cache.entries.push_back(entry.clone());
-                while cache.entries.len() > SNAPSHOTS { cache.entries.pop_front(); }
+                let published_at = now_ms();
+                let same_key = |old: &AgentResourcesEntry| old.store_index == index
+                    && old.history == history && old.local_observation_index == local_index
+                    && old.reducer_version == version && old.epoch == epoch;
+                if let Some(winner) = cache.entries.iter().find(|old| same_key(old)
+                    && old.time_invalidations.first().is_none_or(|(instant, _)| *instant > published_at))
+                {
+                    // Concurrent reductions return the first immutable winner for this key.
+                    (Arc::clone(winner), (None, None))
+                } else {
+                    let replaced = cache.entries.iter().position(|old| same_key(old))
+                        .and_then(|position| cache.entries.remove(position));
+                    cache.entries.push_back(Arc::clone(&entry));
+                    let evicted = if cache.entries.len() > SNAPSHOTS { cache.entries.pop_front() } else { None };
+                    (entry, (replaced, evicted))
+                }
+            } else {
+                (entry, (None, None))
             }
-        }
-        Ok(entry.values())
+        };
+        // Large card snapshots must not be destroyed while another reader waits on the mutex.
+        drop(evicted);
+        Ok(entry)
     }
 }

@@ -69,11 +69,15 @@ future live-work lease expiry, readiness time, or non-terminal mission deadline 
 reduction. A maintained time index selects only expired rows for fresh reduction, even without
 a claim; cache advances do not scan historical timers or rebuild the roster for completed
 mission deadlines. Timer metadata stays internal and never changes card JSON. Repair and
-replay invalidate the cache. Card reduction happens outside the cache mutex.
+replay invalidate the cache. Card reduction uses the dedicated AgentCard status mode and
+runs outside the cache mutex. Concurrent fills for the same claim index, local-observation
+position, history mode, reducer version, and invalidation epoch return the first immutable
+published winner; replaced or evicted snapshots are dropped outside the mutex.
 
 Observation freshness, delivery presence, and running-subagent leases remain request-time
-overlays. Unfiltered lists pin stable roster values and ordering before applying overlays to
-the returned page; status-filtered lists apply overlays before filtering. Continuation cursors
+overlays. Unfiltered lists pin lightweight roster references, ordering, host metadata, and
+queues, then reduce only the returned page using AgentCard mode before applying overlays;
+status-filtered lists apply overlays to cached full cards before filtering. Continuation cursors
 retain the existing frozen snapshot contract. This cache does not change routes, card fields,
 cursor semantics, or persist a separate projection database.
 
