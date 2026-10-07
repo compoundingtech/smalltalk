@@ -7604,16 +7604,20 @@ pub fn checkpointed_operation_outcome(
     .with_detail("claim_id", claim_id.clone()))
 }
 
+/// The claims every stored operation row must come from, in canonical order. The partial
+/// operation index names exactly the claims this scan keeps, so the audit walks it instead of
+/// evaluating json_extract over every claim in the store.
+pub const EXPECTED_OPERATIONS_QUERY: &str =
+    "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
+     FROM claims INDEXED BY claims_operation_index
+     WHERE json_extract(body, '$._operation.id') IS NOT NULL
+       AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=claims.id)
+     ORDER BY id";
+
 pub fn expected_operations(
     connection: &Connection,
 ) -> Result<BTreeMap<String, (String, String, String)>> {
-    let mut statement = connection.prepare(
-        "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
-         FROM claims
-         WHERE json_extract(body, '$._operation.id') IS NOT NULL
-           AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=claims.id)
-         ORDER BY id",
-    )?;
+    let mut statement = connection.prepare(EXPECTED_OPERATIONS_QUERY)?;
     let claims = statement
         .query_map([], claim_from_row)?
         .collect::<Result<Vec<_>, _>>()?;
