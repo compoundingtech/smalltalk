@@ -10,7 +10,7 @@ use super::Table;
 use anyhow::Result;
 use rusqlite::Transaction;
 
-pub const CAPTURE_FINGERPRINT: &str = "st3.agent-card.capture.v4;recursive-delete-v1;declared-sql-inputs-v1;delivery-producer-global-v1;namespace-canonical-v1;canonical-time-text-v1;clock-v1;unfiltered-verdict-admission-v1";
+pub const CAPTURE_FINGERPRINT: &str = "st3.agent-card.capture.v5;recursive-delete-v1;declared-sql-inputs-v1;delivery-producer-global-v1;namespace-canonical-v1;canonical-time-text-v1;clock-v2-captured-snapshot-index;unfiltered-verdict-admission-v1";
 pub const SOURCE: &str = "st3.agent-card-source.v1";
 
 /// Additional lifecycle/local producers must expand this manifest before source attestation.
@@ -215,7 +215,7 @@ pub const TABLES: &[Table] = &[
     },
     Table {
         name: "local_agent_card_clock",
-        columns: &["singleton", "at_ms", "revision", "reason"],
+        columns: &["singleton", "at_ms", "revision", "reason", "snapshot_index"],
         key: &["singleton"],
     },
     Table {
@@ -249,6 +249,27 @@ pub fn capture_fingerprint() -> String {
         "{CAPTURE_FINGERPRINT};schema={}",
         crate::store::runtime::compatibility_digest(&st3_schema::registry().digest())
     )
+}
+
+/// Receiver identity participates in local observation and delivery selection. Production
+/// installation must bind this value; changing it requires a separate source lifecycle.
+pub fn capture_fingerprint_for(receiver: &str) -> Result<String> {
+    anyhow::ensure!(
+        !receiver.is_empty() && receiver.len() <= 1024 && !receiver.bytes().any(|b| b == 0),
+        "invalid agent source receiver identity"
+    );
+    use sha2::{Digest, Sha256};
+    Ok(format!(
+        "{};receiver-sha256={}",
+        capture_fingerprint(),
+        hex::encode(Sha256::digest(receiver.as_bytes()))
+    ))
+}
+
+pub fn install_capture_for(tx: &Transaction<'_>, receiver: &str, epoch: u64) -> Result<()> {
+    super::delivery::create_schema(tx)?;
+    clock::create_schema(tx)?;
+    super::install_recursive(tx, TABLES, &capture_fingerprint_for(receiver)?, epoch)
 }
 
 /// Install input capture only; paired hooks must be attached before explicit source registration.
@@ -297,5 +318,32 @@ mod tests {
         assert!(captured.replacements[0].old.is_none());
         assert!(!super::super::scope::readable(&connection).unwrap());
         assert!(store.ivm_views().is_none());
+    }
+}
+
+#[cfg(test)]
+mod receiver_tests {
+    use super::*;
+    #[test]
+    fn changed_receiver_cannot_reuse_native_capture_binding() {
+        let store = crate::store::Store::open_memory("alder").unwrap();
+        store
+            .connection
+            .batched(|tx| install_capture_for(tx, "alder", 1))
+            .unwrap()
+            .unwrap();
+        let before = super::super::status(&store.readers.get()).unwrap();
+        assert_eq!(
+            before.fingerprint,
+            capture_fingerprint_for("alder").unwrap()
+        );
+        store
+            .connection
+            .batched(|tx| install_capture_for(tx, "briar", 1))
+            .unwrap()
+            .unwrap();
+        let after = super::super::status(&store.readers.get()).unwrap();
+        assert_eq!(after.fingerprint, before.fingerprint);
+        assert!(after.gap.is_some());
     }
 }

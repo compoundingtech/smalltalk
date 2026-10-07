@@ -29,6 +29,43 @@ pub fn scan_page(
     rows: usize,
     bytes: usize,
 ) -> Result<ScanPage> {
+    scan_bound(
+        connection,
+        installer,
+        job,
+        &capture_fingerprint(),
+        rows,
+        bytes,
+    )
+}
+
+/// Production receiver-bound extraction; no node/identity inference from source revision.
+pub fn scan_page_for(
+    connection: &Connection,
+    installer: &Installer,
+    job: &str,
+    receiver: &str,
+    rows: usize,
+    bytes: usize,
+) -> Result<ScanPage> {
+    scan_bound(
+        connection,
+        installer,
+        job,
+        &super::capture_fingerprint_for(receiver)?,
+        rows,
+        bytes,
+    )
+}
+
+fn scan_bound(
+    connection: &Connection,
+    installer: &Installer,
+    job: &str,
+    fingerprint: &str,
+    rows: usize,
+    bytes: usize,
+) -> Result<ScanPage> {
     ensure!(
         super::super::scope::readable(connection)?,
         "source capture is pending or fenced"
@@ -36,7 +73,7 @@ pub fn scan_page(
     let position = installer.position(connection, SOURCE)?;
     let state = super::super::status(connection)?;
     ensure!(
-        state.fingerprint == capture_fingerprint()
+        state.fingerprint == fingerprint
             && position.fingerprint == state.fingerprint
             && position.epoch == state.epoch,
         "source extraction binding changed"

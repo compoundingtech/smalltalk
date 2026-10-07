@@ -22,7 +22,7 @@ pub fn create_schema(connection: &Connection) -> Result<()> {
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS local_agent_card_clock(
         singleton INTEGER PRIMARY KEY CHECK(singleton=1),at_ms TEXT NOT NULL,
-        revision INTEGER NOT NULL CHECK(revision>=0),reason TEXT NOT NULL
+        revision INTEGER NOT NULL CHECK(revision>=0),snapshot_index INTEGER NOT NULL CHECK(snapshot_index>=0),reason TEXT NOT NULL
         CHECK(reason IN ('deadline','kernel','producer-ack')))",
     )?;
     Ok(())
@@ -48,9 +48,9 @@ pub fn tick(tx: &Transaction<'_>, at_ms: u128, reason: Reason) -> Result<()> {
     } else {
         1
     };
-    tx.execute("INSERT INTO local_agent_card_clock(singleton,at_ms,revision,reason) VALUES(1,?1,?2,?3)
-        ON CONFLICT(singleton) DO UPDATE SET at_ms=excluded.at_ms,revision=excluded.revision,reason=excluded.reason",
-        params![at_ms.to_string(),revision,reason.as_str()])?;
+    tx.execute("INSERT INTO local_agent_card_clock(singleton,at_ms,revision,reason,snapshot_index) VALUES(1,?1,?2,?3,?4)
+        ON CONFLICT(singleton) DO UPDATE SET at_ms=excluded.at_ms,revision=excluded.revision,reason=excluded.reason,snapshot_index=excluded.snapshot_index",
+        params![at_ms.to_string(),revision,reason.as_str(),smallclaims::store::current_index(tx)?])?;
     Ok(())
 }
 
@@ -61,6 +61,7 @@ mod tests {
     fn captured_clock_is_monotone_and_rollback_does_not_advance_revision() {
         let mut connection = Connection::open_in_memory().unwrap();
         create_schema(&connection).unwrap();
+        connection.execute_batch("CREATE TABLE claims(store_index INTEGER PRIMARY KEY AUTOINCREMENT); INSERT INTO claims DEFAULT VALUES").unwrap();
         let tx = connection.transaction().unwrap();
         tick(&tx, 100, Reason::Kernel).unwrap();
         tick(&tx, 100, Reason::ProducerAck).unwrap();
@@ -71,6 +72,7 @@ mod tests {
                 .unwrap(),
             2
         );
+        assert_eq!(tx.query_row("SELECT snapshot_index FROM local_agent_card_clock", [], |r| r.get::<_, u64>(0)).unwrap(),1);
         tx.rollback().unwrap();
         assert_eq!(
             connection

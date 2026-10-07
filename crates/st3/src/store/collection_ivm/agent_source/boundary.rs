@@ -13,11 +13,7 @@ const MAX_BYTES: usize = 256 * 1024;
 
 /// Exact full source/operator contract used identically by capture and consumer guards.
 pub(crate) fn manifest() -> String {
-    format!(
-        "{};{}",
-        super::capture_fingerprint(),
-        crate::store::agent_card_ivm::FINGERPRINT
-    )
+    crate::store::agent_card_source::complete_manifest()
 }
 
 pub fn create_schema(connection: &Connection) -> Result<()> {
