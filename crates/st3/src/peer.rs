@@ -70,6 +70,11 @@ pub const CLIENT_READ_FORWARD_PATH: &str = "/v1/internal/client-read/forward";
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "operation", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ClientReadOperation {
+    ConversationContent {
+        session_id: String,
+        reference: String,
+        offset: u64,
+    },
     ConversationChanges {
         session_id: String,
         after: Option<String>,
@@ -1072,6 +1077,13 @@ async fn receive_client_read(
         }
         let client = st3_client::Client::unix_as(state.backend().socket(), &request.authority_actor);
         match request.request {
+            ClientReadOperation::ConversationContent {
+                session_id,
+                reference,
+                offset,
+            } => Ok(serde_json::to_value(
+                client.conversation_content_chunk(&session_id, &reference, offset).await?.value,
+            )?),
             ClientReadOperation::ConversationChanges {
                 session_id,
                 after,
@@ -1270,6 +1282,7 @@ async fn receive_client_read(
                         Some(st3_client::ClientError::Api(code, message, details)) => {
                             let status = match code {
                                 st3_client::ErrorCode::PageCursorExpired
+                                | st3_client::ErrorCode::ConversationContentInvalidated
                                 | st3_client::ErrorCode::CursorGap
                                 | st3_client::ErrorCode::BlobExpired => StatusCode::GONE,
                                 st3_client::ErrorCode::NotFound
@@ -3004,6 +3017,195 @@ mod tests {
         assert!(
             message.is_some_and(|message| message.contains("conversation-owner")),
             "the message names the owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_fetches_authenticated_owner_record_chunks_and_propagates_invalidation() {
+        let owner_root = tempfile::tempdir().unwrap();
+        let gateway_root = tempfile::tempdir().unwrap();
+        let make_state = |root: &Path, node: &str| crate::api::AppState {
+            store: Arc::new(Store::open(&root.join("graph.db"), node).unwrap()),
+            notify: Arc::new(tokio::sync::Notify::new()),
+            event_notify: watch::channel(0_u64).0,
+            node: node.into(),
+            state_dir: root.to_path_buf(),
+            pty_root: root.join("pty"),
+            pty_binary: root.join("unused-pty"),
+            fleet_id: None,
+            configured_peers: Vec::new(),
+            client_relay: None,
+            native_session_home: None,
+            planner_default: crate::model::PlannerSpec::default(),
+        };
+        let mut owner = make_state(owner_root.path(), "conversation-owner");
+        let mut gateway = make_state(gateway_root.path(), "conversation-gateway");
+        let agent = "agent/conversation-peer";
+        let incarnation = "conversation-runtime:i1";
+        owner
+            .store
+            .append_claim(&ClaimInput {
+                subject: agent.into(),
+                kind: "runtime.observed".into(),
+                actor: Some(agent.into()),
+                fields: BTreeMap::from([
+                    (
+                        "runtime_id".into(),
+                        serde_json::json!("conversation-runtime"),
+                    ),
+                    ("incarnation_id".into(), serde_json::json!(incarnation)),
+                    ("status".into(), serde_json::json!("running")),
+                    ("terminal".into(), serde_json::json!(false)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("conversation-peer-runtime".into()),
+            })
+            .unwrap();
+        owner.native_session_home = Some(owner_root.path().to_path_buf());
+        let native_path = owner_root.path().join("native.jsonl");
+        let raw = serde_json::json!({"type":"future","token":"invented-forwarded-token","large":"x".repeat(10000)});
+        fs::write(&native_path, format!("{}\n{}\n", serde_json::json!({"type":"session","id":"native-forwarded","cwd":"/work/invented","timestamp":"2026-10-06T12:00:00Z"}), serde_json::json!({"type":"message","message":{"role":"assistant","content":[raw.clone()]}}))).unwrap();
+        for (kind, fields) in [
+            (
+                "harness.observed",
+                BTreeMap::from([
+                    ("state".into(), serde_json::json!("idle")),
+                    ("driver".into(), serde_json::json!("omp")),
+                    ("incarnation_id".into(), serde_json::json!(incarnation)),
+                ]),
+            ),
+            (
+                "harness.session-file",
+                BTreeMap::from([
+                    ("harness".into(), serde_json::json!("omp")),
+                    ("agent".into(), serde_json::json!(agent)),
+                    ("incarnation_id".into(), serde_json::json!(incarnation)),
+                    ("path".into(), serde_json::json!(native_path)),
+                    ("session_id".into(), serde_json::json!("native-forwarded")),
+                ]),
+            ),
+        ] {
+            owner
+                .store
+                .append_claim(&ClaimInput {
+                    subject: agent.into(),
+                    kind: kind.into(),
+                    actor: Some(agent.into()),
+                    fields,
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+        gateway
+            .store
+            .import_replication(
+                "conversation-owner",
+                &owner.store.export_replication(0).unwrap(),
+            )
+            .unwrap();
+        let session_id = format!(
+            "session/{}",
+            &hex::encode(sha2::Sha256::digest(
+                format!("{agent}:{incarnation}").as_bytes()
+            ))[..24]
+        );
+        let owner_socket = owner_root.path().join("st3.sock");
+        let served_owner = owner_socket.clone();
+        let owner_app = crate::api::router(owner.clone());
+        tokio::spawn(async move { crate::api::serve_unix(&served_owner, owner_app).await });
+        let peer = PeerState::new(
+            MainBackend::new(owner_socket.to_path_buf()),
+            "conversation-owner".into(),
+            FleetAuth::test("fleet-test", &[7; 32]),
+            FleetContext::legacy(BTreeSet::from(["conversation-gateway".into()])),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, peer_router(peer, smalltalk_routes())).await });
+        let secret = gateway_root.path().join("fleet-secret");
+        fs::write(&secret, [7_u8; 32]).unwrap();
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+        gateway.client_relay = ClientRelay::from_config(&Config {
+            node: "conversation-gateway".into(),
+            fleet_id: Some("fleet-test".into()),
+            shared_secret_file: Some(secret),
+            peers: vec![PeerConfig {
+                name: "conversation-owner".into(),
+                url: format!("http://{address}"),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        let gateway_socket = gateway_root.path().join("st3.sock");
+        let served_gateway = gateway_socket.clone();
+        tokio::spawn(async move {
+            crate::api::serve_unix(&served_gateway, crate::api::router(gateway)).await
+        });
+        for socket in [&owner_socket, &gateway_socket] {
+            for _ in 0..200 {
+                if tokio::net::UnixStream::connect(socket).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        let client = st3_client::Client::unix_as(&gateway_socket, "person/example");
+        let page = client
+            .timeline(&session_id, None, None)
+            .await
+            .unwrap()
+            .value;
+        let token = page
+            .items
+            .iter()
+            .find_map(|item| match &item.body {
+                st3_client::TimelineBody::Content(body) => body
+                    .blocks
+                    .first()
+                    .and_then(|block| block.continuation.as_ref())
+                    .map(|continuation| continuation.reference.clone()),
+                _ => None,
+            })
+            .expect("negotiated owner continuation");
+        let chunk = client
+            .conversation_content_chunk(&session_id, &token, 0)
+            .await
+            .unwrap()
+            .value;
+        use base64::Engine as _;
+        let decoded: Value = serde_json::from_slice(
+            &base64::engine::general_purpose::STANDARD
+                .decode(&chunk.data)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(decoded, serde_json::json!({"raw":raw}));
+        use std::io::Write as _;
+        writeln!(fs::OpenOptions::new().append(true).open(&native_path).unwrap(), "{}", serde_json::json!({"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"later"}]}})).unwrap();
+        assert!(
+            client
+                .conversation_content_chunk(&session_id, &token, 0)
+                .await
+                .is_ok()
+        );
+        fs::write(&native_path, format!("{}\n{}\n", serde_json::json!({"type":"session","id":"native-forwarded","cwd":"/work/invented","timestamp":"2026-10-06T12:00:00Z"}), serde_json::json!({"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"edited"}]}}))).unwrap();
+        let error = client
+            .conversation_content_chunk(&session_id, &token, 0)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                st3_client::ClientError::Api(
+                    st3_client::ErrorCode::ConversationContentInvalidated,
+                    _,
+                    _
+                )
+            ),
+            "{error}"
         );
     }
 

@@ -415,7 +415,14 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/client/lanes/{*id}", get(client_v0::lane_detail))
         .route("/v1/client/history", get(client_history))
         .route("/v1/client/history/{*id}", get(client_history_detail))
-        .route("/v1/client/conversations/search", get(client_v0::search::search))
+        .route(
+            "/v1/client/conversations/search",
+            get(client_v0::search::search),
+        )
+        .route(
+            "/v1/client/conversations/{id}/content/{reference}/chunk",
+            get(client_v0::conversation_blocks::chunk),
+        )
         .route("/v1/client/sessions", get(client_sessions))
         .route("/v1/client/sessions/{*id}", get(client_sessions_detail))
         .route(
@@ -1148,6 +1155,7 @@ fn client_error_retryable(status: StatusCode, code: Option<&str>) -> bool {
             "remote-unavailable"
                 | "terminal-unavailable"
                 | "cursor-gap"
+                | "conversation-content-invalidated"
                 | "page-cursor-expired"
                 | "rate-limited"
                 | "runtime-authority-indeterminate"
@@ -1194,6 +1202,8 @@ fn client_error_code(code: Option<&str>) -> String {
         | "runtime-authority-indeterminate"
         | "remote-unavailable"
         | "terminal-unavailable"
+        | "conversation-content-invalidated"
+        | "transcript-unavailable"
         | "terminal-ended"
         | "blob-too-large"
         | "unsupported-media-type"
@@ -4136,7 +4146,7 @@ async fn client_sessions_detail(
                         "remote session detail requires a concrete person or agent",
                     )));
                 }
-                let value = relay
+                let mut value = relay
                     .read(
                         &remote_host,
                         &crate::peer::ClientReadRequest {
@@ -4150,7 +4160,13 @@ async fn client_sessions_detail(
                         },
                     )
                     .await
-                    .map_err(|error| remote_read_error(&remote_host, error))?;
+                    .map_err(|error| {
+                        client_v0::conversation_blocks::availability(remote_read_error(
+                            &remote_host,
+                            error,
+                        ))
+                    })?;
+                client_v0::conversation_blocks::legacy(&mut value, &session);
                 return Ok(Json(value));
             }
         }
@@ -4290,6 +4306,8 @@ fn remote_read_error(host: &str, error: anyhow::Error) -> ApiError {
     if !matches!(
         rejected.code.as_str(),
         "page-cursor-expired"
+            | "conversation-content-invalidated"
+            | "transcript-unavailable"
             | "timeline-history-incomplete"
             | "cursor-gap"
             | "not-found"
