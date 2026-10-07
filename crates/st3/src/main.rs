@@ -5756,6 +5756,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         store.clone(),
         config.observations.clone(),
     ));
+    tokio::spawn(catch_up_account_limits(store.clone()));
     tokio::spawn(st3::recorder_receipts::run(
         store.clone(),
         st3::recorder::receipt_path(&config.state_dir),
@@ -22307,6 +22308,26 @@ async fn convert_envelope_payloads(store: Arc<Store>) {
                 eprintln!("st3: binary envelope conversion failed: {error:?}");
                 tokio::time::sleep(Duration::from_secs(60)).await;
             }
+        }
+    }
+}
+
+/// Fill the account limits projection after an upgrade, a page of claims at a time. Each page is
+/// its own short writer transaction and the daemon answers between pages; the cursor is stored, so
+/// a restart resumes. Once it is caught up this only checks, once a minute, for claims that
+/// replication admitted and no append or projection pass has folded yet.
+async fn catch_up_account_limits(store: Arc<Store>) {
+    loop {
+        let page_store = store.clone();
+        let more = tokio::task::spawn_blocking(move || {
+            st3::profile::task("task account-limits-catch-up", || {
+                page_store.catch_up_account_limits(st3::store::LIMITS_CATCH_UP_PAGE)
+            })
+        })
+        .await;
+        match more {
+            Ok(Ok(true)) => tokio::time::sleep(Duration::from_millis(50)).await,
+            _ => tokio::time::sleep(Duration::from_secs(60)).await,
         }
     }
 }
