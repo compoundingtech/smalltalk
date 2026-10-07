@@ -2709,11 +2709,13 @@ fn managed_session_id(owner: &str, identity: &str) -> String {
     format!("session/{}", &digest[..24])
 }
 
+type ManagedSessionOwner = (String, Option<String>, Option<String>);
+
 fn managed_session_owner_at(
     store: &Store,
     snapshot_index: u64,
     session_id: &str,
-) -> anyhow::Result<Option<(String, Option<String>, Option<String>)>> {
+) -> anyhow::Result<Option<ManagedSessionOwner>> {
     let status = store.status_for_subject_prefix_at("agent/", Some(snapshot_index), true)?;
     for subject in status.subjects {
         if !subject.subject.starts_with("agent/") && subject.kind.as_deref() != Some("agent") {
@@ -2749,7 +2751,7 @@ fn managed_session_owner_for_subject_at(
     snapshot_index: u64,
     session_id: &str,
     owner: &str,
-) -> anyhow::Result<Option<(String, Option<String>, Option<String>)>> {
+) -> anyhow::Result<Option<ManagedSessionOwner>> {
     let Some(subject) = store
         .status_history(Some(owner), None, Some(snapshot_index))?
         .subjects
