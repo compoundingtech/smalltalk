@@ -265,6 +265,79 @@ fn card(cut: &PublicCut) -> &Value {
     cut.cards.iter().find(|row| row["id"] == AGENT).unwrap()
 }
 
+fn future_content(f: &KernelFixture, advance: u64) -> (u64, u128) {
+    let position = f.store().index().unwrap();
+    let record = f.oracle.append(
+        "harness.timeline",
+        json!({
+            "operation":"append", "entry_id":"future-card-content", "revision":1,
+            "role":"assistant", "entry_type":"content", "final":true,
+            "body":{"media_type":"text/plain","text":"Future anchored content"},
+            "driver":"claude", "incarnation_id":"one", "sequence":1
+        }),
+    );
+    assert_eq!(f.store().index().unwrap(), position);
+    let anchor = position + advance;
+    f.store().connection.batched(|tx| {
+        let id: u64 = tx.query_row(
+            "SELECT id FROM local_observations WHERE subject=?1 AND kind='harness.timeline' ORDER BY id DESC LIMIT 1",
+            [AGENT], |row| row.get(0),
+        )?;
+        tx.execute("UPDATE local_observations SET after_store_index=?1 WHERE id=?2",
+            rusqlite::params![anchor, id])?;
+        Ok::<_, anyhow::Error>(())
+    }).unwrap().unwrap();
+    (anchor, record.accepted_at_unix_ms)
+}
+
+#[tokio::test]
+async fn actual_kernel_future_anchored_local_content_stays_outside_full_public_cut() {
+    let root = tempfile::tempdir().unwrap();
+    let oracle = Fixture::new(root.path());
+    oracle.populate();
+    let f = KernelFixture::attach(oracle);
+    let before = f.compare("person/avery").await;
+    let replacements = f.replacements.load(Ordering::SeqCst);
+    let (anchor, _) = future_content(&f, 2);
+    assert!(anchor > f.store().index().unwrap());
+    let after = f.compare("person/avery").await;
+    assert_eq!(
+        card(&after)["last_activity_at"],
+        card(&before)["last_activity_at"]
+    );
+    assert!(f.replacements.load(Ordering::SeqCst) > replacements);
+}
+
+#[tokio::test]
+async fn actual_kernel_normal_claim_advance_includes_local_content_at_exact_anchor() {
+    let root = tempfile::tempdir().unwrap();
+    let oracle = Fixture::new(root.path());
+    oracle.populate();
+    let f = KernelFixture::attach(oracle);
+    let (anchor, observed) = future_content(&f, 2);
+    f.compare("person/avery").await;
+    f.oracle.append(
+        "runtime.reconcile-decision",
+        json!({
+            "key":"other-cut-advance", "decision":"noop", "reason":"Below activity anchor"
+        }),
+    );
+    assert_eq!(f.store().index().unwrap(), anchor - 1);
+    f.compare("person/avery").await;
+    f.oracle.append(
+        "runtime.reconcile-decision",
+        json!({
+            "key":"other-cut-advance", "decision":"noop", "reason":"At activity anchor"
+        }),
+    );
+    assert_eq!(f.store().index().unwrap(), anchor);
+    let after = f.compare("person/avery").await;
+    assert_eq!(
+        card(&after)["last_activity_at"],
+        json!(crate::api::client_timestamp(observed))
+    );
+}
+
 use super::{agent_card_source, cards};
 use crate::store::collection_ivm::{agent_source, scope};
 use anyhow::Result;
@@ -331,7 +404,7 @@ impl KernelFixture {
             .connection
             .batched(|tx| -> Result<()> {
                 installer.create_schema(tx)?;
-                agent_source::install_capture(tx, 1)?;
+                agent_source::install_capture_for(tx, store.origin(), 1)?;
                 Ok(())
             })
             .unwrap()
@@ -376,7 +449,7 @@ impl KernelFixture {
                     &views,
                     &installer,
                     cards::SOURCE,
-                    &agent_source::capture_fingerprint(),
+                    &agent_source::capture_fingerprint_for(store.origin())?,
                     1,
                 )
             })
@@ -419,8 +492,15 @@ impl KernelFixture {
             }
             let c = store.readers.get();
             c.execute_batch("BEGIN DEFERRED").unwrap();
-            let page =
-                agent_source::extract::scan_page(&c, &installer, &job, 128, 1024 * 1024).unwrap();
+            let page = agent_source::extract::scan_page_for(
+                &c,
+                &installer,
+                &job,
+                store.origin(),
+                128,
+                1024 * 1024,
+            )
+            .unwrap();
             c.execute_batch("COMMIT").unwrap();
             drop(c);
             let outcome = store
@@ -545,9 +625,38 @@ impl KernelFixture {
                 .unwrap(),
             before
         );
-        assert_eq!(
-            rows, expected.cards,
-            "actual Kernel prospective row/public HTTP full-field mismatch"
+        let differences: Vec<_> = rows
+            .iter()
+            .zip(&expected.cards)
+            .filter_map(|(actual, public)| {
+                if actual == public {
+                    return None;
+                }
+                let keys: std::collections::BTreeSet<_> = actual
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .chain(public.as_object().unwrap().keys())
+                    .collect();
+                let fields: BTreeMap<_, _> = keys
+                    .into_iter()
+                    .filter(|key| actual.get(*key) != public.get(*key))
+                    .map(|key| {
+                        (
+                            key,
+                            json!({"kernel":actual.get(key),"public":public.get(key)}),
+                        )
+                    })
+                    .collect();
+                Some(json!({"id":public["id"], "fields":fields}))
+            })
+            .collect();
+        assert!(
+            rows == expected.cards,
+            "actual Kernel/public full-field mismatch: {} versus {} rows; {}",
+            rows.len(),
+            expected.cards.len(),
+            serde_json::to_string(&differences).unwrap()
         );
         self.unpublished();
         expected
