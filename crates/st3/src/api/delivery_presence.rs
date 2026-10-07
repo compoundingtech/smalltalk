@@ -13,6 +13,8 @@
 //! so it is `outdated` rather than stale; its reason says whether it will follow the daemon's
 //! binary or needs a seat restart.
 
+pub(crate) mod source;
+
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -64,6 +66,7 @@ struct Presence {
     image: Option<String>,
     beats: Mutex<HashMap<String, Beat>>,
     monitors: Mutex<HashMap<String, Beat>>,
+    source: Mutex<source::State>,
 }
 
 fn presence() -> &'static Presence {
@@ -73,6 +76,7 @@ fn presence() -> &'static Presence {
         image: st_drivers::reexec::running_identity().map(|identity| identity.token()),
         beats: Mutex::new(HashMap::new()),
         monitors: Mutex::new(HashMap::new()),
+        source: Mutex::new(source::State::default()),
     })
 }
 
@@ -83,11 +87,15 @@ pub(crate) fn start() {
 
 /// Record one mailbox poll's delivery report for `recipient`.
 pub(crate) fn record(recipient: &str, report: &str) {
+    record_in(presence(), recipient, report);
+}
+
+fn record_in(presence: &Presence, recipient: &str, report: &str) {
     let Ok(report) = serde_json::from_str::<Report>(report) else {
         return;
     };
-    let presence = presence();
-    if let Ok(mut beats) = presence.beats.lock() {
+    let change = source::Mutation::begin(presence, recipient);
+    let updated = if let Ok(mut beats) = presence.beats.lock() {
         beats.insert(
             recipient.to_owned(),
             Beat {
@@ -96,26 +104,39 @@ pub(crate) fn record(recipient: &str, report: &str) {
                 fence: None,
             },
         );
-    }
+        true
+    } else {
+        false
+    };
+    change.finish(updated);
 }
 
 /// Title updates cannot establish delivery readiness. They can report the outer driver's
 /// attachment check, including a missing plugin for which no delivery process exists.
 pub(super) fn record_fenced(fence: &crate::mailbox::Fence, raw: &str) {
+    record_fenced_in(presence(), fence, raw);
+}
+
+fn record_fenced_in(presence: &Presence, fence: &crate::mailbox::Fence, raw: &str) {
     let Ok(report) = serde_json::from_str::<Report>(raw) else {
         return;
     };
-    let target = if fence.component == "delivery" {
-        if report.transport.as_deref() != Some("claude-channel")
-            && let Ok(mut monitors) = presence().monitors.lock()
-        {
-            monitors.remove(&fence.subject);
-        }
-        &presence().beats
-    } else if report.transport.as_deref() == Some("claude-channel") {
-        &presence().monitors
-    } else {
+    if fence.component != "delivery" && report.transport.as_deref() != Some("claude-channel") {
         return;
+    }
+    let change = source::Mutation::begin(presence, &fence.subject);
+    let mut updated = true;
+    let target = if fence.component == "delivery" {
+        if report.transport.as_deref() != Some("claude-channel") {
+            if let Ok(mut monitors) = presence.monitors.lock() {
+                monitors.remove(&fence.subject);
+            } else {
+                updated = false;
+            }
+        }
+        &presence.beats
+    } else {
+        &presence.monitors
     };
     if let Ok(mut beats) = target.lock() {
         beats.insert(
@@ -126,7 +147,10 @@ pub(super) fn record_fenced(fence: &crate::mailbox::Fence, raw: &str) {
                 fence: Some(fence.clone()),
             },
         );
+    } else {
+        updated = false;
     }
+    change.finish(updated);
 }
 
 pub(super) fn attachment(recipient: &str, incarnation: &str) -> Option<crate::mailbox::Fence> {
@@ -137,19 +161,30 @@ pub(super) fn attachment(recipient: &str, incarnation: &str) -> Option<crate::ma
         && beat.at.elapsed() <= Duration::from_millis(CHANNEL_STALE_AFTER_MS)
         && beat.report.transport.as_deref() == Some("claude-channel")
         && beat.report.ready == Some(true)
-        && beat.report.channel.as_ref().is_some_and(|channel|
-            channel.age_ms.is_some_and(|age| age <= CHANNEL_STALE_AFTER_MS)))
+        && beat.report.channel.as_ref().is_some_and(|channel| {
+            channel
+                .age_ms
+                .is_some_and(|age| age <= CHANNEL_STALE_AFTER_MS)
+        }))
     .then(|| fence.clone())
 }
 
 /// A metadata-free poll from a Unix peer proven to be this seat's native delivery process.
 /// This proves liveness, not that an old executable matches the installed binary.
 pub(crate) fn record_legacy(recipient: &str, transport: &str, pid: u32) {
+    record_legacy_in(presence(), recipient, transport, pid);
+}
+
+fn record_legacy_in(presence: &Presence, recipient: &str, transport: &str, pid: u32) {
+    let change = source::Mutation::begin(presence, recipient);
+    let mut updated = true;
     // A provider launched by an older driver has no title-side attachment monitor.
-    if let Ok(mut monitors) = presence().monitors.lock() {
+    if let Ok(mut monitors) = presence.monitors.lock() {
         monitors.remove(recipient);
+    } else {
+        updated = false;
     }
-    if let Ok(mut beats) = presence().beats.lock() {
+    if let Ok(mut beats) = presence.beats.lock() {
         beats.insert(
             recipient.into(),
             Beat {
@@ -163,7 +198,10 @@ pub(crate) fn record_legacy(recipient: &str, transport: &str, pid: u32) {
                 },
             },
         );
+    } else {
+        updated = false;
     }
+    change.finish(updated);
 }
 
 /// How one seat's delivery path looks from this daemon.
