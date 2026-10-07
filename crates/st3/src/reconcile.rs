@@ -31433,8 +31433,13 @@ subscription "mentions" {{
             .selected_desired_revision("observer/repo")
             .unwrap()
             .unwrap();
+        // These calls are new logical observations, not retries of the same operation. The
+        // deadline participates in its identity, so do not depend on the host millisecond ticking.
+        let observation_time = std::cell::Cell::new(now_ms());
         let observe = |pulls: Value| {
-            store.record_resource_observation("observer/repo", &revision, None, "resource/repo", None, &serde_json::json!({"repository_id": 7, "pull_requests": pulls}), now_ms() + 60_000, &subscriptions, None)
+            let at = observation_time.get() + 1;
+            observation_time.set(at);
+            store.record_resource_observation("observer/repo", &revision, None, "resource/repo", None, &serde_json::json!({"repository_id": 7, "pull_requests": pulls}), at + 60_000, &subscriptions, None)
                 .unwrap()
         };
         let requests = |subscription: &str| {

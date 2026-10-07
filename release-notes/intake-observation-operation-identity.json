@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Make intake routing test observations distinct from exact operation retries",
+  "replay": {
+    "status": "none",
+    "detail": "Only isolated test observation deadlines change; production cached-response and durable delivery behavior are unchanged."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database tables, indexes, triggers, schema version or migrations change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No claim, checkpoint, digest or fleet coordination rules change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No client, protocol, provider or harness contract changes; all original fixture assertions remain."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "This test-only change introduces no service interruption."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No installation steps or starting-state transitions are required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No runtime recovery or database swap-back behavior changes."
+  }
+}
