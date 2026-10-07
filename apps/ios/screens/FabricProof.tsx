@@ -2,7 +2,8 @@ import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { AppState, ScrollView, Share, View } from 'react-native';
 import * as Crypto from 'expo-crypto';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { API_VERSION, ClientError, St3Client } from '../../../clients/typescript/st3-client';
+import { API_VERSION, St3Client } from '../../../clients/typescript/st3-client';
+import { verifyUnpairedFabricGateway } from '../fabricGatewayProof';
 import { dialFabric, fabricIdentity, fabricStats, stopFabric } from '../modules/st-fabric';
 import type { FabricProfile, FabricProofInput } from '../fabricProof';
 import { FabricSession, nativeRefusedAfter, type ProofState } from '../fabricSession';
@@ -40,10 +41,7 @@ export function FabricProofScreen({ input, onClose, renderClient }: {
       dial: () => dialFabric(input.node, input.service, input.address, input.mode),
       pair: async url => {
         const unpaired = new St3Client({ baseUrl: url });
-        let refused = false;
-        try { await unpaired.capabilities(); }
-        catch (error) { if (error instanceof ClientError && [401, 403].includes(error.status)) refused = true; else throw error; }
-        if (!refused) throw new Error('Test gateway accepted an unpaired client');
+        await verifyUnpairedFabricGateway(url);
         const publicKey = Array.from(Crypto.getRandomBytes(32), byte => byte.toString(16).padStart(2, '0')).join('');
         const pairing = await unpaired.completePairing(input.id!, { api_version: API_VERSION, code: input.code!, device_public_key: publicKey });
         return pairing.value.credential;
