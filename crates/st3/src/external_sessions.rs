@@ -2056,14 +2056,14 @@ fn native_message_digest(id: &[u8], created: Option<i64>, message: &Value) -> St
     ))
 }
 
+const OPENCODE_MESSAGE_WINDOW_SQL: &str = "SELECT rowid, id, time_created, data FROM (\
+     SELECT rowid, id, time_created, data FROM message \
+     WHERE session_id = ?1 ORDER BY time_created DESC, id DESC LIMIT ?2\
+ ) ORDER BY time_created, id";
+
 fn normalized_opencode_timeline(session: &ExternalSession) -> Result<Vec<Value>> {
     let connection = open_opencode_database(&session.transcript)?;
-    let mut message_statement = connection.prepare(
-        "SELECT rowid, id, time_created, data FROM (\
-             SELECT rowid, id, time_created, data FROM message \
-             WHERE session_id = ?1 ORDER BY time_created DESC, id DESC LIMIT ?2\
-         ) ORDER BY time_created, id",
-    )?;
+    let mut message_statement = connection.prepare(OPENCODE_MESSAGE_WINDOW_SQL)?;
     // Count only row identities, then stream native bytes. Never collect 4,097 payload rows.
     let message_count: usize = connection.query_row(
         "SELECT count(*) FROM (SELECT 1 FROM message WHERE session_id=?1 LIMIT ?2)",
@@ -5388,6 +5388,140 @@ mod tests {
                 entry["body"]
             );
         }
+    }
+
+    #[test]
+    fn native_owner_window_jsonl_line_over_32_mib_is_not_fetchable() {
+        use std::io::Write as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("session.jsonl");
+        let mut file = std::io::BufWriter::new(File::create(&path).unwrap());
+        file.write_all(
+            br#"{"type":"message","message":{"role":"user","content":[{"type":"text","text":""#,
+        )
+        .unwrap();
+        std::io::copy(
+            &mut std::io::repeat(b'x').take(MAX_TIMELINE_BYTES + 1),
+            &mut file,
+        )
+        .unwrap();
+        file.write_all(br#""}]}}"#).unwrap();
+        file.flush().unwrap();
+        assert!(fs::metadata(&path).unwrap().len() > MAX_TIMELINE_BYTES);
+
+        let session = transcript_session(ExternalDriver::Omp, &path);
+        let entries = normalized_timeline(&session).unwrap();
+        assert_eq!(entries.len(), 1, "no partial JSON masquerading as a record");
+        let notice = &entries[0];
+        assert_eq!(notice["type"], "truncation");
+        assert_eq!(notice["body"]["fetchable"], false);
+        assert_eq!(notice["body"]["limit_bytes"], MAX_TIMELINE_BYTES);
+        assert!(
+            notice["body"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("not fetchable")
+        );
+        assert!(notice.get("_source").is_none(), "no unusable chunk locator");
+
+        // Finish the oversized line and append a complete harness record. The
+        // read starts inside the huge line and must resume at its next newline.
+        file.write_all(b"\n").unwrap();
+        let later = json!({"type":"message","message":{"role":"user","content":[{"type":"text","text":"after the oversized line"}]}});
+        serde_json::to_writer(&mut file, &later).unwrap();
+        file.write_all(b"\n").unwrap();
+        file.flush().unwrap();
+        let entries = normalized_timeline(&session).unwrap();
+        assert_eq!(entries[0]["body"]["fetchable"], false);
+        assert!(texts(&entries).contains(&"after the oversized line"));
+        let entry = entries
+            .iter()
+            .find(|entry| entry["type"] == "content")
+            .unwrap();
+        let locator = serde_json::from_value(entry["_source"].clone()).unwrap();
+        let recovered = normalized_record(&session, &locator)
+            .unwrap()
+            .into_iter()
+            .find(|recovered| recovered["id"] == entry["id"])
+            .unwrap();
+        assert_eq!(recovered["body"], entry["body"]);
+        assert!(serde_json::to_vec(&entries).unwrap().len() < 16 * 1024);
+    }
+
+    #[test]
+    fn native_owner_window_opencode_query_uses_the_harness_index_before_sorting() {
+        let mut db = Connection::open_in_memory().unwrap();
+        // OpenCode v1.18.34's native message index, not an index st installs:
+        // https://github.com/anomalyco/opencode/blob/aec0b9a6d8898f68f923aaf08b7306d931fd9d76/packages/core/src/session/sql.ts#L64-L76
+        db.execute_batch(
+            "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, time_created INTEGER NOT NULL, data TEXT NOT NULL);\
+             CREATE INDEX message_session_time_created_id_idx ON message(session_id, time_created, id);",
+        )
+        .unwrap();
+        let transaction = db.transaction().unwrap();
+        {
+            let mut insert = transaction
+                .prepare("INSERT INTO message VALUES (?1, 'fixture-session', ?2, '{}')")
+                .unwrap();
+            for index in 0..MAX_TIMELINE_LINES + 3 {
+                insert
+                    .execute(params![format!("msg-{index:06}"), (index / 2) as i64])
+                    .unwrap();
+            }
+        }
+        transaction.execute("INSERT INTO message VALUES ('other-session-message', 'other-session', 999999, '{}')", []).unwrap();
+        transaction.commit().unwrap();
+
+        let limit = MAX_TIMELINE_LINES as i64 + 1;
+        let mut explain = db
+            .prepare(&format!("EXPLAIN QUERY PLAN {OPENCODE_MESSAGE_WINDOW_SQL}"))
+            .unwrap();
+        let plan = explain
+            .query_map(params!["fixture-session", limit], |row| {
+                Ok((row.get::<_, i64>(1)?, row.get::<_, String>(3)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        println!("OpenCode bounded message-window plan: {plan:?}");
+        assert!(
+            plan.iter().any(|(_, detail)| detail
+                .contains("SEARCH message USING INDEX message_session_time_created_id_idx")),
+            "{plan:?}"
+        );
+        assert!(
+            !plan
+                .iter()
+                .any(|(_, detail)| detail.starts_with("SCAN message")),
+            "{plan:?}"
+        );
+        for (parent, detail) in &plan {
+            if detail.contains("TEMP B-TREE") {
+                assert_eq!(
+                    *parent, 0,
+                    "only the already-limited outer window may sort: {plan:?}"
+                );
+            }
+        }
+        let mut messages = db.prepare(OPENCODE_MESSAGE_WINDOW_SQL).unwrap();
+        let ids = messages
+            .query_map(params!["fixture-session", limit], |row| {
+                row.get::<_, String>(1)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(ids.len(), limit as usize);
+        assert_eq!(ids.first().unwrap(), "msg-000002");
+        assert_eq!(
+            ids.last().unwrap(),
+            &format!("msg-{:06}", MAX_TIMELINE_LINES + 2)
+        );
+        assert!(
+            ids.windows(2).all(|pair| pair[0] < pair[1]),
+            "timestamp ties keep id ordering"
+        );
     }
 
     #[test]
