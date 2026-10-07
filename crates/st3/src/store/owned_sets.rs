@@ -4,6 +4,9 @@ use crate::model::MemberSpec;
 use serde::Deserialize;
 use std::cell::RefCell;
 
+pub(super) const STAGED_SUBJECTS_QUERY: &str =
+    "SELECT DISTINCT subject FROM claims WHERE json_extract(body,'$.owned_set') IS NOT NULL";
+
 struct SnapshotRows {
     connection: usize,
     rows: BTreeMap<Option<u64>, Vec<View>>,
@@ -1297,10 +1300,7 @@ impl Store {
                 // Empty ownership uses one receipt and one staged-subject query for any roster;
                 // statement count alone does not bound rows or CPU for nonempty history.
                 let staged = connection
-                    .prepare(
-                        "SELECT DISTINCT subject FROM claims
-                     WHERE json_extract(body,'$.owned_set') IS NOT NULL",
-                    )
+                    .prepare(STAGED_SUBJECTS_QUERY)
                     .map_err(internal)?
                     .query_map([], |row| row.get::<_, String>(0))
                     .map_err(internal)?
