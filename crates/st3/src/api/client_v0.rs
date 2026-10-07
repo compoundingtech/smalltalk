@@ -9,6 +9,7 @@ pub(super) mod search;
 pub(super) mod arrangements;
 pub(super) mod conversation_blocks;
 mod collection_windows;
+mod collection_ivm;
 
 const TERMINAL_SUBPROTOCOL: &str = "st3.client.terminal.v0";
 const CONVERSATION_SUBPROTOCOL: &str = "st3.client.conversation.v0";
@@ -54,7 +55,9 @@ struct CollectionSubscription {
     dirty: bool,
     /// Whether the client has this subscription's first snapshot.
     delivered: bool,
-    previous: BTreeMap<String, Value>,
+    previous: Arc<BTreeMap<String, Value>>,
+    ivm: Option<Arc<collection_ivm::Adapter>>,
+    cursor: Option<collection_ivm::Delivered>,
     order: Vec<String>,
     has_more: bool,
 }
@@ -436,10 +439,53 @@ async fn deliver_collection(
         return Refreshed::Closed;
     }
     subscription.delivered = true;
-    subscription.previous = current;
+    subscription.previous = Arc::new(current);
     subscription.order = order;
     subscription.has_more = has_more;
     Refreshed::Current
+}
+
+enum CollectionRead {
+    Legacy(Result<(ClientSnapshot, Vec<Value>, bool), ApiError>),
+    Ivm(Box<Result<collection_ivm::Candidate, ApiError>>),
+}
+
+async fn deliver_ivm_collection(
+    socket: &mut WebSocket,
+    subscription: &mut CollectionSubscription,
+    read: Result<collection_ivm::Candidate, ApiError>,
+    refresh: &mut Vec<String>,
+) -> Refreshed {
+    use collection_ivm::Output;
+    let candidate = match read {
+        Ok(candidate) => candidate,
+        Err(error) => return deliver_collection(socket, subscription, Err(error)).await,
+    };
+    let result = match candidate.output {
+        Output::Window(window) => {
+            let delivered = subscription.delivered;
+            if candidate.replace { subscription.delivered = false; }
+            let result = deliver_collection(socket, subscription, Ok(window)).await;
+            if !matches!(result, Refreshed::Current) { subscription.delivered = delivered; }
+            result
+        }
+        Output::Silent => Refreshed::Current,
+        output @ (Output::Unavailable | Output::Resync) => {
+            let code = if matches!(output, Output::Resync) { "cursor-gap" } else { "internal" };
+            if send_collection(socket, json!({"kind":"resync", "id":subscription.request.id,
+                "collection":subscription.request.collection, "retryable":true,
+                "code":code, "message":"a fresh authorized collection snapshot is required"})).await {
+                Refreshed::Current
+            } else { Refreshed::Closed }
+        }
+    };
+    if matches!(result, Refreshed::Current) {
+        subscription.cursor = candidate.delivered;
+        if candidate.again {
+            refresh.push(subscription.request.id.clone());
+        }
+    }
+    result
 }
 
 /// Wait for the next frame from any held terminal. `None` means its follower stopped.
@@ -756,11 +802,24 @@ async fn collection_stream_socket(
     presence: super::client_presence::StreamGuard,
 ) {
     let windows = collection_windows::Windows::attach(&state.store);
-    collection_stream_socket_with_reader(
+    // Complete source adapters are admitted explicitly, never inferred from partial view IDs.
+    let store = state.store.clone();
+    let sources =
+        match blocking_store(move || collection_ivm::Sources::from_store(store, BTreeMap::new()))
+            .await
+        {
+            Ok(sources) => sources,
+            Err(error) => {
+                tracing::warn!(message=%error.message, "collection source attachment failed");
+                return;
+            }
+        };
+    collection_stream_socket_with_sources(
         socket,
         state,
         session,
         Some(presence),
+        sources,
         move |state, session, request, permit| {
             let windows = windows.clone();
             async move {
@@ -771,18 +830,40 @@ async fn collection_stream_socket(
     .await;
 }
 
+#[cfg(test)]
 async fn collection_stream_socket_with_reader<F, Fut>(
-    mut socket: WebSocket,
+    socket: WebSocket,
     state: AppState,
     session: ClientSession,
     presence: Option<super::client_presence::StreamGuard>,
     read: F,
 ) where
-    F: Fn(AppState, ClientSession, CollectionSubscribe, tokio::sync::OwnedSemaphorePermit) -> Fut + Clone + Send + 'static,
+    F: Fn(AppState, ClientSession, CollectionSubscribe, tokio::sync::OwnedSemaphorePermit) -> Fut
+        + Clone
+        + Send
+        + 'static,
+    Fut: Future<Output = Result<(ClientSnapshot, Vec<Value>, bool), ApiError>> + Send,
+{
+    collection_stream_socket_with_sources(socket, state, session, presence, None, read).await;
+}
+
+async fn collection_stream_socket_with_sources<F, Fut>(
+    mut socket: WebSocket,
+    state: AppState,
+    session: ClientSession,
+    presence: Option<super::client_presence::StreamGuard>,
+    sources: Option<Arc<collection_ivm::Sources>>,
+    read: F,
+) where
+    F: Fn(AppState, ClientSession, CollectionSubscribe, tokio::sync::OwnedSemaphorePermit) -> Fut
+        + Clone
+        + Send
+        + 'static,
     Fut: Future<Output = Result<(ClientSnapshot, Vec<Value>, bool), ApiError>> + Send,
 {
     // Subscribe before the first snapshot, so a commit while building it wakes
     // the next loop and is reflected in a following change frame.
+    let mut ivm_notices = sources.as_ref().map(|sources| sources.subscribe());
     let mut changed = state.event_notify.subscribe();
     let windows = collection_windows::Windows::attach(&state.store);
     let mut window_revisions = [0; 6];
@@ -889,7 +970,7 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                         }
                         refresh.push(request.id.clone());
                         generation += 1;
-                        subscriptions.insert(request.id.clone(), CollectionSubscription { request, generation, reading: None, dirty: false, delivered: false, previous: BTreeMap::new(), order: Vec::new(), has_more: false });
+                        subscriptions.insert(request.id.clone(), CollectionSubscription { generation, reading: None, dirty: false, delivered: false, previous: Arc::new(BTreeMap::new()), ivm: sources.as_ref().and_then(|sources| sources.adapter(&request.collection)), cursor: None, order: Vec::new(), has_more: false, request });
 
                     }
                     next = futures_util::FutureExt::now_or_never(socket.recv());
@@ -901,19 +982,46 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                 if subscription.generation != generation { continue; }
                 subscription.reading = None;
                 if std::mem::take(&mut subscription.dirty) { refresh.push(id.clone()); }
-                match deliver_collection(&mut socket, subscription, result).await {
+                let refreshed = match result {
+                    CollectionRead::Legacy(result) => deliver_collection(&mut socket, subscription, result).await,
+                    CollectionRead::Ivm(result) => deliver_ivm_collection(&mut socket, subscription, *result, &mut refresh).await,
+                };
+                match refreshed {
                     Refreshed::Current => {}
-                    Refreshed::Retry => { reread_due = true; }
+                    Refreshed::Retry => {
+                        if subscription.ivm.is_some() { subscription.dirty = true; }
+                        else { reread_due = true; }
+                    }
                     Refreshed::Dropped => { subscriptions.remove(&id); }
                     Refreshed::Closed => return,
                 }
+            }
+            notice = async {
+                match &mut ivm_notices {
+                    Some(receiver) => crate::graph_watch_ivm::IvmViewBridge::<Store>::next_notice(receiver).await,
+                    None => std::future::pending().await,
+                }
+            }, if !command_waiting && ivm_notices.is_some() => {
+                use crate::graph_watch_ivm::ViewWake;
+                match notice {
+                    ViewWake::Committed(frontiers) => { let _ = frontiers; }
+                    ViewWake::Lagged => {}
+                    ViewWake::Unavailable(error) => { tracing::warn!(%error, "collection IVM notice capture failed"); }
+                    ViewWake::Closed => {
+                        for subscription in subscriptions.values().filter(|s| s.ivm.is_some()) {
+                            if !send_collection(&mut socket, json!({"kind":"resync", "id":subscription.request.id, "retryable":true, "code":"internal", "message":"collection source stopped"})).await { return; }
+                        }
+                        return;
+                    }
+                }
+                refresh.extend(subscriptions.iter().filter(|(_, s)| s.ivm.is_some()).map(|(id, _)| id.clone()));
             }
             result = changed.changed(), if !command_waiting => {
                 if result.is_err() { return; }
                 // Weigh only the commits since the last look: a reread is due when one of them
                 // can change a held window.
                 let index = state.store.index().unwrap_or(weighed);
-                if subscriptions.is_empty() {
+                if subscriptions.values().all(|s| s.ivm.is_some()) {
                     weighed = index;
                     continue;
                 }
@@ -921,7 +1029,7 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                     let (windows, store) = (windows.clone(), state.store.clone());
                     match blocking_store(move || crate::profile::task("stream collection/invalidation", || windows.changes(&store))).await {
                         Ok(revisions) => {
-                            reread_due |= subscriptions.values().any(|subscription| collection_windows::Windows::changed(&subscription.request.collection, &window_revisions, &revisions));
+                            reread_due |= subscriptions.values().filter(|s| s.ivm.is_none()).any(|subscription| collection_windows::Windows::changed(&subscription.request.collection, &window_revisions, &revisions));
                             window_revisions = revisions;
                         }
                         Err(_) => { reread_due = true; }
@@ -933,22 +1041,23 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                     let arrangements_changed = subscriptions.values().any(|s| s.request.collection == "arrangements") && state.store.arrangements_changed(weighed, index).unwrap_or(true);
                     reread_due |= glasses_changed || arrangements_changed || match claims {
                         Err(_) => true,
-                        Ok(claims) => claims.len() >= 10_000 || subscriptions.values().any(|subscription| {
+                        Ok(claims) => claims.len() >= 10_000 || subscriptions.values().filter(|s| s.ivm.is_none()).any(|subscription| {
                             claims.iter().any(|claim| !collection_ignores(&subscription.request.collection, &claim.kind))
                         }),
                     };
                     weighed = index;
                 }
                 if !reread_due || last_reread.elapsed() < COLLECTION_REREAD_INTERVAL { continue; }
-                refresh.extend(subscriptions.keys().cloned());
+                refresh.extend(subscriptions.iter().filter(|(_, s)| s.ivm.is_none()).map(|(id, _)| id.clone()));
             }
-            () = tokio::time::sleep_until(last_reread + COLLECTION_REREAD_INTERVAL), if !command_waiting && reread_due => {
-                refresh.extend(subscriptions.keys().cloned());
+            () = tokio::time::sleep_until(last_reread + COLLECTION_REREAD_INTERVAL), if !command_waiting && (reread_due || subscriptions.values().any(|s| s.ivm.is_some() && s.dirty && s.reading.is_none())) => {
+                refresh.extend(subscriptions.iter().filter(|(_, s)| s.ivm.is_none() && reread_due || s.ivm.is_some() && s.dirty && s.reading.is_none()).map(|(id, _)| id.clone()));
+                last_reread = tokio::time::Instant::now();
             }
             _ = attention_clock.tick(), if !command_waiting && !subscriptions.is_empty() => {
                 // Pairing expiry and mission lease state can change without a claim. Stable
                 // rows remain reusable; authority and local overlays are rechecked on reads.
-                refresh.extend(subscriptions.keys().cloned());
+                refresh.extend(subscriptions.iter().filter(|(_, s)| s.ivm.is_none()).map(|(id, _)| id.clone()));
             }
             _ = ping_clock.tick() => {
                 // Protocol liveness never schedules an authorized window read.
@@ -986,31 +1095,44 @@ async fn collection_stream_socket_with_reader<F, Fut>(
         if refresh.is_empty() {
             continue;
         }
-        if refresh.len() >= subscriptions.len() && !subscriptions.is_empty() {
+        let legacy_windows = subscriptions.values().filter(|s| s.ivm.is_none()).count();
+        let refreshed_legacy = refresh.iter().filter(|id| subscriptions.get(*id).is_some_and(|s| s.ivm.is_none())).count();
+        if legacy_windows > 0 && refreshed_legacy == legacy_windows {
             reread_due = false;
             last_reread = tokio::time::Instant::now();
         }
         // Keep admission, conversation and terminal delivery live while each window reads.
         // Replaced/unsubscribed windows are fenced by their subscription generation.
         for id in refresh {
-            let Some(subscription) = subscriptions.get_mut(&id) else { continue; };
+            let Some(subscription) = subscriptions.get_mut(&id) else {
+                continue;
+            };
             if subscription.reading.is_some() {
                 subscription.dirty = true;
                 continue;
             }
+            subscription.dirty = false;
             let (cancel, canceled) = tokio::sync::oneshot::channel::<()>();
             subscription.reading = Some(cancel);
             let request = subscription.request.clone();
             let generation = subscription.generation;
             let (state, session, read) = (state.clone(), session.clone(), read.clone());
             let read_slots = read_slots.clone();
+            let sources = sources.clone();
+            let adapter = subscription.ivm.clone();
+            let cursor = subscription.cursor.clone();
+            let previous = subscription.previous.clone();
             reads.push(async move {
                 tokio::select! {
                     biased;
                     _ = canceled => None,
                     result = async {
                         let permit = read_slots.acquire_owned().await.expect("socket read slots stay open");
-                        read(state, session, request, permit).await
+                        if let (Some(sources), Some(adapter)) = (sources, adapter) {
+                            CollectionRead::Ivm(Box::new(collection_ivm::read(state, session, request, permit, sources, adapter, collection_ivm::Held {cursor, rows:previous}).await))
+                        } else {
+                            CollectionRead::Legacy(read(state, session, request, permit).await)
+                        }
                     } => {
                         Some((id, generation, result))
                     }

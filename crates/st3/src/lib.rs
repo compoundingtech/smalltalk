@@ -28,6 +28,7 @@ pub mod gate_kinds;
 pub mod gate_report;
 pub mod github_watch;
 pub mod graph;
+pub(crate) mod graph_watch_ivm;
 pub mod harness_events;
 /// The lifecycle hook set st3 publishes beneath its own state directory.
 pub mod hooks;
