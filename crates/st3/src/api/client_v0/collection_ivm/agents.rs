@@ -18,11 +18,7 @@ use smallclaims::ivm::{
 /// The source owner must capture the namespace certificate with this exact complete manifest.
 /// This binds input eligibility/schema and the compiled full-card dependency/output definition.
 pub(in crate::api::client_v0) fn manifest() -> String {
-    format!(
-        "{};{}",
-        agent_source::capture_fingerprint(),
-        cards::FINGERPRINT
-    )
+    agent_source::boundary::manifest()
 }
 
 /// Uses the existing Store-held registry. The source owner supplies its actual Installer and
