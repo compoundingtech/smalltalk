@@ -42,3 +42,5 @@ lane "Scenario tests" pnpm --filter @smalltalk/st3-scenarios test
 lane "Scenario freshness" pnpm --filter @smalltalk/st3-scenarios emit:check
 lane "Scenario decode" pnpm --filter @smalltalk/st3-scenarios decode
 lane "Scenario privacy" pnpm --filter @smalltalk/st3-scenarios scan
+lane "UI kit typecheck" pnpm --filter @smalltalk/fractal-ui typecheck
+lane "UI kit Storybook" pnpm --filter @smalltalk/fractal-ui build-storybook
