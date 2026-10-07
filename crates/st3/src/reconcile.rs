@@ -2379,6 +2379,18 @@ impl<R: RuntimeControl> Reconciler<R> {
                             });
                             self.runtime.observe_exec(&member.runtime_id)?
                         };
+                        if member.lifecycle == MemberLifecycle::TerminalBound {
+                            if let Some(incarnation) =
+                                self.reconcile_terminal_binding(subject, member, observed.as_ref())?
+                            {
+                                work_message_agents.push((
+                                    (**subject).clone(),
+                                    incarnation,
+                                    member.clone(),
+                                ));
+                            }
+                            return Ok(());
+                        }
                         if self.reconcile_rollout(subject, observed.as_ref(), blocked.as_ref())? {
                             if subject.kind == "agent"
                                 && let Some(observation) =
@@ -4492,6 +4504,18 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .and_then(|ended| ended.declaration.member)
         } else { None };
         let member = subject.member.as_ref().or(prior_member.as_ref());
+        if let Some(member) = member.filter(|m| m.lifecycle == MemberLifecycle::TerminalBound) {
+            let incarnation = member
+                .terminal_binding
+                .as_ref()
+                .context("bound seat has no binding")?
+                .agent_incarnation();
+            return self.record_once(
+                &subject.subject,
+                "runtime.observed",
+                member_fields(member, "stopped", Some(&incarnation), true),
+            );
+        }
         let owner_host = member
             .map(|member| member.host.as_str())
             .or_else(|| fields.get("host").and_then(Value::as_str))
@@ -5010,6 +5034,10 @@ impl<R: RuntimeControl> Reconciler<R> {
         reason: &str,
         request: Option<&crate::model::ClaimRecord>,
     ) -> Result<bool> {
+        anyhow::ensure!(
+            member.lifecycle != MemberLifecycle::TerminalBound,
+            "a bound terminal seat cannot be spawned"
+        );
         self.store.owned_desired_guard(subject)?;
         let explicit_person = request.is_some_and(|request| {
             request
@@ -6608,6 +6636,53 @@ impl<R: RuntimeControl> Reconciler<R> {
             crate::performance::record_wake("timer restart", Some(restart_wake_kind(&subject)));
             notify.notify_one();
         });
+    }
+
+    /// Observe only the invocation, never the borrowed shell's lifecycle as an agent exit.
+    fn reconcile_terminal_binding(
+        &self,
+        subject: &DesiredSubject,
+        member: &MemberSpec,
+        observed: Option<&RuntimeObservation>,
+    ) -> Result<Option<String>> {
+        let binding = member
+            .terminal_binding
+            .as_ref()
+            .context("bound seat has no binding")?;
+        let incarnation = binding.agent_incarnation();
+        let prior = self.store.latest_actual_value(&subject.subject)?;
+        if let Some(prior) = prior.as_ref().filter(|actual| {
+            actual_field(actual, "incarnation_id").and_then(Value::as_str)
+                == Some(incarnation.as_str())
+                && matches!(
+                    actual_field(actual, "status").and_then(Value::as_str),
+                    Some("exited" | "vanished" | "stopped")
+                )
+        }) {
+            let status = actual_field(prior, "status")
+                .and_then(Value::as_str)
+                .expect("exit status");
+            let mut fields = member_fields(member, status, Some(&incarnation), true);
+            for key in ["exit_code", "exit_signal"] {
+                if let Some(value) = actual_field(prior, key) {
+                    fields.insert(key.into(), value.clone());
+                }
+            }
+            self.record_once(&subject.subject, "runtime.observed", fields)?;
+            return Ok(None);
+        }
+        // Refuse a replacement PTY with the same runtime ID, including after daemon restart.
+        let running = observed.is_some_and(|o| {
+            o.status == "running"
+                && o.incarnation_id.as_deref() == Some(binding.incarnation.as_str())
+        });
+        let status = if running { "running" } else { "vanished" };
+        self.record_once(
+            &subject.subject,
+            "runtime.observed",
+            member_fields(member, status, Some(&incarnation), true),
+        )?;
+        Ok(running.then_some(incarnation))
     }
 
     fn record_member(
@@ -8607,6 +8682,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             tags: BTreeMap::new(),
             display_name: Some(format!("loop metric {}", metric.name)),
             lifecycle: MemberLifecycle::Service,
+            terminal_binding: None,
             one_shot: false,
             restart: RestartType::Never,
             restart_intensity: RestartIntensity::default(),
@@ -13265,6 +13341,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             tags: BTreeMap::new(),
             display_name: None,
             lifecycle: MemberLifecycle::Service,
+            terminal_binding: None,
             one_shot: false,
             restart: RestartType::Never,
             restart_intensity: RestartIntensity::default(),
@@ -13800,6 +13877,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             tags: BTreeMap::new(),
             display_name: None,
             lifecycle: MemberLifecycle::Service,
+            terminal_binding: None,
             one_shot: false,
             restart: RestartType::Never,
             restart_intensity: RestartIntensity::default(),

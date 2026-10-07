@@ -8473,6 +8473,20 @@ impl Store {
                 }
                 let intent = owned_plan.as_ref().map_or(intent, |p| &p.intent);
                 let expected = owned_plan.as_ref().map_or(expected, |p| &p.preview.expected_subjects);
+                for desired in intent.subjects.values() {
+                    crate::terminal_binding::validate_declaration(desired, actor)?;
+                    if let Some(binding) = desired.member.as_ref().and_then(|m| m.terminal_binding.as_ref()) {
+                        let terminal = current_desired_row_tx(transaction, &binding.subject).map_err(internal)?
+                            .filter(|row| row.kind == "pty")
+                            .and_then(|row| row.member)
+                            .and_then(|member| serde_json::from_str::<crate::model::MemberSpec>(&member).ok())
+                            .ok_or_else(|| St3Error::new("invalid-terminal-binding", "the terminal must already be declared"))?;
+                        let member = desired.member.as_ref().expect("binding member");
+                        if terminal.host != member.host || terminal.runtime_id != member.runtime_id {
+                            return Err(St3Error::new("invalid-terminal-binding", "the bound seat must use its terminal's host and runtime"));
+                        }
+                    }
+                }
                 validate_documents(transaction, &intent.document_refs)?;
                 for desired in intent
                     .subjects
@@ -19765,6 +19779,7 @@ pub(crate) fn append_claim_tx(
     if matches!(kind, "intent.desired" | "mission.published") {
         owned_sets::refuse_unmanaged(transaction, subject).map_err(anyhow::Error::new)?;
     }
+    crate::terminal_binding::validate_claim(kind, body, actor).map_err(anyhow::Error::new)?;
     st3_schema::owned_terminals::validate_declaration_owner(subject, kind, actor)
         .map_err(anyhow::Error::new)?;
     st3_schema::glasses::validate_owner(subject, actor).map_err(anyhow::Error::new)?;
@@ -25455,6 +25470,7 @@ fn classify_replicated_claim_with_registry(
             ),
         ));
     }
+    crate::terminal_binding::validate_claim(&claim.kind, &claim.body, claim.actor.as_deref())?;
     if claim.kind == "owned-set.revised" { owned_sets::validate_receipt(&claim.subject, &claim.body)?; }
     st3_schema::owned_terminals::validate_declaration_owner(
         &claim.subject,
@@ -25475,6 +25491,48 @@ fn classify_replicated_claim_with_registry(
         ));
     }
     Ok(ReplicatedClaimAdmission::Valid)
+}
+
+#[cfg(test)]
+#[test]
+fn terminal_binding_replica_admission_rejects_a_foreign_actor() {
+    let store = Store::open_memory("orchid").unwrap();
+    for (key, source) in [
+        (
+            "terminal",
+            "version 2\nterminal \"person/avery/019a0000-0000-7000-8000-000000000001\" { command \"shell\"; restart \"never\"; }",
+        ),
+        (
+            "binding",
+            "version 2\nagent \"example/bound\" { harness \"claude\" {}; bind-terminal \"pty/person/avery/019a0000-0000-7000-8000-000000000001\" incarnation=\"shell:created\" id=\"019a0000-0000-7000-8000-000000000002\"; }",
+        ),
+    ] {
+        let intent = crate::parse_intent(source, "orchid").unwrap();
+        let expected = intent
+            .subjects
+            .keys()
+            .map(|subject| (subject.clone(), Vec::new()))
+            .collect();
+        store
+            .apply_as(&intent, &expected, key, Some("person/avery"))
+            .unwrap();
+    }
+    let mut claim = store
+        .latest_claim("agent/example/bound", Some("intent.desired"))
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        classify_replicated_claim_with_registry(&claim, st3_schema::registry()),
+        Ok(ReplicatedClaimAdmission::Valid)
+    ));
+    claim.actor = Some("person/intruder".into());
+    assert_eq!(
+        classify_replicated_claim_with_registry(&claim, st3_schema::registry())
+            .err()
+            .unwrap()
+            .code,
+        "terminal-owner-forbidden"
+    );
 }
 
 /// Reapply this host's lease renewals that have not replicated yet after a projection replay,
