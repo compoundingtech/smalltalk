@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Name the oldest live read in the WAL checkpoint log when a snapshot pins the WAL",
+  "replay": {"status": "none", "detail": "No replay or rebuild, and no claim is projected differently. Diagnostics only."},
+  "schema": {"status": "none", "detail": "No tables, columns, indexes or triggers."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged."},
+  "compatibility": {"status": "none", "detail": "No client, wire or harness contract change."},
+  "downtime": {"status": "none", "detail": "None."},
+  "manual": {"status": "none", "detail": "No manual step."},
+  "recovery": {"status": "none", "detail": "The daemon records each read checkout and each read snapshot with its start time and call site in an in-memory list, one short lock per read. When the WAL checkpoint has copied no further for three samples in a row, its log line, which is reported in the abnormal bucket, adds how long the oldest live read has run, whether it is a snapshot or a lent connection, and where it was taken, plus how many reads are live. An idle pooled connection with a half-stepped statement is not on the list, so a pin with no live read points at one. No behaviour changes."}
+}

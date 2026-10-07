@@ -22605,12 +22605,63 @@ impl WalCheckpointLogBucket {
         Some(retained)
     }
 }
+/// Counts checkpoint samples in a row that left part of the WAL un-copied and copied no more
+/// than the sample before: some reader holds an older snapshot open.
+#[derive(Default)]
+struct WalPinTracker {
+    last_backfilled: Option<i32>,
+    stuck: u32,
+}
+
+impl WalPinTracker {
+    /// Samples in a row, including this one, that made no backfill progress.
+    fn observe(&mut self, report: Option<&smallclaims::sqlite::WalCheckpointReport>) -> u32 {
+        let Some(report) = report else { return self.stuck };
+        let pinned = report.frames > report.backfilled
+            && self.last_backfilled == Some(report.backfilled);
+        self.last_backfilled = Some(report.backfilled);
+        self.stuck = if pinned { self.stuck + 1 } else { 0 };
+        self.stuck
+    }
+}
+
+const WAL_PIN_REPORT_AFTER: u32 = 3;
+
 fn abnormal_wal_checkpoint(report: Option<&smallclaims::sqlite::WalCheckpointReport>) -> bool {
     report.is_none_or(|report| {
         report.passive_ms >= 1000
             || report.writer_wait_ms >= 100
             || report.truncate_ms.is_some_and(|ms| ms >= 100)
     })
+}
+
+#[cfg(test)]
+mod wal_pin_tracker_tests {
+    use super::*;
+
+    fn sample(frames: i32, backfilled: i32) -> smallclaims::sqlite::WalCheckpointReport {
+        smallclaims::sqlite::WalCheckpointReport {
+            frames,
+            backfilled,
+            passive_ms: 1,
+            writer_wait_ms: 0,
+            truncate_ms: None,
+            recycled: false,
+        }
+    }
+
+    #[test]
+    fn a_backfill_that_stops_advancing_counts_up_and_progress_resets_it() {
+        let mut pin = WalPinTracker::default();
+        assert_eq!(pin.observe(Some(&sample(100, 50))), 0, "the first sample has no baseline");
+        assert_eq!(pin.observe(Some(&sample(200, 50))), 1);
+        assert_eq!(pin.observe(Some(&sample(300, 50))), 2);
+        assert_eq!(pin.observe(None), 2, "an errored attempt neither counts nor resets");
+        assert_eq!(pin.observe(Some(&sample(400, 50))), 3);
+        assert_eq!(pin.observe(Some(&sample(500, 60))), 0, "backfill moved");
+        assert_eq!(pin.observe(Some(&sample(500, 500))), 0, "fully copied is not a pin");
+        assert_eq!(pin.observe(Some(&sample(500, 500))), 0);
+    }
 }
 
 #[cfg(test)]
@@ -22708,6 +22759,7 @@ fn recycle_idle_wal(path: PathBuf, store: std::sync::Weak<Store>) {
             let mut retry_interval = WAL_CHECKPOINT_INTERVAL;
             let mut ordinary_outcomes = WalCheckpointLogBucket::default();
             let mut abnormal_outcomes = WalCheckpointLogBucket::default();
+            let mut pin = WalPinTracker::default();
             loop {
                 std::thread::sleep(retry_interval);
                 retry_interval = WAL_CHECKPOINT_INTERVAL;
@@ -22741,7 +22793,8 @@ fn recycle_idle_wal(path: PathBuf, store: std::sync::Weak<Store>) {
                 let now = Instant::now();
                 let duration_ms = started.elapsed().as_millis();
                 let report = result.as_ref().ok();
-                let abnormal = abnormal_wal_checkpoint(report);
+                let stuck = pin.observe(report);
+                let abnormal = abnormal_wal_checkpoint(report) || stuck >= WAL_PIN_REPORT_AFTER;
                 let bucket = if abnormal { &mut abnormal_outcomes } else { &mut ordinary_outcomes };
                 if let Some(retained) = bucket.record(now, report, duration_ms) {
                     let outcome = match report {
@@ -22753,9 +22806,22 @@ fn recycle_idle_wal(path: PathBuf, store: std::sync::Weak<Store>) {
                         }),
                         None => json!({"outcome":"error", "phase_durations_available":false}),
                     };
+                    let pinned = (stuck >= WAL_PIN_REPORT_AFTER).then(|| {
+                        let oldest = smallclaims::sqlite::oldest_live_read();
+                        json!({
+                            "stuck_samples": stuck,
+                            "oldest_live_read": oldest.as_ref().map(|read| json!({
+                                "age_ms": read.age_ms,
+                                "kind": if read.snapshot { "snapshot" } else { "lent-connection" },
+                                "at": read.at,
+                            })),
+                            "live_reads": oldest.as_ref().map(|read| read.live),
+                        })
+                    });
                     eprintln!("st3: WAL checkpoint {}", json!({
                         "bucket": if abnormal { "abnormal" } else { "ordinary" },
                         "report": outcome, "duration_ms": duration_ms, "retained": retained,
+                        "pinned": pinned,
                     }));
                 }
                 if let Err(error) = result {

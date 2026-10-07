@@ -519,3 +519,25 @@ fn tail_verdict_busy_remains_typed_and_pending_after_projection_commit() {
     assert!(!store.verdicts_due.load(Ordering::Acquire));
     assert!(!store.replication_projection_deferred());
 }
+
+#[test]
+fn a_live_snapshot_and_a_lent_read_are_listed_with_their_call_sites_until_they_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("claims.sqlite3");
+    let store = Store::open(&path, "node", Arc::new(FaultRuntime::new())).unwrap();
+    let here = |line: u32| format!("{}:{}", file!(), line);
+    let snapshot_line = line!() + 1;
+    store.read_snapshot(|_| {
+        let live = crate::sqlite::live_read_locations();
+        assert!(live.contains(&(here(snapshot_line), true)));
+        Ok(())
+    }).unwrap();
+    assert!(!crate::sqlite::live_read_locations().contains(&(here(snapshot_line), true)));
+    let guard_line = line!() + 1;
+    let guard = store.readers.get();
+    assert!(crate::sqlite::live_read_locations().contains(&(here(guard_line), false)));
+    let oldest = crate::sqlite::oldest_live_read().unwrap();
+    assert!(oldest.live >= 1);
+    drop(guard);
+    assert!(!crate::sqlite::live_read_locations().contains(&(here(guard_line), false)));
+}
