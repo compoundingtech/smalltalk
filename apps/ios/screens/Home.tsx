@@ -207,7 +207,7 @@ function StructuredRequestView({ item, request, from, onAnswered }: { item: Para
     <T bold color={theme.person}>{from} is waiting on you.</T>
     {request.answers?.map(answer => <Pressable key={answer.id} disabled={disabled} onPress={() => send(answer)}
       style={{ borderLeftWidth: 2, borderLeftColor: request.recommendation?.answer === answer.id ? theme.green : theme.surface1, paddingLeft: 8, paddingVertical: 4, opacity: disabled ? 0.5 : 1 }}>
-      <T bold color={theme.accent}>{answer.label}{request.recommendation?.answer === answer.id ? <T color={theme.green}>  recommended</T> : null}</T>
+      <T bold color={theme.accent}>{answer.label}{request.recommendation?.answer === answer.id ? <T color={theme.green}>  recommended</T> : null}{answer.outcome === 'request_changes' ? <T color={theme.yellow}>  needs your words</T> : null}</T>
       <T dim>{answer.consequence}</T>
     </Pressable>)}
     {request.custom ? <Button label="Answer in words" disabled={disabled} onPress={words} /> : null}

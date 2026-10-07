@@ -232,6 +232,7 @@ impl Ui {
             editing: false,
             confirm: None,
             answering: None,
+            needs_words: None,
             chat: None,
         };
         let doc = screens::home_detail(&self.world, Some(subject), 120, &drafts);
@@ -675,6 +676,7 @@ mod tests {
                     editing: false,
                     confirm: None,
                     answering: None,
+                    needs_words: None,
                     chat: None,
                 },
             );
