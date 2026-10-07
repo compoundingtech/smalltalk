@@ -37,7 +37,7 @@ impl Connection {
     pub fn open(socket: &Path) -> Result<Self> {
         let stream = UnixStream::connect(socket).with_context(|| {
             format!(
-                "sekrets is not set up on this host: no gateway at {} (see `st sekrets setup`)",
+                "sekrets is not set up on this host: no gateway at {} (see `sekrets setup`)",
                 socket.display()
             )
         })?;
@@ -69,6 +69,11 @@ impl Connection {
             }
             other => bail!("unexpected reply from the gateway: {other:?}"),
         }
+    }
+
+    /// One request and its reply.
+    pub(crate) fn call(&self, request: &Request) -> Result<Reply> {
+        self.request(request, &[])
     }
 
     fn request(&self, request: &Request, fds: &[RawFd]) -> Result<Reply> {
@@ -108,6 +113,14 @@ impl Connection {
     pub fn run_in(self, mut run: RunRequest, cwd: &Path, streams: Streams) -> Result<i32> {
         let directories = checkout_directories(cwd)?;
         run.directories = directories.len();
+        let files = super::files::pass_files(&mut run.argv, cwd)?;
+        run.files = files.len();
+        if 3 + directories.len() + files.len() > protocol::MAX_FDS {
+            bail!(
+                "a command can read at most {} passed files",
+                protocol::MAX_FDS - 3 - directories.len()
+            );
+        }
         let interactive = matches!(streams, Streams::Terminal);
         if interactive {
             run.tty = Some(terminal_size());
@@ -118,16 +131,18 @@ impl Connection {
             fds.extend(stdio);
         }
         fds.extend(directories.iter().map(|d| d.as_raw_fd()));
+        fds.extend(files.iter().map(|f| f.as_raw_fd()));
         protocol::send(&self.stream, &Request::Run(run), &fds)
             .context("send to the sekrets gateway")?;
         drop(directories);
+        drop(files);
         let Some((reply, mut passed)) = protocol::recv::<Reply>(&self.stream)? else {
             bail!("the sekrets gateway closed the connection");
         };
         match reply {
             Reply::Started { note, .. } => {
                 if let Some(note) = note {
-                    eprintln!("st sekrets: {note}");
+                    eprintln!("sekrets: {note}");
                 }
             }
             Reply::Refused { reason, .. } => bail!("refused: {reason}"),

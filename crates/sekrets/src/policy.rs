@@ -4,8 +4,11 @@
 //! allow prefix matches it and no deny rule does. A prefix element is one literal argument, or
 //! `*` for exactly one argument of any value. So options before a subcommand (`gh -R x pr
 //! create`) match no allow prefix unless one names them. A deny rule with options denies only
-//! when one of those options appears after its prefix, which is how a preset refuses the flags
-//! that make a tool read a file (`gh pr create --body-file`).
+//! when one of those options appears after its prefix. A deny rule's file options are allowed
+//! only when the file they name is the caller's standard input (`-`) or a file the caller passed
+//! (`/dev/fd/N`, which `sekrets` makes from a path the caller can read): a command run with a
+//! profile must never read a file of the sekrets user's, such as the profile's own login, into
+//! what it sends (`gh pr create --body-file ~/.config/gh/hosts.yml`).
 
 use std::fmt;
 
@@ -17,21 +20,85 @@ pub struct Rule {
     pub prefix: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub options: Vec<String>,
+    /// Options whose value names a file to read, allowed only with standard input or a passed
+    /// file (`--body-file`, `--input`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_options: Vec<String>,
+    /// Options whose value reads a file only after `@` (`-F key=@file`), allowed unless that file
+    /// is anything but standard input or a passed file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub field_options: Vec<String>,
 }
 
 impl Rule {
     pub fn prefix(words: &[&str]) -> Self {
         Self {
             prefix: words.iter().map(|word| (*word).to_owned()).collect(),
-            options: Vec::new(),
+            ..Self::default()
         }
     }
 
     pub fn options(words: &[&str], options: &[&str]) -> Self {
         Self {
-            prefix: words.iter().map(|word| (*word).to_owned()).collect(),
             options: options.iter().map(|option| (*option).to_owned()).collect(),
+            ..Self::prefix(words)
         }
+    }
+
+    /// A deny rule that lets `files` read only standard input or a passed file, and `fields`
+    /// read only those after `@`.
+    pub fn files(words: &[&str], files: &[&str], fields: &[&str]) -> Self {
+        Self {
+            file_options: files.iter().map(|option| (*option).to_owned()).collect(),
+            field_options: fields.iter().map(|option| (*option).to_owned()).collect(),
+            ..Self::prefix(words)
+        }
+    }
+
+    /// A deny rule that names no options denies its whole prefix.
+    fn denies_outright(&self) -> bool {
+        self.options.is_empty() && self.file_options.is_empty() && self.field_options.is_empty()
+    }
+
+    /// Why a file or field option after the prefix reads something other than standard input
+    /// or a passed file, if one does.
+    fn file_refusal(&self, argv: &[String]) -> Option<String> {
+        let args = &argv[self.prefix.len()..];
+        for (option, field) in self
+            .file_options
+            .iter()
+            .map(|option| (option, false))
+            .chain(self.field_options.iter().map(|option| (option, true)))
+        {
+            for value in option_values(option, args) {
+                let Some(value) = value else {
+                    return Some(format!(
+                        "option `{option}` is bundled with other short options; give it on its own"
+                    ));
+                };
+                let file = if field {
+                    match value.split_once("=@") {
+                        Some((_, file)) => file,
+                        None => match value.strip_prefix('@') {
+                            Some(file) => file,
+                            None => continue,
+                        },
+                    }
+                } else {
+                    value.as_str()
+                };
+                if !passed_file(file) {
+                    let mut shown = file.chars().take(80).collect::<String>();
+                    if shown.len() < file.len() {
+                        shown.push('…');
+                    }
+                    return Some(format!(
+                        "option `{option}` may read only standard input or a file sekrets passed, not `{shown}`"
+                    ));
+                }
+            }
+        }
+        None
     }
 
     /// Parse `gh pr create` or `gh pr create --body-file,-F`: a prefix, then an optional
@@ -58,7 +125,11 @@ impl Rule {
                 return Err(format!("rule `{text}`: `{option}` is not an option"));
             }
         }
-        Ok(Self { prefix, options })
+        Ok(Self {
+            prefix,
+            options,
+            ..Self::default()
+        })
     }
 
     fn matches_prefix(&self, argv: &[String]) -> bool {
@@ -91,8 +162,61 @@ impl fmt::Display for Rule {
         if !self.options.is_empty() {
             write!(f, " {}", self.options.join(","))?;
         }
+        if !self.file_options.is_empty() || !self.field_options.is_empty() {
+            let mut files = self.file_options.clone();
+            files.extend(
+                self.field_options
+                    .iter()
+                    .map(|option| format!("{option} @")),
+            );
+            write!(f, " [passed files only: {}]", files.join(", "))?;
+        }
         Ok(())
     }
+}
+
+/// Whether `path` is the caller's standard input or a descriptor the caller passed.
+fn passed_file(path: &str) -> bool {
+    path == "-"
+        || path
+            .strip_prefix("/dev/fd/")
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// The value each use of `option` in `args` takes: `--name value`, `--name=value`, `-X value` or
+/// `-Xvalue`. `None` for a short option bundled after others (`-dF x`), whose value is unclear.
+fn option_values(option: &str, args: &[String]) -> Vec<Option<String>> {
+    let mut values = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        let next = || args.get(index + 1).cloned().unwrap_or_default();
+        if arg == option {
+            values.push(Some(next()));
+            index += 2;
+            continue;
+        }
+        if let Some(name) = option.strip_prefix("--") {
+            if let Some(value) = arg
+                .strip_prefix("--")
+                .and_then(|given| given.strip_prefix(name))
+                .and_then(|rest| rest.strip_prefix('='))
+            {
+                values.push(Some(value.to_owned()));
+            }
+        } else if let Some(letter) = option.strip_prefix('-')
+            && arg.starts_with('-')
+            && !arg.starts_with("--")
+        {
+            if let Some(value) = arg.strip_prefix(option) {
+                values.push(Some(value.to_owned()));
+            } else if arg[1..].contains(letter) {
+                values.push(None);
+            }
+        }
+        index += 1;
+    }
+    values
 }
 
 /// Whether `arg` uses `option`. A long option matches itself and `--name=value`. A short option
@@ -177,11 +301,14 @@ impl Policy {
             if !rule.matches_prefix(argv) {
                 continue;
             }
-            if rule.options.is_empty() {
+            if rule.denies_outright() {
                 return Verdict::Refused(format!("denied by rule `{rule}`"));
             }
             if let Some(option) = rule.option_in(argv) {
                 return Verdict::Refused(format!("option `{option}` denied by rule `{rule}`"));
+            }
+            if let Some(reason) = rule.file_refusal(argv) {
+                return Verdict::Refused(reason);
             }
         }
         Verdict::Allowed
@@ -236,21 +363,23 @@ pub const PRESETS: &[(&str, &str)] = &[
         "gh-read, plus create, edit, comment on, ready and close pull requests; no file-reading flags",
     ),
     (
+        "gh-agent",
+        "what agents use gh for: pull requests, issues, runs, workflows, releases, search, labels, variables and gh api; never a credential, and files only as passed",
+    ),
+    (
         "git-push",
         "git push to a remote; no mirror, prune or custom receive-pack",
     ),
+    (
+        "github-api",
+        "authorized requests to GitHub's API with any method, for an st daemon's GitHub calls",
+    ),
 ];
 
-/// Options that make gh read a local file into what it sends.
-const GH_FILE_OPTIONS: &[&str] = &[
-    "--body-file",
-    "-F",
-    "--template",
-    "-T",
-    "--recover",
-    "--editor",
-    "-e",
-];
+/// Options that make gh read a local file, or run an editor, with no way to pass the file: denied.
+const GH_LOCAL_OPTIONS: &[&str] = &["--template", "-T", "--recover", "--editor", "-e"];
+/// Options that make gh read the file their value names into what it sends: only passed files.
+const GH_BODY_FILES: &[&str] = &["--body-file", "-F"];
 
 pub fn preset(name: &str) -> Option<Preset> {
     let gh_read = || {
@@ -299,10 +428,90 @@ pub fn preset(name: &str) -> Option<Preset> {
             let mut deny = Vec::new();
             for verb in ["create", "edit", "comment", "ready", "close", "reopen"] {
                 allow.push(Rule::prefix(&["gh", "pr", verb]));
-                deny.push(Rule::options(&["gh", "pr", verb], GH_FILE_OPTIONS));
+                deny.push(Rule::options(&["gh", "pr", verb], GH_LOCAL_OPTIONS));
+                deny.push(Rule::files(&["gh", "pr", verb], GH_BODY_FILES, &[]));
             }
             Preset { allow, deny }
         }
+        "gh-agent" => {
+            let mut allow = Vec::new();
+            let mut deny = Vec::new();
+            let mut verbs = |group: &str, verbs: &[&str]| {
+                for verb in verbs {
+                    allow.push(Rule::prefix(&["gh", group, verb]));
+                }
+            };
+            verbs(
+                "pr",
+                &[
+                    "view",
+                    "list",
+                    "diff",
+                    "checks",
+                    "status",
+                    "create",
+                    "edit",
+                    "comment",
+                    "ready",
+                    "close",
+                    "reopen",
+                    "merge",
+                    "review",
+                    "update-branch",
+                ],
+            );
+            verbs(
+                "issue",
+                &[
+                    "view", "list", "status", "create", "edit", "comment", "close", "reopen",
+                ],
+            );
+            verbs(
+                "run",
+                &["view", "list", "watch", "rerun", "cancel", "download"],
+            );
+            verbs("workflow", &["view", "list", "run"]);
+            verbs("release", &["view", "list", "download"]);
+            verbs("repo", &["view", "list"]);
+            verbs("search", &["issues", "prs", "code", "repos", "commits"]);
+            verbs("label", &["list"]);
+            verbs("variable", &["list", "get", "set"]);
+            verbs("auth", &["status"]);
+            allow.push(Rule::prefix(&["gh", "api"]));
+            for (group, verbs) in [
+                ("pr", &["create", "edit", "comment", "merge", "review"][..]),
+                ("issue", &["create", "edit", "comment"][..]),
+            ] {
+                for verb in verbs {
+                    deny.push(Rule::options(&["gh", group, verb], GH_LOCAL_OPTIONS));
+                    deny.push(Rule::files(&["gh", group, verb], GH_BODY_FILES, &[]));
+                }
+            }
+            deny.push(Rule::options(
+                &["gh", "auth", "status"],
+                &["--show-token", "-t"],
+            ));
+            deny.push(Rule::files(
+                &["gh", "api"],
+                &["--input"],
+                &["-F", "--field"],
+            ));
+            deny.push(Rule::files(
+                &["gh", "workflow", "run"],
+                &[],
+                &["-F", "--field"],
+            ));
+            deny.push(Rule::files(
+                &["gh", "variable", "set"],
+                &["--body-file", "--env-file", "-f"],
+                &[],
+            ));
+            Preset { allow, deny }
+        }
+        "github-api" => Preset {
+            allow: vec![Rule::prefix(&["http", "*", "github"])],
+            deny: Vec::new(),
+        },
         "git-push" => Preset {
             allow: vec![Rule::prefix(&["git", "push"])],
             deny: vec![Rule::options(
@@ -381,7 +590,12 @@ mod tests {
             let Verdict::Refused(reason) = policy.judge(&argv(refused)) else {
                 panic!("{refused} was allowed");
             };
-            assert!(reason.contains("denied by rule"), "{refused}: {reason}");
+            assert!(
+                reason.contains("denied by rule")
+                    || reason.contains("may read only")
+                    || reason.contains("bundled"),
+                "{refused}: {reason}"
+            );
         }
         assert!(matches!(
             policy.judge(&argv("gh auth token")),
@@ -391,6 +605,70 @@ mod tests {
             policy.judge(&argv("gh api /user")),
             Verdict::Refused(_)
         ));
+    }
+
+    #[test]
+    fn gh_agent_allows_what_agents_do_but_reads_only_passed_files() {
+        let agent = policy(&["gh-agent", "git-push"], &[], &[]);
+        assert!(agent.broad_allow().is_none());
+        for allowed in [
+            "gh pr view 7 --json body -q .body",
+            "gh pr merge 7 --auto",
+            "gh pr review 7 --approve",
+            "gh pr update-branch 7",
+            "gh pr edit 7 --body-file /dev/fd/9",
+            "gh pr create --title x --body-file -",
+            "gh pr create --title x -F /dev/fd/12",
+            "gh pr create --title x --body-file=/dev/fd/12",
+            "gh issue comment 3 --body text",
+            "gh run rerun 9 --failed",
+            "gh workflow run ci.yml -F ref=main",
+            "gh api repos/example/web/pulls/1/comments -f body=thanks",
+            "gh api graphql -F n=12 -f query=x",
+            "gh api repos/example/web/pulls -F body=@/dev/fd/9",
+            "gh api repos/example/web/issues --input -",
+            "gh variable set NAME --body value",
+            "gh auth status",
+            "git push -u origin HEAD",
+        ] {
+            assert_eq!(agent.judge(&argv(allowed)), Verdict::Allowed, "{allowed}");
+        }
+        for (refused, reason) in [
+            ("gh auth token", "no allow rule matches"),
+            ("gh auth status -t", "denied by rule"),
+            ("gh auth status --show-token", "denied by rule"),
+            ("gh secret list", "no allow rule matches"),
+            ("gh alias set x y", "no allow rule matches"),
+            ("gh extension install a/b", "no allow rule matches"),
+            ("gh config get editor", "no allow rule matches"),
+            ("gh pr edit 7 --body-file /tmp/notes.md", "may read only"),
+            (
+                "gh pr edit 7 --body-file .config/gh/hosts.yml",
+                "may read only",
+            ),
+            ("gh pr create -F hosts.yml", "may read only"),
+            ("gh pr create -dF hosts.yml", "bundled"),
+            ("gh pr comment 7 --editor", "denied by rule"),
+            ("gh api repos/x/y/issues --input hosts.yml", "may read only"),
+            (
+                "gh api repos/x/y/issues -F body=@hosts.yml",
+                "may read only",
+            ),
+            (
+                "gh api repos/x/y/issues --field=body=@hosts.yml",
+                "may read only",
+            ),
+            (
+                "gh workflow run ci.yml -F inputs=@hosts.yml",
+                "may read only",
+            ),
+            ("gh variable set NAME -f hosts.yml", "may read only"),
+        ] {
+            let Verdict::Refused(why) = agent.judge(&argv(refused)) else {
+                panic!("{refused} was allowed");
+            };
+            assert!(why.contains(reason), "{refused}: {why}");
+        }
     }
 
     #[test]

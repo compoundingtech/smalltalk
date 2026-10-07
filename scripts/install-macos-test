@@ -229,7 +229,7 @@ class Installer(unittest.TestCase):
             '    (destination/name).symlink_to(source/name)\n')
         for path in fakebin.iterdir():
             path.chmod(0o755)
-        for name in ['st3', 'stui', 'st3-migrate', 'pty']:
+        for name in ['st3', 'stui', 'st3-migrate', 'sekrets', 'pty']:
             path = self.source / name
             path.write_text('#!/bin/sh\nexit 0\n'); path.chmod(0o755)
         env = dict(os.environ, PATH=str(fakebin) + os.pathsep + os.environ['PATH'])

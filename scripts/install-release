@@ -10,7 +10,7 @@ while (($#)); do
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
-binaries=(st3 stui st3-migrate pty)
+binaries=(st3 stui st3-migrate sekrets pty)
 for binary in "${binaries[@]}"; do
   [[ -f $source_dir/$binary && -x $source_dir/$binary ]] || {
     echo "missing executable: $binary" >&2; exit 1;
@@ -36,5 +36,5 @@ for name in "${binaries[@]}" st; do
   if [[ $macos == true && ($name == st3 || $name == stui) ]]; then continue; fi
   mv -f "$stage/$name" "$bin_dir/$name"
 done
-printf 'Installed st3, st -> st3, stui, st3-migrate, and pty in %s\n' "$bin_dir"
+printf 'Installed st3, st -> st3, stui, st3-migrate, sekrets, and pty in %s\n' "$bin_dir"
 echo 'Running services were not restarted.'

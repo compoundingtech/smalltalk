@@ -4,7 +4,8 @@
 # person, gets nothing of ada's unless she grants it. The isolation-vm CI job builds this test's
 # driver and runs it outside the Nix sandbox with a prebuilt st binary:
 #
-#   ST_SEKRETS_BINARY   the st binary, built in the flake's dev shell
+#   ST_BINARY           the st binary, built in the flake's dev shell
+#   ST_SEKRETS_BINARY   the sekrets binary, built beside it
 #
 # The VM compiles nothing. KVM is required; there is no emulation fallback.
 { pkgs, pty }:
@@ -61,7 +62,7 @@ pkgs.testers.runNixOSTest {
       serviceConfig = {
         User = "sekrets";
         Group = "sekrets";
-        ExecStart = "/usr/local/libexec/st-sekrets sekrets serve --config /etc/st-sekrets/gateway.toml";
+        ExecStart = "/usr/local/libexec/sekrets serve --config /etc/st-sekrets/gateway.toml";
         RuntimeDirectory = "st-sekrets";
         RuntimeDirectoryMode = "0755";
         StateDirectory = "st-sekrets";
@@ -76,13 +77,17 @@ pkgs.testers.runNixOSTest {
     import shlex
 
     st = "/usr/local/bin/st"
+    sk = "/usr/local/bin/sekrets"
     machine.wait_for_unit("multi-user.target")
     machine.wait_for_unit("sshd.service")
     machine.wait_for_unit("default.target", "ada")
-    machine.copy_from_host(os.environ["ST_SEKRETS_BINARY"], "/usr/local/libexec/st-sekrets")
+    machine.succeed("mkdir -p /usr/local/bin /usr/local/libexec")
+    machine.copy_from_host(os.environ["ST_BINARY"], "/usr/local/bin/st")
+    machine.copy_from_host(os.environ["ST_SEKRETS_BINARY"], "/usr/local/libexec/sekrets")
     machine.succeed(
-        "chown root:root /usr/local/libexec/st-sekrets && chmod 0755 /usr/local/libexec/st-sekrets"
-        " && mkdir -p /usr/local/bin && ln -sf /usr/local/libexec/st-sekrets /usr/local/bin/st"
+        "chown root:root /usr/local/libexec/sekrets /usr/local/bin/st"
+        " && chmod 0755 /usr/local/libexec/sekrets /usr/local/bin/st"
+        " && ln -sf /usr/local/libexec/sekrets /usr/local/bin/sekrets"
     )
     # As `st sekrets setup` does: the gateway may pass through each home, never read it.
     machine.succeed("setfacl -m u:sekrets:x /srv/people/ada /srv/people/robin")
@@ -117,35 +122,35 @@ pkgs.testers.runNixOSTest {
         return machine.succeed(run) if succeed else machine.fail(run)
 
     # The kernel tells a login session from the service manager.
-    assert "person/ada, from a login session" in login("ada", f"{st} sekrets whoami")
-    assert "unidentified process of person/ada" in manager(f"{st} sekrets whoami")
+    assert "person/ada, from a login session" in login("ada", f"{sk} whoami")
+    assert "unidentified process of person/ada" in manager(f"{sk} whoami")
     machine.fail("su nobody -s /bin/sh -c '/usr/local/bin/st sekrets whoami'")
 
     # Ada's profiles: her own, and one for her agents with a token she puts in.
-    login("ada", f"{st} sekrets profile create ada/gh --preset everything --preset no-credential-printing --default")
-    login("ada", f"{st} sekrets profile create ada/agent-gh --preset gh-pr --preset git-push --allow 'git status'")
-    login("ada", f"printf example-token | {st} sekrets put GH_TOKEN --profile ada/agent-gh")
+    login("ada", f"{sk} profile create ada/gh --preset everything --preset no-credential-printing --default")
+    login("ada", f"{sk} profile create ada/agent-gh --preset gh-pr --preset git-push --allow 'git status'")
+    login("ada", f"printf example-token | {sk} put GH_TOKEN --profile ada/agent-gh")
     assert "gh pr list token= home=/var/lib/st-sekrets/profiles/ada/gh/home" in login(
-        "ada", f"{st} sekrets -- gh pr list"
+        "ada", f"{sk} -- gh pr list"
     )
-    assert "token=set" in login("ada", f"{st} sekrets --profile ada/agent-gh -- gh pr view 1")
-    assert "denied by rule `gh auth token`" in login("ada", f"{st} sekrets -- gh auth token", succeed=False)
+    assert "token=set" in login("ada", f"{sk} --profile ada/agent-gh -- gh pr view 1")
+    assert "denied by rule `gh auth token`" in login("ada", f"{sk} -- gh auth token", succeed=False)
 
     # No one but the sekrets user reads the store; the token appears in no output or log.
     for user in ["ada", "robin"]:
         login(user, "ls /var/lib/st-sekrets", succeed=False)
         login(user, "cat /var/lib/st-sekrets/sekrets.db", succeed=False)
-    assert "example-token" not in login("ada", f"{st} sekrets log --limit 200")
+    assert "example-token" not in login("ada", f"{sk} log --limit 200")
 
     # Robin has nothing of Ada's until she grants it, and then only what the grant allows.
-    assert "owns no profile and has been granted none" in login("robin", f"{st} sekrets -- gh pr list", succeed=False)
-    login("ada", f"{st} sekrets grant ada/agent-gh --to person/robin --preset gh-read")
-    assert "token=set" in login("robin", f"{st} sekrets -- gh pr view 1")
-    assert "no allow rule matches" in login("robin", f"{st} sekrets -- gh pr create --draft", succeed=False)
-    login("robin", f"{st} sekrets grant ada/agent-gh --to person/robin --preset gh-pr", succeed=False)
+    assert "owns no profile and has been granted none" in login("robin", f"{sk} -- gh pr list", succeed=False)
+    login("ada", f"{sk} grant ada/agent-gh --to person/robin --preset gh-read")
+    assert "token=set" in login("robin", f"{sk} -- gh pr view 1")
+    assert "no allow rule matches" in login("robin", f"{sk} -- gh pr create --draft", succeed=False)
+    login("robin", f"{sk} grant ada/agent-gh --to person/robin --preset gh-pr", succeed=False)
 
     # A process in the service manager without its daemon's word is refused.
-    assert "not identified" in manager(f"{st} sekrets -- gh pr list", succeed=False)
+    assert "not identified" in manager(f"{sk} -- gh pr list", succeed=False)
 
     # Ada's st daemon vouches for her seats once she registers its key from a login session.
     machine.succeed(
@@ -161,10 +166,10 @@ pkgs.testers.runNixOSTest {
         )
     )
     machine.wait_for_file("/run/user/1000/st3.sock")
-    assert "can now use the profiles granted to them" in login("ada", f"{st} sekrets enable")
+    assert "can now use the profiles granted to them" in login("ada", f"{sk} enable")
     login(
         "ada",
-        f"{st} sekrets grant ada/agent-gh --to 'agent/fleet/fixture-example/**' --preset gh-pr --preset git-push --allow 'git status'",
+        f"{sk} grant ada/agent-gh --to 'agent/fleet/fixture-example/**' --preset gh-pr --preset git-push --allow 'git status'",
     )
 
     # A seat: a terminal in its own scope, tagged as st tags a seat's terminal, in a checkout
@@ -180,11 +185,11 @@ pkgs.testers.runNixOSTest {
         )
     )
     seat = (
-        f"{st} sekrets whoami; "
-        f"{st} sekrets -- gh pr create --draft --title Example; echo exit=$?; "
-        f"{st} sekrets -- gh auth status; echo exit=$?; "
-        f"{st} sekrets --profile ada/gh -- gh pr list; echo exit=$?; "
-        f"{st} sekrets -- git status --porcelain; echo exit=$?"
+        f"{sk} whoami; "
+        f"{sk} -- gh pr create --draft --title Example; echo exit=$?; "
+        f"{sk} -- gh auth status; echo exit=$?; "
+        f"{sk} --profile ada/gh -- gh pr list; echo exit=$?; "
+        f"{sk} -- git status --porcelain; echo exit=$?"
     )
     machine.succeed(
         "su ada -s /bin/sh -c "
@@ -213,22 +218,12 @@ pkgs.testers.runNixOSTest {
     assert out.count("exit=0") == 2, out
 
     # Every call, refusal and change is a claim on the profile, recorded by ada's daemon.
-    def history(subject):
-        return machine.succeed(
-            "su ada -s /bin/sh -c "
-            + shlex.quote(f"XDG_RUNTIME_DIR=/run/user/1000 {st} subject history {subject} --json")
-        )
-
-    def recorded(_):
-        # A call is a claim on its profile; a refusal before any profile fits is on the gateway.
-        calls = history("sekret/machine/ada/agent-gh")
-        refusals = history("sekret/machine")
-        return (
-            "sekret.called" in calls
-            and "agent/fleet/fixture-example/web" in calls
-            and "sekret.refused" in refusals
-        )
-
-    retry(recorded, timeout_seconds=120)
+    # Every call, its exit and every refusal is in the gateway's log, which ada reads; ada's
+    # daemon records them as local observations that age out and go to OpenTelemetry.
+    log = login("ada", f"{sk} log --limit 200")
+    print(log)
+    assert "call" in log and "agent/fleet/fixture-example/web" in log, log
+    assert "refused" in log and "no allow rule matches" in log, log
+    assert "example-token" not in log, log
   '';
 }

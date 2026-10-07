@@ -11,7 +11,7 @@ last one (see [Daily releases](#daily-releases)). Each release contains:
   source commit, target, Rust compiler version, and PTY runtime revision.
 
 Each archive has `bin/st3`, `bin/st` (a relative symlink to `st3`), `bin/stui`, `bin/st3-migrate`,
-and `bin/pty`, plus `install.sh`, `install-macos.py`, `BUILD.json`, and this guide. PTY is built from the exact
+`bin/sekrets` (the [sekrets](sekrets.md) gateway and command; opt-in), and `bin/pty`, plus `install.sh`, `install-macos.py`, `BUILD.json`, and this guide. PTY is built from the exact
 `flake.lock` runtime revision; this is distinct from the `pty-core` library dependency. These
 archives need neither Nix nor Rust installed. Harness CLIs and their logins remain separate.
 

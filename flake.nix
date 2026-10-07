@@ -378,10 +378,14 @@
             "st3-migrate"
             "-p"
             "stui"
+            "-p"
+            "sekrets"
           ];
           # `--no-fail-fast` reports every failing test target in one run.
           cargoTestFlags = [
             "--no-fail-fast"
+            "-p"
+            "sekrets"
             "-p"
             "smallclaims"
             "-p"
