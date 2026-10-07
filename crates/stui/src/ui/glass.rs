@@ -4016,6 +4016,15 @@ mod tests {
     }
 
     #[test]
+    fn the_footer_in_a_space_says_how_to_quit() {
+        // Nathan, 2026-10-07: "add to the bottom bar: ctrl+q to quit".
+        let ui = glass();
+        let shown = screen(&ui);
+        let footer = shown.lines().rev().find(|line| line.contains("Keys:")).unwrap_or_default();
+        assert!(footer.contains("ctrl+q quit"), "{shown}");
+    }
+
+    #[test]
     fn a_group_a_tab_was_dragged_out_of_still_shows_one_of_its_tabs() {
         // Nathan, 2026-10-04: after dragging a tab to a new place, the group with the other tabs
         // showed none of them.
