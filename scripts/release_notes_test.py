@@ -14,7 +14,7 @@ import unittest
 from unittest.mock import patch
 
 sys.dont_write_bytecode = True
-from release_notes import FIELDS, ImpactError, collect, render, validate
+from release_notes import FIELDS, ImpactError, check_pull_request, collect, render, validate
 
 ROOT = Path(__file__).resolve().parent.parent
 loader = importlib.machinery.SourceFileLoader('release_daily', str(ROOT / 'scripts/release-smalltalk-daily'))
@@ -82,6 +82,138 @@ class ReleaseNotes(unittest.TestCase):
         source = self.commit('Classified later change')
         with self.assertRaisesRegex(ImpactError, missing):
             render(self.repo, 'v0.3.0', source, 'v0.3.1')
+
+    def test_pr_requires_fresh_fragment_even_for_documentation(self):
+        self.write('guide.md', '# Documentation only\n')
+        source = self.commit('Docs without upgrade note')
+        with self.assertRaisesRegex(ImpactError, 'add a uniquely named'):
+            check_pull_request(self.repo, self.base, source)
+
+    def test_adoption_boundary_grandfathers_old_pr_but_not_publication(self):
+        self.write('guide.md', '# PR opened before adoption\n')
+        source = self.commit('Old documentation PR')
+        report = check_pull_request(self.repo, self.base, source, pr_number=1661)
+        self.assertEqual(report['exemptions'], {source: 1661})
+        with self.assertRaisesRegex(ImpactError, 'add a uniquely named'):
+            check_pull_request(self.repo, self.base, source, pr_number=1662)
+        with self.assertRaisesRegex(ImpactError, 'Missing upgrade classifications'):
+            collect(self.repo, self.base, source)
+        result = subprocess.run([sys.executable, str(ROOT / 'scripts/check-release-impact'),
+                                 '--repo', str(self.repo), '--base', self.base, '--source', source,
+                                 '--pr-number', '1661'], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Public release still requires complete classification', result.stdout)
+
+    def test_queue_adoption_boundary_is_per_member_not_head_ref(self):
+        self.git('checkout', '-qb', 'old')
+        self.write('old.rs', '// Old PR without a note\n')
+        self.commit('Old implementation')
+        self.git('checkout', '-q', '-')
+        self.git('merge', '--no-ff', '-qm', 'Merge pull request #1660 from example/old', 'old')
+        old = self.git('rev-parse', 'HEAD')
+        self.git('checkout', '-qb', 'new')
+        self.write('new.rs', '// New PR without a note\n')
+        self.commit('New implementation')
+        self.git('checkout', '-q', '-')
+        self.git('merge', '--no-ff', '-qm', 'Merge pull request #1662 from example/new', 'new')
+        # Even an older head ref cannot exempt the new member in a mixed group.
+        queue_ref = 'refs/heads/gh-readonly-queue/main/pr-1660-' + self.base
+        with self.assertRaisesRegex(ImpactError, 'add a uniquely named'):
+            check_pull_request(self.repo, self.base, 'HEAD', queue_ref=queue_ref)
+        self.git('reset', '--hard', old)
+        self.git('checkout', '-q', 'new')
+        self.add_fragment('new')
+        self.commit('New PR note')
+        self.git('checkout', '-q', '-')
+        self.git('merge', '--no-ff', '-qm', 'Merge pull request #1662 from example/new', 'new')
+        source = self.git('rev-parse', 'HEAD')
+        report = check_pull_request(self.repo, self.base, source, queue_ref=queue_ref)
+        self.assertEqual(report['exemptions'], {old: 1660})
+        self.assertEqual(list(report['coverage']), [source])
+
+    def test_queue_identity_is_required_and_single_pr_ref_is_supported(self):
+        self.write('old.rs', '// Old PR with custom merge subject\n')
+        source = self.commit('Custom merge subject')
+        queue_ref = 'refs/heads/gh-readonly-queue/main/pr-1660-' + self.base
+        self.assertEqual(check_pull_request(self.repo, self.base, source, queue_ref=queue_ref)['exemptions'], {source: 1660})
+        with self.assertRaisesRegex(ImpactError, 'cannot identify PR'):
+            check_pull_request(self.repo, self.base, source, queue_ref='unrecognized-ref')
+
+    def test_pr_does_not_inherit_unreleased_main_backlog(self):
+        self.write('older.rs', '// Unclassified main change\n')
+        base = self.commit('Older main change')
+        self.git('checkout', '-qb', 'feature')
+        self.write('feature.rs', '// Multi-commit PR\n')
+        self.commit('Feature implementation')
+        self.add_fragment('feature')
+        self.commit('Feature note')
+        self.git('checkout', '-q', '-')
+        self.git('merge', '--no-ff', '-qm', 'Effective PR merge', 'feature')
+        source = self.git('rev-parse', 'HEAD')
+        self.assertEqual(list(check_pull_request(self.repo, base, source)['coverage']), [source])
+        with self.assertRaisesRegex(ImpactError, base):
+            collect(self.repo, self.base, source)
+        result = subprocess.run([sys.executable, str(ROOT / 'scripts/check-release-impact'),
+                                 '--repo', str(self.repo), '--base', base, '--source', source],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(source, result.stdout)
+
+    def test_queue_requires_a_fragment_from_every_integrated_pr(self):
+        self.git('checkout', '-qb', 'one')
+        self.write('one.rs', '// No note\n')
+        self.commit('First implementation')
+        self.git('checkout', '-q', '-')
+        self.git('merge', '--no-ff', '-qm', 'Merge first PR', 'one')
+        missing = self.git('rev-parse', 'HEAD')
+        self.git('checkout', '-qb', 'two')
+        value = fragment()
+        value['commits'] = [missing]  # A later backfill cannot bypass PR authorship.
+        self.add_fragment('two', value)
+        self.commit('Second PR with historical backfill')
+        self.git('checkout', '-q', '-')
+        self.git('merge', '--no-ff', '-qm', 'Merge second PR', 'two')
+        with self.assertRaisesRegex(ImpactError, missing):
+            check_pull_request(self.repo, self.base, 'HEAD')
+
+    def test_pr_cannot_edit_delete_or_rename_existing_metadata(self):
+        self.add_fragment('published')
+        base = self.commit('Published note')
+        for operation in ('edit', 'delete', 'rename'):
+            self.git('reset', '--hard', base)
+            if operation == 'edit':
+                self.add_fragment('published', fragment('Changed old summary'))
+            elif operation == 'delete':
+                self.git('rm', 'release-notes/published.json')
+            else:
+                self.git('mv', 'release-notes/published.json', 'release-notes/renamed.json')
+            self.add_fragment('fresh')
+            source = self.commit(operation)
+            with self.assertRaisesRegex(ImpactError, 'existing fragments are immutable'):
+                check_pull_request(self.repo, base, source)
+
+    def test_pr_rejects_invalid_metadata_and_undeclared_version_change(self):
+        self.write('release-notes/bad.json', '{')
+        source = self.commit('Invalid fragment')
+        with self.assertRaisesRegex(ImpactError, 'invalid JSON'):
+            check_pull_request(self.repo, self.base, source)
+        self.git('reset', '--hard', self.base)
+        self.write('crates/st3/src/store/checkpoint_rules.rs', 'pub const RULES_VERSION: u32 = 11;')
+        self.add_fragment()
+        source = self.commit('Missing rules transition')
+        with self.assertRaisesRegex(ImpactError, 'rules version 10 -> 11'):
+            check_pull_request(self.repo, self.base, source)
+
+    def test_pr_accepts_explicit_unknown_and_matching_version_transitions(self):
+        self.write('crates/smallclaims/src/store.rs', 'pub const SCHEMA_VERSION: &str = "PRAGMA user_version = 17;";')
+        self.write('crates/st3/src/store/checkpoint_rules.rs', 'pub const RULES_VERSION: u32 = 11;')
+        value = fragment()
+        value['replay'] = {'status': 'unknown', 'detail': 'Replay on populated state has not been measured; wait for API readiness.'}
+        value['schema'] = {'status': 'changed', 'detail': 'Forward migration; preserve backup.', 'transitions': [[16, 17]]}
+        value['rules'] = {'status': 'changed', 'detail': 'Coordinate members.', 'transitions': [[10, 11]]}
+        self.add_fragment(value=value)
+        source = self.commit('Classified contract change')
+        self.assertEqual(len(check_pull_request(self.repo, self.base, source)['version_changes']), 2)
 
     def test_explicit_source_backfill_and_source_pinning(self):
         self.write('fix.rs', '// Direct fix\n')

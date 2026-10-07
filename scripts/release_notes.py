@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render source-pinned notes; incomplete impact metadata blocks publication only."""
+"""Validate and render source-pinned release upgrade-impact notes."""
 import argparse
 import json
 import math
@@ -23,6 +23,9 @@ VERSIONS = {
 }
 FRAGMENTS = 'release-notes/'
 SHA = re.compile(r'[0-9a-f]{40}')
+# PRs already open when #1661 introduced the check keep their prior merge policy.
+# They still need complete classification before a public release.
+PR_ADOPTION_BOUNDARY = 1661
 
 
 class ImpactError(ValueError):
@@ -155,6 +158,64 @@ def collect(repo, since, source):
         'fragments': [{'path': path, **fragments[path]} for path in selected],
         'versions': {field: [version(repo, since, field), version(repo, source, field)] for field in VERSIONS},
     }
+
+
+def check_pull_request(repo, base, source, pr_number=None, queue_ref=None):
+    """Check the effective merge tree, independently of the unreleased main backlog.
+
+    Each new first-parent PR merge in a queue group needs a fresh fragment. Existing
+    fragments are immutable; a later correction or backfill gets its own file.
+    No event identity means strict local validation without a rollout exemption.
+    """
+    base, source = resolve(repo, base), resolve(repo, source)
+    if subprocess.run(['git', 'merge-base', '--is-ancestor', base, source], cwd=repo).returncode:
+        raise ImpactError('PR/queue base must be an ancestor of the effective merge source')
+    changes = git(repo, 'diff', '--no-renames', '--name-status', base, source, '--', FRAGMENTS).splitlines()
+    for change in changes:
+        status, path = change.split('\t', 1)
+        if path.endswith('.json') and status != 'A':
+            raise ImpactError(f'{path}: existing fragments are immutable; add a new fragment for corrections')
+    commits = git(repo, 'rev-list', '--first-parent', '--reverse', f'{base}..{source}').splitlines()
+    if not commits:
+        raise ImpactError('no integrated change to classify')
+    queue_number = None
+    if queue_ref is not None:
+        match = re.fullmatch(r'(?:refs/heads/)?gh-readonly-queue/main/pr-(\d+)-[0-9a-f]{40}', queue_ref)
+        if not match:
+            raise ImpactError('cannot identify PR from merge-group head ref')
+        queue_number = int(match[1])
+    coverage, exemptions, version_changes = {}, {}, []
+    for commit in commits:
+        number = pr_number
+        if queue_number is not None:
+            subject = git(repo, 'show', '-s', '--format=%s', commit)
+            match = re.match(r'Merge pull request #(\d+) from ', subject)
+            # The ref identifies a single-PR group even with a custom merge message.
+            # For a multi-PR group, identify every member rather than exempting the
+            # whole group based on its head PR's number.
+            if match:
+                number = int(match[1])
+            elif len(commits) == 1:
+                number = queue_number
+            else:
+                raise ImpactError(f'{commit}: cannot identify a PR in the multi-PR merge group')
+        added = git(repo, 'diff', '--no-renames', '--name-only', '--diff-filter=A',
+                    f'{commit}^1', commit, '--', FRAGMENTS).splitlines()
+        fresh = [path for path in added if path.endswith('.json')]
+        exempt = number is not None and number <= PR_ADOPTION_BOUNDARY
+        if not fresh and not exempt:
+            raise ImpactError(f'{commit}: add a uniquely named release-notes/NAME.json for this PR, including docs-only changes')
+        if not fresh:
+            exemptions[commit] = number
+            continue
+        report = collect(repo, f'{commit}^1', commit)
+        coverage.update(report['coverage'])
+        version_changes.extend(report['version_changes'])
+    # Reuse the publication contract, including explicit statuses, measurements and
+    # declared schema/rules transitions. Old PRs without notes are exempt only from
+    # the PR gate; collect() for publication never receives or applies exemptions.
+    return {'previous_source': base, 'source': source, 'coverage': coverage,
+            'version_changes': version_changes, 'exemptions': exemptions}
 
 
 def render(repo, previous, source, tag, repository='compoundingtech/smalltalk', since=None):
