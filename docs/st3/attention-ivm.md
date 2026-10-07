@@ -75,3 +75,10 @@ registry: reads and maintenance remain unavailable until the shared installer ce
 a replacement lifetime. Their installation helper is
 test-only and cannot serve as production source certification. Full collection
 activation and deployed cost measurements remain separate required work.
+
+The installer must also capture late `run_generations`, `mission_run_deadlines` and
+`mission_run_after` rows used by the joined run header; the current operator triggers
+do not cover those tables. Deferred dirty sources need a continuation that can pass
+a fenced family's first page. These are certification requirements before activation.
+Legacy ASCII case variants in person assignments retain the full reader's SQL LIKE
+selection, while person row reads continue to require an exact recipient match.

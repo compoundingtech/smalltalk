@@ -731,3 +731,35 @@ fn checkpoint_trim_preserves_canonical_custom_episode_and_fences_indexed_reads()
     assert!(after.status.sequence > boundary.status.sequence);
     assert!(matches!(after.availability.readiness, Readiness::Fenced));
 }
+
+#[test]
+fn authored_person_assignee_matches_the_full_readers_ascii_sql_like() {
+    let (store, _, _) = person_work::tests::fixture();
+    // Sparse/legacy projected assignments can predate current input validation. Preserve
+    // the full reader's ASCII-insensitive SQL LIKE selection rather than dropping a card.
+    let registry = views(&store);
+    install(&store, &registry);
+    store
+        .connection
+        .write()
+        .execute(
+            "UPDATE step_runs SET assignee='PERSON/avery',status='ready' WHERE assignee='person/avery'",
+            [],
+        )
+        .unwrap();
+    maintain(&store, &registry);
+    let cards = parity(&store, &registry, PERSON_VIEW, "PERSON/avery", u128::MAX);
+    assert!(!cards.is_empty());
+    assert!(
+        window(
+            &store.readers.get(),
+            &registry,
+            PERSON_VIEW,
+            "person/avery",
+            u128::MAX,
+            501
+        )
+        .unwrap()
+        .is_empty()
+    );
+}

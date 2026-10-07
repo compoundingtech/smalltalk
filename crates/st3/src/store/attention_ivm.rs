@@ -73,7 +73,7 @@ impl View for Family {
     fn definition(&self) -> Definition {
         Definition {
             name: self.view(),
-            fingerprint: "projected-source.v1;canonical-person-fences.v1;custom-source.v1;u128-time.v1;public-row.v1",
+            fingerprint: "projected-source.v1;canonical-person-fences.v2.ascii-like;custom-source.v1;u128-time.v1;public-row.v1",
             kinds: &[],
             local_kinds: match self {
                 Self::Person => &[PERSON_CHANGE, PERSON_CLOCK],
@@ -241,11 +241,10 @@ fn person_row(
     let Some(step) = person_work::step(tx, source)? else {
         return Ok(None);
     };
-    if step
-        .assigned_to
-        .as_deref()
-        .is_none_or(|a| !a.starts_with("person/"))
-    {
+    if step.assigned_to.as_deref().is_none_or(|a| {
+        !a.get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("person/"))
+    }) {
         return Ok(None);
     }
     run_dependencies(tx, source, &step.run)?;
@@ -315,7 +314,7 @@ fn person_row(
 }
 
 /// Record the full liveness chain even when a parent is absent, so later restoration wakes
-/// this source. An unbounded or cyclic ancestry fences the family instead of omitting rows.
+/// this source. An ancestry exceeding the bound fences the family instead of omitting rows.
 fn run_dependencies(tx: &Transaction<'_>, source: &str, initial: &str) -> Result<()> {
     let mut pending = vec![initial.to_owned()];
     let mut seen = BTreeSet::new();

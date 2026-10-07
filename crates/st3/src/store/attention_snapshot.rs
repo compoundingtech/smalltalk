@@ -1031,7 +1031,10 @@ pub(super) fn person_attention_item(
         || view
             .assigned_to
             .as_deref()
-            .is_none_or(|a| !a.starts_with("person/"))
+            .is_none_or(|a| {
+                !a.get(..7)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("person/"))
+            })
     {
         return Ok(None);
     }
