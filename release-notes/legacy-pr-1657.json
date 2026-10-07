@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "summary": "#1657: stui pointer-hover highlighting",
+  "commits": [
+    "fa3b1ea86cb5ee02df10ce00da7bea75e174c449"
+  ],
+  "replay": {
+    "status": "none",
+    "detail": "Stui pointer-hover highlighting adds no startup replay trigger or projection invalidation."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No SQLite migration, table, index or trigger change in stui pointer-hover highlighting; schema version remains 16."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules remain 11; no changed digest policy or new sealing coordination requirement."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Stui adds hover paint for terminals that send motion events; motion does not activate actions or change focus. Native terminal programs retain their mouse-motion ownership. Terminals without motion retain their appearance. No API, claim or terminal-wire format requirement changes."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional service interruption or measured upgrade outage is introduced by stui pointer-hover highlighting; normal daemon/client restart procedures apply."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Existing installations need no configuration conversion or manual data repair for stui pointer-hover highlighting."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No additional recovery procedure is introduced. Preserve graph state, keys and configuration and follow roll-forward guidance; this fragment does not qualify binary-only rollback of the whole release."
+  }
+}
