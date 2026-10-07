@@ -23,6 +23,8 @@ use super::sandbox::{self, BoundDirectory, Sandbox};
 use super::store::{GatewayStore, Grant, Profile, now_unix_ms, person_name};
 
 pub const DEFAULT_CONFIG: &str = "/etc/st-sekrets/gateway.toml";
+/// How long the gateway keeps its own log: each daemon has recorded its entries long before.
+const LOG_KEEP_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 pub const DEFAULT_SOCKET: &str = "/run/st-sekrets/gateway.sock";
 pub const DEFAULT_STORE: &str = "/var/lib/st-sekrets";
 
@@ -301,6 +303,15 @@ impl Gateway {
 
     /// Serve each connection on its own thread until the listener fails.
     pub fn serve_listener(self: &Arc<Self>, listener: UnixListener) {
+        let trimmer = Arc::clone(self);
+        std::thread::spawn(move || {
+            loop {
+                if let Err(error) = trimmer.store().trim_log(LOG_KEEP_MS) {
+                    eprintln!("st sekrets: trim the log: {error:#}");
+                }
+                std::thread::sleep(Duration::from_secs(60 * 60));
+            }
+        });
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
             let gateway = Arc::clone(self);

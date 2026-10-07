@@ -6205,7 +6205,15 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()?;
         ids.into_iter()
             .map(|id| {
-                let view = mission_run_view_tx(&connection, &id)?;
+                // The legacy tree consumes step state, summaries and queue order, not
+                // each worker's wake, timing and harness presentation histories.
+                let mut view = mission_run_steps_view_tx(&connection, &id, true)?;
+                enrich_run_step_queues_tx(&connection, &mut view)?;
+                // Keep the run-level fields of the existing tree response.
+                view.provenance =
+                    crate::provenance::read(&connection, &view.mission, &view.revision)?;
+                view.loops = loop_run_views_tx(&connection, &view)?;
+                view.outcome = mission_run_outcome_tx(&connection, &view)?;
                 note_run_view_reads(&view);
                 Ok(view)
             })
@@ -29182,6 +29190,47 @@ fn enrich_step_definition(connection: &Connection, view: &mut StepRunView) -> ru
     Ok(())
 }
 
+/// Keep the tree's queue labels and order without work presentation enrichment.
+/// Read the current generation's pinned definition once for all of this run's steps.
+fn enrich_run_step_queues_tx(
+    connection: &Connection,
+    view: &mut MissionRunView,
+) -> rusqlite::Result<()> {
+    if view.steps.is_empty() {
+        return Ok(());
+    }
+    let body = connection
+        .query_row(
+            "SELECT mission_revisions.body
+             FROM run_generations
+             JOIN mission_runs ON mission_runs.id=run_generations.run_id
+             JOIN mission_revisions
+               ON mission_revisions.mission_id=mission_runs.mission_id
+              AND mission_revisions.revision=run_generations.revision
+             WHERE run_generations.id=?1",
+            [generation_id_from_subject(&view.generation)],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(body) = body else {
+        return Ok(());
+    };
+    let mission = serde_json::from_str::<MissionSpec>(&body).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            body.len(),
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })?;
+    for view in &mut view.steps {
+        if let Some(step) = crate::mission::find_step(&mission, &view.step) {
+            view.queue.clone_from(&step.queue);
+            view.queue_position = step.queue_position;
+        }
+    }
+    Ok(())
+}
+
 fn fresh_context_ready_tx(
     connection: &Connection,
     step: &StepRunView,
@@ -30559,10 +30608,9 @@ fn mission_run_view_for_projection_tx(
 }
 
 /// A run's header and each step's effective state, and with `summaries` each step's latest
-/// progress and completion summaries: what a mission detail and the missions tree show of a
-/// run. The work view's enrichment also folds every step's execution timing, reads the wake
-/// messages and harness history of its assignee and parses the mission for its queue, none of
-/// which those views show; `mission_run_view_tx` does that.
+/// progress and completion summaries. The legacy tree adds queue labels and positions with
+/// `enrich_run_step_queues_tx`. Full work presentation, including execution timing, wake
+/// messages and harness history, remains in `mission_run_view_tx`.
 fn mission_run_steps_view_tx(
     connection: &Connection,
     run_id: &str,
@@ -33277,6 +33325,232 @@ agent "test/empty" { command "true" }
             .next()
             .expect("published mission")
             .clone()
+    }
+
+    #[test]
+    fn mission_root_tree_preserves_state_and_summaries_without_work_enrichment() {
+        let store = Store::open_memory("node").unwrap();
+        publish_mission(
+            &store,
+            r#"version 2
+mission "summary-root" state="ready" {
+  goal "Preserve the complete descendant tree."
+  step "child" { agentless }
+  loop "rounds" {
+    max-rounds 1
+    round { completion { when "all-steps-exhausted" } }
+  }
+}
+mission "summary-child" state="ready" {
+  goal "Preserve effective states and summaries."
+  concurrent-runs max=2
+  queue "investigations" {
+    assigned-to "agent/tree/worker"
+    step "work" { }
+    step "after" { }
+  }
+}
+    "#,
+            "summary-missions",
+        );
+        let request = |mission: &str, key: &str| MissionRunRequest {
+            mission: mission.into(),
+            revision: None,
+            workspace: "/tmp".into(),
+            requester: Some("person/test".into()),
+            mode: Some("run".into()),
+            inputs: BTreeMap::new(),
+            idempotency_key: key.into(),
+        };
+        let root = store
+            .create_mission_run(&request("summary-root", "summary-root"))
+            .unwrap();
+        let root_step = &root
+            .steps
+            .iter()
+            .find(|step| step.step == "child")
+            .unwrap()
+            .subject;
+        let child = store
+            .create_child_mission_run(
+                &request("summary-child", "summary-child"),
+                &root,
+                root_step,
+                None,
+            )
+            .unwrap();
+        let work = &child
+            .steps
+            .iter()
+            .find(|step| step.step == "work")
+            .unwrap()
+            .subject;
+        let grandchild = store
+            .create_child_mission_run(
+                &request("summary-child", "summary-grandchild"),
+                &child,
+                work,
+                None,
+            )
+            .unwrap();
+        for (kind, summary) in [
+            ("work.progress", "selected progress"),
+            ("work.submitted", "selected completion"),
+        ] {
+            store
+                .append_claim(&ClaimInput {
+                    subject: work.clone(),
+                    kind: kind.into(),
+                    actor: Some("agent/tree/worker".into()),
+                    fields: BTreeMap::from([
+                        ("attempt".into(), Value::from(1)),
+                        ("summary".into(), Value::String(summary.into())),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+        // An expired lease must be interpreted, not copied as held work.
+        store
+            .connection
+            .write()
+            .execute(
+                "UPDATE step_runs SET status='working', lease_owner='agent/tree/worker',
+                 lease_incarnation='expired', lease_expires_at_unix_ms='0' WHERE subject=?1",
+                [work],
+            )
+            .unwrap();
+        store
+            .set_mission_run_state(&grandchild.id, "completed", "terminal", None)
+            .unwrap();
+        store
+            .append_claim(&ClaimInput {
+                subject: root.subject.clone(),
+                kind: "reconcile.fault".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    (
+                        "scope".into(),
+                        Value::String("scheduler/first-readiness".into()),
+                    ),
+                    ("status".into(), Value::String("faulted".into())),
+                    (
+                        "reason".into(),
+                        Value::String("preserved scheduler fault".into()),
+                    ),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let index = store.index().unwrap();
+        STEPS_ENRICHED.with(|enriched| enriched.set(0));
+        let tree = store.mission_runs_for_root(&root.subject).unwrap();
+        assert_eq!(STEPS_ENRICHED.with(std::cell::Cell::get), 0);
+        assert_eq!(store.index().unwrap(), index, "tree reads must remain pure");
+        assert_eq!(tree.len(), 3, "no descendants may be truncated");
+        assert_eq!(
+            tree.iter().map(|run| &run.subject).collect::<BTreeSet<_>>(),
+            BTreeSet::from([&root.subject, &child.subject, &grandchild.subject])
+        );
+        assert_eq!(
+            serde_json::to_value(store.mission_runs_for_root(&root.id).unwrap()).unwrap(),
+            serde_json::to_value(&tree).unwrap(),
+            "both root ID forms must work"
+        );
+        let root_view = tree.iter().find(|run| run.subject == root.subject).unwrap();
+        assert!(!root_view.loops.is_empty(), "loop fields must be preserved");
+        assert_eq!(
+            root_view.scheduler_fault.as_deref(),
+            Some("preserved scheduler fault")
+        );
+        let child_view = tree
+            .iter()
+            .find(|run| run.subject == child.subject)
+            .unwrap();
+        // Names sort opposite to queue positions: both fields must survive so the
+        // human tree can keep its labels and definition order.
+        for (name, position) in [("work", 1), ("after", 2)] {
+            let step = child_view
+                .steps
+                .iter()
+                .find(|step| step.step == name)
+                .unwrap();
+            assert_eq!(step.queue.as_deref(), Some("investigations"));
+            assert_eq!(step.queue_position, Some(position));
+        }
+        let step = child_view
+            .steps
+            .iter()
+            .find(|step| step.step == "work")
+            .unwrap();
+        assert_eq!(step.status, "ready");
+        assert!(step.claimant.is_none());
+        assert_eq!(step.progress_summary.as_deref(), Some("selected progress"));
+        assert_eq!(
+            step.completion_summary.as_deref(),
+            Some("selected completion")
+        );
+        // Compare the old reader's observable tree fields and ordering. Only
+        // work-presentation fields deliberately omitted by the summary reader differ.
+        let connection = store.readers.get();
+        let full = tree
+            .iter()
+            .map(|run| mission_run_view_tx(&connection, &run.id).unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            STEPS_ENRICHED.with(std::cell::Cell::get) > 0,
+            "old-reader negative control"
+        );
+        let tree_fields = |views: &[MissionRunView]| {
+            let mut value = serde_json::to_value(views).unwrap();
+            for run in value.as_array_mut().unwrap() {
+                for step in run["steps"].as_array_mut().unwrap() {
+                    for name in [
+                        "execution_started_at_unix_ms",
+                        "execution_elapsed_ms",
+                        "timeout_extension_ms",
+                        "timeout_ms",
+                        "wake",
+                        "ready_age_ms",
+                        "fresh_context",
+                        "person_answers",
+                        "under",
+                    ] {
+                        step.as_object_mut().unwrap().remove(name);
+                    }
+                }
+            }
+            value
+        };
+        assert_eq!(tree_fields(&tree), tree_fields(&full));
+
+        // Only a finished root accepts a user-set outcome. Exercise that separately
+        // after checking active descendants and their expired leases above.
+        store
+            .set_mission_run_state(&root.id, "completed", "terminal", None)
+            .unwrap();
+        store
+            .set_mission_run_outcome(
+                &root.id,
+                "failed",
+                "person/test",
+                "preserved outcome",
+                "summary-outcome",
+            )
+            .unwrap();
+        let index = store.index().unwrap();
+        let finished_tree = store.mission_runs_for_root(&root.id).unwrap();
+        assert_eq!(store.index().unwrap(), index);
+        let finished = finished_tree.iter().find(|run| run.id == root.id).unwrap();
+        assert_eq!(finished.outcome.as_ref().unwrap().reason, "preserved outcome");
+        assert_eq!(
+            finished.outcome,
+            store.mission_run(&root.id).unwrap().unwrap().outcome
+        );
     }
 
     #[test]
