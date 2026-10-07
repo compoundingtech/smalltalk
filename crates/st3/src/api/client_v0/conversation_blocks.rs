@@ -523,7 +523,8 @@ pub(super) fn prepare_one(
                     session_id,
                     &original,
                 );
-                let encoded = serde_json::to_vec(&block["payload"]).map_err(ApiError::internal)?;
+                let encoded =
+                    serde_json::to_vec(&block["payload"]).map_err(ApiError::internal)?;
                 if encoded.len() > VALUE_BYTES || original["_oversized_bytes"].is_number() {
                     block["continuation"] = continuation(
                         reference(source, basis, session_id, &original, &pointer),
@@ -537,22 +538,6 @@ pub(super) fn prepare_one(
                     );
                     bound(&mut block["payload"]);
                 }
-            }
-            if let Some(metadata) = block.get_mut("metadata")
-                && bound_open_value(metadata)
-                && block.get("continuation").is_none()
-            {
-                let pointer = format!("/body/blocks/{index}/metadata");
-                block["continuation"] = continuation(
-                    reference(source, basis, session_id, &original, &pointer),
-                    "application/json",
-                    Some(
-                        serde_json::to_vec(original.pointer(&pointer).expect("native metadata"))
-                            .map_err(ApiError::internal)?
-                            .len(),
-                    ),
-                    "size-limit",
-                );
             }
         }
     }
@@ -593,6 +578,36 @@ pub(super) fn prepare_one(
                     None => {
                         agent.remove("conversation");
                     }
+                }
+            }
+        }
+    }
+    // Keep open display objects (including assistant text/reasoning metadata)
+    // bounded on both full reads and keyset pages. If another subtree already
+    // needs a ref, fetch the whole original body so neither remainder is lost.
+    if let Some(blocks) = body.get_mut("blocks").and_then(Value::as_array_mut) {
+        for (index, block) in blocks.iter_mut().enumerate() {
+            for key in ["metadata", "view"] {
+                if let Some(value) = block.get_mut(key)
+                    && bound_open_value(value)
+                {
+                    let pointer = if block.get("continuation").is_some() {
+                        "/body".to_owned()
+                    } else {
+                        format!("/body/blocks/{index}/{key}")
+                    };
+                    block["continuation"] = continuation(
+                        reference(source, basis, session_id, &original, &pointer),
+                        "application/json",
+                        Some(
+                            serde_json::to_vec(
+                                original.pointer(&pointer).expect("native open value"),
+                            )
+                            .map_err(ApiError::internal)?
+                            .len(),
+                        ),
+                        "size-limit",
+                    );
                 }
             }
         }
@@ -1112,8 +1127,79 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_tool_metadata_fits_full_and_keyset_pages_and_socket_frames_and_fetches_exact_native_values()
-     {
+    async fn oversized_edit_view_and_assistant_metadata_fit_full_and_keyset_pages_and_fetch_exact_values() {
+        use std::io::Write as _;
+        let root = tempfile::tempdir().unwrap();
+        let diff = format!("@@ -1 +1 @@\n-{}\n+new\n", "é".repeat(CLIENT_MAX_RESPONSE_BYTES));
+        let native = fixture(
+            root.path(),
+            json!([{
+                "type":"toolResult", "call_id":"large-edit", "toolName":"edit",
+                "content":"patched", "details":{"path":"example.rs", "diff":diff}
+            }]),
+        );
+        let model = "m".repeat(CLIENT_MAX_RESPONSE_BYTES + 1);
+        let assistant = json!({
+            "type":"message", "id":"metadata-test", "timestamp":"2026-10-06T12:00:02Z",
+            "message":{"role":"assistant", "model":model, "provider":"example",
+                "content":[{"type":"text","text":"done"}]}
+        });
+        writeln!(
+            std::fs::OpenOptions::new().append(true).open(&native.transcript).unwrap(),
+            "{assistant}"
+        )
+        .unwrap();
+        let originals = crate::external_sessions::normalized_timeline(&native).unwrap();
+        let mut state = super::super::tests::test_state_named(root.path(), "view-owner");
+        state.native_session_home = Some(root.path().to_path_buf());
+        for negotiated in [true, false] {
+            let mut session = ClientSession::local(None).unwrap();
+            session.conversation_blocks = negotiated;
+            let full = read(&native, &session, &native.id).unwrap();
+            assert!(serde_json::to_vec(&full).unwrap().len() < CLIENT_MAX_RESPONSE_BYTES);
+            assert_native_keyset_pages_match_full_read(&state, &native, &session, &full);
+            let _: Vec<st3_client::TimelineEntry> =
+                serde_json::from_value(json!(full)).unwrap();
+            if !negotiated {
+                assert!(full.iter().all(|item| item["body"].get("blocks").is_none()));
+                continue;
+            }
+            for (key, field, exact) in [
+                ("view", "diff", &diff),
+                ("metadata", "model", &model),
+            ] {
+                let item = full
+                    .iter()
+                    .find(|item| item["body"]["blocks"][0][key][field].is_string())
+                    .unwrap();
+                let block = &item["body"]["blocks"][0];
+                assert!(block[key][field].as_str().unwrap().contains(
+                    "[st truncated this native timeline value: size limit;"
+                ));
+                if key == "view" {
+                    assert_eq!(block[key]["type"], "edit");
+                    assert_eq!(block[key]["path"], "example.rs");
+                } else {
+                    assert_eq!(block[key]["provider"], "example");
+                }
+                let token = block["continuation"]["ref"].as_str().unwrap();
+                let pointer = locator(token, &native.id).unwrap().pointer;
+                let original = originals.iter().find(|entry| entry["id"] == item["id"]).unwrap();
+                let fetched = fetch_json_chunks(&state, &native, token).await;
+                assert_eq!(fetched, *original.pointer(&pointer).unwrap());
+                let fetched_value = if pointer == "/body" {
+                    &fetched["blocks"][0][key]
+                } else {
+                    assert_eq!(pointer, format!("/body/blocks/0/{key}"));
+                    &fetched
+                };
+                assert_eq!(fetched_value[field].as_str().unwrap(), exact);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn open_tool_metadata_fits_full_and_keyset_pages_and_socket_frames_and_fetches_exact_native_values() {
         use futures_util::{SinkExt as _, StreamExt as _};
         let root = tempfile::tempdir().unwrap();
         let details = json!({
@@ -1153,9 +1239,10 @@ mod tests {
                 let token = block["continuation"]["ref"].as_str().unwrap();
                 assert_eq!(
                     locator(token, &native.id).unwrap().pointer,
-                    "/body/blocks/0/metadata"
+                    "/body"
                 );
-                assert_eq!(fetch_json_chunks(&state, &native, token).await, details);
+                let fetched = fetch_json_chunks(&state, &native, token).await;
+                assert_eq!(fetched["blocks"][0]["metadata"], details);
             } else {
                 assert!(item["body"].get("blocks").is_none());
                 let _: Vec<st3_client::TimelineEntry> =
@@ -1328,7 +1415,7 @@ mod tests {
 
     #[tokio::test]
     async fn pathological_metadata_replaces_only_its_entry_on_full_and_keyset_pages_and_preserves_owner_fetch()
-     {
+    {
         use axum::body::{Body, to_bytes};
         use axum::http::Request;
         use tower::ServiceExt as _;
