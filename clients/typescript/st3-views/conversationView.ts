@@ -87,6 +87,12 @@ const BOOKKEEPING_RECORDS = [
   'event_msg', 'token_usage_record', 'turn_context', 'world_state',
 ];
 
+// A record Claude writes about its own session, in kinds that keep appearing (instructions, session
+// context, prompt snapshots, deferred tools, hook summaries): an attachment, system record or entry
+// no renderer knows by name. Claude's own screen shows none as conversation, so they are
+// bookkeeping as a class (as in st3-conversation-ui).
+const claudeContextRecord = (text: string) => /^\[unrecognized claude (attachment|system|entry) `/.test(text);
+
 // A reasoning step whose text the model did not share is bookkeeping too.
 function isBookkeeping(entry: Entry, filters: readonly DisplayFilter[]): boolean {
   if (!filters.includes('bookkeeping') || entry.type !== 'content') return false;
@@ -94,7 +100,7 @@ function isBookkeeping(entry: Entry, filters: readonly DisplayFilter[]): boolean
   const shown = (Array.isArray(body.blocks) ? body.blocks : []).map(record).filter(block => !['internal', 'hidden-by-harness'].includes(str(block.visibility) ?? ''));
   if (!shown.length) return false;
   if (entry.role === 'assistant') return shown.every(block => block.kind === 'reasoning' && !(str(record(block.payload).text) ?? '').trim());
-  if (entry.role === 'system') return shown.every(block => block.kind === 'unknown' && BOOKKEEPING_RECORDS.includes(str(block.source_type) ?? ''));
+  if (entry.role === 'system') return shown.every(block => block.kind === 'unknown' && (BOOKKEEPING_RECORDS.includes(str(block.source_type) ?? '') || claudeContextRecord(str(body.text) ?? '')));
   return false;
 }
 

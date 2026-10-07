@@ -561,6 +561,17 @@ const BOOKKEEPING_RECORDS: &[&str] = &[
     "world_state",
 ];
 
+/// A record Claude writes about its own session, in kinds that keep appearing (instructions,
+/// session context, prompt snapshots, deferred tools, credential organisation, hook summaries):
+/// an attachment, a system record or a transcript entry that no renderer knows by name. Claude's
+/// own screen shows none of them as conversation, so they are bookkeeping as a class, not one
+/// name at a time.
+fn claude_context_record(text: &str) -> bool {
+    ["attachment", "system", "entry"]
+        .iter()
+        .any(|kind| text.starts_with(&format!("[unrecognized claude {kind} `")))
+}
+
 fn is_bookkeeping(entry: &TimelineEntry, filters: &[crate::DisplayFilter]) -> bool {
     let TimelineBody::Content(content) = &entry.body else {
         return false;
@@ -588,7 +599,8 @@ fn is_bookkeeping(entry: &TimelineEntry, filters: &[crate::DisplayFilter]) -> bo
             shown.clone().next().is_some()
                 && shown.into_iter().all(|block| {
                     block.kind == "unknown"
-                        && BOOKKEEPING_RECORDS.contains(&block.source_type.as_str())
+                        && (BOOKKEEPING_RECORDS.contains(&block.source_type.as_str())
+                            || claude_context_record(content.text.as_deref().unwrap_or("")))
                 })
         }
         _ => false,
