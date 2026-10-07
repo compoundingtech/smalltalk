@@ -1417,6 +1417,7 @@ fn typed_content(content: &st3_client::TimelineContentBody) -> Option<Vec<Body>>
             delivered: true,
             dictated: false,
             images: Vec::new(),
+            signed: None,
         }]),
         "job" => Some(
             view.get("jobs")
