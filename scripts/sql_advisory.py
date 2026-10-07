@@ -14,8 +14,14 @@ N+1 detectors, per route, from the larger store's numbers:
   n-plus-one-growth   statements grew by more than 1.5x (plus a slack of 10) from the smaller to
                       the larger store while the answer returned more items. Statements should
                       not grow with the number of items.
-  n-plus-one-repeat   one statement text ran at least 20 times and at least once per returned
-                      item.
+  n-plus-one-repeat   one statement text ran at least 20 times and either at least once per
+                      item of the answer's largest unit, or between one and five times per item
+                      of any smaller unit of five or more (a lookup per run in an answer that
+                      also lists a thousand steps). Units are the lengths of the answer's lists
+                      of objects and the steps nested in them.
+
+Only a route that was measured at both scales without an error is judged. A budget entry for a
+route that failed or was not measured is kept and reported as not judged, never as fixed.
 """
 import argparse
 import json
@@ -27,13 +33,39 @@ SLACK = 10
 REPEAT_FLOOR = 20
 
 
+def judged_routes(report):
+    """The routes measured at both scales without an error, and the ones that failed."""
+    small, large = report.get("small", {}), report.get("large", {})
+    judged, failed = set(), {}
+    for route, after in large.items():
+        before = small.get(route)
+        error = after.get("error") or (before or {}).get("error")
+        if before is None:
+            continue
+        if error:
+            failed[route] = str(error)
+        else:
+            judged.add(route)
+    return judged, failed
+
+
+def repeats_per_item(repeat, units):
+    """Whether a statement text ran like a loop over the answer: as often as the largest unit, or
+    once to five times per item of a smaller unit."""
+    if repeat < REPEAT_FLOOR:
+        return False
+    units = units or [1]
+    return repeat >= max(units) or any(u >= 5 and u <= repeat <= 5 * u for u in units)
+
+
 def findings(report):
     """Every detector hit in a cost report, as dicts with the value to compare to a ceiling."""
     found = []
     small, large = report.get("small", {}), report.get("large", {})
+    judged, _ = judged_routes(report)
     for route, after in sorted(large.items()):
         before = small.get(route)
-        if before is None or after.get("error") or before.get("error"):
+        if route not in judged:
             continue
         items_before, items_after = before.get("items", 1), after.get("items", 1)
         statements_before, statements_after = before["statements"], after["statements"]
@@ -50,22 +82,24 @@ def findings(report):
                 }
             )
         repeat, items = after.get("max_repeat", 0), max(after.get("items", 1), 1)
-        if repeat >= REPEAT_FLOOR and repeat >= items:
+        units = after.get("item_units") or [items]
+        if repeats_per_item(repeat, units):
             shape = (after.get("top_shape") or "").replace("\n", " ")
             found.append(
                 {
                     "route": route,
                     "detector": "n-plus-one-repeat",
                     "value": repeat,
-                    "detail": f"one statement ran {repeat} times for {items} items: {shape[:110]}",
+                    "detail": f"one statement ran {repeat} times for {'/'.join(str(u) for u in units)} items: {shape[:110]}",
                 }
             )
     return found
 
 
-def classify(found, budget):
-    """Mark each finding new, known (within its budgeted ceiling) or worse (over it), and list
-    budget entries that no longer fire."""
+def classify(found, budget, judged=None):
+    """Mark each finding new, known (within its budgeted ceiling) or worse (over it). Returns the
+    findings, the budget entries that no longer fire on a route that was judged, and the entries
+    whose route was not judged this run. With no `judged` set every route counts as judged."""
     entries = {(e["route"], e["detector"]): e for e in budget.get("entries", [])}
     seen = set()
     for finding in found:
@@ -82,14 +116,21 @@ def classify(found, budget):
             finding["status"] = "known"
             finding["ceiling"] = entry["ceiling"]
             finding["owner"] = entry.get("owner", "")
-    stale = [entry for key, entry in entries.items() if key not in seen]
-    return found, stale
+    stale, unjudged = [], []
+    for key, entry in entries.items():
+        if key in seen:
+            continue
+        if judged is None or entry["route"] in judged:
+            stale.append(entry)
+        else:
+            unjudged.append(entry)
+    return found, stale, unjudged
 
 
 ORDER = {"new": 0, "worse": 1, "known": 2}
 
 
-def render(found, stale):
+def render(found, stale, unjudged=(), failed=None):
     lines = ["## Advisory SQL report", "", "Advisory only: this report never blocks a merge.", ""]
     fresh = [f for f in found if f["status"] in ("new", "worse")]
     known = [f for f in found if f["status"] == "known"]
@@ -109,6 +150,16 @@ def render(found, stale):
         for entry in stale:
             lines.append(f"- `{entry['route']}` {entry['detector']}: {entry.get('reason', '')}")
         lines.append("")
+    if failed:
+        lines.append("Routes that failed or were not measured, so not judged (their budget entries stay):")
+        for route, error in sorted(failed.items()):
+            lines.append(f"- `{route}`: {error[:120]}")
+        lines.append("")
+    if unjudged:
+        lines.append("Budget entries whose route was not judged this run, kept, not fixed:")
+        for entry in unjudged:
+            lines.append(f"- `{entry['route']}` {entry['detector']}")
+        lines.append("")
     return "\n".join(lines)
 
 
@@ -121,8 +172,9 @@ def main(argv=None):
     try:
         report = json.load(open(args.report))
         budget = json.load(open(args.budget)) if os.path.exists(args.budget) else {}
-        found, stale = classify(findings(report), budget)
-        text = render(found, stale)
+        judged, failed = judged_routes(report)
+        found, stale, unjudged = classify(findings(report), budget, judged)
+        text = render(found, stale, unjudged, failed)
     except Exception as error:  # Advisory: a broken report must not break the build.
         text = f"## Advisory SQL report\n\nThe report could not be built: {error}\n"
     print(text)
