@@ -30916,6 +30916,34 @@ fn step_generation_is_current(
 }
 
 #[cfg(test)]
+pub(crate) fn expire_work_lease_by_claim(store: &Store, subject: &str, actor: &str, incarnation: &str) {
+    let current = store.step_run(subject).unwrap().unwrap();
+    let mut connection = store.connection.lock().unwrap();
+    let transaction = connection.transaction().unwrap();
+    let claim = append_claim_tx(
+        &transaction,
+        &store.origin,
+        subject,
+        "work.renewed",
+        Some(actor),
+        &json!({"fields": {
+            "attempt": current.attempt,
+            "status": current.status,
+            "worker_reported": current.worker_reported,
+            "claimant": actor,
+            "claim_incarnation": incarnation,
+            "claim_expires_at_unix_ms": 0,
+            "readiness_epoch": current.readiness_epoch,
+        }}),
+        &[],
+        None,
+    )
+    .unwrap();
+    project_mission_run_update(&transaction, &claim).unwrap();
+    transaction.commit().unwrap();
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::graph::parse_test_intent as parse_intent;
@@ -33047,30 +33075,7 @@ agent "test/empty" { command "true" }
     }
 
     fn expire_work_lease_by_claim(store: &Store, subject: &str, actor: &str, incarnation: &str) {
-        let current = store.step_run(subject).unwrap().unwrap();
-        let mut connection = store.connection.lock().unwrap();
-        let transaction = connection.transaction().unwrap();
-        let claim = append_claim_tx(
-            &transaction,
-            &store.origin,
-            subject,
-            "work.renewed",
-            Some(actor),
-            &json!({"fields": {
-                "attempt": current.attempt,
-                "status": current.status,
-                "worker_reported": current.worker_reported,
-                "claimant": actor,
-                "claim_incarnation": incarnation,
-                "claim_expires_at_unix_ms": 0,
-                "readiness_epoch": current.readiness_epoch,
-            }}),
-            &[],
-            None,
-        )
-        .unwrap();
-        project_mission_run_update(&transaction, &claim).unwrap();
-        transaction.commit().unwrap();
+        super::expire_work_lease_by_claim(store, subject, actor, incarnation);
     }
 
     fn simple(command: &str) -> NormalizedIntent {

@@ -36105,38 +36105,27 @@ mission "gated" state="ready" {
         let subject = SeatQueueFixture::step(&run, "work");
         let old = seat.store.step_run(&subject).unwrap().unwrap();
         let wake = seat.store.messages(Some(SEAT), false).unwrap().remove(0);
-        seat.store
-            .append_claim(&ClaimInput {
-                subject: wake.subject,
-                kind: "message.closed".into(),
-                actor: Some(SEAT.into()),
-                fields: BTreeMap::from([("status".into(), Value::String("closed".into()))]),
-                evidence: Vec::new(),
-                expected_subject: None,
-                idempotency_key: Some("expired-consumed-wake-close".into()),
-            })
-            .unwrap();
+        for (kind, status) in [
+            ("message.delivered", "delivered"),
+            ("message.read", "read"),
+            ("message.closed", "closed"),
+        ] {
+            seat.store
+                .append_claim(&ClaimInput {
+                    subject: wake.subject.clone(),
+                    kind: kind.into(),
+                    actor: Some(SEAT.into()),
+                    fields: BTreeMap::from([("status".into(), Value::String(status.into()))]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("expired-consumed-wake-{status}")),
+                })
+                .unwrap();
+        }
         seat.work(&subject, "claim", "expiry-first-claim").unwrap();
-        // A replicated expired renewal is a real work record, not a fabricated
-        // ready view. The harness stays seat-one throughout recovery.
-        seat.store
-            .append_claim(&ClaimInput {
-                subject: subject.clone(),
-                kind: "work.renewed".into(),
-                actor: Some(SEAT.into()),
-                fields: BTreeMap::from([
-                    ("status".into(), Value::String("working".into())),
-                    ("attempt".into(), Value::from(old.attempt)),
-                    ("readiness_epoch".into(), Value::from(old.readiness_epoch)),
-                    ("claimant".into(), Value::String(SEAT.into())),
-                    ("claim_incarnation".into(), Value::String("seat-one".into())),
-                    ("claim_expires_at_unix_ms".into(), Value::from(0)),
-                ]),
-                evidence: Vec::new(),
-                expected_subject: None,
-                idempotency_key: Some("expiry-renewal".into()),
-            })
-            .unwrap();
+        // Reuse the Store's canonical expired-renewal fixture: a normal append
+        // re-applies the local live lease overlay, so it cannot model expiry.
+        crate::store::expire_work_lease_by_claim(&seat.store, &subject, SEAT, "seat-one");
         let ready = seat.store.step_run(&subject).unwrap().unwrap();
         assert_eq!(ready.status, "ready");
         assert_eq!(ready.readiness_epoch, old.readiness_epoch + 1);
@@ -36204,17 +36193,23 @@ mission "gated" state="ready" {
         let run = seat.start("queued", "idle-unclaimed-run");
         let subject = SeatQueueFixture::step(&run, "work");
         let wake = seat.store.messages(Some(SEAT), false).unwrap().remove(0);
-        seat.store
-            .append_claim(&ClaimInput {
-                subject: wake.subject.clone(),
-                kind: "message.closed".into(),
-                actor: Some(SEAT.into()),
-                fields: BTreeMap::from([("status".into(), Value::String("closed".into()))]),
-                evidence: Vec::new(),
-                expected_subject: None,
-                idempotency_key: Some("idle-unclaimed-close".into()),
-            })
-            .unwrap();
+        for (kind, status) in [
+            ("message.delivered", "delivered"),
+            ("message.read", "read"),
+            ("message.closed", "closed"),
+        ] {
+            seat.store
+                .append_claim(&ClaimInput {
+                    subject: wake.subject.clone(),
+                    kind: kind.into(),
+                    actor: Some(SEAT.into()),
+                    fields: BTreeMap::from([("status".into(), Value::String(status.into()))]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("idle-unclaimed-{status}")),
+                })
+                .unwrap();
+        }
         // Age only this isolated fixture's wake. No wall-clock sleep is needed
         // to exercise the actual reconciliation and diagnostic path.
         let sent = seat
