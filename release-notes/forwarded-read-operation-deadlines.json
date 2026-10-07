@@ -15,7 +15,7 @@
   },
   "compatibility": {
     "status": "changed",
-    "detail": "Forwarded read envelopes use15s including body/queue/relay/response work, plus only the supported operation long-poll wait (capped10s), rather than120s bulk. Timeout drops the blocking handler-owned relay future and returns typed504/read-deadline through gateways. Terminal actions keep mutation acknowledgement semantics; public30s long-poll and120s bulk/doctor budgets remain."
+    "detail": "Forwarded read envelopes use15s including body/queue/relay/response work, plus only the supported operation long-poll wait (capped10s), rather than120s bulk. Timeout drops the blocking handler-owned relay future and returns typed504/read-deadline through gateways. Terminal actions keep mutation acknowledgement semantics; public30s long-poll and120s bulk/doctor budgets remain. Each forwarded query keeps its separate15s child budget; body timeouts log bounded route/phase/callsite. Cancellation still needs cooperative checks inside synchronous CPU/SQLite/IO granules; an async timer does not preempt those granules."
   },
   "downtime": {
     "status": "unknown",

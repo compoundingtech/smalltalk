@@ -15282,7 +15282,9 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
     #[test]
     fn an_owner_read_deadline_keeps_its_typed_gateway_timeout() {
         let rejected = crate::peer::ClientReadRejected::new(
-            "read-deadline", StatusCode::GATEWAY_TIMEOUT, "the owner read exceeded its budget",
+            "read-deadline",
+            StatusCode::GATEWAY_TIMEOUT,
+            "the owner read exceeded its budget",
         );
         let error = remote_read_error("host/owner", rejected.into());
         assert_eq!(error.status, StatusCode::GATEWAY_TIMEOUT);

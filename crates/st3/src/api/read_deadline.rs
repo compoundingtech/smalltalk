@@ -111,7 +111,8 @@ fn deadline(request: &Request<Body>) -> Option<Duration> {
 }
 
 fn long_poll_route(route: &str) -> bool {
-    route == "/v1/events"
+    route == crate::peer::CLIENT_READ_FORWARD_PATH
+        || route == "/v1/events"
         || route == "/v1/events/page"
         || route == "/v1/client/events"
         || (route.starts_with("/v1/client/conversations/") && route.ends_with("/changes"))
@@ -178,6 +179,17 @@ fn timeout_response(state: &AppState, path: &str) -> Response {
     (StatusCode::GATEWAY_TIMEOUT, Json(value)).into_response()
 }
 
+#[track_caller]
+fn body_timeout_response(state: &AppState) -> Response {
+    // Static route and phase only: never include the forwarded JSON or credentials.
+    eprintln!(
+        "st3: read cancelled route={:?} phase=request-body callsite={} deadline_elapsed=true",
+        crate::peer::CLIENT_READ_FORWARD_PATH,
+        std::panic::Location::caller(),
+    );
+    timeout_response(state, crate::peer::CLIENT_READ_FORWARD_PATH)
+}
+
 pub(super) async fn envelope(
     state: (AppState, ClientTransportBoundary),
     mut request: Request<Body>,
@@ -205,7 +217,7 @@ pub(super) async fn envelope(
                 };
                 return status.into_response();
             }
-            Err(_) => return timeout_response(&state.0, parts.uri.path()),
+            Err(_) => return body_timeout_response(&state.0),
         };
         if let Ok(forwarded) = serde_json::from_slice::<crate::peer::ClientReadRequest>(&bytes) {
             duration = forwarded_deadline(&forwarded.request);
@@ -500,6 +512,71 @@ mod tests {
             deadline(&request(Method::POST, "/v1/internal/replication/heal/next")),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn forwarded_long_poll_queries_cannot_spend_the_envelopes_wait_budget() {
+        let parent = ReadBudget::new(
+            crate::peer::CLIENT_READ_FORWARD_PATH,
+            ORDINARY + Duration::from_secs(10),
+        );
+        let work = read_budget::with(Some(parent.clone()), || {
+            spawn_blocking(|| read_budget::current().unwrap().remaining())
+        });
+        assert!(work.await.unwrap() <= ORDINARY);
+        assert!(parent.remaining() > ORDINARY);
+        assert!(!parent.expired());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forwarded_long_poll_keeps_its_allowed_wait_in_the_envelope() {
+        use axum::{Router, middleware::from_fn_with_state, routing::post};
+        use tower::ServiceExt;
+        let root = tempfile::tempdir().unwrap();
+        let state = super::super::tests::state(root.path());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let signals = Arc::new(std::sync::Mutex::new(Some((started_tx, finish_rx))));
+        let app = Router::new()
+            .route(
+                crate::peer::CLIENT_READ_FORWARD_PATH,
+                post(move || {
+                    let signals = signals.clone();
+                    async move {
+                        let (started, finish) = signals.lock().unwrap().take().unwrap();
+                        let _ = started.send(());
+                        finish.await.unwrap();
+                        Json(json!({"items": []}))
+                    }
+                }),
+            )
+            .layer(from_fn_with_state(
+                (state, ClientTransportBoundary::Unix),
+                super::super::response_envelope,
+            ));
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(crate::peer::CLIENT_READ_FORWARD_PATH)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&crate::peer::ClientReadRequest {
+                    authority_actor: "person/invented".into(),
+                    relay: None,
+                    request: crate::peer::ClientReadOperation::ConversationChanges {
+                        session_id: "invented".into(),
+                        after: None,
+                        wait_ms: 10_000,
+                    },
+                })
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = tokio::spawn(app.oneshot(request));
+        started_rx.await.unwrap();
+        tokio::time::advance(ORDINARY + Duration::from_secs(1)).await;
+        assert!(!response.is_finished());
+        finish_tx.send(()).unwrap();
+        assert_eq!(response.await.unwrap().unwrap().status(), StatusCode::OK);
     }
 
     #[tokio::test(start_paused = true)]
