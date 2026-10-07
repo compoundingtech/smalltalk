@@ -1,45 +1,15 @@
-# Generated file - DO NOT EDIT
-# Source: perf.yml.genie.ts
-
-name: Performance
+# Ephemeral diagnostic branch; not a product workflow change.
+name: Performance controlled comparison
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - crates/smallclaims/**
-      - crates/st3/src/**
-      - crates/st3/tests/daemon_*.rs
-      - crates/st3/tests/perf_load.rs
-      - crates/st3/Cargo.toml
-      - Cargo.toml
-      - Cargo.lock
-      - .cargo/config.toml
-      - flake.nix
-      - flake.lock
-      - docs/st3/schema.md
-      - scripts/ci-perf*
-      - scripts/ci-nix-cache
-      - .github/workflows/perf.yml
-  schedule:
-    - cron: 23 2 * * *
-  pull_request:
-    paths:
-      - crates/smallclaims/**
-      - crates/st3/src/**
-      - crates/st3/tests/daemon_*.rs
-      - crates/st3/tests/perf_load.rs
-      - crates/st3/Cargo.toml
-      - Cargo.toml
-      - Cargo.lock
-      - .cargo/config.toml
-      - flake.nix
-      - flake.lock
-      - docs/st3/schema.md
-      - scripts/ci-perf*
-      - scripts/ci-nix-cache
-      - .github/workflows/perf.yml
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        required: true
+        type: choice
+        options:
+          - 705e2333ec6078589445438cf8d77fe3a1568c72
+          - 58358162bbad1781c7e5111eacc57749d59a0915
 
 permissions:
   contents: read
@@ -47,8 +17,8 @@ permissions:
   pull-requests: read
 
 concurrency:
-  group: "perf-${{ github.event.pull_request.number || (github.event_name == 'push' && github.ref == 'refs/heads/main' && 'main') || github.run_id }}"
-  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
+  group: speed-controlled-performance-pair
+  cancel-in-progress: false
 
 jobs:
   perf-load:
@@ -70,8 +40,20 @@ jobs:
       PERF_PR_NUMBER: ${{ github.event.pull_request.number }}
       PERF_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
     steps:
+      - name: Start the whole-job diagnostic clock
+        run: printf 'PERF_DIAGNOSTIC_WHOLE_START=%s\n' "$(date +%s)" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
         with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Preserve the controller outside the clean benchmark checkout
+        run: |
+          cp scripts/ci-perf-diagnostic.py "$RUNNER_TEMP/ci-perf-diagnostic.py"
+          sha256sum "$RUNNER_TEMP/ci-perf-diagnostic.py"
+      - name: Check out the frozen benchmark source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha }}
           fetch-depth: 0
           persist-credentials: false
       - name: Name compatible snapshot recipes
@@ -107,37 +89,11 @@ jobs:
         run: if [ ! -s "$RUNNER_TEMP/st-bench/generated-1.sqlite3" ]; then sudo mount -o remount,size=10G /dev/shm; fi
       - name: Run the release load test
         shell: bash
-        run: "nix develop '.#perf' -c bash scripts/ci-perf load"
+        env:
+          PERF_DIAGNOSTIC_SOURCE: ${{ inputs.source_sha }}
+          PERF_DIAGNOSTIC_CONTROLLER_SHA256: 3b1a22d87f83e6318d392dfe091924d69eccfa101278f83e1ce3762b559db302
+        run: nix develop '.#perf' -c python3 "$RUNNER_TEMP/ci-perf-diagnostic.py"
         id: load
-      - id: cache
-        name: Save build and Nix snapshots
-        if: "!cancelled() && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main') && (steps.load.outcome == 'success' || steps.load.outcome == 'failure')"
-        run: |
-          if ! python3 scripts/ci-perf-cache check-report; then exit 0; fi
-          nix print-dev-env .#perf --profile "$RUNNER_TEMP/perf-shell" > /dev/null
-          nix develop .#perf -c env TMPDIR="$RUNNER_TEMP" sccache --show-stats
-          CI_PERF_SHELL_ROOT="$RUNNER_TEMP/perf-shell" bash scripts/ci-nix-cache save
-          python3 scripts/ci-perf-cache pack
-      - name: Retain the build and Nix cache
-        if: "!cancelled() && steps.cache.outcome == 'success' && steps.cache.outputs.publish == 'true'"
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.PERF_BUILD_SNAPSHOT }}
-          path: "${{ runner.temp }}/perf-snapshots/build.tar.zst"
-          compression-level: 0
-          retention-days: 7
-          if-no-files-found: error
-          overwrite: true
-      - name: Retain the generated stores
-        if: "!cancelled() && steps.cache.outcome == 'success' && steps.cache.outputs.publish == 'true'"
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.PERF_STORES_SNAPSHOT }}
-          path: "${{ runner.temp }}/perf-snapshots/stores.tar.zst"
-          compression-level: 0
-          retention-days: 7
-          if-no-files-found: error
-          overwrite: true
       - name: Retain the load report, log and timing
         uses: actions/upload-artifact@v4
         if: always()
