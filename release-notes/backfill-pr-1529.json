@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "summary": "#1529: agent-list build coalescing and idle WAL recycling",
+  "commits": ["35651d6e16579911fbd654ad5728412170d9c7fb"],
+  "replay": {"status": "none", "detail": "No new projection invalidation or startup replay trigger in the merged agent-list build coalescing and idle WAL recycling change."},
+  "schema": {"status": "none", "detail": "No database table, index, trigger or migration change in agent-list build coalescing and idle WAL recycling; SQLite user_version is unchanged."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digest/drop policy are unchanged; this change adds no sealing coordination requirement."},
+  "compatibility": {"status": "none", "detail": "Agent-list build coalescing and idle wal recycling changes internal execution or build behavior without a new external API/claim version requirement."},
+  "downtime": {"status": "none", "detail": "No additional upgrade service stop or measured outage introduced by agent-list build coalescing and idle WAL recycling; the standard daemon/client restart procedure still applies."},
+  "manual": {"status": "none", "detail": "No data repair or configuration conversion required for existing installations by agent-list build coalescing and idle WAL recycling."},
+  "recovery": {"status": "none", "detail": "No additional recovery procedure introduced by this change. Preserve graph state, keys and configuration and follow the standard roll-forward guidance; this note does not qualify binary-only downgrade of the whole release."}
+}

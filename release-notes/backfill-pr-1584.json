@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "summary": "#1584: observer completion lock and revision fencing",
+  "commits": ["ed6d638f8b0378960c0c7cda1c28e7a1e0f67ae2"],
+  "replay": {"status": "none", "detail": "No new projection invalidation or startup replay trigger in the merged observer completion lock and revision fencing change."},
+  "schema": {"status": "none", "detail": "No database table, index, trigger or migration change in observer completion lock and revision fencing; SQLite user_version is unchanged."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digest/drop policy are unchanged; this change adds no sealing coordination requirement."},
+  "compatibility": {"status": "none", "detail": "Observer completion lock and revision fencing changes internal execution or build behavior without a new external API/claim version requirement."},
+  "downtime": {"status": "none", "detail": "No additional upgrade service stop or measured outage introduced by observer completion lock and revision fencing; the standard daemon/client restart procedure still applies."},
+  "manual": {"status": "none", "detail": "No data repair or configuration conversion required for existing installations by observer completion lock and revision fencing."},
+  "recovery": {"status": "none", "detail": "No additional recovery procedure introduced by this change. Preserve graph state, keys and configuration and follow the standard roll-forward guidance; this note does not qualify binary-only downgrade of the whole release."}
+}

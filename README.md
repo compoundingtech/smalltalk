@@ -19,9 +19,10 @@ Platforms/status: Linux x86_64 and macOS Apple Silicon; fresh-Mac setup is not y
 - [Talking to agents](docs/talking-to-agents.md): UI, phone, CLI, attachments, and human requests.
 - [Build and run the iOS app](docs/ios-app.md): local simulator and iPhone builds, then pairing.
 - [Seat lifecycle](docs/seat-lifecycle.md): create, restart, suspend, and import seats.
+- [0.x compatibility](docs/st3/compatibility.md): upgrade baselines, client/harness boundaries and platform proof.
 - [Upgrading st](docs/upgrading-st.md): install the same build everywhere and check recovery.
 - [GitHub integration](docs/github-integration.md): repository intake, review, triage, and landing work.
-- [When something is wrong](docs/when-something-is-wrong.md): health, work, usage, and stop reasons.
+- [When something is wrong](docs/when-something-is-wrong.md): startup, install/upgrade diagnosis, sanitized issue reports, health and stop reasons.
 
 ## Reference
 

@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "summary": "#1480: person-root fingerprint pinning for device pairing",
+  "commits": [
+    "a6488840596e9272af2eab2262f1433185dd796e"
+  ],
+  "replay": {
+    "status": "none",
+    "detail": "No new projection invalidation or startup replay trigger in the merged person-root fingerprint pinning for device pairing change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database table, index, trigger or migration change in person-root fingerprint pinning for device pairing; SQLite user_version is unchanged."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules and digest/drop policy are unchanged; this change adds no sealing coordination requirement."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "CLI, stui and phone pairing completion now require a trusted person-root fingerprint or an explicit warned unpinned override. Existing saved pairings continue to work; old clients may ignore the new optional response fields. New pinned messaging pairing can work with older members, but pinned read-only pairing requires a member that returns the added signed root proof; upgrade that member first."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional upgrade service stop or measured outage introduced by person-root fingerprint pinning for device pairing; the standard daemon/client restart procedure still applies."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "For a new pairing or re-pair, copy the full person-root fingerprint separately from the trusted machine and supply it through the client fingerprint field or --fingerprint. Never obtain the trust pin from the completing gateway. Existing profiles need no conversion or forced re-pair. Missing trust input is refused before submitting the pairing code; --unpinned is an explicit security-reducing override, not an automatic upgrade repair."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Failed re-pair verification preserves the existing saved profile and signing key. Retry with the independently trusted fingerprint and an upgraded member where pinned read-only pairing needs the new root proof. No graph repair is required; preserve graph state, keys and configuration and follow roll-forward guidance."
+  }
+}

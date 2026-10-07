@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Retry transient CI build snapshot uploads once while retaining terminal failures",
+  "replay": {
+    "status": "none",
+    "detail": "No runtime replay change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or fleet coordination change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No runtime, client, wire or harness contract change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No deployed service change or additional interruption."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No installation or operator steps required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No database or runtime recovery change."
+  }
+}

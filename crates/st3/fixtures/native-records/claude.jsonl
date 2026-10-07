@@ -1,0 +1,23 @@
+{"type":"user","uuid":"fixture-user","message":{"role":"user","content":[{"type":"text","text":"fixture prompt"}]}}
+{"type":"assistant","message":{"id":"fixture-assistant","role":"assistant","content":[{"type":"text","text":"fixture reply"},{"type":"thinking","thinking":"fixture reasoning"},{"type":"tool_use","id":"fixture-call","name":"Bash","input":{"command":"printf fixture"}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"fixture-call","content":"fixture result"},{"type":"document","source":{"type":"text","media_type":"text/plain","data":"fixture document"}}]}}
+{"type":"attachment","attachment":{"type":"queued_command","prompt":"fixture queued prompt"}}
+{"type":"attachment","attachment":{"type":"directory","path":"/tmp/fixture"}}
+{"type":"system","subtype":"api_error","content":"fixture diagnostic"}
+{"type":"system","subtype":"turn_duration","durationMs":12}
+{"type":"progress","fixture":true}
+{"type":"file-history-snapshot","fixture":true}
+{"type":"file-history-delta","fixture":true}
+{"type":"queue-operation","fixture":true}
+{"type":"permission-mode","fixture":true}
+{"type":"mode","fixture":true}
+{"type":"atis-latch","fixture":true}
+{"type":"last-prompt","fixture":true}
+{"type":"ai-title","fixture":true}
+{"type":"custom-title","fixture":true}
+{"type":"cost-state","fixture":true}
+{"type":"agent-name","fixture":true}
+{"type":"tag","fixture":true}
+{"type":"pr-link","fixture":true}
+{"type":"bridge-session","fixture":true}
+{"type":"fork-context-ref","fixture":true}

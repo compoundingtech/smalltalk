@@ -258,6 +258,11 @@ fn rust_operation_methods(
                 out,
                 "    pub async fn events(&self, after: Option<&str>, limit: Option<usize>, wait_ms: Option<u64>) -> Result<Envelope<EventPage>, ClientError> {{ self.events_internal(after, limit, wait_ms).await }}"
             )?;
+        } else if id == "conversation-content.chunk" {
+            writeln!(
+                out,
+                "    pub async fn conversation_content_chunk(&self, id: &str, reference: &str, offset: u64) -> Result<Envelope<ConversationContentChunk>, ClientError> {{ self.get(&format!(\"/v1/client/conversations/{{}}/content/{{}}/chunk?offset={{offset}}\", percent_encode_segment(id), percent_encode_segment(reference))).await }}"
+            )?;
         } else if id == "terminal.screen" {
             writeln!(
                 out,
@@ -365,6 +370,11 @@ fn swift_operation_methods(
                 | "agent-queue.get"
         ) {
             continue;
+        } else if id == "conversation-content.chunk" {
+            writeln!(
+                out,
+                "    public func conversationContentChunk(id: String, reference: String, offset: UInt64 = 0) async throws -> Envelope<ConversationContentChunk> {{ try await get(\"v1/client/conversations/\\(Self.routedSessionID(id))/content/\\(Self.routedSessionID(reference))/chunk\", query: [.init(name: \"offset\", value: String(offset))]) }}"
+            )?;
         } else if id == "conversation.search" {
             writeln!(
                 out,
@@ -414,7 +424,7 @@ fn swift_operation_methods(
         } else if id == "custom-subjects.list" {
             writeln!(
                 out,
-                "    public func customSubjectsList(kind: String? = nil, version: Int? = nil, cursor: String? = nil, limit: Int? = nil) async throws -> Envelope<Page> {{ var query: [URLQueryItem] = []; if let kind {{ query.append(.init(name: \"kind\", value: kind)) }}; if let version {{ query.append(.init(name: \"version\", value: String(version))) }}; if let cursor {{ query.append(.init(name: \"cursor\", value: cursor)) }}; if let limit {{ query.append(.init(name: \"limit\", value: String(limit))) }}; return try await get(\"v1/client/custom-subjects\", query: query) }}"
+                "    public func customSubjectsList(kind: String? = nil, version: Int? = nil, cursor: String? = nil, limit: Int? = nil) async throws -> Envelope<ResourcePage> {{ var query: [URLQueryItem] = []; if let kind {{ query.append(.init(name: \"kind\", value: kind)) }}; if let version {{ query.append(.init(name: \"version\", value: String(version))) }}; if let cursor {{ query.append(.init(name: \"cursor\", value: cursor)) }}; if let limit {{ query.append(.init(name: \"limit\", value: String(limit))) }}; return try await get(\"v1/client/custom-subjects\", query: query) }}"
             )?;
         } else if id == "resources.list" {
             writeln!(
@@ -632,6 +642,7 @@ fn validate_surfaces(
         "StatusHistory",
         "StatusTransition",
         "AgentRepository",
+        "AgentCheckout",
         "HostRepositories",
         "CanonicalNode",
         "SubjectDefinition",
@@ -655,6 +666,9 @@ fn validate_surfaces(
         "AgentQueueMove",
         "LaneEntry",
         "LaneChange",
+        "TimelineBlock",
+        "ConversationContentRef",
+        "ConversationContentChunk",
         "TimelineEntry",
         "TimelinePage",
         "ConversationChanges",
@@ -1221,6 +1235,11 @@ fn typescript_operation_methods(
             writeln!(
                 out,
                 "    async subjectDefinition(subject: string, showEnvValues = false): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}' + query({{ subject, show_env_values: showEnvValues }})); }}"
+            )?;
+        } else if id == "conversation-content.chunk" {
+            writeln!(
+                out,
+                "    async conversationContentChunk(id: string, reference: string, offset = 0): Promise<EnvelopeOf<ConversationContentChunk>> {{ return this.get(`/v1/client/conversations/${{encodeURIComponent(id)}}/content/${{encodeURIComponent(reference)}}/chunk` + query({{offset}})); }}"
             )?;
         } else if id == "conversation.changes" {
             writeln!(

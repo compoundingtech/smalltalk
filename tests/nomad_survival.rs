@@ -591,18 +591,37 @@ fn assert_managed_agent_color_contract(suffix: &str) {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(poll_until(SPAWN_TIMEOUT, || {
-        ambient_snapshot.exists() && explicit_snapshot.exists()
-    }));
+    // Shell redirection creates the file before printenv writes. Wait for complete
+    // records, independently of their values, and assert the captured records.
+    let complete_snapshot = |path: &Path| {
+        let contents = std::fs::read_to_string(path).ok()?;
+        (contents.ends_with('\n') && contents.lines().count() == 1).then_some(contents)
+    };
+    let mut initial_snapshots = None;
+    let observed = poll_until(SPAWN_TIMEOUT, || {
+        let Some(ambient) = complete_snapshot(&ambient_snapshot) else {
+            return false;
+        };
+        let Some(explicit) = complete_snapshot(&explicit_snapshot) else {
+            return false;
+        };
+        initial_snapshots = Some((ambient, explicit));
+        true
+    });
+    assert!(
+        observed,
+        "initial color snapshots did not complete:\nambient: {:?}\nexplicit: {:?}",
+        std::fs::read_to_string(&ambient_snapshot),
+        std::fs::read_to_string(&explicit_snapshot)
+    );
+    let (ambient, explicit) = initial_snapshots.unwrap();
 
     assert_eq!(
-        std::fs::read_to_string(&ambient_snapshot).unwrap(),
-        "unset\n",
+        ambient, "unset\n",
         "the reconciler's capture-only NO_COLOR must not disable agent color"
     );
     assert_eq!(
-        std::fs::read_to_string(&explicit_snapshot).unwrap(),
-        "1\n",
+        explicit, "1\n",
         "an explicit Agent Spec NO_COLOR must still reach the agent"
     );
 
