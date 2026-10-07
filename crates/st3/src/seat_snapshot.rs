@@ -678,7 +678,14 @@ mod tests {
         git(&path, &["init", "-q"], None, None).unwrap();
         fs::write(path.join("tracked"), "original\n").unwrap();
         git(&path, &["add", "."], None, None).unwrap();
-        git(&path, &["commit", "-qm", "Original"], None, None).unwrap();
+        // Fixture commits must not run hooks inherited from the account's Git configuration.
+        git(
+            &path,
+            &["-c", "core.hooksPath=", "commit", "-qm", "Original"],
+            None,
+            None,
+        )
+        .unwrap();
         fs::write(path.join("tracked"), "changed\n").unwrap();
         fs::write(path.join("untracked"), "portable\n").unwrap();
         let sessions = sessions(&root.join("state/drivers"), "agent/sample", "omp");
