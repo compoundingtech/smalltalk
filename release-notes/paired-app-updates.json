@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Daily iOS builds receive signed Expo updates through their paired gateway using short-lived app/channel tokens; local publishers use st app-updates publish.",
+  "replay": { "status": "none", "detail": "No existing claims need replay. Publication metadata uses new custom.app-update.published claims; native-build-required receipts are node-local observations." },
+  "schema": { "status": "none", "detail": "No database migration is needed. The claim registry adds app-update.native-build-required with local retention; immutable update objects live in the managed app-updates-v1 directory." },
+  "rules": { "status": "none", "detail": "No fleet coordination rules change. Update publishing is exposed only on the local Unix socket." },
+  "compatibility": { "status": "changed", "detail": "New pairings grant read.app-updates. Existing paired clients need a new pairing grant to mint update tokens. Only compatible runtimeVersion manifests are served; older compatible updates remain available." },
+  "downtime": { "status": "changed", "detail": "Restart st3 to register the update routes. Restarting invalidates derived update tokens, which the daily client renews using its Keychain pairing credential. Restart downtime has not been measured." },
+  "manual": { "status": "changed", "detail": "Generate a deployer-owned signing pair outside source control, supply the public certificate through ST_IOS_UPDATES_CERT and install a daily Release native build. Daily fails closed without this setting. The private key remains only with the publisher. Export, sign and publish with the commands in apps/ios/README.md." },
+  "recovery": { "status": "none", "detail": "Expo embedded/cached recovery and anti-bricking protections remain enabled. Immutable manifests and their referenced assets are never evicted; publishing refuses the configured fixed capacity rather than break old manifests." }
+}

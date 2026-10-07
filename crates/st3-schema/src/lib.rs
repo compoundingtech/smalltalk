@@ -1753,6 +1753,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             &[],
         ),
         (
+            "app-update.native-build-required",
+            &["daemon"],
+            WritePolicy::SystemOnly,
+            Cardinality::Append,
+            None,
+            false,
+            &[],
+        ),
+        (
             "harness.diagnostic",
             &["agent"],
             WritePolicy::SameSubjectActor,
@@ -2448,6 +2457,7 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
 /// `docs/st3/data-authority.md` for the local observation log.
 fn claim_retention(kind: &str) -> Retention {
     match kind {
+        "app-update.native-build-required" => Retention::Local,
         // The owner reads a transcript from the harness's own session file, or from this log
         // when there is none. Other nodes relay timeline reads to the owner.
         "harness.timeline" | "harness.telemetry" => Retention::Local,
@@ -3086,6 +3096,14 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
                 enumeration(&["active", "inactive", "missing", "unknown"]),
             ),
             ("modified_at", string()),
+        ],
+        "app-update.native-build-required" => &[
+            ("app", required_string()),
+            ("channel", required_string()),
+            ("pairing_grant", required_string()),
+            ("installed_runtime", required_string()),
+            ("required_runtime", required_string()),
+            ("update_id", required_string()),
         ],
         "harness.diagnostic" => &[
             ("driver", string()),
@@ -4038,6 +4056,7 @@ mod tests {
                 "agent.placement.source-offline",
                 "agent.presence",
                 "agent.queue.moved",
+                "app-update.native-build-required",
                 "arrangement.edited",
                 "attention.requested",
                 "attention.resolved",

@@ -870,6 +870,27 @@ export const AgentWorkspace = /*#__PURE__*/ (() => Schema.Struct({
 export type AgentWorkspace = typeof AgentWorkspace.Type
 export type AgentWorkspaceEncoded = typeof AgentWorkspace.Encoded
 
+export const AppUpdateTarget = /*#__PURE__*/ (() => Schema.Struct({
+  "app": Schema.String.check(Schema.isPattern(new RegExp("^[A-Za-z0-9._-]+$", "u"))).check(Schema.isMinLength(1)).check(Schema.isMaxLength(128)),
+  "channel": Schema.String.check(Schema.isPattern(new RegExp("^[A-Za-z0-9._-]+$", "u"))).check(Schema.isMinLength(1)).check(Schema.isMaxLength(128))
+}).annotate({ identifier: "AppUpdateTarget" }))()
+export type AppUpdateTarget = typeof AppUpdateTarget.Type
+export type AppUpdateTargetEncoded = typeof AppUpdateTarget.Encoded
+
+/** Short-lived, app/channel-only bearer; pairing revocation and daemon restart also revoke it. */
+export const AppUpdateToken = /*#__PURE__*/ (() => Schema.Struct({
+  "expiresAtUnixMs": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "token": Schema.String
+}).annotate({ identifier: "AppUpdateToken", description: "Short-lived, app/channel-only bearer; pairing revocation and daemon restart also revoke it." }))()
+export type AppUpdateToken = typeof AppUpdateToken.Type
+export type AppUpdateTokenEncoded = typeof AppUpdateToken.Encoded
+
+export const AppUpdateTokensRevoked = /*#__PURE__*/ (() => Schema.Struct({
+  "revoked": Schema.Boolean
+}).annotate({ identifier: "AppUpdateTokensRevoked" }))()
+export type AppUpdateTokensRevoked = typeof AppUpdateTokensRevoked.Type
+export type AppUpdateTokensRevokedEncoded = typeof AppUpdateTokensRevoked.Encoded
+
 export const ArrangementNameRegister = /*#__PURE__*/ (() => Schema.Struct({
   "revision": Revision,
   "value": ArrangementName
@@ -2511,7 +2532,7 @@ export const PairingBegin = /*#__PURE__*/ (() => Schema.Struct({
   "full_control": optionalKey(Schema.Boolean),
   "person_id": Schema.String.check(Schema.isPattern(new RegExp("^person/[^/]+$", "u"))),
   /** Narrows the default limited grant. Must not be combined with full_control. */
-  "scopes": optionalKey(Schema.Array(Schema.Literals(["read.projections","read.glasses","control.glasses","terminal.read","control.attention","control.launches"])).check(Schema.isMinLength(1)).check(Schema.isUnique())).annotate({ description: "Narrows the default limited grant. Must not be combined with full_control." })
+  "scopes": optionalKey(Schema.Array(Schema.Literals(["read.projections","read.app-updates","read.glasses","control.glasses","terminal.read","control.attention","control.launches"])).check(Schema.isMinLength(1)).check(Schema.isUnique())).annotate({ description: "Narrows the default limited grant. Must not be combined with full_control." })
 }).annotate({ identifier: "PairingBegin" }))()
 export type PairingBegin = typeof PairingBegin.Type
 export type PairingBeginEncoded = typeof PairingBegin.Encoded

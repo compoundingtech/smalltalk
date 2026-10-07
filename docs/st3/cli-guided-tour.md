@@ -563,6 +563,22 @@ st terminals attach steward
 Check that each stub is printed, that entity candidates carry descriptions, that hidden/internal
 commands remain hidden, and that an ambiguous short name lists its matches.
 
+### 21. `app-updates` — locally publish signed daily iOS updates
+
+Why: the daily Release app uses its paired gateway, not Metro or an Expo account, to fetch
+compatible signed JS/assets. Publishing belongs to the machine owner over the Unix socket;
+paired clients can only mint short-lived read tokens for one app/channel.
+
+```sh
+st app-updates --help
+st app-updates publish --help
+```
+
+Export and sign a disposable update using the [iOS publication guide](../../apps/ios/README.md#local-signing-and-publication),
+then run `st app-updates publish --app com.compoundingtech.smalltalk --channel daily --dir dist`.
+Inspect `--ref` for manual branch metadata and `--expected-head` for a stale-job fence.
+Never publish through an HTTP endpoint or put the publisher's private key in gateway storage.
+
 ## Exit criteria
 
 The walkthrough is complete when every public path above has a recorded disposition, every claimed

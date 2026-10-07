@@ -36,6 +36,7 @@ libc = "0.2"
 # Exactly pty-terminal's pin: libghostty's C API is not stable between Ghostty commits.
 libghostty-vt = "=0.2.1"
 libghostty-vt-sys = { version = "=0.2.1", features = ["pkg-config"] }
+parking_lot = "0.12"
 notify = "8"
 pty-client = { git = "https://github.com/compoundingtech/pty", rev = "b9d02f3468b718ceff27031e0b9cb38de3bb6b1c" }
 pty-core = { git = "https://github.com/compoundingtech/pty", rev = "b9d02f3468b718ceff27031e0b9cb38de3bb6b1c" }

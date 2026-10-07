@@ -73,6 +73,8 @@
     {"id": "glasses.get", "method": "GET", "path": "/v1/client/glasses/{id}", "response": "Glass", "scope": "read.glasses"}
   ],
   "commands": [
+    { "id": "app-updates.token", "method": "POST", "path": "/v1/client/app-updates/token", "request": "AppUpdateTarget", "response": "AppUpdateToken", "scope": "read.app-updates" },
+    { "id": "app-updates.tokens.revoke", "method": "POST", "path": "/v1/client/app-updates/token/revoke", "response": "AppUpdateTokensRevoked", "scope": "read.app-updates" },
     { "id": "action.submit", "method": "POST", "path": "/v1/client/actions", "request": "ActionRequest", "response": "ActionResult" },
     { "id": "pairing.begin", "method": "POST", "path": "/v1/client/pairings", "request": "PairingBegin", "response": "PairingChallenge", "local_only": true },
     { "id": "pairing.complete", "method": "POST", "path": "/v1/client/pairings/{id}/complete", "request": "PairingComplete", "response": "PairedSession" },

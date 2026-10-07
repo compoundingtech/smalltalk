@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `50de8434a035f4965ce447589a2cf2de4d87184260897723ad256bba275f32ba`
+Digest: `85219fb19ce48e39e76f1832ee3c56b40ef9a98a886d459fb828e7f37c4eb939`
 
 ## Subject families
 
@@ -72,6 +72,7 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `agent.placement.source-offline` | `agent` | `authorized-requester` | `append` | `durable` | `desired_token!:string`, `destination!:string`, `sources!:array` |  |
 | `agent.presence` | `agent` | `same-subject-actor` | `append` | `durable` | `presence!:string`, `reachability:string`, `reason:string` |  |
 | `agent.queue.moved` | `agent` | `authorized-requester` | `append` | `durable` | `anchor:subject-reference(mission-run)`, `placement!:string`, `reason:string`, `run!:subject-reference(mission-run)` |  |
+| `app-update.native-build-required` | `daemon` | `system-only` | `append` | `local` | `app!:string`, `channel!:string`, `installed_runtime!:string`, `pairing_grant!:string`, `required_runtime!:string`, `update_id!:string` |  |
 | `arrangement.edited` | `arrangement` | `ordinary-client` | `append` | `durable` | `action_digest:string`, `action_id:string`, `operations!:array`, `owner!:subject-reference(person)` |  |
 | `attention.requested` | `attention` | `authorized-participant` | `once` | `durable` | `closed_by:string`, `reason!:string`, `reviewer!:subject-reference(person)`, `severity!:string`, `step:subject-reference(step-run)`, `step_attempt:integer`, `targets:array`, `title!:string`, `until:string` |  |
 | `attention.resolved` | `attention` | `authorized-participant` | `once` | `durable` | `outcome!:string`, `reason:string`, `request!:string` |  |

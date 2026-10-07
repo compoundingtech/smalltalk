@@ -1320,6 +1320,7 @@ pub(super) async fn publication_definition(
 
 const ALL_SCOPES: &[&str] = &[
     "read.projections",
+    "read.app-updates",
     "read.declarations",
     "read.glasses",
     "control.glasses",
@@ -1337,6 +1338,7 @@ const ALL_SCOPES: &[&str] = &[
 ];
 const LIMITED_PAIRING_SCOPES: &[&str] = &[
     "read.projections",
+    "read.app-updates",
     "read.glasses",
     "control.glasses",
     "read.arrangements",
@@ -1650,6 +1652,9 @@ pub(super) fn authenticate(
                 .any(|feature| feature.trim() == "conversation-blocks.v1")
         });
     let Some(value) = request.headers().get(AUTHORIZATION) else {
+        if super::app_updates::is_protocol_read(request.uri().path()) {
+            return Err(forbidden("an update-only token is required"));
+        }
         if transport == "unix" {
             let person = request
                 .headers()
@@ -1674,6 +1679,12 @@ pub(super) fn authenticate(
         .strip_prefix("Bearer ")
         .filter(|value| !value.is_empty())
         .ok_or_else(|| forbidden("the client authorization scheme must be Bearer"))?;
+    if request.method() == axum::http::Method::GET
+        && (request.uri().path() == "/v1/client/app-updates/manifest"
+            || request.uri().path().starts_with("/v1/client/app-updates/assets/"))
+    {
+        return super::app_updates::authenticate(state, request, credential, transport);
+    }
     let digest = credential_digest(credential);
     let pairings = state
         .store
@@ -1750,7 +1761,7 @@ fn paired_client_session(
 
 /// Held collection sockets carry no bearer secret. Re-resolve their session grant at each
 /// arrangement read, using the same expiration/revocation checks as HTTP authentication.
-fn revalidate_session(state: &AppState, session: &ClientSession) -> Result<ClientSession, ApiError> {
+pub(super) fn revalidate_session(state: &AppState, session: &ClientSession) -> Result<ClientSession, ApiError> {
     if session.transport == "unix" && acting_party(session) {
         return Ok(session.clone());
     }
