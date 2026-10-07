@@ -365,6 +365,9 @@ pub struct Ui {
     /// Conversations scrolled up to their oldest entry since the last frame: each asks st for
     /// the page before it.
     older_wanted: RefCell<BTreeSet<String>>,
+    /// The fleet is about to be looked at (the palette, the Fleet tab, a machine): read it again,
+    /// so a member that joined since the last read is there.
+    machines_wanted: Cell<bool>,
     popover: Option<String>,
     chat: Option<ChatState>,
     /// st's conversation search for the palette: the query asked and what came back.
@@ -514,6 +517,7 @@ impl Ui {
             acted: HashSet::new(),
             closed: HashSet::new(),
             older_wanted: RefCell::default(),
+            machines_wanted: Cell::new(false),
             popover: None,
             chat: None,
             parked: Vec::new(),
@@ -3332,6 +3336,9 @@ impl Ui {
 
     fn switch_tab(&mut self, tab: usize) {
         self.answering = None;
+        if tab == 3 {
+            self.machines_wanted.set(true);
+        }
         self.tab = tab.min(TABS.len() - 1);
         self.editing = false;
         self.chat = None;
@@ -3384,6 +3391,11 @@ impl Ui {
         {
             self.older_wanted.borrow_mut().insert(target.to_owned());
         }
+    }
+
+    /// Whether the fleet should be read again now, once per look at it.
+    pub(crate) fn take_machines_wanted(&self) -> bool {
+        self.machines_wanted.replace(false)
     }
 
     /// The conversations scrolled up to their start since this was last asked.
