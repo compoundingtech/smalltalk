@@ -66,6 +66,19 @@ const CLIENT_READ_LINKS_TTL: Duration = Duration::from_secs(5);
 const CLIENT_READ_FENCE_WINDOW: Duration = Duration::from_secs(60);
 /// The daemon route a replication worker hands a read to when it must forward it.
 pub const CLIENT_READ_FORWARD_PATH: &str = "/v1/internal/client-read/forward";
+/// Optional, untrusted conversation lookup metadata; never part of the signed JSON contract.
+pub const CLIENT_READ_SUBJECT_HINT_HEADER: &str = "x-st3-conversation-subject-hint";
+pub const CLIENT_READ_OWNER_PATH: &str = "/v1/client/internal/client-read-owner";
+
+fn conversation_subject_hint(value: &str) -> Option<&str> {
+    (value.len() <= 512
+        && value.starts_with("agent/")
+        && value.split('/').all(|part| {
+            !part.is_empty()
+                && part.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+        }))
+    .then_some(value)
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "operation", rename_all = "kebab-case", deny_unknown_fields)]
@@ -141,6 +154,13 @@ pub struct ClientReadRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay: Option<ClientReadRoute>,
 }
+/// Private owner-local dispatch envelope, not the mixed-version peer wire request.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ClientReadOwnerRequest {
+    pub request: ClientReadRequest,
+    pub subject_hint: String,
+}
+
 
 /// Where a relayed client read is going and where it has been.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -459,6 +479,26 @@ impl ClientRelay {
         host_id: &str,
         request: &ClientReadRequest,
     ) -> Result<(serde_json::Value, ClientReadProvenance)> {
+        self.read_traced_with_subject_hint(host_id, request, None).await
+    }
+
+    pub async fn read_with_subject_hint(
+        &self,
+        host_id: &str,
+        request: &ClientReadRequest,
+        subject_hint: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        self.read_traced_with_subject_hint(host_id, request, subject_hint)
+            .await
+            .map(|(value, _)| value)
+    }
+
+    async fn read_traced_with_subject_hint(
+        &self,
+        host_id: &str,
+        request: &ClientReadRequest,
+        subject_hint: Option<&str>,
+    ) -> Result<(serde_json::Value, ClientReadProvenance)> {
         let target = host_id
             .strip_prefix("host/")
             .context("the owner host ID is invalid")?;
@@ -467,6 +507,7 @@ impl ClientRelay {
             .send_toward(
                 target,
                 request,
+                subject_hint,
                 vec![self.node.clone()],
                 CLIENT_READ_MAX_HOPS,
             )
@@ -543,6 +584,14 @@ impl ClientRelay {
 
     /// Carry on a read a peer relayed here because this node is on its way to the owner.
     pub async fn forward(&self, request: &ClientReadRequest) -> Result<serde_json::Value> {
+        self.forward_with_subject_hint(request, None).await
+    }
+
+    pub async fn forward_with_subject_hint(
+        &self,
+        request: &ClientReadRequest,
+        subject_hint: Option<&str>,
+    ) -> Result<serde_json::Value> {
         let route = request
             .relay
             .as_ref()
@@ -561,7 +610,7 @@ impl ClientRelay {
         }
         let mut path = route.path.clone();
         path.push(self.node.clone());
-        self.send_toward(target, request, path, route.hops_left - 1)
+        self.send_toward(target, request, subject_hint, path, route.hops_left - 1)
             .await
             .map(|(value, _)| value)
     }
@@ -573,6 +622,7 @@ impl ClientRelay {
         &self,
         target: &str,
         request: &ClientReadRequest,
+        subject_hint: Option<&str>,
         path: Vec<String>,
         hops_left: u8,
     ) -> Result<(serde_json::Value, PeerConfig)> {
@@ -596,7 +646,7 @@ impl ClientRelay {
                 request: request.request.clone(),
                 relay,
             };
-            match self.send(&peer, &outgoing).await {
+            match self.send(&peer, &outgoing, subject_hint).await {
                 Ok(value) => return Ok((value, peer)),
                 Err(error) => {
                     let rejected = match error.downcast::<ClientReadRejected>() {
@@ -648,6 +698,7 @@ impl ClientRelay {
         &self,
         peer: &PeerConfig,
         request: &ClientReadRequest,
+        subject_hint: Option<&str>,
     ) -> Result<serde_json::Value> {
         let name = peer.name.as_str();
         let url = match parse_route(&peer.url).context("invalid peer client route")? {
@@ -678,9 +729,12 @@ impl ClientRelay {
             "the client read request exceeds its bound"
         );
         let digest = FleetAuth::body_digest(&body);
-        let headers = self
+        let mut headers = self
             .auth
             .request_headers_for(CLIENT_READ_PATH, &self.node, &body)?;
+        if let Some(hint) = subject_hint.and_then(conversation_subject_hint) {
+            headers.insert(CLIENT_READ_SUBJECT_HINT_HEADER, HeaderValue::from_str(hint)?);
+        }
         let mut response = self
             .http
             .post(format!("{}{}", url.trim_end_matches('/'), CLIENT_READ_PATH))
@@ -1023,10 +1077,15 @@ async fn receive_raw_terminal(
 async fn forward_client_read(
     state: &PeerState,
     request: &ClientReadRequest,
+    subject_hint: Option<&str>,
 ) -> Result<serde_json::Value> {
     let daemon = Client::unix(state.backend().socket().to_path_buf());
+    let path = subject_hint.map_or_else(
+        || CLIENT_READ_FORWARD_PATH.to_owned(),
+        |hint| format!("{CLIENT_READ_FORWARD_PATH}?conversation_subject_hint={}", urlencoding::encode(hint)),
+    );
     daemon
-        .post::<_, serde_json::Value>(CLIENT_READ_FORWARD_PATH, request)
+        .post::<_, serde_json::Value>(&path, request)
         .await
         .map_err(|error| match crate::client::api_error_parts(&error) {
             Some((status, code, message, details)) => ClientReadRejected {
@@ -1053,6 +1112,10 @@ async fn receive_client_read(
             Ok(sender) if state.accept(&sender).is_ok() => sender.name,
             _ => return (StatusCode::UNAUTHORIZED, "untrusted fleet client read").into_response(),
         };
+    let subject_hint = headers
+        .get(CLIENT_READ_SUBJECT_HINT_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(conversation_subject_hint);
     state.note_activity(&sender);
     let request_digest = FleetAuth::body_digest(&body);
     let result: Result<serde_json::Value> = async {
@@ -1076,7 +1139,51 @@ async fn receive_client_read(
                 "the relayed client read's path does not end at its sender"
             );
             if route.target != format!("host/{}", state.node()) {
-                return forward_client_read(&state, &request).await;
+                return forward_client_read(&state, &request, subject_hint).await;
+            }
+        }
+        match &request.request {
+            ClientReadOperation::ConversationChanges { wait_ms, .. } => {
+                anyhow::ensure!(*wait_ms <= CLIENT_READ_MAX_WAIT_MS, "the conversation wait exceeds its bound");
+            }
+            ClientReadOperation::Timeline { limit, .. } => {
+                anyhow::ensure!((1..=200).contains(limit), "the timeline limit is invalid");
+            }
+            _ => {}
+        }
+        if let Some(hint) = subject_hint
+            && matches!(
+                &request.request,
+                ClientReadOperation::ConversationContent { .. }
+                    | ClientReadOperation::ConversationChanges { .. }
+                    | ClientReadOperation::Timeline { .. }
+            )
+            // Optional metadata must not narrow the legacy actor syntax contract.
+            && let Ok(owner) = (if request.authority_actor.starts_with("person/") {
+                Client::unix_as(state.backend().socket(), &request.authority_actor)
+            } else {
+                Client::unix_agent(state.backend().socket(), &request.authority_actor)
+            })
+        {
+            let envelope = ClientReadOwnerRequest {
+                request: request.clone(),
+                subject_hint: hint.to_owned(),
+            };
+            match owner.post::<_, Value>(CLIENT_READ_OWNER_PATH, &envelope).await {
+                Ok(value) => return Ok(value),
+                // Old daemons have no owner route. Never retry authorization failures.
+                Err(error) if crate::client::http_status(&error) == Some(404) => {}
+                Err(error) => {
+                    return Err(match crate::client::api_error_parts(&error) {
+                        Some((status, code, message, details)) => ClientReadRejected {
+                            code: code.to_owned(),
+                            status,
+                            message: message.to_owned(),
+                            details: details.clone(),
+                        }.into(),
+                        None => error,
+                    });
+                }
             }
         }
         let client = st3_client::Client::unix_as(state.backend().socket(), &request.authority_actor);
@@ -1093,10 +1200,6 @@ async fn receive_client_read(
                 after,
                 wait_ms,
             } => {
-                anyhow::ensure!(
-                    wait_ms <= CLIENT_READ_MAX_WAIT_MS,
-                    "the conversation wait exceeds its bound"
-                );
                 Ok(serde_json::to_value(
                     client
                         .conversation_changes(&session_id, after.as_deref(), wait_ms)
@@ -1109,7 +1212,6 @@ async fn receive_client_read(
                 limit,
                 cursor,
             } => {
-                anyhow::ensure!((1..=200).contains(&limit), "the timeline limit is invalid");
                 let value = client
                     .timeline(&session_id, cursor.as_deref(), Some(limit))
                     .await?
@@ -1650,6 +1752,7 @@ mod tests {
 
     include!("peer/raw_terminal_tests.rs");
     include!("peer/stale_link_tests.rs");
+    include!("peer/conversation_subject_hint_tests.rs");
 
     #[tokio::test]
     async fn a_gateway_streams_a_remote_terminal_through_owner_long_polls() {
