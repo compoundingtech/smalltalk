@@ -20,6 +20,7 @@ pub mod principal;
 pub mod profile;
 pub mod replication;
 pub mod rules;
+pub mod shared_append_fault;
 pub mod sqlite;
 pub mod store;
 pub mod sync;

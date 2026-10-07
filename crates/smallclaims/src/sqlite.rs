@@ -694,10 +694,21 @@ fn run_write_batch_inner(
                 // A one-job transaction keeps the old serial path and installs no row hook.
                 if sharing && !attempted_scope && !answers.is_empty() && append_policy.is_some() {
                     attempted_scope = true;
-                    shared_scope = crate::append_group::Scope::begin_observed(
+                    match crate::append_group::Scope::begin_observed(
                         transaction,
                         mutation_observer.cloned(),
-                    );
+                    ) {
+                        Ok(scope) => shared_scope = scope,
+                        Err(error) => {
+                            // Setup/cleanup failure cannot leave provisional temp state alive
+                            // after a successful ACK: roll back the whole real transaction.
+                            failure = Some(error);
+                            crate::profile::writer_released(acquired);
+                            drop(run);
+                            answers.push(done);
+                            break;
+                        }
+                    }
                 }
                 crate::append_group::start_job(append_policy);
                 let mut succeeded = false;

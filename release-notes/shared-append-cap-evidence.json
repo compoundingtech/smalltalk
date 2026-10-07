@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Retain bounded local fault evidence when an experimental shared replica payload exceeds the actual encoded cap.",
+  "replay": {
+    "status": "none",
+    "detail": "No startup scan or repair is introduced. Pending evidence after restart remains uncertified; known committed fault evidence blocks ordinary re-sealing."
+  },
+  "schema": {
+    "status": "changed",
+    "detail": "No tables, indexes, user_version or migrations change. Experimental new batches add local-only meta markers and a bounded summary, then local-only fault keys on sealing failure; these metadata operations are not included in claim or envelope wire payloads."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint selection and RULES_VERSION are unchanged. Expiry, trim or deletion of implicated rows does not resolve retained fault evidence."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Adds a smallclaims bounded fault-read API and typed sealing failure. Default-off ordinary appends retain their serial behavior; experimental marked payloads are checked using actual complete serialized CBOR, including claim signatures, before sealing commits."
+  },
+  "downtime": {
+    "status": "unknown",
+    "detail": "No new restart pause is introduced with grouping disabled. If experimental grouping is enabled and a cap fault occurs, ordinary sealing stops and retains evidence; operator repair/clear and already-sealed-marker recovery are not implemented in this draft."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Keep grouping disabled. Exact pre-append metadata admission, explicit same-incarnation repair, deployed old-node compatibility and copied-store post-dedupe latency proofs remain required before enabling."
+  },
+  "recovery": {
+    "status": "unknown",
+    "detail": "On oversize, the entire sealing chunk rolls back, then the same loan separately commits bounded evidence. Evidence COMMIT failure retains the observation in memory and leaves durable pending markers; restart cannot report verified. No supported fault-clear procedure is claimed yet."
+  }
+}

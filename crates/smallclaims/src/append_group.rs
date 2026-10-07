@@ -129,13 +129,13 @@ pub(crate) struct Scope<'a> {
 impl<'a> Scope<'a> {
     #[cfg(test)]
     pub(crate) fn begin(connection: &'a Connection) -> Option<Self> {
-        Self::begin_observed(connection, None)
+        Self::begin_observed(connection, None).expect("witness setup succeeds")
     }
 
     pub(crate) fn begin_observed(
         connection: &'a Connection,
         observer: Option<Arc<crate::sqlite::writer_observer::MutationState>>,
-    ) -> Option<Self> {
+    ) -> rusqlite::Result<Option<Self>> {
         // The row hook cannot see WITHOUT ROWID writes. Temporary after-row triggers
         // witness each such mutation through one private rowid table. Its hook counts both
         // the original write and the witness UPDATE; unknown writes still fail the total-
@@ -147,14 +147,14 @@ impl<'a> Scope<'a> {
                     Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(4)?))
                 })?
                 .collect()
-        })()
-        .ok()?;
+        })();
+        let Ok(tables) = tables else { return Ok(None) };
         for (database, table, kind, without_rowid) in &tables {
             let requires_rows = (database == "main"
                 && matches!(table.as_str(), "batches" | "claims"))
                 || (database == "temp" && table == "write_clock");
             if (requires_rows && *without_rowid) || (relevant(database, table) && kind != "table") {
-                return None;
+                return Ok(None);
             }
         }
         let without_rowid = tables
@@ -169,7 +169,7 @@ impl<'a> Scope<'a> {
             Err(error) => {
                 WITNESS_FAILURES.fetch_add(1, Ordering::Relaxed);
                 eprintln!("smallclaims: shared append witness setup failed: {error}");
-                return None;
+                return Err(error);
             }
         };
         let key = connection_key(connection);
@@ -188,12 +188,12 @@ impl<'a> Scope<'a> {
             }))
         });
         crate::sqlite::writer_observer::install_rows(connection, observer.clone(), true);
-        Some(Self {
+        Ok(Some(Self {
             connection,
             previous,
             observer,
             witness: Some(witness),
-        })
+        }))
     }
 
     pub(crate) fn close(mut self) -> rusqlite::Result<()> {
@@ -271,7 +271,7 @@ impl Witness {
         })();
         if let Err(error) = result {
             // Partial setup never publishes a frontier. Cleanup is local to this transaction.
-            let _ = witness.remove(connection);
+            witness.remove(connection)?;
             return Err(error);
         }
         Ok(witness)
@@ -583,6 +583,7 @@ pub(crate) fn prepare(
             id = None;
         }
         let inserted = frontier.batch.is_none();
+        let mut marker_mutations = 0;
         if !inserted {
             REUSED_BATCHES.fetch_add(1, Ordering::Relaxed);
         }
@@ -593,6 +594,7 @@ pub(crate) fn prepare(
             let batch = format!("batch/{origin}/{}/{hash}", frontier.sequence);
             transaction.execute("INSERT INTO batches(id, origin, replica_sequence, previous_hash, hash, accepted_at_unix_ms) VALUES (?1,?2,?3,?4,?5,?6)",
                 params![batch, origin, frontier.sequence, frontier.previous, hash, now.to_string()])?;
+            marker_mutations = crate::shared_append_fault::mark(transaction, &batch)?;
             let sequence = frontier.sequence;
             let previous = frontier.previous.clone();
             frontier.sequence += 1;
@@ -629,8 +631,9 @@ pub(crate) fn prepare(
             id,
             frontier,
             connection: key,
-            // Exactly one claim INSERT plus the optional batch INSERT are intended mutations.
-            expected_epoch: epoch.wrapping_add(1 + u64::from(inserted)),
+            // One claim INSERT, optional batch INSERT and explicit marker/summary mutations.
+            // Extra trigger mutations still prevent restoration of provisional frontier state.
+            expected_epoch: epoch.wrapping_add(1 + u64::from(inserted) + marker_mutations),
         })
     })())
 }
@@ -808,6 +811,165 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(store.claim_by_id(&claim.id).unwrap().is_some());
+    }
+
+    fn oversized_signing_metadata(store: &Store) -> Vec<ClaimRecord> {
+        let out = Arc::new(Mutex::new(Vec::new()));
+        queued(store, jobs(4, &out));
+        let claims = out.lock().unwrap().clone();
+        let last = claims.last().unwrap();
+        let key = crate::fleet::MemberKey::generate().unwrap().0;
+        let signature = crate::principal::ClaimSignature::sign(
+            &key,
+            &crate::principal::content_digest(&last.subject, &last.kind, None, &last.body),
+            "host/sample",
+            None,
+            vec!["x".repeat(REPLICA_BATCH_BYTES)],
+            1234,
+        );
+        let mut conn = store.connection.write();
+        let tx = conn.transaction().unwrap();
+        crate::store::principals::store_claim_signature_tx(&tx, &last.id, &signature).unwrap();
+        tx.commit().unwrap();
+        claims
+    }
+
+    #[test]
+    fn real_sealer_rolls_back_the_whole_chunk_and_retains_a_bounded_fault() {
+        use std::sync::atomic::Ordering;
+        let store = node();
+        let claims = oversized_signing_metadata(&store);
+        let before = store.seeded_batch_rowid.load(Ordering::Acquire);
+        let error = store.seal_local_batches().unwrap_err();
+        let fault = error
+            .downcast_ref::<crate::shared_append_fault::SealingFailure>()
+            .unwrap();
+        assert!(fault.report.has_faults());
+        assert_eq!(store.seeded_batch_rowid.load(Ordering::Acquire), before);
+        let read = store.readers.get();
+        let envelopes: u64 = read
+            .query_row("SELECT COUNT(*) FROM replica_envelopes", [], |r| r.get(0))
+            .unwrap();
+        let signatures: u64 = read
+            .query_row("SELECT COUNT(*) FROM claim_signatures", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            envelopes, 0,
+            "the earlier provisional serial envelope also rolls back"
+        );
+        assert_eq!(
+            signatures, 1,
+            "pre-existing signature metadata remains unchanged"
+        );
+        drop(read);
+        for claim in &claims {
+            assert!(store.claim_by_id(&claim.id).unwrap().is_some());
+        }
+        let report = store.shared_append_faults().unwrap();
+        assert_eq!(report.durable.as_ref().unwrap().faults, 1);
+        assert!(!report.verified());
+        let conn = store.connection.write();
+        conn.execute(
+            "DELETE FROM claims WHERE batch_id=?1",
+            [&claims.last().unwrap().batch_id],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM batches WHERE id=?1",
+            [&claims.last().unwrap().batch_id],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(
+            store.seal_local_batches().is_err(),
+            "deleting the batch cannot clear retained evidence"
+        );
+        assert_eq!(
+            store
+                .shared_append_faults()
+                .unwrap()
+                .durable
+                .unwrap()
+                .faults,
+            1
+        );
+    }
+
+    #[test]
+    fn partial_witness_setup_and_cleanup_failure_roll_back_without_a_success_ack() {
+        use rusqlite::hooks::{AuthAction, Authorization};
+        let store = node();
+        let held = store.connection.write();
+        held.authorizer(Some(|context: rusqlite::hooks::AuthContext<'_>| {
+            if matches!(
+                context.action,
+                AuthAction::CreateTempTrigger { .. } | AuthAction::DropTempTable { .. }
+            ) {
+                Authorization::Deny
+            } else {
+                Authorization::Allow
+            }
+        }));
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let mut replies = Vec::new();
+        for (append_policy, run) in jobs(2, &out) {
+            let (done, reply) = mpsc::sync_channel(1);
+            store.connection.send(WriterJob::Batched {
+                run,
+                append_policy,
+                profile: None,
+                wait: None,
+                done,
+            });
+            replies.push(reply);
+        }
+        drop(held);
+        for reply in replies {
+            assert!(reply.recv().unwrap().is_err());
+        }
+        let conn = store.connection.write();
+        conn.authorizer(None::<fn(rusqlite::hooks::AuthContext<'_>) -> Authorization>);
+        let claims: u64 = conn
+            .query_row("SELECT COUNT(*) FROM claims", [], |r| r.get(0))
+            .unwrap();
+        let temp: u64 = conn.query_row("SELECT COUNT(*) FROM sqlite_temp_schema WHERE name LIKE '_smallclaims_append_witness_%'", [], |r| r.get(0)).unwrap();
+        assert_eq!(claims, 0);
+        assert_eq!(temp, 0);
+        assert_eq!(
+            out.lock().unwrap().len(),
+            1,
+            "the first job had run before setup failed"
+        );
+    }
+
+    #[test]
+    fn evidence_commit_failure_preserves_the_real_observation_and_restart_is_uncertified() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sample.sqlite3");
+        let store = Store::open(&path, "sample", Arc::new(Plain)).unwrap();
+        store.set_write_clock_at(1234).unwrap();
+        oversized_signing_metadata(&store);
+        let conn = store.connection.write();
+        conn.commit_hook(Some(|| true));
+        drop(conn);
+        let error = store.seal_local_batches().unwrap_err();
+        let fault = error
+            .downcast_ref::<crate::shared_append_fault::SealingFailure>()
+            .unwrap();
+        assert!(fault.report.observed.is_some());
+        assert!(fault.report.publication_failed);
+        let conn = store.connection.write();
+        conn.commit_hook(None::<fn() -> bool>);
+        drop(conn);
+        let report = store.shared_append_faults().unwrap();
+        assert_eq!(report.durable.as_ref().unwrap().faults, 0);
+        assert!(report.has_faults());
+        assert!(report.publication_failed);
+        drop(store);
+        let reopened = Store::open(&path, "sample", Arc::new(Plain)).unwrap();
+        let report = reopened.shared_append_faults().unwrap();
+        assert!(report.durable.unwrap().pending > 0);
+        assert!(!reopened.shared_append_faults().unwrap().verified());
     }
 
     #[test]

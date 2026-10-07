@@ -25,7 +25,7 @@ class. Wall time is sampled for every claim. A millisecond change starts another
 header, preserving canonical time ordering across origins. Groups contain at
 most 32 claims and use a provisional 256 KiB input budget. The heuristic does
 not yet prove an encoded CBOR cap when signing-key delegation metadata is large;
-that proof and sealing failure handling remain blockers for enabling grouping. Blob references
+that admission proof remains a blocker for enabling grouping. Final sealing now checks the complete serialized CBOR payload, including signatures, against the cap. Blob references
 and oversized candidates take the serial path. Duplicate hashes start another
 batch and remain two accepted claims. Membership, authority and rule writes
 cannot join retained message groups.
@@ -55,6 +55,19 @@ statement-cache cost must be included in enabled/disabled measurements.
 A debug SQL oracle checks cached sequence, previous hash, clock,
 header, claim membership and finalization before reuse. This path uses ordinary
 rusqlite hooks, without preupdate, bindgen or extra SQLite build flags.
+
+Each new experimental batch has an atomic local-only pending marker and a bounded
+summary in `meta`. These are excluded from the envelope payload. The actual CBOR cap
+check resolves a marker only in the sealing COMMIT. On oversize, the whole sealing
+chunk rolls back before the same writer loan publishes bounded, incarnation-checked
+fault evidence in a separate transaction. An evidence commit failure remains visible
+in process memory; restart still sees pending evidence and cannot report verified.
+The read accessor performs one bounded point lookup, never sealing or scanning.
+Known faults prevent ordinary sealing from re-encoding the same bad batch, even if
+its rows are subsequently deleted. Explicit repair/clear, already-sealed-marker
+recovery and an admission bound for grandfathered signing metadata remain unfinished;
+no operator recovery procedure or healthy-runtime activation is claimed. Marker,
+summary and fault operations also require before/after cost measurements.
 
 Signing keeps its existing point: committed batches are sealed on a later FIFO
 writer loan. The payload therefore contains exactly the claims whose savepoints
