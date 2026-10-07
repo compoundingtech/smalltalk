@@ -11,21 +11,25 @@ use serde_json::Value;
 
 pub use crate::gate_kinds::GateAnswer;
 
+use crate::github_http::GithubAuth;
 use super::{
     GITHUB_AUTH_REMEDY, ProviderForbidden, ProviderRateLimit, ProviderUnauthenticated,
-    github_api_base, github_client, github_json, github_token,
+    github_api_base, github_client, github_json, github_auth,
 };
 
 /// Whether pull request `locator` (`OWNER/REPO#NUMBER`) has merged.
 pub async fn pull_request_merged(locator: &str) -> GateAnswer {
-    let token = github_token().await.ok();
-    pull_request_merged_at(locator, &github_api_base(), token.as_deref()).await
+    let token = match github_auth().await {
+        Ok(token) => token,
+        Err(error) => return GateAnswer::Broken(error.to_string()),
+    };
+    pull_request_merged_at(locator, &github_api_base(), Some(&token)).await
 }
 
 pub(crate) async fn pull_request_merged_at(
     locator: &str,
     api_base: &str,
-    token: Option<&str>,
+    token: Option<&GithubAuth>,
 ) -> GateAnswer {
     let Some((repository, number)) = locator.rsplit_once('#').filter(|(repository, number)| {
         repository_parts(repository).is_some() && number.parse::<u64>().is_ok()
@@ -34,7 +38,7 @@ pub(crate) async fn pull_request_merged_at(
             "`{locator}` is not a pull request; write OWNER/REPO#NUMBER"
         ));
     };
-    let Some(token) = token.filter(|token| !token.trim().is_empty()) else {
+    let Some(token) = token.filter(|token| token.is_valid()) else {
         return GateAnswer::Broken(GITHUB_AUTH_REMEDY.into());
     };
     let url = format!("{api_base}/repos/{repository}/pulls/{number}");
@@ -65,8 +69,11 @@ fn pull_request_answer(locator: &str, pull: &Value) -> GateAnswer {
 /// Whether the check run or commit status named `check` passed on `reference`, a commit or a
 /// branch of `repository` (`OWNER/REPO`).
 pub async fn check_passed(repository: &str, reference: &str, check: &str) -> GateAnswer {
-    let token = github_token().await.ok();
-    check_passed_at(repository, reference, check, &github_api_base(), token.as_deref()).await
+    let token = match github_auth().await {
+        Ok(token) => token,
+        Err(error) => return GateAnswer::Broken(error.to_string()),
+    };
+    check_passed_at(repository, reference, check, &github_api_base(), Some(&token)).await
 }
 
 pub(crate) async fn check_passed_at(
@@ -74,14 +81,14 @@ pub(crate) async fn check_passed_at(
     reference: &str,
     check: &str,
     api_base: &str,
-    token: Option<&str>,
+    token: Option<&GithubAuth>,
 ) -> GateAnswer {
     if repository_parts(repository).is_none() {
         return GateAnswer::Broken(format!(
             "`{repository}` is not a repository; write OWNER/REPO"
         ));
     }
-    let Some(token) = token.filter(|token| !token.trim().is_empty()) else {
+    let Some(token) = token.filter(|token| token.is_valid()) else {
         return GateAnswer::Broken(GITHUB_AUTH_REMEDY.into());
     };
     let client = github_client();
@@ -236,6 +243,7 @@ fn lookup_failure(error: &anyhow::Error, what: &str) -> GateAnswer {
 
 #[cfg(test)]
 mod tests {
+    use crate::github_http::GithubAuth;
     use super::{
         GateAnswer, check_answer, check_passed_at, pull_request_answer, pull_request_merged_at,
     };
@@ -290,7 +298,8 @@ mod tests {
             ),
         ]))
         .await;
-        let token = Some("test-token");
+        let auth = GithubAuth::test("test-token");
+        let token = Some(&auth);
         assert!(matches!(
             pull_request_merged_at("acme/app#42", &base, token).await,
             GateAnswer::Pass(reason) if reason.contains(sha)
