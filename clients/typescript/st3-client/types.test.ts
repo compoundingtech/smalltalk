@@ -75,7 +75,7 @@ void searchHit;
 
 // Rust None and TypeScript omission are both supported wire shapes.
 import type { CollectionCommand, CollectionFrame } from './Models.generated.ts';
-const nullFilters: CollectionCommand = { kind: 'subscribe', id: 'agents', collection: 'agents', person: null, actor: null, status: null };
+const nullFilters: CollectionCommand = { kind: 'subscribe', id: 'agents', collection: 'agents', person: null, actor: null, status: null, filter: null };
 const currentTerminal: CollectionCommand = { kind: 'subscribe', id: 'term', collection: 'terminal', terminal: 'terminal/example', capability: 'proof' };
 const nullIncarnation: CollectionCommand = { ...currentTerminal, incarnation: null };
 const collectionResync: CollectionFrame = { kind: 'resync', id: 'agents', code: 'internal', message: 'Retry', retryable: true };
@@ -87,3 +87,9 @@ const missingTerminalCapability: CollectionCommand = { kind: 'subscribe', id: 't
 // @ts-expect-error Failure metadata is explicitly declared; arbitrary properties remain closed.
 const extraResyncProperty: CollectionFrame = { kind: 'resync', id: 'agents', undeclared: true };
 void [missingTerminalCapability, extraResyncProperty];
+
+import type { ListOptions, TerminalListOptions, CollectionFilters } from './Client.generated.ts';
+const textFilteredPage: ListOptions = { filter: 'release review', limit: 1, cursor: 'next/&' };
+const textFilteredTerminals: TerminalListOptions = { filter: 'shell', owner: 'person/ada', state: 'running' };
+const textFilteredWindow: CollectionFilters = { filter: 'release review', actor: 'agent/worker' };
+void [textFilteredPage, textFilteredTerminals, textFilteredWindow];

@@ -71,6 +71,31 @@ pub use checkpoint_agreement::{
 };
 pub use checkpoint_trim::{CheckpointManifestNeed, TRIM_CHUNK_ENVELOPES, TrimFault};
 
+/// Literal case-insensitive substring matching shared by SQL and projected JSON lists.
+pub fn list_filter_contains(value: &str, filter: &str) -> bool {
+    value.to_lowercase().contains(&filter.to_lowercase())
+}
+
+/// Register literal Unicode lowercase substring matching for projected list metadata.
+/// This is a predicate, not an index: callers must still select the appropriate current rows.
+pub fn register_list_filter_function(connection: &Connection) -> rusqlite::Result<()> {
+    use rusqlite::functions::FunctionFlags;
+    connection.create_scalar_function(
+        "st_list_contains",
+        2,
+        FunctionFlags::SQLITE_UTF8
+            | FunctionFlags::SQLITE_DETERMINISTIC
+            | FunctionFlags::SQLITE_INNOCUOUS,
+        |context| {
+            let value = context.get::<Option<String>>(0)?;
+            let filter = context.get::<Option<String>>(1)?;
+            Ok(filter.is_none_or(|filter| {
+                value.is_some_and(|value| list_filter_contains(&value, &filter))
+            }))
+        },
+    )
+}
+
 /// A committed projection frontier plus optional work inside its current transaction.
 #[derive(Clone, Copy, Debug)]
 pub struct ProjectionProgress {
@@ -4943,7 +4968,22 @@ impl Store {
         after: Option<(&str, u64)>,
         limit: usize,
     ) -> Result<Vec<DocumentVersion>> {
+        self.list_documents_page_filtered(name, prefix, history, after, limit, None)
+    }
+
+    /// Match document names before selecting the requested current/history page.
+    /// The predicate reads binding metadata; it does not inspect document or claim bodies.
+    pub fn list_documents_page_filtered(
+        &self,
+        name: Option<&str>,
+        prefix: Option<&str>,
+        history: bool,
+        after: Option<(&str, u64)>,
+        limit: usize,
+        filter: Option<&str>,
+    ) -> Result<Vec<DocumentVersion>> {
         let connection = self.readers.get();
+        register_list_filter_function(&connection)?;
         let query = "SELECT d.name, d.hash, b.size, d.created_index,
                      d.hash=(SELECT n.hash FROM documents n
                  WHERE n.name=d.name ORDER BY n.binding_key DESC LIMIT 1)
@@ -4951,6 +4991,7 @@ impl Store {
                      FROM documents d JOIN blobs b ON b.hash=d.hash
                      JOIN claims c ON c.id=d.binding_claim_id
                      WHERE (?1 IS NULL OR d.name=?1)
+                       AND (?7 IS NULL OR st_list_contains(d.name,?7))
                        AND (?2 OR d.hash=(SELECT n.hash FROM documents n
                  WHERE n.name=d.name ORDER BY n.binding_key DESC LIMIT 1))
                        AND (?3 IS NULL OR substr(d.name,1,length(?3))=?3)
@@ -4967,7 +5008,8 @@ impl Store {
                 prefix,
                 after.map(|v| v.0),
                 after.map(|v| v.1),
-                limit
+                limit,
+                filter
             ],
             |row| {
                 Ok(DocumentVersion {

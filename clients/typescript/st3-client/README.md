@@ -8,6 +8,14 @@ consumers use `allowImportingTsExtensions` for no-emit checking, or
 
 The client uses standard `fetch`, so callers can supply a fetch implementation and a credential callback. Call `discover()` before rendering capability-dependent controls. List and event limits are checked against the server's advertised bounds. Submit fenced actions with the generated typed methods, then use `followOperation(operation_id)` for accepted actions. `terminalStream` opens the screen stream a `terminal.attach` capability allows and calls `onScreen` with each changed screen; it needs a WebSocket that accepts headers, such as React Native's, or a `socket` factory. `collectionStream` opens the one collections socket: `subscribe` holds a window of missions, attention, agents, or work, `subscribeTerminal` follows a terminal with its attach capability, and `subscribeConversation` follows an agent's or a session's conversation, each by a client-chosen ID; `onFrame` receives every frame. `applyWindow` folds `snapshot` and `changes` frames into a window's ordered rows. Commands sent before the socket opens wait for it.
 
+Operational list methods accept `filter` in `ListOptions`, for example
+`client.workList({ filter: 'release review', limit: 10 })`. The server matches a literal,
+case-insensitive substring of id, name, or title before paging. Repeat the filter with the
+next cursor. Paged HTTP methods require the exact `value.filters.filter` acknowledgment and
+refuse older servers that silently ignore it. Collection subscriptions accept the same text in
+`CollectionFilters`: `stream.subscribe('work', 'work', 50, { filter: 'release review' })`.
+Subscriptions do not yet verify server acknowledgment.
+
 The default transport binds `globalThis.fetch` to `globalThis`, preserving the receiver required by browser implementations. Supplying `fetchImpl` overrides that default without rebinding the custom implementation.
 
 Run the client checks from the repository root with Node 24 or newer:

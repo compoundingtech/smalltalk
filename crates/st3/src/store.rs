@@ -3077,8 +3077,22 @@ impl Store {
         limit: usize,
         after: Option<&(u128, String)>,
     ) -> Result<Vec<(String, u128)>> {
+        self.mission_collection_page_filtered(history, offset, limit, after, None)
+    }
+
+    /// Match the projected mission identity/title before paging and card enrichment.
+    /// Run summaries are still computed from the mission projection tables.
+    pub(crate) fn mission_collection_page_filtered(
+        &self,
+        history: bool,
+        offset: usize,
+        limit: usize,
+        after: Option<&(u128, String)>,
+        filter: Option<&str>,
+    ) -> Result<Vec<(String, u128)>> {
         let ended_since = recently_ended_since();
         let connection = self.readers.get();
+        smallclaims::store::register_list_filter_function(&connection)?;
         let mut statement = connection.prepare(
             "WITH ids AS (
                 SELECT mission_id FROM mission_definitions
@@ -3097,7 +3111,8 @@ impl Store {
              LEFT JOIN claims published ON published.id=def.claim_id
              LEFT JOIN run_states ON run_states.mission_id=ids.mission_id
              LEFT JOIN latest ON latest.mission_id=ids.mission_id AND latest.rank=1
-             WHERE (?5 IS NULL OR CAST(COALESCE(latest.updated_at_unix_ms,published.accepted_at_unix_ms, '0') AS INTEGER) < ?5
+             WHERE (?7 IS NULL OR st_list_contains('mission/' || ids.mission_id,?7))
+               AND (?5 IS NULL OR CAST(COALESCE(latest.updated_at_unix_ms,published.accepted_at_unix_ms, '0') AS INTEGER) < ?5
                  OR (CAST(COALESCE(latest.updated_at_unix_ms,published.accepted_at_unix_ms, '0') AS INTEGER) = ?5 AND ids.mission_id > ?6))
                AND (?1 OR ids.mission_id NOT LIKE '__st3/%')
                AND (?1 OR CASE
@@ -3125,7 +3140,8 @@ impl Store {
                     offset as i64,
                     ended_since as i64,
                     after.map(|key| key.0 as i64),
-                    after.map(|key| key.1.trim_start_matches("mission/"))
+                    after.map(|key| key.1.trim_start_matches("mission/")),
+                    filter
                 ],
                 |row| {
                     Ok((
@@ -6285,13 +6301,25 @@ impl Store {
         include_terminal: bool,
         snapshot_unix_ms: u128,
     ) -> Result<Vec<StepRunView>> {
-        self.work_at_snapshot_internal_with_agentless(
+        self.client_work_at_snapshot_filtered(actor, include_terminal, snapshot_unix_ms, None)
+    }
+
+    /// Match current work subject/title before presentation history is enriched.
+    pub fn client_work_at_snapshot_filtered(
+        &self,
+        actor: Option<&str>,
+        include_terminal: bool,
+        snapshot_unix_ms: u128,
+        filter: Option<&str>,
+    ) -> Result<Vec<StepRunView>> {
+        self.work_at_snapshot_internal_with_agentless_filtered(
             actor,
             include_terminal,
             snapshot_unix_ms,
             true,
             true,
             false,
+            filter,
         )
     }
 
@@ -6658,6 +6686,22 @@ impl Store {
         include_agentless: bool,
         open_only: bool,
     ) -> Result<Vec<StepRunView>> {
+        self.work_at_snapshot_internal_with_agentless_filtered(
+            actor, include_terminal, snapshot_unix_ms, detailed, include_agentless, open_only, None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn work_at_snapshot_internal_with_agentless_filtered(
+        &self,
+        actor: Option<&str>,
+        include_terminal: bool,
+        snapshot_unix_ms: u128,
+        detailed: bool,
+        include_agentless: bool,
+        open_only: bool,
+        filter: Option<&str>,
+    ) -> Result<Vec<StepRunView>> {
         let actor = actor.map(|value| normalize_actor(value, "agent"));
         let connection = self.readers.get();
         let query = if actor.is_some() {
@@ -6665,11 +6709,29 @@ impl Store {
         } else {
             work_at_snapshot_query(open_only)
         };
+        // Both variants expose the same current subject/title fields. Matching before the
+        // presentation reduction avoids replaying the histories of nonmatching steps.
+        let query = if filter.is_some() {
+            smallclaims::store::register_list_filter_function(&connection)?;
+            query.replace(
+                "         ORDER BY created_at_unix_ms, step_path",
+                "           AND (st_list_contains(subject,?4) OR st_list_contains(title,?4))\n         ORDER BY created_at_unix_ms, step_path",
+            )
+        } else {
+            query
+        };
         let mut statement = connection.prepare_cached(&query)?;
-        let rows = statement.query_map(
-            params![actor.as_deref(), include_terminal, include_agentless],
-            step_run_from_row,
-        )?;
+        let rows = if filter.is_some() {
+            statement.query_map(
+                params![actor.as_deref(), include_terminal, include_agentless, filter],
+                step_run_from_row,
+            )?
+        } else {
+            statement.query_map(
+                params![actor.as_deref(), include_terminal, include_agentless],
+                step_run_from_row,
+            )?
+        };
         let views = rows.collect::<Result<Vec<_>, _>>()?;
         let carried_claimants = carried_claimants_tx(
             &connection,
@@ -6766,8 +6828,24 @@ impl Store {
         limit: usize,
         after: Option<&(u128, String)>,
     ) -> Result<(Vec<StepRunView>, bool)> {
+        self.client_work_history_page_after_filtered(
+            actor, snapshot_unix_ms, offset, limit, after, None,
+        )
+    }
+
+    /// Match step projection metadata before visibility, offset, and history enrichment.
+    pub(crate) fn client_work_history_page_after_filtered(
+        &self,
+        actor: Option<&str>,
+        snapshot_unix_ms: u128,
+        offset: usize,
+        limit: usize,
+        after: Option<&(u128, String)>,
+        filter: Option<&str>,
+    ) -> Result<(Vec<StepRunView>, bool)> {
         let actor = actor.map(|value| normalize_actor(value, "agent"));
         let connection = self.readers.get();
+        smallclaims::store::register_list_filter_function(&connection)?;
         // Enrichment can clear a step's claimant, through its effective state alone, but
         // never changes its assignee, its candidates or its update time. So this finds every
         // step the actor can see, in the order the history shows them, and a step it matches
@@ -6792,7 +6870,8 @@ impl Store {
             "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
                     lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints
              FROM step_runs
-             WHERE (?2 IS NULL OR length(updated_at_unix_ms)<length(?2)
+             WHERE (?4 IS NULL OR st_list_contains(subject,?4) OR st_list_contains(title,?4))
+               AND (?2 IS NULL OR length(updated_at_unix_ms)<length(?2)
                     OR (length(updated_at_unix_ms)=length(?2) AND updated_at_unix_ms<?2)
                     OR (updated_at_unix_ms=?2 AND subject>?3))
                AND (agentless=0 OR ?1 IS NULL)
@@ -6804,7 +6883,8 @@ impl Store {
             params![
                 actor.as_deref(),
                 after.map(|key| key.0.to_string()),
-                after.map(|key| key.1.as_str())
+                after.map(|key| key.1.as_str()),
+                filter
             ],
             step_run_from_row,
         )?;
@@ -11803,6 +11883,42 @@ impl Store {
             }
         }
         Ok((output, next_after))
+    }
+
+    /// Match canonically reduced metadata in one bounded raw mailbox candidate window.
+    /// Nonmatching rows do not consume result slots. A candidate continuation may produce
+    /// an empty matching page, as recipient/lifecycle selection already can; CLI mailbox
+    /// listing follows it. Never loop through an entire mailbox to fill a sparse filter.
+    pub fn messages_page_filtered(
+        &self,
+        recipient: Option<&str>,
+        include_closed: bool,
+        after: Option<u64>,
+        through: u64,
+        limit: usize,
+        filter: Option<&str>,
+    ) -> Result<(Vec<MessageView>, Option<u64>)> {
+        let Some(filter) = filter.filter(|filter| !filter.is_empty()) else {
+            return self.messages_page(recipient, include_closed, after, through, limit);
+        };
+        if limit == 0 {
+            return Ok((Vec::new(), None));
+        }
+        let (candidates, candidate_next) =
+            self.messages_page(recipient, include_closed, after, through, 200)?;
+        let mut matches = candidates.into_iter().filter(|message| {
+            smallclaims::store::list_filter_contains(&message.subject, filter)
+                || message.title.as_deref().is_some_and(|title| {
+                    smallclaims::store::list_filter_contains(title, filter)
+                })
+        });
+        let output = matches.by_ref().take(limit).collect::<Vec<_>>();
+        let next = if matches.next().is_some() {
+            output.last().map(|message| message.created_index)
+        } else {
+            candidate_next
+        };
+        Ok((output, next))
     }
 
     pub fn operational_messages(
@@ -52008,5 +52124,222 @@ mod harness_event_tests {
         input.sequence = 1;
         input.claim.kind = "intent.desired".into();
         assert!(store.append_harness_event(&input).is_err());
+    }
+}
+
+#[cfg(test)]
+mod list_filter_tests {
+    use super::*;
+
+    #[test]
+    fn list_filter_is_literal_unicode_and_applied_before_document_paging() {
+        let store = Store::open_memory("filter").unwrap();
+        store
+            .put_document("doc/aaa", b"noise", &None, "noise")
+            .unwrap();
+        let old = store.put_document("doc/Ä_%", b"old", &None, "old").unwrap();
+        let current = store
+            .put_document(
+                "doc/Ä_%",
+                b"new",
+                &Some(old.binding_claim_id.clone()),
+                "new",
+            )
+            .unwrap();
+        store
+            .put_document("doc/ä-anything", b"other", &None, "other")
+            .unwrap();
+        let page = store
+            .list_documents_page_filtered(None, None, false, None, 1, Some("ä_%"))
+            .unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].hash, current.hash);
+        assert!(page[0].latest);
+        let first = store
+            .list_documents_page_filtered(None, None, true, None, 1, Some("ä_%"))
+            .unwrap();
+        assert_eq!(first[0].hash, current.hash);
+        let second = store
+            .list_documents_page_filtered(
+                None,
+                None,
+                true,
+                Some((&first[0].name, first[0].created_index)),
+                1,
+                Some("ä_%"),
+            )
+            .unwrap();
+        assert_eq!(second[0].hash, old.hash);
+        assert!(!second[0].latest);
+        assert!(smallclaims::store::list_filter_contains("Ä_%", "ä_%"));
+        assert!(!smallclaims::store::list_filter_contains(
+            "Ä-anything",
+            "ä_%"
+        ));
+    }
+
+    #[test]
+    fn list_filter_selects_work_before_enrichment_and_history_slots() {
+        let store = Store::open_memory("filter").unwrap();
+        let source = r#"version 2
+mission "aaa-noise" state="ready" { goal "Noise." }
+mission "zz-match" state="ready" {
+  goal "Filter before enriching."
+  step "one" { agentless }
+  step "two" { agentless }
+  step "three" { agentless }
+}"#;
+        let intent = crate::graph::parse_intent(source, "filter").unwrap();
+        let plan = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &plan.subject_tokens, "publish")
+            .unwrap();
+        let missions = store
+            .mission_collection_page_filtered(false, 0, 1, None, Some("ZZ-MATCH"))
+            .unwrap();
+        assert_eq!(missions.len(), 1);
+        assert_eq!(missions[0].0, "mission/zz-match");
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "zz-match".into(),
+                revision: None,
+                workspace: ".".into(),
+                requester: None,
+                mode: None,
+                inputs: BTreeMap::new(),
+                idempotency_key: "start".into(),
+            })
+            .unwrap();
+        {
+            let connection = store.connection.write();
+            for (index, step) in run.steps.iter().enumerate() {
+                let title = if index == 0 { "noise" } else { "Review Ä_%" };
+                connection.execute("UPDATE step_runs SET title=?2,status='ready',updated_at_unix_ms=?3 WHERE subject=?1",
+                    params![step.subject, title, (10 + index).to_string()]).unwrap();
+            }
+        }
+        STEPS_ENRICHED.with(|count| count.set(0));
+        let current = store
+            .client_work_at_snapshot_filtered(None, false, now_ms(), Some("ä_%"))
+            .unwrap();
+        assert_eq!(current.len(), 2);
+        assert_eq!(STEPS_ENRICHED.with(std::cell::Cell::get), 2);
+        STEPS_ENRICHED.with(|count| count.set(0));
+        let (first, more) = store
+            .client_work_history_page_after_filtered(None, now_ms(), 0, 1, None, Some("ä_%"))
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        assert!(more);
+        assert_eq!(STEPS_ENRICHED.with(std::cell::Cell::get), 1);
+        let after = (first[0].updated_at_unix_ms, first[0].subject.clone());
+        let (second, more) = store
+            .client_work_history_page_after_filtered(
+                None,
+                now_ms(),
+                0,
+                1,
+                Some(&after),
+                Some("ä_%"),
+            )
+            .unwrap();
+        assert_eq!(second.len(), 1);
+        assert!(!more);
+        assert_ne!(first[0].subject, second[0].subject);
+        assert!(
+            store
+                .client_work_at_snapshot_filtered(None, false, now_ms(), Some("missing"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn raw_message_filter_bounds_sparse_candidate_work_and_preserves_continuation() {
+        let store = Store::open_memory("filter").unwrap();
+        for n in 0..201 {
+            store.append_claim(&ClaimInput {
+                subject: format!("message/sparse-{n:03}"),
+                kind: "message.sent".into(), actor: Some("person/test".into()),
+                fields: BTreeMap::from([
+                    ("from".into(), json!("person/test")), ("to".into(), json!("agent/worker")),
+                    ("title".into(), json!(if n == 200 { "needle" } else { "ordinary" })),
+                    ("content".into(), json!("body")), ("status".into(), json!("sent")),
+                ]),
+                evidence: vec![], expected_subject: None, idempotency_key: Some(format!("sparse-{n}")),
+            }).unwrap();
+        }
+        let through = store.index().unwrap();
+        let (first, next) = store.messages_page_filtered(Some("agent/worker"), false, None, through, 1, Some("needle")).unwrap();
+        assert!(first.is_empty(), "a sparse filter must not scan past the bounded candidate window");
+        assert!(next.is_some(), "empty matching windows must preserve raw candidate continuation");
+        let (second, next) = store.messages_page_filtered(Some("agent/worker"), false, next, through, 1, Some("needle")).unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].subject, "message/sparse-200");
+        assert!(next.is_none());
+    }
+
+    #[test]
+    fn raw_message_filter_fills_pages_after_recipient_and_closed_selection() {
+        let store = Store::open_memory("filter").unwrap();
+        for (id, to, title) in [
+            ("noise", "agent/worker", "ä-anything"),
+            ("first", "agent/worker", "Ä_% first"),
+            ("other", "agent/other", "Ä_% other"),
+            ("second", "agent/worker", "ä_% second"),
+            ("closed", "agent/worker", "ä_% closed"),
+        ] {
+            store
+                .append_claim(&ClaimInput {
+                    subject: format!("message/{id}"),
+                    kind: "message.sent".into(),
+                    actor: Some("person/test".into()),
+                    fields: BTreeMap::from([
+                        ("from".into(), json!("person/test")),
+                        ("to".into(), json!(to)),
+                        ("content".into(), json!("ä_% exists only in content")),
+                        ("title".into(), json!(title)),
+                        ("status".into(), json!("sent")),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("filter-{id}")),
+                })
+                .unwrap();
+        }
+        for status in ["delivered", "read", "closed"] {
+            store.append_claim(&ClaimInput {
+                subject: "message/closed".into(),
+                kind: format!("message.{status}"),
+                actor: Some("agent/worker".into()),
+                fields: BTreeMap::from([("status".into(), json!(status))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some(format!("close-filter-{status}")),
+            }).unwrap();
+        }
+        let through = store.index().unwrap();
+        let (first, next) = store
+            .messages_page_filtered(Some("agent/worker"), false, None, through, 1, Some("ä_%"))
+            .unwrap();
+        assert_eq!(first[0].subject, "message/first");
+        assert_eq!(next, Some(first[0].created_index));
+        let (second, next) = store
+            .messages_page_filtered(Some("agent/worker"), false, next, through, 1, Some("ä_%"))
+            .unwrap();
+        assert_eq!(second[0].subject, "message/second");
+        assert!(next.is_none());
+        let (all, next) = store
+            .messages_page_filtered(None, false, None, through, 20, Some("ä_%"))
+            .unwrap();
+        assert_eq!(all.len(), 3);
+        assert!(next.is_none());
     }
 }

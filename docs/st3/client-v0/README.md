@@ -206,6 +206,24 @@ documented filters. The server clamps `limit` to `capabilities.limits.max_page_i
 sort after present values, strings compare as Unicode scalar sequences, and the final key is always
 the stable `id` ascending. No locale-sensitive ordering is permitted.
 
+The agents, attention, devices, lanes, launches, messages, missions, sessions, sets, terminals,
+and work list routes also accept `filter=TEXT`. It is a case-insensitive literal substring of
+an item's id, name, or title. It composes with the other filters and runs on the server before
+pagination; page membership, counts, and `has_more` describe the matching collection. Empty
+text has the same membership as an omitted filter. Repeat the same filter and page size with
+`cursor`; changing either is refused. A nonempty filter is echoed exactly in `value.filters.filter`.
+Rust and TypeScript paged HTTP SDK methods refuse a response without that acknowledgment and
+ask for a server upgrade. Raw CLI reads and collection subscriptions do not yet verify the
+acknowledgment.
+
+Every `st … ls` command accepts `--filter TEXT`; the shared `agents tree` and `conversations
+sessions` views also accept it. For example, `st work ls --filter 'release review' --limit 10`.
+Filtered pagination hints go to stderr and retain the shell-quoted filter, so piped stdout
+contains the listing. Mailbox listings continue through all matching pages automatically.
+Raw mailbox filtering examines one bounded candidate window per request; a sparse filter
+can yield an empty page with a continuation, which the CLI follows before finishing.
+The current `--watch` lists send the filter with their collection subscriptions.
+
 | Resource | List and detail routes | Deterministic list order |
 |---|---|---|
 | Attention | `/attention`, `/attention/{id}` | priority descending, requested time ascending, ID |

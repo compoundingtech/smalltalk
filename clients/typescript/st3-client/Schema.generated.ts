@@ -1175,7 +1175,8 @@ export type ClientConnections = typeof ClientConnections.Type
 export type ClientConnectionsEncoded = typeof ClientConnections.Encoded
 
 export const CollectionCommand = /*#__PURE__*/ (() => Schema.Union([
-  Schema.Struct({ "actor": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "collection": Schema.Literals(["missions","attention","agents","work","glasses"]), "id": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(128)), "kind": Schema.Literal("subscribe"), "limit": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(Schema.isLessThanOrEqualTo(200))), "person": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "status": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE) }),
+  Schema.Struct({ "actor": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "collection": Schema.Literals(["missions","attention","agents","work","glasses"]), /** Case-insensitive literal substring of an id, name, or title, matched before the collection window limit. Empty or null matches all items. */
+"filter": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE).annotate({ description: "Case-insensitive literal substring of an id, name, or title, matched before the collection window limit. Empty or null matches all items." }), "id": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(128)), "kind": Schema.Literal("subscribe"), "limit": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(Schema.isLessThanOrEqualTo(200))), "person": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "status": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE) }),
   Schema.Struct({ "collection": Schema.Literal("arrangements"), "id": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(128)), "kind": Schema.Literal("subscribe"), "limit": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(Schema.isLessThanOrEqualTo(200))), "person": ArrangementPerson, /** Follow only this arrangement; its owner must equal person. */
 "subject": optionalKey(ArrangementId) }),
   Schema.Struct({ "capability": Schema.String, "collection": Schema.Literal("terminal"), "id": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(128)), "incarnation": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "kind": Schema.Literal("subscribe"), "terminal": Id }),
@@ -2251,7 +2252,8 @@ export type MailBacklogEncoded = typeof MailBacklog.Encoded
 
 export const Page = /*#__PURE__*/ (() => Schema.Struct({
   "collection": Schema.String.check(Schema.makeFilter((value: string) => value !== "resources", { expected: "a string other than \"resources\"" })),
-  "filters": Schema.Record(Schema.String, Schema.String),
+  /** Effective collection filters. A nonempty filter query is echoed exactly as filters.filter. */
+  "filters": Schema.Record(Schema.String, Schema.String).annotate({ description: "Effective collection filters. A nonempty filter query is echoed exactly as filters.filter." }),
   "items": Schema.Array(Resource),
   "kind": Schema.Literal("page"),
   "page": PageInfo,

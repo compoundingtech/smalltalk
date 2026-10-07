@@ -1605,6 +1605,9 @@ struct UpArgs {
 enum LaunchCommand {
     /// List current launch conversations; use --all for finished history.
     Ls {
+        /// Case-insensitive substring of an id, name, or title, matched before pagination.
+        #[arg(long, value_name = "TEXT")]
+        filter: Option<String>,
         #[arg(long)]
         all: bool,
         #[arg(long)]
@@ -1646,6 +1649,9 @@ enum MissionViewCommand {
     Tree,
     /// List current missions; use --all for historical terminal missions.
     Ls {
+        /// Case-insensitive substring of an id, name, or title, matched before pagination.
+        #[arg(long, value_name = "TEXT")]
+        filter: Option<String>,
         /// Follow current collection changes.
         #[arg(long, conflicts_with_all = ["all", "cursor", "since", "until", "status"])]
         watch: bool,
@@ -2051,6 +2057,9 @@ enum PtyCommand {
     End(PtyScreenArgs),
     /// List current terminal sessions; use --all for stopped history.
     Ls {
+        /// Case-insensitive substring of an id, name, or title, matched before pagination.
+        #[arg(long, value_name = "TEXT")]
+        filter: Option<String>,
         /// Match the exact owner subject before pagination (for example agent/example/worker).
         #[arg(long, add = ArgValueCompleter::new(Complete(Entity::Actor)))]
         owner: Option<String>,
@@ -2406,6 +2415,9 @@ enum DevicesCommand {
 
 #[derive(Args)]
 struct DevicesArgs {
+    /// Case-insensitive substring of an id, name, or title, matched before pagination.
+    #[arg(long, value_name = "TEXT", global = true)]
+    filter: Option<String>,
     /// Concrete human authority carried over the trusted local Unix boundary.
     #[arg(add = ArgValueCompleter::new(Complete(Entity::Person)))]
     #[arg(long = "as", value_parser = parse_person_subject, global = true)]
@@ -2692,6 +2704,9 @@ enum DocCommand {
     },
     /// List selected document bindings; use --all for immutable version history.
     Ls {
+        /// Case-insensitive substring of an id, name, or title, matched before pagination.
+        #[arg(long, value_name = "TEXT")]
+        filter: Option<String>,
         name: Option<String>,
         #[arg(long)]
         all: bool,
@@ -2706,7 +2721,11 @@ enum DocCommand {
 #[derive(Subcommand)]
 enum RuleCommand {
     /// List the rules, each with its mode: off, audit or enforce.
-    Ls,
+    Ls {
+        /// Case-insensitive substring of an id, name, or title, matched before pagination.
+        #[arg(long, value_name = "TEXT")]
+        filter: Option<String>,
+    },
     /// List the writes the rules in audit mode would have refused, newest first.
     Audit {
         /// Only this rule's records.
@@ -2738,6 +2757,9 @@ enum RuleCommand {
 enum ImportCommand {
     /// List running native sessions; use --all for resumable saved history.
     Ls {
+        /// Case-insensitive substring of an id, name, or title, matched before pagination.
+        #[arg(long, value_name = "TEXT")]
+        filter: Option<String>,
         #[arg(long)]
         all: bool,
         /// Resume the next bounded page returned by an earlier list.
@@ -2763,6 +2785,9 @@ enum ImportCommand {
 
 #[derive(Args)]
 struct AgentsArgs {
+    /// Case-insensitive substring of an id, name, or title, matched before pagination.
+    #[arg(long, value_name = "TEXT")]
+    filter: Option<String>,
     /// Follow current collection changes.
     #[arg(long, conflicts_with_all = ["all", "cursor"])]
     watch: bool,
@@ -2932,6 +2957,9 @@ struct AgentQueueMoveArgs {
 enum LaneCommand {
     /// List open lanes; `--all` also lists lanes whose run ended.
     Ls {
+        /// Case-insensitive substring of an id, name, or title, matched before pagination.
+        #[arg(long, value_name = "TEXT")]
+        filter: Option<String>,
         #[arg(long)]
         all: bool,
     },
@@ -3083,7 +3111,16 @@ struct ApplyArgs {
 #[derive(Subcommand)]
 enum OwnedSetsCommand {
     /// List selected owned sets and their source receipts.
-    Ls,
+    Ls {
+        /// Case-insensitive substring of an id, name, or title, matched before pagination.
+        #[arg(long, value_name = "TEXT")]
+        filter: Option<String>,
+        /// Resume the next bounded page returned by an earlier list.
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
     /// Show a set's live membership, retirements and blockers.
     Show {
         name: String,
@@ -3231,8 +3268,31 @@ async fn run_owned_sets(
 ) -> Result<()> {
     let client = generated_client(endpoint, None)?;
     match command {
-        OwnedSetsCommand::Ls => {
-            print_value(&client.sets_list(None, None, false).await?, json_output)
+        OwnedSetsCommand::Ls {
+            filter,
+            cursor,
+            limit,
+        } => {
+            anyhow::ensure!(
+                (1..=200).contains(&limit),
+                "the set limit must be 1 through 200"
+            );
+            let response = client
+                .with_list_filter(filter.as_deref())
+                .sets_list(cursor.as_deref(), Some(limit), false)
+                .await?;
+            print_value(&response, json_output)?;
+            let command = if json_output {
+                "st sets ls --json"
+            } else {
+                "st sets ls"
+            };
+            eprint!(
+                "{}",
+                filtered_page_hint(&response.value, command, filter.as_deref())
+            );
+            note_partial_page(&response.value);
+            Ok(())
         }
         OwnedSetsCommand::Show { name } => print_value(&client.sets_get(&name).await?, json_output),
         OwnedSetsCommand::Status { name, sha } => {
@@ -3499,6 +3559,9 @@ struct GhUnwatchArgs {
 
 #[derive(Args)]
 struct GhLsArgs {
+    /// Case-insensitive substring of an id, name, or title, matched before pagination.
+    #[arg(long, value_name = "TEXT")]
+    filter: Option<String>,
     /// Every seat's watches, not only this seat's.
     #[arg(long)]
     all: bool,
@@ -3582,6 +3645,9 @@ struct SubscriptionRequestArgs {
 enum AttentionCommand {
     /// List all current human attention items.
     Ls {
+        /// Case-insensitive substring of an id, name, or title, matched before pagination.
+        #[arg(long, value_name = "TEXT")]
+        filter: Option<String>,
         /// Follow current collection changes.
         #[arg(long, conflicts_with_all = ["all", "cursor"])]
         watch: bool,
@@ -3731,6 +3797,9 @@ enum WorkCommand {
     CancelAsk(WorkDoneArgs),
     /// List current actionable work; use --as to filter one agent or --all for history.
     Ls {
+        /// Case-insensitive substring of an id, name, or title, matched before pagination.
+        #[arg(long, value_name = "TEXT")]
+        filter: Option<String>,
         /// Follow current collection changes.
         #[arg(long, conflicts_with_all = ["all", "cursor", "since", "until", "status"])]
         watch: bool,
@@ -4089,6 +4158,9 @@ enum MessageCommand {
     Thread(MessageReferenceArgs),
     /// List normalized harness sessions available for native conversation views.
     Sessions {
+        /// Case-insensitive substring of an id, name, or title, matched before pagination.
+        #[arg(long, value_name = "TEXT")]
+        filter: Option<String>,
         #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
         #[arg(long = "as", value_parser = parse_actor_subject)]
         actor: Option<String>,
@@ -4165,6 +4237,9 @@ struct MessageSendArgs {
 
 #[derive(Args)]
 struct MessageListArgs {
+    /// Case-insensitive substring of an id, name, or title, matched before pagination.
+    #[arg(long, value_name = "TEXT")]
+    filter: Option<String>,
     /// Mailbox identity; defaults to the non-empty ST_AGENT value.
     #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     identity: Option<String>,
@@ -5364,7 +5439,9 @@ async fn run_gh(client: &st3::client::Client, command: GhCommand, json: bool) ->
                 || "/v1/github/watches".to_owned(),
                 |agent| format!("/v1/github/watches?agent={}", urlencoding::encode(agent)),
             );
-            let views: Vec<Value> = client.get(&path).await?;
+            let views: Vec<Value> = client
+                .get(&list_filter_path(&path, args.filter.as_deref()))
+                .await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&views)?);
                 return Ok(());
@@ -5882,20 +5959,28 @@ async fn run_launch(
     default_planner: &PlannerSpec,
     json_output: bool,
 ) -> Result<()> {
-    if let LaunchCommand::Ls { all, cursor, limit } = &command {
+    if let LaunchCommand::Ls {
+        all,
+        cursor,
+        limit,
+        filter,
+    } = &command
+    {
         anyhow::ensure!(
             *limit > 0 && *limit <= 200,
             "the launch limit must be 1 through 200"
         );
         let response = generated_client(endpoint, None)?
+            .with_list_filter(filter.as_deref())
             .launches_list(cursor.as_deref(), Some(*limit), *all)
             .await?;
         let history = if *all { " --all" } else { "" };
-        return print_product_page(
+        return print_filtered_product_page(
             "LAUNCHES",
             &response,
             json_output,
             &format!("st launch ls{history}"),
+            filter.as_deref(),
         );
     }
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
@@ -6265,6 +6350,7 @@ async fn run_mission_view(
             }
         }
         MissionViewCommand::Ls {
+            filter,
             watch,
             all,
             cursor,
@@ -6287,6 +6373,7 @@ async fn run_mission_view(
                 return list_outcomes(
                     client,
                     "missions",
+                    filter,
                     since,
                     until,
                     status,
@@ -6304,6 +6391,7 @@ async fn run_mission_view(
                     "missions",
                     None,
                     None,
+                    filter.as_deref(),
                     limit,
                     "MISSIONS",
                     json_output,
@@ -6311,14 +6399,16 @@ async fn run_mission_view(
                 .await;
             }
             let response = generated_client(endpoint, None)?
+                .with_list_filter(filter.as_deref())
                 .missions_list(cursor.as_deref(), Some(limit), all)
                 .await?;
             let history = if all { " --all" } else { "" };
-            print_product_page(
+            print_filtered_product_page(
                 "MISSIONS",
                 &response,
                 json_output,
                 &format!("st missions ls{history}"),
+                filter.as_deref(),
             )
         }
         MissionViewCommand::Show(args) => {
@@ -7289,6 +7379,7 @@ async fn run_pty(
             print_client_value(&result, json_output)
         }
         PtyCommand::Ls {
+            filter,
             all,
             cursor,
             limit,
@@ -7300,6 +7391,7 @@ async fn run_pty(
                 "the terminal limit must be 1 through 200"
             );
             let response = generated_client(endpoint, None)?
+                .with_list_filter(filter.as_deref())
                 .terminals_list_filtered(
                     cursor.as_deref(),
                     Some(limit),
@@ -7316,7 +7408,13 @@ async fn run_pty(
                     command.push_str(&format!(" --{name} '{quoted}'"));
                 }
             }
-            print_product_page("TERMINALS", &response, json_output, &command)
+            print_filtered_product_page(
+                "TERMINALS",
+                &response,
+                json_output,
+                &command,
+                filter.as_deref(),
+            )
         }
         PtyCommand::Attach(args) => {
             let budget = (!args.subject.contains('/'))
@@ -8240,6 +8338,7 @@ async fn run_devices(
     json_output: bool,
 ) -> Result<()> {
     let DevicesArgs {
+        filter,
         person,
         all,
         cursor,
@@ -8256,23 +8355,30 @@ async fn run_devices(
                 "the device limit must be 1 through 200"
             );
             let response = client
+                .clone()
+                .with_list_filter(filter.as_deref())
                 .devices_list(cursor.as_deref(), Some(limit), all)
                 .await?;
             let history = if all { " --all" } else { "" };
             if json_output {
-                return print_product_page("DEVICES", &response, true, "");
+                return print_filtered_product_page(
+                    "DEVICES", &response, true,
+                    &format!("st devices --as {}{history}", shell_argument(&person)),
+                    filter.as_deref(),
+                );
             }
             // Each device says whether it is connected to this member now, or when it was last
             // seen, with the build it reported. A daemon without clients.list says nothing.
             let clients = client.clients_list().await.ok();
-            let rendered = render_product_page(
-                "DEVICES",
-                &response.value,
+            let command = list_continuation_command(
                 &format!("st devices --as {person}{history}"),
+                filter.as_deref(),
             );
-            print!(
-                "{}",
-                with_device_presence(&rendered, clients.as_ref().map(|found| &found.value), now_ms())
+            let rendered = render_product_page("DEVICES", &response.value, &command);
+            print_list_text(
+                &with_device_presence(&rendered, clients.as_ref().map(|found| &found.value), now_ms()),
+                &list_page_hint("items", &response.value, &command),
+                filter.is_some(),
             );
             note_partial_page(&response.value);
             Ok(())
@@ -8526,21 +8632,117 @@ fn print_client_value<T: serde::Serialize>(
     }
 }
 
+fn list_filter_path(path: &str, filter: Option<&str>) -> String {
+    match filter {
+        Some(filter) => format!(
+            "{path}{}filter={}",
+            if path.contains('?') { "&" } else { "?" },
+            urlencoding::encode(filter)
+        ),
+        None => path.to_owned(),
+    }
+}
+
+fn list_continuation_command(command: &str, filter: Option<&str>) -> String {
+    match filter {
+        Some(filter) => format!("{command} --filter {}", shell_argument(filter)),
+        None => command.to_owned(),
+    }
+}
+
+fn list_page_hint(label: &str, page: &ClientPage, continuation_command: &str) -> String {
+    page.page
+        .next_cursor
+        .as_deref()
+        .map(|cursor| {
+            format!(
+                "More {label} are available: {continuation_command} --cursor {} --limit {}\n",
+                shell_argument(cursor),
+                page.page.limit
+            )
+        })
+        .unwrap_or_default()
+}
+
+fn filtered_page_hint(page: &ClientPage, command: &str, filter: Option<&str>) -> String {
+    if !page.page.has_more || filter.is_none() {
+        return String::new();
+    }
+    let command = list_continuation_command(command, filter);
+    if page.page.next_cursor.is_some() {
+        list_page_hint("items", page, &command)
+    } else {
+        format!(
+            "More matching items are available. Start a paged listing with: {command} --limit {}\n",
+            page.page.limit
+        )
+    }
+}
+
+fn list_output_parts<'a>(rendered: &'a str, hint: &str, filtered: bool) -> (&'a str, &'a str) {
+    if filtered && !hint.is_empty() {
+        if let Some(rows) = rendered.strip_suffix(hint) {
+            return (rows, &rendered[rows.len()..]);
+        }
+    }
+    (rendered, "")
+}
+
+fn print_list_text(rendered: &str, hint: &str, filtered: bool) {
+    let (rows, hint) = list_output_parts(rendered, hint, filtered);
+    print!("{rows}");
+    eprint!("{hint}");
+}
+
+fn print_list_hint(hint: &str, filtered: bool) {
+    if filtered {
+        eprintln!("{hint}");
+    } else {
+        println!("{hint}");
+    }
+}
+
 fn print_product_page(
     title: &str,
     response: &ClientEnvelope<ClientPage>,
     json_output: bool,
     continuation_command: &str,
 ) -> Result<()> {
+    print_filtered_product_page(title, response, json_output, continuation_command, None)
+}
+
+fn print_filtered_product_page(
+    title: &str,
+    response: &ClientEnvelope<ClientPage>,
+    json_output: bool,
+    continuation_command: &str,
+    filter: Option<&str>,
+) -> Result<()> {
     if json_output {
         print_value(response, true)?;
+        eprint!(
+            "{}",
+            filtered_page_hint(
+                &response.value,
+                &format!("{continuation_command} --json"),
+                filter
+            )
+        );
     } else {
         if let Some(sync) = &response.value.sync {
             print!("{}", render_sync_notice(sync, now_ms()));
         }
-        print!(
+        let command = list_continuation_command(continuation_command, filter);
+        print_list_text(
+            &render_product_page(title, &response.value, &command),
+            &list_page_hint("items", &response.value, &command),
+            filter.is_some(),
+        );
+    }
+    if !json_output && response.value.page.next_cursor.is_none() {
+        eprint!(
             "{}",
-            render_product_page(title, &response.value, continuation_command)
+            filtered_page_hint(&response.value, continuation_command, filter)
         );
     }
     note_partial_page(&response.value);
@@ -8562,11 +8764,23 @@ async fn run_collection_watch(
     collection: &str,
     actor: Option<&str>,
     status: Option<&str>,
+    filter: Option<&str>,
     limit: usize,
     title: &str,
     json_output: bool,
 ) -> Result<()> {
     let client = generated_client(endpoint, person)?;
+    let mut continuation = format!("st {collection} ls");
+    if let Some(actor) = actor.or(person) {
+        continuation.push_str(&format!(" --as {}", shell_argument(actor)));
+    }
+    if let Some(status) = status {
+        continuation.push_str(&format!(" --status {}", shell_argument(status)));
+    }
+    if json_output {
+        continuation.push_str(" --json");
+    }
+    let continuation = list_continuation_command(&continuation, filter);
     let mut rows = BTreeMap::<String, Value>::new();
     loop {
         let mut stream = match client.collection_stream().await {
@@ -8578,7 +8792,7 @@ async fn run_collection_watch(
             Err(error) => return Err(error.into()),
         };
         stream
-            .subscribe("list", collection, limit, actor, status)
+            .subscribe_filtered("list", collection, limit, actor, status, filter)
             .await?;
         loop {
             let frame = match stream.next().await {
@@ -8626,6 +8840,11 @@ async fn run_collection_watch(
                 .filter_map(Value::as_str)
                 .map(str::to_owned)
                 .collect::<Vec<_>>();
+            if filter.is_some() && frame["has_more"].as_bool() == Some(true) {
+                eprintln!(
+                    "More matching items are available. Start a paged listing with: {continuation} --limit {limit}"
+                );
+            }
             if json_output {
                 print_value(&frame, true)?;
                 continue;
@@ -8977,13 +9196,7 @@ fn render_product_page(title: &str, page: &ClientPage, continuation_command: &st
             }
         }
     }
-    if let Some(cursor) = page.page.next_cursor.as_deref() {
-        let _ = writeln!(
-            output,
-            "More items are available: {continuation_command} --cursor {cursor} --limit {}",
-            page.page.limit
-        );
-    }
+    output.push_str(&list_page_hint("items", page, continuation_command));
     output
 }
 
@@ -9859,6 +10072,8 @@ fn outcome_time(value: &str, now: u128) -> Result<u128> {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct OutcomeCursor {
+    #[serde(default)]
+    filter: Option<String>,
     collection: String,
     since: u128,
     until: u128,
@@ -9871,6 +10086,7 @@ struct OutcomeCursor {
 async fn list_outcomes(
     client: &Client,
     collection: &str,
+    text_filter: Option<String>,
     since: Option<String>,
     until: Option<String>,
     status: Option<String>,
@@ -9890,6 +10106,7 @@ async fn list_outcomes(
             saved.collection == collection
                 && saved.limit == limit
                 && saved.actor == actor
+                && saved.filter == text_filter
                 && status
                     .as_deref()
                     .is_none_or(|s| saved.status.as_deref() == Some(s)),
@@ -9902,6 +10119,7 @@ async fn list_outcomes(
         saved
     } else {
         OutcomeCursor {
+            filter: text_filter,
             collection: collection.into(),
             since: since
                 .as_deref()
@@ -9933,7 +10151,9 @@ async fn list_outcomes(
     if let Some(actor) = &filter.actor {
         path.push_str(&format!("&actor={}", urlencoding::encode(actor)));
     }
-    let mut page: Value = client.get(&path).await?;
+    let mut page: Value = client
+        .get(&list_filter_path(&path, filter.filter.as_deref()))
+        .await?;
     if let Some(before) = page["next_before"].as_u64() {
         filter.before = before;
         let next = format!(
@@ -9944,8 +10164,32 @@ async fn list_outcomes(
     }
     let partial = page["has_more"].as_bool().unwrap_or(false);
     let shown = page["items"].as_array().map_or(0, Vec::len);
+    let continuation = page["next_cursor"].as_str().map(|cursor| {
+        let actor = filter
+            .actor
+            .as_deref()
+            .map(|a| format!(" --as {a}"))
+            .unwrap_or_default();
+        format!(
+            "Next: {} --limit {limit} --cursor {}",
+            list_continuation_command(
+                &format!(
+                    "st {collection} ls{actor}{}",
+                    if json_output { " --json" } else { "" }
+                ),
+                filter.filter.as_deref()
+            ),
+            shell_argument(cursor)
+        )
+    });
     if json_output {
         print_value(&page, true)?;
+        if filter.filter.is_some() {
+            if let Some(continuation) = continuation.as_deref() {
+                eprintln!("{continuation}");
+            }
+        }
+
         if partial {
             st3::gate_report::note_partial_listing(shown);
         }
@@ -9967,13 +10211,8 @@ async fn list_outcomes(
             println!("  mission: {mission}");
         }
     }
-    if let Some(cursor) = page["next_cursor"].as_str() {
-        let actor = filter
-            .actor
-            .as_deref()
-            .map(|a| format!(" --as {a}"))
-            .unwrap_or_default();
-        println!("Next: st {collection} ls{actor} --limit {limit} --cursor '{cursor}'");
+    if let Some(continuation) = continuation {
+        print_list_hint(&continuation, filter.filter.is_some());
     }
     if partial {
         st3::gate_report::note_partial_listing(shown);
@@ -11431,13 +11670,17 @@ async fn run_rules(
         }
     };
     match command {
-        RuleCommand::Ls => {
-            let rules: Vec<NamedRule> = client.get("/v1/rules").await?;
+        RuleCommand::Ls { filter } => {
+            let rules: Vec<NamedRule> = client
+                .get(&list_filter_path("/v1/rules", filter.as_deref()))
+                .await?;
             if json_output {
                 return print_value(&rules, true);
             }
             if rules.is_empty() {
-                println!("no rules: every principal may write what its person may (st rules lockdown sets the presets)");
+                println!(
+                    "no rules: every principal may write what its person may (st rules lockdown sets the presets)"
+                );
             }
             for rule in rules {
                 println!(
@@ -11597,6 +11840,7 @@ async fn run_doc(client: &Client, command: DocCommand, json_output: bool) -> Res
             Ok(())
         }
         DocCommand::Ls {
+            filter,
             name,
             all,
             limit,
@@ -11614,10 +11858,32 @@ async fn run_doc(client: &Client, command: DocCommand, json_output: bool) -> Res
             if let Some(cursor) = &cursor {
                 path.push_str(&format!("&cursor={}", urlencoding::encode(cursor)));
             }
-            let response: DocumentListResponse = client.get(&path).await?;
+            let response: DocumentListResponse = client
+                .get(&list_filter_path(&path, filter.as_deref()))
+                .await?;
             if json_output {
                 let (partial, shown) = (response.has_more, response.items.len());
                 print_value(&response, true)?;
+                if partial && filter.is_some() {
+                    if let Some(cursor) = response.next_cursor.as_deref() {
+                        eprintln!(
+                            "More document versions are available. Continue with: {}",
+                            list_continuation_command(
+                                &format!(
+                                    "{} --json",
+                                    document_continuation_command(
+                                        name.as_deref(),
+                                        all,
+                                        limit,
+                                        cursor
+                                    )
+                                ),
+                                filter.as_deref(),
+                            )
+                        );
+                    }
+                }
+
                 if partial {
                     st3::gate_report::note_partial_listing(shown);
                 }
@@ -11650,9 +11916,20 @@ async fn run_doc(client: &Client, command: DocCommand, json_output: bool) -> Res
                 }
                 if response.has_more {
                     if let Some(cursor) = response.next_cursor {
-                        println!(
-                            "More document versions are available. Continue with: {}",
-                            document_continuation_command(name.as_deref(), all, limit, &cursor)
+                        print_list_hint(
+                            &format!(
+                                "More document versions are available. Continue with: {}",
+                                list_continuation_command(
+                                    &document_continuation_command(
+                                        name.as_deref(),
+                                        all,
+                                        limit,
+                                        &cursor
+                                    ),
+                                    filter.as_deref(),
+                                )
+                            ),
+                            filter.is_some(),
                         );
                     }
                     st3::gate_report::note_partial_listing(shown);
@@ -11681,19 +11958,29 @@ fn document_continuation_command(
 
 async fn run_import(endpoint: &Endpoint, command: ImportCommand, json_output: bool) -> Result<()> {
     match command {
-        ImportCommand::Ls { all, cursor, limit } => {
+        ImportCommand::Ls {
+            all,
+            cursor,
+            limit,
+            filter,
+        } => {
             anyhow::ensure!(
                 limit > 0 && limit <= 200,
                 "the import limit must be 1 through 200"
             );
-            let client = generated_client(endpoint, None)?;
+            let client = generated_client(endpoint, None)?.with_list_filter(filter.as_deref());
             let response = client
                 .sessions_list_native(cursor.as_deref(), Some(limit), all)
                 .await?;
             if json_output {
-                print_value(&response, true)?;
-                note_partial_page(&response.value);
-                return Ok(());
+                let history = if all { " --all" } else { "" };
+                return print_filtered_product_page(
+                    "NATIVE SESSIONS",
+                    &response,
+                    true,
+                    &format!("st import ls{history}"),
+                    filter.as_deref(),
+                );
             }
             let partial = response.value.page.has_more;
             let shown = response.value.items.len();
@@ -11709,8 +11996,16 @@ async fn run_import(endpoint: &Endpoint, command: ImportCommand, json_output: bo
             }
             if let Some(cursor) = next_cursor {
                 let history = if all { " --all" } else { "" };
-                println!(
-                    "More sessions are available: st import ls{history} --cursor {cursor} --limit {limit}"
+                print_list_hint(
+                    &format!(
+                        "More sessions are available: {} --cursor {} --limit {limit}",
+                        list_continuation_command(
+                            &format!("st import ls{history}"),
+                            filter.as_deref()
+                        ),
+                        shell_argument(&cursor),
+                    ),
+                    filter.is_some(),
                 );
             }
             if partial {
@@ -12959,13 +13254,14 @@ async fn run_agent_inspection(
             "agents",
             None,
             args.status.as_deref(),
+            args.filter.as_deref(),
             args.limit,
             "AGENTS",
             json_output,
         )
         .await;
     }
-    let generated = generated_client(endpoint, None)?;
+    let generated = generated_client(endpoint, None)?.with_list_filter(args.filter.as_deref());
     let response = if let Some(status) = args.status.as_deref() {
         generated
             .agents_list_for_status(status, args.cursor.as_deref(), Some(args.limit), args.all)
@@ -12975,11 +13271,6 @@ async fn run_agent_inspection(
             .agents_list(args.cursor.as_deref(), Some(args.limit), args.all)
             .await?
     };
-    if json_output {
-        print_value(&response, true)?;
-        note_partial_page(&response.value);
-        return Ok(());
-    }
     let mut continuation = if tree {
         "st agents tree".to_owned()
     } else {
@@ -12994,9 +13285,20 @@ async fn run_agent_inspection(
     if args.all {
         continuation.push_str(" --all");
     }
-    print!(
-        "{}",
-        render_client_agents(&response.value, tree, args.enrich, &continuation)
+    if json_output {
+        return print_filtered_product_page(
+            "AGENTS",
+            &response,
+            true,
+            &continuation,
+            args.filter.as_deref(),
+        );
+    }
+    let continuation = list_continuation_command(&continuation, args.filter.as_deref());
+    print_list_text(
+        &render_client_agents(&response.value, tree, args.enrich, &continuation),
+        &list_page_hint("agents", &response.value, &continuation),
+        args.filter.is_some(),
     );
     note_partial_page(&response.value);
     Ok(())
@@ -13162,9 +13464,13 @@ async fn run_lanes(
             idempotency_key: format!("lane-change:{}", uuid::Uuid::now_v7().simple()),
         };
     let request = match command {
-        LaneCommand::Ls { all } => {
-            let lanes: Vec<st3::model::LaneView> =
-                client.get(&format!("/v1/lanes?all={all}")).await?;
+        LaneCommand::Ls { all, filter } => {
+            let lanes: Vec<st3::model::LaneView> = client
+                .get(&list_filter_path(
+                    &format!("/v1/lanes?all={all}"),
+                    filter.as_deref(),
+                ))
+                .await?;
             if json_output {
                 return print_value(&lanes, true);
             }
@@ -14062,13 +14368,7 @@ fn render_client_agents(
             }
         }
     }
-    if let Some(cursor) = page.page.next_cursor.as_deref() {
-        let _ = writeln!(
-            output,
-            "More agents are available: {continuation_command} --cursor {cursor} --limit {}",
-            page.page.limit
-        );
-    }
+    output.push_str(&list_page_hint("agents", page, continuation_command));
     output
 }
 
@@ -14423,6 +14723,7 @@ async fn run_attention(
 ) -> Result<()> {
     match command {
         AttentionCommand::Ls {
+            filter,
             watch,
             actor,
             all,
@@ -14441,6 +14742,7 @@ async fn run_attention(
                     "attention",
                     None,
                     None,
+                    filter.as_deref(),
                     limit,
                     &format!("HUMAN ATTENTION FOR {actor}"),
                     json_output,
@@ -14448,14 +14750,16 @@ async fn run_attention(
                 .await;
             }
             let response = generated_client(endpoint, Some(&actor))?
+                .with_list_filter(filter.as_deref())
                 .attention_list(cursor.as_deref(), Some(limit), all)
                 .await?;
             let history = if all { " --all" } else { "" };
-            print_product_page(
+            print_filtered_product_page(
                 &format!("HUMAN ATTENTION FOR {actor}"),
                 &response,
                 json_output,
                 &format!("st attention ls --as {actor}{history}"),
+                filter.as_deref(),
             )
         }
         AttentionCommand::Show { subject, actor } => {
@@ -14873,6 +15177,7 @@ async fn run_work(
         }
 
         WorkCommand::Ls {
+            filter,
             watch,
             actor,
             all,
@@ -14899,6 +15204,7 @@ async fn run_work(
                 return list_outcomes(
                     client,
                     "work",
+                    filter,
                     since,
                     until,
                     status,
@@ -14916,13 +15222,14 @@ async fn run_work(
                     "work",
                     actor.as_deref(),
                     None,
+                    filter.as_deref(),
                     limit,
                     "WORK",
                     json_output,
                 )
                 .await;
             }
-            let generated = generated_client(endpoint, None)?;
+            let generated = generated_client(endpoint, None)?.with_list_filter(filter.as_deref());
             let response = if let Some(actor) = actor.as_deref() {
                 generated
                     .work_list_for_actor(actor, cursor.as_deref(), Some(limit), all)
@@ -14939,7 +15246,7 @@ async fn run_work(
             if all {
                 command.push_str(" --all");
             }
-            print_product_page("WORK", &response, json_output, &command)
+            print_filtered_product_page("WORK", &response, json_output, &command, filter.as_deref())
         }
         WorkCommand::Show { subject } => {
             let normalized = if subject.starts_with("step-run/") {
@@ -15486,15 +15793,6 @@ async fn wait_for_agent_incarnation_from(
     }
 }
 
-async fn message_page(
-    client: &Client,
-    recipient: Option<&str>,
-    include_closed: bool,
-    cursor: Option<&str>,
-) -> Result<MessagePage> {
-    message_page_reporting(client, recipient, include_closed, cursor, None).await
-}
-
 /// One mailbox page. A seat's delivery process passes its delivery report, which the daemon
 /// keeps in memory to tell a live, current delivery path from a stale one.
 async fn message_page_reporting(
@@ -15504,6 +15802,24 @@ async fn message_page_reporting(
     cursor: Option<&str>,
     report: Option<&str>,
 ) -> Result<MessagePage> {
+    client
+        .get(&message_list_path(
+            recipient,
+            include_closed,
+            cursor,
+            report,
+            None,
+        ))
+        .await
+}
+
+fn message_list_path(
+    recipient: Option<&str>,
+    include_closed: bool,
+    cursor: Option<&str>,
+    report: Option<&str>,
+    filter: Option<&str>,
+) -> String {
     let mut path = format!("/v1/messages/page?include_closed={include_closed}&limit=100");
     if let Some(recipient) = recipient {
         path.push_str(&format!("&to={}", urlencoding::encode(recipient)));
@@ -15514,18 +15830,36 @@ async fn message_page_reporting(
     if let Some(report) = report {
         path.push_str(&format!("&delivery={}", urlencoding::encode(report)));
     }
-    client.get(&path).await
+    list_filter_path(&path, filter)
 }
 
 async fn for_each_message(
     client: &Client,
     recipient: Option<&str>,
     include_closed: bool,
+    visit: impl FnMut(MessageView) -> Result<()>,
+) -> Result<()> {
+    for_each_message_filtered(client, recipient, include_closed, None, visit).await
+}
+
+async fn for_each_message_filtered(
+    client: &Client,
+    recipient: Option<&str>,
+    include_closed: bool,
+    filter: Option<&str>,
     mut visit: impl FnMut(MessageView) -> Result<()>,
 ) -> Result<()> {
     let mut cursor = None;
     loop {
-        let page = message_page(client, recipient, include_closed, cursor.as_deref()).await?;
+        let page: MessagePage = client
+            .get(&message_list_path(
+                recipient,
+                include_closed,
+                cursor.as_deref(),
+                None,
+                filter,
+            ))
+            .await?;
         for message in page.items {
             visit(message)?;
         }
@@ -15595,34 +15929,40 @@ async fn run_message(
             if json_output && !args.count {
                 print!("[");
             }
-            for_each_message(client, Some(&identity), args.archive, |message| {
-                if sender
-                    .as_deref()
-                    .is_some_and(|sender| sender != message.from)
-                {
-                    return Ok(());
-                }
-                count += 1;
-                if args.count {
-                    return Ok(());
-                }
-                if json_output {
-                    if !first {
-                        print!(",");
+            for_each_message_filtered(
+                client,
+                Some(&identity),
+                args.archive,
+                args.filter.as_deref(),
+                |message| {
+                    if sender
+                        .as_deref()
+                        .is_some_and(|sender| sender != message.from)
+                    {
+                        return Ok(());
                     }
-                    print!("{}", serde_json::to_string(&message)?);
-                    first = false;
-                } else {
-                    rows.push(format!(
-                        "{}\t{}\t{}\t{}",
-                        message.subject,
-                        message.status,
-                        message.from,
-                        message.title.as_deref().unwrap_or("message")
-                    ));
-                }
-                Ok(())
-            })
+                    count += 1;
+                    if args.count {
+                        return Ok(());
+                    }
+                    if json_output {
+                        if !first {
+                            print!(",");
+                        }
+                        print!("{}", serde_json::to_string(&message)?);
+                        first = false;
+                    } else {
+                        rows.push(format!(
+                            "{}\t{}\t{}\t{}",
+                            message.subject,
+                            message.status,
+                            message.from,
+                            message.title.as_deref().unwrap_or("message")
+                        ));
+                    }
+                    Ok(())
+                },
+            )
             .await?;
             if args.count {
                 println!("{count}");
@@ -15880,6 +16220,7 @@ async fn run_message(
             Ok(())
         }
         MessageCommand::Sessions {
+            filter,
             actor,
             all,
             cursor,
@@ -15890,14 +16231,22 @@ async fn run_message(
                 "the session limit must be 1 through 200"
             );
             let response = generated_client(endpoint, actor.as_deref().or(configured_person))?
+                .with_list_filter(filter.as_deref())
                 .sessions_list(cursor.as_deref(), Some(limit), all)
                 .await?;
             let history = if all { " --all" } else { "" };
-            print_product_page(
+            print_filtered_product_page(
                 "SESSIONS",
                 &response,
                 json_output,
-                &format!("st conversations sessions{history}"),
+                &format!(
+                    "st conversations sessions{history}{}",
+                    actor
+                        .as_deref()
+                        .map(|actor| format!(" --as {}", shell_argument(actor)))
+                        .unwrap_or_default()
+                ),
+                filter.as_deref(),
             )
         }
         MessageCommand::Timeline {
@@ -25032,6 +25381,289 @@ mod tests {
             sync: None,
             replicated: None,
         }
+    }
+
+    #[test]
+    fn every_ls_command_accepts_a_server_side_text_filter() {
+        fn visit(command: &clap::Command, prefix: &mut Vec<String>, checked: &mut usize) {
+            if command.get_name() == "ls" {
+                assert!(
+                    command
+                        .get_arguments()
+                        .any(|arg| arg.get_long() == Some("filter")),
+                    "{} has no --filter",
+                    prefix.join(" ")
+                );
+                *checked += 1;
+            }
+            for child in command.get_subcommands() {
+                if child.get_name() == "help" {
+                    continue;
+                }
+                prefix.push(child.get_name().to_owned());
+                visit(child, prefix, checked);
+                prefix.pop();
+            }
+        }
+        let mut command = Cli::command();
+        command.build();
+        let mut checked = 0;
+        visit(&command, &mut vec!["st".into()], &mut checked);
+        assert_eq!(checked, 14);
+
+        for path in [
+            &["agents", "ls"][..],
+            &["agents", "tree"][..],
+            &["work", "ls"][..],
+            &["missions", "ls"][..],
+            &["conversations", "ls"][..],
+            &["conversations", "sessions"][..],
+            &["attention", "ls"][..],
+            &["terminals", "ls"][..],
+            &["documents", "ls"][..],
+            &["launch", "ls"][..],
+            &["import", "ls"][..],
+            &["rules", "ls"][..],
+            &["sets", "ls"][..],
+            &["devices", "ls"][..],
+            &["devices"][..],
+            &["lanes", "ls"][..],
+            &["gh", "ls"][..],
+        ] {
+            let mut argv = vec!["st"];
+            argv.extend_from_slice(path);
+            argv.extend_from_slice(&["--filter", "Review '& / ä"]);
+            let matches = command.clone().try_get_matches_from(&argv).unwrap();
+            let mut leaf = &matches;
+            while let Some((_, child)) = leaf.subcommand() {
+                leaf = child;
+            }
+            assert_eq!(
+                leaf.get_one::<String>("filter").map(String::as_str),
+                Some("Review '& / ä")
+            );
+            Cli::try_parse_from(&argv).unwrap();
+        }
+        for root in ["agents", "work", "missions", "attention"] {
+            Cli::try_parse_from(["st", root, "ls", "--watch", "--filter", "Review"]).unwrap();
+        }
+    }
+
+    #[test]
+    fn filtered_list_continuations_preserve_shell_arguments_and_leave_stdout_clean() {
+        let filter = "Review '& $(ignored) / ä\nMore items are available: nested";
+        let command = list_continuation_command("st work ls --all", Some(filter));
+        assert_eq!(
+            command,
+            format!("st work ls --all --filter {}", shell_argument(filter))
+        );
+        let page = fixture_product_page(&["work"], true);
+        let rendered = render_product_page("WORK", &page, &command);
+        let hint = list_page_hint("items", &page, &command);
+        let (stdout, stderr) = list_output_parts(&rendered, &hint, true);
+        assert!(stdout.starts_with("WORK"));
+        assert!(!stdout.contains("More items are available:"));
+        assert!(stderr.starts_with("More items are available: st work ls --all --filter "));
+        assert!(stderr.contains(" --cursor cursor/next --limit 100"));
+        assert_eq!(
+            list_output_parts(&rendered, &hint, false),
+            (rendered.as_str(), "")
+        );
+
+        let page = fixture_product_page(&["agent"], true);
+        let command = list_continuation_command("st agents ls", Some(filter));
+        let agents = render_client_agents(&page, false, false, &command);
+        let hint = list_page_hint("agents", &page, &command);
+        let (stdout, stderr) = list_output_parts(&agents, &hint, true);
+        assert!(!stdout.contains("More agents are available:"));
+        assert!(stderr.starts_with("More agents are available:"));
+        assert_eq!(
+            list_output_parts("No documents.\n", "", true),
+            ("No documents.\n", "")
+        );
+
+        let shell = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "set -- {}; printf '%s' \"$1\"",
+                shell_argument(filter)
+            ))
+            .output()
+            .unwrap();
+        assert!(shell.status.success());
+        assert_eq!(String::from_utf8(shell.stdout).unwrap(), filter);
+    }
+
+    #[test]
+    fn filtered_json_pages_and_sets_have_usable_continuation_hints() {
+        let filter = "Review '& / ä";
+        let mut page = fixture_product_page(&[], true);
+        page.page.limit = 1;
+        page.page.next_cursor = Some("next/&".into());
+        let hint = filtered_page_hint(&page, "st sets ls --json", Some(filter));
+        assert_eq!(
+            hint,
+            format!(
+                "More items are available: st sets ls --json --filter {} --cursor {} --limit 1\n",
+                shell_argument(filter),
+                shell_argument("next/&"),
+            )
+        );
+        let cli = Cli::try_parse_from([
+            "st", "sets", "ls", "--json", "--filter", filter, "--cursor", "next/&", "--limit", "1",
+        ])
+        .unwrap();
+        let Command::Sets {
+            command:
+                OwnedSetsCommand::Ls {
+                    filter: parsed,
+                    cursor,
+                    limit,
+                },
+        } = cli.command
+        else {
+            panic!("expected sets listing")
+        };
+        assert!(cli.json);
+        assert_eq!(parsed.as_deref(), Some(filter));
+        assert_eq!(cursor.as_deref(), Some("next/&"));
+        assert_eq!(limit, 1);
+        assert!(filtered_page_hint(&page, "st sets ls", None).is_empty());
+        page.page.has_more = false;
+        assert!(filtered_page_hint(&page, "st sets ls", Some(filter)).is_empty());
+        page.page.has_more = true;
+        page.page.next_cursor = None;
+        let hint = filtered_page_hint(&page, "st work ls --json --as agent/worker", Some(filter));
+        assert!(
+            hint.contains(
+                "Start a paged listing with: st work ls --json --as agent/worker --filter "
+            )
+        );
+        assert!(hint.ends_with(" --limit 1\n"));
+    }
+
+    #[tokio::test]
+    async fn filtered_mailbox_pages_forward_the_same_filter_with_each_cursor() {
+        use axum::{Json, Router, extract::Query, routing::get};
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let received = requests.clone();
+        let app = Router::new().route(
+            "/v1/messages/page",
+            get(move |Query(query): Query<BTreeMap<String, String>>| {
+                let received = received.clone();
+                async move {
+                    let first = !query.contains_key("cursor");
+                    received.lock().unwrap().push(query);
+                    Json(json!({
+                        "api_version": "st3.v1",
+                        "value": {
+                            "items": [{
+                                "subject": if first { "message/first" } else { "message/second" },
+                                "from": "agent/sender", "to": "agent/test", "content": "body",
+                                "status": "unread", "created_index": if first { 1 } else { 2 },
+                                "title": "Review '& / ä"
+                            }],
+                            "has_more": first,
+                            "next_cursor": if first { Some("next/&") } else { None },
+                            "limit": 100
+                        }
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = Client::new(Endpoint::Http(format!("http://{address}")));
+        let mut ids = Vec::new();
+        for_each_message_filtered(
+            &client,
+            Some("agent/test"),
+            true,
+            Some("Review '& / ä"),
+            |message| {
+                ids.push(message.subject);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(ids, ["message/first", "message/second"]);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        for query in requests.iter() {
+            assert_eq!(query["filter"], "Review '& / ä");
+            assert_eq!(query["to"], "agent/test");
+            assert_eq!(query["include_closed"], "true");
+        }
+        assert_eq!(requests[1]["cursor"], "next/&");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn filtered_work_cli_forwards_filter_before_pagination() {
+        use axum::{Json, Router, extract::Query, routing::get};
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let received = requests.clone();
+        let app = Router::new().route(
+            "/v1/client/work",
+            get(move |Query(query): Query<BTreeMap<String, String>>| {
+                received.lock().unwrap().push(query);
+                async {
+                    Json(json!({
+                        "api_version": CLIENT_V0_API_VERSION,
+                        "request_id": "request/filter",
+                        "snapshot": {
+                            "id": "snapshot/filter", "host_id": "host/test", "store_index": 1,
+                            "projection_version": "client-projection.v0", "created_at": "2026-10-06T00:00:00Z"
+                        },
+                        "value": {
+                            "kind": "resource-page", "collection": "work", "filters": {"filter": "Review '& / ä"}, "items": [],
+                            "page": {"limit": 1, "has_more": false, "next_cursor": null}
+                        }
+                    }))
+                }
+            }),
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("filter.sock");
+        let server_socket = socket.clone();
+        let (ready, ready_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            st3::api::serve_unix_with_ready(&server_socket, app, || {
+                let _ = ready.send(());
+            })
+            .await
+            .unwrap();
+        });
+        ready_rx.await.unwrap();
+        let endpoint = Endpoint::Unix(socket);
+        let cli = Cli::try_parse_from([
+            "st",
+            "work",
+            "ls",
+            "--filter",
+            "Review '& / ä",
+            "--all",
+            "--limit",
+            "1",
+            "--cursor",
+            "next/&",
+        ])
+        .unwrap();
+        let Command::Work { command } = cli.command else {
+            panic!("expected work command")
+        };
+        run_work(&Client::new(endpoint.clone()), &endpoint, command, true)
+            .await
+            .unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["filter"], "Review '& / ä");
+        assert_eq!(requests[0]["limit"], "1");
+        assert_eq!(requests[0]["cursor"], "next/&");
+        assert_eq!(requests[0]["history"], "true");
+        server.abort();
     }
 
     #[test]

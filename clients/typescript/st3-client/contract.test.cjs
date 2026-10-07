@@ -36,6 +36,29 @@ test('discovers capabilities, bounds pages, and encodes opaque cursors', async (
     assert.equal(calls.length, 2);
 });
 
+test('literal list filters are encoded before paging and require server acknowledgment', async () => {
+    const calls = [];
+    const filter = "Review '& / ä%_";
+    let acknowledgment = filter;
+    const client = new St3Client({ baseUrl: 'https://example.test', fetchImpl: async url => {
+        calls.push(url);
+        if (url.endsWith('/capabilities')) return response(envelope(capabilities));
+        return response(envelope({ kind: 'page', collection: 'work', filters: acknowledgment === undefined ? {} : { filter: acknowledgment }, items: [], page: { limit: 1, has_more: false } }));
+    } });
+    await client.workList({ filter, limit: 1 });
+    await client.workList({ filter, limit: 1, cursor: 'next/&' });
+    for (const url of calls.slice(1)) {
+        assert.equal(new URL(url).searchParams.get('filter'), filter);
+        assert.equal(new URL(url).searchParams.get('limit'), '1');
+    }
+    assert.equal(new URL(calls[2]).searchParams.get('cursor'), 'next/&');
+    for (acknowledgment of [undefined, 'another filter']) {
+        await assert.rejects(client.workList({ filter, limit: 1 }), /server does not support list text filtering; upgrade the server/);
+    }
+    await client.workList({ filter: '', limit: 1 });
+    assert.equal(new URL(calls.at(-1)).searchParams.has('filter'), false);
+});
+
 test('sends typed fenced action and follows the returned operation', async () => {
     const calls = [];
     const client = new St3Client({ baseUrl: 'https://example.test', fetchImpl: async (url, init) => {
@@ -184,12 +207,14 @@ test('collection commands preserve omitted and nullable options and failure meta
     const stream = await client.collectionStream({ onFrame: frame => frames.push(frame), socket: () => socket });
     socket.onopen();
     stream.subscribe('agents', 'agents');
-    stream.subscribe('nullable', 'work', 100, { person: null, actor: null, status: null });
+    stream.subscribe('nullable', 'work', 100, { person: null, actor: null, status: null, filter: null });
+    stream.subscribe('filtered', 'missions', 1, { filter: 'release review' });
     stream.subscribeTerminal('current', 'terminal/example', undefined, 'capability-proof');
     stream.subscribeTerminal('nullable-terminal', 'terminal/example', null, 'capability-proof');
     assert.deepEqual(socket.sent, [
         { kind: 'subscribe', id: 'agents', collection: 'agents' },
-        { kind: 'subscribe', id: 'nullable', collection: 'work', limit: 100, person: null, actor: null, status: null },
+        { kind: 'subscribe', id: 'nullable', collection: 'work', limit: 100, person: null, actor: null, status: null, filter: null },
+        { kind: 'subscribe', id: 'filtered', collection: 'missions', limit: 1, filter: 'release review' },
         { kind: 'subscribe', id: 'current', collection: 'terminal', terminal: 'terminal/example', capability: 'capability-proof' },
         { kind: 'subscribe', id: 'nullable-terminal', collection: 'terminal', terminal: 'terminal/example', incarnation: null, capability: 'capability-proof' },
     ]);

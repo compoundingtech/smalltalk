@@ -10,8 +10,8 @@ import type {
 } from './Models.generated.ts';
 
 export type PageOptions = { cursor?: string; limit?: number };
-export type TerminalListOptions = PageOptions & { history?: boolean; owner?: string; state?: string };
-export type ListOptions = PageOptions & { history?: boolean; owner_run?: string; actor?: string; status?: string; native_only?: boolean };
+export type TerminalListOptions = PageOptions & { history?: boolean; owner?: string; state?: string; filter?: string };
+export type ListOptions = PageOptions & { history?: boolean; owner_run?: string; actor?: string; status?: string; native_only?: boolean; filter?: string };
 export type EventOptions = { after?: string; limit?: number; wait_ms?: number };
 export type ClientOptions = {
     baseUrl: string;
@@ -47,8 +47,8 @@ export type TerminalStreamOptions = {
 };
 export type TerminalStream = { close(): void };
 
-/** `person` applies to attention, `actor` to work, and `status` to agents. */
-export type CollectionFilters = { person?: string | null; actor?: string | null; status?: string | null };
+/** `person` applies to attention, `actor` to work, `status` to agents, and `filter` matches id/name/title before the window limit. */
+export type CollectionFilters = { person?: string | null; actor?: string | null; status?: string | null; filter?: string | null };
 /** The WebSocket surface the collections socket uses: a terminal socket that also sends. */
 export type CollectionSocket = TerminalSocket & {
     onopen: (() => void) | null;
@@ -109,7 +109,7 @@ function routedId(id: string): string {
 function query(options: Record<string, string | number | boolean | undefined>): string {
     const params = new URLSearchParams();
     for (const [key, value] of Object.entries(options)) {
-        if (value !== undefined) params.set(key, String(value));
+        if (value !== undefined && !(key === 'filter' && value === '')) params.set(key, String(value));
     }
     const result = params.toString();
     return result ? `?${result}` : '';
@@ -177,7 +177,12 @@ export class St3Client {
         if (wait !== null && (!Number.isSafeInteger(Number(wait)) || Number(wait) < 0 || Number(wait) > capabilities.value.limits.max_wait_ms)) {
             throw new RangeError(`wait_ms exceeds negotiated maximum ${capabilities.value.limits.max_wait_ms}`);
         }
-        return this.request<T>('GET', path);
+        const response = await this.request<T>('GET', path);
+        const filter = url.searchParams.get('filter');
+        if (filter !== null && filter !== '' && (response.value as { filters?: Record<string, string> }).filters?.filter !== filter) {
+            throw new Error('The server does not support list text filtering; upgrade the server');
+        }
+        return response;
     }
 
     /** Keep one image (PNG, JPEG, GIF or WebP, at most 10 MiB) on the member this client talks to. Name the answer's `blob` in a `message.send` attachment. */

@@ -138,6 +138,22 @@ impl Store {
         before: u64,
         limit: usize,
     ) -> Result<Value> {
+        self.outcome_history_filtered(collection, since, until, status, actor, before, limit, None)
+    }
+
+    /// Match projected run/step identities and titles before selecting transition history.
+    #[allow(clippy::too_many_arguments)]
+    pub fn outcome_history_filtered(
+        &self,
+        collection: &str,
+        since: u128,
+        until: u128,
+        status: Option<&str>,
+        actor: Option<&str>,
+        before: u64,
+        limit: usize,
+        filter: Option<&str>,
+    ) -> Result<Value> {
         anyhow::ensure!(
             matches!(collection, "missions" | "work"),
             "unknown outcome collection"
@@ -147,6 +163,7 @@ impl Store {
             "status must be failed, cancelled, timed-out, or completed"
         );
         let connection = self.readers.get();
+        smallclaims::store::register_list_filter_function(&connection)?;
         let kinds = if collection == "missions" {
             "c.kind='mission-run.state'"
         } else {
@@ -170,6 +187,9 @@ impl Store {
              LEFT JOIN mission_runs r ON r.id=substr(c.subject,13) AND c.subject LIKE 'mission-run/%'
              WHERE c.kind IN ('mission-run.state','step-run.state','work.failed')
                AND {kinds} AND c.store_index < ?1
+               AND (?7 IS NULL OR st_list_contains(c.subject,?7)
+                    OR st_list_contains('mission/' || COALESCE(r.mission_id,sr.mission_id),?7)
+                    OR st_list_contains(s.title,?7))
                AND CAST(c.accepted_at_unix_ms AS INTEGER)>=?2
                AND CAST(c.accepted_at_unix_ms AS INTEGER)<=?3
                AND json_extract(c.body,'$.fields.status') IN ('failed','cancelled','completed')
@@ -188,7 +208,8 @@ impl Store {
                 until.min(i64::MAX as u128) as i64,
                 status,
                 actor,
-                limit.clamp(1, 200) + 1
+                limit.clamp(1, 200) + 1,
+                filter
             ],
             |row| {
                 Ok((
@@ -305,6 +326,45 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outcome_filter_matches_literal_projected_identity_before_page_limit() {
+        let store = Store::open_memory("filter").unwrap();
+        {
+            let connection = store.connection.write();
+            connection.execute("INSERT INTO batches(id,origin,replica_sequence,hash,accepted_at_unix_ms) VALUES ('filter-batch','filter',1,'filter-hash','1')", []).unwrap();
+            for (index, subject) in [
+                "mission-run/Ä_%/one",
+                "mission-run/ä_%/two",
+                "mission-run/noise",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                connection.execute("INSERT INTO claims(id,batch_id,subject,kind,origin,body,predecessors,accepted_at_unix_ms) VALUES (?1,'filter-batch',?2,'mission-run.state','filter',?3,'[]',?4)",
+                    params![format!("outcome-{index}"), subject, json!({"fields":{"status":"failed","reason":"ä_% exists only in history body"}}).to_string(), (index + 1).to_string()]).unwrap();
+            }
+        }
+        let first = store
+            .outcome_history_filtered("missions", 0, 100, None, None, u64::MAX, 1, Some("ä_%"))
+            .unwrap();
+        assert_eq!(first["items"][0]["subject"], "mission-run/ä_%/two");
+        assert_eq!(first["has_more"], true);
+        let second = store
+            .outcome_history_filtered(
+                "missions",
+                0,
+                100,
+                None,
+                None,
+                first["next_before"].as_u64().unwrap(),
+                1,
+                Some("ä_%"),
+            )
+            .unwrap();
+        assert_eq!(second["items"][0]["subject"], "mission-run/Ä_%/one");
+        assert_eq!(second["has_more"], false);
+    }
     #[test]
     fn cleanup_reason_recovery_uses_canonical_order_despite_reversed_arrival() {
         let store = Store::open_memory("fixture").unwrap();

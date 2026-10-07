@@ -149,6 +149,8 @@ type ClientPageResponse = (Extension<ClientSnapshot>, Json<ClientResourcePage>);
 
 #[derive(Clone, Debug, Default, Deserialize)]
 struct ClientListQuery {
+    #[serde(default)]
+    filter: Option<String>,
     limit: Option<usize>,
     cursor: Option<String>,
     #[serde(default)]
@@ -167,6 +169,8 @@ struct ClientListQuery {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct ClientPageCursor {
+    #[serde(default)]
+    filter: Option<String>,
     snapshot: ClientSnapshot,
     collection: String,
     offset: usize,
@@ -1395,6 +1399,21 @@ fn client_page_expired(message: impl Into<String>) -> ApiError {
     }
 }
 
+/// Literal Unicode substring search over public identity and display metadata.
+/// Aliases name the actual CLI item when its API id is an opaque runtime/resource id.
+fn list_item_matches(item: &Value, filter: Option<&str>) -> bool {
+    let Some(filter) = filter.filter(|filter| !filter.is_empty()) else { return true; };
+    ["id", "name", "title", "subject", "terminal_id", "owner_id", "thread"]
+        .into_iter()
+        .filter_map(|field| item[field].as_str())
+        .any(|value| smallclaims::store::list_filter_contains(value, filter))
+}
+
+#[derive(Default, Deserialize)]
+struct TextFilterQuery {
+    filter: Option<String>,
+}
+
 fn client_page(
     state: &AppState,
     snapshot: &ClientSnapshot,
@@ -1421,6 +1440,10 @@ fn client_page_read(
     } else {
         (None, None)
     };
+    let mut items = items;
+    if query.cursor.is_none() {
+        items.retain(|item| list_item_matches(item, query.filter.as_deref()));
+    }
     let requested_limit = query
         .limit
         .unwrap_or(CLIENT_DEFAULT_PAGE_ITEMS)
@@ -1430,6 +1453,7 @@ fn client_page_read(
     {
         let cursor = decode_client_cursor(cursor)?;
         if cursor.collection != collection
+            || cursor.filter != query.filter
             || cursor.history != query.history
             || cursor.person != query.person
             || cursor.actor != query.actor
@@ -1532,6 +1556,7 @@ fn client_page_read(
             collection: collection.into(),
             offset: end,
             limit,
+            filter: query.filter.clone(),
             history: query.history,
             person: query.person.clone(),
             actor: query.actor.clone(),
@@ -1571,6 +1596,7 @@ fn client_page_filters(collection: &str, query: &ClientListQuery) -> BTreeMap<St
         filters.insert("history".into(), "all".into());
     }
     for (name, value) in [
+        ("filter", query.filter.as_ref()),
         ("person", query.person.as_ref()),
         ("actor", query.actor.as_ref()),
         ("owner_run", query.owner_run.as_ref()),
@@ -1747,10 +1773,21 @@ fn client_work_resources(
     snapshot_unix_ms: u128,
     snapshot_index: u64,
 ) -> anyhow::Result<Vec<Value>> {
+    client_work_resources_filtered(store, actor, history, snapshot_unix_ms, snapshot_index, None)
+}
+
+fn client_work_resources_filtered(
+    store: &Store,
+    actor: Option<&str>,
+    history: bool,
+    snapshot_unix_ms: u128,
+    snapshot_index: u64,
+    filter: Option<&str>,
+) -> anyhow::Result<Vec<Value>> {
     let mut work = if history {
         store.client_work_history_at_snapshot(actor, snapshot_unix_ms)?
     } else {
-        store.client_work_at_snapshot(actor, false, snapshot_unix_ms)?
+        store.client_work_at_snapshot_filtered(actor, false, snapshot_unix_ms, filter)?
     };
     if history {
         work.sort_by(|left, right| {
@@ -1838,6 +1875,7 @@ fn client_work_history_page(
     )
 }
 
+#[cfg(test)]
 fn client_work_history_page_after(
     store: &Store,
     actor: Option<&str>,
@@ -1847,8 +1885,22 @@ fn client_work_history_page_after(
     limit: usize,
     after: Option<&(u128, String)>,
 ) -> anyhow::Result<(Vec<Value>, bool)> {
+    client_work_history_page_after_filtered(store, actor, snapshot_unix_ms, snapshot_index, offset, limit, after, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn client_work_history_page_after_filtered(
+    store: &Store,
+    actor: Option<&str>,
+    snapshot_unix_ms: u128,
+    snapshot_index: u64,
+    offset: usize,
+    limit: usize,
+    after: Option<&(u128, String)>,
+    filter: Option<&str>,
+) -> anyhow::Result<(Vec<Value>, bool)> {
     let (work, has_more) =
-        store.client_work_history_page_after(actor, snapshot_unix_ms, offset, limit, after)?;
+        store.client_work_history_page_after_filtered(actor, snapshot_unix_ms, offset, limit, after, filter)?;
     let desired = store.desired_subjects_for_owner_steps(
         &work
             .iter()
@@ -3938,13 +3990,15 @@ async fn client_work(
         return client_work_history(&state, snapshot, &query).await;
     }
     let actor = query.actor.clone();
+    let filter = query.filter.clone();
     client_snapshot_page(&state, snapshot, "work", &query, move |state, snapshot| {
-        client_work_resources(
+        client_work_resources_filtered(
             &state.store,
             actor.as_deref(),
             false,
             client_snapshot_time(snapshot),
             snapshot.store_index,
+            filter.as_deref(),
         )
     })
     .await
@@ -3963,6 +4017,7 @@ async fn client_work_history(
         if cursor.collection != "work"
             || cursor.snapshot.id != snapshot.id
             || cursor.snapshot.store_index != snapshot.store_index
+            || cursor.filter != query.filter
             || cursor.history != query.history
             || cursor.person != query.person
             || cursor.actor != query.actor
@@ -4004,10 +4059,11 @@ async fn client_work_history(
     };
     let reader = state.clone();
     let actor = query.actor.clone();
+    let filter = query.filter.clone();
     let read = blocking_store(move || {
         reader.store.clone().read_snapshot(|index| {
             let snapshot = client_snapshot_at(&reader, index);
-            let (items, has_more) = client_work_history_page_after(
+            let (items, has_more) = client_work_history_page_after_filtered(
                 &reader.store,
                 actor.as_deref(),
                 client_snapshot_time(&snapshot),
@@ -4015,6 +4071,7 @@ async fn client_work_history(
                 offset,
                 limit,
                 after_key.as_ref(),
+                filter.as_deref(),
             )?;
             Ok(Some((snapshot, items, has_more)))
         })
@@ -4032,7 +4089,8 @@ async fn client_work_history(
                 collection: "work".into(),
                 offset: offset.saturating_add(items.len()),
                 limit,
-                history: query.history,
+                filter: query.filter.clone(),
+            history: query.history,
                 person: query.person.clone(),
                 actor: query.actor.clone(),
                 owner_run: query.owner_run.clone(),
@@ -4563,6 +4621,7 @@ async fn relayed_messages_page(
                     history: query.history,
                     limit: query.limit.map(|limit| limit.clamp(1, 200)),
                     cursor: query.cursor.clone(),
+                    filter: query.filter.clone(),
                 },
             },
         )
@@ -4727,6 +4786,7 @@ async fn client_history(
         if cursor.collection != "history"
             || cursor.snapshot.id != snapshot.id
             || cursor.snapshot.store_index != snapshot.store_index
+            || cursor.filter != query.filter
             || cursor.history != query.history
             || cursor.person != query.person
             || cursor.actor != query.actor
@@ -4779,7 +4839,8 @@ async fn client_history(
                 collection: "history".into(),
                 offset: offset.saturating_add(items.len()),
                 limit,
-                history: query.history,
+                filter: query.filter.clone(),
+            history: query.history,
                 person: query.person.clone(),
                 actor: query.actor.clone(),
                 owner_run: query.owner_run.clone(),
@@ -10181,9 +10242,14 @@ async fn put_document(
 
 async fn list_rules(
     State(state): State<AppState>,
+    Query(query): Query<TextFilterQuery>,
 ) -> Result<Json<Vec<smallclaims::rules::NamedRule>>, ApiError> {
     let store = state.store.clone();
-    blocking_store(move || store.current_rules().map(|rules| rules.as_ref().clone()))
+    blocking_store(move || {
+        let mut rules = store.current_rules()?.as_ref().clone();
+        rules.retain(|rule| query.filter.as_deref().is_none_or(|filter| smallclaims::store::list_filter_contains(&rule.name, filter)));
+        Ok(rules)
+    })
         .await
         .map(Json)
 }
@@ -10264,6 +10330,8 @@ async fn set_rule(
 
 #[derive(Deserialize)]
 struct DocumentQuery {
+    #[serde(default)]
+    filter: Option<String>,
     name: Option<String>,
     prefix: Option<String>,
     cursor: Option<String>,
@@ -10274,6 +10342,8 @@ struct DocumentQuery {
 
 #[derive(Serialize, Deserialize)]
 struct DocumentCursor {
+    #[serde(default)]
+    filter: Option<String>,
     name: String,
     created_index: u64,
     exact_name: Option<String>,
@@ -10305,7 +10375,8 @@ async fn list_documents(
                     "invalid document cursor",
                 ))
             })?;
-            if cursor.exact_name != query.name
+            if cursor.filter != query.filter
+                || cursor.exact_name != query.name
                 || cursor.prefix != query.prefix
                 || cursor.history != history
             {
@@ -10320,8 +10391,9 @@ async fn list_documents(
     let store = state.store.clone();
     let name = query.name.clone();
     let prefix = query.prefix.clone();
+    let filter = query.filter.clone();
     let mut items = blocking_store(move || {
-        store.list_documents_page(
+        store.list_documents_page_filtered(
             name.as_deref(),
             prefix.as_deref(),
             history,
@@ -10329,6 +10401,7 @@ async fn list_documents(
                 .as_ref()
                 .map(|cursor| (cursor.name.as_str(), cursor.created_index)),
             limit.saturating_add(1),
+            filter.as_deref(),
         )
     })
     .await?;
@@ -10337,6 +10410,7 @@ async fn list_documents(
     let next_cursor = if has_more {
         let last = items.last().expect("nonempty page with more items");
         let cursor = DocumentCursor {
+            filter: query.filter,
             name: last.name.clone(),
             created_index: last.created_index,
             exact_name: query.name,
@@ -11548,6 +11622,8 @@ struct MessagesQuery {
 
 #[derive(Deserialize)]
 struct MessagesPageQuery {
+    #[serde(default)]
+    filter: Option<String>,
     to: Option<String>,
     #[serde(default)]
     include_closed: bool,
@@ -11559,6 +11635,8 @@ struct MessagesPageQuery {
 
 #[derive(Serialize, Deserialize)]
 struct MessagesPageCursor {
+    #[serde(default)]
+    filter: Option<String>,
     after: u64,
     through: u64,
     to: Option<String>,
@@ -11594,7 +11672,8 @@ async fn list_messages_page(
             let cursor: MessagesPageCursor = serde_json::from_slice(&bytes).map_err(|_| {
                 ApiError::bad(St3Error::new("validation-failed", "invalid message cursor"))
             })?;
-            if cursor.to != to
+            if cursor.filter != query.filter
+                || cursor.to != to
                 || cursor.include_closed != query.include_closed
                 || cursor.limit != limit
             {
@@ -11612,9 +11691,10 @@ async fn list_messages_page(
     };
     let after = cursor.as_ref().map(|cursor| cursor.after);
     let store = state.store.clone();
+    let filter = query.filter.clone();
     let (items, next_after) = blocking_store(move || {
         let (mut items, next_after) =
-            store.messages_page(to.as_deref(), query.include_closed, after, through, limit)?;
+            store.messages_page_filtered(to.as_deref(), query.include_closed, after, through, limit, filter.as_deref())?;
         mailbox::hold_pre_boot_mail(
             &store, peer.as_ref().map(|peer| &peer.0), to.as_deref(), &mut items,
         )?;
@@ -11624,6 +11704,7 @@ async fn list_messages_page(
     let next_cursor = next_after
         .map(|after| {
             let cursor = MessagesPageCursor {
+                filter: query.filter.clone(),
                 after,
                 through,
                 to: query.to.as_deref().map(normalize_message_party),
@@ -12278,6 +12359,8 @@ async fn mission_overview(
 
 #[derive(Deserialize)]
 struct OutcomeHistoryQuery {
+    #[serde(default)]
+    filter: Option<String>,
     collection: String,
     #[serde(default)]
     since: u64,
@@ -12308,7 +12391,7 @@ async fn outcome_history(
     }
     blocking_store(move || {
         state.store.read_snapshot(|index| {
-            state.store.outcome_history(
+            state.store.outcome_history_filtered(
                 &query.collection,
                 u128::from(query.since),
                 query.until.map(u128::from).unwrap_or_else(client_now_ms),
@@ -12316,6 +12399,7 @@ async fn outcome_history(
                 query.actor.as_deref(),
                 query.before.unwrap_or(index.saturating_add(1)),
                 query.limit.unwrap_or(50),
+                query.filter.as_deref(),
             )
         })
     })
@@ -13114,6 +13198,8 @@ async fn move_agent_queue(
 #[derive(Debug, Default, Deserialize)]
 struct LaneListQuery {
     #[serde(default)]
+    filter: Option<String>,
+    #[serde(default)]
     all: bool,
     #[serde(default)]
     run: Option<String>,
@@ -13178,9 +13264,13 @@ async fn list_lanes(
     Query(query): Query<LaneListQuery>,
 ) -> Result<Json<Vec<crate::model::LaneView>>, ApiError> {
     let store = state.store.clone();
-    blocking_store(move || match query.run.as_deref() {
+    blocking_store(move || {
+        let mut lanes = match query.run.as_deref() {
         Some(run) => store.lanes_for_run(run),
         None => store.lanes(query.all),
+        }?;
+        lanes.retain(|lane| list_item_matches(&serde_json::to_value(lane).expect("lane serialization"), query.filter.as_deref()));
+        Ok(lanes)
     })
     .await
     .map(Json)
@@ -16502,6 +16592,37 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
             started.elapsed()
         );
         server.abort();
+    }
+
+    #[test]
+    fn list_filter_precedes_page_selection_and_binds_continuations() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let snapshot = new_client_snapshot(&state);
+        let query = ClientListQuery {
+            limit: Some(1), filter: Some("STUI".into()),
+            ..Default::default()
+        };
+        let mut items = (0..60).map(|n| json!({"id":format!("agent/{n:03}"),"name":"ordinary"})).collect::<Vec<_>>();
+        items.extend([
+            json!({"id":"agent/fleet/stui","name":"phone"}),
+            json!({"id":"agent/display","name":"STUI builder"}),
+            json!({"id":"agent/body-only","content":"stui"}),
+        ]);
+        let first = client_page(&state, &snapshot, "agents", items, &query).unwrap();
+        assert_eq!(first.items.len(), 1);
+        assert_eq!(first.items[0]["id"], "agent/fleet/stui");
+        assert_eq!(first.filters["filter"], "STUI");
+        assert!(first.page.has_more);
+        let continuation = ClientListQuery { cursor: first.page.next_cursor, ..query };
+        let second = client_page(&state, &snapshot, "agents", vec![], &continuation).unwrap();
+        assert_eq!(second.items[0]["id"], "agent/display");
+        assert!(!second.page.has_more);
+        let changed = ClientListQuery { filter: Some("other".into()), ..continuation };
+        assert_eq!(client_page(&state, &snapshot, "agents", vec![], &changed).unwrap_err().code, "page-cursor-expired");
+        assert!(list_item_matches(&json!({"title":"Équipe 100%_"}), Some("ÉQUIPE 100%_")));
+        assert!(!list_item_matches(&json!({"title":"anything"}), Some("%_")));
+        assert!(list_item_matches(&json!({"id":"runtime/opaque","terminal_id":"terminal/stui"}), Some("STUI")));
     }
 
     #[test]
