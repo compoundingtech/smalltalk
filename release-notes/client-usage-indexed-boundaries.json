@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Bound client usage reads to indexed cumulative snapshot boundaries",
+  "replay": {"status": "none", "detail": "No claim or projection replay. Usage reads use the existing replicated rollups."},
+  "schema": {"status": "changed", "detail": "Adds the partial claims_usage_period_boundary_index on normalized series and observed timestamp expressions, and drops the obsolete claims_usage_rollup_index. Existing stores build the new index on first open; no table, schema-version or shared projection change."},
+  "rules": {"status": "none", "detail": "No checkpoint rules, retention or digest change; canonical snapshot tie-breaking is preserved."},
+  "compatibility": {"status": "none", "detail": "The client usage response and pairing scope are unchanged. Existing cumulative rollups remain readable, including missing attribution and pricing provenance."},
+  "downtime": {"status": "unknown", "detail": "First open waits for SQLite to construct the partial index over existing claims. Production-size restart-to-API time has not been measured; later opens reuse the index."},
+  "manual": {"status": "none", "detail": "No manual migration or client changes are required; index creation is automatic at store open."},
+  "recovery": {"status": "none", "detail": "Binary swap-back is supported: previous builds recreate their prior partial index, ignore the additional index, and retain the same claim data."}
+}
