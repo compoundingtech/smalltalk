@@ -71,6 +71,11 @@ impl Connection {
         }
     }
 
+    /// One request and its reply.
+    pub(crate) fn call(&self, request: &Request) -> Result<Reply> {
+        self.request(request, &[])
+    }
+
     fn request(&self, request: &Request, fds: &[RawFd]) -> Result<Reply> {
         protocol::send(&self.stream, request, fds).context("send to the sekrets gateway")?;
         let Some((reply, _)) =

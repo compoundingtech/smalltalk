@@ -9,7 +9,7 @@ use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
@@ -44,6 +44,9 @@ pub struct GatewayConfig {
     /// passes.
     #[serde(default = "default_checkout_roots")]
     pub checkout_roots: Vec<PathBuf>,
+    /// The API base an authorized request may reach with a profile's token.
+    #[serde(default = "default_github_api")]
+    pub github_api: String,
     /// The name callers see, such as the host's.
     #[serde(default)]
     pub name: Option<String>,
@@ -62,6 +65,9 @@ fn default_bwrap() -> PathBuf {
 }
 fn default_path() -> Vec<PathBuf> {
     vec!["/usr/local/bin".into(), "/usr/bin".into(), "/bin".into()]
+}
+fn default_github_api() -> String {
+    "https://api.github.com".into()
 }
 fn default_checkout_roots() -> Vec<PathBuf> {
     vec!["/home".into()]
@@ -105,6 +111,9 @@ pub struct Gateway {
     git: Option<PathBuf>,
     store: Mutex<GatewayStore>,
     logged: Condvar,
+    http: OnceLock<Arc<super::authorized::Http>>,
+    /// Each profile's API token, read from the profile, until a 401 says it changed.
+    tokens: Mutex<BTreeMap<String, String>>,
 }
 
 /// Start the gateway and serve until the process ends.
@@ -234,6 +243,9 @@ impl Caller {
             CallerView::Agent { agent, .. } => Err(format!(
                 "{agent} is an agent; only a person changes profiles, grants and keys, from a login session"
             )),
+            CallerView::Host { node, .. } => Err(format!(
+                "{node}'s st is not a person; only a person changes profiles, grants and keys, from a login session"
+            )),
             CallerView::Unidentified { reason, .. } => Err(reason.clone()),
         }
     }
@@ -282,6 +294,8 @@ impl Gateway {
             git,
             store: Mutex::new(store),
             logged: Condvar::new(),
+            http: OnceLock::new(),
+            tokens: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -362,6 +376,7 @@ impl Gateway {
                     limit,
                     wait_ms,
                 } => self.read_log(&caller.person, after, limit, wait_ms)?,
+                Request::Authorized(call) => self.authorized(&caller, call)?,
                 other => match self.manage(&caller, other) {
                     Ok(value) => Reply::Ok { value },
                     Err(reason) => Reply::Refused { reason, call: None },
@@ -403,6 +418,10 @@ impl Gateway {
                     ));
                 };
                 match self.check_attestation(uid, pid, person, &cgroup, attestation, nonce) {
+                    Ok(node) if node.starts_with("host/") => CallerView::Host {
+                        node,
+                        person: person.to_owned(),
+                    },
                     Ok(agent) => CallerView::Agent {
                         agent,
                         person: person.to_owned(),
@@ -442,6 +461,9 @@ impl Gateway {
             .map_err(|error| format!("unreadable statement: {error}"))?;
         if statement.node != node {
             return Err(format!("statement names {}, not {node}", statement.node));
+        }
+        if statement.agent.starts_with("host/") && statement.agent != node {
+            return Err(format!("{} speaks only for {node}", statement.agent));
         }
         if statement.person != person {
             return Err(format!(
@@ -909,6 +931,163 @@ impl Gateway {
         }
     }
 
+    /// One authorized API request: the caller's grant of the profile must allow `http METHOD
+    /// github`, the URL must lie under the API base, and the caller brings no credential.
+    fn authorized(
+        &self,
+        caller: &Caller,
+        call: super::authorized::AuthorizedCall,
+    ) -> Result<Reply> {
+        use super::authorized::{GITHUB_TARGET, MAX_REQUEST_BODY, check_url, forwarded_headers};
+        let refuse = |reason: String| Ok(Reply::Refused { reason, call: None });
+        let Some(principal) = caller.principal() else {
+            return refuse(caller.require_person().err().unwrap_or_default());
+        };
+        let argv = vec![
+            "http".to_owned(),
+            call.method.to_ascii_uppercase(),
+            GITHUB_TARGET.to_owned(),
+        ];
+        let usable = self
+            .usable(caller)?
+            .into_iter()
+            .filter(|u| u.profile.id == call.profile)
+            .collect::<Vec<_>>();
+        if usable.is_empty() {
+            return refuse(format!(
+                "profile {} is not {principal}'s and no grant gives it to {principal}",
+                call.profile
+            ));
+        }
+        let mut reasons = Vec::new();
+        let Some(usable) = usable.into_iter().find(|u| match u.judge(&argv) {
+            Verdict::Allowed => true,
+            Verdict::Refused(reason) => {
+                reasons.push(reason);
+                false
+            }
+        }) else {
+            return refuse(reasons.join("; "));
+        };
+        let url = match check_url(&call.url, &self.config.github_api) {
+            Ok(url) => url,
+            Err(reason) => return refuse(reason),
+        };
+        let headers = match forwarded_headers(&call.headers) {
+            Ok(headers) => headers,
+            Err(reason) => return refuse(reason),
+        };
+        let body =
+            match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &call.body) {
+                Ok(body) if body.len() <= MAX_REQUEST_BODY => body,
+                Ok(_) => {
+                    return refuse(format!("the request body is over {MAX_REQUEST_BODY} bytes"));
+                }
+                Err(error) => return refuse(format!("the request body is not base64: {error}")),
+            };
+        let token = match self.api_token(&usable.profile) {
+            Ok(token) => token,
+            Err(error) => {
+                return Ok(Reply::Error {
+                    message: format!("{error:#}"),
+                });
+            }
+        };
+        let http = match self.http.get() {
+            Some(http) => Arc::clone(http),
+            None => {
+                let http = super::authorized::Http::new()?;
+                Arc::clone(self.http.get_or_init(|| http))
+            }
+        };
+        let path = url.path().to_owned();
+        let outcome = http.send(&call.method, url, &headers, &token, body);
+        let detail = match &outcome {
+            Ok(response) => {
+                json!({ "method": call.method, "path": path, "status": response.status })
+            }
+            Err(error) => json!({ "method": call.method, "path": path, "error": error }),
+        };
+        self.log(
+            caller,
+            Some(&usable.profile.owner),
+            "requested",
+            Some(&usable.profile.id),
+            detail,
+        )?;
+        match outcome {
+            Ok(response) => {
+                if response.status == 401 {
+                    // The token was revoked or replaced: read it from the profile next time.
+                    self.tokens
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .remove(&usable.profile.id);
+                }
+                Ok(Reply::Response {
+                    status: response.status,
+                    headers: response.headers,
+                    body: base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        response.body,
+                    ),
+                })
+            }
+            Err(message) => Ok(Reply::Error { message }),
+        }
+    }
+
+    /// A profile's API token: a value put into it (`GH_TOKEN`, `GITHUB_TOKEN`), else what its gh
+    /// login holds, read by running gh as the sekrets user with the profile's home.
+    fn api_token(&self, profile: &Profile) -> Result<String> {
+        if let Some(token) = self
+            .tokens
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&profile.id)
+        {
+            return Ok(token.clone());
+        }
+        let env = self.store().env(&profile.id)?;
+        let token = match env
+            .iter()
+            .find(|(name, _)| name == "GH_TOKEN" || name == "GITHUB_TOKEN")
+        {
+            Some((_, value)) => value.clone(),
+            None => {
+                let gh = sandbox::resolve_tool("gh", &self.config.path, self.tool_owner)?;
+                let home = self.store().profile_home(&profile.id);
+                let output = std::process::Command::new(gh)
+                    .env_clear()
+                    .env("HOME", &home)
+                    .env("XDG_CONFIG_HOME", home.join(".config"))
+                    .env(
+                        "PATH",
+                        std::env::join_paths(&self.config.path).unwrap_or_default(),
+                    )
+                    .args(["auth", "token", "--hostname", "github.com"])
+                    .stdin(std::process::Stdio::null())
+                    .output()
+                    .context("read the profile's gh login")?;
+                if !output.status.success() {
+                    bail!(
+                        "profile {} has no GitHub login: put GH_TOKEN into it or log it in with gh",
+                        profile.id
+                    );
+                }
+                String::from_utf8_lossy(&output.stdout).trim().to_owned()
+            }
+        };
+        if token.is_empty() {
+            bail!("profile {} has an empty GitHub token", profile.id);
+        }
+        self.tokens
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(profile.id.clone(), token.clone());
+        Ok(token)
+    }
+
     fn read_log(&self, person: &str, after: i64, limit: i64, wait_ms: u64) -> Result<Reply> {
         let deadline = std::time::Instant::now() + Duration::from_millis(wait_ms.min(300_000));
         let mut store = self.store();
@@ -1142,8 +1321,13 @@ impl Gateway {
             } => {
                 owned(&profile)?;
                 check_policy(&policy)?;
-                if !(to.starts_with("agent/") || to.starts_with("person/")) {
-                    return Err(format!("grant to an agent or a person, not `{to}`"));
+                if !(to.starts_with("agent/")
+                    || to.starts_with("person/")
+                    || to.starts_with("host/"))
+                {
+                    return Err(format!(
+                        "grant to an agent, a person or a node's st (host/NAME), not `{to}`"
+                    ));
                 }
                 if to == person {
                     return Err(format!("{person} owns {profile} already"));

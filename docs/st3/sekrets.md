@@ -80,6 +80,33 @@ Until seats run as another user, keep a person's own profile on a policy that le
 commands that print credentials (`no-credential-printing`), and remove credentials from the
 person's home (`st sekrets adopt`, the next step).
 
+## Authorized requests
+
+The st daemon, and st commands such as gates, call GitHub's API themselves. With a sekrets
+profile they do it without ever holding the token: each request goes to the gateway, which adds
+the profile's token and returns the response. It is one request and one response over the
+gateway socket, not a proxy.
+
+- The caller is `host/NODE`: the process signs a statement with the node key its person
+  registered (`st sekrets enable`), bound to its pid, cgroup and the gateway's nonce, as a seat's
+  daemon does for a seat. A person in a login session can also call with their own profiles.
+- The profile and the grant must allow `http METHOD github`; the `github-api` preset allows any
+  method. Grant it to the node: `st sekrets grant ada/daemon-gh --to host/alder --preset github-api`.
+- Only URLs under the gateway's `github_api` base (`https://api.github.com` unless root's
+  configuration says otherwise) are reachable. A request that carries its own `Authorization` or
+  `Cookie` header is refused; host and hop-by-hop headers are dropped; the gateway adds
+  `Authorization: Bearer TOKEN`.
+- Redirects are never followed: a 3xx comes back as it is. Every response header (ETag, Link,
+  rate limits) and the raw body come back; a 4xx or 5xx is a response, not an error. Nothing is
+  retried. Request bodies are limited to 16 MiB and response bodies to 64 MiB; each request has 60
+  seconds.
+- The token is a value put into the profile (`GH_TOKEN` or `GITHUB_TOKEN`), else the profile's gh
+  login, read once and kept until a 401 says it changed.
+- Each request is logged by method, path and status, never with the token or the body.
+
+In Rust: `st3::sekrets::authorized::authorized_request(&config, "ada/daemon-gh", &request)`
+returns the response or `Unavailable` (no gateway or no node key), `Refused` or `Transport`.
+
 ## The sandbox
 
 The gateway runs each command as the sekrets user inside bubblewrap:

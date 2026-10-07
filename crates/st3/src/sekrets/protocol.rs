@@ -23,7 +23,8 @@ const RECV_FLAGS: libc::c_int = libc::MSG_CMSG_CLOEXEC;
 const RECV_FLAGS: libc::c_int = 0;
 
 /// The largest frame either side accepts.
-const MAX_FRAME: usize = 1 << 20;
+/// Big enough for an authorized request's largest response, in base64.
+const MAX_FRAME: usize = 96 << 20;
 /// The most descriptors one frame carries.
 pub const MAX_FDS: usize = 16;
 
@@ -81,6 +82,8 @@ pub enum Request {
         attestation: Option<Attestation>,
     },
     Run(RunRequest),
+    /// An API request with the profile's credential; see `authorized`.
+    Authorized(super::authorized::AuthorizedCall),
     /// Forward a signal to a running command.
     Signal {
         signal: i32,
@@ -166,6 +169,11 @@ pub enum CallerView {
         agent: String,
         person: String,
     },
+    /// An st daemon or st command, signed with the node key its person registered.
+    Host {
+        node: String,
+        person: String,
+    },
     /// A process of a known person's Unix user that is neither in a login session nor attested.
     Unidentified {
         person: String,
@@ -178,6 +186,7 @@ impl CallerView {
         match self {
             Self::Person { person } => Some(person),
             Self::Agent { agent, .. } => Some(agent),
+            Self::Host { node, .. } => Some(node),
             Self::Unidentified { .. } => None,
         }
     }
@@ -198,6 +207,12 @@ pub enum Reply {
         /// Something the caller should know, such as where the command runs.
         #[serde(default)]
         note: Option<String>,
+    },
+    /// The response to an authorized request; the body is base64.
+    Response {
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: String,
     },
     Exited {
         #[serde(default)]

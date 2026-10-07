@@ -370,6 +370,10 @@ pub const PRESETS: &[(&str, &str)] = &[
         "git-push",
         "git push to a remote; no mirror, prune or custom receive-pack",
     ),
+    (
+        "github-api",
+        "authorized requests to GitHub's API with any method, for an st daemon's GitHub calls",
+    ),
 ];
 
 /// Options that make gh read a local file, or run an editor, with no way to pass the file: denied.
@@ -504,6 +508,10 @@ pub fn preset(name: &str) -> Option<Preset> {
             ));
             Preset { allow, deny }
         }
+        "github-api" => Preset {
+            allow: vec![Rule::prefix(&["http", "*", "github"])],
+            deny: Vec::new(),
+        },
         "git-push" => Preset {
             allow: vec![Rule::prefix(&["git", "push"])],
             deny: vec![Rule::options(

@@ -57,6 +57,15 @@ fn sandbox_available() -> bool {
 
 impl Fixture {
     fn new() -> Self {
+        Self::build("")
+    }
+
+    /// A gateway whose authorized requests reach `api` instead of GitHub.
+    fn with_github(api: &str) -> Self {
+        Self::build(&format!("github_api = {api:?}\n"))
+    }
+
+    fn build(extra: &str) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let root = fs::canonicalize(dir.path()).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
@@ -74,7 +83,7 @@ impl Fixture {
         let socket = run.join("gateway.sock");
         let config: GatewayConfig = toml::from_str(&format!(
             "socket = {socket:?}\nstore = {store:?}\npath = [{tools:?}, \"/usr/bin\", \"/bin\"]\n\
-             checkout_roots = [{checkouts:?}]\n[people]\n\"{uid}\" = \"person/ada\"\n",
+             checkout_roots = [{checkouts:?}]\n{extra}[people]\n\"{uid}\" = \"person/ada\"\n",
         ))
         .unwrap();
         let kernel = Arc::new(FakeKernel {
@@ -1007,4 +1016,203 @@ fn a_seat_passes_the_files_gh_reads_and_names_no_file_of_the_profile() {
         };
         assert!(reason.contains("may read only"), "{reason}");
     }
+}
+
+/// A stand-in for GitHub's API: it records each request and answers 200 with an ETag, or 302
+/// from `/redirect`.
+fn api_server() -> (String, Arc<Mutex<Vec<String>>>) {
+    use std::io::{BufRead as _, BufReader, Write as _};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&seen);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut head = String::new();
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap_or(0);
+                }
+                head.push_str(&line.to_ascii_lowercase());
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            head.push_str(&String::from_utf8_lossy(&body));
+            let redirect = head.starts_with("get /redirect ");
+            record.lock().unwrap().push(head);
+            let response = if redirect {
+                "HTTP/1.1 302 Found\r\nLocation: https://elsewhere.example/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned()
+            } else {
+                "HTTP/1.1 200 OK\r\nETag: \"v1\"\r\nX-RateLimit-Remaining: 4999\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}".to_owned()
+            };
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    (base, seen)
+}
+
+#[test]
+fn a_nodes_st_makes_api_requests_with_a_token_it_never_holds() {
+    use super::authorized::{AuthorizedError, AuthorizedRequest, request_from_cgroup};
+    let (api, seen) = api_server();
+    let fixture = Fixture::with_github(&api);
+    fixture
+        .manage(Request::ProfileCreate {
+            profile: "ada/daemon-gh".into(),
+            description: None,
+            policy: policy(&["github-api"], &[]),
+            default: false,
+        })
+        .unwrap();
+    fixture
+        .manage(Request::Put {
+            profile: "ada/daemon-gh".into(),
+            name: "GH_TOKEN".into(),
+            value: "example-token".into(),
+        })
+        .unwrap();
+    // This node's st: its config, and the node key the person registered.
+    let state = tempfile::tempdir().unwrap();
+    let config = crate::config::Config {
+        state_dir: state.path().to_path_buf(),
+        node: "example".into(),
+        person: Some("person/ada".into()),
+        ..crate::config::Config::default()
+    };
+    let key = MemberKey::load_or_create(
+        &crate::fleet::join::key_directory(state.path()).join("node.key"),
+    )
+    .unwrap();
+    fixture
+        .manage(Request::Register {
+            node: "host/example".into(),
+            key: key.public().into(),
+        })
+        .unwrap();
+    fixture.as_seat();
+    let request = |url: &str, headers: &[(&str, &str)]| AuthorizedRequest {
+        method: "GET".into(),
+        url: url.into(),
+        headers: headers
+            .iter()
+            .map(|(n, v)| ((*n).to_owned(), (*v).to_owned()))
+            .collect(),
+        body: Vec::new(),
+    };
+    let call = |request: &AuthorizedRequest| {
+        request_from_cgroup(
+            &fixture.socket,
+            &config,
+            "ada/daemon-gh",
+            request,
+            fixture.seat_cgroup(),
+        )
+    };
+    // Not granted to this node yet.
+    let refused = call(&request(&format!("{api}/repos/example/web"), &[]));
+    assert!(
+        matches!(&refused, Err(AuthorizedError::Refused(reason)) if reason.contains("no grant gives it to host/example")),
+        "{refused:?}"
+    );
+    fixture.as_person();
+    fixture
+        .manage(Request::GrantAdd {
+            profile: "ada/daemon-gh".into(),
+            to: "host/example".into(),
+            policy: policy(&["github-api"], &[]),
+            until_unix_ms: None,
+        })
+        .unwrap();
+    fixture.as_seat();
+    let response = call(&request(
+        &format!("{api}/repos/example/web"),
+        &[("If-None-Match", "\"v0\""), ("Connection", "close")],
+    ))
+    .unwrap();
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"{\"ok\":true}");
+    assert!(
+        response
+            .headers
+            .iter()
+            .any(|(n, v)| n == "etag" && v == "\"v1\"")
+    );
+    assert!(
+        response
+            .headers
+            .iter()
+            .any(|(n, v)| n == "x-ratelimit-remaining" && v == "4999")
+    );
+    {
+        let seen = seen.lock().unwrap();
+        let head = seen.last().unwrap();
+        assert!(head.starts_with("get /repos/example/web "), "{head}");
+        assert!(
+            head.contains("authorization: bearer example-token"),
+            "{head}"
+        );
+        assert!(head.contains("if-none-match: \"v0\""), "{head}");
+    }
+    // A redirect comes back as it is.
+    let before = seen.lock().unwrap().len();
+    let redirect = call(&request(&format!("{api}/redirect"), &[])).unwrap();
+    assert_eq!(redirect.status, 302);
+    assert_eq!(seen.lock().unwrap().len(), before + 1);
+    // The caller brings no credential, and reaches nothing but the API.
+    for (url, headers, reason) in [
+        (
+            format!("{api}/user"),
+            vec![("Authorization", "Bearer mine")],
+            "carries its own",
+        ),
+        (
+            "https://elsewhere.example/x".to_owned(),
+            vec![],
+            "authorizes requests to its API only",
+        ),
+    ] {
+        let refused = call(&request(&url, &headers));
+        assert!(
+            matches!(&refused, Err(AuthorizedError::Refused(why)) if why.contains(reason)),
+            "{url}: {refused:?}"
+        );
+    }
+    // A node with no key cannot call at all.
+    let other_state = tempfile::tempdir().unwrap();
+    let mut stranger = config.clone();
+    stranger.state_dir = other_state.path().to_path_buf();
+    let unavailable = request_from_cgroup(
+        &fixture.socket,
+        &stranger,
+        "ada/daemon-gh",
+        &request(&format!("{api}/repos/example/web"), &[]),
+        fixture.seat_cgroup(),
+    );
+    assert!(
+        matches!(unavailable, Err(AuthorizedError::Unavailable(_))),
+        "{unavailable:?}"
+    );
+    // The token never reaches the caller, and each request is logged without it.
+    fixture.as_person();
+    let log = fixture
+        .manage(Request::Log {
+            after: 0,
+            limit: 100,
+            wait_ms: 0,
+        })
+        .unwrap();
+    assert!(
+        log.as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["event"] == "requested" && entry["actor"] == "host/example")
+    );
+    assert!(!log.to_string().contains("example-token"));
 }
