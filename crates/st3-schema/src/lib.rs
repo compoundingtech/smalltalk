@@ -1135,6 +1135,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             &[],
         ),
         (
+            "harness.prompt",
+            &["agent"],
+            WritePolicy::SameSubjectActor,
+            Cardinality::Append,
+            None,
+            false,
+            &[],
+        ),
+        (
             "agent.account",
             &["agent"],
             WritePolicy::SameSubjectActor,
@@ -2451,7 +2460,7 @@ fn claim_retention(kind: &str) -> Retention {
     match kind {
         // The owner reads a transcript from the harness's own session file, or from this log
         // when there is none. Other nodes relay timeline reads to the owner.
-        "harness.timeline" | "harness.telemetry" => Retention::Local,
+        "harness.timeline" | "harness.telemetry" | "harness.prompt" => Retention::Local,
         // Only the node that made them reads these: render receipts and the readiness
         // deadline, whose attention request replicates.
         "render.applied" | "runtime.readiness-deadline-reached" => Retention::Local,
@@ -2478,6 +2487,7 @@ fn claim_retention(kind: &str) -> Retention {
 fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
     let names: &[(&str, FieldSpec)] = match kind {
         "person.delegation-set" => &[("actions", required_array())],
+        "harness.prompt" => &[("incarnation_id",required_string()),("prompt",required_object())],
         "workspace.observed" => &[
             ("host", required_string()),
             ("workspace", required_string()),

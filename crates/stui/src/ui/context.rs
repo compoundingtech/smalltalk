@@ -234,6 +234,7 @@ impl Ui {
             answering: None,
             needs_words: None,
             chat: None,
+            closed: false,
         };
         let doc = screens::home_detail(&self.world, Some(subject), 120, &drafts);
         let mut items = vec![(
@@ -676,6 +677,7 @@ mod tests {
                     answering: None,
                     needs_words: None,
                     chat: None,
+                    closed: false,
                 },
             );
             for target in doc.targets {

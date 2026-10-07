@@ -167,11 +167,6 @@ pub fn enable(agent_dir: &Path, runtime_incarnation: &str) -> Result<()> {
 }
 
 fn append_event(tx: &Connection, kind: &str, body: &Value) -> Result<()> {
-    let bytes: u64 = tx.query_row(
-        "SELECT CAST(value AS INTEGER) FROM metadata WHERE key='pending-bytes'",
-        [],
-        |row| row.get(0),
-    )?;
     let token = body["incarnation"]
         .as_str()
         .or_else(|| body["incarnationId"].as_str())
@@ -180,6 +175,15 @@ fn append_event(tx: &Connection, kind: &str, body: &Value) -> Result<()> {
         "SELECT value FROM metadata WHERE key=?1",
         [format!("provider-runtime:{token}")],
         |r| r.get(0),
+    )?;
+    append_event_for_runtime(tx, &runtime, kind, body)
+}
+
+fn append_event_for_runtime(tx: &Connection, runtime: &str, kind: &str, body: &Value) -> Result<()> {
+    let bytes: u64 = tx.query_row(
+        "SELECT CAST(value AS INTEGER) FROM metadata WHERE key='pending-bytes'",
+        [],
+        |row| row.get(0),
     )?;
     // Capture the binding at the producer. A successor may drain this event after switching
     // accounts, so its own environment cannot supply the event's paying account.
@@ -321,6 +325,54 @@ pub fn write_channel_todo(agent_dir: &Path, runtime: &str, fields: &Value) -> Re
     tx.commit()?;
     signal_wake(agent_dir);
     Ok(())
+}
+
+pub fn prompt_runtime(agent_dir: &Path, incarnation: &str) -> Result<String> {
+    let connection = open(agent_dir)?;
+    anyhow::ensure!(current_token(&connection)?.as_deref() == Some(incarnation), "permission provider was superseded");
+    Ok(connection.query_row("SELECT value FROM metadata WHERE key=?1", [format!("provider-runtime:{incarnation}")], |row| row.get(0))?)
+}
+
+pub fn write_prompt(agent_dir: &Path, value: &Value) -> Result<()> {
+    let mut connection = open(agent_dir)?;
+    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    anyhow::ensure!(current_token(&tx)?.as_deref() == value["incarnation"].as_str(), "permission provider was superseded");
+    append_event(&tx, "harness-prompt", value)?;
+    let key=format!("harness-prompt:{}",value["episode"].as_str().ok_or_else(||anyhow::anyhow!("prompt needs episode"))?);
+    if value["state"] == "open" {
+        tx.execute("INSERT INTO snapshots(kind,body) VALUES(?1,?2) ON CONFLICT(kind) DO UPDATE SET body=excluded.body",
+            params![key,serde_json::to_vec(value)?])?;
+    } else {
+        tx.execute("DELETE FROM snapshots WHERE kind=?1",[key])?;
+    }
+    tx.commit()?;
+    signal_wake(agent_dir);
+    Ok(())
+}
+
+/// A current driver can retire a vanished invocation even after the provider token
+/// changes. This path cannot publish an open prompt or a person decision.
+pub fn write_prompt_unavailable(agent_dir: &Path, prompt: &crate::prompts::Prompt) -> Result<()> {
+    prompt.validate()?;
+    anyhow::ensure!(prompt.state == "unavailable" && prompt.endpoint.is_none(), "retirement needs disappearance evidence");
+    let mut connection = open(agent_dir)?;
+    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let runtime: String = tx.query_row("SELECT value FROM metadata WHERE key='runtime'", [], |row|row.get(0))?;
+    anyhow::ensure!(runtime == prompt.runtime_incarnation, "prompt runtime was superseded");
+    append_event_for_runtime(&tx, &runtime, "harness-prompt", &serde_json::to_value(prompt)?)?;
+    tx.execute("DELETE FROM snapshots WHERE kind=?1", [format!("harness-prompt:{}",prompt.episode)])?;
+    tx.commit()?;
+    signal_wake(agent_dir);
+    Ok(())
+}
+
+/// Restore only live invocation slots on driver re-exec, never historical observations.
+pub fn live_prompts(agent_dir:&Path,runtime:&str)->Result<Vec<crate::prompts::Prompt>> {
+    let connection=open(agent_dir)?;
+    let mut query=connection.prepare("SELECT body FROM snapshots WHERE kind>= 'harness-prompt:' AND kind<'harness-prompt;' LIMIT 256")?;
+    let rows=query.query_map([],|row|row.get::<_,Vec<u8>>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter().map(|raw| Ok(serde_json::from_slice::<crate::prompts::Prompt>(&raw)?))
+        .collect::<Result<Vec<_>>>().map(|prompts|prompts.into_iter().filter(|p|p.runtime_incarnation==runtime).collect())
 }
 
 /// At a known evidence deadline, queue the derived unknown once. Compare in the same

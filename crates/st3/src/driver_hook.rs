@@ -325,6 +325,27 @@ fn claude_observe(
         }
         eprintln!("st: Claude {event} was not recorded: {error:#}");
     }
+    if event == "PermissionRequest" && st_drivers::harness_events::enabled(&paths.agent_dir) {
+        let payload: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+        if payload["tool_name"] != "AskUserQuestion"
+            && let Some(incarnation) = hook_var(env, st_drivers::claude_session::SESSION_ENV)
+        {
+            // The hook parent going away is disappearance evidence, not a guessed denial.
+            let parent = unsafe { libc::getppid() };
+            if st_drivers::prompts::run_claude(
+                &paths.agent_dir,
+                &incarnation,
+                &payload,
+                std::time::Duration::from_secs(105),
+                &mut std::io::stdout(),
+                &|| unsafe { libc::getppid() } != parent,
+            )
+            .is_err()
+            {
+                eprintln!("st: native Claude prompt response became unavailable");
+            }
+        }
+    }
     if !session_start {
         return 0;
     }

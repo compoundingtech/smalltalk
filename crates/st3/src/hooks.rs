@@ -187,7 +187,7 @@ pub fn claude_settings_registration() -> serde_json::Value {
             "StopFailure": observe("StopFailure"),
             "UserPromptSubmit": observe("UserPromptSubmit"),
             "Stop": observe("Stop"),
-            "PermissionRequest": observe("PermissionRequest"),
+            "PermissionRequest": [{"hooks":[{"type":"command","command":"\"$ST_HOOKS/claude-observe.sh\" PermissionRequest","timeout":120}]}],
             "PreToolUse": observe("PreToolUse"),
             "PostToolUse": observe("PostToolUse"),
             // Subagents the seat runs, and the session end that ends them.

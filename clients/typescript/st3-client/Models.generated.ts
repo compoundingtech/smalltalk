@@ -11,7 +11,7 @@ export type ActionCommon = {
   parameters: {
 
 };
-  type: "arrangement.edit" | "custom.reply" | "attention.resolve" | "review.approve" | "review.reject" | "review.request-changes" | "message.send" | "message.read" | "message.close" | "launch.create" | "launch.revise" | "launch.preview" | "launch.approve" | "launch.cancel" | "mission.start" | "mission.revise" | "mission.approve-revision" | "mission.cancel-revision" | "mission.cancel" | "session.import" | "work.ask" | "work.done" | "work.cancel-ask" | "work.claim" | "work.renew" | "work.progress" | "work.complete" | "work.fail" | "work.release" | "work.retry" | "work.publish-mission" | "agent.create" | "agent.stop" | "agent.start" | "agent.suspend" | "agent.resume" | "terminal.create" | "terminal.end" | "agent.queue-move" | "lane.join" | "lane.leave" | "lane.move" | "lane.mark" | "lane.approve" | "runtime.stop" | "runtime.restart" | "runtime.reset" | "runtime.context-clear" | "runtime.signal" | "terminal.input" | "terminal.resize" | "terminal.attach" | "terminal.detach" | "pairing.revoke";
+  type: "arrangement.edit" | "custom.reply" | "attention.resolve" | "review.approve" | "review.reject" | "review.request-changes" | "message.send" | "message.read" | "message.close" | "launch.create" | "launch.revise" | "launch.preview" | "launch.approve" | "launch.cancel" | "mission.start" | "mission.revise" | "mission.approve-revision" | "mission.cancel-revision" | "mission.cancel" | "session.import" | "work.ask" | "work.done" | "prompt.respond" | "work.cancel-ask" | "work.claim" | "work.renew" | "work.progress" | "work.complete" | "work.fail" | "work.release" | "work.retry" | "work.publish-mission" | "agent.create" | "agent.stop" | "agent.start" | "agent.suspend" | "agent.resume" | "terminal.create" | "terminal.end" | "agent.queue-move" | "lane.join" | "lane.leave" | "lane.move" | "lane.mark" | "lane.approve" | "runtime.stop" | "runtime.restart" | "runtime.reset" | "runtime.context-clear" | "runtime.signal" | "terminal.input" | "terminal.resize" | "terminal.attach" | "terminal.detach" | "pairing.revoke";
 };
 
 export type ActionResult = {
@@ -398,8 +398,8 @@ export type Attention = ResourceHeader & {
   action_parameters?: {
 
 };
-  actions: Array<"custom.reply" | "work.done" | "review.approve" | "review.reject" | "review.request-changes" | "launch.approve" | "launch.cancel" | "mission.approve-revision" | "mission.cancel-revision" | "message.read">;
-  attention_kind: ("human-gate" | "launch-approval" | "revision-approval" | "unread-message" | "person-step" | "agent-request" | "fault" | string);
+  actions: Array<"custom.reply" | "work.done" | "prompt.respond" | "review.approve" | "review.reject" | "review.request-changes" | "launch.approve" | "launch.cancel" | "mission.approve-revision" | "mission.cancel-revision" | "message.read">;
+  attention_kind: ("human-gate" | "launch-approval" | "revision-approval" | "unread-message" | "person-step" | "agent-request" | "fault" | "harness-prompt" | string);
   because?: string;
   blocked?: AttentionBlocked;
   custom_form?: {
@@ -419,9 +419,11 @@ export type Attention = ResourceHeader & {
   preview?: (LaunchPreview | null);
   preview_token?: string | null;
   priority: "critical" | "high" | "normal" | "low";
+  prompt?: HarnessPrompt;
   request?: StructuredRequest;
   requested_at: Timestamp;
   requester_id?: Id;
+  resolution?: AttentionResolution;
   review_mode?: "approve" | "feedback";
   source_id: Id;
   source_kind?: string;
@@ -440,6 +442,20 @@ export type AttentionBlocked = {
   goal: string;
   step: string;
   step_run_id: Id;
+};
+
+export type AttentionHistoryAvailability = {
+  complete: boolean;
+  note?: string;
+  since?: Timestamp;
+};
+
+export type AttentionResolution = {
+  answer_label?: string;
+  at?: Timestamp;
+  by?: Id;
+  kind?: "answered" | "withdrawn" | "cancelled" | "closed";
+  reason?: string;
 };
 
 export type AttentionTargetState = {
@@ -801,6 +817,26 @@ export type GoldenResourceSet = Array<Resource>;
 export type HarnessPhase = {
   name: string;
   tasks: Array<HarnessTask>;
+};
+
+export type HarnessPrompt = {
+  at?: string | null;
+  by?: string | null;
+  can_answer?: boolean;
+  capability?: string;
+  choices?: Array<PromptChoice>;
+  content?: string;
+  disposition?: string | null;
+  expires_at?: string;
+  how?: string | null;
+  kind?: string;
+  next_action?: string | null;
+  prompt_id?: string;
+  provider?: string;
+  resolved_at_unix_ms?: number | null;
+  runtime_incarnation?: string;
+  seat_id?: string;
+  state?: "open" | "answered" | "cancelled" | "timed_out" | "ended" | "unavailable";
 };
 
 export type HarnessTask = {
@@ -1184,6 +1220,7 @@ export type Page = {
   filters: {
   [key: string]: string;
 };
+  history?: AttentionHistoryAvailability;
   items: Array<Resource>;
   kind: "page";
   page: PageInfo;
@@ -1318,6 +1355,19 @@ export type ProjectionEvent = Omit<{
   timestamp: Timestamp;
   type: "upsert" | "delete" | "timeline.delta" | "terminal.available" | "capabilities.changed";
 }, 'type' | 'body'> & ({ type: "timeline.delta"; body: TimelineDelta });
+
+export type PromptChoice = {
+  consequence: string;
+  id: string;
+  label: string;
+};
+
+export type PromptRespondParameters = {
+  answer_id: string;
+  episode: string;
+  prompt_id: string;
+  target_id: Id;
+};
 
 export type PublicationDefinition = {
   declaration: {
@@ -2126,6 +2176,7 @@ export type ActionRequest =
   workspace: string;
 }; fence: Fence }) |
   (Omit<ActionCommon, 'type' | 'parameters' | 'fence'> & { type: 'pairing.revoke'; parameters: TargetParameters; fence: Fence }) |
+  (Omit<ActionCommon, 'type' | 'parameters' | 'fence'> & { type: 'prompt.respond'; parameters: PromptRespondParameters; fence: Fence & Required<Pick<Fence, 'runtime_incarnation'>> }) |
   (Omit<ActionCommon, 'type' | 'parameters' | 'fence'> & { type: 'review.approve'; parameters: TargetParameters; fence: Fence }) |
   (Omit<ActionCommon, 'type' | 'parameters' | 'fence'> & { type: 'review.reject'; parameters: TargetParameters; fence: Fence }) |
   (Omit<ActionCommon, 'type' | 'parameters' | 'fence'> & { type: 'review.request-changes'; parameters: TargetParameters; fence: Fence }) |

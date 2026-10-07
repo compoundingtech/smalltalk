@@ -32,6 +32,7 @@ const actionLabels: Record<Attention['actions'][number], string> = {
   'mission.approve-revision': 'Approve revision',
   'mission.cancel-revision': 'Cancel revision',
   'message.read': 'Mark read',
+  'prompt.respond': 'Answer prompt',
 };
 export function attentionActionLabel(action: string): string {
   return actionLabels[action as keyof typeof actionLabels] ?? titleCase(action.replace(/[.-]/g, ' '));

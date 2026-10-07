@@ -1,3 +1,4 @@
+mod prompts;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
@@ -62,6 +63,8 @@ mod client_blobs;
 mod client_adapters;
 mod client_presence;
 mod client_v0;
+#[cfg(test)]
+mod attention_history_tests;
 mod custom;
 mod delivery_presence;
 mod delivery_probes;
@@ -193,6 +196,10 @@ struct ClientPageCursor {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     after_key: Option<(u128, String)>,
     expires_at_unix_ms: u128,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    history_snapshot: Option<crate::store::HistorySnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prompt_history: Option<prompts::HistoryCursor>,
 }
 
 fn signal_changed(state: &AppState) {
@@ -1590,6 +1597,8 @@ fn client_page_read(
     }
     let next_cursor = if has_more {
         Some(encode_client_cursor(&ClientPageCursor {
+            history_snapshot: None,
+            prompt_history: None,
             snapshot: snapshot.clone(),
             collection: collection.into(),
             offset: end,
@@ -1623,6 +1632,7 @@ fn client_page_read(
         },
         sync: client_sync_notice(state),
         replicated: None,
+        history: None,
     })
 }
 
@@ -1641,6 +1651,11 @@ fn client_page_filters(collection: &str, query: &ClientListQuery) -> BTreeMap<St
         if let Some(value) = value {
             filters.insert(name.into(), value.clone());
         }
+    }
+    if collection == "attention"
+        && let Some(state) = &query.state
+    {
+        filters.insert("state".into(), state.clone());
     }
     if collection == "terminals" {
         for (name, value) in [
@@ -3055,6 +3070,7 @@ fn client_attention_actions(kind: &str, review_mode: Option<&str>) -> Vec<&'stat
         }
         "unread-message" => vec!["message.read"],
         "person-step" => vec!["work.done"],
+        "harness-prompt" => vec!["prompt.respond"],
         "fault" | "agent-request" => Vec::new(),
         _ => Vec::new(),
     }
@@ -3085,7 +3101,7 @@ fn insert_attention_target_states(
 
 /// An attention card's ID: its source, recipient and waiting episode. A source asked again
 /// (a human gate's new request, a person step's new episode) gets a new card.
-fn client_attention_id(subject: &str, person: &str, episode: &str) -> anyhow::Result<String> {
+pub(crate) fn client_attention_id(subject: &str, person: &str, episode: &str) -> anyhow::Result<String> {
     let identity = serde_json::to_vec(&(subject, person, episode))?;
     Ok(format!(
         "attention/{}",
@@ -3145,6 +3161,21 @@ fn client_attention_resources_at(
             resource["custom_form"] = source["attention"]["reply"].clone();
             resource["action_parameters"] = json!({"custom.reply":{"target_id":item.subject,"registration":source["registration"],"revision":source["revision"],"episode":item.episode}});
         }
+        if item.kind == "harness-prompt" {
+            if let Some(request) = &item.request { resource["request"] = json!(request); }
+            if let Some(metadata) = store.prompt_metadata(&item.episode, &item.person)? {
+                if metadata["state"] != "open" { resource["state"] = json!("resolved"); }
+                if metadata["can_answer"] == true {
+                    resource["action_parameters"] = json!({"prompt.respond":{
+                        "target_id":item.subject,"episode":item.episode,"prompt_id":metadata["prompt_id"]}});
+                } else {
+                    resource["actions"] = json!([]);
+                    resource["operational"]["actionable"] = json!(false);
+                    resource["operational"]["reasons"] = json!(["native-response-unavailable"]);
+                }
+                resource["prompt"] = metadata;
+            }
+        }
         if item.kind == "person-step" {
             resource["action_parameters"] =
                 json!({"work.done": {"target_id": item.subject, "episode": item.episode}});
@@ -3188,6 +3219,9 @@ fn client_attention_compatibility(items: &mut [Value], custom_forms: bool) {
             item["custom_attention_kind"] = item["attention_kind"].clone();
             item["attention_kind"] = json!("agent-request");
             item["actions"] = json!([]);
+            if item["state"] == "resolved" {
+                continue;
+            }
             let p = &item["action_parameters"]["custom.reply"];
             let command = [
                 "st", "subject", "reply", item["source_id"].as_str().unwrap_or_default(),
@@ -4082,6 +4116,8 @@ async fn client_work_history(
     let next_cursor = has_more
         .then(|| {
             encode_client_cursor(&ClientPageCursor {
+                history_snapshot: None,
+                prompt_history: None,
                 snapshot: snapshot.clone(),
                 collection: "work".into(),
                 offset: offset.saturating_add(items.len()),
@@ -4114,6 +4150,7 @@ async fn client_work_history(
         },
         sync: client_sync_notice(state),
         replicated: None,
+        history: None,
     };
     Ok((Extension(snapshot), Json(page)))
 }
@@ -4478,6 +4515,18 @@ async fn client_attention(
     let person = client_v0::person_filter(&session, query.person.as_deref())?;
     let mut effective_query = query.clone();
     effective_query.person.clone_from(&person);
+    validate_attention_history_query(&query)?;
+    if query.history && query.state.as_deref() != Some("open") {
+        return prompts::history_page(
+            &state,
+            snapshot,
+            &effective_query,
+            session.custom_forms,
+            session.authority_actor.starts_with("person/")
+                && person.as_deref() == Some(session.authority_actor.as_str()),
+        )
+        .await;
+    }
     let history = query.history;
     client_snapshot_page(
         &state,
@@ -4485,7 +4534,9 @@ async fn client_attention(
         "attention",
         &effective_query,
         move |state, _| {
-            let mut items = client_attention_resources_with_previews(state, person.as_deref(), history)?;
+            let mut items =
+                client_attention_resources_with_previews(state, person.as_deref(), history)?;
+            prompts::retain_authorized(&mut items, &session.authority_actor);
             client_attention_compatibility(&mut items, session.custom_forms);
             Ok(items)
         },
@@ -4495,15 +4546,86 @@ async fn client_attention(
 
 async fn client_attention_detail(
     State(state): State<AppState>,
+    Extension(snapshot): Extension<ClientSnapshot>,
     Extension(session): Extension<client_v0::ClientSession>,
     AxumPath(id): AxumPath<String>,
     Query(query): Query<ClientListQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let person = client_v0::person_filter(&session, query.person.as_deref())?;
-    let mut items = client_attention_resources_with_previews(&state, person.as_deref(), query.history)
-        .map_err(ApiError::internal)?;
+    validate_attention_history_query(&query)?;
+    if query.history && query.state.as_deref() != Some("open") {
+        let person = attention_history_person(person.as_deref())?;
+        let store = state.store.clone();
+        let requested = client_detail_id("attention", &id);
+        let prompt_authorized = session.authority_actor == person;
+        let at = client_now_ms();
+        let item = blocking_store(move || {
+            store.request_attention_history()?;
+            let item = store.attention_history_item(&requested, &person, snapshot.store_index)?;
+            if item.is_none() && prompt_authorized {
+                store.prompt_history_item(&person, &requested, at)
+            } else {
+                Ok(item)
+            }
+        })
+        .await?;
+        let mut items = item.into_iter().collect::<Vec<_>>();
+        client_attention_compatibility(&mut items, session.custom_forms);
+        return client_detail(items, "attention", &id);
+    }
+    let mut items =
+        client_attention_resources_with_previews(&state, person.as_deref(), query.history)
+            .map_err(ApiError::internal)?;
+    prompts::retain_authorized(&mut items, &session.authority_actor);
     client_attention_compatibility(&mut items, session.custom_forms);
     client_detail(items, "attention", &id)
+}
+
+fn validate_attention_history_query(query: &ClientListQuery) -> Result<(), ApiError> {
+    if query
+        .state
+        .as_deref()
+        .is_some_and(|state| !matches!(state, "open" | "resolved"))
+        || (!query.history && query.state.as_deref() == Some("resolved"))
+    {
+        return Err(ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "validation-failed".into(),
+            message: "attention state must be open, or resolved with history=true".into(),
+            details: Box::default(),
+        });
+    }
+    Ok(())
+}
+
+// The complete cursor is authenticated, including the effective person, snapshot, limit,
+// filters and seek position. Process-local secrets expire cursors safely on daemon restart.
+fn attention_cursor_mac(cursor: &ClientPageCursor) -> Result<String, ApiError> {
+    use hmac::{Hmac, Mac};
+    static KEY: OnceLock<Result<[u8; 32], String>> = OnceLock::new();
+    let key = KEY
+        .get_or_init(|| {
+            let mut key = [0; 32];
+            getrandom::fill(&mut key)
+                .map_err(|error| format!("page cursor entropy unavailable: {error}"))?;
+            Ok(key)
+        })
+        .as_ref()
+        .map_err(ApiError::internal)?;
+    let mut unsigned = cursor.clone();
+    unsigned.items_digest.clear();
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).map_err(ApiError::internal)?;
+    mac.update(&serde_json::to_vec(&unsigned).map_err(ApiError::internal)?);
+    Ok(hex::encode(mac.finalize().into_bytes()))
+}
+
+fn attention_history_person(person: Option<&str>) -> Result<String, ApiError> {
+    person.filter(|person| person.starts_with("person/")).map(str::to_owned).ok_or_else(|| ApiError {
+        status: StatusCode::FORBIDDEN,
+        code: "forbidden".into(),
+        message: "closed attention history requires an explicit person filter and read.projections authority".into(),
+        details: Box::default(),
+    })
 }
 
 async fn client_messages(
@@ -4830,6 +4952,8 @@ async fn client_history(
         .next_cursor
         .map(|next| {
             encode_client_cursor(&ClientPageCursor {
+                history_snapshot: None,
+                prompt_history: None,
                 snapshot: snapshot.clone(),
                 collection: "history".into(),
                 offset: offset.saturating_add(items.len()),
@@ -4879,6 +5003,7 @@ async fn client_history(
         },
         sync: client_sync_notice(&state),
         replicated: None,
+        history: None,
     }))
 }
 
@@ -19875,10 +20000,18 @@ version 2
                 .and_then(Value::as_str),
             Some(request_reference)
         );
+        let closed=store.attention_history_test_page("person/alex", 20).unwrap().items;
+        let launches=closed.iter().filter(|r|r["attention_kind"]=="launch-approval").collect::<Vec<_>>();
+        assert_eq!(launches.len(),2,"each reviewed launch preview is a distinct episode");
+        assert_eq!(launches[0]["resolution"]["kind"],"answered");
+        assert_eq!(launches[0]["resolution"]["answer_label"],"Approved");
+        assert_eq!(launches[1]["resolution"]["answer_label"],"Changes requested");
+        assert_eq!(launches[0]["resolution"]["by"],"person/alex");
         let before = serde_json::to_value(store.planning_session(session).unwrap()).unwrap();
         store.rebuild_claim_projections().unwrap();
         let after = serde_json::to_value(store.planning_session(session).unwrap()).unwrap();
         assert_eq!(after, before);
+        assert_eq!(store.attention_history_test_page("person/alex", 20).unwrap().items,closed);
     }
 
     #[tokio::test]
@@ -23844,6 +23977,9 @@ agent "seat" { workspace "/tmp"; command "true" }
             .unwrap()
             .unwrap();
         assert_eq!(projection.person_answers[0].respondent, actor);
+        let closed=state.store.attention_history_test_page("person/avery", 5).unwrap().items;
+        assert_eq!(closed[0]["resolution"]["by"],actor);
+        assert_eq!(closed[0]["resolution"]["kind"],"answered");
         assert_eq!(
             projection.person_answers[0].acted_for.as_deref(),
             Some("person/avery")

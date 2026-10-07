@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { ANSWERS, isRequest, report, spaced, yesNo } from '@smalltalk/st3-views/requestView';
+import { ANSWERS, isRequest, report, spaced, yesNo, openPromptFor } from '@smalltalk/st3-views/requestView';
 
 // The same report stui's test reads (crates/stui/src/ui/screens.rs).
 const text = 'The deploy finished: {"status":"failed","error":"unit st3.service did not start","commit":"8821eced","host":"willow","attempt":2,"log":"/var/log/x","duration_ms":1234,"members":["maple","cedar"],"plan":{"a":1},"notes":"long\\nnotes"}';
@@ -38,4 +38,14 @@ assert.equal(spaced('The release run on the Linux runner failed: mold is missing
   assert.deepEqual(personAnswer(decision, 'change', 'rename it'), { id: 'change', text: 'rename it' });
   assert.deepEqual(personAnswer(decision, undefined, 'rename it'), { id: 'change', text: 'rename it' });
   assert.equal(typeof personAnswer({ type: 'choice', answers: options }, undefined, 'words'), 'string');
+}
+
+// A harness prompt shows in its own seat's conversation while it is open, and in no other.
+{
+  const prompt = (id, seat, state = 'open', extra = {}) => ({ id, attention_kind: 'harness-prompt', state: 'open', prompt: { seat_id: seat, state }, ...extra });
+  const items = [prompt('a', 'agent/example/one', 'timed_out'), prompt('b', 'agent/example/two'), prompt('c', 'agent/example/one'), { id: 'd', attention_kind: 'agent-request', state: 'open' }];
+  assert.equal(openPromptFor(items, 'agent/example/one')?.id, 'c', 'the open one of that seat');
+  assert.equal(openPromptFor(items, 'agent/example/two')?.id, 'b');
+  assert.equal(openPromptFor(items, 'agent/example/three'), undefined);
+  assert.equal(openPromptFor([prompt('e', 'agent/example/one', 'open', { state: 'resolved' })], 'agent/example/one'), undefined, 'a resolved one is not shown');
 }

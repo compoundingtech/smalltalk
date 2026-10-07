@@ -162,6 +162,8 @@ pub struct PageInfo {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Page {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<AttentionHistoryAvailability>,
     pub kind: String,
     pub collection: String,
     #[serde(default)]
@@ -296,6 +298,10 @@ pub struct Operational {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Attention {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<HarnessPrompt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<AttentionResolution>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_form: Option<Value>,
     #[serde(default)]
     pub episode: String,
@@ -343,6 +349,28 @@ pub struct Attention {
     pub target_states: Vec<AttentionTargetState>,
     #[serde(default)]
     pub actions: Vec<String>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct AttentionHistoryAvailability {
+    pub complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+/// Durable source closure. Absent fields mean that provenance was not recorded.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct AttentionResolution {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_label: Option<String>,
 }
 /// The mission step that asked and waits for the answer.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -2158,6 +2186,8 @@ pub struct Fence {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub enum ActionType {
+    #[serde(rename = "prompt.respond")]
+    PromptRespond,
     #[serde(rename = "custom.reply")]
     CustomReply,
     #[serde(rename = "arrangement.edit")]
@@ -2687,6 +2717,20 @@ impl ActionRequest {
         Self::new(
             id,
             ActionType::PairingRevoke,
+            idempotency_key,
+            fence,
+            &parameters,
+        )
+    }
+    pub fn prompt_respond(
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: PromptRespondParameters,
+    ) -> Result<Self, serde_json::Error> {
+        Self::new(
+            id,
+            ActionType::PromptRespond,
             idempotency_key,
             fence,
             &parameters,
@@ -3813,4 +3857,56 @@ pub struct ConversationContentChunk {
     pub size: u64,
     pub data: String,
     pub next_offset: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct HarnessPrompt {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub choices: Option<Vec<PromptChoice>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_action: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub how: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_incarnation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub can_answer: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposition: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_at_unix_ms: Option<u64>,
+}
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct PromptRespondParameters {
+    pub target_id: String,
+    pub episode: String,
+    pub prompt_id: String,
+    pub answer_id: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct PromptChoice {
+    pub id: String,
+    pub label: String,
+    pub consequence: String,
 }

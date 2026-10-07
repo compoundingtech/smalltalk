@@ -10,6 +10,7 @@ import { agentName } from '../agentsView';
 import { attentionActionLabel, attentionKindLabel, blockedLine } from '../presentation';
 import { missionTitle } from '../missionsView';
 import { useStore } from '../store';
+import { PromptCard } from '../PromptCard';
 import { randomName } from '../launcher';
 import { theme } from '../theme';
 import { Button, Legend, ListRow, Markdown, Note, Screen, SectionHeader, T } from '../ui';
@@ -136,6 +137,17 @@ export function AttentionScreen({ route, navigation }: RootScreen<'Attention'>) 
           ? <Button label="clear from Home" onPress={() => { actions.clearClosed(item.id); navigation.goBack(); }} />
           : item.actions.includes('work.done') ? <Button label="mark read" disabled={busy || status !== 'online'} onPress={() => void actions.done(item, 'Read', 'read').then(done => { if (done) navigation.goBack(); })} /> : null}
         {agentId ? <Button label={`chat with ${from}`} onPress={() => navigation.navigate('Conversation', { target: agentId, title: from })} /> : null}
+        <T dim selectable>{item.id}</T>
+      </ScrollView>
+    </Screen>;
+  }
+  if (item.attention_kind === 'harness-prompt' && item.prompt) {
+    return <Screen>
+      <Banners />
+      <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ padding: 12, gap: 8, paddingBottom: 32 }}>
+        <T><T bold color={theme[row.color]}>{row.glyph} prompt</T><T dim>  {item.prompt.kind ?? 'harness'} · waited {row.age}</T></T>
+        <PromptCard item={item} from={agent ? agentName(agent) : item.prompt.seat_id?.replace(/^agent\//, '') ?? 'A harness'} onAnswered={() => navigation.goBack()} />
+        {agentId ? <Button label={`chat with ${agent ? agentName(agent) : agentId}`} onPress={() => navigation.navigate('Conversation', { target: agentId, title: agent ? agentName(agent) : agentId })} /> : null}
         <T dim selectable>{item.id}</T>
       </ScrollView>
     </Screen>;

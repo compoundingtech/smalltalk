@@ -84,3 +84,8 @@ export function personAnswer(request: Request | null | undefined, chosen: string
   const changes = request.answers?.find(answer => answer.outcome === 'request_changes');
   return changes ? { id: changes.id, text } : 'This asks you to pick one of its answers.';
 }
+
+/** The prompt a harness is waiting on for one agent, still open: the card shown in its conversation. */
+export function openPromptFor<T extends { attention_kind: string; state: string; prompt?: { seat_id?: string; state?: string } }>(items: readonly T[], agentId: string): T | undefined {
+  return items.find(item => item.attention_kind === 'harness-prompt' && item.state !== 'resolved' && item.prompt?.seat_id === agentId && (!item.prompt.state || item.prompt.state === 'open'));
+}

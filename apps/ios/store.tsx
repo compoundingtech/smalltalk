@@ -364,6 +364,21 @@ function useAppStore(proof?: FabricProfile) {
       if (typeof typed === 'string') { setError(typed); return false; }
       return runAction(async () => { const id = actionId(); return client.workDone({ id, idempotency_key: id, fence: await fence({ [item.id]: item.revision }), parameters: { target_id: item.source_id, episode: item.episode || item.revision, summary, ...(typed ? { answer: typed } : {}) } }); });
     },
+    /** Answer a prompt a harness is waiting on, by the id of one of its choices. The fence carries the
+     * incarnation the prompt was shown for, so an answer for an earlier one is refused. */
+    async respondPrompt(item: Attention, answerId: string) {
+      if (!client) return false;
+      const prompt = item.prompt;
+      if (!prompt) { setError('This prompt changed; look again.'); return false; }
+      if (!prompt.runtime_incarnation) { setError('This prompt has no incarnation to answer; look again.'); return false; }
+      const incarnation = prompt.runtime_incarnation;
+      acted.current.add(item.id);
+      return runAction(async () => {
+        const id = actionId();
+        const base = await fence({ [item.id]: item.revision });
+        return client.promptRespond({ id, idempotency_key: id, fence: { ...base, runtime_incarnation: incarnation }, parameters: { target_id: item.source_id, episode: item.episode || item.revision, prompt_id: prompt.prompt_id ?? '', answer_id: answerId as 'approve' | 'deny' } });
+      });
+    },
     /** Clear an item st closed: only the person's own word removes it from Home. */
     clearClosed(id: string) {
       acted.current.add(id);

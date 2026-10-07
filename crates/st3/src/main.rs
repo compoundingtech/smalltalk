@@ -5810,6 +5810,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         recorder.map(|installation| installation.directory),
     )?.with_schedule_peers(state.configured_peers.clone()).with_client_relay(state.client_relay.clone()).with_person(config.person.clone()));
     tokio::spawn(reconciler.supervise());
+    tokio::spawn(store.clone().run_attention_history());
     // A start no longer rebuilds the operation projection; check it once the API serves.
     tokio::spawn({
         let store = store.clone();
@@ -18295,6 +18296,7 @@ struct NativeObservations {
     retry_pending: bool,
     initial_wake: bool,
     pipe: Option<tokio::io::unix::AsyncFd<std::fs::File>>,
+    prompts: std::collections::BTreeMap<String,st_drivers::prompts::Prompt>,
 }
 impl NativeObservations {
     fn start(dir: &Path, runtime: &str) -> Result<Self> {
@@ -18322,6 +18324,7 @@ impl NativeObservations {
             .as_deref()
             .and_then(|raw| serde_json::from_slice(raw).ok());
         Ok(Self {
+            prompts: if enabled { st_drivers::harness_events::live_prompts(dir,runtime)?.into_iter().map(|p|(p.episode.clone(),p)).collect() } else { Default::default() },
             dir: dir.into(),
             runtime: runtime.into(),
             enabled,
@@ -18356,6 +18359,22 @@ impl NativeObservations {
         }
     }
     fn expire_due(&mut self) -> Result<()> {
+        let now=st_drivers::message::now_ms();
+        self.prompts.retain(|_,prompt| {
+            // Loss of a live invocation socket is direct disappearance evidence. Expiry alone
+            // is not a provider timeout; the native hook records its own deadline explicitly.
+            let vanished=prompt.endpoint.as_deref().is_some_and(|path| !st_drivers::prompts::visible(path));
+            let replaced=st_drivers::harness_events::prompt_runtime(&self.dir,&prompt.incarnation).ok().as_deref()!=Some(prompt.runtime_incarnation.as_str());
+            if vanished || replaced {
+                prompt.state="unavailable".into();prompt.disposition=Some("unavailable".into());prompt.how=None;
+                prompt.at_ms=Some(now);prompt.endpoint=None;
+                if st_drivers::harness_events::write_prompt_unavailable(&self.dir,prompt).is_ok() {
+                    self.retry_pending=true;
+                    return false;
+                }
+            }
+            true
+        });
         if let Some(state) = &self.evidence_deadline {
             let stamp = state["writtenAtMs"]
                 .as_u64()
@@ -18504,6 +18523,20 @@ impl NativeObservations {
                         &mut None,
                     )
                     .await?;
+                }
+                "harness-prompt" => {
+                    let prompt:st_drivers::prompts::Prompt=serde_json::from_value(event.payload.clone())?;
+                    if event.runtime_incarnation==self.runtime {
+                        if prompt.state=="open" { self.prompts.insert(prompt.episode.clone(),prompt); }
+                        else { self.prompts.remove(&prompt.episode); }
+                    }
+                    let _: ClaimRecord = publisher.post("/v1/claims", &ClaimInput {
+                        subject: subject.into(), kind: "harness.prompt".into(), actor: Some(subject.into()),
+                        fields: BTreeMap::from([("incarnation_id".into(),event.runtime_incarnation.clone().into()),
+                            ("prompt".into(),event.payload.clone())]),
+                        evidence:Vec::new(),expected_subject:None,
+                        idempotency_key:Some(format!("permission:{subject}:{}:{}",event.runtime_incarnation,event.sequence)),
+                    }).await?;
                 }
                 "harness-todo" => {
                     let mut fields: BTreeMap<String, Value> =
@@ -26075,6 +26108,7 @@ mod tests {
             },
             sync: None,
             replicated: None,
+            history: None,
         }
     }
 
@@ -30183,6 +30217,126 @@ mission "review" state="ready" {
         assert_eq!(captured.len(), 2);
         assert_eq!(captured[0], captured[1]);
         assert_eq!(store.local_observations_tail(100).unwrap().len(), 1);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn native_prompt_visibility_reexec_and_disappearance_close_the_source_without_an_end() {
+        use axum::{Json, Router, routing::post};
+        use std::os::unix::net::UnixListener;
+        use std::sync::Arc;
+        let root = tempfile::tempdir().unwrap();
+        st_drivers::harness_events::enable(root.path(), "runtime-a").unwrap();
+        st_drivers::harness_state::claim(root.path(), "garden/orchard", "claude", "provider-a")
+            .unwrap();
+        for event in st_drivers::harness_events::pending(root.path(), 100).unwrap() {
+            st_drivers::harness_events::acknowledge(root.path(), event.sequence).unwrap();
+        }
+        let socket = root.path().join("native-prompt");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let mut prompt = st_drivers::prompts::claude_prompt(root.path(), "provider-a",
+            &json!({"session_id":"session-a","tool_name":"Bash","tool_input":{"command":"printf fixture-visible"}}),
+            Duration::from_secs(60)).unwrap();
+        prompt.endpoint = Some(socket.to_string_lossy().into_owned());
+        st_drivers::harness_events::write_prompt(root.path(), &json!(prompt)).unwrap();
+        let store = Arc::new(Store::open_memory("amber").unwrap());
+        let intent = st3::parse_intent(
+            "version 2\nagent \"garden/orchard\" { command \"true\" }",
+            store.origin(),
+        )
+        .unwrap();
+        let plan = store
+            .mission(
+                &intent,
+                st3::model::IntentInput {
+                    kdl: String::new(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply_as(
+                &intent,
+                &plan.subject_tokens,
+                "visible-prompt-seat",
+                Some("person/ada"),
+            )
+            .unwrap();
+        store
+            .append_claim(&ClaimInput {
+                subject: "agent/garden/orchard".into(),
+                kind: "runtime.observed".into(),
+                actor: Some("agent/garden/orchard".into()),
+                fields: BTreeMap::from([
+                    ("status".into(), json!("running")),
+                    ("incarnation_id".into(), json!("runtime-a")),
+                ]),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let app = Router::new().route("/v1/harness-events", post({
+            let store = store.clone();
+            move |Json(publication): Json<st3::harness_events::Publication>| {
+                let store = store.clone();
+                async move { Json(json!({"api_version":"st3.v1","value":store.append_harness_event(&publication).unwrap().0})) }
+            }
+        }));
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = tcp.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(tcp, app).await.unwrap() });
+        let client = Client::new(st3::client::Endpoint::Http(format!("http://{address}")));
+        let mut observations = NativeObservations::start(root.path(), "runtime-a").unwrap();
+        let mut ready = false;
+        observations
+            .drain(&client, "agent/garden/orchard", "claude", &mut ready)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .attention_snapshot(Some("person/ada"), now_ms())
+                .unwrap()
+                .iter()
+                .filter(|item| item.kind == "harness-prompt")
+                .count(),
+            1
+        );
+        drop(observations);
+        let mut observations = NativeObservations::start(root.path(), "runtime-a").unwrap();
+        assert_eq!(observations.prompts.len(), 1);
+        observations.expire_due().unwrap();
+        assert_eq!(observations.prompts.len(), 1);
+        // The transport disappears without a native outcome or timeout event. A real
+        // driver reread must revoke visibility, persist unavailable and disable the item.
+        drop(listener);
+        assert!(
+            st_drivers::harness_events::pending(root.path(), 100)
+                .unwrap()
+                .is_empty()
+        );
+        observations.expire_due().unwrap();
+        assert!(observations.prompts.is_empty());
+        let pending = st_drivers::harness_events::pending(root.path(), 100).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].payload["state"], "unavailable");
+        assert!(pending[0].payload["how"].is_null());
+        observations
+            .drain(&client, "agent/garden/orchard", "claude", &mut ready)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .attention_snapshot(Some("person/ada"), now_ms())
+                .unwrap()
+                .iter()
+                .all(|item| item.kind != "harness-prompt")
+        );
+        assert!(
+            NativeObservations::start(root.path(), "runtime-a")
+                .unwrap()
+                .prompts
+                .is_empty()
+        );
         server.abort();
     }
     #[tokio::test]

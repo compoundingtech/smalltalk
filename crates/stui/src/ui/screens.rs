@@ -265,6 +265,8 @@ pub struct Drafts<'a> {
     pub needs_words: Option<String>,
     /// "Chat about this": who it goes to, the draft, and the thread so far.
     pub chat: Option<Chat<'a>>,
+    /// What st closed while it was shown: nothing here can be answered, only cleared.
+    pub closed: bool,
 }
 
 pub struct Chat<'a> {
@@ -428,7 +430,7 @@ fn structured_request(
         .as_ref()
         .map(|wanted| wanted.answer.as_str());
     for (index, answer) in request.answers.iter().enumerate() {
-        let chosen = drafts.answering == Some(index);
+        let chosen = drafts.answering == Some(index) && !drafts.closed;
         let mut head = vec![
             text::run(
                 if chosen { " ▸ " } else { "   " },
@@ -458,15 +460,24 @@ fn structured_request(
             &[text::run("   ", theme::dim())],
             None,
         ));
-        card.targets.push(crate::ui::doc::Target {
-            line: from_line,
-            column: 0,
-            width: inner as u16,
-            hit: Hit::Answer(index),
-        });
+        if !drafts.closed {
+            card.targets.push(crate::ui::doc::Target {
+                line: from_line,
+                column: 0,
+                width: inner as u16,
+                hit: Hit::Answer(index),
+            });
+        }
     }
     card.blank();
-    if drafts.editing || drafts.text.is_some_and(|text| !text.is_empty()) {
+    if drafts.closed {
+        // It was closed under the person's eyes: what it asked stays readable, and only x
+        // clears it from the list.
+        card.wrap(
+            &text::inline("Closed: there is nothing to answer here. x clears it from the list.", theme::dim()),
+            inner,
+        );
+    } else if drafts.editing || drafts.text.is_some_and(|text| !text.is_empty()) {
         let hint = drafts.needs_words.as_ref().map(|label| {
             format!("what should change? Enter sends it with “{label}” · Esc cancels")
         });
@@ -705,7 +716,15 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
         theme::fg(color),
     )];
     if let Some(waiting) = &item.waiting {
-        meta.push(span(format!("· {waiting} is waiting · "), theme::dim()));
+        // A closed item says so, not that someone "is waiting".
+        meta.push(span(
+            if waiting.starts_with("closed") {
+                format!("· {waiting} · ")
+            } else {
+                format!("· {waiting} is waiting · ")
+            },
+            theme::dim(),
+        ));
     } else {
         meta.push(span("· ", theme::dim()));
     }
@@ -1296,6 +1315,7 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
             needs_words: None,
             confirm: None,
             chat: None,
+            closed: false,
         };
         text_box(
             &mut card,
