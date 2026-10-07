@@ -77,7 +77,11 @@ impl Newcomer {
     }
 
     fn path(root: &Path) -> String {
-        format!("{}:{}", root.join("bin").display(), std::env::var("PATH").unwrap())
+        format!(
+            "{}:{}",
+            root.join("bin").display(),
+            std::env::var("PATH").unwrap()
+        )
     }
 
     fn command(root: &Path) -> Command {
@@ -200,7 +204,13 @@ fn a_newcomer_gets_keys_without_a_prompt_and_private_writer_oracle_verifies_clai
     assert!(audits.starts_with("no write"), "{audits}");
     let check = newcomer.signatures();
     assert_eq!(check["status"], "unknown", "{check}");
-    assert!(check["message"].as_str().unwrap().contains("evidence incomplete"), "{check}");
+    assert!(
+        check["message"]
+            .as_str()
+            .unwrap()
+            .contains("evidence incomplete"),
+        "{check}"
+    );
     // The keys are private files in the state directory, made without asking.
     let keys = newcomer.root.path().join("state/keys");
     assert!(keys.join("node.key").exists());
@@ -221,14 +231,116 @@ fn a_newcomer_gets_keys_without_a_prompt_and_private_writer_oracle_verifies_clai
         std::fs::copy(source_wal, scratch.path().join("claims.sqlite3-wal")).unwrap();
     }
     let writer = st3::store::Store::open(&database, "studio").unwrap();
-    writer.set_node_key(std::sync::Arc::new(
-        st3::fleet::join::standalone_node_key(&newcomer.root.path().join("state")).unwrap(),
-    )).unwrap();
+    writer
+        .set_node_key(std::sync::Arc::new(
+            st3::fleet::join::standalone_node_key(&newcomer.root.path().join("state")).unwrap(),
+        ))
+        .unwrap();
     writer.use_key_directory(&keys).unwrap();
     writer.replication_snapshot().unwrap();
     writer.judge_claims(true).unwrap();
     let counts = writer.claim_verdict_counts().unwrap();
-    assert!(counts.get("verified").copied().unwrap_or(0) > 0, "{counts:?}");
-    assert!(counts.iter().all(|(verdict, count)| verdict == "verified" || *count == 0), "{counts:?}");
+    assert!(
+        counts.get("verified").copied().unwrap_or(0) > 0,
+        "{counts:?}"
+    );
+    assert!(
+        counts
+            .iter()
+            .all(|(verdict, count)| verdict == "verified" || *count == 0),
+        "{counts:?}"
+    );
+}
 
+#[test]
+fn offline_strict_checks_computed_evidence_without_contacting_a_daemon() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    for directory in ["bin", "home", "run", "state", "ws", "scratch"] {
+        std::fs::create_dir_all(root.path().join(directory)).unwrap();
+    }
+    let input = root.path().join("private.sqlite3");
+    let store = st3::store::Store::open(&input, "alder").unwrap();
+    store
+        .append_client_claim(&st3::model::ClaimInput {
+            subject: "resource/example".into(),
+            kind: "resource.observed".into(),
+            actor: None,
+            fields: std::collections::BTreeMap::from([(
+                "kind".into(),
+                serde_json::json!("custom.test.example"),
+            )]),
+            evidence: vec![],
+            expected_subject: None,
+            idempotency_key: Some("offline-fixture".into()),
+        })
+        .unwrap();
+    drop(store);
+    let listener = std::os::unix::net::UnixListener::bind(root.path().join("run/st.sock")).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let run = || {
+        Newcomer::command(root.path())
+            .args([
+                "doctor",
+                "--offline-audit",
+                input.to_str().unwrap(),
+                "--audit-scratch-dir",
+                root.path().join("scratch").to_str().unwrap(),
+                "--strict",
+                "--json",
+            ])
+            .output()
+            .unwrap()
+    };
+    let before = std::fs::read(&input).unwrap();
+    let healthy = run();
+    assert!(
+        healthy.status.success(),
+        "{}",
+        String::from_utf8_lossy(&healthy.stderr)
+    );
+    let report: Value = serde_json::from_slice(&healthy.stdout).unwrap();
+    assert_eq!(report["status"], "warn");
+    assert!(
+        report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| check["status"] == "unknown")
+    );
+    assert!(
+        !report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| check["status"] == "warn" || check["status"] == "fail")
+    );
+    assert_eq!(std::fs::read(&input).unwrap(), before);
+    let connection = rusqlite::Connection::open(&input).unwrap();
+    connection
+        .execute("UPDATE operations SET state='conflict'", [])
+        .unwrap();
+    drop(connection);
+    let corrupted = run();
+    assert_eq!(corrupted.status.code(), Some(2));
+    let report: Value = serde_json::from_slice(&corrupted.stdout).unwrap();
+    assert!(
+        report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| check["name"] == "operation-projection" && check["status"] == "fail")
+    );
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert_eq!(
+        std::fs::read_dir(root.path().join("scratch"))
+            .unwrap()
+            .count(),
+        0
+    );
 }

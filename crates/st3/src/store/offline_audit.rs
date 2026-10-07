@@ -73,7 +73,12 @@ impl Drop for ProgressGuard<'_, '_> {
     fn drop(&mut self) {
         // SAFETY: the connection outlives this guard, and removal retains no callback data.
         unsafe {
-            rusqlite::ffi::sqlite3_progress_handler(self.connection.handle(), 0, None, std::ptr::null_mut());
+            rusqlite::ffi::sqlite3_progress_handler(
+                self.connection.handle(),
+                0,
+                None,
+                std::ptr::null_mut(),
+            );
         }
     }
 }
@@ -273,6 +278,46 @@ fn offline_full_audit_with_limits(
     // and WAL are never handed to SQLite and are never migrated or checkpointed.
     let source = Connection::open_with_flags(&copied, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let source_progress = progress(&source, &budget);
+    // Check raw pages and indexes before VACUUM can rebuild or mask their damage.
+    let integrity = raw_integrity_check(&source);
+    budget.check()?;
+    if integrity.status != "pass" {
+        let schema_version = source
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap_or(0);
+        let store_index = current_index(&source).ok();
+        let mut checks = vec![integrity];
+        for name in [
+            "foreign-keys",
+            "operation-projection",
+            "projection-digest-evidence",
+            "graph-references",
+            "operational-repair",
+            "canonical-projections",
+        ] {
+            checks.push(unknown_check(
+                name,
+                "not computed because raw SQLite integrity was not established",
+            ));
+        }
+        checks.extend(unsupported_oracles());
+        drop(source_progress);
+        budget.check()?;
+        return Ok(audit_report(schema_version, store_index, checks));
+    }
+    let foreign_keys = audit_check("foreign-keys", || {
+        Ok(source
+            .prepare("PRAGMA foreign_key_check")?
+            .query_map([], |row| {
+                Ok(format!(
+                    "{} row {:?} references {}",
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, String>(2)?
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    });
     let snapshot = scratch.path().join("evidence.sqlite3");
     source.execute("VACUUM INTO ?1", [snapshot.to_string_lossy()])?;
     drop(source_progress);
@@ -282,28 +327,7 @@ fn offline_full_audit_with_limits(
         Connection::open_with_flags(&snapshot, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let evidence_progress = progress(&evidence, &budget);
     let schema_version = evidence.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    let mut checks = vec![
-        audit_check("sqlite-integrity", || {
-            let rows = evidence
-                .prepare("PRAGMA integrity_check")?
-                .query_map([], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows.into_iter().filter(|row| row != "ok").collect())
-        }),
-        audit_check("foreign-keys", || {
-            Ok(evidence
-                .prepare("PRAGMA foreign_key_check")?
-                .query_map([], |row| {
-                    Ok(format!(
-                        "{} row {:?} references {}",
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Option<i64>>(1)?,
-                        row.get::<_, String>(2)?
-                    ))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?)
-        }),
-    ];
+    let mut checks = vec![integrity, foreign_keys];
     let store_index = current_index(&evidence).ok();
     checks.push(audit_check("operation-projection", || {
         operation_drift(&evidence)
@@ -347,11 +371,23 @@ fn offline_full_audit_with_limits(
         budget.check()?;
         Ok(projection_digest::differing(&actual, &expected))
     }));
-    checks.push(DoctorCheck {
-        name: "claim-signatures".into(), status: "warn".into(),
-        message: "evidence incomplete; this audit does not yet recompute signature authority and verdicts".into(),
-    });
-    for name in [
+    checks.extend(unsupported_oracles());
+    drop(evidence_progress);
+    budget.check()?;
+    Ok(audit_report(schema_version, store_index, checks))
+}
+
+fn unknown_check(name: &str, reason: &str) -> DoctorCheck {
+    DoctorCheck {
+        name: name.into(),
+        status: "unknown".into(),
+        message: format!("evidence incomplete; {reason}"),
+    }
+}
+
+fn unsupported_oracles() -> Vec<DoctorCheck> {
+    [
+        "claim-signatures",
         "terminal-exec-gates",
         "account-limits",
         "runtime-ownership",
@@ -369,24 +405,33 @@ fn offline_full_audit_with_limits(
         "checkpoint-evidence",
         "claude-hooks",
         "member-reconcile",
-    ] {
-        checks.push(DoctorCheck {
-            name: name.into(),
-            status: "warn".into(),
-            message: "evidence incomplete; this private-copy audit has not implemented this oracle"
-                .into(),
-        });
-    }
+    ]
+    .into_iter()
+    .map(|name| {
+        unknown_check(
+            name,
+            "this private-copy audit has not implemented this oracle",
+        )
+    })
+    .collect()
+}
+
+fn audit_report(
+    schema_version: u32,
+    store_index: Option<u64>,
+    checks: Vec<DoctorCheck>,
+) -> OfflineAuditReport {
     let status = if checks.iter().any(|check| check.status == "fail") {
         "fail"
-    } else if checks.iter().any(|check| check.status == "warn") {
+    } else if checks
+        .iter()
+        .any(|check| matches!(check.status.as_str(), "warn" | "unknown"))
+    {
         "warn"
     } else {
         "pass"
     };
-    drop(evidence_progress);
-    budget.check()?;
-    Ok(OfflineAuditReport {
+    OfflineAuditReport {
         mode: "offline-full-audit",
         schema_version,
         store_index,
@@ -396,7 +441,38 @@ fn offline_full_audit_with_limits(
             checks,
             performance: json!({}),
         },
-    })
+    }
+}
+
+fn raw_integrity_check(connection: &Connection) -> DoctorCheck {
+    let result = connection
+        .prepare("PRAGMA integrity_check")
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        });
+    match result {
+        Ok(rows) => audit_check("sqlite-integrity", || {
+            Ok(rows.into_iter().filter(|row| row != "ok").collect())
+        }),
+        Err(rusqlite::Error::SqliteFailure(code, message))
+            if matches!(
+                code.code,
+                rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+            ) =>
+        {
+            DoctorCheck {
+                name: "sqlite-integrity".into(),
+                status: "fail".into(),
+                message: format!(
+                    "raw SQLite corruption: {code}: {}",
+                    message.unwrap_or_default()
+                ),
+            }
+        }
+        Err(error) => audit_check("sqlite-integrity", || Err(error.into())),
+    }
 }
 
 fn audit_check(name: &str, audit: impl FnOnce() -> Result<Vec<String>>) -> DoctorCheck {
@@ -456,6 +532,16 @@ fn full_digests(connection: &Connection) -> Result<BTreeMap<String, String>> {
     let mut result = BTreeMap::new();
     for (table, excluded) in PROJECTION_DIGEST_TABLES {
         let columns = projection_digest::columns(connection, table, excluded)?;
+        anyhow::ensure!(
+            columns.iter().all(|column| {
+                !column.is_empty()
+                    && column
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                    && !column.as_bytes()[0].is_ascii_digit()
+            }),
+            "unsupported projection column identifier in {table}"
+        );
         let encoded = serde_json::to_string(&columns)?;
         let query = if *table == "operations" {
             projection_digest::operation_rows()
@@ -527,9 +613,10 @@ mod tests {
             ) {
                 assert_eq!(check.status, "pass", "{healthy:?}");
             } else {
-                assert_eq!(check.status, "warn", "{healthy:?}");
+                assert_eq!(check.status, "unknown", "{healthy:?}");
             }
         }
+        assert_eq!(healthy.report.exit_status(true), 0, "{healthy:?}");
         store
             .connection
             .write()
@@ -561,6 +648,48 @@ mod tests {
                 .any(|check| check.name == "projection-digest-evidence" && check.status == "fail"),
             "{missing:?}"
         );
+    }
+
+    #[test]
+    fn offline_audit_reports_raw_index_corruption_before_vacuum() {
+        use std::io::{Seek, SeekFrom};
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("corrupt-index.sqlite3");
+        drop(Store::open(&input, "alder").unwrap());
+        let connection = Connection::open(&input).unwrap();
+        let page_size: u64 = connection
+            .pragma_query_value(None, "page_size", |row| row.get(0))
+            .unwrap();
+        let page: u64 = connection.query_row(
+            "SELECT rootpage FROM sqlite_master WHERE type='index' AND rootpage>1 ORDER BY name LIMIT 1",
+            [], |row| row.get(0)).unwrap();
+        drop(connection);
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&input)
+            .unwrap();
+        file.seek(SeekFrom::Start((page - 1) * page_size)).unwrap();
+        file.write_all(&[0]).unwrap();
+        drop(file);
+        let before = std::fs::read(&input).unwrap();
+        let audit = offline_full_audit(&input, &root.path().join("live.sqlite3")).unwrap();
+        assert!(
+            audit
+                .report
+                .checks
+                .iter()
+                .any(|check| check.name == "sqlite-integrity" && check.status == "fail"),
+            "{audit:?}"
+        );
+        assert!(
+            audit
+                .report
+                .checks
+                .iter()
+                .any(|check| check.name == "canonical-projections" && check.status == "unknown")
+        );
+        assert_eq!(audit.report.exit_status(true), 2);
+        assert_eq!(std::fs::read(&input).unwrap(), before);
     }
 
     #[test]

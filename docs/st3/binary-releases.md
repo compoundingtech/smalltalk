@@ -56,8 +56,9 @@ lists unchecked invariants by name as `unknown` and reports `warn`. In the updat
 from its exit condition. A strict success therefore verifies only the computed checks and
 cannot certify the unchecked store invariants. Older CLIs still fail on the aggregate warning;
 upgrade the CLI along with the daemon before using computed-only strict upgrade checks.
-An explicit offline audit preserves unknown results for unsupported checks and cannot
-substitute for complete certification.
+An explicit offline audit uses the same computed-only strict policy: unsupported checks
+remain named `unknown` and are not certified by strict success. It requires
+`--audit-scratch-dir` on a filesystem with room for its private copies.
 
 `st replication checkpoint status` also exits 2 while checkpoint comparison evidence is
 uncomputed: its HTTP 503 `diagnostic-evidence-incomplete` response describes an uncertified

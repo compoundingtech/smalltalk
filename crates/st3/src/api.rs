@@ -5574,7 +5574,11 @@ fn isolation_name(mode: st_runtime::Isolation) -> &'static str {
 
 async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, ApiError> {
     let reader_store = state.store.clone();
-    let mut report = current_doctor_report(&state)?.0;
+    let report_state = state.clone();
+    let mut report = read_deadline::spawn_blocking(move || current_doctor_report(&report_state))
+        .await
+        .map_err(ApiError::internal)??
+        .0;
     // These checks used to start shell, compiler, credential and runtime probes on GET.
     // Until their bounded, off-read evidence is maintained, expose the missing evidence.
     for name in [
@@ -6156,11 +6160,19 @@ fn terminal_exec_gates_check(store: &Store) -> anyhow::Result<DoctorCheck> {
 /// Missing materialized invariant evidence must not be replaced by a read-time oracle.
 /// The reviewed IVM integration will replace each unknown with a checked current source cut.
 fn current_doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
-    let index = state.store.index().map_err(ApiError::internal)?;
-    let mut checks = vec![DoctorCheck {
-        name: "claim-store".into(),
-        status: "pass".into(),
-        message: format!("the claim store is readable at index {index}"),
+    let mut checks = vec![match state.store.index() {
+        Ok(index) => DoctorCheck {
+            name: "claim-store".into(),
+            status: "pass".into(),
+            message: format!(
+                "store index {index} is available; invariant evidence is not certified"
+            ),
+        },
+        Err(error) => DoctorCheck {
+            name: "claim-store".into(),
+            status: "fail".into(),
+            message: error.to_string(),
+        },
     }];
     for name in [
         "claim-signatures",

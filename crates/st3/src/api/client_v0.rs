@@ -3015,7 +3015,7 @@ fn operation_resources(state: &AppState, at: &str) -> Result<Vec<Value>, ApiErro
             "updated_at": at,
             "component": "daemon",
             "severity": "warning",
-            "state": "unknown",
+            "state": "degraded",
             "summary": "current diagnostic evidence is incomplete; this read does not start an audit",
             "targets": [],
             "operational": { "layer": "current", "actionable": false, "reasons": ["diagnostic"] }
@@ -3032,7 +3032,7 @@ fn operation_resources(state: &AppState, at: &str) -> Result<Vec<Value>, ApiErro
                 "updated_at": at,
                 "component": match check.name.as_str() { "replication" => "transport", "runtime-drift" | "runtime-ownership" | "pty-runtime" | "driver-readiness" => "runtime", _ => "daemon" },
                 "severity": match check.status.as_str() { "fail" => "critical", "warn" | "unknown" => "warning", _ => "info" },
-                "state": match check.status.as_str() { "fail" => "failed", "warn" => "degraded", "unknown" => "unknown", _ => "healthy" },
+                "state": match check.status.as_str() { "fail" => "failed", "warn" | "unknown" => "degraded", _ => "healthy" },
                 "summary": check.message,
                 "targets": [],
                 "operational": { "layer": "current", "actionable": false, "reasons": ["diagnostic"] }
@@ -11828,10 +11828,25 @@ subscription "watch/source" {
         assert!(crate::store::STATEMENTS_RUN.with(std::cell::Cell::get) <= 1);
         assert!(!pending.is_empty());
         assert!(
-            pending.iter().any(|item| item["state"] == "unknown"),
+            pending.iter().any(|item| item["state"] == "degraded"
+                && item["revision"].as_str().unwrap().ends_with(":unknown")),
             "{pending:?}"
         );
         assert!(pending.iter().all(|item| item["state"] != "running"));
+        let mut schema: Value = serde_json::from_str(include_str!(
+            "../../../../docs/st3/client-v0/schemas/client-v0.schema.json"
+        )).unwrap();
+        schema.as_object_mut().unwrap().remove("oneOf");
+        schema["$ref"] = json!("#/$defs/Operation");
+        let validator = jsonschema::options()
+            .with_draft(jsonschema::Draft::Draft202012).build(&schema).unwrap();
+        for item in &pending {
+            let errors = validator.iter_errors(item).map(|error| error.to_string()).collect::<Vec<_>>();
+            assert!(errors.is_empty(), "{item}: {errors:?}");
+        }
+        let mut invalid = pending[0].clone();
+        invalid["state"] = json!("unknown");
+        assert!(!validator.is_valid(&invalid), "unknown is outside the published Operation enum");
     }
 
     #[test]

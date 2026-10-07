@@ -572,3 +572,17 @@ The walkthrough is complete when every public path above has a recorded disposit
 bug has reproducible evidence, and the entire agreed finding set is encoded in one autonomous
 follow-up mission. The walkthrough itself does not rename the repository or begin TUI/iOS
 implementation.
+
+An explicit full audit runs only on a frozen private database copy:
+
+```sh
+st doctor --offline-audit /private/copy.sqlite3 --audit-scratch-dir /scratch/audits --strict --json
+```
+
+Include the copy's WAL when present. The command requires an explicit scratch directory;
+choose a filesystem with room for the copy, snapshot and replay oracle. It refuses the
+configured live database and inode aliases, preserves the input, and contacts no daemon or
+network. Unsupported checks stay named `unknown`; strict fails on computed warnings or
+failures, and success certifies only computed checks. SIGINT, SIGTERM and SIGHUP clean up
+private scratch. SIGKILL or a host crash can leave capped scratch files; remove a leftover
+`st3-offline-command-*` directory only after its audit process has stopped.

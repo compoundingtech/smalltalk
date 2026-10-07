@@ -186,13 +186,14 @@ fn bare_service_environment_does_not_probe_tools_or_credentials_on_doctor() {
         &bin.join("gh"),
         &format!("#!/bin/sh\nprintf x >> '{}'\nprintf 'orchid-test-credential\\n'\n", calls.display()),
     );
-    // A failed lookup backs off rather than spawning gh for every doctor request.
+    // Auth backoff/credential refresh is covered directly in github_http tests.
+    // Doctor must not start a lookup, including after credential metadata changes.
     let retry = doctor();
     let retry_auth = retry["checks"].as_array().unwrap().iter()
         .find(|check| check["name"] == "github-observer-auth").unwrap();
-    assert_eq!(retry_auth["status"], "warn");
-    assert_eq!(std::fs::read(&calls).unwrap().len(), 1);
-    // A login changing gh's credential file clears the backoff for the next caller.
+    assert_eq!(retry_auth["status"], "unknown");
+    assert!(!calls.exists(), "doctor invoked gh");
+    // A login changes observer input; it does not turn this read into an auth probe.
     let gh_config = root.path().join("config/gh");
     std::fs::create_dir_all(&gh_config).unwrap();
     std::fs::write(gh_config.join("hosts.yml"), "fixture credential metadata changed\n").unwrap();
@@ -206,7 +207,7 @@ fn bare_service_environment_does_not_probe_tools_or_credentials_on_doctor() {
     assert_eq!(auth["status"], "unknown");
     assert!(!report.to_string().contains("orchid-test-credential"));
     doctor();
-    assert_eq!(std::fs::read(&calls).unwrap().len(), 2);
+    assert!(!calls.exists(), "doctor invoked gh after credential metadata changed");
 }
 
 #[test]

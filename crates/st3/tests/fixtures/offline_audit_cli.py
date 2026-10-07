@@ -1,6 +1,6 @@
-"""Exercise offline CLI isolation and real SIGINT/SIGTERM cleanup on private evidence.
+"""Exercise offline CLI isolation and real SIGINT/SIGTERM/SIGHUP cleanup on private evidence.
 
-Run through builds-slice-run: python3 offline_audit_cli.py /path/to/new/st3.
+Run: python3 offline_audit_cli.py /path/to/new/st3.
 No live store or daemon is opened. All input, configuration and scratch files are private.
 """
 import hashlib
@@ -38,7 +38,7 @@ with tempfile.TemporaryDirectory(prefix="st3-offline-cli-test-") as name:
         # Large enough to observe the descriptor copy before it finishes, without a live scan.
         db.executemany("INSERT INTO private_fixture VALUES(zeroblob(65536))", [()] * 1024)
     before = hashlib.file_digest(evidence.open("rb"), "sha256").hexdigest()
-    for interruption in [signal.SIGINT, signal.SIGTERM]:
+    for interruption in [signal.SIGINT, signal.SIGTERM, signal.SIGHUP]:
         scratch = root / f"scratch-{interruption.name}"
         scratch.mkdir()
         command = [str(binary), "--endpoint", str(endpoint), "--daemon-wait", "0",

@@ -1,6 +1,6 @@
 """Check new CLI rendering and legacy success parsing through a private mock wire.
 
-Run through builds-slice-run: python3 diagnostic_new_cli_wire.py /path/to/new/st3.
+Run: python3 diagnostic_new_cli_wire.py /path/to/new/st3.
 Actual router behavior is covered by the Rust diagnostic tests.
 """
 import hashlib, json, os, socket, subprocess, sys, tempfile, threading

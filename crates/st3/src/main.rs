@@ -2481,7 +2481,12 @@ struct DoctorArgs {
     #[arg(long)]
     performance: bool,
     /// Fully audit a private database copy offline, without contacting the daemon or network.
-    #[arg(long, value_name = "DATABASE", conflicts_with = "performance")]
+    #[arg(
+        long,
+        value_name = "DATABASE",
+        conflicts_with = "performance",
+        requires = "audit_scratch_dir"
+    )]
     offline_audit: Option<PathBuf>,
     /// Filesystem for private audit databases and SQLite temporary files.
     #[arg(long, requires = "offline_audit", value_name = "DIRECTORY")]
@@ -4581,9 +4586,9 @@ fn run_offline_doctor(args: &DoctorArgs, json_output: bool) -> Result<()> {
     let config = Config::load_unvalidated(None)?;
     let scratch_root = args
         .audit_scratch_dir
-        .clone()
-        .unwrap_or_else(|| config.state_dir.join("diagnostic-audits"));
-    std::fs::create_dir_all(&scratch_root)?;
+        .as_ref()
+        .context("offline audit requires an explicit --audit-scratch-dir")?;
+    std::fs::create_dir_all(scratch_root)?;
     extern "C" fn interrupt(_: libc::c_int) {
         st3::store::offline_audit::AUDIT_INTERRUPTED
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -4593,10 +4598,11 @@ fn run_offline_doctor(args: &DoctorArgs, json_output: bool) -> Result<()> {
     unsafe {
         libc::signal(libc::SIGINT, interrupt as *const () as libc::sighandler_t);
         libc::signal(libc::SIGTERM, interrupt as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGHUP, interrupt as *const () as libc::sighandler_t);
     }
     let scratch = tempfile::Builder::new()
         .prefix("st3-offline-command-")
-        .tempdir_in(&scratch_root)?;
+        .tempdir_in(scratch_root)?;
     // SAFETY: no thread or SQLite connection has been started by this command.
     unsafe {
         std::env::set_var("SQLITE_TMPDIR", scratch.path());
@@ -4622,12 +4628,8 @@ fn run_offline_doctor(args: &DoctorArgs, json_output: bool) -> Result<()> {
         }
     }
     anyhow::ensure!(
-        audit.report.status != "fail",
-        "offline audit found a failed invariant"
-    );
-    anyhow::ensure!(
-        !args.strict || audit.report.status == "pass",
-        "offline audit evidence is incomplete in strict mode"
+        audit.report.exit_status(args.strict) == 0,
+        "offline audit found a computed failure or strict warning"
     );
     Ok(())
 }
@@ -10417,12 +10419,8 @@ async fn run_doctor(client: &Client, args: DoctorArgs, json_output: bool) -> Res
         print!("{}", render_performance(&report.performance));
     }
     anyhow::ensure!(
-        report.status != "fail" && !report.checks.iter().any(|check| check.status == "fail"),
-        "st doctor found a failed check"
-    );
-    anyhow::ensure!(
-        !args.strict || !report.checks.iter().any(|check| check.status == "warn"),
-        "st doctor found a computed warning in strict mode"
+        report.exit_status(args.strict) == 0,
+        "st doctor found a computed failure or strict warning"
     );
     Ok(())
 }
@@ -24130,6 +24128,9 @@ mod tests {
             .is_err()
         );
         assert!(Cli::try_parse_from(["st3", "doctor"]).is_ok());
+        assert!(Cli::try_parse_from([
+            "st3", "doctor", "--offline-audit", "/private/copy"
+        ]).is_err());
     }
 
     // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
