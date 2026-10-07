@@ -16,7 +16,7 @@ use std::{
 };
 use tokio::sync::{broadcast, watch};
 
-const FORMAT: &str = "smallclaims.ivm.async.v1";
+const FORMAT: &str = "smallclaims.ivm.async.v2";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
@@ -95,6 +95,8 @@ WHEN (SELECT admitted FROM ivm_source WHERE singleton=1)>0
 BEGIN UPDATE ivm_async_state SET available=0,error='async prefix metadata installation requires explicit recovery'; END;
 CREATE TRIGGER IF NOT EXISTS ivm_async_admit AFTER INSERT ON claims
 BEGIN
+ UPDATE ivm_async_state SET available=0,error='async input inserted behind certified prefix; explicit recovery required'
+  WHERE NEW.store_index<=(SELECT projected FROM ivm_source WHERE singleton=1);
  UPDATE ivm_async_state SET capturing=1 WHERE singleton=1;
  INSERT INTO ivm_async_queue SELECT NEW.store_index,NEW.id,
   length(CAST(NEW.body AS BLOB))+length(CAST(NEW.predecessors AS BLOB))+length(CAST(NEW.id AS BLOB))+length(CAST(NEW.batch_id AS BLOB))+length(CAST(NEW.subject AS BLOB))+length(CAST(NEW.kind AS BLOB))+length(CAST(NEW.origin AS BLOB))+length(CAST(COALESCE(NEW.actor,'') AS BLOB))+length(CAST(NEW.accepted_at_unix_ms AS BLOB))
@@ -152,6 +154,15 @@ pub(super) fn check_owner(connection: &Connection, limits: Option<Limits>) -> Re
             limits.is_some(),
             "asynchronous IVM file requires its asynchronous runtime owner"
         );
+        let format: String = connection.query_row(
+            "SELECT format FROM ivm_async_state WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            format == FORMAT,
+            "async format incompatible; explicit installation required"
+        );
     } else if limits.is_some() {
         ensure!(
             current_index(connection)? == 0,
@@ -208,6 +219,36 @@ pub(super) fn initialize(
             )?;
         }
     }
+    Ok(())
+}
+
+fn verify_registry(connection: &Connection, views: &Views, epoch: u64) -> Result<()> {
+    let expected: BTreeMap<_, _> = views
+        .views
+        .iter()
+        .enumerate()
+        .map(|(index, view)| (view.definition().name, views.fingerprints[index].as_str()))
+        .collect();
+    let mut statement = connection.prepare_cached(
+        "SELECT view,fingerprint,epoch FROM ivm_async_views ORDER BY view LIMIT 257",
+    )?;
+    let registered = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, u64>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    ensure!(
+        registered.len() == expected.len()
+            && registered
+                .iter()
+                .all(|(name, fingerprint, stored_epoch)| *stored_epoch == epoch
+                    && expected.get(name.as_str()) == Some(&fingerprint.as_str())),
+        "async worker registry incompatible with registered source; use its runtime owner"
+    );
     Ok(())
 }
 
@@ -341,6 +382,7 @@ fn page_tx(tx: &Transaction<'_>, runtime: &ViewRuntime) -> Result<PageReport> {
         .asynchronous
         .context("synchronous runtime cannot drain async queue")?;
     ensure!(limits == state.limits, "async runtime bounds incompatible");
+    verify_registry(tx, &runtime.views, previous.epoch)?;
     let mut statement = tx.prepare_cached(
         "SELECT store_index,claim_id,bytes FROM ivm_async_queue ORDER BY store_index LIMIT ?1",
     )?;

@@ -674,20 +674,64 @@ fn operator_gap_is_durable_and_a_ready_boolean_cannot_certify_missing_work() {
 fn page_storage_failure_rolls_back_output_prefix_and_queue_reclamation() {
     let rt = Arc::new(
         ViewRuntime::asynchronous(
-            Views::new(vec![Box::new(Fault { database: true })]).unwrap(),
+            Views::new(vec![
+                Box::new(real_views::Family::Mailbox),
+                Box::new(Fault { database: true }),
+            ])
+            .unwrap(),
             Limits::default(),
         )
         .unwrap(),
     );
     let store = Store::open_memory("alder", rt.clone()).unwrap();
+    store
+        .connection
+        .batched(|tx| events::install(tx, 128))
+        .unwrap()
+        .unwrap();
+    let publisher = Publisher::attach(&store, 8).unwrap();
+    append(
+        &store,
+        "message/a",
+        "message.sent",
+        None,
+        json!({"to":"person/ada","from":"person/sender","body":"rollback this output"}),
+    );
     append(&store, "fault/a", "fault.input", None, json!({"x":1}));
+    let before: u64 = store
+        .readers
+        .get()
+        .query_row(
+            "SELECT generation FROM ivm_views WHERE name='mailbox'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let mut notices = publisher.subscribe();
     assert!(async_views::step(&store, &rt).is_err());
     assert_eq!(
         async_views::state(&store.readers.get())
             .unwrap()
             .retained_rows,
-        1
+        2
     );
+    assert!(rows(&store.readers.get(), "mailbox").is_empty());
+    assert_eq!(
+        store
+            .readers
+            .get()
+            .query_row(
+                "SELECT generation FROM ivm_views WHERE name='mailbox'",
+                [],
+                |r| r.get::<_, u64>(0)
+            )
+            .unwrap(),
+        before
+    );
+    assert!(matches!(
+        notices.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
     assert_eq!(
         source_cut(&store.readers.get()).unwrap().unwrap().projected,
         0
@@ -1136,4 +1180,144 @@ fn reopening_with_a_reduced_registry_cannot_skip_a_registered_view() {
             .unwrap(),
         Readiness::Ready(_)
     ));
+}
+
+#[test]
+fn direct_input_insertion_behind_the_prefix_fences_without_a_frontier_advance() {
+    let (store, rt) = fixture(Limits::default());
+    let claim = append(
+        &store,
+        "message/a",
+        "message.read",
+        None,
+        json!({"reader":"person/ada"}),
+    );
+    drain(&store, &rt);
+    let cut = source_cut(&store.readers.get()).unwrap().unwrap();
+    let availability = rt
+        .views
+        .availability(&store.readers.get(), "mailbox", 1)
+        .unwrap()
+        .token;
+    // Unsupported direct SQL source mutation, not a certified admission/repair lifecycle.
+    store.connection.write().execute("INSERT INTO claims(id,store_index,batch_id,subject,kind,origin,actor,body,predecessors,accepted_at_unix_ms) SELECT 'unverified-backward-fixture',0,batch_id,subject,kind,origin,actor,body,predecessors,accepted_at_unix_ms FROM claims WHERE id=?1",[&claim.id]).unwrap();
+    let reader = store.readers.get();
+    assert_eq!(source_cut(&reader).unwrap().unwrap(), cut);
+    assert!(!async_views::state(&reader).unwrap().available);
+    assert!(!matches!(
+        rt.views.readiness(&reader, "mailbox", 1).unwrap(),
+        Readiness::Ready(_)
+    ));
+    assert_ne!(
+        rt.views.availability(&reader, "mailbox", 1).unwrap().token,
+        availability
+    );
+    assert!(matches!(
+        async_views::step(&store, &rt).unwrap().status,
+        PageStatus::Stopped(_)
+    ));
+}
+
+struct DifferentMailbox;
+impl View for DifferentMailbox {
+    fn definition(&self) -> Definition {
+        Definition {
+            name: "mailbox",
+            fingerprint: "different.v1",
+            kinds: &["message.sent"],
+            local_kinds: &[],
+            max_contributions: 1,
+        }
+    }
+}
+#[test]
+fn a_worker_cannot_skip_registered_views_by_using_another_runtime() {
+    let (store, rt) = fixture(Limits::default());
+    append(
+        &store,
+        "message/a",
+        "message.sent",
+        None,
+        json!({"to":"person/ada","from":"person/sender","body":"pending"}),
+    );
+    let subset = ViewRuntime::asynchronous(
+        Views::new(vec![Box::new(real_views::Family::Mailbox)]).unwrap(),
+        Limits::default(),
+    )
+    .unwrap();
+    let different = ViewRuntime::asynchronous(
+        Views::new(vec![
+            Box::new(real_views::Family::Card),
+            Box::new(DifferentMailbox),
+            Box::new(real_views::Family::Desired),
+        ])
+        .unwrap(),
+        Limits::default(),
+    )
+    .unwrap();
+    for wrong in [&subset, &different] {
+        assert!(async_views::step(&store, wrong).is_err());
+        assert_eq!(
+            source_cut(&store.readers.get()).unwrap().unwrap().projected,
+            0
+        );
+        assert_eq!(
+            async_views::state(&store.readers.get())
+                .unwrap()
+                .retained_rows,
+            1
+        );
+        assert!(rows(&store.readers.get(), "mailbox").is_empty());
+    }
+    drain(&store, &rt);
+    oracle(&store);
+    assert!(matches!(
+        rt.views
+            .readiness(&store.readers.get(), "mailbox", 1)
+            .unwrap(),
+        Readiness::Ready(_)
+    ));
+}
+
+#[test]
+fn incompatible_capture_format_is_refused_before_schema_or_startup_work() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let rt = runtime(Limits::default());
+    {
+        let store = Store::open(file.path(), "alder", rt.clone()).unwrap();
+        append(
+            &store,
+            "message/a",
+            "message.read",
+            None,
+            json!({"reader":"person/ada"}),
+        );
+        drain(&store, &rt);
+        store
+            .connection
+            .write()
+            .execute(
+                "UPDATE ivm_async_state SET format='smallclaims.ivm.async.v1'",
+                [],
+            )
+            .unwrap();
+    }
+    let raw = rusqlite::Connection::open(file.path()).unwrap();
+    let cookie: i64 = raw
+        .query_row("PRAGMA schema_version", [], |r| r.get(0))
+        .unwrap();
+    drop(raw);
+    assert!(Store::open(file.path(), "alder", rt).is_err());
+    let raw = rusqlite::Connection::open(file.path()).unwrap();
+    assert_eq!(
+        raw.query_row("PRAGMA schema_version", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        cookie
+    );
+    assert_eq!(
+        raw.query_row("SELECT COUNT(*) FROM ivm_async_queue", [], |r| r
+            .get::<_, u64>(0))
+            .unwrap(),
+        0
+    );
 }

@@ -15,7 +15,9 @@ deltas were processed. Outer rollback/storage failures commit neither claim nor 
 The reference runtime has Plain-like admission, not production signature/authority closure.
 Adapters must preserve their actual admission policies and complete source capture.
 
-`asynchronous::step` performs one page and returns `PageReport`. Input row and encoded-byte
+`asynchronous::step` performs one page and returns `PageReport`. Every page verifies the
+entire bounded registered name/fingerprint/epoch set before maintenance; a caller cannot
+skip a view or change its operator by supplying another runtime. Input row and encoded-byte
 bounds apply before fetching/decoding claim bodies. The queue has at most 4,096 entries and
 16 MiB of claim-field payload; a page has at most 128 entries and 1 MiB. Defaults are 8 rows
 and 256 KiB per page, with 4,096 rows/16 MiB queued. SQLite/index/page overhead is additional.
@@ -52,7 +54,7 @@ every view or changing semantic generations. Readiness conservatively requires c
 through all currently admitted claims plus complete view evidence. This first adapter uses
 a common processing prefix, rather than independent queues for each view.
 
-Source deletion/remap, queue deletion/replacement, prefix jumps over captured input and
+Source deletion/remap, insertion behind a certified prefix, queue deletion/replacement, prefix jumps over captured input and
 missing/replaced completeness metadata remain explicitly unavailable. These controls do
 not certify arbitrary external SQL mutation or restoration. Event database identity and
 source epoch still need explicit restore handling. The checkpoint refusal remains.
@@ -122,3 +124,7 @@ synchronous maxima were 4.243/2.678 ms. Genuine 1/8/32-output page maxima were
 retained; no scheduling/CPU cause is inferred. The default is therefore eight input rows;
 32-row cost shapes explicitly request that larger page. This reduces per-page work, not
 wall-clock scheduling delay, and does not establish a production timing guarantee.
+
+The capture format is `smallclaims.ivm.async.v2`. Earlier prototype capture formats are
+refused before projection schema work; unchanged IF-NOT-EXISTS triggers from an older
+format cannot silently count as current coverage. No automatic format upgrade is supplied.
