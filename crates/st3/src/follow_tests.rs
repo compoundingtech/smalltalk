@@ -59,7 +59,9 @@ fn claims_path(after: u64) -> String {
 }
 
 fn events_path(after: u64) -> String {
-    format!("/v1/events?after={after}&wait=true&timeout_ms=30000&subject=host%2Ffollow-fixture")
+    format!(
+        "/v1/events/page?after={after}&wait=true&timeout_ms=30000&subject=host%2Ffollow-fixture"
+    )
 }
 
 fn event(index: u64) -> Value {
@@ -114,6 +116,199 @@ fn assert_refusal(output: &FollowOutput, gaps: usize) {
 }
 
 #[tokio::test(start_paused = true)]
+async fn default_trace_follow_starts_at_the_frontier_for_old_and_empty_history() {
+    for history in [vec![], vec![claim(10)]] {
+        let history_length = history.len();
+        let output = scripted_cli(
+            &["--json", "trace", "show", SUBJECT, "--follow"],
+            vec![
+                (
+                    "/v1/claims?limit=100&order=desc&subject=host%2Ffollow-fixture".into(),
+                    Reply::Value(json!({"claims":history,"next_cursor":null})),
+                ),
+                ("/v1/health".into(), Reply::Value(json!({"store_index":50}))),
+                (
+                    events_path(50),
+                    Reply::Value(json!({"items":[event(51)],"next_after":51})),
+                ),
+                (events_path(51), Reply::Error(401)),
+            ],
+        )
+        .await;
+        assert_refusal(&output, 0);
+        let rows = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(rows.lines().count(), history_length + 1);
+        let last: Value = serde_json::from_str(rows.lines().last().unwrap()).unwrap();
+        assert_eq!(last["store_index"], 51);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn trace_follow_advances_empty_filtered_pages_and_stops_on_resync() {
+    let output = scripted_cli(
+        &[
+            "--json",
+            "trace",
+            "show",
+            SUBJECT,
+            "--after-index",
+            "10",
+            "--follow",
+        ],
+        vec![
+            (
+                "/v1/claims?limit=100&order=asc&subject=host%2Ffollow-fixture&after_index=10"
+                    .into(),
+                Reply::Value(json!({"claims": [], "next_cursor": null})),
+            ),
+            (
+                events_path(10),
+                Reply::Value(json!({"items":[],"next_after":30})),
+            ),
+            (events_path(30), Reply::Error(410)),
+        ],
+    )
+    .await;
+    assert_refusal(&output, 0);
+    assert!(output.stdout.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn trace_follow_uses_legacy_only_when_the_page_route_is_absent() {
+    let output = scripted_cli(
+        &[
+            "--json",
+            "trace",
+            "show",
+            SUBJECT,
+            "--after-index",
+            "10",
+            "--follow",
+        ],
+        vec![
+            (
+                "/v1/claims?limit=100&order=asc&subject=host%2Ffollow-fixture&after_index=10"
+                    .into(),
+                Reply::Value(json!({"claims": [], "next_cursor": null})),
+            ),
+            (events_path(10), Reply::MissingRoute),
+            (
+                "/v1/health".into(),
+                Reply::Value(json!({"features":{"bounded_legacy_events":1}})),
+            ),
+            (
+                events_path(10).replace("/events/page?", "/events?"),
+                Reply::Value(json!([event(11)])),
+            ),
+            (
+                events_path(11).replace("/events/page?", "/events?"),
+                Reply::Error(410),
+            ),
+        ],
+    )
+    .await;
+    assert_refusal(&output, 0);
+    let event: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(event["store_index"], 11);
+}
+
+#[tokio::test(start_paused = true)]
+async fn trace_follow_refuses_an_unbounded_legacy_daemon_without_reading_its_history() {
+    let output = scripted_cli(
+        &[
+            "--json",
+            "trace",
+            "show",
+            SUBJECT,
+            "--after-index",
+            "10",
+            "--follow",
+        ],
+        vec![
+            (
+                "/v1/claims?limit=100&order=asc&subject=host%2Ffollow-fixture&after_index=10"
+                    .into(),
+                Reply::Value(json!({"claims": [], "next_cursor": null})),
+            ),
+            (events_path(10), Reply::MissingRoute),
+            ("/v1/health".into(), Reply::Value(json!({"features":{}}))),
+        ],
+    )
+    .await;
+    assert!(output.result.is_err());
+    assert_eq!(output.requests.len(), 3);
+    assert!(
+        output
+            .result
+            .unwrap_err()
+            .to_string()
+            .contains("upgrade the daemon")
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn trace_follow_reports_the_gap_and_explicit_continuation_without_resetting() {
+    let output = scripted_cli(
+        &[
+            "--json",
+            "trace",
+            "show",
+            SUBJECT,
+            "--after-index",
+            "10",
+            "--follow",
+        ],
+        vec![
+            (
+                "/v1/claims?limit=100&order=asc&subject=host%2Ffollow-fixture&after_index=10"
+                    .into(),
+                Reply::Value(json!({"claims": [], "next_cursor": null})),
+            ),
+            (
+                events_path(10),
+                Reply::CursorGap {
+                    floor: 30,
+                    frontier: 50,
+                },
+            ),
+        ],
+    )
+    .await;
+    let error = output.result.unwrap_err();
+    assert!(error.downcast_ref::<EventCursorGap>().is_some());
+    assert!(error.to_string().contains("retained floor 30, frontier 50"));
+    assert!(
+        error
+            .to_string()
+            .contains("st trace show 'host/follow-fixture' --after-index 50 --follow")
+    );
+    assert_eq!(output.requests.len(), 2);
+    assert!(output.stdout.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn non_trace_event_gap_does_not_suggest_a_trace_continuation() {
+    let path = events_path(10);
+    let client = Client::scripted_follow_test(vec![(
+        path.clone(),
+        Reply::CursorGap {
+            floor: 30,
+            frontier: 50,
+        },
+    )]);
+    let error = LocalEventFeed::default()
+        .read(&client, path.split_once('?').unwrap().1)
+        .await
+        .err()
+        .unwrap();
+    assert!(error.downcast_ref::<EventCursorGap>().is_some());
+    assert!(error.to_string().contains("retained floor 30, frontier 50"));
+    assert!(error.to_string().contains("retry this command explicitly"));
+    assert!(!error.to_string().contains("st trace show"));
+    assert_eq!(client.follow_test_result().0.len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
 async fn trace_follow_retries_timeout_after_last_delivered_index_once() {
     let initial = "/v1/claims?limit=2&order=asc&subject=host%2Ffollow-fixture&after_index=10";
     let output = scripted_cli(
@@ -133,10 +328,16 @@ async fn trace_follow_retries_timeout_after_last_delivered_index_once() {
                 initial.into(),
                 Reply::Value(json!({"claims": [], "next_cursor": null})),
             ),
-            (events_path(10), Reply::Value(json!([event(11), event(12)]))),
+            (
+                events_path(10),
+                Reply::Value(json!({"items":[event(11), event(12)],"next_after":12})),
+            ),
             (events_path(12), Reply::Timeout),
             (events_path(12), Reply::Disconnect),
-            (events_path(12), Reply::Value(json!([event(13), event(14)]))),
+            (
+                events_path(12),
+                Reply::Value(json!({"items":[event(13), event(14)],"next_after":14})),
+            ),
             (events_path(14), Reply::Error(404)),
         ],
     )
@@ -177,7 +378,10 @@ async fn trace_follow_retries_claim_details_before_advancing_index() {
                 Reply::Value(json!({"claims": [], "next_cursor": null})),
             ),
             (events_path(10), Reply::Timeout),
-            (events_path(10), Reply::Value(json!([event(11), event(12)]))),
+            (
+                events_path(10),
+                Reply::Value(json!({"items":[event(11), event(12)],"next_after":12})),
+            ),
             (
                 claims_path(10),
                 Reply::Value(json!({"claims": [claim(11)], "next_cursor": null})),
@@ -279,11 +483,17 @@ async fn idle_trace_long_polls_thirty_seconds_without_deadlines_or_gaps() {
             ),
             (
                 events_path(10),
-                Reply::Delayed(json!([]), Duration::from_secs(30)),
+                Reply::Delayed(
+                    json!({"items":[],"next_after":null}),
+                    Duration::from_secs(30),
+                ),
             ),
             (
                 events_path(10),
-                Reply::Delayed(json!([event(11)]), Duration::from_secs(30)),
+                Reply::Delayed(
+                    json!({"items":[event(11)],"next_after":11}),
+                    Duration::from_secs(30),
+                ),
             ),
             (events_path(11), Reply::Error(404)),
         ],
@@ -310,7 +520,10 @@ async fn deadline_backoff_survives_recovered_pages_and_caps_at_sixty_seconds() {
     )];
     for index in 10..16 {
         script.push((events_path(index), Reply::Timeout));
-        script.push((events_path(index), Reply::Value(json!([event(index + 1)]))));
+        script.push((
+            events_path(index),
+            Reply::Value(json!({"items":[event(index + 1)],"next_after":index+1})),
+        ));
     }
     script.push((events_path(16), Reply::Error(404)));
     let output = scripted_cli(

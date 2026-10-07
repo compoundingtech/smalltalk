@@ -4702,7 +4702,9 @@ async fn run_cli(cli: Cli) -> ExitCode {
                 st3::gate_report::note_refusal(&plain_error(&error));
             }
             let message = error.to_string();
-            if daemon_is_unreachable(&error) {
+            if error.downcast_ref::<EventCursorGap>().is_some() {
+                ExitCode::from(6)
+            } else if daemon_is_unreachable(&error) {
                 ExitCode::from(5)
             } else if message.contains("stale-subject") {
                 ExitCode::from(3)
@@ -5754,6 +5756,8 @@ async fn run_up(args: UpArgs) -> Result<()> {
     recycle_idle_wal(config.state_dir.join("claims.sqlite3"), Arc::downgrade(&store));
     let _contention_retry = retry_projection_contention(Arc::downgrade(&store), notify.clone(), event_notify.clone(), config.state_dir.clone());
     tokio::spawn(convert_envelope_payloads(store.clone()));
+    tokio::spawn(migrate_event_payloads(store.clone()));
+    spawn_response_expiry(store.clone());
     tokio::spawn(trim_local_observations(
         store.clone(),
         config.observations.clone(),
@@ -7941,10 +7945,24 @@ async fn run_trace_to(
     if !args.follow {
         return Ok(());
     }
+    if args.after_index.is_none() {
+        // The bounded history may be empty or older than the global event floor. Default
+        // follow starts now; an explicit --after-index still requires continuous replay.
+        let health: Value = client.get("/v1/health").await?;
+        cursor = health["store_index"]
+            .as_u64()
+            .context("the daemon health response has no store index")?;
+    }
     client.follow_recovered();
+    let mut event_feed = LocalEventFeed {
+        trace: true,
+        ..Default::default()
+    };
     loop {
         let mut event_query = vec![
-            format!("after={cursor}"), "wait=true".into(), "timeout_ms=30000".into(),
+            format!("after={cursor}"),
+            "wait=true".into(),
+            "timeout_ms=30000".into(),
         ];
         if let Some(subject) = &args.subject {
             event_query.push(format!("subject={}", urlencoding::encode(subject)));
@@ -7952,10 +7970,9 @@ async fn run_trace_to(
         if let Some(owner_run) = &args.owner_run {
             event_query.push(format!("owner_run={}", urlencoding::encode(owner_run)));
         }
-        let events: Vec<EventRecord> = client
-            .get(&format!("/v1/events?{}", event_query.join("&")))
-            .await?;
-        for event in events {
+        let page = event_feed.read(client, &event_query.join("&")).await?;
+        let scanned = page.next_after;
+        for event in page.items {
             if json_output {
                 writeln!(output, "{}", serde_json::to_string(&event)?)?;
             } else {
@@ -7981,6 +7998,9 @@ async fn run_trace_to(
                 }
             }
             cursor = cursor.max(event.store_index);
+        }
+        if let Some(scanned) = scanned {
+            cursor = cursor.max(scanned);
         }
         client.follow_recovered();
     }
@@ -9729,6 +9749,94 @@ async fn run_trace_command(
     }
 }
 
+#[derive(serde::Deserialize)]
+struct LocalEventPage {
+    items: Vec<EventRecord>,
+    next_after: Option<u64>,
+}
+
+#[derive(Debug)]
+struct EventCursorGap(String);
+
+impl std::fmt::Display for EventCursorGap {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        output.write_str(&self.0)
+    }
+}
+impl std::error::Error for EventCursorGap {}
+
+fn event_cursor_error(error: anyhow::Error, query: &str, trace: bool) -> anyhow::Error {
+    let Some((410, "cursor-gap", _, details)) = st3::client::api_error_parts(&error) else {
+        return error;
+    };
+    let Some(floor) = details.get("resume_floor").and_then(Value::as_u64) else {
+        return error;
+    };
+    let Some(frontier) = details.get("frontier").and_then(Value::as_u64) else {
+        return error;
+    };
+    let mut filters = String::new();
+    let mut after = "unknown";
+    for (key, value) in query.split('&').filter_map(|pair| pair.split_once('=')) {
+        match key {
+            "after" => after = value,
+            "subject" | "owner_run" => {
+                let value = urlencoding::decode(value).unwrap_or_else(|_| value.into());
+                let quoted = format!("'{}'", value.replace('\'', "'\"'\"'"));
+                if key == "owner_run" {
+                    filters.push_str(" --owner-run");
+                }
+                filters.push(' ');
+                filters.push_str(&quoted);
+            }
+            _ => {}
+        }
+    }
+    let mut message = format!(
+        "event cursor {after} has a gap: retained floor {floor}, frontier {frontier}. Missed transitions were not replayed."
+    );
+    if trace {
+        message.push_str(&format!(" Inspect retained claims, then explicitly continue on the same endpoint with `st trace show{filters} --after-index {frontier} --follow`"));
+    } else {
+        message.push_str(" Inspect the current subject state and retry this command explicitly.");
+    }
+    EventCursorGap(message).into()
+}
+
+#[derive(Default)]
+struct LocalEventFeed {
+    legacy: bool,
+    trace: bool,
+}
+
+impl LocalEventFeed {
+    async fn read(&mut self, client: &Client, query: &str) -> Result<LocalEventPage> {
+        if !self.legacy {
+            match client.get(&format!("/v1/events/page?{query}")).await {
+                Ok(page) => return Ok(page),
+                Err(error) if st3::client::is_missing_route(&error) => {
+                    let health: Value = client.get("/v1/health").await?;
+                    anyhow::ensure!(
+                        health
+                            .pointer("/features/bounded_legacy_events")
+                            .and_then(Value::as_u64)
+                            == Some(1),
+                        "this daemon does not support bounded event continuation; upgrade the daemon and retry"
+                    );
+                    self.legacy = true;
+                }
+                Err(error) => return Err(event_cursor_error(error, query, self.trace)),
+            }
+        }
+        let items: Vec<EventRecord> = client
+            .get(&format!("/v1/events?{query}"))
+            .await
+            .map_err(|error| event_cursor_error(error, query, self.trace))?;
+        let next_after = items.last().map(|event| event.store_index);
+        Ok(LocalEventPage { items, next_after })
+    }
+}
+
 async fn wait_for_condition(
     client: &Client,
     subject: &str,
@@ -9741,6 +9849,7 @@ async fn wait_for_condition(
     let mut cursor = health["store_index"]
         .as_u64()
         .context("the daemon health response has no store index")?;
+    let mut event_feed = LocalEventFeed::default();
     loop {
         if let Some(value) = condition_value(client, subject, condition).await? {
             return Ok(value);
@@ -9754,13 +9863,14 @@ async fn wait_for_condition(
             || format!("&subject={}", urlencoding::encode(subject)),
             |_| String::new(),
         );
-        let events: Vec<EventRecord> = client
-            .get(&format!(
-                "/v1/events?after={cursor}{scope}&wait=true&timeout_ms=30000"
-            ))
+        let page = event_feed
+            .read(
+                client,
+                &format!("after={cursor}{scope}&wait=true&timeout_ms=30000"),
+            )
             .await?;
-        for event in events {
-            cursor = cursor.max(event.store_index);
+        if let Some(scanned) = page.next_after {
+            cursor = cursor.max(scanned);
         }
     }
 }
@@ -12190,6 +12300,7 @@ async fn run_agents(
             let gateway = generated_client(endpoint, None)?;
             let wait = async {
                 let mut cursor = request.store_index;
+                let mut event_feed = LocalEventFeed::default();
                 loop {
                     let status = status_for(&client, &subject).await?;
                     let current = status
@@ -12243,13 +12354,19 @@ async fn run_agents(
                             );
                         }
                     }
-                    let events: Vec<EventRecord> = client
-                        .get(&format!(
-                            "/v1/events?after={cursor}&subject={}&wait=true&timeout_ms=1000",
-                            urlencoding::encode(&subject),
-                        ))
+                    let page = event_feed
+                        .read(
+                            &client,
+                            &format!(
+                                "after={cursor}&subject={}&wait=true&timeout_ms=1000",
+                                urlencoding::encode(&subject),
+                            ),
+                        )
                         .await?;
-                    for event in events {
+                    if let Some(scanned) = page.next_after {
+                        cursor = cursor.max(scanned);
+                    }
+                    for event in page.items {
                         let fields = event.body.get("fields").unwrap_or(&event.body);
                         if event.kind == "runtime.reconcile-decision"
                             && matches!(fields["decision"].as_str(), Some("member-fault" | "raise"))
@@ -12847,6 +12964,7 @@ async fn wait_for_agent_harness(
         .as_u64()
         .context("the daemon health response has no store index")?;
     let mut reported = String::new();
+    let mut event_feed = LocalEventFeed::default();
     loop {
         let agent = match gateway.agents_get(subject).await {
             Ok(response) => match response.value {
@@ -12882,14 +13000,17 @@ async fn wait_for_agent_harness(
                 reported = progress;
             }
         }
-        let events: Vec<EventRecord> = client
-            .get(&format!(
-                "/v1/events?after={cursor}&subject={}&wait=true&timeout_ms=30000",
-                urlencoding::encode(subject)
-            ))
+        let page = event_feed
+            .read(
+                client,
+                &format!(
+                    "after={cursor}&subject={}&wait=true&timeout_ms=30000",
+                    urlencoding::encode(subject),
+                ),
+            )
             .await?;
-        for event in events {
-            cursor = cursor.max(event.store_index);
+        if let Some(scanned) = page.next_after {
+            cursor = cursor.max(scanned);
         }
     }
 }
@@ -23179,6 +23300,420 @@ async fn convert_envelope_payloads(store: Arc<Store>) {
     }
 }
 
+async fn migrate_event_payloads(store: Arc<Store>) {
+    match st3::maintenance::migrate_event_payloads(store).await {
+        Ok(report) if report.pending_at_start => {
+            eprintln!(
+                "st3: event payload migration completed: {} rows in {} chunks, {:.0} ms elapsed, {:.1} ms maximum chunk call",
+                report.moved_rows, report.chunks, report.elapsed_ms, report.max_chunk_call_ms
+            );
+        }
+        Ok(_) => {}
+        Err(error) => eprintln!("st3: event payload migration stopped: {error:#}"),
+    }
+}
+
+fn maintenance_contention(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(cause.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(code, _)) if matches!(code.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
+    })
+}
+
+/// Register before the first rowid deadline read. The callback performs no SQL and never
+/// takes the writer: it only coalesces committed-write notifications. Deadline reads run on a
+/// pooled reader, so unrelated commits add no expiry SQL to the writer path.
+fn spawn_response_expiry(store: Arc<Store>) -> tokio::task::JoinHandle<()> {
+    let (changed, receiver) = tokio::sync::watch::channel(());
+    let observer = store.observe_commits(move |connection| {
+        if connection.is_autocommit() {
+            changed.send_replace(());
+        }
+    });
+    tokio::spawn(async move {
+        let _observer = observer;
+        expire_completed_responses(store, receiver).await;
+    })
+}
+
+async fn expire_completed_responses(
+    store: Arc<Store>,
+    mut changed: tokio::sync::watch::Receiver<()>,
+) {
+    let mut clock_deferred = false;
+    let mut retry = Duration::from_millis(200);
+    loop {
+        // Subscribe before the rowid read. Consume the old generation before reading so a
+        // commit between that read and the wait remains visible to changed().
+        changed.borrow_and_update();
+        let read_store = store.clone();
+        let deadline =
+            match tokio::task::spawn_blocking(move || read_store.next_idempotency_expiry()).await {
+                Ok(Ok(deadline)) => deadline,
+                Ok(Err(error)) if maintenance_contention(&error) => {
+                    eprintln!(
+                        "st3: response expiry read contention; retrying in {retry:?}: {error:#}"
+                    );
+                    tokio::time::sleep(retry).await;
+                    retry = (retry * 2).min(Duration::from_secs(5));
+                    continue;
+                }
+                error => {
+                    eprintln!("st3: response expiry scheduler stopped: {error:?}");
+                    return;
+                }
+            };
+        let now = now_ms().min(i64::MAX as u128) as i64;
+        if deadline.is_none_or(|deadline| deadline > now) {
+            match deadline {
+                None => {
+                    if changed.changed().await.is_err() {
+                        return;
+                    }
+                }
+                Some(deadline) => {
+                    // UTC stamps govern eligibility; the wait uses the monotonic clock. Every
+                    // wake rechecks UTC, so a backward clock step cannot cause early expiry.
+                    // A forward step may defer cleanup until this deadline or a committed
+                    // deadline change; rows remain ineligible before their recorded UTC deadline.
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_millis(deadline.saturating_sub(now) as u64)) => {},
+                        result = changed.changed() => if result.is_err() {return;},
+                    }
+                }
+            }
+            continue;
+        }
+        let clock_store = store.clone();
+        let clock_limit = match tokio::task::spawn_blocking(move || {
+            clock_store.idempotency_clock_limit()
+        })
+        .await
+        {
+            Ok(Ok(limit)) => limit,
+            Ok(Err(error)) if maintenance_contention(&error) => {
+                eprintln!(
+                    "st3: response expiry clock contention; retrying in {retry:?}: {error:#}"
+                );
+                tokio::time::sleep(retry).await;
+                retry = (retry * 2).min(Duration::from_secs(5));
+                continue;
+            }
+            error => {
+                eprintln!("st3: response expiry clock read stopped: {error:?}");
+                return;
+            }
+        };
+        if clock_limit.is_none_or(|limit| deadline.unwrap() > limit) {
+            if !clock_deferred {
+                eprintln!(
+                    "st3: response expiry deferred until committed claim time validates the deadline"
+                );
+                clock_deferred = true;
+            }
+            if changed.changed().await.is_err() {
+                return;
+            }
+            continue;
+        }
+        clock_deferred = false;
+        let clean_store = store.clone();
+        match tokio::task::spawn_blocking(move || {
+            st3::profile::task("task expire-completed-responses", || {
+                clean_store.cleanup_idempotency(now)
+            })
+        })
+        .await
+        {
+            Ok(Ok(_)) => {
+                retry = Duration::from_millis(200);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Ok(Err(error)) if maintenance_contention(&error) => {
+                eprintln!(
+                    "st3: response expiry write contention; retrying in {retry:?}: {error:#}"
+                );
+                tokio::time::sleep(retry).await;
+                retry = (retry * 2).min(Duration::from_secs(5));
+            }
+            error => {
+                eprintln!("st3: response expiry cleanup stopped: {error:?}");
+                return;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod response_expiry_tests {
+    use super::*;
+
+    fn fixture() -> (tempfile::TempDir, Arc<Store>) {
+        let directory = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(Store::open(&directory.path().join("claims.sqlite3"), "node").unwrap());
+        store
+            .append_claim(&smallclaims::ClaimInput {
+                subject: "custom/test/clock-anchor".into(),
+                kind: "custom.test.recorded".into(),
+                actor: None,
+                fields: Default::default(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        (directory, store)
+    }
+
+    fn notices(
+        store: &Store,
+    ) -> (
+        smallclaims::sqlite::CommitObserver,
+        tokio::sync::watch::Receiver<()>,
+    ) {
+        let (sender, receiver) = tokio::sync::watch::channel(());
+        let observer = store.observe_commits(move |_| {
+            sender.send_replace(());
+        });
+        (observer, receiver)
+    }
+
+    fn insert(store: &Store, key: &str, deadline: i64) {
+        store
+            .connection
+            .batched(|transaction| {
+                transaction.execute(
+                    "INSERT INTO idempotency(operation_id,response,replay_safe) VALUES (?1,'{}',1)",
+                    [key],
+                )?;
+                transaction.execute(
+                    "UPDATE idempotency SET expires_at_unix_ms=?2 WHERE operation_id=?1",
+                    rusqlite::params![key, deadline],
+                )?;
+                Ok::<_, rusqlite::Error>(())
+            })
+            .unwrap()
+            .unwrap();
+    }
+
+    async fn count_becomes(
+        store: &Store,
+        mut changed: tokio::sync::watch::Receiver<()>,
+        expected: u64,
+    ) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                changed.borrow_and_update();
+                let count = store
+                    .readers
+                    .get()
+                    .query_row("SELECT COUNT(*) FROM idempotency", [], |row| {
+                        row.get::<_, u64>(0)
+                    })
+                    .unwrap();
+                if count == expected {
+                    return;
+                }
+                changed.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("committed response expiry progresses without polling");
+    }
+
+    #[tokio::test]
+    async fn response_expiry_defers_without_claim_time_and_wakes_on_a_committed_anchor() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(&directory.path().join("claims.sqlite3"), "node").unwrap());
+        insert(&store, "unvalidated", 0);
+        let (_observer, changes) = notices(&store);
+        let task = spawn_response_expiry(store.clone());
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(store.next_idempotency_expiry().unwrap(), Some(0));
+        store
+            .append_claim(&smallclaims::ClaimInput {
+                subject: "custom/test/clock-anchor".into(),
+                kind: "custom.test.recorded".into(),
+                actor: None,
+                fields: Default::default(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        count_becomes(&store, changes, 0).await;
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn response_expiry_retries_a_busy_writer_and_recovers_after_release() {
+        let (directory, store) = fixture();
+        store
+            .connection
+            .write()
+            .busy_timeout(Duration::ZERO)
+            .unwrap();
+        insert(&store, "busy", 0);
+        let blocker = rusqlite::Connection::open(directory.path().join("claims.sqlite3")).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        // Both bounded maintenance APIs must retain SQLite's numeric error, including when
+        // BEGIN fails before the chunk callback runs.
+        for error in [
+            store.cleanup_idempotency(now_ms() as i64).unwrap_err(),
+            store.migrate_event_payloads().unwrap_err(),
+        ] {
+            assert!(maintenance_contention(&error));
+        }
+        let (_observer, changes) = notices(&store);
+        let mut attempted = changes.clone();
+        let task = spawn_response_expiry(store.clone());
+        tokio::time::timeout(Duration::from_secs(5), attempted.changed())
+            .await
+            .expect("the maintenance writer loan returned after a busy BEGIN")
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !task.is_finished(),
+            "transient contention must not stop cleanup"
+        );
+        assert_eq!(store.next_idempotency_expiry().unwrap(), Some(0));
+        blocker.execute_batch("ROLLBACK").unwrap();
+        count_becomes(&store, changes, 0).await;
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn response_expiry_first_receipt_wakes_an_empty_scheduler() {
+        let (_directory, store) = fixture();
+        let (_observer, changes) = notices(&store);
+        let task = spawn_response_expiry(store.clone());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        insert(&store, "first", 0);
+        count_becomes(&store, changes, 0).await;
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn response_expiry_earlier_commit_interrupts_a_future_deadline() {
+        let (_directory, store) = fixture();
+        let future = now_ms() as i64 + smallclaims::store::idempotency::RETENTION_MS;
+        insert(&store, "future", future);
+        let (_observer, changes) = notices(&store);
+        let task = spawn_response_expiry(store.clone());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        store
+            .connection
+            .batched(|transaction| {
+                transaction.execute(
+                    "UPDATE idempotency SET expires_at_unix_ms=0 WHERE operation_id='future'",
+                    [],
+                )
+            })
+            .unwrap()
+            .unwrap();
+        count_becomes(&store, changes, 0).await;
+        assert_eq!(store.next_idempotency_expiry().unwrap(), None);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn response_expiry_loan_return_and_rollback_publish_only_authority() {
+        let (_directory, store) = fixture();
+        let (_observer, changes) = notices(&store);
+        let task = spawn_response_expiry(store.clone());
+        {
+            let mut writer = store.connection.write();
+            let transaction = writer.transaction().unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO idempotency(operation_id,response,replay_safe) VALUES ('rolled-back','{}',1)",
+                    [],
+                )
+                .unwrap();
+            transaction
+                .execute("UPDATE idempotency SET expires_at_unix_ms=0", [])
+                .unwrap();
+            transaction.rollback().unwrap();
+        }
+        assert_eq!(store.next_idempotency_expiry().unwrap(), None);
+        let mut writer = store.connection.write();
+        let transaction = writer.transaction().unwrap();
+        transaction
+            .execute(
+                "INSERT INTO idempotency(operation_id,response,replay_safe) VALUES ('committed','{}',1)",
+                [],
+            )
+            .unwrap();
+        transaction
+            .execute("UPDATE idempotency SET expires_at_unix_ms=0", [])
+            .unwrap();
+        transaction.commit().unwrap();
+        assert_eq!(
+            store
+                .readers
+                .get()
+                .query_row("SELECT COUNT(*) FROM idempotency", [], |row| row
+                    .get::<_, u64>(0))
+                .unwrap(),
+            1
+        );
+        drop(writer);
+        count_becomes(&store, changes, 0).await;
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn response_expiry_yields_between_sixty_four_row_commits() {
+        let (_directory, store) = fixture();
+        let counts = Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+        let observed = counts.clone();
+        let _counts = store.observe_commits(move |connection| {
+            let count = connection
+                .query_row("SELECT COUNT(*) FROM idempotency", [], |row| {
+                    row.get::<_, u64>(0)
+                })
+                .unwrap();
+            observed.lock().unwrap().push(count);
+        });
+        let (_observer, changes) = notices(&store);
+        let task = spawn_response_expiry(store.clone());
+        store
+            .connection
+            .batched(|transaction| {
+                for index in 0..130 {
+                    transaction.execute(
+                        "INSERT INTO idempotency(operation_id,response,replay_safe) VALUES (?1,'{}',1)",
+                        [format!("receipt-{index}")],
+                    )?;
+                }
+                transaction.execute("UPDATE idempotency SET expires_at_unix_ms=0", [])?;
+                Ok::<_, rusqlite::Error>(())
+            })
+            .unwrap()
+            .unwrap();
+        count_becomes(&store, changes, 0).await;
+        assert_eq!(*counts.lock().unwrap(), [130, 66, 2, 0]);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn response_expiry_schema_read_failure_stops_visibly() {
+        let (_directory, store) = fixture();
+        store
+            .connection
+            .write()
+            .execute_batch("DROP TABLE idempotency")
+            .unwrap();
+        let task = spawn_response_expiry(store);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
 /// Fill the account limits projection after an upgrade, a page of claims at a time. Each page is
 /// its own short writer transaction and the daemon answers between pages; the cursor is stored, so
 /// a restart resumes. Once it is caught up this only checks, once a minute, for claims that
@@ -25075,7 +25610,7 @@ mod tests {
             move |request: axum::extract::Request, next: axum::middleware::Next| {
                 let sent = sent.clone();
                 async move {
-                    if request.uri().path() == "/v1/events" {
+                    if request.uri().path() == "/v1/events/page" {
                         let _ = sent.send(request.uri().query().unwrap_or_default().to_owned());
                     }
                     next.run(request).await
