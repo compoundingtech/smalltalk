@@ -1,33 +1,5 @@
 //! Pairing and private profile storage shared with `st devices complete`.
-use anyhow::Result;
-pub use st3_client::device::{Profile, profile_path, read_pairing_code as read_code};
-use std::path::Path;
-
-pub async fn pair(
-    path: &Path,
-    endpoint: &str,
-    pairing_id: &str,
-    code: &str,
-    allow_public_http: bool,
-    fingerprint: Option<&str>,
-    unpinned: bool,
-) -> Result<String> {
-    let key = st3_client::device::SigningKey::generate(st3_client::device::KeyAlgorithm::P256)?;
-    let device = st3_client::device::complete_with_options(
-        path,
-        endpoint,
-        pairing_id,
-        code,
-        key,
-        st3_client::device::CompletionOptions {
-            allow_public_http,
-            fingerprint,
-            unpinned,
-        },
-    )
-    .await?;
-    Ok(device.session.person_id)
-}
+pub use st3_client::device::{Profile, profile_path};
 
 #[cfg(test)]
 mod tests {

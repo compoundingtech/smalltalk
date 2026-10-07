@@ -31,7 +31,7 @@ import time
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--binary", default="target/release/stui")
+    parser.add_argument("--binary", default="target/release/st3")
     parser.add_argument("--seconds", type=float, default=180)
     parser.add_argument("--label", default="measure")
     parser.add_argument("--rows", type=int, default=50)
@@ -48,7 +48,10 @@ def main() -> None:
     env.pop("ST_AGENT", None)
     if arguments.timing:
         env["STUI_TIMING_LOG"] = arguments.timing
-    process = subprocess.Popen([arguments.binary], stdin=slave, stdout=slave, stderr=slave, env=env)
+    command = [arguments.binary]
+    if os.path.basename(arguments.binary) != "stui":
+        command.append("ui")
+    process = subprocess.Popen(command, stdin=slave, stdout=slave, stderr=slave, env=env)
     os.close(slave)
     received = 0
 
@@ -86,6 +89,8 @@ def main() -> None:
                 process.kill()
         os.close(master)
     print(f"test client done: exit {process.returncode}, {received} bytes drawn", flush=True)
+    if process.returncode:
+        raise SystemExit(process.returncode)
 
 
 main()
