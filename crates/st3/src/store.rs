@@ -2666,6 +2666,31 @@ impl Store {
         Ok(Some(subjects))
     }
 
+    /// An allow-list for shallow refs, narrower than card-local invalidation: runtime status
+    /// can move an undeclared or stopped agent into history, so runtime.observed is not safe.
+    fn agent_page_refs_unchanged(&self, after: u64, through: u64, refs: &[Value]) -> Result<bool> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare_cached(
+            "SELECT subject, kind FROM claims WHERE store_index>?1 AND store_index<=?2",
+        )?;
+        for row in statement.query_map(params![after, through], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })? {
+            let (subject, kind) = row?;
+            let unchanged = match kind.as_str() {
+                "daemon.diagnostic" => true,
+                "harness.observed" | "harness.diagnostic" | "harness.timeline"
+                    | "harness.todo.observed" | "harness.session-file" | "harness.usage" => {
+                    subject.starts_with("agent/")
+                        && refs.iter().any(|item| item["id"].as_str() == Some(subject.as_str()))
+                }
+                _ => false,
+            };
+            if !unchanged { return Ok(false); }
+        }
+        Ok(true)
+    }
+
     /// The last claim that can change an agent's status: one about an agent, or about the run
     /// or generation that owns it, whose row decides the agent's projection layer. Steps,
     /// gates, subscriptions and diagnostics commit far more often and change no agent status.
@@ -2681,79 +2706,224 @@ impl Store {
             .unwrap_or_default())
     }
 
-    /// Keep bounded immutable snapshots. Advance the nearest older snapshot by rebuilding
-    /// only cards whose local observations changed; historical reads never advance backwards.
+    /// One physical roster reader across HTTP pages and differently authorized WS windows.
+    /// Waiting happens before SQLite snapshot acquisition, so followers pin no old WAL mark.
+    pub(crate) async fn admit_agent_resources(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        let started = std::time::Instant::now();
+        let guard = self.smalltalk.agent_resources_admission.clone().lock_owned().await;
+        // Waiting here is waiting for the shared admission or for another reader's in-flight
+        // build; the holder keeps the admission until its projection is published.
+        crate::performance::record_request("roster/admission-wait", None, started.elapsed());
+        guard
+    }
+
+    #[cfg(test)]
+    pub(crate) fn agent_resources_builds_for_test(&self) -> usize {
+        self.smalltalk.agent_resources_builds.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub(crate) fn cached_agent_resources(
         &self,
         index: u64,
         history: bool,
         build: impl FnOnce(Option<(&BTreeSet<String>, &[Value])>) -> Result<Vec<Value>>,
     ) -> Result<Vec<Value>> {
-        let cache = self
-            .smalltalk
-            .agent_resources_cache
-            .lock()
-            .expect("agent resources cache poisoned");
-        if let Some(items) = cache
-            .iter()
-            .find(|(at, all, _)| *at == index && *all == history)
-            .map(|(_, _, items)| Arc::clone(items))
-        {
+        self.cached_agent_resources_for(index, history, None, build)
+    }
+
+    /// The complete agents WS window inherits the queue deadline from its shared projection.
+    pub(crate) fn agent_roster_valid_until(&self, index: u64) -> Option<u128> {
+        self.smalltalk.agent_resources_cache.lock()
+            .expect("agent resources cache poisoned").iter().rev()
+            .find(|entry| entry.index == index && !entry.history && entry.covered.is_none())
+            .and_then(|entry| entry.valid_until_unix_ms)
+    }
+
+    /// Queue selection changes at lease expiry even when the claim frontier is unchanged.
+    /// Scan only on a cache miss, inside the same SQLite snapshot as the queue projection.
+    fn agent_queue_valid_until(&self, now: u128) -> Result<Option<u128>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare_cached(
+            "SELECT lease_expires_at_unix_ms FROM step_runs
+             WHERE agentless=0 AND status IN ('claimed','working','verifying')
+               AND status NOT IN ('completed','failed','cancelled')
+               AND lease_expires_at_unix_ms IS NOT NULL
+               AND generation_id=(SELECT current_generation_id FROM mission_runs WHERE id=step_runs.run_id)",
+        )?;
+        let mut deadline = None;
+        for row in statement.query_map([], |row| row.get::<_, String>(0))? {
+            if let Some(expiry) = row?.parse::<u128>().ok().filter(|expiry| *expiry > now) {
+                deadline = Some(deadline.map_or(expiry, |previous: u128| previous.min(expiry)));
+            }
+        }
+        Ok(deadline)
+    }
+
+    /// Membership/order/queue refs contain no local timeline data. Reuse them for unchanged
+    /// graph cuts and agent-only observations, so a warm HTTP page does not scan fleet work.
+    pub(crate) fn cached_agent_page_refs(
+        &self,
+        index: u64,
+        history: bool,
+        build: impl FnOnce() -> Result<Vec<Value>>,
+    ) -> Result<Vec<Value>> {
+        let now = now_ms();
+        let valid = |entry: &&runtime::AgentResourcesEntry| {
+            entry.valid_until_unix_ms.is_none_or(|expiry| now < expiry)
+        };
+        let cache = self.smalltalk.agent_page_refs_cache.lock()
+            .expect("agent page refs cache poisoned");
+        if let Some(entry) = cache.iter().filter(valid).find(|entry| entry.index == index && entry.history == history) {
+            let items = Arc::clone(&entry.items);
             drop(cache);
             return Ok((*items).clone());
         }
-        let previous = cache
-            .iter()
-            .filter(|(at, all, _)| *at < index && *all == history)
-            .max_by_key(|(at, _, _)| *at)
-            .map(|(at, _, items)| (*at, Arc::clone(items)));
-        // A caller already holds a SQLite snapshot. Waiting behind another card build here
-        // pins that old WAL read mark for the whole build, starving checkpoints.
+        let previous = cache.iter().filter(valid).filter(|entry| entry.index < index && entry.history == history)
+            .max_by_key(|entry| entry.index).cloned();
         drop(cache);
-        let items = if let Some((at, previous)) = previous {
-            match self.changed_agent_resources(at, index)? {
-                Some(changed) if changed.is_empty() => (*previous).clone(),
-                Some(changed) => {
-                    let fresh = build(Some((&changed, &previous)))?;
-                    let mut items = previous
-                        .iter()
-                        .filter(|item| !changed.contains(item["id"].as_str().unwrap_or_default()))
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    items.extend(fresh);
-                    items.sort_by(|a, b| {
-                        a["name"]
-                            .as_str()
-                            .cmp(&b["name"].as_str())
-                            .then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
-                    });
-                    items
-                }
-                None => build(None)?,
+        let (items, valid_until_unix_ms) = match previous {
+            Some(previous) if self.agent_page_refs_unchanged(previous.index, index, &previous.items)? => {
+                (previous.items, previous.valid_until_unix_ms)
             }
-        } else {
-            build(None)?
+            _ => (Arc::new(build()?), self.agent_queue_valid_until(now)?),
         };
-        let mut cache = self
-            .smalltalk
-            .agent_resources_cache
-            .lock()
-            .expect("agent resources cache poisoned");
-        let (items, evicted) = if let Some((_, _, published)) = cache
-            .iter()
-            .find(|(at, all, _)| *at == index && *all == history)
-        {
-            // Concurrent builds still return one immutable result for this snapshot.
-            (Arc::clone(published), None)
-        } else {
-            let items = Arc::new(items);
-            cache.push_back((index, history, Arc::clone(&items)));
-            let evicted = if cache.len() > 8 { cache.pop_front() } else { None };
-            (items, evicted)
-        };
+        let mut cache = self.smalltalk.agent_page_refs_cache.lock()
+            .expect("agent page refs cache poisoned");
+        cache.push_back(runtime::AgentResourcesEntry {
+            index, local: 0, history, covered: None, valid_until_unix_ms, items: Arc::clone(&items),
+        });
+        let evicted = if cache.len() > 8 { cache.pop_front() } else { None };
         drop(cache);
         drop(evicted);
         Ok((*items).clone())
+    }
+
+    /// Bounded immutable projections shared by pages and streams. Pages fill only missing
+    /// subjects; a complete stream projection subsumes them. Local observations advance only
+    /// affected cards, and historical cuts never borrow newer rows.
+    pub(crate) fn cached_agent_resources_for(
+        &self,
+        index: u64,
+        history: bool,
+        selected: Option<&BTreeSet<String>>,
+        build: impl FnOnce(Option<(&BTreeSet<String>, &[Value])>) -> Result<Vec<Value>>,
+    ) -> Result<Vec<Value>> {
+        let now = now_ms();
+        let valid = |entry: &&runtime::AgentResourcesEntry| {
+            entry.valid_until_unix_ms.is_none_or(|expiry| now < expiry)
+        };
+        // Local timeline rows do not advance the graph index, but do change last_activity.
+        // Read their frontier inside the caller's SQLite snapshot, never from a future atomic
+        // generation that could race this cut. The ordinary warm read is one primary-key seek.
+        let local = crate::performance::task("roster/frontier-read", || -> Result<u64> {
+            let connection = self.readers.get();
+            let local = connection.query_row(
+                "SELECT COALESCE((SELECT id FROM local_observations WHERE after_store_index<=?1
+                 ORDER BY id DESC LIMIT 1), 0)", [index], |row| row.get::<_, u64>(0),
+            )?;
+            drop(connection);
+            Ok(local)
+        })?;
+        let select = |items: &[Value]| items.iter().filter(|item| {
+            selected.is_none_or(|names| names.contains(item["id"].as_str().unwrap_or_default()))
+        }).cloned().collect::<Vec<_>>();
+        let cache = self.smalltalk.agent_resources_cache.lock()
+            .expect("agent resources cache poisoned");
+        let satisfies = |entry: &runtime::AgentResourcesEntry| {
+            entry.covered.as_ref().is_none_or(|covered| {
+                selected.is_some_and(|names| names.is_subset(covered))
+            })
+        };
+        if let Some(entry) = cache.iter().filter(valid).find(|entry| {
+            entry.index == index && entry.local == local && entry.history == history && satisfies(entry)
+        }) {
+            let items = Arc::clone(&entry.items);
+            drop(cache);
+            return crate::performance::task("roster/cache-hit", || Ok(select(&items)));
+        }
+        let previous = cache.iter().filter(valid)
+            .filter(|entry| entry.index <= index && entry.local <= local && entry.history == history)
+            .max_by_key(|entry| (entry.index, entry.local)).cloned();
+        drop(cache);
+        let entry = crate::performance::task("roster/build",
+        || -> Result<runtime::AgentResourcesEntry> {
+        let previous = match previous {
+            Some(entry) if entry.index == index => Some((entry, BTreeSet::new())),
+            Some(entry) => self.changed_agent_resources(entry.index, index)?
+                .map(|changed| (entry, changed)),
+            None => None,
+        };
+        let (mut items, covered, valid_until_unix_ms) = match previous {
+            Some((previous, mut changed)) => {
+                if previous.local != local {
+                    let connection = self.readers.get();
+                    let mut statement = connection.prepare_cached(
+                        "SELECT DISTINCT subject FROM local_observations WHERE id>?1 AND id<=?2
+                         AND after_store_index<=?3 AND kind='harness.timeline' AND subject LIKE 'agent/%'",
+                    )?;
+                    changed.extend(statement.query_map(params![previous.local, local, index],
+                        |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<BTreeSet<_>>>()?);
+                }
+                let covered = match (&previous.covered, selected) {
+                    (None, _) => None,
+                    (Some(covered), Some(names)) => {
+                        changed.retain(|name| covered.contains(name));
+                        changed.extend(names.difference(covered).cloned());
+                        Some(covered.union(names).cloned().collect())
+                    }
+                    (Some(covered), None) => {
+                        let connection = self.readers.get();
+                        let names = connection.prepare_cached(RANGE_SUBJECTS)?
+                            .query_map(params![index, "agent/", "agent0"], |row| row.get::<_, String>(0))?
+                            .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+                        let names = if history { names } else {
+                            self.current_view_candidates(&connection, names, index, true)?
+                        };
+                        changed.extend(names.difference(covered).cloned());
+                        None
+                    }
+                };
+                let mut items = previous.items.iter()
+                    .filter(|item| !changed.contains(item["id"].as_str().unwrap_or_default()))
+                    .cloned().collect::<Vec<_>>();
+                if !changed.is_empty() {
+                    #[cfg(test)]
+                    self.smalltalk.agent_resources_builds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    items.extend(crate::performance::task("roster/card-projection",
+                        || build(Some((&changed, &previous.items))))?);
+                }
+                (items, covered, previous.valid_until_unix_ms)
+            }
+            _ => {
+                #[cfg(test)]
+                self.smalltalk.agent_resources_builds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                (crate::performance::task("roster/card-projection",
+                    || build(selected.map(|names| (names, &[][..]))))?, selected.cloned(),
+                    self.agent_queue_valid_until(now)?)
+            }
+        };
+        items.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str())
+            .then_with(|| a["id"].as_str().cmp(&b["id"].as_str())));
+        Ok(runtime::AgentResourcesEntry {
+            index, local, history, covered, valid_until_unix_ms, items: Arc::new(items),
+        })
+        })?;
+        let mut cache = self.smalltalk.agent_resources_cache.lock()
+            .expect("agent resources cache poisoned");
+        // All endpoint callers hold admission. Direct internal readers may still race; never
+        // replace a complete published projection with a partial one.
+        let published = cache.iter().filter(valid).find(|entry| {
+            entry.index == index && entry.local == local && entry.history == history && satisfies(entry)
+        }).map(|entry| Arc::clone(&entry.items));
+        let items = if let Some(published) = published { published } else {
+            cache.retain(|entry| entry.index != index || entry.local != local || entry.history != history);
+            let items = Arc::clone(&entry.items);
+            cache.push_back(entry);
+            if cache.len() > 8 { cache.pop_front(); }
+            items
+        };
+        drop(cache);
+        Ok(select(&items))
     }
 
     /// Rebuild the operation projection when it no longer matches the claim log, and say
@@ -6389,6 +6559,7 @@ impl Store {
     /// One current-step scan for the whole roster. This avoids replaying wake
     /// history or querying the step table separately for every agent card.
     pub fn agent_work_queues(&self) -> Result<BTreeMap<String, AgentWorkQueue>> {
+        crate::performance::task("agent_work_queues", || -> Result<BTreeMap<String, AgentWorkQueue>> {
         let connection = self.readers.get();
         let orders = seat_run_orders_tx(&connection, None)?;
         let rows = seat_step_rows_tx(&connection, None)?;
@@ -6432,6 +6603,7 @@ impl Store {
             );
         }
         Ok(queues)
+        })
     }
 
     /// The live mission runs queued for every seat, in seat-queue order.

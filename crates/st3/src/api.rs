@@ -1675,8 +1675,14 @@ where
         let page = client_page(state, &snapshot, collection, Vec::new(), query)?;
         return Ok((Extension(snapshot), Json(page)));
     }
+    let roster_admission = if collection == "agents" {
+        Some(state.store.admit_agent_resources().await)
+    } else {
+        None
+    };
     let reader = state.clone();
     let (snapshot, items) = blocking_store(move || {
+        let _roster_admission = roster_admission;
         reader.store.clone().read_snapshot(|index| {
             let snapshot = client_snapshot_at(&reader, index);
             let items = reader
@@ -2198,6 +2204,10 @@ fn client_agent_resources_cached(
 // Freeze membership, ordering and the inexpensive declaration/queue metadata. The expensive
 // status, usage, fault and activity reductions are needed only for the returned page.
 fn client_agent_page_refs(store: &Store, history: bool, index: u64) -> anyhow::Result<Vec<Value>> {
+    store.cached_agent_page_refs(index, history, || client_agent_page_refs_uncached(store, history, index))
+}
+
+fn client_agent_page_refs_uncached(store: &Store, history: bool, index: u64) -> anyhow::Result<Vec<Value>> {
     let connection = store.readers.get();
     let mut subjects = connection
         .prepare_cached(crate::store::RANGE_SUBJECTS)?
@@ -2271,8 +2281,17 @@ fn client_agent_cards_for_page(
         .iter()
         .filter_map(|r| r["id"].as_str().map(str::to_owned))
         .collect::<BTreeSet<_>>();
-    let mut cards = client_agent_resources_selected(store, history, index, Some((&selected, refs)))
-        .map_err(ApiError::internal)?;
+    let mut cards = store.cached_agent_resources_for(index, history, Some(&selected), |changed| {
+        let (subjects, _) = changed.expect("a selected page always names its missing cards");
+        // Pagination refs are frozen response metadata, never shared projection inputs.
+        // Reuse the independently time-fenced current refs to avoid a second fleet queue scan.
+        let metadata = client_agent_page_refs(store, history, index)?;
+        let mut cards = client_agent_resources_selected(
+            store, history, index, Some((subjects, &metadata)),
+        )?;
+        add_agent_todos(store, &mut cards, index)?;
+        Ok(cards)
+    }).map_err(ApiError::internal)?;
     if cards.len() != refs.len() {
         return Err(client_page_expired(
             "agent page membership is no longer available; restart pagination",
@@ -2292,9 +2311,14 @@ fn client_agent_cards_for_page(
         // The original cut's ordering and host metadata must survive later declaration changes.
         card["name"] = reference["name"].clone();
         card["host_id"] = reference["host_id"].clone();
+        for field in [
+            "current_work_ids", "active_work_count", "next_work_id", "upcoming_work_ids",
+            "queued_work_count", "current_work", "next_work", "upcoming_work",
+        ] {
+            card[field] = reference[field].clone();
+        }
         ordered.push(card);
     }
-    add_agent_todos(store, &mut ordered, index).map_err(ApiError::internal)?;
     overlay_agent_resources(store, &mut ordered, at).map_err(ApiError::internal)?;
     Ok(ordered)
 }
@@ -4183,7 +4207,9 @@ async fn client_agents(
     }
     // Name/id ordering is independent of the live overlays. Only the returned page needs them.
     let store = state.store.clone();
+    let roster_admission = store.admit_agent_resources().await;
     blocking_store(move || {
+        let _roster_admission = roster_admission;
         let (Extension(snapshot), Json(mut page)) = page;
         let items = store.read_snapshot(|_| {
             Ok(store.with_owned_set_snapshot_reads(|| {
@@ -15456,7 +15482,7 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
     }
 
     #[test]
-    fn repeated_agent_list_does_not_wait_for_busy_read_connections() {
+    fn repeated_agent_list_reads_only_local_frontier_without_rebuilding() {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
         let index = state.store.index().unwrap();
@@ -15482,28 +15508,14 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
             .unwrap()
             .store_index;
         client_agent_resources(&state.store, false, "after diagnostic", index).unwrap();
-        let (ready_send, ready_recv) = std::sync::mpsc::channel();
-        let (release_send, release_recv) = std::sync::mpsc::channel();
-        let holder = state.store.clone();
-        let held = std::thread::spawn(move || {
-            holder.hold_read_connections_for_test(|| {
-                ready_send.send(()).unwrap();
-                release_recv.recv().unwrap();
-            });
-        });
-        ready_recv.recv().unwrap();
-        let store = state.store.clone();
-        let (result_send, result_recv) = std::sync::mpsc::channel();
-        let read = std::thread::spawn(move || {
-            result_send
-                .send(client_agent_resources(&store, false, "second", index))
-                .unwrap();
-        });
-        let result = result_recv.recv_timeout(Duration::from_millis(250));
-        release_send.send(()).unwrap();
-        held.join().unwrap();
-        read.join().unwrap();
-        assert!(result.unwrap().unwrap().is_empty());
+        // The former zero-reader cache hit missed same-index local activity. Correct warm
+        // reads now perform one indexed frontier seek, but never reduce cards again.
+        let builds = state.store.agent_resources_builds_for_test();
+        let work = smallclaims::sqlite::work::total();
+        let rows = client_agent_resources(&state.store, false, "second", index).unwrap();
+        assert!(rows.is_empty());
+        assert_eq!(state.store.agent_resources_builds_for_test(), builds);
+        assert!((smallclaims::sqlite::work::total() - work).vm_steps < 100);
     }
 
     #[tokio::test]
@@ -15664,6 +15676,209 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
             1
         );
         assert_eq!(cards, oracle[..1]);
+        let builds = state.store.agent_resources_builds_for_test();
+        assert_eq!(client_agent_cards_for_page(&state.store, false, index, &refs[..1], "cut")
+            .unwrap(), cards);
+        assert_eq!(state.store.agent_resources_builds_for_test(), builds);
+        assert_eq!(client_agent_resources(&state.store, false, "cut", index).unwrap(), oracle);
+        assert_eq!(crate::store::SUBJECT_REDUCTIONS.with(std::cell::Cell::get), 16);
+        assert_eq!(state.store.agent_resources_builds_for_test(), builds + 1);
+        client_agent_cards_for_page(&state.store, false, index, &refs[1..2], "cut").unwrap();
+        assert_eq!(state.store.agent_resources_builds_for_test(), builds + 1);
+    }
+
+    #[test]
+    fn agent_page_refs_reuse_warm_metadata_and_rebuild_for_new_membership() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let append = |subject: &str| state.store.append_claim(&ClaimInput {
+            subject: subject.into(), kind: "runtime.observed".into(), actor: None,
+            fields: serde_json::from_value(json!({"status":"running", "runtime_id":subject,
+                "incarnation_id":"one"})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        append("agent/refs-first");
+        let index = state.store.index().unwrap();
+        let refs = client_agent_page_refs(&state.store, false, index).unwrap();
+        assert_eq!(refs, client_agent_page_refs_uncached(&state.store, false, index).unwrap());
+        let work = smallclaims::sqlite::work::total();
+        assert_eq!(client_agent_page_refs(&state.store, false, index).unwrap(), refs);
+        assert_eq!((smallclaims::sqlite::work::total() - work).statements, 0);
+        // A repeated live status has the same result; runtime changes still rebuild shallow refs.
+        append("agent/refs-first");
+        let index = state.store.index().unwrap();
+        assert_eq!(client_agent_page_refs(&state.store, false, index).unwrap(), refs);
+        append("agent/refs-second");
+        let index = state.store.index().unwrap();
+        let added = client_agent_page_refs(&state.store, false, index).unwrap();
+        assert_eq!(added.len(), 2);
+        assert_eq!(added, client_agent_page_refs_uncached(&state.store, false, index).unwrap());
+        state.store.forget_current_views();
+        assert_eq!(added, client_agent_page_refs(&state.store, false, index).unwrap());
+        state.store.append_claim(&ClaimInput {
+            subject: "agent/refs-second".into(), kind: "runtime.observed".into(), actor: None,
+            fields: serde_json::from_value(json!({"status":"stopped", "runtime_id":"agent/refs-second",
+                "incarnation_id":"one"})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let index = state.store.index().unwrap();
+        let removed = client_agent_page_refs(&state.store, false, index).unwrap();
+        assert_eq!(removed.len(), 1, "a stopped undeclared runtime moves to history");
+        assert_eq!(removed, client_agent_page_refs_uncached(&state.store, false, index).unwrap());
+    }
+
+    #[test]
+    fn agent_page_refs_rebuild_for_work_desired_membership_and_order_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = &state.store;
+        let source = |command: &str, extra: &str| format!(r#"version 2
+agent "amber" {{ command "{command}"; name "Amber" }}
+{extra}
+mission "refs-work" state="ready" {{
+  concurrent-runs max=2
+  goal "Exercise roster reference invalidation."
+  step "work" {{ assigned-to "agent/node.amber" }}
+}}
+"#);
+        let apply = |source: String, key: &str| {
+            let intent = crate::graph::parse_test_intent(&source, "node").unwrap();
+            let plan = store.mission(&intent, crate::model::IntentInput {
+                kdl: source, source_name: None,
+            }).unwrap();
+            store.apply(&intent, &plan.subject_tokens, key).unwrap();
+        };
+        apply(source("true", ""), "refs-original");
+        let builds = std::cell::Cell::new(0_usize);
+        let read = |rebuild: bool| {
+            let index = store.index().unwrap();
+            let before = builds.get();
+            let refs = store.cached_agent_page_refs(index, false, || {
+                builds.set(builds.get() + 1);
+                client_agent_page_refs_uncached(store, false, index)
+            }).unwrap();
+            assert_eq!(builds.get(), before + usize::from(rebuild));
+            assert_eq!(refs, client_agent_page_refs_uncached(store, false, index).unwrap());
+            refs
+        };
+        read(true);
+        read(false);
+        store.append_claim(&ClaimInput {
+            subject: "agent/node.amber".into(), kind: "harness.observed".into(),
+            actor: Some("agent/node.amber".into()),
+            fields: BTreeMap::from([("state".into(), Value::String("working".into()))]),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        read(false);
+        let new_run = |key: &str| {
+            let run = store.create_mission_run(&MissionRunRequest {
+                mission: "refs-work".into(), revision: None, workspace: "/tmp".into(),
+                requester: Some("person/test".into()), mode: Some("run".into()),
+                inputs: BTreeMap::new(), idempotency_key: key.into(),
+            }).unwrap();
+            store.set_step_state(&run.steps[0].subject, "ready", None).unwrap();
+            run
+        };
+        let first = new_run("refs-first-work");
+        let refs = read(true);
+        assert_eq!(refs[0]["next_work_id"], first.steps[0].subject);
+        let second = new_run("refs-second-work");
+        read(true);
+        // Queue ordering is a separate claim on the existing agent, not an observation.
+        store.move_seat_queue_run(&crate::model::SeatQueueMoveRequest {
+            agent: "agent/node.amber".into(), run: second.id.clone(), placement: "top".into(),
+            anchor: None, reason: None, actor: "person/test".into(),
+            idempotency_key: "refs-reorder".into(),
+        }).unwrap();
+        let refs = read(true);
+        assert_eq!(refs[0]["next_work_id"], second.steps[0].subject);
+        let action = |name: &str| store.work_action(&second.steps[0].subject, name, &WorkRequest {
+            actor: Some("agent/node.amber".into()), incarnation: Some("refs-runtime".into()),
+            summary: Some("Complete fixture work.".into()), reason: None, evidence: Vec::new(),
+            idempotency_key: format!("refs-{name}"),
+        }).unwrap();
+        action("claim");
+        let refs = read(true);
+        assert_eq!(refs[0]["current_work_ids"], json!([second.steps[0].subject]));
+        action("complete");
+        let refs = read(true);
+        assert_eq!(refs[0]["next_work_id"], first.steps[0].subject);
+        apply(source("false", ""), "refs-desired-change");
+        read(true);
+        apply(source("false", r#"agent "beta" { command "true"; name "Beta" }"#), "refs-new-agent");
+        let refs = read(true);
+        assert_eq!(refs.len(), 2);
+        store.rename_agent("agent/node.amber", Some("Zeta"), "refs-name-order").unwrap();
+        let refs = read(true);
+        assert_eq!(refs.iter().map(|item| item["name"].as_str().unwrap()).collect::<Vec<_>>(),
+            ["Beta", "Zeta"]);
+    }
+
+    #[tokio::test]
+    async fn agent_page_continuation_does_not_seed_frozen_queues_into_the_shared_roster() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = &state.store;
+        let source = r#"version 2
+agent "amber" { command "true" }
+agent "zeta" { command "true" }
+mission "expiring-work" state="ready" {
+  goal "Refresh queue state at its lease boundary."
+  step "work" { assigned-to "agent/node.zeta" }
+}
+"#;
+        let intent = crate::graph::parse_test_intent(source, "node").unwrap();
+        let plan = store.mission(&intent, crate::model::IntentInput {
+            kdl: source.into(), source_name: None,
+        }).unwrap();
+        store.apply(&intent, &plan.subject_tokens, "lease-fence-fixture").unwrap();
+        let run = store.create_mission_run(&MissionRunRequest {
+            mission: "expiring-work".into(), revision: None, workspace: "/tmp".into(),
+            requester: Some("person/test".into()), mode: Some("run".into()),
+            inputs: BTreeMap::new(), idempotency_key: "lease-fence-run".into(),
+        }).unwrap();
+        let step = &run.steps[0].subject;
+        store.set_step_state(step, "ready", None).unwrap();
+        store.work_action(step, "claim", &WorkRequest {
+            actor: Some("agent/node.zeta".into()), incarnation: Some("fixture-runtime".into()),
+            summary: None, reason: None, evidence: Vec::new(), idempotency_key: "lease-fence-claim".into(),
+        }).unwrap();
+        // Shorten this fixture's lease before any cache is built; no claims are changed.
+        let expires = client_now_ms() + 1_000;
+        store.connection.lock().expect("fixture writer").execute(
+            "UPDATE step_runs SET lease_expires_at_unix_ms=?1 WHERE subject=?2",
+            rusqlite::params![expires.to_string(), step],
+        ).unwrap();
+        let index = store.index().unwrap();
+        let (status, claimed) = get_request(router(state.clone()), "/v1/client/agents").await;
+        assert_eq!(status, StatusCode::OK, "{claimed}");
+        assert_eq!(claimed["items"][1]["current_work_ids"], json!([step]));
+        let full = client_agent_resources_cached(store, false, index).unwrap();
+        assert_eq!(full[1]["current_work_ids"], json!([step]));
+        assert_eq!(store.agent_roster_valid_until(index), Some(expires));
+        let (status, first) = get_request(router(state.clone()), "/v1/client/agents?limit=1").await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        assert_eq!(first["items"][0]["id"], "agent/node.amber");
+        let cursor = first["page"]["next_cursor"].as_str().unwrap();
+        // Wait for the actual captured lease boundary, not an arbitrary settling interval.
+        tokio::time::sleep(Duration::from_millis(
+            u64::try_from(expires.saturating_sub(client_now_ms()) + 1).unwrap(),
+        )).await;
+        assert_eq!(store.index().unwrap(), index, "lease expiry must not append a claim");
+        let continuation = format!("/v1/client/agents?limit=1&cursor={}", urlencoding::encode(cursor));
+        let (status, second) = get_request(router(state.clone()), &continuation).await;
+        assert_eq!(status, StatusCode::OK, "{second}");
+        assert_eq!(second["items"][0]["id"], "agent/node.zeta");
+        assert_eq!(second["items"][0]["current_work_ids"], json!([step]),
+            "the continuation must preserve the first page's frozen queue cut");
+        let full = client_agent_resources_cached(store, false, index).unwrap();
+        assert_eq!(full[1]["current_work_ids"], json!([]), "frozen queues must not poison WS cards");
+        assert_eq!(full[1]["next_work_id"], step.as_str());
+        let (status, ready) = get_request(router(state.clone()), "/v1/client/agents").await;
+        assert_eq!(status, StatusCode::OK, "{ready}");
+        assert_eq!(ready["items"][1]["current_work_ids"], json!([]));
+        assert_eq!(ready["items"][1]["next_work_id"], step.as_str());
+        assert_eq!(store.agent_roster_valid_until(index), None);
     }
 
     #[test]
@@ -21568,6 +21783,90 @@ mission "wake" state="ready" {
             client_agent_resources_uncached(store, history, index).unwrap()
         );
         cached
+    }
+
+    #[test]
+    #[ignore = "focused roster timing fixture; run explicitly with --ignored --nocapture"]
+    fn agent_roster_snapshot_fixture_timing() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = &state.store;
+        let source = format!("version 2\n{}", (0..70)
+            .map(|n| format!("agent \"roster-{n:02}\" {{ command \"true\" }}\n"))
+            .collect::<String>());
+        let intent = crate::graph::parse_test_intent(&source, "node").unwrap();
+        let plan = store.mission(&intent, crate::model::IntentInput {
+            kdl: source, source_name: None,
+        }).unwrap();
+        store.apply(&intent, &plan.subject_tokens, "roster-fixture").unwrap();
+        let subjects = (0..70).map(|n| format!("agent/node.roster-{n:02}")).collect::<Vec<_>>();
+        for subject in &subjects {
+            for session in 0..20 {
+                let incarnation = format!("session-{session}");
+                for (kind, fields) in [
+                    ("runtime.observed", json!({"status":"running", "runtime_id":subject,
+                        "incarnation_id":incarnation})),
+                    ("harness.observed", json!({"state":"idle", "driver":"codex",
+                        "incarnation_id":incarnation})),
+                    ("harness.usage", json!({"semantics":"response", "driver":"codex",
+                        "incarnation_id":incarnation, "model":"fixture",
+                        "input_tokens":10, "output_tokens":5, "total_tokens":15})),
+                ] {
+                    store.append_claim(&ClaimInput {
+                        subject: subject.clone(), kind: kind.into(), actor: Some(subject.clone()),
+                        fields: serde_json::from_value(fields).unwrap(), evidence: Vec::new(),
+                        expected_subject: None, idempotency_key: None,
+                    }).unwrap();
+                }
+            }
+        }
+        let index = store.index().unwrap();
+        let measure = |label: &str, read: &dyn Fn()| {
+            let before = smallclaims::sqlite::work::total();
+            let started = Instant::now();
+            read();
+            println!("roster fixture {label}: {:.3} ms; sqlite_work={:?}",
+                started.elapsed().as_secs_f64() * 1000.0,
+                smallclaims::sqlite::work::total() - before);
+        };
+        store.forget_current_views();
+        measure("main cold card status", &|| {
+            store.agent_card_status_at(None, index, false).unwrap();
+        });
+        measure("main usage fold", &|| {
+            store.usage_summaries_at(&subjects, Some(index)).unwrap();
+        });
+        let oracle = client_agent_resources_uncached(store, false, index).unwrap();
+        measure("main repeated projections x22", &|| {
+            for _ in 0..22 {
+                let mut rows = client_agent_resources_selected(store, false, index, None).unwrap();
+                add_agent_todos(store, &mut rows, index).unwrap();
+            }
+        });
+        store.forget_current_views();
+        measure("shared cold projection", &|| {
+            let mut rows = client_agent_resources_cached(store, false, index).unwrap();
+            for row in &mut rows { row.as_object_mut().unwrap().remove("todo"); }
+            assert_eq!(rows, oracle);
+        });
+        measure("shared warm projections x22", &|| {
+            for _ in 0..22 { client_agent_resources_cached(store, false, index).unwrap(); }
+        });
+        store.append_claim(&ClaimInput {
+            subject: subjects[0].clone(), kind: "harness.observed".into(),
+            actor: Some(subjects[0].clone()),
+            fields: serde_json::from_value(json!({"state":"working", "driver":"codex",
+                "incarnation_id":"session-19"})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let index = store.index().unwrap();
+        let mut advanced = Vec::new();
+        let started = Instant::now();
+        advanced.extend(client_agent_resources_cached(store, false, index).unwrap());
+        println!("roster fixture shared one-card advance: {:.3} ms",
+            started.elapsed().as_secs_f64() * 1000.0);
+        for row in &mut advanced { row.as_object_mut().unwrap().remove("todo"); }
+        assert_eq!(advanced, client_agent_resources_uncached(store, false, index).unwrap());
     }
 
     #[test]

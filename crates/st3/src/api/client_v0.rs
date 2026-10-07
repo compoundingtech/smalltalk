@@ -200,6 +200,11 @@ async fn collection_items_with_windows(
         Some(prepared) => Some(prepared.admit().await),
         None => None,
     };
+    let roster_admission = if request.collection == "agents" {
+        Some(state.store.admit_agent_resources().await)
+    } else {
+        None
+    };
     let state = state.clone();
     let session = session.clone();
     let request = request.clone();
@@ -214,6 +219,7 @@ async fn collection_items_with_windows(
             // Keep the physical read slot even if its awaiting subscription is canceled.
             let _read_permit = read_permit;
             let _admission = admission;
+            let _roster_admission = roster_admission;
             let store = state.store.clone();
             let commits = windows.as_ref().map(|windows| windows.commits());
             store.read_snapshot(|index| {
@@ -10077,6 +10083,78 @@ mod tests {
         let mut bad_retry = frame.clone();
         bad_retry["retryable"] = json!("yes");
         assert!(!validator.is_valid(&bad_retry));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn agent_roster_subscribers_share_one_build_and_http_reuses_it() {
+        const SUBSCRIBERS: usize = 22;
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        state.store.append_claim(&ClaimInput {
+            subject: "agent/shared-roster".into(), kind: "runtime.observed".into(),
+            actor: None, fields: serde_json::from_value(json!({"status":"running",
+                "runtime_id":"shared-roster", "incarnation_id":"one"})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(SUBSCRIBERS));
+        let barrier = Arc::new(tokio::sync::Barrier::new(SUBSCRIBERS));
+        for phase in 0..3 {
+            let builds_before = state.store.agent_resources_builds_for_test();
+            let mut readers = Vec::new();
+            for subscriber in 0..SUBSCRIBERS {
+                let state = state.clone();
+                let semaphore = semaphore.clone();
+                let barrier = barrier.clone();
+                readers.push(tokio::spawn(async move {
+                    let request: CollectionSubscribe = serde_json::from_value(json!({
+                        "kind":"subscribe", "id":format!("roster-{subscriber}"),
+                        "collection":"agents", "limit":200,
+                    })).unwrap();
+                    let permit = semaphore.acquire_owned().await.unwrap();
+                    barrier.wait().await;
+                    collection_items(&state, &ClientSession::local(None).unwrap(), &request, permit)
+                        .await.unwrap()
+                }));
+            }
+            let mut expected = None;
+            for reader in readers {
+                let (snapshot, items, has_more) = reader.await.unwrap();
+                assert_eq!(snapshot.store_index, state.store.index().unwrap());
+                assert!(!has_more);
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0]["last_activity_at"].is_null(), phase < 2);
+                if let Some(expected) = &expected { assert_eq!(&items, expected); }
+                else { expected = Some(items); }
+            }
+            assert_eq!(state.store.agent_resources_builds_for_test(), builds_before + 1);
+            let snapshot = new_client_snapshot(&state);
+            let (_, Json(page)) = client_agents(State(state.clone()), Extension(snapshot),
+                Query(ClientListQuery::default())).await.unwrap();
+            assert_eq!(page.items, expected.unwrap());
+            assert_eq!(state.store.agent_resources_builds_for_test(), builds_before + 1);
+            if phase == 0 {
+                state.store.append_claim(&ClaimInput {
+                    subject: "agent/shared-roster".into(), kind: "harness.observed".into(),
+                    actor: None, fields: serde_json::from_value(json!({"state":"working",
+                        "driver":"codex", "incarnation_id":"one"})).unwrap(),
+                    evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+                }).unwrap();
+            }
+            if phase == 1 {
+                let index = state.store.index().unwrap();
+                state.store.append_claim(&ClaimInput {
+                    subject: "agent/shared-roster".into(), kind: "harness.timeline".into(),
+                    actor: Some("agent/shared-roster".into()),
+                    fields: serde_json::from_value(json!({"operation":"append",
+                        "entry_id":"local-activity", "source_id":"fixture/local-activity",
+                        "sequence":1, "revision":1, "role":"assistant", "entry_type":"message",
+                        "final":true, "driver":"codex", "incarnation_id":"one",
+                        "observed_at_unix_ms":client_now_ms(), "body":{"text":"local activity"}})).unwrap(),
+                    evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+                }).unwrap();
+                assert_eq!(state.store.index().unwrap(), index, "local activity must not advance the graph");
+            }
+        }
     }
 
     #[tokio::test]
