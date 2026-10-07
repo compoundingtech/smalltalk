@@ -577,16 +577,7 @@ impl RuntimeControl for NativeRuntime {
 
     fn remove(&self, runtime_id: &str, terminal: bool) -> Result<()> {
         if terminal {
-            if self
-                .pty()?
-                .snapshot()?
-                .iter()
-                .any(|item| item.name == runtime_id)
-            {
-                self.pty()?.remove(runtime_id)
-            } else {
-                Ok(())
-            }
+            self.pty()?.remove(runtime_id)
         } else {
             self.exec.remove(runtime_id)
         }

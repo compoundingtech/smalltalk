@@ -15,6 +15,33 @@ on the session as the `st3.scope-unit` tag. The PTY server starts there and fork
 Once the session is published, st moves the PTY server alone into a scope of its own. The harness
 stays behind.
 
+Seat scopes have the fixed description `st seat`, never the launch command. They inherit the
+environment of the `systemd-run` child process; `EnvironmentFile` is a service property and is
+not supported by scopes. st does not pass environment assignments in either `systemd-run` or
+`pty run` arguments.
+
+The PTY's persisted harness command restores the managed overlay from a private file at
+`$XDG_RUNTIME_DIR/st3/seat-env`. st requires the runtime directory to be owned by its user
+with mode 0700, rejects symlinks for the runtime and product directories, and never stores
+overlays in persistent state or cache directories. If private runtime storage is unavailable,
+the initial launch still inherits its environment, but st omits the restart overlay and warns
+with variable names only. A manual restart in that mode cannot restore the managed overlay.
+
+The overlay directory is created with mode 0700, and each file is exclusively created with
+mode 0600 before any values are written. Shell values are single-quoted, including embedded
+apostrophes, substitutions and newlines. Each new launch atomically replaces the seat's file.
+After a natural harness exit, the file remains only while its PTY restart record is retained.
+st deletes it when that record is removed or found missing, and after an explicit stop or kill.
+These control actions and launches use the same per-seat spawn lock, so cleanup cannot delete
+a replacement launch's overlay. After an explicit stop, a new st launch recreates the overlay;
+the old persisted command alone cannot restore it. Runtime storage also expires at logout/reboot.
+
+This protects environment values from command lines and unit descriptions, not from the user
+who owns the seat: that user can still read its private file or process environment. Existing
+scopes must be restarted to use the new launcher. Historical journal entries are not rewritten;
+journal rotation and vacuuming (`journalctl --rotate` / `journalctl --vacuum-time=...`) are
+operational cleanup, not part of launching seats.
+
 | What | Unit | CPU weight | IO weight |
 | --- | --- | --- | --- |
 | st daemon | `st3.service` | 1000 | 1000 |

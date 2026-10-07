@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Keep st3 seat environment values out of launch arguments and systemd unit descriptions",
+  "replay": {
+    "status": "none",
+    "detail": "No claim or projection replay changes. The launcher change applies to newly launched seat incarnations."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database or replicated schema changes. Private environment files are local runtime state."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint and sealing rules are unchanged."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "New PTY sessions persist a shell wrapper and private environment file path instead of environment assignments in argv. PTY_SESSION remains owned by PTY. Overlays require an owned mode-0700 XDG_RUNTIME_DIR; without private runtime storage, initial launches inherit their overlay but manual restart cannot restore it, and the warning lists variable names only. No persistent-state fallback is used. Files are replaced on the next st launch, retained after natural exit only while the restart record exists, and deleted after explicit stop/kill or record removal."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No extra automatic seat restarts. Existing incarnations continue using their original launch metadata until restarted. Restart-to-health timing was not measured."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Restart existing seats to replace old launch metadata and unit descriptions. Historical journal scrubbing with journal rotation and vacuuming is operational cleanup and outside this change. The legacy st2 launcher still uses its existing environment argument mechanism."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No database migration or recovery changes. Private files use mode 0600 in a mode 0700 runtime directory. After explicit stop/kill or record removal, a new st launch recreates the overlay; an old persisted command alone cannot restore it. Missing restart records are handled idempotently so retirement also cleans overlays for already-reaped sessions."
+  }
+}
