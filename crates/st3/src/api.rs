@@ -2717,34 +2717,38 @@ fn managed_session_owner_at(
     snapshot_index: u64,
     session_id: &str,
 ) -> anyhow::Result<Option<ManagedSessionOwner>> {
-    let status = store.status_for_subject_prefix_at("agent/", Some(snapshot_index), true)?;
-    for subject in status.subjects {
-        if !subject.subject.starts_with("agent/") && subject.kind.as_deref() != Some("agent") {
-            continue;
+    #[cfg(test)]
+    record_managed_session_roster_lookup(store);
+    crate::performance::task("conversation/owner/roster", || {
+        let status = store.status_for_subject_prefix_at("agent/", Some(snapshot_index), true)?;
+        for subject in status.subjects {
+            if !subject.subject.starts_with("agent/") && subject.kind.as_deref() != Some("agent") {
+                continue;
+            }
+            let fields = subject
+                .actual
+                .as_ref()
+                .map(|actual| actual.get("fields").unwrap_or(actual));
+            let incarnation = fields
+                .and_then(|fields| fields.get("incarnation_id"))
+                .and_then(Value::as_str)
+                .or(subject.projection.runtime_incarnation.as_deref());
+            let runtime = fields
+                .and_then(|fields| fields.get("runtime_id"))
+                .and_then(Value::as_str);
+            let Some(identity) = incarnation.or(runtime) else {
+                continue;
+            };
+            if managed_session_id(&subject.subject, identity) == session_id {
+                return Ok(Some((
+                    subject.subject,
+                    incarnation.map(str::to_owned),
+                    subject.actual_origin,
+                )));
+            }
         }
-        let fields = subject
-            .actual
-            .as_ref()
-            .map(|actual| actual.get("fields").unwrap_or(actual));
-        let incarnation = fields
-            .and_then(|fields| fields.get("incarnation_id"))
-            .and_then(Value::as_str)
-            .or(subject.projection.runtime_incarnation.as_deref());
-        let runtime = fields
-            .and_then(|fields| fields.get("runtime_id"))
-            .and_then(Value::as_str);
-        let Some(identity) = incarnation.or(runtime) else {
-            continue;
-        };
-        if managed_session_id(&subject.subject, identity) == session_id {
-            return Ok(Some((
-                subject.subject,
-                incarnation.map(str::to_owned),
-                subject.actual_origin,
-            )));
-        }
-    }
-    Ok(None)
+        Ok(None)
+    })
 }
 
 /// A hint only selects an exact lookup; the current identity must still hash to this session.
@@ -2769,39 +2773,41 @@ fn managed_session_owner_for_subject_at(
     session_id: &str,
     owner: &str,
 ) -> anyhow::Result<Option<ManagedSessionOwner>> {
-    let Some(subject) = store
-        .status_history(Some(owner), None, Some(snapshot_index))?
-        .subjects
-        .into_iter()
-        .next()
-    else {
-        return Ok(None);
-    };
-    if !subject.subject.starts_with("agent/") && subject.kind.as_deref() != Some("agent") {
-        return Ok(None);
-    }
-    let fields = subject
-        .actual
-        .as_ref()
-        .map(|actual| actual.get("fields").unwrap_or(actual));
-    let incarnation = fields
-        .and_then(|fields| fields.get("incarnation_id"))
-        .and_then(Value::as_str)
-        .or(subject.projection.runtime_incarnation.as_deref());
-    let runtime = fields
-        .and_then(|fields| fields.get("runtime_id"))
-        .and_then(Value::as_str);
-    let Some(identity) = incarnation.or(runtime) else {
-        return Ok(None);
-    };
-    if managed_session_id(&subject.subject, identity) != session_id {
-        return Ok(None);
-    }
-    Ok(Some((
-        subject.subject,
-        incarnation.map(str::to_owned),
-        subject.actual_origin,
-    )))
+    crate::performance::task("conversation/owner/hinted", || {
+        let Some(subject) = store
+            .status_history(Some(owner), None, Some(snapshot_index))?
+            .subjects
+            .into_iter()
+            .next()
+        else {
+            return Ok(None);
+        };
+        if !subject.subject.starts_with("agent/") && subject.kind.as_deref() != Some("agent") {
+            return Ok(None);
+        }
+        let fields = subject
+            .actual
+            .as_ref()
+            .map(|actual| actual.get("fields").unwrap_or(actual));
+        let incarnation = fields
+            .and_then(|fields| fields.get("incarnation_id"))
+            .and_then(Value::as_str)
+            .or(subject.projection.runtime_incarnation.as_deref());
+        let runtime = fields
+            .and_then(|fields| fields.get("runtime_id"))
+            .and_then(Value::as_str);
+        let Some(identity) = incarnation.or(runtime) else {
+            return Ok(None);
+        };
+        if managed_session_id(&subject.subject, identity) != session_id {
+            return Ok(None);
+        }
+        Ok(Some((
+            subject.subject,
+            incarnation.map(str::to_owned),
+            subject.actual_origin,
+        )))
+    })
 }
 
 /// How many of a subject's claims, oldest first, date its session in the session list.
@@ -14499,11 +14505,85 @@ fn normalize_message_party(value: &str) -> String {
 }
 
 #[cfg(test)]
+pub(crate) fn record_managed_session_roster_lookup(store: &Store) {
+    store.record_managed_session_roster_lookup();
+}
+
+#[cfg(test)]
+pub(crate) fn managed_session_roster_lookup_count(store: &Store) -> u64 {
+    store.managed_session_roster_lookup_count()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use axum::body::to_bytes;
     use axum::http::Request;
     use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn conversation_subject_hint_agent_changes_http_never_reads_roster() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        state.store.append_claim(&ClaimInput {
+            subject: "agent/hinted".into(), kind: "runtime.observed".into(),
+            actor: Some("agent/hinted".into()),
+            fields: serde_json::from_value(json!({"status":"running", "incarnation_id":"first"})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let session_id = managed_session_id("agent/hinted", "first");
+        let before = managed_session_roster_lookup_count(&state.store);
+        assert_eq!(before, 0);
+        let socket = root.path().join("api.sock");
+        let server_socket = socket.clone();
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            serve_unix(&server_socket, router(server_state)).await.unwrap();
+        });
+        let client = reqwest::Client::builder().unix_socket(socket.clone()).build().unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !socket.exists() {
+            assert!(tokio::time::Instant::now() < deadline, "isolated API did not start");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // The subject comes from the AGENT path, not optional relay metadata. The real
+        // authenticated route must retain it through ConversationMark and timeline reads.
+        let response = client.get(
+            "http://localhost/v1/client/conversations/agent%2Fhinted/changes?wait_ms=0",
+        ).header(client_v0::LOCAL_PERSON_HEADER, "person/example").send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let envelope: Value = response.json().await.unwrap();
+        let changes = &envelope["value"];
+        assert_eq!(changes["kind"], "conversation-changes");
+        assert_eq!(changes["session_id"], session_id);
+        assert!(changes["items"].is_array());
+        let cursor = changes["next_cursor"].as_str().unwrap();
+        assert_eq!(managed_session_roster_lookup_count(&state.store), before);
+
+        // Exercise the same route's local cursor fast path as well.
+        let response = client.get(
+            "http://localhost/v1/client/conversations/agent%2Fhinted/changes",
+        ).query(&[("wait_ms", "0"), ("after", cursor)])
+            .header(client_v0::LOCAL_PERSON_HEADER, "person/example").send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let resumed: Value = response.json().await.unwrap();
+        assert_eq!(resumed["value"]["session_id"], session_id);
+        assert_eq!(resumed["value"]["items"], json!([]));
+        assert_eq!(managed_session_roster_lookup_count(&state.store), before);
+
+        // An opaque session and no subject metadata must really take the roster path:
+        // this proves the zero above is not an unwired or globally contaminated counter.
+        let response = client.get(format!(
+            "http://localhost/v1/client/conversations/{}/changes?wait_ms=0",
+            session_id.replace('/', "%2F"),
+        )).header(client_v0::LOCAL_PERSON_HEADER, "person/example").send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let opaque: Value = response.json().await.unwrap();
+        assert_eq!(opaque["value"]["session_id"], session_id);
+        assert!(managed_session_roster_lookup_count(&state.store) > before);
+        server.abort();
+        let _ = server.await;
+    }
 
     #[tokio::test]
     async fn conversation_subject_hint_owner_route_uses_client_prefix_authentication() {

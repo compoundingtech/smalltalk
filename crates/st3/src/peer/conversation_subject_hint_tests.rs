@@ -2,6 +2,7 @@ struct ConversationHintFixture {
     _root: tempfile::TempDir,
     relay: ClientRelay,
     request: ClientReadRequest,
+    store: Arc<Store>,
     owner_calls: Arc<tokio::sync::Mutex<Vec<(String, String)>>>,
     servers: Vec<tokio::task::JoinHandle<()>>,
 }
@@ -19,8 +20,9 @@ async fn conversation_hint_fixture(old_peer: bool, owner_status: Option<StatusCo
     let home = root.path().join("native-home");
     let transcript = home.join(".codex/sessions/2026/09/24/hint.jsonl");
     fs::create_dir_all(transcript.parent().unwrap()).unwrap();
-    fs::write(&transcript, format!("{}\n{}\n",
+    fs::write(&transcript, format!("{}\n{}\n{}\n",
         serde_json::json!({"type":"session_meta","timestamp":"2026-09-24T15:00:00Z","payload":{"id":"hint-native-id","cwd":root.path(),"source":"test"}}),
+        serde_json::json!({"type":"response_item","timestamp":"2026-09-24T15:00:00Z","payload":{"type":"message","role":"user","id":"question","content":[{"type":"input_text","text":"Hint owner question"}]}}),
         serde_json::json!({"type":"response_item","timestamp":"2026-09-24T15:00:01Z","payload":{"type":"message","role":"assistant","id":"answer","content":[{"type":"output_text","text":"Hint owner answer"}]}}),
     )).unwrap();
     let session = crate::external_sessions::discover_fresh(Some(&home), true)
@@ -40,6 +42,7 @@ async fn conversation_hint_fixture(old_peer: bool, owner_status: Option<StatusCo
         native_session_home: Some(home),
         planner_default: crate::model::PlannerSpec::default(),
     };
+    let store = main.store.clone();
     let owner_calls = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let calls = owner_calls.clone();
     let app = crate::api::router(main).layer(axum::middleware::from_fn(
@@ -87,7 +90,7 @@ async fn conversation_hint_fixture(old_peer: bool, owner_status: Option<StatusCo
         ..Default::default()
     }).unwrap().unwrap();
     ConversationHintFixture {
-        _root: root, relay,
+        _root: root, relay, store,
         request: ClientReadRequest { authority_actor: "person/test".into(), relay: None,
             request: ClientReadOperation::Timeline { session_id: session.id, limit: 20, cursor: None } },
         owner_calls, servers: vec![daemon, peer_server],
@@ -123,6 +126,33 @@ async fn conversation_subject_hint_owner_route_preserves_authority() {
     // ordinary discovery rather than grant access to an arbitrary hinted subject.
     assert_hint_timeline(&fixture.relay.read_with_subject_hint("host/owner", &fixture.request, Some("agent/hinted")).await.unwrap());
     assert!(fixture.owner_calls.lock().await.iter().any(|(path, actor)| path == CLIENT_READ_OWNER_PATH && actor == "person/test"));
+}
+
+#[tokio::test]
+async fn conversation_subject_hint_timeline_cursor_keeps_owner_snapshot() {
+    let mut fixture = conversation_hint_fixture(false, None).await;
+    let ClientReadOperation::Timeline { limit, .. } = &mut fixture.request.request else { panic!("timeline fixture"); };
+    *limit = 1;
+    let first = fixture.relay.read_with_subject_hint(
+        "host/owner", &fixture.request, Some("agent/hinted"),
+    ).await.unwrap();
+    let cursor = first["page"]["next_cursor"].as_str().unwrap().to_owned();
+    fixture.store.append_claim(&crate::model::ClaimInput {
+        subject: "agent/unrelated".into(), kind: "runtime.observed".into(),
+        actor: Some("agent/unrelated".into()),
+        fields: serde_json::from_value(serde_json::json!({"status":"running","incarnation_id":"unrelated"})).unwrap(),
+        evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+    }).unwrap();
+    let ClientReadOperation::Timeline { cursor: request_cursor, .. } = &mut fixture.request.request else { panic!("timeline fixture"); };
+    *request_cursor = Some(cursor);
+    let next = fixture.relay.read_with_subject_hint(
+        "host/owner", &fixture.request, Some("agent/hinted"),
+    ).await.unwrap();
+    assert_eq!(next["session_id"], first["session_id"]);
+    assert_eq!(next["items"].as_array().unwrap().len(), 1);
+    assert_ne!(next["items"][0]["id"], first["items"][0]["id"]);
+    assert_eq!(fixture.owner_calls.lock().await.iter()
+        .filter(|(path, _)| path == CLIENT_READ_OWNER_PATH).count(), 2);
 }
 
 #[tokio::test]

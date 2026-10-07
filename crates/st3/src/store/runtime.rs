@@ -11,6 +11,8 @@ pub struct SmalltalkRuntime {
     pub(crate) mailbox_wakes: std::sync::OnceLock<Arc<mailbox_wakes::Wakes>>,
     #[cfg(test)]
     pub(crate) work_extension_roots_rebuilt: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    pub(crate) managed_session_roster_lookups: std::sync::atomic::AtomicU64,
     /// Simulate different build registries on isolated nodes in compatibility tests.
     #[cfg(test)]
     pub(crate) claim_registry: std::sync::OnceLock<st3_schema::Registry>,

@@ -1169,7 +1169,14 @@ async fn receive_client_read(
                 request: request.clone(),
                 subject_hint: hint.to_owned(),
             };
-            match owner.post::<_, Value>(CLIENT_READ_OWNER_PATH, &envelope).await {
+            // Client middleware pins timeline snapshots from the URI cursor, just as the
+            // legacy GET route does. The opaque cursor remains in the operation body too.
+            let path = match &request.request {
+                ClientReadOperation::Timeline { cursor: Some(cursor), .. } =>
+                    std::borrow::Cow::Owned(format!("{CLIENT_READ_OWNER_PATH}?cursor={}", urlencoding::encode(cursor))),
+                _ => std::borrow::Cow::Borrowed(CLIENT_READ_OWNER_PATH),
+            };
+            match owner.post::<_, Value>(&path, &envelope).await {
                 Ok(value) => return Ok(value),
                 // Old daemons have no owner route. Never retry authorization failures.
                 Err(error) if crate::client::http_status(&error) == Some(404) => {}

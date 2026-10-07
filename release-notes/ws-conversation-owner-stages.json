@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Expose conversation admission, exact or roster owner resolution, and first-page timings while proving named-agent reads avoid roster reversal",
+  "replay": {"status": "none", "detail": "No claim replay or recovery changes."},
+  "schema": {"status": "none", "detail": "No database changes or new indexes. Per-store roster counters exist only in tests and use runtime atomics."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or digest changes."},
+  "compatibility": {"status": "none", "detail": "Existing performance tables gain static conversation stage labels with no subject or session identifiers. Public client and peer JSON contracts, permissions, and session IDs are unchanged; hinted timeline pagination retains the owner's cursor snapshot."},
+  "downtime": {"status": "none", "detail": "No additional startup work or expected interruption."},
+  "manual": {"status": "none", "detail": "No configuration changes or re-pairing required. Existing performance telemetry exposes the stage timings for canary diagnosis."},
+  "recovery": {"status": "none", "detail": "No persistent state change or new binary swap-back restriction."}
+}

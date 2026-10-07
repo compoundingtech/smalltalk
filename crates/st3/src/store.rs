@@ -10114,6 +10114,16 @@ impl Store {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn record_managed_session_roster_lookup(&self) {
+        self.smalltalk.managed_session_roster_lookups.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn managed_session_roster_lookup_count(&self) -> u64 {
+        self.smalltalk.managed_session_roster_lookups.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn status_history(
         &self,
         selected: Option<&str>,

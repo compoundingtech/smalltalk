@@ -412,12 +412,15 @@ async fn open_conversation_subscription(
 ) -> Result<(String, Option<String>), ApiError> {
     tokio::task::spawn_blocking(move || {
         let _permits = permits;
-        let target = request.conversation.as_deref().unwrap_or_default();
-        let session_id = conversation_session_id(&state, target)?;
-        let remote = conversation_owner_host(
-            &state, &session, &session_id, target.starts_with("agent/").then_some(target),
-        )?;
-        Ok((session_id, remote))
+        // Charge the admission lookup to its own stage: this thread has left the request's task.
+        crate::performance::task("conversation/admission", || {
+            let target = request.conversation.as_deref().unwrap_or_default();
+            let session_id = conversation_session_id(&state, target)?;
+            let remote = conversation_owner_host(
+                &state, &session, &session_id, target.starts_with("agent/").then_some(target),
+            )?;
+            Ok((session_id, remote))
+        })
     })
     .await
     .map_err(ApiError::internal)?
@@ -4476,6 +4479,19 @@ pub(super) fn timeline_value(
             "page": page.page
         })));
     }
+    crate::performance::task("conversation/first-page", || {
+        timeline_first_page(state, snapshot, session, &session_id, query)
+    })
+}
+
+/// The no-cursor timeline reduction: the first page a client, follower, or owner relay reads.
+fn timeline_first_page(
+    state: &AppState,
+    snapshot: &ClientSnapshot,
+    session: &ClientSession,
+    session_id: &str,
+    query: &ClientListQuery,
+) -> Result<Json<Value>, ApiError> {
     let managed = super::managed_session_owner_at_with_hint(&state.store, snapshot.store_index, &session_id, session.conversation_subject_hint())
         .map_err(ApiError::internal)?;
     if let Some((owner, _, _)) = &managed {
@@ -14045,9 +14061,16 @@ mission "example/zero-run" state="ready" {
         let id = conversation_session_id(&state, "agent/hinted").unwrap();
         for target in ["agent/hinted", id.as_str()] {
             let session = ClientSession::local(Some("agent/hinted")).unwrap();
+            let before_admission = super::super::managed_session_roster_lookup_count(&state.store);
             assert_eq!(conversation_owner_host(&state, &session, &id,
                 target.starts_with("agent/").then_some(target)).unwrap(), None);
             assert_eq!(session.conversation_subject_hint(), Some("agent/hinted"));
+            let after_admission = super::super::managed_session_roster_lookup_count(&state.store);
+            if target.starts_with("agent/") {
+                assert_eq!(after_admission, before_admission);
+            } else {
+                assert!(after_admission > before_admission);
+            }
             let follower = session.clone();
             let mark = ConversationMark::new(&state, &follower, &id).unwrap();
             assert_eq!(mark.owner.as_deref(), Some("agent/hinted"));
@@ -14055,6 +14078,20 @@ mission "example/zero-run" state="ready" {
             assert_eq!(page["session_id"], id);
             let changes = conversation_changes_value(&state, &follower, &id, None, None, 0).await.unwrap();
             assert_eq!(changes["session_id"], id);
+            let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+            let task = tokio::spawn(follow_conversation(
+                state.clone(), follower, "chat".into(), 1, id.clone(), None, sender,
+            ));
+            let (_, generation, frame) = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+                .await.unwrap().unwrap();
+            task.abort();
+            let _ = task.await;
+            assert_eq!(generation, 1);
+            assert_eq!(frame["kind"], "conversation", "{frame}");
+            assert_eq!(frame["session_id"], id);
+            assert_eq!(frame["replace"], true);
+            assert!(frame["items"].is_array());
+            assert_eq!(super::super::managed_session_roster_lookup_count(&state.store), after_admission);
         }
         // An old gateway supplies no metadata; ordinary owner reads still discover ownership.
         let session = ClientSession::local(Some("person/example")).unwrap();
