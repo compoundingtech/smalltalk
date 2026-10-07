@@ -8,6 +8,8 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::Value;
 use smallclaims::ivm::install::Mutation;
 
+pub mod scope;
+
 const MAX_TABLES: usize = 32;
 const MAX_COLUMNS: usize = 64;
 const MAX_ROWS: u64 = 256;
@@ -17,7 +19,9 @@ const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS st3_ivm_capture_state (
  singleton INTEGER PRIMARY KEY CHECK(singleton=1), fingerprint TEXT NOT NULL,
  epoch INTEGER NOT NULL, gap TEXT, rows INTEGER NOT NULL DEFAULT 0,
- bytes INTEGER NOT NULL DEFAULT 0
+ bytes INTEGER NOT NULL DEFAULT 0,
+ guarded INTEGER NOT NULL DEFAULT 0 CHECK(guarded IN (0,1)),
+ managed INTEGER NOT NULL DEFAULT 0 CHECK(managed IN (0,1))
 );
 CREATE TABLE IF NOT EXISTS st3_ivm_capture (
  sequence INTEGER PRIMARY KEY AUTOINCREMENT, source_table TEXT NOT NULL,
@@ -182,6 +186,17 @@ pub fn install(
         validate(tx, table)?;
     }
     tx.execute_batch(SCHEMA)?;
+    // Explicit installations from the staging-only schema retain their gap and queue.
+    // Adding scope metadata never attests coverage or restores a serving view.
+    let fields = tx
+        .prepare("PRAGMA table_info(st3_ivm_capture_state)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<std::collections::BTreeSet<_>>>()?;
+    for field in ["guarded", "managed"] {
+        if !fields.contains(field) {
+            tx.execute_batch(&format!("ALTER TABLE st3_ivm_capture_state ADD COLUMN {field} INTEGER NOT NULL DEFAULT 0 CHECK({field} IN (0,1))"))?;
+        }
+    }
     let existing = tx
         .query_row(
             "SELECT fingerprint,epoch FROM st3_ivm_capture_state WHERE singleton=1",
@@ -231,6 +246,8 @@ fn enqueue(table: &Table, old_key: &str, old: &str, new_key: &str, new: &str) ->
     );
     format!(
         r#"
+ UPDATE st3_ivm_capture_state SET gap=COALESCE(gap,'source mutation outside managed transaction')
+ WHERE singleton=1 AND guarded=1 AND managed=0;
  UPDATE st3_ivm_capture_state SET gap=COALESCE(gap,'source capture quota exceeded')
  WHERE singleton=1 AND (rows>={MAX_ROWS} OR length(CAST({payload} AS BLOB))>{MAX_PAYLOAD}
  OR bytes+length(CAST({payload} AS BLOB))>{MAX_BYTES});
