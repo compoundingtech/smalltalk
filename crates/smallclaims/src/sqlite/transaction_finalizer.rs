@@ -726,4 +726,100 @@ mod tests {
     }
 
     use rusqlite::OptionalExtension;
+
+    #[test]
+    fn no_hook_lent_and_queued_writes_keep_ordinary_commit_and_rollback() {
+        let writer = writer();
+        writer
+            .batched(|tx| free_write(tx, 1, "queued"))
+            .unwrap()
+            .unwrap();
+        {
+            let mut guard = writer.write();
+            let tx = guard.transaction().unwrap();
+            free_write(&tx, 2, "lent").unwrap();
+            tx.commit().unwrap();
+            let tx = guard.transaction().unwrap();
+            free_write(&tx, 3, "rolled back").unwrap();
+            tx.rollback().unwrap();
+        }
+        assert_eq!(count(&writer, "source"), 2);
+        assert_eq!(count(&writer, "delta"), 2);
+        assert_eq!(count(&writer, "output"), 0);
+    }
+
+    #[test]
+    fn batch_finalizer_error_keeps_context_chain() {
+        let writer = writer();
+        writer
+            .install_transaction_finalizer(|_| {
+                Err(anyhow::anyhow!("original cause").context("adapter context"))
+            })
+            .unwrap();
+        let error = writer
+            .batched(|tx| free_write(tx, 1, "no commit"))
+            .unwrap_err();
+        assert!(error.contains("adapter context"));
+        assert!(error.contains("original cause"));
+        assert_eq!(count(&writer, "source"), 0);
+    }
+
+    #[test]
+    fn lent_finalizer_panic_rolls_back_and_releases_writer() {
+        let writer = writer();
+        let calls = Arc::new(AtomicU64::new(0));
+        let called = calls.clone();
+        writer
+            .install_transaction_finalizer(move |tx| {
+                drain(tx)?;
+                if called.fetch_add(1, Ordering::Relaxed) == 0 {
+                    panic!("lent fixture");
+                }
+                Ok(())
+            })
+            .unwrap();
+        {
+            let mut guard = writer.write();
+            let tx = guard.transaction().unwrap();
+            free_write(&tx, 1, "failed").unwrap();
+            assert!(
+                tx.commit()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("finalizer panicked")
+            );
+        }
+        assert_eq!(count(&writer, "source"), 0);
+        assert_eq!(count(&writer, "output"), 0);
+        writer
+            .batched(|tx| free_write(tx, 2, "next"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(count(&writer, "output"), 1);
+    }
+
+    #[test]
+    fn raw_sql_commit_is_a_contract_violation_not_a_reversible_managed_failure() {
+        let writer = writer();
+        let calls = Arc::new(AtomicU64::new(0));
+        let called = calls.clone();
+        writer
+            .install_transaction_finalizer(move |_| {
+                called.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            })
+            .unwrap();
+        {
+            let mut guard = writer.write();
+            let tx = guard.transaction().unwrap();
+            free_write(&tx, 1, "raw committed").unwrap();
+            tx.execute_batch("COMMIT").unwrap();
+            let error = tx.commit().unwrap_err();
+            assert!(error.downcast_ref::<rusqlite::Error>().is_none());
+            assert!(error.to_string().contains("transaction"));
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert_eq!(count(&writer, "source"), 1);
+        assert_eq!(count(&writer, "output"), 0);
+    }
 }

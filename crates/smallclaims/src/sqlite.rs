@@ -689,7 +689,7 @@ fn run_write_batch(
     if committed.is_ok() {
         observers.notify(connection);
     }
-    let committed = committed.map_err(|error| error.to_string());
+    let committed = committed.map_err(|error| format!("{error:#}"));
     for done in answers {
         let _ = done.send(committed.clone());
     }

@@ -72,3 +72,24 @@ rank and per-kind repair eligibility, signer/authority dependencies, local obser
 deadline inputs, bounded initial installation, restore/checkpoint handling, rollback and
 same-snapshot read certification. Neither callback installation nor a maximum applied
 index makes a projection Ready. Existing runtimes install no callback by default.
+
+The default path has small library overhead: two OnceLock loads per queued batch; a lent
+transaction adds an Arc clone, a OnceLock load and an autocommit check at commit. No
+callback or source SQL runs unless explicitly installed. This is not a zero-cost claim.
+
+For an adapter's persisted gap singleton, explicitly call
+`Views::install_gap_trigger(tx, table, gap_column)`. The ordinary main table must already
+have exactly one row, one explicit primary-key column and at most 128 columns. Identifiers
+are restricted ASCII names of at most 128 bytes. The finite installed registry is capped
+at 256 views and 64 KiB of names. This installs local INSERT/UPDATE/DELETE triggers only
+when requested. A nonnull changed gap, identity change, deletion or extra row fences that
+registry in the same transaction, with the existing 1024-character error bound and
+availability coalescing. An existing nonnull gap fences immediately. Clearing the field
+never restores Ready. Installation and fencing roll back with the caller's transaction.
+
+The trigger does not certify source-table capture, Installer namespace roots, arbitrary
+DDL/recreation, restore, other database handles, or a raw COMMIT inside an already-managed
+scope. That last escape may commit an active marker without finalizing; consumers must
+reject outstanding scope/pending state independently of a Ready flag. An adapter must
+separately attest schema/lifecycle coverage and fence unsupported paths. This library API
+installs neither a production source adapter nor any read migration.

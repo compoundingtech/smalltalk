@@ -194,3 +194,230 @@ fn unknown_view_fails_without_silent_fence_or_new_ready_registration() {
         before.source_cut
     );
 }
+
+fn install_gap(store: &Store, views: &Views, gap: Option<&str>) {
+    let mut writer = store.connection.write();
+    let tx = writer.transaction().unwrap();
+    tx.execute_batch("CREATE TABLE capture_state(id INTEGER PRIMARY KEY,gap TEXT); INSERT INTO capture_state VALUES(1,NULL)").unwrap();
+    tx.execute("UPDATE capture_state SET gap=?1", [gap])
+        .unwrap();
+    views
+        .install_gap_trigger(&tx, "capture_state", "gap")
+        .unwrap();
+    tx.commit().unwrap();
+}
+
+#[test]
+fn raw_gap_commit_fences_same_index_and_changed_evidence_without_restoring_ready() {
+    let (store, views) = fixture();
+    install_gap(&store, &views, None);
+    let before = capture(&store, &views, "alpha");
+    let publisher = Publisher::attach(&store, 4).unwrap();
+    let mut notices = publisher.subscribe();
+    // No managed transaction or Rust finalizer runs on this autocommit path.
+    store
+        .connection
+        .write()
+        .execute("UPDATE capture_state SET gap='raw source mutation'", [])
+        .unwrap();
+    assert!(notices.try_recv().is_ok());
+    let first = capture(&store, &views, "alpha");
+    assert!(matches!(first.availability.readiness, Readiness::Fenced));
+    assert_eq!(first.source_cut, before.source_cut);
+    assert_eq!(first.keys, before.keys);
+    assert_eq!(
+        first.snapshot.semantic_generation,
+        before.snapshot.semantic_generation
+    );
+    assert_eq!(
+        first.availability.error.as_deref(),
+        Some("raw source mutation")
+    );
+    assert!(matches!(
+        capture(&store, &views, "beta").availability.readiness,
+        Readiness::Fenced
+    ));
+    store
+        .connection
+        .write()
+        .execute("UPDATE capture_state SET gap='raw source mutation'", [])
+        .unwrap();
+    assert!(matches!(notices.try_recv(), Err(TryRecvError::Empty)));
+    assert_eq!(capture(&store, &views, "alpha"), first);
+    store
+        .connection
+        .write()
+        .execute("UPDATE capture_state SET gap='new evidence'", [])
+        .unwrap();
+    assert!(notices.try_recv().is_ok());
+    let changed = capture(&store, &views, "alpha");
+    assert_ne!(changed.availability.token, first.availability.token);
+    assert_eq!(changed.availability.error.as_deref(), Some("new evidence"));
+    store
+        .connection
+        .write()
+        .execute("UPDATE capture_state SET gap=NULL", [])
+        .unwrap();
+    assert!(matches!(notices.try_recv(), Err(TryRecvError::Empty)));
+    assert_eq!(capture(&store, &views, "alpha"), changed);
+}
+
+#[test]
+fn raw_gap_rollback_publishes_nothing_and_existing_gap_fences_on_install() {
+    let (store, views) = fixture();
+    install_gap(&store, &views, None);
+    let before = capture(&store, &views, "alpha");
+    let publisher = Publisher::attach(&store, 4).unwrap();
+    let mut notices = publisher.subscribe();
+    {
+        let mut writer = store.connection.write();
+        let tx = writer.transaction().unwrap();
+        tx.execute("UPDATE capture_state SET gap='rolled back'", [])
+            .unwrap();
+        tx.rollback().unwrap();
+    }
+    assert!(matches!(notices.try_recv(), Err(TryRecvError::Empty)));
+    assert_eq!(capture(&store, &views, "alpha"), before);
+    let (existing_store, existing_views) = fixture();
+    install_gap(&existing_store, &existing_views, Some("already incomplete"));
+    let existing = capture(&existing_store, &existing_views, "alpha");
+    assert!(matches!(existing.availability.readiness, Readiness::Fenced));
+    assert_eq!(
+        existing.availability.error.as_deref(),
+        Some("already incomplete")
+    );
+}
+
+#[test]
+fn gap_singleton_deletion_identity_change_and_extra_row_fence() {
+    for (sql, reason) in [
+        ("DELETE FROM capture_state", "source gap state removed"),
+        (
+            "UPDATE capture_state SET id=2",
+            "source gap state identity changed",
+        ),
+        (
+            "INSERT INTO capture_state VALUES(2,NULL)",
+            "source gap state has multiple rows",
+        ),
+        (
+            "INSERT OR REPLACE INTO capture_state VALUES(1,'replacement gap')",
+            "replacement gap",
+        ),
+    ] {
+        let (store, views) = fixture();
+        install_gap(&store, &views, None);
+        store.connection.write().execute(sql, []).unwrap();
+        let after = capture(&store, &views, "alpha");
+        assert!(matches!(after.availability.readiness, Readiness::Fenced));
+        assert_eq!(after.availability.error.as_deref(), Some(reason));
+    }
+}
+
+#[test]
+fn gap_installer_rejects_unsupported_shapes_before_ddl() {
+    let (store, views) = fixture();
+    let mut writer = store.connection.write();
+    let tx = writer.transaction().unwrap();
+    tx.execute_batch("CREATE TABLE good(id INTEGER PRIMARY KEY,gap TEXT); INSERT INTO good VALUES(1,NULL);
+        CREATE TABLE no_key(gap TEXT); INSERT INTO no_key VALUES(NULL);
+        CREATE TABLE empty(id INTEGER PRIMARY KEY,gap TEXT);
+        CREATE TABLE multiple(id INTEGER PRIMARY KEY,gap TEXT); INSERT INTO multiple VALUES(1,NULL),(2,NULL);
+        CREATE TABLE composite(a INTEGER,b INTEGER,gap TEXT,PRIMARY KEY(a,b)); INSERT INTO composite VALUES(1,1,NULL);
+        CREATE VIEW gap_view AS SELECT * FROM good;").unwrap();
+    let before: i64 = tx
+        .query_row("PRAGMA schema_version", [], |r| r.get(0))
+        .unwrap();
+    for (table, column) in [
+        ("good; DROP TABLE good", "gap"),
+        ("good", "gap'"),
+        ("good", "missing"),
+        ("no_key", "gap"),
+        ("empty", "gap"),
+        ("multiple", "gap"),
+        ("composite", "gap"),
+        ("gap_view", "gap"),
+        ("absent", "gap"),
+    ] {
+        assert!(
+            views.install_gap_trigger(&tx, table, column).is_err(),
+            "{table}/{column}"
+        );
+        assert_eq!(
+            tx.query_row::<i64, _, _>("PRAGMA schema_version", [], |r| r.get(0))
+                .unwrap(),
+            before
+        );
+    }
+    tx.rollback().unwrap();
+}
+
+#[test]
+fn gap_trigger_installation_rolls_back_and_explicit_reinstall_coalesces_evidence() {
+    let (store, views) = fixture();
+    install_gap(&store, &views, Some("persistent gap"));
+    let before = capture(&store, &views, "alpha");
+    {
+        let mut writer = store.connection.write();
+        let tx = writer.transaction().unwrap();
+        views
+            .install_gap_trigger(&tx, "capture_state", "gap")
+            .unwrap();
+        tx.commit().unwrap();
+    }
+    assert_eq!(capture(&store, &views, "alpha"), before);
+    let (fresh, fresh_views) = fixture();
+    {
+        let mut writer = fresh.connection.write();
+        let tx = writer.transaction().unwrap();
+        tx.execute_batch("CREATE TABLE capture_state(id INTEGER PRIMARY KEY,gap TEXT); INSERT INTO capture_state VALUES(1,'gap')").unwrap();
+        fresh_views
+            .install_gap_trigger(&tx, "capture_state", "gap")
+            .unwrap();
+        tx.rollback().unwrap();
+    }
+    assert!(matches!(
+        capture(&fresh, &fresh_views, "alpha")
+            .availability
+            .readiness,
+        Readiness::Ready(_)
+    ));
+    assert_eq!(
+        fresh
+            .readers
+            .get()
+            .query_row::<i64, _, _>(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE name LIKE 'ivm_source_gap_%'",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn gap_error_is_bounded_and_trigger_targets_only_installer_registry() {
+    let (store, all) = fixture();
+    let only = Views::new(vec![Box::new(Empty("alpha"))]).unwrap();
+    install_gap(&store, &only, None);
+    let text = "界".repeat(2000);
+    store
+        .connection
+        .write()
+        .execute("UPDATE capture_state SET gap=?1", [&text])
+        .unwrap();
+    assert_eq!(
+        capture(&store, &all, "alpha")
+            .availability
+            .error
+            .unwrap()
+            .chars()
+            .count(),
+        1024
+    );
+    assert!(matches!(
+        capture(&store, &all, "beta").availability.readiness,
+        Readiness::Ready(_)
+    ));
+}
