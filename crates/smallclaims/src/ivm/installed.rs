@@ -400,6 +400,16 @@ impl Views {
         self.installed_definition(installer, view)?;
         let cut = super::source_cut(db)?.context("IVM source unready")?;
         self.token(db, view, cut.epoch)?;
-        installer.root(db, view)
+        let root = installer.root(db, view)?;
+        let namespace: Option<String> = db.query_row(
+            "SELECT namespace FROM ivm_installed_bindings WHERE view=?1",
+            [view],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            namespace.as_deref() == Some(root.namespace.as_str()),
+            "installed namespace changed"
+        );
+        Ok(root)
     }
 }

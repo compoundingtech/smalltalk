@@ -34,6 +34,10 @@ mutation count, not a claim store index; its epoch can also differ from graph ep
 `certified_graph_cut` is an independent source-owner attestation, not one constructed from
 MAX index alone. Its entire shared registry must be processed or fenced. Equality with the
 actual graph frontier is a necessary check, not proof of source/extractor/authority coverage.
+Publication is the explicit compatible recovery operation: it clears the view fence but
+it does not read or clear source-owner gap columns installed through `install_gap_trigger`.
+A retained non-null raw gap therefore still requires independent source-read rejection;
+the source owner must prove recovery and resolve that evidence before exposing output.
 Publication does not enumerate every output key; it advances availability and semantic
 version for an explicit full authorized bounded-window refresh. Rollback hides all of it.
 
@@ -53,7 +57,11 @@ An unchanged root with no changed keys preserves semantic/key generations. Unrel
 progress may advance the shared cut without rewriting the view. Live sync requires the
 same active namespace, cannot clear a later gap, and returns `SyncOutcome::Fenced` on
 logical unavailability or excessive changed keys, preserving valid source admission and
-the last certificate/cut. Bridge storage errors propagate to the outer transaction.
+the last certificate/cut. A stale SourcePosition, pending/incompatible graph cut, or
+incompatible binding instead returns an error before synchronization; callers must not
+propagate those errors out of valid source admission unless rollback is intended. They can
+explicitly fence the view and namespace source in that same transaction. Bridge storage
+errors propagate to the outer transaction.
 
 Use `Views::installed_root(connection, &installer, view)` and `events::capture` in the SAME
 short read snapshot as the authorized namespace rows. Ordinary token/readiness validation
@@ -73,5 +81,7 @@ source-certified reads). Installation callbacks, source capture, local observati
 deadlines, authority, repair/rank changes, DDL/uninstall, restore, retention and incompatible
 source-identity transitions remain owner obligations. This PR has no incompatible binding
 replacement or checkpoint participation protocol; incompatible registration is refused.
+A source epoch change or restore requires a separately reviewed new binding lifecycle,
+not another ordinary install job on the old binding.
 The bridge performs no full-history reconstruction or production activation. Callback,
 bootstrap and commit-inclusive writer cost remain separate measurement gates.

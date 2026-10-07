@@ -53,8 +53,25 @@ impl ViewRuntime {
             })
             .collect::<Vec<_>>();
         use sha2::{Digest, Sha256};
-        let schema_digest =
+        let mut schema_digest =
             hex::encode(Sha256::digest(serde_json::to_vec(&(LAYOUT, definitions))?));
+        // Preserve the existing digest bytes for all-legacy registries. Namespace mode
+        // additionally binds the declared source identity and certificate layout.
+        let installed_sources = views
+            .views
+            .iter()
+            .filter_map(|view| {
+                view.installed_source()
+                    .map(|source| (view.definition().name, source))
+            })
+            .collect::<Vec<_>>();
+        if !installed_sources.is_empty() {
+            schema_digest = hex::encode(Sha256::digest(serde_json::to_vec(&(
+                super::installed::LAYOUT,
+                schema_digest,
+                installed_sources,
+            ))?));
+        }
         Ok(Self {
             views,
             claim_source: None,

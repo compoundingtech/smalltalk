@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Installed view runtime digests bind source identity and root reads recheck the namespace",
+  "replay": {
+    "status": "none",
+    "detail": "No automatic scan, startup/read rebuild, source replay or read migration. Existing explicit bounded Installer jobs remain owner-initiated."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No additional tables, triggers or shared schema change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Source admission, authority, canonical order and checkpoint rules are unchanged."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Namespace-mode ViewRuntime digests include the declared installed source and binding layout; all-legacy runtime digests remain byte-identical."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No production activation, deployment or restart is included."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No new operator command or production adapter. Existing bridge signatures are unchanged."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "Library recovery documentation clarifies that explicit publication does not clear source-owner raw gap evidence, stale certificates return errors, and epoch changes or restore require a separate binding lifecycle."
+  }
+}

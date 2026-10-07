@@ -7,5 +7,5 @@
   "compatibility": {"status": "changed", "detail": "Namespace-aware views opt into a separate fingerprint and require matching Installer operator/source definitions. Ordinary view fingerprints and default callbacks remain unchanged."},
   "downtime": {"status": "none", "detail": "No production activation, deployment or restart is included."},
   "manual": {"status": "changed", "detail": "Library adopters register a binding, explicitly complete a namespace job and synchronize live semantic keys with independent source and graph certificates."},
-  "recovery": {"status": "changed", "detail": "A later fence cannot be cleared by an older root or live synchronization. A fresh completed namespace may recover compatible state; incompatible identities require separately reviewed lifecycle handling."}
+  "recovery": {"status": "changed", "detail": "A later fence cannot be cleared by an older root or live synchronization. A fresh completed namespace may recover compatible state; a source epoch change or restore requires a separately reviewed new binding lifecycle, not reinstalling the old binding."}
 }
