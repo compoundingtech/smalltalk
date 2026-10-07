@@ -249,11 +249,15 @@ mod tests {
         value
     }
 
-    async fn inventory_reads(reads: &mut tokio::sync::mpsc::UnboundedReceiver<String>) {
+    async fn inventory_reads(
+        reads: &mut tokio::sync::mpsc::UnboundedReceiver<(String, u64)>,
+        through: u64,
+    ) {
         tokio::time::timeout(Duration::from_secs(5), async {
             let mut completed = BTreeSet::new();
             while completed.len() < 2 {
-                completed.insert(reads.recv().await.unwrap());
+                let (id, index) = reads.recv().await.unwrap();
+                if index >= through { completed.insert(id); }
             }
         }).await.expect("both owner and selected windows must be reread");
     }
@@ -299,7 +303,8 @@ mod tests {
                                 async move {
                                     let result = collection_items_with_windows(
                                         &state, &session, &request, permit, windows).await;
-                                    completed.send(request.id).unwrap();
+                                    let index = result.as_ref().unwrap().0.store_index;
+                                    completed.send((request.id, index)).unwrap();
                                     result
                                 }
                             },
@@ -323,7 +328,7 @@ mod tests {
             let frame = inventory_frame(&mut socket).await;
             initial.insert(frame["id"].as_str().unwrap().to_owned(), frame);
         }
-        inventory_reads(&mut reads).await;
+        inventory_reads(&mut reads, state.store.index().unwrap()).await;
         assert_eq!(initial["owner"]["order"], json!([SUBJECT]));
         assert_eq!(initial["owner"]["has_more"], true);
         assert_eq!(initial["selected"]["items"], json!([winner]));
@@ -354,7 +359,7 @@ mod tests {
             assert_eq!(state.store.arrangement_inventory_revision("person/ada", index).unwrap(),
                 index, "owner frontier must cover the arrival");
             signal_changed(&state);
-            inventory_reads(&mut reads).await;
+            inventory_reads(&mut reads, index).await;
             let frame = inventory_frame(&mut socket).await;
             assert_eq!(frame["kind"], "changes");
             assert_eq!(frame["id"], "owner");
@@ -377,7 +382,7 @@ mod tests {
             "arrangement/person/other/019a0000-0000-7000-8000-000000000001",
             json!([{"op":"create","name":"Sidebar"}]));
         signal_changed(&state);
-        inventory_reads(&mut reads).await;
+        inventory_reads(&mut reads, state.store.index().unwrap()).await;
         assert!(tokio::time::timeout(Duration::from_millis(200), socket.next()).await.is_err());
         state.store.append_claim(&ClaimInput {
             subject:"resource/inventory-noise".into(), kind:"resource.observed".into(), actor:None,
