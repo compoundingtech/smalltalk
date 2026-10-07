@@ -181,6 +181,82 @@ test('collection stream holds commands until the socket opens and passes frames 
     assert.deepEqual(socket.closed, [1000]);
 });
 
+test('command observers see queued and direct commands only after socket.send', async () => {
+    const socket = collectionSocket();
+    const observed = [];
+    const ends = [];
+    const client = new St3Client({ baseUrl: 'https://example.test', fetchImpl: async () => { throw new Error('no HTTP'); } });
+    const stream = await client.collectionStream({
+        onFrame: () => {},
+        onEnd: error => ends.push(error),
+        onCommandSent: command => {
+            assert.equal(socket.sent.length, observed.length + 1);
+            assert.deepEqual({ kind: socket.sent.at(-1).kind, id: socket.sent.at(-1).id }, command);
+            observed.push(command);
+        },
+        socket: () => socket,
+    });
+    stream.subscribe('queued', 'agents');
+    assert.deepEqual(observed, []);
+    socket.onopen();
+    stream.subscribe('direct', 'missions');
+    stream.unsubscribe('direct');
+    assert.deepEqual(observed, [
+        { kind: 'subscribe', id: 'queued' },
+        { kind: 'subscribe', id: 'direct' },
+        { kind: 'unsubscribe', id: 'direct' },
+    ]);
+    assert.deepEqual(ends, []);
+    stream.close();
+});
+
+test('a replacement stream opens and reports resubscription sends afresh after an end', async () => {
+    const sockets = [collectionSocket(), collectionSocket()];
+    const lifecycle = [];
+    const ends = [];
+    let created = 0;
+    const client = new St3Client({ baseUrl: 'https://example.test', fetchImpl: async () => { throw new Error('no HTTP'); } });
+    const createStream = index => client.collectionStream({
+        onFrame: () => {},
+        onEnd: error => ends.push([index, error]),
+        onOpen: () => lifecycle.push([index, 'open']),
+        onCommandSent: command => {
+            const socket = sockets[index];
+            const sent = lifecycle.filter(event => event[0] === index && event[1] !== 'open');
+            assert.equal(socket.sent.length, sent.length + 1);
+            assert.deepEqual({ kind: socket.sent.at(-1).kind, id: socket.sent.at(-1).id }, command);
+            lifecycle.push([index, command.kind, command.id]);
+        },
+        socket: () => { created += 1; return sockets[index]; },
+    });
+    const first = await createStream(0);
+    first.subscribe('agents', 'agents');
+    first.subscribe('missions', 'missions');
+    sockets[0].onopen();
+    sockets[0].onclose({ code: 1000 });
+    assert.equal(created, 1); // Reconnection requires a new collectionStream call.
+    assert.deepEqual(ends, [[0, undefined]]);
+    assert.equal(sockets[0].onopen, null);
+    assert.equal(sockets[0].onclose, null);
+    const replacement = await createStream(1);
+    replacement.subscribe('agents', 'agents');
+    replacement.subscribe('missions', 'missions');
+    assert.deepEqual(sockets[1].sent, []);
+    sockets[1].onopen();
+    first.subscribe('ignored', 'agents');
+    first.unsubscribe('agents');
+    first.close();
+    assert.equal(created, 2);
+    assert.deepEqual(lifecycle, [
+        [0, 'open'], [0, 'subscribe', 'agents'], [0, 'subscribe', 'missions'],
+        [1, 'open'], [1, 'subscribe', 'agents'], [1, 'subscribe', 'missions'],
+    ]);
+    assert.deepEqual(sockets[0].sent.map(command => command.id), ['agents', 'missions']);
+    assert.deepEqual(sockets[1].sent.map(command => command.id), ['agents', 'missions']);
+    assert.deepEqual(ends, [[0, undefined]]);
+    replacement.close();
+});
+
 test('closing from onOpen cancels all queued commands', async () => {
     const socket = collectionSocket();
     const lifecycle = [];
