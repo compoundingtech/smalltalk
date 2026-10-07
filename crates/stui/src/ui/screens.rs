@@ -163,7 +163,11 @@ fn legend(entries: &[(&str, Color, &str)]) -> Vec<Line<'static>> {
 
 // --------------------------------------------------------------------- home
 
-pub fn home_list(world: &World, snoozed: &std::collections::HashSet<String>) -> Listing {
+pub fn home_list(
+    world: &World,
+    snoozed: &std::collections::HashSet<String>,
+    closed: &std::collections::HashSet<String>,
+) -> Listing {
     let mut items = Vec::new();
     let mut ids = Vec::new();
     let mut attention = world
@@ -172,21 +176,30 @@ pub fn home_list(world: &World, snoozed: &std::collections::HashSet<String>) -> 
         .iter()
         .filter(|item| !snoozed.contains(&item.id))
         .collect::<Vec<_>>();
-    attention.sort_by_key(|item| item.tier);
+    // What st closed while it was shown stays, in a section of its own below what needs you, so
+    // the two are never mistaken for each other (Nathan, 2026-10-07: "2 need you", 4 listed).
+    attention.sort_by_key(|item| (closed.contains(&item.id), item.tier));
     let mut current = None;
     for item in attention {
-        if current != Some(item.tier) {
-            current = Some(item.tier);
+        let is_closed = closed.contains(&item.id);
+        if current != Some((is_closed, item.tier)) {
+            current = Some((is_closed, item.tier));
             let count = world
                 .attention
                 .items()
                 .iter()
-                .filter(|other| other.tier == item.tier)
+                .filter(|other| {
+                    closed.contains(&other.id) == is_closed && (is_closed || other.tier == item.tier)
+                })
                 .count();
             items.push(Item::Header {
-                title: item.tier.title().into(),
+                title: if is_closed {
+                    "closed elsewhere: x clears each".into()
+                } else {
+                    item.tier.title().into()
+                },
                 count,
-                color: if item.tier == Tier::Stopped {
+                color: if !is_closed && item.tier == Tier::Stopped {
                     theme::PERSON
                 } else {
                     theme::OVERLAY1
