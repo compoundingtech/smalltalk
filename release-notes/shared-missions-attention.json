@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Share WebSocket mission and attention projections across equivalent subscribers with exact clock validity",
+  "replay": {"status": "none", "detail": "No replay or migration is introduced; shared projections are disposable process-local state."},
+  "schema": {"status": "none", "detail": "No persistent schema, index, or schema version changes."},
+  "rules": {"status": "none", "detail": "Claim retention and checkpoint rules remain unchanged."},
+  "compatibility": {"status": "none", "detail": "Existing collection protocol, authority checks, snapshot fences, and bounded subscriber windows are retained."},
+  "downtime": {"status": "none", "detail": "No additional downtime beyond the normal binary restart."},
+  "manual": {"status": "none", "detail": "No manual migration or configuration changes are required."},
+  "recovery": {"status": "none", "detail": "Restart or rollback discards the process-local cache; persisted claims and derived state are unchanged."}
+}

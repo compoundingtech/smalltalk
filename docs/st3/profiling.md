@@ -54,14 +54,31 @@ equivalent cached window waits asynchronously before starting its blocking snaps
 the physical worker retains admission through cancellation. Cache locks only select or publish
 immutable results. Each Store retains at most 64 windows, with 16 per session; query churn past
 that session quota evicts only that session's inactive windows. Separate local-commit epochs
-survive later ignored claims, and attention/mission computation uses the same captured clock
-as its cache period. This cache covers the six collections named above.
+survive later ignored claims. Missions share a bounded 200-card fleet projection independent
+of subscriber grants and limits; attention shares by effective person visibility and custom-form
+compatibility. Authorization is checked before reuse, including grant expiry and scope loss.
+Their cached projections record the captured clock and the earliest exact output transition,
+including effective mission-preview leases and attention admission times; a backward clock or
+reaching a transition rebuilds. Attention rows do not age out: observer grace, final-step fault
+aging and checkpoint waits already belong to the separate fault projection, not this collection.
+Wake times and execution deadlines affect stored states through graph writes, not these cards'
+read clock. Mission `must_act` and its step previews use one captured time.
+The socket's existing 30-second timer remains the delivery cadence for clock-only changes.
+This cache covers the six collections named above.
 
 A disposable local single-client cold-read comparison is available with:
 `cargo test -p st3 --lib shared_windows_local_single_client_cost -- --ignored --nocapture`.
 It compares uncached, cold cached and warm reads for 100 glass rows under Unix and paired
 sessions, alternating case order and reporting aggregate wall/process CPU. Debug-profile
 fixture results do not measure deployed paired-client CPU or production tail latency.
+
+`cargo test -p st3 --lib mission_attention_projection_fixture_timing -- --ignored --nocapture`
+compares 22 uncached projections with shared cold and 22 warm reads over 70 generated missions
+and person steps, asserting projection parity. Its stage profile separates mission attention-run
+selection, definition reads, run overviews, step previews and attention snapshot work. The
+`perf_load` workload includes `collection missions` and `collection attention`: synthetic bursts
+of 20 concurrent WebSocket subscribers alongside the existing busy request mix. These are
+synthetic fixture measurements, not measurements of a deployed daemon or transport latency.
 
 Conversation collection followers (`follow_conversation`) and standalone conversation sockets
 (`conversation_stream_socket`) use the existing conversation page/change reader. Mailbox reads

@@ -137,6 +137,131 @@ impl Store {
         Ok((total, done, steps))
     }
 
+    /// Exclusive clock fence for collection cards at `now`, with the graph held unchanged.
+    ///
+    /// Cards observe effective leases and person asks becoming current at their acceptance
+    /// time. They do not enrich steps with wakes or execution timing: `not_before`, mission
+    /// deadlines and step timeout budgets only change these cards after a graph write.
+    /// Only the selected missions' newest three runs and their first twenty steps appear
+    /// in these collection cards. Mission IDs may include the `mission/` prefix.
+    pub(crate) fn mission_collection_valid_until(
+        &self,
+        ids: &[String],
+        now: u128,
+    ) -> Result<Option<u128>> {
+        if ids.is_empty() {
+            return Ok(None);
+        }
+        let ids = serde_json::to_string(ids)?;
+        let connection = self.readers.get();
+        let newest = "WITH newest AS (
+            SELECT id, ROW_NUMBER() OVER (
+                PARTITION BY mission_id ORDER BY created_at_unix_ms DESC,id DESC
+            ) AS position FROM mission_runs
+            WHERE mission_id IN (SELECT CASE WHEN value LIKE 'mission/%'
+                THEN substr(value,9) ELSE value END FROM json_each(?1))
+        )";
+        let mut statement = connection.prepare(&format!(
+            "{newest}, preview AS (
+                SELECT s.*,ROW_NUMBER() OVER (
+                    PARTITION BY s.run_id ORDER BY s.created_at_unix_ms,s.step_path
+                ) AS step_position
+                FROM step_runs s JOIN newest n ON n.id=s.run_id AND n.position<=3
+                JOIN mission_runs r ON r.id=s.run_id AND r.current_generation_id=s.generation_id
+            )
+            SELECT subject,run_id,step_path,definition_hash,status,attempt,assignee,available_to,
+                   agentless,title,goals,worker_reported,lease_owner,lease_incarnation,
+                   lease_expires_at_unix_ms,blocked_reason,not_before_unix_ms,created_at_unix_ms,
+                   updated_at_unix_ms,readiness_epoch,constraints
+            FROM preview WHERE step_position<=20 AND (
+                (lease_expires_at_unix_ms IS NOT NULL
+                 AND status IN ('claimed','working','verifying','blocked'))
+                OR (assignee LIKE 'person/%' AND status IN ('ready','pending'))
+                OR status='waiting-person' OR (status='ready' AND blocked_reason IS NOT NULL)
+            )"
+        ))?;
+        let steps = statement
+            .query_map([&ids], step_run_from_row)?
+            .map(|row| row.map(|step| (step.subject.clone(), step)))
+            .collect::<rusqlite::Result<BTreeMap<_, _>>>()?;
+        let changed = |step: &StepRunView, at: u128| -> Result<bool> {
+            let mut before = step.clone();
+            let mut after = step.clone();
+            apply_effective_step_state(&connection, &mut before, now)?;
+            apply_effective_step_state(&connection, &mut after, at)?;
+            Ok(before.status != after.status
+                || before.claimant != after.claimant
+                || before.blocked_reason != after.blocked_reason
+                || before.blockers != after.blockers)
+        };
+        let mut until = None;
+        for step in steps.values() {
+            if let Some(expiry) = step.claim_expires_at_unix_ms.filter(|expiry| *expiry > now)
+                && until.is_none_or(|earliest| expiry < earliest)
+                && changed(step, expiry)?
+            {
+                until = Some(expiry);
+            }
+        }
+
+        // Decimal-text comparison preserves the full u128 clock range, unlike SQLite's
+        // signed INTEGER cast. Only person_work::current consults acceptance time here.
+        let mut statement = connection.prepare(&canonical_sql(&format!(
+            "{newest}
+             SELECT claims.id,claims.store_index,claims.batch_id,claims.subject,claims.kind,
+                    claims.origin,claims.actor,claims.body,claims.predecessors,claims.accepted_at_unix_ms
+             FROM claims JOIN step_runs person ON person.subject=claims.subject
+             JOIN newest n ON n.id=person.run_id AND n.position<=3
+             WHERE claims.kind='work.person-asked'
+               AND (length(claims.accepted_at_unix_ms)>length(?2)
+                    OR (length(claims.accepted_at_unix_ms)=length(?2) AND claims.accepted_at_unix_ms>?2))
+             ORDER BY CANONICAL_ASC(claims)"
+        )))?;
+        let asks = statement
+            .query_map(params![ids, now.to_string()], claim_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if asks.is_empty() {
+            return Ok(until);
+        }
+        let mut statement = connection.prepare(&format!(
+            "{newest} SELECT id FROM newest WHERE position<=3"
+        ))?;
+        let runs = statement
+            .query_map([&ids], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+        let attention = self.human_attention_runs_at(now)?;
+        for ask in asks {
+            let at = ask.accepted_at_unix_ms;
+            if until.is_some_and(|earliest| at >= earliest)
+                || !person_work::current(&connection, &ask, at)?
+            {
+                continue;
+            }
+            // A future ask can change a preview's effective status or blocker list even
+            // when another person item already keeps that run in human attention.
+            let own = steps.get(&ask.subject);
+            let origin = ask.body["fields"]["origin_step"]
+                .as_str()
+                .and_then(|subject| steps.get(subject));
+            let preview_changes = own.map(|step| changed(step, at)).transpose()?.unwrap_or(false)
+                || origin.map(|step| changed(step, at)).transpose()?.unwrap_or(false);
+            let person = person_work::step(&connection, &ask.subject)?;
+            let attention_changes = if let Some(person) = person {
+                runs.contains(person.run.trim_start_matches("mission-run/"))
+                    && person.assigned_to.as_deref().is_some_and(|id| id.starts_with("person/"))
+                    && !attention.contains(&person.run)
+                    && person_work::request(&connection, &ask.subject)?
+                        .is_some_and(|first| first.id == ask.id)
+            } else {
+                false
+            };
+            if preview_changes || attention_changes {
+                until = Some(at);
+            }
+        }
+        Ok(until)
+    }
+
     /// Terminal transitions in a stable claim-index window. A retry does not erase a failure.
     pub fn outcome_history(
         &self,
@@ -357,6 +482,221 @@ mod tests {
         let source = "version 2\nmission \"example/overview\" state=\"ready\" { goal \"Build.\"; step \"build\" { goal \"Build.\"; }; }\n";
         let intent = crate::graph::parse_intent(source, store.origin()).unwrap();
         store.apply_internal(&intent, "overview-mission").unwrap();
+    }
+
+    fn clock_run(store: &Store, key: &str) -> MissionRunView {
+        store
+            .create_mission_run(&MissionRunRequest {
+                mission: "example/overview".into(),
+                revision: None,
+                workspace: "/example".into(),
+                requester: Some("person/operator".into()),
+                mode: None,
+                inputs: BTreeMap::new(),
+                idempotency_key: key.into(),
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn mission_clock_fence_expires_leases_at_equality_without_signed_clock_truncation() {
+        let store = Store::open_memory("fixture").unwrap();
+        publish_overview_mission(&store);
+        let run = clock_run(&store, "clock-run");
+        let expiry = u128::from(u64::MAX) + 100;
+        for status in ["claimed", "working", "verifying", "blocked"] {
+            store.connection.lock().unwrap().execute(
+                "UPDATE step_runs SET status=?2,lease_owner='agent/fixture/worker',
+                     lease_incarnation='worker-one',lease_expires_at_unix_ms=?3,blocked_reason=NULL
+                 WHERE subject=?1",
+                params![run.steps[0].subject, status, expiry.to_string()],
+            ).unwrap();
+            assert_eq!(store.mission_collection_valid_until(&["mission/example/overview".into()], expiry - 1).unwrap(), Some(expiry));
+            assert_eq!(store.mission_collection_valid_until(&[], expiry - 1).unwrap(), None);
+            assert_eq!(store.mission_collection_valid_until(&["mission/example/unselected".into()], expiry - 1).unwrap(), None);
+            assert_eq!(store.mission_collection_valid_until(&["example/overview".into()], expiry - 1).unwrap(), Some(expiry));
+            let before = store.mission_step_preview_at(&run.subject, expiry - 1).unwrap().2;
+            let at = store.mission_step_preview_at(&run.subject, expiry).unwrap().2;
+            assert_eq!(before[0].status, status);
+            assert_eq!(at[0].status, "ready");
+            assert_eq!(at[0].claimant, None);
+            assert_eq!(store.mission_collection_valid_until(&["mission/example/overview".into()], expiry).unwrap(), None);
+            assert_eq!(store.mission_collection_valid_until(&["mission/example/overview".into()], expiry + 1).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn mission_clock_fence_ignores_graph_driven_deadlines_and_terminal_owners() {
+        let store = Store::open_memory("fixture").unwrap();
+        publish_overview_mission(&store);
+        let run = clock_run(&store, "clock-run");
+        {
+            let connection = store.connection.lock().unwrap();
+            connection.execute(
+                "UPDATE step_runs SET status='pending',not_before_unix_ms='2000' WHERE subject=?1",
+                [&run.steps[0].subject],
+            ).unwrap();
+            connection.execute(
+                "INSERT INTO mission_run_deadlines(run_id,timeout_ms,deadline_at_unix_ms)
+                 VALUES (?1,1000,'1500')",
+                [&run.id],
+            ).unwrap();
+        }
+        assert_eq!(store.mission_collection_valid_until(&["mission/example/overview".into()], 1000).unwrap(), None);
+        assert_eq!(
+            store.mission_step_preview_at(&run.subject, 2500).unwrap().2[0].status,
+            "pending"
+        );
+        for terminal_owner in [
+            "UPDATE mission_runs SET status='completed',phase='terminal'",
+            "UPDATE mission_runs SET status='running',phase='normal';
+             UPDATE run_generations SET status='superseded'",
+        ] {
+            let connection = store.connection.lock().unwrap();
+            connection.execute_batch(terminal_owner).unwrap();
+            connection.execute(
+                "UPDATE step_runs SET status='claimed',lease_owner='agent/fixture/worker',
+                 lease_expires_at_unix_ms='3000' WHERE subject=?1",
+                [&run.steps[0].subject],
+            ).unwrap();
+            drop(connection);
+            assert_eq!(store.mission_collection_valid_until(&["mission/example/overview".into()], 1000).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn mission_clock_fence_only_observes_three_run_headers_and_twenty_preview_steps() {
+        let store = Store::open_memory("fixture").unwrap();
+        let source = "version 2\nmission \"example/overview\" state=\"ready\" { concurrent-runs max=4; goal \"Build.\"; step \"build\" { goal \"Build.\"; }; }\n";
+        let intent = crate::graph::parse_intent(source, store.origin()).unwrap();
+        store.apply_internal(&intent, "preview-clock-mission").unwrap();
+        let mut runs = Vec::new();
+        for i in 0..4 {
+            let run = clock_run(&store, &format!("clock-run-{i}"));
+            store.connection.lock().unwrap().execute(
+                "UPDATE mission_runs SET created_at_unix_ms=?2 WHERE id=?1",
+                params![run.id, format!("100{i}")],
+            ).unwrap();
+            runs.push(run);
+        }
+        {
+            let connection = store.connection.lock().unwrap();
+            connection.execute(
+                "UPDATE step_runs SET status='claimed',lease_expires_at_unix_ms='1500'
+                 WHERE run_id=?1",
+                [&runs[0].id],
+            ).unwrap();
+            // The newest run has twenty earlier rows before the leased twenty-first row.
+            connection.execute(
+                "UPDATE step_runs SET created_at_unix_ms='1' WHERE run_id=?1",
+                [&runs[3].id],
+            ).unwrap();
+            for i in 1..=20 {
+                connection.execute(
+                    "INSERT INTO step_runs(subject,run_id,generation_id,step_path,definition_hash,
+                         status,attempt,available_to,agentless,goals,created_at_unix_ms,updated_at_unix_ms)
+                     SELECT ?2,run_id,generation_id,?3,definition_hash,?4,attempt,available_to,
+                            agentless,goals,?5,updated_at_unix_ms FROM step_runs WHERE subject=?1",
+                    params![runs[3].steps[0].subject,
+                        format!("step-run/{}/extra-{i:02}", runs[3].generation.trim_start_matches("run-generation/")),
+                        format!("extra-{i:02}"), if i == 20 { "claimed" } else { "pending" },
+                        format!("{:02}", i + 1)],
+                ).unwrap();
+            }
+            connection.execute(
+                "UPDATE step_runs SET lease_expires_at_unix_ms='1600' WHERE step_path='extra-20'",
+                [],
+            ).unwrap();
+        }
+        assert_eq!(store.mission_collection_valid_until(&["mission/example/overview".into()], 1000).unwrap(), None);
+        store.connection.lock().unwrap().execute(
+            "UPDATE step_runs SET status='claimed',lease_expires_at_unix_ms='1700'
+             WHERE subject=?1",
+            [&runs[3].steps[0].subject],
+        ).unwrap();
+        assert_eq!(store.mission_collection_valid_until(&["mission/example/overview".into()], 1000).unwrap(), Some(1700));
+    }
+
+    #[test]
+    fn mission_clock_fence_tracks_future_person_ask_and_blocker_acceptance() {
+        let (store, origin, input) = person_work::tests::fixture();
+        let ask = store.ask_person(&input).unwrap();
+        let at = now_ms() + 10_000;
+        store.connection.lock().unwrap().execute(
+            "UPDATE claims SET accepted_at_unix_ms=?2 WHERE subject=?1 AND kind='work.person-asked'",
+            params![ask.subject, at.to_string()],
+        ).unwrap();
+        assert_eq!(store.mission_collection_valid_until(&["mission/person-work".into()], at - 1).unwrap(), Some(at));
+        assert_eq!(store.mission_collection_valid_until(&["mission/example/unselected".into()], at - 1).unwrap(), None);
+        let before = store.mission_step_preview_at(&origin.run, at - 1).unwrap().2;
+        let after = store.mission_step_preview_at(&origin.run, at).unwrap().2;
+        let before = before.iter().find(|step| step.subject == origin.subject).unwrap();
+        let after = after.iter().find(|step| step.subject == origin.subject).unwrap();
+        assert_eq!(before.status, "ready");
+        assert!(before.blockers.is_empty());
+        assert_eq!(after.status, "waiting-person");
+        assert_eq!(after.blockers, vec![ask.subject.clone()]);
+        assert_eq!(store.mission_collection_valid_until(&["mission/person-work".into()], at).unwrap(), None);
+        store.connection.lock().unwrap().execute(
+            "UPDATE step_runs SET status='completed' WHERE subject=?1",
+            [&ask.subject],
+        ).unwrap();
+        assert_eq!(store.mission_collection_valid_until(&["mission/person-work".into()], at - 1).unwrap(), None);
+    }
+
+    #[test]
+    fn mission_clock_fence_tracks_person_attention_outside_the_step_preview() {
+        let (store, origin, input) = person_work::tests::fixture();
+        let ask = store.ask_person(&input).unwrap();
+        let at = now_ms() + 10_000;
+        {
+            let connection = store.connection.lock().unwrap();
+            connection.execute(
+                "UPDATE claims SET accepted_at_unix_ms=?2 WHERE subject=?1 AND kind='work.person-asked'",
+                params![ask.subject, at.to_string()],
+            ).unwrap();
+            // Keep the real ask live but place all person steps beyond the card preview.
+            connection.execute(
+                "UPDATE step_runs SET created_at_unix_ms='9' WHERE assignee LIKE 'person/%'",
+                [],
+            ).unwrap();
+            connection.execute(
+                "UPDATE step_runs SET status='pending' WHERE step_path='review'",
+                [],
+            ).unwrap();
+            connection.execute(
+                "UPDATE step_runs SET created_at_unix_ms='1' WHERE subject=?1",
+                [&origin.subject],
+            ).unwrap();
+            for i in 1..20 {
+                connection.execute(
+                    "INSERT INTO step_runs(subject,run_id,generation_id,step_path,definition_hash,
+                         status,attempt,available_to,agentless,goals,created_at_unix_ms,updated_at_unix_ms)
+                     SELECT ?2,run_id,generation_id,?3,definition_hash,'pending',attempt,available_to,
+                            agentless,goals,'1',updated_at_unix_ms FROM step_runs WHERE subject=?1",
+                    params![origin.subject,
+                        format!("step-run/{}/extra-{i:02}", origin.generation.trim_start_matches("run-generation/")),
+                        format!("extra-{i:02}")],
+                ).unwrap();
+            }
+            // The originating blocker is not previewed either.
+            connection.execute(
+                "UPDATE step_runs SET created_at_unix_ms='9' WHERE subject=?1",
+                [&origin.subject],
+            ).unwrap();
+            connection.execute(
+                "INSERT INTO step_runs(subject,run_id,generation_id,step_path,definition_hash,
+                     status,attempt,available_to,agentless,goals,created_at_unix_ms,updated_at_unix_ms)
+                 SELECT ?2,run_id,generation_id,'extra-20',definition_hash,'pending',attempt,
+                        available_to,agentless,goals,'1',updated_at_unix_ms FROM step_runs WHERE subject=?1",
+                params![origin.subject,
+                    format!("step-run/{}/extra-20", origin.generation.trim_start_matches("run-generation/"))],
+            ).unwrap();
+        }
+        assert!(!store.human_attention_runs_at(at - 1).unwrap().contains(&origin.run));
+        assert!(store.human_attention_runs_at(at).unwrap().contains(&origin.run));
+        assert_eq!(store.mission_collection_valid_until(&["mission/person-work".into()], at - 1).unwrap(), Some(at));
+        assert_eq!(store.mission_collection_valid_until(&["mission/person-work".into()], at).unwrap(), None);
     }
 
     #[test]

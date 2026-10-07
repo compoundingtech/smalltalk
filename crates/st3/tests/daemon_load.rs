@@ -111,6 +111,9 @@ const MIX: &[Load] = &[
     load("replication wake", 0.2, 1_000),
     load("message send", 0.1, 250),
     load("person read", 0.5, 250),
+    // Synthetic 20-subscriber bursts exercise shared collection admission under the mix.
+    load("collection missions", 0.1, 4_000),
+    load("collection attention", 0.1, 4_000),
 ];
 
 /// What a person reads while moving through stui, one after another, and each read's p99 budget.
@@ -656,6 +659,7 @@ struct Context {
     client: Client,
     /// Client reads come from a person, as stui and the app make them.
     person: Client,
+    collections: st3_client::Client,
     store: Arc<Store>,
     peer: Arc<Store>,
     daemon: tokio::runtime::Handle,
@@ -907,6 +911,7 @@ fn run(
     let context = Arc::new(Context {
         client: Client::unix(&socket),
         person: Client::unix_as(&socket, "person/bench-operator").unwrap(),
+        collections: st3_client::Client::unix_as(&socket, "person/bench-operator"),
         store,
         peer,
         daemon: daemon.handle().clone(),
@@ -1579,6 +1584,35 @@ async fn send_one(context: &Context, name: &str) -> Result<(), String> {
                 }),
             )
             .await
+        }
+        "collection missions" | "collection attention" => {
+            let collection = if name == "collection missions" { "missions" } else { "attention" };
+            let mut readers = tokio::task::JoinSet::new();
+            let barrier = Arc::new(tokio::sync::Barrier::new(20));
+            for n in 0..20 {
+                let client = context.collections.clone();
+                let barrier = barrier.clone();
+                readers.spawn(async move {
+                    let mut stream = client.collection_stream().await.map_err(|e| e.to_string())?;
+                    barrier.wait().await;
+                    stream.subscribe(&format!("load-{n}"), collection, 20, None, None)
+                        .await.map_err(|e| e.to_string())?;
+                    let event = tokio::time::timeout(Duration::from_secs(10), stream.next_event())
+                        .await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
+                    if !matches!(event, Some(st3_client::CollectionEvent::Snapshot { .. })) {
+                        return Err(format!("{collection}: expected initial snapshot, got {event:?}"));
+                    }
+                    Ok::<_, String>(stream)
+                });
+            }
+            // Hold every socket until all frames arrive; the registry's weak lifetime must
+            // not expire between readers, and errors propagate rather than skipping a line.
+            let mut streams = Vec::new();
+            while let Some(result) = readers.join_next().await {
+                streams.push(result.map_err(|e| e.to_string())??);
+            }
+            for stream in streams { stream.close().await; }
+            Ok(())
         }
         "person read" => {
             let (path, _) = PERSON_READS[turn % PERSON_READS.len()];
