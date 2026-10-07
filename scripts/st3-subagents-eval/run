@@ -206,6 +206,19 @@ class Seat:
         return until(lambda: [row for row in self.receipts() if row["event"] == "ready" and row["at"] > after],
                      timeout, f"{self.subject}: the stand-in never started")[-1]
 
+    def restarted_driver_ready(self, previous_incarnation, session, timeout=30):
+        """The stand-in's ready receipt precedes the driver's current harness observation."""
+        def ready():
+            card = self.node.api("/v1/client/agents/" + self.subject) or {}
+            if (card.get("state") == "running"
+                    and card.get("harness_state") in ("ready", "working", "idle")
+                    and card.get("incarnation_id")
+                    and card["incarnation_id"] != previous_incarnation
+                    and card.get("current_session_id") == session):
+                return card
+        return until(ready, timeout,
+                     f"{self.subject}: the restarted driver never became ready for session {session}")
+
     def claims(self):
         """The seat's subagent claims, oldest first, a trace page at a time."""
         rows, after = [], 0
@@ -522,18 +535,31 @@ def killed_scenarios(node, seat, checks):
 
     # A killed seat records no end: its short lease runs out, or its restart closes it first.
     seat.control("spawn", id="k2", description="dies with its seat")
-    seat.appeared("k2")
+    previous_incarnation = seat.appeared("k2")["incarnation_id"]
     killed_at = time.time()
     kill_seat(seat)
     ended = seat.ended("k2", timeout=90)
     expect(ended.get("outcome") in ("expired", "harness-exited"), f"k2 end: {ended}")
-    seat.ready(after=killed_at)
+    restarted = seat.ready(after=killed_at)
     checks["killed_seat"] = ended
 
-    # A killed harness: its driver records the end.
+    # Wait before starting k3's short lease: a stand-in receipt alone does not prove that
+    # the restarted driver is ready to observe its harness exiting.
+    driver = seat.restarted_driver_ready(previous_incarnation, restarted["session"])
+    checks["killed_harness_ready"] = {
+        "previous_incarnation": previous_incarnation,
+        "incarnation": driver["incarnation_id"], "session": restarted["session"],
+        "harness_state": driver["harness_state"], "stand_in": restarted,
+    }
+
+    # A killed harness: its ready driver records the end for this incarnation.
     seat.control("spawn", id="k3", description="dies with its harness")
-    seat.appeared("k3")
-    seat.node.signal_seat(KILLED, signal.SIGKILL, only="/bin/claude")
+    appeared = seat.appeared("k3")
+    expect(appeared.get("incarnation_id") == driver["incarnation_id"]
+           and appeared.get("session_id") == restarted["session"],
+           f"k3 appeared outside the ready incarnation/session: {appeared}")
+    killed = seat.node.signal_seat(KILLED, signal.SIGKILL, only="/bin/claude")
+    expect(restarted["pid"] in killed, "the ready harness was not killed")
     ended = seat.ended("k3", timeout=60)
     expect(ended.get("outcome") == "harness-exited", f"k3 end: {ended}")
     checks["killed_harness"] = ended
