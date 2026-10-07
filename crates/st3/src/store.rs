@@ -20573,7 +20573,11 @@ fn claude_attachment_fence(
     }))
 }
 
-/// Whether any observation of this runtime epoch of `subject` carries the reason `providerAuth`:
+/// Whether any observation of this runtime epoch of `subject` carries the reason `providerAuth`
+/// or the state `needs-login`, the two ways the observation fold can end in `needs-login`. Today's
+/// claim validation refuses the state `needs-login` in an observation, so only claims written
+/// before that rule can carry it, which is why no test can append one; the probe still asks, so a
+/// store holding such a claim keeps raising its login item:
 /// those that name `incarnation_id`, and those that name no incarnation as text and were accepted
 /// no earlier than the runtime observation (`runtime_accepted_at`), the same two sets the
 /// observation fold reads. The seat's login evidence sits in `claims_harness_login_candidate_index`,
@@ -20587,6 +20591,8 @@ fn provider_auth_reason_in_epoch(
 ) -> Result<bool> {
     let reason = "json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
                             THEN '$.reason' ELSE '$.fields.reason' END)";
+    let state = "json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
+                            THEN '$.state' ELSE '$.fields.state' END)";
     let sql = format!(
         "SELECT EXISTS(SELECT 1 FROM claims INDEXED BY claims_harness_login_candidate_index
            WHERE claims.subject=?1 AND (
@@ -20598,7 +20604,8 @@ fn provider_auth_reason_in_epoch(
                    THEN '$.state' ELSE '$.fields.state' END)='needs-login'))
              OR (kind='harness.diagnostic'
                AND json_extract(body, '$.fields.code')='provider-auth-expired'))
-           AND kind='harness.observed' AND store_index<=?2 AND {reason}='providerAuth'
+           AND kind='harness.observed' AND store_index<=?2
+           AND ({reason}='providerAuth' OR {state}='needs-login')
            AND ({INCARNATION_OF_CLAIM}=?3
                 OR (({INCARNATION_OF_CLAIM} IS NULL OR typeof({INCARNATION_OF_CLAIM})!='text')
                     AND (length(claims.accepted_at_unix_ms)>length(?4)
