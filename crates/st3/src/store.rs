@@ -97,11 +97,14 @@ pub use smallclaims::store::{
 mod accounts;
 mod adhoc_work;
 mod attention_snapshot;
+mod attention_history;
+pub(crate) use attention_history::HistorySnapshot;
 mod backup;
 mod checkpoint_rules;
 pub(crate) mod delegation;
 mod limits;
 mod person_work;
+mod prompts;
 pub(crate) mod work_summaries_ivm;
 mod subagents;
 mod watches;
@@ -1499,6 +1502,7 @@ fn stale_pull_request_request_tx(
 }
 
 fn migrate_schema(connection: &Connection) -> Result<()> {
+    connection.execute_batch(prompts::SCHEMA)?;
     let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version == 0
         || version == 13
@@ -9245,7 +9249,7 @@ impl Store {
             || !matches!(
                 input.kind.as_str(),
                 "harness.observed" | "harness.usage" | "harness.limits" | "harness.timeline"
-                    | "harness.todo.observed"
+                    | "harness.todo.observed" | "harness.prompt"
             )
             || input.actor.as_deref() != Some(input.subject.as_str())
             || input.idempotency_key.is_none()
@@ -9403,6 +9407,9 @@ impl Store {
         &self,
         input: &ClaimInput,
     ) -> Result<(ClaimRecord, bool), St3Error> {
+        if input.kind=="harness.prompt" {
+            return Err(St3Error::new("unbound-harness-prompt","prompt sources require a bound native driver event"));
+        }
         st3_schema::registry()
             .validate_public_claim(
                 &input.subject,
@@ -12629,6 +12636,7 @@ impl Store {
         let mut items = self.mission_run_attention_items(person)?;
         items.extend(self.person_attention_items(person, as_of)?);
         items.extend(self.harness_login_attention_items(person)?);
+        items.extend(self.prompt_items(person, as_of)?);
         items.extend(self.custom_attention_items(person)?);
         // A person who published a broken gate is the one to correct it.
         items.extend(
@@ -18587,6 +18595,9 @@ fn insert_local_observation_tx(
         )
         .map_err(internal)?;
     let id = transaction.last_insert_rowid();
+    if input.kind == "harness.prompt" {
+        prompts::observe(transaction, input, observed_at, id)?;
+    }
     Ok((
         ClaimRecord {
             id: local_observation_id(origin, id),
@@ -19840,6 +19851,9 @@ pub(crate) fn append_claim_tx(
     }
     if kind == "arrangement.edited" {
         arrangements::project(transaction, &record)?;
+    }
+    if matches!(kind,"runtime.observed"|"intent.desired") {
+        prompts::runtime_changed(transaction,origin,subject,record.accepted_at_unix_ms)?;
     }
     normalize_local_projection_timestamps_tx(
         transaction,
@@ -27028,6 +27042,7 @@ fn replay_graph_from_nothing_with_progress_tx(
     stage("full-replay/arrangements");
     arrangements::rebuild(transaction).map_err(internal)?;
     stage("full-replay/flush");
+    attention_history::invalidate(transaction).map_err(internal)?;
     Ok(())
 }
 
@@ -49162,6 +49177,11 @@ version 2
             )
             .unwrap();
         assert_eq!(first_approval.status, "pending-approval");
+        let closed=store.attention_history_test_page("person/mission-reviewer", 5).unwrap().items;
+        assert_eq!(closed.len(),1);
+        assert_eq!(closed[0]["episode"],format!("{}:{}",proposal.source_generation,proposal.preview_hash.as_deref().unwrap()));
+        assert_eq!(closed[0]["resolution"]["by"],"person/mission-reviewer");
+        assert_eq!(closed[0]["resolution"]["answer_label"],"Approved");
         assert_eq!(first_approval.mission_run.generation, run.generation);
         assert!(
             store
@@ -49185,6 +49205,9 @@ version 2
             )
             .unwrap();
         assert_eq!(applied.status, "applied");
+        let closed=store.attention_history_test_page("person/step-reviewer", 5).unwrap().items;
+        assert_eq!(closed.len(),1);
+        assert_eq!(closed[0]["resolution"]["by"],"person/step-reviewer");
         assert_ne!(applied.mission_run.generation, run.generation);
         assert_eq!(
             applied

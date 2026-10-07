@@ -713,6 +713,117 @@ fn refresh_source(tx: &Transaction<'_>, subject: &str) -> Result<()> {
     Ok(())
 }
 
+/// Historical attention transitions reconstructed from this subject's canonical facts and
+/// immutable manifest. Called only when the source changes, never while reading a page.
+/// Dependency freshness and registration conflicts cannot prove an episode was closed.
+pub(super) fn attention_history(
+    connection: &Connection,
+    subject: &str,
+    deadline: std::time::Instant,
+) -> Result<Vec<Value>> {
+    if !subject.starts_with("custom/") || subject.starts_with("custom/client/") {
+        return Ok(Vec::new());
+    }
+    let Some((hash, manifest, state)) = registration(connection, subject)? else {
+        return Ok(Vec::new());
+    };
+    if state != "ready" {
+        return Ok(Vec::new());
+    }
+    let Some(attention) = &manifest.attention else {
+        return Ok(Vec::new());
+    };
+    let history = claims(connection, subject)?
+        .into_iter()
+        .filter(|c| fields(c).get("_registration") == Some(&json!(hash)))
+        .collect::<Vec<_>>();
+    let Some(creation) = history.iter().find(|c| c.kind == manifest.creation_kind) else {
+        return Ok(Vec::new());
+    };
+    // This first scoped history implementation supports self-contained source facts. A basis
+    // may depend on missing or stale external state whose past validity cannot be reconstructed.
+    if history.iter().any(|c| fields(c).contains_key("_basis")) {
+        return Ok(Vec::new());
+    }
+    let Some(person) = fields(creation)
+        .get(&attention.recipient_field)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        return Ok(Vec::new());
+    };
+    let mut valid = Vec::new();
+    let mut waiting: Option<Value> = None;
+    let mut rows = Vec::new();
+    for claim in &history {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "history source exceeded reconstruction deadline"
+        );
+        if validate_fact(
+            connection,
+            &manifest,
+            &claim.kind,
+            claim.actor.as_deref(),
+            &fields(claim),
+            Some(creation),
+        )
+        .is_err()
+        {
+            return Ok(Vec::new());
+        }
+        valid.push(claim.clone());
+        let selected = slots(&manifest, &valid);
+        let active = predicate(&attention.when, &selected);
+        let episode = eval(&attention.episode, &selected);
+        if let Some(mut prior) = waiting.take() {
+            if !active || prior["episode"] != episode {
+                let reply = claim.body["_custom_reply"]["episode"] == prior["episode"]
+                    && claim.actor.as_deref() == Some(&person);
+                super::attention_history::resolve(
+                    &mut prior,
+                    claim,
+                    if reply { "answered" } else { "closed" },
+                    None,
+                );
+                rows.push(prior);
+            } else {
+                waiting = Some(prior);
+            }
+        }
+        if active && waiting.is_none() {
+            let (Some(episode), Some(title), Some(detail)) = (
+                episode.as_str().map(str::to_owned),
+                eval(&attention.title, &selected)
+                    .as_str()
+                    .map(str::to_owned),
+                eval(&attention.detail, &selected)
+                    .as_str()
+                    .map(str::to_owned),
+            ) else {
+                continue;
+            };
+            if episode.is_empty() || title.is_empty() {
+                continue;
+            }
+            let mut row = super::attention_history::resource(
+                subject,
+                &person,
+                &episode,
+                &format!("custom.{}", manifest.kind),
+                &title,
+                &detail,
+                creation.accepted_at_unix_ms,
+            )?;
+            row["source_kind"] = json!("custom");
+            row["targets"] = json!([]);
+            row["requester_id"] = json!(creation.actor);
+            waiting = Some(row);
+        }
+    }
+    Ok(rows)
+}
+
 impl Store {
     pub fn register_custom_kind(&self, request: &RegistrationRequest) -> Result<Value, St3Error> {
         request.manifest.validate().map_err(typed)?;

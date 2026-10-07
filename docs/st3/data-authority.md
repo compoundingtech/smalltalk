@@ -178,6 +178,10 @@ order from the same admitted claims.
 | `step_runs` | Projection | `step-run.*` and `work.*` claims |
 | `local_work_lease_renewals` | Local operational fact | Recent quiet lease renewals; replayed over replicated claim projections and bounded by periodic `work.renewed` anchors |
 | `local_observations` | Local observation log | Observations of `local` and `latest` retention made on this node; never replicated, trimmed after `[observations] retention` |
+| `local_attention_history_v2` | Disposable local history cache | Recorded canonical closure claims and retained custom manifests/facts; rebuilt in bounded background reads, never closure authority |
+| `local_attention_history_state` | Local cache bookkeeping | Lazy enablement, resumable backfill position and monotonic cache epoch/version; not replicated |
+| `local_attention_history_dirty` | Local cache work queue | Relevant source changes after enablement; backfill reconstructs from canonical sources |
+| `local_attention_history_errors` | Local cache diagnostics | Quarantined oversized, slow or malformed sources; incomplete coverage is disclosed and new source writes retry them |
 | `local_latest_slots` | Local observation log | For each `latest` slot this node writes: its last replicated observation and time, and the newest local observation no claim carries yet |
 | `local_usage_seen` | Local deduplication index | Stable provider response IDs from local timeline observations; never replicated |
 | `local_usage_totals` | Local cumulative observation projection | Token buckets from accepted local response observations; never replicated and retained across log trimming |

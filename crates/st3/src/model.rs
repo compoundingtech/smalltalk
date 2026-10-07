@@ -1474,6 +1474,8 @@ pub struct ClientPageInfo {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ClientResourcePage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<st3_client::AttentionHistoryAvailability>,
     pub kind: String,
     pub collection: String,
     #[serde(default)]

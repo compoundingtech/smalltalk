@@ -52,6 +52,14 @@ fn custom_round_trip_replicates_restarts_and_retains_human_actor() {
     let answer = b.reply_custom_subject(&r).unwrap();
     assert_eq!(answer.actor.as_deref(), Some("person/lichen"));
     assert!(b.attention_items(Some("person/lichen")).unwrap().is_empty());
+    let closed = b
+        .attention_history_test_page("person/lichen", 5)
+        .unwrap()
+        .items;
+    assert_eq!(closed.len(), 1);
+    assert_eq!(closed[0]["resolution"]["kind"], "answered");
+    assert_eq!(closed[0]["resolution"]["by"], "person/lichen");
+    assert_eq!(closed[0]["episode"], q.id);
     assert_eq!(b.reply_custom_subject(&r).unwrap().id, answer.id);
     let mut changed = r.clone();
     changed.fields.insert("selection".into(), json!("discard"));
@@ -67,6 +75,12 @@ fn custom_round_trip_replicates_restarts_and_retains_human_actor() {
     );
     assert_eq!(a.custom_subject(id).unwrap(), b.custom_subject(id).unwrap());
     assert_eq!(
+        a.attention_history_test_page("person/lichen", 5)
+            .unwrap()
+            .items,
+        closed
+    );
+    assert_eq!(
         projection_digest::oracle(&a.readers.get()).unwrap(),
         projection_digest::oracle(&b.readers.get()).unwrap()
     );
@@ -78,6 +92,12 @@ fn custom_round_trip_replicates_restarts_and_retains_human_actor() {
     );
     assert!(b.attention_items(Some("person/lichen")).unwrap().is_empty());
     assert_eq!(b.claims_for(id, None).unwrap().len(), 2);
+    assert_eq!(
+        b.attention_history_test_page("person/lichen", 5)
+            .unwrap()
+            .items,
+        closed
+    );
 }
 #[test]
 fn custom_raw_writes_enforce_schema_namespace_and_human_authority() {
@@ -416,6 +436,10 @@ fn custom_signed_round_trip_late_manifest_partition_answers_and_checkpoint_repla
     assert_eq!(a.custom_subject(id).unwrap(), b.custom_subject(id).unwrap());
     let digest = projection_digest::oracle(&a.readers.get()).unwrap();
     assert_eq!(digest, projection_digest::oracle(&b.readers.get()).unwrap());
+    let closed = a.attention_history_test_page("person/lichen", 5).unwrap().items;
+    assert_eq!(closed.len(), 1);
+    assert_eq!(closed[0]["resolution"]["kind"], "answered");
+    assert_eq!(closed, b.attention_history_test_page("person/lichen", 5).unwrap().items);
     assert_eq!(a.custom_subject(id).unwrap().unwrap()["state"], "conflict");
     assert_eq!(
         a.custom_subject(id).unwrap().unwrap()["reply_conflicts"]
@@ -435,12 +459,120 @@ fn custom_signed_round_trip_late_manifest_partition_answers_and_checkpoint_repla
     assert!(plan.claims.iter().all(|c| !custom_ids.contains(&c.id)));
     a.apply_checkpoint_drop("checkpoint/garden", &plan.envelopes, &plan.claims)
         .unwrap();
+    assert_eq!(closed, a.attention_history_test_page("person/lichen", 5).unwrap().items, "actual checkpoint trim preserves retained closure provenance");
     a.connection
         .batched(replay_graph_from_nothing_tx)
         .unwrap()
         .unwrap();
     assert_eq!(before, a.custom_subject(id).unwrap());
     assert_eq!(digest, projection_digest::oracle(&a.readers.get()).unwrap());
+    assert_eq!(closed, a.attention_history_test_page("person/lichen", 5).unwrap().items);
+}
+
+#[test]
+fn custom_history_rebuilds_recorded_reopened_episodes_without_local_transitions() {
+    let a = Store::open_memory("alder").unwrap();
+    let b = Store::open_memory("birch").unwrap();
+    let mut manifest = example();
+    let kind = "custom.garden.review.v1.state";
+    manifest.claims.insert(
+        kind.into(),
+        schema::ClaimSchema {
+            authority: Authority::Owner,
+            fields: BTreeMap::from([(
+                "status".into(),
+                serde_json::from_value(
+                    json!({"value_type":"string","required":true,"values":["pending","closed"]}),
+                )
+                .unwrap(),
+            )]),
+            additional_fields: false,
+        },
+    );
+    manifest.slots.insert(
+        "state".into(),
+        schema::Slot {
+            kind: kind.into(),
+            select: Select::Last,
+        },
+    );
+    let attention = manifest.attention.as_mut().unwrap();
+    attention.when = Predicate::Eq {
+        left: Expr::Field {
+            slot: "state".into(),
+            field: "status".into(),
+        },
+        right: Expr::Constant {
+            value: json!("pending"),
+        },
+    };
+    attention.episode = Expr::ClaimId {
+        slot: "state".into(),
+    };
+    a.register_custom_kind(&RegistrationRequest {
+        manifest,
+        actor: "agent/garden/seed".into(),
+    })
+    .unwrap();
+    let id = "custom/garden/review/v1/reopened-history";
+    request(&a, id);
+    let mut episodes = Vec::new();
+    for (n, status) in ["pending", "closed", "pending", "closed"]
+        .into_iter()
+        .enumerate()
+    {
+        let c = a
+            .append_claim(&ClaimInput {
+                subject: id.into(),
+                kind: kind.into(),
+                actor: Some("agent/garden/seed".into()),
+                fields: BTreeMap::from([("status".into(), json!(status))]),
+                idempotency_key: Some(format!("custom-history-state-{n}")),
+                ..empty_input()
+            })
+            .unwrap();
+        if status == "pending" {
+            episodes.push(c.id);
+        }
+    }
+    let closed = a
+        .attention_history_test_page("person/lichen", 5)
+        .unwrap()
+        .items;
+    assert_eq!(closed.len(), 2);
+    assert_eq!(
+        closed
+            .iter()
+            .map(|r| r["episode"].as_str().unwrap().to_owned())
+            .collect::<BTreeSet<_>>(),
+        episodes.into_iter().collect()
+    );
+    assert!(closed.iter().all(
+        |r| r["resolution"]["kind"] == "closed" && r["resolution"]["by"] == "agent/garden/seed"
+    ));
+    // The late node never saw either episode open, yet derives both from the retained facts.
+    legacy_sync(&a, &b);
+    assert_eq!(
+        closed,
+        b.attention_history_test_page("person/lichen", 5)
+            .unwrap()
+            .items
+    );
+    b.connection
+        .batched(|tx| -> Result<()> {
+            tx.execute_batch(
+                "DELETE FROM local_attention_history_v2; DELETE FROM local_attention_history_dirty;",
+            )?;
+            super::super::attention_history::invalidate(tx)
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        closed,
+        b.attention_history_test_page("person/lichen", 5)
+            .unwrap()
+            .items
+    );
 }
 #[test]
 fn custom_offline_registration_conflicts_and_indexed_reads() {
