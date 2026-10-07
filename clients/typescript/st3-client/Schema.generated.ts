@@ -179,7 +179,7 @@ export const ActionCommon = /*#__PURE__*/ (() => Schema.Struct({
   "id": Id,
   "idempotency_key": Schema.String.check(Schema.isMinLength(16)).check(Schema.isMaxLength(256)).pipe(Schema.brand("st3/IdempotencyKey")),
   "parameters": Schema.Record(Schema.String, Schema.Unknown),
-  "type": Schema.Literals(["arrangement.edit","custom.reply","attention.resolve","review.approve","review.reject","review.request-changes","message.send","message.read","message.close","launch.create","launch.revise","launch.preview","launch.approve","launch.cancel","mission.start","mission.revise","mission.approve-revision","mission.cancel-revision","mission.cancel","session.import","work.ask","work.done","work.cancel-ask","work.claim","work.renew","work.progress","work.complete","work.fail","work.release","work.retry","work.publish-mission","agent.create","agent.stop","agent.start","agent.suspend","agent.resume","terminal.create","terminal.end","agent.queue-move","lane.join","lane.leave","lane.move","lane.mark","lane.approve","runtime.stop","runtime.restart","runtime.reset","runtime.context-clear","runtime.signal","terminal.input","terminal.resize","terminal.attach","terminal.detach","pairing.revoke"])
+  "type": Schema.Literals(["arrangement.edit","custom.reply","attention.resolve","review.approve","review.reject","review.request-changes","message.send","message.read","message.close","launch.create","launch.revise","launch.preview","launch.approve","launch.cancel","mission.start","mission.revise","mission.approve-revision","mission.cancel-revision","mission.cancel","session.import","work.ask","work.done","prompt.respond","work.cancel-ask","work.claim","work.renew","work.progress","work.complete","work.fail","work.release","work.retry","work.publish-mission","agent.create","agent.stop","agent.start","agent.suspend","agent.resume","terminal.create","terminal.end","agent.queue-move","lane.join","lane.leave","lane.move","lane.mark","lane.approve","runtime.stop","runtime.restart","runtime.reset","runtime.context-clear","runtime.signal","terminal.input","terminal.resize","terminal.attach","terminal.detach","pairing.revoke"])
 }).annotate({ identifier: "ActionCommon" }))()
 export type ActionCommon = typeof ActionCommon.Type
 export type ActionCommonEncoded = typeof ActionCommon.Encoded
@@ -379,6 +379,15 @@ export const PersonStepParameters = /*#__PURE__*/ (() => Schema.Struct({
 export type PersonStepParameters = typeof PersonStepParameters.Type
 export type PersonStepParametersEncoded = typeof PersonStepParameters.Encoded
 
+export const PromptRespondParameters = /*#__PURE__*/ (() => Schema.Struct({
+  "answer_id": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(256)),
+  "episode": Schema.String,
+  "prompt_id": Schema.String,
+  "target_id": Id
+}).annotate({ identifier: "PromptRespondParameters" }))()
+export type PromptRespondParameters = typeof PromptRespondParameters.Type
+export type PromptRespondParametersEncoded = typeof PromptRespondParameters.Encoded
+
 export const TargetParameters = /*#__PURE__*/ (() => Schema.Struct({
   "evidence": optionalKey(Schema.Array(Id)),
   "reason": optionalKey(Schema.String),
@@ -397,6 +406,8 @@ export type TerminalCreateParameters = typeof TerminalCreateParameters.Type
 export type TerminalCreateParametersEncoded = typeof TerminalCreateParameters.Encoded
 
 export const ActionRequest = /*#__PURE__*/ (() => Schema.Union([
+  Schema.Struct({ "api_version": Schema.Literal("st3.client.v0"), /** The snapshot and exact mutable identities the user acted on; echoed byte-identically in actions. */
+"fence": Schema.Struct({ "attempt": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "mission_generation": optionalKey(RunGenerationId), "preview_token": optionalKey(Schema.String.check(Schema.isPattern(new RegExp("^lpv0:[0-9a-f]{64}$", "u"))).pipe(Schema.brand("st3/PreviewToken"))), "readiness_epoch": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "runtime_desired_revision": optionalKey(Schema.String), "runtime_incarnation": Schema.String, "snapshot_id": SnapshotId, "step_definition": optionalKey(Revision), "subject_revisions": Schema.Record(Schema.String, Revision).check(Schema.makeFilter((o: object) => Object.keys(o).every(Schema.is(Schema.String.check(Schema.isPattern(new RegExp("^[a-z][a-z0-9-]*/", "u"))))), { expected: "property names matching the schema" })), "terminal_sequence": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))) }).annotate({ description: "The snapshot and exact mutable identities the user acted on; echoed byte-identically in actions." }), "id": Id, "idempotency_key": Schema.String.check(Schema.isMinLength(16)).check(Schema.isMaxLength(256)).pipe(Schema.brand("st3/IdempotencyKey")), "parameters": PromptRespondParameters, "type": Schema.Literal("prompt.respond") }),
   Schema.Struct({ "api_version": Schema.Literal("st3.client.v0"), "fence": Fence, "id": Id, "idempotency_key": Schema.String.check(Schema.isMinLength(16)).check(Schema.isMaxLength(256)).pipe(Schema.brand("st3/IdempotencyKey")), "parameters": ArrangementEditParameters, "type": Schema.Literal("arrangement.edit") }),
   Schema.Struct({ "api_version": Schema.Literal("st3.client.v0"), "fence": Fence, "id": Id, "idempotency_key": Schema.String.check(Schema.isMinLength(16)).check(Schema.isMaxLength(256)).pipe(Schema.brand("st3/IdempotencyKey")), "parameters": CustomReplyParameters, "type": Schema.Literal("custom.reply") }),
   Schema.Struct({ "api_version": Schema.Literal("st3.client.v0"), "fence": Fence, "id": Id, "idempotency_key": Schema.String.check(Schema.isMinLength(16)).check(Schema.isMaxLength(256)).pipe(Schema.brand("st3/IdempotencyKey")), "parameters": AgentCreateParameters, "type": Schema.Literal("agent.create") }),
@@ -1022,6 +1033,17 @@ export const AttentionBlocked = /*#__PURE__*/ (() => Schema.Struct({
 export type AttentionBlocked = typeof AttentionBlocked.Type
 export type AttentionBlockedEncoded = typeof AttentionBlocked.Encoded
 
+export const AttentionResolution = /*#__PURE__*/ (() => Schema.Struct({
+  "answer_label": optionalKey(Schema.String),
+  "at": optionalKey(Timestamp),
+  /** The source claim actor, including delegated agent IDs; never a device receipt. */
+  "by": optionalKey(Id),
+  "kind": optionalKey(Schema.Literals(["answered","withdrawn","cancelled","closed"])),
+  "reason": optionalKey(Schema.String)
+}).annotate({ identifier: "AttentionResolution" }))()
+export type AttentionResolution = typeof AttentionResolution.Type
+export type AttentionResolutionEncoded = typeof AttentionResolution.Encoded
+
 export const AttentionTargetState = /*#__PURE__*/ (() => Schema.Struct({
   "id": Id,
   "since": optionalKey(Timestamp),
@@ -1029,6 +1051,36 @@ export const AttentionTargetState = /*#__PURE__*/ (() => Schema.Struct({
 }).annotate({ identifier: "AttentionTargetState" }))()
 export type AttentionTargetState = typeof AttentionTargetState.Type
 export type AttentionTargetStateEncoded = typeof AttentionTargetState.Encoded
+
+export const PromptChoice = /*#__PURE__*/ (() => Schema.Struct({
+  "consequence": Schema.String,
+  "id": Schema.String,
+  "label": Schema.String
+}).annotate({ identifier: "PromptChoice" }))()
+export type PromptChoice = typeof PromptChoice.Type
+export type PromptChoiceEncoded = typeof PromptChoice.Encoded
+
+export const HarnessPrompt = /*#__PURE__*/ (() => Schema.Struct({
+  "at": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
+  "by": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
+  "can_answer": optionalKey(Schema.Boolean),
+  "capability": optionalKey(Schema.String),
+  "choices": optionalKey(Schema.Array(PromptChoice)),
+  "content": optionalKey(Schema.String),
+  "disposition": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
+  "expires_at": optionalKey(Schema.String),
+  "how": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
+  "kind": optionalKey(Schema.String),
+  "next_action": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
+  "prompt_id": optionalKey(Schema.String),
+  "provider": optionalKey(Schema.String),
+  "resolved_at_unix_ms": Schema.OptionFromOptionalNullOr(Schema.Int, NULL_NONE),
+  "runtime_incarnation": optionalKey(Schema.String),
+  "seat_id": optionalKey(Schema.String),
+  "state": optionalKey(Schema.Literals(["open","answered","cancelled","timed_out","ended","unavailable"]))
+}).annotate({ identifier: "HarnessPrompt" }))()
+export type HarnessPrompt = typeof HarnessPrompt.Type
+export type HarnessPromptEncoded = typeof HarnessPrompt.Encoded
 
 export const LaunchPreview = /*#__PURE__*/ (() => Schema.Struct({
   "agents": Schema.Array(Schema.Struct({ "harness": optionalKey(Schema.Unknown), "host": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "id": Schema.String, "worktree": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE) })),
@@ -1055,8 +1107,8 @@ export type PersonUpdateEncoded = typeof PersonUpdate.Encoded
 
 export const Attention = /*#__PURE__*/ (() => Schema.Struct({
   "action_parameters": optionalKey(Schema.Record(Schema.String, Schema.Unknown)),
-  "actions": Schema.Array(Schema.Literals(["custom.reply","work.done","review.approve","review.reject","review.request-changes","launch.approve","launch.cancel","mission.approve-revision","mission.cancel-revision","message.read"])),
-  "attention_kind": Schema.Union([Schema.Literals(["human-gate","launch-approval","revision-approval","unread-message","person-step","agent-request","fault"]), Schema.String.check(Schema.isPattern(new RegExp("^custom\\.[a-zA-Z0-9_.-]+$", "u")))]),
+  "actions": Schema.Array(Schema.Literals(["custom.reply","work.done","prompt.respond","review.approve","review.reject","review.request-changes","launch.approve","launch.cancel","mission.approve-revision","mission.cancel-revision","message.read"])),
+  "attention_kind": Schema.Union([Schema.Literals(["human-gate","launch-approval","revision-approval","unread-message","person-step","agent-request","fault","harness-prompt"]), Schema.String.check(Schema.isPattern(new RegExp("^custom\\.[a-zA-Z0-9_.-]+$", "u")))]),
   "because": optionalKey(Schema.String),
   /** The mission step waiting on this ask, on an ask a mission step made; absent on a standalone ask. */
   "blocked": optionalKey(AttentionBlocked),
@@ -1076,10 +1128,13 @@ export const Attention = /*#__PURE__*/ (() => Schema.Struct({
   "preview": Schema.OptionFromOptionalNullOr(LaunchPreview, NULL_NONE),
   "preview_token": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
   "priority": Schema.Literals(["critical","high","normal","low"]),
+  "prompt": optionalKey(HarnessPrompt),
   /** A person-step ask's structured request; absent on a free-text ask. */
   "request": optionalKey(StructuredRequest),
   "requested_at": Timestamp,
   "requester_id": optionalKey(Id),
+  /** Recorded source closure; every field is optional when historical provenance is unavailable. */
+  "resolution": optionalKey(AttentionResolution),
   "review_mode": optionalKey(Schema.Literals(["approve","feedback"])),
   "revision": Revision,
   "source_id": Id,
@@ -1097,6 +1152,14 @@ export const Attention = /*#__PURE__*/ (() => Schema.Struct({
 }).annotate({ identifier: "Attention" }))()
 export type Attention = typeof Attention.Type
 export type AttentionEncoded = typeof Attention.Encoded
+
+export const AttentionHistoryAvailability = /*#__PURE__*/ (() => Schema.Struct({
+  "complete": Schema.Boolean,
+  "note": optionalKey(Schema.String.check(Schema.isMaxLength(120))),
+  "since": optionalKey(Timestamp)
+}).annotate({ identifier: "AttentionHistoryAvailability" }))()
+export type AttentionHistoryAvailability = typeof AttentionHistoryAvailability.Type
+export type AttentionHistoryAvailabilityEncoded = typeof AttentionHistoryAvailability.Encoded
 
 export const BlobChunk = /*#__PURE__*/ (() => Schema.Struct({
   /** Base64 of up to 512 KiB starting at offset. */
@@ -2252,6 +2315,7 @@ export type MailBacklogEncoded = typeof MailBacklog.Encoded
 export const Page = /*#__PURE__*/ (() => Schema.Struct({
   "collection": Schema.String.check(Schema.makeFilter((value: string) => value !== "resources", { expected: "a string other than \"resources\"" })),
   "filters": Schema.Record(Schema.String, Schema.String),
+  "history": optionalKey(AttentionHistoryAvailability),
   "items": Schema.Array(Resource),
   "kind": Schema.Literal("page"),
   "page": PageInfo,

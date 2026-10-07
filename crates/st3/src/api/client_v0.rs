@@ -315,6 +315,7 @@ async fn collection_items_with_windows(
                         )?,
                         _ => unreachable!(),
                     };
+                    super::prompts::retain_authorized(&mut items, &current.authority_actor);
                     client_attention_compatibility(&mut items, custom_forms);
                     // Agent status/availability depends on live local delivery presence; overlay and
                     // filter it on every read, after reusing the immutable graph-derived rows.
@@ -1534,6 +1535,7 @@ const LIMITED_PAIRING_SCOPES: &[&str] = &[
     "control.launches",
 ];
 const ACTIONS: &[&str] = &[
+    "prompt.respond",
     "arrangement.edit",
     "attention.resolve",
     "review.approve",
@@ -1590,6 +1592,7 @@ const ACTIONS: &[&str] = &[
     "pairing.revoke",
 ];
 const AVAILABLE_ACTIONS: &[&str] = &[
+    "prompt.respond",
     "custom.reply",
     "arrangement.edit",
     "review.approve",
@@ -3453,6 +3456,8 @@ pub(super) async fn missions(
     let next_cursor = has_more
         .then(|| {
             encode_client_cursor(&ClientPageCursor {
+                history_snapshot: None,
+                prompt_history: None,
                 snapshot: snapshot.clone(),
                 collection: "missions".into(),
                 offset: offset.saturating_add(items.len()),
@@ -3489,6 +3494,7 @@ pub(super) async fn missions(
         },
         sync: client_sync_notice(&state),
         replicated: None,
+        history: None,
     };
     Ok((Extension(snapshot), Json(page)))
 }
@@ -3829,6 +3835,7 @@ pub(super) async fn now(
         move |state, snapshot| {
             let mut items =
                 super::client_attention_resources_with_previews(state, person.as_deref(), history)?;
+            super::prompts::retain_authorized(&mut items, &session.authority_actor);
             client_attention_compatibility(&mut items, session.custom_forms);
             // The default Now view is the person's attention queue. Mission work belongs
             // in Control; only an explicit work filter opts it into this combined view.
@@ -5991,6 +5998,13 @@ fn safe_event_projection(state: &AppState, record: &EventRecord) -> (String, Vec
         );
     }
     let fields = record.body.get("fields").unwrap_or(&record.body);
+    if record.kind == "harness.prompt" {
+        return (
+            "attention.changed".into(),
+            vec![record.subject.clone()],
+            json!({"reason":"native-prompt-source-changed"}),
+        );
+    }
     if record.kind == "harness.timeline" {
         let resource_ids = fields
             .get("incarnation_id")
@@ -6216,12 +6230,18 @@ type FeedEvent = (EventRecord, Option<u64>);
 
 fn local_feed_event(record: ClaimRecord) -> FeedEvent {
     let local = crate::store::local_observation_position(&record);
+    // The activity stream is an overview, not an owning person's prompt surface.
+    let body = if record.kind == "harness.prompt" {
+        json!({"fields":{"incarnation_id":record.body["fields"]["incarnation_id"],
+            "episode":record.body["fields"]["prompt"]["episode"],
+            "state":record.body["fields"]["prompt"]["state"]}})
+    } else { record.body };
     (
         EventRecord {
             store_index: record.store_index,
             kind: record.kind,
             subject: record.subject,
-            body: record.body,
+            body,
         },
         local,
     )
@@ -7918,7 +7938,7 @@ fn action_scope(action: &str) -> Option<&'static str> {
     ) {
         return Some("control.runtimes");
     }
-    if matches!(action, "work.done" | "custom.reply") {
+    if matches!(action, "work.done" | "custom.reply" | "prompt.respond") {
         return Some("control.attention");
     }
     Some(match action.split_once('.')?.0 {
@@ -8611,6 +8631,24 @@ async fn dispatch_action(
     let p = &request.parameters;
     let authority_actor = &session.authority_actor;
     match request.action_type.as_str() {
+        "prompt.respond" => {
+            let target=parameter_string(p,"target_id")?;
+            let answer=st_drivers::prompts::Answer {
+                episode:parameter_string(p,"episode")?,prompt_id:parameter_string(p,"prompt_id")?,
+                answer_id:parameter_string(p,"answer_id")?,
+                runtime_incarnation:request.fence.runtime_incarnation.clone().ok_or_else(|| validation("permission response requires runtime incarnation"))?,
+            };
+            if target!=format!("prompt/{}",answer.episode) { return Err(validation("permission target differs from episode")); }
+            let prompt=state.store.reserve_prompt(authority_actor,&answer,&request.idempotency_key).map_err(ApiError::bad)?;
+            signal_changed(state);
+            let endpoint=prompt.endpoint.ok_or_else(|| validation("permission response endpoint unavailable"))?;
+            let result=tokio::task::spawn_blocking(move || st_drivers::prompts::send_answer(&endpoint,&answer))
+                .await.map_err(ApiError::internal)?.map_err(|_| ApiError::bad(St3Error::new("permission-transport-uncertain","native response delivery failed; prompt remains fenced until the provider settles it")))?;
+            signal_changed(state);
+            if result["accepted"]!=true { return Err(ApiError::bad(St3Error::new(
+                match result["code"].as_str() { Some("stale-permission-prompt") => "stale-permission-prompt", Some("permission-expired") => "permission-expired", Some("permission-already-answered") => "permission-already-answered", _ => "permission-provider-rejected" },"native provider refused this permission response"))); }
+            Ok(vec![target])
+        }
         "agent.create" => create_agent(state, snapshot, session, request).await,
         "terminal.create" => create_terminal(state, snapshot, session, request).await,
         "terminal.end" => {
@@ -9994,6 +10032,285 @@ pub(super) async fn action(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn prompt_response_round_trip_uses_native_socket_and_keeps_content_private() {
+        use std::time::{Duration, Instant};
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "prompt-fixture");
+        let seat = "agent/garden/orchard";
+        let intent = crate::parse_intent(
+            "version 2\nagent \"garden/orchard\" { command \"true\" }",
+            state.store.origin(),
+        )
+        .unwrap();
+        let plan = state
+            .store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: String::new(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply_as(
+                &intent,
+                &plan.subject_tokens,
+                "prompt-declaration",
+                Some("person/ada"),
+            )
+            .unwrap();
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: seat.into(),
+                kind: "runtime.observed".into(),
+                actor: Some(seat.into()),
+                fields: BTreeMap::from([
+                    ("status".into(), json!("running")),
+                    ("incarnation_id".into(), json!("runtime-a")),
+                ]),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let native = tempfile::tempdir().unwrap();
+        st_drivers::harness_events::enable(native.path(), "runtime-a").unwrap();
+        st_drivers::harness_events::write_snapshot(
+            native.path(),
+            "harness-state",
+            &serde_json::to_vec(&json!({"incarnation":"provider-a","harness":"claude"})).unwrap(),
+        )
+        .unwrap();
+        let path = native.path().to_owned();
+        let worker = std::thread::spawn(move || {
+            let mut output = Vec::new();
+            st_drivers::prompts::run_claude(&path,"provider-a",&json!({"session_id":"session-a","tool_name":"Bash","tool_input":{"command":"printf private-fixture"}}),Duration::from_secs(20),&mut output,&||false).unwrap();
+            output
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let prompt = loop {
+            if let Some(p) = st_drivers::harness_events::live_prompts(native.path(), "runtime-a")
+                .unwrap()
+                .into_iter()
+                .next()
+            {
+                break p;
+            }
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        let publish = |p: &st_drivers::prompts::Prompt, sequence| {
+            state
+                .store
+                .append_harness_event(&crate::harness_events::Publication {
+                    runtime_incarnation: p.runtime_incarnation.clone(),
+                    sequence,
+                    claim: ClaimInput {
+                        subject: seat.into(),
+                        kind: "harness.prompt".into(),
+                        actor: Some(seat.into()),
+                        fields: BTreeMap::from([
+                            ("incarnation_id".into(), json!(p.runtime_incarnation)),
+                            ("prompt".into(), json!(p)),
+                        ]),
+                        evidence: vec![],
+                        expected_subject: None,
+                        idempotency_key: Some(format!("prompt:{sequence}")),
+                    },
+                })
+                .unwrap()
+                .0
+        };
+        let record = publish(&prompt, 1);
+        let feed = serde_json::to_string(&local_feed_event(record).0.body).unwrap();
+        assert!(!feed.contains("private-fixture"));
+        assert!(!feed.contains("/reply"));
+        let resources =
+            super::super::client_attention_resources(&state.store, Some("person/ada"), false)
+                .unwrap();
+        let card = resources
+            .iter()
+            .find(|c| c["attention_kind"] == "harness-prompt")
+            .unwrap();
+        assert_eq!(card["prompt"]["content"], "printf private-fixture");
+        assert!(card["prompt"].get("endpoint").is_none());
+        let readonly = ClientSession::local(None).unwrap();
+        let query: ClientListQuery =
+            serde_json::from_value(json!({"person":"person/ada"})).unwrap();
+        let (_, Json(page)) = super::super::client_attention(
+            State(state.clone()),
+            Extension(new_client_snapshot(&state)),
+            Extension(readonly.clone()),
+            Query(query.clone()),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !serde_json::to_string(&page)
+                .unwrap()
+                .contains("private-fixture")
+        );
+        let (_, Json(page)) = now(
+            State(state.clone()),
+            Extension(new_client_snapshot(&state)),
+            Extension(readonly.clone()),
+            Query(query),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !serde_json::to_string(&page)
+                .unwrap()
+                .contains("private-fixture")
+        );
+        let subscribe: CollectionSubscribe = serde_json::from_value(json!({"kind":"subscribe","id":"private-prompt","collection":"attention","person":"person/ada"})).unwrap();
+        for session in [
+            &readonly,
+            &ClientSession::local(Some("person/ada")).unwrap(),
+        ] {
+            let permit = Arc::new(tokio::sync::Semaphore::new(1))
+                .acquire_owned()
+                .await
+                .unwrap();
+            let (_, streamed, _) = collection_items(&state, session, &subscribe, permit)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::to_string(&streamed)
+                    .unwrap()
+                    .contains("private-fixture"),
+                session.authority_actor == "person/ada"
+            );
+        }
+        let mut schema: Value = serde_json::from_str(include_str!(
+            "../../../../docs/st3/client-v0/schemas/client-v0.schema.json"
+        ))
+        .unwrap();
+        schema.as_object_mut().unwrap().remove("oneOf");
+        schema["$ref"] = json!("#/$defs/HarnessPrompt");
+        let validator = jsonschema::options()
+            .with_draft(jsonschema::Draft::Draft202012)
+            .build(&schema)
+            .unwrap();
+        let errors = validator
+            .iter_errors(&card["prompt"])
+            .map(|error| error.to_string())
+            .collect::<Vec<_>>();
+        assert!(errors.is_empty(), "{errors:?}");
+        let snapshot = new_client_snapshot(&state);
+        let request = ActionRequest {
+            api_version: CLIENT_API_VERSION.into(),
+            id: "action/prompt-fixture".into(),
+            action_type: "prompt.respond".into(),
+            idempotency_key: "prompt-fixture-answer-001".into(),
+            fence: Fence {
+                snapshot_id: snapshot.id.clone(),
+                runtime_incarnation: Some("runtime-a".into()),
+                ..Default::default()
+            },
+            parameters: json!({"target_id":format!("prompt/{}",prompt.episode),"episode":prompt.episode,"prompt_id":prompt.prompt_id,"answer_id":"approve"}),
+        };
+        let session = ClientSession::local(Some("person/ada")).unwrap();
+        assert_eq!(
+            dispatch_action(
+                &state,
+                &snapshot,
+                &ClientSession::local(Some("person/intruder")).unwrap(),
+                &request
+            )
+            .await
+            .unwrap_err()
+            .code,
+            "forbidden"
+        );
+        let result = action(
+            State(state.clone()),
+            Extension(snapshot.clone()),
+            Extension(session.clone()),
+            Json(request.clone()),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(result["status"], "completed");
+        let output: Value = serde_json::from_slice(&worker.join().unwrap()).unwrap();
+        assert_eq!(
+            output["hookSpecificOutput"]["decision"]["behavior"],
+            "allow"
+        );
+        let replay = action(
+            State(state.clone()),
+            Extension(snapshot),
+            Extension(session),
+            Json(request),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(replay["operation_id"], result["operation_id"]);
+        let mut final_event = st_drivers::harness_events::pending(native.path(), 32)
+            .unwrap()
+            .into_iter()
+            .rev()
+            .find(|e| e.kind == "harness-prompt")
+            .unwrap()
+            .payload;
+        final_event.as_object_mut().unwrap().remove("account_ref");
+        let final_prompt: st_drivers::prompts::Prompt =
+            serde_json::from_value(final_event).unwrap();
+        publish(&final_prompt, 2);
+        assert!(
+            state
+                .store
+                .prompt_items(Some("person/ada"), client_now_ms())
+                .unwrap()
+                .is_empty()
+        );
+        let closed = state
+            .store
+            .prompt_metadata(&prompt.episode, "person/ada")
+            .unwrap()
+            .unwrap();
+        assert_eq!(closed["state"], "answered");
+        assert_eq!(closed["can_answer"], false);
+        // Local native closures must remain visible even when no replicated claim has
+        // advanced the graph's snapshot clock since the seat declaration.
+        let query: ClientListQuery = serde_json::from_value(json!({"history":true})).unwrap();
+        let (_, Json(history)) = super::super::client_attention(
+            State(state.clone()),
+            Extension(new_client_snapshot(&state)),
+            Extension(ClientSession::local(Some("person/ada")).unwrap()),
+            Query(query.clone()),
+        )
+        .await
+        .unwrap();
+        assert!(
+            history
+                .items
+                .iter()
+                .any(|item| item["episode"] == prompt.episode)
+        );
+        let id = card["id"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("attention/")
+            .unwrap()
+            .to_owned();
+        let Json(detail) = super::super::client_attention_detail(
+            State(state.clone()),
+            Extension(new_client_snapshot(&state)),
+            Extension(ClientSession::local(Some("person/ada")).unwrap()),
+            AxumPath(id),
+            Query(query),
+        )
+        .await
+        .unwrap();
+        assert_eq!(detail["prompt"]["state"], "answered");
+    }
     use super::*;
     use std::os::unix::fs::MetadataExt as _;
     use std::sync::Barrier;

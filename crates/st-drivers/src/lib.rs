@@ -72,6 +72,7 @@ mod pi_family_session;
 pub mod pi_session;
 pub mod pretrust;
 pub mod provider_session;
+pub mod prompts;
 pub mod push_mailbox;
 pub mod reconcile;
 pub mod reexec;

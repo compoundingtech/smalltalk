@@ -634,6 +634,8 @@ fn validate_surfaces(
         "ResourceObservation",
         "ResourcesFilter",
         "ResourcesPage",
+        "AttentionHistoryAvailability",
+        "AttentionResolution",
         "AttentionBlocked",
         "AttentionTargetState",
         "DocumentContent",
