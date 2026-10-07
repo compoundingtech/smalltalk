@@ -5270,6 +5270,13 @@ impl Ui {
                 }
             }
             Hit::Key('s') if self.glasses.is_none() => self.sidebar = !self.sidebar,
+            // "↑↓ Another" while an answer is being chosen goes to the next one, round again.
+            Hit::Key('a') if self.answering.is_some() => {
+                let count = self
+                    .structured_request()
+                    .map_or(0, |(_, request)| request.answers.len());
+                self.answering = self.answering.map(|index| (index + 1) % count.max(1));
+            }
             Hit::Key(key) => {
                 if key == 'y' {
                     if let Some(action) = self.confirm.take() {
@@ -5281,6 +5288,10 @@ impl Ui {
                 }
             }
             Hit::Enter if self.new_mission.is_some() => self.create_launch(),
+            // "Send this answer" sends the answer being chosen, not the (empty) text box.
+            Hit::Enter if self.answering.is_some() => {
+                self.answer_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            }
             Hit::Enter => {
                 if self.chat.is_some() {
                     self.submit_chat()
@@ -5288,6 +5299,7 @@ impl Ui {
                     self.submit()
                 }
             }
+            Hit::Escape if self.answering.is_some() => self.answering = None,
             Hit::Escape if self.new_mission.is_some() => {
                 self.new_mission = None;
                 self.close_form_tab();
@@ -6435,6 +6447,84 @@ mod tests {
                 if id == "attention/shipped" && answer == "read" && reason == "Read it"),
             "{:?}",
             ui.effects
+        );
+    }
+
+    #[test]
+    fn the_buttons_under_a_chosen_answer_send_it_move_on_and_put_it_away() {
+        // Nathan, 2026-10-07: "I can't choose an option for this attention item, it says I must
+        // write something": the Send button went to the empty text box.
+        let mut world = demo::world();
+        let option = |id: &str, label: &str| st3_client::RequestAnswerOption {
+            id: id.into(),
+            label: label.into(),
+            consequence: "Clears this item.".into(),
+            ..Default::default()
+        };
+        let request = st3_client::StructuredRequest {
+            version: 1,
+            entry_type: "choice".into(),
+            question: "What should change?".into(),
+            why_person: "Only you can say.".into(),
+            summary: None,
+            reasons: Vec::new(),
+            recommendation: None,
+            subjects: Vec::new(),
+            answers: vec![option("a", "Refresh"), option("b", "Shorten"), option("c", "Leave it")],
+            custom: false,
+        };
+        let item = Attention {
+            id: "attention/choose".into(),
+            tier: Tier::Stopped,
+            title: "What should change?".into(),
+            waiting: None,
+            age: "1h".into(),
+            mission: None,
+            agent: Some("agent/example/cos".into()),
+            kind: AttentionKind::Request {
+                from: "Chief of Staff".into(),
+                from_id: "agent/example/cos".into(),
+                question: request.question.clone(),
+                structured: Some(Box::new(request)),
+            },
+            actions: vec!["work.done".into()],
+            related: Vec::new(),
+            raised_by: None,
+            blocked: None,
+        };
+        if let Load::Ready(items) = &mut world.attention {
+            items.insert(0, item);
+        }
+        let mut ui = Ui::new(world);
+        ui.live = true;
+        ui.tab = 0;
+        ui.select(0);
+        ui.click(Hit::Answer(1));
+        // Another goes to the next answer, round again, and does not start over at the first.
+        ui.click(Hit::Key('a'));
+        assert_eq!(ui.answering, Some(2));
+        ui.click(Hit::Key('a'));
+        assert_eq!(ui.answering, Some(0));
+        ui.click(Hit::Key('a'));
+        ui.click(Hit::Key('a'));
+        assert_eq!(ui.answering, Some(2));
+        // Not now puts it away without sending.
+        ui.click(Hit::Escape);
+        assert_eq!(ui.answering, None);
+        assert!(ui.effects.is_empty(), "{:?}", ui.effects);
+        // Send this answer sends the chosen one, and never says "Write something first".
+        ui.click(Hit::Answer(2));
+        ui.click(Hit::Enter);
+        assert!(
+            matches!(&ui.effects[..], [Effect::Attention { id, answer: Some(answer), .. }]
+                if id == "attention/choose" && answer == "c"),
+            "{:?}",
+            ui.effects
+        );
+        assert!(
+            ui.flash.as_ref().is_none_or(|(text, _)| !text.contains("Write something")),
+            "{:?}",
+            ui.flash
         );
     }
 
