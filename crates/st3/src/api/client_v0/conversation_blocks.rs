@@ -395,10 +395,13 @@ pub(super) fn read(
     session: &ClientSession,
     session_id: &str,
 ) -> Result<Vec<Value>, ApiError> {
+    let timeline = crate::external_sessions::LineTimeline::acquire(source);
+    let mut held = timeline.hold();
+    // The fold is held before the slot is taken: waiting viewers of this conversation hold
+    // no global read slot, so they never crowd an unrelated conversation out of the budget.
     let _slot = read_slot(&READ_SLOTS)?;
     let before = basis(source)?;
-    let items =
-        crate::external_sessions::normalized_timeline(source).map_err(ApiError::internal)?;
+    let items = held.read(source).map_err(ApiError::internal)?;
     if before != basis(source)? {
         return Err(invalidated());
     }
@@ -413,6 +416,8 @@ pub(super) struct PreparedSlice {
     pub(super) items: Vec<Value>,
     pub(super) has_more: bool,
     pub(super) basis: String,
+    /// Source content generation at this slice; moves on any non-append transcript change.
+    pub(super) generation: u64,
 }
 
 pub(super) fn read_slice(
@@ -423,9 +428,13 @@ pub(super) fn read_slice(
     before: Option<&crate::external_sessions::TimelineKey>,
     limit: usize,
 ) -> Result<PreparedSlice, ApiError> {
+    let timeline = crate::external_sessions::LineTimeline::acquire(source);
+    let mut held = timeline.hold();
+    // Same ordering as `read`: park on the shared fold first, then take the global slot.
     let _slot = read_slot(&READ_SLOTS)?;
     let basis = basis(source)?;
-    let mut slice = crate::external_sessions::timeline_slice(source, order, before, limit)
+    let mut slice = held
+        .slice(source, order, before, limit)
         .map_err(ApiError::internal)?;
     for item in &mut slice.items {
         prepare_one(source, session, session_id, &basis, item)?;
@@ -437,6 +446,7 @@ pub(super) fn read_slice(
         items: slice.items,
         has_more: slice.has_more,
         basis,
+        generation: slice.generation,
     })
 }
 
@@ -1978,6 +1988,77 @@ mod tests {
         db.execute("UPDATE part SET message_id='renamed-message'", [])
             .unwrap();
         assert!(located_value(&native, &location).is_err());
+    }
+
+    fn fold_fixture(root: &std::path::Path, name: &str) -> ExternalSession {
+        let path = root.join(format!(".omp/agent/sessions/{name}/{name}.jsonl"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let header = json!({"type":"session","id":name,"cwd":"/work/example","timestamp":"2026-10-06T12:00:00Z"});
+        let message = json!({"type":"message","id":format!("message-{name}"),"timestamp":"2026-10-06T12:00:01Z","message":{"role":"assistant","content":[{"type":"text","text":format!("content of {name}")}]}});
+        std::fs::write(&path, format!("{header}\n{message}\n")).unwrap();
+        ExternalSession {
+            id: format!("session/external-{name}"),
+            revision: "revision-test".into(),
+            driver: ExternalDriver::Omp,
+            native_id: name.into(),
+            transcript: path,
+            codex_home: None,
+            cwd: None,
+            title: None,
+            started_at_unix_ms: 0,
+            updated_at_unix_ms: 0,
+            process: None,
+        }
+    }
+
+    #[test]
+    fn same_fold_viewers_wait_without_holding_global_read_slots() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().to_owned();
+        let shared = fold_fixture(&home, "shared").transcript;
+        crate::external_sessions::timeline_test_support::arm_refresh(&shared);
+        let identities = |items: &[Value]| {
+            items
+                .iter()
+                .map(|item| (item["id"].clone(), item["sequence"].clone()))
+                .collect::<Vec<_>>()
+        };
+        let viewer = |name: &'static str| {
+            let source = fold_fixture(&home, name);
+            let session = ClientSession::local(Some("person/example")).unwrap();
+            std::thread::spawn(move || {
+                read_slice(
+                    &source,
+                    &session,
+                    &source.id,
+                    crate::external_sessions::TimelineOrder::Sequence,
+                    None,
+                    10,
+                )
+            })
+        };
+        let first = viewer("shared");
+        crate::external_sessions::timeline_test_support::wait_refresh_arrived(&shared);
+        let parked: Vec<_> = (0..4).map(|_| viewer("shared")).collect();
+        // Every viewer of the shared transcript is queued on its fold, none on a read slot.
+        crate::external_sessions::timeline_test_support::wait_fold_waiters(4);
+        let unrelated = viewer("other");
+        let unrelated = unrelated.join().unwrap().unwrap();
+        assert!(
+            serde_json::to_string(&unrelated.items)
+                .unwrap()
+                .contains("content of other"),
+            "another conversation is admitted while the shared fold is contended"
+        );
+        crate::external_sessions::timeline_test_support::release_refresh(&shared);
+        let first = first.join().unwrap().unwrap();
+        assert!(!first.items.is_empty());
+        for viewer in parked {
+            assert_eq!(
+                identities(&viewer.join().unwrap().unwrap().items),
+                identities(&first.items)
+            );
+        }
     }
 
     #[test]

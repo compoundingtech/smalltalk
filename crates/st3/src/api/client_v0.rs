@@ -4244,8 +4244,9 @@ fn native_timeline_order(
 
 pub(super) const NATIVE_PAGE_CURSOR_PREFIX: &str = "page/native/";
 
-/// All stateless cursor authority is authenticated, including expiry and the source basis.
-/// A process restart changes the key, invalidating these pages just like cached offset pages.
+/// All stateless cursor authority is authenticated, including expiry, the source basis, and
+/// the source's content generation. A process restart changes the key, invalidating these
+/// pages just like cached offset pages.
 #[derive(Serialize, Deserialize)]
 struct NativePagePosition {
     session_id: String,
@@ -4256,6 +4257,9 @@ struct NativePagePosition {
     filter_digest: String,
     snapshot: ClientSnapshot,
     source_basis: String,
+    /// Content generation at the page boundary. An in-place replacement moves it even when
+    /// driver, native id, path and inode are unchanged.
+    source_generation: u64,
     expires_at_unix_ms: u128,
 }
 
@@ -4361,6 +4365,13 @@ fn native_slice_page(
     if native.basis != source_basis {
         return Err(client_page_expired("the transcript changed while reading the page"));
     }
+    if let Some(cursor) = &cursor
+        && cursor.source_generation != native.generation
+    {
+        return Err(client_page_expired(
+            "the transcript was replaced while paging; restart pagination",
+        ));
+    }
     let messages = if order == crate::external_sessions::TimelineOrder::TimestampSequence {
         native_session_messages(state, snapshot, session_id)?
     } else {
@@ -4405,6 +4416,7 @@ fn native_slice_page(
             limit,
             filter_digest,
             source_basis,
+            source_generation: native.generation,
             expires_at_unix_ms,
         })?)
     } else {
@@ -15063,6 +15075,57 @@ mission "example/zero-run" state="ready" {
         assert_eq!(texts, ["third", "second", "first"]);
         assert_eq!(walked.last().unwrap()["type"], "truncation");
         assert_eq!(walked.last().unwrap()["sequence"], 0);
+    }
+
+    #[test]
+    fn native_page_cursor_expires_after_in_place_transcript_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "native-replaced-pages");
+        let session_id = "session/external-replaced-pages";
+        let path = root.path().join("replaced.jsonl");
+        let record = |id: &str, text: &str, stamp: &str| json!({
+            "type":"response_item", "timestamp":stamp,
+            "payload":{"type":"message", "role":"assistant", "id":id,
+                "content":[{"type":"output_text", "text":text}]}
+        });
+        std::fs::write(&path, format!(
+            "{}\n{}\n{}\n",
+            record("one", "first", "2099-01-01T00:00:00Z"),
+            record("two", "second", "2030-01-01T00:00:00Z"),
+            record("three", "third", "2020-01-01T00:00:00Z"),
+        )).unwrap();
+        let source = page_test_source(&path, session_id);
+        let snapshot = new_client_snapshot(&state);
+        let session = ClientSession::local(Some("person/alex")).unwrap();
+        let first = native_slice_page(&state, &snapshot, &session, session_id,
+            &ClientListQuery { limit: Some(1), ..Default::default() }, &source).unwrap().0;
+        let cursor = first["page"]["next_cursor"].as_str().unwrap().to_owned();
+        // Rewrite in place: same driver, native id, path and inode, different content.
+        #[cfg(unix)]
+        let inode_before = {
+            use std::os::unix::fs::MetadataExt as _;
+            std::fs::metadata(&path).unwrap().ino()
+        };
+        std::fs::write(&path, format!(
+            "{}\n", record("replaced", "replaced", "2099-01-01T00:00:00Z"),
+        )).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode_before,
+                "the replacement must keep the same inode");
+        }
+        let error = native_slice_page(&state, &snapshot, &session, session_id,
+            &ClientListQuery { cursor: Some(cursor), ..Default::default() }, &source)
+            .unwrap_err();
+        assert_eq!(error.status, StatusCode::GONE);
+        assert_eq!(error.code, "page-cursor-expired");
+        // A fresh page sequence reads the replaced transcript normally.
+        let fresh = native_slice_page(&state, &snapshot, &session, session_id,
+            &ClientListQuery { limit: Some(1), ..Default::default() }, &source).unwrap().0;
+        let texts: Vec<_> = fresh["items"].as_array().unwrap().iter()
+            .filter_map(|item| item["body"]["text"].as_str()).collect();
+        assert_eq!(texts, ["replaced"]);
     }
 
     #[test]

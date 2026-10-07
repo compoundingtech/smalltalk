@@ -1683,8 +1683,14 @@ including secrets in exposed reasoning, tool arguments/output and unknown JSON.
 Local people and agents, anonymous local read-only Unix readers, and default paired
 phones and wall displays have this access. No content is scrubbed. Refs die on a
 daemon restart; clients must reload the timeline. Four expensive owner timeline/chunk
-reads can run concurrently; busy reads return HTTP 429 `rate-limited`, including
-managed timeline reads. Clients must back off and retry.
+reads can run concurrently; viewers of the same conversation queue on that transcript's
+bounded read instead of the shared budget, so busy reads returning HTTP 429 `rate-limited`
+(including managed timeline reads) mean four different transcripts are mid-refresh, not
+another viewer of this one. Clients must back off and retry.
+Native timeline page cursors also carry the transcript's content generation. Appends keep
+a page valid, while an in-place replacement or truncation of the same file — identical
+driver, native session, path and inode — expires outstanding cursors with
+`page-cursor-expired` so no old page boundary is ever applied to rewritten records.
 Known blocks can use `payload: {body_ref: true}` to refer to the containing fallback
 body without duplicating its bytes. Content refs authenticate one native record;
 chunk reads do not rebuild the session. The owner never requests transcript HTTP(S)

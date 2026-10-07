@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::{BufRead as _, BufReader, Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1012,12 +1013,6 @@ pub(crate) fn normalized_record(
 /// the rest of the transcript. What it emits stays conservative: an unreadable line or an
 /// unrecognized record becomes a clearly-labelled `system` entry, never an entry attributed to
 /// the user or the agent. Only opening the file can fail the whole read.
-pub(crate) fn normalized_timeline(session: &ExternalSession) -> Result<Vec<Value>> {
-    if session.driver == ExternalDriver::OpenCode {
-        return normalized_opencode_timeline(session);
-    }
-    read_line_timeline(session, |fold| fold.read(session))
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TimelineOrder {
@@ -1077,33 +1072,20 @@ pub(crate) struct TimelineSlice {
     /// Newest-first entries strictly before the supplied key.
     pub(crate) items: Vec<Value>,
     pub(crate) has_more: bool,
+    /// Source content generation: stable across appends, moved by every non-append rebuild.
+    pub(crate) generation: u64,
 }
 
+#[cfg(test)]
 pub(crate) fn timeline_slice(
     session: &ExternalSession,
     order: TimelineOrder,
     before: Option<&TimelineKey>,
     limit: usize,
 ) -> Result<TimelineSlice> {
-    if session.driver == ExternalDriver::OpenCode {
-        let mut items = normalized_opencode_timeline(session)?;
-        items.sort_by(|a, b| {
-            compare_timeline_positions(
-                native_timeline_position(a),
-                native_timeline_position(b),
-                order,
-            )
-        });
-        return Ok(collect_timeline_slice(
-            items.iter().rev(),
-            std::iter::empty(),
-            order,
-            before,
-            limit,
-            Value::clone,
-        ));
-    }
-    read_line_timeline(session, |fold| fold.slice(session, order, before, limit))
+    let timeline = LineTimeline::acquire(session);
+    let mut held = timeline.hold();
+    held.slice(session, order, before, limit)
 }
 
 fn collect_timeline_slice<'a>(
@@ -1150,6 +1132,7 @@ fn collect_timeline_slice<'a>(
     TimelineSlice {
         items,
         has_more: committed.peek().is_some() || transient.peek().is_some(),
+        generation: 0,
     }
 }
 
@@ -1158,6 +1141,121 @@ const MAX_FOLDED_SOURCE_BYTES: usize = 96 * 1024 * 1024;
 type SharedLineFold = Arc<Mutex<LineTimelineFold>>;
 type LineFoldCache = VecDeque<(PathBuf, ExternalDriver, SharedLineFold, usize)>;
 static LINE_FOLDS: LazyLock<Mutex<LineFoldCache>> = LazyLock::new(Mutex::default);
+
+/// Process-random epoch for timeline generations. A restart draws a fresh epoch, so page
+/// cursors bound to a generation never carry into another process, matching the cursor MAC
+/// key. Within one process, rebuild serials keep generations strictly increasing.
+static TIMELINE_GENERATION_EPOCH: LazyLock<u64> = LazyLock::new(|| {
+    let mut bytes = [0_u8; 8];
+    getrandom::fill(&mut bytes).expect("timeline generation epoch entropy");
+    // Clear the top bit so adding rebuild serials cannot wrap in any relevant lifetime.
+    u64::from_be_bytes(bytes) & (u64::MAX >> 1)
+});
+static TIMELINE_REBUILDS: AtomicU64 = AtomicU64::new(0);
+fn next_timeline_generation() -> u64 {
+    TIMELINE_GENERATION_EPOCH.wrapping_add(
+        TIMELINE_REBUILDS
+            .fetch_add(1, AtomicOrdering::Relaxed)
+            .saturating_add(1),
+    )
+}
+
+/// Test-only determinism hooks: park one transcript refresh mid-read and observe readers
+/// queued on a contended fold. Nothing here is compiled into release builds.
+#[cfg(test)]
+pub(crate) mod timeline_test_support {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Condvar, LazyLock, Mutex};
+
+    static FOLD_WAITERS: AtomicUsize = AtomicUsize::new(0);
+    static REFRESH_GATES: LazyLock<Mutex<HashMap<PathBuf, RefreshGate>>> =
+        LazyLock::new(Mutex::default);
+    static REFRESH_ARRIVED: Condvar = Condvar::new();
+
+    /// One gated transcript refresh: arrived once its reader parked, released to let it run.
+    struct RefreshGate {
+        arrived: bool,
+        released: bool,
+    }
+
+    /// Test hooks never propagate lock poison: a gate recovering its current state is always
+    /// sound, matching the fold's own poison recovery.
+    fn gates() -> std::sync::MutexGuard<'static, HashMap<PathBuf, RefreshGate>> {
+        REFRESH_GATES
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// Park the next refresh of `path` until `release_refresh(path)`, so a test controls
+    /// exactly when the fold's I/O completes while holding the fold. Gates are per path, so
+    /// parallel tests never release each other's readers.
+    pub(crate) fn arm_refresh(path: &Path) {
+        let mut gates = gates();
+        gates.insert(
+            path.to_owned(),
+            RefreshGate {
+                arrived: false,
+                released: false,
+            },
+        );
+        REFRESH_ARRIVED.notify_all();
+    }
+
+    pub(crate) fn wait_refresh_arrived(path: &Path) {
+        let mut gates = gates();
+        while !gates.get(path).is_some_and(|gate| gate.arrived) {
+            gates = REFRESH_ARRIVED
+                .wait(gates)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
+
+    pub(crate) fn release_refresh(path: &Path) {
+        let mut gates = gates();
+        if let Some(gate) = gates.get_mut(path) {
+            gate.released = true;
+        }
+        REFRESH_ARRIVED.notify_all();
+    }
+
+    pub(crate) fn gate_refresh(path: &Path) {
+        let mut gates = gates();
+        loop {
+            let Some(gate) = gates.get_mut(path) else {
+                return;
+            };
+            if gate.released {
+                return;
+            }
+            if !gate.arrived {
+                gate.arrived = true;
+                REFRESH_ARRIVED.notify_all();
+                continue;
+            }
+            gates = REFRESH_ARRIVED
+                .wait(gates)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
+
+    /// Block until `count` readers are parked on a contended fold. They are guaranteed to
+    /// arrive: the gated refresh holds that fold for as long as the test wants.
+    pub(crate) fn wait_fold_waiters(count: usize) {
+        while FOLD_WAITERS.load(Ordering::SeqCst) < count {
+            std::thread::yield_now();
+        }
+    }
+
+    pub(crate) fn enter_contended() {
+        FOLD_WAITERS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub(crate) fn leave_contended() {
+        FOLD_WAITERS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 fn line_fold(session: &ExternalSession) -> SharedLineFold {
     let mut folds = match LINE_FOLDS.lock() {
@@ -1216,12 +1314,13 @@ fn trim_line_folds(folds: &mut LineFoldCache, budget: usize) {
     }
 }
 
-fn read_line_timeline<T>(
-    session: &ExternalSession,
-    read: impl FnOnce(&mut LineTimelineFold) -> Result<T>,
-) -> Result<T> {
-    let fold = line_fold(session);
-    let mut state = match fold.lock() {
+fn lock_fold(fold: &SharedLineFold) -> std::sync::MutexGuard<'_, LineTimelineFold> {
+    if let Ok(state) = fold.try_lock() {
+        return state;
+    }
+    #[cfg(test)]
+    timeline_test_support::enter_contended();
+    let state = match fold.lock() {
         Ok(state) => state,
         Err(error) => {
             let mut state = error.into_inner();
@@ -1230,18 +1329,92 @@ fn read_line_timeline<T>(
             state
         }
     };
-    let result = read(&mut state);
-    account_line_fold(&fold, state.retained_source_bytes);
-    result
+    #[cfg(test)]
+    timeline_test_support::leave_contended();
+    state
+}
+
+/// One transcript's bounded reader. Whole-source drivers (OpenCode) have no shared fold;
+/// line drivers share one, and `hold` waits for it before the caller takes any global read
+/// slot, so several viewers of one conversation queue on the fold instead of exhausting the
+/// bounded read budget an unrelated conversation still needs.
+pub(crate) struct LineTimeline {
+    fold: Option<SharedLineFold>,
+}
+
+impl LineTimeline {
+    /// Resolves the shared fold without locking it and without transcript I/O.
+    pub(crate) fn acquire(session: &ExternalSession) -> Self {
+        if session.driver == ExternalDriver::OpenCode {
+            return Self { fold: None };
+        }
+        Self {
+            fold: Some(line_fold(session)),
+        }
+    }
+
+    /// Blocks for the fold while holding no caller resource.
+    pub(crate) fn hold(&self) -> LineTimelineHeld<'_> {
+        LineTimelineHeld {
+            fold: self.fold.as_ref(),
+            guard: self.fold.as_ref().map(lock_fold),
+        }
+    }
+}
+
+pub(crate) struct LineTimelineHeld<'a> {
+    fold: Option<&'a SharedLineFold>,
+    guard: Option<std::sync::MutexGuard<'a, LineTimelineFold>>,
+}
+
+impl LineTimelineHeld<'_> {
+    pub(crate) fn read(&mut self, session: &ExternalSession) -> Result<Vec<Value>> {
+        match self.guard.as_mut() {
+            Some(state) => {
+                let result = state.read(session);
+                let fold = self.fold.expect("held fold state has its fold");
+                account_line_fold(fold, state.retained_source_bytes);
+                result
+            }
+            None => normalized_opencode_timeline(session),
+        }
+    }
+
+    pub(crate) fn slice(
+        &mut self,
+        session: &ExternalSession,
+        order: TimelineOrder,
+        before: Option<&TimelineKey>,
+        limit: usize,
+    ) -> Result<TimelineSlice> {
+        match self.guard.as_mut() {
+            Some(state) => {
+                let result = state.slice(session, order, before, limit);
+                let fold = self.fold.expect("held fold state has its fold");
+                account_line_fold(fold, state.retained_source_bytes);
+                result
+            }
+            None => opencode_timeline_slice(session, order, before, limit),
+        }
+    }
+}
+
+pub(crate) fn normalized_timeline(session: &ExternalSession) -> Result<Vec<Value>> {
+    let timeline = LineTimeline::acquire(session);
+    let mut held = timeline.hold();
+    held.read(session)
 }
 
 /// Volatile bounded fold of an append-only JSONL transcript. Replacement, shrinkage and a
-/// changed last complete record rebuild it. Earlier edits are fenced by normalized_record on
-/// pinned content reads, rather than by scanning the entire transcript on every page.
+/// changed last complete record rebuild it and draw a new generation, expiring page cursors
+/// from the replaced content; pure appends keep the generation. Earlier edits are fenced by
+/// normalized_record on pinned content reads, rather than by scanning the entire transcript
+/// on every page.
 #[derive(Default)]
 pub(crate) struct LineTimelineFold {
     identity: Option<FileIdentity>,
     last_record: Option<(u64, usize, [u8; 32])>,
+    generation: u64,
     consumed: u64,
     observed_len: u64,
     lines: VecDeque<FoldedLine>,
@@ -1374,7 +1547,7 @@ impl LineTimelineFold {
                 order,
             )
         });
-        match order {
+        let mut slice = match order {
             TimelineOrder::Sequence => {
                 let upper = before.map(|key| (key.sequence, key.rank, key.id.clone()));
                 let committed = self
@@ -1385,14 +1558,14 @@ impl LineTimelineFold {
                     ))
                     .rev()
                     .map(|(_, &position)| self.indexed_item(position));
-                Ok(collect_timeline_slice(
+                collect_timeline_slice(
                     committed,
                     transient.iter().rev(),
                     order,
                     before,
                     limit,
                     |item| self.clone_output(item),
-                ))
+                )
             }
             TimelineOrder::TimestampSequence => {
                 let upper = before.map(|key| {
@@ -1411,16 +1584,18 @@ impl LineTimelineFold {
                     ))
                     .rev()
                     .map(|(_, &position)| self.indexed_item(position));
-                Ok(collect_timeline_slice(
+                collect_timeline_slice(
                     committed,
                     transient.iter().rev(),
                     order,
                     before,
                     limit,
                     |item| self.clone_output(item),
-                ))
+                )
             }
-        }
+        };
+        slice.generation = self.generation;
+        Ok(slice)
     }
 
     fn indexed_item(&self, (number, index): (usize, usize)) -> &Value {
@@ -1482,6 +1657,8 @@ impl LineTimelineFold {
     }
 
     fn refresh(&mut self, session: &ExternalSession) -> Result<Vec<Value>> {
+        #[cfg(test)]
+        timeline_test_support::gate_refresh(session.transcript.as_path());
         let mut file = File::open(&session.transcript)
             .with_context(|| format!("read transcript {}", session.transcript.display()))?;
         let metadata = file.metadata()?;
@@ -1489,9 +1666,12 @@ impl LineTimelineFold {
         let window_start = len.saturating_sub(MAX_TIMELINE_BYTES);
         let identity = file_identity(&metadata);
         if !self.resumable(&identity, len, window_start, &mut file) {
+            // Any non-append change (replacement, shrink, edit, or a cold fold) draws a new
+            // generation, so outstanding page cursors stop applying their old boundary.
             *self = Self {
                 identity: Some(identity),
                 consumed: window_start,
+                generation: next_timeline_generation(),
                 ..Self::default()
             };
         }
@@ -2629,6 +2809,36 @@ const OPENCODE_MESSAGE_WINDOW_SQL: &str = "SELECT rowid, id, time_created, data 
  ) ORDER BY time_created, id";
 
 fn normalized_opencode_timeline(session: &ExternalSession) -> Result<Vec<Value>> {
+    Ok(opencode_timeline(session)?.0)
+}
+
+fn opencode_timeline_slice(
+    session: &ExternalSession,
+    order: TimelineOrder,
+    before: Option<&TimelineKey>,
+    limit: usize,
+) -> Result<TimelineSlice> {
+    let (mut items, generation) = opencode_timeline(session)?;
+    items.sort_by(|a, b| {
+        compare_timeline_positions(
+            native_timeline_position(a),
+            native_timeline_position(b),
+            order,
+        )
+    });
+    let mut slice = collect_timeline_slice(
+        items.iter().rev(),
+        std::iter::empty(),
+        order,
+        before,
+        limit,
+        Value::clone,
+    );
+    slice.generation = generation;
+    Ok(slice)
+}
+
+fn opencode_timeline(session: &ExternalSession) -> Result<(Vec<Value>, u64)> {
     let connection = open_opencode_database(&session.transcript)?;
     let mut message_statement = connection.prepare(OPENCODE_MESSAGE_WINDOW_SQL)?;
     // Count only row identities, then stream native bytes. Never collect 4,097 payload rows.
@@ -2653,7 +2863,10 @@ fn normalized_opencode_timeline(session: &ExternalSession) -> Result<Vec<Value>>
     let parts_unavailable = part_statement.is_none();
     let mut items = VecDeque::new();
     // Include the surrounding JSON array delimiters so this remains an exact bound on the
-    // serialized timeline, not just on its native payloads.
+    // serialized timeline, not just on its native payloads. The content generation folds
+    // exactly what this read can return, so any database change that alters the bounded
+    // timeline moves it.
+    let mut generation = Sha256::new();
     let mut serialized_bytes = 2_usize;
     let mut sequence = 1_u64;
     let mut last_created = session.started_at_unix_ms;
@@ -2666,6 +2879,7 @@ fn normalized_opencode_timeline(session: &ExternalSession) -> Result<Vec<Value>>
         let at = timestamp(last_created);
         let row_bytes = sqlite_row_bytes(row, &[1, 2, 3])?;
         if row_bytes > MAX_TIMELINE_BYTES as usize {
+            generation.update(format!("oversized-message:{row_bytes}").as_bytes());
             let notice = oversized_sqlite_row(&mut sequence, &at, "message", row_bytes)?;
             extend_bounded_opencode_timeline(
                 &mut items,
@@ -2689,11 +2903,13 @@ fn normalized_opencode_timeline(session: &ExternalSession) -> Result<Vec<Value>>
         };
         let mut additions = Vec::with_capacity(2);
         let entry_sequence = next_opencode_sequence(&mut sequence)?;
+        let row_digest = sqlite_message_digest(&id_bytes, &created_bytes, &encoded);
+        generation.update(row_digest.as_bytes());
         let mut record =
             opencode_message_record(&id_bytes, &created_bytes, &encoded, entry_sequence, &at);
         record["_source"] = serde_json::to_value(NativeLocator::SqliteMessage {
             message_row,
-            digest: sqlite_message_digest(&id_bytes, &created_bytes, &encoded),
+            digest: row_digest,
             sequence: entry_sequence,
             timestamp: at.clone(),
         })?;
@@ -2712,6 +2928,7 @@ fn normalized_opencode_timeline(session: &ExternalSession) -> Result<Vec<Value>>
             let part_row = row.get::<_, i64>(0)?;
             let row_bytes = sqlite_row_bytes(row, &[1, 2])?;
             if row_bytes > MAX_TIMELINE_BYTES as usize {
+                generation.update(format!("oversized-part:{row_bytes}").as_bytes());
                 let notice = oversized_sqlite_row(&mut sequence, &at, "part", row_bytes)?;
                 extend_bounded_opencode_timeline(
                     &mut items,
@@ -2736,7 +2953,11 @@ fn normalized_opencode_timeline(session: &ExternalSession) -> Result<Vec<Value>>
             let locator = serde_json::to_value(NativeLocator::Sqlite {
                 part_row,
                 message_row,
-                digest: sqlite_part_digest(&part_id, &encoded_part),
+                digest: {
+                    let part_digest = sqlite_part_digest(&part_id, &encoded_part);
+                    generation.update(part_digest.as_bytes());
+                    part_digest
+                },
                 message_digest: message_digest.clone(),
                 sequence: entry_sequence,
                 timestamp: at.clone(),
@@ -2774,6 +2995,14 @@ fn normalized_opencode_timeline(session: &ExternalSession) -> Result<Vec<Value>>
             vec![notice],
         );
     }
+    generation.update(
+        format!("truncated:{truncated}:count:{message_count}:parts:{parts_unavailable}").as_bytes(),
+    );
+    let generation = u64::from_be_bytes(
+        generation.finalize()[..8]
+            .try_into()
+            .expect("an 8-byte generation prefix"),
+    );
     if truncated {
         prepend_opencode_truncation(
             &mut items,
@@ -2793,7 +3022,10 @@ fn normalized_opencode_timeline(session: &ExternalSession) -> Result<Vec<Value>>
             ),
         );
     }
-    Ok(items.into_iter().map(|(item, _)| item).collect())
+    Ok((
+        items.into_iter().map(|(item, _)| item).collect(),
+        generation,
+    ))
 }
 
 // Inspect SQLite's borrowed cells before allocating any Rust payload copies. Numeric values
@@ -6383,6 +6615,124 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn codex_record(id: &str, text: &str) -> String {
+        format!(
+            "{}\n",
+            json!({"type":"response_item","timestamp":"2026-10-07T00:00:00Z",
+                "payload":{"type":"message","role":"assistant","id":id,
+                    "content":[{"type":"output_text","text":text}]}})
+        )
+    }
+
+    #[test]
+    fn timeline_generation_survives_appends_and_moves_on_in_place_rewrites() {
+        use std::io::Write as _;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("generation.jsonl");
+        fs::write(
+            &path,
+            format!(
+                "{}{}",
+                codex_record("one", "one"),
+                codex_record("two", "two")
+            ),
+        )
+        .unwrap();
+        let session = transcript_session(ExternalDriver::Codex, &path);
+        let order = TimelineOrder::Sequence;
+        let first = timeline_slice(&session, order, None, 10).unwrap();
+        assert_eq!(texts(&first.items).len(), 2);
+        // A pure append keeps the generation, so an outstanding page cursor still applies.
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        write!(file, "{}", codex_record("three", "three")).unwrap();
+        let appended = timeline_slice(&session, order, None, 10).unwrap();
+        assert_eq!(appended.generation, first.generation);
+        // Same inode, truncated and rewritten: every basis input still matches.
+        fs::write(&path, codex_record("replaced", "replaced")).unwrap();
+        let replaced = timeline_slice(&session, order, None, 10).unwrap();
+        assert_ne!(replaced.generation, first.generation);
+        assert_eq!(texts(&replaced.items), ["replaced"]);
+        // A rewrite of the single retained record moves it again.
+        fs::write(&path, codex_record("edited", "edited")).unwrap();
+        let edited = timeline_slice(&session, order, None, 10).unwrap();
+        assert_ne!(edited.generation, replaced.generation);
+        assert_eq!(texts(&edited.items), ["edited"]);
+    }
+
+    #[test]
+    fn concurrent_append_during_a_parked_refresh_is_read_completely() {
+        use std::io::Write as _;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("parked.jsonl");
+        fs::write(&path, codex_record("one", "one")).unwrap();
+        timeline_test_support::arm_refresh(&path);
+        let reader = {
+            let session = transcript_session(ExternalDriver::Codex, &path);
+            std::thread::spawn(move || normalized_timeline(&session).unwrap())
+        };
+        timeline_test_support::wait_refresh_arrived(&path);
+        // The append lands while the fold's refresh is parked inside its read.
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        write!(file, "{}", codex_record("two", "two")).unwrap();
+        timeline_test_support::release_refresh(&path);
+        let parked = reader.join().unwrap();
+        assert_eq!(texts(&parked), ["one", "two"]);
+        let session = transcript_session(ExternalDriver::Codex, &path);
+        let after = timeline_slice(&session, TimelineOrder::Sequence, None, 10).unwrap();
+        assert_eq!(texts(&after.items), ["two", "one"]);
+    }
+
+    #[test]
+    fn opencode_timeline_generation_tracks_database_content() {
+        let home = tempfile::tempdir().unwrap();
+        let parent = home.path().join(".local/share/opencode");
+        fs::create_dir_all(&parent).unwrap();
+        let database = parent.join("opencode.db");
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE message (\
+                    id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, \
+                    time_updated INTEGER, data TEXT\
+                 );\
+                 CREATE TABLE part (\
+                    id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, \
+                    time_created INTEGER, time_updated INTEGER, data TEXT\
+                 );",
+            )
+            .unwrap();
+        let insert = |connection: &Connection, id: &str, created: i64| {
+            connection
+                .execute(
+                    "INSERT INTO message VALUES (?1, 'ses_native', ?2, ?2, ?3)",
+                    params![id, created, r#"{"role":"assistant"}"#],
+                )
+                .unwrap();
+        };
+        insert(&connection, "msg_1", 1_700_000_000_000);
+        let external = ExternalSession {
+            id: external_session_id(ExternalDriver::OpenCode, "ses_native"),
+            revision: "revision".into(),
+            driver: ExternalDriver::OpenCode,
+            native_id: "ses_native".into(),
+            transcript: database,
+            codex_home: None,
+            cwd: None,
+            title: None,
+            started_at_unix_ms: 1_700_000_000_000,
+            updated_at_unix_ms: 1_700_000_001_000,
+            process: None,
+        };
+        let order = TimelineOrder::Sequence;
+        let first = timeline_slice(&external, order, None, 10).unwrap();
+        let again = timeline_slice(&external, order, None, 10).unwrap();
+        assert_eq!(first.generation, again.generation);
+        insert(&connection, "msg_2", 1_700_000_001_000);
+        drop(connection);
+        let changed = timeline_slice(&external, order, None, 10).unwrap();
+        assert_ne!(changed.generation, first.generation);
     }
 
     #[test]
