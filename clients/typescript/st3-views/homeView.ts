@@ -20,7 +20,7 @@ export type HomeKind = 'review' | 'launch' | 'revision' | 'request' | 'update';
 /** Semantic colors; renderers resolve them through their own palette. */
 export type HomeColor = 'person' | 'green';
 export type HomeRow = {
-  item: Attention;
+  item: KeptAttention;
   tier: Tier;
   kind: HomeKind;
   glyph: string;
@@ -65,12 +65,32 @@ export function onHome(item: Pick<Attention, 'state' | 'person_id'>, actor: stri
   return item.state !== 'resolved' && (!person || !item.person_id || item.person_id === person);
 }
 
-export function homeRows(items: Attention[], actor: string | undefined, now = Date.now()): HomeRow[] {
+/** An item st stopped listing (or resolved) that stays on Home until the person clears it. */
+export type KeptAttention = Attention & { closedElsewhere?: boolean };
+
+/**
+ * What stays on Home when st's list changes: nothing leaves by itself (Nathan, 2026-10-07).
+ * An item shown before that st no longer lists as open, and that the person did not act on from
+ * here, is kept, marked closed elsewhere, with no actions, until the person clears it.
+ */
+export function keepClosed(previous: readonly KeptAttention[], next: readonly Attention[], acted: ReadonlySet<string>, actor?: string): KeptAttention[] {
+  const kept: KeptAttention[] = [...next];
+  const open = new Set(next.filter(item => onHome(item, actor)).map(item => item.id));
+  for (const old of previous) {
+    if (open.has(old.id) || acted.has(old.id) || !onHome(old, actor)) continue;
+    const marked: KeptAttention = old.closedElsewhere ? old : { ...old, closedElsewhere: true, actions: [] };
+    const at = kept.findIndex(item => item.id === old.id);
+    if (at >= 0) kept[at] = marked; else kept.push(marked);
+  }
+  return kept;
+}
+
+export function homeRows(items: KeptAttention[], actor: string | undefined, now = Date.now()): HomeRow[] {
   const rows = items.filter(item => onHome(item, actor)).flatMap((item): HomeRow[] => {
     const place = homeKind(item);
     if (!place) return [];
     const step = item.step_run_id?.split('/').pop();
-    return [{ item, ...place, ...kindGlyph(place.kind), title: cleanTitle(item.title), waiting: step ? `step ${step}` : null, age: ago(item.requested_at, now) }];
+    return [{ item, ...place, ...kindGlyph(place.kind), title: cleanTitle(item.title), waiting: item.closedElsewhere ? 'closed elsewhere; stays until you clear it' : step ? `step ${step}` : null, age: ago(item.requested_at, now) }];
   });
   // A stable sort by tier keeps st's order within each tier.
   return rows.map((row, index) => ({ row, index })).sort((a, b) => TIERS.indexOf(a.row.tier) - TIERS.indexOf(b.row.tier) || a.index - b.index).map(({ row }) => row);
