@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Regression coverage for oversized native JSONL lines and the OpenCode message-window query plan",
+  "replay": {"status": "none", "detail": "Tests and documentation only; the extracted message-window SQL is byte-identical and replay behavior is unchanged."},
+  "schema": {"status": "none", "detail": "The native message index is recreated only in an isolated in-memory test database; deployed stores and harness databases are unchanged."},
+  "rules": {"status": "none", "detail": "No checkpoint rule, digest or fleet-coordination change."},
+  "compatibility": {"status": "none", "detail": "No client schema, generated client, wire format, scope or harness-admission change."},
+  "downtime": {"status": "none", "detail": "This test and documentation change adds no runtime interruption."},
+  "manual": {"status": "none", "detail": "No action is required on existing installations."},
+  "recovery": {"status": "none", "detail": "No runtime, migration or recovery behavior changes."}
+}

@@ -193,6 +193,16 @@ copy bound, not a SQLite-engine or process RSS guarantee. Over-limit rows emit
 Direct chunk reads apply the same row bound; enlargement invalidates an old ref.
 The native source is still authoritative and is not modified by these limits.
 
+The OpenCode message-window query-plan regression uses the harness's
+`message_session_time_created_id_idx(session_id, time_created, id)` from
+[OpenCode v1.18.34](https://github.com/anomalyco/opencode/blob/aec0b9a6d8898f68f923aaf08b7306d931fd9d76/packages/core/src/session/sql.ts#L64-L76).
+`EXPLAIN QUERY PLAN` shows an indexed session lookup in the inner query, with
+only the already-limited outer window sorted chronologically (at most 4,097
+rows). A read-only check of the installed native schema produces the same plan.
+This guarantee assumes that composite index exists; older schemas without it
+may sort session history before applying the limit. The regression exercises
+the production SQL, including timestamp ties and session isolation.
+
 An authenticated ref contains a JSONL offset/length/digest or SQLite part/message
 identity/digest (message role/time, independent of streaming usage updates),
 entry/revision, session and stable native file identity. Its encrypted source
