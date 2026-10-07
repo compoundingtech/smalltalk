@@ -98,7 +98,7 @@ def main():
                             str(Path.cwd()), '--list-type', 'binaries-only', '--message-format', 'json'], check=True)
         hooks = extracted / 'st2/target/debug/st2'
         if not hooks.is_file() or not os.access(hooks, os.X_OK):
-            raise ValueError('the matching st2 rendered-hook binary must be archived')
+            raise ValueError('the matching rendered-hook executable must be archived')
         scratch = Path(os.environ['RUNNER_TEMP']) / 'ci-test-scratch'
         scratch.mkdir(exist_ok=True)
         production = directory / 'sekrets-st3'
