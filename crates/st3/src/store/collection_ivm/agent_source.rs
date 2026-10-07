@@ -10,7 +10,7 @@ use super::Table;
 use anyhow::Result;
 use rusqlite::Transaction;
 
-pub const CAPTURE_FINGERPRINT: &str = "st3.agent-card.capture.v3;recursive-delete-v1;declared-sql-inputs-v1;delivery-producer-global-v1;namespace-canonical-v1;clock-v1;unfiltered-verdict-admission-v1";
+pub const CAPTURE_FINGERPRINT: &str = "st3.agent-card.capture.v4;recursive-delete-v1;declared-sql-inputs-v1;delivery-producer-global-v1;namespace-canonical-v1;canonical-time-text-v1;clock-v1;unfiltered-verdict-admission-v1";
 pub const SOURCE: &str = "st3.agent-card-source.v1";
 
 /// Additional lifecycle/local producers must expand this manifest before source attestation.

@@ -115,6 +115,11 @@ pub(super) fn decode_sql(physical: &Value) -> Result<ClaimRecord> {
         physical["actor"].is_null() || physical["actor"].is_string(),
         "invalid retained claim actor"
     );
+    let accepted: u128 = text("accepted_at_unix_ms")?.parse()?;
+    ensure!(
+        text("accepted_at_unix_ms")? == accepted.to_string(),
+        "noncanonical claim acceptance text cannot certify numeric rank"
+    );
     let body: Value = serde_json::from_str(text("body")?)?;
     let operation = smallclaims::store::operation_parts(&body)
         .map(|(id, digest)| (id.to_owned(), digest.to_owned()));
@@ -130,7 +135,7 @@ pub(super) fn decode_sql(physical: &Value) -> Result<ClaimRecord> {
         request_digest: operation.map(|value| value.1),
         body,
         predecessors: serde_json::from_str(text("predecessors")?)?,
-        accepted_at_unix_ms: text("accepted_at_unix_ms")?.parse()?,
+        accepted_at_unix_ms: accepted,
     })
 }
 
@@ -180,6 +185,10 @@ pub fn new_fact(connection: &Connection, id: &str) -> Result<Option<Fact>> {
         .as_str()
         .context("invalid acceptance time cell")?
         .parse()?;
+    ensure!(
+        physical["accepted_at_unix_ms"].as_str() == Some(accepted.to_string().as_str()),
+        "noncanonical source acceptance text cannot certify numeric rank"
+    );
     ensure!(
         body == claim.body
             && predecessors == claim.predecessors
@@ -392,5 +401,35 @@ mod retained_tests {
         let mut invalid = encoded;
         invalid["sql"]["body"] = json!("malformed");
         assert!(Fact::decode(&invalid).is_err());
+    }
+}
+
+#[cfg(test)]
+mod canonical_text_tests {
+    use super::*;
+    #[test]
+    fn numeric_rank_refuses_legacy_noncanonical_sql_time_order() {
+        let mut physical = json!({"id":"time-text","store_index":1,"batch_id":"batch","subject":"agent/time-text","kind":"runtime.observed","origin":"grove","actor":null,"body":"{}","predecessors":"[]","accepted_at_unix_ms":"10"});
+        assert_eq!(decode_sql(&physical).unwrap().accepted_at_unix_ms, 10);
+        for bad in ["0009", "+9", "09", " 9"] {
+            physical["accepted_at_unix_ms"] = json!(bad);
+            assert!(decode_sql(&physical).is_err(), "{bad}");
+        }
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE ordering(at TEXT); INSERT INTO ordering VALUES('0009'),('10')",
+            )
+            .unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT at FROM ordering ORDER BY length(at),at LIMIT 1",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            "10"
+        );
     }
 }

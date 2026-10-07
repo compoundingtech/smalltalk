@@ -11,6 +11,15 @@ use smallclaims::ivm::{
 
 const MAX_BYTES: usize = 256 * 1024;
 
+/// Exact full source/operator contract used identically by capture and consumer guards.
+pub(crate) fn manifest() -> String {
+    format!(
+        "{};{}",
+        super::capture_fingerprint(),
+        crate::store::agent_card_ivm::FINGERPRINT
+    )
+}
+
 pub fn create_schema(connection: &Connection) -> Result<()> {
     connection.execute_batch("CREATE TABLE IF NOT EXISTS local_agent_source_boundary(
         namespace TEXT PRIMARY KEY,manifest TEXT NOT NULL,source_epoch INTEGER NOT NULL,

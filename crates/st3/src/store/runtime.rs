@@ -10,6 +10,11 @@ use super::*;
 pub struct SmalltalkRuntime {
     /// One registry per graph. Registration alone does not certify source coverage.
     pub(crate) ivm_views: Option<Arc<smallclaims::ivm::Views>>,
+    /// Exact Installer retained by the explicitly installed collection source.
+    /// Presence does not prove source coverage or select a reader.
+    pub(crate) ivm_installer: std::sync::OnceLock<Arc<smallclaims::ivm::install::Installer>>,
+    /// Keep the single process-local producer sink alive with this Store runtime.
+    pub(crate) ivm_delivery_source: std::sync::OnceLock<crate::api::delivery_presence::source::Registration<'static>>,
     /// Receipt waits and collection sockets share this one commit observer. Publisher
     /// construction is serialized, including simultaneous first subscriptions.
     pub(crate) ivm_publisher: Mutex<Option<Arc<smallclaims::ivm::events::Publisher>>>,

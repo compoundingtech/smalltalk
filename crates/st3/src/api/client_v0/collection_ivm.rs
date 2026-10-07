@@ -6,6 +6,8 @@ use crate::graph_watch_ivm::{IvmViewBridge, ViewPage};
 use smallclaims::ivm::{Readiness, events};
 use std::cell::RefCell;
 
+mod agents;
+
 type Window = (ClientSnapshot, Vec<Value>, bool);
 type RowReader = dyn Fn(
         &AppState,

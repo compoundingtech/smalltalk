@@ -2587,6 +2587,24 @@ impl Store {
         self.smalltalk.ivm_views.clone()
     }
 
+    /// The exact source Installer for this Store. Registration alone cannot certify a read.
+    pub fn ivm_installer(&self) -> Option<Arc<smallclaims::ivm::install::Installer>> {
+        self.smalltalk.ivm_installer.get().cloned()
+    }
+
+    pub(crate) fn retain_collection_runtime(
+        &self,
+        installer: Arc<smallclaims::ivm::install::Installer>,
+        producer: crate::api::delivery_presence::source::Registration<'static>,
+    ) -> Result<()> {
+        anyhow::ensure!(self.ivm_views().is_some(), "collection source requires Store registry");
+        anyhow::ensure!(self.smalltalk.ivm_installer.get().is_none()
+            && self.smalltalk.ivm_delivery_source.get().is_none(), "collection source runtime already retained");
+        self.smalltalk.ivm_installer.set(installer).map_err(|_|anyhow::anyhow!("collection Installer attachment raced"))?;
+        self.smalltalk.ivm_delivery_source.set(producer).map_err(|_|anyhow::anyhow!("collection producer attachment raced"))?;
+        Ok(())
+    }
+
     /// Lazily attach the one Store publisher shared by receipt waits and collection
     /// consumers. Registration and journal installation happen when the Store opens.
     pub fn ivm_publisher(&self) -> Result<Option<Arc<smallclaims::ivm::events::Publisher>>> {
