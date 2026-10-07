@@ -276,6 +276,10 @@ fn query_kind(sql: &str) -> String {
     }
     out.trim().to_owned()
 }
+/// The text a statement is counted under: literals and numbers removed.
+pub fn normalize_query(sql: &str) -> String {
+    query_kind(sql)
+}
 pub fn record_query(sql: &str, duration: Duration) {
     let kind = query_kind(sql);
     METER.get_or_init(Mutex::default).lock().unwrap().record(
