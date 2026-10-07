@@ -60,6 +60,10 @@ export type CollectionStreamOptions = {
     /** Called once when the socket ends: without an error after a normal close. Open a new
      * socket and subscribe again; its snapshots are authoritative. */
     onEnd?: (error?: Error) => void;
+    /** Called when the WebSocket reports open, before queued commands are flushed. Observer errors are isolated. */
+    onOpen?: () => void;
+    /** Called after a collection command is passed to socket.send, including queued commands. Observer errors are isolated. */
+    onCommandSent?: (command: { readonly kind: 'subscribe' | 'unsubscribe'; readonly id: string }) => void;
     socket?: CollectionSocketFactory;
 };
 export type CollectionStream = {
@@ -304,15 +308,30 @@ export class St3Client {
         if (this.client) headers['x-st3-client'] = this.client;
         const socket = (options.socket ?? (defaultTerminalSocket as unknown as CollectionSocketFactory))(url.toString(), [COLLECTIONS_SUBPROTOCOL], headers);
         let ended = false, open = false;
-        const waiting: string[] = [];
+        const waiting: Record<string, unknown>[] = [];
         const stop = () => { ended = true; socket.onopen = null; socket.onmessage = null; socket.onclose = null; socket.onerror = null; };
         const end = (error?: Error) => { if (ended) return; stop(); options.onEnd?.(error); };
+        const notify = (callback: () => void) => {
+            try { callback(); } catch (error) {
+                end(error as Error);
+                socket.close(1000);
+            }
+        };
+        const sendNow = (command: Record<string, unknown>) => {
+            if (ended) return;
+            socket.send(JSON.stringify(command));
+            const kind = command.kind;
+            const id = command.id;
+            const onCommandSent = options.onCommandSent;
+            if ((kind === 'subscribe' || kind === 'unsubscribe') && typeof id === 'string' && onCommandSent) {
+                notify(() => onCommandSent({ kind, id }));
+            }
+        };
         const send = (command: Record<string, unknown>) => {
             if (ended) return;
-            const text = JSON.stringify(command);
-            if (open) socket.send(text); else waiting.push(text);
+            if (open) sendNow(command); else waiting.push(command);
         };
-        socket.onopen = () => { open = true; for (const text of waiting.splice(0)) socket.send(text); };
+        socket.onopen = () => { open = true; if (options.onOpen) notify(options.onOpen); for (const command of waiting.splice(0)) { if (ended) break; sendNow(command); } };
         socket.onmessage = event => {
             let frame: CollectionFrame;
             try { frame = JSON.parse(String(event.data)) as CollectionFrame; } catch { end(new Error('A collections message is not JSON')); socket.close(1000); return; }
