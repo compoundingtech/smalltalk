@@ -1775,6 +1775,15 @@
       "verification": "real CLI over isolated disk-backed Unix daemons; source fences, partition/heal and retirement confirmation"
     },
     {
+      "command": "st setup",
+      "description": "Configure this machine and start st, with flags for unattended setup",
+      "tests": [
+        "crates/st3/tests/setup.rs::archive_setup_installs_st_and_starts_one_isolated_daemon_without_gh_or_harness",
+        "crates/st3/tests/setup.rs::flags_merge_config_without_prompting_and_invalid_names_do_not_write"
+      ],
+      "verification": "real CLI with an isolated HOME, state and sockets; no harness or gh"
+    },
+    {
       "command": "st skill",
       "description": "Default read command for this group.",
       "tests": [

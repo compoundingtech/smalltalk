@@ -32,6 +32,7 @@ const GROUPS: &[(&str, &[&str])] = &[
     (
         "Running st on a machine or fleet",
         &[
+            "setup",
             "up",
             "service",
             "fleet",
