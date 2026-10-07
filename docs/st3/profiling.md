@@ -134,9 +134,11 @@ cross-thread pinned snapshot dependencies (#1381).
 The doctor planning envelope uses the larger of current open readers and idle retention,
 multiplied by the per-reader target, plus the writer's 32 MiB target and a 512 MiB reserve for
 schema/statements, projections, tasks and allocator overhead. At defaults this is 1,568 MiB:
-1 GiB for 128 retained reader caches, 32 MiB for the writer and the 512 MiB reserve. This
-exceeds a 1 GiB service cap; set `SMALLCLAIMS_READ_CACHE_KIB=2048` to restore the 800 MiB
-planning envelope on memory-constrained installations, or adjust the service limit.
+1 GiB for 128 retained reader caches, 32 MiB for the writer and the 512 MiB reserve.
+The 1 GiB cap used in diagnostic examples is illustrative, not the service default:
+the Home Manager module defaults `memoryMax` to `"8G"` and installations can override it.
+For an installation limited to 1 GiB, set `SMALLCLAIMS_READ_CACHE_KIB=2048` to restore
+the 800 MiB planning envelope, or adjust its service limit.
 The reserve is a planning allowance, not an enforced limit or a guarantee for every graph
 or workload. On Linux, doctor
 locates the daemon's own cgroup v2 mount and checks `memory.max` and `memory.events` in that
