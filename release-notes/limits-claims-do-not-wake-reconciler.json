@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Stop waking the reconciler for harness.limits claims",
+  "replay": {"status": "none", "detail": "No replay or rebuild, and no claim is projected differently. Only which events wake the reconciler changes."},
+  "schema": {"status": "none", "detail": "No tables, columns, indexes or triggers."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged."},
+  "compatibility": {"status": "none", "detail": "No client, wire or harness contract change. Clients still see the claim through the event feed, and replication still carries it."},
+  "downtime": {"status": "none", "detail": "None."},
+  "manual": {"status": "none", "detail": "No manual step."},
+  "recovery": {"status": "none", "detail": "A harness.limits claim no longer starts a reconcile pass on its own. The account limits policy still runs on its own two-minute timer. A pool start that is waiting for account limits is retried by the reconciler's normal wakes and passes, not by the limits claim itself, so it may wait for the next of those."}
+}

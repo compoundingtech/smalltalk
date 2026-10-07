@@ -10485,7 +10485,9 @@ async fn finish_claim_publication(
     if appended {
         if crate::store::local_observation_position(&response).is_some() {
             signal_local_change(state);
-        } else if kind == "harness.usage" || kind == "subagent.renewed" {
+        } else if matches!(kind, "harness.usage" | "harness.limits" | "subagent.renewed") {
+            // The reconciler reads none of these. The limits policy runs on its own two-minute
+            // timer, so a limits claim woke a full reconcile pass for nothing, every few seconds.
             signal_visible_change(state);
         } else if kind.starts_with("message.") {
             let store = state.store.clone();
@@ -16000,6 +16002,26 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
             "usage kept local does not wake replication"
         );
         assert!(!reconciler_woke().await);
+        assert!(client_feed_woke());
+
+        // The reconciler reads no limits claim; the limits policy runs on its own timer.
+        let limits = |weekly: f64| ClaimInput {
+            subject: subject.into(),
+            kind: "harness.limits".into(),
+            actor: Some(subject.into()),
+            fields: BTreeMap::from([
+                ("driver".into(), Value::String("codex".into())),
+                ("account".into(), Value::String("codex/ada".into())),
+                ("account_ref".into(), Value::String("ada".into())),
+                ("weekly_percent".into(), Value::from(weekly)),
+                ("measured_at_unix_ms".into(), Value::from(1u64)),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(format!("wake-limits-{weekly}")),
+        };
+        let _ = post(limits(10.0)).await.unwrap();
+        assert!(!reconciler_woke().await, "limits never reconcile");
         assert!(client_feed_woke());
     }
 
