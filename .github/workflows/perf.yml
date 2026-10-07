@@ -10,6 +10,7 @@ on:
         options:
           - 705e2333ec6078589445438cf8d77fe3a1568c72
           - 58358162bbad1781c7e5111eacc57749d59a0915
+          - 7fbd853ed3c5a2c81a29144ca6fffa36ab88a705
 
 permissions:
   contents: read
@@ -91,7 +92,7 @@ jobs:
         shell: bash
         env:
           PERF_DIAGNOSTIC_SOURCE: ${{ inputs.source_sha }}
-          PERF_DIAGNOSTIC_CONTROLLER_SHA256: 39458f41f82ab469ec8e4976b5b1721aa306aa32a79ebd196d674e5eba4d5cd7
+          PERF_DIAGNOSTIC_CONTROLLER_SHA256: d2be7586c0912ccfbd50024d2b344e3511f0602ae3bd6da9529c0cdec11df3dd
         run: |
           export PERF_DIAGNOSTIC_NIX="$(command -v nix)"
           "$PERF_DIAGNOSTIC_NIX" develop '.#perf' -c python3 "$RUNNER_TEMP/ci-perf-diagnostic.py"
