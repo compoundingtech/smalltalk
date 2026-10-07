@@ -228,8 +228,22 @@ read -r _
         // regardless of whether the provider JoinHandle has finished.
         let fence = title_owner(root.path());
         pending_admitted = Some(st3::test_support::check_fixture_mailbox(&store, &fence));
-        std::fs::write(barrier.join("release-provider"), b"go").unwrap();
         std::fs::write(barrier.join("poll-driver"), b"go").unwrap();
+        wait_file(&barrier.join("fence-received")).await;
+        assert_eq!(std::fs::read_to_string(barrier.join("fence-received")).unwrap(),
+            if order == "after" { "finished" } else { "pending" });
+        std::fs::write(barrier.join("release-provider"), b"go").unwrap();
+    }
+    if let Some(owner) = &rejection_fence {
+        // The real rejection is accepted while the provider is still alive. Tokio waits
+        // for a blocking provider worker on shutdown, so release it only after that proof.
+        wait_file(&barrier.join("fence-received")).await;
+        assert_eq!(std::fs::read_to_string(barrier.join("fence-received")).unwrap(), "pending");
+        if rejection == Some("token") {
+            assert!(st3::test_support::check_fixture_mailbox(&store, owner).is_ok());
+        }
+        assert!(!barrier.join("provider-return.json").exists());
+        std::fs::write(barrier.join("exit-provider"), b"go").unwrap();
     }
     let mut stdout = tokio::io::BufReader::new(shell.stdout.take().unwrap());
     let mut line = String::new();
@@ -260,9 +274,8 @@ read -r _
     }
     if let Some(owner) = rejection_fence {
         assert!(shell.try_wait().unwrap().is_none());
-        if rejection == Some("token") {
-            assert!(st3::test_support::check_fixture_mailbox(&store, &owner).is_ok());
-        }
+        assert_eq!(st3::test_support::check_fixture_mailbox(&store, &owner).unwrap_err().code,
+            "stale-mailbox-session");
         assert!(runtime.actions.lock().unwrap().is_empty());
         std::fs::write(barrier.join("exit-provider"), b"go").unwrap();
         server.abort(); shell.kill().await.unwrap();

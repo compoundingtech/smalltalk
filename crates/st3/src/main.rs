@@ -17706,6 +17706,14 @@ async fn drive_st2_native(
         ).await?;
         tokio::select! {
             frame = mailbox.recv() => {
+                #[cfg(feature = "test-support")]
+                if env!("CARGO_BIN_NAME") == "st3-fixture"
+                    && matches!(&frame, Some(st3::mailbox::Frame::Fenced { .. }))
+                    && let Some(root) = std::env::var_os("ST3_FIXTURE_TERMINAL_COMPLETION")
+                {
+                    fs::write(PathBuf::from(root).join("fence-received"),
+                        if task.is_finished() { "finished" } else { "pending" })?;
+                }
                 let mail_changed = matches!(&frame, Some(st3::mailbox::Frame::Mailbox { .. }));
                 mailbox.accept(frame, &runtime_id)?;
                 if driver == "opencode" && mail_changed
@@ -17719,7 +17727,7 @@ async fn drive_st2_native(
                     note_driver_tick_failure(subject, error, &mut last_control_warning);
                 }
             }
-            result = &mut task => {
+            result = &mut task, if fixture_completion_task_enabled() => {
                 let outcome = result?;
                 if let Some(session) = detached_session(&outcome) {
                     loop_state.delivery_episode = delivery.episode;
@@ -18082,6 +18090,20 @@ async fn drive_st2_native(
             }
         }
     }
+}
+
+// Fixture controls force the actual stream rejection branch before disposing the result.
+// The installed executable always enables the provider completion branch.
+fn fixture_completion_task_enabled() -> bool {
+    #[cfg(feature = "test-support")]
+    if env!("CARGO_BIN_NAME") == "st3-fixture"
+        && let Some(root) = std::env::var_os("ST3_FIXTURE_TERMINAL_COMPLETION").map(PathBuf::from)
+        && root.join("join-phase").exists()
+        && !root.join("fence-received").exists()
+    {
+        return false;
+    }
+    true
 }
 
 // Only the separately compiled fixture executable can schedule this control.
