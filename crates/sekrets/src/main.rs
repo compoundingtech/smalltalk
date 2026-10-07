@@ -1,7 +1,11 @@
 use clap::Parser;
 
 #[derive(Parser)]
-#[command(name = "sekrets", version, about = "Run any CLI with credentials no seat can read")]
+#[command(
+    name = "sekrets",
+    version,
+    about = "Run any CLI with credentials no seat can read"
+)]
 struct Cli {
     #[arg(long, global = true)]
     json: bool,

@@ -67,6 +67,11 @@ enum SekretsCommand {
     Enable,
     /// Print the root commands that create the sekrets user, its store and the gateway service.
     Setup(SetupArgs),
+    /// Move a tool onto sekrets for your agents, one step at a time. Today: gh, step 1 (every
+    /// seat's gh runs through sekrets; your shell and st's daemon keep gh as it is).
+    Adopt(AdoptArgs),
+    /// Undo `adopt`: remove the shim, so seats run the tool directly again.
+    Unadopt(AdoptArgs),
     /// Serve the gateway. Run as the sekrets user, by its service.
     #[command(hide = true)]
     Serve {
@@ -177,6 +182,41 @@ struct LogArgs {
 }
 
 #[derive(Args, Debug)]
+struct AdoptArgs {
+    /// The tool: gh.
+    tool: String,
+    /// The profile your agents use; PERSON/agent-gh when omitted.
+    #[arg(long)]
+    agent_profile: Option<String>,
+    /// Where the shim goes; ~/.local/bin when omitted.
+    #[arg(long)]
+    bin_dir: Option<PathBuf>,
+    /// Create a missing profile or grant without asking.
+    #[arg(long)]
+    yes: bool,
+}
+
+impl AdoptArgs {
+    fn adopt(&self) -> Result<super::adopt::Adopt> {
+        if self.tool != "gh" {
+            bail!("sekrets adopts gh only, for now");
+        }
+        let home = std::env::var_os("HOME").context("HOME is not set")?;
+        Ok(super::adopt::Adopt {
+            socket: socket_path(),
+            bin_dir: self
+                .bin_dir
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(home).join(".local/bin")),
+            agent_profile: self.agent_profile.clone(),
+            yes: self.yes,
+            sekrets: std::fs::canonicalize(std::env::current_exe()?)?,
+            path: std::env::var_os("PATH").unwrap_or_default(),
+        })
+    }
+}
+
+#[derive(Args, Debug)]
 struct SetupArgs {
     /// The person this host's Unix user is, such as person/ada.
     #[arg(long)]
@@ -217,6 +257,21 @@ pub fn run(args: SekretsArgs, json_output: bool) -> Result<i32> {
         }
         SekretsCommand::Setup(setup) => {
             print!("{}", setup_script(&setup)?);
+            Ok(0)
+        }
+        SekretsCommand::Adopt(args) => {
+            let lines = args.adopt()?.gh(&mut super::adopt::ask_terminal)?;
+            for line in &lines {
+                println!("{line}");
+            }
+            Ok(i32::from(
+                lines
+                    .iter()
+                    .any(|line| line.state == super::adopt::State::Needs),
+            ))
+        }
+        SekretsCommand::Unadopt(args) => {
+            println!("{}", args.adopt()?.unadopt_gh()?);
             Ok(0)
         }
         SekretsCommand::Presets => {
@@ -351,6 +406,8 @@ fn management_request(command: SekretsCommand) -> Result<Request> {
         | SekretsCommand::Login(_)
         | SekretsCommand::Presets
         | SekretsCommand::Setup(_)
+        | SekretsCommand::Adopt(_)
+        | SekretsCommand::Unadopt(_)
         | SekretsCommand::Serve { .. } => unreachable!("handled before"),
     })
 }

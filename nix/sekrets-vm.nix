@@ -217,7 +217,6 @@ pkgs.testers.runNixOSTest {
     # gh pr create and git status ran; gh auth status and ada's own profile were refused.
     assert out.count("exit=0") == 2, out
 
-    # Every call, refusal and change is a claim on the profile, recorded by ada's daemon.
     # Every call, its exit and every refusal is in the gateway's log, which ada reads; ada's
     # daemon records them as local observations that age out and go to OpenTelemetry.
     log = login("ada", f"{sk} log --limit 200")
@@ -225,5 +224,40 @@ pkgs.testers.runNixOSTest {
     assert "call" in log and "agent/fleet/fixture-example/web" in log, log
     assert "refused" in log and "no allow rule matches" in log, log
     assert "example-token" not in log, log
+
+    # Adopting gh, step 1: every seat's gh runs through sekrets with the agent profile; ada's own
+    # shell keeps the real gh. Running it again changes nothing.
+    adopt = f"{sk} adopt gh --yes --bin-dir /srv/people/ada/.local/bin"
+    first = login("ada", adopt)
+    print(first)
+    assert "done  agent grant" in first and "done  gh shim" in first, first
+    again = login("ada", adopt)
+    print(again)
+    assert "done" not in again and "todo" not in again, again
+    assert "/usr/local/libexec/sekrets" in login("ada", "cat /srv/people/ada/.local/bin/gh")
+    shell = login("ada", "PATH=/srv/people/ada/.local/bin:$PATH gh pr list")
+    assert "home=/srv/people/ada" in shell, shell
+    machine.succeed(
+        "su ada -s /bin/sh -c "
+        + shlex.quote(
+            "XDG_RUNTIME_DIR=/run/user/1000 PTY_ROOT=/srv/people/ada/.local/state/st3/pty "
+            "systemd-run --user --scope --unit st3-seat-adopt.scope --quiet "
+            "--setenv=PATH=/run/current-system/sw/bin "
+            "-- pty run -d --force --id seat-adopt --cwd /srv/people/ada/web "
+            "--tag st3.scope-unit=st3-seat-adopt.scope --tag st3.subject=agent/fleet/fixture-example/adopter "
+            "--env ST_AGENT=agent/fleet/fixture-example/adopter --env XDG_RUNTIME_DIR=/run/user/1000 "
+            "--env PATH=/srv/people/ada/.local/bin:/run/current-system/sw/bin:/usr/local/bin "
+            "-- sh -c " + shlex.quote("{ gh pr view 1; gh auth token; echo exit=$?; } > /srv/people/ada/adopt.out 2>&1; echo done >> /srv/people/ada/adopt.out; sleep 600")
+        )
+    )
+    machine.wait_until_succeeds("grep -q '^done' /srv/people/ada/adopt.out", timeout=120)
+    seat_out = machine.succeed("cat /srv/people/ada/adopt.out")
+    print(seat_out)
+    assert "gh pr view 1 token=set home=/var/lib/st-sekrets/profiles/ada/agent-gh/home" in seat_out, seat_out
+    assert "no allow rule matches `gh auth token`" in seat_out, seat_out
+    assert "done  gh shim" not in login("ada", adopt)
+    undone = login("ada", f"{sk} unadopt gh --bin-dir /srv/people/ada/.local/bin")
+    assert "removed" in undone, undone
+    machine.fail("test -e /srv/people/ada/.local/bin/gh")
   '';
 }

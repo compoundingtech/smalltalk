@@ -118,6 +118,26 @@ gateway socket, not a proxy.
 In Rust: `st3::sekrets::authorized::authorized_request(&config, "ada/daemon-gh", &request)`
 returns the response or `Unavailable` (no gateway or no node key), `Refused` or `Transport`.
 
+## Adopting gh
+
+`sekrets adopt gh`, run by the person from a login session, moves their agents onto sekrets one
+step at a time. Step 1, the only step so far:
+
+- The agent profile (`PERSON/agent-gh`, or `--agent-profile`) exists, allows `gh-agent` and has
+  a GitHub login. A missing profile, policy or grant is created after a yes (or with `--yes`);
+  a missing login is reported with the `sekrets login` command to run.
+- One grant gives that profile to every agent of the person, `agent/**`, with `gh-agent` and no
+  expiry. Older, narrower grants of the same profile keep working beside it.
+- A `gh` shim in `~/.local/bin` (or `--bin-dir`) sends a seat's gh (a process with `ST_AGENT`
+  set) through `sekrets -- gh` and runs the real gh for everything else, so the person's shell
+  and st's daemon keep working exactly as before. `SEKRETS_DIRECT=1 gh ...` always runs the real
+  gh, which is never moved. The shim goes in last, only once the parts above are in place.
+
+Running it again reports each part and repairs what is missing. `sekrets unadopt gh` removes the
+shim (only a shim sekrets installed); profiles and grants stay. The person's own gh login stays in
+`~/.config/gh` in this step, so an agent could still read it: moving `git push` through sekrets
+and then removing that login are later steps, each on the person's word.
+
 ## The sandbox
 
 The gateway runs each command as the sekrets user inside bubblewrap:

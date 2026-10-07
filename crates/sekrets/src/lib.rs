@@ -9,6 +9,7 @@
 //! This crate is the gateway and the `sekrets` command. It depends on nothing of st: the st
 //! daemon vouches for its seats and records the gateway's log through this crate's protocol.
 
+pub mod adopt;
 pub mod authorized;
 pub mod cli;
 pub mod client;
