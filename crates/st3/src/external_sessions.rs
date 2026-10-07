@@ -3159,6 +3159,7 @@ fn normalize_omp(
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
             );
+            preserve_omp_result_timing(items, message);
             return;
         }
         // A shell command the person ran with `!`: shown as the harness recorded it, without
@@ -3237,16 +3238,19 @@ fn push_omp_content(
                         part.get("name").and_then(Value::as_str).unwrap_or("tool"),
                         part.get("arguments").cloned().unwrap_or_else(|| json!({})),
                     ),
-                    Some("toolResult" | "tool_result") => push_tool_result(
-                        items,
-                        item_sequence,
-                        &timestamp,
-                        part.get("toolCallId")
-                            .or_else(|| part.get("call_id"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("native-call"),
-                        part.get("content").cloned().unwrap_or(Value::Null),
-                    ),
+                    Some("toolResult" | "tool_result") => {
+                        push_tool_result(
+                            items,
+                            item_sequence,
+                            &timestamp,
+                            part.get("toolCallId")
+                                .or_else(|| part.get("call_id"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("native-call"),
+                            part.get("content").cloned().unwrap_or(Value::Null),
+                        );
+                        preserve_omp_result_timing(items, part);
+                    }
                     Some(kind) if REASONING_BLOCKS.contains(&kind) => {
                         push_reasoning(items, item_sequence, &timestamp, role, part);
                     }
@@ -3354,6 +3358,37 @@ fn push_tool_result_with_status(
 ) {
     let status = if failed { "error" } else { "success" };
     items.push(timeline_item(sequence, timestamp, "tool", "tool_result", json!({"call_id":call_id, "status":status, "media_type":"application/json", "content":content})));
+}
+
+fn preserve_omp_result_timing(items: &mut [Value], native_result: &Value) {
+    let Some(details) = native_result.get("details").and_then(Value::as_object) else {
+        return;
+    };
+    if details.is_empty() {
+        return;
+    }
+    let blocks = items.last_mut().expect("result was just appended")["body"]["blocks"]
+        .as_array_mut()
+        .expect("tool result has normalized blocks");
+    for block in blocks {
+        if block["kind"] != "tool_output" {
+            continue;
+        }
+        // Keep the native details object open: original names, units and future fields
+        // survive beside any metadata already supplied by normalization.
+        let metadata = block
+            .as_object_mut()
+            .expect("normalized block is an object")
+            .entry("metadata")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .expect("block metadata is an object");
+        metadata.extend(
+            details
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+    }
 }
 
 fn timeline_item(
@@ -4031,6 +4066,74 @@ mod tests {
         assert_eq!(result["body"]["call_id"], call["body"]["call_id"]);
         assert_eq!(result["body"]["status"], "error");
         assert_eq!(result["body"]["content"], fixture[3]["message"]["content"]);
+    }
+
+    #[test]
+    fn pi_and_omp_tool_result_blocks_preserve_native_details_and_source_records() {
+        for driver in [ExternalDriver::Omp, ExternalDriver::Pi] {
+            for details in [
+                json!({"wallTimeMs": 12.75, "timeoutSeconds": 0, "futureTimeNs": 0.125}),
+                json!({"wallTimeMs": 0, "timeoutSeconds": 0.125, "future": {"unit": "ticks", "value": 4.5}}),
+            ] {
+                for nested_kind in [None, Some("toolResult"), Some("tool_result")] {
+                    let mut entry = omp_tool_result_fixture()[1].clone();
+                    entry["message"]["arguments"] = json!({"timeoutSeconds": 999});
+                    if let Some(kind) = nested_kind {
+                        entry["message"]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("toolCallId");
+                        entry["message"]["content"] = json!([{
+                            "type": kind, "call_id": "nested",
+                            "content": "finished", "details": details
+                        }]);
+                    } else {
+                        entry["message"]["details"] = details.clone();
+                    }
+                    let mut items = Vec::new();
+                    normalize_native_line(driver, &entry, 0, "", &mut items);
+                    let result = items
+                        .iter()
+                        .find(|item| item["type"] == "tool_result")
+                        .unwrap();
+                    assert_eq!(result["body"]["blocks"][0]["kind"], "tool_output");
+                    assert_eq!(result["body"]["blocks"][0]["metadata"], details);
+                    assert!(result["body"].get("metadata").is_none());
+                    let source = items
+                        .iter()
+                        .flat_map(|item| item["body"]["blocks"].as_array().unwrap())
+                        .find(|block| block["kind"] == "source_record")
+                        .unwrap();
+                    assert_eq!(source["payload"]["raw"], entry);
+                    assert!(source.get("metadata").is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_tool_result_details_merge_without_inventing_absent_timing() {
+        let mut entry = omp_tool_result_fixture()[1].clone();
+        entry["message"].as_object_mut().unwrap().remove("details");
+        entry["message"]["arguments"] = json!({"timeoutSeconds": 999});
+        let mut items = Vec::new();
+        normalize_native_line(ExternalDriver::Omp, &entry, 0, "", &mut items);
+        assert!(
+            items.last().unwrap()["body"]["blocks"][0]
+                .get("metadata")
+                .is_none()
+        );
+        items.last_mut().unwrap()["body"]["blocks"][0]["metadata"] =
+            json!({"existing": true, "wallTimeMs": 999});
+        entry["message"]["details"] =
+            json!({"wallTimeMs": 0, "timeoutSeconds": 0.125, "future": "unchanged"});
+        let source_before = items[0]["body"]["blocks"].clone();
+        preserve_omp_result_timing(&mut items, &entry["message"]);
+        assert_eq!(
+            items.last().unwrap()["body"]["blocks"][0]["metadata"],
+            json!({"existing": true, "wallTimeMs": 0, "timeoutSeconds": 0.125, "future": "unchanged"})
+        );
+        assert_eq!(items[0]["body"]["blocks"], source_before);
     }
 
     #[test]

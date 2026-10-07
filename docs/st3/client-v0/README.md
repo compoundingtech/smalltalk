@@ -617,8 +617,12 @@ pages and updates are bounded by the negotiated byte and item limits.
 
 Pi-family native replay recognizes OMP's message-level `role: "toolResult"` records: the
 `toolCallId` correlates the result with its call, `isError` selects error or success status, and
-the result's text content is retained. Legacy tool-result blocks inside message content remain
-supported.
+the result's text content is retained. Native result `details` objects are merged verbatim into
+the normalized `tool_output` block's optional open `metadata`, preserving `wallTimeMs`,
+`timeoutSeconds`, zero/fractional values, original units, and future fields. There is no
+`tool_result` body metadata field; the complete native record remains unchanged in its
+`source_record` block. Legacy tool-result blocks inside message content remain supported and
+use the same block metadata shape.
 
 External process sessions remain listed even when st cannot identify a native transcript.
 Opening their timeline returns a non-retryable `unsupported-capability` error with
