@@ -34,6 +34,8 @@ use std::time::{Duration, Instant};
 
 /// Lines kept above the screen to scroll back through.
 const HISTORY: usize = 10_000;
+/// The most wheel reports sent to a program at once.
+const WHEEL_REPORTS: usize = 6;
 /// How long the first screen may take to arrive.
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -146,6 +148,13 @@ impl Screen {
         self.parser.advance(&mut self.term, bytes);
         self.output_at = Some(Instant::now());
     }
+}
+
+fn is_wheel(mouse: &pty_terminal::MouseEvent) -> bool {
+    matches!(
+        mouse.button,
+        Some(ProtocolButton::Four | ProtocolButton::Five | ProtocolButton::Six | ProtocolButton::Seven)
+    )
 }
 
 enum Input {
@@ -346,7 +355,8 @@ impl NativeTerminal {
         let mode = self.mode();
         if !local && mode.intersects(TermMode::MOUSE_MODE) {
             if let Some(mouse) = protocol_mouse(mouse, column, row) {
-                self.send(Input::Mouse(mouse, lines.unsigned_abs() as usize));
+                // A terminal sends one report per wheel notch, whatever the lines it scrolls.
+                self.send(Input::Mouse(mouse, 1));
             }
         } else if matches!(
             mouse.kind,
@@ -662,8 +672,18 @@ fn run(
         screen.attached = true;
     }
     loop {
+        // Wheel reports that queued up while the program drew are sent as one write, and at
+        // most `WHEEL_REPORTS` of them: a program redraws for each, and a long flick must not
+        // queue minutes of redraws behind it.
+        let mut wheel: Option<(Vec<u8>, usize)> = None;
         loop {
-            match inputs.try_recv() {
+            let input = inputs.try_recv();
+            if !matches!(&input, Ok(Input::Mouse(mouse, _)) if is_wheel(mouse))
+                && let Some((bytes, count)) = wheel.take()
+            {
+                connection.write(&bytes.repeat(count));
+            }
+            match input {
                 Ok(Input::Bytes(bytes)) => connection.write(&bytes),
                 Ok(Input::Resize(size)) => {
                     connection.resize(size.rows, size.columns);
@@ -675,7 +695,14 @@ fn run(
                 }
                 Ok(Input::Mouse(mouse, count)) => {
                     if let Some(bytes) = protocol.encode_mouse(&mouse) {
-                        connection.write(&bytes.repeat(count));
+                        if is_wheel(&mouse) {
+                            let (kept, total) = wheel.get_or_insert((bytes.clone(), 0));
+                            if *kept == bytes {
+                                *total = (*total + count).min(WHEEL_REPORTS);
+                            }
+                        } else {
+                            connection.write(&bytes.repeat(count));
+                        }
                     }
                 }
                 Ok(Input::Focus(gained)) => {
@@ -1329,6 +1356,25 @@ mod tests {
                 .collect::<String>()
                 .contains("line 29")
         });
+        // A program that asked for the mouse gets one report per notch, not one per line.
+        daemon
+            .write_all(&encode_packet(MessageType::Data, b"\x1b[?1000h\x1b[?1006h"))
+            .unwrap();
+        wait(&|| terminal.mode().intersects(TermMode::MOUSE_MODE));
+        let notch = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        terminal.wheel(3, notch, 0, 0, false);
+        let data = next(&mut daemon, &mut packets);
+        assert_eq!(data.type_, MessageType::Data);
+        assert_eq!(data.payload, b"\x1b[<64;1;1M");
+        daemon
+            .write_all(&encode_packet(MessageType::Data, b"\x1b[?1000l\x1b[?1006l"))
+            .unwrap();
+        wait(&|| !terminal.mode().intersects(TermMode::MOUSE_MODE));
         terminal.wheel(
             5,
             MouseEvent {
