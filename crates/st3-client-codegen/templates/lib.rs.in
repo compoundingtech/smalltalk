@@ -206,8 +206,8 @@ impl Drop for RequestGuard {
     }
 }
 
-type Observer = Box<dyn Fn(&Observation<'_>) + Send + Sync>;
-static OBSERVER: std::sync::OnceLock<Observer> = std::sync::OnceLock::new();
+type ObserverFn = Box<dyn Fn(&Observation<'_>) + Send + Sync>;
+static OBSERVER: std::sync::OnceLock<ObserverFn> = std::sync::OnceLock::new();
 
 /// Report each request and collections frame of this process to `observer`, once; later calls
 /// are ignored. Without it nothing is measured and nothing is allocated.
