@@ -1682,6 +1682,7 @@ impl Ui {
         if rect.width < 30 || rect.height < 8 {
             return;
         }
+        self.cover(body);
         for y in body.y..body.y + body.height {
             for x in body.x..body.x + body.width {
                 if !rect.contains((x, y).into()) {
@@ -2226,6 +2227,7 @@ impl Ui {
     }
 
     fn draw_palette(&self, buf: &mut Buffer, area: Rect, palette: &Palette) {
+        self.cover(area);
         let width = area.width.saturating_sub(8).clamp(20, 84);
         let height = area.height.saturating_sub(6).clamp(6, 26);
         let rect = Rect {
@@ -3367,6 +3369,7 @@ impl Ui {
     /// The right-click menu, drawn at the click and kept inside the glass; each row is a target.
     fn draw_context_menu(&self, buf: &mut Buffer, area: Rect) {
         let Some(menu) = &self.context else { return };
+        self.cover(area);
         let width = menu
             .items
             .iter()
