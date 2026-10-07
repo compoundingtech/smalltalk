@@ -1206,7 +1206,7 @@ async fn fleet_leave(
         }))?
         .as_bytes(),
     )?;
-    fs::remove_dir_all(config.state_dir.join("fleet"))?;
+    st3::config::FleetFile::remove(&config.state_dir)?;
     // The member key signed for this node and the people and agents it held keys for; a node
     // that joins again starts with new keys.
     let keys = st3::fleet::join::key_directory(&config.state_dir);
