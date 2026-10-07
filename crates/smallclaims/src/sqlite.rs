@@ -771,7 +771,7 @@ pub struct ReadGuard<'a> {
     pub pinned: Option<Rc<ReadConnection>>,
     /// Declared last, so it ends after the connection is returned. `None` for a read inside a
     /// pinned snapshot, which `Store::read_snapshot` already registers.
-    live: Option<LiveReadToken>,
+    _live: Option<LiveReadToken>,
 }
 
 thread_local! {
@@ -865,7 +865,7 @@ impl ReadPool {
                 pool: self,
                 connection: None,
                 pinned,
-                live: None,
+                _live: None,
             };
         }
         let waiting = crate::profile::enabled().then(std::time::Instant::now);
@@ -903,7 +903,7 @@ impl ReadPool {
             pool: self,
             connection: Some(connection),
             pinned: None,
-            live: Some(register_live_read(false)),
+            _live: Some(register_live_read(false)),
         }
     }
 
