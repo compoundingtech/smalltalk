@@ -3065,126 +3065,6 @@ pub fn missions_tree(world: &World, spinner: &'static str, system: bool) -> List
     listing
 }
 
-#[cfg(test)]
-mod tree_tests {
-    use super::*;
-
-    #[test]
-    fn a_request_holding_a_json_report_shows_what_happened_and_folds_the_rest() {
-        let text = r#"The deploy finished: {"status":"failed","error":"unit st3.service did not start","commit":"8821eced","host":"willow","attempt":2,"log":"/var/log/x","duration_ms":1234,"members":["maple","cedar"],"plan":{"a":1},"notes":"long\nnotes"}"#;
-        let shown = report(text, 60)
-            .unwrap()
-            .iter()
-            .map(text::plain)
-            .collect::<Vec<_>>();
-        assert_eq!(shown[0], "The deploy finished:");
-        let joined = shown.join("\n");
-        for wanted in [
-            "status",
-            "failed",
-            "error",
-            "unit st3.service did not start",
-            "commit",
-            "8821eced",
-        ] {
-            assert!(joined.contains(wanted), "{joined}");
-        }
-        assert!(shown.last().unwrap().contains("more fields"), "{joined}");
-        assert!(!joined.contains('{'), "no braces: {joined}");
-        assert!(report("Can you look at the deploy?", 60).is_none());
-    }
-
-    #[test]
-    fn a_folder_holding_only_a_folder_joins_it_on_one_line() {
-        let path = |text: &str| text.split('/').map(str::to_owned).collect::<Vec<_>>();
-        let compact = compact_folders(&[
-            path("fleet/smalltalk/operations/2026-10-01/operator"),
-            path("fleet/smalltalk/ci/watcher"),
-            path("fleet/cos/standing/cos"),
-            path("solo"),
-        ]);
-        assert_eq!(
-            compact,
-            [
-                vec![
-                    "fleet".to_owned(),
-                    "smalltalk".into(),
-                    "operations/2026-10-01".into()
-                ],
-                vec!["fleet".to_owned(), "smalltalk".into(), "ci".into()],
-                vec!["fleet".to_owned(), "cos/standing".into()],
-                Vec::<String>::new(),
-            ]
-        );
-    }
-
-    #[test]
-    fn an_agents_subagents_hang_beneath_its_row_and_are_never_selectable() {
-        let world = super::super::demo::world();
-        for listing in [agents_list(&world, "⠋", 60), agents_tree(&world, "⠋", 60)] {
-            let builder = listing
-                .ids
-                .iter()
-                .position(|id| id == "agent/example/atlas/builder")
-                .unwrap();
-            let children = listing
-                .items
-                .iter()
-                .find_map(|item| match item {
-                    Item::Row {
-                        index, children, ..
-                    } if *index == builder => Some(children),
-                    _ => None,
-                })
-                .unwrap();
-            let lines = children
-                .iter()
-                .map(super::super::text::plain)
-                .collect::<Vec<_>>();
-            assert_eq!(lines.len(), 2, "{lines:?}");
-            assert!(
-                lines[0].contains("├ map the parser's error paths · Explore 4m"),
-                "{lines:?}"
-            );
-            assert!(
-                lines[1].contains("└ run the slow tests · general-purpose 1m"),
-                "{lines:?}"
-            );
-            // Only agents are selectable; their subagents add no rows of their own.
-            assert_eq!(listing.ids.len(), world.agents.items().len());
-            assert!(listing.ids.iter().all(|id| !id.contains("a3f9e1")));
-        }
-    }
-
-    #[test]
-    fn a_tree_has_one_line_per_folder_and_leaf_in_path_order() {
-        let listing = agents_tree(&super::super::demo::world(), "⠋", 40);
-        let kinds = listing
-            .items
-            .iter()
-            .map(|item| match item {
-                Item::Folder(line) => format!("F {}", super::super::text::plain(line).trim()),
-                Item::Row { first, .. } => format!(
-                    "R {}",
-                    first
-                        .iter()
-                        .map(|span| span.content.as_ref())
-                        .collect::<String>()
-                        .trim()
-                ),
-                Item::Note(_) => "N".into(),
-                Item::Header { .. } => "H".into(),
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(kinds[0], "F ▾ example/", "{kinds:#?}");
-        assert!(
-            kinds
-                .iter()
-                .all(|kind| !kind.starts_with('N') && !kind.starts_with('H')),
-            "{kinds:#?}"
-        );
-    }
-}
 
 // ------------------------------------------------------------- new mission
 
@@ -3325,4 +3205,125 @@ pub fn devices_card(world: &World, width: usize) -> Doc {
     let mut doc = Doc::new();
     doc.card("your devices", theme::OVERLAY1, false, inner, width);
     doc
+}
+
+#[cfg(test)]
+mod tree_tests {
+    use super::*;
+
+    #[test]
+    fn a_request_holding_a_json_report_shows_what_happened_and_folds_the_rest() {
+        let text = r#"The deploy finished: {"status":"failed","error":"unit st3.service did not start","commit":"8821eced","host":"willow","attempt":2,"log":"/var/log/x","duration_ms":1234,"members":["maple","cedar"],"plan":{"a":1},"notes":"long\nnotes"}"#;
+        let shown = report(text, 60)
+            .unwrap()
+            .iter()
+            .map(text::plain)
+            .collect::<Vec<_>>();
+        assert_eq!(shown[0], "The deploy finished:");
+        let joined = shown.join("\n");
+        for wanted in [
+            "status",
+            "failed",
+            "error",
+            "unit st3.service did not start",
+            "commit",
+            "8821eced",
+        ] {
+            assert!(joined.contains(wanted), "{joined}");
+        }
+        assert!(shown.last().unwrap().contains("more fields"), "{joined}");
+        assert!(!joined.contains('{'), "no braces: {joined}");
+        assert!(report("Can you look at the deploy?", 60).is_none());
+    }
+
+    #[test]
+    fn a_folder_holding_only_a_folder_joins_it_on_one_line() {
+        let path = |text: &str| text.split('/').map(str::to_owned).collect::<Vec<_>>();
+        let compact = compact_folders(&[
+            path("fleet/smalltalk/operations/2026-10-01/operator"),
+            path("fleet/smalltalk/ci/watcher"),
+            path("fleet/cos/standing/cos"),
+            path("solo"),
+        ]);
+        assert_eq!(
+            compact,
+            [
+                vec![
+                    "fleet".to_owned(),
+                    "smalltalk".into(),
+                    "operations/2026-10-01".into()
+                ],
+                vec!["fleet".to_owned(), "smalltalk".into(), "ci".into()],
+                vec!["fleet".to_owned(), "cos/standing".into()],
+                Vec::<String>::new(),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_agents_subagents_hang_beneath_its_row_and_are_never_selectable() {
+        let world = super::super::demo::world();
+        for listing in [agents_list(&world, "⠋", 60), agents_tree(&world, "⠋", 60)] {
+            let builder = listing
+                .ids
+                .iter()
+                .position(|id| id == "agent/example/atlas/builder")
+                .unwrap();
+            let children = listing
+                .items
+                .iter()
+                .find_map(|item| match item {
+                    Item::Row {
+                        index, children, ..
+                    } if *index == builder => Some(children),
+                    _ => None,
+                })
+                .unwrap();
+            let lines = children
+                .iter()
+                .map(super::super::text::plain)
+                .collect::<Vec<_>>();
+            assert_eq!(lines.len(), 2, "{lines:?}");
+            assert!(
+                lines[0].contains("├ map the parser's error paths · Explore 4m"),
+                "{lines:?}"
+            );
+            assert!(
+                lines[1].contains("└ run the slow tests · general-purpose 1m"),
+                "{lines:?}"
+            );
+            // Only agents are selectable; their subagents add no rows of their own.
+            assert_eq!(listing.ids.len(), world.agents.items().len());
+            assert!(listing.ids.iter().all(|id| !id.contains("a3f9e1")));
+        }
+    }
+
+    #[test]
+    fn a_tree_has_one_line_per_folder_and_leaf_in_path_order() {
+        let listing = agents_tree(&super::super::demo::world(), "⠋", 40);
+        let kinds = listing
+            .items
+            .iter()
+            .map(|item| match item {
+                Item::Folder(line) => format!("F {}", super::super::text::plain(line).trim()),
+                Item::Row { first, .. } => format!(
+                    "R {}",
+                    first
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                        .trim()
+                ),
+                Item::Note(_) => "N".into(),
+                Item::Header { .. } => "H".into(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(kinds[0], "F ▾ example/", "{kinds:#?}");
+        assert!(
+            kinds
+                .iter()
+                .all(|kind| !kind.starts_with('N') && !kind.starts_with('H')),
+            "{kinds:#?}"
+        );
+    }
 }
