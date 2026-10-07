@@ -1243,6 +1243,38 @@ async fn attention_socket_evicts_completed_sources_and_reconnects_without_cached
 }
 
 #[tokio::test]
+async fn missions_first_page_returns_fifty_cards_and_a_cursor() {
+    let root = tempfile::tempdir().unwrap();
+    let state = test_state(root.path());
+    let source = format!(
+        "version 2\n{}",
+        (0..51)
+            .map(|index| format!("mission \"page-{index:02}\" state=\"ready\" {{ goal \"Read a page\" }}\n"))
+            .collect::<String>()
+    );
+    let intent = st3::graph::parse_intent(&source, "client-v0-baseline").unwrap();
+    let planned = state
+        .store
+        .mission(
+            &intent,
+            st3::model::IntentInput {
+                kdl: source,
+                source_name: None,
+            },
+        )
+        .unwrap();
+    state
+        .store
+        .apply(&intent, &planned.subject_tokens, "mission-page-smoke")
+        .unwrap();
+    let (status, page) = client_json(st3::api::router(state), "/v1/client/missions?limit=50").await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(page["value"]["items"].as_array().unwrap().len(), 50);
+    assert_eq!(page["value"]["page"]["has_more"], true);
+    assert!(page["value"]["page"]["next_cursor"].is_string());
+}
+
+#[tokio::test]
 async fn client_v0_read_routes_conform_to_the_manifest() {
     let root = tempfile::tempdir().unwrap();
     let app = st3::api::router(test_state(root.path()));

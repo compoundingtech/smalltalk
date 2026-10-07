@@ -17,11 +17,16 @@ uses the same SQLite page read as the HTTP handler. It builds 3,001 definitions,
 50 cards, checks continuation, and permits at most 310 SQL statements (six per card
 plus ten page/attention/snapshot statements), using the existing thread-local counter.
 Statements from other parallel tests cannot enter the count. The page read stays
-inside one SQLite snapshot. HTTP envelope and cursor behavior remain covered by the
-client contract tests; Performance continues to measure route cost and latency.
+inside one SQLite snapshot. A separate cheap HTTP smoke test seeds 51 definitions and
+checks HTTP 200, 50 cards and a continuation cursor without timing. Performance continues
+to measure route cost and latency.
 
 The statement budget detects materializing every definition through per-card queries.
-It does not claim to bound all rows visited inside a statement or elapsed time.
+It does not catch a slow single query or bound all rows visited inside a statement.
+The first-page route in `daemon_cost` guards SQLite work at two store sizes, and the
+Performance job measures elapsed time. The counter is available in every unit-test profile:
+`store::STATEMENTS_RUN` is exported under `cfg(test)`, and the `smallclaims` dev-dependency
+enables its `test-support` counter independent of optimization level.
 
 ## Concurrent quick-agent responses
 
