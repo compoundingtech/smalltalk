@@ -341,7 +341,7 @@ finally:
         .env("FIXTURE_SEAT", SEAT)
         .env("ST3_SUBJECT", TERMINAL)
         .env("ST3_ENDPOINT", root.path().join("api.sock"))
-        .env("ST3_BIN", env!("CARGO_BIN_EXE_st3-fixture"))
+        .env("ST3_BIN", test_env!("CARGO_BIN_EXE_st3-fixture"))
         .env("ST3_DRIVER_STATE_DIR", root.path().join("drivers"))
         .env("ST3_MAILBOX_TRANSPORT", "push")
         .env("FIXTURE_RECEIVED", &received)

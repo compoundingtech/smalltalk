@@ -113,6 +113,17 @@ the fallback. Archive mode rejects missing or mismatched roots/binaries. Tests, 
 partitions, retries, eight test threads, real VM checks and required contexts are unchanged.
 Local and macOS runs still use the existing build selection unless `CI_TEST_PARTITION` is set.
 
+If `genie-freshness` reports `unrelocated test paths: FILE:LINE`, replace the raw test path
+at that location with `test_env!("CARGO_BIN_EXE_st3-fixture")`,
+`test_env!("CARGO_MANIFEST_DIR")` or `test_env!("CARGO_TARGET_TMPDIR")`, as appropriate.
+Use `test_env!("CARGO_MANIFEST_DIR", "/relative/fixture")` instead of a `concat!` fixture
+path, and `test_bin!("st3-fixture")` instead of `cargo_bin!`. The integration test root and
+test-enabled libraries already import `scripts/ci-test-paths.rs`; a separate test target
+must import that helper with `#[macro_use]` and a `#[path = "..."]` relative to its source
+file. Keep the original fixture, executable, arguments and assertions. Run
+`python3 scripts/check-ci-test-paths` and the affected test before pushing. Apply the same
+fix if a merge group finds a raw path introduced by another PR; do not bypass the guard.
+
 Main upkeep probes the exact Cargo and Nix cache keys for each stage before provisioning Nix
 or restoring build archives. When both entries exist it stops after the probes. A miss is flagged
 as P0 and fills the missing entries with builds only: selected test executables, Clippy artifacts,
