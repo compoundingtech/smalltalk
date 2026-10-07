@@ -996,6 +996,7 @@ async fn response_envelope_unbounded(
             let cpu_kind = request_route.clone();
             let cpu_client = caller.clone();
             let handler_queue = profile.as_ref().map(|op| op.wall_span("handler/queue"));
+            let forwarded_handler = request_path == crate::peer::CLIENT_READ_FORWARD_PATH;
             match crate::api::read_deadline::spawn_handler(move || {
                 drop(handler_queue);
                 if let Some(profile) = &handler_profile {
@@ -1004,9 +1005,12 @@ async fn response_envelope_unbounded(
                 let _entered = crate::profile::enter(handler_profile.as_ref());
                 crate::performance::with_cpu(Some(&cpu_kind), Some(&cpu_client), || {
                     runtime.block_on(async move {
-                        // The blocking handler owns the actual relay future. An outer
-                        // timeout alone stops its waiter but leaves this future running.
-                        if let Some(budget) = smallclaims::read_budget::current() {
+                        // Cancel the actual forwarded relay, not only its outer waiter.
+                        // Other routes retain their existing cooperative cancellation;
+                        // this transport's mutation variants carry no read budget.
+                        if let Some(budget) = smallclaims::read_budget::current()
+                            .filter(|_| forwarded_handler)
+                        {
                             match tokio::time::timeout(budget.remaining(), next.run(request)).await {
                                 Ok(response) => response,
                                 Err(_) => {

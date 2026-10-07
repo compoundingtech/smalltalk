@@ -155,13 +155,18 @@ impl<F> Drop for Budgeted<F> {
 fn forwarded_deadline(operation: &crate::peer::ClientReadOperation) -> Option<Duration> {
     // This transport also carries terminal actions: cancelling their acknowledgement
     // would turn a completed mutation into an apparently failed read.
-    if matches!(
-        operation,
-        crate::peer::ClientReadOperation::TerminalControl { .. }
-    ) {
-        None
-    } else {
-        Some(ORDINARY + operation.wait())
+    use crate::peer::ClientReadOperation;
+    match operation {
+        ClientReadOperation::TerminalControl { .. } => None,
+        ClientReadOperation::ConversationChanges { .. }
+        | ClientReadOperation::TerminalScreenChange { .. } => Some(ORDINARY + operation.wait()),
+        ClientReadOperation::ConversationContent { .. }
+        | ClientReadOperation::Timeline { .. }
+        | ClientReadOperation::TerminalScreen { .. }
+        | ClientReadOperation::SeatSnapshot { .. }
+        | ClientReadOperation::AgentWorkspace { .. }
+        | ClientReadOperation::Blob { .. }
+        | ClientReadOperation::Messages { .. } => Some(ORDINARY),
     }
 }
 
@@ -696,6 +701,159 @@ mod tests {
         assert!(!response.is_finished());
         finish_tx.send(()).unwrap();
         assert_eq!(response.await.unwrap().unwrap().status(), StatusCode::OK);
+    }
+
+    fn forwarded_app(state: AppState) -> axum::Router {
+        use axum::{
+            Router, extract::DefaultBodyLimit, middleware::from_fn_with_state, routing::post,
+        };
+        Router::new()
+            .route(
+                crate::peer::CLIENT_READ_FORWARD_PATH,
+                post(super::super::forward_client_read).layer(DefaultBodyLimit::max(16_384)),
+            )
+            .with_state(state.clone())
+            .layer(from_fn_with_state(
+                (state, ClientTransportBoundary::Unix),
+                super::super::response_envelope,
+            ))
+    }
+
+    #[tokio::test]
+    async fn forwarded_real_handler_rejects_oversized_and_malformed_bodies() {
+        use tower::ServiceExt;
+        let root = tempfile::tempdir().unwrap();
+        let app = forwarded_app(super::super::tests::state(root.path()));
+        for (body, expected) in [
+            ("x".repeat(16_385), StatusCode::PAYLOAD_TOO_LARGE),
+            ("{".into(), StatusCode::BAD_REQUEST),
+        ] {
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(crate::peer::CLIENT_READ_FORWARD_PATH)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn forwarded_real_handler_preserves_long_poll_wait_through_a_signed_peer() {
+        use crate::peer::{
+            ClientReadOperation, ClientReadRequest, ClientReadRoute, ClientRelay, FleetAuth,
+        };
+        use axum::{Router, routing::post};
+        use std::os::unix::fs::PermissionsExt;
+        use tower::ServiceExt;
+        let root = tempfile::tempdir().unwrap();
+        let secret = root.path().join("fleet-secret");
+        std::fs::write(&secret, [5_u8; 32]).unwrap();
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let auth = FleetAuth::test("fleet-test", &[5; 32]);
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+        let seen = Arc::new(std::sync::Mutex::new(Some(seen_tx)));
+        let peer = Router::new().route(
+            "/v1/peer/client-read",
+            post(move |body: axum::body::Bytes| {
+                let auth = auth.clone();
+                let seen = seen.clone();
+                async move {
+                    let received: ClientReadRequest = serde_json::from_slice(&body).unwrap();
+                    seen.lock().unwrap().take().unwrap().send(received).unwrap();
+                    // Allowed owner wait plus ordinary work exceeds the 15-second query
+                    // budget, but fits in the forwarding envelope's 25-second budget.
+                    tokio::time::sleep(ORDINARY + Duration::from_secs(1)).await;
+                    let answer = serde_json::to_vec(&crate::model::ApiResponse {
+                        api_version: "st3.v1".into(),
+                        request_id: "invented".into(),
+                        snapshot_host: "far".into(),
+                        store_index: 0,
+                        value: json!({"items": []}),
+                    })
+                    .unwrap();
+                    let headers = auth
+                        .response_headers_for(
+                            "/v1/peer/client-read",
+                            "far",
+                            &answer,
+                            &FleetAuth::body_digest(&body),
+                        )
+                        .unwrap();
+                    let mut response = (StatusCode::OK, answer).into_response();
+                    response.headers_mut().insert(
+                        "content-type",
+                        axum::http::HeaderValue::from_static("application/json"),
+                    );
+                    response.headers_mut().extend(headers);
+                    response
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, peer).await.unwrap() });
+        let mut state = super::super::tests::state(root.path());
+        state.node = "middle".into();
+        state.client_relay = ClientRelay::from_config(&crate::config::Config {
+            node: "middle".into(),
+            fleet_id: Some("fleet-test".into()),
+            shared_secret_file: Some(secret),
+            peers: vec![crate::config::PeerConfig {
+                name: "far".into(),
+                url: format!("http://{address}"),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(crate::peer::CLIENT_READ_FORWARD_PATH)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&ClientReadRequest {
+                    authority_actor: "person/invented".into(),
+                    relay: Some(ClientReadRoute {
+                        target: "host/far".into(),
+                        path: vec!["near".into()],
+                        hops_left: 3,
+                    }),
+                    request: ClientReadOperation::ConversationChanges {
+                        session_id: "invented".into(),
+                        after: None,
+                        wait_ms: 10_000,
+                    },
+                })
+                .unwrap(),
+            ))
+            .unwrap();
+        let started = std::time::Instant::now();
+        let response = forwarded_app(state).oneshot(request).await.unwrap();
+        server.abort();
+        let _ = server.await;
+        let seen = seen_rx.await.unwrap();
+        assert_eq!(seen.authority_actor, "person/invented");
+        assert!(
+            seen.relay.is_none(),
+            "the last hop reaches the owner directly"
+        );
+        assert!(matches!(
+            seen.request,
+            ClientReadOperation::ConversationChanges {
+                wait_ms: 10_000,
+                ..
+            }
+        ));
+        assert!(started.elapsed() >= ORDINARY);
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 16_384)
+            .await
+            .unwrap();
+        let answer: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(answer["value"]["items"], json!([]));
     }
 
     #[tokio::test(start_paused = true)]
