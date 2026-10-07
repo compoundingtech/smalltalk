@@ -141,6 +141,13 @@ pub(crate) struct Registration<'a> {
     epoch: String,
 }
 
+impl Registration<'_> {
+    /// Identity of this exclusive producer lifetime; persisted earlier epochs remain stale.
+    pub(crate) fn epoch(&self) -> &str {
+        &self.epoch
+    }
+}
+
 impl Drop for Registration<'_> {
     fn drop(&mut self) {
         if let Ok(mut state) = self.presence.source.lock()
