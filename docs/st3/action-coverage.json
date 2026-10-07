@@ -846,9 +846,9 @@
     },
     {
       "command": "st doctor",
-      "description": "Check the daemon and runtime dependencies",
+      "description": "Check current daemon evidence and list unchecked invariants",
       "tests": [
-        "crates/st3/tests/daemon_environment.rs::doctor_reports_missing_build_tools_and_whether_a_small_crate_links"
+        "crates/st3/tests/daemon_environment.rs::doctor_does_not_link_a_crate_or_probe_missing_build_tools"
       ],
       "verification": "existing CLI integration"
     },
@@ -1952,7 +1952,7 @@
       "command": "st up",
       "description": "Start the HTTP API, readers, peers, and reconciler",
       "tests": [
-        "crates/st3/tests/daemon_environment.rs::bare_service_environment_loads_shell_path_and_rechecks_credentials"
+        "crates/st3/tests/daemon_environment.rs::bare_service_environment_does_not_probe_tools_or_credentials_on_doctor"
       ],
       "verification": "existing CLI integration"
     },
