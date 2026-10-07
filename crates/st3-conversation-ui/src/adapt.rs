@@ -619,6 +619,14 @@ fn filtered_entry(entry: &TimelineEntry, filters: &[crate::DisplayFilter]) -> Ti
         if !matches!(entry.role, TimelineRole::User | TimelineRole::System) {
             text = crate::clean_message_text_with_filters(&text, filters);
         }
+        // The harness's label for a reasoning step is not part of what it said: thinking it did
+        // share reads as "Thinking · ..." (empty steps are hidden as bookkeeping).
+        if filters.contains(&DisplayFilter::Bookkeeping)
+            && entry.role == TimelineRole::Assistant
+            && let Some(thought) = raw.strip_prefix("[reasoning]")
+        {
+            text = format!("Thinking · {}", thought.trim());
+        }
         if filters.contains(&DisplayFilter::Excerpts) && raw.starts_with("[unrecognized ") {
             text = bounded_preview(&text, 512).into_owned();
         }
