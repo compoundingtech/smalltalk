@@ -14,7 +14,7 @@
     "detail": "No checkpoint rules change."
   },
   "compatibility": {
-    "status": "compatible",
+    "status": "changed",
     "detail": "Raises the existing per-socket bound from eight to sixteen; no new fields or client requirement. Existing clients keep their subscriptions."
   },
   "downtime": {
