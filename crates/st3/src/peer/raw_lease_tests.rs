@@ -230,6 +230,15 @@ async fn lease_eof(stream: &mut tokio::net::UnixStream) {
     .expect("revoked stream remained open beyond fail-closed deadline");
 }
 #[tokio::test]
+async fn accepted_owner_proof_releases_peek_before_next_heartbeat() {
+    let pair = lease_pair().await;
+    let peek = tokio::time::timeout(Duration::from_millis(500), leased_peek(&pair))
+        .await
+        .expect("accepted authority proof must wake screen reads before the one-second heartbeat");
+    drop(peek);
+}
+
+#[tokio::test]
 async fn raw_lease_revocation_crosses_two_daemons_without_graph_replication() {
     let pair = lease_pair().await;
     let mut first = leased_peek(&pair).await;
