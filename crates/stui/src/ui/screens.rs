@@ -2556,7 +2556,10 @@ pub fn agent_actions_doc(agent: &Agent, width: usize, spinner: &'static str) -> 
     }
     doc.blank();
     doc.wrap(
-        &text::inline("Restart, suspend and retire ask y first. Esc closes.", theme::dim()),
+        &text::inline(
+            "Interrupt, restart, suspend and retire ask y first. Esc closes.",
+            theme::dim(),
+        ),
         width,
     );
     doc

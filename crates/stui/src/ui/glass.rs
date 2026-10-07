@@ -101,6 +101,26 @@ enum Drop {
 /// What a row of the right-click menu does.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum MenuAction {
+    /// Reuse a registered action, after opening the subject it belongs to if needed.
+    Activate {
+        subject: Option<String>,
+        hit: Box<Hit>,
+    },
+    Agent {
+        agent: String,
+        key: char,
+    },
+    Declaration(String),
+    CopyText(String),
+    Reply {
+        agent: String,
+        message: Option<String>,
+    },
+    Messages(String),
+    Message {
+        agent: String,
+        entry: String,
+    },
     CloseTab(usize, usize),
     SplitTab { group: usize, tab: usize, right: bool },
     MoveTab { group: usize, tab: usize, to: usize },
@@ -113,10 +133,11 @@ pub(crate) enum MenuAction {
 /// A menu opened by a right click, at the place of the click.
 #[derive(Clone, Debug)]
 pub(crate) struct ContextMenu {
-    column: u16,
-    row: u16,
-    title: String,
-    items: Vec<(String, MenuAction)>,
+    pub(super) column: u16,
+    pub(super) row: u16,
+    pub(super) title: String,
+    pub(super) items: Vec<(String, MenuAction)>,
+    pub(super) selected: usize,
 }
 
 /// The old stui's Usage tab, which now floats over the glass as Now does.
@@ -1078,7 +1099,6 @@ impl Ui {
         if let Some(palette) = &glasses.palette {
             self.draw_palette(buf, area, palette);
         }
-        self.draw_context_menu(buf, area);
         self.draw_drag(buf);
     }
 
@@ -2388,13 +2408,6 @@ impl Ui {
         if key.code == KeyCode::Esc && self.cancel_drag() {
             return true;
         }
-        // Esc closes the right-click menu; it is the only key the menu takes.
-        if self.context.is_some() {
-            self.context = None;
-            if key.code == KeyCode::Esc {
-                return true;
-            }
-        }
         let terminal_focused = self.terminal_focused();
         let mission_form = self.mission_form_focused();
         let Some(glasses) = self.glasses.as_mut() else {
@@ -3276,7 +3289,7 @@ impl Ui {
     /// Home stays.
     /// Open the right-click menu for what is under the pointer: a tab, or a split's strip or
     /// non-terminal body (a terminal body keeps the click for its program).
-    pub(crate) fn open_context_menu(&mut self, column: u16, row: u16) {
+    pub(super) fn open_glass_context_menu(&mut self, column: u16, row: u16) {
         let Some(glasses) = self.glasses.as_ref() else {
             return;
         };
@@ -3300,8 +3313,17 @@ impl Ui {
             else {
                 return;
             };
-            let subject = pane.split_once(':').map(|(_, subject)| subject.to_owned()).filter(|s| !s.is_empty());
-            let mut items = vec![("Close tab".to_owned(), MenuAction::CloseTab(group, tab))];
+            let subject = pane
+                .split_once(':')
+                .map(|(_, subject)| subject.to_owned())
+                .filter(|s| !s.is_empty());
+            let mut items = vec![(
+                "Show tab [Enter]".to_owned(),
+                MenuAction::Activate {
+                    subject: None,
+                    hit: Box::new(Hit::GlassTab(group, tab)),
+                },
+            )];
             if groups.get(group).is_some_and(|group| group.tabs.len() > 1) {
                 items.push(("Split right with this tab".into(), MenuAction::SplitTab { group, tab, right: true }));
                 items.push(("Split below with this tab".into(), MenuAction::SplitTab { group, tab, right: false }));
@@ -3316,11 +3338,16 @@ impl Ui {
             if let Some(subject) = subject {
                 items.push(("Copy its path".into(), MenuAction::CopyPath(subject.clone())));
             }
+            items.push((
+                "Close tab [Ctrl+W]".into(),
+                MenuAction::CloseTab(group, tab),
+            ));
             ContextMenu {
                 column,
                 row,
                 title: "tab".into(),
                 items,
+                selected: 0,
             }
         } else {
             let leaf = {
@@ -3356,18 +3383,28 @@ impl Ui {
                 row,
                 title: "split".into(),
                 items: vec![
-                    ("Split right".into(), MenuAction::SplitGroup { group, right: true }),
-                    ("Split below".into(), MenuAction::SplitGroup { group, right: false }),
-                    ("New tab…".into(), MenuAction::NewTab(group)),
+                    (
+                        "Split right [Ctrl+V]".into(),
+                        MenuAction::SplitGroup { group, right: true },
+                    ),
+                    (
+                        "Split below [Ctrl+X]".into(),
+                        MenuAction::SplitGroup {
+                            group,
+                            right: false,
+                        },
+                    ),
+                    ("New tab… [Ctrl+T]".into(), MenuAction::NewTab(group)),
                     ("New terminal".into(), MenuAction::NewTerminal(group)),
                 ],
+                selected: 0,
             }
         };
         self.context = Some(menu);
     }
 
     /// The right-click menu, drawn at the click and kept inside the glass; each row is a target.
-    fn draw_context_menu(&self, buf: &mut Buffer, area: Rect) {
+    pub(super) fn draw_context_menu(&self, buf: &mut Buffer, area: Rect) {
         let Some(menu) = &self.context else { return };
         self.cover(area);
         let width = menu
@@ -3376,11 +3413,15 @@ impl Ui {
             .map(|(label, _)| text::width(label))
             .chain([text::width(&menu.title)])
             .max()
-            .unwrap_or(8) as u16
-            + 4;
-        let height = menu.items.len() as u16 + 1;
+            .unwrap_or(8)
+            .saturating_add(4)
+            .min(area.width as usize) as u16;
+        let height = menu.items.len().saturating_add(2).min(area.height as usize) as u16;
         let x = menu.column.min((area.x + area.width).saturating_sub(width));
-        let y = (menu.row + 1).min((area.y + area.height).saturating_sub(height));
+        let y = menu
+            .row
+            .saturating_add(1)
+            .min((area.y + area.height).saturating_sub(height));
         let rect = Rect {
             x,
             y,
@@ -3389,6 +3430,11 @@ impl Ui {
         };
         self.frame.borrow_mut().menu = Some(rect);
         buf.set_style(rect, Style::default().bg(theme::MANTLE));
+        for y in rect.y..rect.bottom() {
+            for x in rect.x..rect.right() {
+                buf[(x, y)].set_symbol(" ");
+            }
+        }
         buf.set_stringn(
             rect.x + 1,
             rect.y,
@@ -3396,27 +3442,87 @@ impl Ui {
             rect.width.saturating_sub(2) as usize,
             theme::dim().bg(theme::MANTLE),
         );
-        for (index, (label, action)) in menu.items.iter().enumerate() {
+        let visible = rect.height.saturating_sub(2) as usize;
+        let top = menu.selected.saturating_sub(visible.saturating_sub(1));
+        for (offset, (index, (label, action))) in menu
+            .items
+            .iter()
+            .enumerate()
+            .skip(top)
+            .take(visible)
+            .enumerate()
+        {
             let line = Rect {
-                y: rect.y + 1 + index as u16,
+                y: rect.y + 1 + offset as u16,
                 height: 1,
                 ..rect
             };
+            let background = if index == menu.selected {
+                theme::ROW_SELECTED
+            } else {
+                theme::MANTLE
+            };
+            buf.set_style(line, theme::text().bg(background));
             buf.set_stringn(
                 line.x + 2,
                 line.y,
                 label,
                 line.width.saturating_sub(3) as usize,
-                theme::text().bg(theme::MANTLE),
+                theme::text().bg(background),
             );
             self.hit(line, Hit::Menu(action.clone()));
         }
+        buf.set_stringn(
+            rect.x + 1,
+            rect.y + rect.height.saturating_sub(1),
+            "↑↓ · Enter · Esc",
+            rect.width.saturating_sub(2) as usize,
+            theme::dim().bg(theme::MANTLE),
+        );
     }
 
     /// A row of the right-click menu was chosen.
     pub(crate) fn run_menu_action(&mut self, action: MenuAction) {
         self.context = None;
         match action {
+            MenuAction::Activate { subject, hit } => {
+                self.popover = None;
+                if let Some(subject) = subject {
+                    self.open(&subject);
+                    if let Hit::Key(key) = *hit {
+                        self.action_key(key);
+                    } else {
+                        self.click(*hit);
+                    }
+                } else {
+                    self.click(*hit);
+                }
+            }
+            MenuAction::Agent { agent, key } => {
+                self.popover = None;
+                self.agent_action(agent, key);
+            }
+            MenuAction::Declaration(mission) => {
+                self.open(&mission);
+                if !self.kdl {
+                    self.action_key('k');
+                }
+            }
+            MenuAction::CopyText(text) => {
+                copy(&text);
+                self.flash("Copied message text");
+            }
+            MenuAction::Reply { agent, message } => {
+                self.open(&agent);
+                if let Some(message) = message {
+                    self.replies.insert(agent, message);
+                } else {
+                    self.replies.remove(&agent);
+                }
+                self.editing = true;
+            }
+            MenuAction::Messages(agent) => self.open_message_choices(&agent),
+            MenuAction::Message { agent, entry } => self.open_message_actions(&agent, &entry),
             MenuAction::CloseTab(group, tab) => {
                 self.show_in(group, tab);
                 self.close_tab();
