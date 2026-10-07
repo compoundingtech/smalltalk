@@ -69,6 +69,8 @@ const COLLECTION_MAX_SUBSCRIPTIONS: usize = 16;
 const COLLECTION_REREAD_INTERVAL: Duration = Duration::from_millis(1_500);
 // Observer grace periods and checkpoint waits can enter attention without a new claim.
 const ATTENTION_CLOCK_INTERVAL: Duration = Duration::from_secs(30);
+const COLLECTION_PING_INTERVAL: Duration = Duration::from_secs(8);
+const COLLECTION_SEND_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Claims that no collection window shows: rereading for them only costs.
 fn collection_ignores(collection: &str, kind: &str) -> bool {
@@ -355,7 +357,14 @@ async fn send_collection(socket: &mut WebSocket, value: Value) -> bool {
     if payload.len() > CLIENT_MAX_RESPONSE_BYTES {
         return false;
     }
-    socket.send(WsMessage::Text(payload.into())).await.is_ok()
+    send_collection_message(socket, WsMessage::Text(payload.into())).await
+}
+
+async fn send_collection_message(socket: &mut WebSocket, message: WsMessage) -> bool {
+    matches!(
+        tokio::time::timeout(COLLECTION_SEND_TIMEOUT, socket.send(message)).await,
+        Ok(Ok(()))
+    )
 }
 
 enum Refreshed {
@@ -790,8 +799,16 @@ async fn collection_stream_socket_with_reader<F, Fut>(
     let (conversation_outbox, mut conversation_frames) =
         tokio::sync::mpsc::unbounded_channel::<(String, Value)>();
     // The commits already weighed for a reread, whether one is due, and when the last ran.
-    let mut attention_clock = tokio::time::interval(ATTENTION_CLOCK_INTERVAL);
+    let mut attention_clock = tokio::time::interval_at(
+        tokio::time::Instant::now() + ATTENTION_CLOCK_INTERVAL,
+        ATTENTION_CLOCK_INTERVAL,
+    );
     attention_clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut ping_clock = tokio::time::interval_at(
+        tokio::time::Instant::now() + COLLECTION_PING_INTERVAL,
+        COLLECTION_PING_INTERVAL,
+    );
+    ping_clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut weighed = state.store.index().unwrap_or_default();
     let mut reread_due = false;
     let mut last_reread = tokio::time::Instant::now() - COLLECTION_REREAD_INTERVAL;
@@ -816,6 +833,9 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                         let Some(Ok(message)) = incoming else { return; };
                         let WsMessage::Text(payload) = message else {
                             if matches!(message, WsMessage::Close(_)) { return; }
+                            if let WsMessage::Ping(payload) = message
+                                && !send_collection_message(&mut socket, WsMessage::Pong(payload)).await
+                            { return; }
                             break 'command;
                         };
                         let request = match serde_json::from_str::<CollectionSubscribe>(&payload) {
@@ -944,6 +964,11 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                 // Pairing expiry and mission lease state can change without a claim. Stable
                 // rows remain reusable; authority and local overlays are rechecked on reads.
                 refresh.extend(subscriptions.keys().cloned());
+            }
+            _ = ping_clock.tick() => {
+                // Protocol liveness never schedules an authorized window read.
+                if !send_collection_message(&mut socket, WsMessage::Ping(Vec::new().into())).await { return; }
+                continue;
             }
             Some((id, frame)) = conversation_frames.recv(), if !command_waiting => {
                 // A follower stopped by unsubscribe may still have had a frame on the way.
@@ -10103,6 +10128,73 @@ mission "zz-match-two" state="ready" { goal "Remain in the filtered continuation
             assert_eq!(frame["items"], json!([]), "{frame}");
             assert_eq!(frame["has_more"], false, "{frame}");
         }
+        socket.close(None).await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn collections_socket_ping_pong_does_not_read_held_windows() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let reads = Arc::new(AtomicUsize::new(0));
+        let observed = reads.clone();
+        let app = axum::Router::new().route(
+            "/stream",
+            axum::routing::get(move |upgrade: WebSocketUpgrade| {
+                let (state, reads) = (state.clone(), reads.clone());
+                async move {
+                    upgrade.on_upgrade(move |socket| {
+                        collection_stream_socket_with_reader(
+                            socket,
+                            state,
+                            ClientSession::local(None).unwrap(),
+                            None,
+                            move |state, session, request, permit| {
+                                reads.fetch_add(1, Ordering::SeqCst);
+                                async move {
+                                    collection_items(&state, &session, &request, permit).await
+                                }
+                            },
+                        )
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream"))
+            .await
+            .unwrap();
+        socket.send(Message::Text(json!({
+            "kind":"subscribe", "id":"held", "collection":"work", "limit":2
+        }).to_string().into())).await.unwrap();
+        let snapshot = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await.unwrap().unwrap().unwrap();
+        let snapshot: Value = serde_json::from_str(snapshot.to_text().unwrap()).unwrap();
+        assert_eq!(snapshot["kind"], "snapshot");
+        assert_eq!(observed.load(Ordering::SeqCst), 1);
+
+        let payload = b"idle-window".to_vec();
+        socket.send(Message::Ping(payload.clone().into())).await.unwrap();
+        let pong = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await.unwrap().unwrap().unwrap();
+        assert_eq!(pong, Message::Pong(payload.clone().into()));
+        let ping = tokio::time::timeout(Duration::from_secs(10), socket.next())
+            .await.unwrap().unwrap().unwrap();
+        assert!(matches!(ping, Message::Ping(_)), "{ping:?}");
+        socket.flush().await.unwrap();
+        // A second client probe proves the server handled our automatic Pong and kept
+        // receiving commands after its own ping, without rebuilding the held window.
+        socket.send(Message::Ping(payload.clone().into())).await.unwrap();
+        let pong = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await.unwrap().unwrap().unwrap();
+        assert_eq!(pong, Message::Pong(payload.into()));
+        assert_eq!(observed.load(Ordering::SeqCst), 1);
         socket.close(None).await.unwrap();
         server.abort();
     }
