@@ -787,10 +787,11 @@ producer rather than only its constants:
   withheld value is never fabricated from a previous one — so a frame omitting
   the cost would *erase* the published one at the next turn boundary. The
   extension holds the last assistant `usage.cost.total` and restates it, which is
-  exactly what `costUsd` means for pi and omp. The field description and
-  HC-R16 now explicitly allow each harness's reported scope; summing to a session
-  total would need the producer-side accumulator HC-R16 refuses for
-  `sessionTotalTokens` for the same reason. The hold is
+  exactly what pi and omp currently publish for `costUsd`. The producer table
+  describes this per-message scope, while HC-R16 still says "session cost";
+  the proposed wording change in HC-R16 is pending Johannes's confirmation.
+  Summing to a session total would need the producer-side accumulator HC-R16
+  refuses for `sessionTotalTokens` for the same reason. The hold is
   cleared on session replacement, so a `/new` session does not restate its
   predecessor's cost.
 
