@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Report unavailable Git truthfully when suspending a seat and resolve Git from the daemon's login-shell environment.",
+  "replay": {"status": "none", "detail": "No replay behavior changes."},
+  "schema": {"status": "none", "detail": "No database schema or migration changes."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or digest changes."},
+  "compatibility": {"status": "changed", "detail": "Seat snapshot Git resolution follows the existing login-shell executable convention. Missing or unspawnable Git now reports git-unavailable with the underlying error, rather than workspace-not-git. Actual non-Git workspaces remain unsupported and report workspace-not-git; no wire format changes."},
+  "downtime": {"status": "none", "detail": "No additional service interruption introduced."},
+  "manual": {"status": "none", "detail": "No migration or manual state changes required. Git must remain executable on the account's login-shell PATH."},
+  "recovery": {"status": "none", "detail": "No persistent format changes; ordinary binary rollback remains supported."}
+}
