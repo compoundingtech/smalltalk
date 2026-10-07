@@ -1,10 +1,12 @@
 //! Incremental actual fields and runtime causal authority for the agent card.
 //! The card owner certifies extraction, all source hooks and authorization. This module
 //! owns neither a registry nor a Publisher; dirty/incomplete ancestry rejects reads.
+//! Parent identities are captured namespace inputs, including foreign subjects and known
+//! absence. Repair must not read global source tables after an installation source cut.
 use super::*;
 use smallclaims::ivm::install::Namespace;
 
-pub(crate) const FINGERPRINT: &str = "agent-authority.v1;namespace.v1;actual-patch.v1;schema-reset.v1;canonical-rank.v1;live-runtime-ancestry.v1;bounds128-256.v1";
+pub(crate) const FINGERPRINT: &str = "agent-authority.v2;namespace.v1;captured-parent-identity.v1;actual-patch.v1;schema-reset.v1;canonical-rank.v1;live-runtime-ancestry.v1;bounds128-256.v1";
 
 // Namespace is an opaque Installer context. Escape its value as a SQL literal; all
 // source/user fields continue to use bound parameters. No identifier is interpolated.
@@ -42,6 +44,9 @@ CREATE INDEX IF NOT EXISTS agent_authority_closure
  ON local_agent_authority_nodes(namespace,complete,agent,id);
 CREATE INDEX IF NOT EXISTS agent_authority_origin
  ON local_agent_authority_nodes(namespace,agent,origin,runtime,rank DESC,id);
+CREATE TABLE IF NOT EXISTS local_agent_authority_parent_identities(
+ namespace TEXT NOT NULL, id TEXT NOT NULL, subject TEXT, PRIMARY KEY(namespace,id)
+) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS local_agent_authority_edges(
  namespace TEXT NOT NULL, child TEXT NOT NULL, parent TEXT NOT NULL, PRIMARY KEY(namespace,child,parent)
 ) WITHOUT ROWID;
@@ -108,12 +113,25 @@ fn queue(tx: &Transaction<'_>, namespace: &Namespace, agent: &str, id: &str) -> 
     )?;
     Ok(())
 }
-fn children(tx: &Transaction<'_>, namespace: &Namespace, agent: &str, id: &str) -> Result<()> {
+fn children(
+    tx: &Transaction<'_>,
+    namespace: &Namespace,
+    agent: &str,
+    id: &str,
+) -> Result<BTreeSet<String>> {
     let children = tx.prepare_cached(&sql(namespace, "SELECT n.agent,e.child FROM local_agent_authority_edges e
       JOIN local_agent_authority_nodes n ON n.namespace=e.namespace AND n.id=e.child WHERE e.namespace=@NS@ AND e.parent=?1 ORDER BY e.child LIMIT ?2"))?
       .query_map(params![id,EDGES+1], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?
       .collect::<rusqlite::Result<Vec<_>>>()?;
     if children.len() > EDGES {
+        // Unvisited children may belong to other agents. A namespace-wide fence prevents
+        // their indexed reads from silently using stale ancestry outside this bounded page.
+        fence(
+            tx,
+            namespace,
+            "",
+            "runtime authority child fanout exceeds bound",
+        )?;
         fence(
             tx,
             namespace,
@@ -121,11 +139,40 @@ fn children(tx: &Transaction<'_>, namespace: &Namespace, agent: &str, id: &str) 
             "runtime authority child fanout exceeds bound",
         )?;
     }
+    let mut affected = BTreeSet::new();
     for (agent, child) in children.into_iter().take(EDGES) {
         queue(tx, namespace, &agent, &child)?;
+        affected.insert(agent);
     }
-    Ok(())
+    Ok(affected)
 }
+
+/// Capture the claim/checkpoint catalog's subject at the namespace's certified source cut.
+/// `None` records known absence; a missing catalog row is an uncaptured lookup. Both keep
+/// an unresolved parent pending. Different-subject edges can be ignored only after an
+/// explicit captured identity. No body/history is read here or during ancestry repair.
+/// The source owner must deliver corrections/removals even without an agent-node mutation.
+pub(crate) fn apply_parent_identity(
+    tx: &Transaction<'_>,
+    namespace: &Namespace,
+    id: &str,
+    subject: Option<&str>,
+) -> Result<BTreeSet<String>> {
+    let prior: Option<Option<String>>=tx.query_row(&sql(namespace,"SELECT subject FROM local_agent_authority_parent_identities WHERE namespace=@NS@ AND id=?1"),[id],|r|r.get(0)).optional()?;
+    if prior.as_ref().is_some_and(|old| old.as_deref() == subject) {
+        return Ok(BTreeSet::new());
+    }
+    tx.execute(
+        &sql(
+            namespace,
+            "INSERT INTO local_agent_authority_parent_identities VALUES(@NS@,?1,?2)
+      ON CONFLICT(namespace,id) DO UPDATE SET subject=excluded.subject",
+        ),
+        params![id, subject],
+    )?;
+    children(tx, namespace, subject.unwrap_or(""), id)
+}
+
 fn refresh_origin(
     tx: &Transaction<'_>,
     namespace: &Namespace,
@@ -176,6 +223,12 @@ pub(crate) fn apply_claim(
             key.5 == claim.id && key.0 == claim.accepted_at_unix_ms && key.3 == claim.batch_id,
             "authority canonical key belongs to another claim"
         );
+        changed.extend(apply_parent_identity(
+            tx,
+            namespace,
+            &claim.id,
+            Some(&claim.subject),
+        )?);
         changed.insert(claim.subject.clone());
         // Replacement callers may supply only new; retire this source's previous metadata.
         let prior: Option<(String, String)> = tx
@@ -342,6 +395,8 @@ pub(crate) fn apply_tombstone(
     if !agent.starts_with("agent/") {
         return Ok(BTreeSet::new());
     }
+    let mut changed = apply_parent_identity(tx, namespace, id, Some(agent))?;
+    changed.insert(agent.to_owned());
     let prior: Option<String> = tx
         .query_row(
             &sql(
@@ -361,7 +416,7 @@ pub(crate) fn apply_tombstone(
     )?;
     set_edges(tx, namespace, agent, id, parents)?;
     queue(tx, namespace, agent, id)?;
-    Ok(BTreeSet::from([agent.to_owned()]))
+    Ok(changed)
 }
 
 type Ancestors = BTreeMap<String, (Vec<u8>, String)>;
@@ -389,24 +444,31 @@ fn close_node(tx: &Transaction<'_>, namespace: &Namespace, agent: &str, id: &str
         next.insert(origin, (rank, id.to_owned()));
     }
     for parent in parents {
-        let state: Option<(String,bool,bool)>=tx.query_row(
-          &sql(namespace, "SELECT agent,complete,EXISTS(SELECT 1 FROM local_agent_authority_dirty d WHERE d.namespace=n.namespace AND d.agent=n.agent AND d.id=n.id)
-           FROM local_agent_authority_nodes n WHERE n.namespace=@NS@ AND id=?1"),[&parent],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
-        let Some((owner, complete, dirty)) = state else {
-            // A known different-subject edge is outside the reducer's subject graph.
-            let owner: Option<String>=tx.query_row("SELECT subject FROM claims WHERE id=?1 UNION ALL SELECT subject FROM checkpoint_claims WHERE id=?1 LIMIT 1",[&parent],|r|r.get(0)).optional()?;
-            if owner.as_deref().is_some_and(|owner| owner != agent) {
-                continue;
-            }
-            tx.execute(
-                &sql(namespace, "UPDATE local_agent_authority_nodes SET complete=0 WHERE namespace=@NS@ AND id=?1"),
-                [id],
-            )?;
+        let identity: Option<Option<String>> = tx
+            .query_row(
+                &sql(
+                    namespace,
+                    "SELECT subject FROM local_agent_authority_parent_identities
+          WHERE namespace=@NS@ AND id=?1",
+                ),
+                [&parent],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(Some(owner)) = identity else {
+            tx.execute(&sql(namespace,"UPDATE local_agent_authority_nodes SET complete=0 WHERE namespace=@NS@ AND id=?1"),[id])?;
             return Ok(false);
         };
         if owner != agent {
             continue;
         }
+        let state: Option<(bool,bool)>=tx.query_row(
+          &sql(namespace, "SELECT complete,EXISTS(SELECT 1 FROM local_agent_authority_dirty d WHERE d.namespace=n.namespace AND d.agent=n.agent AND d.id=n.id)
+           FROM local_agent_authority_nodes n WHERE n.namespace=@NS@ AND id=?1 AND agent=?2"),params![parent,agent],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        let Some((complete, dirty)) = state else {
+            tx.execute(&sql(namespace,"UPDATE local_agent_authority_nodes SET complete=0 WHERE namespace=@NS@ AND id=?1"),[id])?;
+            return Ok(false);
+        };
         if !complete || dirty {
             tx.execute(
                 &sql(namespace, "UPDATE local_agent_authority_nodes SET complete=0 WHERE namespace=@NS@ AND id=?1"),
@@ -551,6 +613,7 @@ pub(crate) fn reclaim_namespace(
     anyhow::ensure!(!ready, "cannot reclaim a ready authority namespace");
     let tables = [
         ("local_agent_authority_nodes", "id"),
+        ("local_agent_authority_parent_identities", "id"),
         ("local_agent_authority_edges", "child,parent"),
         ("local_agent_authority_ancestors", "id,origin"),
         ("local_agent_authority_fields", "agent,field,id"),
@@ -596,7 +659,7 @@ pub(crate) fn read_authority(
         .query_row(
             &sql(
                 namespace,
-                "SELECT reason FROM local_agent_authority_fences WHERE namespace=@NS@ AND agent=?1",
+                "SELECT reason FROM local_agent_authority_fences WHERE namespace=@NS@ AND agent IN (?1,'') ORDER BY agent LIMIT 1",
             ),
             [agent],
             |r| r.get(0),

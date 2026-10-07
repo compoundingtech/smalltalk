@@ -525,3 +525,204 @@ fn legacy_ascii_harness_kind_can_select_a_source_without_actual_fields() {
     assert!(!got.actual_presence);
     assert!(got.actual.is_none());
 }
+
+fn append_subject(store: &Store, subject: &str) -> ClaimRecord {
+    store.append_claim(&ClaimInput {subject:subject.into(),kind:"runtime.observed".into(),actor:Some(AGENT.into()),
+      fields:serde_json::from_value(json!({"status":"running","host":store.origin(),"incarnation_id":"captured-parent-fixture"})).unwrap(),
+      evidence:vec![],expected_subject:None,idempotency_key:None}).unwrap()
+}
+
+#[test]
+fn later_global_foreign_parent_cannot_complete_an_older_namespace_snapshot() {
+    let source = Store::open_memory("birch").unwrap();
+    let parent = append_subject(&source, "agent/garden/unrelated");
+    let store = Store::open_memory("alder").unwrap();
+    let child = runtime(&store, "running");
+    // Isolated legacy-source fixture with an unresolved cross-subject predecessor. Its
+    // parent is not received until AFTER this real Store read snapshot is released.
+    store
+        .connection
+        .write()
+        .execute(
+            "UPDATE claims SET predecessors=?2 WHERE id=?1",
+            params![
+                child.id,
+                serde_json::to_string(&vec![parent.id.clone()]).unwrap()
+            ],
+        )
+        .unwrap();
+    let (old_cut, captured_child, key) = store
+        .read_snapshot(|cut| {
+            let child = store.claim_by_id(&child.id)?.unwrap();
+            let key = canonical::claim_key(&store.readers.get(), &child.id)?;
+            assert!(store.claim_by_id(&parent.id)?.is_none());
+            Ok((cut, child, key))
+        })
+        .unwrap();
+    let old = context(&store);
+    {
+        let mut writer = store.connection.write();
+        let tx = writer.transaction().unwrap();
+        apply_claim(&tx, &old, None, Some((&captured_child, &key))).unwrap();
+        assert!(!flush_ancestry(&tx, &old, None, 128).unwrap().1);
+        assert!(read_authority(&tx, &old, AGENT, None).is_err());
+        tx.commit().unwrap();
+    }
+    store
+        .import_replication("birch", &source.export_replication(0).unwrap())
+        .unwrap();
+    let (new_cut, identity) = store
+        .read_snapshot(|cut| Ok((cut, store.claim_by_id(&parent.id)?.unwrap().subject)))
+        .unwrap();
+    assert!(new_cut > old_cut);
+    assert_ne!(identity, AGENT);
+    {
+        // This repair transaction can see the newer global foreign claim. It must still
+        // reject the OLD namespace, whose captured input has not advanced with that cut.
+        let mut writer = store.connection.write();
+        let tx = writer.transaction().unwrap();
+        assert!(claim_by_id_tx(&tx, &parent.id).unwrap().is_some());
+        assert!(!flush_ancestry(&tx, &old, None, 128).unwrap().1);
+        assert!(ensure_closed(&tx, &old).is_err());
+        assert!(read_authority(&tx, &old, AGENT, None).is_err());
+        tx.commit().unwrap();
+    }
+    let new = context(&store);
+    {
+        let mut writer = store.connection.write();
+        let tx = writer.transaction().unwrap();
+        apply_claim(&tx, &new, None, Some((&captured_child, &key))).unwrap();
+        apply_parent_identity(&tx, &new, &parent.id, Some(&identity)).unwrap();
+        finish(&tx, &new);
+        assert!(ensure_closed(&tx, &new).is_ok());
+        assert!(ensure_closed(&tx, &old).is_err());
+        // A known-absent captured fact remains unresolved, even with a later global row.
+        assert_eq!(
+            apply_parent_identity(&tx, &old, &parent.id, None).unwrap(),
+            BTreeSet::from([AGENT.into()])
+        );
+        assert!(!flush_ancestry(&tx, &old, None, 128).unwrap().1);
+        tx.commit().unwrap();
+    }
+    parity(&store, &new, None);
+    {
+        // Only an explicit input capture at the advanced source cut can close the old
+        // dependency. The fixture operator never certifies a production Ready root.
+        let mut writer = store.connection.write();
+        let tx = writer.transaction().unwrap();
+        assert_eq!(
+            apply_parent_identity(&tx, &old, &parent.id, Some(&identity)).unwrap(),
+            BTreeSet::from([AGENT.into()])
+        );
+        finish(&tx, &old);
+        tx.commit().unwrap();
+    }
+    parity(&store, &old, None);
+}
+
+#[test]
+fn captured_identity_removal_and_correction_invalidate_existing_node_ancestry() {
+    let store = Store::open_memory("alder").unwrap();
+    let parent = runtime(&store, "running");
+    runtime(&store, "starting");
+    let ns = install(&store);
+    let before = parity(&store, &ns, None);
+    let mut writer = store.connection.write();
+    let tx = writer.transaction().unwrap();
+    assert!(
+        apply_parent_identity(&tx, &ns, &parent.id, Some(AGENT))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        apply_parent_identity(&tx, &ns, &parent.id, None).unwrap(),
+        BTreeSet::from([AGENT.into()])
+    );
+    assert!(read_authority(&tx, &ns, AGENT, None).is_err());
+    assert!(!flush_ancestry(&tx, &ns, None, 128).unwrap().1);
+    // The captured identity overrides a stale node: a foreign identity skips this edge,
+    // while changing it back to a same-subject unresolved node cannot retain completion.
+    apply_parent_identity(&tx, &ns, &parent.id, Some("agent/garden/unrelated")).unwrap();
+    finish(&tx, &ns);
+    apply_parent_identity(&tx, &ns, &parent.id, Some(AGENT)).unwrap();
+    finish(&tx, &ns);
+    assert_eq!(read_authority(&tx, &ns, AGENT, None).unwrap(), before);
+    // Identity corrections cannot borrow a node of a different captured subject.
+    tx.execute(&sql(&ns,"UPDATE local_agent_authority_nodes SET agent='agent/garden/unrelated' WHERE namespace=@NS@ AND id=?1"),[&parent.id]).unwrap();
+    apply_parent_identity(&tx, &ns, &parent.id, None).unwrap();
+    apply_parent_identity(&tx, &ns, &parent.id, Some(AGENT)).unwrap();
+    assert!(!flush_ancestry(&tx, &ns, None, 128).unwrap().1);
+    assert!(read_authority(&tx, &ns, AGENT, None).is_err());
+    tx.rollback().unwrap();
+    drop(writer);
+    assert_eq!(parity(&store, &ns, None), before);
+}
+
+#[test]
+fn parent_identity_capture_is_namespace_isolated_and_transactional() {
+    let store = Store::open_memory("alder").unwrap();
+    let parent = runtime(&store, "running");
+    runtime(&store, "starting");
+    let old = install(&store);
+    let next = install(&store);
+    let before = parity(&store, &old, None);
+    {
+        let mut writer = store.connection.write();
+        let tx = writer.transaction().unwrap();
+        apply_parent_identity(&tx, &next, &parent.id, None).unwrap();
+        assert!(!flush_ancestry(&tx, &next, None, 128).unwrap().1);
+        assert_eq!(read_authority(&tx, &old, AGENT, None).unwrap(), before);
+        assert!(read_authority(&tx, &next, AGENT, None).is_err());
+        tx.rollback().unwrap();
+    }
+    assert_eq!(parity(&store, &next, None), before);
+    let mut writer = store.connection.write();
+    let tx = writer.transaction().unwrap();
+    for _ in 0..256 {
+        if reclaim_namespace(&tx, &next, 1).unwrap() {
+            break;
+        }
+    }
+    let remains: bool=tx.query_row(&sql(&next,"SELECT EXISTS(SELECT 1 FROM local_agent_authority_parent_identities WHERE namespace=@NS@)"),[],|r|r.get(0)).unwrap();
+    assert!(!remains);
+    assert_eq!(read_authority(&tx, &old, AGENT, None).unwrap(), before);
+    tx.commit().unwrap();
+}
+
+#[test]
+fn identity_reverse_fanout_fences_even_children_outside_the_bounded_page() {
+    let store = Store::open_memory("alder").unwrap();
+    let parent = append_subject(&store, "agent/garden/unrelated");
+    let ns = context(&store);
+    let mut claims = Vec::new();
+    for n in 0..=EDGES {
+        let mut child = append_subject(&store, &format!("agent/garden/fanout/{n:03}"));
+        child.predecessors = vec![parent.id.clone()];
+        claims.push(child);
+    }
+    let mut writer = store.connection.write();
+    let tx = writer.transaction().unwrap();
+    apply_parent_identity(&tx, &ns, &parent.id, Some(&parent.subject)).unwrap();
+    for child in &claims {
+        let key = canonical::claim_key(&tx, &child.id).unwrap();
+        apply_claim(&tx, &ns, None, Some((child, &key))).unwrap();
+    }
+    finish(&tx, &ns);
+    ensure_closed(&tx, &ns).unwrap();
+    let affected = apply_parent_identity(&tx, &ns, &parent.id, None).unwrap();
+    assert_eq!(affected.len(), EDGES);
+    let unvisited = claims
+        .iter()
+        .find(|c| !affected.contains(&c.subject))
+        .unwrap();
+    let queued: bool=tx.query_row(&sql(&ns,"SELECT EXISTS(SELECT 1 FROM local_agent_authority_dirty WHERE namespace=@NS@ AND agent=?1)"),[&unvisited.subject],|r|r.get(0)).unwrap();
+    assert!(!queued);
+    assert!(ensure_closed(&tx, &ns).is_err());
+    assert!(
+        read_authority(&tx, &ns, &unvisited.subject, None)
+            .unwrap_err()
+            .to_string()
+            .contains("child fanout")
+    );
+    tx.rollback().unwrap();
+}
