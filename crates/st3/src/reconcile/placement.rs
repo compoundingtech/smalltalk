@@ -6,6 +6,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         &self,
         subject: &DesiredSubject,
         ptys: Option<&HashMap<String, RuntimeObservation>>,
+        work_message_agents: &mut Vec<(String, String, MemberSpec)>,
     ) -> Result<()> {
         if !subject.subject.starts_with("agent/")
             || subject.member.as_ref().is_some_and(|m| m.host == self.host)
@@ -98,6 +99,23 @@ impl<R: RuntimeControl> Reconciler<R> {
                     c.body.get("fields") != Some(&serde_json::to_value(&fields).unwrap())
                 }) {
                     self.record_once(&subject.subject, "runtime.observed", fields)?;
+                }
+                if subject.kind != "stop"
+                    && self.defer_declared_restart(subject, observation, now_ms(), None)?
+                {
+                    let screen = member.terminal
+                        .then(|| self.member_screen(&member.runtime_id).ok()).flatten();
+                    self.reconcile_harness_authentication(subject, member, observation, screen.as_deref())?;
+                    self.reconcile_blocking_screen(subject, member, observation, screen.as_deref())?;
+                    self.reconcile_claude_trust_screen(subject, member, observation, now_ms())?;
+                    self.reconcile_driver_readiness(subject, member, observation, now_ms())?;
+                    if let Some(incarnation) = incarnation {
+                        work_message_agents.push((
+                            subject.subject.clone(), incarnation.into(), member.clone(),
+                        ));
+                    }
+                    stopped = false;
+                    continue;
                 }
                 stopped &= self.reconcile_runtime_stop(
                     &subject.subject,

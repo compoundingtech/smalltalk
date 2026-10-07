@@ -5417,7 +5417,7 @@ async fn health(State(state): State<AppState>) -> Result<Json<Value>, ApiError> 
         "isolation": isolation_name(st_runtime::isolation_mode()),
         "store_index": state.store.index().map_err(ApiError::internal)?,
         "security": "trusted-network-no-tls-no-acls",
-        "features": {"owned_sets":1,"seat_rollout":1,"seat_rollout_manual":1},
+        "features": {"owned_sets":1,"seat_rollout":1,"seat_rollout_manual":1,"apply_deferred_restart":1},
     })))
 }
 
@@ -10008,11 +10008,12 @@ async fn apply(
     }
     let mut response = state
         .store
-        .apply_as(
+        .apply_as_with_restart_policy(
             &intent,
             &request.expected_subjects,
             &request.idempotency_key,
             Some(actor),
+            request.defer_restart.as_ref(),
         )
         .map_err(ApiError::bad)?;
     response.resolved_kdl = request.intent.kdl;
@@ -16928,6 +16929,7 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
             expected_subjects: preview.subject_tokens,
             idempotency_key: key.into(),
             actor: Some(actor.into()),
+            defer_restart: None,
         }
     }
 
@@ -17803,6 +17805,7 @@ mission "orchid" state="ready" { goal "Expose a scheduler wait."; step "work" { 
                     .unwrap(),
                 idempotency_key: format!("apply-{}", hex::encode(Sha256::digest(kdl))),
                 actor: Some("person/alex".into()),
+                defer_restart: None,
             })
             .unwrap(),
         )
@@ -18050,6 +18053,7 @@ mission "invalid-message" state="ready" {
                 expected_subjects: BTreeMap::new(),
                 idempotency_key: "reject-invalid-nested-message".into(),
                 actor: Some("person/alex".into()),
+                defer_restart: None,
             })
             .unwrap(),
         )

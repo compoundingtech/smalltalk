@@ -342,6 +342,7 @@ pub(super) fn current(connection: &Connection, ask: &ClaimRecord, as_of: u128) -
     }
     if let Some(declaration) = fields["requester_declaration"].as_str() {
         if current_desired_row(connection, requester)?.is_none_or(|row| row.claim_id != declaration)
+            && !super::rollouts::deferred_ask_live(connection, ask)?
         {
             return Ok(false);
         }
@@ -515,6 +516,9 @@ impl Store {
                     return Err(St3Error::new("idempotency-conflict", "this ask key already names a different question"));
                 }
                 return step(tx, &subject).map_err(internal)?.ok_or_else(|| St3Error::new("missing-step-run", "the ask is no longer retained"));
+            }
+            if super::rollouts::restart_cutover(tx, &input.actor).map_err(internal)? {
+                return Err(St3Error::new("seat-rollout-draining", "person asks wait for the seat cutover"));
             }
             let legacy_origin = input.legacy_request.as_ref().map(|id| -> Result<bool> {
                 let legacy = tx.query_row("SELECT body FROM claims WHERE id=?1 AND kind='attention.requested' AND actor=?2", params![id, input.actor], |row| row.get::<_, String>(0)).optional()?;
@@ -826,6 +830,9 @@ impl Store {
                     return Err(St3Error::new("idempotency-conflict", "this ask key already names another question"));
                 }
                 return step(tx, &subject).map_err(internal)?.ok_or_else(|| St3Error::new("missing-step-run", "the ask is no longer retained"));
+            }
+            if super::rollouts::restart_cutover(tx, &input.actor).map_err(internal)? {
+                return Err(St3Error::new("seat-rollout-draining", "person asks wait for the seat cutover"));
             }
             let mission_id = format!("person-ask/{}", &hash[..32]);
             let kdl = format!("version 2\nmission {mission_id:?} state=\"ready\" {{ goal {:?}; step \"ask\" {{ assigned-to {:?}; goal {:?}; }} }}", input.title, input.person, input.reason);

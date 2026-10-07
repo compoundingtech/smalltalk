@@ -1,6 +1,85 @@
 use super::*;
 use crate::rollout::{Operation, Policy, Selection};
 
+/// Both frontiers fence a safe-point read against shared claims and driver-local reports.
+fn restart_frontier(connection: &Connection) -> Result<(u64, u64)> {
+    connection.query_row(
+        "SELECT (SELECT COALESCE(MAX(store_index),0) FROM claims),
+                (SELECT COALESCE(MAX(id),0) FROM local_observations)",
+        [], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).map_err(Into::into)
+}
+
+fn restart_cutover_request(connection: &Connection, subject: &str) -> Result<Option<ClaimRecord>> {
+    let Some(desired) = current_desired_row(connection, subject)? else {
+        return Ok(None);
+    };
+    let (_, owner, conflict) = selected_actual_source_at(connection, subject, None, None)?;
+    let Some(actual) = latest_actual(connection, subject)?.filter(|actual| actual["status"] == "running") else {
+        return Ok(None);
+    };
+    if conflict { return Ok(None); }
+    let incarnation = actual["incarnation_id"].as_str();
+    let request = connection.query_row(&canonical_sql(
+        "SELECT id,store_index,batch_id,subject,kind,origin,actor,body,predecessors,accepted_at_unix_ms
+         FROM claims WHERE subject=?1 AND kind='runtime.action.requested'
+            AND origin=?2 AND json_extract(body,'$.fields.action')='apply-restart-cutover'
+            AND json_extract(body,'$.fields.rollout.desired_token')=?3
+            AND json_extract(body,'$.fields.incarnation_id')=?4
+            AND NOT EXISTS (SELECT 1 FROM claims ended WHERE ended.subject=claims.subject
+                AND ended.origin=claims.origin AND ended.kind='runtime.action.failed'
+                AND json_extract(ended.body,'$.fields.operation')=claims.id
+                AND json_extract(ended.body,'$.fields.operation_status')='aborted')
+         ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
+        params![subject, owner, desired.claim_id, incarnation], claim_from_row,
+    ).optional()?;
+    if request.is_none() { return Ok(None); }
+    let evaluated = connection.query_row(
+        "SELECT subject,kind,body,member,owner_run,owner_generation,owner_step FROM desired WHERE subject=?1",
+        [subject], desired_from_row,
+    )?;
+    // Old or externally produced barriers cannot hold a seat whose launch is already current.
+    if running_restart_at(connection, &evaluated, None).map_err(internal)?.is_none() {
+        return Ok(None);
+    }
+    Ok(request)
+}
+
+pub(super) fn restart_cutover(connection: &Connection, subject: &str) -> Result<bool> {
+    Ok(restart_cutover_request(connection, subject)?.is_some())
+}
+
+/// An independent ask made by the incumbent remains live while its changed launch waits.
+/// Keep the incumbent's request context across pending publications, never across owner generations.
+pub(super) fn deferred_ask_live(connection: &Connection, ask: &ClaimRecord) -> Result<bool> {
+    let Some(subject) = ask.actor.as_deref() else { return Ok(false); };
+    let Some(token) = ask.body.pointer("/fields/requester_declaration").and_then(Value::as_str) else {
+        return Ok(false);
+    };
+    let Some(current) = current_desired_row(connection, subject)? else { return Ok(false); };
+    let Some(selected) = claim_by_id_tx(connection, &current.claim_id)? else { return Ok(false); };
+    if selected.body.get("deferred_restart").is_none() { return Ok(false); }
+    let Ok(selected) = serde_json::from_value::<DesiredSubject>(selected.body) else { return Ok(false); };
+    let Some(declared) = claim_by_id_tx(connection, token)? else { return Ok(false); };
+    if declared.subject != subject || declared.kind != "intent.desired" { return Ok(false); }
+    let declared_pending = declared.body.get("deferred_restart").is_some();
+    let Ok(declared) = serde_json::from_value::<DesiredSubject>(declared.body) else { return Ok(false); };
+    if declared.owner_run != selected.owner_run || declared.owner_generation != selected.owner_generation {
+        return Ok(false);
+    }
+    let (_, _, conflict) = selected_actual_source_at(connection, subject, None, None)?;
+    let Some(actual) = latest_actual(connection, subject)?.filter(|actual| actual["status"] == "running") else {
+        return Ok(false);
+    };
+    if conflict { return Ok(false); }
+    let Some(incarnation) = actual["incarnation_id"].as_str() else { return Ok(false); };
+    let Some(incumbent) = running_member_at(connection, subject, incarnation, None).map_err(internal)? else {
+        return Ok(false);
+    };
+    Ok(selected.member.is_some_and(|member| !member.launch_changes(&incumbent).is_empty())
+        && (declared_pending || declared.member.is_some_and(|member| member.launch_changes(&incumbent).is_empty())))
+}
+
 fn selection(connection: &Connection, subject: &str) -> Result<Option<Selection>, St3Error> {
     owned_sets::guard_member(connection, subject)?;
     let Some(row) = current_desired_row(connection, subject).map_err(internal)? else {
@@ -233,6 +312,9 @@ pub(super) fn intake_held(
     subject: &str,
     step: &str,
 ) -> Result<bool, St3Error> {
+    if restart_cutover(connection, subject).map_err(internal)? {
+        return Ok(true);
+    }
     let Some(operation) = operation(connection, subject)?.filter(|o| o.holds_intake()) else {
         return Ok(false);
     };
@@ -251,6 +333,9 @@ pub(super) fn message_allowed(
     connection: &Connection,
     message: &MessageView,
 ) -> Result<bool, St3Error> {
+    if restart_cutover(connection, &message.to).map_err(internal)? {
+        return Ok(false);
+    }
     let Some(operation) = operation(connection, &message.to)?.filter(|o| o.holds_intake()) else {
         return Ok(true);
     };
@@ -308,6 +393,110 @@ pub(super) fn message_allowed(
 }
 
 impl Store {
+    /// Bind the policy/token to the declaration the caller actually evaluated, before proof reads.
+    pub(crate) fn restart_policy_for(
+        &self, evaluated: &DesiredSubject,
+    ) -> Result<Option<(String, Option<crate::rollout::DeferredRestart>)>> {
+        let connection = self.readers.get();
+        let Some(row) = current_desired_row(&connection, &evaluated.subject)? else {
+            return Ok(None);
+        };
+        let current = connection.query_row(
+            "SELECT subject,kind,body,member,owner_run,owner_generation,owner_step FROM desired WHERE subject=?1",
+            [&evaluated.subject], desired_from_row,
+        )?;
+        if current != *evaluated { return Ok(None); }
+        let claim = claim_by_id_tx(&connection, &row.claim_id)?;
+        let pending = claim.and_then(|claim| claim.body.get("deferred_restart").cloned())
+            .map(serde_json::from_value).transpose()?;
+        Ok(Some((row.claim_id, pending)))
+    }
+
+    pub(crate) fn abort_restart_cutover(&self, subject: &str, token: &str, reason: &str) -> Result<()> {
+        self.connection.batched(|tx| -> Result<()> {
+            let Some(request) = restart_cutover_request(tx, subject)? else { return Ok(()); };
+            if request.body.pointer("/fields/rollout/desired_token").and_then(Value::as_str) != Some(token) {
+                return Ok(());
+            }
+            append_claim_tx(tx, self.origin(), subject, "runtime.action.failed", Some(subject),
+                &json!({"fields":{"action":"apply-restart-cutover","operation":request.id,
+                    "operation_status":"aborted","reason":reason},"evidence":[request.id]}),
+                &[], None)?;
+            Ok(())
+        }).map_err(anyhow::Error::msg)?
+    }
+
+    pub(crate) fn restart_cutover(&self, subject: &str) -> Result<bool> {
+        restart_cutover(&self.readers.get(), subject)
+    }
+
+    pub(crate) fn restart_frontier(&self) -> Result<(u64, u64)> {
+        restart_frontier(&self.readers.get())
+    }
+
+    /// Keep publication-era asks attached to their running incumbent. The same
+    /// origin-step/attempt fence is used by owned rollouts to allow retiring work.
+    pub(crate) fn restart_person_work_pending(&self, subject: &str) -> Result<bool> {
+        let connection = self.readers.get();
+        if connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM step_runs step JOIN claims ask
+                ON json_extract(ask.body,'$.fields.origin_step')=step.subject
+                WHERE step.status IN ('waiting-person','ready') AND ask.kind='work.person-asked'
+                AND ask.actor=?1 AND json_extract(ask.body,'$.fields.origin_attempt')=step.attempt)",
+            [subject], |row| row.get::<_, bool>(0),
+        )? {
+            return Ok(true);
+        }
+        // Independent asks own their person step. Use the existing requester/run/attempt
+        // liveness rules instead of treating every historical asking claim as open.
+        let mut query = connection.prepare_cached(
+            "SELECT ask.id,ask.store_index,ask.batch_id,ask.subject,ask.kind,ask.origin,
+                    ask.actor,ask.body,ask.predecessors,ask.accepted_at_unix_ms
+             FROM claims ask JOIN step_runs step ON step.subject=ask.subject
+             WHERE ask.kind='work.person-asked' AND ask.actor=?1
+                AND json_extract(ask.body,'$.fields.origin_step') IS NULL
+                AND json_extract(ask.body,'$.fields.request.type') IS NOT 'update'
+                AND step.status IN ('pending','ready')",
+        )?;
+        for ask in query.query_map([subject], claim_from_row)? {
+            if person_work::current(&connection, &ask?, now_ms())? { return Ok(true); }
+        }
+        Ok(false)
+    }
+
+    /// A proof taken outside the writer is accepted only if neither frontier changed.
+    /// Claim intake uses this same writer, so it either precedes the proof or sees the fence.
+    pub(crate) fn commit_restart_cutover(
+        &self, evaluated: &DesiredSubject, desired_token: &str, incarnation: &str,
+        frontier: (u64, u64), deadline: u128,
+    ) -> Result<bool> {
+        let subject = &evaluated.subject;
+        self.connection.batched(|tx| -> Result<bool> {
+            if restart_frontier(tx)? != frontier || now_ms() >= deadline {
+                return Ok(false);
+            }
+            let Some(desired) = current_desired_row(tx, subject)? else { return Ok(false); };
+            let (_, owner, conflict) = selected_actual_source_at(tx, subject, None, None)?;
+            let actual = latest_actual(tx, subject)?;
+            let current = tx.query_row(
+                "SELECT subject,kind,body,member,owner_run,owner_generation,owner_step FROM desired WHERE subject=?1",
+                [subject], desired_from_row,
+            )?;
+            if desired.claim_id != desired_token || current != *evaluated || conflict
+                || owner.as_deref() != Some(self.origin())
+                || actual.as_ref().is_none_or(|a| a["status"] != "running" || a["incarnation_id"] != incarnation)
+                || running_restart_at(tx, &current, None).map_err(internal)?.is_none()
+            {
+                return Ok(false);
+            }
+            append_claim_tx(tx, self.origin(), subject, "runtime.action.requested", Some(subject),
+                &json!({"fields":{"action":"apply-restart-cutover","incarnation_id":incarnation,
+                    "rollout":{"desired_token":desired_token}},"evidence":[desired_token]}),
+                &[], None)?;
+            Ok(true)
+        }).map_err(anyhow::Error::msg)?
+    }
+
     pub fn rollout_message_allowed(&self, message: &MessageView) -> Result<bool, St3Error> {
         message_allowed(&self.readers.get(), message)
     }

@@ -1188,3 +1188,194 @@ fn manual_rollout_policy_requires_each_active_daemon_and_is_in_the_receipt_diges
         preview.blockers
     );
 }
+
+fn restart_preview_bundle(changed: bool) -> NormalizedIntent {
+    let command = if changed { "second" } else { "first" };
+    parse_intent(
+        &format!(
+            "version 2\n\
+             agent \"garden/a\" {{ command {command:?} }}\n\
+             agent \"garden/b\" {{ command {command:?} }}\n\
+             agent \"garden/stopped\" {{ command {command:?} }}\n\
+             agent \"garden/unreceipted\" {{ command {command:?} }}\n\
+             agent \"garden/unchanged\" {{ command \"first\" }}\n{}",
+            if changed {
+                "agent \"garden/new\" { command \"second\" }"
+            } else {
+                ""
+            },
+        ),
+        "amber",
+    )
+    .unwrap()
+}
+
+fn restart_preview_observe(store: &Store, subject: &str, status: &str, receipt: bool) {
+    let desired = store.desired_subject_with_writer(subject).unwrap().unwrap().0;
+    let member = desired.member.unwrap();
+    let incarnation = format!("{subject}-original");
+    store
+        .append_claim(&ClaimInput {
+            subject: subject.into(),
+            kind: "runtime.observed".into(),
+            actor: Some(subject.into()),
+            fields: serde_json::from_value(json!({
+                "status": status,
+                "host": member.host,
+                "runtime_id": member.runtime_id,
+                "terminal": member.terminal,
+                "incarnation_id": incarnation,
+            }))
+            .unwrap(),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+    if receipt {
+        let start = ClaimInput {
+            subject: subject.into(),
+            kind: "runtime.action.succeeded".into(),
+            actor: if subject == "agent/garden/b" { None } else { Some(subject.into()) },
+            fields: serde_json::from_value(json!({
+                "action": "start",
+                "desired_token": store.selected_desired_token(subject).unwrap().unwrap(),
+                "incarnation_id": incarnation,
+            }))
+            .unwrap(),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        };
+        store.append_claim(&start).unwrap();
+    }
+}
+
+#[test]
+fn apply_restart_preview_counts_changed_running_seats_for_plain_and_owned_sets() {
+    for owned in [false, true] {
+        let store = Store::open_memory("amber").unwrap();
+        let original = restart_preview_bundle(false);
+        if owned {
+            apply(&store, &original, 1);
+        } else {
+            direct(&store, &original, "initial").unwrap();
+        }
+        for (subject, status, receipt) in [
+            ("agent/garden/a", "running", true),
+            ("agent/garden/b", "running", true),
+            ("agent/garden/stopped", "stopped", true),
+            ("agent/garden/unchanged", "running", true),
+            ("agent/garden/unreceipted", "running", false),
+        ] {
+            restart_preview_observe(&store, subject, status, receipt);
+        }
+        let changed = restart_preview_bundle(true);
+        let preview = if owned {
+            serde_json::to_value(store.owned_set_preview(&changed, &options(&store, 2)).unwrap())
+                .unwrap()
+        } else {
+            serde_json::to_value(
+                store
+                    .mission(
+                        &changed,
+                        IntentInput {
+                            kdl: "".into(),
+                            source_name: None,
+                        },
+                    )
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        assert_eq!(preview["running_restart_count"], 2);
+        assert_eq!(
+            preview["running_restarts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|action| action["subject"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["agent/garden/a", "agent/garden/b"],
+        );
+        for action in preview["running_restarts"].as_array().unwrap() {
+            assert_eq!(action["action"], "restart");
+        }
+    }
+}
+
+#[test]
+fn apply_restart_preview_compares_running_receipt_even_when_desired_is_already_updated() {
+    for owned in [false, true] {
+        let store = Store::open_memory("amber").unwrap();
+        let original = bundle("first", false);
+        if owned {
+            apply(&store, &original, 1);
+        } else {
+            direct(&store, &original, "initial").unwrap();
+        }
+        let subject = "agent/garden/orchard";
+        restart_preview_observe(&store, subject, "running", true);
+        let changed = bundle("second", false);
+        if owned {
+            apply(&store, &changed, 2);
+        } else {
+            direct(&store, &changed, "changed").unwrap();
+        }
+        // A newer receipt for a different incarnation is not the running seat's launch.
+        store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "runtime.action.succeeded".into(),
+                actor: Some(subject.into()),
+                fields: serde_json::from_value(json!({
+                    "action": "start",
+                    "desired_token": store.selected_desired_token(subject).unwrap().unwrap(),
+                    "incarnation_id": "another-incarnation",
+                }))
+                .unwrap(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let (count, restarts) = if owned {
+            let pending = store.owned_set_preview(&changed, &options(&store, 3)).unwrap();
+            assert_eq!(pending.changes[subject], "unchanged");
+            (pending.running_restart_count, pending.running_restarts)
+        } else {
+            let pending = store
+                .mission(
+                    &changed,
+                    IntentInput {
+                        kdl: "".into(),
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            assert!(pending.changes.is_empty());
+            assert_eq!(pending.predicted_actions[0].action, "restart");
+            (pending.running_restart_count, pending.running_restarts)
+        };
+        assert_eq!(count, 1);
+        assert_eq!(restarts[0].subject, subject);
+        // Reverting desired to what is actually running needs no restart.
+        let (count, restarts) = if owned {
+            let reverted = store.owned_set_preview(&original, &options(&store, 3)).unwrap();
+            (reverted.running_restart_count, reverted.running_restarts)
+        } else {
+            let reverted = store
+                .mission(
+                    &original,
+                    IntentInput {
+                        kdl: "".into(),
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            (reverted.running_restart_count, reverted.running_restarts)
+        };
+        assert_eq!(count, 0);
+        assert!(restarts.is_empty());
+    }
+}

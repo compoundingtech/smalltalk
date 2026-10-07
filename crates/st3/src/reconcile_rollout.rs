@@ -2,6 +2,57 @@ use super::*;
 use crate::rollout::{self, Operation};
 
 impl<R: RuntimeControl> Reconciler<R> {
+    /// Keep intake open while waiting; fence it atomically when the safe point is accepted.
+    pub(super) fn defer_declared_restart(
+        &self,
+        subject: &DesiredSubject,
+        observation: &RuntimeObservation,
+        now: u128,
+        blocked: Option<&anyhow::Error>,
+    ) -> Result<bool> {
+        let Some((token, pending)) = self.store.restart_policy_for(subject)? else {
+            // The pass evaluated a superseded declaration. Do not stop for stale launch changes.
+            self.arm_restart(&format!("deferred-restart:{}", subject.subject), now);
+            return Ok(true);
+        };
+        let Some(pending) = pending else { return Ok(false); };
+        if let Some(error) = blocked {
+            self.store.abort_restart_cutover(&subject.subject, &token, &format!("{error:#}"))?;
+            if now < pending.deadline_unix_ms {
+                self.arm_restart(&format!("deferred-restart:{}", subject.subject), pending.deadline_unix_ms);
+            }
+            return Ok(true);
+        }
+        if self.store.restart_cutover(&subject.subject)? {
+            return Ok(false);
+        }
+        let frontier = self.store.restart_frontier()?;
+        let incarnation = observation.incarnation_id.as_deref()
+            .context("deferred restart needs an incarnation")?;
+        let blockers = rollout::restart_blockers(&self.store, &subject.subject, incarnation)?;
+        let expired = now >= pending.deadline_unix_ms;
+        if !expired && blockers.is_empty() {
+            self.store.commit_restart_cutover(
+                subject, &token, incarnation, frontier, pending.deadline_unix_ms,
+            )?;
+            // A separate pass renders only after the durable barrier is visible.
+            self.arm_restart(&format!("deferred-restart:{}", subject.subject), now);
+            return Ok(true);
+        }
+        self.record_once(
+            &subject.subject,
+            "runtime.reconcile-decision",
+            BTreeMap::from([
+                ("decision".into(), serde_json::json!(if expired { "restart-held" } else { "restart-pending" })),
+                ("reason".into(), serde_json::json!(if expired { "safe-point deadline reached; original seat keeps running" } else { "waiting for idle with no open ask" })),
+            ]),
+        )?;
+        if !expired {
+            self.arm_restart(&format!("deferred-restart:{}", subject.subject), pending.deadline_unix_ms);
+        }
+        Ok(true)
+    }
+
     pub(super) fn rollout_render_guard(&self, subject: &DesiredSubject) -> Result<()> {
         self.store.owned_desired_guard(subject)?;
         let Some(operation) = self.store.rollout(&subject.subject)? else {

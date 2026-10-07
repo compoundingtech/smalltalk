@@ -12,11 +12,19 @@ st apply --set garden seats.kdl --repository acme/garden --ref refs/heads/main \
 st sets status garden --sha "$SOURCE_SHA" --json
 ```
 
-The policy is part of the immutable receipt and preview digest. Omitting `--rollout` retains
-immediate publication behavior for automatic seats. A seat with `rollout "manual"` still defers
-its cutover without an apply-time flag. New seats start normally; unchanged launches and display labels
-keep their original launch lineage. Missions and schedules keep their existing semantics, including
-preserving active runs after omission.
+The policy is part of the immutable receipt and preview digest. `--defer-restart` selects the
+same `when-idle` rollout with `--restart-max-wait` (default `30m`) as its deadline, without
+forcing interruption at expiry. It cannot be combined with `--rollout` or `--restart-now`.
+Omitting both deferral flags, or passing `--restart-now`, retains immediate publication
+behavior for automatic seats. A seat with `rollout "manual"` still defers its cutover without
+an apply-time flag. New seats start normally; unchanged launches and display labels keep
+their original launch lineage. Missions and schedules keep their existing semantics,
+including preserving active runs after omission.
+
+Dry-run and normal publication announce `WILL RESTART N running seats` and list their launch
+changes before publication. Preview and normal CLI JSON include `running_restart_count` and
+`running_restarts`, comparing the proposed launch to each running incarnation's launch receipt.
+The announcement goes to stderr so JSON stdout remains parseable.
 
 The initial supported cutover is a top-level native PTY seat on its existing host, harness family and native login account.
 Authored session selectors and unsupported native launches are refused before publication. Every
