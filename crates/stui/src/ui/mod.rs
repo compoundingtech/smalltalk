@@ -1126,11 +1126,12 @@ impl Ui {
             self.render_glass(buf, area);
         } else {
             self.top_bar(buf, Rect { height: 1, ..area });
+            self.top_bar_border(buf, area);
             self.draw_body(
                 buf,
                 Rect {
-                    y: area.y + 1,
-                    height: area.height - 2,
+                    y: area.y + 2,
+                    height: area.height - 3,
                     ..area
                 },
             );
@@ -1212,6 +1213,15 @@ impl Ui {
 
     fn hit(&self, rect: Rect, hit: Hit) {
         self.frame.borrow_mut().hits.push((rect, hit));
+    }
+
+    /// A soft, single-row edge between the top bar and the content in either layout.
+    fn top_bar_border(&self, buf: &mut Buffer, area: Rect) {
+        for x in area.x..area.right() {
+            buf[(x, area.y + 1)]
+                .set_symbol("─")
+                .set_style(theme::fg(theme::OVERLAY0).bg(theme::BASE));
+        }
     }
 
     fn top_bar(&self, buf: &mut Buffer, area: Rect) {
@@ -5995,6 +6005,64 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn the_top_bar_border_keeps_controls_above_the_body_in_both_layouts() {
+        for spaces in [false, true] {
+            for (width, height) in [(20, 6), (80, 12), (140, 40)] {
+                let mut ui = Ui::new(demo::world());
+                if spaces {
+                    ui.glasses = Some(glass::Glasses::open(None, None));
+                }
+                ui.world.link = Link::Offline("Connection unavailable".into());
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal.draw(|frame| ui.render(frame)).unwrap();
+                let buffer = terminal.backend().buffer();
+                for x in 0..width {
+                    let cell = &buffer[(x, 1)];
+                    assert_eq!(cell.symbol(), "─");
+                    assert_eq!(cell.fg, theme::OVERLAY0);
+                    assert_eq!(cell.bg, theme::BASE);
+                }
+                assert!(ui.frame.borrow().panes.iter().all(|pane| pane.rect.y >= 2));
+                assert!(
+                    ui.frame
+                        .borrow()
+                        .hits
+                        .iter()
+                        .all(|(rect, _)| !contains(*rect, 1, 1))
+                );
+                let target = if spaces { Hit::Connection } else { Hit::Tab(1) };
+                let rect = ui
+                    .frame
+                    .borrow()
+                    .hits
+                    .iter()
+                    .find(|(_, hit)| *hit == target)
+                    .map(|(rect, _)| *rect)
+                    .unwrap();
+                assert_eq!(rect.y, 0);
+                assert_eq!(rect.height, 1);
+                if rect.x < width {
+                    ui.mouse(MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: rect.x,
+                        row: 0,
+                        modifiers: KeyModifiers::NONE,
+                    });
+                    if spaces {
+                        assert!(
+                            ui.flash
+                                .as_ref()
+                                .is_some_and(|(text, _)| text.contains("Connection unavailable"))
+                        );
+                    } else {
+                        assert_eq!(ui.tab, 1);
+                    }
+                }
+            }
+        }
+    }
+
     /// A feedback gate offers approve and request-changes, an approval gate approve and reject.
     /// Notes sent back from either card take the answer that gate offers.
     #[test]
@@ -7196,6 +7264,47 @@ mod tests {
         ui.switch_tab(2);
         let listed = frame(&ui, 150, 40).join("\n");
         assert!(listed.contains("Tests pass; opening the PR"), "{listed}");
+    }
+
+    #[test]
+    fn voice_that_never_answers_cannot_hold_the_keys() {
+        // Nathan, 2026-10-06: keys stopped working, Ctrl+Q did not quit, until the
+        // terminal tab was closed.
+        let mut ui = Ui::new(demo::world());
+        ui.switch_tab(1);
+        let input = ui.draft_key().expect("a conversation is open");
+        let mut waiting = voice::VoiceState::stand_in(&input);
+        waiting.started = Instant::now() - Duration::from_secs(30);
+        ui.voice = Some(waiting);
+        ui.step_voice();
+        assert!(ui.voice.is_none(), "a helper silent for 30 s is given up");
+        assert!(
+            ui.flash.as_ref().is_some_and(|(text, _)| text.contains("keys work again")),
+            "{:?}",
+            ui.flash
+        );
+        // While it listens, a chord is not swallowed: Ctrl+Q quits.
+        ui.voice = Some(voice::VoiceState::stand_in(&input));
+        ui.key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+        assert!(ui.voice.is_none());
+        assert!(ui.quit, "Ctrl+Q went through");
+        // Plain typing still waits (it must not mix into the words) and Esc drops them.
+        let mut ui = Ui::new(demo::world());
+        ui.switch_tab(1);
+        let input = ui.draft_key().unwrap();
+        let mut heard = voice::VoiceState::stand_in(&input);
+        heard.device = "Built-in microphone".into();
+        ui.voice = Some(heard);
+        ui.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(ui.voice.is_some());
+        ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(ui.voice.is_none());
+        // Leaving its conversation ends it.
+        let mut away = voice::VoiceState::stand_in("agent/example/someone-else");
+        away.device = "Built-in microphone".into();
+        ui.voice = Some(away);
+        ui.step_voice();
+        assert!(ui.voice.is_none());
     }
 
     #[test]

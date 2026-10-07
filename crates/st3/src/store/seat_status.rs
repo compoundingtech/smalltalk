@@ -6,6 +6,16 @@ pub(crate) const WINDOW_MS: u128 = 7 * 24 * 60 * 60 * 1000;
 pub(crate) const MAX_TRANSITIONS: usize = 200;
 pub(crate) const STALE_MS: u128 = 90_000;
 
+pub(super) fn permission_blocked(
+    state: Option<&str>,
+    blocked_on: Option<&str>,
+    ask: Option<&str>,
+) -> bool {
+    state.is_some_and(|state| !matches!(state, "ended" | "indeterminate"))
+        && blocked_on == Some("human")
+        && ask == Some("permission")
+}
+
 pub(super) fn observation_time(claim: &ClaimRecord) -> u128 {
     claim
         .body
@@ -31,6 +41,8 @@ fn transitions(claims: &[&ClaimRecord]) -> Vec<(usize, Option<String>, bool)> {
         prompt: Option<&'a str>,
         update_prompt: bool,
         provider_auth: Option<bool>,
+        blocked_on: Option<&'a str>,
+        ask: Option<&'a str>,
         state: Option<&'a str>,
     }
     let mut runtime = None;
@@ -58,7 +70,22 @@ fn transitions(claims: &[&ClaimRecord]) -> Vec<(usize, Option<String>, bool)> {
                     continue;
                 };
                 let status = statuses.entry(incarnation).or_default();
-                status.harness = Some(state);
+                if matches!(state, "ended" | "indeterminate") {
+                    status.blocked_on = None;
+                    status.ask = None;
+                } else {
+                    if let Some(blocked_on) = fields.get("blocked_on") {
+                        status.blocked_on = blocked_on.as_str();
+                    }
+                    if let Some(ask) = fields.get("ask") {
+                        status.ask = ask.as_str();
+                    }
+                }
+                status.harness = Some(if permission_blocked(Some(state), status.blocked_on, status.ask) {
+                    "blocked"
+                } else {
+                    state
+                });
                 if let Some(auth) = fields.get("provider_auth").and_then(Value::as_bool) {
                     status.provider_auth = Some(auth);
                 }
@@ -452,6 +479,170 @@ mod tests {
     }
 
     #[test]
+    fn approval_observation_is_blocked_in_current_then_clears() {
+        let store = Store::open_memory("cedar").unwrap();
+        runtime(&store, "one");
+        let at = now_ms();
+        observe(&store, "one", "working", at, "working");
+        store
+            .append_latest_observation(
+                &input(
+                    "harness.observed",
+                    json!({
+                        "state":"working", "incarnation_id":"one", "observed_at_ms":(at + 1) as u64,
+                        "blocked_on":"human", "ask":"permission", "reason":"waitingOnApproval"
+                    }),
+                ),
+                at + 1,
+            )
+            .unwrap();
+        let blocked = store.current_harness("agent/cedar").unwrap().unwrap();
+        assert_eq!(blocked.state, "blocked");
+        assert_eq!(blocked.blocked_on.as_deref(), Some("human"));
+        assert_eq!(blocked.ask.as_deref(), Some("permission"));
+        assert_eq!(blocked.reason.as_deref(), Some("waitingOnApproval"));
+
+        let sparse = store
+            .append_latest_observation(
+                &input(
+                    "harness.observed",
+                    json!({
+                        "state":"working", "incarnation_id":"one", "observed_at_ms":(at + 2) as u64,
+                        "reason":"stillWaiting"
+                    }),
+                ),
+                at + 2,
+            )
+            .unwrap()
+            .0;
+        assert_eq!(sparse.body["fields"]["status_transition"], false);
+        assert_eq!(store.current_harness("agent/cedar").unwrap().unwrap().state, "blocked");
+
+        store
+            .append_latest_observation(
+                &input(
+                    "harness.observed",
+                    json!({
+                        "state":"working", "incarnation_id":"one", "observed_at_ms":(at + 3) as u64,
+                        "blocked_on":null, "ask":null, "reason":null
+                    }),
+                ),
+                at + 3,
+            )
+            .unwrap();
+        let resumed = store.current_harness("agent/cedar").unwrap().unwrap();
+        assert_eq!(resumed.state, "working");
+        assert!(resumed.blocked_on.is_none());
+
+        store
+            .append_latest_observation(
+                &input(
+                    "harness.observed",
+                    json!({
+                        "state":"working", "incarnation_id":"one", "observed_at_ms":(at + 4) as u64,
+                        "blocked_on":"human", "ask":"question", "reason":"waitingOnUserInput"
+                    }),
+                ),
+                at + 4,
+            )
+            .unwrap();
+        assert_eq!(
+            store.current_harness("agent/cedar").unwrap().unwrap().state,
+            "working"
+        );
+        let history = store.seat_status_history("agent/cedar", at + 5).unwrap();
+        let states = history["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["state"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(states, ["working", "blocked", "working"]);
+
+        runtime(&store, "two");
+        observe(&store, "two", "working", at + 5, "working");
+        let current = store.current_harness("agent/cedar").unwrap().unwrap();
+        assert_eq!(current.incarnation_id, "two");
+        assert_eq!(current.state, "working");
+        let history = store.seat_status_history("agent/cedar", at + 6).unwrap();
+        let last = history["items"].as_array().unwrap().last().unwrap();
+        assert_eq!(last["state"], "working");
+        assert_eq!(last["runtime_incarnation"], "two");
+    }
+
+    #[test]
+    fn terminal_observation_fences_permission_before_sparse_work_resumes() {
+        let store = Store::open_memory("cedar").unwrap();
+        runtime(&store, "one");
+        let at = now_ms() - 1_000;
+        let publish = |state: &str, fields: Value, time: u128| {
+            let mut fields = fields.as_object().unwrap().clone();
+            fields.insert("state".into(), json!(state));
+            fields.insert("incarnation_id".into(), json!("one"));
+            fields.insert("observed_at_ms".into(), json!(time as u64));
+            store.append_latest_observation(&input("harness.observed", json!(fields)), time)
+                .unwrap().0
+        };
+        publish("working", json!({"blocked_on":"human", "ask":"permission"}), at);
+        assert_eq!(store.current_harness("agent/cedar").unwrap().unwrap().state, "blocked");
+        let ended = publish("ended", json!({"blocked_on":"human", "ask":"permission"}), at + 1);
+        assert!(ended.body["fields"]["blocked_on"].is_null());
+        assert!(ended.body["fields"]["ask"].is_null());
+        let resumed = publish("working", json!({"reason":"resumed"}), at + 2);
+        assert!(resumed.body["fields"]["blocked_on"].is_null());
+        assert!(resumed.body["fields"]["ask"].is_null());
+        assert_eq!(resumed.body["fields"]["status_transition"], true);
+        assert_eq!(resumed.body["fields"]["observed_since_ms"], json!((at + 2) as u64));
+        let current = store.current_harness("agent/cedar").unwrap().unwrap();
+        assert_eq!(current.state, "working");
+        assert_eq!(current.since_unix_ms, at + 2);
+        assert!(current.blocked_on.is_none());
+        assert!(current.ask.is_none());
+        let history = store.seat_status_history("agent/cedar", at + 3).unwrap();
+        let states = history["items"].as_array().unwrap().iter()
+            .filter_map(|item| item["state"].as_str()).collect::<Vec<_>>();
+        assert_eq!(states, ["blocked", "ended", "working"]);
+    }
+
+    #[test]
+    fn unknown_provider_auth_does_not_clear_a_known_rejection() {
+        let store = Store::open_memory("cedar").unwrap();
+        runtime(&store, "one");
+        let at = now_ms();
+        let rejected = store
+            .append_latest_observation(
+                &input("harness.observed", json!({
+                    "state":"working", "incarnation_id":"one", "observed_at_ms":at as u64,
+                    "provider_auth":false, "reason":"providerAuth"
+                })),
+                at,
+            )
+            .unwrap()
+            .0;
+        let uncertain = store
+            .append_latest_observation(
+                &input("harness.observed", json!({
+                    "state":"working", "incarnation_id":"one", "observed_at_ms":(at + 1) as u64,
+                    "provider_auth":null, "reason":"authUnknown"
+                })),
+                at + 1,
+            )
+            .unwrap()
+            .0;
+        assert_eq!(uncertain.body["fields"]["provider_auth"], false);
+        assert_eq!(uncertain.body["fields"]["status_transition"], false);
+        assert_eq!(
+            uncertain.body["fields"]["observed_since_ms"],
+            rejected.body["fields"]["observed_since_ms"]
+        );
+        assert_eq!(store.current_harness("agent/cedar").unwrap().unwrap().state, "needs-login");
+        let history = store.seat_status_history("agent/cedar", at + 2).unwrap();
+        let states = history["items"].as_array().unwrap().iter()
+            .filter_map(|item| item["state"].as_str()).collect::<Vec<_>>();
+        assert_eq!(states, ["unauthenticated"]);
+    }
+
+    #[test]
     fn repeated_observations_and_detail_changes_preserve_since_and_refresh_freshness() {
         let store = Store::open_memory("cedar").unwrap();
         runtime(&store, "one");
@@ -694,7 +885,7 @@ mod tests {
         };
         publish(json!(false), 1, at);
         let successor = publish(Value::Null, 1, at + 1);
-        assert!(local_observation_position(&successor).is_none());
+        assert!(local_observation_position(&successor).is_some());
         let blocked = store.current_harness("agent/cedar").unwrap().unwrap();
         assert_eq!(blocked.state, "needs-login");
         assert_eq!(blocked.since_unix_ms, at);

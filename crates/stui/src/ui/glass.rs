@@ -996,9 +996,10 @@ impl Ui {
         let Some(glasses) = &self.glasses else { return };
         let glass = glasses.glass();
         self.status_line(buf, Rect { height: 1, ..area }, glass);
+        self.top_bar_border(buf, area);
         let mut body = Rect {
-            y: area.y + 1,
-            height: area.height.saturating_sub(2),
+            y: area.y + 2,
+            height: area.height.saturating_sub(3),
             ..area
         };
         // The sidebar takes the left of the glass, beside the splits rather than over them.
@@ -3829,7 +3830,7 @@ mod tests {
         assert!(
             screen(&ui)
                 .lines()
-                .nth(1)
+                .nth(2)
                 .unwrap()
                 .contains("◆ Atlas Builder"),
             "it needs the person"
@@ -4059,7 +4060,7 @@ mod tests {
         );
         assert_eq!(ui.tab, 2, "the new split has the focus");
         let shown = screen(&ui);
-        let strip = shown.lines().nth(1).unwrap();
+        let strip = shown.lines().nth(2).unwrap();
         assert!(
             strip.contains("Atlas Builder")
                 && strip.contains("Weekly release")
@@ -5174,14 +5175,14 @@ mod tests {
         let zoomed = screen(&ui);
         assert!(zoomed.contains("zoomed · ctrl+o"), "{zoomed}");
         assert!(
-            !zoomed.lines().nth(1).unwrap().contains("Atlas Builder"),
+            !zoomed.lines().nth(2).unwrap().contains("Atlas Builder"),
             "only the focused split shows"
         );
         ctrl(&mut ui, 'o');
         assert!(
             screen(&ui)
                 .lines()
-                .nth(1)
+                .nth(2)
                 .unwrap()
                 .contains("Atlas Builder")
         );

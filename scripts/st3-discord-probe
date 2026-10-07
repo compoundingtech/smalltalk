@@ -1,0 +1,185 @@
+#!/usr/bin/python3 -I
+"""Normal-user Discord REST connectivity test. No installation is required.
+
+No agent routing or Gateway connection. Enter the token at a hidden local prompt,
+or pass it on stdin from a password manager. The token is never saved or printed.
+"""
+
+import argparse
+import getpass
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+import urllib.error
+import urllib.request
+import warnings
+
+ROUTE = Path.home() / '.local/state/st3/discord-probe/trial.json'
+API = 'https://discord.com/api/v10'
+MARKER = 'st probe hello'
+LIMIT = 256 * 1024
+
+
+class ProbeError(Exception):
+    pass
+
+
+def load_route(path=ROUTE):
+    info = path.lstat()
+    if info.st_uid != os.geteuid() or info.st_mode & 0o077 or not stat.S_ISREG(info.st_mode) or info.st_size > 4096:
+        raise ProbeError('The route must be a private regular file owned by your user (chmod 600).')
+    route = json.loads(path.read_text())
+    for key in ('application_id', 'guild_id', 'channel_id', 'user_id'):
+        if not isinstance(route.get(key), str) or not re.fullmatch(r'[1-9][0-9]{0,19}', route[key]):
+            raise ProbeError('The route needs numeric application, guild, channel and user IDs.')
+    if not isinstance(route.get('nonce'), str) or not re.fullmatch(r'[a-zA-Z0-9]{1,25}', route['nonce']):
+        raise ProbeError('The route needs a fixed probe nonce of at most 25 characters.')
+    return route
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+class Discord:
+    def __init__(self, token):
+        if not re.fullmatch(r'[A-Za-z0-9._-]{20,1024}', token):
+            raise ProbeError('The bot token is missing or malformed.')
+        self.token = token
+        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+
+    def request(self, method, path, body=None):
+        data = None if body is None else json.dumps(body).encode()
+        request = urllib.request.Request(API + path, data=data, method=method, headers={
+            'Authorization': 'Bot ' + self.token,
+            'Content-Type': 'application/json',
+            'User-Agent': 'DiscordBot (https://github.com/compoundingtech/smalltalk, 0.1)',
+        })
+        try:
+            with self.opener.open(request, timeout=15) as response:
+                raw = response.read(LIMIT + 1)
+                if len(raw) > LIMIT:
+                    raise ProbeError('Discord response exceeded the probe size limit.')
+                return json.loads(raw)
+        except urllib.error.HTTPError as error:
+            # Never print response bodies, headers, URLs, exception text or credentials.
+            reasons = {401: 'Bot authentication failed.', 403: 'Bot permission was refused.',
+                       404: 'Bot cannot find the configured resource.',
+                       429: 'Discord rate limited the probe; no automatic retry was made.'}
+            note = reasons.get(error.code, 'Discord refused the request.')
+            if method == 'POST' and error.code >= 500:
+                note += ' Send outcome may be unknown; inspect the channel before retrying.'
+            raise ProbeError(note) from None
+        except (urllib.error.URLError, TimeoutError, OSError):
+            note = 'Discord request could not complete.'
+            if method == 'POST':
+                note += ' Send outcome may be unknown; inspect the channel before retrying.'
+            raise ProbeError(note) from None
+        except Exception:
+            note = 'Discord returned an unreadable or oversized response.'
+            if method == 'POST':
+                note += ' Send outcome may be unknown; inspect the channel before retrying.'
+            raise ProbeError(note) from None
+
+
+def probe(action, route, discord, after_message=None):
+    app = discord.request('GET', '/oauth2/applications/@me')
+    if not isinstance(app, dict) or app.get('id') != route['application_id']:
+        raise ProbeError('The token belongs to a different application; nothing was sent.')
+    channel_path = '/channels/' + route['channel_id']
+    channel = discord.request('GET', channel_path)
+    if not isinstance(channel, dict) or channel.get('id') != route['channel_id'] or channel.get('guild_id') != route['guild_id'] or channel.get('type') != 0:
+        raise ProbeError('The configured private-server text channel did not match; nothing was sent.')
+    result = {'application_id': route['application_id'], 'guild_id': route['guild_id'],
+              'channel_id': route['channel_id'], 'agent_routing': False}
+    if action == 'check':
+        result['status'] = 'application_and_channel_access_confirmed'
+    elif action == 'send':
+        sent = discord.request('POST', channel_path + '/messages', {
+            'content': 'st Discord connectivity probe. Agent routing is not enabled. '
+                       'Please type "st probe hello" here so we can check reading too.',
+            'allowed_mentions': {'parse': []},
+            'nonce': route['nonce'], 'enforce_nonce': True,
+        })
+        if not isinstance(sent, dict) or sent.get('channel_id') != route['channel_id'] or not isinstance(sent.get('id'), str) or not re.fullmatch(r'[1-9][0-9]{0,19}', sent['id']):
+            raise ProbeError('Send receipt did not match; inspect the channel before retrying.')
+        result.update(status='test_message_sent', message_id=sent['id'])
+    elif action == 'verify':
+        messages = discord.request('GET', channel_path + '/messages?limit=20')
+        if not isinstance(messages, list):
+            raise ProbeError('Invalid message listing.')
+        candidates = [item for item in messages
+                      if isinstance(item, dict) and item.get('channel_id') == route['channel_id']
+                      and isinstance(item.get('author'), dict)
+                      and item['author'].get('id') == route['user_id']
+                      and not item['author'].get('bot') and not item.get('webhook_id')
+                      and (after_message is None or
+                           (isinstance(item.get('id'), str) and
+                            re.fullmatch(r'[1-9][0-9]{0,19}', item['id']) and
+                            int(item['id']) > int(after_message)))]
+        if not any(item.get('content') == MARKER for item in candidates):
+            if not messages:
+                raise ProbeError('Discord returned no recent messages. Check the bot\'s Read Message History permission in the test channel.')
+            if not candidates:
+                raise ProbeError('No recent message from the configured user was found. Send "st probe hello" from that account in the channel with the bot\'s test message.')
+            if all(item.get('content') in ('', None) for item in candidates):
+                raise ProbeError('Messages from the configured user were found, but their text is empty. Message Content Intent may be off: Developer Portal > your application > Bot > Privileged Gateway Intents. Enable Message Content Intent, save, then run verify again.')
+            raise ProbeError('Messages from the configured user have readable text, but none is exactly "st probe hello". Send that exact text in the test channel, then run verify again.')
+        result.update(status='user_message_content_confirmed', user_id=route['user_id'])
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('action', choices=('check', 'send', 'verify', 'test'))
+    parser.add_argument('--route', type=Path, default=ROUTE)
+    parser.add_argument('--token-stdin', action='store_true', help='Read the token from a password-manager pipe; unavailable for interactive test.')
+    args = parser.parse_args()
+    try:
+        route = load_route(args.route)
+        if args.token_stdin:
+            if args.action == 'test':
+                raise ProbeError('Use an interactive terminal for the combined test.')
+            token = sys.stdin.read(1025).strip()
+        else:
+            if not sys.stdin.isatty():
+                raise ProbeError('Run from your own interactive terminal, or use --token-stdin with your password manager.')
+            with warnings.catch_warnings():
+                warnings.simplefilter('error', getpass.GetPassWarning)
+                token = getpass.getpass('Paste the bot token from 1Password (input hidden): ')
+        discord = Discord(token)
+        token = None
+        if args.action == 'test':
+            result = probe('send', route, discord)
+            sent_id = result['message_id']
+            print('Bot application and channel checked. Test message posted.')
+            print('Open Discord and send "st probe hello" in the channel with the bot\'s test message.')
+            while input('After sending it in Discord, press Enter here without typing anything: ').strip():
+                print('Send the message in Discord. This terminal only waits for an empty Enter press.')
+            result = probe('verify', route, discord, after_message=sent_id)
+            print('Read/write test passed: your Discord message was received from the configured user.')
+        else:
+            result = probe(args.action, route, discord)
+        print(json.dumps(result))
+        return 0
+    except (EOFError, KeyboardInterrupt):
+        print('Probe stopped.', file=sys.stderr)
+        return 1
+    except getpass.GetPassWarning:
+        print('Hidden token input is unavailable; no token was read.', file=sys.stderr)
+        return 1
+    except ProbeError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    except Exception:
+        # Even malformed provider responses must never result in a credential-bearing traceback.
+        print('Probe failed while reading its route or the Discord response.', file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

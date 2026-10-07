@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "summary": "Rebuild a run tree for this node's own claims only when another writer's claims arrive for it",
+  "replay": {
+    "status": "none",
+    "detail": "No replay or rebuild is added. The incremental replication projection rebuilds fewer run trees: a tree that holds this node's own claims alone, which were applied when written, is no longer rebuilt on every pass; a local work extension still is. The projection digest after a pass equals a full replay's in the new test and in the existing replication, convergence and work-extension tests."
+  },
+  "schema": {"status": "none", "detail": "No database tables, columns, indexes, triggers or schema version change."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged."},
+  "compatibility": {"status": "none", "detail": "No client, wire or harness contract change."},
+  "downtime": {"status": "none", "detail": "No additional service interruption is introduced."},
+  "manual": {"status": "none", "detail": "No manual step."},
+  "recovery": {"status": "none", "detail": "No database recovery change; an older build rebuilds every such tree as before."}
+}

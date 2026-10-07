@@ -41,6 +41,10 @@ fn not_yet(error: &st3_client::TimelineErrorBody) -> bool {
 /// One conversation: the harness transcript and Small Talk messages, in time order.
 /// Draw one conversation as st joined it: the harness's turns and the agent's Small Talk, in
 /// the order st sent them.
+/// Said once at the start of a conversation st read only the newest part of.
+const NATIVE_PREFIX_NOTE: &str =
+    "Earlier history is not shown: st reads only the newest part of this agent's transcript";
+
 pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>) -> Vec<Entry> {
     let name = |id: &str| -> String {
         names.get(id).cloned().unwrap_or_else(|| match id {
@@ -332,10 +336,7 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
             (_, TimelineBody::Truncation(truncation))
                 if truncation.reason.contains("native transcript prefix") =>
             {
-                Body::Event(
-                    "Earlier history is not shown: st reads only the newest part of this agent's transcript"
-                        .into(),
-                )
+                Body::Event(NATIVE_PREFIX_NOTE.into())
             }
             (_, TimelineBody::Truncation(truncation)) => Body::Event(format!(
                 "history omitted: {} (sequences {}–{}{})",
@@ -385,6 +386,11 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
         append_unpaired_media(&mut stamped, pending, message, &name);
     }
     stamped.sort_by(|a, b| a.0.cmp(&b.0));
+    // That earlier history is not shown is said at the start, where the history would be, not at
+    // the time st stamped the note with (the session's last update: the bottom, by the box).
+    stamped.sort_by_key(|(_, entry)| {
+        !matches!(&entry.body, Body::Event(text) if text == NATIVE_PREFIX_NOTE)
+    });
     for (_, entry) in &mut stamped {
         if let Body::Mail {
             delivered: mark, ..
