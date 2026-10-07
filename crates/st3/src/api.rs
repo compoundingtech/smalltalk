@@ -21853,6 +21853,11 @@ mission "wake" state="ready" {
             .unwrap();
         store.apply(&intent, &plan.subject_tokens, "roster-followup").unwrap();
         store.append_claim(&roster_local_observation(
+            "runtime.observed",
+            json!({"status":"running", "runtime_id":"node.amber",
+                "incarnation_id":"amber-1"}),
+        )).unwrap();
+        store.append_claim(&roster_local_observation(
             "harness.observed",
             json!({"state":"idle", "driver":"codex", "incarnation_id":"amber-1",
                 "observed_at_ms":1}),
