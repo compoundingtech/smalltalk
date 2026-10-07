@@ -376,9 +376,15 @@ fn nested_ready_parent_and_submitted_parent_follow_existing_selector() {
     let mut source = Source::default();
     source.capture(&store, &ns);
     source.settle(&store, &ns, now_ms(), 1);
-    source.parity(&store, &ns, now_ms(), &[agent.clone()]);
+    source.parity(&store, &ns, now_ms(), std::slice::from_ref(&agent));
     assert!(
-        !rows(&store.readers.get(), &ns, &[agent.clone()], now_ms()).unwrap()[&agent]
+        !rows(
+            &store.readers.get(),
+            &ns,
+            std::slice::from_ref(&agent),
+            now_ms()
+        )
+        .unwrap()[&agent]
             .upcoming_work_ids
             .contains(&child.subject)
     );
@@ -387,8 +393,14 @@ fn nested_ready_parent_and_submitted_parent_follow_existing_selector() {
         .unwrap();
     source.capture(&store, &ns);
     source.settle(&store, &ns, now_ms(), 1);
-    source.parity(&store, &ns, now_ms(), &[agent.clone()]);
-    let queue = &rows(&store.readers.get(), &ns, &[agent.clone()], now_ms()).unwrap()[&agent];
+    source.parity(&store, &ns, now_ms(), std::slice::from_ref(&agent));
+    let queue = &rows(
+        &store.readers.get(),
+        &ns,
+        std::slice::from_ref(&agent),
+        now_ms(),
+    )
+    .unwrap()[&agent];
     assert_eq!(queue.active_work_count, 0);
     assert!(queue.upcoming_work_ids.contains(&child.subject));
     store
@@ -440,7 +452,14 @@ fn normal_claim_and_inclusive_lease_deadline_require_writer_maintenance() {
     source.parity(&store, &ns, expiry, &agents);
     assert_eq!(next_deadline(&store.readers.get(), &ns).unwrap(), None);
     assert_eq!(
-        rows(&store.readers.get(), &ns, &[agent.clone()], expiry).unwrap()[agent].active_work_count,
+        rows(
+            &store.readers.get(),
+            &ns,
+            std::slice::from_ref(&agent),
+            expiry
+        )
+        .unwrap()[agent]
+            .active_work_count,
         0
     );
 }
@@ -614,7 +633,13 @@ fn real_generation_cut_and_carried_priority_then_claim_match_existing_reader() {
     source.settle(&store, &ns, now_ms(), 1);
     source.parity(&store, &ns, now_ms(), &agents);
     assert_eq!(
-        rows(&store.readers.get(), &ns, &[agent.clone()], now_ms()).unwrap()[&agent]
+        rows(
+            &store.readers.get(),
+            &ns,
+            std::slice::from_ref(&agent),
+            now_ms()
+        )
+        .unwrap()[&agent]
             .next_work_id
             .as_deref(),
         Some(carried.subject.as_str())
@@ -626,7 +651,13 @@ fn real_generation_cut_and_carried_priority_then_claim_match_existing_reader() {
     source.settle(&store, &ns, now_ms(), 1);
     source.parity(&store, &ns, now_ms(), &agents);
     assert_eq!(
-        rows(&store.readers.get(), &ns, &[agent.clone()], now_ms()).unwrap()[&agent]
+        rows(
+            &store.readers.get(),
+            &ns,
+            std::slice::from_ref(&agent),
+            now_ms()
+        )
+        .unwrap()[&agent]
             .active_work_count,
         1
     );

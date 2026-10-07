@@ -418,16 +418,15 @@ fn carried(
     for body in candidates {
         let body: Value = serde_json::from_str(&body)?;
         let fields = body.get("fields"); // Existing carried reader deliberately has no legacy-body fallback.
-        if fields.and_then(|f| f.get("status")).and_then(Value::as_str) == Some("ready") {
-            if let Some(claimant) = fields
+        if fields.and_then(|f| f.get("status")).and_then(Value::as_str) == Some("ready")
+            && let Some(claimant) = fields
                 .and_then(|f| f.get("claimant"))
                 .filter(|value| !value.is_null())
-            {
-                let Some(claimant) = claimant.as_str() else {
-                    return Ok(Err("non-text carried claimant".into()));
-                };
-                eligible.push(claimant.to_owned());
-            }
+        {
+            let Some(claimant) = claimant.as_str() else {
+                return Ok(Err("non-text carried claimant".into()));
+            };
+            eligible.push(claimant.to_owned());
         }
     }
     if eligible.len() > 1 {
@@ -483,6 +482,26 @@ fn mark_context(tx: &Transaction<'_>, namespace: &str, row: &Association) -> Res
     tx.execute("INSERT INTO local_agent_queue_scope_work VALUES(?1,?2,?3,?4,?5,NULL,NULL) ON CONFLICT(namespace,agent,run,selector,prefix) DO UPDATE SET cursor_path=NULL,cursor_subject=NULL",params![namespace,row.agent,row.run,row.selector,row.path])?;
     Ok(())
 }
+type StepCandidate = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+    Vec<u8>,
+    Option<String>,
+);
+type ScopeRepair = (
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+);
+
 fn refresh_step(
     tx: &Transaction<'_>,
     namespace: &str,
@@ -494,7 +513,7 @@ fn refresh_step(
         .query_map(params![namespace, subject], association_from_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     // This shadow predicate and the inclusive Rust expiry transform match SEAT_STEP_ROWS.
-    let candidate:Option<(String,String,String,Option<String>,Option<String>,String,String,Vec<u8>,Option<String>)>=tx.query_row(
+    let candidate:Option<StepCandidate>=tx.query_row(
   "SELECT s.run,s.path,s.status,s.assignee,s.claimant,s.available,s.created,s.created_num,s.expiry
    FROM local_agent_queue_steps s JOIN local_agent_queue_runs r ON r.namespace=s.namespace AND r.run=s.run
    WHERE s.namespace=?1 AND s.subject=?2 AND s.agentless=0
@@ -797,7 +816,7 @@ pub(crate) fn drain(
             processed += keys.len().max(1);
             continue;
         }
-        let scope:Option<(String,String,String,String,Option<String>,Option<String>)>=tx.query_row("SELECT agent,run,selector,prefix,cursor_path,cursor_subject FROM local_agent_queue_scope_work WHERE namespace=?1 ORDER BY agent,run,selector,prefix LIMIT 1",[namespace],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?))).optional()?;
+        let scope:Option<ScopeRepair>=tx.query_row("SELECT agent,run,selector,prefix,cursor_path,cursor_subject FROM local_agent_queue_scope_work WHERE namespace=?1 ORDER BY agent,run,selector,prefix LIMIT 1",[namespace],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?))).optional()?;
         if let Some((agent, run, selector, prefix, cursor_path, cursor_subject)) = scope {
             let query = if cursor_path.is_some() {
                 "SELECT path,subject FROM local_agent_queue_associations WHERE namespace=?1 AND agent=?2 AND run=?3 AND selector=?4 AND status='ready' AND path>=?5 AND path<?6 AND (path,subject)>(?7,?8) ORDER BY path,subject LIMIT ?9"

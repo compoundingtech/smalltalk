@@ -249,6 +249,8 @@ pub(super) fn current_activity(
     Ok(latest)
 }
 
+pub(super) type LocalCutRow = (u64, String, String);
+
 /// Indexed invalidation when the captured native claim position crosses local anchors.
 /// This predicate input establishes no projected prefix or readiness on its own. The owner
 /// retains the range/cursor transactionally, shares its budget, and rejects incomplete repair.
@@ -259,7 +261,7 @@ pub(super) fn local_cut_page(
     upper: u64,
     after: Option<(u64, &str)>,
     limit: usize,
-) -> Result<(Vec<(u64, String, String)>, bool)> {
+) -> Result<(Vec<LocalCutRow>, bool)> {
     anyhow::ensure!(
         (1..=128).contains(&limit) && lower <= upper && upper <= i64::MAX as u64,
         "local activity cut page bounds"

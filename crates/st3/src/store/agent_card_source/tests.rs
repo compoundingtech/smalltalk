@@ -742,13 +742,12 @@ fn local_scan_page_before_clock_does_not_adopt_a_future_anchor() {
     drain(&store, &ns, &kernel);
     compare(&store, &ns, at);
     let c = store.readers.get();
-    assert_eq!(
-        c.query_row(
+    assert!(
+        !c.query_row(
             "SELECT eligible FROM local_agent_card_activity_inputs WHERE namespace=?1 AND source=1",
             [ns.as_str()],
             |r| r.get::<_, bool>(0)
         )
-        .unwrap(),
-        false
+        .unwrap()
     );
 }

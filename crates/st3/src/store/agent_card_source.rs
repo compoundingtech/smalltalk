@@ -260,21 +260,15 @@ impl Kernel {
             ns,
             agent_authority_ivm::apply_claim(tx, ns, before.as_ref(), now)?,
         )?;
-        if next.is_none() {
-            if let Some(row) = &checkpoint {
-                let parents: Vec<String> = serde_json::from_str(txt(row, "predecessors")?)?;
-                agents(
-                    tx,
-                    ns,
-                    agent_authority_ivm::apply_tombstone(
-                        tx,
-                        ns,
-                        id,
-                        txt(row, "subject")?,
-                        &parents,
-                    )?,
-                )?;
-            }
+        if next.is_none()
+            && let Some(row) = &checkpoint
+        {
+            let parents: Vec<String> = serde_json::from_str(txt(row, "predecessors")?)?;
+            agents(
+                tx,
+                ns,
+                agent_authority_ivm::apply_tombstone(tx, ns, id, txt(row, "subject")?, &parents)?,
+            )?;
         }
         agents(
             tx,

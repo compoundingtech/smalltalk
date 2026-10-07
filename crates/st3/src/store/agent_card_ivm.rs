@@ -101,6 +101,8 @@ pub(crate) fn coverage(
     )
 }
 
+type CoverageEvidence = (u64, u64, u64, u64, u64, u64, u64, String, Option<String>);
+
 fn coverage_at(
     connection: &Connection,
     namespace: &str,
@@ -109,7 +111,7 @@ fn coverage_at(
     cut: &smallclaims::ivm::SourceCut,
     now_unix_ms: u128,
 ) -> Result<bool> {
-    let evidence: Option<(u64, u64, u64, u64, u64, u64, u64, String, Option<String>)> =
+    let evidence: Option<CoverageEvidence> =
         connection
             .query_row(
                 "SELECT incomplete,pending,source_epoch,source_revision,graph_epoch,projected,local_generation,evaluation_time,next_deadline FROM local_agent_card_coverage WHERE namespace=?1",

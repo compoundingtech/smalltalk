@@ -404,21 +404,20 @@ fn edit(
             && c.claim.actor.as_deref() == Some("daemon/runtime")
             && c.claim.body["kind"] == "stop"
             && c.claim.predecessors.len() == 1
+            && let Some(set) = c.claim.body["owned_set"].as_str()
         {
-            if let Some(set) = c.claim.body["owned_set"].as_str() {
-                tx.execute(
-                    "INSERT INTO local_agent_owned_stops VALUES(?1,?2,?3,?4,?5,?6,?7)",
-                    params![
-                        ns,
-                        c.claim.subject,
-                        set,
-                        c.claim.predecessors[0],
-                        c.claim.origin,
-                        c.claim.id,
-                        canonical::sortable_key(c.rank)
-                    ],
-                )?;
-            }
+            tx.execute(
+                "INSERT INTO local_agent_owned_stops VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    ns,
+                    c.claim.subject,
+                    set,
+                    c.claim.predecessors[0],
+                    c.claim.origin,
+                    c.claim.id,
+                    canonical::sortable_key(c.rank)
+                ],
+            )?;
         }
     }
     for set in &sets {
@@ -672,22 +671,22 @@ fn effective(
         return Ok(Some((member.clone(), true, false)));
     }
     if let Some(member) = view.receipt.members.get(subject) {
-        if member.one_shot {
-            if let Some(declaration) = captured(db, ns, &member.claim)? {
-                let desired: DesiredSubject = serde_json::from_value(declaration.body)?;
-                if let Some(launch) = desired.member.filter(|m| m.one_shot) {
-                    let retirement=db.query_row("SELECT claim FROM local_agent_owned_stops WHERE namespace=?1 AND subject=?2 AND set_id=?3 AND predecessor=?4 AND origin=?5 ORDER BY rank DESC LIMIT 1",params![ns,subject,view.id,member.claim,launch.host],|r|r.get::<_,String>(0)).optional()?;
-                    if let Some(claim) = retirement {
-                        return Ok(Some((
-                            owned_sets::Member {
-                                claim,
-                                revision: desired_revision(&stop(subject)?),
-                                ..member.clone()
-                            },
-                            true,
-                            false,
-                        )));
-                    }
+        if member.one_shot
+            && let Some(declaration) = captured(db, ns, &member.claim)?
+        {
+            let desired: DesiredSubject = serde_json::from_value(declaration.body)?;
+            if let Some(launch) = desired.member.filter(|m| m.one_shot) {
+                let retirement=db.query_row("SELECT claim FROM local_agent_owned_stops WHERE namespace=?1 AND subject=?2 AND set_id=?3 AND predecessor=?4 AND origin=?5 ORDER BY rank DESC LIMIT 1",params![ns,subject,view.id,member.claim,launch.host],|r|r.get::<_,String>(0)).optional()?;
+                if let Some(claim) = retirement {
+                    return Ok(Some((
+                        owned_sets::Member {
+                            claim,
+                            revision: desired_revision(&stop(subject)?),
+                            ..member.clone()
+                        },
+                        true,
+                        false,
+                    )));
                 }
             }
         }
@@ -728,39 +727,39 @@ fn maintain_row(tx: &Transaction<'_>, ns: &str, subject: &str) -> Result<bool> {
         )?;
         let view: owned_sets::View = serde_json::from_str(&value)?;
         row.blockers = view.blockers.clone();
-        if row.blockers.is_empty() {
-            if let Some((member, retired, implicit)) = effective(tx, ns, &view, subject)? {
-                let desired = if member.kind == "mission" {
-                    None
-                } else if implicit {
-                    Some(stop(subject)?)
-                } else {
-                    Some(serde_json::from_value(
-                        captured(tx, ns, &member.claim)?
-                            .context("missing effective member")?
-                            .body,
-                    )?)
-                };
-                let is_manual = match &desired {
-                    Some(d) if d.kind != "stop" => crate::rollout::manual(d),
-                    _ => manual(tx, ns, &member)?,
-                };
-                let actor = captured(tx, ns, &view.claim)?.and_then(|c| c.actor);
-                row.selected = Some(SelectedMember {
-                    set: set.clone(),
-                    receipt: view.claim,
-                    receipt_revision: view.revision,
-                    updated_at: view.updated_at,
-                    source: view.receipt.source,
-                    policy: view.receipt.rollout,
-                    actor,
-                    member,
-                    retired,
-                    implicit,
-                    manual: is_manual,
-                    desired,
-                });
-            }
+        if row.blockers.is_empty()
+            && let Some((member, retired, implicit)) = effective(tx, ns, &view, subject)?
+        {
+            let desired = if member.kind == "mission" {
+                None
+            } else if implicit {
+                Some(stop(subject)?)
+            } else {
+                Some(serde_json::from_value(
+                    captured(tx, ns, &member.claim)?
+                        .context("missing effective member")?
+                        .body,
+                )?)
+            };
+            let is_manual = match &desired {
+                Some(d) if d.kind != "stop" => crate::rollout::manual(d),
+                _ => manual(tx, ns, &member)?,
+            };
+            let actor = captured(tx, ns, &view.claim)?.and_then(|c| c.actor);
+            row.selected = Some(SelectedMember {
+                set: set.clone(),
+                receipt: view.claim,
+                receipt_revision: view.revision,
+                updated_at: view.updated_at,
+                source: view.receipt.source,
+                policy: view.receipt.rollout,
+                actor,
+                member,
+                retired,
+                implicit,
+                manual: is_manual,
+                desired,
+            });
         }
     } else if tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM local_agent_owned_staged WHERE namespace=?1 AND subject=?2)",

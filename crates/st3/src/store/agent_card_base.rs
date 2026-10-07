@@ -165,68 +165,67 @@ fn apply(
             }
         }
     }
-    if let Some((claim, key)) = new {
-        if claim.subject.starts_with("agent/")
+    if let Some((claim, key)) = new
+        && (claim.subject.starts_with("agent/")
             || claim.subject.starts_with("mission-run/")
-            || claim.subject.starts_with("run-generation/")
+            || claim.subject.starts_with("run-generation/"))
+    {
+        let fields = claim.body.get("fields").unwrap_or(&claim.body);
+        if actual(&claim.kind) {
+            anyhow::ensure!(
+                fields.get("fields").is_none(),
+                "ambiguous nested actual fields source"
+            );
+            // The opener-specific resource merge carries state not represented
+            // by fixed owner/card heads. It needs an explicit compatible source.
+            anyhow::ensure!(
+                !(claim.kind == "resource.observed"
+                    && fields["attribution_only"] == true
+                    && fields["kind"].as_str().is_some_and(carries_opener)),
+                "attribution-only owner source unsupported"
+            );
+        }
+        let rank = canonical::sortable_key(key);
+        let operation = claim.body.pointer("/_operation/id").and_then(Value::as_str);
+        tx.execute(
+            "INSERT INTO local_agent_card_base_claims VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![
+                namespace,
+                claim.id,
+                claim.subject,
+                claim.kind,
+                rank,
+                claim.accepted_at_unix_ms.to_string(),
+                operation,
+                !known_replicated_claim_kind(&claim.kind)
+            ],
+        )?;
+        if claim.subject.starts_with("agent/")
+            && let Some(operation) = operation
         {
-            let fields = claim.body.get("fields").unwrap_or(&claim.body);
-            if actual(&claim.kind) {
-                anyhow::ensure!(
-                    fields.get("fields").is_none(),
-                    "ambiguous nested actual fields source"
-                );
-                // The opener-specific resource merge carries state not represented
-                // by fixed owner/card heads. It needs an explicit compatible source.
-                anyhow::ensure!(
-                    !(claim.kind == "resource.observed"
-                        && fields["attribution_only"] == true
-                        && fields["kind"].as_str().is_some_and(carries_opener)),
-                    "attribution-only owner source unsupported"
-                );
-            }
-            let rank = canonical::sortable_key(key);
-            let operation = claim.body.pointer("/_operation/id").and_then(Value::as_str);
             tx.execute(
-                "INSERT INTO local_agent_card_base_claims VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-                params![
-                    namespace,
-                    claim.id,
-                    claim.subject,
-                    claim.kind,
-                    rank,
-                    claim.accepted_at_unix_ms.to_string(),
-                    operation,
-                    !known_replicated_claim_kind(&claim.kind)
-                ],
+                "INSERT OR IGNORE INTO local_agent_card_owner_dependents VALUES(?1,?2,?3)",
+                params![namespace, format!("#operation:{operation}"), claim.subject],
             )?;
-            if claim.subject.starts_with("agent/")
-                && let Some(operation) = operation
-            {
-                tx.execute(
-                    "INSERT OR IGNORE INTO local_agent_card_owner_dependents VALUES(?1,?2,?3)",
-                    params![namespace, format!("#operation:{operation}"), claim.subject],
-                )?;
-                operation_agent(tx, namespace, operation, &claim.subject)?;
-            }
-            if !claim.subject.starts_with("agent/")
-                && actual(&claim.kind)
-                && let Some(fields) = fields.as_object()
-            {
-                let spec = st3_schema::registry().claim(&claim.kind);
-                for field in ["status", "mode"] {
-                    let reset = claim.kind != "resource.observed"
-                        && spec.is_some_and(|s| {
-                            s.cardinality == st3_schema::Cardinality::StateTransition
-                                && s.fields.contains_key(field)
-                        });
-                    if fields.contains_key(field) || reset {
-                        let value = fields.get(field).map(serde_json::to_string).transpose()?;
-                        tx.execute(
-                            "INSERT INTO local_agent_card_owner_fields VALUES(?1,?2,?3,?4,?5,?6)",
-                            params![namespace, claim.subject, field, claim.id, rank, value],
-                        )?;
-                    }
+            operation_agent(tx, namespace, operation, &claim.subject)?;
+        }
+        if !claim.subject.starts_with("agent/")
+            && actual(&claim.kind)
+            && let Some(fields) = fields.as_object()
+        {
+            let spec = st3_schema::registry().claim(&claim.kind);
+            for field in ["status", "mode"] {
+                let reset = claim.kind != "resource.observed"
+                    && spec.is_some_and(|s| {
+                        s.cardinality == st3_schema::Cardinality::StateTransition
+                            && s.fields.contains_key(field)
+                    });
+                if fields.contains_key(field) || reset {
+                    let value = fields.get(field).map(serde_json::to_string).transpose()?;
+                    tx.execute(
+                        "INSERT INTO local_agent_card_owner_fields VALUES(?1,?2,?3,?4,?5,?6)",
+                        params![namespace, claim.subject, field, claim.id, rank, value],
+                    )?;
                 }
             }
         }
