@@ -15,7 +15,7 @@
   },
   "compatibility": {
     "status": "none",
-    "detail": "No client, socket, pairing or admission change. The new library operator is inactive in default production readers and preserves canonical observed-harness semantics in ten real Store controls."
+    "detail": "No client, socket, pairing or admission change. The new library operator is inactive in default production readers. Eleven real Store controls cover canonical observed-harness semantics and explicit unavailability with error evidence for unsupported legacy states or non-text admission reasons. Work activity overlays remain separate before hookup."
   },
   "downtime": {
     "status": "none",

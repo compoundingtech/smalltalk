@@ -103,6 +103,12 @@ impl Summary {
         let mut out = Self::default();
         if event.kind == "harness.observed" {
             let state = event.fields.get("state").and_then(Value::as_str);
+            if let Some(state) = state {
+                anyhow::ensure!(
+                    STATES[1..].contains(&state),
+                    "unsupported legacy harness state {state:?}"
+                );
+            }
             if state.is_some() {
                 out.state = Some(event.clone());
             }
@@ -412,7 +418,7 @@ impl View for AgentView {
     fn definition(&self) -> Definition {
         Definition {
             name: VIEW,
-            fingerprint: "agent-ordered-harness.v1;canonical.v1;sparse-seven;episodes433;retain-repaired",
+            fingerprint: "agent-ordered-harness.v1;canonical.v1;sparse-seven;episodes433;retain-repaired;strict-state-reason",
             kinds: KINDS,
             local_kinds: &[],
             max_contributions: 1,
@@ -557,7 +563,7 @@ fn observed(
             "indeterminate",
             None,
             None,
-            text(event, "reason"),
+            Some(text(event, "reason").context("non-text harness admission reason")?),
             None,
         ))
     } else if runtime.fields["status"] != "running" {
@@ -728,6 +734,8 @@ fn observed(
 
 /// Called only inside the authorized caller's SQLite snapshot. A row has no authority
 /// of its own, and an uncertified source never invokes a canonical read fallback.
+/// This returns observed harness state only. The work.claimed/work.progress overlay
+/// used by current_harness is a separate dependency that must be covered before hookup.
 pub fn read_harness(
     connection: &Connection,
     views: &smallclaims::ivm::Views,
@@ -1375,6 +1383,14 @@ mod tests {
                 "harness.observed",
                 json!({"state":"working","incarnation_id":"one","status_transition":false}),
             ),
+            (
+                "harness.observed",
+                json!({"state":"idle","incarnation_id":"one"}),
+            ),
+            (
+                "harness.observed",
+                json!({"state":"blocked","incarnation_id":"one","blocked_on":"human"}),
+            ),
         ] {
             let mut connection = f.store.connection.write();
             let tx = connection.transaction().unwrap();
@@ -1393,6 +1409,71 @@ mod tests {
             tx.commit().unwrap();
             drop(connection);
             f.check(SEAT);
+        }
+    }
+    #[test]
+    fn ordered_agent_unsupported_states_and_null_admission_reason_fence_with_evidence() {
+        for (kind, fields, expected) in [
+            (
+                "harness.observed",
+                json!({"state":"","incarnation_id":"one"}),
+                "unsupported legacy harness state",
+            ),
+            (
+                "harness.observed",
+                json!({"state":"legacy-unknown","incarnation_id":"one"}),
+                "unsupported legacy harness state",
+            ),
+            (
+                "harness.observed",
+                json!({"state":"","incarnation_id":"one","status_transition":false}),
+                "unsupported legacy harness state",
+            ),
+            (
+                "harness.diagnostic",
+                json!({"code":"harness-admission-failed","incarnation_id":"one","reason":null}),
+                "non-text harness admission reason",
+            ),
+        ] {
+            let f = Fixture::new();
+            f.append(
+                SEAT,
+                "runtime.observed",
+                json!({"status":"running","incarnation_id":"one"}),
+            );
+            f.append(
+                SEAT,
+                "harness.observed",
+                json!({"state":"idle","incarnation_id":"one"}),
+            );
+            let mut connection = f.store.connection.write();
+            let tx = connection.transaction().unwrap();
+            let claim = smallclaims::store::append_claim_record_tx(
+                &tx,
+                "grove",
+                SEAT,
+                kind,
+                None,
+                &json!({"fields":fields}),
+                &[],
+                None,
+            )
+            .unwrap();
+            let key = canonical::claim_key(&tx, &claim.id).unwrap();
+            let changes = f.views.change(&tx, None, Some((&claim, &key)), 1).unwrap();
+            assert!(changes.deferred.contains(VIEW));
+            assert!(changes.changed.is_empty());
+            f.publish_tx(&tx);
+            tx.commit().unwrap();
+            drop(connection);
+            let connection = f.store.readers.get();
+            let status = f.views.availability(&connection, VIEW, 1).unwrap();
+            assert!(matches!(status.readiness, Readiness::Fenced));
+            assert!(status.error.unwrap().contains(expected));
+            assert!(read_harness(&connection, &f.views, SEAT).is_err());
+            if kind == "harness.diagnostic" {
+                assert!(current_harness_fold_at(&connection, SEAT, None, false, false).is_err());
+            }
         }
     }
 }
