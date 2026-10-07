@@ -613,7 +613,7 @@ mod tests {
         let actor = (position % 5 != 0).then_some(if position % 2 == 0 {
             "person/a"
         } else {
-            "person/z"
+            "person/other"
         });
         connection
             .execute(
@@ -659,8 +659,8 @@ mod tests {
                         (Some("resource.observed"), None),
                         (Some("missing.kind"), None),
                         (None, Some("person/a")),
-                        (None, Some("person/z")),
-                        (None, Some("person/missing")),
+                        (None, Some("person/other")),
+                        (None, Some("person/intruder")),
                     ] {
                         let expected = connection
                             .query_row(
