@@ -498,6 +498,36 @@ async fn act_on_card(
             parameters.fields = fields;
             client.custom_reply(id, idem, fence, parameters).await?
         }
+        "prompt.respond" => {
+            let prompt = attention
+                .prompt
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("This prompt changed; look again"))?;
+            let answer_id = answer.ok_or_else(|| anyhow::anyhow!("Choose an answer"))?;
+            fence.runtime_incarnation = prompt.runtime_incarnation.clone();
+            client
+                .prompt_respond(
+                    id,
+                    idem,
+                    fence,
+                    st3_client::PromptRespondParameters {
+                        target_id: source,
+                        episode: attention.episode.clone(),
+                        prompt_id: prompt.prompt_id.clone().unwrap_or_default(),
+                        answer_id,
+                    },
+                )
+                .await
+                .map_err(|error| {
+                    if format!("{error:?}").contains("stale-permission-prompt") {
+                        anyhow::anyhow!(
+                            "This prompt is no longer the one waiting (it ended or the seat restarted); look again"
+                        )
+                    } else {
+                        error.into()
+                    }
+                })?
+        }
         "work.done" => {
             let summary = reason
                 .filter(|summary| !summary.trim().is_empty())

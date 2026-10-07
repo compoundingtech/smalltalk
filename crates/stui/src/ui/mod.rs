@@ -3192,9 +3192,22 @@ impl Ui {
                     return true;
                 }
                 if self.live {
+                    // A prompt a harness is waiting on is answered through its own action.
+                    let action = if self
+                        .world
+                        .attention
+                        .items()
+                        .iter()
+                        .find(|item| item.id == id)
+                        .is_some_and(|item| item.actions.iter().any(|a| a == "prompt.respond"))
+                    {
+                        "prompt.respond"
+                    } else {
+                        "work.done"
+                    };
                     self.effects.push(Effect::Attention {
                         id,
-                        action: "work.done".into(),
+                        action: action.into(),
                         reason: Some(answer.label.clone()),
                         answer: Some(answer.id.clone()),
                     });
@@ -4543,6 +4556,15 @@ impl Ui {
                         id: id.clone(),
                         feedback: draft,
                     }),
+                    // A harness prompt takes one of its choices, never words.
+                    Some(AttentionKind::Request { .. })
+                        if self.current_item().is_some_and(|item| {
+                            item.actions.iter().any(|a| a == "prompt.respond")
+                        }) =>
+                    {
+                        self.flash("Choose one of the answers: this prompt takes no words");
+                        None
+                    }
                     Some(AttentionKind::Request { .. }) => Some(Effect::Attention {
                         id: id.clone(),
                         action: if self
@@ -6758,6 +6780,100 @@ mod tests {
         let after_press = ui.selected[0];
         ui.key(key(KeyCode::Down, KeyModifiers::NONE, KeyEventKind::Repeat));
         assert_eq!(ui.selected[0], after_press + 1);
+    }
+
+    fn prompt_item(prompt: st3_client::HarnessPrompt, actions: Vec<String>) -> Attention {
+        Attention {
+            id: "attention/prompt".into(),
+            tier: Tier::Stopped,
+            title: "Run the checks?".into(),
+            waiting: None,
+            age: "1m".into(),
+            mission: None,
+            agent: Some("agent/example/lead".into()),
+            kind: adapt::prompt_request(&prompt, "Run the checks?", ""),
+            actions,
+            related: Vec::new(),
+            raised_by: None,
+            blocked: None,
+        }
+    }
+
+    fn with_item(item: Attention) -> Ui {
+        let mut world = demo::world();
+        if let Load::Ready(items) = &mut world.attention {
+            items.insert(0, item);
+        }
+        let mut ui = Ui::new(world);
+        ui.live = true;
+        ui.tab = 0;
+        ui.select(0);
+        ui
+    }
+
+    fn open_prompt() -> st3_client::HarnessPrompt {
+        let choice = |id: &str, label: &str| st3_client::PromptChoice {
+            id: id.into(),
+            label: label.into(),
+            consequence: "Tells the harness.".into(),
+        };
+        st3_client::HarnessPrompt {
+            kind: Some("permission".into()),
+            content: Some("Run cargo test in the example repository?".into()),
+            choices: Some(vec![choice("approve", "Approve"), choice("deny", "Deny")]),
+            seat_id: Some("agent/example/lead".into()),
+            prompt_id: Some("prompt-1".into()),
+            runtime_incarnation: Some("incarnation-1".into()),
+            state: Some("open".into()),
+            can_answer: Some(true),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_open_harness_prompt_is_answered_with_its_own_action_and_never_with_words() {
+        let mut ui = with_item(prompt_item(open_prompt(), vec!["prompt.respond".into()]));
+        let screen = frame(&ui, 140, 50).join("\n");
+        for shown in ["Run cargo test in the example repository?", "Approve", "Deny", "Tells the harness."] {
+            assert!(screen.contains(shown), "{shown}: {screen}");
+        }
+        // Choose Deny (the second) and send it.
+        ui.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        ui.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(&ui.effects[..], [Effect::Attention { id, action, answer: Some(answer), .. }]
+                if id == "attention/prompt" && action == "prompt.respond" && answer == "deny"),
+            "{:?}",
+            ui.effects
+        );
+        // Words are not an answer to a prompt.
+        ui.effects.clear();
+        ui.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        for letter in "yes".chars() {
+            ui.key(KeyEvent::new(KeyCode::Char(letter), KeyModifiers::NONE));
+        }
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(ui.effects.is_empty(), "{:?}", ui.effects);
+    }
+
+    #[test]
+    fn a_harness_prompt_that_ended_or_cannot_be_answered_offers_no_answers() {
+        for (state, can_answer, how) in [
+            ("timed_out", Some(true), None),
+            ("answered", Some(true), Some("in the terminal")),
+            ("open", Some(false), None),
+        ] {
+            let mut prompt = open_prompt();
+            prompt.state = Some(state.into());
+            prompt.can_answer = can_answer;
+            prompt.how = how.map(str::to_owned);
+            prompt.next_action = Some("Answer it in the seat's terminal.".into());
+            let ui = with_item(prompt_item(prompt, Vec::new()));
+            let screen = frame(&ui, 140, 50).join("\n");
+            assert!(screen.contains("Answer it in the seat's terminal."), "{state}: {screen}");
+            assert!(!screen.contains("Tells the harness."), "{state}: no answers: {screen}");
+        }
     }
 
     #[test]

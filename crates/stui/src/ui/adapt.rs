@@ -314,6 +314,12 @@ fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
                             .collect(),
                     },
                 ),
+                // A prompt a harness is waiting on: its content and choices as a request, answered
+                // by its own action while it is open.
+                "harness-prompt" if let Some(prompt) = &item.prompt => (
+                    Tier::Stopped,
+                    prompt_request(prompt, &item.title, &item.detail),
+                ),
                 // An agent stopped on the person: a request to answer, not a fault to clear.
                 "person-step" | "agent-request" => (
                     Tier::Stopped,
@@ -1990,5 +1996,72 @@ mod tests {
             text.contains("terminal:terminal/agent/lark/planner"),
             "{text}"
         );
+    }
+}
+
+/// A harness prompt as a request card: what it asks and the choices st can send. Where it cannot
+/// be answered, or has ended, the card says so plainly and offers no answers.
+pub(crate) fn prompt_request(prompt: &st3_client::HarnessPrompt, title: &str, detail: &str) -> AttentionKind {
+    let content = prompt
+        .content
+        .clone()
+        .filter(|content| !content.trim().is_empty())
+        .unwrap_or_else(|| {
+            if detail.trim().is_empty() {
+                title.to_owned()
+            } else {
+                detail.to_owned()
+            }
+        });
+    let open = prompt.state.as_deref().is_none_or(|state| state == "open");
+    let answerable = open && prompt.can_answer != Some(false);
+    let answers = if answerable {
+        prompt
+            .choices
+            .iter()
+            .flatten()
+            .map(|choice| st3_client::RequestAnswerOption {
+                id: choice.id.clone(),
+                label: choice.label.clone(),
+                consequence: choice.consequence.clone(),
+                ..Default::default()
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // Where nothing can be answered here, say what to do and how it ended, never a button.
+    let mut reasons = Vec::new();
+    if let Some(next) = prompt.next_action.as_deref().filter(|next| !next.trim().is_empty()) {
+        reasons.push(next.to_owned());
+    }
+    if !open {
+        let state = prompt.state.as_deref().unwrap_or("ended").replace('_', " ");
+        reasons.push(match prompt.how.as_deref().filter(|how| !how.trim().is_empty()) {
+            Some(how) => format!("This prompt {state}: {how}"),
+            None => format!("This prompt {state}"),
+        });
+    }
+    let request = st3_client::StructuredRequest {
+        version: 1,
+        entry_type: "decision".into(),
+        question: content.clone(),
+        why_person: "A harness is waiting for your answer.".into(),
+        summary: None,
+        reasons,
+        recommendation: None,
+        subjects: Vec::new(),
+        answers,
+        custom: false,
+    };
+    AttentionKind::Request {
+        from: prompt
+            .seat_id
+            .clone()
+            .map(|seat| short(&seat))
+            .unwrap_or_else(|| "The harness".into()),
+        from_id: prompt.seat_id.clone().unwrap_or_default(),
+        question: content,
+        structured: Some(Box::new(request)),
     }
 }
