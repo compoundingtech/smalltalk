@@ -1060,7 +1060,9 @@ fn api_server() -> (String, Arc<Mutex<Vec<String>>>) {
 
 #[test]
 fn a_nodes_st_makes_api_requests_with_a_token_it_never_holds() {
-    use super::authorized::{AuthorizedError, AuthorizedRequest, HostIdentity, request_from_cgroup};
+    use super::authorized::{
+        AuthorizedError, AuthorizedRequest, HostIdentity, request_from_cgroup,
+    };
     let (api, seen) = api_server();
     let fixture = Fixture::with_github(&api);
     fixture
@@ -1209,4 +1211,133 @@ fn a_nodes_st_makes_api_requests_with_a_token_it_never_holds() {
             .any(|entry| entry["event"] == "requested" && entry["actor"] == "host/example")
     );
     assert!(!log.to_string().contains("example-token"));
+}
+
+#[test]
+fn adopting_gh_moves_a_persons_agents_onto_sekrets_and_running_it_again_changes_nothing() {
+    use super::adopt::{Adopt, State};
+    if !sandbox_available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.tool(
+        "gh",
+        "case \"$1 $2\" in 'auth status') exit 0 ;; esac\necho \"gh $* token=${GH_TOKEN:+set}\"",
+    );
+    // The person's own path: a real gh somewhere, and the bin directory the shim goes in.
+    let elsewhere = fixture.root.join("usr-bin");
+    fs::create_dir(&elsewhere).unwrap();
+    fs::write(elsewhere.join("gh"), "#!/bin/sh\necho \"real gh $*\"\n").unwrap();
+    fs::set_permissions(elsewhere.join("gh"), fs::Permissions::from_mode(0o755)).unwrap();
+    let bin = fixture.root.join("home-bin");
+    let adopt = Adopt {
+        socket: fixture.socket.clone(),
+        bin_dir: bin.clone(),
+        agent_profile: None,
+        yes: true,
+        sekrets: PathBuf::from("/usr/local/bin/sekrets"),
+        path: std::env::join_paths([&bin, &elsewhere]).unwrap(),
+    };
+    let mut never = |_: &str| false;
+    // From a seat it refuses: only the person adopts.
+    fixture.as_seat();
+    assert!(adopt.gh(&mut never).is_err());
+    fixture.as_person();
+    let first = adopt.gh(&mut never).unwrap();
+    let states = first
+        .iter()
+        .map(|line| (line.part, line.state))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        states,
+        [
+            ("agent profile", State::Done),
+            ("agent login", State::Already),
+            ("agent grant", State::Done),
+            ("gh shim", State::Done),
+        ],
+        "{}",
+        first
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let shim = fs::read_to_string(bin.join("gh")).unwrap();
+    assert!(
+        shim.contains("exec '/usr/local/bin/sekrets' -- gh \"$@\""),
+        "{shim}"
+    );
+    assert!(shim.contains(&format!("exec '{}' \"$@\"", elsewhere.join("gh").display())));
+    let again = adopt.gh(&mut never).unwrap();
+    assert!(
+        again.iter().all(|line| line.state == State::Already),
+        "{}",
+        again
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    // A seat now runs gh through the agent profile it was granted.
+    let (key, _) = MemberKey::generate().unwrap();
+    fixture
+        .manage(Request::Register {
+            node: "host/example".into(),
+            key: key.public().into(),
+        })
+        .unwrap();
+    let cwd = fixture.checkout("web");
+    let viewed = run(
+        fixture.seat(&key, "agent/fleet/fixture-web/builder"),
+        None,
+        &["gh", "pr", "view", "7"],
+        &cwd,
+    );
+    assert_eq!(viewed.result.unwrap(), 0, "{}", viewed.stderr);
+    assert_eq!(viewed.stdout, "gh pr view 7 token=\n");
+    let refused = run(
+        fixture.seat(&key, "agent/fleet/fixture-web/builder"),
+        None,
+        &["gh", "auth", "token"],
+        &cwd,
+    );
+    assert!(refusal(&refused).contains("no allow rule matches"));
+    // A seat with an older, narrower grant of the same profile is not left choosing.
+    fixture.as_person();
+    fixture
+        .manage(Request::GrantAdd {
+            profile: "ada/agent-gh".into(),
+            to: "agent/fleet/fixture-web/**".into(),
+            policy: policy(&["gh-read"], &[]),
+            until_unix_ms: None,
+        })
+        .unwrap();
+    let both = run(
+        fixture.seat(&key, "agent/fleet/fixture-web/builder"),
+        None,
+        &["gh", "pr", "view", "7"],
+        &cwd,
+    );
+    assert_eq!(both.result.unwrap(), 0, "{}", both.stderr);
+    // Without --yes and without a person to ask, nothing is created.
+    let shy = Adopt {
+        agent_profile: Some("ada/other-agent-gh".into()),
+        yes: false,
+        ..adopt
+    };
+    fixture.as_person();
+    let declined = shy.gh(&mut never).unwrap();
+    assert_eq!(declined.len(), 1);
+    assert_eq!(declined[0].state, State::Needs);
+    assert!(
+        declined[0]
+            .detail
+            .starts_with("sekrets profile create ada/other-agent-gh")
+    );
+    // Undo removes only our shim.
+    assert_eq!(shy.unadopt_gh().unwrap().state, State::Done);
+    assert!(!bin.join("gh").exists());
+    fs::write(bin.join("gh"), "#!/bin/sh\necho mine\n").unwrap();
+    assert!(shy.unadopt_gh().is_err());
 }

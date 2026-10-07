@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "summary": "`sekrets adopt gh` step 1: every seat's gh runs through sekrets with an agent profile; people and st's daemon keep gh as before.",
+  "replay": {"status": "none", "detail": "No claim, projection or replay change."},
+  "schema": {"status": "none", "detail": "No store change."},
+  "rules": {"status": "none", "detail": "No checkpoint rule change."},
+  "compatibility": {
+    "status": "changed",
+    "detail": "Opt-in: nothing changes until a person runs `sekrets adopt gh`. Then a seat's `gh` (ST_AGENT set) goes through the gateway with the agent profile and the gh-agent preset, which refuses `gh auth token` and other commands outside it; the person's shell and st's daemon run the real gh. Two grants of the same profile to one seat are no longer refused as ambiguous."
+  },
+  "downtime": {"status": "none", "detail": "No restart beyond a normal deploy."},
+  "manual": {
+    "status": "changed",
+    "detail": "To adopt: from a login session, `sekrets adopt gh` (log the agent profile in with `sekrets login gh --profile PERSON/agent-gh` if it reports no login). To undo: `sekrets unadopt gh`."
+  },
+  "recovery": {"status": "none", "detail": "`sekrets unadopt gh` removes the shim; profiles and grants can stay or be removed. `SEKRETS_DIRECT=1 gh` always runs the real gh."}
+}

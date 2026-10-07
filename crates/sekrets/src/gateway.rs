@@ -592,20 +592,20 @@ impl Gateway {
                 Verdict::Refused(reason) => reasons.push(reason),
             }
         }
-        match allowed.len() {
+        // Several grants of one profile are one choice: any of them lets this command through.
+        let mut ids = allowed
+            .iter()
+            .map(|u| u.profile.id.clone())
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids.dedup();
+        match ids.len() {
             0 => Ok(Err(reasons.join("; "))),
-            1 => Ok(Ok(allowed.pop().expect("one"))),
-            _ => {
-                let mut ids = allowed
-                    .iter()
-                    .map(|u| u.profile.id.as_str())
-                    .collect::<Vec<_>>();
-                ids.dedup();
-                Ok(Err(format!(
-                    "more than one profile allows this; choose one with --profile ({})",
-                    ids.join(", ")
-                )))
-            }
+            1 => Ok(Ok(allowed.swap_remove(0))),
+            _ => Ok(Err(format!(
+                "more than one profile allows this; choose one with --profile ({})",
+                ids.join(", ")
+            ))),
         }
     }
 
