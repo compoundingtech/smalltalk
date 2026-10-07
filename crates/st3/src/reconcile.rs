@@ -4504,6 +4504,16 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .and_then(|ended| ended.declaration.member)
         } else { None };
         let member = subject.member.as_ref().or(prior_member.as_ref());
+        let owner_host = member
+            .map(|member| member.host.as_str())
+            .or_else(|| fields.get("host").and_then(Value::as_str))
+            .or(selected_origin.as_deref());
+        if owner_host != Some(self.host.as_str()) {
+            // A stop intent is fleet-visible, but only the runtime's owner can
+            // observe or terminate its process. A remote empty PTY snapshot is
+            // not evidence that the owner's process stopped.
+            return Ok(());
+        }
         if let Some(member) = member.filter(|m| m.lifecycle == MemberLifecycle::TerminalBound) {
             let incarnation = member
                 .terminal_binding
@@ -4515,16 +4525,6 @@ impl<R: RuntimeControl> Reconciler<R> {
                 "runtime.observed",
                 member_fields(member, "stopped", Some(&incarnation), true),
             );
-        }
-        let owner_host = member
-            .map(|member| member.host.as_str())
-            .or_else(|| fields.get("host").and_then(Value::as_str))
-            .or(selected_origin.as_deref());
-        if owner_host != Some(self.host.as_str()) {
-            // A stop intent is fleet-visible, but only the runtime's owner can
-            // observe or terminate its process. A remote empty PTY snapshot is
-            // not evidence that the owner's process stopped.
-            return Ok(());
         }
         let Some(runtime_id) = member.map(|m| m.runtime_id.as_str())
             .or_else(|| fields.get("runtime_id").and_then(Value::as_str)) else {

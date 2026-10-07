@@ -237,6 +237,19 @@ fn exits_stops_and_replaced_shells_never_act_on_the_borrowed_pty() {
         "stop",
     )
     .unwrap();
+    Reconciler::new(
+        store.clone(),
+        runtime.clone(),
+        "iris".into(),
+        Arc::new(Notify::new()),
+    )
+    .reconcile_once()
+    .unwrap();
+    assert_eq!(status(&store)["status"], "running");
+    assert_eq!(
+        store.selected_actual_origin(SEAT).unwrap().as_deref(),
+        Some("orchid")
+    );
     reconcile(&store, &runtime);
     assert_eq!(status(&store)["status"], "stopped");
     // A terminal with the same name but another process cannot satisfy the old binding.
