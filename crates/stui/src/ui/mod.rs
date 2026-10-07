@@ -1934,6 +1934,7 @@ impl Ui {
                 })
             }),
             chat,
+            closed: self.closed.contains(key),
         }
     }
 
@@ -7094,6 +7095,10 @@ mod tests {
             items.retain(|item| item.id != "attention/prompt");
         }
         ui.set_world(gone);
+        // What it asked stays readable, but nothing on the card can be answered or chosen.
+        let shown = frame(&ui, 140, 50).join("\n");
+        assert!(shown.contains("Closed: there is nothing to answer here"), "{shown}");
+        assert!(!shown.contains("Choose an answer") && !shown.contains("is waiting · "), "{shown}");
         assert_eq!(ui.answering, None, "the choice is put away");
         assert!(ui.flash.as_ref().is_some_and(|(text, _)| text.contains("ended or changed")));
         assert!(ui.listing(60).ids.contains(&"attention/prompt".to_owned()), "it stays");
