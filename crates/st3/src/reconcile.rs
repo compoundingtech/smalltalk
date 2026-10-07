@@ -748,6 +748,8 @@ fn first_readiness_since(run: &MissionRunView) -> u128 {
 }
 
 type MemberWake = (DesiredSubject, String, MemberSpec);
+#[cfg(test)]
+type WorkWakeObserveHook = Box<dyn FnOnce(&crate::incremental::Incremental, bool) + Send>;
 
 pub struct Reconciler<R = NativeRuntime> {
     store: Arc<Store>,
@@ -850,8 +852,7 @@ pub struct Reconciler<R = NativeRuntime> {
     raised_faults: Mutex<Option<Vec<String>>>,
     /// Publish during a unit test after the work feed was observed, before wake selection.
     #[cfg(test)]
-    after_work_wake_observe:
-        Mutex<Option<Box<dyn FnOnce(&crate::incremental::Incremental, bool) + Send>>>,
+    after_work_wake_observe: Mutex<Option<WorkWakeObserveHook>>,
 }
 
 #[derive(Clone, Eq, PartialEq)]
