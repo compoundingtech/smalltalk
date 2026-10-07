@@ -1371,6 +1371,14 @@ pub(super) async fn observe_at(
     if !issues.is_empty() {
         facts.insert("issues".into(), Value::Array(issues));
     }
+    if fields.contains(super::github_workflows::PERFORMANCE_FAILURES_FIELD) {
+        let repository = format!("{}/{}", current_location.0, current_location.1);
+        let failures = super::github_workflows::main_performance_failures(
+            &client, &base, &repository, token, cache_for,
+        ).await?;
+        facts.insert(super::github_workflows::PERFORMANCE_FAILURES_FIELD.into(),
+            serde_json::to_value(failures)?);
+    }
     Ok(ProviderObservation {
         facts: Value::Object(facts),
         cursor: Some(serde_json::to_string(&cursor)?),
@@ -1652,6 +1660,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct FakeGithub {
         routes: Arc<Mutex<HashMap<String, (String, String)>>>,
+        links: Arc<Mutex<HashMap<String, String>>>,
         refused: Arc<Mutex<HashMap<String, String>>>,
         graphql: Arc<Mutex<String>>,
         graphql_requests: Arc<Mutex<Vec<Value>>>,
@@ -1707,8 +1716,11 @@ mod tests {
                         let respond = |status: &str, etag: Option<&str>, body: &str| {
                             let etag =
                                 etag.map_or(String::new(), |etag| format!("ETag: {etag}\r\n"));
+                            let link = target.split(' ').nth(1)
+                                .and_then(|path| server.links.lock().unwrap().get(path).cloned())
+                                .map_or(String::new(), |link| format!("Link: {link}\r\n"));
                             format!(
-                                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{etag}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{etag}{link}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                                 body.len()
                             )
                         };
@@ -1938,6 +1950,90 @@ mod tests {
             None,
         );
         assert!(!legacy.facts.contains_key("node_id"));
+    }
+
+    fn workflow_run(id: u64, attempt: u64) -> Value {
+        json!({"id": id, "run_attempt": attempt, "head_sha": "a".repeat(40),
+            "name": "Performance", "path": ".github/workflows/perf.yml", "event": "push",
+            "head_branch": "main", "status": "completed", "conclusion": "failure",
+            "repository": {"full_name": "acme/garden"}})
+    }
+
+    const WORKFLOW_RUNS: &str = "/repos/acme/garden/actions/workflows/perf.yml/runs?branch=main&event=push&status=failure&per_page=100";
+
+    #[tokio::test]
+    async fn main_performance_failures_are_narrow_and_only_read_run_metadata() {
+        let (github, base) = FakeGithub::start().await;
+        github.route("/repos/acme/garden", json!({"id": 7, "full_name": "acme/garden"}));
+        let mut runs = vec![workflow_run(7, 1), workflow_run(7, 1)];
+        let mut ref_path = workflow_run(8, 2);
+        ref_path["path"] = json!(".github/workflows/perf.yml@refs/heads/main");
+        runs.push(ref_path);
+        for (field, wrong) in [
+            ("event", json!("pull_request")), ("head_branch", json!("feature")),
+            ("status", json!("in_progress")), ("conclusion", json!("success")),
+            ("conclusion", json!("cancelled")), ("conclusion", json!("timed_out")),
+            ("name", json!("Other workflow")), ("path", json!(".github/workflows/other.yml")),
+            ("run_attempt", json!(0)), ("head_sha", json!("missing")),
+            ("repository", json!({"full_name": "another/repository"})),
+        ] {
+            let mut excluded = workflow_run(99, 1);
+            excluded[field] = wrong;
+            runs.push(excluded);
+        }
+        github.route(WORKFLOW_RUNS, json!({"workflow_runs": runs}));
+        let field = super::super::github_workflows::PERFORMANCE_FAILURES_FIELD;
+        let first = observe_at(request(&[field], None, None), &base,
+            Some(&GithubAuth::test("fixture-auth"))).await.unwrap();
+        let failures = first.facts[field].as_array().unwrap();
+        assert_eq!(failures.len(), 2);
+        assert_eq!(failures[0]["run_id"], 7);
+        assert_eq!(failures[1]["run_attempt"], 2);
+        assert_eq!(failures[1]["workflow_path"], ".github/workflows/perf.yml");
+        assert_eq!(failures[0]["url"], "https://github.com/acme/garden/actions/runs/7");
+        assert_eq!(github.take_requests(), vec!["GET /repos/acme/garden HTTP/1.1".to_owned(),
+            format!("GET {WORKFLOW_RUNS} HTTP/1.1")]);
+        let second = observe_at(request(&[field], first.cursor.as_deref(), Some(first.facts.clone())),
+            &base, Some(&GithubAuth::test("fixture-auth"))).await.unwrap();
+        assert_eq!(second.facts, first.facts);
+        let revalidated = github.requests.lock().unwrap().clone();
+        assert_eq!(revalidated.len(), 2);
+        assert!(revalidated.iter().all(|head| head.to_ascii_lowercase().contains("if-none-match:")));
+        assert!(github.graphql_requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn main_performance_failures_follow_conditional_object_pagination_and_fail_closed() {
+        let (github, base) = FakeGithub::start().await;
+        github.route("/repos/acme/garden", json!({"id": 7, "full_name": "acme/garden"}));
+        let page_two = "/repos/acme/garden/actions/workflows/perf.yml/runs?page=2";
+        github.route(WORKFLOW_RUNS, json!({"workflow_runs": [workflow_run(1, 1)]}));
+        github.route(page_two, json!({"workflow_runs": [workflow_run(2, 1)]}));
+        github.links.lock().unwrap().insert(WORKFLOW_RUNS.into(), format!("<{base}{page_two}>; rel=\"next\""));
+        let field = super::super::github_workflows::PERFORMANCE_FAILURES_FIELD;
+        let first = observe_at(request(&[field], None, None), &base,
+            Some(&GithubAuth::test("fixture-auth"))).await.unwrap();
+        assert_eq!(first.facts[field].as_array().unwrap().len(), 2);
+        github.take_requests();
+        let unchanged = observe_at(request(&[field], first.cursor.as_deref(), Some(first.facts.clone())),
+            &base, Some(&GithubAuth::test("fixture-auth"))).await.unwrap();
+        assert_eq!(unchanged.facts, first.facts);
+        assert!(github.take_requests().iter().any(|request| request.contains("page=2")));
+        github.route(page_two, json!({"workflow_runs": [workflow_run(2, 2)]}));
+        let rerun = observe_at(request(&[field], unchanged.cursor.as_deref(), Some(unchanged.facts)),
+            &base, Some(&GithubAuth::test("fixture-auth"))).await.unwrap();
+        assert_eq!(rerun.facts[field][1]["run_attempt"], 2);
+        github.route(WORKFLOW_RUNS, json!({"total_count": 1001, "workflow_runs": [workflow_run(1, 1)]}));
+        let overflow = observe_at(request(&[field], rerun.cursor.as_deref(), Some(rerun.facts.clone())),
+            &base, Some(&GithubAuth::test("fixture-auth"))).await.unwrap_err();
+        assert!(overflow.to_string().contains("page bound"));
+        github.route(WORKFLOW_RUNS, json!({"unexpected_collection": []}));
+        assert!(observe_at(request(&[field], rerun.cursor.as_deref(), Some(rerun.facts.clone())),
+            &base, Some(&GithubAuth::test("fixture-auth"))).await.is_err());
+        github.refuse(WORKFLOW_RUNS, "403 Forbidden");
+        assert!(observe_at(request(&[field], rerun.cursor.as_deref(), Some(rerun.facts)),
+            &base, Some(&GithubAuth::test("fixture-auth"))).await.is_err());
+        assert!(github.graphql_requests.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
