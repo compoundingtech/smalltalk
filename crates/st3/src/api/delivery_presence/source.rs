@@ -19,6 +19,8 @@ use serde_json::Value;
 
 use super::{Presence, assess_beat, presence};
 
+pub(crate) mod boundary;
+
 const MAX_RECIPIENT_BYTES: usize = 1024;
 const MAX_CAPTURE_BYTES: usize = 16 * 1024;
 const MAX_READ_KEYS: usize = 200;
@@ -29,8 +31,62 @@ type Sink = dyn Fn(&Change) -> Result<()> + Send + Sync;
 pub(super) struct State {
     owner: Option<Owner>,
     active_mutations: u64,
+    memory_inflight: u64,
+    projection_inflight: u64,
+    global_revision: u64,
+    pending: usize,
+    failures: usize,
+    boundary_fault: bool,
+    boundary: Option<boundary::Certificate>,
     exhausted: bool,
     entries: HashMap<String, Entry>,
+}
+
+impl State {
+    fn invalidate(&mut self) {
+        self.boundary = None;
+        if let Some(next) = self.global_revision.checked_add(1) {
+            self.global_revision = next;
+        } else {
+            self.exhausted = true;
+        }
+    }
+
+    fn dirty(&mut self, recipient: &str, failed: bool) {
+        self.invalidate();
+        let entry = self.entries.entry(recipient.to_owned()).or_default();
+        if !entry.needs_ack {
+            entry.needs_ack = true;
+            self.pending += 1;
+        }
+        if failed && !entry.failed {
+            entry.failed = true;
+            self.failures += 1;
+        }
+        entry.committed.clear();
+    }
+
+    fn acknowledge(&mut self, recipient: &str, certificate: Option<Certificate>) {
+        let entry = self
+            .entries
+            .get_mut(recipient)
+            .expect("validated recipient");
+        if entry.failed {
+            entry.failed = false;
+            self.failures = self.failures.saturating_sub(1);
+        }
+        if let Some(certificate) = certificate {
+            entry
+                .committed
+                .insert(certificate.driver.clone(), certificate);
+        } else {
+            entry.committed.clear();
+        }
+        if entry.needs_ack && (entry.committed.is_empty() || entry.committed.len() == 5) {
+            entry.needs_ack = false;
+            self.pending = self.pending.saturating_sub(1);
+        }
+    }
 }
 
 struct Owner {
@@ -43,6 +99,7 @@ struct Entry {
     revision: u64,
     active: u64,
     failed: bool,
+    needs_ack: bool,
     exhausted: bool,
     committed: HashMap<String, Certificate>,
 }
@@ -94,6 +151,9 @@ impl Drop for Registration<'_> {
         {
             state.owner = None;
             state.entries.clear();
+            state.boundary = None;
+            state.pending = 0;
+            state.failures = 0;
         }
     }
 }
@@ -114,13 +174,18 @@ fn install_in(presence: &Presence, sink: Arc<Sink>) -> Result<Registration<'_>> 
         "delivery source already has a sink owner"
     );
     ensure!(
-        state.active_mutations == 0 && !state.exhausted,
+        state.active_mutations == 0 && state.projection_inflight == 0 && !state.exhausted,
         "delivery producer still has an active mutation or callback"
     );
     let mut nonce = [0_u8; 32];
     getrandom::fill(&mut nonce).map_err(|error| anyhow!("delivery epoch: {error}"))?;
     let epoch = hex::encode(nonce);
     state.entries.clear();
+    state.global_revision = 0;
+    state.pending = 0;
+    state.failures = 0;
+    state.boundary_fault = false;
+    state.boundary = None;
     state.owner = Some(Owner {
         epoch: epoch.clone(),
         sink,
@@ -134,6 +199,7 @@ pub(super) struct Mutation<'a> {
     presence: &'a Presence,
     change: Option<Change>,
     tracked: bool,
+    memory_ended: bool,
 }
 
 impl<'a> Mutation<'a> {
@@ -142,15 +208,22 @@ impl<'a> Mutation<'a> {
         let change = presence.source.lock().ok().and_then(|mut state| {
             if let Some(active) = state.active_mutations.checked_add(1) {
                 state.active_mutations = active;
+                state.memory_inflight = state.memory_inflight.checked_add(1).unwrap_or_else(|| {
+                    state.exhausted = true;
+                    u64::MAX
+                });
                 tracked = true;
             } else {
                 state.exhausted = true;
                 return None;
             }
+            let epoch = state.owner.as_ref()?.epoch.clone();
             if recipient.len() > MAX_RECIPIENT_BYTES {
+                state.invalidate();
+                state.exhausted = true;
                 return None;
             }
-            let epoch = state.owner.as_ref()?.epoch.clone();
+            state.dirty(recipient, false);
             let entry = state.entries.entry(recipient.to_owned()).or_default();
             entry.committed.clear();
             if let (Some(revision), Some(active)) =
@@ -173,6 +246,7 @@ impl<'a> Mutation<'a> {
             presence,
             change,
             tracked,
+            memory_ended: false,
         }
     }
 
@@ -190,18 +264,20 @@ impl<'a> Mutation<'a> {
                         .owner
                         .as_ref()
                         .is_some_and(|owner| owner.epoch == change.epoch)
-                    && let Some(entry) = state.entries.get_mut(&change.recipient)
                 {
-                    entry.failed = true;
-                    entry.committed.clear();
+                    state.dirty(&change.recipient, true);
                 }
                 tracing::warn!(recipient = %change.recipient, "delivery normalized source callback failed; coverage fenced");
             }
         }
     }
 
-    fn end(&self, change: &Change, failed: bool) -> Option<Arc<Sink>> {
+    fn end(&mut self, change: &Change, failed: bool) -> Option<Arc<Sink>> {
         let mut state = self.presence.source.lock().ok()?;
+        if !self.memory_ended {
+            state.memory_inflight = state.memory_inflight.saturating_sub(1);
+            self.memory_ended = true;
+        }
         let owner = state.owner.as_ref()?;
         if owner.epoch != change.epoch {
             return None;
@@ -209,7 +285,9 @@ impl<'a> Mutation<'a> {
         let sink = owner.sink.clone();
         let entry = state.entries.get_mut(&change.recipient)?;
         entry.active = entry.active.saturating_sub(1);
-        entry.failed |= failed;
+        if failed {
+            state.dirty(&change.recipient, true);
+        }
         Some(sink)
     }
 }
@@ -223,6 +301,9 @@ impl Drop for Mutation<'_> {
             && let Ok(mut state) = self.presence.source.lock()
         {
             state.active_mutations = state.active_mutations.saturating_sub(1);
+            if !self.memory_ended {
+                state.memory_inflight = state.memory_inflight.saturating_sub(1);
+            }
         }
     }
 }
@@ -417,11 +498,13 @@ fn fence_file(presence: &Presence, epoch: &str, recipient: &str, revision: u64) 
             .owner
             .as_ref()
             .is_some_and(|owner| owner.epoch == epoch)
-        && let Some(entry) = state.entries.get_mut(recipient)
-        && entry.revision == revision
+        && state
+            .entries
+            .get(recipient)
+            .is_some_and(|entry| entry.revision == revision)
     {
-        entry.failed = true;
-        entry.committed.clear();
+        state.dirty(recipient, true);
+        let entry = state.entries.get_mut(recipient).expect("checked recipient");
         if let Some(next) = entry.revision.checked_add(1) {
             entry.revision = next;
         } else {
@@ -430,12 +513,7 @@ fn fence_file(presence: &Presence, epoch: &str, recipient: &str, revision: u64) 
     }
 }
 
-fn validate_current(
-    presence: &Presence,
-    certificate: &Certificate,
-    now: Instant,
-    committed: bool,
-) -> Result<()> {
+fn validate_time(presence: &Presence, certificate: &Certificate, now: Instant) -> Result<()> {
     let elapsed = now
         .checked_duration_since(presence.started)
         .ok_or_else(|| anyhow!("delivery clock precedes startup"))?;
@@ -443,21 +521,10 @@ fn validate_current(
         ns(elapsed)? >= certificate.watermark_ns && ns(elapsed)? < certificate.deadline_ns,
         "delivery source deadline expired"
     );
-    if let Some((path, identity)) = &certificate.follows
-        && !file_identity(path).is_ok_and(|current| current == *identity)
-    {
-        fence_file(
-            presence,
-            &certificate.epoch,
-            &certificate.recipient,
-            certificate.revision,
-        );
-        bail!("followed executable identity changed or unavailable");
-    }
-    let state = presence
-        .source
-        .lock()
-        .map_err(|_| anyhow!("delivery source lock poisoned"))?;
+    Ok(())
+}
+
+fn validate_state(state: &State, certificate: &Certificate, committed: bool) -> Result<()> {
     let owner = state
         .owner
         .as_ref()
@@ -484,6 +551,56 @@ fn validate_current(
     Ok(())
 }
 
+fn validate_file(presence: &Presence, certificate: &Certificate) -> Result<()> {
+    if let Some((path, identity)) = &certificate.follows
+        && !file_identity(path).is_ok_and(|current| current == *identity)
+    {
+        fence_file(
+            presence,
+            &certificate.epoch,
+            &certificate.recipient,
+            certificate.revision,
+        );
+        bail!("followed executable identity changed or unavailable");
+    }
+    Ok(())
+}
+
+fn validate_current(
+    presence: &Presence,
+    certificate: &Certificate,
+    now: Instant,
+    committed: bool,
+) -> Result<()> {
+    // Authenticate the metadata before querying its path or using it to fence a live producer.
+    {
+        let state = presence
+            .source
+            .lock()
+            .map_err(|_| anyhow!("delivery source lock poisoned"))?;
+        validate_state(&state, certificate, committed)?;
+        validate_time(presence, certificate, now)?;
+    }
+    validate_file(presence, certificate)?;
+    let state = presence
+        .source
+        .lock()
+        .map_err(|_| anyhow!("delivery source lock poisoned"))?;
+    validate_state(&state, certificate, committed)?;
+    validate_time(presence, certificate, now)
+}
+
+fn validate_live_current(presence: &Presence, certificate: &Certificate) -> Result<()> {
+    validate_current(presence, certificate, Instant::now(), false)?;
+    let state = presence
+        .source
+        .lock()
+        .map_err(|_| anyhow!("delivery source lock poisoned"))?;
+    validate_state(&state, certificate, false)?;
+    // File metadata and source lock acquisition can both outlast the initial timestamp.
+    validate_time(presence, certificate, Instant::now())
+}
+
 /// The closure must durably commit the assessment and its exact certificate together, through the
 /// owner’s normal Store route. Success acknowledges only an unchanged, still-live producer. The
 /// closure runs with no source lock held. SQL/source races leave persisted evidence unservable.
@@ -499,33 +616,19 @@ fn commit_in(
     capture: &CapturedAssessment,
     commit: impl FnOnce(&CapturedAssessment) -> Result<()>,
 ) -> Result<Certificate> {
-    validate_current(presence, &capture.certificate, Instant::now(), false)?;
+    validate_live_current(presence, &capture.certificate)?;
+    let _projection = boundary::Projection::begin(presence)?;
     commit(capture)?;
-    validate_current(presence, &capture.certificate, Instant::now(), false)?;
+    validate_live_current(presence, &capture.certificate)?;
     let mut state = presence
         .source
         .lock()
         .map_err(|_| anyhow!("delivery source lock poisoned"))?;
-    let owner = state
-        .owner
-        .as_ref()
-        .ok_or_else(|| anyhow!("delivery source not installed"))?;
-    ensure!(
-        owner.epoch == capture.certificate.epoch,
-        "delivery source epoch changed during commit"
-    );
-    let entry = state
-        .entries
-        .get_mut(&capture.certificate.recipient)
-        .ok_or_else(|| anyhow!("delivery recipient not captured"))?;
-    ensure!(
-        entry.active == 0 && !entry.exhausted && entry.revision == capture.certificate.revision,
-        "delivery source changed during commit"
-    );
-    entry.failed = false;
-    entry.committed.insert(
-        capture.certificate.driver.clone(),
-        capture.certificate.clone(),
+    validate_state(&state, &capture.certificate, false)?;
+    validate_time(presence, &capture.certificate, Instant::now())?;
+    state.acknowledge(
+        &capture.certificate.recipient,
+        Some(capture.certificate.clone()),
     );
     Ok(capture.certificate.clone())
 }
@@ -544,17 +647,56 @@ fn read_in<T>(
     certificates: &[Certificate],
     read: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
+    read_with_guards(
+        presence,
+        certificates,
+        read,
+        |certificate| validate_file(presence, certificate),
+        Instant::now,
+    )
+}
+
+fn check_batch(
+    presence: &Presence,
+    certificates: &[Certificate],
+    now: impl FnOnce() -> Instant,
+) -> Result<()> {
+    let state = presence
+        .source
+        .lock()
+        .map_err(|_| anyhow!("delivery source lock poisoned"))?;
+    // Every selected key uses one producer boundary and a timestamp sampled after lock acquisition.
+    let now = now();
+    for certificate in certificates {
+        validate_state(&state, certificate, true)?;
+        validate_time(presence, certificate, now)?;
+    }
+    Ok(())
+}
+
+fn read_with_guards<T>(
+    presence: &Presence,
+    certificates: &[Certificate],
+    read: impl FnOnce() -> Result<T>,
+    mut file: impl FnMut(&Certificate) -> Result<()>,
+    mut now: impl FnMut() -> Instant,
+) -> Result<T> {
     ensure!(
         !certificates.is_empty() && certificates.len() <= MAX_READ_KEYS,
         "delivery read requires bounded source certificates"
     );
+    check_batch(presence, certificates, &mut now)?;
     for certificate in certificates {
-        validate_current(presence, certificate, Instant::now(), true)?;
+        file(certificate)?;
     }
+    check_batch(presence, certificates, &mut now)?;
     let result = read()?;
     for certificate in certificates {
-        validate_current(presence, certificate, Instant::now(), true)?;
+        file(certificate)?;
     }
+    // Recheck every deadline/revision after all filesystem checks, including earlier keys whose
+    // deadlines could have expired while a later key's metadata syscall was blocked.
+    check_batch(presence, certificates, now)?;
     Ok(result)
 }
 
@@ -570,7 +712,7 @@ mod tests {
 
     const RECIPIENT: &str = "agent/source-control";
 
-    fn fixture() -> Presence {
+    pub(super) fn fixture() -> Presence {
         Presence {
             started: Instant::now() - Duration::from_secs(100),
             image: Some("new".into()),
@@ -579,13 +721,13 @@ mod tests {
             source: Mutex::new(State::default()),
         }
     }
-    fn captured(p: &Presence, driver: &str) -> CapturedAssessment {
+    pub(super) fn captured(p: &Presence, driver: &str) -> CapturedAssessment {
         capture_at(p, RECIPIENT, driver, Instant::now(), 100_000).unwrap()
     }
     fn commit(p: &Presence, driver: &str) -> Certificate {
         commit_in(p, &captured(p, driver), |_| Ok(())).unwrap()
     }
-    fn poll(p: &Presence) {
+    pub(super) fn poll(p: &Presence) {
         record_in(
             p,
             RECIPIENT,
@@ -992,5 +1134,121 @@ mod tests {
         };
         let _unknown = install_in(&unknown_image, Arc::new(|_| Ok(()))).unwrap();
         assert!(capture_at(&unknown_image, RECIPIENT, "codex", Instant::now(), 0).is_err());
+    }
+    #[test]
+    fn delayed_metadata_before_or_after_snapshot_refuses_deadlines_at_the_final_boundary() {
+        use std::cell::Cell;
+        for delay_after_read in [false, true] {
+            let p = fixture();
+            let _registration = install_in(&p, Arc::new(|_| Ok(()))).unwrap();
+            poll(&p);
+            let certificate = commit(&p, "codex");
+            let clock = Cell::new(certificate.watermark_ns);
+            let files = Cell::new(0);
+            let reads = Cell::new(0);
+            let result = read_with_guards(
+                &p,
+                std::slice::from_ref(&certificate),
+                || {
+                    reads.set(reads.get() + 1);
+                    Ok("old row")
+                },
+                |_| {
+                    files.set(files.get() + 1);
+                    if files.get() == if delay_after_read { 2 } else { 1 } {
+                        clock.set(certificate.deadline_ns);
+                    }
+                    Ok(())
+                },
+                || {
+                    assert!(p.source.try_lock().is_err());
+                    p.started + Duration::from_nanos(clock.get())
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(reads.get(), u32::from(delay_after_read));
+        }
+    }
+
+    #[test]
+    fn batch_rechecks_earliest_deadline_after_later_metadata_finishes() {
+        use std::cell::Cell;
+        let p = fixture();
+        let _registration = install_in(&p, Arc::new(|_| Ok(()))).unwrap();
+        poll(&p);
+        let mut earlier = commit(&p, "codex");
+        let later = commit(&p, "claude");
+        earlier.deadline_ns = later.watermark_ns + 10_000;
+        assert!(earlier.deadline_ns < later.deadline_ns);
+        p.source
+            .lock()
+            .unwrap()
+            .entries
+            .get_mut(RECIPIENT)
+            .unwrap()
+            .committed
+            .insert("codex".into(), earlier.clone());
+        let clock = Cell::new(later.watermark_ns);
+        let files = Cell::new(0);
+        let expiry = earlier.deadline_ns;
+        let result = read_with_guards(
+            &p,
+            &[earlier, later],
+            || Ok("two rows"),
+            |_| {
+                files.set(files.get() + 1);
+                if files.get() == 4 {
+                    clock.set(expiry);
+                }
+                Ok(())
+            },
+            || p.started + Duration::from_nanos(clock.get()),
+        );
+        assert_eq!(files.get(), 4);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn batch_rechecks_an_earlier_recipient_changed_during_later_file_validation() {
+        use std::cell::Cell;
+        let p = fixture();
+        let _registration = install_in(&p, Arc::new(|_| Ok(()))).unwrap();
+        poll(&p);
+        let first = commit(&p, "codex");
+        let other = "agent/source-other";
+        record_legacy_in(&p, other, "native", 5);
+        let captured = capture_at(&p, other, "codex", Instant::now(), 100_000).unwrap();
+        let second = commit_in(&p, &captured, |_| Ok(())).unwrap();
+        let files = Cell::new(0);
+        assert!(
+            read_with_guards(
+                &p,
+                &[first, second],
+                || Ok("two rows"),
+                |_| {
+                    files.set(files.get() + 1);
+                    if files.get() == 4 {
+                        poll(&p);
+                    }
+                    Ok(())
+                },
+                Instant::now
+            )
+            .is_err()
+        );
+        assert_eq!(files.get(), 4);
+    }
+
+    #[test]
+    fn mismatched_persisted_file_metadata_is_refused_without_fencing_live_evidence() {
+        let p = fixture();
+        let _registration = install_in(&p, Arc::new(|_| Ok(()))).unwrap();
+        poll(&p);
+        let current = commit(&p, "codex");
+        let mut forged = current.clone();
+        forged.follows = Some(("/missing/forged/delivery-image".into(), "wrong".into()));
+        assert!(read_in(&p, &[forged], || Ok(())).is_err());
+        assert!(!p.source.lock().unwrap().entries[RECIPIENT].failed);
+        assert!(read_in(&p, &[current], || Ok(())).is_ok());
     }
 }
