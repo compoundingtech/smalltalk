@@ -112,6 +112,9 @@ function useAppStore(proof?: FabricProfile) {
   const imageCache = useRef(new Map<string, Promise<string>>());
   // Attention the person acted on from here: st closing it is their doing, not a vanishing.
   const acted = useRef(new Set<string>());
+  // Whether this connection has delivered its first attention window: what a stored copy held
+  // and st no longer lists was not on screen while it closed, so only later windows keep items.
+  const attentionLive = useRef(false);
   const missionDetailCache = useRef(new Map<string, Mission>());
   const client = useMemo(() => url ? new St3Client({ baseUrl: url, credential: () => credential ?? undefined, fetchImpl: gatewayFetch(), client: clientName('smalltalk-ios', app.expo.version, process.env.EXPO_PUBLIC_ST3_BUILD) }) : null, [url, credential]);
   // Image bytes go up through Expo's fetch: React Native's cannot send a byte array as a body.
@@ -168,6 +171,7 @@ function useAppStore(proof?: FabricProfile) {
     if (!client || !credential) { setStatus('setup'); return; }
     const generation = cacheGeneration.current;
     const current = () => generation === cacheGeneration.current;
+    attentionLive.current = false;
     const opened = new Feed(client, {
       onWindow: (name, rows, hasMore, at) => {
         if (!current()) return;
@@ -175,7 +179,9 @@ function useAppStore(proof?: FabricProfile) {
         // Home decides what of attention to show, as stui does; agents drop only history.
         const shown = name === 'agents' ? (rows as Array<{ operational?: { layer?: string } }>).filter(currentAgent) : rows;
         // Nothing leaves Home by itself: what st closes while it is shown stays until cleared.
-        setData(previous => ({ ...previous, [name]: name === 'attention' ? keepClosed(previous.attention, shown as Attention[], acted.current, capsRef.current?.session_actor) : shown }));
+        const seen = attentionLive.current;
+        if (name === 'attention') attentionLive.current = true;
+        setData(previous => ({ ...previous, [name]: name === 'attention' && seen ? keepClosed(previous.attention, shown as Attention[], acted.current, capsRef.current?.session_actor) : shown }));
         setTruncated(previous => ({ ...previous, [name]: hasMore }));
         setLoadErrors(previous => { if (!(name in previous)) return previous; const rest = { ...previous }; delete rest[name]; return rest; });
         proofRef.current?.record('window', { name, rows: shown.length });
@@ -220,7 +226,7 @@ function useAppStore(proof?: FabricProfile) {
     const timer = setTimeout(() => {
       cacheSavedAt.current = Date.now();
       const truncatedKeys = (Object.keys(truncated) as Array<keyof Data>).filter(key => truncated[key]);
-      const encoded = encodeProjectionCache(url, caps.session_actor, snapshot.host_id, snapshot.store_index, data, cacheSavedAt.current, truncatedKeys);
+      const encoded = encodeProjectionCache(url, caps.session_actor, snapshot.host_id, snapshot.store_index, { ...data, attention: data.attention.filter(item => !item.closedElsewhere) }, cacheSavedAt.current, truncatedKeys);
       if (encoded) void AsyncStorage.setItem(PROJECTION_CACHE_KEY, encoded).catch(() => { cacheSavedAt.current = 0; });
     }, Math.max(0, cacheSavedAt.current + 10_000 - Date.now()));
     return () => clearTimeout(timer);
