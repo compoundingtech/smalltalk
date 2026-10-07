@@ -3381,6 +3381,35 @@ impl Ui {
         }
     }
 
+    /// Whether a held key may act again as a press. While text is being typed (a message box,
+    /// the palette, find, a form) any key but Enter, Esc, Tab and the function keys may; outside
+    /// it only the keys that move. Never a pending confirmation or answer: Enter, y and the
+    /// commands that change things act once per press, so holding one can never repeat them.
+    fn repeat_is_safe(&self, key: &KeyEvent) -> bool {
+        if self.confirm.is_some() || self.answering.is_some() || self.terminal_focused() {
+            return false;
+        }
+        let typing = self.editing
+            || self.find.is_some()
+            || self.palette_open()
+            || self.chat.as_ref().is_some_and(|chat| chat.editing)
+            || self.new_mission.is_some();
+        match key.code {
+            KeyCode::Enter | KeyCode::Esc | KeyCode::Tab | KeyCode::BackTab | KeyCode::F(_) => {
+                false
+            }
+            KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::PageUp
+            | KeyCode::PageDown
+            | KeyCode::Home
+            | KeyCode::End => true,
+            _ => typing,
+        }
+    }
+
     pub fn key(&mut self, key: KeyEvent) {
         let ctrl_t = key.code == KeyCode::Char('t') && key.modifiers == KeyModifiers::CONTROL;
         if self.terminal_hold.is_some() {
@@ -3412,6 +3441,11 @@ impl Ui {
                 && !matches!(key.code, KeyCode::Char('c' | 'd') if key.modifiers.contains(KeyModifiers::CONTROL) && !self.shell_focused())
             {
                 self.terminal_key(key);
+            } else if key.kind == KeyEventKind::Repeat && self.repeat_is_safe(&key) {
+                // Held down, a key goes on: Ctrl+W deletes word after word, an arrow moves on.
+                let mut again = key;
+                again.kind = KeyEventKind::Press;
+                self.key(again);
             }
             return;
         }
@@ -6635,6 +6669,45 @@ mod tests {
         assert!(ui.effects.is_empty(), "nothing sent for an item already closed");
         ui.set_world(next);
         assert!(!ui.listing(60).ids.contains(&gone));
+    }
+
+    #[test]
+    fn a_held_key_repeats_while_typing_and_never_repeats_a_command() {
+        // Nathan, 2026-10-07: holding Ctrl+W deleted one word, not word after word.
+        let mut ui = Ui::new(demo::world());
+        ui.live = true;
+        ui.tab = 1;
+        ui.select(0);
+        let agent = ui.selected_id().unwrap();
+        ui.editing = true;
+        ui.conversation_state
+            .drafts
+            .insert(agent.clone(), "one two three four".into());
+        let key = |code, modifiers, kind| {
+            let mut key = KeyEvent::new(code, modifiers);
+            key.kind = kind;
+            key
+        };
+        ui.key(key(KeyCode::Char('w'), KeyModifiers::CONTROL, KeyEventKind::Press));
+        for _ in 0..2 {
+            ui.key(key(KeyCode::Char('w'), KeyModifiers::CONTROL, KeyEventKind::Repeat));
+        }
+        assert_eq!(ui.conversation_state.drafts[&agent], "one ");
+        // A release is nothing, and a held Enter never sends again.
+        ui.key(key(KeyCode::Char('w'), KeyModifiers::CONTROL, KeyEventKind::Release));
+        ui.key(key(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Repeat));
+        assert!(ui.effects.is_empty(), "{:?}", ui.effects);
+        assert_eq!(ui.conversation_state.drafts[&agent], "one ");
+        // Not typing, a held command key acts once (its press), never on repeats; a held arrow moves on.
+        ui.editing = false;
+        ui.tab = 0;
+        ui.select(0);
+        ui.key(key(KeyCode::Char('x'), KeyModifiers::NONE, KeyEventKind::Repeat));
+        assert!(ui.confirm.is_none() && ui.effects.is_empty() && ui.flash.is_none());
+        ui.key(key(KeyCode::Down, KeyModifiers::NONE, KeyEventKind::Press));
+        let after_press = ui.selected[0];
+        ui.key(key(KeyCode::Down, KeyModifiers::NONE, KeyEventKind::Repeat));
+        assert_eq!(ui.selected[0], after_press + 1);
     }
 
     #[test]
