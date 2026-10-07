@@ -1,0 +1,379 @@
+{
+  "capturedAt": "2032-01-19T00:00:00.000Z",
+  "snapshot": "snapshot/synthetic-138/1",
+  "missions": [
+    {
+      "kind": "mission",
+      "id": "mission/synthetic-138/1",
+      "revision": "rev/synthetic-138-1",
+      "updated_at": "2032-01-19T00:00:00.000Z",
+      "title": "Sample assembly 1",
+      "state": "running",
+      "runs": [
+        "mission-run/synthetic-138/1"
+      ],
+      "run_details": [
+        {
+          "id": "mission-run/synthetic-138/1",
+          "status": "running",
+          "generation_id": "run-generation/synthetic-138/1",
+          "requester": "person/operator",
+          "phase": "execution",
+          "progress": {
+            "done": 0,
+            "total": 4
+          },
+          "current_steps": [
+            {
+              "id": "step-run/synthetic-138/1",
+              "assignee": "agent/synthetic-138/1",
+              "claimant": "agent/synthetic-138/1",
+              "since": "2032-01-18T23:58:00.000Z",
+              "state": "claimed",
+              "title": "Assemble sample 1"
+            }
+          ],
+          "must_act": "agent",
+          "state_since": "2032-01-18T23:58:00.000Z",
+          "outcome": null,
+          "last_progress": null,
+          "blocker": null,
+          "after": null,
+          "deadline": null,
+          "steps": [
+            {
+              "id": "step-run/synthetic-138/1",
+              "path": "assemble",
+              "title": "Assemble sample 1",
+              "state": "claimed",
+              "since": "2032-01-18T23:58:00.000Z",
+              "attempt": 1,
+              "assignee": "agent/synthetic-138/1",
+              "claimant": "agent/synthetic-138/1"
+            }
+          ]
+        }
+      ],
+      "mission_revision": "rev/synthetic-138-1",
+      "must_act": "agent",
+      "active_runs": 1,
+      "total_runs": 1,
+      "runs_truncated": false,
+      "run_counts": {
+        "running": 1
+      },
+      "run_generations": {
+        "mission-run/synthetic-138/1": "run-generation/synthetic-138/1"
+      },
+      "visualization": null,
+      "usage": null
+    },
+    {
+      "kind": "mission",
+      "id": "mission/synthetic-138/2",
+      "revision": "rev/synthetic-138-2",
+      "updated_at": "2032-01-19T00:00:00.000Z",
+      "title": "Sample assembly 2",
+      "state": "running",
+      "runs": [
+        "mission-run/synthetic-138/2"
+      ],
+      "run_details": [
+        {
+          "id": "mission-run/synthetic-138/2",
+          "status": "waiting",
+          "generation_id": "run-generation/synthetic-138/2",
+          "requester": "person/operator",
+          "phase": "execution",
+          "progress": {
+            "done": 1,
+            "total": 4
+          },
+          "current_steps": [
+            {
+              "id": "step-run/synthetic-138/2",
+              "assignee": "agent/synthetic-138/2",
+              "claimant": "agent/synthetic-138/2",
+              "since": "2032-01-18T23:58:00.000Z",
+              "state": "waiting",
+              "title": "Assemble sample 2"
+            }
+          ],
+          "must_act": "you",
+          "state_since": "2032-01-18T23:58:00.000Z",
+          "outcome": null,
+          "last_progress": null,
+          "blocker": null,
+          "after": null,
+          "deadline": null,
+          "steps": [
+            {
+              "id": "step-run/synthetic-138/2",
+              "path": "assemble",
+              "title": "Assemble sample 2",
+              "state": "waiting",
+              "since": "2032-01-18T23:58:00.000Z",
+              "attempt": 1,
+              "assignee": "agent/synthetic-138/2",
+              "claimant": "agent/synthetic-138/2"
+            }
+          ]
+        }
+      ],
+      "mission_revision": "rev/synthetic-138-2",
+      "must_act": "you",
+      "active_runs": 1,
+      "total_runs": 1,
+      "runs_truncated": false,
+      "run_counts": {
+        "waiting": 1
+      },
+      "run_generations": {
+        "mission-run/synthetic-138/2": "run-generation/synthetic-138/2"
+      },
+      "visualization": null,
+      "usage": null
+    },
+    {
+      "kind": "mission",
+      "id": "mission/synthetic-138/3",
+      "revision": "rev/synthetic-138-3",
+      "updated_at": "2032-01-19T00:00:00.000Z",
+      "title": "Sample assembly 3",
+      "state": "running",
+      "runs": [
+        "mission-run/synthetic-138/3"
+      ],
+      "run_details": [
+        {
+          "id": "mission-run/synthetic-138/3",
+          "status": "running",
+          "generation_id": "run-generation/synthetic-138/3",
+          "requester": "person/operator",
+          "phase": "execution",
+          "progress": {
+            "done": 2,
+            "total": 4
+          },
+          "current_steps": [
+            {
+              "id": "step-run/synthetic-138/3",
+              "assignee": "agent/synthetic-138/3",
+              "claimant": "agent/synthetic-138/3",
+              "since": "2032-01-18T23:58:00.000Z",
+              "state": "claimed",
+              "title": "Assemble sample 3"
+            }
+          ],
+          "must_act": "agent",
+          "state_since": "2032-01-18T23:58:00.000Z",
+          "outcome": null,
+          "last_progress": null,
+          "blocker": null,
+          "after": null,
+          "deadline": null,
+          "steps": [
+            {
+              "id": "step-run/synthetic-138/3",
+              "path": "assemble",
+              "title": "Assemble sample 3",
+              "state": "claimed",
+              "since": "2032-01-18T23:58:00.000Z",
+              "attempt": 1,
+              "assignee": "agent/synthetic-138/3",
+              "claimant": "agent/synthetic-138/3"
+            }
+          ]
+        }
+      ],
+      "mission_revision": "rev/synthetic-138-3",
+      "must_act": "agent",
+      "active_runs": 1,
+      "total_runs": 1,
+      "runs_truncated": false,
+      "run_counts": {
+        "running": 1
+      },
+      "run_generations": {
+        "mission-run/synthetic-138/3": "run-generation/synthetic-138/3"
+      },
+      "visualization": null,
+      "usage": null
+    }
+  ],
+  "runs": [
+    {
+      "subject": "mission-run/synthetic-138/1",
+      "id": "mission-run/synthetic-138/1",
+      "mission": "mission/synthetic-138/1",
+      "revision": "rev/synthetic-138-1",
+      "status": "running",
+      "phase": "execution",
+      "requester": "person/operator",
+      "workspace": "/srv/work/sample",
+      "created_at_unix_ms": 1958083080000,
+      "updated_at_unix_ms": 1958083200000,
+      "steps": [
+        {
+          "subject": "step-run/synthetic-138/1",
+          "step": "assemble",
+          "title": "Assemble sample 1",
+          "status": "claimed",
+          "assigned_to": "agent/synthetic-138/1",
+          "claimant": "agent/synthetic-138/1",
+          "agentless": false,
+          "attempt": 1,
+          "execution_elapsed_ms": 1832,
+          "created_at_unix_ms": 1958083080000,
+          "updated_at_unix_ms": 1958083200000,
+          "blocked_reason": null,
+          "goals": [
+            "Produce four synthetic rows"
+          ],
+          "constraints": [
+            "Use only generated data"
+          ]
+        }
+      ]
+    },
+    {
+      "subject": "mission-run/synthetic-138/2",
+      "id": "mission-run/synthetic-138/2",
+      "mission": "mission/synthetic-138/2",
+      "revision": "rev/synthetic-138-2",
+      "status": "waiting",
+      "phase": "execution",
+      "requester": "person/operator",
+      "workspace": "/srv/work/sample",
+      "created_at_unix_ms": 1958083080000,
+      "updated_at_unix_ms": 1958083200000,
+      "steps": [
+        {
+          "subject": "step-run/synthetic-138/2",
+          "step": "assemble",
+          "title": "Assemble sample 2",
+          "status": "waiting",
+          "assigned_to": "agent/synthetic-138/2",
+          "claimant": "agent/synthetic-138/2",
+          "agentless": false,
+          "attempt": 1,
+          "execution_elapsed_ms": 1231,
+          "created_at_unix_ms": 1958083080000,
+          "updated_at_unix_ms": 1958083200000,
+          "blocked_reason": null,
+          "goals": [
+            "Produce four synthetic rows"
+          ],
+          "constraints": [
+            "Use only generated data"
+          ]
+        }
+      ]
+    },
+    {
+      "subject": "mission-run/synthetic-138/3",
+      "id": "mission-run/synthetic-138/3",
+      "mission": "mission/synthetic-138/3",
+      "revision": "rev/synthetic-138-3",
+      "status": "running",
+      "phase": "execution",
+      "requester": "person/operator",
+      "workspace": "/srv/work/sample",
+      "created_at_unix_ms": 1958083080000,
+      "updated_at_unix_ms": 1958083200000,
+      "steps": [
+        {
+          "subject": "step-run/synthetic-138/3",
+          "step": "assemble",
+          "title": "Assemble sample 3",
+          "status": "claimed",
+          "assigned_to": "agent/synthetic-138/3",
+          "claimant": "agent/synthetic-138/3",
+          "agentless": false,
+          "attempt": 1,
+          "execution_elapsed_ms": 1658,
+          "created_at_unix_ms": 1958083080000,
+          "updated_at_unix_ms": 1958083200000,
+          "blocked_reason": null,
+          "goals": [
+            "Produce four synthetic rows"
+          ],
+          "constraints": [
+            "Use only generated data"
+          ]
+        }
+      ]
+    }
+  ],
+  "queues": [
+    {
+      "kind": "agent-queue",
+      "agent_id": "agent/synthetic-138/1",
+      "current_work_ids": [
+        "step-run/synthetic-138/1"
+      ],
+      "next_work_id": null,
+      "runs": [
+        {
+          "mission_run_id": "mission-run/synthetic-138/1",
+          "position": 0,
+          "state": "active",
+          "ready_work_ids": [],
+          "waiting_work_ids": [],
+          "claimed_work_ids": [
+            "step-run/synthetic-138/1"
+          ],
+          "waiting_for_run_id": null
+        }
+      ],
+      "moves": [],
+      "move_count": 0
+    },
+    {
+      "kind": "agent-queue",
+      "agent_id": "agent/synthetic-138/2",
+      "current_work_ids": [
+        "step-run/synthetic-138/2"
+      ],
+      "next_work_id": null,
+      "runs": [
+        {
+          "mission_run_id": "mission-run/synthetic-138/2",
+          "position": 0,
+          "state": "active",
+          "ready_work_ids": [],
+          "waiting_work_ids": [],
+          "claimed_work_ids": [
+            "step-run/synthetic-138/2"
+          ],
+          "waiting_for_run_id": null
+        }
+      ],
+      "moves": [],
+      "move_count": 0
+    },
+    {
+      "kind": "agent-queue",
+      "agent_id": "agent/synthetic-138/3",
+      "current_work_ids": [
+        "step-run/synthetic-138/3"
+      ],
+      "next_work_id": null,
+      "runs": [
+        {
+          "mission_run_id": "mission-run/synthetic-138/3",
+          "position": 0,
+          "state": "active",
+          "ready_work_ids": [],
+          "waiting_work_ids": [],
+          "claimed_work_ids": [
+            "step-run/synthetic-138/3"
+          ],
+          "waiting_for_run_id": null
+        }
+      ],
+      "moves": [],
+      "move_count": 0
+    }
+  ]
+}
