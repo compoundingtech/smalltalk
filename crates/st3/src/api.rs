@@ -16027,7 +16027,7 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
             expected_subject: None,
             idempotency_key: Some(format!("wake-limits-{weekly}")),
         };
-        post(limits(10.0)).await.unwrap();
+        let _ = post(limits(10.0)).await.unwrap();
         assert!(!reconciler_woke().await, "limits never reconcile");
         assert!(client_feed_woke());
     }
