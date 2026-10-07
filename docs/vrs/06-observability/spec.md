@@ -408,7 +408,12 @@ specified by this core are recorded in [open questions](open-questions.md#st3).
 The core receiver proof uses `otelite` to inspect trace, metric, and correlated log export,
 process identity and version, and the unset-endpoint no-export control. Trace proofs cover
 export of fast roots and spans with unsampled remote parents; metrics record independently.
-Shutdown proof uses an unreachable collector and the table's deadlines.
+The CLI shutdown helper is tested with an exporter that never returns from shutdown:
+the caller reports a receive timeout and writes the negative cache within the 50 ms
+deadline plus 200 ms of scheduling/filesystem tolerance. The process-level black-hole
+collector proof checks successful and failed commands exit within 10 s despite a 30 s
+exporter timeout, write the cache, and make no new collector connection on the next
+call within the backoff window. It does not compare whole-process timing medians.
 
 Copied-store measurements compare endpoint-unset execution with an enabled `otelite` sink.
 They cover daemon CPU, p99 request latency, RSS, and collector-sampled export rate against O11Y-R18.

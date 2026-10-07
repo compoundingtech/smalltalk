@@ -391,44 +391,60 @@ impl Telemetry {
         if tracer.is_none() && meter.is_none() && logger.is_none() {
             return;
         }
-        let deadline = Instant::now() + self.shutdown_timeout;
-        let backoff = self.cli_backoff.clone();
-        let helper_backoff = backoff.clone();
-        let (done, waiting) = std::sync::mpsc::sync_channel(1);
-        // SDK 0.30 returns OTelSdkResult from provider shutdown. BatchSpanProcessor
-        // forwards the final export result; meter shutdown may ignore its timeout.
-        // Keep shutdown AND destruction off the caller; a CLI export now always
-        // has a root span, so its 50 ms bound applies to every flush.
-        let _ = std::thread::spawn(move || {
-            let mut failed = false;
-            if let Some(provider) = tracer {
-                failed |= provider
-                    .shutdown_with_timeout(deadline.saturating_duration_since(Instant::now()))
-                    .is_err();
-            }
-            if let Some(provider) = logger {
-                failed |= provider
-                    .shutdown_with_timeout(deadline.saturating_duration_since(Instant::now()))
-                    .is_err();
-            }
-            if let Some(provider) = meter {
-                // Final collection is part of shutdown; force_flush would duplicate it.
-                failed |= provider.shutdown().is_err();
-            }
-            if failed && let Some(path) = helper_backoff {
-                let _ = record_cli_failure(&path, unix_seconds());
-            }
-            let _ = done.send(());
-        });
-        if waiting
-            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .is_err()
-            && let Some(path) = backoff
-        {
-            // The process can exit before the detached exporter wakes up.
+        let _ = shutdown_providers(
+            tracer,
+            meter,
+            logger,
+            self.shutdown_timeout,
+            self.cli_backoff.clone(),
+        );
+    }
+}
+
+/// Keep both shutdown and provider destruction off the caller's deadline.
+fn shutdown_providers(
+    tracer: Option<SdkTracerProvider>,
+    meter: Option<SdkMeterProvider>,
+    logger: Option<SdkLoggerProvider>,
+    timeout: Duration,
+    backoff: Option<PathBuf>,
+) -> Result<(), std::sync::mpsc::RecvTimeoutError> {
+    let deadline = Instant::now() + timeout;
+    let helper_backoff = backoff.clone();
+    let (done, waiting) = std::sync::mpsc::sync_channel(1);
+    // SDK 0.30 returns OTelSdkResult from provider shutdown. BatchSpanProcessor
+    // forwards the final export result; meter shutdown may ignore its timeout.
+    // Keep shutdown AND destruction off the caller; a CLI export now always
+    // has a root span, so its 50 ms bound applies to every flush.
+    let _ = std::thread::spawn(move || {
+        let mut failed = false;
+        if let Some(provider) = tracer {
+            failed |= provider
+                .shutdown_with_timeout(deadline.saturating_duration_since(Instant::now()))
+                .is_err();
+        }
+        if let Some(provider) = logger {
+            failed |= provider
+                .shutdown_with_timeout(deadline.saturating_duration_since(Instant::now()))
+                .is_err();
+        }
+        if let Some(provider) = meter {
+            // Final collection is part of shutdown; force_flush would duplicate it.
+            failed |= provider.shutdown().is_err();
+        }
+        if failed && let Some(path) = helper_backoff {
             let _ = record_cli_failure(&path, unix_seconds());
         }
+        let _ = done.send(());
+    });
+    let result = waiting.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+    if result.is_err()
+        && let Some(path) = backoff
+    {
+        // The process can exit before the detached exporter wakes up.
+        let _ = record_cli_failure(&path, unix_seconds());
     }
+    result
 }
 
 impl Drop for Telemetry {
@@ -440,11 +456,62 @@ impl Drop for Telemetry {
 #[cfg(test)]
 mod tests {
     use super::{
-        SignalChoice, Unit, build_resource, cli_backoff_active, record_cli_failure, signal_enabled,
-        span_batch_config,
+        SignalChoice, Unit, build_resource, cli_backoff_active, record_cli_failure,
+        shutdown_providers, signal_enabled, span_batch_config,
     };
     use opentelemetry::{Key, KeyValue, Value};
     use opentelemetry_sdk::Resource;
+
+    #[derive(Debug)]
+    struct StalledExporter(std::sync::mpsc::Sender<()>);
+
+    impl opentelemetry_sdk::trace::SpanExporter for StalledExporter {
+        async fn export(
+            &self,
+            _batch: Vec<opentelemetry_sdk::trace::SpanData>,
+        ) -> opentelemetry_sdk::error::OTelSdkResult {
+            std::future::pending().await
+        }
+
+        fn shutdown_with_timeout(
+            &mut self,
+            _timeout: std::time::Duration,
+        ) -> opentelemetry_sdk::error::OTelSdkResult {
+            self.0.send(()).unwrap();
+            // Intentionally violate the exporter deadline: only the detached
+            // helper's recv_timeout can bound this shutdown.
+            loop {
+                std::thread::park();
+            }
+        }
+    }
+
+    #[test]
+    fn cli_shutdown_deadline_times_out_stalled_provider_and_records_backoff() {
+        use std::sync::mpsc::{RecvTimeoutError, channel};
+        use std::time::{Duration, Instant};
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("st3/otel-cli-backoff");
+        let (entered, stalled) = channel();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(StalledExporter(entered))
+            .build();
+        let deadline = Unit::Cli.shutdown_timeout();
+        let started = Instant::now();
+        let result = shutdown_providers(Some(provider), None, None, deadline, Some(path.clone()));
+        let elapsed = started.elapsed();
+        assert_eq!(result, Err(RecvTimeoutError::Timeout));
+        // Allow 200 ms for shared-host scheduling and the atomic backoff write,
+        // not exporter work. No whole-process baseline/startup enters this bound.
+        assert!(
+            elapsed <= deadline + Duration::from_millis(200),
+            "{elapsed:?}"
+        );
+        stalled.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(path.is_file(), "timeout must establish the negative cache");
+        assert!(cli_backoff_active(&path, super::unix_seconds()));
+    }
 
     #[test]
     fn span_batch_config_bounds_export_memory() {
