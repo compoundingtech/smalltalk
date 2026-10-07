@@ -7,6 +7,7 @@ packages:
     clients/typescript/st3-client,
     clients/typescript/st3-scenarios,
     clients/typescript/st3-views,
+    packages/fractal-ui,
   ]
 
 peerDependencyRules:
