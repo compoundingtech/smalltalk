@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Serialize fleet leave cleanup with replication refusal settings writes",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay or projection rebuild change. The durable member-left claim and replication drain criteria are preserved."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema or fleet.toml format changes. A private fleet-settings.lock file outside the fleet directory coordinates cleanup and refusal persistence."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules, authority digests or membership admission changes."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "The CLI and local replication worker must both run this version to serialize their filesystem operations. Older local workers do not honor the lock. Peer protocols and client APIs are unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional service interruption beyond normal deployment. Leave --no-service continues to avoid service managers and keeps the foreground daemon and worker running."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Update the local CLI and replication worker together before leaving. No graph migration or fleet reconfiguration is needed; the original drain deadlines remain unchanged."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "Leave waits for an in-flight refusal settings write before deleting the fleet directory. A delayed refusal reloads settings under the lock and cannot recreate an absent directory or mark a newly joined member key removed. Downgrading restores the prior cleanup race."
+  }
+}

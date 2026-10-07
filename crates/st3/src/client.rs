@@ -62,6 +62,8 @@ pub enum FollowTestReply {
     Timeout,
     Disconnect,
     Error(u16),
+    MissingRoute,
+    CursorGap { floor: u64, frontier: u64 },
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -579,6 +581,10 @@ impl Client {
                 FollowTestReply::Timeout => (serde_json::Value::Null, deadline * 2),
                 FollowTestReply::Disconnect => return Err(DaemonUnreachable::response("fixture", "no response").into()),
                 FollowTestReply::Error(status) => return Err(api_error(status, br#"{"code":"fixture-refusal","message":"fixture read refused"}"#)),
+                FollowTestReply::MissingRoute => return Err(api_error(404,b"")),
+                FollowTestReply::CursorGap {floor,frontier} => return Err(api_error(410,&serde_json::to_vec(&serde_json::json!({
+                    "code":"cursor-gap","message":"cursor expired","details":{"resume_floor":floor,"frontier":frontier,"full_resync":true}
+                })).unwrap())),
             };
             if !delay.is_zero() {
                 tokio::time::timeout(deadline, tokio::time::sleep(delay)).await
@@ -934,6 +940,13 @@ pub fn is_not_found(error: &anyhow::Error) -> bool {
         .is_some_and(|error| error.status == 404 || error.code == "not-found")
 }
 
+/// An unimplemented route on an older daemon, distinct from a typed subject/auth refusal.
+pub fn is_missing_route(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<UnexpectedResponse>()
+        .is_some_and(|error| error.status == 404)
+}
+
 /// The HTTP status an API call failed with, including an answer without an error body.
 pub fn http_status(error: &anyhow::Error) -> Option<u16> {
     error
@@ -1255,7 +1268,9 @@ fn request_deadline(path: &str, deadlines: ClientDeadlines) -> Duration {
     } else if path.starts_with("/v1/checkpoint/plan") {
         // An explicit dry run copies the store and replays it twice.
         Duration::from_secs(30 * 60)
-    } else if path.starts_with("/v1/events?") && path.contains("wait=true") {
+    } else if (path.starts_with("/v1/events?") || path.starts_with("/v1/events/page?"))
+        && path.contains("wait=true")
+    {
         deadlines.event
     } else {
         deadlines.request

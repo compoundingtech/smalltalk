@@ -24,7 +24,9 @@
 //! - `ST_LOAD_SECONDS` sets how long the load runs. The default is 120.
 //! - `ST_LOAD_BASELINE` names main's reports to compare with, a file or a directory of them; the
 //!   comparison takes the worst of each. Without one only the budgets apply.
-//! - `ST_LOAD_REPORT` writes this run's report there, for the next comparison.
+//! - `ST_LOAD_REPORT` writes the steady report there, for the next comparison; the explicit
+//!   upgrade-under-load report is saved in its sibling `upgrade` directory. Both cases keep
+//!   the same workload, budgets and baseline. Migration setup/completion is reported separately.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::net::UnixStream;
@@ -36,7 +38,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use st3::api::AppState;
 use st3::client::Client;
-use st3::model::{EventRecord, WorkRequest};
+use st3::model::WorkRequest;
 use st3::store::Store;
 use tokio::sync::{Notify, watch};
 
@@ -127,6 +129,20 @@ struct Report {
     daemon_cores: f64,
     #[serde(default)]
     long_poll_seats: usize,
+    #[serde(default)]
+    regime: String,
+    #[serde(default)]
+    actual_ci_checkout: Option<String>,
+    #[serde(default)]
+    event_migration: Option<st3::maintenance::EventMigrationReport>,
+    #[serde(default)]
+    migration_pending_at_load_start: bool,
+    #[serde(default)]
+    migration_pending_at_load_end: bool,
+    #[serde(default)]
+    fixture_legacy_reconstruction_ms: f64,
+    #[serde(default)]
+    store_open_ms: f64,
     paths: BTreeMap<String, PathReport>,
     failed: BTreeMap<String, usize>,
 }
@@ -162,27 +178,59 @@ fn the_daemon_keeps_its_budgets_under_a_busy_hosts_load() {
         .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/st-bench"));
     std::fs::create_dir_all(&keep).unwrap();
 
-    let daemon = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .thread_name("st3-daemon")
-        .enable_all()
-        .build()
-        .unwrap();
+    let make_daemon = || {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .thread_name("st3-daemon")
+            .enable_all()
+            .build()
+            .unwrap()
+    };
+    let generation = make_daemon();
     let started = Instant::now();
-    let (source, peer_source) = daemon.block_on(generated_stores(&keep, scale));
+    let (source, peer_source) = generation.block_on(generated_stores(&keep, scale));
     println!("store ready in {:.0}s", started.elapsed().as_secs_f64());
-    let report = run(
-        &daemon,
-        scale,
-        &source,
-        &peer_source,
-        Duration::from_secs(seconds),
-    );
-    print(&report);
-    if let Some(path) = std::env::var_os("ST_LOAD_REPORT") {
-        std::fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+    drop(generation);
+    let mut failures = Vec::new();
+    for regime in [LoadRegime::Upgrade, LoadRegime::Steady] {
+        // Separate runtimes ensure no reconciler/server from the first case affects the second.
+        let daemon = make_daemon();
+        let report = run(
+            &daemon,
+            scale,
+            &source,
+            &peer_source,
+            Duration::from_secs(seconds),
+            regime,
+        );
+        print(&report);
+        if let Some(path) = std::env::var_os("ST_LOAD_REPORT") {
+            let path = PathBuf::from(path);
+            let path = if matches!(regime, LoadRegime::Upgrade) {
+                let parent = path.parent().unwrap().join("upgrade");
+                std::fs::create_dir_all(&parent).unwrap();
+                parent.join(path.file_name().unwrap())
+            } else {
+                path
+            };
+            std::fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+        }
+        failures.extend(
+            report_failures(&report)
+                .into_iter()
+                .map(|failure| format!("{}: {failure}", regime.name())),
+        );
+        drop(daemon);
     }
+    assert!(
+        failures.is_empty(),
+        "the daemon missed {} budgets:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
 
+fn report_failures(report: &Report) -> Vec<String> {
     let mut failures = Vec::new();
     for (name, path) in &report.paths {
         if path.p99_ms > path.budget_ms {
@@ -224,19 +272,14 @@ fn the_daemon_keeps_its_budgets_under_a_busy_hosts_load() {
     }
     if let Some(baseline) = std::env::var_os("ST_LOAD_BASELINE") {
         match worst_of(Path::new(&baseline)) {
-            Some(baseline) => failures.extend(compare(&report, &baseline)),
+            Some(baseline) => failures.extend(compare(report, &baseline)),
             None => println!(
                 "no baseline at {}; only the budgets apply",
                 Path::new(&baseline).display()
             ),
         }
     }
-    assert!(
-        failures.is_empty(),
-        "the daemon missed {} budgets:\n{}",
-        failures.len(),
-        failures.join("\n")
-    );
+    failures
 }
 
 /// Main's reports at `path`, a report or a directory of them, combined into the worst of each:
@@ -462,6 +505,21 @@ fn latency_needs_five_main_runs_but_cpu_compares_during_bootstrap() {
 
 fn print(report: &Report) {
     println!(
+        "regime: {}; migration pending at timed start/end: {}/{}; private fixture reconstruction {:.1}ms; Store::open {:.1}ms",
+        report.regime,
+        report.migration_pending_at_load_start,
+        report.migration_pending_at_load_end,
+        report.fixture_legacy_reconstruction_ms,
+        report.store_open_ms
+    );
+    if let Some(migration) = &report.event_migration {
+        println!(
+            "event migration (including pauses/retries): {}",
+            serde_json::to_string(migration).unwrap()
+        );
+    }
+
+    println!(
         "\n== load test: scale {}, {} claims, {:.0}s, daemon {:.2} cores",
         report.scale, report.claims, report.seconds, report.daemon_cores
     );
@@ -480,6 +538,41 @@ fn print(report: &Report) {
     }
 }
 
+#[test]
+fn upgrade_reports_stay_separate_from_the_unchanged_steady_baseline() {
+    let root = tempfile::tempdir().unwrap();
+    let mut steady = Report {
+        daemon_cores: 1.0,
+        ..Report::default()
+    };
+    steady.paths.insert(
+        "claim".into(),
+        PathReport {
+            p99_ms: 10.0,
+            count: 100,
+            ..PathReport::default()
+        },
+    );
+    std::fs::write(
+        root.path().join("main.json"),
+        serde_json::to_vec(&steady).unwrap(),
+    )
+    .unwrap();
+    std::fs::create_dir(root.path().join("upgrade")).unwrap();
+    let mut upgrade = steady;
+    upgrade.daemon_cores = 99.0;
+    upgrade.paths.get_mut("claim").unwrap().p99_ms = 99.0;
+    std::fs::write(
+        root.path().join("upgrade/main.json"),
+        serde_json::to_vec(&upgrade).unwrap(),
+    )
+    .unwrap();
+    let baseline = worst_of(root.path()).unwrap();
+    assert_eq!(baseline.runs, 1);
+    assert_eq!(baseline.report.daemon_cores, 1.0);
+    assert_eq!(baseline.report.paths["claim"].p99_ms, 10.0);
+}
+
 /// Everything a request needs.
 struct Context {
     client: Client,
@@ -493,12 +586,134 @@ struct Context {
     turns: AtomicUsize,
 }
 
+#[derive(Clone, Copy)]
+enum LoadRegime {
+    Upgrade,
+    Steady,
+}
+
+impl LoadRegime {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Upgrade => "upgrade-under-load",
+            Self::Steady => "steady-after-migration",
+        }
+    }
+}
+
+type MigrationTask =
+    tokio::task::JoinHandle<anyhow::Result<st3::maintenance::EventMigrationReport>>;
+
+fn start_event_migration(
+    daemon: &tokio::runtime::Runtime,
+    store: Arc<Store>,
+    regime: LoadRegime,
+) -> (
+    Option<MigrationTask>,
+    Option<st3::maintenance::EventMigrationReport>,
+) {
+    let migration = daemon.spawn(st3::maintenance::migrate_event_payloads(store.clone()));
+    if matches!(regime, LoadRegime::Steady) {
+        let report = daemon.block_on(migration).unwrap().unwrap();
+        assert!(report.pending_at_start && report.completed);
+        assert!(!store.event_payload_migration_pending().unwrap());
+        (None, Some(report))
+    } else {
+        (Some(migration), None)
+    }
+}
+
+#[test]
+fn load_fixture_starts_the_shared_worker_and_steady_waits_for_completion() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    for regime in [LoadRegime::Upgrade, LoadRegime::Steady] {
+        let path = root.path().join(format!("{}.sqlite3", regime.name()));
+        let store = Store::open(&path, NODE).unwrap();
+        for number in 0..65 {
+            store
+                .append_claim(&st3::model::ClaimInput {
+                    subject: format!("custom/test/migration-{number}"),
+                    kind: "custom.test.recorded".into(),
+                    actor: None,
+                    fields: Default::default(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+        let before = store.events_after(0, None).unwrap();
+        drop(store);
+        prepare_legacy_event_fixture(&path);
+        let store = Arc::new(Store::open(&path, NODE).unwrap());
+        assert!(store.event_payload_migration_pending().unwrap());
+        let (task, report) = start_event_migration(&daemon, store.clone(), regime);
+        let report = match regime {
+            LoadRegime::Upgrade => {
+                assert!(
+                    report.is_none(),
+                    "upgrade overlaps the workload with the running worker"
+                );
+                daemon.block_on(task.unwrap()).unwrap().unwrap()
+            }
+            LoadRegime::Steady => {
+                assert!(
+                    task.is_none(),
+                    "steady workload cannot start until the worker finishes"
+                );
+                assert!(!store.event_payload_migration_pending().unwrap());
+                report.unwrap()
+            }
+        };
+        assert!(report.pending_at_start && report.completed);
+        assert_eq!((report.moved_rows, report.chunks), (65, 2));
+        assert_eq!(
+            serde_json::to_value(before).unwrap(),
+            serde_json::to_value(store.events_after(0, None).unwrap()).unwrap()
+        );
+    }
+}
+
+/// Cached generated sources may already be schema 17. Reconstruct only the legacy event
+/// table on this private fixture copy so the explicit upgrade case really has work to drain.
+/// This fixture preparation is reported separately; it is not production upgrade cost.
+fn prepare_legacy_event_fixture(path: &Path) -> f64 {
+    let started = Instant::now();
+    let connection = rusqlite::Connection::open(path).unwrap();
+    let kind: String = connection
+        .query_row(
+            "SELECT type FROM sqlite_master WHERE name='events'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    if kind == "view" {
+        connection.execute_batch(
+            "BEGIN;
+             CREATE TABLE legacy_fixture_events(store_index INTEGER PRIMARY KEY,kind TEXT,subject TEXT,body TEXT);
+             INSERT INTO legacy_fixture_events SELECT * FROM events;
+             DROP VIEW events;
+             DROP TABLE IF EXISTS local_event_payloads;
+             DROP TABLE event_positions;
+             ALTER TABLE legacy_fixture_events RENAME TO events;
+             PRAGMA user_version=16;
+             COMMIT;"
+        ).unwrap();
+    }
+    started.elapsed().as_secs_f64() * 1_000.0
+}
+
 fn run(
     daemon: &tokio::runtime::Runtime,
     scale: f64,
     source: &Path,
     peer_source: &Path,
     duration: Duration,
+    regime: LoadRegime,
 ) -> Report {
     let work = tempfile::tempdir().unwrap();
     let root = work.path();
@@ -521,7 +736,12 @@ fn run(
         .copied()
         .collect::<BTreeSet<_>>();
 
+    let fixture_legacy_reconstruction_ms = prepare_legacy_event_fixture(&database);
+    let opened = Instant::now();
     let store = Arc::new(Store::open(&database, NODE).unwrap());
+    let store_open_ms = opened.elapsed().as_secs_f64() * 1_000.0;
+    assert!(store.event_payload_migration_pending().unwrap());
+    let (migration, mut event_migration) = start_event_migration(daemon, store.clone(), regime);
     store.bind_fleet(FLEET).ok();
     let claims = store.index().unwrap();
     let socket = root.join("st3.sock");
@@ -623,6 +843,10 @@ fn run(
     let in_flight = Arc::new(AtomicUsize::new(0));
     let running = Arc::new(AtomicBool::new(true));
     let long_poll_seats = Arc::new(AtomicUsize::new(0));
+    let migration_pending_at_load_start = context.store.event_payload_migration_pending().unwrap();
+    if matches!(regime, LoadRegime::Steady) {
+        assert!(!migration_pending_at_load_start);
+    }
     let cpu_before = (process_cpu(), load_cpu(&peer_threads));
     let cursor = context.store.index().unwrap();
     let started = Instant::now();
@@ -714,18 +938,18 @@ fn run(
                 let mut answered = false;
                 while running.load(Ordering::Relaxed) {
                     let path = format!(
-                        "/v1/events?after={cursor}&subject={}&wait=true&timeout_ms=30000",
+                        "/v1/events/page?after={cursor}&subject={}&wait=true&timeout_ms=30000&limit=200",
                         urlencoding::encode(&seat)
                     );
                     let started = Instant::now();
-                    match client.get::<Vec<EventRecord>>(&path).await {
+                    match client.get::<Value>(&path).await {
                         Ok(events) => {
                             if !answered {
                                 long_poll_seats.fetch_add(1, Ordering::Relaxed);
                                 answered = true;
                             }
-                            if let Some(last) = events.last() {
-                                cursor = last.store_index;
+                            if let Some(next) = events["next_after"].as_u64() {
+                                cursor = next;
                             }
                             timings
                                 .lock()
@@ -767,6 +991,18 @@ fn run(
     let cpu_after = (process_cpu(), load_cpu(&peer_threads));
     let daemon_cpu = (cpu_after.0 - cpu_before.0) - (cpu_after.1 - cpu_before.1);
 
+    let migration_pending_at_load_end = context.store.event_payload_migration_pending().unwrap();
+    if let Some(migration) = migration {
+        event_migration = Some(daemon.block_on(async {
+            tokio::time::timeout(Duration::from_secs(600), migration)
+                .await
+                .expect("upgrade worker completes, even if it outlives the timed load")
+                .unwrap()
+                .unwrap()
+        }));
+    }
+    assert!(event_migration.as_ref().unwrap().completed);
+    assert!(!context.store.event_payload_migration_pending().unwrap());
     let timings = std::mem::take(&mut *timings.lock().unwrap());
     let budgets = MIX
         .iter()
@@ -794,6 +1030,13 @@ fn run(
         seconds: elapsed,
         daemon_cores: daemon_cpu / elapsed,
         long_poll_seats: long_poll_seats.load(Ordering::Relaxed),
+        regime: regime.name().into(),
+        actual_ci_checkout: std::env::var("GITHUB_SHA").ok(),
+        event_migration,
+        migration_pending_at_load_start,
+        migration_pending_at_load_end,
+        fixture_legacy_reconstruction_ms,
+        store_open_ms,
         paths,
         failed,
     }

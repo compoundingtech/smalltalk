@@ -45,6 +45,16 @@ pub struct ReplayProgress {
 
 /// A runtime's claim kinds and projections.
 pub trait Runtime: Send + Sync {
+    /// A completed local response still names live work. Cleanup extends its retry window;
+    /// the runtime checks only the bounded candidate, never its complete history.
+    fn idempotency_response_in_use(
+        &self,
+        _connection: &Connection,
+        _response: &str,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Migrate an older store's tables before any table is created. The graph has checked that
     /// the schema version is one it supports.
     fn migrate_schema(&self, connection: &Connection) -> Result<()>;
@@ -141,6 +151,11 @@ pub trait Runtime: Send + Sync {
     /// only when their rules digests match.
     fn checkpoint_rules_digest(&self) -> String;
 
+    /// Fail before sealing history or copying a store when a runtime has no checkpoint contract.
+    fn checkpoint_preflight(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Decide what a checkpoint drops from `sealed`: a pure function of the sealed claims.
     fn plan_checkpoint_drops(&self, sealed: &SealedSet) -> DropPlan;
 
@@ -158,6 +173,17 @@ pub trait Runtime: Send + Sync {
         subject: &str,
         cut: u128,
     ) -> Result<Value>;
+
+    /// Return the same proof answers, with optional bounded per-item source identities captured
+    /// during that read. Sources are diagnostic only and never enter the proof/digest contract.
+    fn checkpoint_subject_answers_with_sources(
+        &self,
+        connection: &Connection,
+        subject: &str,
+        cut: u128,
+    ) -> Result<(Value, super::checkpoint::CheckpointAnswerSources)> {
+        Ok((self.checkpoint_subject_answers(connection, subject, cut)?, Default::default()))
+    }
 }
 
 /// The runtime of a program that only keeps and syncs claims: it accepts every claim as it is,

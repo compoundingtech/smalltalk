@@ -74,6 +74,22 @@ pub enum MemberLifecycle {
     #[default]
     Service,
     AdoptOnly,
+    /// Borrow a caller-owned shell's PTY; never launch or terminate that PTY.
+    TerminalBound,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TerminalBinding {
+    pub subject: String,
+    pub incarnation: String,
+    /// Unique per invocation, even when another harness uses the same shell.
+    pub id: String,
+}
+
+impl TerminalBinding {
+    pub fn agent_incarnation(&self) -> String {
+        format!("{}:bound:{}", self.incarnation, self.id)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -126,6 +142,8 @@ pub struct MemberSpec {
     pub tags: BTreeMap<String, String>,
     pub display_name: Option<String>,
     pub lifecycle: MemberLifecycle,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_binding: Option<TerminalBinding>,
     /// Retire this seat when its process finishes, independently of its restart policy.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub one_shot: bool,
@@ -1975,6 +1993,10 @@ pub struct QuickAgentResponse {
     pub runtime_id: String,
     pub event_cursor: u64,
     pub incarnation_id: Option<String>,
+    /// True when an older daemon committed the declaration without its response receipt.
+    /// Readiness/incarnation were reconstructed at recovery, not at the original declaration.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub response_reconstructed: bool,
     pub ready: bool,
 }
 

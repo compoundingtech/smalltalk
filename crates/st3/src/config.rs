@@ -34,6 +34,9 @@ pub struct Config {
     pub planner: PlannerSpec,
     /// The local observation log of this node.
     pub observations: ObservationsConfig,
+    /// Daemon GitHub HTTP authentication. Omitted unless an explicit credential source is configured.
+    #[serde(skip_serializing_if = "GithubConfig::is_default")]
+    pub github: GithubConfig,
     /// Checkpoints that trim replicated history. Written only when it differs from the
     /// default, so a config this build writes still loads in a build without checkpoints.
     #[serde(skip_serializing_if = "CheckpointConfig::is_default")]
@@ -44,6 +47,32 @@ pub struct Config {
     /// `STATE/fleet/fleet.toml`, merged by `apply_fleet_file` after command-line overrides.
     #[serde(skip)]
     pub fleet: Option<FleetFile>,
+}
+
+/// `[github]`: an explicit token file, or gateway-authorized requests with a sekrets profile.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GithubConfig {
+    /// A single-token file readable only by its owner.
+    pub token_file: Option<PathBuf>,
+    pub sekrets_profile: Option<String>,
+}
+
+impl GithubConfig {
+    pub fn is_default(&self) -> bool { self == &Self::default() }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        anyhow::ensure!(self.token_file.is_none() || self.sekrets_profile.is_none(),
+            "github.token_file and github.sekrets_profile are mutually exclusive");
+        if let Some(profile) = &self.sekrets_profile {
+            anyhow::ensure!(!profile.trim().is_empty() && profile.trim() == profile,
+                "github.sekrets_profile must name a non-empty profile without surrounding whitespace");
+        }
+        if let Some(path) = &self.token_file {
+            crate::github_http::open_token_file(path)?;
+        }
+        Ok(())
+    }
 }
 
 /// Whether this node takes part in checkpoints. A node that does not never seals, and every
@@ -184,6 +213,7 @@ impl Default for Config {
             peers: Vec::new(),
             planner: PlannerSpec::default(),
             observations: ObservationsConfig::default(),
+            github: GithubConfig::default(),
             checkpoint: CheckpointConfig::default(),
             limits: LimitsConfig::default(),
             fleet: None,
@@ -298,6 +328,7 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
+        self.github.validate()?;
         anyhow::ensure!(
             matches!(
                 self.planner.provider.as_str(),
@@ -506,6 +537,44 @@ fn host_name() -> String {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn github_profile_is_opt_in_and_rejects_empty_configuration() {
+        let config = Config::default();
+        assert!(config.github.sekrets_profile.is_none());
+        assert!(!toml::to_string(&config).unwrap().contains("[github]"));
+        let configured: Config = toml::from_str(r#"[github]
+sekrets_profile = "nathan/daemon-gh"
+"#).unwrap();
+        configured.validate().unwrap();
+        assert_eq!(configured.github.sekrets_profile.as_deref(), Some("nathan/daemon-gh"));
+        for profile in ["", " ", " nathan/daemon-gh", "nathan/daemon-gh "] {
+            let mut invalid = Config::default();
+            invalid.github.sekrets_profile = Some(profile.into());
+            assert!(invalid.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn github_token_file_permissions_are_checked_at_startup() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempdir().unwrap();
+        let path = root.path().join("token");
+        fs::write(&path, b"fixture-token\n").unwrap();
+        let mut config = Config::default();
+        config.github.token_file = Some(path.clone());
+        for mode in [0o640, 0o604, 0o644] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            assert!(config.validate().unwrap_err().to_string().contains("group or others"));
+        }
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        config.validate().unwrap();
+        config.github.sekrets_profile = Some("owner/daemon-gh".into());
+        assert!(config.validate().unwrap_err().to_string().contains("mutually exclusive"));
+        config.github.sekrets_profile = None;
+        fs::remove_file(&path).unwrap();
+        assert!(config.validate().is_err());
+    }
 
     #[test]
     fn unix_socket_path_reports_byte_limit_and_override() {

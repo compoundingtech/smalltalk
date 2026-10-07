@@ -661,6 +661,11 @@ async fn send_terminal_key(
 fn main() -> Result<()> {
     // What `st clients` lists for this stui: its name and build, as reported.
     st3_client::set_client_name(version::client_name());
+    // A designated test client (scripts/stui-test-client) can log the timing of its own requests
+    // and collection frames: routes, statuses, sizes and durations only, never contents.
+    if let Some(path) = std::env::var_os("STUI_TIMING_LOG") {
+        install_timing_log(path.into());
+    }
     let args = std::env::args().collect::<Vec<_>>();
     if args
         .iter()
@@ -1611,4 +1616,31 @@ mod custom_form_tests {
         );
         assert!(custom_form_input(Some(&multi), "keep").is_err());
     }
+}
+
+/// Append one JSON line per request and collections frame this process makes to `path`.
+fn install_timing_log(path: PathBuf) {
+    use std::io::Write as _;
+    let started = std::time::Instant::now();
+    let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) else {
+        return;
+    };
+    let file = std::sync::Mutex::new(file);
+    st3_client::set_observer(move |observation| {
+        let at_ms = started.elapsed().as_millis() as u64;
+        let line = match observation {
+            st3_client::Observation::Request { method, route, outcome, status, took } => serde_json::json!({
+                "at_ms": at_ms, "type": "request", "method": method, "route": route,
+                "outcome": format!("{outcome:?}"), "status": status,
+                "took_ms": took.as_secs_f64() * 1000.0,
+            }),
+            st3_client::Observation::Frame { id, kind, bytes, since_subscribe } => serde_json::json!({
+                "at_ms": at_ms, "type": "frame", "id": id, "kind": kind, "bytes": bytes,
+                "since_subscribe_ms": since_subscribe.map(|d| d.as_secs_f64() * 1000.0),
+            }),
+        };
+        if let Ok(mut file) = file.lock() {
+            let _ = writeln!(file, "{line}");
+        }
+    });
 }

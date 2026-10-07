@@ -160,7 +160,8 @@ fn bare_service_environment_does_not_probe_tools_or_credentials_on_doctor() {
         &bin.join("pty"),
         "#!/bin/sh\n[ \"$ORCHID_CONTROL\" = from-shell ] || exit 9\nprintf '[]\\n'\n",
     );
-    executable(&bin.join("gh"), "#!/bin/sh\nexit 1\n");
+    let calls = root.path().join("gh-calls");
+    executable(&bin.join("gh"), &format!("#!/bin/sh\nprintf x >> '{}'\nexit 1\n", calls.display()));
     let (_service, socket) = start_service(root.path(), &home, &root.path().join("state"));
     let doctor = || doctor_report(&home, &socket);
     let report = doctor();
@@ -183,8 +184,18 @@ fn bare_service_environment_does_not_probe_tools_or_credentials_on_doctor() {
     assert!(auth["message"].as_str().unwrap().contains("does not start a platform probe"));
     executable(
         &bin.join("gh"),
-        "#!/bin/sh\nprintf 'orchid-test-credential\\n'\n",
+        &format!("#!/bin/sh\nprintf x >> '{}'\nprintf 'orchid-test-credential\\n'\n", calls.display()),
     );
+    // A failed lookup backs off rather than spawning gh for every doctor request.
+    let retry = doctor();
+    let retry_auth = retry["checks"].as_array().unwrap().iter()
+        .find(|check| check["name"] == "github-observer-auth").unwrap();
+    assert_eq!(retry_auth["status"], "warn");
+    assert_eq!(std::fs::read(&calls).unwrap().len(), 1);
+    // A login changing gh's credential file clears the backoff for the next caller.
+    let gh_config = root.path().join("config/gh");
+    std::fs::create_dir_all(&gh_config).unwrap();
+    std::fs::write(gh_config.join("hosts.yml"), "fixture credential metadata changed\n").unwrap();
     let report = doctor();
     let auth = report["checks"]
         .as_array()
@@ -194,6 +205,8 @@ fn bare_service_environment_does_not_probe_tools_or_credentials_on_doctor() {
         .unwrap();
     assert_eq!(auth["status"], "unknown");
     assert!(!report.to_string().contains("orchid-test-credential"));
+    doctor();
+    assert_eq!(std::fs::read(&calls).unwrap().len(), 2);
 }
 
 #[test]
@@ -307,4 +320,76 @@ fn a_login_shell_too_slow_for_the_first_capture_still_lets_the_daemon_start() {
         .find(|check| check["name"] == "daemon-environment")
         .unwrap();
     assert_eq!(environment["status"], "unknown", "{environment}");
+}
+
+#[test]
+fn a_profile_configured_gate_uses_the_gateway_and_node_identity_without_local_credentials() {
+    if st3::test_support::supervise_test() { return; }
+    use st3::sekrets::protocol::{self, CallerView, Reply, Request};
+    use base64::Engine as _;
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let bin = home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let calls = root.path().join("gh-calls");
+    executable(&bin.join("gh"), &format!("#!/bin/sh\nprintf x >> '{}'\nprintf fixture-local-credential\n", calls.display()));
+    let config = st3::config::Config {
+        node: "fixture-node".into(), person: Some("person/fixture".into()),
+        state_dir: root.path().join("node-state"),
+        github: st3::config::GithubConfig { sekrets_profile: Some("owner/daemon-gh".into()), token_file: None },
+        ..Default::default()
+    };
+    let key = smallclaims::fleet::MemberKey::load_or_create(
+        &st3::fleet::join::key_directory(&config.state_dir).join("node.key")).unwrap();
+    let config_path = root.path().join("config/st3/config.toml");
+    std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+    std::fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+    let socket = root.path().join("gateway.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let gateway = std::thread::spawn(move || {
+        for status in [200, 401] {
+            let (stream,_) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let (hello,_) = protocol::recv::<Request>(&stream).unwrap().unwrap();
+            assert!(matches!(hello, Request::Hello { attestation: None }));
+            protocol::send(&stream, &Reply::Hello { caller: CallerView::Unidentified {
+                person: "person/fixture".into(), reason: "fixture process".into() },
+                nonce: "fixture nonce".into(), gateway: "fixture".into() }, &[]).unwrap();
+            let (hello,_) = protocol::recv::<Request>(&stream).unwrap().unwrap();
+            let Request::Hello { attestation: Some(attestation) } = hello else { panic!("node did not attest"); };
+            let statement: st3::sekrets::identity::Statement = serde_json::from_str(&attestation.statement).unwrap();
+            assert_eq!(statement.node, "host/fixture-node");
+            assert_eq!(statement.agent, "host/fixture-node");
+            assert_eq!(statement.person, "person/fixture");
+            assert_eq!(statement.nonce, "fixture nonce");
+            assert!(!attestation.signature.is_empty());
+            assert_eq!(key.sign(&st3::sekrets::identity::signing_message(&attestation.statement)), attestation.signature);
+            protocol::send(&stream, &Reply::Hello { caller: CallerView::Host {
+                node: "host/fixture-node".into(), person: "person/fixture".into() },
+                nonce: "fixture nonce".into(), gateway: "fixture".into() }, &[]).unwrap();
+            let (request,_) = protocol::recv::<Request>(&stream).unwrap().unwrap();
+            let Request::Authorized(call) = request else { panic!("not an authorized request"); };
+            assert_eq!(call.profile, "owner/daemon-gh");
+            assert_eq!(call.method, "GET");
+            assert_eq!(call.url, "https://api.github.com/repos/acme/garden/pulls/1");
+            assert!(!call.headers.iter().any(|(name,_)| name.eq_ignore_ascii_case("authorization")));
+            let body = if status == 200 { br#"{"merged":true,"merge_commit_sha":"fixture-sha"}"#.as_slice() }
+                else { br#"{"message":"Bad credentials"}"#.as_slice() };
+            protocol::send(&stream, &Reply::Response { status,
+                headers: vec![("etag".into(), "fixture-etag".into())],
+                body: base64::engine::general_purpose::STANDARD.encode(body) }, &[]).unwrap();
+            assert!(protocol::recv::<Request>(&stream).unwrap().is_none(), "request retried after reply");
+        }
+    });
+    for expected_code in [0, 3] {
+        let output = st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
+            .env_clear().env("HOME", &home).env("PATH", &bin)
+            .env("GH_TOKEN", "fixture-local-credential").env("GITHUB_TOKEN", "fixture-secondary")
+            .env("ST_SEKRETS_SOCKET", &socket).env("XDG_CONFIG_HOME", root.path().join("config"))
+            .args(["gate", "merged", "acme/garden#1"]).output().unwrap();
+        assert_eq!(output.status.code(), Some(expected_code), "{output:?}");
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("fixture-local-credential"));
+        assert!(!calls.exists(), "configured profile spawned gh");
+    }
+    gateway.join().unwrap();
 }

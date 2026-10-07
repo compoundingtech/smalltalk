@@ -19,7 +19,7 @@ hmac = "0.12"
 libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 ring = "0.17"
-rusqlite = { version = "0.32", features = ["bundled", "trace", "functions"] }
+rusqlite = { version = "0.32", features = ["bundled", "trace", "functions", "hooks"] }
 serde = { version = "1", features = ["derive"] }
 # Claim bodies keep the writer's field order when they decode, so a claim hashed in insertion
 # order by an old build still verifies (see `hash::claim_id_is_content_hash`). Inside smalltalk

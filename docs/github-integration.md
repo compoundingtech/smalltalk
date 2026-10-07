@@ -10,7 +10,72 @@ gh auth status
 st doctor
 ```
 
-The observer uses the daemon account's `GH_TOKEN`, `GITHUB_TOKEN`, or `gh auth token`. Login must be visible in its login-shell environment. Agents' `gh` comments, reviews, and pushes use **the person's GitHub account**; an agent seat name is not a separate GitHub identity. Set clear publishing constraints in the work brief.
+By default, the observer uses the daemon account's `GH_TOKEN`, `GITHUB_TOKEN`, or `gh auth token`. Login must be visible in its login-shell environment. The daemon resolves credentials once and reuses them until GitHub returns HTTP 401 or the selected credential source changes. A rejected credential is invalidated for future requests; refresh attempts back off for 30 seconds, and the original request is never retried, including a comment or review. `GH_TOKEN` takes precedence over `GITHUB_TOKEN`, then `gh auth token`; exported credentials are rechecked through the daemon's existing login-environment snapshot (refreshed on use every 60 seconds), and changes to `gh`'s `hosts.yml` metadata trigger one refresh. A keychain-only change that leaves that file untouched requires a 401 or daemon restart. Agents' `gh` comments, reviews, and pushes use **the person's GitHub account**; an agent seat name is not a separate GitHub identity. Set clear publishing constraints in the work brief.
+
+## Token-file configuration
+
+Choose an explicit token file in the daemon's configuration to take precedence over the
+login-shell environment and `gh auth token`:
+
+```toml
+[github]
+token_file = "/path/to/github-token"
+```
+
+The file must contain only one token, with an optional trailing newline. Make it readable
+only by the daemon account (`chmod 600`), which must own it. Group and others must have no
+permission bits. The final path component must not be a symlink; keep its parent directories
+under trusted ownership. The daemon checks permissions at startup and on each
+credential acquisition, caches the contents, and reloads when the mtime changes. Atomic file
+replacement is detected even when the mtime is preserved. An unreadable, unsafe or malformed
+file fails authentication rather than selecting another source.
+
+## Gateway-authorized configuration
+
+To keep the GitHub token at the sekrets gateway, configure the daemon:
+
+```toml
+[github]
+sekrets_profile = "owner/daemon-gh"
+```
+
+Grant the profile to the daemon's node with the `github-api` preset (see
+[sekrets](st3/sekrets.md)). The gateway client reads the daemon or gate CLI's Config and
+existing node key; no initializer or token handoff is needed. Every daemon GitHub HTTP
+request uses the gateway's authorized-request operation, including GraphQL, pagination,
+conditional reads and comment/review mutations. The profile path never resolves local
+files, exported tokens or `gh auth token`; it never receives the profile token.
+
+A missing gateway, identity, grant or refused URL errors without selecting another source.
+The gateway authorizes only `https://api.github.com`, rejects a request's own Authorization,
+and adds the profile credential there. It follows no redirect and retries no request. The
+client runs off the async worker threads and returns the original status, headers and body,
+including 3xx, 401, ETag, Link, rate limits and Retry-After. HTTP errors remain responses;
+transport and policy errors remain failures. Request/response limits are 16 MiB/64 MiB,
+with the gateway's 60-second HTTP timeout. Local API overrides pointing elsewhere are
+refused in profile mode. The caller also rejects foreign origins, userinfo, non-default ports
+and an Authorization header before the RPC. It refuses streamed bodies and buffered request
+bodies above 16 MiB, and checks the 64 MiB response bound before constructing its HTTP response.
+
+Setting `github.sekrets_profile` together with `github.token_file` is a configuration error.
+With neither option set, the existing environment/CLI source precedence and cache apply.
+
+## Daemon GitHub callers
+
+The daemon's shared authentication and send path covers these API requests:
+
+| Caller | Requests |
+| --- | --- |
+| `github.repository` | Repository metadata, issues, pulls, comments, reactions, rules and branch protection via REST; pull-request details and resolved nodes via GraphQL. |
+| `github.pull-request` and `github.ref` | Pull listings, reviews, check runs, branches and comparisons. |
+| `merged` and `ci-passed` gates | Pull merge state, commit heads, check runs and commit statuses. |
+| `st gh watch` and wake excerpts | Issue/thread validation, comments, reviews and inline review comments. |
+| `st gh comment` and `st gh own` | POST comments or reviews; read a comment/review and the current GitHub login. |
+
+REST listings follow GitHub's `Link` pagination. Conditional reads retain ETags and reuse the
+complete cached body and pagination link after a 304. Response status and rate-limit headers
+remain available to the caller. Credential invalidation changes future authentication;
+it does not retry any of these HTTP requests.
 
 ## Prepare finite review and triage work
 

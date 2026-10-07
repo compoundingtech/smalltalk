@@ -8,6 +8,7 @@ pub(super) mod resources;
 pub(super) mod search;
 pub(super) mod arrangements;
 pub(super) mod conversation_blocks;
+mod collection_windows;
 
 const TERMINAL_SUBPROTOCOL: &str = "st3.client.terminal.v0";
 const CONVERSATION_SUBPROTOCOL: &str = "st3.client.conversation.v0";
@@ -58,7 +59,7 @@ struct CollectionSubscription {
     has_more: bool,
 }
 
-const COLLECTION_MAX_SUBSCRIPTIONS: usize = 8;
+const COLLECTION_MAX_SUBSCRIPTIONS: usize = 16;
 /// The least time between two rereads of a socket's held windows. A window read can take a
 /// few hundred milliseconds and the fleet commits about once a second, so rereading on every
 /// commit kept a daemon busy for as long as a client stayed connected. Commits in between are
@@ -69,6 +70,11 @@ const ATTENTION_CLOCK_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Claims that no collection window shows: rereading for them only costs.
 fn collection_ignores(collection: &str, kind: &str) -> bool {
+    // A held window must be rechecked when its exact grant or delegated scopes change,
+    // including otherwise graph-only glasses and arrangements.
+    if matches!(kind, "custom.client.pairing-completed" | "custom.client.pairing-revoked") {
+        return false;
+    }
     if collection == "glasses" { return !kind.starts_with("glass."); }
     if collection == "arrangements" {
         return !kind.starts_with("arrangement.")
@@ -106,11 +112,22 @@ pub(super) async fn collection_stream(
 
 /// Read one bounded window. The whole read sees one SQLite snapshot, and the fence names
 /// that snapshot's index, so commits landing meanwhile never tear or delay it.
+#[cfg(test)]
 async fn collection_items(
     state: &AppState,
     session: &ClientSession,
     request: &CollectionSubscribe,
     read_permit: tokio::sync::OwnedSemaphorePermit,
+) -> Result<(ClientSnapshot, Vec<Value>, bool), ApiError> {
+    collection_items_with_windows(state, session, request, read_permit, None).await
+}
+
+async fn collection_items_with_windows(
+    state: &AppState,
+    session: &ClientSession,
+    request: &CollectionSubscribe,
+    read_permit: tokio::sync::OwnedSemaphorePermit,
+    windows: Option<Arc<collection_windows::Windows>>,
 ) -> Result<(ClientSnapshot, Vec<Value>, bool), ApiError> {
     if !matches!(
         request.collection.as_str(),
@@ -122,7 +139,9 @@ async fn collection_items(
         return Err(validation("status filters are supported for agents only"));
     }
     if request.subject.is_some() && request.collection != "arrangements" {
-        return Err(validation("subject filters are supported for arrangements only"));
+        return Err(validation(
+            "subject filters are supported for arrangements only",
+        ));
     }
     let limit = request.limit.unwrap_or(CLIENT_DEFAULT_PAGE_ITEMS);
     if !(1..=CLIENT_MAX_PAGE_ITEMS).contains(&limit) {
@@ -135,7 +154,9 @@ async fn collection_items(
         Some(glass_person(session, false)?)
     } else if request.collection == "arrangements" {
         if request.actor.is_some() {
-            return Err(validation("arrangements select an explicit person, not an actor"));
+            return Err(validation(
+                "arrangements select an explicit person, not an actor",
+            ));
         }
         let current_session = revalidate_session(state, session)?;
         let person = arrangements::person(&current_session, request.person.as_deref(), false)?;
@@ -152,66 +173,172 @@ async fn collection_items(
     } else {
         None
     };
+    let (prepared, read_permit) = if let Some(windows) = &windows {
+        let (current, read_permit) = if session.transport == "unix" {
+            (session.clone(), read_permit)
+        } else {
+            let state = state.clone();
+            let session = session.clone();
+            let label = collection_window_label(&request.collection);
+            let (current, read_permit) = super::blocking_store(move || {
+                crate::profile::task(label, || {
+                    // Preparation is physical SQL too; canceled callers retain their slot
+                    // until this indexed authority read actually finishes.
+                    Ok((revalidate_session(&state, &session), read_permit))
+                })
+            })
+            .await?;
+            (current?, read_permit)
+        };
+        (windows.prepare(state, &current, request), read_permit)
+    } else {
+        (None, read_permit)
+    };
+    let admission = match &prepared {
+        Some(prepared) => Some(prepared.admit().await),
+        None => None,
+    };
     let state = state.clone();
+    let session = session.clone();
+    let request = request.clone();
     let actor = request.actor.clone();
     let subject = request.subject.clone();
     let status = request.status.clone();
     let collection = request.collection.clone();
     let custom_forms = session.custom_forms;
+    let arrangement_window = collection == "arrangements";
     let (snapshot, mut items, mut has_more) = super::blocking_store(move || {
-        // Keep the physical read slot even if its awaiting subscription is canceled.
-        let _read_permit = read_permit;
-        let store = state.store.clone();
-        store.read_snapshot(|index| {
-            let snapshot = client_snapshot_at(&state, index);
-            let at = snapshot.created_at.clone();
-            let mut items = match collection.as_str() {
-                "missions" => {
-                    let mut ids =
-                        store.mission_collection_ids(false, 0, limit.saturating_add(1))?;
-                    let mut has_more = ids.len() > limit;
-                    ids.truncate(limit);
-                    let mut items = mission_list_cards(&store, &ids)?;
-                    has_more |= bound_mission_cards(&mut items)?;
-                    return Ok((snapshot, items, has_more));
-                }
-                "glasses" => {
-                    store.glasses(person.as_deref().expect("authenticated glass owner"), index)?
-                }
-                "arrangements" => {
-                    if let Some(subject) = &subject {
-                        store.arrangement(subject, index)?.into_iter().collect()
+        crate::profile::task(collection_window_label(&collection), || {
+            // Keep the physical read slot even if its awaiting subscription is canceled.
+            let _read_permit = read_permit;
+            let _admission = admission;
+            let store = state.store.clone();
+            let commits = windows.as_ref().map(|windows| windows.commits());
+            store.read_snapshot(|index| {
+                let now = client_now_ms();
+                // Recheck paired grants, including expiry and changed scopes, before any reuse.
+                let (current, person) = match (|| {
+                    let current = if session.transport == "unix" {
+                        session.clone()
                     } else {
-                        store.arrangements(person.as_deref().expect("explicit arrangement owner"), index)?
+                        revalidate_session(&state, &session)?
+                    };
+                    require_scope(&current, "read.projections")?;
+                    let person = match collection.as_str() {
+                        "glasses" => Some(glass_person(&current, false)?),
+                        "arrangements" => Some(arrangements::person(
+                            &current,
+                            request.person.as_deref(),
+                            false,
+                        )?),
+                        "attention" => person_filter(&current, request.person.as_deref())?,
+                        _ => person.clone(),
+                    };
+                    Ok::<_, ApiError>((current, person))
+                })() {
+                    Ok(current) => current,
+                    Err(error) => return Ok(Err(error)),
+                };
+                let snapshot = client_snapshot_at(&state, index);
+                let at = snapshot.created_at.clone();
+                let compute = || {
+                    let mut items = match collection.as_str() {
+                        "missions" => {
+                            let mut ids =
+                                store.mission_collection_ids(false, 0, limit.saturating_add(1))?;
+                            let mut has_more = ids.len() > limit;
+                            ids.truncate(limit);
+                            let mut items = mission_list_cards_at(&store, &ids, now)?;
+                            has_more |= bound_mission_cards(&mut items)?;
+                            return Ok((items, has_more));
+                        }
+                        "glasses" => store.glasses(
+                            person.as_deref().expect("authenticated glass owner"),
+                            index,
+                        )?,
+                        "arrangements" => {
+                            if let Some(subject) = &subject {
+                                store.arrangement(subject, index)?.into_iter().collect()
+                            } else {
+                                store.arrangements(
+                                    person.as_deref().expect("explicit arrangement owner"),
+                                    index,
+                                )?
+                            }
+                        }
+                        "attention" => {
+                            client_attention_resources_at(&store, person.as_deref(), false, now)?
+                        }
+                        "agents" => client_agent_resources_cached(&store, false, index)?,
+                        "work" => client_work_resources(
+                            &store,
+                            actor.as_deref(),
+                            false,
+                            store.projection_time_at(index)?,
+                            index,
+                        )?,
+                        _ => unreachable!(),
+                    };
+                    client_attention_compatibility(&mut items, custom_forms);
+                    // Agent status/availability depends on live local delivery presence; overlay and
+                    // filter it on every read, after reusing the immutable graph-derived rows.
+                    if collection == "agents" {
+                        return Ok((items, false));
                     }
+                    if let Some(status) = &status {
+                        items.retain(|item| item["state"].as_str() == Some(status.as_str()));
+                    }
+                    let has_more = items.len() > limit;
+                    items.truncate(limit);
+                    Ok((items, has_more))
+                };
+                let (mut items, mut has_more) = match &windows {
+                    Some(windows) => windows.read(
+                        &state,
+                        &current,
+                        &request,
+                        collection_windows::ReadFence {
+                            index,
+                            now,
+                            commits: commits.expect("window commit sequence"),
+                            prepared,
+                        },
+                        compute,
+                    )?,
+                    None => compute()?,
+                };
+                if collection == "agents" {
+                    overlay_agent_resources(&store, &mut items, &at)?;
+                    if let Some(status) = &status {
+                        items.retain(|item| item["state"].as_str() == Some(status.as_str()));
+                    }
+                    has_more = items.len() > limit;
+                    items.truncate(limit);
                 }
-                "attention" => client_attention_resources(&store, person.as_deref(), false)?,
-                "agents" => client_agent_resources(&store, false, &at, index)?,
-                "work" => client_work_resources(
-                    &store,
-                    actor.as_deref(),
-                    false,
-                    store.projection_time_at(index)?,
-                    index,
-                )?,
-                _ => unreachable!(),
-            };
-            client_attention_compatibility(&mut items, custom_forms);
-            if let Some(status) = status {
-                items.retain(|item| item["state"].as_str() == Some(status.as_str()));
-            }
-            let has_more = items.len() > limit;
-            Ok((snapshot, items, has_more))
+                Ok(Ok((snapshot, items, has_more)))
+            })
         })
     })
-    .await?;
+    .await??;
     items.truncate(limit);
-    if request.collection == "arrangements" {
+    if arrangement_window {
         let end = arrangements::window_end(&items, 0, items.len())?;
         has_more |= end < items.len();
         items.truncate(end);
     }
     Ok((snapshot, items, has_more))
+}
+
+fn collection_window_label(collection: &str) -> &'static str {
+    match collection {
+        "missions" => "stream collection/missions",
+        "attention" => "stream collection/attention",
+        "agents" => "stream collection/agents",
+        "work" => "stream collection/work",
+        "glasses" => "stream collection/glasses",
+        "arrangements" => "stream collection/arrangements",
+        _ => "stream collection/invalid",
+    }
 }
 
 async fn send_collection(socket: &mut WebSocket, value: Value) -> bool {
@@ -339,7 +466,7 @@ async fn open_terminal_subscription(
         let session = session.clone();
         let incarnation = request.incarnation.clone();
         let capability = request.capability.clone();
-        tokio::task::spawn_blocking(move || {
+        crate::api::read_deadline::spawn_blocking(move || {
             prepare_terminal_follow(
                 &state,
                 &session,
@@ -423,7 +550,7 @@ async fn conversation_page(
             .map_err(|error| conversation_blocks::availability(remote_read_error(owner, error)));
     }
     let (state, session, session_id) = (state.clone(), session.clone(), session_id.to_owned());
-    tokio::task::spawn_blocking(move || {
+    crate::api::read_deadline::spawn_blocking(move || {
         timeline_value(
             &state,
             &new_client_snapshot(&state),
@@ -619,12 +746,18 @@ async fn collection_stream_socket(
     session: ClientSession,
     presence: super::client_presence::StreamGuard,
 ) {
+    let windows = collection_windows::Windows::attach(&state.store);
     collection_stream_socket_with_reader(
         socket,
         state,
         session,
         Some(presence),
-        |state, session, request, permit| async move { collection_items(&state, &session, &request, permit).await },
+        move |state, session, request, permit| {
+            let windows = windows.clone();
+            async move {
+                collection_items_with_windows(&state, &session, &request, permit, windows).await
+            }
+        },
     )
     .await;
 }
@@ -642,6 +775,8 @@ async fn collection_stream_socket_with_reader<F, Fut>(
     // Subscribe before the first snapshot, so a commit while building it wakes
     // the next loop and is reflected in a following change frame.
     let mut changed = state.event_notify.subscribe();
+    let windows = collection_windows::Windows::attach(&state.store);
+    let mut window_revisions = [0; 6];
     let mut subscriptions = BTreeMap::<String, CollectionSubscription>::new();
     let mut terminals = BTreeMap::<String, watch::Receiver<TerminalFrame>>::new();
     let mut conversations = ConversationFollowers::default();
@@ -758,13 +893,30 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                 // Weigh only the commits since the last look: a reread is due when one of them
                 // can change a held window.
                 let index = state.store.index().unwrap_or(weighed);
-                if index > weighed {
-                    let claims = state.store.claims_page(None, None, weighed, index.checked_add(1), false, 10_000).map(|page| page.claims).unwrap_or_default();
+                if subscriptions.is_empty() {
+                    weighed = index;
+                    continue;
+                }
+                if let Some(windows) = &windows {
+                    let (windows, store) = (windows.clone(), state.store.clone());
+                    match blocking_store(move || crate::profile::task("stream collection/invalidation", || windows.changes(&store))).await {
+                        Ok(revisions) => {
+                            reread_due |= subscriptions.values().any(|subscription| collection_windows::Windows::changed(&subscription.request.collection, &window_revisions, &revisions));
+                            window_revisions = revisions;
+                        }
+                        Err(_) => { reread_due = true; }
+                    }
+                    weighed = index;
+                } else if index > weighed {
+                    let claims = state.store.claims_page(None, None, weighed, index.checked_add(1), false, 10_000).map(|page| page.claims);
                     let glasses_changed = subscriptions.values().any(|s| s.request.collection == "glasses") && state.store.glasses_changed(weighed, index).unwrap_or(true);
                     let arrangements_changed = subscriptions.values().any(|s| s.request.collection == "arrangements") && state.store.arrangements_changed(weighed, index).unwrap_or(true);
-                    reread_due |= glasses_changed || arrangements_changed || claims.len() >= 10_000 || subscriptions.values().any(|subscription| {
-                        claims.iter().any(|claim| !collection_ignores(&subscription.request.collection, &claim.kind))
-                    });
+                    reread_due |= glasses_changed || arrangements_changed || match claims {
+                        Err(_) => true,
+                        Ok(claims) => claims.len() >= 10_000 || subscriptions.values().any(|subscription| {
+                            claims.iter().any(|claim| !collection_ignores(&subscription.request.collection, &claim.kind))
+                        }),
+                    };
                     weighed = index;
                 }
                 if !reread_due || last_reread.elapsed() < COLLECTION_REREAD_INTERVAL { continue; }
@@ -773,8 +925,10 @@ async fn collection_stream_socket_with_reader<F, Fut>(
             () = tokio::time::sleep_until(last_reread + COLLECTION_REREAD_INTERVAL), if !command_waiting && reread_due => {
                 refresh.extend(subscriptions.keys().cloned());
             }
-            _ = attention_clock.tick(), if !command_waiting && subscriptions.values().any(|s| matches!(s.request.collection.as_str(), "attention" | "agents" | "arrangements")) => {
-                refresh.extend(subscriptions.iter().filter(|(_, s)| matches!(s.request.collection.as_str(), "attention" | "agents" | "arrangements")).map(|(id, _)| id.clone()));
+            _ = attention_clock.tick(), if !command_waiting && !subscriptions.is_empty() => {
+                // Pairing expiry and mission lease state can change without a claim. Stable
+                // rows remain reusable; authority and local overlays are rechecked on reads.
+                refresh.extend(subscriptions.keys().cloned());
             }
             Some((id, frame)) = conversation_frames.recv(), if !command_waiting => {
                 // A follower stopped by unsubscribe may still have had a frame on the way.
@@ -1413,6 +1567,7 @@ pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
             })
         })
         .collect::<Vec<_>>();
+    capabilities.push(json!({"id":"collections", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"custom-subjects", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"owned-sets", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"glasses", "version":2, "state":if glass_person(session, false).is_ok() && glass_person(session, true).is_ok() { "granted" } else { "ungranted" }}));
@@ -1599,9 +1754,14 @@ fn revalidate_session(state: &AppState, session: &ClientSession) -> Result<Clien
     if session.transport == "unix" && acting_party(session) {
         return Ok(session.clone());
     }
-    let pairings = state.store.claims_for_kind_at(
-        "custom.client.pairing-completed", None, true, 10_000,
-    ).map_err(ApiError::internal)?;
+    let pairings = match session.pairing_grant.as_deref() {
+        Some(subject) => state.store.claims_for_subject_kind_at(
+            subject, "custom.client.pairing-completed", None, true, 1,
+        ),
+        None => state.store.claims_for_kind_at(
+            "custom.client.pairing-completed", None, true, 10_000,
+        ),
+    }.map_err(ApiError::internal)?;
     let paired = pairings.claims.iter().find(|claim| match session.pairing_grant.as_deref() {
         Some(subject) => claim.subject.as_str() == subject,
         None => claim.body.pointer("/fields/session_actor").and_then(Value::as_str) == Some(session.actor.as_str()),
@@ -1697,6 +1857,14 @@ pub(super) fn mission_resources(
 /// Collection cards keep only three run headers, regardless of a mission's history size.
 /// Full run and step detail stays on the detail endpoint.
 fn mission_list_cards(store: &Store, ids: &[String]) -> anyhow::Result<Vec<Value>> {
+    mission_list_cards_at(store, ids, client_now_ms())
+}
+
+fn mission_list_cards_at(
+    store: &Store,
+    ids: &[String],
+    at_unix_ms: u128,
+) -> anyhow::Result<Vec<Value>> {
     let attention = store.human_attention_runs()?;
     let definitions = store
         .mission_definitions_for_ids(ids)?
@@ -1724,7 +1892,7 @@ fn mission_list_cards(store: &Store, ids: &[String]) -> anyhow::Result<Vec<Value
             .map(|(_,count)| count.as_u64().unwrap_or(0)).sum::<u64>();
         let details = newest.iter().rev().map(|run| {
             let run_id=run["id"].as_str().expect("run header id");
-            let (total,done,steps)=store.mission_step_preview(run_id)?;
+            let (total,done,steps)=store.mission_step_preview_at(run_id, at_unix_ms)?;
             let terminal=matches!(run["status"].as_str(),Some("completed"|"failed"|"cancelled"));
             let scheduler_fault=store.reconcile_fault(run_id, crate::reconcile::FIRST_READINESS_FAULT_SCOPE)?;
             let must_act=if terminal {"nobody"} else if attention.contains(run_id) {"you"}
@@ -2192,6 +2360,28 @@ fn runtime_resources_for_owner(
             history,
         )?
     };
+    runtime_resources_from_status(state, snapshot, session, status)
+}
+
+fn terminal_resources_for_owner(
+    state: &AppState,
+    history: bool,
+    snapshot: &ClientSnapshot,
+    session: &ClientSession,
+    owner: Option<&str>,
+) -> anyhow::Result<Vec<Value>> {
+    let status = state
+        .store
+        .terminal_resource_status_at(owner, snapshot.store_index, history)?;
+    runtime_resources_from_status(state, snapshot, session, status)
+}
+
+fn runtime_resources_from_status(
+    state: &AppState,
+    snapshot: &ClientSnapshot,
+    session: &ClientSession,
+    status: crate::model::StatusResponse,
+) -> anyhow::Result<Vec<Value>> {
     // Each runtime's declaration and observation time, in one statement apiece for the list.
     let desired_tokens = state.store.selected_desired_tokens(
         &status
@@ -3260,7 +3450,7 @@ pub(super) async fn terminals(
         "terminals",
         &query,
         move |state, snapshot| {
-            let mut items = runtime_resources_for_owner(
+            let mut items = terminal_resources_for_owner(
                 state,
                 history,
                 snapshot,
@@ -3672,41 +3862,13 @@ fn session_messages(
     incarnation: Option<&str>,
     before: Option<u64>,
 ) -> Result<Vec<ClaimRecord>, ApiError> {
-    // The incarnation's life: from its first runtime observation to the next incarnation's.
-    let (mut started, mut ended) = (None::<u128>, None::<u128>);
-    if let Some(incarnation) = incarnation {
-        let observed = state
-            .store
-            .claims_for(owner, Some("runtime.observed"))
-            .map_err(ApiError::internal)?;
-        let of = |claim: &ClaimRecord| {
-            claim
-                .body
-                .pointer("/fields/incarnation_id")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        };
-        started = observed
-            .iter()
-            .filter(|claim| of(claim).as_deref() == Some(incarnation))
-            .map(|claim| claim.accepted_at_unix_ms)
-            .min();
-        if let Some(started) = started {
-            ended = observed
-                .iter()
-                .filter(|claim| {
-                    claim.accepted_at_unix_ms > started
-                        && of(claim).is_some_and(|other| other != incarnation)
-                })
-                .map(|claim| claim.accepted_at_unix_ms)
-                .min();
-        }
-    }
-    let mut messages = state
-        .store
-        .claims_for_kind_at("message.sent", before, true, 10_000)
-        .map_err(ApiError::internal)?
-        .claims;
+    let (started, ended) = match incarnation {
+        Some(incarnation) => state.store.conversation_runtime_span(owner, incarnation)
+            .map_err(ApiError::internal)?,
+        None => (None, None),
+    };
+    let mut messages = state.store.conversation_messages_at(owner, before, 0)
+        .map_err(ApiError::internal)?;
     messages.retain(|claim| {
         let fields = claim.body.get("fields").unwrap_or(&claim.body);
         let from = fields.get("from").and_then(Value::as_str);
@@ -4712,28 +4874,11 @@ fn conversation_cursor(
 
 pub(super) fn conversation_session_id(state: &AppState, id: &str) -> Result<String, ApiError> {
     if id.starts_with("agent/") {
-        let status = state
-            .store
-            .status_for_subject_prefix_at("agent/", None, true)
-            .map_err(ApiError::internal)?;
-        let subject = status
-            .subjects
-            .into_iter()
-            .find(|subject| subject.subject == id)
+        let frontier = state.store.index().map_err(ApiError::internal)?;
+        let owners = state.store.conversation_owners_at(frontier).map_err(ApiError::internal)?;
+        let owner = owners.get(id)
             .ok_or_else(|| ApiError::not_found(format!("agent `{id}` does not exist")))?;
-        let fields = subject
-            .actual
-            .as_ref()
-            .map(|actual| actual.get("fields").unwrap_or(actual));
-        let incarnation = fields
-            .and_then(|fields| fields.get("incarnation_id"))
-            .and_then(Value::as_str)
-            .or(subject.projection.runtime_incarnation.as_deref())
-            .or_else(|| {
-                fields
-                    .and_then(|fields| fields.get("runtime_id"))
-                    .and_then(Value::as_str)
-            })
+        let incarnation = owner.incarnation.as_deref().or(owner.runtime.as_deref())
             .ok_or_else(|| validation("the agent has no current session"))?;
         return Ok(client_session_id(id, incarnation));
     }
@@ -4788,6 +4933,17 @@ fn conversation_position(
 }
 
 fn conversation_read_now(
+    state: &AppState,
+    session: &ClientSession,
+    session_id: &str,
+    after: Option<&str>,
+) -> Result<Value, ApiError> {
+    super::read_deadline::query(&state.store, "/v1/client/conversations/{id}/changes", || {
+        conversation_read_now_unbounded(state, session, session_id, after)
+    })
+}
+
+fn conversation_read_now_unbounded(
     state: &AppState,
     session: &ClientSession,
     session_id: &str,
@@ -4877,23 +5033,12 @@ fn conversation_read_now(
                 }
             }
         }
-        for claim in state
-            .store
-            .claims_for_kind_at("message.sent", None, true, 10_000)
-            .map_err(ApiError::internal)?
-            .claims
-        {
+        for claim in owner.as_deref().map(|owner| {
+            state.store.conversation_messages_at(owner, snapshot.store_index.checked_add(1), store_index)
+        }).transpose().map_err(ApiError::internal)?.unwrap_or_default() {
             let fields = claim.body.get("fields").unwrap_or(&claim.body);
-            if claim.store_index > store_index
-                && fields
-                    .get("session_id")
-                    .and_then(Value::as_str)
-                    .is_none_or(|message_session| message_session == session_id)
-                && owner.as_deref().is_some_and(|owner| {
-                    fields.get("from").and_then(Value::as_str) == Some(owner)
-                        || fields.get("to").and_then(Value::as_str) == Some(owner)
-                })
-            {
+            if fields.get("session_id").and_then(Value::as_str)
+                .is_none_or(|message_session| message_session == session_id) {
                 changed_indexes.insert(claim.store_index);
                 message_indexes.insert(claim.store_index);
             }
@@ -5066,6 +5211,12 @@ fn transcript_seen(path: Option<&std::path::Path>) -> Option<(u64, std::time::Sy
 
 impl ConversationMark {
     fn new(state: &AppState, session_id: &str) -> Result<Self, ApiError> {
+        super::read_deadline::query(&state.store, "/v1/client/conversations/{id}/changes", || {
+            Self::new_unbounded(state, session_id)
+        })
+    }
+
+    fn new_unbounded(state: &AppState, session_id: &str) -> Result<Self, ApiError> {
         let index = state.store.index().map_err(ApiError::internal)?;
         let managed = super::managed_session_owner_at(&state.store, index, session_id)
             .map_err(ApiError::internal)?;
@@ -5091,6 +5242,12 @@ impl ConversationMark {
 
     /// Whether anything that concerns the conversation changed since the last look.
     fn changed(&mut self, state: &AppState) -> Result<bool, ApiError> {
+        super::read_deadline::query(&state.store, "/v1/client/conversations/{id}/changes", || {
+            self.changed_unbounded(state)
+        })
+    }
+
+    fn changed_unbounded(&mut self, state: &AppState) -> Result<bool, ApiError> {
         let mut changed = false;
         let index = state.store.index().map_err(ApiError::internal)?;
         if index > self.store_index {
@@ -5603,47 +5760,67 @@ pub(super) async fn events(
 ) -> Result<Json<Value>, ApiError> {
     require_scope(&session, "read.projections")?;
     let limit = query.limit.unwrap_or(100).clamp(1, 500);
-    let (oldest, newest) = state.store.event_bounds().map_err(ApiError::internal)?;
+    // Registration precedes both the floor/frontier and empty-page reads.
+    let mut changed = state.event_notify.subscribe();
     let after = decode_event_cursor(&state.node, query.after.as_deref())?;
-    validate_event_cursor(
-        &state.node,
-        query.after.is_some(),
-        after.claim,
-        oldest,
-        newest,
-    )?;
     let deadline =
         tokio::time::Instant::now() + Duration::from_millis(query.wait_ms.unwrap_or(0).min(30_000));
     // Subscribe before the first store read. An event between reading an empty
     // page and subscribing must wake this long poll, not wait for another event.
-    let mut changed = state.event_notify.subscribe();
-    let records = loop {
-        let records = if query.after.is_some() {
-            feed_events_after(&state.store, after, limit.saturating_add(1))
-        } else {
-            feed_events_tail(&state.store, limit)
-        }
-        .map_err(ApiError::internal)?;
+    let (records, oldest, newest) = loop {
+        let (records, oldest, newest) =
+            super::read_deadline::query(&state.store, "/v1/client/events", || {
+                state
+                    .store
+                    .read_snapshot(|_| {
+                        let (oldest, newest) = state.store.event_bounds()?;
+                        if let Err(error) = validate_event_cursor(
+                            &state.node,
+                            query.after.is_some(),
+                            after.claim,
+                            oldest,
+                            newest,
+                        ) {
+                            return Ok(Err(error));
+                        }
+                        let records = if query.after.is_some() {
+                            feed_events_after(&state.store, after, limit.saturating_add(1))?
+                        } else {
+                            feed_events_tail(&state.store, limit)?
+                        };
+                        Ok(Ok((records, oldest, newest)))
+                    })
+                    .map_err(ApiError::internal)?
+            })?;
         if !records.is_empty() || tokio::time::Instant::now() >= deadline {
-            break records;
+            break (records, oldest, newest);
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if !matches!(
             tokio::time::timeout(remaining, changed.changed()).await,
             Ok(Ok(()))
         ) {
-            break Vec::new();
+            // Read the current floor again at timeout; migration may not emit a normal event.
+            continue;
         }
     };
     let has_more = query.after.is_some() && records.len() > limit;
     let records = records.into_iter().take(limit).collect::<Vec<_>>();
-    let resume = records
+    let mut resume = records
         .last()
         .map(|(record, local)| EventCursor {
             claim: record.store_index,
             local: *local,
         })
         .unwrap_or(after);
+    if query.after.is_none() && resume.claim < newest {
+        // A bounded replacement at resync may show the latest retained activity, but its next
+        // request must start at the observed current frontier, not below the new upgrade floor.
+        resume = EventCursor {
+            claim: newest,
+            local: None,
+        };
+    }
     let items = records
         .into_iter()
         .map(|(record, local)| {
@@ -6349,7 +6526,7 @@ const TERMINAL_FACTS_TIMEOUT: Duration = Duration::from_secs(1);
 async fn terminal_facts(state: &AppState, id: &str) -> Option<Value> {
     let live = terminal_live_session(state, &terminal_subject(id), None).ok()?;
     let root = state.pty_root.clone();
-    tokio::task::spawn_blocking(move || {
+    crate::api::read_deadline::spawn_blocking(move || {
         let stats = pty_client::stats::query_stats_in_with_timeout(
             &root,
             &live.runtime_id,
@@ -7078,7 +7255,6 @@ fn consume_terminal_attachment(
     capability: Option<&str>,
 ) -> Result<(), ApiError> {
     consume_terminal_attachment_mode(state, session, terminal_id, incarnation, capability, None)
-        .map(|_| ())
 }
 
 fn consume_terminal_attachment_mode(
@@ -7088,7 +7264,7 @@ fn consume_terminal_attachment_mode(
     incarnation: &str,
     capability: Option<&str>,
     raw_mode: Option<&str>,
-) -> Result<Option<String>, ApiError> {
+) -> Result<(), ApiError> {
     let lookup_span = crate::profile::span("terminal/capability-lookup");
     let capability = capability
         .filter(|value| !value.is_empty())
@@ -7111,9 +7287,7 @@ fn consume_terminal_attachment_mode(
         && raw_mode.is_none_or(|_| {
             field("person_id").and_then(Value::as_str) == Some(session.authority_actor.as_str())
         })
-        && (raw_mode != Some("peek")
-            || field("raw_authorization_epoch").and_then(Value::as_str)
-                == Some(raw_terminal::authorization_epoch(state, session)?.as_str()))
+        && raw_mode != Some("peek")
         && raw_live.as_ref().is_none_or(|live| {
             field("owner_host_id").and_then(Value::as_str) == Some(live.owner_host_id.as_str())
                 && field("runtime_id").and_then(Value::as_str) == Some(live.runtime_id.as_str())
@@ -7140,7 +7314,7 @@ fn consume_terminal_attachment_mode(
     }
     if raw_mode.is_none() {
         // A projected-screen capability is a lease and stays valid for more streams.
-        return Ok(None);
+        return Ok(());
     }
     let _span = crate::profile::span("terminal/capability-consume");
     state
@@ -7161,9 +7335,7 @@ fn consume_terminal_attachment_mode(
         })
         .map_err(|_| forbidden("the terminal stream capability was already consumed"))?;
     signal_changed(state);
-    Ok(field("raw_authorization_epoch")
-        .and_then(Value::as_str)
-        .map(str::to_owned))
+    Ok(())
 }
 
 fn detach_terminal_attachment(
@@ -7595,7 +7767,7 @@ async fn import_external_session_action(
     // until the exact native process has stopped, so two harnesses never own one native session.
     if let Some(process) = external.process.clone() {
         let driver = external.driver;
-        tokio::task::spawn_blocking(move || {
+        crate::api::read_deadline::spawn_blocking(move || {
             crate::external_sessions::terminate_exact_process(driver, &process)
         })
         .await
@@ -8718,7 +8890,7 @@ async fn dispatch_action(
             }
             let socket = state.pty_root.join(format!("{}.sock", live.runtime_id));
             let runtime_id = live.runtime_id.clone();
-            tokio::task::spawn_blocking(move || {
+            crate::api::read_deadline::spawn_blocking(move || {
                 let stream = std::os::unix::net::UnixStream::connect(&socket)?;
                 let mut connection = pty_client::SessionConnection::attach_over(
                     stream,
@@ -9499,6 +9671,87 @@ mod tests {
     use std::os::unix::fs::MetadataExt as _;
     use std::sync::Barrier;
 
+    #[tokio::test]
+    async fn collections_socket_keeps_sixteen_windows_and_refuses_the_seventeenth() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        assert!(
+            capabilities(&ClientSession::local(None).unwrap())
+                .iter()
+                .any(|capability| {
+                    capability["id"] == "collections"
+                        && capability["version"] == 1
+                        && capability["state"] == "granted"
+                })
+        );
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let app = axum::Router::new().route(
+            "/stream",
+            axum::routing::get(move |upgrade: WebSocketUpgrade| {
+                let state = state.clone();
+                async move {
+                    upgrade.on_upgrade(move |socket| {
+                        collection_stream_socket_with_reader(
+                            socket,
+                            state,
+                            ClientSession::local(None).unwrap(),
+                            None,
+                            |state, session, request, permit| async move {
+                                collection_items(&state, &session, &request, permit).await
+                            },
+                        )
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream"))
+            .await
+            .unwrap();
+        for index in 0..17 {
+            let id = format!("window-{index}");
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    json!({"kind":"subscribe","id":id,"collection":"work","limit":2})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            assert_eq!(frame["id"], id);
+            assert_eq!(frame["kind"], if index < 16 { "snapshot" } else { "error" });
+        }
+        // A refusal leaves existing windows alive and replacements admissible at capacity.
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({"kind":"subscribe","id":"window-0","collection":"missions","limit":2})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(frame["id"], "window-0");
+        assert_eq!(frame["kind"], "snapshot");
+        socket.close(None).await.unwrap();
+        server.abort();
+    }
+
     #[test]
     fn terminal_contention_preserves_retryable_code_and_service_close() {
         for code in ["database-busy", "database-locked"] {
@@ -9687,7 +9940,7 @@ mod tests {
                                         let (sender, receiver) = tokio::sync::oneshot::channel();
                                         tokio::spawn(async move { let _ = receiver.await; let _ = dropped.send(()); });
                                         let _dropped = Dropped(Some(sender));
-                                        tokio::task::spawn_blocking(move || {
+                                        crate::api::read_deadline::spawn_blocking(move || {
                                             entered.send(()).unwrap();
                                             let _ = tokio::runtime::Handle::current().block_on(held.wait_for(|released| *released));
                                             completed.send(()).unwrap();
@@ -9925,7 +10178,7 @@ mod tests {
                             move |state, session, request, permit| {
                                 let (mut gate, started) = (gate.clone(), started.clone());
                                 async move {
-                                    let permit = tokio::task::spawn_blocking(move || {
+                                    let permit = crate::api::read_deadline::spawn_blocking(move || {
                                         started.send(permit.semaphore().clone()).unwrap();
                                         let _ = tokio::runtime::Handle::current().block_on(gate.wait_for(|released| *released));
                                         permit
@@ -9950,7 +10203,7 @@ mod tests {
         }
         socket.send(tokio_tungstenite::tungstenite::Message::Text(command.into())).await.unwrap();
         // A conversation outbox frame positively confirms command/frame dispatch is live
-        // while all eight physical workers are held; no wall-clock negative wait.
+        // while all sixteen physical workers are held; no wall-clock negative wait.
         socket.send(tokio_tungstenite::tungstenite::Message::Text(
             json!({"kind":"subscribe","id":"admission","collection":"conversation","conversation":"session/missing"}).to_string().into(),
         )).await.unwrap();
@@ -11412,6 +11665,157 @@ subscription "watch/source" {
             observe(number);
         }
         assert_eq!(statements(40), few);
+    }
+
+    #[test]
+    fn terminal_resource_summary_matches_full_status_at_current_and_old_cuts() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let session = ClientSession::local(Some("person/alex")).unwrap();
+        let intent = crate::graph::parse_intent(
+            "version 2\nagent \"declared-terminal\" { command \"true\" }\n",
+            state.store.origin(),
+        )
+        .unwrap();
+        let planned = state
+            .store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: String::new(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(
+                &intent,
+                &planned.subject_tokens,
+                "terminal-summary-declaration",
+            )
+            .unwrap();
+        let subjects = [
+            "agent/declared-terminal",
+            "exec/undeclared-terminal",
+            "agent/nonterminal",
+        ];
+        let mut snapshots = vec![new_client_snapshot(&state)];
+        for (status, incarnation) in [
+            ("running", "first"),
+            ("stopped", "first"),
+            ("running", "second"),
+        ] {
+            for subject in subjects {
+                state
+                    .store
+                    .append_claim(&ClaimInput {
+                        subject: subject.into(),
+                        kind: "runtime.observed".into(),
+                        actor: Some(subject.into()),
+                        fields: serde_json::from_value(json!({
+                            "status": status, "runtime_id": subject, "incarnation_id": incarnation,
+                            "terminal": subject != "agent/nonterminal",
+                        }))
+                        .unwrap(),
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: None,
+                    })
+                    .unwrap();
+                if subject.starts_with("agent/") {
+                    state
+                        .store
+                        .append_claim(&ClaimInput {
+                            subject: subject.into(),
+                            kind: "harness.observed".into(),
+                            actor: Some(subject.into()),
+                            fields: serde_json::from_value(json!({
+                                "state": "idle", "incarnation_id": incarnation, "driver": "claude",
+                            }))
+                            .unwrap(),
+                            evidence: Vec::new(),
+                            expected_subject: None,
+                            idempotency_key: None,
+                        })
+                        .unwrap();
+                }
+            }
+            snapshots.push(new_client_snapshot(&state));
+        }
+        // Read newest first, then older cuts: a cached new incarnation cannot leak backwards.
+        for snapshot in snapshots.iter().rev() {
+            for history in [false, true] {
+                for owner in [
+                    None,
+                    Some(subjects[0]),
+                    Some(subjects[1]),
+                    Some("agent/missing"),
+                    Some("glass/missing"),
+                ] {
+                    let lean =
+                        terminal_resources_for_owner(&state, history, snapshot, &session, owner)
+                            .unwrap();
+                    let full =
+                        runtime_resources_for_owner(&state, history, snapshot, &session, owner)
+                            .unwrap();
+                    assert_eq!(
+                        lean, full,
+                        "cut={} history={history} owner={owner:?}",
+                        snapshot.store_index
+                    );
+                    state.store.forget_current_views();
+                    assert_eq!(
+                        terminal_resources_for_owner(&state, history, snapshot, &session, owner)
+                            .unwrap(),
+                        full
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_resource_summary_reuses_status_without_full_cache_warming() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let session = ClientSession::local(Some("person/alex")).unwrap();
+        let statements = |count: usize| {
+            let snapshot = new_client_snapshot(&state);
+            // Only the terminals reduction warms this read; no runtime or machine read.
+            let first =
+                terminal_resources_for_owner(&state, false, &snapshot, &session, None).unwrap();
+            assert_eq!(first.len(), count);
+            crate::store::STATEMENTS_RUN.with(|run| run.set(0));
+            let again =
+                terminal_resources_for_owner(&state, false, &snapshot, &session, None).unwrap();
+            assert_eq!(again, first);
+            crate::store::STATEMENTS_RUN.with(std::cell::Cell::get)
+        };
+        let few = std::cell::Cell::new(0);
+        for number in 0..40 {
+            let subject = format!("exec/terminal-summary/{number}");
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: subject.clone(),
+                    kind: "runtime.observed".into(),
+                    actor: Some(subject),
+                    fields: serde_json::from_value(json!({
+                        "status": "running", "runtime_id": format!("summary-{number}"),
+                        "incarnation_id": "first", "terminal": true,
+                    }))
+                    .unwrap(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+            if number == 2 {
+                few.set(statements(3));
+            }
+        }
+        assert_eq!(statements(40), few.get());
     }
 
     /// A cold operations read must remain truthful without starting diagnostics.
@@ -12882,6 +13286,7 @@ mission "example/zero-run" state="ready" {
             Extension(session.clone()),
         )
         .await
+        .unwrap()
         .0;
         let expected = format!("event-cursor/retention-node/{floor}");
         assert_eq!(capabilities["oldest_event_cursor"], expected);
@@ -12915,6 +13320,73 @@ mission "example/zero-run" state="ready" {
         .0;
         assert_eq!(page["oldest_cursor"], expected);
         assert!(!serde_json::to_string(&page).unwrap().contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn event_resync_replacement_produces_one_valid_frontier_cursor() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "resync-node");
+        let record = state
+            .store
+            .append_claim(&ClaimInput {
+                subject: "custom/test/resync".into(),
+                kind: "custom.test.recorded".into(),
+                actor: None,
+                fields: BTreeMap::new(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        state
+            .store
+            .prune_events_before(record.store_index + 1)
+            .unwrap();
+        let session = ClientSession::local(None).unwrap();
+        let gap = events(
+            State(state.clone()),
+            Extension(session.clone()),
+            Query(EventsQuery {
+                after: Some("event-cursor/resync-node/0".into()),
+                limit: Some(3),
+                wait_ms: None,
+            }),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(gap.code, "cursor-gap");
+        let replacement = events(
+            State(state.clone()),
+            Extension(session.clone()),
+            Query(EventsQuery {
+                after: None,
+                limit: Some(3),
+                wait_ms: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(replacement["items"].as_array().unwrap().is_empty());
+        let cursor = replacement["resume_cursor"].as_str().unwrap().to_owned();
+        assert_eq!(
+            cursor,
+            format!("event-cursor/resync-node/{}", record.store_index)
+        );
+        let resumed = events(
+            State(state),
+            Extension(session),
+            Query(EventsQuery {
+                after: Some(cursor),
+                limit: Some(3),
+                wait_ms: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(resumed["items"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -13300,6 +13772,10 @@ mission "example/zero-run" state="ready" {
             .unwrap();
         let session_id = managed_session_id(agent, incarnation);
         assert_eq!(conversation_session_id(&owner, agent).unwrap(), session_id);
+        let before_alias = crate::store::STATEMENTS_RUN.with(std::cell::Cell::get);
+        assert_eq!(conversation_session_id(&owner, agent).unwrap(), session_id);
+        let alias_queries = crate::store::STATEMENTS_RUN.with(std::cell::Cell::get) - before_alias;
+        assert!(alias_queries <= 3, "a warm agent alias must not reduce fleet history: {alias_queries}");
         let session = ClientSession::local(Some("person/example")).unwrap();
         let origin = super::super::managed_session_owner_at(
             &follower.store,
@@ -15418,7 +15894,7 @@ mission "example/zero-run" state="ready" {
         }
         let _cleanup = Cleanup(runtime.clone());
         let pty_root = state.pty_root.clone();
-        let output = tokio::task::spawn_blocking(move || std::process::Command::new(pty)
+        let output = crate::api::read_deadline::spawn_blocking(move || std::process::Command::new(pty)
             .env("PTY_ROOT", pty_root)
             .args(["run", "-d", "--force", "--id", "fence-test", "--tag", "keep=true", "--", "/bin/sh", "-c", "stty -echo; printf ready; while IFS= read -r line; do printf '\\r\\naccepted:%s' \"$line\"; done"])
             .output().unwrap()).await.unwrap();
@@ -15928,6 +16404,12 @@ mission "example/zero-run" state="ready" {
             .unwrap();
         let status = follower.store.status(Some(subject)).unwrap();
         assert_eq!(status.subjects[0].reachability, "reachable");
+        let session = ClientSession::local(Some("person/alex")).unwrap();
+        let snapshot = new_client_snapshot(&follower);
+        assert_eq!(
+            terminal_resources_for_owner(&follower, true, &snapshot, &session, Some(subject)).unwrap(),
+            runtime_resources_for_owner(&follower, true, &snapshot, &session, Some(subject)).unwrap(),
+        );
         let live = remote_terminal_live_session(&follower, subject, "same-runtime-id:i1")
             .unwrap_or_else(|error| panic!("{}: {}", error.code, error.message));
         assert_eq!(live.owner_host_id, "host/owner-node");
@@ -16139,6 +16621,11 @@ mission "example/zero-run" state="ready" {
         assert_eq!(indeterminate["state"], "unreachable");
         assert_eq!(indeterminate["terminal_access"]["read"], "unavailable");
         assert_eq!(indeterminate["operational"]["actionable"], false);
+        let snapshot = new_client_snapshot(&owner);
+        let lean = terminal_resources_for_owner(&owner, true, &snapshot, &session, Some(subject)).unwrap();
+        assert_eq!(lean, runtime_resources_for_owner(&owner, true, &snapshot, &session, Some(subject)).unwrap());
+        assert_eq!(lean[0]["state"], "unreachable");
+        assert_eq!(lean[0]["terminal_access"]["read"], "unavailable");
     }
     #[test]
     fn status_freshness_uses_cached_card_time_without_resetting_since() {

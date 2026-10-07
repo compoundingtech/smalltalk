@@ -1959,7 +1959,7 @@ async fn cli_missions_publish_cancel_outcome_retire_and_work_leases_survive_rest
     );
     let run = daemon
         .store()
-        .mission_run("coverage-cli-run")
+        .mission_run("example/cli-work/coverage-cli-run")
         .unwrap()
         .unwrap();
     let step = &run.steps[0].subject;

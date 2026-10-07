@@ -1973,6 +1973,144 @@ async fn a_frozen_member_is_not_reported_up() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn leave_drains_the_refusal_settings_writer_before_removing_its_directory() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    refusal_settings_writer_across_leave("loaded").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_refusal_settings_writer_cannot_recreate_a_fleet_after_leave() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    refusal_settings_writer_across_leave("before-lock").await;
+}
+
+async fn refusal_settings_writer_across_leave(stage: &str) {
+    let root = tempfile::tempdir().unwrap();
+    let a = anchor(root.path(), "alder").await;
+    let mut b = joined(root.path(), &a, "birch", &[]).await;
+    b.wait_listening().await;
+    b.stop_worker();
+    let barrier = root.path().join("refusal-writer");
+    fs::create_dir(&barrier).unwrap();
+    fs::write(barrier.join("stage"), stage).unwrap();
+    b.env.push((
+        "ST3_TEST_REMOVAL_WRITE_BARRIER".into(),
+        barrier.to_str().unwrap().into(),
+    ));
+    // Write the durable leave, then let the real worker receive the peer's signed refusal.
+    for step in ["begin", "claim"] {
+        let _: Value = b
+            .client()
+            .post(
+                &format!("/v1/internal/fleet/leave/{step}"),
+                &json!({"person": PERSON}),
+            )
+            .await
+            .unwrap();
+    }
+    b.start_worker();
+    wait_until("the refusal writer reaches its barrier", 20, || async {
+        barrier.join("entered").exists()
+    })
+    .await;
+    assert_eq!(
+        fs::read_to_string(barrier.join("entered")).unwrap(),
+        b.worker.as_ref().unwrap().id().to_string(),
+        "the barrier must belong to this node's replication-worker"
+    );
+    // Offline finalization exercises the same cleanup without requiring the paused writer
+    // to publish its refusal as the online acknowledgement. The leave claim already exists.
+    let mut leave = b
+        .command(&[
+            "fleet",
+            "leave",
+            "--offline",
+            "--no-service",
+            "--wait",
+            "60s",
+            "--as",
+            PERSON,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_until("leave reaches settings cleanup", 20, || async {
+        b.state_dir().join("left-fleet.json").exists()
+    })
+    .await;
+    if stage == "before-lock" {
+        // Cleanup wins ownership while the signed refusal is pending. Resume the real
+        // writer only after leave succeeds: it must reload rather than recreate settings.
+        wait_until(
+            "leave finishes before the pending refusal writer",
+            20,
+            || {
+                let exited = leave.try_wait().unwrap().is_some();
+                async move { exited }
+            },
+        )
+        .await;
+        assert!(!b.state_dir().join("fleet").exists());
+    } else {
+        // An in-flight settings writer owns the directory until both renames finish.
+        // No service manager stops it on the CLI's behalf.
+        wait_until(
+            "the leave CLI contends with the active settings writer",
+            20,
+            || async { barrier.join("contended").exists() },
+        )
+        .await;
+        assert_eq!(
+            fs::read_to_string(barrier.join("contended")).unwrap(),
+            leave.id().to_string()
+        );
+    }
+    let completed_before_release = leave.try_wait().unwrap().is_some();
+    fs::write(barrier.join("release"), b"continue").unwrap();
+    wait_until("the refusal settings write finishes", 20, || async {
+        barrier.join("finished").exists()
+    })
+    .await;
+    wait_until("leave exits after the writer drains", 20, || {
+        let exited = leave.try_wait().unwrap().is_some();
+        async move { exited }
+    })
+    .await;
+    let output = leave.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        b.logs()
+    );
+    assert!(
+        !b.state_dir().join("fleet").exists(),
+        "the replication-worker recreated fleet settings after successful leave (completed before release: {completed_before_release})"
+    );
+    assert_eq!(
+        completed_before_release,
+        stage == "before-lock",
+        "leave must wait only for a writer that already owns the settings"
+    );
+    assert!(b.worker.as_mut().unwrap().try_wait().unwrap().is_none());
+    assert!(
+        a.claims()
+            .await
+            .iter()
+            .any(|claim| claim["subject"] == "host/birch" && claim["kind"] == "fleet.member-left")
+    );
+    b.note("local-after-refusal-drained").await;
+    b.restart().await;
+    assert!(!b.state_dir().join("fleet").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn leave_drains_everything_before_it_leaves() {
     if st3::test_support::supervise_test() {
         return;

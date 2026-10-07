@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""Run the real stui headless, as a designated test client, for measuring what one attached
+client costs the daemon.
+
+    scripts/stui-test-client [--binary PATH] [--seconds N] [--label NAME] [--keys HEX_OR_TEXT ...]
+
+It starts the stui binary in a pseudo-terminal (no display), answers the terminal queries stui
+makes, sends any `--keys`, then leaves it idle for `--seconds` and quits it with Ctrl+Q. Everything
+a real stui does at idle happens: the three collection windows, the glasses window, the followed
+conversation of the selected agent, and its periodic reads (clients every 10 s, usage every
+60 s, machines and devices). The connection names itself `stui <version> [LABEL]` in the
+`x-st3-client` header, so `st clients` and a profile tell it from a person's stui. Identity is the
+caller's, as for any stui run from this account (`ST3_PERSON`, or the local default); a label is
+never authority. Prints only a few status lines, never terminal contents.
+
+`--keys` takes text sent as typed, with `\\x1b`, `\\r` and `\\x0b` (Ctrl+K) escapes understood,
+for example to open the palette and choose an agent: --keys '\\x0bstui\\r'.
+"""
+
+import argparse
+import fcntl
+import os
+import pty
+import select
+import signal
+import struct
+import subprocess
+import termios
+import time
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--binary", default="target/release/stui")
+    parser.add_argument("--seconds", type=float, default=180)
+    parser.add_argument("--label", default="measure")
+    parser.add_argument("--rows", type=int, default=50)
+    parser.add_argument("--columns", type=int, default=160)
+    parser.add_argument("--keys", action="append", default=[])
+    parser.add_argument("--timing", help="append JSON lines of this client's request and frame timings (routes, statuses, sizes, durations; never contents)")
+    arguments = parser.parse_args()
+
+    master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", arguments.rows, arguments.columns, 0, 0))
+    env = os.environ.copy()
+    env["TERM"] = "xterm-256color"
+    env["STUI_CLIENT_LABEL"] = arguments.label
+    env.pop("ST_AGENT", None)
+    if arguments.timing:
+        env["STUI_TIMING_LOG"] = arguments.timing
+    process = subprocess.Popen([arguments.binary], stdin=slave, stdout=slave, stderr=slave, env=env)
+    os.close(slave)
+    received = 0
+
+    def pump(seconds: float) -> None:
+        nonlocal received
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline and process.poll() is None:
+            ready, _, _ = select.select([master], [], [], 0.2)
+            if not ready:
+                continue
+            try:
+                chunk = os.read(master, 65536)
+            except OSError:
+                return
+            received += len(chunk)
+            if b"\x1b[c" in chunk:
+                os.write(master, b"\x1b[?62;c")
+
+    try:
+        pump(5)
+        for keys in arguments.keys:
+            os.write(master, keys.encode().decode("unicode_escape").encode("latin-1"))
+            pump(1.5)
+        print(f"test client up: pid {process.pid}, label {arguments.label!r}, idle for {arguments.seconds:g}s", flush=True)
+        pump(arguments.seconds)
+        if process.poll() is None:
+            os.write(master, b"\x11")  # Ctrl+Q
+            pump(3)
+    finally:
+        if process.poll() is None:
+            process.send_signal(signal.SIGTERM)
+            try:
+                process.wait(5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        os.close(master)
+    print(f"test client done: exit {process.returncode}, {received} bytes drawn", flush=True)
+
+
+main()

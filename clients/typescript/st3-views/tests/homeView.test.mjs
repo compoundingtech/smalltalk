@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { homeRows, homeSections, onHome } from '@smalltalk/st3-views/homeView';
+import { homeRows, homeSections, keepClosed, onHome } from '@smalltalk/st3-views/homeView';
 
 const now = Date.parse('2026-09-30T12:00:00Z');
 const item = (id, attention_kind, extra = {}) => ({ id: `attention/${id}`, kind: 'attention', attention_kind, title: id, detail: '', priority: 'normal', state: 'open', person_id: 'person/alex', requested_at: '2026-09-30T11:00:00Z', source_id: 'x', actions: [], ...extra });
@@ -43,3 +43,30 @@ assert.deepEqual(homeSections(withUpdate).map(section => section.title), ['someb
 
 // Renderers choose actual colors; the shared model describes their meaning.
 assert.deepEqual(withUpdate.map(row => row.color), ['person', 'green']);
+
+// Nothing leaves Home by itself: an item st closes (or resolves) while it is shown stays, marked.
+{
+  const open = id => ({ id, state: 'open', attention_kind: 'person-step', actions: ['work.done'], title: id, requested_at: '2026-10-07T07:00:00Z', update: { summary: 'x', about: 'y' } });
+  const first = [open('attention/a'), open('attention/b'), open('attention/c')];
+  // a is gone, b is resolved, c was answered here.
+  const next = [{ ...open('attention/b'), state: 'resolved' }];
+  const kept = keepClosed(first, next, new Set(['attention/c']));
+  assert.deepEqual(kept.map(item => item.id).sort(), ['attention/a', 'attention/b']);
+  assert.ok(kept.every(item => item.closedElsewhere && item.actions.length === 0));
+  const rows = homeRows(kept, undefined, Date.parse('2026-10-07T07:05:00Z'));
+  assert.equal(rows.length, 2, 'a resolved copy is replaced by the open one that was shown');
+  assert.match(rows[0].waiting, /closed; stays/);
+  const sections = homeSections(homeRows([open('attention/open'), ...kept], undefined, Date.parse('2026-10-07T07:05:00Z')));
+  assert.deepEqual(sections.map(section => [section.title, section.count]), [['when there is time', 1], ['Recently closed: clear each', 2]], 'closed items have a section of their own');
+  // Again, with the marked ones as the previous list: they stay.
+  assert.equal(keepClosed(kept, next, new Set()).length, 2);
+  // An item that was never open on Home is not invented.
+  assert.deepEqual(keepClosed([{ ...open('attention/z'), state: 'resolved' }], [], new Set()), []);
+  // Only the latest five stay listed; the oldest drops first.
+  const all = [0, 1, 2, 3, 4, 5, 6, 7].map(n => open(`attention/${n}`));
+  let list = all;
+  for (let n = 0; n < 7; n++) list = keepClosed(list, all.slice(n + 1), new Set());
+  assert.deepEqual(list.filter(item => item.closedElsewhere).map(item => item.id).sort(), ['attention/2', 'attention/3', 'attention/4', 'attention/5', 'attention/6']);
+  // An item that comes back open loses its mark.
+  assert.equal(keepClosed(kept, [open('attention/a')], new Set()).find(item => item.id === 'attention/a').closedElsewhere, undefined);
+}

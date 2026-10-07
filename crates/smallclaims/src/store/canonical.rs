@@ -111,12 +111,17 @@ pub fn claim_key(connection: &Connection, id: &str) -> Result<ClaimKey> {
             claims.batch_id, {position}, claims.id FROM claims JOIN batches ON batches.id=claims.batch_id
             WHERE claims.id=?1")
     });
-    let (time, writer, sequence, batch, position, id) = connection.prepare_cached(&QUERY)?
-        .query_row([id], |row| Ok((
-            row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, u64>(2)?,
-            row.get::<_, String>(3)?, row.get::<_, u64>(4)?, row.get::<_, String>(5)?,
-        )),
-    )?;
+    let (time, writer, sequence, batch, position, id) =
+        connection.prepare_cached(&QUERY)?.query_row([id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, u64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, u64>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?;
     Ok((time.parse()?, writer, sequence, batch, position, id))
 }
 
@@ -132,11 +137,16 @@ fn claim_keys_preserve_numeric_time_and_record_or_legacy_position_order() {
          INSERT INTO claims VALUES ('a', 'batch', '10', 3), ('b', 'batch', '9', 2), ('c', 'batch', '10', 1);
          INSERT INTO replica_records VALUES ('b', 8), ('b', 4);"
     ).unwrap();
-    let mut keys: Vec<_> = ["a", "b", "c"].map(|id| claim_key(&connection, id).unwrap()).into();
+    let mut keys: Vec<_> = ["a", "b", "c"]
+        .map(|id| claim_key(&connection, id).unwrap())
+        .into();
     keys.sort();
-    assert_eq!(keys, vec![
-        (9, "writer".into(), 2, "batch".into(), 4, "b".into()),
-        (10, "writer".into(), 2, "batch".into(), 0, "c".into()),
-        (10, "writer".into(), 2, "batch".into(), 2, "a".into()),
-    ]);
+    assert_eq!(
+        keys,
+        vec![
+            (9, "writer".into(), 2, "batch".into(), 4, "b".into()),
+            (10, "writer".into(), 2, "batch".into(), 0, "c".into()),
+            (10, "writer".into(), 2, "batch".into(), 2, "a".into()),
+        ]
+    );
 }

@@ -39,6 +39,8 @@ use crate::sqlite::{
 #[cfg(test)]
 mod projection_busy_tests;
 mod binary_payloads;
+pub mod events;
+pub mod idempotency;
 mod inventory_generation;
 pub use binary_payloads::PayloadConversion;
 pub mod canonical;
@@ -201,11 +203,12 @@ fn projection_failure_log_line(
         "error": bounded(message, 4096), "error_truncated": message.chars().take(4097).count()>4096,
         "stage": field("projection_stage"), "claim_id": field("projection_claim_id"),
         "subject": field("projection_subject"), "operation_id": field("projection_operation_id"),
+        "claim_kind": field("projection_claim_kind"),
         "frontier": if details.get("projection_frontier_unknown").and_then(Value::as_bool).unwrap_or(false) { None } else { Some(frontier) }, "target": target,
         "suppressed_errors": emission.suppressed, "rate_bucket_overflow": emission.overflow,
         "context_truncated": details.get("projection_context_truncated").and_then(Value::as_bool).unwrap_or(false)
             || phase.chars().take(129).count()>128 || code.chars().take(129).count()>128
-            || ["projection_stage", "projection_claim_id", "projection_subject", "projection_operation_id"].iter()
+            || ["projection_stage", "projection_claim_id", "projection_subject", "projection_operation_id", "projection_claim_kind"].iter()
                 .any(|name| details.get(*name).and_then(Value::as_str).is_some_and(|value| value.chars().take(257).count()>256)),
     });
     format!("st: projection failure detail {diagnostic}")
@@ -360,6 +363,7 @@ mod projection_failure_diagnostic_tests {
         let details = serde_json::Map::from_iter([
             ("projection_claim_id".into(), json!("claim")),
             ("projection_subject".into(), json!("subject\nnext")),
+            ("projection_claim_kind".into(), json!(format!("work.\"\n{}", "é".repeat(300)))),
             ("secret-payload".into(), json!("never copy")),
         ]);
         let line = projection_failure_log_line(
@@ -379,6 +383,9 @@ mod projection_failure_diagnostic_tests {
         assert_eq!(value["error_truncated"], true);
         assert_eq!(value["claim_id"], "claim");
         assert_eq!(value["subject"], "subject\nnext");
+        assert_eq!(value["claim_kind"].as_str().unwrap().chars().count(), 256);
+        assert!(value["claim_kind"].as_str().unwrap().starts_with("work.\"\n"));
+        assert_eq!(value["context_truncated"], true);
         assert_eq!(value["operation_id"], Value::Null);
         assert!(!line.contains("never copy"));
         let short = projection_failure_log_line(
@@ -502,13 +509,6 @@ CREATE INDEX IF NOT EXISTS documents_hash_index ON documents(hash);
 CREATE TABLE IF NOT EXISTS idempotency (
     operation_id TEXT PRIMARY KEY,
     response TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS events (
-    store_index INTEGER PRIMARY KEY,
-    kind TEXT NOT NULL,
-    subject TEXT NOT NULL,
-    body TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS peer_cursors (
@@ -683,7 +683,7 @@ ON checkpoint_claims(operation_id) WHERE operation_id IS NOT NULL;
 "#;
 
 /// The store's schema version, set once the graph's and the runtime's tables exist.
-pub const SCHEMA_VERSION: &str = "PRAGMA user_version = 16;";
+pub const SCHEMA_VERSION: &str = "PRAGMA user_version = 17;";
 
 /// The graph half of a store. A runtime's store wraps it and derefs to it, so the runtime's
 /// projections read and write through the same connections.
@@ -850,13 +850,15 @@ impl Store {
         runtime.migrate_schema(connection)?;
         connection.execute_batch(SCHEMA)?;
         connection.execute_batch(&fleet_generation_schema())?;
+        idempotency::initialize(connection)?;
+        events::initialize(connection)?;
         inventory_generation::initialize(connection)?;
         connection.execute_batch(principals::PRINCIPAL_SCHEMA)?;
         runtime.create_schema(connection)?;
         // Reassigning user_version dirties the database header even when it is unchanged.
         // Upgrade once, then let ordinary reopens avoid that write and its durable commit.
         let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version != 16 {
+        if version != 17 {
             connection.execute_batch(SCHEMA_VERSION)?;
         }
         document_index::initialize(connection)?;
@@ -1453,11 +1455,11 @@ pub fn reject_old_schema(connection: &Connection) -> Result<()> {
         |row| row.get(0),
     )?;
     anyhow::ensure!(
-        table_count == 0 || matches!(version, 10..=16),
+        table_count == 0 || matches!(version, 10..=17),
         "this database uses an unsupported st schema; start with a new state directory"
     );
     anyhow::ensure!(
-        matches!(version, 0 | 10 | 11 | 12 | 13 | 14 | 15 | 16),
+        matches!(version, 0 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17),
         "this database uses unsupported st schema version {version}"
     );
     Ok(())
@@ -1602,6 +1604,9 @@ pub fn selected_index(current: u64, requested: Option<u64>) -> Result<u64, St3Er
 }
 
 pub fn claim_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClaimRecord> {
+    if crate::read_budget::check().is_err() {
+        return Err(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_INTERRUPT), None));
+    }
     let body = row.get::<_, String>(7)?;
     let predecessors = row.get::<_, String>(8)?;
     let accepted = row.get::<_, String>(9)?;
@@ -4770,23 +4775,25 @@ impl Store {
         appended
     }
 
+    #[track_caller]
     pub fn read_snapshot<T>(&self, read: impl FnOnce(u64) -> Result<T>) -> Result<T> {
         let key = self.readers.key();
         if PINNED_READER.with(|slot| slot.borrow().as_ref().is_some_and(|(pool, _)| *pool == key)) {
             let index = current_index(&self.readers.get())?;
             return read(index);
         }
+        // The snapshot's own entry: the guard below is lent out and dropped at once.
+        let _live = crate::sqlite::register_live_read(true);
         let mut guard = self.readers.get();
         // Declared first so it drops last: on every exit it ends the transaction, releases the
         // pin, and returns the connection to the pool.
         let pinned = PinnedRead {
             pool: &self.readers,
-            connection: Some(Rc::new(
-                guard
-                    .connection
-                    .take()
-                    .expect("an unpinned read guard holds a pooled connection"),
-            )),
+            previous: PINNED_READER.with(|slot| slot.borrow_mut().take()),
+            connection: Some(match guard.connection.take() {
+                Some(connection) => Rc::new(connection),
+                None => guard.pinned.take().expect("a request loan holds its connection"),
+            }),
         };
         drop(guard);
         let connection = pinned
@@ -4798,6 +4805,47 @@ impl Store {
         let index = current_index(&connection)?;
         PINNED_READER.with(|slot| *slot.borrow_mut() = Some((key, connection)));
         read(index)
+    }
+
+    /// Move one bounded chunk of old event payloads to the position index.
+    pub fn migrate_event_payloads(&self) -> Result<usize> {
+        // Maintenance owns one bounded transaction. Lending preserves numeric SQLite errors
+        // from BEGIN and COMMIT too; the batched API reports outer failures as strings.
+        let mut writer = self.connection.write();
+        let transaction = writer.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let moved = events::migrate_chunk_tx(&transaction)?;
+        transaction.commit()?;
+        Ok(moved)
+    }
+
+    /// The oldest new receipt's expiry deadline for the cleanup scheduler.
+    pub fn next_idempotency_expiry(&self) -> Result<Option<i64>> {
+        idempotency::next_expiry(&self.readers.get())
+    }
+
+    pub fn idempotency_clock_limit(&self) -> Result<Option<i64>> {
+        idempotency::clock_limit(&self.readers.get())
+    }
+
+    /// Remove one indexed chunk of expired local responses. Claims, operations, and checkpoint
+    /// tombstones are unaffected. A live runtime generation extends the response's window.
+    pub fn cleanup_idempotency(&self, now_unix_ms: i64) -> Result<idempotency::Cleanup> {
+        let mut writer = self.connection.write();
+        let transaction = writer.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let Some(clock_limit) = idempotency::clock_limit(&transaction)? else {
+            return Ok(idempotency::Cleanup::default());
+        };
+        let cleaned = idempotency::cleanup_tx(
+            &transaction,
+            now_unix_ms.min(clock_limit),
+            idempotency::CLEANUP_CHUNK,
+            |connection, response| {
+                self.runtime
+                    .idempotency_response_in_use(connection, response)
+            },
+        )?;
+        transaction.commit()?;
+        Ok(cleaned)
     }
 
     pub fn put_document(
@@ -4844,6 +4892,24 @@ impl Store {
                 {
                     return serde_json::from_str(&response).map_err(internal);
                 }
+                if let Some(claim_id) = idempotency::original_claim(transaction, idempotency_key).map_err(internal)? {
+                    let original = transaction.query_row(
+                        "SELECT id,store_index,batch_id,subject,kind,origin,actor,body,predecessors,accepted_at_unix_ms
+                         FROM claims WHERE id=?1 AND kind='doc.bound'", [&claim_id], claim_from_row,
+                    ).optional().map_err(internal)?;
+                    if let Some(record) = original {
+                        return Ok(DocumentVersion {
+                            name: record.body["name"].as_str().ok_or_else(|| St3Error::new("internal","document claim has no name"))?.into(),
+                            hash: record.body["hash"].as_str().ok_or_else(|| St3Error::new("internal","document claim has no hash"))?.into(),
+                            size: record.body["size"].as_u64().ok_or_else(|| St3Error::new("internal","document claim has no size"))?,
+                            created_index: record.store_index, latest: true,
+                            binding_claim_id: record.id, created_at_unix_ms: record.accepted_at_unix_ms,
+                            owner: record.actor.or(Some(record.origin)),
+                        });
+                    }
+                    return Err(St3Error::new("idempotency-key-expired","this request was already committed and its claim was checkpointed")
+                        .with_detail("idempotency_key",idempotency_key.to_owned()).with_detail("claim_id",claim_id));
+                }
                 if let Some(version) = find_document(transaction, name, &hash).map_err(internal)? {
                     return Ok(version);
                 }
@@ -4873,7 +4939,8 @@ impl Store {
                     principals::rules_gate_tx(transaction, &self.origin, writer, "doc.bound", name)
                         .map_err(crate::error::typed)?;
                 }
-                let body = json!({ "name": name, "hash": hash, "size": bytes.len() });
+                let mut body = json!({ "name": name, "hash": hash, "size": bytes.len() });
+                idempotency::attach(&mut body, idempotency_key).map_err(internal)?;
                 let record = self.runtime.append_claim_tx(
                     transaction,
                     &self.origin,
@@ -4885,6 +4952,7 @@ impl Store {
                     None,
                 )
                 .map_err(internal)?;
+                register_operation_tx(transaction, &record).map_err(internal)?;
                 select_replicated_document(transaction, &record, record.store_index)?;
                 self.runtime.after_projection(transaction)?;
                 let version = DocumentVersion {
@@ -7604,16 +7672,20 @@ pub fn checkpointed_operation_outcome(
     .with_detail("claim_id", claim_id.clone()))
 }
 
+/// The claims every stored operation row must come from, in canonical order. The partial
+/// operation index names exactly the claims this scan keeps, so the audit walks it instead of
+/// evaluating json_extract over every claim in the store.
+pub const EXPECTED_OPERATIONS_QUERY: &str =
+    "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
+     FROM claims INDEXED BY claims_operation_index
+     WHERE json_extract(body, '$._operation.id') IS NOT NULL
+       AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=claims.id)
+     ORDER BY id";
+
 pub fn expected_operations(
     connection: &Connection,
 ) -> Result<BTreeMap<String, (String, String, String)>> {
-    let mut statement = connection.prepare(
-        "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
-         FROM claims
-         WHERE json_extract(body, '$._operation.id') IS NOT NULL
-           AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=claims.id)
-         ORDER BY id",
-    )?;
+    let mut statement = connection.prepare(EXPECTED_OPERATIONS_QUERY)?;
     let claims = statement
         .query_map([], claim_from_row)?
         .collect::<Result<Vec<_>, _>>()?;
