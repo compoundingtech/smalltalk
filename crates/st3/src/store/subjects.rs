@@ -147,32 +147,60 @@ impl Store {
         let (lower, upper) = family_bounds(family, ref_prefix);
         let connection = self.readers.get();
         let local_cutoff = native_sources::local_cutoff(&connection, fence)?;
-        let (actor_scope, actor) = recorded_actor.map_or((0, ""), |actor| (1, actor));
-        let mut statement = connection.prepare_cached(
-            "SELECT subject FROM (
-               SELECT subject FROM (SELECT subject FROM native_source_ranges_v2 NOT INDEXED
-               WHERE source=0 AND actor_scope=?6 AND actor=?7 AND kind=''
-                 AND level=16 AND node=0 AND subject>=?1 AND subject<?2
-                 AND (?3 IS NULL OR subject>?3) AND first_position<=?4
-               ORDER BY subject LIMIT ?8)
-               UNION
-               SELECT subject FROM (SELECT subject FROM native_source_ranges_v2 NOT INDEXED
-               WHERE source=1 AND actor_scope=?6 AND actor=?7 AND kind=''
-                 AND level=16 AND node=0 AND subject>=?1 AND subject<?2
-                 AND (?3 IS NULL OR subject>?3) AND first_position<=?5
-               ORDER BY subject LIMIT ?8)
-             ) ORDER BY subject LIMIT ?8",
-        )?;
+        let (seek, exclusive) = after_ref
+            .filter(|after| *after >= lower.as_str())
+            .map_or((lower.as_str(), false), |after| (after, true));
+        // MIN(subject) seeks one eligible row, then each recursive step skips
+        // that subject's entire history. Keep both seed comparisons static so
+        // an exclusive cursor does not scan all rows at its previous subject.
+        macro_rules! refs_sql {
+            ($comparison:literal) => {
+                concat!(
+                    "WITH RECURSIVE durable(subject) AS (
+                       SELECT MIN(record.subject) FROM claims record INDEXED BY native_claims_cover
+                       WHERE record.subject", $comparison, "?1 AND record.subject<?2
+                         AND record.store_index<=?3 AND (?5 IS NULL OR record.actor=?5)
+                         AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims repaired
+                                        WHERE repaired.id=record.id)
+                       UNION ALL
+                       SELECT (SELECT MIN(record.subject)
+                               FROM claims record INDEXED BY native_claims_cover
+                               WHERE record.subject>durable.subject AND record.subject<?2
+                                 AND record.store_index<=?3 AND (?5 IS NULL OR record.actor=?5)
+                                 AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims repaired
+                                                WHERE repaired.id=record.id))
+                       FROM durable WHERE subject IS NOT NULL LIMIT ?6
+                     ), local(subject) AS (
+                       SELECT MIN(record.subject)
+                       FROM local_observations record INDEXED BY native_local_cover
+                       WHERE record.subject", $comparison, "?1 AND record.subject<?2
+                         AND record.id<=?4 AND (?5 IS NULL OR record.actor=?5)
+                       UNION ALL
+                       SELECT (SELECT MIN(record.subject)
+                               FROM local_observations record INDEXED BY native_local_cover
+                               WHERE record.subject>local.subject AND record.subject<?2
+                                 AND record.id<=?4 AND (?5 IS NULL OR record.actor=?5))
+                       FROM local WHERE subject IS NOT NULL LIMIT ?6
+                     )
+                     SELECT subject FROM durable WHERE subject IS NOT NULL
+                     UNION SELECT subject FROM local WHERE subject IS NOT NULL
+                     ORDER BY subject LIMIT ?6"
+                )
+            };
+        }
+        let mut statement = connection.prepare_cached(if exclusive {
+            refs_sql!(">")
+        } else {
+            refs_sql!(">=")
+        })?;
         Ok(statement
             .query_map(
                 params![
-                    lower,
+                    seek,
                     upper,
-                    after_ref,
                     fence.graph_index,
                     local_cutoff,
-                    actor_scope,
-                    actor,
+                    recorded_actor,
                     sql_limit(limit)
                 ],
                 |row| row.get(0),
@@ -439,33 +467,23 @@ impl Store {
     ) -> Result<String> {
         let (lower, upper) = family_bounds(family, ref_prefix);
         let connection = self.readers.get();
-        let durable = native_sources::membership(
+        let durable = native_sources::family_count(
             &connection,
             0,
             fence.graph_index,
-            &native_sources::SourceSelection {
-                subject: None,
-                kind: None,
-                lower: &lower,
-                end: &upper,
-                recorded_actor,
-            },
-        )?
-        .count;
+            &lower,
+            &upper,
+            recorded_actor,
+        )?;
         let local_cutoff = native_sources::local_cutoff(&connection, fence)?;
-        let local = native_sources::membership(
+        let local = native_sources::family_count(
             &connection,
             1,
             local_cutoff,
-            &native_sources::SourceSelection {
-                subject: None,
-                kind: None,
-                lower: &lower,
-                end: &upper,
-                recorded_actor,
-            },
-        )?
-        .count;
+            &lower,
+            &upper,
+            recorded_actor,
+        )?;
         // Keyed like the per-subject fingerprint: counts include sources the cursor
         // holder cannot read, so they must not be guessable offline.
         keyed_canonical_hash(
@@ -800,11 +818,11 @@ mod tests {
     }
 
     #[test]
-    fn source_ranges_match_original_fenced_membership_and_cursor_hashes() {
+    fn source_indexes_match_original_fenced_membership_and_cursor_hashes() {
         let store = Store::open_memory("node").unwrap();
         let mut records = Vec::new();
         let mut fences = Vec::new();
-        // Cross radix-16 and radix-256 boundaries, keeping family cardinality fixed.
+        // Grow history while keeping family cardinality fixed and retaining old fences.
         for index in 0..270 {
             records.push(claim(
                 &store,
@@ -985,9 +1003,6 @@ mod tests {
         {
             let mut connection = store.connection.lock().unwrap();
             let transaction = connection.transaction().unwrap();
-            transaction
-                .execute("DELETE FROM meta WHERE key='native_source_ranges_v2'", [])
-                .unwrap();
             native_sources::open(&transaction).unwrap();
             transaction.commit().unwrap();
         }

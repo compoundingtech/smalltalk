@@ -59,7 +59,6 @@ fn every_persistent_table_has_a_projection_scope() {
         "agent_message_days",
         "local_agent_message_pending",
         "local_observations",
-        "native_source_ranges_v2",
         "local_blobs",
         "local_blob_uploads",
         "local_subscription_mission_deferrals",

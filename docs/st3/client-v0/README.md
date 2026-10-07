@@ -367,55 +367,48 @@ Use the native `subjects` collection for bounded current windows, described in
 
 #### Native source cost and retention
 
-The native family read model is host-local derived state, not an authorization cache. The
-claim tables remain authoritative; every candidate still passes the existing identity,
-audience, field-disclosure, and canonical-head policies in one pinned SQLite read snapshot.
+Native source discovery reads admitted claims and local observations directly, not an
+authorization cache. Every candidate still passes the existing identity, audience,
+field-disclosure, and canonical-head policies in one pinned SQLite read snapshot.
 
-The original family query bounded its output but not its work: `DISTINCT subject` walked
-every claim of the selected family, and the continuation fingerprint counted that same
-history. The cost probe for `GET /v1/client/subjects?family=agent&limit=20` reported
-116,908 → 443,091 SQLite VM steps as retained claims grew from 2,406 → 23,785, while
-answer bytes grew only from 30,128 → 36,113. Limiting the result or waiving the cost gate
-would not fix those history-linear reads.
+Covering source indexes contain only the subject, source position, claim ID, kind,
+recorded actor, and local graph position needed by discovery and retention checks.
+Family enumeration uses successive indexed `MIN(subject)` seeks rather than walking
+every historical row to deduplicate a bounded page. Each source independently limits
+its candidates before the ordered merge. Exclusive continuation seeks skip the previous
+subject's whole history; old fences still select only eligible retained source rows.
 
-`native_source_ranges_v2` maintains radix-16 retained-source counts and extrema for
-each subject, source, kind selector, and recorded-actor selector. Family enumeration seeks
-one root row per subject in each source, then merges independently bounded candidate
-pages. Current-fence fingerprints read root aggregates; older fences decompose into at
-most fifteen ranges of at most fifteen complete radix nodes plus a primary-position seek
-over at most fifteen uncached source rows. Read work depends on selected subject
-cardinality and bounded range nodes, not claims per subject.
+Family fingerprints need counts, not extrema. Their claim count subtracts matching
+repair markers from the covering source count instead of probing the repair table once
+per claim. Only retained claims matching the literal family/prefix range, source fence,
+and recorded actor are subtracted; absent or out-of-selector repairs contribute nothing.
+Per-subject fingerprints retain their original count and extrema semantics.
 
-Normal appends update only the root's two or three selector rows, rather than every
-ancestor of each source position. Crossing a sixteen-position boundary seals the previous
-block from at most sixteen source rows; crossing larger radix boundaries combines at most
-sixteen completed child nodes, bottom-up. An outer boundary gate runs before any child
-seek, so an uncrossed level never scans its partial block. Sparse positions and pruning
-do not require filling gaps. The source log's indexed greatest position supplies the frontier,
-so there is no separately written high-water cache. Historical readmission updates completed ancestors;
-removals correct existing ancestors and recompute extrema only when a boundary is removed.
-Grouped source reads backfill only populated closed levels and the root once on open.
+No source aggregate or aggregate-maintenance trigger remains. Source writes pay for
+ordinary index maintenance, not root/ancestor UPSERTs or block sealing. The remaining
+family count work grows with matching source rows and repair markers; this design does
+not claim history-independent fingerprint cost. Both the unchanged daemon cost probe
+and cold store generation remain the end-to-end performance gates.
 
-Append, checkpoint deletion, local retention deletion, and repair admission changes update
-the model in the same source transaction, so pruning or repairing an unseen ref below an
-original fence expires its continuation. Later appends, deletions above either fence, and
-mutations outside the selected literal prefix or recorded actor do not expire it. Local
-observation IDs order their nondecreasing `after_store_index`: writes capture the graph's
-committed high water under the writer lock, and checkpoint pruning cannot decrease that
-watermark. An indexed graph-position seek therefore intersects the local ID and graph
-fences exactly before reading the local range aggregates.
+Pruning or repairing an unseen ref below an original fence expires its continuation.
+Later appends, deletions above either fence, and mutations outside the selected literal
+prefix or recorded actor do not expire it. Local observation IDs order their
+nondecreasing `after_store_index`: writes capture the graph's committed high water under
+the writer lock, and checkpoint pruning cannot decrease that watermark. An indexed
+graph-position seek intersects the local ID and graph fences exactly.
 
-The fingerprint still hashes the original selector/fence-specific retained counts and
-extrema over the existing v1 encoding, keyed with a per-store HMAC secret created when
-projections open: a cursor holder cannot enumerate small count spaces offline to recover
-retained membership it cannot read, and rebuilding the read model alone does not invalidate
-an otherwise usable cursor. No request cache, global invalidation generation, replicated
-projection digest, or public source count is introduced. Source-contract tests compare
-the aggregates and cursor hashes with direct fenced source queries across radix
-boundaries, sparse integer positions, pruning, repair/readmission, and rebuild. Main-shaped
-stores and the predecessor cache both rebuild transactionally to the same model as a fresh
-store while retaining the fingerprint secret. The unchanged daemon cost probe remains the
-end-to-end read-performance gate.
+Fingerprints preserve the original selector/fence-specific v1 encoding, keyed with the
+per-store HMAC secret: a cursor holder cannot enumerate small count spaces offline to
+recover retained membership it cannot read. Opening a main-shaped store creates the
+indexes and secret transactionally. Opening either unmerged aggregate-cache version
+drops its derived tables/triggers and creates the indexes while retaining authoritative
+source rows and the secret. Reopening or index creation alone does not invalidate an
+otherwise usable cursor. No request cache, global invalidation generation, replicated
+projection digest, or public source count is introduced.
+
+Source-contract tests compare indexed membership and cursor hashes with direct fenced
+source queries across sparse integer positions, pruning, repair/readmission, and reopen.
+Cutover tests cover main-shaped stores and both predecessor cache versions.
 
 
 ### Applied subject definitions
