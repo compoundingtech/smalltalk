@@ -13142,6 +13142,9 @@ async fn sekrets_node(State(state): State<AppState>) -> Result<Json<Value>, ApiE
 #[derive(Deserialize)]
 struct SekretsAttestRequest {
     nonce: String,
+    /// Vouch for the caller's parent: the `sekrets` command asks through an `st` it runs.
+    #[serde(default)]
+    for_parent: bool,
 }
 
 /// Sign which seat the calling process is, for the sekrets gateway. Only over the local socket,
@@ -13158,11 +13161,21 @@ async fn sekrets_attest(
         )));
     };
     tokio::task::spawn_blocking(move || {
+        let pid = if request.for_parent {
+            crate::sekrets::daemon::parent_pid(peer.pid).ok_or_else(|| {
+                St3Error::new(
+                    "sekrets-attestation-refused",
+                    format!("cannot read the parent of process {}", peer.pid),
+                )
+            })?
+        } else {
+            peer.pid
+        };
         crate::sekrets::daemon::attest(
             &state.store,
             &state.node,
             &state.pty_root,
-            peer.pid,
+            pid,
             peer.ancestor.as_deref(),
             &request.nonce,
         )

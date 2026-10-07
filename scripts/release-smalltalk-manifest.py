@@ -16,7 +16,7 @@ for target in targets:
         assert record['target'] == target, 'wrong target in archive'
         link = archive.getmember(f'{package}/bin/st')
         assert link.issym() and link.linkname == 'st3', 'st must be a relative st3 symlink'
-        for binary in ('st3', 'stui', 'st3-migrate', 'pty'):
+        for binary in ('st3', 'stui', 'st3-migrate', 'sekrets', 'pty'):
             member = archive.getmember(f'{package}/bin/{binary}')
             assert member.isfile() and member.mode & 0o111, f'missing executable: {binary}'
         for installer in ('install.sh', 'install-macos.py'):

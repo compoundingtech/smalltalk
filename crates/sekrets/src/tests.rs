@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
-use smallclaims::fleet::MemberKey;
+use crate::keys::Signer as MemberKey;
 
 use super::client::{Connection, Streams};
 use super::gateway::{Gateway, GatewayConfig, Kernel};
@@ -1060,7 +1060,7 @@ fn api_server() -> (String, Arc<Mutex<Vec<String>>>) {
 
 #[test]
 fn a_nodes_st_makes_api_requests_with_a_token_it_never_holds() {
-    use super::authorized::{AuthorizedError, AuthorizedRequest, request_from_cgroup};
+    use super::authorized::{AuthorizedError, AuthorizedRequest, HostIdentity, request_from_cgroup};
     let (api, seen) = api_server();
     let fixture = Fixture::with_github(&api);
     fixture
@@ -1078,18 +1078,15 @@ fn a_nodes_st_makes_api_requests_with_a_token_it_never_holds() {
             value: "example-token".into(),
         })
         .unwrap();
-    // This node's st: its config, and the node key the person registered.
-    let state = tempfile::tempdir().unwrap();
-    let config = crate::config::Config {
-        state_dir: state.path().to_path_buf(),
-        node: "example".into(),
-        person: Some("person/ada".into()),
-        ..crate::config::Config::default()
+    // This node's st: its name, its person, and the node key the person registered.
+    let (key, document) = MemberKey::generate().unwrap();
+    let identity = || {
+        Ok(HostIdentity {
+            node: "example".into(),
+            person: "person/ada".into(),
+            key: MemberKey::from_pkcs8(&document).map_err(|error| error.to_string())?,
+        })
     };
-    let key = MemberKey::load_or_create(
-        &crate::fleet::join::key_directory(state.path()).join("node.key"),
-    )
-    .unwrap();
     fixture
         .manage(Request::Register {
             node: "host/example".into(),
@@ -1109,7 +1106,7 @@ fn a_nodes_st_makes_api_requests_with_a_token_it_never_holds() {
     let call = |request: &AuthorizedRequest| {
         request_from_cgroup(
             &fixture.socket,
-            &config,
+            identity,
             "ada/daemon-gh",
             request,
             fixture.seat_cgroup(),
@@ -1185,12 +1182,9 @@ fn a_nodes_st_makes_api_requests_with_a_token_it_never_holds() {
         );
     }
     // A node with no key cannot call at all.
-    let other_state = tempfile::tempdir().unwrap();
-    let mut stranger = config.clone();
-    stranger.state_dir = other_state.path().to_path_buf();
     let unavailable = request_from_cgroup(
         &fixture.socket,
-        &stranger,
+        || Err("this node has no key".into()),
         "ada/daemon-gh",
         &request(&format!("{api}/repos/example/web"), &[]),
         fixture.seat_cgroup(),

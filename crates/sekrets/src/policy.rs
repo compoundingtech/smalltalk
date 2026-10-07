@@ -6,7 +6,7 @@
 //! create`) match no allow prefix unless one names them. A deny rule with options denies only
 //! when one of those options appears after its prefix. A deny rule's file options are allowed
 //! only when the file they name is the caller's standard input (`-`) or a file the caller passed
-//! (`/dev/fd/N`, which `st sekrets` makes from a path the caller can read): a command run with a
+//! (`/dev/fd/N`, which `sekrets` makes from a path the caller can read): a command run with a
 //! profile must never read a file of the sekrets user's, such as the profile's own login, into
 //! what it sends (`gh pr create --body-file ~/.config/gh/hosts.yml`).
 
@@ -93,7 +93,7 @@ impl Rule {
                         shown.push('…');
                     }
                     return Some(format!(
-                        "option `{option}` may read only standard input or a file st sekrets passed, not `{shown}`"
+                        "option `{option}` may read only standard input or a file sekrets passed, not `{shown}`"
                     ));
                 }
             }

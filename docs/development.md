@@ -48,7 +48,7 @@ source instead, which needs Zig 0.15.2 on `PATH`. On macOS, the vendored
 [`libghostty-vt-sys`](../vendor/libghostty-vt-sys/README.md) build script lets Zig 0.15.2 link against
 the macOS 26.5 and 27 SDKs.
 
-The script builds and installs `st3`, `stui`, and `st3-migrate`, and makes `st` a symlink to
+The script builds and installs `st3`, `stui`, `st3-migrate`, and `sekrets`, and makes `st` a symlink to
 the installed `st3`. `st` is never a separate build. On macOS, both tools live in a fixed app bundle; see [macOS installation and signing](st3/macos-installation.md). A source install also needs [`pty`](https://github.com/compoundingtech/pty-rust) on `PATH`.
 
 ## Continuous integration
@@ -120,6 +120,7 @@ Ratatui builds, and [build your own client](clients/build-your-own.md) for the c
 | `crates/st3-ui-model`, `crates/st3-conversation-ui` | Shared mission and conversation presentation. |
 | `clients`, `apps/ios` | TypeScript/Swift clients and the iOS app. |
 | `crates/st3-migrate` | Migration tooling. |
+| `crates/sekrets` | The sekrets gateway and the `sekrets` command; see [sekrets](st3/sekrets.md). |
 | `src`, `tests` | Legacy st2 package and its integration tests. |
 | `components`, `evals`, `fixtures` | Provider components, evals, and proof fixtures. |
 | `examples/st3`, `docs` | Runnable declarations and documentation. |

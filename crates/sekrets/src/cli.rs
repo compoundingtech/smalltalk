@@ -1,4 +1,4 @@
-//! `st sekrets`: run any command through the gateway, and manage profiles, grants and locks.
+//! `sekrets`: run any command through the gateway, and manage profiles, grants and locks.
 
 use std::io::{IsTerminal as _, Read as _};
 use std::path::{Path, PathBuf};
@@ -14,7 +14,7 @@ use super::protocol::{Attestation, CallerView, Request, RunRequest};
 #[derive(Args, Debug)]
 #[command(
     args_conflicts_with_subcommands = true,
-    after_help = "Run a command:  st sekrets [--profile P] -- gh pr create --draft\n\
+    after_help = "Run a command:  sekrets [--profile P] -- gh pr create --draft\n\
                   A command runs as the sekrets user with the profile's home and environment, \
                   under its allow and deny policy; the caller never reads the credential."
 )]
@@ -108,7 +108,7 @@ struct UnlockArgs {
 
 #[derive(Args, Debug, Clone)]
 struct PolicyArgs {
-    /// A named policy; repeat to combine. See `st sekrets presets`.
+    /// A named policy; repeat to combine. See `sekrets presets`.
     #[arg(long = "preset")]
     presets: Vec<String>,
     /// Allow commands that start with these whole arguments, such as "gh pr view".
@@ -187,7 +187,7 @@ struct SetupArgs {
     /// More people on a shared host: UID=person/NAME.
     #[arg(long = "also")]
     also: Vec<String>,
-    /// The st binary root copies for the gateway; this one when omitted.
+    /// The sekrets binary root copies for the gateway; this one when omitted.
     #[arg(long)]
     st: Option<PathBuf>,
     /// Directories callers' checkouts live under.
@@ -196,14 +196,14 @@ struct SetupArgs {
 }
 
 /// Exit code for the caller: the command's own, or 1 for st's errors.
-pub async fn run(args: SekretsArgs, json_output: bool) -> Result<i32> {
+pub fn run(args: SekretsArgs, json_output: bool) -> Result<i32> {
     let Some(command) = args.command else {
         if args.argv.is_empty() {
             bail!(
-                "name a command after `--`, such as `st sekrets -- gh pr list`, or see `st sekrets --help`"
+                "name a command after `--`, such as `sekrets -- gh pr list`, or see `sekrets --help`"
             );
         }
-        let connection = identified_connection().await?;
+        let connection = identified_connection()?;
         return connection.run(RunRequest {
             profile: args.profile,
             argv: args.argv,
@@ -232,7 +232,7 @@ pub async fn run(args: SekretsArgs, json_output: bool) -> Result<i32> {
             } else {
                 argv.extend(login.args);
             }
-            let connection = identified_connection().await?;
+            let connection = identified_connection()?;
             connection.run(RunRequest {
                 profile: Some(login.profile),
                 argv,
@@ -241,7 +241,7 @@ pub async fn run(args: SekretsArgs, json_output: bool) -> Result<i32> {
             })
         }
         SekretsCommand::Whoami => {
-            let connection = identified_connection().await?;
+            let connection = identified_connection()?;
             if json_output {
                 println!(
                     "{}",
@@ -256,11 +256,8 @@ pub async fn run(args: SekretsArgs, json_output: bool) -> Result<i32> {
             Ok(0)
         }
         SekretsCommand::Enable => {
-            let connection = identified_connection().await?;
-            let config = crate::config::Config::load_unvalidated(None)?;
-            let client =
-                crate::client::Client::new(crate::client::Endpoint::Unix(config.client_socket()));
-            let node: Value = client.get("/v1/sekrets/node").await?;
+            let connection = identified_connection()?;
+            let node = st_json(&["sekrets-node"]).context("ask st for this node's key")?;
             let (Some(node_name), Some(key)) = (node["node"].as_str(), node["key"].as_str()) else {
                 bail!("the daemon did not say its node key");
             };
@@ -277,7 +274,7 @@ pub async fn run(args: SekretsArgs, json_output: bool) -> Result<i32> {
             })
         }
         other => {
-            let connection = identified_connection().await?;
+            let connection = identified_connection()?;
             let request = management_request(other)?;
             let value = connection.manage(&request)?;
             print_value(&value, json_output, |value| render(&request, value))
@@ -359,21 +356,33 @@ fn management_request(command: SekretsCommand) -> Result<Request> {
 }
 
 /// Connect, and when this process is a seat, bring its daemon's attestation.
-async fn identified_connection() -> Result<Connection> {
+fn identified_connection() -> Result<Connection> {
     let mut connection = Connection::open(&socket_path())?;
     if let CallerView::Unidentified { .. } = connection.caller
         && std::env::var("ST_AGENT").is_ok_and(|agent| agent.starts_with("agent/"))
     {
-        let config = crate::config::Config::load_unvalidated(None)?;
-        let client =
-            crate::client::Client::new(crate::client::Endpoint::Unix(config.client_socket()));
-        let attestation: Attestation = client
-            .post("/v1/sekrets/attest", &json!({ "nonce": connection.nonce }))
-            .await
-            .context("ask this seat's daemon to vouch for it")?;
+        let attestation: Attestation = serde_json::from_value(
+            st_json(&["sekrets-attest", "--nonce", &connection.nonce])
+                .context("ask this seat's daemon to vouch for it")?,
+        )?;
         connection.hello(Some(attestation))?;
     }
     Ok(connection)
+}
+
+/// Run st, which knows its own daemon, and read the JSON it prints. A seat's st is
+/// `ST3_BIN`; otherwise `st` on the path. st asks its daemon about this process: its parent.
+fn st_json(args: &[&str]) -> Result<Value> {
+    let st = std::env::var_os("ST3_BIN").unwrap_or_else(|| "st".into());
+    let output = std::process::Command::new(&st)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .with_context(|| format!("run {}", std::path::Path::new(&st).display()))?;
+    if !output.status.success() {
+        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    Ok(serde_json::from_slice(&output.stdout)?)
 }
 
 fn describe(caller: &CallerView) -> String {
@@ -665,8 +674,8 @@ fn setup_script(setup: &SetupArgs) -> Result<String> {
         .join("\n");
     Ok(format!(
         r#"#!/bin/sh
-# st sekrets: the gateway, its user and its store. Review, then run as root, for example
-#   st sekrets setup --person {person} > sekrets-setup.sh && sudo sh sekrets-setup.sh
+# sekrets: the gateway, its user and its store. Review, then run as root, for example
+#   sekrets setup --person {person} > sekrets-setup.sh && sudo sh sekrets-setup.sh
 # Run it again after updating st to give the gateway the new binary.
 set -eu
 command -v bwrap >/dev/null || {{ echo "install bubblewrap first (apt install bubblewrap)" >&2; exit 1; }}
@@ -675,7 +684,8 @@ id -u sekrets >/dev/null 2>&1 || useradd --system --user-group --home-dir {store
 install -d -o sekrets -g sekrets -m 0700 {store}
 install -d -o root -g root -m 0755 /etc/st-sekrets /usr/local/libexec
 # The gateway runs a copy root owns, so no person or seat can change what runs as sekrets.
-install -o root -g root -m 0755 {st} /usr/local/libexec/st-sekrets
+install -o root -g root -m 0755 {st} /usr/local/libexec/sekrets
+rm -f /usr/local/libexec/st-sekrets
 cat > /etc/st-sekrets/gateway.toml <<'EOF'
 socket = "{socket}"
 store = "{store}"
@@ -695,13 +705,13 @@ for uid in {uids}; do
 done
 cat > /etc/systemd/system/st-sekrets.service <<'EOF'
 [Unit]
-Description=st sekrets gateway
+Description=sekrets gateway
 After=network-online.target
 
 [Service]
 User=sekrets
 Group=sekrets
-ExecStart=/usr/local/libexec/st-sekrets sekrets serve --config /etc/st-sekrets/gateway.toml
+ExecStart=/usr/local/libexec/sekrets serve --config /etc/st-sekrets/gateway.toml
 RuntimeDirectory=st-sekrets
 RuntimeDirectoryMode=0755
 UMask=0077
@@ -714,7 +724,7 @@ EOF
 systemctl daemon-reload
 systemctl enable st-sekrets.service
 systemctl restart st-sekrets.service
-echo "sekrets gateway running; next, from a login session: st sekrets enable"
+echo "sekrets gateway running; next, from a login session: sekrets enable"
 "#,
         uids = people
             .iter()

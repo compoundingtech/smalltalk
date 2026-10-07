@@ -36,9 +36,9 @@ pty_url=$(python3 -c 'import json,sys; p=json.load(open(sys.argv[1])); print("ht
 # inherited Nix stamp identify a different source than the release's BUILD.json.
 unset CLI_BUILD_STAMP
 export CARGO_ENCODED_RUSTFLAGS=
-cargo build --release --locked --target "$target" -p st3 -p st3-migrate -p stui
+cargo build --release --locked --target "$target" -p st3 -p st3-migrate -p stui -p sekrets
 build_dir=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
-for binary in st3 st3-migrate stui; do
+for binary in st3 st3-migrate stui sekrets; do
   install -m 0755 "$build_dir/$target/release/$binary" "$work/$package/bin/$binary"
 done
 
@@ -82,7 +82,7 @@ install -m 0755 scripts/install-macos.py "$work/$package/install-macos.py"
 cp docs/st3/binary-releases.md "$work/$package/README.md"
 cp docs/st3/macos-installation.md "$work/$package/macos-installation.md"
 
-for binary in st3 stui st3-migrate pty; do
+for binary in st3 stui st3-migrate sekrets pty; do
   path="$work/$package/bin/$binary"
   file "$path"
   if [[ $target == *linux* ]]; then

@@ -256,8 +256,6 @@ enum Command {
         #[command(subcommand)]
         command: RuleCommand,
     },
-    /// Run any CLI with credentials no seat can read, through the sekrets gateway.
-    Sekrets(st3::sekrets::cli::SekretsArgs),
     /// Discover native harness sessions and move one under durable st ownership.
     Import {
         #[command(subcommand)]
@@ -283,6 +281,16 @@ enum Command {
     ReplicationWorker(ReplicationWorkerArgs),
     #[command(hide = true)]
     Driver(DriverArgs),
+    /// For the `sekrets` command: ask this daemon to vouch for the calling process (st's
+    /// parent) to the sekrets gateway, and print the attestation.
+    #[command(hide = true, name = "sekrets-attest")]
+    SekretsAttest {
+        #[arg(long)]
+        nonce: String,
+    },
+    /// For `sekrets enable`: print this node's name and the key it vouches with.
+    #[command(hide = true, name = "sekrets-node")]
+    SekretsNode,
 }
 
 #[derive(Args)]
@@ -4850,13 +4858,6 @@ async fn run(cli: Cli) -> Result<()> {
     if let Command::Skill(args) = cli.command {
         return run_skill(args);
     }
-    // The gateway runs as the sekrets user, which has no st configuration.
-    if let Command::Sekrets(args) = cli.command {
-        let code = st3::sekrets::cli::run(args, cli.json).await?;
-        use std::io::Write as _;
-        let _ = std::io::stdout().flush();
-        std::process::exit(code);
-    }
     if let Command::Admission { command } = cli.command {
         return run_admission(command, cli.json);
     }
@@ -4905,7 +4906,6 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Sets { command } => run_owned_sets(&endpoint, command, cli.json).await,
         Command::Up(_) => unreachable!(),
         Command::Skill(_) => unreachable!(),
-        Command::Sekrets(_) => unreachable!(),
         Command::Admission { .. } => unreachable!(),
         Command::ReplicationWorker(_) => unreachable!(),
         Command::Now(args) => run_now(&endpoint, config.person.as_deref(), args, cli.json).await,
@@ -5056,6 +5056,21 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Driver(args) => run_driver(&immediate, args, cli.catalog.as_deref()).await,
+        Command::SekretsAttest { nonce } => {
+            let attestation: Value = immediate
+                .post(
+                    "/v1/sekrets/attest",
+                    &json!({ "nonce": nonce, "for_parent": true }),
+                )
+                .await?;
+            println!("{attestation}");
+            Ok(())
+        }
+        Command::SekretsNode => {
+            let node: Value = immediate.get("/v1/sekrets/node").await?;
+            println!("{node}");
+            Ok(())
+        }
         Command::Gate { command } => run_gate(command).await,
     }
 }

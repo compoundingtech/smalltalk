@@ -37,7 +37,7 @@ impl Connection {
     pub fn open(socket: &Path) -> Result<Self> {
         let stream = UnixStream::connect(socket).with_context(|| {
             format!(
-                "sekrets is not set up on this host: no gateway at {} (see `st sekrets setup`)",
+                "sekrets is not set up on this host: no gateway at {} (see `sekrets setup`)",
                 socket.display()
             )
         })?;
@@ -142,7 +142,7 @@ impl Connection {
         match reply {
             Reply::Started { note, .. } => {
                 if let Some(note) = note {
-                    eprintln!("st sekrets: {note}");
+                    eprintln!("sekrets: {note}");
                 }
             }
             Reply::Refused { reason, .. } => bail!("refused: {reason}"),

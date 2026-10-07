@@ -11,7 +11,7 @@ chmod +x "$work/platform-bin/uname"
 export PATH="$work/platform-bin:$PATH"
 mkdir -p "$work/package/bin" "$work/installed"
 cp "$repo/scripts/install-release" "$work/package/install.sh"
-for binary in st3 stui st3-migrate pty; do
+for binary in st3 stui st3-migrate sekrets pty; do
   printf '#!/bin/sh\necho new-%s\n' "$binary" > "$work/package/bin/$binary"
   chmod +x "$work/package/bin/$binary"
   printf 'old\n' > "$work/installed/$binary"
@@ -20,7 +20,7 @@ ln -s /missing/old-st "$work/installed/st"
 "$work/package/install.sh" --bin-dir "$work/installed"
 test "$(readlink "$work/installed/st")" = st3
 test "$("$work/installed/st")" = new-st3
-for binary in st3 stui st3-migrate pty; do
+for binary in st3 stui st3-migrate sekrets pty; do
   test "$("$work/installed/$binary")" = "new-$binary"
 done
 # Missing payload and directory collisions must fail before replacing installed files.

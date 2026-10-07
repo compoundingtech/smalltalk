@@ -97,6 +97,13 @@ mod registry_tests {
     }
 }
 
+/// A process's parent, as the kernel reports it: field 4 of `/proc/PID/stat`.
+pub fn parent_pid(pid: u32) -> Option<u32> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_, after) = text.rsplit_once(") ")?;
+    after.split_whitespace().nth(1)?.parse().ok().filter(|parent| *parent > 1)
+}
+
 /// This node and the public key it signs attestations with.
 pub fn node_key(store: &Store, node: &str) -> Result<(String, String), St3Error> {
     let key = store.keyring.node().ok_or_else(|| {

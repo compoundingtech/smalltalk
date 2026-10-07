@@ -76,7 +76,7 @@ nix --extra-experimental-features 'nix-command flakes' profile install github:co
 command -v st stui pty
 ```
 
-Nix builds `st3`, its `st` alias, `stui`, and `st3-migrate`, and supplies the pinned `pty` runtime and build dependencies. You do not need a separate Rust toolchain or PTY install. Use this **instead of** the archive route; the commands below are the same. Check that the paths above belong to your Nix profile, then continue with the daemon setup.
+Nix builds `st3`, its `st` alias, `stui`, `st3-migrate`, and `sekrets`, and supplies the pinned `pty` runtime and build dependencies. You do not need a separate Rust toolchain or PTY install. Use this **instead of** the archive route; the commands below are the same. Check that the paths above belong to your Nix profile, then continue with the daemon setup.
 
 For a declarative setup, use the [Home Manager module](home-manager.md): it installs the tools, writes the person configuration, and starts the user daemon on Linux or macOS. If that module owns your daemon, configure its person there and skip the manual config/service-install block in step 3. Lingering on Linux, macOS permissions, harness login, and fleet joining remain host setup. Nix profile installs use store paths; the macOS app-bundle setup above belongs to the source/release installers.
 

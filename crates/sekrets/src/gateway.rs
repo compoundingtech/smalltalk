@@ -1,4 +1,4 @@
-//! The gateway: `st sekrets serve`, run as the sekrets user. It owns the store, decides each
+//! The gateway: `sekrets serve`, run as the sekrets user. It owns the store, decides each
 //! call, and runs allowed commands in the sandbox with the profile's credentials.
 
 use std::collections::BTreeMap;
@@ -166,7 +166,7 @@ pub fn serve(config_path: &Path) -> Result<()> {
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o666))?;
     let gateway = Arc::new(Gateway::new(config, uid, Some(uid), Box::new(Proc))?);
     eprintln!(
-        "st sekrets: gateway listening on {} for {} people",
+        "sekrets: gateway listening on {} for {} people",
         socket.display(),
         gateway.config.people.len()
     );
@@ -307,7 +307,7 @@ impl Gateway {
         std::thread::spawn(move || {
             loop {
                 if let Err(error) = trimmer.store().trim_log(LOG_KEEP_MS) {
-                    eprintln!("st sekrets: trim the log: {error:#}");
+                    eprintln!("sekrets: trim the log: {error:#}");
                 }
                 std::thread::sleep(Duration::from_secs(60 * 60));
             }
@@ -424,7 +424,7 @@ impl Gateway {
                 let Some(attestation) = attestation else {
                     return unidentified(format!(
                         "process {pid} runs in {person}'s service manager, not a login session, and \
-                         brought no attestation from its daemon; a seat calls through `st sekrets`, \
+                         brought no attestation from its daemon; a seat calls through `sekrets`, \
                          and a person calls from a login session"
                     ));
                 };
@@ -458,7 +458,7 @@ impl Gateway {
             .map_err(|error| error.to_string())?;
         let Some((_, node, key)) = registered else {
             return Err(format!(
-                "{person} has registered no daemon key; run `st sekrets enable` from a login session"
+                "{person} has registered no daemon key; run `sekrets enable` from a login session"
             ));
         };
         if !crate::keys::verify(

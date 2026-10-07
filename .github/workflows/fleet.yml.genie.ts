@@ -391,9 +391,9 @@ printf '| VM test driver total | %ss |\\n' "$((SECONDS - start))" >> "$GITHUB_ST
         // The sekrets gateway needs real Unix users, a login session and a user manager: a second
         // VM runs it with this st binary (nix/sekrets-vm.nix).
         {
-          name: 'Build the st binary for the sekrets VM',
+          name: 'Build st and sekrets for the sekrets VM',
           run: `start=$SECONDS
-nix develop -c cargo build --locked -p st3 --bin st3
+nix develop -c cargo build --locked -p st3 -p sekrets --bin st3 --bin sekrets
 printf '| st build | %ss |\\n' "$((SECONDS - start))" >> "$GITHUB_STEP_SUMMARY"`,
         },
         {
@@ -404,7 +404,10 @@ printf '| sekrets VM driver build | %ss |\\n' "$((SECONDS - start))" >> "$GITHUB
         },
         {
           name: 'Run the sekrets gateway test in the VM',
-          env: { ST_SEKRETS_BINARY: '${{ github.workspace }}/target/debug/st3' },
+          env: {
+            ST_BINARY: '${{ github.workspace }}/target/debug/st3',
+            ST_SEKRETS_BINARY: '${{ github.workspace }}/target/debug/sekrets',
+          },
           run: `start=$SECONDS
 mkdir -p "$RUNNER_TEMP/sekrets-vm-out"
 "$RUNNER_TEMP/sekrets-vm-driver/bin/nixos-test-driver" --output_directory "$RUNNER_TEMP/sekrets-vm-out"
