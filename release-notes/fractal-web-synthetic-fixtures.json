@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Synthetic fractal-web fixtures with generation, validation and privacy scanning gates",
+  "replay": {"status": "none", "detail": "Synthetic development fixtures only; no runtime replay change."},
+  "schema": {"status": "none", "detail": "Fixture validation does not change the database schema."},
+  "rules": {"status": "none", "detail": "No checkpoint rules change."},
+  "compatibility": {"status": "none", "detail": "No client protocol or deployed runtime compatibility change."},
+  "downtime": {"status": "none", "detail": "No service interruption introduced."},
+  "manual": {"status": "none", "detail": "No deployed installation action required; identity and state are unchanged."},
+  "recovery": {"status": "none", "detail": "No database or runtime recovery change."}
+}
