@@ -1643,6 +1643,16 @@ async fn rejoin_exchanges_live_claims_beyond_differing_checkpoint_tombstones() {
     if st3::test_support::supervise_test() {
         return;
     }
+    rejoin_tombstone_fixture(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rejoin_slow_exports_preserve_live_claims_and_show_overload_retry() {
+    if st3::test_support::supervise_test() { return; }
+    rejoin_tombstone_fixture(true).await;
+}
+
+async fn rejoin_tombstone_fixture(slow_export: bool) {
     let root = tempfile::tempdir().unwrap();
     let mut birch = anchor(root.path(), "birch").await;
     let mut cedar = joined(root.path(), &birch, "cedar", &[]).await;
@@ -1696,10 +1706,31 @@ async fn rejoin_exchanges_live_claims_beyond_differing_checkpoint_tombstones() {
             .as_u64()
             .unwrap()
     });
+    if slow_export {
+        // Restart only the isolated daemon with the fixture-only injection. Each response
+        // export takes 25 seconds, beyond the old caller's entire 20-second HTTP deadline.
+        cedar.env.push(("ST3_TEST_REPLICATION_EXPORT_DELAY_MS".into(), "25000".into()));
+        cedar.stop();
+        cedar.start().await;
+        cedar.stop_worker();
+    }
     birch.start_worker();
     cedar.start_worker();
+    if slow_export {
+        wait_until("signed overload exposes polling phase and retry", 90, || async {
+            let status = birch.st_json(&["replication", "status"]);
+            status["peers"].as_array().unwrap().iter().any(|peer| {
+                peer["worker"]["phase"] == "overload"
+                    && peer["worker"]["last_attempt_at_unix_ms"].as_u64().is_some()
+                    && peer["worker"]["next_retry_at_unix_ms"].as_u64().is_some()
+            })
+        }).await;
+        let text = birch.st_ok(&["replication", "status"]);
+        assert!(text.contains("worker overload"), "{text}");
+        assert!(text.contains("next retry in"), "{text}");
+    }
     for (node, before) in [&birch, &cedar].into_iter().zip(before) {
-        wait_until("both rejoined workers exchange successfully", 15, || async {
+        wait_until("both rejoined workers exchange successfully", if slow_export { 180 } else { 15 }, || async {
             node.st_json(&["replication", "status"])["timings"]["exchanges"]
                 .as_u64()
                 .unwrap() >= before + 4
@@ -1709,7 +1740,7 @@ async fn rejoin_exchanges_live_claims_beyond_differing_checkpoint_tombstones() {
             node.name, status["timings"]["exchanges"], status["timings"]["envelopes_received"]);
     }
     for node in [&birch, &cedar] {
-        wait_for_notes(node, &expected, 30, &[&birch, &cedar]).await;
+        wait_for_notes(node, &expected, if slow_export { 180 } else { 30 }, &[&birch, &cedar]).await;
         let connection =
             rusqlite::Connection::open(node.state_dir().join("claims.sqlite3")).unwrap();
         let count: u64 = connection
@@ -3939,4 +3970,150 @@ async fn suspended_seat_moves_between_two_daemons_with_its_workspace_and_convers
         "--timeout",
         "60s",
     ]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs ST3_TERMINALS_COMPAT_BIN: an st3 build before terminal owner filters"]
+async fn terminal_owner_filters_are_safe_across_mixed_builds() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let mut old = Node::new(root.path(), "terminal-legacy");
+    old.binary = PathBuf::from(std::env::var("ST3_TERMINALS_COMPAT_BIN").unwrap());
+    old.start().await;
+    let current_client = st3_client::Client::unix(old.socket());
+    current_client
+        .terminals_list(None, Some(50), false)
+        .await
+        .unwrap();
+    let error = current_client
+        .terminals_list_filtered(
+            None,
+            Some(1),
+            false,
+            Some("agent/lookup/unknown"),
+            Some("running"),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, st3_client::ClientError::Protocol(message) if message.contains("upgrade the server"))
+    );
+
+    let mut current = Node::new(root.path(), "terminal-current");
+    current.start().await;
+    let output = old
+        .command(&[
+            "--endpoint",
+            current.socket().to_str().unwrap(),
+            "--json",
+            "terminals",
+            "ls",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["value"]["collection"], "terminals");
+    assert_eq!(response["value"]["filters"], serde_json::json!({}));
+    assert_eq!(response["value"]["page"]["limit"], 50);
+}
+
+/// This narrower compatibility boundary needs a build that already knows today's mission
+/// format, but predates mission.provenance. The ancient fleet baseline is a different contract.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs ST3_PROVENANCE_COMPAT_BIN: a pre-provenance build with the current mission format"]
+async fn an_older_daemon_runs_a_provenance_revision_and_reads_its_sidecar_after_upgrade() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let old = PathBuf::from(
+        std::env::var("ST3_PROVENANCE_COMPAT_BIN").expect("pre-provenance st3 binary"),
+    );
+    let root = tempfile::tempdir().unwrap();
+    let current = anchor(root.path(), "current").await;
+    let mut older = joined(root.path(), &current, "older", &[]).await;
+    older.stop();
+    older.binary = old;
+    older.start().await;
+    let file = current.root.join("provenance.kdl");
+    fs::write(
+        &file,
+        r#"version 2
+mission "orchard/release" state="ready" {
+  provenance {
+    reason "Approved release source."
+    source {
+      repository "https://example.invalid/orchard/missions"
+      commit "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      path "missions/release.kdl"
+      renderer "orchard-renderer-v1"
+    }
+    decision "decision/opaque-approved-scope"
+    evidence "doc/orchard/proof@opaque-reference"
+  }
+  goal "Prepare the release."
+  step "prepare" { goal "Prepare the release." }
+}
+"#,
+    )
+    .unwrap();
+    current.st_ok(&[
+        "apply",
+        file.to_str().unwrap(),
+        "--no-gate-check",
+        "--as",
+        PERSON,
+    ]);
+    let path = "/v1/missions/orchard%2Frelease";
+    wait_until(
+        "older daemon projects the provenance-bearing revision",
+        60,
+        || async { older.client().get::<Value>(path).await.is_ok() },
+    )
+    .await;
+    let plain: Value = older.client().get(path).await.unwrap();
+    let with: Value = current.client().get(path).await.unwrap();
+    assert_eq!(plain["revision"], with["revision"]);
+    assert!(
+        plain.get("provenance").is_none(),
+        "the binary must predate provenance: {plain}"
+    );
+    assert_eq!(with["provenance"]["reason"], "Approved release source.");
+    let started = older.st_json(&[
+        "missions",
+        "start",
+        "orchard/release",
+        "--id",
+        "orchard/older-run",
+        "--as",
+        PERSON,
+    ]);
+    let run = &started["mission_run"];
+    assert_eq!(run["revision"], plain["revision"]);
+    assert!(!run["steps"].as_array().unwrap().is_empty());
+    let status = older.st_json(&["replication", "status"]);
+    assert_eq!(status["invalid_records"], 0, "{status}");
+    assert!(
+        status["waiting_claims"].as_u64().unwrap_or(0) >= 1,
+        "{status}"
+    );
+    older.stop();
+    older.binary = PathBuf::from(ST3);
+    older.start().await;
+    wait_until("upgraded daemon reads the retained sidecar", 60, || async {
+        older
+            .client()
+            .get::<Value>(path)
+            .await
+            .is_ok_and(|mission| mission["provenance"]["reason"] == "Approved release source.")
+    })
+    .await;
+    let shown = older.st_json(&["missions", "show", run["subject"].as_str().unwrap()]);
+    assert_eq!(shown["provenance"]["reason"], "Approved release source.");
 }

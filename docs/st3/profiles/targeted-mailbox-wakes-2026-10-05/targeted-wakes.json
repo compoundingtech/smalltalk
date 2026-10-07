@@ -1,0 +1,577 @@
+{
+  "seats": 128,
+  "streams": 256,
+  "writes": 3000,
+  "targeted_messages": 100,
+  "wall_ms": 30313.641037,
+  "daemon_cpu_ms": 5576.115,
+  "delivery_p50_ms": 2.1403049999999997,
+  "delivery_p95_ms": 2.81079,
+  "delivery_max_ms": 9.481933,
+  "ownership_p50_ms": 0.727,
+  "ownership_p95_ms": 0.882271,
+  "ownership_max_ms": 2.168829,
+  "write_p95_ms": 1.803915,
+  "before": {
+    "window_seconds": 300,
+    "requests": [
+      {
+        "count": 256,
+        "total_ms": 81.65,
+        "max_ms": 0.682,
+        "mean_ms": 0.3189453125,
+        "cpu_ms": 80.544,
+        "kind": "task mailbox-snapshot"
+      },
+      {
+        "count": 256,
+        "total_ms": 76.206,
+        "max_ms": 0.8,
+        "mean_ms": 0.2976796875,
+        "cpu_ms": 52.762,
+        "kind": "/v1/mailbox/bind"
+      },
+      {
+        "count": 252,
+        "total_ms": 23.807,
+        "max_ms": 5.767,
+        "mean_ms": 0.09447222222222224,
+        "cpu_ms": 17.056,
+        "kind": "task mailbox-wake-dispatch"
+      },
+      {
+        "count": 256,
+        "total_ms": 12.212,
+        "max_ms": 0.145,
+        "mean_ms": 0.047703125,
+        "cpu_ms": 3.364,
+        "kind": "/v1/mailbox"
+      }
+    ],
+    "queries": [
+      {
+        "count": 12994,
+        "total_ms": 127.0,
+        "max_ms": 1.0,
+        "mean_ms": 0.0097737417269509,
+        "cpu_ms": 0.0,
+        "kind": "(other)"
+      },
+      {
+        "count": 519,
+        "total_ms": 35.0,
+        "max_ms": 1.0,
+        "mean_ms": 0.0674373795761079,
+        "cpu_ms": 0.0,
+        "kind": "COMMIT"
+      },
+      {
+        "count": 2,
+        "total_ms": 1.0,
+        "max_ms": 1.0,
+        "mean_ms": 0.5,
+        "cpu_ms": 0.0,
+        "kind": "CREATE INDEX IF NOT EXISTS claims_person_ask_generation_index ON claims(json_extract(body, ?)) WHERE kind=?;"
+      },
+      {
+        "count": 2,
+        "total_ms": 1.0,
+        "max_ms": 1.0,
+        "mean_ms": 0.5,
+        "cpu_ms": 0.0,
+        "kind": "CREATE INDEX IF NOT EXISTS claims_subagent_appeared_lease_index ON claims(CAST(json_extract(body, ?) AS INTEGER)) WHERE kind=?;"
+      },
+      {
+        "count": 2,
+        "total_ms": 1.0,
+        "max_ms": 1.0,
+        "mean_ms": 0.5,
+        "cpu_ms": 0.0,
+        "kind": "CREATE INDEX IF NOT EXISTS claims_subscription_deferred_deadline_index ON claims(CAST(json_extract(body, ?) AS INTEGER)) WHERE kind=?;"
+      },
+      {
+        "count": 2,
+        "total_ms": 1.0,
+        "max_ms": 1.0,
+        "mean_ms": 0.5,
+        "cpu_ms": 0.0,
+        "kind": "CREATE INDEX IF NOT EXISTS mission_revisions_claim_index ON mission_revisions(claim_id);"
+      },
+      {
+        "count": 2,
+        "total_ms": 1.0,
+        "max_ms": 1.0,
+        "mean_ms": 0.5,
+        "cpu_ms": 0.0,
+        "kind": "CREATE INDEX IF NOT EXISTS revision_proposals_run_index ON revision_proposals(run_id);"
+      },
+      {
+        "count": 2,
+        "total_ms": 1.0,
+        "max_ms": 1.0,
+        "mean_ms": 0.5,
+        "cpu_ms": 0.0,
+        "kind": "CREATE TABLE IF NOT EXISTS claim_verdicts ( claim_id TEXT PRIMARY KEY, verdict TEXT NOT NULL, reason TEXT, signer TEXT NOT NULL, on_behalf TEXT );"
+      },
+      {
+        "count": 2,
+        "total_ms": 1.0,
+        "max_ms": 1.0,
+        "mean_ms": 0.5,
+        "cpu_ms": 0.0,
+        "kind": "CREATE TABLE IF NOT EXISTS peer_cursors ( peer TEXT PRIMARY KEY, accepted_through INTEGER NOT NULL );"
+      },
+      {
+        "count": 2,
+        "total_ms": 1.0,
+        "max_ms": 1.0,
+        "mean_ms": 0.5,
+        "cpu_ms": 0.0,
+        "kind": "CREATE TABLE IF NOT EXISTS planning_sessions ( id TEXT PRIMARY KEY, mission_id TEXT NOT NULL, request_ref TEXT NOT NULL, workspace TEXT NOT NULL, requester TEXT NOT NULL, planner TEXT NOT NULL, planner_spec_json TEXT NOT NULL DEFAULT ?, status TEXT NOT NULL, target_run_id TEXT, source_generation_id TEXT, published_revision TEXT, created_at_unix_ms TEXT NOT NULL, updated_at_unix_ms TEXT NOT NULL );"
+      },
+      {
+        "count": 2,
+        "total_ms": 1.0,
+        "max_ms": 1.0,
+        "mean_ms": 0.5,
+        "cpu_ms": 0.0,
+        "kind": "CREATE TRIGGER IF NOT EXISTS glass_heads_batch_update AFTER UPDATE OF origin,replica_sequence ON batches WHEN OLD.origin IS NOT NEW.origin OR OLD.replica_sequence IS NOT NEW.replica_sequence BEGIN INSERT OR IGNORE INTO local_glass_head_dirty SELECT subject FROM claims WHERE batch_id=NEW.id AND kind IN (?,?) AND NOT EXISTS (SELECT ? FROM local_glass_head_pending WHERE claim_id=claims.id); END;"
+      },
+      {
+        "count": 2,
+        "total_ms": 1.0,
+        "max_ms": 1.0,
+        "mean_ms": 0.5,
+        "cpu_ms": 0.0,
+        "kind": "CREATE TRIGGER IF NOT EXISTS resource_observations_record_update AFTER UPDATE ON replica_records WHEN NEW.claim_id IS NOT NULL BEGIN INSERT OR IGNORE INTO local_resource_projection_pending SELECT subject FROM claims WHERE id=NEW.claim_id AND kind=?; END;"
+      },
+      {
+        "count": 263,
+        "total_ms": 0.0,
+        "max_ms": 0.0,
+        "mean_ms": 0.0,
+        "cpu_ms": 0.0,
+        "kind": "BEGIN DEFERRED"
+      },
+      {
+        "count": 6,
+        "total_ms": 0.0,
+        "max_ms": 0.0,
+        "mean_ms": 0.0,
+        "cpu_ms": 0.0,
+        "kind": "BEGIN IMMEDIATE;"
+      },
+      {
+        "count": 6,
+        "total_ms": 0.0,
+        "max_ms": 0.0,
+        "mean_ms": 0.0,
+        "cpu_ms": 0.0,
+        "kind": "COMMIT;"
+      },
+      {
+        "count": 2,
+        "total_ms": 0.0,
+        "max_ms": 0.0,
+        "mean_ms": 0.0,
+        "cpu_ms": 0.0,
+        "kind": "CREATE INDEX IF NOT EXISTS agent_message_sends_time ON agent_message_sends(sent_ms,recipient);"
+      },
+      {
+        "count": 2,
+        "total_ms": 0.0,
+        "max_ms": 0.0,
+        "mean_ms": 0.0,
+        "cpu_ms": 0.0,
+        "kind": "CREATE INDEX IF NOT EXISTS batches_writer_sequence ON batches(origin, replica_sequence);"
+      },
+      {
+        "count": 2,
+        "total_ms": 0.0,
+        "max_ms": 0.0,
+        "mean_ms": 0.0,
+        "cpu_ms": 0.0,
+        "kind": "CREATE INDEX IF NOT EXISTS checkpoint_claims_envelope ON checkpoint_claims(writer, sequence, envelope_hash);"
+      },
+      {
+        "count": 2,
+        "total_ms": 0.0,
+        "max_ms": 0.0,
+        "mean_ms": 0.0,
+        "cpu_ms": 0.0,
+        "kind": "CREATE INDEX IF NOT EXISTS checkpoint_claims_operation ON checkpoint_claims(operation_id) WHERE operation_id IS NOT NULL;"
+      },
+      {
+        "count": 2,
+        "total_ms": 0.0,
+        "max_ms": 0.0,
+        "mean_ms": 0.0,
+        "cpu_ms": 0.0,
+        "kind": "CREATE INDEX IF NOT EXISTS checkpoint_claims_subject ON checkpoint_claims(subject);"
+      }
+    ],
+    "request_count": 512,
+    "sampled_seconds": 1,
+    "clients": [
+      {
+        "count": 512,
+        "total_ms": 88.418,
+        "max_ms": 0.8,
+        "mean_ms": 0.17269140625,
+        "cpu_ms": 56.126,
+        "client": "st3-5351dbe761f3fece"
+      }
+    ],
+    "client_requests": [
+      {
+        "count": 256,
+        "total_ms": 12.212,
+        "max_ms": 0.145,
+        "mean_ms": 0.047703125,
+        "cpu_ms": 3.364,
+        "client": "st3-5351dbe761f3fece",
+        "kind": "/v1/mailbox"
+      },
+      {
+        "count": 256,
+        "total_ms": 76.206,
+        "max_ms": 0.8,
+        "mean_ms": 0.2976796875,
+        "cpu_ms": 52.762,
+        "client": "st3-5351dbe761f3fece",
+        "kind": "/v1/mailbox/bind"
+      }
+    ],
+    "reconciler_wakes": [],
+    "incremental_corrections": [],
+    "incremental_evaluations": [],
+    "query_time_note": "Statement wall time includes row processing; concurrent times overlap."
+  },
+  "after": {
+    "window_seconds": 300,
+    "requests": [
+      {
+        "count": 3000,
+        "total_ms": 3035.088,
+        "max_ms": 5.526,
+        "mean_ms": 1.011696,
+        "cpu_ms": 233.977,
+        "kind": "/fixture/claims"
+      },
+      {
+        "count": 3016,
+        "total_ms": 1247.78,
+        "max_ms": 25.707,
+        "mean_ms": 0.4137201591511936,
+        "cpu_ms": 1147.924,
+        "kind": "task mailbox-snapshot"
+      },
+      {
+        "count": 3252,
+        "total_ms": 336.688,
+        "max_ms": 5.767,
+        "mean_ms": 0.10353259532595326,
+        "cpu_ms": 313.1,
+        "kind": "task mailbox-wake-dispatch"
+      },
+      {
+        "count": 256,
+        "total_ms": 76.206,
+        "max_ms": 0.8,
+        "mean_ms": 0.2976796875,
+        "cpu_ms": 52.762,
+        "kind": "/v1/mailbox/bind"
+      },
+      {
+        "count": 200,
+        "total_ms": 19.878,
+        "max_ms": 0.482,
+        "mean_ms": 0.09939,
+        "cpu_ms": 18.228,
+        "kind": "task mailbox-change-check"
+      },
+      {
+        "count": 256,
+        "total_ms": 12.212,
+        "max_ms": 0.145,
+        "mean_ms": 0.047703125,
+        "cpu_ms": 3.364,
+        "kind": "/v1/mailbox"
+      },
+      {
+        "count": 1,
+        "total_ms": 0.33,
+        "max_ms": 0.33,
+        "mean_ms": 0.33,
+        "cpu_ms": 0.205,
+        "kind": "/fixture/stats"
+      }
+    ],
+    "queries": [
+      {
+        "count": 2099,
+        "total_ms": 555.0,
+        "max_ms": 1.0,
+        "mean_ms": 0.26441162458313483,
+        "cpu_ms": 0.0,
+        "kind": "INSERT INTO claims(id, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms) VALUES (??, ??, ??, ??, ??, ??, ??, ??, ??)"
+      },
+      {
+        "count": 46769,
+        "total_ms": 488.0,
+        "max_ms": 2.0,
+        "mean_ms": 0.01043426201116124,
+        "cpu_ms": 0.0,
+        "kind": "(other)"
+      },
+      {
+        "count": 3519,
+        "total_ms": 405.0,
+        "max_ms": 1.0,
+        "mean_ms": 0.11508951406649616,
+        "cpu_ms": 0.0,
+        "kind": "COMMIT"
+      },
+      {
+        "count": 2698,
+        "total_ms": 70.0,
+        "max_ms": 2.0,
+        "mean_ms": 0.02594514455151964,
+        "cpu_ms": 0.0,
+        "kind": "SELECT claims.id, claims.body FROM claims INDEXED BY claims_subject_kind_accepted_index JOIN batches ON batches.id=claims.batch_id WHERE claims.subject=?? AND claims.kind=? AND +claims.store_index<=?? ORDER BY length(claims.accepted_at_unix_ms) DESC, claims.accepted_at_unix_ms DESC, (SELECT origin FROM batches WHERE id=claims.batch_id) DESC, (SELECT replica_sequence FROM batches WHERE id=claims.batch_id) DESC, claims.batch_id DESC, COALESCE((SELECT MIN(position) FROM replica_records WHERE claim_"
+      },
+      {
+        "count": 2099,
+        "total_ms": 53.0,
+        "max_ms": 1.0,
+        "mean_ms": 0.025250119104335396,
+        "cpu_ms": 0.0,
+        "kind": "SELECT store_index,subject FROM claims WHERE store_index>?? ORDER BY store_index LIMIT ?"
+      },
+      {
+        "count": 2099,
+        "total_ms": 46.0,
+        "max_ms": 3.0,
+        "mean_ms": 0.021915197713196763,
+        "cpu_ms": 0.0,
+        "kind": "SELECT json_extract(body,?) FROM claims WHERE subject=?? AND kind=? UNION SELECT json_extract(child.value,?) FROM desired,json_each(desired.body,?) child WHERE desired.subject=?? AND desired.kind=? AND json_extract(child.value,?)=?"
+      },
+      {
+        "count": 5396,
+        "total_ms": 43.0,
+        "max_ms": 1.0,
+        "mean_ms": 0.007968865826538177,
+        "cpu_ms": 0.0,
+        "kind": "SELECT claims.id, json_extract(body, CASE WHEN json_type(body, ?) IS NULL THEN ? ELSE ? END) FROM claims INDEXED BY claims_harness_state_incarnation_accepted_index JOIN batches ON batches.id=claims.batch_id WHERE subject=?? AND kind=? AND json_type(body, CASE WHEN json_type(body, ?) IS NULL THEN ? ELSE ? END)=? AND CASE WHEN json_type(body, CASE WHEN json_type(body, ?) IS NULL THEN ? ELSE ? END)=? THEN json_extract(body, CASE WHEN json_type(body, ?) IS NULL THEN ? ELSE ? END) END IS ?? ORDER BY"
+      },
+      {
+        "count": 5943,
+        "total_ms": 35.0,
+        "max_ms": 3.0,
+        "mean_ms": 0.005889281507656066,
+        "cpu_ms": 0.0,
+        "kind": "SELECT claims.accepted_at_unix_ms, batches.origin, batches.replica_sequence, claims.batch_id, COALESCE((SELECT MIN(position) FROM replica_records WHERE claim_id=claims.id), (SELECT COUNT(*) FROM claims legacy_position WHERE legacy_position.batch_id=claims.batch_id AND legacy_position.store_index<claims.store_index)), claims.id FROM claims JOIN batches ON batches.id=claims.batch_id WHERE claims.id=??"
+      },
+      {
+        "count": 2099,
+        "total_ms": 31.0,
+        "max_ms": 1.0,
+        "mean_ms": 0.01476893758932825,
+        "cpu_ms": 0.0,
+        "kind": "SELECT kind FROM claims WHERE subject=?? AND kind IN (?,?,?,?,?) ORDER BY length(claims.accepted_at_unix_ms) DESC, claims.accepted_at_unix_ms DESC, (SELECT origin FROM batches WHERE id=claims.batch_id) DESC, (SELECT replica_sequence FROM batches WHERE id=claims.batch_id) DESC, claims.batch_id DESC, COALESCE((SELECT MIN(position) FROM replica_records WHERE claim_id=claims.id), (SELECT COUNT(*) FROM claims legacy_position WHERE legacy_position.batch_id=claims.batch_id AND legacy_position.store_ind"
+      },
+      {
+        "count": 2099,
+        "total_ms": 22.0,
+        "max_ms": 1.0,
+        "mean_ms": 0.010481181515007144,
+        "cpu_ms": 0.0,
+        "kind": "BEGIN IMMEDIATE"
+      },
+      {
+        "count": 1930,
+        "total_ms": 17.0,
+        "max_ms": 1.0,
+        "mean_ms": 0.008808290155440414,
+        "cpu_ms": 0.0,
+        "kind": "SELECT COALESCE(MAX(id), ?) FROM local_observations"
+      },
+      {
+        "count": 1930,
+        "total_ms": 16.0,
+        "max_ms": 1.0,
+        "mean_ms": 0.008290155440414507,
+        "cpu_ms": 0.0,
+        "kind": "SELECT owner.incarnation, owner.epoch, EXISTS(SELECT ? FROM local_mailbox_bindings WHERE token=??) FROM local_mailbox_owners owner WHERE owner.subject=?? AND owner.component=??"
+      },
+      {
+        "count": 965,
+        "total_ms": 16.0,
+        "max_ms": 1.0,
+        "mean_ms": 0.016580310880829015,
+        "cpu_ms": 0.0,
+        "kind": "WITH candidates(subject) AS ( SELECT subject FROM claims INDEXED BY claims_message_to_index WHERE kind=? AND json_extract(body, ?) IN (??, ??) UNION SELECT desired.subject FROM desired, json_each(desired.body, ?) child WHERE desired.kind=? AND json_extract(child.value, ?)=? AND json_extract(child.value, ?) IN (??, ??) ), created AS ( SELECT subject, (SELECT MIN(store_index) FROM claims WHERE claims.subject=candidates.subject) created_index FROM candidates ) SELECT subject, created_index FROM cre"
+      },
+      {
+        "count": 2099,
+        "total_ms": 13.0,
+        "max_ms": 1.0,
+        "mean_ms": 0.006193425440686041,
+        "cpu_ms": 0.0,
+        "kind": "SELECT id,subject FROM local_observations WHERE id>?? ORDER BY id LIMIT ?"
+      },
+      {
+        "count": 2099,
+        "total_ms": 12.0,
+        "max_ms": 1.0,
+        "mean_ms": 0.005717008099094807,
+        "cpu_ms": 0.0,
+        "kind": "INSERT OR IGNORE INTO events(store_index, kind, subject, body) VALUES (??, ??, ??, ??)"
+      },
+      {
+        "count": 2698,
+        "total_ms": 11.0,
+        "max_ms": 1.0,
+        "mean_ms": 0.00407709414381023,
+        "cpu_ms": 0.0,
+        "kind": "SELECT owner.incarnation, owner.epoch FROM local_mailbox_owners owner JOIN local_mailbox_bindings binding ON binding.token=?? AND binding.subject=owner.subject AND binding.component=owner.component AND binding.incarnation=owner.incarnation AND binding.epoch=owner.epoch WHERE owner.subject=?? AND owner.component=??"
+      },
+      {
+        "count": 2099,
+        "total_ms": 10.0,
+        "max_ms": 1.0,
+        "mean_ms": 0.0047641734159123384,
+        "cpu_ms": 0.0,
+        "kind": "SELECT id FROM claims INDEXED BY claims_subject_accepted_index WHERE subject=?? ORDER BY length(claims.accepted_at_unix_ms) DESC, claims.accepted_at_unix_ms DESC, (SELECT origin FROM batches WHERE id=claims.batch_id) DESC, (SELECT replica_sequence FROM batches WHERE id=claims.batch_id) DESC, claims.batch_id DESC, COALESCE((SELECT MIN(position) FROM replica_records WHERE claim_id=claims.id), (SELECT COUNT(*) FROM claims legacy_position WHERE legacy_position.batch_id=claims.batch_id AND legacy_pos"
+      },
+      {
+        "count": 1930,
+        "total_ms": 10.0,
+        "max_ms": 1.0,
+        "mean_ms": 0.005181347150259067,
+        "cpu_ms": 0.0,
+        "kind": "SELECT subject, kind, body, member, owner_run, owner_generation, owner_step FROM desired WHERE subject IN (SELECT value FROM json_each(??)) ORDER BY subject"
+      },
+      {
+        "count": 2099,
+        "total_ms": 9.0,
+        "max_ms": 1.0,
+        "mean_ms": 0.004287756074321106,
+        "cpu_ms": 0.0,
+        "kind": "SELECT CAST(accepted_at_unix_ms AS INTEGER),body FROM claims WHERE subject=?? AND kind=? ORDER BY CAST(accepted_at_unix_ms AS INTEGER),id LIMIT ?"
+      },
+      {
+        "count": 138,
+        "total_ms": 9.0,
+        "max_ms": 1.0,
+        "mean_ms": 0.06521739130434782,
+        "cpu_ms": 0.0,
+        "kind": "SELECT EXISTS(SELECT ? FROM claims WHERE subject=?? AND store_index>??) OR EXISTS(SELECT ? FROM claims INDEXED BY claims_message_to_order_index WHERE kind=? AND json_extract(body, ?) IN (??, ??) AND store_index>??) OR EXISTS(SELECT ? FROM claims WHERE subject IN (SELECT value FROM json_each(??)) AND store_index>??) OR EXISTS(SELECT ? FROM claims WHERE kind=? AND store_index>?? AND subject GLOB ?) OR EXISTS(SELECT ? FROM local_observations WHERE subject=?? AND id>??)"
+      }
+    ],
+    "request_count": 3513,
+    "sampled_seconds": 31,
+    "clients": [
+      {
+        "count": 3513,
+        "total_ms": 3123.836,
+        "max_ms": 5.526,
+        "mean_ms": 0.8892217477939083,
+        "cpu_ms": 290.308,
+        "client": "st3-5351dbe761f3fece"
+      }
+    ],
+    "client_requests": [
+      {
+        "count": 3000,
+        "total_ms": 3035.088,
+        "max_ms": 5.526,
+        "mean_ms": 1.011696,
+        "cpu_ms": 233.977,
+        "client": "st3-5351dbe761f3fece",
+        "kind": "/fixture/claims"
+      },
+      {
+        "count": 256,
+        "total_ms": 12.212,
+        "max_ms": 0.145,
+        "mean_ms": 0.047703125,
+        "cpu_ms": 3.364,
+        "client": "st3-5351dbe761f3fece",
+        "kind": "/v1/mailbox"
+      },
+      {
+        "count": 256,
+        "total_ms": 76.206,
+        "max_ms": 0.8,
+        "mean_ms": 0.2976796875,
+        "cpu_ms": 52.762,
+        "client": "st3-5351dbe761f3fece",
+        "kind": "/v1/mailbox/bind"
+      },
+      {
+        "count": 1,
+        "total_ms": 0.33,
+        "max_ms": 0.33,
+        "mean_ms": 0.33,
+        "cpu_ms": 0.205,
+        "client": "st3-5351dbe761f3fece",
+        "kind": "/fixture/stats"
+      }
+    ],
+    "reconciler_wakes": [],
+    "incremental_corrections": [],
+    "incremental_evaluations": [],
+    "query_time_note": "Statement wall time includes row processing; concurrent times overlap."
+  },
+  "measurement": {
+    "variant": "targeted-wakes",
+    "base_commit": "0295286eb051650674b769e5c023aa8acb80d990",
+    "build": "cargo test --release -p st3 --lib; Nix Rust 1.97.0 / LLVM 21.1.8",
+    "profile_enabled": true,
+    "scope": "Isolated WAL API daemon; 128 seats, delivery and title streams per seat; no providers or reconciler; separate load process. Same fixture on both versions.",
+    "requested_writes_per_second": 100,
+    "actual_writes_per_second": 98.96534686606212,
+    "average_daemon_cores": 0.18394738504668398,
+    "latency_scope": "API request start to recipient mailbox frame or old-owner fenced frame. CPU covers all 3000 writes and a 300ms settle, excluding setup, doctor and ownership replacement phase.",
+    "counter_scope": "before/after and doctor counters are rolling five-minute snapshots; sampled durations differ and are not full-run deltas.",
+    "fixture_sha256": "fc13f75d62f4c1c0a951ae4f08728e736d70feb5bc98c645a9ec7690dfd90c06",
+    "production_source_sha256": {
+      "crates/st3/src/api/mailbox.rs": "11b4f4f91ced94c9ee5215009ff20d6322acec52e4a1135bee6804ae715f45c8",
+      "crates/st3/src/store.rs": "989e08a2a49fba53565346b2e19edc7104f0b7b4bda1ae000bddde83628499eb",
+      "crates/st3/src/store/runtime.rs": "70b29b2235299c3c1e4f9a848e3b2f15d5b42d49f91da53aef0a2e660d2b43d7",
+      "crates/st3/src/store/mailbox_wakes.rs": "9f227d11c1a5bc2217f3be8bf70411b39a9979350c722c26b1a44e1314abe4fa"
+    }
+  },
+  "doctor_performance": {
+    "window_seconds": 300,
+    "sampled_seconds": 33,
+    "request_count": 3514,
+    "mailbox_tasks": [
+      {
+        "count": 3016,
+        "total_ms": 1247.78,
+        "max_ms": 25.707,
+        "mean_ms": 0.4137201591511936,
+        "cpu_ms": 1147.924,
+        "kind": "task mailbox-snapshot"
+      },
+      {
+        "count": 3252,
+        "total_ms": 336.688,
+        "max_ms": 5.767,
+        "mean_ms": 0.10353259532595326,
+        "cpu_ms": 313.1,
+        "kind": "task mailbox-wake-dispatch"
+      },
+      {
+        "count": 200,
+        "total_ms": 19.878,
+        "max_ms": 0.482,
+        "mean_ms": 0.09939,
+        "cpu_ms": 18.228,
+        "kind": "task mailbox-change-check"
+      }
+    ]
+  }
+}

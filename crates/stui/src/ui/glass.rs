@@ -98,6 +98,48 @@ enum Drop {
     },
 }
 
+/// What a row of the right-click menu does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MenuAction {
+    /// Reuse a registered action, after opening the subject it belongs to if needed.
+    Activate {
+        subject: Option<String>,
+        hit: Box<Hit>,
+    },
+    Agent {
+        agent: String,
+        key: char,
+    },
+    Declaration(String),
+    CopyText(String),
+    Reply {
+        agent: String,
+        message: Option<String>,
+    },
+    Messages(String),
+    Message {
+        agent: String,
+        entry: String,
+    },
+    CloseTab(usize, usize),
+    SplitTab { group: usize, tab: usize, right: bool },
+    MoveTab { group: usize, tab: usize, to: usize },
+    CopyPath(String),
+    SplitGroup { group: usize, right: bool },
+    NewTab(usize),
+    NewTerminal(usize),
+}
+
+/// A menu opened by a right click, at the place of the click.
+#[derive(Clone, Debug)]
+pub(crate) struct ContextMenu {
+    pub(super) column: u16,
+    pub(super) row: u16,
+    pub(super) title: String,
+    pub(super) items: Vec<(String, MenuAction)>,
+    pub(super) selected: usize,
+}
+
 /// The old stui's Usage tab, which now floats over the glass as Now does.
 const USAGE_TAB: usize = 4;
 /// The sidebar's sections, by the tab whose list each shows. Now and Usage are not ones: they
@@ -534,6 +576,33 @@ struct Choice {
     action: Action,
 }
 
+/// The graph path a row stands for, without its kind: `example/atlas/builder` for an agent.
+fn choice_path(action: &Action) -> Option<String> {
+    match action {
+        Action::Open(Pane::Agent(Some(id)) | Pane::Terminal(id)) => {
+            Some(id.trim_start_matches("agent/").to_owned())
+        }
+        Action::Open(Pane::Mission(Some(id))) => Some(id.trim_start_matches("mission/").to_owned()),
+        _ => None,
+    }
+}
+
+/// `query` against `text`, or, when it holds several words, every word against it: "atlas builder"
+/// finds `agent/example/atlas/builder`, which no one-run match reaches across the slashes.
+fn fuzzy_words(query: &str, text: &str) -> Option<i64> {
+    if let Some(score) = fuzzy(query, text) {
+        return Some(score);
+    }
+    let words = query.split_whitespace().collect::<Vec<_>>();
+    if words.len() < 2 {
+        return None;
+    }
+    words
+        .iter()
+        .map(|word| fuzzy(word, text))
+        .sum::<Option<i64>>()
+}
+
 /// How well `query` matches `text`: higher is better, `None` is no match. A query matches as a
 /// substring, or letter by letter where each letter either follows the last one or starts a
 /// word ("ab" finds "Atlas Builder"); letters scattered inside words do not match.
@@ -920,7 +989,7 @@ impl Ui {
                 let score = if choice.search.is_empty() {
                     Some(0)
                 } else {
-                    fuzzy(&palette.query, &choice.search)
+                    fuzzy_words(&palette.query, &choice.search)
                 };
                 score.map(|score| (choice, score))
             })
@@ -931,10 +1000,14 @@ impl Ui {
             // "close glass" closes the glass rather than starting an agent named that.
             // What is typed exactly as a choice begins ("new mission", "atlas") is first.
             let typed = palette.query.trim().to_lowercase();
+            // A command typed as it begins ("new mission") is first. Among what can be opened,
+            // agents come first, then missions, whatever a mission's title starts with
+            // (Nathan, 2026-10-06); within a section, what begins as typed comes first.
             scored.sort_by_key(|(choice, score)| {
                 let catch_all = matches!(choice.action, Action::NewAgent(Some(_)));
                 let named = choice.label.to_lowercase().starts_with(&typed);
-                (catch_all, !named, RANK[choice.section], -score)
+                let command = named && choice.section > 3;
+                (catch_all, !command, RANK[choice.section], !named, -score)
             });
         }
         scored.into_iter().map(|(choice, _)| choice).collect()
@@ -944,9 +1017,10 @@ impl Ui {
         let Some(glasses) = &self.glasses else { return };
         let glass = glasses.glass();
         self.status_line(buf, Rect { height: 1, ..area }, glass);
+        self.top_bar_border(buf, area);
         let mut body = Rect {
-            y: area.y + 1,
-            height: area.height.saturating_sub(2),
+            y: area.y + 2,
+            height: area.height.saturating_sub(3),
             ..area
         };
         // The sidebar takes the left of the glass, beside the splits rather than over them.
@@ -1628,6 +1702,7 @@ impl Ui {
         if rect.width < 30 || rect.height < 8 {
             return;
         }
+        self.cover(body);
         for y in body.y..body.y + body.height {
             for x in body.x..body.x + body.width {
                 if !rect.contains((x, y).into()) {
@@ -1851,17 +1926,25 @@ impl Ui {
     fn status_line(&self, buf: &mut Buffer, area: Rect, glass: &Glass) {
         buf.set_style(area, Style::default().bg(theme::CRUST));
         let bar = |style: Style| style.bg(theme::CRUST);
-        let mut spans = vec![Span::styled(" ≡ st  ", bar(theme::strong(theme::ACCENT)))];
+        // No label at the left: the bar starts at what is live (Nathan, 2026-10-06).
+        let mut spans = vec![Span::styled(" ", bar(theme::strong(theme::ACCENT)))];
         let (glyph, word, color) = match &self.world.link {
             Link::Live if !self.world.diverged.is_empty() => ("⚠", "diverged", theme::RED),
             Link::Live => ("●", "live", theme::GREEN),
             Link::Connecting => (self.spinner(), "connecting", theme::YELLOW),
             Link::Offline(_) => ("○", "offline", theme::RED),
         };
-        spans.push(Span::styled(
-            format!("{glyph} {word}"),
-            bar(theme::fg(color)),
-        ));
+        let link_text = format!("{glyph} {word}");
+        // The connection opens what is known of it: this machine, or why it is not reached.
+        self.hit(
+            Rect {
+                x: area.x + Line::from(spans.clone()).width() as u16,
+                width: text::width(&link_text) as u16,
+                ..area
+            },
+            Hit::Connection,
+        );
+        spans.push(Span::styled(link_text, bar(theme::fg(color))));
         // Now opens over the glass from its count, "need you" (Nathan, 2026-10-04: one way in,
         // named as `st now` is).
         let need = self
@@ -2164,6 +2247,7 @@ impl Ui {
     }
 
     fn draw_palette(&self, buf: &mut Buffer, area: Rect, palette: &Palette) {
+        self.cover(area);
         let width = area.width.saturating_sub(8).clamp(20, 84);
         let height = area.height.saturating_sub(6).clamp(6, 26);
         let rect = Rect {
@@ -2242,7 +2326,14 @@ impl Ui {
             };
             let detail_width = text::width(&choice.detail).min(inner / 3);
             let label = text::truncate(&choice.label, inner.saturating_sub(detail_width + 6));
-            let fill = inner.saturating_sub(text::width(&label) + detail_width + 4);
+            // The whole path after the name, so two agents with one name are told apart and
+            // what was typed against the path is seen to match (Nathan, 2026-10-06).
+            let room = inner.saturating_sub(text::width(&label) + detail_width + 6);
+            let path = choice_path(&choice.action)
+                .filter(|path| room > 6 && !path.eq_ignore_ascii_case(&choice.label))
+                .map(|path| format!("  {}", text::truncate(&path, room - 2)))
+                .unwrap_or_default();
+            let fill = inner.saturating_sub(text::width(&label) + text::width(&path) + detail_width + 4);
             rows.push((
                 Some(index),
                 Line::from(vec![
@@ -2255,6 +2346,7 @@ impl Ui {
                         theme::fg(choice.glyph.1).bg(bg),
                     ),
                     Span::styled(label, theme::text().bg(bg)),
+                    Span::styled(path, theme::dim().bg(bg)),
                     Span::styled(" ".repeat(fill), Style::default().bg(bg)),
                     Span::styled(
                         text::truncate(&choice.detail, detail_width),
@@ -2406,8 +2498,8 @@ impl Ui {
         {
             return false;
         }
-        // In a focused, attached terminal every key is the agent's; Ctrl+\ leaves it first.
-        if terminal_focused {
+        // Space control chords retain their owner; the other terminal keys go to the child.
+        if terminal_focused && !super::terminal_space_key(key) {
             return false;
         }
         // Alt and a letter or digit commands nothing: on a Mac Option types a character instead,
@@ -2463,9 +2555,14 @@ impl Ui {
             KeyCode::Char('e') if control && conversation.is_some() => self.toggle_all_tools(),
             KeyCode::Char('p') if control && conversation.is_some() => self.toggle_simple(),
             KeyCode::Char('d') if control && conversation.is_some() => self.toggle_details(),
+            // Ctrl+R sends a message st never had again; with none to send it speaks into the box,
+            // as it does once the box is open (Nathan, 2026-10-05: it did nothing until a letter
+            // had opened the box).
             KeyCode::Char('r') if control && conversation.is_some() && self.live => {
                 if let Some(entry) = self.undelivered() {
                     self.effects.push(Effect::Resend { entry });
+                } else {
+                    self.start_voice();
                 }
             }
             // Backspace takes a message st never had back into the box, to change or delete.
@@ -3190,6 +3287,281 @@ impl Ui {
 
     /// Close the focused group's shown tab; an empty group other than the first goes with it.
     /// Home stays.
+    /// Open the right-click menu for what is under the pointer: a tab, or a split's strip or
+    /// non-terminal body (a terminal body keeps the click for its program).
+    pub(super) fn open_glass_context_menu(&mut self, column: u16, row: u16) {
+        let Some(glasses) = self.glasses.as_ref() else {
+            return;
+        };
+        if glasses.palette.is_some() {
+            return;
+        }
+        let glass = glasses.glass();
+        let groups = glass.layout.groups();
+        let tab_under = {
+            let info = self.frame.borrow();
+            info.hits.iter().rev().find_map(|(rect, hit)| match hit {
+                Hit::GlassTab(group, tab) if contains(*rect, column, row) => Some((*group, *tab)),
+                _ => None,
+            })
+        };
+        let menu = if let Some((group, tab)) = tab_under {
+            let Some(pane) = groups
+                .get(group)
+                .and_then(|members| members.tabs.get(tab.saturating_sub(offset(group))))
+                .map(|tab| tab.pane.clone())
+            else {
+                return;
+            };
+            let subject = pane
+                .split_once(':')
+                .map(|(_, subject)| subject.to_owned())
+                .filter(|s| !s.is_empty());
+            let mut items = vec![(
+                "Show tab [Enter]".to_owned(),
+                MenuAction::Activate {
+                    subject: None,
+                    hit: Box::new(Hit::GlassTab(group, tab)),
+                },
+            )];
+            if groups.get(group).is_some_and(|group| group.tabs.len() > 1) {
+                items.push(("Split right with this tab".into(), MenuAction::SplitTab { group, tab, right: true }));
+                items.push(("Split below with this tab".into(), MenuAction::SplitTab { group, tab, right: false }));
+            }
+            if groups.len() > 1 {
+                let to = (group + 1) % groups.len();
+                items.push((
+                    format!("Move to split {}", to + 1),
+                    MenuAction::MoveTab { group, tab, to },
+                ));
+            }
+            if let Some(subject) = subject {
+                items.push(("Copy its path".into(), MenuAction::CopyPath(subject.clone())));
+            }
+            items.push((
+                "Close tab [Ctrl+W]".into(),
+                MenuAction::CloseTab(group, tab),
+            ));
+            ContextMenu {
+                column,
+                row,
+                title: "tab".into(),
+                items,
+                selected: 0,
+            }
+        } else {
+            let leaf = {
+                let info = self.frame.borrow();
+                info.glass_leaves.iter().position(|rect| {
+                    contains(
+                        Rect {
+                            y: rect.y.saturating_sub(1),
+                            height: rect.height + 1,
+                            ..*rect
+                        },
+                        column,
+                        row,
+                    )
+                })
+            };
+            let Some(group) = leaf else { return };
+            let strip = self
+                .frame
+                .borrow()
+                .glass_leaves
+                .get(group)
+                .is_some_and(|rect| row + 1 == rect.y);
+            let on_terminal = groups
+                .get(group)
+                .and_then(|members| members.tabs.get(members.current.saturating_sub(offset(group))))
+                .is_some_and(|tab| matches!(Pane::parse(&tab.pane), Some(Pane::Terminal(_))));
+            if on_terminal && !strip {
+                return;
+            }
+            ContextMenu {
+                column,
+                row,
+                title: "split".into(),
+                items: vec![
+                    (
+                        "Split right [Ctrl+V]".into(),
+                        MenuAction::SplitGroup { group, right: true },
+                    ),
+                    (
+                        "Split below [Ctrl+X]".into(),
+                        MenuAction::SplitGroup {
+                            group,
+                            right: false,
+                        },
+                    ),
+                    ("New tab… [Ctrl+T]".into(), MenuAction::NewTab(group)),
+                    ("New terminal".into(), MenuAction::NewTerminal(group)),
+                ],
+                selected: 0,
+            }
+        };
+        self.context = Some(menu);
+    }
+
+    /// The right-click menu, drawn at the click and kept inside the glass; each row is a target.
+    pub(super) fn draw_context_menu(&self, buf: &mut Buffer, area: Rect) {
+        let Some(menu) = &self.context else { return };
+        self.cover(area);
+        let width = menu
+            .items
+            .iter()
+            .map(|(label, _)| text::width(label))
+            .chain([text::width(&menu.title)])
+            .max()
+            .unwrap_or(8)
+            .saturating_add(4)
+            .min(area.width as usize) as u16;
+        let height = menu.items.len().saturating_add(2).min(area.height as usize) as u16;
+        let x = menu.column.min((area.x + area.width).saturating_sub(width));
+        let y = menu
+            .row
+            .saturating_add(1)
+            .min((area.y + area.height).saturating_sub(height));
+        let rect = Rect {
+            x,
+            y,
+            width: width.min(area.width),
+            height: height.min(area.height),
+        };
+        self.frame.borrow_mut().menu = Some(rect);
+        buf.set_style(rect, Style::default().bg(theme::MANTLE));
+        for y in rect.y..rect.bottom() {
+            for x in rect.x..rect.right() {
+                buf[(x, y)].set_symbol(" ");
+            }
+        }
+        buf.set_stringn(
+            rect.x + 1,
+            rect.y,
+            &menu.title,
+            rect.width.saturating_sub(2) as usize,
+            theme::dim().bg(theme::MANTLE),
+        );
+        let visible = rect.height.saturating_sub(2) as usize;
+        let top = menu.selected.saturating_sub(visible.saturating_sub(1));
+        for (offset, (index, (label, action))) in menu
+            .items
+            .iter()
+            .enumerate()
+            .skip(top)
+            .take(visible)
+            .enumerate()
+        {
+            let line = Rect {
+                y: rect.y + 1 + offset as u16,
+                height: 1,
+                ..rect
+            };
+            let background = if index == menu.selected {
+                theme::ROW_SELECTED
+            } else {
+                theme::MANTLE
+            };
+            buf.set_style(line, theme::text().bg(background));
+            buf.set_stringn(
+                line.x + 2,
+                line.y,
+                label,
+                line.width.saturating_sub(3) as usize,
+                theme::text().bg(background),
+            );
+            self.hit(line, Hit::Menu(action.clone()));
+        }
+        buf.set_stringn(
+            rect.x + 1,
+            rect.y + rect.height.saturating_sub(1),
+            "↑↓ · Enter · Esc",
+            rect.width.saturating_sub(2) as usize,
+            theme::dim().bg(theme::MANTLE),
+        );
+    }
+
+    /// A row of the right-click menu was chosen.
+    pub(crate) fn run_menu_action(&mut self, action: MenuAction) {
+        self.context = None;
+        match action {
+            MenuAction::Activate { subject, hit } => {
+                self.popover = None;
+                if let Some(subject) = subject {
+                    self.open(&subject);
+                    if let Hit::Key(key) = *hit {
+                        self.action_key(key);
+                    } else {
+                        self.click(*hit);
+                    }
+                } else {
+                    self.click(*hit);
+                }
+            }
+            MenuAction::Agent { agent, key } => {
+                self.popover = None;
+                self.agent_action(agent, key);
+            }
+            MenuAction::Declaration(mission) => {
+                self.open(&mission);
+                if !self.kdl {
+                    self.action_key('k');
+                }
+            }
+            MenuAction::CopyText(text) => {
+                copy(&text);
+                self.flash("Copied message text");
+            }
+            MenuAction::Reply { agent, message } => {
+                self.open(&agent);
+                if let Some(message) = message {
+                    self.replies.insert(agent, message);
+                } else {
+                    self.replies.remove(&agent);
+                }
+                self.editing = true;
+            }
+            MenuAction::Messages(agent) => self.open_message_choices(&agent),
+            MenuAction::Message { agent, entry } => self.open_message_actions(&agent, &entry),
+            MenuAction::CloseTab(group, tab) => {
+                self.show_in(group, tab);
+                self.close_tab();
+            }
+            MenuAction::SplitTab { group, tab, right } => self.drop_tab(
+                (group, tab),
+                Drop::Edge {
+                    group,
+                    side: if right { Side::Right } else { Side::Below },
+                    first: false,
+                },
+            ),
+            MenuAction::MoveTab { group, tab, to } => {
+                let end = self
+                    .glasses
+                    .as_ref()
+                    .and_then(|glasses| glasses.glass().layout.groups().get(to).map(|group| group.tabs.len()))
+                    .unwrap_or(0);
+                self.drop_tab((group, tab), Drop::Strip { group: to, index: end });
+            }
+            MenuAction::CopyPath(path) => {
+                copy(&path);
+                self.flash(format!("Copied {path}"));
+            }
+            MenuAction::SplitGroup { group, right } => {
+                self.focus_group(group);
+                self.split(right);
+            }
+            MenuAction::NewTab(group) => {
+                self.focus_group(group);
+                self.open_palette(None, Open::Tab);
+            }
+            MenuAction::NewTerminal(group) => {
+                self.focus_group(group);
+                self.open_new_terminal();
+            }
+        }
+    }
+
     fn close_tab(&mut self) {
         let Some(glasses) = self.glasses.as_mut() else {
             return;
@@ -3204,13 +3576,14 @@ impl Ui {
         let Some(group) = glass.layout.group_mut(focus) else {
             return;
         };
-        let mut detach = false;
+        let mut released: Option<String> = None;
         match group.current.checked_sub(offset(focus)) {
             Some(index) if index < group.tabs.len() => {
                 let closed = group.tabs.remove(index);
-                // Closing the attached terminal's tab lets it go.
-                detach = matches!(Pane::parse(&closed.pane), Some(Pane::Terminal(agent))
-                    if self.terminal.as_ref().is_some_and(|view| view.agent == agent));
+                // Closing an attached terminal's tab lets it go.
+                if let Some(Pane::Terminal(agent)) = Pane::parse(&closed.pane) {
+                    released = Some(agent);
+                }
                 let shown = group.tabs.len() + offset(focus);
                 group.current = group.current.min(shown.saturating_sub(1));
             }
@@ -3222,9 +3595,12 @@ impl Ui {
             glass.focus = focus.saturating_sub(1);
         }
         let id = glass.id.clone();
-        if detach {
-            self.terminal = None;
-            self.effects.push(Effect::CloseTerminal);
+        if let Some(agent) = released {
+            // The one that had the keys also stops being followed through st.
+            let focused = self.terminal.as_ref().is_some_and(|view| view.agent == agent);
+            if self.drop_terminal(&agent) && focused {
+                self.effects.push(Effect::CloseTerminal);
+            }
         }
         self.glass_changed(&id);
         self.show_focused();
@@ -3563,7 +3939,7 @@ mod tests {
         assert!(
             screen(&ui)
                 .lines()
-                .nth(1)
+                .nth(2)
                 .unwrap()
                 .contains("◆ Atlas Builder"),
             "it needs the person"
@@ -3696,6 +4072,24 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_r_speaks_in_a_conversation_without_the_box_open_first() {
+        let mut ui = glass();
+        ui.live = true;
+        ui.open_in_glass(
+            Pane::Agent(Some("agent/example/atlas/builder".into())),
+            Open::Tab,
+        );
+        assert!(!ui.editing, "the box is closed");
+        ctrl(&mut ui, 'r');
+        // Without a speech helper (this test has none) it says so; before, it did nothing.
+        let flash = ui.flash.as_ref().map(|(message, _)| message.as_str());
+        assert!(
+            flash.is_some_and(|message| message.contains("voice")),
+            "ctrl+r reached voice: {flash:?}"
+        );
+    }
+
+    #[test]
     fn letters_in_the_sidebar_never_type_into_the_conversation_behind_it() {
         let mut ui = glass();
         ui.open_in_glass(
@@ -3775,7 +4169,7 @@ mod tests {
         );
         assert_eq!(ui.tab, 2, "the new split has the focus");
         let shown = screen(&ui);
-        let strip = shown.lines().nth(1).unwrap();
+        let strip = shown.lines().nth(2).unwrap();
         assert!(
             strip.contains("Atlas Builder")
                 && strip.contains("Weekly release")
@@ -3932,6 +4326,184 @@ mod tests {
             Some(shell)
         );
         assert_eq!(tabs(&ui).2, vec![vec![format!("terminal:{shell}")]]);
+    }
+
+    #[test]
+    fn two_terminals_in_two_splits_stay_attached_and_keys_follow_focus() {
+        // Nathan, 2026-10-06: attaching one terminal detached the other.
+        let mut ui = glass();
+        let ids = ui
+            .world
+            .agents
+            .items()
+            .iter()
+            .filter(|agent| agent.terminal)
+            .map(|agent| (agent.id.clone(), agent.name.clone()))
+            .take(2)
+            .collect::<Vec<_>>();
+        let [(first, first_name), (second, second_name)] = &ids[..] else {
+            panic!("the demo has two agents with terminals");
+        };
+        ui.open_in_glass(Pane::Agent(Some(first.clone())), Open::Tab);
+        ctrl(&mut ui, ']');
+        ui.open_in_glass(Pane::Agent(Some(second.clone())), Open::Right);
+        ctrl(&mut ui, ']');
+        assert_eq!(ui.terminal.as_ref().map(|view| view.agent.as_str()), Some(second.as_str()));
+        assert_eq!(ui.parked.len(), 1, "the first is still attached");
+        let shown = screen(&ui);
+        assert!(
+            shown.contains(first_name) && shown.contains(second_name),
+            "both terminals draw: {shown}"
+        );
+        // Focus moves to the left split; the next key finds its terminal.
+        let left = ui.frame.borrow().glass_leaves[0];
+        ui.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: left.x + 2,
+            row: left.y + 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        press(&mut ui, KeyCode::Char('a'), KeyModifiers::NONE);
+        assert_eq!(ui.terminal.as_ref().map(|view| view.agent.as_str()), Some(first.as_str()));
+        assert_eq!(ui.parked.first().map(|view| view.agent.as_str()), Some(second.as_str()));
+        // Closing a tab lets only its own terminal go (Ctrl+W goes to a focused terminal).
+        ui.close_tab();
+        assert!(ui.terminal_view(first).is_none());
+        assert!(ui.terminal_view(second).is_some(), "the other stays attached");
+    }
+
+    #[test]
+    fn native_split_terminals_route_wheel_and_focus_to_their_own_connections() {
+        use pty_core::protocol::{MessageType, PacketReader, encode_packet};
+        use std::io::{Read as _, Write as _};
+        use std::os::unix::net::UnixStream;
+        use std::time::{Duration, Instant};
+
+        fn input(peer: &mut UnixStream, reader: &mut PacketReader) -> Vec<u8> {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                assert!(Instant::now() < deadline, "no terminal input");
+                let mut bytes = [0u8; 1024];
+                let count = peer.read(&mut bytes).unwrap();
+                for packet in reader.feed(&bytes[..count]).unwrap() {
+                    if packet.type_ == MessageType::Data {
+                        return packet.payload;
+                    }
+                }
+            }
+        }
+
+        let mut ui = glass();
+        let ids: Vec<_> = ui
+            .world
+            .agents
+            .items()
+            .iter()
+            .filter(|agent| agent.terminal)
+            .take(2)
+            .map(|agent| agent.id.clone())
+            .collect();
+        let [first, second] = &ids[..] else {
+            panic!("two demo terminals")
+        };
+        ui.open_in_glass(Pane::Agent(Some(first.clone())), Open::Tab);
+        ctrl(&mut ui, ']');
+        ui.open_in_glass(Pane::Agent(Some(second.clone())), Open::Right);
+        ctrl(&mut ui, ']');
+        let mut peers = Vec::new();
+        for agent in &ids {
+            let (client, mut peer) = UnixStream::pair().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            ui.terminal_view_mut(agent).unwrap().native = Some(
+                crate::ui::pty::NativeTerminal::spawn(client, agent, "one".into(), 24, 80),
+            );
+            peer.write_all(&encode_packet(
+                MessageType::Screen,
+                b"\x1b[?1004h\x1b[?1003h\x1b[?1006h",
+            ))
+            .unwrap();
+            peers.push(peer);
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !ids.iter().all(|agent| {
+            ui.terminal_view(agent)
+                .unwrap()
+                .native
+                .as_ref()
+                .unwrap()
+                .mode()
+                .contains(alacritty_terminal::term::TermMode::MOUSE_MOTION)
+        }) {
+            assert!(Instant::now() < deadline, "screen did not arrive");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        screen(&ui);
+        let mut readers = [PacketReader::new(), PacketReader::new()];
+        ui.input_event(crossterm::event::Event::FocusGained);
+        assert_eq!(input(&mut peers[1], &mut readers[1]), b"\x1b[I");
+        let body = ui
+            .frame
+            .borrow()
+            .panes
+            .iter()
+            .find(|pane| pane.key == Pane::Terminal(first.clone()).key())
+            .unwrap()
+            .rect;
+        ui.terminal_selection_mode = true;
+        ui.input_event(crossterm::event::Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: body.x + 4,
+            row: body.y + 2,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert_eq!(
+            input(&mut peers[0], &mut readers[0]),
+            b"\x1b[<65;5;3M".repeat(3)
+        );
+        assert_eq!(
+            ui.terminal.as_ref().unwrap().agent,
+            *second,
+            "wheel does not move focus"
+        );
+        let left = ui.frame.borrow().glass_leaves[0];
+        ui.input_event(crossterm::event::Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: left.x + 2,
+            row: left.y + 2,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert_eq!(ui.terminal.as_ref().unwrap().agent, *first);
+        assert!(
+            !ui.terminal_selection_mode,
+            "selection override does not leak into another tab"
+        );
+        assert_eq!(input(&mut peers[1], &mut readers[1]), b"\x1b[O");
+        assert_eq!(input(&mut peers[0], &mut readers[0]), b"\x1b[I");
+        screen(&ui);
+        assert!(
+            ui.terminal_cursor.get().is_some(),
+            "the other split must not erase the focused cursor"
+        );
+        ui.input_event(crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+        ));
+        assert_eq!(input(&mut peers[0], &mut readers[0]), b"a");
+    }
+
+    #[test]
+    fn usage_in_a_narrow_pane_reads_whole_a_limit_to_a_line_and_notes_wrapped() {
+        // Nathan, 2026-10-06: the usage view was cut off and double spaced.
+        let mut ui = glass();
+        ui.toggle_usage();
+        let shown = screen(&ui);
+        let lines = shown.lines().collect::<Vec<_>>();
+        let weekly = lines.iter().position(|line| line.contains("weekly   23%")).unwrap();
+        assert!(lines[weekly + 1].contains("5-hour   41%"), "{shown}");
+        let summary = lines.iter().position(|line| line.contains("summary")).unwrap();
+        assert!(
+            lines[summary + 1].contains("$77.30"),
+            "the summary starts straight under its heading: {shown}"
+        );
     }
 
     #[test]
@@ -4712,14 +5284,14 @@ mod tests {
         let zoomed = screen(&ui);
         assert!(zoomed.contains("zoomed · ctrl+o"), "{zoomed}");
         assert!(
-            !zoomed.lines().nth(1).unwrap().contains("Atlas Builder"),
+            !zoomed.lines().nth(2).unwrap().contains("Atlas Builder"),
             "only the focused split shows"
         );
         ctrl(&mut ui, 'o');
         assert!(
             screen(&ui)
                 .lines()
-                .nth(1)
+                .nth(2)
                 .unwrap()
                 .contains("Atlas Builder")
         );
@@ -4796,6 +5368,61 @@ mod tests {
     }
 
     #[test]
+    fn new_agent_worktree_fields_follow_focus_and_send_the_selected_checkout() {
+        let mut ui = glass();
+        ui.live = true;
+        ui.open_new_agent(None);
+        ui.new_agent.as_mut().unwrap().name = "willow.keen-otter".into();
+        let host = ui.agent_repository_host().unwrap();
+        ui.agent_repositories = Some((
+            host,
+            super::super::view::Load::Ready(vec![
+                "/srv/example/atlas".into(),
+                "/srv/example/site".into(),
+            ]),
+        ));
+        screen(&ui);
+        for _ in 0..6 {
+            press(&mut ui, KeyCode::Tab, KeyModifiers::NONE);
+        }
+        let shown = screen(&ui);
+        assert!(
+            shown.contains("REPOSITORY") && shown.contains("/srv/example/atlas"),
+            "{shown}"
+        );
+        ctrl(&mut ui, 'n');
+        assert_eq!(
+            ui.new_agent.as_ref().unwrap().repository,
+            "/srv/example/atlas"
+        );
+        ui.click(Hit::Repository("/srv/example/site".into()));
+        press(&mut ui, KeyCode::Tab, KeyModifiers::NONE);
+        assert!(screen(&ui).contains("keen-otter"));
+        ui.paste("fix/login".into());
+        press(&mut ui, KeyCode::Tab, KeyModifiers::NONE);
+        ui.paste("origin/develop".into());
+        press(&mut ui, KeyCode::Tab, KeyModifiers::NONE);
+        ui.paste("/srv/example/login".into());
+        let shown = screen(&ui);
+        assert!(
+            shown.contains("WORKSPACE") && shown.contains("/srv/example/login"),
+            "{shown}"
+        );
+        press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(
+            matches!(&ui.effects[0], Effect::CreateAgent { repo: Some(repo), branch: Some(branch), base: Some(base), workspace: Some(workspace), .. } if repo == "/srv/example/site" && branch == "fix/login" && base == "origin/develop" && workspace == "/srv/example/login")
+        );
+        // Changing hosts clears paths and cannot cycle suggestions from the old host.
+        ui.new_agent.as_mut().unwrap().focus = 5;
+        press(&mut ui, KeyCode::Right, KeyModifiers::NONE);
+        assert!(ui.new_agent.as_ref().unwrap().repository.is_empty());
+        assert!(ui.new_agent.as_ref().unwrap().workspace.is_empty());
+        ui.new_agent.as_mut().unwrap().focus = 6;
+        ctrl(&mut ui, 'n');
+        assert!(ui.new_agent.as_ref().unwrap().repository.is_empty());
+    }
+
+    #[test]
     fn a_new_agent_starts_from_a_form_in_its_own_tab() {
         let mut ui = glass();
         ui.live = true;
@@ -4836,6 +5463,10 @@ mod tests {
                 model: Some("gpt-6-sol".into()),
                 effort: None,
                 host: None,
+                repo: None,
+                branch: None,
+                base: None,
+                workspace: None,
                 message: Some("fix the login test, then open a PR".into()),
             }],
             "a name keeps to letters, digits, dots and dashes"
@@ -5102,6 +5733,112 @@ mod tests {
         assert_eq!((tabs(&ui).0, ui.tab), (0, 1));
     }
 
+    fn mouse(ui: &mut Ui, kind: MouseEventKind, column: u16, row: u16) {
+        ui.mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+
+    #[test]
+    fn a_right_click_on_a_tab_offers_its_actions_and_a_split_offers_a_new_split() {
+        let mut ui = glass();
+        ui.open_in_glass(
+            Pane::Agent(Some("agent/example/atlas/builder".into())),
+            Open::Tab,
+        );
+        ui.open_in_glass(
+            Pane::Mission(Some("mission/fleet/release/weekly".into())),
+            Open::Tab,
+        );
+        screen(&ui);
+        let (group, tab, rect) = {
+            let info = ui.frame.borrow();
+            info.hits
+                .iter()
+                .find_map(|(rect, hit)| match hit {
+                    Hit::GlassTab(group, tab) if *tab == 0 => Some((*group, *tab, *rect)),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_eq!(group, 0);
+        let before = tabs(&ui).2[0].len();
+        mouse(&mut ui, MouseEventKind::Down(MouseButton::Right), rect.x, rect.y);
+        assert!(ui.context.is_some());
+        let shown = screen(&ui);
+        assert!(shown.contains("Close tab") && shown.contains("Copy its path"), "{shown}");
+        // A click elsewhere only closes the menu.
+        mouse(&mut ui, MouseEventKind::Down(MouseButton::Left), 1, 20);
+        assert!(ui.context.is_none());
+        assert_eq!(tabs(&ui).2[0].len(), before);
+        // A row acts: Close tab.
+        mouse(&mut ui, MouseEventKind::Down(MouseButton::Right), rect.x, rect.y);
+        screen(&ui);
+        let close = {
+            let info = ui.frame.borrow();
+            info.hits
+                .iter()
+                .find_map(|(rect, hit)| {
+                    (*hit == Hit::Menu(MenuAction::CloseTab(group, tab))).then_some(*rect)
+                })
+                .unwrap()
+        };
+        mouse(&mut ui, MouseEventKind::Down(MouseButton::Left), close.x + 2, close.y);
+        assert!(ui.context.is_none());
+        assert_eq!(tabs(&ui).2[0].len(), before - 1);
+        // The empty end of a strip offers a new split.
+        screen(&ui);
+        let leaf = ui.frame.borrow().glass_leaves[0];
+        mouse(
+            &mut ui,
+            MouseEventKind::Down(MouseButton::Right),
+            leaf.x + leaf.width - 2,
+            leaf.y - 1,
+        );
+        let shown = screen(&ui);
+        assert!(shown.contains("Split right") && shown.contains("New terminal"), "{shown}");
+        ui.run_menu_action(MenuAction::SplitGroup { group: 0, right: true });
+        assert_eq!(tabs(&ui).2.len(), 2, "a second split exists");
+    }
+
+    #[test]
+    fn the_connection_word_is_clickable_and_says_what_is_known() {
+        let mut ui = glass();
+        ui.world.link = Link::Offline("Last connected at 10:02 · reconnecting · r retry now".into());
+        screen(&ui);
+        let rect = {
+            let info = ui.frame.borrow();
+            info.hits
+                .iter()
+                .find_map(|(rect, hit)| (*hit == Hit::Connection).then_some(*rect))
+                .unwrap()
+        };
+        mouse(&mut ui, MouseEventKind::Down(MouseButton::Left), rect.x, rect.y);
+        assert!(
+            ui.flash
+                .as_ref()
+                .is_some_and(|(text, _)| text.contains("Last connected at 10:02")),
+            "{:?}",
+            ui.flash
+        );
+        // Live opens this machine.
+        ui.world.link = Link::Live;
+        screen(&ui);
+        mouse(&mut ui, MouseEventKind::Down(MouseButton::Left), rect.x, rect.y);
+        assert!(
+            tabs(&ui)
+                .2
+                .iter()
+                .flatten()
+                .any(|pane| pane.starts_with("machine:machine/")),
+            "{:?}",
+            tabs(&ui)
+        );
+    }
+
     #[test]
     fn clicking_another_split_only_moves_focus_away_from_an_attached_terminal() {
         let mut ui = glass();
@@ -5243,6 +5980,39 @@ mod tests {
         ctrl(&mut ui, 'k');
         typed(&mut ui, "atlas");
         assert!(!screen(&ui).contains("said in conversations"));
+    }
+
+    #[test]
+    fn find_ranks_agents_before_missions_and_matches_words_across_the_path() {
+        // A mission whose title starts with what is typed does not outrank an agent that
+        // matches it (Nathan, 2026-10-06).
+        let mut ui = glass();
+        let agent = ui.world.agents.items()[0].clone();
+        let title = agent.name.clone();
+        if let Load::Ready(missions) = &mut ui.world.missions {
+            missions[0].title = format!("{title} rollout");
+        }
+        ctrl(&mut ui, 'k');
+        typed(&mut ui, &title.to_lowercase());
+        let found = ui.matches(ui.glasses.as_ref().unwrap().palette.as_ref().unwrap());
+        let first_mission = found.iter().position(|choice| choice.section == 2);
+        let first_agent = found.iter().position(|choice| choice.section == 1);
+        assert!(first_agent < first_mission, "agents lead: {first_agent:?} {first_mission:?}");
+        // Words typed against the path find the agent across its slashes, and the row shows
+        // the whole path.
+        let path = agent.id.trim_start_matches("agent/").to_owned();
+        let words = path.split('/').take(2).collect::<Vec<_>>().join(" ");
+        ctrl(&mut ui, 'k');
+        ctrl(&mut ui, 'k');
+        typed(&mut ui, &words);
+        let found = ui.matches(ui.glasses.as_ref().unwrap().palette.as_ref().unwrap());
+        assert!(
+            found
+                .iter()
+                .any(|choice| choice_path(&choice.action).as_deref() == Some(path.as_str())),
+            "{words:?} finds {path}"
+        );
+        assert!(screen(&ui).contains(&path), "{}", screen(&ui));
     }
 
     #[test]

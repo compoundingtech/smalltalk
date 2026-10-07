@@ -49,6 +49,7 @@ pub mod person_request;
 pub mod pricing;
 pub use smallclaims::{performance, profile};
 pub mod projection;
+pub mod provenance;
 pub mod reconcile;
 pub mod rules;
 /// Observes git and gh calls without changing their command behavior.
@@ -70,6 +71,7 @@ pub mod sekrets;
 pub mod service;
 /// The st agent skill bundled in this binary and installed for each harness.
 pub mod skill;
+pub mod startup;
 pub mod store;
 pub mod subagents;
 /// Suspends a quiet seat and resumes its own native session.

@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "summary": "#1461: Ctrl+R voice activation",
+  "commits": ["b6049f95cdd26afc270a9481d79d3ea686a5ad63"],
+  "replay": {"status": "none", "detail": "No new projection invalidation or startup replay trigger in the merged Ctrl+R voice activation change."},
+  "schema": {"status": "none", "detail": "No database table, index, trigger or migration change in Ctrl+R voice activation; SQLite user_version is unchanged."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digest/drop policy are unchanged; this change adds no sealing coordination requirement."},
+  "compatibility": {"status": "none", "detail": "Ctrl+r voice activation changes presentation or UI interaction only; stored claims and daemon wire contracts are unchanged."},
+  "downtime": {"status": "none", "detail": "No additional upgrade service stop or measured outage introduced by Ctrl+R voice activation; the standard daemon/client restart procedure still applies."},
+  "manual": {"status": "none", "detail": "No data repair or configuration conversion required for existing installations by Ctrl+R voice activation."},
+  "recovery": {"status": "none", "detail": "No additional recovery procedure introduced by this change. Preserve graph state, keys and configuration and follow the standard roll-forward guidance; this note does not qualify binary-only downgrade of the whole release."}
+}

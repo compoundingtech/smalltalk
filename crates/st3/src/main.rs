@@ -12,7 +12,9 @@ use clap::{Args, CommandFactory as _, FromArgMatches as _, Parser, Subcommand, V
 use kdl::{KdlDocument, KdlEntry, KdlNode};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
-use st3::api::{AppState, fabric_router, router, serve_unix};
+#[cfg(test)]
+use st3::api::serve_unix;
+use st3::api::{AppState, fabric_router, router};
 use st3::client::{Client, Endpoint};
 use st3::config::{Config, PeerConfig, validate_unix_socket_path};
 use st3::model::{
@@ -55,6 +57,8 @@ use completion::{Complete, Entity, WorkFilter};
 
 mod cli_help;
 mod completion;
+#[cfg(test)]
+mod follow_tests;
 mod presentation;
 
 use presentation::{
@@ -113,6 +117,10 @@ enum Command {
     /// Show token spend over a period, with the largest spenders first.
     Usage(UsageArgs),
     /// Inspect and control missions.
+    ///
+    /// A mission records an authorized goal, its plan, owners, verification and result.
+    /// Use work start for a small independent job; use a finite mission for dependencies,
+    /// distinct owners, gates or review. st skill explains the agent workflow.
     Missions {
         #[command(subcommand)]
         command: MissionViewCommand,
@@ -150,6 +158,10 @@ enum Command {
     /// stui, the phone and st itself, with their builds as they report them.
     Clients,
     /// Claim and update durable mission work.
+    ///
+    /// Claim existing work first. work start records a small independent authorized job;
+    /// missions record a plan with dependencies and review. Complete work with evidence,
+    /// then turn review feedback into the next authorized iteration. See st skill.
     Work {
         #[command(subcommand)]
         command: WorkCommand,
@@ -1276,6 +1288,7 @@ async fn run_uninstall(endpoint: &Endpoint, args: UninstallArgs) -> Result<()> {
         config.socket.clone(),
         config.client_gateway_socket.clone(),
     ];
+    paths.extend(st3::startup::paths(&config.socket));
     if st2_only_hooks {
         paths.push(st2_state);
     }
@@ -1326,7 +1339,9 @@ async fn run_uninstall(endpoint: &Endpoint, args: UninstallArgs) -> Result<()> {
     if !args.no_service && services_installed() {
         st3::service::stop_owned_runtimes(&config)?;
         st3::service::uninstall()?;
-    } else if client.get::<Value>("/v1/health").await.is_ok() {
+    } else if client.get::<Value>("/v1/health").await.is_ok()
+        || st3::startup::read(&config.socket).is_some()
+    {
         anyhow::bail!("stop st3 up and st3 replication-worker, then run st uninstall --yes again");
     }
     for path in &paths {
@@ -1658,6 +1673,9 @@ enum MissionViewCommand {
     /// `depends-on` orders steps; `missions start --after` orders runs without reports.
     /// A final step assigned to the author, depending on the last real step, reaches the
     /// author once when work is done. Review gates mark decisions only a person can make.
+    /// Preview with --dry-run before publication; it runs no exec gates unless --check is set.
+    /// Actual publication normally runs gates once and refuses broken answers, allowing valid
+    /// "not yet" answers. See st skill for goals, evidence, review and feedback loops.
     Publish(MissionPublishArgs),
     /// Run each exec gate in a mission file once, now, the way a run would, and report its
     /// answer: pass (exit 0), not yet (exit 1), broken (anything else), or unchecked.
@@ -1668,6 +1686,8 @@ enum MissionViewCommand {
     /// `depends-on` orders steps; `--after` orders runs without reports.
     /// A final step assigned to the author, depending on the last real step, reaches the
     /// author once when work is done. Review gates mark decisions only a person can make.
+    /// Publication and preview do not start a run. Claim its ready steps, verify the result
+    /// and record evidence before review. Recording work does not widen its authorization.
     Start(MissionRunStartArgs),
     /// Cancel one exact running mission and stop its owned work and runtimes.
     Cancel(MissionCancelArgs),
@@ -1699,6 +1719,7 @@ enum MissionViewCommand {
 struct MissionShowArgs {
     #[arg(add = ArgValueCompleter::new(Complete(Entity::MissionOrRun)))]
     mission_or_run: String,
+    /// Follow until finished or stopped; retry timeouts and wait up to 5min for an unreachable daemon.
     #[arg(long)]
     follow: bool,
 }
@@ -1801,6 +1822,7 @@ struct MissionRunStartArgs {
     #[arg(long, value_name = "RUN")]
     #[arg(add = ArgValueCompleter::new(Complete(Entity::MissionRun { unfinished_only: true })))]
     after: Option<String>,
+    /// Follow until finished or stopped; retry timeouts and wait up to 5min for an unreachable daemon.
     #[arg(long)]
     follow: bool,
     #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
@@ -2029,6 +2051,12 @@ enum PtyCommand {
     End(PtyScreenArgs),
     /// List current terminal sessions; use --all for stopped history.
     Ls {
+        /// Match the exact owner subject before pagination (for example agent/example/worker).
+        #[arg(long, add = ArgValueCompleter::new(Complete(Entity::Actor)))]
+        owner: Option<String>,
+        /// Match the exact projected runtime state, such as running.
+        #[arg(long)]
+        state: Option<String>,
         #[arg(long)]
         all: bool,
         /// Resume the next bounded page returned by an earlier list.
@@ -2216,6 +2244,7 @@ struct TraceArgs {
     limit: usize,
     #[arg(long)]
     after_index: Option<u64>,
+    /// Follow from the last index; retry timeouts and wait up to 5min for an unreachable daemon.
     #[arg(short = 'f', long)]
     follow: bool,
 }
@@ -2359,6 +2388,12 @@ enum DevicesCommand {
         /// Allow a public HTTP address only when it is already an encrypted path.
         #[arg(long)]
         allow_public_http: bool,
+        /// Person-root fingerprint obtained separately from the trusted pairing machine.
+        #[arg(long, conflicts_with = "unpinned")]
+        fingerprint: Option<String>,
+        /// Explicitly bypass person-root identity verification (unsafe against active attackers).
+        #[arg(long)]
+        unpinned: bool,
     },
     /// Revoke one paired device.
     Revoke {
@@ -3570,6 +3605,9 @@ enum AttentionCommand {
         #[arg(long = "as", value_parser = parse_person_subject)]
         actor: Option<String>,
     },
+    /// Chat about an item: send a message to the agent involved, titled after the item, with a
+    /// reference to what it is about. This is what "Chat about this" does in stui.
+    Discuss(AttentionDiscussArgs),
     /// Legacy mutation: returns attention-migrated. Use work ask or remedy the source.
     Request(AttentionRequestArgs),
     /// Legacy mutation: returns attention-migrated. Complete a person step with work done.
@@ -3582,6 +3620,26 @@ enum AttentionCommand {
     Reject(ReviewArgs),
     /// Ask a feedback-mode step to change its work and rerun.
     RequestChanges(FeedbackReviewArgs),
+}
+
+#[derive(Args)]
+struct AttentionDiscussArgs {
+    /// The item to talk about: its `attention/...` ID from `st attention ls`.
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Attention)))]
+    subject: String,
+    /// What to say. The message also names the item, so the agent knows what it is about.
+    #[arg(short = 'm', long)]
+    body: String,
+    /// Who to talk to. By default the agent that asked for the item.
+    #[arg(long)]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Agent { running_only: false })))]
+    to: Option<String>,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Person)))]
+    #[arg(long = "as", value_parser = parse_person_subject)]
+    actor: Option<String>,
+    /// Name this message for retries, as `conversations send --idempotency-key` does.
+    #[arg(long)]
+    idempotency_key: Option<String>,
 }
 
 #[derive(Args)]
@@ -3619,6 +3677,11 @@ struct AttentionRequestArgs {
 
 #[derive(Args)]
 struct AttentionResolveArgs {
+    #[command(flatten)]
+    delegation: DelegationArgs,
+    /// The update's original work.person-asked claim ID.
+    #[arg(long, requires = "acted_for")]
+    episode: Option<String>,
     #[arg(add = ArgValueCompleter::new(Complete(Entity::Attention)))]
     subject: String,
     #[arg(long, value_parser = ["resolved", "dismissed"])]
@@ -3643,7 +3706,13 @@ struct AttentionWithdrawArgs {
 
 #[derive(Subcommand)]
 enum WorkCommand {
+    /// Replace your allowed delegation list; repeat --action, or omit all to revoke.
+    Delegation(DelegationPolicyArgs),
     /// Open a one-step run for this seat without authoring a mission; then use claim.
+    ///
+    /// For a small independent authorized job: describe the result, use the returned claim
+    /// command, perform the work and complete it with durable evidence. Finish or release
+    /// other independent claimed work first. See st skill for the full workflow.
     Start(WorkStartArgs),
     /// Release claimed work to another seat or person with a note they acknowledge.
     Handoff(WorkHandoffArgs),
@@ -3698,12 +3767,16 @@ enum WorkCommand {
     Renew(WorkActionArgs),
     /// Record a material progress update without changing ownership.
     ///
-    /// Records progress in the graph at no cost to anyone; people read it in stui.
+    /// Records progress in the graph without messaging another agent; people read it in stui.
     #[command(mut_arg("subject", |arg| arg.add(ArgValueCompleter::new(Complete(Entity::Work(WorkFilter::Claimed))))))]
     Progress(WorkActionArgs),
     /// Add time to the execution budget of claimed work that ran out of it.
     Extend(WorkExtendArgs),
     /// Finish claimed work and attach its durable evidence.
+    ///
+    /// Include the result, exact revision, verification and material limits. Gates can keep
+    /// the step verifying after submission. A dependent review step becomes ready when it
+    /// completes; review feedback can become the next authorized step or run. See st skill.
     #[command(mut_arg("subject", |arg| arg.add(ArgValueCompleter::new(Complete(Entity::Work(WorkFilter::Claimed))))))]
     Complete(WorkActionArgs),
     /// Fail claimed work with an actionable reason and evidence.
@@ -3821,6 +3894,8 @@ struct WorkUpdateArgs {
 
 #[derive(Args)]
 struct WorkDoneArgs {
+    #[command(flatten)]
+    delegation: DelegationArgs,
     #[arg(add = ArgValueCompleter::new(Complete(Entity::Work(WorkFilter::Any))))]
     subject: String,
     #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
@@ -4145,6 +4220,11 @@ struct MessageReplyArgs {
 
 #[derive(Args)]
 struct MessageArchiveArgs {
+    #[command(flatten)]
+    delegation: DelegationArgs,
+    /// Original message.sent claim ID when acting for a person.
+    #[arg(long, requires = "acted_for")]
+    episode: Option<String>,
     #[arg(num_args = 1..)]
     #[arg(add = ArgValueCompleter::new(Complete(Entity::Message)))]
     references: Vec<String>,
@@ -4172,6 +4252,11 @@ struct MessageStatusArgs {
 
 #[derive(Args)]
 struct ReviewArgs {
+    #[command(flatten)]
+    delegation: DelegationArgs,
+    /// Exact gate.requested claim ID when acting for a person.
+    #[arg(long, requires = "acted_for")]
+    episode: Option<String>,
     /// The gate to answer: its `attention/...` ID from `st attention ls`, or the step, mission
     /// or loop run (`step-run/...`, `mission-run/...`, `loop-run/...`) that owns it.
     target: String,
@@ -4180,6 +4265,56 @@ struct ReviewArgs {
     #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as", value_parser = parse_actor_subject)]
     actor: String,
+}
+
+#[derive(Args, Default)]
+struct DelegationArgs {
+    /// Record a person's existing instruction, with yourself as the actor.
+    #[arg(long = "for", value_parser = parse_person_subject, requires_all = ["policy", "instruction", "quote", "episode"])]
+    acted_for: Option<String>,
+    /// Claim ID of the person's current person.delegation-set policy.
+    #[arg(long, requires = "acted_for")]
+    policy: Option<String>,
+    /// The person's original message/ID instructing this action.
+    #[arg(long, requires = "acted_for")]
+    instruction: Option<String>,
+    /// The person's instruction, quoted verbatim.
+    #[arg(long, requires = "acted_for")]
+    quote: Option<String>,
+}
+
+impl DelegationArgs {
+    fn proof(self, episode: Option<&str>) -> Result<Option<st3::model::DelegationProof>> {
+        let Some(person) = self.acted_for else {
+            return Ok(None);
+        };
+        Ok(Some(st3::model::DelegationProof {
+            person,
+            policy: self.policy.context("delegation needs --policy")?,
+            message: format!(
+                "message/{}",
+                normalize_message_reference(
+                    &self.instruction.context("delegation needs --instruction")?,
+                )
+            ),
+            quote: self.quote.context("delegation needs --quote")?,
+            episode: episode.context("delegation needs --episode")?.into(),
+        }))
+    }
+}
+
+#[derive(Args)]
+struct DelegationPolicyArgs {
+    #[arg(long = "for", value_parser = parse_person_subject)]
+    person: String,
+    #[arg(long = "as", value_parser = parse_actor_subject)]
+    actor: String,
+    #[arg(long = "action", value_parser = ["answer-ask", "close-item", "record-go-stop"])]
+    actions: Vec<String>,
+    #[arg(long, required = true)]
+    evidence: Vec<String>,
+    #[arg(long)]
+    idempotency_key: Option<String>,
 }
 
 #[derive(Args)]
@@ -4681,6 +4816,8 @@ async fn run(cli: Cli) -> Result<()> {
                 key_file,
                 profile,
                 allow_public_http,
+                fingerprint,
+                unpinned,
             }),
         ..
     }) = &cli.command
@@ -4691,7 +4828,11 @@ async fn run(cli: Cli) -> Result<()> {
             algorithm,
             key_file.as_deref(),
             profile.as_deref(),
-            *allow_public_http,
+            st3_client::device::CompletionOptions {
+                allow_public_http: *allow_public_http,
+                fingerprint: fingerprint.as_deref(),
+                unpinned: *unpinned,
+            },
             cli.json,
         )
         .await;
@@ -5014,6 +5155,8 @@ fn guard_mutating_cli_actor(
             _ => None,
         },
         Command::Work { command } => match command {
+            WorkCommand::Delegation(args) => Some(args.actor.as_str()),
+            WorkCommand::Done(args) | WorkCommand::CancelAsk(args) => Some(args.actor.as_str()),
             WorkCommand::Start(args) => Some(args.actor.as_str()),
             WorkCommand::Handoff(args) => Some(args.actor.as_str()),
             WorkCommand::Acknowledge(args) => Some(args.actor.as_str()),
@@ -5057,6 +5200,9 @@ fn guard_mutating_cli_actor(
             _ => None,
         },
         Command::Claim(args) => args.actor.as_deref(),
+        Command::Conversations {
+            command: MessageCommand::Archive(args),
+        } => args.actor.as_deref(),
         Command::Diagnostic(args) => Some(args.actor.as_str()),
         Command::Gh { command } => match command {
             GhCommand::Watch(args) => Some(args.actor.as_str()),
@@ -5428,11 +5574,14 @@ async fn run_up(args: UpArgs) -> Result<()> {
     validate_unix_socket_path(&config.socket, "--socket")?;
     validate_unix_socket_path(&config.client_gateway_socket, "--client-gateway-socket")?;
     fs::create_dir_all(&config.state_dir)?;
+    let startup = Arc::new(st3::startup::Startup::begin(&config.socket)?);
+    startup.phase("install-hooks");
     st3::hooks::ensure_installed(&st3::hooks::root(&config.state_dir)).context(
         "publishing this st binary's required lifecycle hook set before starting the daemon",
     )?;
     st3::profile::init_from_env();
     raise_open_file_limit();
+    startup.phase("open-store");
     let store = Arc::new(st3::profile::task("startup open-store", || {
         Store::open(&config.state_dir.join("claims.sqlite3"), &config.node)
     })?);
@@ -5450,20 +5599,27 @@ async fn run_up(args: UpArgs) -> Result<()> {
         )?))?;
     }
     store.use_key_directory(&keys)?;
+    startup.phase("judge-claims");
     st3::profile::task("startup judge-claims", || store.judge_claims(true))?;
+    startup.phase("validate-replication-backlog");
     let admission = st3::profile::task("startup validate-replication-backlog", || {
         store.validate_replication_backlog()
     })?;
+    startup.phase("apply-replication-repairs");
     st3::profile::task("startup apply-replication-repairs", || {
         store.apply_replication_repairs()
     })?;
+    startup.phase("settle-runs");
     for run in st3::profile::task("startup settle-runs", || {
         store.settle_runs_for_canonical_replay()
     })? {
         eprintln!("st: mission run `{run}` stays over as this node's graph showed it");
     }
     let projected = st3::profile::task("startup project-replication-backlog", || {
-        store.project_replication_backlog()
+        store.project_replication_backlog_with_progress(
+            "startup/project-replication-backlog",
+            |progress| startup.progress(progress),
+        )
     })?;
     if !projected {
         eprintln!(
@@ -5476,6 +5632,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
     if admission.invalid != 0 {
         eprintln!("st: replication has {} invalid records", admission.invalid);
     }
+    startup.phase("initialize-runtime");
     store.append_claim(&ClaimInput {
         subject: format!("daemon/{}", config.node),
         kind: "daemon.started".into(),
@@ -5558,7 +5715,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         notify.clone(),
         event_notify.clone(),
         recorder.map(|installation| installation.directory),
-    )?.with_schedule_peers(state.configured_peers.clone()).with_client_relay(state.client_relay.clone()));
+    )?.with_schedule_peers(state.configured_peers.clone()).with_client_relay(state.client_relay.clone()).with_person(config.person.clone()));
     tokio::spawn(reconciler.supervise());
     // A start no longer rebuilds the operation projection; check it once the API serves.
     tokio::spawn({
@@ -5594,6 +5751,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
             },
         ));
     }
+    recycle_idle_wal(config.state_dir.join("claims.sqlite3"));
     tokio::spawn(convert_envelope_payloads(store.clone()));
     tokio::spawn(trim_local_observations(
         store.clone(),
@@ -5639,11 +5797,6 @@ async fn run_up(args: UpArgs) -> Result<()> {
             .await;
         }
     });
-    eprintln!("st: local API listening at {}", config.socket.display());
-    eprintln!(
-        "st: paired client gateway listening at {}",
-        config.client_gateway_socket.display()
-    );
     let local_socket = config.socket.clone();
     let state_socket = config.state_dir.join("run/st3.sock");
     let client_gateway_socket = config.client_gateway_socket.clone();
@@ -5651,9 +5804,26 @@ async fn run_up(args: UpArgs) -> Result<()> {
     st3::api::start_operation_report(&state);
     // Nor does the first session list wait to read every native transcript's header.
     st3::api::start_native_session_discovery(&state);
+    startup.phase("bind-listeners");
+    let bound = std::sync::atomic::AtomicUsize::new(0);
+    let ready = || {
+        if bound.fetch_add(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+            startup.serving();
+            eprintln!("st: local API listening at {}", config.socket.display());
+            eprintln!(
+                "st: paired client gateway listening at {}",
+                config.client_gateway_socket.display()
+            );
+        }
+    };
     tokio::try_join!(
-        st3::api::serve_unix_bound(&local_socket, &state_socket, router(state.clone())),
-        serve_unix(&client_gateway_socket, fabric_router(state)),
+        st3::api::serve_unix_bound_with_ready(
+            &local_socket,
+            &state_socket,
+            router(state.clone()),
+            ready
+        ),
+        st3::api::serve_unix_with_ready(&client_gateway_socket, fabric_router(state), ready),
     )?;
     Ok(())
 }
@@ -6151,6 +6321,12 @@ async fn run_mission_view(
             )
         }
         MissionViewCommand::Show(args) => {
+            let client = if args.follow {
+                client.clone().with_follow_retry()
+            } else {
+                client.clone()
+            };
+            let client = &client;
             let mut selected = args.mission_or_run;
             if !selected.starts_with("mission-run/") {
                 let overview: Value = client
@@ -6805,34 +6981,51 @@ fn started_revision_note(
 
 async fn follow_mission_run(
     client: &Client,
-    mut run: MissionRunView,
+    run: MissionRunView,
     _cursor: u64,
     json_output: bool,
 ) -> Result<()> {
-    let mut prior = String::new();
     let interactive = std::io::stdout().is_terminal();
     let _screen = if !json_output && interactive {
         Some(TerminalScreen::open()?)
     } else {
         None
     };
-    let style = OutputStyle::stdout();
+    follow_mission_run_to(
+        client, run, json_output, interactive, OutputStyle::stdout(), &mut std::io::stdout(),
+    ).await
+}
+
+async fn follow_mission_run_to(
+    client: &Client,
+    mut run: MissionRunView,
+    json_output: bool,
+    interactive: bool,
+    style: OutputStyle,
+    output: &mut impl std::io::Write,
+) -> Result<()> {
+    let client = client.clone().with_follow_retry();
+    let client = &client;
+    let mut prior = String::new();
     loop {
         let runs = load_mission_run_tree(client, &run).await?;
         let summary = mission_run_signature(&runs)?;
         if summary != prior && !json_output {
             let frame = render_mission_run(&run, &runs, style, current_unix_ms()?);
-            print!(
+            write!(
+                output,
                 "{}",
                 follow_snapshot(&frame, interactive, !prior.is_empty())
-            );
-            std::io::stdout().flush()?;
+            )?;
+            output.flush()?;
             prior = summary;
         }
+        client.follow_recovered();
         match run.status.as_str() {
             status if mission_run_follow_succeeded(status) => {
                 return if json_output {
-                    print_value(&run, true)
+                    writeln!(output, "{}", serde_json::to_string_pretty(&run)?)?;
+                    Ok(())
                 } else {
                     Ok(())
                 };
@@ -7094,21 +7287,35 @@ async fn run_pty(
                 .await?;
             print_client_value(&result, json_output)
         }
-        PtyCommand::Ls { all, cursor, limit } => {
+        PtyCommand::Ls {
+            all,
+            cursor,
+            limit,
+            owner,
+            state,
+        } => {
             anyhow::ensure!(
                 limit > 0 && limit <= 200,
                 "the terminal limit must be 1 through 200"
             );
             let response = generated_client(endpoint, None)?
-                .terminals_list(cursor.as_deref(), Some(limit), all)
+                .terminals_list_filtered(
+                    cursor.as_deref(),
+                    Some(limit),
+                    all,
+                    owner.as_deref(),
+                    state.as_deref(),
+                )
                 .await?;
             let history = if all { " --all" } else { "" };
-            print_product_page(
-                "TERMINALS",
-                &response,
-                json_output,
-                &format!("st terminals ls{history}"),
-            )
+            let mut command = format!("st terminals ls{history}");
+            for (name, value) in [("owner", owner.as_deref()), ("state", state.as_deref())] {
+                if let Some(value) = value {
+                    let quoted = value.replace('\'', "'\"'\"'");
+                    command.push_str(&format!(" --{name} '{quoted}'"));
+                }
+            }
+            print_product_page("TERMINALS", &response, json_output, &command)
         }
         PtyCommand::Attach(args) => {
             let budget = (!args.subject.contains('/'))
@@ -7678,32 +7885,54 @@ async fn run_inspect(client: &Client, args: InspectArgs, json_output: bool) -> R
             urlencoding::encode(&args.subject)
         ))
         .await?;
-    print_value(
-        &json!({ "status": status, "recent_claims": claims.claims }),
-        json_output,
-    )
+    let mut shown = json!({ "status": status, "recent_claims": claims.claims });
+    // Who signed a message a person wrote, and whether that checks.
+    if args.subject.starts_with("message/")
+        && let Some(provenance) = message_provenance(client, &args.subject).await
+    {
+        shown["provenance"] = provenance;
+    }
+    print_value(&shown, json_output)
 }
 
 async fn run_trace(client: &Client, args: TraceArgs, json_output: bool) -> Result<()> {
+    run_trace_to(client, args, json_output, &mut std::io::stdout()).await
+}
+
+async fn run_trace_to(
+    client: &Client,
+    args: TraceArgs,
+    json_output: bool,
+    output: &mut impl std::io::Write,
+) -> Result<()> {
     anyhow::ensure!(
         args.limit > 0 && args.limit <= 500,
         "the trace limit must be 1 through 500"
     );
+    let client = if args.follow {
+        client.clone().with_follow_retry()
+    } else {
+        client.clone()
+    };
+    let client = &client;
     let claims = trace_claims(client, &args).await?;
     let mut cursor = args.after_index.unwrap_or_default();
     for claim in claims {
         cursor = cursor.max(claim.store_index);
         if json_output {
-            println!("{}", serde_json::to_string(&claim)?);
+            writeln!(output, "{}", serde_json::to_string(&claim)?)?;
         } else {
-            print_trace_claim(&claim);
+            write_trace_claim(output, &claim)?;
         }
     }
     if !args.follow {
         return Ok(());
     }
+    client.follow_recovered();
     loop {
-        let mut event_query = vec![format!("after={cursor}")];
+        let mut event_query = vec![
+            format!("after={cursor}"), "wait=true".into(), "timeout_ms=30000".into(),
+        ];
         if let Some(subject) = &args.subject {
             event_query.push(format!("subject={}", urlencoding::encode(subject)));
         }
@@ -7714,9 +7943,8 @@ async fn run_trace(client: &Client, args: TraceArgs, json_output: bool) -> Resul
             .get(&format!("/v1/events?{}", event_query.join("&")))
             .await?;
         for event in events {
-            cursor = cursor.max(event.store_index);
             if json_output {
-                println!("{}", serde_json::to_string(&event)?);
+                writeln!(output, "{}", serde_json::to_string(&event)?)?;
             } else {
                 let claims: ClaimsPage = client
                     .get(&format!(
@@ -7730,15 +7958,18 @@ async fn run_trace(client: &Client, args: TraceArgs, json_output: bool) -> Resul
                     .into_iter()
                     .find(|claim| claim.store_index == event.store_index)
                 {
-                    print_trace_claim(&claim);
+                    write_trace_claim(output, &claim)?;
                 } else {
-                    println!(
+                    writeln!(
+                        output,
                         "{}\t{}\t{}\t(no claim details)",
                         event.store_index, event.kind, event.subject
-                    );
+                    )?;
                 }
             }
+            cursor = cursor.max(event.store_index);
         }
+        client.follow_recovered();
     }
 }
 
@@ -7768,7 +7999,7 @@ async fn trace_claims(client: &Client, args: &TraceArgs) -> Result<Vec<ClaimReco
     Ok(claims)
 }
 
-fn print_trace_claim(claim: &ClaimRecord) {
+fn write_trace_claim(output: &mut impl std::io::Write, claim: &ClaimRecord) -> Result<()> {
     let fields = claim.body.get("fields").unwrap_or(&claim.body);
     let summary = ["state", "status", "verdict", "action", "reason"]
         .into_iter()
@@ -7786,16 +8017,19 @@ fn print_trace_claim(claim: &ClaimRecord) {
     .map(|value| value.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
     .unwrap_or_else(|| claim.accepted_at_unix_ms.to_string());
     if summary.is_empty() {
-        println!(
+        writeln!(
+            output,
             "{}\t{}\t{}\t{}",
             claim.store_index, timestamp, claim.kind, claim.subject
-        );
+        )?;
     } else {
-        println!(
+        writeln!(
+            output,
             "{}\t{}\t{}\t{}\t{}",
             claim.store_index, timestamp, claim.kind, claim.subject, summary
-        );
+        )?;
     }
+    Ok(())
 }
 
 fn trace_scalar(value: &Value) -> String {
@@ -7829,6 +8063,22 @@ fn generated_client(endpoint: &Endpoint, person: Option<&str>) -> Result<Generat
             "client-v0 product commands require the trusted local Unix endpoint; remote clients must use a paired Fabric credential"
         );
     };
+    if let Some(startup) = st3::startup::read(socket)
+        && startup.status == "starting"
+        // A bound API can already answer before both listeners have published `serving`.
+        // Try the connection before interpreting an observation as an outage.
+        && std::os::unix::net::UnixStream::connect(socket).is_err()
+    {
+        if startup.full_replay() {
+            if let Some(outage) = st3::client::DaemonUnreachable::during_startup(socket)
+                && outage.full_replay()
+            {
+                return Err(outage.into());
+            }
+        } else {
+            eprintln!("st: {}", startup.summary());
+        }
+    }
     Ok(person
         .map_or_else(
             || GeneratedClient::unix(socket),
@@ -8047,6 +8297,15 @@ async fn run_devices(
                 .await?;
             print_client_value(&response, json_output)?;
             if !json_output {
+                if let Some(fingerprint) = &response.value.person_root_fingerprint {
+                    println!(
+                        "Person-root fingerprint: {fingerprint}\nCopy this separately from the pairing code to the new device's fingerprint field or --fingerprint option."
+                    );
+                } else {
+                    eprintln!(
+                        "WARNING: This member has no person-root fingerprint; pinned pairing requires a signing-enabled member."
+                    );
+                }
                 print!("{}", cli_help::pairing_next_steps(&person));
             }
             Ok(())
@@ -8080,10 +8339,11 @@ async fn run_devices_complete(
     algorithm: &str,
     key_file: Option<&Path>,
     profile: Option<&Path>,
-    allow_public_http: bool,
+    options: st3_client::device::CompletionOptions<'_>,
     json_output: bool,
 ) -> Result<()> {
     use st3_client::device::{KeyAlgorithm, SigningKey};
+    options.validate()?;
     let algorithm = match algorithm {
         "ed25519" => KeyAlgorithm::Ed25519,
         "p256" => KeyAlgorithm::P256,
@@ -8098,8 +8358,8 @@ async fn run_devices_complete(
         .map(Ok)
         .unwrap_or_else(st3_client::device::profile_path)?;
     let code = st3_client::device::read_pairing_code()?;
-    let device = st3_client::device::complete_with_http_policy(
-        &path, member_url, pairing_id, &code, key, allow_public_http,
+    let device = st3_client::device::complete_with_options(
+        &path, member_url, pairing_id, &code, key, options,
     )
     .await?;
     // Always choose explicit safe fields, including --json. PairedSession contains a bearer.
@@ -8111,6 +8371,7 @@ async fn run_devices_complete(
                 "person_id": device.session.person_id, "scopes": device.session.scopes,
                 "expires_at": device.session.expires_at, "profile": path,
                 "signing_key": device.signing_key.as_ref().map(SigningKey::public_key).transpose()?,
+                "person_root_fingerprint": device.person_root_fingerprint,
             }))?
         );
     } else {
@@ -8440,6 +8701,51 @@ fn render_sync_notice(sync: &st3_client::SyncNotice, now: u128) -> String {
     output
 }
 
+/// What kind of thing an attention item is, in the word a person uses for it.
+fn attention_word(item: &st3_client::Attention) -> &'static str {
+    if item.update.is_some() {
+        "update"
+    } else if let Some(request) = &item.request {
+        match request.entry_type.as_str() {
+            "decision" => "decision",
+            "choice" => "choice",
+            "feedback" => "feedback",
+            _ => "request",
+        }
+    } else if item.launch_id.is_some() {
+        "launch"
+    } else if item.review_mode.is_some() {
+        "review"
+    } else if item.message_id.is_some() {
+        "message"
+    } else {
+        "request"
+    }
+}
+
+/// An attention item's first lines: its kind and title, then who it is from and how long ago,
+/// with its priority and state only when they are not the usual normal and open.
+fn attention_heading(item: &st3_client::Attention, now_unix_ms: u128) -> String {
+    let mut about = Vec::new();
+    if let Some(from) = &item.requester_id {
+        about.push(format!("from {}", from.strip_prefix("agent/").unwrap_or(from)));
+    }
+    about.push(ago(&item.requested_at, now_unix_ms));
+    if item.priority != "normal" {
+        about.push(format!("{} priority", item.priority));
+    }
+    if item.state != "open" {
+        about.push(item.state.clone());
+    }
+    format!(
+        "\n{:<9} {}\n{:<9} {}\n",
+        attention_word(item),
+        item.title,
+        "",
+        about.join(" · ")
+    )
+}
+
 /// `target mission/fleet/typecase: cancelled 4h ago`
 fn attention_target_line(target: &st3_client::AttentionTargetState, now_unix_ms: u128) -> String {
     let since = target
@@ -8493,19 +8799,23 @@ fn render_product_page(title: &str, page: &ClientPage, continuation_command: &st
     for item in &page.items {
         match item {
             ClientResource::Attention(item) => {
-                let _ = writeln!(
-                    output,
-                    "{}  attention  {}  {}  {}",
-                    item.header.id, item.priority, item.state, item.title
-                );
+                output.push_str(&attention_heading(item, now_ms()));
                 for target in &item.target_states {
                     let _ = writeln!(output, "  {}", attention_target_line(target, now_ms()));
                 }
+                // Opening an update is reading it: it leaves the person's home, so the line says so.
+                let reads = if item.update.is_some() {
+                    " (marks it read)"
+                } else {
+                    ""
+                };
                 let _ = writeln!(
                     output,
-                    "  action: st attention show {} --as {}",
+                    "  action{reads}: st attention show {} --as {}",
                     item.source_id, item.person_id
                 );
+                // What `st attention approve` and its siblings take: a person copies it from here.
+                let _ = writeln!(output, "  id: {}", item.header.id);
                 if item.header.operational.as_ref().is_some_and(|operational| {
                     operational
                         .reasons
@@ -9682,6 +9992,14 @@ fn render_mission_overview(view: &Value) -> String {
             let _ = writeln!(out, "  {state}: {count}");
         }
     }
+    if let Some(revision) = view["revision"].as_str() {
+        let _ = writeln!(out, "REVISION {revision}");
+    }
+    if let Some(value) = view.get("provenance")
+        && let Ok(provenance) = serde_json::from_value(value.clone())
+    {
+        out.push_str(&st3::provenance::render(&provenance));
+    }
     for (key, title) in [("newest", "NEWEST"), ("failed", "FAILED")] {
         let _ = writeln!(out, "{title} (up to {} runs)", view["preview_limit"]);
         if let Some(runs) = view[key].as_array() {
@@ -9815,21 +10133,75 @@ fn render_performance(view: &Value) -> String {
     out
 }
 
+async fn doctor_request<T: serde::de::DeserializeOwned>(
+    client: &Client,
+    path: &str,
+    readiness: Option<&st3::startup::Readiness>,
+    json_output: bool,
+) -> Result<T> {
+    match client.get(path).await {
+        Err(error)
+            if st3::client::daemon_unreachable(&error).is_some()
+                && readiness.is_some_and(|startup| startup.status == "starting") =>
+        {
+            let startup = readiness.expect("starting observation was checked");
+            if json_output {
+                print_value(
+                    &serde_json::json!({"status":"fail", "startup":startup,
+                    "checks":[{"status":"fail", "name":"startup", "message":startup.summary()}]}),
+                    true,
+                )?;
+            } else {
+                println!("fail\tstartup\t{}", startup.summary());
+            }
+            anyhow::bail!("the daemon is starting; the API is not ready");
+        }
+        outcome => outcome,
+    }
+}
+
 async fn run_doctor(client: &Client, args: DoctorArgs, json_output: bool) -> Result<()> {
+    let readiness = client.socket_path().and_then(st3::startup::read);
+
     if args.performance {
-        let report: Value = client.get("/v1/performance").await?;
+        let mut report: Value =
+            doctor_request(client, "/v1/performance", readiness.as_ref(), json_output).await?;
         if json_output {
+            if let Some(startup) = &readiness {
+                report["startup"] = serde_json::to_value(startup)?;
+            }
             return print_value(&report, true);
+        }
+        if let Some(startup) = &readiness {
+            let status = if startup.status == "starting" {
+                "info"
+            } else {
+                "pass"
+            };
+            println!("{status}\tstartup\t{}", startup.summary());
         }
         print!("{}", render_performance(&report));
         return Ok(());
     }
-    let report: DoctorReport = client.get("/v1/doctor").await?;
+    let report: DoctorReport =
+        doctor_request(client, "/v1/doctor", readiness.as_ref(), json_output).await?;
     if json_output {
-        print_value(&report, true)?;
+        let mut value = serde_json::to_value(&report)?;
+        if let Some(startup) = &readiness {
+            value["startup"] = serde_json::to_value(startup)?;
+        }
+        print_value(&value, true)?;
     } else {
         if let Some(version) = &report.machine_version {
             println!("daemon\t{version}");
+        }
+        if let Some(startup) = &readiness {
+            let status = if startup.status == "starting" {
+                "info"
+            } else {
+                "pass"
+            };
+            println!("{status}\tstartup\t{}", startup.summary());
         }
         for check in &report.checks {
             println!("{}\t{}\t{}", check.status, check.name, check.message);
@@ -10210,6 +10582,21 @@ fn render_replication_peers(
                 .or(peer.last_error.as_deref())
                 .unwrap_or("")
         );
+        if let Some(worker) = &peer.worker {
+            let _ = writeln!(
+                output,
+                "  worker {}: last attempt {}",
+                worker.phase,
+                relative_time(worker.last_attempt_at_unix_ms, now)
+            );
+            if let Some(at) = worker.next_retry_at_unix_ms {
+                let _ = writeln!(
+                    output,
+                    "  next retry in {}s (unix ms {at})",
+                    at.saturating_sub(now).div_ceil(1000)
+                );
+            }
+        }
         if !peer.differing_tables.is_empty() {
             let _ = writeln!(
                 output,
@@ -10735,7 +11122,15 @@ fn run_service(command: ServiceCommand, json_output: bool) -> Result<()> {
             st3::service::install(Config::load_with_fleet(config.as_deref())?)
         }
         ServiceCommand::Status => {
-            let report = st3::service::status()?;
+            let mut report = st3::service::status()?;
+            let config = Config::load_unvalidated(None)?;
+            if let Some(startup) = st3::startup::read(&config.client_socket()) {
+                for service in &mut report.services {
+                    if service.name == "st3.service" || service.name == "com.compoundingtech.st3" {
+                        service.state = format!("{} · {}", service.state, startup.summary());
+                    }
+                }
+            }
             if json_output {
                 print_value(&report, true)
             } else {
@@ -13331,6 +13726,11 @@ fn render_client_agent(
         agent.driver.as_deref().unwrap_or("none"),
         agent.harness_state.as_deref().unwrap_or("unobserved")
     );
+    if agent.blocked_on.as_deref() == Some("human")
+        && agent.ask.as_deref() == Some("permission")
+    {
+        let _ = writeln!(output, "AWAITING     approval");
+    }
     if let Some(todo) = &agent.todo {
         let snapshot = &todo.snapshot;
         let _ = write!(output, "Todo         ");
@@ -13946,6 +14346,7 @@ async fn run_review_decision(
         .post(
             &path,
             &ReviewRequest {
+                delegation: args.delegation.proof(args.episode.as_deref())?,
                 decision: decision.to_owned(),
                 reason: args.reason,
                 actor: Some(args.actor),
@@ -13954,6 +14355,62 @@ async fn run_review_decision(
         )
         .await?;
     print_value(&response, json_output)
+}
+
+/// The attention item a person can act on now, found from an `attention/...` ID or its source, and
+/// the card ID when the subject was one. It must not read an update for the person.
+async fn actionable_attention_item(
+    client: &Client,
+    endpoint: &Endpoint,
+    subject: &str,
+    actor: &str,
+) -> Result<(AttentionItemView, Option<String>)> {
+    let normalized = resolve_member_subject(
+        endpoint,
+        subject,
+        "attention",
+        Entity::Attention,
+        completion::Matching::Fuzzy,
+    )
+    .await?;
+    // Public card IDs name a recipient and waiting episode, not just a work source.
+    // Resolve through the actor-scoped read projection; this must not read an update
+    // for the person or let a spent card open a later episode of the same source.
+    let alias = if normalized.starts_with("attention/") {
+        match generated_client(endpoint, Some(actor))?
+            .attention_get(&normalized)
+            .await
+        {
+            Ok(response) => match response.value {
+                ClientResource::Attention(card)
+                    if card.header.id == normalized && card.person_id == actor =>
+                {
+                    Some(card)
+                }
+                _ => None,
+            },
+            Err(GeneratedClientError::Api(ClientErrorCode::NotFound, _, _)) => None,
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        None
+    };
+    let path = format!("/v1/attention?person={}", urlencoding::encode(actor));
+    let item = client
+        .get::<Vec<AttentionItemView>>(&path)
+        .await?
+        .into_iter()
+        .find(|item| {
+            alias.as_ref().map_or_else(
+                || item.subject == normalized,
+                |card| item.subject == card.source_id && item.episode == card.episode,
+            )
+        })
+        .with_context(|| {
+            format!("attention item `{normalized}` is not currently actionable")
+        })?;
+    let card_id = alias.map(|card| card.header.id);
+    Ok((item, card_id))
 }
 
 async fn run_attention(
@@ -14002,50 +14459,7 @@ async fn run_attention(
         }
         AttentionCommand::Show { subject, actor } => {
             let actor = configured_human(actor.as_deref(), configured_person, "attention")?;
-            let normalized = resolve_member_subject(
-                endpoint,
-                &subject,
-                "attention",
-                Entity::Attention,
-                completion::Matching::Fuzzy,
-            )
-            .await?;
-            // Public card IDs name a recipient and waiting episode, not just a work source.
-            // Resolve through the actor-scoped read projection; this must not read an update
-            // for the person or let a spent card open a later episode of the same source.
-            let alias = if normalized.starts_with("attention/") {
-                match generated_client(endpoint, Some(&actor))?
-                    .attention_get(&normalized)
-                    .await
-                {
-                    Ok(response) => match response.value {
-                        ClientResource::Attention(card)
-                            if card.header.id == normalized && card.person_id == actor =>
-                        {
-                            Some(card)
-                        }
-                        _ => None,
-                    },
-                    Err(GeneratedClientError::Api(ClientErrorCode::NotFound, _, _)) => None,
-                    Err(error) => return Err(error.into()),
-                }
-            } else {
-                None
-            };
-            let path = format!("/v1/attention?person={}", urlencoding::encode(&actor));
-            let item = client
-                .get::<Vec<AttentionItemView>>(&path)
-                .await?
-                .into_iter()
-                .find(|item| {
-                    alias.as_ref().map_or_else(
-                        || item.subject == normalized,
-                        |card| item.subject == card.source_id && item.episode == card.episode,
-                    )
-                })
-                .with_context(|| {
-                    format!("attention item `{normalized}` is not currently actionable")
-                })?;
+            let (item, _) = actionable_attention_item(client, endpoint, &subject, &actor).await?;
             if json_output {
                 print_value(&item, true)?;
             } else {
@@ -14064,6 +14478,7 @@ async fn run_attention(
                     .post(
                         "/v1/work/done",
                         &PersonStepResponse {
+                            delegation: None,
                             subject: item.subject.clone(),
                             actor: actor.clone(),
                             summary: String::new(),
@@ -14079,6 +14494,54 @@ async fn run_attention(
                 }
             }
             Ok(())
+        }
+        AttentionCommand::Discuss(args) => {
+            let actor = configured_human(args.actor.as_deref(), configured_person, "attention")?;
+            let (item, card_id) =
+                actionable_attention_item(client, endpoint, &args.subject, &actor).await?;
+            let to = match args.to {
+                Some(to) => to,
+                None => item
+                    .requester_id
+                    .clone()
+                    .filter(|requester| requester.starts_with("agent/"))
+                    .context("this item names no agent to talk to; pass --to AGENT")?,
+            };
+            let id = card_id.unwrap_or_else(|| item.subject.clone());
+            // The same words stui's "Chat about this" sends.
+            let mut body = format!("{}\n\n---\nThis is about {} ({id}", args.body, item.title);
+            if let Some(mission) = &item.mission {
+                body.push_str(&format!(", mission {mission}"));
+            }
+            body.push(')');
+            let Some(receipt) = send_message(
+                client,
+                MessageSendArgs {
+                    to,
+                    body,
+                    subject: Some(format!("About: {}", item.title)),
+                    in_reply_to: None,
+                    tags: Vec::new(),
+                    from: actor,
+                    attach: Vec::new(),
+                    print_kdl: false,
+                    idempotency_key: args.idempotency_key,
+                },
+                Vec::new(),
+            )
+            .await?
+            else {
+                return Ok(());
+            };
+            if let Err(error) = sync_message_projection(client).await {
+                eprintln!(
+                    "st: {} was sent (idempotency key {}), but the message projection was not refreshed: {}",
+                    receipt.message.subject,
+                    receipt.idempotency_key,
+                    plain_error(&error)
+                );
+            }
+            print_message_receipt(&receipt, json_output)
         }
         AttentionCommand::Request(args) => {
             let actor = args
@@ -14127,6 +14590,7 @@ async fn run_attention(
                         urlencoding::encode(&args.subject)
                     ),
                     &AttentionResolveRequest {
+                        delegation: args.delegation.proof(args.episode.as_deref())?,
                         outcome: args.outcome,
                         reason: args.reason,
                         actor: args.actor,
@@ -14174,6 +14638,8 @@ async fn run_attention(
                 client,
                 "changes-requested",
                 ReviewArgs {
+                    delegation: DelegationArgs::default(),
+                    episode: None,
                     target: args.target,
                     reason: Some(args.reason),
                     actor: args.actor,
@@ -14235,6 +14701,24 @@ async fn run_work(
     json_output: bool,
 ) -> Result<()> {
     match command {
+        WorkCommand::Delegation(args) => {
+            reject_foreign_agent_actor(&args.actor)?;
+            let result: ClaimRecord = client
+                .post(
+                    "/v1/work/delegation",
+                    &st3::model::DelegationPolicyRequest {
+                        person: args.person,
+                        actor: args.actor,
+                        actions: args.actions,
+                        evidence: args.evidence,
+                        idempotency_key: args.idempotency_key.unwrap_or_else(|| {
+                            format!("delegation-policy:{}", uuid::Uuid::now_v7())
+                        }),
+                    },
+                )
+                .await?;
+            print_value(&result, json_output)
+        }
         WorkCommand::Start(args) => {
             reject_foreign_agent_actor(&args.actor)?;
             let response: StepRunView = client
@@ -14366,6 +14850,7 @@ async fn run_work(
                 .post(
                     path,
                     &PersonStepResponse {
+                        delegation: args.delegation.proof(args.episode.as_deref())?,
                         subject: args.subject,
                         actor: args.actor,
                         summary: args.summary.unwrap_or_default(),
@@ -15162,10 +15647,18 @@ async fn run_message(
                 );
             }
             if json_output {
-                if messages.len() == 1 {
-                    print_value(&messages[0], true)?;
+                let mut shown = Vec::with_capacity(messages.len());
+                for message in &messages {
+                    let mut value = serde_json::to_value(message)?;
+                    if let Some(provenance) = message_provenance(client, &message.subject).await {
+                        value["provenance"] = provenance;
+                    }
+                    shown.push(value);
+                }
+                if shown.len() == 1 {
+                    print_value(&shown[0], true)?;
                 } else {
-                    print_value(&messages, true)?;
+                    print_value(&shown, true)?;
                 }
             } else {
                 for (index, message) in messages.iter().enumerate() {
@@ -15180,6 +15673,9 @@ async fn run_message(
                     } else {
                         println!("Message: {}", message.subject);
                         println!("From: {}", message.from);
+                        if let Some(provenance) = message_provenance(client, &message.subject).await {
+                            println!("Signed: {}", provenance_line(&provenance));
+                        }
                         println!("To: {}", message.to);
                         if let Some(title) = &message.title {
                             println!("Subject: {title}");
@@ -15265,12 +15761,40 @@ async fn run_message(
             }
         }
         MessageCommand::Archive(args) => {
+            let delegation = args.delegation.proof(args.episode.as_deref())?;
             let actor = args
                 .actor
                 .context("message archive needs explicit --as to record its lifecycle")?;
             reject_foreign_agent_actor(&actor)?;
             let mut claims = Vec::with_capacity(args.references.len());
+            anyhow::ensure!(
+                delegation.is_none() || args.references.len() == 1,
+                "delegated archive names one message and episode at a time"
+            );
             for reference in args.references {
+                if let Some(proof) = &delegation {
+                    let reference = normalize_message_reference(&reference);
+                    let claim: ClaimRecord = client
+                        .post(
+                            &format!("/v1/messages/{}/claims", urlencoding::encode(&reference)),
+                            &MessageLifecycleRequest {
+                                delegation: Some(proof.clone()),
+                                lifecycle: "closed".into(),
+                                actor: Some(actor.clone()),
+                                transport: None,
+                                runtime_id: None,
+                                evidence: Vec::new(),
+                                expected_subject: None,
+                                idempotency_key: format!(
+                                    "delegated-archive:{reference}:{}:{}",
+                                    proof.policy, proof.message
+                                ),
+                            },
+                        )
+                        .await?;
+                    claims.push(claim);
+                    continue;
+                }
                 let message = read_message(client, &reference).await?;
                 accept_message(client, &message, &actor).await?;
                 claims.push(close_message(client, &reference, &actor).await?);
@@ -15728,6 +16252,39 @@ fn message_mission_intent(
     publication_document(mission)
 }
 
+/// Who signed a message a person wrote, as the daemon read it: `None` for an agent's message or a
+/// daemon that does not say.
+async fn message_provenance(client: &Client, reference: &str) -> Option<Value> {
+    let reference = normalize_message_reference(reference);
+    let read: Value = client
+        .get(&format!(
+            "/v1/messages/read/{}",
+            urlencoding::encode(&reference)
+        ))
+        .await
+        .ok()?;
+    read.get("provenance").cloned()
+}
+
+/// A provenance as one line: `verified · person/example · example phone (secure enclave) · p256:BPLX…`.
+fn provenance_line(provenance: &Value) -> String {
+    let text = |field: &str| provenance.get(field).and_then(Value::as_str);
+    let mut parts = vec![text("verdict").unwrap_or("unknown").to_owned()];
+    if let Some(reason) = text("reason") {
+        parts.push(reason.to_owned());
+    }
+    for field in ["signer", "device"] {
+        if let Some(value) = text(field) {
+            parts.push(value.to_owned());
+        }
+    }
+    if let Some(key) = text("key") {
+        let shown: String = key.chars().take(16).collect();
+        parts.push(format!("{shown}…"));
+    }
+    parts.join(" · ")
+}
+
 async fn read_message(client: &Client, reference: &str) -> Result<MessageView> {
     let reference = normalize_message_reference(reference);
     client
@@ -15810,6 +16367,7 @@ async fn accept_message(client: &Client, message: &MessageView, actor: &str) -> 
         .post(
             &format!("/v1/messages/{}/claims", urlencoding::encode(reference)),
             &MessageLifecycleRequest {
+                delegation: None,
                 lifecycle: "read".into(),
                 actor: Some(actor),
                 transport: None,
@@ -15834,6 +16392,7 @@ async fn deliver_message(
         .post(
             &format!("/v1/messages/{}/claims", urlencoding::encode(&reference)),
             &MessageLifecycleRequest {
+                delegation: None,
                 lifecycle: "delivered".into(),
                 actor: Some(actor.into()),
                 transport: None,
@@ -15860,6 +16419,7 @@ async fn stage_message(
         .post(
             &format!("/v1/messages/{}/claims", urlencoding::encode(&reference)),
             &MessageLifecycleRequest {
+                delegation: None,
                 lifecycle: "staged".into(),
                 actor: Some(actor.into()),
                 transport: Some(transport.into()),
@@ -15878,6 +16438,7 @@ async fn close_message(client: &Client, reference: &str, actor: &str) -> Result<
         .post(
             &format!("/v1/messages/{}/claims", urlencoding::encode(&reference)),
             &MessageLifecycleRequest {
+                delegation: None,
                 lifecycle: "closed".into(),
                 actor: Some(normalize_message_subject(actor)),
                 transport: None,
@@ -16896,7 +17457,12 @@ async fn drive_st2_native(
     loop {
         tokio::select! {
             frame = mailbox.recv() => {
+                let mail_changed = matches!(&frame, Some(st3::mailbox::Frame::Mailbox { .. }));
                 mailbox.accept(frame, &runtime_id)?;
+                if driver == "opencode" && mail_changed
+                    && let Err(error) = sync_native_delivery_control(client, subject, &mut paths, &mailbox, &inbox, "opencode-server").await {
+                    note_driver_tick_failure(subject, error, &mut last_control_warning);
+                }
             }
             wake = observations.recv() => {
                 wake?;
@@ -16991,12 +17557,8 @@ async fn drive_st2_native(
                     }
                 }
 
-                if driver == "opencode" {
-                    if let Err(error) = refresh_native_delivery_control(client, subject, &mut paths, |gate| {
-                        if let Some(subscription) = &mailbox.subscription {
-                            subscription.report(native_delivery_control_report("opencode-server", gate));
-                        }
-                    }).await {
+                if driver == "opencode" && mailbox.subscription.is_some() {
+                    if let Err(error) = sync_native_delivery_control(client, subject, &mut paths, &mailbox, &inbox, "opencode-server").await {
                         note_driver_tick_failure(subject, error, &mut last_control_warning);
                     }
                 }
@@ -17120,6 +17682,12 @@ async fn drive_st2_native(
                     )
                     .await;
                 }
+                }
+                // The older mailbox projection can create the first inbox file in this pass.
+                // Read control now so an idle gate adds no extra polling interval to delivery.
+                if driver == "opencode" && mailbox.subscription.is_none()
+                    && let Err(error) = sync_native_delivery_control(client, subject, &mut paths, &mailbox, &inbox, "opencode-server").await {
+                    note_driver_tick_failure(subject, error, &mut last_control_warning);
                 }
                 let tick: Result<()> = async {
                     if observations.enabled { return Ok(()) }
@@ -18568,6 +19136,14 @@ async fn run_pi_channel(
         }
         None => {
             let incarnation = wait_for_agent_incarnation(client, subject).await?;
+            if push_mailbox_enabled() {
+                // An argv seat can run its channel before reconciliation publishes
+                // runtime.running. Give bind the same starting handshake as a typed
+                // harness; it still allocates no ownership until this incarnation is live.
+                retry_while_daemon_unreachable(subject, || {
+                    publish_harness_state(client, subject, driver, "starting", Some(&incarnation), None)
+                }).await?;
+            }
             let context_name = format!("doc/context/{identity}/now");
             let context = retry_while_daemon_unreachable(subject, || {
                 latest_document_text(client, &context_name)
@@ -19331,18 +19907,24 @@ impl PiFamilyReports {
             match &self.fence {
                 Some(fence) => mailbox_receipt(client, fence, &message, "read").await?,
                 None => {
-                    let _: ClaimRecord = client.post(
-                        &format!("/v1/messages/{}/claims", urlencoding::encode(message.trim_start_matches("message/"))),
-                        &MessageLifecycleRequest {
-                            lifecycle: "read".into(),
-                            actor: Some(subject.into()),
-                            transport: None,
-                            runtime_id: None,
-                            evidence: Vec::new(),
-                            expected_subject: None,
-                            idempotency_key: format!("pi-read:{subject}:{message}"),
-                        },
-                    ).await?;
+                    let _: ClaimRecord = client
+                        .post(
+                            &format!(
+                                "/v1/messages/{}/claims",
+                                urlencoding::encode(message.trim_start_matches("message/"))
+                            ),
+                            &MessageLifecycleRequest {
+                                delegation: None,
+                                lifecycle: "read".into(),
+                                actor: Some(subject.into()),
+                                transport: None,
+                                runtime_id: None,
+                                evidence: Vec::new(),
+                                expected_subject: None,
+                                idempotency_key: format!("pi-read:{subject}:{message}"),
+                            },
+                        )
+                        .await?;
                 }
             }
             // Both transports retain the native receipt until the graph acknowledges it.
@@ -19590,6 +20172,43 @@ async fn refresh_native_delivery_control(
     refresh_graph_delivery_gate_with_report(client, subject, &paths.delivery_gate, report).await
 }
 
+/// Idle providers need no permit. Read graph control on mailbox arrival, then renew the
+/// existing short lease only while mail waits; a late provider handoff still fails closed.
+async fn sync_native_delivery_control(
+    client: &Client,
+    subject: &str,
+    paths: &mut NativePaths,
+    mailbox: &NativeMailbox,
+    inbox: &Path,
+    transport: &str,
+) -> Result<()> {
+    let report = |gate: &st_drivers::session_control::DeliveryGate| {
+        if let Some(subscription) = &mailbox.subscription {
+            subscription.report(native_delivery_control_report(transport, gate));
+        }
+    };
+    let waiting = if mailbox.subscription.is_some() {
+        mailbox.messages.iter().any(|message| {
+            matches!(message.status.as_str(), "sent" | "staged" | "delivered")
+        })
+    } else {
+        match st_drivers::message::list_dir(inbox) {
+            Ok(messages) => !messages.is_empty(),
+            Err(error) => {
+                paths.delivery_gate.unavailable();
+                report(&paths.delivery_gate);
+                return Err(error);
+            }
+        }
+    };
+    if !waiting && paths.pending_hold_adoption.is_none() {
+        paths.delivery_gate.idle();
+        report(&paths.delivery_gate);
+        return Ok(());
+    }
+    refresh_native_delivery_control(client, subject, paths, report).await
+}
+
 /// The only transitional status read: one fresh DND on an adopted predecessor, with no writes.
 fn legacy_delivery_hold(
     subject: &str,
@@ -19803,7 +20422,14 @@ async fn drive_codex_native(
     let mut replacement = DriverReplacement::new();
     loop {
         tokio::select! {
-            frame = mailbox.recv() => { mailbox.accept(frame, &runtime_id)?; }
+            frame = mailbox.recv() => {
+                let mail_changed = matches!(&frame, Some(st3::mailbox::Frame::Mailbox { .. }));
+                mailbox.accept(frame, &runtime_id)?;
+                if mail_changed
+                    && let Err(error) = sync_native_delivery_control(client, subject, &mut paths, &mailbox, &inbox, "app-server").await {
+                    note_driver_tick_failure(subject, error, &mut last_control_warning);
+                }
+            }
 
             wake = observations.recv() => {
                 wake?;
@@ -19898,11 +20524,8 @@ async fn drive_codex_native(
                     }
                 }
 
-                if let Err(error) = refresh_native_delivery_control(client, subject, &mut paths, |gate| {
-                        if let Some(subscription) = &mailbox.subscription {
-                            subscription.report(native_delivery_control_report("app-server", gate));
-                        }
-                    }).await {
+                if mailbox.subscription.is_some()
+                    && let Err(error) = sync_native_delivery_control(client, subject, &mut paths, &mailbox, &inbox, "app-server").await {
                     note_driver_tick_failure(subject, error, &mut last_control_warning);
                 }
                 // Delivery runs first and on its own: a failing observation publish must never
@@ -19929,6 +20552,9 @@ async fn drive_codex_native(
                     &mut delivery,
                 )
                 .await;
+                if let Err(error) = sync_native_delivery_control(client, subject, &mut paths, &mailbox, &inbox, "app-server").await {
+                    note_driver_tick_failure(subject, error, &mut last_control_warning);
+                }
                 }
                 let tick: Result<()> = async {
                     if !loop_state.ready && std::fs::read(state_dir.join("binding.json"))
@@ -20343,9 +20969,17 @@ fn work_incarnation_key(incarnation: Option<&str>) -> String {
 }
 
 async fn renew_claimed_work(client: &Client, subject: &str, minute: u64) -> Result<()> {
+    let work: Vec<StepRunView> = client
+        .get(&format!("/v1/work?actor={}", urlencoding::encode(subject)))
+        .await?;
+    // Most resident seats hold no work. Only a held claim needs the status reduction
+    // that proves its harness incarnation is still live before renewing the lease.
+    if !work.iter().any(|step| work_claim_is_held_by(step, subject)) {
+        return Ok(());
+    }
     let status: StatusResponse = client
         .get(&format!(
-            "/v1/status?subject={}",
+            "/v1/status?subject={}&harness_only=true",
             urlencoding::encode(subject)
         ))
         .await?;
@@ -20354,9 +20988,6 @@ async fn renew_claimed_work(client: &Client, subject: &str, minute: u64) -> Resu
         .iter()
         .find(|candidate| candidate.subject == subject)
         .and_then(|candidate| candidate.harness.as_ref());
-    let work: Vec<StepRunView> = client
-        .get(&format!("/v1/work?actor={}", urlencoding::encode(subject)))
-        .await?;
     let mut failure = None;
     for step in work
         .into_iter()
@@ -20469,15 +21100,19 @@ fn renewal_lost_its_claim(error: &anyhow::Error) -> bool {
     )
 }
 
+fn work_claim_is_held_by(step: &StepRunView, subject: &str) -> bool {
+    matches!(
+        step.status.as_str(),
+        "claimed" | "working" | "verifying" | "blocked"
+    ) && step.claimant.as_deref() == Some(subject)
+}
+
 fn work_claim_has_active_harness(
     step: &StepRunView,
     subject: &str,
     harness: Option<&CurrentHarnessView>,
 ) -> bool {
-    matches!(
-        step.status.as_str(),
-        "claimed" | "working" | "verifying" | "blocked"
-    ) && step.claimant.as_deref() == Some(subject)
+    work_claim_is_held_by(step, subject)
         && harness.is_some_and(|harness| {
             harness.state != "ended"
                 && step.claim_incarnation.as_deref() == Some(harness.incarnation_id.as_str())
@@ -21063,7 +21698,7 @@ fn update_native_title(seat: &st3::model::DesiredSubject, runtime_id: &str) -> R
     let session = std::env::var("PTY_SESSION")
         .ok()
         .filter(|session| !session.is_empty())
-        .unwrap_or_else(|| runtime_id.to_owned());
+        .unwrap_or_else(|| runtime_id.replace('/', "."));
     let result = std::process::Command::new("pty")
         .args(["rename", &session, &label])
         .output()?;
@@ -21602,6 +22237,64 @@ async fn enforce_account_limits(store: Arc<Store>, policy: st3::store::LimitsPol
     }
 }
 
+/// Page copying runs off the writer queue; recycling never waits for a reader or writer lock.
+fn recycle_idle_wal(path: PathBuf) {
+    // Five seconds finds gaps between short readers without polling on every write.
+    const WAL_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
+    const WAL_CHECKPOINT_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+    // Backfill can take tens of seconds even with a zero busy timeout. A detached native
+    // thread owns its connection so Tokio shutdown never waits for this best-effort work
+    // in its blocking pool. Dropping the handle also avoids joining it at process exit.
+    let worker = std::thread::Builder::new()
+        .name("st3-wal-checkpoint".into())
+        .spawn(move || {
+            let mut connection = None;
+            let mut last_error_log: Option<Instant> = None;
+            let mut retry_interval = WAL_CHECKPOINT_INTERVAL;
+            loop {
+                std::thread::sleep(retry_interval);
+                retry_interval = WAL_CHECKPOINT_INTERVAL;
+                // The connection is taken into the attempt and dropped on unwind; no
+                // potentially panic-damaged connection is reused by the next attempt.
+                let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let connection = match connection.take() {
+                        Some(connection) => connection,
+                        None => rusqlite::Connection::open(&path)
+                            .context("open WAL checkpoint connection")?,
+                    };
+                    let result = smallclaims::sqlite::checkpoint_idle_wal(&connection);
+                    Ok::<_, anyhow::Error>((connection, result))
+                }));
+                let result = match attempt {
+                    Ok(Ok((returned, result))) => {
+                        connection = Some(returned);
+                        result.context("recycle idle WAL")
+                    }
+                    Ok(Err(error)) => Err(error),
+                    Err(_) => {
+                        // catch_unwind still invokes the process panic hook. Back off
+                        // its retries too, without changing the hook for other threads.
+                        retry_interval = WAL_CHECKPOINT_ERROR_LOG_INTERVAL;
+                        Err(anyhow::anyhow!("WAL checkpoint panicked; reopening connection"))
+                    }
+                };
+                if let Err(error) = result {
+                    let now = Instant::now();
+                    if last_error_log.is_none_or(|last| {
+                        now.duration_since(last) >= WAL_CHECKPOINT_ERROR_LOG_INTERVAL
+                    }) {
+                        eprintln!("st3: {error:#}");
+                        last_error_log = Some(now);
+                    }
+                }
+            }
+        });
+    if let Err(error) = worker {
+        eprintln!("st3: start WAL checkpoint worker: {error}");
+    }
+}
+
 /// Old payloads convert after startup; each page joins the normal writer queue and commits
 /// its own cursor. A failed page retries, including after a daemon restart.
 async fn convert_envelope_payloads(store: Arc<Store>) {
@@ -22030,6 +22723,7 @@ mod tests {
 
     fn peer_status(peer: &str, digest: Option<&str>) -> st3::model::ReplicationPeerStatus {
         st3::model::ReplicationPeerStatus {
+            worker: None,
             projection_digests: Default::default(),
             differing_tables: Vec::new(),
             projection_comparison_waiting: false,
@@ -22458,6 +23152,9 @@ mod tests {
     #[test]
     fn a_harness_cannot_mutate_as_a_peer_or_person() {
         let cases: &[&[&str]] = &[
+            &["st3", "work", "done", "step-run/example/ask", "--as", "person/avery", "--summary", "Friday"],
+            &["st3", "conversations", "archive", "message/notice", "--as", "person/avery"],
+            &["st3", "work", "delegation", "--for", "person/avery", "--as", "person/avery", "--evidence", "claim/decision"],
             &[
                 "st3",
                 "missions",
@@ -23001,6 +23698,20 @@ mod tests {
         assert!(card.contains(
             "FAULT        render refuses to change tracked file .claude/settings.local.json"
         ));
+    }
+
+    #[test]
+    fn agent_card_names_a_pending_codex_approval() {
+        let agent: st3_client::Agent = serde_json::from_value(serde_json::json!({
+            "kind": "agent", "id": "agent/approval", "revision": "one",
+            "updated_at": "2026-10-06T12:00:00Z", "name": "Approval",
+            "state": "running", "reachability": "local", "runtime_ids": [],
+            "driver": "codex", "harness_state": "blocked", "blocked_on": "human",
+            "ask": "permission", "reason": "waitingOnApproval"
+        })).unwrap();
+        let card = render_client_agent(&agent, &[], 0);
+        assert!(card.contains("HARNESS      codex · blocked\n"));
+        assert!(card.contains("AWAITING     approval\n"));
     }
 
     fn subagent_worker() -> serde_json::Value {
@@ -23748,6 +24459,7 @@ mod tests {
         let peer =
             |name: &str, graph: Option<&str>, sync: Option<st3::model::ReplicationPeerSync>| {
                 ReplicationPeerStatus {
+                    worker: None,
                     projection_digests: BTreeMap::from([("claim_sources".into(), "sample".into())]),
                     differing_tables: Vec::new(),
                     projection_comparison_waiting: false,
@@ -23995,16 +24707,26 @@ mod tests {
             render_product_page("NOW", &fixture_product_page(&[], false), "st now"),
             "NOW  0\nNo current items.\n"
         );
+        let mixed = render_product_page(
+            "NOW",
+            &fixture_product_page(&["attention", "work", "operation"], false),
+            "st now",
+        );
+        // An attention item leads with its kind and title, then who it is from and how long ago
+        // (which moves with the clock) and its priority when it is not normal.
+        let (head, rest) = mixed
+            .split_once("  action: st attention show")
+            .expect(&mixed);
+        assert!(
+            head.starts_with("NOW  3\n\nrequest   Review release\n          "),
+            "{mixed}"
+        );
+        assert!(head.ends_with(" ago · high priority\n"), "{mixed}");
         assert_eq!(
-            render_product_page(
-                "NOW",
-                &fixture_product_page(&["attention", "work", "operation"], false),
-                "st now"
-            ),
+            rest,
             concat!(
-                "NOW  3\n",
-                "attention/release-review  attention  high  open  Review release\n",
-                "  action: st attention show launch/release --as person/alex\n",
+                " launch/release --as person/alex\n",
+                "  id: attention/release-review\n",
                 "work/release/1/build  work  claimed  build  attempt 1\n",
                 "  assigned: agent/release\n",
                 "  action: st work show work/release/1/build\n",
@@ -24012,6 +24734,54 @@ mod tests {
                 "  recovery: st doctor\n",
             )
         );
+    }
+
+    #[test]
+    fn an_attention_item_names_its_kind_sender_and_age() {
+        let mut item = match fixture_product_page(&["attention"], false)
+            .items
+            .into_iter()
+            .next()
+            .unwrap()
+        {
+            ClientResource::Attention(item) => item,
+            other => panic!("{other:?}"),
+        };
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-20T11:07:00Z")
+            .unwrap()
+            .timestamp_millis() as u128;
+        assert_eq!(
+            attention_heading(&item, now),
+            "\nrequest   Review release\n          7m ago · high priority\n"
+        );
+        item.priority = "normal".into();
+        item.requester_id = Some("agent/example/worker".into());
+        item.update = Some(st3_client::PersonUpdate {
+            version: 1,
+            entry_type: "update".into(),
+            about: "message/abc".into(),
+            subjects: Vec::new(),
+            summary: None,
+        });
+        assert_eq!(
+            attention_heading(&item, now),
+            "\nupdate    Review release\n          from example/worker · 7m ago\n"
+        );
+        // An update's action line warns that opening it reads it.
+        let mut page = fixture_product_page(&["attention"], false);
+        if let Some(ClientResource::Attention(shown)) = page.items.first_mut() {
+            shown.update = item.update.clone();
+        }
+        let rendered = render_product_page("NOW", &page, "st now");
+        assert!(
+            rendered.contains("  action (marks it read): st attention show launch/release"),
+            "{rendered}"
+        );
+        item.state = "snoozed".into();
+        item.update = None;
+        item.review_mode = Some("approve".into());
+        assert!(attention_heading(&item, now).starts_with("\nreview    "));
+        assert!(attention_heading(&item, now).ends_with(" · 7m ago · snoozed\n"));
     }
 
     #[test]
@@ -24172,6 +24942,35 @@ mod tests {
             "agent/node.worker",
             Some(&replacement)
         ));
+        assert!(!work_claim_has_active_harness(
+            &step,
+            "agent/other",
+            Some(&replacement)
+        ));
+        assert!(!work_claim_has_active_harness(
+            &step,
+            "agent/node.worker",
+            None
+        ));
+        let mut ended = replacement.clone();
+        ended.incarnation_id = "worker-one".into();
+        ended.state = "ended".into();
+        assert!(!work_claim_has_active_harness(
+            &step,
+            "agent/node.worker",
+            Some(&ended)
+        ));
+        for state in ["claimed", "working", "verifying", "blocked"] {
+            let mut held = step.clone();
+            held.status = state.into();
+            assert!(work_claim_is_held_by(&held, "agent/node.worker"));
+            assert!(!work_claim_is_held_by(&held, "agent/other"));
+        }
+        for state in ["ready", "pending", "completed", "cancelled", "failed"] {
+            let mut unheld = step.clone();
+            unheld.status = state.into();
+            assert!(!work_claim_is_held_by(&unheld, "agent/node.worker"));
+        }
     }
 
     #[test]
@@ -25371,6 +26170,88 @@ mod tests {
     }
 
     #[test]
+    fn delegated_commands_require_complete_proof_and_keep_the_agent_actor() {
+        for command in [
+            vec![
+                "work",
+                "done",
+                "step-run/example/ask",
+                "--summary",
+                "Friday",
+            ],
+            vec!["conversations", "archive", "message/notice"],
+            vec!["attention", "approve", "step-run/example/build"],
+            vec![
+                "attention",
+                "reject",
+                "step-run/example/build",
+                "--reason",
+                "Stop",
+            ],
+            vec![
+                "attention",
+                "resolve",
+                "attention/update",
+                "--outcome",
+                "resolved",
+            ],
+        ] {
+            let mut args = vec!["st3"];
+            args.extend(command);
+            args.extend(["--as", "agent/example/helper", "--for", "person/avery"]);
+            assert!(
+                Cli::try_parse_from(&args).is_err(),
+                "missing proof: {args:?}"
+            );
+            args.extend([
+                "--policy",
+                "claim/policy",
+                "--instruction",
+                "message/decision",
+                "--quote",
+                "Friday",
+                "--episode",
+                "claim/episode",
+            ]);
+            let parsed = Cli::try_parse_from(&args).unwrap();
+            let (proof, actor) = match parsed.command {
+                Command::Work {
+                    command: WorkCommand::Done(args),
+                } => (args.delegation, args.actor),
+                Command::Conversations {
+                    command: MessageCommand::Archive(args),
+                } => (args.delegation, args.actor.unwrap()),
+                Command::Attention {
+                    command: AttentionCommand::Approve(args) | AttentionCommand::Reject(args),
+                } => (args.delegation, args.actor),
+                Command::Attention {
+                    command: AttentionCommand::Resolve(args),
+                } => (args.delegation, args.actor),
+                _ => panic!("unexpected delegated command"),
+            };
+            assert_eq!(actor, "agent/example/helper");
+            let proof = proof.proof(Some("claim/episode")).unwrap().unwrap();
+            assert_eq!(proof.person, "person/avery");
+            assert_eq!(proof.message, "message/decision");
+        }
+        assert!(
+            Cli::try_parse_from([
+                "st3",
+                "work",
+                "delegation",
+                "--for",
+                "person/avery",
+                "--as",
+                "person/avery",
+                "--evidence",
+                "claim/decision",
+            ])
+            .is_ok(),
+            "a person can revoke by setting an empty action list"
+        );
+    }
+
+    #[test]
     fn message_archive_accepts_more_than_one_reference() {
         let cli = Cli::try_parse_from([
             "st3",
@@ -25415,6 +26296,23 @@ mod tests {
         assert_eq!(args.references, ["message/first", "message/second"]);
         assert_eq!(args.actor.as_deref(), Some("agent/sup"));
         assert!(args.archive);
+    }
+
+    #[test]
+    fn a_provenance_reads_as_one_line() {
+        let line = provenance_line(&json!({
+            "verdict": "verified", "signer": "person/example",
+            "device": "example phone (secure enclave)", "key": "p256:BPLXtCkgqnBglKrxCU_RE"
+        }));
+        assert_eq!(
+            line,
+            "verified · person/example · example phone (secure enclave) · p256:BPLXtCkgqnB…"
+        );
+        assert_eq!(
+            provenance_line(&json!({"verdict": "held", "reason": "delegation d1 has not arrived"})),
+            "held · delegation d1 has not arrived"
+        );
+        assert_eq!(provenance_line(&json!({"verdict": "unsigned"})), "unsigned");
     }
 
     #[tokio::test]
@@ -26418,8 +27316,25 @@ mission "review" state="ready" {
     }
 
     #[test]
-    fn graph_delivery_deliberate_hold_keeps_mailbox_ready() {
+    fn graph_delivery_idle_and_deliberate_hold_keep_mailbox_ready() {
         let gate = st_drivers::session_control::DeliveryGate::default();
+        gate.unavailable();
+        for transport in ["app-server", "opencode-server"] {
+            assert_eq!(
+                native_delivery_control_report(transport, &gate)["ready"],
+                false
+            );
+        }
+        gate.idle();
+        assert!(gate.held(), "idle must close any handoff permission");
+        for transport in ["app-server", "opencode-server"] {
+            let report = native_delivery_control_report(transport, &gate);
+            assert_eq!(
+                report["ready"], true,
+                "idle must clear an obsolete control failure"
+            );
+            assert!(report["reason"].is_null());
+        }
         gate.update(true, DELIVERY_CONTROL_LEASE);
         assert!(gate.held(), "a deliberate hold must still block native input");
         for transport in ["app-server", "opencode-server"] {

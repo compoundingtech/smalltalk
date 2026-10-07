@@ -477,6 +477,7 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
             body,
             delivered,
             dictated,
+            signed,
             images,
         } => {
             // Mail the person is part of leads; mail between others stays in the background
@@ -550,6 +551,14 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
                     run(format!("  {}", entry.at), on(theme.dim())),
                     // Spoken, then transcribed: a reader allows for transcription mistakes.
                     run(if *dictated { "  🎤" } else { "" }, on(theme.dim())),
+                    // Who signed it and whether that checks, for what a person wrote.
+                    run(
+                        signed
+                            .as_deref()
+                            .map(|signed| format!("  {signed}"))
+                            .unwrap_or_default(),
+                        on(theme.dim()),
+                    ),
                     run(progress.text, on(progress.style)),
                 ],
                 inner,
@@ -774,6 +783,7 @@ mod tests {
                     body: "The keys rotated.\n\nThree hosts still read the old ones.".into(),
                     delivered: false,
                     dictated: false,
+                    signed: None,
                     images: Vec::new(),
                 },
             )
@@ -811,6 +821,35 @@ mod tests {
         // Opened, it reads in full.
         let opened = text(&HashSet::from(["message/others".to_owned()])).join("\n");
         assert_eq!(opened.matches("Three hosts").count(), 2, "{opened}");
+    }
+
+    #[test]
+    fn rows_as_the_person_sees_them_count_a_run_of_calls_once() {
+        let call = |id: &str| {
+            entry(
+                id,
+                Body::Tool {
+                    title: "$ ls".into(),
+                    state: ToolState::Ok,
+                    output: Vec::new(),
+                },
+            )
+        };
+        let entries = vec![
+            entry("a", Body::User("check".into())),
+            call("t1"),
+            call("t2"),
+            call("t3"),
+            entry("b", Body::Assistant("done".into())),
+            call("t4"),
+            entry("c", Body::Assistant("more".into())),
+            call("t5"),
+            call("t6"),
+        ];
+        // Two messages and a reply, and three runs of calls.
+        assert_eq!(crate::display_rows(&entries), 6);
+        assert_eq!(crate::display_rows(&[]), 0);
+        assert_eq!(crate::display_rows(&[call("only")]), 1);
     }
 
     #[test]
@@ -930,6 +969,7 @@ mod tests {
                     body: "ship the harbor fix".into(),
                     delivered: true,
                     dictated,
+                    signed: None,
                     images: Vec::new(),
                 },
             )
@@ -966,6 +1006,7 @@ mod tests {
                 body: String::new(),
                 delivered: false,
                 dictated: false,
+                signed: None,
                 images: vec![image.clone()],
             },
         );
@@ -1001,6 +1042,7 @@ mod tests {
                     body: body.clone(),
                     delivered: false,
                     dictated: false,
+                    signed: None,
                     images: Vec::new(),
                 },
             )

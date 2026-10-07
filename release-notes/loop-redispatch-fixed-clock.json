@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Make the unclaimed loop redispatch timeout test deterministic",
+  "replay": {
+    "status": "none",
+    "detail": "Only an isolated test fixture clock changes; runtime replay behavior is unchanged."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database tables, indexes, triggers, schema versions or migration code change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules, digests or fleet coordination behavior change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No client, protocol, provider or harness contract changes; the existing fixture assertions are preserved."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "This test-only change introduces no additional service interruption."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No installation steps or starting-state transitions are required for this test-only change."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No runtime recovery or database swap-back behavior changes."
+  }
+}

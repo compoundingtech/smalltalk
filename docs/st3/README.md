@@ -14,6 +14,8 @@ Use these documents for implementation details:
 - [Seat rollout](owned-seat-cutover.md) defines idle cutover, strict native-session continuity and source status.
 - [Free mode](kdl-lifecycle.md#free-mode): within a fleet, an agent may do anything the person who
   runs the fleet may do, as itself, until principals and grants land.
+- [Person delegation](person-delegation.md): record a person's prior answer or instruction as
+  the agent, with the person's allowed list, exact episode, and quoted evidence.
 - [Schema registry](schema.md) lists the generated public subject, resource, and claim vocabulary.
 - [Typed custom subjects](custom-subjects.md) defines immutable registrations, generic reads and replies, and derived-state freshness,
   and the decision-tree manifest.

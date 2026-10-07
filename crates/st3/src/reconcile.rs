@@ -659,6 +659,7 @@ impl NativeRuntime {
                         &environment,
                         member.display_name.as_deref(),
                         &member.tags,
+                        member.terminal_size,
                         predecessor,
                         operation,
                         guard,
@@ -671,6 +672,7 @@ impl NativeRuntime {
                         &environment,
                         member.display_name.as_deref(),
                         &member.tags,
+                        member.terminal_size,
                         predecessor,
                         operation,
                     )
@@ -686,6 +688,7 @@ impl NativeRuntime {
                     &environment,
                     member.display_name.as_deref(),
                     &member.tags,
+                    member.terminal_size,
                 )
             }
         } else {
@@ -706,6 +709,27 @@ impl NativeRuntime {
 /// item on its own.
 pub trait FaultInjection: Send + Sync + 'static {
     fn fault(&self, scope: &str, subject: &str) -> Option<String>;
+}
+
+pub(crate) const FIRST_READINESS_FAULT_AFTER_MS: u128 = 120_000;
+pub(crate) const FIRST_READINESS_FAULT_SCOPE: &str = "scheduler/first-readiness";
+
+fn first_readiness_pending(run: &MissionRunView) -> bool {
+    run.phase == "normal"
+        && !run.steps.is_empty()
+        && run
+            .steps
+            .iter()
+            .all(|step| step.status == "pending" && step.readiness_epoch == 0)
+}
+
+fn first_readiness_since(run: &MissionRunView) -> u128 {
+    run.steps
+        .iter()
+        .map(|step| step.created_at_unix_ms)
+        .max()
+        .unwrap_or(run.created_at_unix_ms)
+        .max(run.created_at_unix_ms)
 }
 
 pub struct Reconciler<R = NativeRuntime> {
@@ -757,6 +781,8 @@ pub struct Reconciler<R = NativeRuntime> {
     /// incarnation, so a pass compares the declared launch without reading the store.
     launched_members: Mutex<HashMap<String, (String, Option<MemberSpec>)>>,
     retired_predecessor_generations: Mutex<BTreeSet<String>>,
+    /// The person whose published launch geometry terminal seats start at.
+    person: Option<String>,
     #[cfg(test)]
     mission_declaration_parses: std::sync::atomic::AtomicUsize,
     file_watchers: Arc<Mutex<HashMap<String, notify::RecommendedWatcher>>>,
@@ -850,6 +876,7 @@ impl Reconciler<NativeRuntime> {
             endpoint,
             driver_state_dir: state_dir.join("drivers"),
             client_relay: None,
+            person: None,
             incoming_resumes: Arc::default(),
             st_binary: Some(publish_st_binary(state_dir)?),
             runtime_environment: BTreeMap::from([
@@ -928,6 +955,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             endpoint: "unused-test-endpoint".into(),
             driver_state_dir: std::env::temp_dir().join("st3-test-drivers"),
             client_relay: None,
+            person: None,
             incoming_resumes: Arc::default(),
             st_binary: None,
             runtime_environment: BTreeMap::new(),
@@ -986,6 +1014,11 @@ impl<R: RuntimeControl> Reconciler<R> {
 
     pub fn with_client_relay(mut self, relay: Option<crate::peer::ClientRelay>) -> Self {
         self.client_relay = relay;
+        self
+    }
+
+    pub fn with_person(mut self, person: Option<String>) -> Self {
+        self.person = person;
         self
     }
 
@@ -1686,6 +1719,14 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     fn append_fault(&self, subject: &str, scope: &str, status: &str, reason: &str) -> Result<()> {
+        if scope == FIRST_READINESS_FAULT_SCOPE
+            && let Some(error) = self
+                .fault_injection
+                .as_ref()
+                .and_then(|faults| faults.fault("first-readiness-fault-write", subject))
+        {
+            anyhow::bail!(error);
+        }
         self.store.append_claim(&ClaimInput {
             subject: subject.into(),
             kind: "reconcile.fault".into(),
@@ -4884,6 +4925,9 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .entry(key.clone())
                 .or_insert_with(|| value.clone());
         }
+        if launch_member.terminal {
+            launch_member.terminal_size = self.launch_geometry()?;
+        }
         self.bind_account(subject, member, &mut launch_member)?;
         if let Some(id) = member.environment.get(crate::rollout::OPERATION_ENV) {
             let operation = self.store.rollout(&subject.subject)?.context("rollout disappeared before account selection")?;
@@ -5130,6 +5174,30 @@ impl<R: RuntimeControl> Reconciler<R> {
         )?;
         self.signal_changed();
         Ok(true)
+    }
+
+    /// The configured person's latest `terminal.launch-geometry`: the size their client draws a
+    /// seat at, so a seat started now needs no resize when they first open it. Nothing without a
+    /// configured person or before they publish one.
+    fn launch_geometry(&self) -> Result<Option<st_runtime::TerminalSize>> {
+        let Some(person) = &self.person else {
+            return Ok(None);
+        };
+        let Some(claim) = self
+            .store
+            .latest_observation(person, "terminal.launch-geometry")?
+        else {
+            return Ok(None);
+        };
+        let dimension = |name: &str| {
+            claim
+                .body
+                .pointer(&format!("/fields/{name}"))
+                .and_then(st3_schema::terminal_dimension)
+        };
+        Ok(dimension("rows")
+            .zip(dimension("columns"))
+            .map(|(rows, columns)| st_runtime::TerminalSize { rows, columns }))
     }
 
     /// Point a seat whose harness block binds an account (or a pool) at that account's login
@@ -6532,6 +6600,10 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .map(|observation| observation.status)
         });
         let ids = self.store.active_mission_run_ids_for_origin(&self.host)?;
+        self.evaluate_mission_run_ids(ids)
+    }
+
+    fn evaluate_mission_run_ids(&self, ids: Vec<String>) -> Result<()> {
         let mut active_generations = BTreeSet::new();
         let mut active_steps = BTreeSet::new();
         let mut changed = false;
@@ -6569,7 +6641,22 @@ impl<R: RuntimeControl> Reconciler<R> {
                         // From the view the evaluation started with: a write it makes changes subjects
                         // it read, so the next pass evaluates it again and takes the new times.
                         due = crate::incremental::run_due(&run, now_ms());
-                        self.evaluate_active_mission_run(&run)
+                        let evaluated = self.evaluate_active_mission_run(&run);
+                        // Recovery is diagnostic too: admission and execution writes come first.
+                        if (!first_readiness_pending(&run)
+                            || now_ms().saturating_sub(first_readiness_since(&run))
+                                < FIRST_READINESS_FAULT_AFTER_MS)
+                            && let Err(error) = self.close_fault(
+                                &run.subject,
+                                FIRST_READINESS_FAULT_SCOPE,
+                                "the run no longer has an overdue first-readiness wait",
+                            )
+                        {
+                            eprintln!(
+                                "st3: first-readiness recovery for {}: {error:#}", run.subject
+                            );
+                        }
+                        evaluated
                     })
                 })
             });
@@ -6615,14 +6702,21 @@ impl<R: RuntimeControl> Reconciler<R> {
             .iter()
             .flatten()
             .filter(|((subject, scope), _)| match scope.as_str() {
-                "mission-run" => !active.contains(subject),
+                "mission-run" | FIRST_READINESS_FAULT_SCOPE => !active.contains(subject),
                 "step" => !active_steps.contains(subject),
                 _ => false,
             })
             .map(|((subject, scope), _)| (subject.clone(), scope.clone()))
             .collect::<Vec<_>>();
         for (subject, scope) in inactive {
-            self.close_fault(&subject, &scope, "it is no longer active")?;
+            let recovery = self.close_fault(&subject, &scope, "it is no longer active");
+            if scope == FIRST_READINESS_FAULT_SCOPE {
+                if let Err(error) = recovery {
+                    eprintln!("st3: first-readiness recovery for {subject}: {error:#}");
+                }
+            } else {
+                recovery?;
+            }
         }
         if changed {
             self.signal_changed();
@@ -6651,6 +6745,14 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     fn evaluate_active_mission_run(&self, run: &MissionRunView) -> Result<bool> {
+        if run.phase == "normal"
+            && let Some(reason) = self.store.stale_subscription_pull_request_run(run)?
+        {
+            return self
+                .store
+                .request_mission_run_cancellation(&run.id, &reason)
+                .map_err(Into::into);
+        }
         if run
             .deadline_at_unix_ms
             .is_some_and(|deadline| deadline <= now_ms())
@@ -7130,7 +7232,14 @@ impl<R: RuntimeControl> Reconciler<R> {
                             )?;
                             return Ok(changed);
                         }
+                        // Save readiness before diagnostic writes. A diagnostic failure must not
+                        // fail admission or become a step fault. Use the original pending view.
                         changed |= self.store.set_step_state(&view.subject, "ready", None)?;
+                        if let Err(error) = self.record_first_readiness_wait(run, now_ms()) {
+                            eprintln!(
+                                "st3: first-readiness diagnosis for {}: {error:#}", run.subject
+                            );
+                        }
                         return Ok(changed);
                     }
                     if !matches!(
@@ -7340,6 +7449,28 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .set_mission_run_state(&run.id, status, "normal", reason)?;
         }
         Ok(changed)
+    }
+
+    fn record_first_readiness_wait(&self, run: &MissionRunView, now: u128) -> Result<()> {
+        if !first_readiness_pending(run) {
+            return Ok(());
+        }
+        // A revision can replace an old run's generation. Its new steps get their own grace.
+        let since = first_readiness_since(run);
+        let waited = now.saturating_sub(since);
+        if waited < FIRST_READINESS_FAULT_AFTER_MS {
+            return Ok(());
+        }
+        // Elapsed time changes on every pass; it must not manufacture a new cause each time.
+        if self.open_faults()?.as_ref().is_some_and(|faults| {
+            faults.contains_key(&(run.subject.clone(), FIRST_READINESS_FAULT_SCOPE.into()))
+        }) {
+            return Ok(());
+        }
+        self.record_fault(&run.subject, FIRST_READINESS_FAULT_SCOPE, Err(anyhow::anyhow!(
+            "{} waited {waited}ms with every step pending before satisfied readiness predicates were reached (threshold {FIRST_READINESS_FAULT_AFTER_MS}ms)",
+            run.subject
+        )))
     }
 
     fn reconcile_mission_run_cleanup(&self, run: &MissionRunView) -> Result<bool> {
@@ -8310,6 +8441,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             restart_intensity: RestartIntensity::default(),
             shutdown_timeout_ms: 5_000,
             driver: Some("loop-metric".into()),
+            terminal_size: None,
         };
         self.perform_start(
             &DesiredSubject {
@@ -11823,7 +11955,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             let created = self.store.create_subscription_mission_run(&request_value, parent.as_ref(), &item.subject, resource, discovery);
             let run = match created {
                 Ok(run) => run,
-                Err(error) if error.code == "stale-ref-head" => {
+                Err(error) if matches!(error.code, "stale-ref-head" | "stale-pull-request" | "completed-subscription-snapshot") => {
                     self.store.append_claim(&ClaimInput {
                         subject: item.subject.clone(), kind: "subscription.mission-request-cancelled".into(), actor: None,
                         fields: BTreeMap::from([("request".into(), Value::String(request.id.clone())), ("reason".into(), Value::String(error.message))]),
@@ -12166,6 +12298,9 @@ impl<R: RuntimeControl> Reconciler<R> {
             .cloned()
             .unwrap_or_default();
         if spec.stopped {
+            let prefix = format!("{}:", observer.subject);
+            self.armed_observers.lock().unwrap_or_else(PoisonError::into_inner)
+                .retain(|operation| !operation.starts_with(&prefix));
             let is_stopped = self
                 .store
                 .latest_actual_value(&observer.subject)?
@@ -12274,6 +12409,8 @@ impl<R: RuntimeControl> Reconciler<R> {
         let notify = self.notify.clone();
         let event_notify = self.event_notify.clone();
         let armed = self.armed_observers.clone();
+        #[cfg(test)]
+        let completion_fault = self.fault_injection.clone();
         let deadlines = self.observer_deadlines.clone();
         let cursors = self.observer_cursors.clone();
         let observer_subject = observer.subject.clone();
@@ -12335,13 +12472,23 @@ impl<R: RuntimeControl> Reconciler<R> {
                 let observed =
                     crate::resource::spend_as(observer_subject.clone(), provider.observe(request))
                         .await;
-                let mut active = armed.lock().unwrap_or_else(PoisonError::into_inner);
-                if !active.contains(&operation)
+                // This UUID is the arm generation. The writer checks it inside the
+                // transaction; never keep the scheduler lock while waiting for Store I/O.
+                let current = || {
+                    #[cfg(test)]
+                    if let Some(injection) = &completion_fault {
+                        injection.fault("observer-completion-write", &observer_subject);
+                    }
+                    armed.lock().unwrap_or_else(PoisonError::into_inner).contains(&operation)
+                };
+                if !current()
                     || store.selected_desired_revision(&observer_subject).ok().flatten().as_deref() != Some(revision.as_str()) {
-                    active.remove(&operation);
+                    armed.lock().unwrap_or_else(PoisonError::into_inner).remove(&operation);
                     signal_changed(&notify, &event_notify);
                     return;
                 }
+                let mut completed_deadline = None;
+                let mut completed_cursor = None;
                 match observed {
                     Ok(mut observation) => {
                         if spec.provider == "github.repository" {
@@ -12376,23 +12523,16 @@ impl<R: RuntimeControl> Reconciler<R> {
                             &observation.facts,
                             observation.next_check_unix_ms,
                             &selected,
+                            Some(&current),
                         ) {
                             Ok(_) => {
-                                deadlines
-                                    .lock()
-                                    .unwrap_or_else(PoisonError::into_inner)
-                                    .insert(deadline_key.clone(), observation.next_check_unix_ms);
-                                cursors
-                                    .lock()
-                                    .unwrap_or_else(PoisonError::into_inner)
-                                    .insert(deadline_key.clone(), observation.cursor);
+                                completed_deadline = Some(observation.next_check_unix_ms);
+                                completed_cursor = Some(observation.cursor);
                             }
+                            Err(error) if error.code == "observer-operation-retired" => {}
                             Err(error) => {
                                 let retry_at = now_ms().saturating_add(60_000);
-                                deadlines
-                                    .lock()
-                                    .unwrap_or_else(PoisonError::into_inner)
-                                    .insert(deadline_key.clone(), retry_at);
+                                completed_deadline = Some(retry_at);
                                 let reason = error.to_string();
                                 let failure_hash = hex::encode(sha2::Sha256::digest(
                                     format!("{revision}:{}:{reason}", error.code).as_bytes(),
@@ -12415,7 +12555,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                                     ),
                                     None => format!("observer-rejected:{}", &failure_hash[..20]),
                                 };
-                                let _ = store.append_claim(&ClaimInput {
+                                let _ = store.append_observer_state(&ClaimInput {
                                     subject: observer_subject.clone(),
                                     kind: "observer.state".into(),
                                     actor: None,
@@ -12423,7 +12563,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                                     evidence: Vec::new(),
                                     expected_subject: None,
                                     idempotency_key: Some(key),
-                                });
+                                }, &revision, &current);
                             }
                         }
                     }
@@ -12434,10 +12574,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                             |limit| limit.retry_at_unix_ms.max(now_ms().saturating_add(1_000)),
                         );
                         let reason = error.to_string();
-                        deadlines
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner)
-                            .insert(deadline_key.clone(), retry_at);
+                        completed_deadline = Some(retry_at);
                         let previous = store.latest_actual_value(&observer_subject).ok().flatten();
                         let condition = ObserverCondition::of(&error, previous.as_ref());
                         let unchanged_failure = previous.as_ref().is_some_and(|actual| {
@@ -12472,7 +12609,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                             if let Some(attempt) = &refresh_attempt {
                                 fields.insert("attempt".into(), Value::String(attempt.clone()));
                             }
-                            let _ = store.append_claim(&ClaimInput {
+                            let _ = store.append_observer_state(&ClaimInput {
                                 subject: observer_subject.clone(),
                                 kind: "observer.state".into(),
                                 actor: None,
@@ -12483,12 +12620,31 @@ impl<R: RuntimeControl> Reconciler<R> {
                                     "observer-failure:{}",
                                     &failure_hash[..20]
                                 )),
-                            });
+                            }, &revision, &current);
                         }
+                    }
+                }
+                // A cadence change or cancellation may retire this arm while its
+                // writer job waits. Publish only this still-current generation.
+                let revision_current = store.selected_desired_revision(&observer_subject)
+                    .ok().flatten().as_deref() == Some(revision.as_str());
+                let mut active = armed.lock().unwrap_or_else(PoisonError::into_inner);
+                if active.contains(&operation) && revision_current {
+                    if let Some(next_check) = completed_deadline {
+                        deadlines.lock().unwrap_or_else(PoisonError::into_inner)
+                            .insert(deadline_key.clone(), next_check);
+                    }
+                    if let Some(cursor) = completed_cursor {
+                        cursors.lock().unwrap_or_else(PoisonError::into_inner)
+                            .insert(deadline_key.clone(), cursor);
                     }
                 }
                 active.remove(&operation);
                 drop(active);
+                #[cfg(test)]
+                if let Some(injection) = &completion_fault {
+                    injection.fault("observer-completion-finished", &observer_subject);
+                }
                 signal_changed(&notify, &event_notify);
             });
         } else {
@@ -12735,6 +12891,13 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
             let subject = format!("gate-operation/predicate/{}", &digest[..32]);
             fields.insert("operation".into(), Value::String(subject.clone()));
+            if let Some(reason) = self
+                .fault_injection
+                .as_ref()
+                .and_then(|injection| injection.fault("gate-write", &subject))
+            {
+                anyhow::bail!(reason);
+            }
             self.record_once(&subject, "gate.result", fields)?;
         }
         Ok(outcome)
@@ -12915,6 +13078,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             restart_intensity: RestartIntensity::default(),
             shutdown_timeout_ms: 5_000,
             driver: Some("mechanical-gate".into()),
+            terminal_size: None,
         };
         let desired = DesiredSubject {
             subject: operation.clone(),
@@ -13449,6 +13613,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             restart_intensity: RestartIntensity::default(),
             shutdown_timeout_ms: 5_000,
             driver: Some("llm-gate".into()),
+            terminal_size: None,
         };
         let desired = DesiredSubject {
             subject: result_subject,
@@ -15193,9 +15358,11 @@ fn now_ms() -> u128 {
 mod tests {
     mod channel_recovery;
     mod differential;
+    mod first_readiness_tests;
     mod incremental_deadlines;
-    mod rollout_tests;
+    mod pull_request_run_tests;
     mod ref_watch_tests;
+    mod rollout_tests;
     #[test]
     fn native_exec_and_gate_shell_resolve_the_declared_path() {
         use super::{NativeRuntime, RuntimeControl};
@@ -16419,6 +16586,53 @@ version 2
         assert_eq!(gate.environment["ST_GATE"], "verify context");
         assert_eq!(gate.environment["ST_MISSION_RUN"], run.id);
         assert_eq!(gate.environment["ST_STEP"], "work");
+    }
+
+    #[test]
+    fn a_terminal_seat_starts_at_the_configured_persons_latest_launch_geometry() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        for (rows, columns) in [(24, 80), (48, 160)] {
+            store
+                .append_client_claim(&ClaimInput {
+                    subject: "person/avery".into(),
+                    kind: "terminal.launch-geometry".into(),
+                    actor: Some("person/avery".into()),
+                    fields: BTreeMap::from([
+                        ("rows".into(), Value::from(rows)),
+                        ("columns".into(), Value::from(columns)),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+        apply_source(
+            &store,
+            "version 2\nagent \"example/sized\" { workspace \"/tmp\"; command \"true\" }",
+            "sized-seat",
+        );
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store,
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        )
+        .with_person(Some("person/avery".into()));
+        reconciler.reconcile_once().unwrap();
+        let started = runtime.started_members.lock().unwrap();
+        let [seat] = started.as_slice() else {
+            panic!("expected one start, got {started:?}");
+        };
+        assert!(seat.terminal);
+        assert_eq!(
+            seat.terminal_size,
+            Some(st_runtime::TerminalSize {
+                rows: 48,
+                columns: 160
+            })
+        );
     }
 
     #[tokio::test]
@@ -24802,7 +25016,17 @@ mission "untimed-clock" state="ready" {
 
     #[test]
     fn an_unclaimed_timed_out_round_is_redispatched_without_spending_a_round() {
+        struct TestClock;
+        impl Drop for TestClock {
+            fn drop(&mut self) {
+                smallclaims::store::set_thread_clock(None);
+            }
+        }
+        let _clock = TestClock;
+        const START: u128 = 1_800_000_000_000;
+        smallclaims::store::set_thread_clock(Some(START));
         let store = Arc::new(Store::open_memory("node").unwrap());
+        store.set_write_clock_at(START).unwrap();
         let source = r#"
 version 2
 
@@ -24840,11 +25064,32 @@ mission "unclaimed-loop" state="ready" {
         for _ in 0..6 {
             reconciler.reconcile_once().unwrap();
         }
-        std::thread::sleep(Duration::from_millis(25));
         let loop_subject = format!(
             "loop-run/{}/improve",
             run.generation.strip_prefix("run-generation/").unwrap()
         );
+        assert!(
+            store
+                .claims_for(&loop_subject, Some("loop.round-dispatch"))
+                .unwrap()
+                .is_empty(),
+            "fixed-clock setup must not redispatch a round"
+        );
+        let child_subject = store.mission_run_subject_for_idempotency_key(&format!(
+            "loop-round:{}:1",
+            run.steps[0].subject
+        ));
+        let child = store.mission_run(&child_subject).unwrap().unwrap();
+        assert_eq!(
+            child.parent_step_run.as_deref(),
+            Some(run.steps[0].subject.as_str())
+        );
+        let deadline = child.deadline_at_unix_ms.expect("the round has a timeout");
+        assert_eq!(deadline, child.created_at_unix_ms + 20);
+        // Expire this child once, independently of setup speed or child/parent ordering.
+        let expired_at = deadline + 1;
+        smallclaims::store::set_thread_clock(Some(expired_at));
+        store.set_write_clock_at(expired_at).unwrap();
         for _ in 0..12 {
             reconciler.reconcile_once().unwrap();
             if !store
@@ -28396,20 +28641,10 @@ subscription "b" {{
 }}"#
         );
         apply_source(&store, &source, "shared-discovery-watch");
-        store
-            .record_resource_observation(
-                "observer/a",
-                &store
-                    .selected_desired_revision("observer/a")
-                    .unwrap()
-                    .unwrap(),
-                None,
-                "resource/repo",
-                Some("baseline"),
-                &serde_json::json!({"issues": []}),
-                now_ms() + 60_000,
-                &[],
-            )
+        store.record_resource_observation("observer/a", &store
+            .selected_desired_revision("observer/a")
+            .unwrap()
+            .unwrap(), None, "resource/repo", Some("baseline"), &serde_json::json!({"issues": []}), now_ms() + 60_000, &[], None)
             .unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let reconciler = Reconciler::new(
@@ -28864,20 +29099,10 @@ subscription "reviews" {{
             .unwrap();
         let spec = crate::graph::subscription_spec(&subscription.desired).unwrap();
         let subscriptions = vec![(subscription.subject.clone(), spec)];
-        let baseline = store
-            .record_resource_observation(
-                "observer/repo",
-                &store
-                    .selected_desired_revision("observer/repo")
-                    .unwrap()
-                    .unwrap(),
-                None,
-                "resource/repo",
-                Some("one"),
-                &serde_json::json!({"pull_requests": []}),
-                now_ms() + 60_000,
-                &subscriptions,
-            )
+        let baseline = store.record_resource_observation("observer/repo", &store
+            .selected_desired_revision("observer/repo")
+            .unwrap()
+            .unwrap(), None, "resource/repo", Some("one"), &serde_json::json!({"pull_requests": []}), now_ms() + 60_000, &subscriptions, None)
             .unwrap();
         let baseline_claim = baseline
             .observation_claim
@@ -28896,20 +29121,10 @@ subscription "reviews" {{
                 idempotency_key: "occupied-review".into(),
             })
             .unwrap();
-        let changed = store
-            .record_resource_observation(
-                "observer/repo",
-                &store
-                    .selected_desired_revision("observer/repo")
-                    .unwrap()
-                    .unwrap(),
-                None,
-                "resource/repo",
-                Some("two"),
-                &serde_json::json!({"pull_requests": [{"number": 7, "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}),
-                now_ms() + 60_000,
-                &subscriptions,
-            )
+        let changed = store.record_resource_observation("observer/repo", &store
+            .selected_desired_revision("observer/repo")
+            .unwrap()
+            .unwrap(), None, "resource/repo", Some("two"), &serde_json::json!({"pull_requests": [{"number": 7, "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}), now_ms() + 60_000, &subscriptions, None)
             .unwrap();
         // The repository's own facts did not change; only the new item records a claim.
         assert!(changed.observation_claim.is_none());
@@ -29053,17 +29268,7 @@ subscription "reviews" {{
                        head: Option<&str>,
                        state: &str| {
             let pulls = head.map(|head| serde_json::json!([{"number": 4, "head": head, "state": state, "draft": false}])).unwrap_or_else(|| serde_json::json!([]));
-            store
-                .record_resource_observation(
-                    "observer/repo",
-                    observer_revision,
-                    None,
-                    "resource/repo",
-                    None,
-                    &serde_json::json!({"repository_id": 17, "pull_requests": pulls}),
-                    now_ms() + 60_000,
-                    subscriptions,
-                )
+            store.record_resource_observation("observer/repo", observer_revision, None, "resource/repo", None, &serde_json::json!({"repository_id": 17, "pull_requests": pulls}), now_ms() + 60_000, subscriptions, None)
                 .unwrap();
         };
         let a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -29157,17 +29362,7 @@ subscription "run/{run}/reviews" {{
         let observe = |revision: &str,
                        subscriptions: &Vec<(String, crate::model::SubscriptionSpec)>,
                        pulls: Value| {
-            store
-                .record_resource_observation(
-                    "observer/repo",
-                    revision,
-                    None,
-                    "resource/repo",
-                    None,
-                    &serde_json::json!({"repository_id": 17, "pull_requests": pulls}),
-                    now_ms() + 60_000,
-                    subscriptions,
-                )
+            store.record_resource_observation("observer/repo", revision, None, "resource/repo", None, &serde_json::json!({"repository_id": 17, "pull_requests": pulls}), now_ms() + 60_000, subscriptions, None)
                 .unwrap()
         };
         let requested = |subject: &str| {
@@ -29409,17 +29604,7 @@ subscription "run/{run}/reviews" {{
                        head: Option<&str>,
                        state: &str| {
             let pulls = head.map(|head| serde_json::json!([{"number": 4, "head": head, "state": state, "draft": false}])).unwrap_or_else(|| serde_json::json!([]));
-            store
-                .record_resource_observation(
-                    "observer/repo",
-                    revision,
-                    None,
-                    "resource/repo",
-                    None,
-                    &serde_json::json!({"repository_id": 17, "pull_requests": pulls}),
-                    now_ms() + 60_000,
-                    subscriptions,
-                )
+            store.record_resource_observation("observer/repo", revision, None, "resource/repo", None, &serde_json::json!({"repository_id": 17, "pull_requests": pulls}), now_ms() + 60_000, subscriptions, None)
                 .unwrap();
         };
         let a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -29505,8 +29690,7 @@ subscription "triage" {{
             let issues = issue_title
                 .map(|title| serde_json::json!([{"number": 5, "title": title}]))
                 .unwrap_or_else(|| serde_json::json!([]));
-            store.record_resource_observation("observer/repo", revision, None, "resource/repo", None,
-                &serde_json::json!({"repository_id": 17, "pull_requests": pulls, "issues": issues}), now_ms() + 60_000, subscriptions).unwrap();
+            store.record_resource_observation("observer/repo", revision, None, "resource/repo", None, &serde_json::json!({"repository_id": 17, "pull_requests": pulls, "issues": issues}), now_ms() + 60_000, subscriptions, None).unwrap();
         };
         {
             let store = Store::open(&path, "node").unwrap();
@@ -29644,17 +29828,7 @@ subscription "reviews" {
             .unwrap()
             .unwrap();
         let observe = |pulls: Value| {
-            store
-                .record_resource_observation(
-                    "observer/repo",
-                    &observer_revision,
-                    None,
-                    "resource/repo",
-                    None,
-                    &serde_json::json!({"repository_id": 17, "pull_requests": pulls}),
-                    now_ms() + 60_000,
-                    &subscriptions,
-                )
+            store.record_resource_observation("observer/repo", &observer_revision, None, "resource/repo", None, &serde_json::json!({"repository_id": 17, "pull_requests": pulls}), now_ms() + 60_000, &subscriptions, None)
                 .unwrap();
         };
         observe(serde_json::json!([]));
@@ -29798,17 +29972,7 @@ subscription "reviews" {
                 "state": "open", "draft": false
             }]),
         ] {
-            store
-                .record_resource_observation(
-                    "observer/repo",
-                    &observer_revision,
-                    None,
-                    "resource/repo",
-                    None,
-                    &serde_json::json!({"repository_id": 17, "pull_requests": pulls}),
-                    now_ms() + 60_000,
-                    &subscriptions,
-                )
+            store.record_resource_observation("observer/repo", &observer_revision, None, "resource/repo", None, &serde_json::json!({"repository_id": 17, "pull_requests": pulls}), now_ms() + 60_000, &subscriptions, None)
                 .unwrap();
         }
         assert_eq!(
@@ -29890,20 +30054,10 @@ subscription "triage" {{
         facts: &Value,
         subscriptions: &[(String, crate::model::SubscriptionSpec)],
     ) {
-        store
-            .record_resource_observation(
-                "observer/repo",
-                &store
-                    .selected_desired_revision("observer/repo")
-                    .unwrap()
-                    .unwrap(),
-                None,
-                "resource/repo",
-                None,
-                facts,
-                now_ms() + 60_000,
-                subscriptions,
-            )
+        store.record_resource_observation("observer/repo", &store
+            .selected_desired_revision("observer/repo")
+            .unwrap()
+            .unwrap(), None, "resource/repo", None, facts, now_ms() + 60_000, subscriptions, None)
             .unwrap();
     }
 
@@ -29965,17 +30119,7 @@ subscription "mentions" { observer "observer/repo"; on "mentions"; to "agent/exa
             .unwrap()
             .unwrap();
         let observe = |facts: Value| {
-            store
-                .record_resource_observation(
-                    "observer/repo",
-                    &revision,
-                    None,
-                    "resource/repo",
-                    None,
-                    &facts,
-                    now_ms() + 60_000,
-                    &subscriptions,
-                )
+            store.record_resource_observation("observer/repo", &revision, None, "resource/repo", None, &facts, now_ms() + 60_000, &subscriptions, None)
                 .unwrap()
         };
         let facts_of =
@@ -30127,17 +30271,7 @@ subscription "pulls" { observer "observer/repo"; on "pull_requests"; to "agent/e
             .unwrap()
             .unwrap();
         let observe = |facts: Value| {
-            store
-                .record_resource_observation(
-                    "observer/repo",
-                    &revision,
-                    None,
-                    "resource/repo",
-                    None,
-                    &facts,
-                    now_ms() + 60_000,
-                    &subscriptions,
-                )
+            store.record_resource_observation("observer/repo", &revision, None, "resource/repo", None, &facts, now_ms() + 60_000, &subscriptions, None)
                 .unwrap()
         };
         let recent = |number: u64| {
@@ -30286,17 +30420,7 @@ agent "example.reviewer" { workspace "/tmp"; command "true" }"#,
                 .selected_desired_revision(&self.observer)
                 .unwrap()
                 .unwrap();
-            self.store
-                .record_resource_observation(
-                    &self.observer,
-                    &revision,
-                    None,
-                    &self.resource,
-                    None,
-                    &facts,
-                    now_ms() + 60_000,
-                    &subscriptions,
-                )
+            self.store.record_resource_observation(&self.observer, &revision, None, &self.resource, None, &facts, now_ms() + 60_000, &subscriptions, None)
                 .unwrap()
         }
 
@@ -30814,17 +30938,7 @@ mission "intake" state="ready" {{
                     .then(|| (item.subject.clone(), spec))
                 })
                 .collect::<Vec<_>>();
-            store
-                .record_resource_observation(
-                    observer_subject,
-                    &store.selected_desired_revision(observer_subject).unwrap().unwrap(),
-                    None,
-                    resource,
-                    Some(cursor),
-                    &serde_json::json!({"repository_id": 41, "pull_requests": pulls, "issues": issues}),
-                    now_ms() + 60_000,
-                    &subscriptions,
-                )
+            store.record_resource_observation(observer_subject, &store.selected_desired_revision(observer_subject).unwrap().unwrap(), None, resource, Some(cursor), &serde_json::json!({"repository_id": 41, "pull_requests": pulls, "issues": issues}), now_ms() + 60_000, &subscriptions, None)
                 .unwrap();
         };
         let requested = |subscription: &str| {
@@ -31031,17 +31145,7 @@ subscription "mentions" {{
             .unwrap()
             .unwrap();
         let observe = |pulls: Value| {
-            store
-                .record_resource_observation(
-                    "observer/repo",
-                    &revision,
-                    None,
-                    "resource/repo",
-                    None,
-                    &serde_json::json!({"repository_id": 7, "pull_requests": pulls}),
-                    now_ms() + 60_000,
-                    &subscriptions,
-                )
+            store.record_resource_observation("observer/repo", &revision, None, "resource/repo", None, &serde_json::json!({"repository_id": 7, "pull_requests": pulls}), now_ms() + 60_000, &subscriptions, None)
                 .unwrap()
         };
         let requests = |subscription: &str| {
@@ -31284,17 +31388,7 @@ subscription "curate" {
             .unwrap()
             .unwrap();
         let observe = |facts: Value| {
-            store
-                .record_resource_observation(
-                    "observer/repo",
-                    &revision,
-                    None,
-                    "resource/repo",
-                    None,
-                    &facts,
-                    now_ms() + 60_000,
-                    &subscriptions,
-                )
+            store.record_resource_observation("observer/repo", &revision, None, "resource/repo", None, &facts, now_ms() + 60_000, &subscriptions, None)
                 .unwrap()
         };
         let reconciler = Reconciler::new(
@@ -31657,17 +31751,7 @@ subscription "reviews" {
             .unwrap()
             .unwrap();
         let observe = |pulls, deliveries: &[(String, crate::model::SubscriptionSpec)]| {
-            store
-                .record_resource_observation(
-                    "observer/repo",
-                    &observer_revision,
-                    None,
-                    "resource/repo",
-                    None,
-                    &serde_json::json!({"repository_id": 7, "pull_requests": pulls}),
-                    now_ms() + 60_000,
-                    deliveries,
-                )
+            store.record_resource_observation("observer/repo", &observer_revision, None, "resource/repo", None, &serde_json::json!({"repository_id": 7, "pull_requests": pulls}), now_ms() + 60_000, deliveries, None)
                 .unwrap()
         };
         observe(serde_json::json!([]), &[]);
@@ -31766,8 +31850,9 @@ subscription "reviews" {
                 },
             )
             .unwrap();
-        // Occupy capacity so the migration must queue the valid hold rather than just start it.
-        let discovery = legacy[0].body["fields"]["discovery"].as_str().unwrap();
+        // Occupy capacity with another snapshot: completing the valid hold's own snapshot
+        // would correctly suppress its later delivery rather than test queue migration.
+        let discovery = legacy[1].body["fields"]["discovery"].as_str().unwrap();
         let occupied = store
             .create_mission_run(&MissionRunRequest {
                 mission: "review".into(),
@@ -31777,7 +31862,7 @@ subscription "reviews" {
                 mode: None,
                 inputs: BTreeMap::from([(
                     "source".into(),
-                    format!("resource/repo/pull-request/1@{discovery}"),
+                    format!("resource/repo/pull-request/2@{discovery}"),
                 )]),
                 idempotency_key: "occupied".into(),
             })
@@ -33953,7 +34038,7 @@ agent "plain" {{ workspace {:?}; harness "claude" {{}} }}
     }
 
     #[test]
-    fn a_new_desired_revision_that_becomes_ready_resolves_the_codex_crash_loop_alert() {
+    fn a_new_revision_resolves_a_codex_normalized_model_mismatch_crash_loop() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let workspace = tempfile::tempdir().unwrap();
         let source = |model: &str| {
@@ -33974,8 +34059,17 @@ agent "plain" {{ workspace {:?}; harness "claude" {{}} }}
             Arc::new(Notify::new()),
         );
         reconciler
-            .raise_codex_crash_loop("agent/node.worker", &token_a, "the start failed")
+            .raise_codex_crash_loop(
+                "agent/node.worker",
+                &token_a,
+                "declared gpt-6.1-sol but resume returned gpt-6.1-sol-2026-10-06",
+            )
             .unwrap();
+        assert!(
+            reconciler
+                .codex_crash_loop_raised("agent/node.worker", &token_a)
+                .unwrap()
+        );
         assert_eq!(store.fault_items(Some("person/alex")).unwrap().len(), 1);
 
         // A person revises the declaration, and the new revision's incarnation becomes ready.
@@ -34747,6 +34841,7 @@ mission "ios-proof-blocked" state="ready" {
         store
             .finish_person_step(
                 &crate::model::PersonStepResponse {
+                    delegation: None,
                     subject: ask.subject,
                     actor: "person/alex".into(),
                     summary: "Simulator components repaired.".into(),

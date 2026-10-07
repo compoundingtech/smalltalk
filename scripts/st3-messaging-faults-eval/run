@@ -328,6 +328,38 @@ async def send(node, case):
         "--body", f"receipt-token:{case}", "--json"))["subject"]
 
 
+def recovery_timing(subject, restored, channel_ready, channel_incarnation, link_events, rows, claims):
+    """Keep recovery phases separate from the later fresh send's timing origin.
+
+    Peer requests prove transport activity, not the recipient's local claim arrival.
+    Channel readiness is the first observation in the existing readiness waits.
+    Staging precedes writing the native frame; only native receipts prove consumption.
+    """
+    def earliest(values):
+        return min(values, default=None)
+
+    stamps = {
+        "channel_ready_observed": channel_ready,
+        "partition_cleared": restored,
+        "first_peer_exchange_request": earliest(event["at_unix_ms"] for event in link_events
+            if event["event"] == "request" and event["at_unix_ms"] >= restored
+            and event.get("line", "").startswith("POST /v1/peer/exchange ")),
+        "staged_accepted": earliest(claim["accepted_at_unix_ms"] for claim in claims
+            if claim.get("subject") == subject and claim.get("kind") == "message.staged"),
+        "native_received": earliest(row["at_unix_ms"] for row in rows
+            if row.get("subject") == subject and row["event"] == "received"),
+        "read_accepted": earliest(row["accepted_at_unix_ms"] for row in rows
+            if row.get("subject") == subject and row["event"] == "read"),
+    }
+    return {
+        "subject": subject,
+        "channel_incarnation": channel_incarnation,
+        "at_unix_ms": stamps,
+        "after_partition_clear_ms": {name: stamp - restored if stamp is not None else None
+                                     for name, stamp in stamps.items()},
+    }
+
+
 def judge(proof):
     """Require independent native, graph, runtime, and sender evidence."""
     failures = []
@@ -470,6 +502,7 @@ agent "fault-probe" {{
         fault_monotonic = time.monotonic()
         subject = None
         recovery_started = None
+        channel_ready_at = channel_incarnation = None
         phase = "fault-injection"
         if case == "daemon-restart":
             # Queue before shutting down, without racing a successful handoff.
@@ -565,7 +598,9 @@ agent "fault-probe" {{
         else:
             subject = await send(source, case)
         if case in RECOVERY_CASES and not link.enabled:
-            await until(lambda: current_channel(target), args.ready_seconds)
+            channel = await until(lambda: current_channel(target), args.ready_seconds)
+            channel_ready_at = now_ms()
+            channel_incarnation = channel.get("incarnation_id")
             # Recovery starts when the blocked link is actually restored, not during its outage.
             cleared = now_ms()
             link.enabled = True
@@ -581,7 +616,10 @@ agent "fault-probe" {{
         if case in RECOVERY_CASES:
             # A recent never-offered send survives recovery exactly once. Keep the full
             # observation tail and then send live mail to expose any duplicate native offer.
-            await until(lambda: current_channel(target), args.ready_seconds)
+            channel = await until(lambda: current_channel(target), args.ready_seconds)
+            if channel_ready_at is None:
+                channel_ready_at = now_ms()
+                channel_incarnation = channel.get("incarnation_id")
             link.enabled = True
             recovered_subject = subject
             recovery_cleared = cleared
@@ -592,6 +630,7 @@ agent "fault-probe" {{
             recovered_rows = [row for row in receipts(target) if row.get("subject") == recovered_subject]
             recovered_trace = await target.cli("trace", "show", recovered_subject, "--json", "--limit", "100")
             recovered_claims = [json.loads(line) for line in recovered_trace.splitlines() if line]
+            write_json(directory / "recovered-trace.json", recovered_claims)
             recovered_source = await source.api("/v1/messages/read/" + recovered_subject)
             recovered_target = await target.api("/v1/messages/read/" + recovered_subject)
             recovery_reads = [row for row in recovered_rows if row["event"] == "read"]
@@ -604,7 +643,10 @@ agent "fault-probe" {{
                           recovered_received_copies=sum(row["event"] == "received" for row in recovered_rows),
                           recovered_read_claims=sum(row.get("kind") == "message.read" for row in recovered_claims),
                           recovered_sender_status=(recovered_source or {}).get("status"),
-                          recovered_recipient_status=(recovered_target or {}).get("status"))
+                          recovered_recipient_status=(recovered_target or {}).get("status"),
+                          recovery_timing=recovery_timing(recovered_subject, recovery_cleared,
+                              channel_ready_at, channel_incarnation, link.events,
+                              recovered_rows, recovered_claims))
         after = target.seats()
         after_card = await agent(target)
         all_receipts = receipts(target)

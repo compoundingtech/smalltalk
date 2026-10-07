@@ -455,6 +455,7 @@ async fn dispatch(
         "agent.resume" => agent_resume, "agent.start" => agent_start,
         "agent.stop" => agent_stop, "agent.suspend" => agent_suspend,
         "custom.reply" => custom_reply,
+        "arrangement.edit" => arrangement_edit,
         "attention.resolve" => attention_resolve,
         "lane.approve" => lane_approve, "lane.join" => lane_join, "lane.leave" => lane_leave,
         "lane.mark" => lane_mark, "lane.move" => lane_move,
@@ -2463,6 +2464,156 @@ async fn cli_revision_propose_inspect_approve_and_cancel_survive_restart() {
             }
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_delegation_policy_and_answers_preserve_identity_across_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let mut daemon = Daemon::new().await;
+    daemon.worker();
+    let instruction = cli_value(
+        daemon
+            .cli(
+                PERSON,
+                &[
+                    "conversations",
+                    "send",
+                    WORKER,
+                    "--from",
+                    PERSON,
+                    "--body",
+                    "Friday.",
+                    "--idempotency-key",
+                    "delegation-instruction",
+                ],
+            )
+            .await,
+    );
+    let message = instruction["subject"].as_str().unwrap();
+    let decision = daemon
+        .store()
+        .claims_for(message, Some("message.sent"))
+        .unwrap()[0]
+        .id
+        .clone();
+    let policy_args = [
+        "work",
+        "delegation",
+        "--for",
+        PERSON,
+        "--as",
+        PERSON,
+        "--action",
+        "answer-ask",
+        "--evidence",
+        &decision,
+        "--idempotency-key",
+        "delegation-policy",
+    ];
+    let impersonated = daemon.cli(WORKER, &policy_args).await;
+    assert!(!impersonated.status.success());
+    let policy = cli_value(daemon.cli(PERSON, &policy_args).await);
+    let policy_id = policy["id"].as_str().unwrap();
+    daemon.restart().await;
+    assert_eq!(
+        cli_value(daemon.cli(PERSON, &policy_args).await)["id"],
+        policy_id
+    );
+    let ask = cli_value(
+        daemon
+            .cli(
+                WORKER,
+                &[
+                    "work",
+                    "ask",
+                    "--for",
+                    PERSON,
+                    "--title",
+                    "Release date",
+                    "--reason",
+                    "Choose the date",
+                    "--new-run",
+                    "delegated-date",
+                    "--as",
+                    WORKER,
+                    "--idempotency-key",
+                    "delegation-ask",
+                ],
+            )
+            .await,
+    );
+    let step = ask["subject"].as_str().unwrap();
+    let episode = daemon
+        .store()
+        .claims_for(step, Some("work.person-asked"))
+        .unwrap()[0]
+        .id
+        .clone();
+    let answer_args = [
+        "work",
+        "done",
+        step,
+        "--as",
+        WORKER,
+        "--for",
+        PERSON,
+        "--policy",
+        policy_id,
+        "--instruction",
+        message,
+        "--quote",
+        "Friday",
+        "--episode",
+        &episode,
+        "--summary",
+        "Friday",
+        "--idempotency-key",
+        "delegation-answer",
+    ];
+    daemon.restart().await;
+    cli_value(daemon.cli(WORKER, &answer_args).await);
+    let index = daemon.store().index().unwrap();
+    daemon.restart().await;
+    cli_value(daemon.cli(WORKER, &answer_args).await);
+    assert_eq!(
+        daemon.store().index().unwrap(),
+        index,
+        "answer replay wrote twice"
+    );
+    let view = daemon.store().step_run(step).unwrap().unwrap();
+    assert_eq!(view.person_answers[0].respondent, WORKER);
+    assert_eq!(view.person_answers[0].acted_for.as_deref(), Some(PERSON));
+    cli_value(
+        daemon
+            .cli(
+                PERSON,
+                &[
+                    "work",
+                    "delegation",
+                    "--for",
+                    PERSON,
+                    "--as",
+                    PERSON,
+                    "--evidence",
+                    &decision,
+                    "--idempotency-key",
+                    "revoke-delegation",
+                ],
+            )
+            .await,
+    );
+    daemon.restart().await;
+    let policies = daemon
+        .store()
+        .claims_for(PERSON, Some("person.delegation-set"))
+        .unwrap();
+    assert_eq!(policies.len(), 2);
+    assert_eq!(
+        policies.last().unwrap().body["fields"]["actions"],
+        json!([])
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

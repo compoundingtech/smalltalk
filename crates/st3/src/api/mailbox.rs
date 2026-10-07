@@ -250,16 +250,56 @@ fn snapshot(store: &Store, binding: &Fence) -> anyhow::Result<Snapshot> {
 }
 
 /// The longest a mailbox stream goes without reading its seat's mailbox in full.
-const MAILBOX_FULL_SNAPSHOT: Duration = Duration::from_secs(60);
+const MAILBOX_FULL_SNAPSHOT: Duration = Duration::from_secs(30);
 
 async fn stream(state: AppState, fence: Fence, socket: WebSocket) {
     stream_with_reader(state, fence, socket, snapshot).await;
 }
 
-async fn stream_with_reader<F>(state: AppState, fence: Fence, mut socket: WebSocket, read: F)
+fn safety_delay(fence: &Fence) -> Duration {
+    use std::hash::BuildHasher;
+    // A random per-process seed and the binding spread reconnecting streams across the full
+    // period. Only the phase varies: the maximum gap stays thirty seconds.
+    static SEED: std::sync::OnceLock<std::collections::hash_map::RandomState> =
+        std::sync::OnceLock::new();
+    let phase = SEED.get_or_init(Default::default).hash_one((
+        &fence.subject,
+        &fence.component,
+        &fence.token,
+    ));
+    Duration::from_nanos(phase % MAILBOX_FULL_SNAPSHOT.as_nanos() as u64)
+}
+
+fn safety_timer(fence: &Fence) -> tokio::time::Interval {
+    let delay = safety_delay(fence);
+    let mut timer =
+        tokio::time::interval_at(tokio::time::Instant::now() + delay, MAILBOX_FULL_SNAPSHOT);
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    timer
+}
+
+async fn stream_with_reader<F>(state: AppState, fence: Fence, socket: WebSocket, read: F)
 where
     F: Fn(&Store, &Fence) -> anyhow::Result<Snapshot> + Clone + Send + 'static,
 {
+    let safety = futures_util::stream::unfold(safety_timer(&fence), |mut timer| async move {
+        timer.tick().await;
+        Some(((), timer))
+    });
+    stream_with_rechecks(state, fence, socket, read, safety).await;
+}
+
+async fn stream_with_rechecks<F, S>(
+    state: AppState,
+    fence: Fence,
+    mut socket: WebSocket,
+    read: F,
+    safety: S,
+) where
+    F: Fn(&Store, &Fence) -> anyhow::Result<Snapshot> + Clone + Send + 'static,
+    S: futures_util::Stream<Item = ()> + Send + 'static,
+{
+    futures_util::pin_mut!(safety);
     let since = client_now_ms();
     let through = match state.store.index() {
         Ok(index) => index,
@@ -267,15 +307,16 @@ where
     };
     // Subscribe before reading to close the replay-to-live race. Watch coalesces writes; every
     // wake recomputes the durable state, so lag needs no lossy event cursor.
-    let mut changed = state.event_notify.subscribe();
+    let mut subscription = state.store.subscribe_mailbox(&fence, &state.event_notify);
     let mut previous_seat = Vec::new();
     let mut previous_mailbox = Vec::new();
     let mut previous_drain = None;
     let mut recovered = std::collections::BTreeSet::new();
     let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
     let mut dirty = true;
+    let mut force_snapshot = false;
     // What the last snapshot read, and when the last full snapshot ran. A wake reads the seat's
-    // mailbox again only when something it depends on changed, or a minute has passed.
+    // mailbox again only when something it depends on changed, or the safety timer fires.
     let mut last: Option<(
         crate::store::MailboxWatermark,
         Vec<String>,
@@ -283,8 +324,9 @@ where
     )> = None;
     loop {
         if dirty {
-            changed.borrow_and_update();
+            subscription.changed.borrow_and_update();
             if let Some((mark, subjects, at)) = last.clone()
+                && !force_snapshot
                 && at.elapsed() < MAILBOX_FULL_SNAPSHOT
             {
                 let store = state.store.clone();
@@ -372,10 +414,11 @@ where
             // stored in the graph.
             crate::github_watch::add_excerpts(&mut messages).await;
             last = mark.map(|mark| {
-                let subjects = messages
+                let subjects: Vec<String> = messages
                     .iter()
                     .map(|message| message.subject.clone())
                     .collect();
+                subscription.messages(&subjects);
                 (mark, subjects, tokio::time::Instant::now())
             });
             let bytes = serde_json::to_vec(&messages).unwrap_or_default();
@@ -412,9 +455,11 @@ where
                 }
             }
             dirty = false;
+            force_snapshot = false;
         }
         tokio::select! {
-            event = changed.changed() => { if event.is_err() { return; } dirty = true; },
+            event = subscription.changed.changed() => { if event.is_err() { return; } dirty = true; },
+            tick = safety.next() => { if tick.is_none() { return; } dirty = true; force_snapshot = true; },
             incoming = socket.recv() => match incoming {
                 Some(Ok(WsMessage::Text(report))) => {
                     if state.store.check_mailbox(&fence).is_ok() {
@@ -515,7 +560,7 @@ mod tests {
         socket: &mut tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>,
     ) -> Frame {
         loop {
-            match tokio::time::timeout(Duration::from_secs(3), socket.next())
+            match tokio::time::timeout(MAILBOX_FULL_SNAPSHOT / 2, socket.next())
                 .await
                 .unwrap()
                 .unwrap()
@@ -1130,12 +1175,7 @@ mod tests {
                         .map(|spec| (desired.subject, spec))
                 })
                 .collect::<Vec<_>>();
-            state.store.record_resource_observation(
-                &thread.observer(), &state.store.selected_desired_revision(&thread.observer()).unwrap().unwrap(),
-                None, &thread.resource(), None,
-                &json!({"repository_id": 7, "issues": [{"number": 12, "new": false, "state": "open", "recent_comments": comments}]}),
-                0, &subscriptions,
-            ).unwrap();
+            state.store.record_resource_observation(&thread.observer(), &state.store.selected_desired_revision(&thread.observer()).unwrap().unwrap(), None, &thread.resource(), None, &json!({"repository_id": 7, "issues": [{"number": 12, "new": false, "state": "open", "recent_comments": comments}]}), 0, &subscriptions, None).unwrap();
         };
         observe(json!([]));
         apply("version 2\nstop \"agent/eval.worker\"\n", "stop");
@@ -1557,6 +1597,362 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn a_write_during_the_first_snapshot_is_delivered_without_waiting_for_safety() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = super::super::tests::state(root.path());
+        state.store = Arc::new(Store::open(&root.path().join("graph.db"), "node").unwrap());
+        crate::mailbox::tests::ready(&state.store, "session-1");
+        let fence = state
+            .store
+            .bind_mailbox(&Fence::new("agent/eval.worker", "session-1", "delivery"))
+            .unwrap();
+        let injected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let app = Router::new()
+            .route(
+                "/v1/mailbox",
+                get(
+                    move |State(state): State<AppState>,
+                          Query(fence): Query<Fence>,
+                          websocket: WebSocketUpgrade| {
+                        let injected = injected.clone();
+                        async move {
+                            let events = state.event_notify.clone();
+                            websocket.on_upgrade(move |socket| {
+                                stream_with_rechecks(
+                                    state,
+                                    fence,
+                                    socket,
+                                    move |store, fence| {
+                                        let result = snapshot(store, fence)?;
+                                        if !injected.swap(true, std::sync::atomic::Ordering::SeqCst)
+                                        {
+                                            store.append_claim(&ClaimInput {
+                                                subject: "message/during-snapshot".into(),
+                                                kind: "message.sent".into(),
+                                                actor: Some("person/fixture".into()),
+                                                fields: BTreeMap::from([
+                                                    ("status".into(), json!("sent")),
+                                                    ("from".into(), json!("person/fixture")),
+                                                    ("to".into(), json!("agent/eval.worker")),
+                                                    (
+                                                        "content".into(),
+                                                        json!("Written after the read."),
+                                                    ),
+                                                ]),
+                                                evidence: vec![],
+                                                expected_subject: None,
+                                                idempotency_key: None,
+                                            })?;
+                                            events.send_modify(|generation| *generation += 1);
+                                        }
+                                        Ok(result)
+                                    },
+                                    futures_util::stream::pending(),
+                                )
+                            })
+                        }
+                    },
+                ),
+            )
+            .with_state(state);
+        let path = root.path().join("daemon.sock");
+        let server_path = path.clone();
+        let server = tokio::spawn(async move { serve_unix(&server_path, app).await.unwrap() });
+        while !path.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let client = Client::new(Endpoint::Unix(path));
+        let mut socket = client.open_mailbox(&fence).await.unwrap();
+        assert!(
+            matches!(next(&mut socket).await, Frame::Mailbox { messages } if messages.is_empty())
+        );
+        let frame = tokio::time::timeout(MAILBOX_FULL_SNAPSHOT / 2, next(&mut socket))
+            .await
+            .unwrap();
+        assert!(
+            matches!(frame, Frame::Mailbox { messages } if messages.len() == 1 && messages[0].subject == "message/during-snapshot")
+        );
+        server.abort();
+    }
+
+    struct ControlledStream {
+        socket: tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>,
+        recheck: tokio::sync::mpsc::UnboundedSender<()>,
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+        server: tokio::task::JoinHandle<()>,
+    }
+    impl Drop for ControlledStream {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    async fn controlled_stream(state: AppState, fence: &Fence, path: &Path) -> ControlledStream {
+        let (recheck, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let receiver = Arc::new(std::sync::Mutex::new(Some(receiver)));
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = reads.clone();
+        let app = Router::new()
+            .route(
+                "/v1/mailbox",
+                get(
+                    move |State(state): State<AppState>,
+                          Query(fence): Query<Fence>,
+                          websocket: WebSocketUpgrade| {
+                        let receiver = receiver.lock().unwrap().take().unwrap();
+                        let counted = counted.clone();
+                        async move {
+                            websocket.on_upgrade(move |socket| {
+                                let ticks = futures_util::stream::unfold(
+                                    receiver,
+                                    |mut receiver| async move {
+                                        receiver.recv().await.map(|()| ((), receiver))
+                                    },
+                                );
+                                stream_with_rechecks(
+                                    state,
+                                    fence,
+                                    socket,
+                                    move |store, fence| {
+                                        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                        snapshot(store, fence)
+                                    },
+                                    ticks,
+                                )
+                            })
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/v1/internal/replication/receive",
+                post(super::super::replication_receive),
+            )
+            .layer(from_fn_with_state(
+                (state.clone(), ClientTransportBoundary::Unix),
+                response_envelope,
+            ))
+            .with_state(state);
+        let server_path = path.to_owned();
+        let server = tokio::spawn(async move { serve_unix(&server_path, app).await.unwrap() });
+        while !path.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let client = Client::new(Endpoint::Unix(path.to_owned()));
+        let mut socket = client.open_mailbox(fence).await.unwrap();
+        assert!(
+            matches!(next(&mut socket).await, Frame::Mailbox { messages } if messages.is_empty())
+        );
+        ControlledStream {
+            socket,
+            recheck,
+            reads,
+            server,
+        }
+    }
+
+    #[tokio::test]
+    async fn replication_worker_receive_delivers_and_fences_without_safety_ticks() {
+        const FLEET: &str = "18ba3167-11fb-472c-8ff8-e46e0fefb1e4";
+        let root = tempfile::tempdir().unwrap();
+        let mut state = super::super::tests::state(root.path());
+        state.store = Arc::new(Store::open(&root.path().join("graph.db"), "target").unwrap());
+        state.store.bind_fleet(FLEET).unwrap();
+        let source = Store::open_memory("source").unwrap();
+        source.bind_fleet(FLEET).unwrap();
+        crate::mailbox::tests::ready(&source, "session-1");
+        let request = || ReplicationReceiveRequest {
+            peer: "source".into(),
+            fleet_id: FLEET.into(),
+            exchange: source
+                .export_replication_exchange(FLEET, &state.store.replication_inventory().unwrap())
+                .unwrap(),
+            // The native replication worker supplies this; it enables the worker's heal path.
+            round_trip_ms: Some(1),
+        };
+        // Establish the remote incarnation before binding the live stream.
+        let Json(initial) = super::super::replication_receive(State(state.clone()), Json(request()))
+            .await
+            .unwrap();
+        assert!(initial.changed);
+        let fence = state
+            .store
+            .bind_mailbox(&Fence::new("agent/eval.worker", "session-1", "delivery"))
+            .unwrap();
+        let path = root.path().join("daemon.sock");
+        let mut stream = controlled_stream(state.clone(), &fence, &path).await;
+        let client = Client::unix(&path);
+        source
+            .append_claim(&ClaimInput {
+                subject: "message/worker-arrival".into(),
+                kind: "message.sent".into(),
+                actor: Some("person/fixture".into()),
+                fields: BTreeMap::from([
+                    ("status".into(), json!("sent")),
+                    ("from".into(), json!("person/fixture")),
+                    ("to".into(), json!("agent/eval.worker")),
+                    ("content".into(), json!("An arriving fixture note.")),
+                ]),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        // Use the same Unix endpoint/request as peer::Daemon::receive, not a local claim API
+        // or a manually signaled event. Its receive/admit/project/notify path must route this.
+        let arrival: ReplicationReceiveResponse = client
+            .post("/v1/internal/replication/receive", &request())
+            .await
+            .unwrap();
+        assert!(arrival.changed);
+        assert!(matches!(
+            next(&mut stream.socket).await,
+            Frame::Mailbox { messages }
+                if messages.len() == 1 && messages[0].subject == "message/worker-arrival"
+        ));
+        assert_eq!(stream.reads.load(std::sync::atomic::Ordering::SeqCst), 2);
+        // Binding epochs/tokens are daemon-local and never replicated. A replicated live
+        // incarnation replacement must instead wake the seat dependency and fence this boot.
+        crate::mailbox::tests::ready(&source, "session-2");
+        let replacement: ReplicationReceiveResponse = client
+            .post("/v1/internal/replication/receive", &request())
+            .await
+            .unwrap();
+        assert!(replacement.changed);
+        assert!(matches!(
+            next(&mut stream.socket).await,
+            Frame::Fenced { .. }
+        ));
+        assert_eq!(
+            stream.reads.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "fencing must come from the dispatched snapshot, not a heartbeat check"
+        );
+        assert_eq!(
+            state.store.check_mailbox(&fence).unwrap_err().code,
+            "stale-mailbox-session"
+        );
+        // No stream.recheck.send() occurred: neither assertion can pass via the safety timer.
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn safety_timer_staggers_streams_with_a_bounded_interval() {
+        let mut phases = std::collections::HashSet::new();
+        for seat in 0..128 {
+            let phase = safety_delay(&Fence::new(
+                &format!("agent/fixture-{seat}"),
+                "boot",
+                "delivery",
+            ));
+            assert!(phase < MAILBOX_FULL_SNAPSHOT);
+            phases.insert(phase);
+        }
+        assert!(
+            phases.len() > 100,
+            "reconnecting streams must spread their first read"
+        );
+        let mut timer = safety_timer(&Fence::new("agent/fixture", "boot", "delivery"));
+        let first = timer.tick().await;
+        let second = timer.tick().await;
+        assert_eq!(second - first, MAILBOX_FULL_SNAPSHOT);
+    }
+
+    #[tokio::test]
+    async fn safety_recheck_delivers_a_deliberately_missed_dependency() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = super::super::tests::state(root.path());
+        state.store = Arc::new(Store::open(&root.path().join("graph.db"), "node").unwrap());
+        crate::mailbox::tests::ready(&state.store, "session-1");
+        let fence = state
+            .store
+            .bind_mailbox(&Fence::new("agent/eval.worker", "session-1", "delivery"))
+            .unwrap();
+        let mut stream =
+            controlled_stream(state.clone(), &fence, &root.path().join("daemon.sock")).await;
+        state
+            .store
+            .miss_mailbox_recipient_for_test("agent/eval.worker");
+        // A second recipient is a dispatcher barrier: after its wake the missing key has
+        // definitely been processed. The safety source is controlled, so no timer races it.
+        let mut barrier = state.store.subscribe_mailbox(
+            &Fence::new("agent/barrier", "boot", "delivery"),
+            &state.event_notify,
+        );
+        for (subject, to) in [
+            ("message/missed-dependency", "agent/eval.worker"),
+            ("message/barrier", "agent/barrier"),
+        ] {
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "message.sent".into(),
+                    actor: Some("person/fixture".into()),
+                    fields: BTreeMap::from([
+                        ("status".into(), json!("sent")),
+                        ("from".into(), json!("person/fixture")),
+                        ("to".into(), json!(to)),
+                        ("content".into(), json!("A fixture note.")),
+                    ]),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+        signal_changed(&state);
+        tokio::time::timeout(MAILBOX_FULL_SNAPSHOT / 2, barrier.changed.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stream.reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        stream.recheck.send(()).unwrap();
+        assert!(
+            matches!(next(&mut stream.socket).await, Frame::Mailbox { messages } if messages.len() == 1 && messages[0].subject == "message/missed-dependency")
+        );
+        state
+            .store
+            .miss_mailbox_owner_for_test("agent/eval.worker", "delivery");
+        state
+            .store
+            .bind_mailbox(&Fence::new("agent/eval.worker", "session-1", "delivery"))
+            .unwrap();
+        stream.recheck.send(()).unwrap();
+        assert!(matches!(
+            next(&mut stream.socket).await,
+            Frame::Fenced { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_direct_binding_wake_fences_a_live_stale_stream_without_a_recheck() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = super::super::tests::state(root.path());
+        state.store = Arc::new(Store::open(&root.path().join("graph.db"), "node").unwrap());
+        crate::mailbox::tests::ready(&state.store, "session-1");
+        let old = state
+            .store
+            .bind_mailbox(&Fence::new("agent/eval.worker", "session-1", "delivery"))
+            .unwrap();
+        let mut stream =
+            controlled_stream(state.clone(), &old, &root.path().join("daemon.sock")).await;
+        // No API/global-feed notification, no safety ticks, and no graph write: only the
+        // bind transaction's targeted owner wake can promptly fence this live stream.
+        let index = state.store.index().unwrap();
+        let new = state
+            .store
+            .bind_mailbox(&Fence::new("agent/eval.worker", "session-1", "delivery"))
+            .unwrap();
+        assert_eq!(state.store.index().unwrap(), index);
+        assert!(state.store.check_mailbox(&new).is_ok());
+        let frame = tokio::time::timeout(MAILBOX_FULL_SNAPSHOT / 2, next(&mut stream.socket))
+            .await
+            .unwrap();
+        assert!(matches!(frame, Frame::Fenced { .. }));
+        assert_eq!(stream.reads.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
     #[test]
     fn a_mailbox_stream_reads_again_only_for_what_its_snapshot_depends_on() {
         let store = Store::open_memory("node").unwrap();
@@ -1628,3 +2024,7 @@ mod tests {
         assert!(authorize(&fence, Some(&peer)).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "mailbox_profile.rs"]
+mod profile;

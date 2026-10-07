@@ -12,11 +12,14 @@ Needs contents: write (the release creates the tag) and actions: read (the artif
 """
 import argparse
 import json
+import os
 import pathlib
 import re
 import subprocess
 import sys
 import tempfile
+
+from release_notes import ImpactError, render
 
 WORKFLOW = 'release-smalltalk.yml'
 SEMVER = re.compile(r'v(\d+)\.(\d+)\.(\d+)')
@@ -47,44 +50,6 @@ def next_tag():
     return f'v{major}.{minor}.{patch + 1}'
 
 
-def merged_titles(since, sha):
-    """One line per first-parent commit: the pull request title, with its number when there is one."""
-    raw = run('git', 'log', '--first-parent', '--reverse', '--format=%s%x1f%b%x1e', f'{since}..{sha}')
-    lines = []
-    for record in filter(None, (r.strip('\n') for r in raw.split('\x1e'))):
-        subject, _, body = record.partition('\x1f')
-        merge = re.match(r'Merge pull request #(\d+) from ', subject)
-        if merge:
-            number = merge.group(1)
-            # The pull request's own title; a merge body can be anything the merger typed.
-            try:
-                title = run('gh', 'pr', 'view', number, '--json', 'title', '--jq', '.title')
-            except subprocess.CalledProcessError:
-                title = body.strip().splitlines()[0] if body.strip() else subject
-            lines.append(f'- {title} (#{number})')
-        else:
-            lines.append(f'- {subject}')
-    return lines
-
-
-def release_notes(tag, previous, since, sha, guide):
-    titles = merged_titles(since, sha)
-    return '\n'.join([
-        f'Daily release of main at `{sha}`, built and verified by the main workflow run for that commit.',
-        '',
-        f'## Changes since {previous}',
-        '',
-        *(titles or ['- No merged pull requests.']),
-        '',
-        '---',
-        '',
-        guide.rstrip('\n'),
-        '',
-        f'Exact source: `{sha}`. See RELEASE.json for the PTY revision and targets.',
-        '',
-    ])
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     parser.add_argument('--dry-run', action='store_true', help='verify and print the notes; publish nothing')
@@ -106,6 +71,11 @@ def main():
                       capture_output=True).returncode == 0:
         say(f'{tag} already exists; refusing to reuse a tag')
         return 1
+    try:
+        rendered, impact = render(repo, previous, sha, tag, os.environ.get('GH_REPO', 'compoundingtech/smalltalk'), since)
+    except ImpactError as error:
+        say(str(error))
+        return 1
     say(f'releasing {tag} from {sha} (run {run_id}), previous release {previous} at {since}')
 
     dist = pathlib.Path(tempfile.mkdtemp(prefix='smalltalk-release-'))
@@ -115,9 +85,10 @@ def main():
     say(run('python3', str(repo / 'scripts/release-smalltalk-manifest.py'), sha, cwd=dist))
 
     notes = dist / 'RELEASE-NOTES.md'
-    notes.write_text(release_notes(tag, previous, since, sha, (repo / 'docs/st3/binary-releases.md').read_text()))
+    notes.write_text(rendered)
+    (dist / 'UPGRADE-IMPACT.json').write_text(json.dumps(impact, indent=2) + '\n')
     assets = sorted(str(p) for pattern in ('*.tar.gz', '*.sha256') for p in dist.glob(pattern))
-    assets += [str(dist / 'SHA256SUMS'), str(dist / 'RELEASE.json')]
+    assets += [str(dist / 'SHA256SUMS'), str(dist / 'RELEASE.json'), str(dist / 'UPGRADE-IMPACT.json')]
     if args.dry_run:
         print(notes.read_text())
         say(f'dry run: would publish {tag} at {sha} with {len(assets)} assets')

@@ -1,0 +1,73 @@
+{
+  "person": "person/avery",
+  "device_key": "p256:BBvD8kaf-PqsuxTqv3fOZmn7TSYTdeEKMxrTEFNwb0w_UuRs5OLOvBOazBk971JJjLatx7PFjYd9KR6kLU2vOSM",
+  "chain": [
+    "e3be249b8cd62319022b863ae1d5a672a1e538f19980e299b495ac2f21e70e9f",
+    "3d953b95bd203a1f7d4bf5ce1e03c41792ebcc53e7b29fe30f23c216c2aa5f5c"
+  ],
+  "proofs": [
+    {
+      "id": "e3be249b8cd62319022b863ae1d5a672a1e538f19980e299b495ac2f21e70e9f",
+      "batch_id": "batch/pre-pin-reader/6/7714c3bed503ed6bad829d4942cdd692633048d495a10842402f8d2441eb6217",
+      "subject": "person/avery",
+      "kind": "principal.key-granted",
+      "origin": "pre-pin-reader",
+      "actor": "person/avery",
+      "body": {
+        "_operation": {
+          "id": "op/e0d8398d1969598a5aac1d5d371731ab66ca885ec70536ceca133046e343d6d7",
+          "request_digest": "7569f4893a1c821e729e87b228805787e9410293e0fb42787f8971eaa18b9a78"
+        },
+        "evidence": [],
+        "fields": {
+          "issuer": "person/avery",
+          "issuer_key": "-wXtlUNDLSft_KyhWgDPF6ILio-I8AAsYQhMqFCc3YA",
+          "key": "p256:BBvD8kaf-PqsuxTqv3fOZmn7TSYTdeEKMxrTEFNwb0w_UuRs5OLOvBOazBk971JJjLatx7PFjYd9KR6kLU2vOSM",
+          "label": "Vector device (software key)",
+          "role": "device"
+        }
+      },
+      "predecessors": [
+        "fe76036e2d9f1884c303f76b1e997cf14f38f226c15408656fa9e8a2076c9434"
+      ],
+      "signature": {
+        "signer": "person/avery",
+        "key": "-wXtlUNDLSft_KyhWgDPF6ILio-I8AAsYQhMqFCc3YA",
+        "chain": [
+          "3d953b95bd203a1f7d4bf5ce1e03c41792ebcc53e7b29fe30f23c216c2aa5f5c"
+        ],
+        "nonce": "8b5ab6a18c864d9cc76c8e8a78322879",
+        "signed_at_unix_ms": 1791274657020,
+        "signature": "5sPw4f6F6IZ7FAhvDQOGl234CiOR3VbWjY0GaWketkn5M_KwHMWq1LLbMTE6xezGTNORKHr9fj7Pk7lu7E2gBg"
+      }
+    },
+    {
+      "id": "3d953b95bd203a1f7d4bf5ce1e03c41792ebcc53e7b29fe30f23c216c2aa5f5c",
+      "batch_id": "batch/pre-pin-reader/3/f2657f3f1407826932238df99952b1a7e33665d33249385ff0e49f0ee69e4422",
+      "subject": "person/avery",
+      "kind": "principal.key-granted",
+      "origin": "pre-pin-reader",
+      "actor": "host/pre-pin-reader",
+      "body": {
+        "evidence": [],
+        "fields": {
+          "issuer": "host/pre-pin-reader",
+          "issuer_key": "kndmNkTnFknHeQPi-yjgMmE4BS9o6SxlXNvo6kTkHOY",
+          "key": "-wXtlUNDLSft_KyhWgDPF6ILio-I8AAsYQhMqFCc3YA",
+          "role": "root"
+        }
+      },
+      "predecessors": [],
+      "signature": {
+        "signer": "host/pre-pin-reader",
+        "key": "kndmNkTnFknHeQPi-yjgMmE4BS9o6SxlXNvo6kTkHOY",
+        "chain": [],
+        "nonce": "e4823661692a4aaf4e66f2d894f7110c",
+        "signed_at_unix_ms": 1791274656989,
+        "signature": "TpGsc4cSR2WvFnuoVWdlLhaFPpgNz-3oTDnMq-H1OgfbEMqBL7yXHvbS2sfaVDvwTSBF0ZY9RLsbqZlNBjApBg"
+      }
+    }
+  ],
+  "fingerprint": "sha256:ZK_9CpBfMtVAeKMjSBdMIvCGkG7WeUmaBZZJsQB0PNM",
+  "other_fingerprint": "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+}

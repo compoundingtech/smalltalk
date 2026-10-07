@@ -10,8 +10,11 @@ use axum::http::Request;
 use tower::ServiceExt as _;
 
 use super::*;
-use crate::claim::ClaimInput;
+use crate::claim::{ClaimInput, ReplicaEnvelopeId};
+use crate::fleet::handshake::JoinRequest;
+use crate::replication::{ReplicationExportResponse, ReplicationReceiveResponse};
 use crate::store::runtime::Plain;
+use crate::store::{CheckpointAction, CheckpointManifestNeed};
 use crate::store::{Runtime as _, Store};
 use crate::sync::Local;
 
@@ -1102,6 +1105,8 @@ mod retry_tests {
             tokio::time::advance(REPLICATION_EXCHANGE_TIMEOUT).await;
             assert!(
                 wait_peer_retry(
+                    &Local(Arc::new(plain_memory("retry-fixture").unwrap())),
+                    crate::store::now_ms(),
                     Duration::from_secs(3600),
                     &mut routes,
                     &mut inbound,
@@ -1120,6 +1125,8 @@ mod retry_tests {
         // Old activity must not reset the next failed attempt's backoff.
         assert!(
             !wait_peer_retry(
+                &Local(Arc::new(plain_memory("retry-fixture").unwrap())),
+                crate::store::now_ms(),
                 Duration::from_secs(3600),
                 &mut routes,
                 &mut inbound,
@@ -1136,7 +1143,7 @@ mod retry_tests {
     }
 
     #[tokio::test]
-    async fn a_silent_http_return_interrupts_backoff_without_an_inventory_export() {
+    async fn a_silent_http_return_caps_backoff_without_an_inventory_export() {
         let store = Arc::new(plain_memory("beacon").unwrap());
         let fleet = FleetContext::legacy(BTreeSet::new());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1168,9 +1175,11 @@ mod retry_tests {
         );
         let started = tokio::time::Instant::now();
         assert!(
-            tokio::time::timeout(
-                Duration::from_secs(10),
+            !tokio::time::timeout(
+                Duration::from_secs(35),
                 wait_peer_retry(
+                    &Local(Arc::new(plain_memory("retry-fixture").unwrap())),
+                    crate::store::now_ms(),
                     Duration::from_secs(3600),
                     &mut routes,
                     &mut inbound,
@@ -1186,18 +1195,23 @@ mod retry_tests {
             .await
             .unwrap()
         );
-        assert!(fleet.activity.read().unwrap().contains_key("traveller"));
+        assert!(
+            fleet.activity.read().unwrap().is_empty(),
+            "HEAD must not refresh authenticated activity"
+        );
         assert!(
             fleet.inbound.read().unwrap().is_empty(),
             "HEAD must not invoke receive_exchange"
         );
 
-        // After five minutes, even this responsive route is no longer polled rapidly.
+        // Without a successful signed exchange for five minutes, absence stays quiet.
         inbound.borrow_and_update();
         let old = (url, tokio::time::Instant::now() - PEER_PROBE_WINDOW);
         tokio::time::pause();
         assert!(
             !wait_peer_retry(
+                &Local(Arc::new(plain_memory("retry-fixture").unwrap())),
+                crate::store::now_ms(),
                 Duration::from_secs(3600),
                 &mut routes,
                 &mut inbound,
@@ -1493,7 +1507,10 @@ mod retry_tests {
         let mut connectivity = fleet.connectivity_changed.subscribe();
         for away in [Duration::from_secs(120), Duration::from_secs(4 * 3600)] {
             tokio::time::advance(away).await;
+            let backend = Local(Arc::new(plain_memory("retry-fixture").unwrap()));
             let wait = wait_peer_retry(
+                &backend,
+                crate::store::now_ms(),
                 Duration::from_secs(300),
                 &mut routes,
                 &mut inbound,
@@ -1528,7 +1545,10 @@ mod retry_tests {
             assert!(wait.await);
         }
         tokio::time::advance(Duration::from_millis(1)).await;
+        let backend = Local(Arc::new(plain_memory("retry-fixture").unwrap()));
         let wait = wait_peer_retry(
+            &backend,
+            crate::store::now_ms(),
             Duration::from_secs(300),
             &mut routes,
             &mut inbound,
@@ -1850,7 +1870,10 @@ mod retry_tests {
         let mut inbound = fleet.inbound_changed.subscribe();
         let mut activity = fleet.activity_changed.subscribe();
         let mut connectivity = fleet.connectivity_changed.subscribe();
+        let backend = Local(Arc::new(plain_memory("retry-fixture").unwrap()));
         let wait = wait_peer_retry(
+            &backend,
+            crate::store::now_ms(),
             Duration::from_secs(3600),
             &mut routes,
             &mut inbound,
@@ -1880,5 +1903,781 @@ mod retry_tests {
             &serde_json::json!({"reset":false,"events":[{"peer_id":"configured-id","online":true}]}),
         );
         assert!(fleet.online.read().unwrap().contains_key("beacon"));
+    }
+}
+
+#[derive(Clone)]
+struct SlowExport {
+    local: Local<Store>,
+    slow: Arc<std::sync::atomic::AtomicBool>,
+    fail_next: Arc<std::sync::atomic::AtomicBool>,
+    receives: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Backend for SlowExport {
+    async fn export(
+        &self,
+        fleet_id: &str,
+        inventory: &ReplicationInventory,
+        summary_only: bool,
+        signature_requests: &[ReplicaEnvelopeId],
+    ) -> Result<ReplicationExportResponse> {
+        if !summary_only
+            && self
+                .fail_next
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            anyhow::bail!("injected export failure");
+        }
+        if !summary_only && self.slow.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_secs(25)).await;
+        }
+        self.local
+            .export(fleet_id, inventory, summary_only, signature_requests)
+            .await
+    }
+    async fn receive(
+        &self,
+        peer: &str,
+        fleet_id: &str,
+        exchange: &ReplicationExchange,
+        round_trip: Option<Duration>,
+    ) -> Result<ReplicationReceiveResponse> {
+        let result = self
+            .local
+            .receive(peer, fleet_id, exchange, round_trip)
+            .await?;
+        self.receives
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(result)
+    }
+    async fn heal_answer(
+        &self,
+        peer: &str,
+        fleet_id: &str,
+        query: &ReplicationHealQuery,
+    ) -> Result<ReplicationHealAnswer> {
+        self.local.heal_answer(peer, fleet_id, query).await
+    }
+    async fn heal_next(
+        &self,
+        peer: &str,
+        answer: ReplicationHealAnswer,
+    ) -> Result<ReplicationHealStep> {
+        self.local.heal_next(peer, answer).await
+    }
+    async fn checkpoint_manifest(
+        &self,
+        request: &CheckpointManifestRequest,
+    ) -> Result<CheckpointManifestPage> {
+        self.local.checkpoint_manifest(request).await
+    }
+    async fn checkpoint_need(&self) -> Result<Option<CheckpointManifestNeed>> {
+        self.local.checkpoint_need().await
+    }
+    async fn adopt_checkpoint(
+        &self,
+        manifest: &CheckpointManifest,
+    ) -> Result<Vec<CheckpointAction>> {
+        self.local.adopt_checkpoint(manifest).await
+    }
+    async fn publish_endpoints(&self, mode: &str, endpoints: &[Value]) -> Result<()> {
+        self.local.publish_endpoints(mode, endpoints).await
+    }
+    async fn redeem(&self, request: &JoinRequest) -> Result<Value> {
+        self.local.redeem(request).await
+    }
+    async fn fleet_view(&self) -> Result<FleetView> {
+        self.local.fleet_view().await
+    }
+    async fn record_failure(&self, peer: &str, status: &str, error: &str) -> Result<()> {
+        self.local.record_failure(peer, status, error).await
+    }
+}
+
+/// Isolated two-node proof: a cancelled response leaves admitted envelopes intact;
+/// identical signed retries share backend work while a 25-second export exceeds the
+/// old caller deadline. No live graph, transport or fleet configuration is used.
+#[tokio::test]
+async fn slow_export_returns_signed_overload_and_preserves_interrupted_receipt() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let root = tempfile::tempdir().unwrap();
+    let fleet_id = "1f91ca65-7793-48cc-866e-ac15690130e1";
+    let auth = FleetAuth::test(fleet_id, &[7; 32]);
+    let left = Arc::new(plain_open(&root.path().join("birch.sqlite3"), "birch").unwrap());
+    let right = Arc::new(plain_open(&root.path().join("cedar.sqlite3"), "cedar").unwrap());
+    for store in [&left, &right] {
+        store.bind_fleet(fleet_id).unwrap();
+        store
+            .append_claim(&ClaimInput {
+                subject: format!("note/{}", store.origin),
+                kind: "example.note".into(),
+                actor: None,
+                fields: BTreeMap::from([("text".into(), Value::String(store.origin.clone()))]),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+    }
+    let backend = SlowExport {
+        local: Local(right.clone()),
+        slow: Arc::new(AtomicBool::new(true)),
+        fail_next: Arc::new(AtomicBool::new(false)),
+        receives: Arc::new(AtomicUsize::new(0)),
+    };
+    let state = PeerState::new(
+        backend.clone(),
+        "cedar".into(),
+        auth.clone(),
+        FleetContext::legacy(BTreeSet::from(["birch".into()])),
+    );
+    let query = left
+        .export_replication_exchange(fleet_id, &ReplicationInventory::default())
+        .unwrap();
+    let bytes = Bytes::from(serde_json::to_vec(&query).unwrap());
+    let digest = FleetAuth::body_digest(&bytes);
+    let headers = auth.request_headers("birch", &bytes).unwrap();
+    let interrupted = tokio::spawn(receive_exchange(
+        State(state.clone()),
+        headers.clone(),
+        bytes.clone(),
+    ));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while backend.receives.load(Ordering::Relaxed) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    interrupted.abort();
+    assert!(
+        right
+            .latest_claim("note/birch", Some("example.note"))
+            .unwrap()
+            .is_some()
+    );
+
+    let started = tokio::time::Instant::now();
+    let overload = receive_exchange(State(state.clone()), headers.clone(), bytes.clone()).await;
+    assert_eq!(overload.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(started.elapsed() < REPLICATION_EXCHANGE_TIMEOUT);
+    let overload_headers = overload.headers().clone();
+    let body = to_bytes(overload.into_body(), MAX_EXCHANGE_BYTES)
+        .await
+        .unwrap();
+    auth.verify_sender(
+        &overload_headers,
+        "RESPONSE",
+        EXCHANGE_PATH,
+        &body,
+        Some("cedar"),
+        Some(&digest),
+    )
+    .unwrap();
+    assert!(
+        auth.verify_sender(
+            &overload_headers,
+            "RESPONSE",
+            EXCHANGE_PATH,
+            &body,
+            Some("cedar"),
+            Some("different-request")
+        )
+        .is_err()
+    );
+    let answer: PeerResponse<Value> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(answer.value["code"], "replication-overloaded");
+    assert_eq!(answer.value["retry_after_ms"], 5000);
+    assert_eq!(
+        backend.receives.load(Ordering::Relaxed),
+        1,
+        "retry must reuse admitted work"
+    );
+
+    // A different request from the same peer is refused immediately without adding work.
+    let changed = Bytes::from(
+        serde_json::to_vec(&left.export_replication_summary(fleet_id).unwrap()).unwrap(),
+    );
+    let busy = receive_exchange(
+        State(state.clone()),
+        auth.request_headers("birch", &changed).unwrap(),
+        changed,
+    )
+    .await;
+    assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(backend.receives.load(Ordering::Relaxed), 1);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer = PeerConfig {
+        name: "cedar".into(),
+        url: format!("http://{}", listener.local_addr().unwrap()),
+    };
+    let requests = Arc::new(AtomicUsize::new(0));
+    let count = requests.clone();
+    let app = peer_router(state, Router::new()).layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            count.fetch_add(1, Ordering::Relaxed);
+            async move { next.run(request).await }
+        },
+    ));
+    let server = tokio::spawn(axum::serve(listener, app).into_future());
+    let fleet = FleetContext::legacy(BTreeSet::from(["cedar".into()]));
+    let (answer, _) = post_signed(
+        &replication_http_client(),
+        &Local(left.clone()),
+        &peer,
+        "birch",
+        &auth,
+        &fleet,
+        &query,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        requests.load(Ordering::Relaxed),
+        1,
+        "completed in-flight export is fetched, not restarted"
+    );
+    assert_eq!(backend.receives.load(Ordering::Relaxed), 1);
+    Local(left.clone())
+        .receive("cedar", fleet_id, &answer, None)
+        .await
+        .unwrap();
+    for store in [&left, &right] {
+        for writer in ["birch", "cedar"] {
+            assert_eq!(
+                store
+                    .claims_for(&format!("note/{writer}"), Some("example.note"))
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+    }
+    // Once an answer is delivered, a later identical query must export fresh data.
+    post_signed(
+        &replication_http_client(),
+        &Local(left.clone()),
+        &peer,
+        "birch",
+        &auth,
+        &fleet,
+        &query,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(backend.receives.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        right
+            .claims_for("note/birch", Some("example.note"))
+            .unwrap()
+            .len(),
+        1
+    );
+    exchange(
+        &replication_http_client(),
+        &Local(left.clone()),
+        "birch",
+        &peer,
+        &auth,
+        &fleet,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        left.replication_inventory().unwrap().digest,
+        right.replication_inventory().unwrap().digest
+    );
+    server.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn authenticated_overload_polls_have_separate_time_and_request_bounds() {
+    // Direct client/server HTTP with injected clock: every response is an authenticated
+    // overload; the five-second minimum permits at most 60 requests in five minutes.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let auth = FleetAuth::test("1f91ca65-7793-48cc-866e-ac15690130e1", &[7; 32]);
+    let fleet = FleetContext::legacy(BTreeSet::from(["cedar".into()]));
+    let state = PeerState::new(
+        Local(Arc::new(plain_memory("cedar").unwrap())),
+        "cedar".into(),
+        auth.clone(),
+        FleetContext::legacy(BTreeSet::from(["birch".into()])),
+    );
+    let requests = Arc::new(AtomicUsize::new(0));
+    let count = requests.clone();
+    let app = Router::new().route(
+        EXCHANGE_PATH,
+        post(move |body: Bytes| {
+            let state = state.clone();
+            let count = count.clone();
+            async move {
+                count.fetch_add(1, Ordering::Relaxed);
+                signed_overload(&state, &FleetAuth::body_digest(&body))
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer = PeerConfig {
+        name: "cedar".into(),
+        url: format!("http://{}", listener.local_addr().unwrap()),
+    };
+    let server = tokio::spawn(axum::serve(listener, app).into_future());
+    // Prevent automatic clock advances from racing socket readiness.
+    let keep_awake = tokio::spawn(async {
+        loop {
+            tokio::task::yield_now().await;
+        }
+    });
+    let started = tokio::time::Instant::now();
+    let task = tokio::spawn(async move {
+        post_signed(
+            &replication_http_client(),
+            &Local(Arc::new(plain_memory("birch").unwrap())),
+            &peer,
+            "birch",
+            &auth,
+            &fleet,
+            &plain_memory("birch")
+                .unwrap()
+                .export_replication_summary(auth.fleet_id())
+                .unwrap(),
+            false,
+        )
+        .await
+    });
+    for _ in 0..65 {
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        if task.is_finished() {
+            break;
+        }
+        tokio::time::advance(OVERLOAD_RETRY).await;
+    }
+    let error = task.await.unwrap().unwrap_err();
+    assert!(error.is::<PeerOverloaded>(), "{error:#}");
+    assert!(started.elapsed() <= EXCHANGE_POLL_BUDGET + OVERLOAD_RETRY);
+    assert!(requests.load(Ordering::Relaxed) <= 60);
+    assert!(requests.load(Ordering::Relaxed) > 1);
+    keep_awake.abort();
+    server.abort();
+}
+
+#[tokio::test]
+async fn worker_phase_status_is_local_and_reports_retry_deadline() {
+    let store = Arc::new(plain_memory("birch").unwrap());
+    let index = store.index().unwrap();
+    let attempt = crate::store::now_ms();
+    for phase in ["exchange", "heal", "backoff", "idle"] {
+        let retry = (phase == "backoff").then_some(Duration::from_secs(30));
+        record_worker(&Local(store.clone()), "cedar", phase, attempt, retry).await;
+        let status = store
+            .replication_status(false, None, &["cedar".into()])
+            .unwrap();
+        let worker = status.peers[0].worker.as_ref().unwrap();
+        assert_eq!(worker.phase, phase);
+        assert_eq!(worker.last_attempt_at_unix_ms, attempt);
+        assert_eq!(worker.next_retry_at_unix_ms.is_some(), retry.is_some());
+    }
+    assert_eq!(
+        store.index().unwrap(),
+        index,
+        "worker state must never create replicated claims"
+    );
+    let fleet = FleetContext::legacy(BTreeSet::new());
+    fleet.note_activity("cedar");
+    assert_eq!(
+        retry_delay(Duration::from_secs(3600), &fleet, "cedar"),
+        Duration::from_secs(30)
+    );
+    assert_eq!(
+        retry_delay(Duration::from_secs(3600), &fleet, "absent"),
+        Duration::from_secs(3600)
+    );
+}
+
+#[tokio::test]
+async fn overload_requires_authentication_and_clamps_signed_retry_delays() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let auth = FleetAuth::test("invented-fleet", &[7; 32]);
+    let query = plain_memory("birch")
+        .unwrap()
+        .export_replication_summary(auth.fleet_id())
+        .unwrap();
+    // Each request gets one controlled wire answer: unsigned, forged, replayed, then
+    // authenticated delays below, within, and above the permitted range.
+    let requests = Arc::new(AtomicUsize::new(0));
+    let count = requests.clone();
+    let signing = auth.clone();
+    let app = Router::new().route(
+        EXCHANGE_PATH,
+        post(move |body: Bytes| {
+            let index = count.fetch_add(1, Ordering::Relaxed);
+            let signing = signing.clone();
+            async move {
+                let millis = [0, 0, 0, 0, 4999, 10_000, 30_001, u64::MAX][index];
+                let envelope = PeerResponse::new(
+                    "cedar",
+                    0,
+                    serde_json::json!({
+                        "code": "replication-overloaded", "retry_after_ms": millis
+                    }),
+                );
+                let bytes = serde_json::to_vec(&envelope).unwrap();
+                let mut response = (StatusCode::SERVICE_UNAVAILABLE, bytes.clone()).into_response();
+                if index != 0 {
+                    let auth = if index == 1 {
+                        FleetAuth::test("invented-fleet", &[8; 32])
+                    } else {
+                        signing
+                    };
+                    let digest = if index == 2 {
+                        "another-request".into()
+                    } else {
+                        FleetAuth::body_digest(&body)
+                    };
+                    response.headers_mut().extend(
+                        auth.response_headers_for(EXCHANGE_PATH, "cedar", &bytes, &digest)
+                            .unwrap(),
+                    );
+                }
+                response
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer = PeerConfig {
+        name: "cedar".into(),
+        url: format!("http://{}", listener.local_addr().unwrap()),
+    };
+    let server = tokio::spawn(axum::serve(listener, app).into_future());
+    let http = replication_http_client();
+    let fleet = FleetContext::legacy(BTreeSet::from(["cedar".into()]));
+    let local = Local(Arc::new(plain_memory("birch").unwrap()));
+    for expected_count in 1..=3 {
+        let error = post_signed(&http, &local, &peer, "birch", &auth, &fleet, &query, false)
+            .await
+            .unwrap_err();
+        assert!(
+            !error.is::<PeerOverloaded>(),
+            "unverified overload must not enter polling: {error:#}"
+        );
+        assert_eq!(
+            requests.load(Ordering::Relaxed),
+            expected_count,
+            "unverified overload must not be retried"
+        );
+        assert!(
+            fleet.activity.read().unwrap().is_empty(),
+            "unverified overload cannot mark the peer alive"
+        );
+    }
+    for seconds in [5, 5, 10, 30, 30] {
+        let error = post_signed_to::<_, ReplicationExchange>(
+            &http,
+            &peer,
+            "birch",
+            &auth,
+            &fleet,
+            EXCHANGE_PATH,
+            &query,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<PeerOverloaded>().unwrap().retry_after,
+            Duration::from_secs(seconds)
+        );
+        assert!(fleet.activity.read().unwrap().contains_key("cedar"));
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn failed_export_job_is_removed_and_identical_retry_preserves_receipt() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let root = tempfile::tempdir().unwrap();
+    let auth = FleetAuth::test("invented-fleet", &[7; 32]);
+    let left = plain_open(&root.path().join("birch.sqlite3"), "birch").unwrap();
+    let right = Arc::new(plain_open(&root.path().join("cedar.sqlite3"), "cedar").unwrap());
+    for store in [&left, right.as_ref()] {
+        store.bind_fleet(auth.fleet_id()).unwrap();
+    }
+    left.append_claim(&ClaimInput {
+        subject: "note/copper".into(),
+        kind: "example.note".into(),
+        actor: None,
+        fields: BTreeMap::from([("text".into(), Value::String("copper".into()))]),
+        evidence: vec![],
+        expected_subject: None,
+        idempotency_key: None,
+    })
+    .unwrap();
+    let query = left
+        .export_replication_exchange(auth.fleet_id(), &ReplicationInventory::default())
+        .unwrap();
+    let bytes = Bytes::from(serde_json::to_vec(&query).unwrap());
+    let backend = SlowExport {
+        local: Local(right.clone()),
+        slow: Arc::new(AtomicBool::new(false)),
+        fail_next: Arc::new(AtomicBool::new(true)),
+        receives: Arc::new(AtomicUsize::new(0)),
+    };
+    let state = PeerState::new(
+        backend.clone(),
+        "cedar".into(),
+        auth.clone(),
+        FleetContext::legacy(BTreeSet::from(["birch".into()])),
+    );
+    for expected_status in [StatusCode::INTERNAL_SERVER_ERROR, StatusCode::OK] {
+        let response = receive_exchange(
+            State(state.clone()),
+            auth.request_headers("birch", &bytes).unwrap(),
+            bytes.clone(),
+        )
+        .await;
+        assert_eq!(response.status(), expected_status);
+        let headers = response.headers().clone();
+        let answer = to_bytes(response.into_body(), MAX_EXCHANGE_BYTES)
+            .await
+            .unwrap();
+        auth.verify_sender(
+            &headers,
+            "RESPONSE",
+            EXCHANGE_PATH,
+            &answer,
+            Some("cedar"),
+            Some(&FleetAuth::body_digest(&bytes)),
+        )
+        .unwrap();
+        assert!(
+            state.fleet.exchange_jobs.peers.lock().unwrap().is_empty(),
+            "failed and delivered jobs must not pin the peer slot"
+        );
+        assert_eq!(
+            right
+                .claims_for("note/copper", Some("example.note"))
+                .unwrap()
+                .len(),
+            1,
+            "admitted envelope survives export failure and remains idempotent"
+        );
+    }
+    assert_eq!(
+        backend.receives.load(Ordering::Relaxed),
+        2,
+        "identical retry must recompute the failed job"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_always_failing_http_peer_cannot_refresh_its_own_probe_window() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let probes = Arc::new(AtomicUsize::new(0));
+    let count = probes.clone();
+    let app = Router::new().route(
+        EXCHANGE_PATH,
+        axum::routing::head(move || {
+            count.fetch_add(1, Ordering::Relaxed);
+            async { StatusCode::OK }
+        })
+        .post(|| async { StatusCode::UNAUTHORIZED }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let peer = PeerConfig {
+        name: "cedar".into(),
+        url: url.clone(),
+    };
+    let server = tokio::spawn(axum::serve(listener, app).into_future());
+    let keep_awake = tokio::spawn(async {
+        loop {
+            tokio::task::yield_now().await;
+        }
+    });
+    let fleet = FleetContext::legacy(BTreeSet::from(["cedar".into()]));
+    let (_route_tx, mut routes) = watch::channel(vec![Route::Http(url.clone())]);
+    let mut inbound = fleet.inbound_changed.subscribe();
+    let mut activity = fleet.activity_changed.subscribe();
+    let mut connectivity = fleet.connectivity_changed.subscribe();
+    let http = replication_http_client();
+    let auth = FleetAuth::test("invented-fleet", &[7; 32]);
+    let store = Arc::new(plain_memory("birch").unwrap());
+    let local = Local(store.clone());
+    let query = store.export_replication_summary(auth.fleet_id()).unwrap();
+    let previous = (url, tokio::time::Instant::now());
+    // A recent successful exchange permits a cheap probe to shorten a retry once.
+    let error = post_signed(&http, &local, &peer, "birch", &auth, &fleet, &query, false)
+        .await
+        .unwrap_err();
+    assert!(!error.is::<PeerOverloaded>());
+    {
+        let started = tokio::time::Instant::now();
+        let wait = wait_peer_retry(
+            &local,
+            crate::store::now_ms(),
+            Duration::from_secs(3600),
+            &mut routes,
+            &mut inbound,
+            &mut activity,
+            &mut connectivity,
+            &fleet,
+            "cedar",
+            started,
+            Some(&previous),
+            &http,
+        );
+        tokio::pin!(wait);
+        let mut completed = false;
+        // Drive sockets without Tokio advancing time ahead of them.
+        for _ in 0..35 {
+            tokio::select! {
+                result = &mut wait => { assert!(!result); completed = true; break; }
+                _ = async { for _ in 0..100 { tokio::task::yield_now().await; } } => {}
+            }
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        assert!(
+            completed,
+            "a recent HTTP route should recover within 30 seconds"
+        );
+    }
+    assert!(probes.load(Ordering::Relaxed) > 0);
+    assert!(fleet.activity.read().unwrap().is_empty());
+    // The endpoint still answers, but repeated failing signed exchanges cannot extend
+    // eligibility. Once the authenticated window expires, a full quiet wait resumes.
+    tokio::time::advance(PEER_PROBE_WINDOW).await;
+    let before = probes.load(Ordering::Relaxed);
+    let error = post_signed(&http, &local, &peer, "birch", &auth, &fleet, &query, false)
+        .await
+        .unwrap_err();
+    assert!(!error.is::<PeerOverloaded>());
+    let started = tokio::time::Instant::now();
+    let delay = retry_delay(Duration::from_secs(3600), &fleet, "cedar");
+    assert_eq!(delay, Duration::from_secs(3600));
+    let wait = wait_peer_retry(
+        &local,
+        crate::store::now_ms(),
+        delay,
+        &mut routes,
+        &mut inbound,
+        &mut activity,
+        &mut connectivity,
+        &fleet,
+        "cedar",
+        started,
+        Some(&previous),
+        &http,
+    );
+    tokio::pin!(wait);
+    for _ in 0..2 {
+        tokio::select! {
+            _ = &mut wait => panic!("an expired route must retain quiet backoff"),
+            _ = async { for _ in 0..100 { tokio::task::yield_now().await; } } => {}
+        }
+        tokio::time::advance(Duration::from_secs(15)).await;
+    }
+    tokio::time::advance(Duration::from_secs(3570)).await;
+    assert!(!wait.await);
+    assert_eq!(
+        probes.load(Ordering::Relaxed),
+        before,
+        "an expired route must not keep probing itself alive"
+    );
+    keep_awake.abort();
+    server.abort();
+}
+
+#[tokio::test]
+async fn concurrent_slow_exports_refuse_more_work_with_authenticated_overload() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let root = tempfile::tempdir().unwrap();
+    let store = Arc::new(plain_open(&root.path().join("cedar.sqlite3"), "cedar").unwrap());
+    let auth = FleetAuth::test("1f91ca65-7793-48cc-866e-ac15690130e1", &[7; 32]);
+    store.bind_fleet(auth.fleet_id()).unwrap();
+    let fleet = FleetContext::legacy(
+        ["birch", "alder", "ash", "fir", "elm"]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+    );
+    let query = store.export_replication_summary(auth.fleet_id()).unwrap();
+    let received = Arc::new(AtomicUsize::new(0));
+    let mut requests = Vec::new();
+    for name in ["birch", "alder", "ash", "fir"] {
+        let mut input = query.clone();
+        input.peer = name.into();
+        let bytes = Bytes::from(serde_json::to_vec(&input).unwrap());
+        let backend = SlowExport {
+            local: Local(store.clone()),
+            slow: Arc::new(AtomicBool::new(true)),
+            fail_next: Arc::new(AtomicBool::new(false)),
+            receives: received.clone(),
+        };
+        let state = PeerState::new(backend, "cedar".into(), auth.clone(), fleet.clone());
+        requests.push(tokio::spawn(receive_exchange(
+            State(state),
+            auth.request_headers(name, &bytes).unwrap(),
+            bytes,
+        )));
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while received.load(Ordering::Relaxed) < MAX_EXCHANGE_JOBS {
+            for request in &mut requests {
+                if request.is_finished() {
+                    let response = request.await.unwrap();
+                    let status = response.status();
+                    let body = to_bytes(response.into_body(), MAX_EXCHANGE_BYTES)
+                        .await
+                        .unwrap();
+                    panic!(
+                        "unexpected early admission response {status}: {}",
+                        String::from_utf8_lossy(&body)
+                    );
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut input = query;
+    input.peer = "elm".into();
+    let query = Bytes::from(serde_json::to_vec(&input).unwrap());
+    let state = PeerState::new(Local(store), "cedar".into(), auth.clone(), fleet.clone());
+    let started = tokio::time::Instant::now();
+    let response = receive_exchange(
+        State(state),
+        auth.request_headers("elm", &query).unwrap(),
+        query.clone(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(started.elapsed() < Duration::from_secs(1));
+    let headers = response.headers().clone();
+    let body = to_bytes(response.into_body(), MAX_EXCHANGE_BYTES)
+        .await
+        .unwrap();
+    auth.verify_sender(
+        &headers,
+        "RESPONSE",
+        EXCHANGE_PATH,
+        &body,
+        Some("cedar"),
+        Some(&FleetAuth::body_digest(&query)),
+    )
+    .unwrap();
+    assert_eq!(received.load(Ordering::Relaxed), MAX_EXCHANGE_JOBS);
+    assert_eq!(
+        fleet.exchange_jobs.peers.lock().unwrap().len(),
+        MAX_EXCHANGE_JOBS
+    );
+    for request in requests {
+        request.abort();
     }
 }

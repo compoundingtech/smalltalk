@@ -1418,10 +1418,17 @@ pub fn agents_list(world: &World, spinner: &'static str, width: usize) -> Listin
                 ),
                 span(format!(" {:>4}", agent.activity), theme::dim()),
             ],
-            second: vec![span(
-                format!("   {}", text::truncate(path, width.saturating_sub(4))),
-                theme::dim(),
-            )],
+            // What its step last reported leads; the path says who it is when nothing was said.
+            second: match &agent.details.progress {
+                Some(progress) => vec![span(
+                    format!("   {}", text::truncate(progress, width.saturating_sub(4))),
+                    theme::soft(),
+                )],
+                None => vec![span(
+                    format!("   {}", text::truncate(path, width.saturating_sub(4))),
+                    theme::dim(),
+                )],
+            },
             children: subagent_lines(agent, "   ", width),
         });
         ids.push(agent.id.clone());
@@ -1516,6 +1523,15 @@ pub fn agent_header(world: &World, agent: &Agent, width: usize, spinner: &'stati
             None,
         ));
     }
+    if let Some(progress) = &agent.details.progress {
+        doc.lines(text::wrap(
+            &text::inline(progress, theme::text()),
+            width,
+            &[text::run("   ", theme::dim())],
+            &[text::run("   ", theme::dim())],
+            None,
+        ));
+    }
     if let (Some(mission), Some(step)) = (&agent.mission, &agent.step) {
         let title = world
             .missions
@@ -1562,7 +1578,18 @@ fn failed_before_today(mission: &Mission) -> bool {
         })
 }
 
-pub fn missions_list(world: &World, spinner: &'static str, system: bool) -> Listing {
+/// What a step in hand last reported, on one line: the status of a run in progress.
+fn mission_progress(mission: &Mission) -> Option<String> {
+    mission
+        .steps
+        .iter()
+        .filter(|step| step.state == StepState::Working)
+        .find_map(|step| mission.step_metadata.get(&step.id)?.last_progress.as_deref())
+        .map(|progress| progress.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|progress| !progress.is_empty())
+}
+
+pub fn missions_list(world: &World, width: usize, spinner: &'static str, system: bool) -> Listing {
     let mut items = Vec::new();
     let mut ids = Vec::new();
     let missions = mission_order(world, system);
@@ -1602,14 +1629,21 @@ pub fn missions_list(world: &World, spinner: &'static str, system: bool) -> List
                 span(mission.title.clone(), theme::bold()),
             ],
             right,
-            second: vec![span(
-                format!(
-                    "   {} · {}",
-                    mission.id.trim_start_matches("mission/"),
-                    mission.age
-                ),
-                theme::dim(),
-            )],
+            // A run in progress says what its step last reported before where it lives.
+            second: match mission_progress(mission) {
+                Some(progress) => vec![span(
+                    format!("   {}", text::truncate(&progress, width.saturating_sub(4))),
+                    theme::soft(),
+                )],
+                None => vec![span(
+                    format!(
+                        "   {} · {}",
+                        mission.id.trim_start_matches("mission/"),
+                        mission.age
+                    ),
+                    theme::dim(),
+                )],
+            },
             children: Vec::new(),
         });
         ids.push(mission.id.clone());
@@ -1804,6 +1838,21 @@ pub fn mission_detail(
         if let Some(note) = &step.note {
             steps.lines(text::wrap(
                 &text::inline(note, theme::dim()),
+                inner,
+                &[run("      ", theme::dim())],
+                &[run("      ", theme::dim())],
+                None,
+            ));
+        }
+        // A step in hand says what it last reported, the status a person reads first.
+        if step.state == StepState::Working
+            && let Some(progress) = mission
+                .step_metadata
+                .get(&step.id)
+                .and_then(|metadata| metadata.last_progress.as_deref())
+        {
+            steps.lines(text::wrap(
+                &text::inline(progress, theme::text()),
                 inner,
                 &[run("      ", theme::dim())],
                 &[run("      ", theme::dim())],
@@ -2507,7 +2556,10 @@ pub fn agent_actions_doc(agent: &Agent, width: usize, spinner: &'static str) -> 
     }
     doc.blank();
     doc.wrap(
-        &text::inline("Restart, suspend and retire ask y first. Esc closes.", theme::dim()),
+        &text::inline(
+            "Interrupt, restart, suspend and retire ask y first. Esc closes.",
+            theme::dim(),
+        ),
         width,
     );
     doc
@@ -2539,6 +2591,9 @@ pub fn peek(world: &World, subject: &str, width: usize, spinner: &'static str) -
         doc.field("host", &agent.host, width, theme::soft());
         if let Some(tree) = &agent.worktree {
             doc.field("worktree", tree, width, theme::soft());
+        }
+        if let Some(progress) = &agent.details.progress {
+            doc.field("now", progress, width, theme::text());
         }
         if let (Some(mission), Some(step)) = (&agent.mission, &agent.step) {
             let title = world
@@ -2689,6 +2744,16 @@ pub fn agent_details(world: &World, agent: &Agent, width: usize, spinner: &'stat
         doc.blank();
     }
     doc.section("now", None, width);
+    // What its step last reported is the status; the step and its goal say where it comes from.
+    if let Some(progress) = &details.progress {
+        doc.lines(text::wrap(
+            &text::inline(progress, theme::bold()),
+            width,
+            &[],
+            &[],
+            None,
+        ));
+    }
     match (&agent.mission, &agent.step) {
         (Some(mission), Some(step)) => {
             let title = world
@@ -2963,7 +3028,7 @@ pub fn missions_tree(world: &World, spinner: &'static str, system: bool) -> List
         state_of(&world.missions, "Loading missions…", "No missions yet."),
         vec![],
     );
-    listing.legend = missions_list(world, spinner, system).legend;
+    listing.legend = missions_list(world, 40, spinner, system).legend;
     listing
 }
 
@@ -3188,6 +3253,11 @@ pub fn models(harness: &str) -> &'static [&'static str] {
 pub struct AgentForm {
     pub task: String,
     pub name: String,
+    pub repository: String,
+    /// Empty follows the safe simple name as it changes.
+    pub branch: String,
+    pub base: String,
+    pub workspace: String,
     pub harness: usize,
     pub model: usize,
     pub effort: usize,
@@ -3197,7 +3267,27 @@ pub struct AgentForm {
 }
 
 impl AgentForm {
-    pub const FIELDS: usize = 6;
+    pub const FIELDS: usize = 10;
+
+    pub fn branch(&self) -> String {
+        if self.branch.trim().is_empty() {
+            st3_client::agent_branch(self.name.trim())
+        } else {
+            self.branch.trim().to_owned()
+        }
+    }
+
+    pub fn base(&self) -> &str {
+        if self.base.trim().is_empty() {
+            "origin/main"
+        } else {
+            self.base.trim()
+        }
+    }
+
+    pub fn choice(&self) -> bool {
+        (2..=5).contains(&self.focus)
+    }
 
     pub fn new(task: String) -> Self {
         Self {
@@ -3239,7 +3329,11 @@ impl AgentForm {
                 step(&mut self.model, count)
             }
             4 => step(&mut self.effort, EFFORTS.len()),
-            5 => step(&mut self.host, hosts + 1),
+            5 => {
+                step(&mut self.host, hosts + 1);
+                self.repository.clear();
+                self.workspace.clear();
+            }
             _ => {}
         }
     }
@@ -3268,7 +3362,8 @@ pub fn random_name() -> String {
 pub fn new_agent_form(
     form: &AgentForm,
     hosts: &[String],
-    cursors: [usize; 2],
+    cursors: [usize; 6],
+    repositories: &Load<Vec<String>>,
     width: usize,
 ) -> Doc {
     let mut inner = Doc::new();
@@ -3296,6 +3391,13 @@ pub fn new_agent_form(
             w,
         );
         for line in start..inner.lines.len() {
+            if inner
+                .targets
+                .iter()
+                .any(|target| target.line == line && matches!(target.hit, Hit::Repository(_)))
+            {
+                continue;
+            }
             inner.targets.push(super::doc::Target {
                 line,
                 column: 0,
@@ -3373,6 +3475,73 @@ pub fn new_agent_form(
                 theme::dim(),
             ),
         ]));
+        field(&mut inner, index, label, body);
+    }
+    inner.blank();
+    inner.wrap(&[run("Choose a repository for a worktree, or leave it empty for a plain workspace. Paths belong to the selected host.", theme::soft())], w);
+    for (cursor_index, index, label, value, hint) in [
+        (
+            2,
+            6,
+            "repository",
+            form.repository.as_str(),
+            "empty: plain workspace".to_owned(),
+        ),
+        (3, 7, "branch", form.branch.as_str(), form.branch()),
+        (4, 8, "base", form.base.as_str(), form.base().to_owned()),
+        (
+            5,
+            9,
+            "workspace",
+            form.workspace.as_str(),
+            "empty: st chooses a new directory".to_owned(),
+        ),
+    ] {
+        let mut body = Doc::new();
+        let focused = form.focus == index;
+        if value.is_empty() {
+            body.line(Line::from(span(hint, theme::dim())));
+        }
+        for runs in super::edit::lines(
+            value,
+            focused.then_some(cursors[cursor_index]),
+            theme::text(),
+        ) {
+            body.lines(text::wrap(&runs, w.saturating_sub(4), &[], &[], None));
+        }
+        if index == 6 {
+            match repositories {
+                Load::Loading => body.line(Line::from(span(
+                    "Loading this host’s repositories…",
+                    theme::dim(),
+                ))),
+                Load::Failed(why) => body.line(Line::from(span(
+                    format!("Suggestions unavailable: {why}"),
+                    theme::dim(),
+                ))),
+                Load::Ready(paths) => {
+                    body.line(Line::from(span(
+                        "ctrl+p / ctrl+n choose a repository; or type a path",
+                        theme::dim(),
+                    )));
+                    for path in paths
+                        .iter()
+                        .filter(|path| {
+                            form.repository.is_empty() || path.contains(&form.repository)
+                        })
+                        .take(5)
+                    {
+                        body.targets.push(super::doc::Target {
+                            line: body.lines.len(),
+                            column: 0,
+                            width: w.saturating_sub(4) as u16,
+                            hit: Hit::Repository(path.clone()),
+                        });
+                        body.line(Line::from(span(path.clone(), theme::soft())));
+                    }
+                }
+            }
+        }
         field(&mut inner, index, label, body);
     }
     inner.blank();

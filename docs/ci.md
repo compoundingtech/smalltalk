@@ -27,8 +27,22 @@ head: it tests that head merged with the current base. The merge queue combines 
 the current `main`; the head does not need to be rebased first. No `pull_request_target` job runs PR code,
 and the gate has only `contents: read` permission. Forks do not receive publishing secrets.
 
+The fast `upgrade-impact` job starts independently on GitHub-hosted `ubuntu-latest`, using only
+Python and Git. The adoption boundary is **PR #1661**: PR numbers above it require a fresh valid
+upgrade fragment, including documentation changes. PRs #1661 and below without a fragment retain
+their prior merge policy; they still require classification before public release. Supplied
+fragments are validated, including schema/rules transitions, and existing fragments are immutable.
+PR events supply their number; queue refs identify a single PR, while multi-PR queue groups
+identify each member by its merge subject so an old head PR cannot exempt a newer member. It checks
+the effective PR merge against that merge commit's first parent, and each integrated PR in a
+merge group against the group's supplied base. A PR event's recorded `base.sha` can be stale
+after main advances; it is not the PR check's comparison base. Both bases stay pinned to the
+tested source rather than a later `origin/main` fetch;
+unrelated unreleased main changes do not block a new PR's check. It does not download dependencies
+or compile. Manual dispatch runs the safety tests without inventing a PR delta.
+
 The Linux gate runs two test partitions plus Clippy and fleet compatibility on separate runners.
-`linux-gate` is the aggregate Linux check: it needs the four stage jobs and the named mail redelivery
+`linux-gate` is the aggregate Linux check: it needs `upgrade-impact`, the four stage jobs and the named mail redelivery
 check, and passes only when every one succeeded (a skipped or cancelled stage fails it). The stage jobs use the shape label
 `nscloud-ubuntu-24.04-amd64-8x16-with-features`; `genie-freshness`, `isolation-vm` and `typescript-client`
 use `namespace-profile-linux-x86-64` when they overflow. The `linux-gate` aggregate uses GitHub-hosted
@@ -117,6 +131,13 @@ The messaging fault matrix runs as eleven independent `messaging_faults::*` test
 Each case keeps its own evidence directory under `target/messaging-faults/`. The fixture uses
 a systemd user runtime only when its bus exists, so runners without a user manager use the
 existing detached process path instead of trying to create scopes through a synthetic runtime.
+Recovery cases include `recovery_timing` in the result printed by a failed test: partition
+restoration, the observed current channel and its incarnation, the first peer exchange request,
+staging acceptance, native consumption, and read acceptance. Staging precedes writing the
+native frame and does not prove an accepted offer. These timestamps and offsets use
+the recovery restoration time, independently of the later fresh send. `recovered-trace.json`
+retains the recovered message's graph claims. A peer request proves transport activity, not
+the recipient's local message arrival; channel readiness records an observation, not its first transition.
 
 `.config/nextest.toml` gives the messaging fault matrix and the fleet reconnect test, both with
 real multi-minute outages, first priority so their retries fit the CI test window. Failed tests

@@ -89,7 +89,7 @@ export function isSystemMission(id: string): boolean {
   return id.startsWith('mission/__st3/') || id.split('/').includes('ci');
 }
 
-export type MissionRow = { mission: Mission; word: Word; title: string; path: string; age: string; done: number; total: number; system: boolean };
+export type MissionRow = { mission: Mission; word: Word; title: string; path: string; age: string; done: number; total: number; system: boolean; progress?: string };
 export function missionRows(missions: Mission[], attention: Attention[], agents: Agent[], showSystem: boolean, now = Date.now()): { rows: MissionRow[]; hidden: number } {
   const all = missions.map((mission): MissionRow => {
     const steps = missionSteps(mission);
@@ -102,6 +102,8 @@ export function missionRows(missions: Mission[], attention: Attention[], agents:
       done: steps.filter(step => step.state === 'completed').length,
       total: steps.length,
       system: isSystemMission(mission.id),
+      // What a step in hand last reported: the status of a run in progress.
+      progress: steps.filter(step => ['claimed', 'working', 'running'].includes(step.state)).map(step => step.last_progress?.split(/\s+/).filter(Boolean).join(' ')).find(Boolean),
     };
   });
   // A failure ages out of the list after its day, as in stui (Nathan, 2026-10-02); showing the

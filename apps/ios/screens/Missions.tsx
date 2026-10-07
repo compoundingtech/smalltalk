@@ -60,7 +60,7 @@ export function MissionsScreen() {
         glyphColor={wordStyle(row.word).color}
         title={row.title}
         right={<Meter done={row.done} total={row.total} color={wordStyle(row.word).color} />}
-        second={`${row.path} · ${row.age}`}
+        second={row.progress ?? `${row.path} · ${row.age}`}
         onPress={() => navigation.navigate('Mission', { id: row.mission.id, title: row.title })}
       />}
       ListEmptyComponent={<Empty text={loadErrors.missions ? `Missions could not be loaded: ${loadErrors.missions}` : hasSynced ? 'No missions yet.' : 'Loading missions…'} />}
@@ -118,6 +118,7 @@ export function MissionScreen({ route, navigation }: RootScreen<'Mission'>) {
         return <View key={step.id} style={{ paddingHorizontal: 12, paddingVertical: 5 }}>
           <T><T bold color={style.color}>{style.glyph} </T><T bold>{step.path}</T><T color={style.color}>  {style.word}</T></T>
           {step.blocked_reason ? <T color={theme.waiting} style={{ paddingLeft: 22 }}>{step.blocked_reason}</T> : null}
+          {['claimed', 'working', 'running'].includes(step.state) && step.last_progress ? <T style={{ paddingLeft: 22 }}>{step.last_progress}</T> : null}
           {step.goals?.[0] ? <View style={{ paddingLeft: 22 }}><Markdown text={step.goals[0]} color={theme.subtext0} /></View> : null}
           {holder ? agent
             ? <Pressable onPress={() => navigation.navigate('Conversation', { target: agent.id, title: agentName(agent) })} style={{ paddingLeft: 22 }}><T><T dim>held by </T><T color={theme.accent}>{agentName(agent)}</T></T></Pressable>

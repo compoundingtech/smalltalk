@@ -24,6 +24,41 @@ its own digest so a mismatch names the source. Local receipt metadata, physical 
 lease overlays and live reachability are excluded explicitly. Retained history and checkpoint
 tombstones represent the same logical source identity.
 
+Owner-read relay routes use each observer's latest `transport.observed` claim for each peer.
+The nominal lifetime of an `up` link is two hours after its `last_success_at` (or its original
+claim timestamp for legacy observations). Receiving or replaying a claim does not renew it.
+Readers tolerate at most five minutes of clock skew in either direction: observations more
+than five minutes ahead are discarded; those within the allowance expire after two hours plus
+five minutes of timestamp age. Thus even the most-ahead accepted clock cannot extend a link
+beyond two hours and ten minutes of real elapsed time, plus the five-second gateway cache.
+Only a successful live exchange refreshes a stable `up`, at most once every 15 minutes. The
+real refresh interval can be 15-16 minutes with the worker's 30-60-second exchange cadence;
+the two-hour window leaves room for quiet sync and propagation. A down or unknown observation
+never renews an earlier success. Old nodes publish status changes only: their observations
+expire on upgraded readers even while they keep exchanging. Direct listening routes and the
+existing unseen-owner fallback remain usable; relayed path ordering improves once that
+observer upgrades and supplies bounded live refreshes.
+
+This refresh cadence adds at most 96 claims per healthy directed link per day (30 times fewer
+than a 30-second refresh), excluding actual status changes. For six fully connected listening
+nodes, 30 directed links add at most 2,880 claims/day. The unchanged checkpoint retention rule
+keeps the newest observation per origin/subject after the D+2 cut; a two-to-three-day pre-cut
+window holds roughly 5,760-8,640 refresh claims, plus each retained newest claim. These are
+arithmetic bounds, not measured saturated-daemon costs.
+
+Gateways cache filtered links and sealed membership for at most five seconds, including
+per-item `reaches()` checks. Links involving current dial-out members never support
+bidirectional owner routes, even while fresh. Dial-out owners return `remote-unavailable`
+with `details.reason = "dial-out-owner"` and an explicit no-inbound-route message across
+conversation, terminal, raw attach, workspace and attachment reads, without trying listening
+peers as relays. The member's published mode overrides a configured direct URL. Correct an
+incorrect mode on the owning member with `st fleet mode listening`. This restarts installed
+services; without installed services (or with `--no-service`), restart `st3 replication-worker`
+as the command instructs. The restarted worker enables its listener and publishes the new
+mode/endpoints. Other nodes see it after replication and at most five seconds of membership
+caching. Reverse owner-RPC and PTY transport over a dial-out connection
+requires separate transport support.
+
 Uploaded bytes in `local_blobs` are staged locally until a durable claim references them.
 Claim admission promotes those bytes into `blobs` in the claim's transaction; every column of
 `blobs` remains in the shared digest. Unreferenced uploads never enter envelopes and cannot be
@@ -332,10 +367,21 @@ interface addresses stop being advertised.
 An HTTP link can return silently without changing either machine's addresses. For five minutes
 after a successful outbound exchange, a failed dialer's retry wait probes that same HTTP route
 every three seconds, with a one-second timeout. The probe uses `HEAD` on the existing exchange
-route: any HTTP response, including an older build's `405`, wakes a signed exchange at once.
-It neither exports an inventory nor records a failure. A route that has never worked, a replaced
-route, or a peer absent for more than five minutes keeps the long retry schedule. Transport life
-only schedules an exchange; the exchange still authenticates every claim and peer.
+route: any HTTP response, including an older build's `405`, caps that retry wait at 30 seconds
+without resetting its failure count. It neither exports an inventory nor records a failure.
+Probes do not extend their own eligibility window. Only authenticated activity, including an
+overload answer, keeps the 30-second cap active; a peer that answers probes but keeps failing
+signed exchanges returns to the long retry schedule after five minutes. A route that has never
+worked or a replaced route keeps the long retry schedule. Graph wakes
+still leave intentionally absent peers alone. Transport life only schedules an exchange;
+the exchange still authenticates every claim and peer.
+
+`st replication status` shows each outbound worker's `exchange`, `overload`, `heal`, `backoff`
+or `idle` phase, the last attempt time, and the next retry time during a wait. JSON carries
+these additive fields under each peer's `worker`. They are host-local memory and create no
+replicated claims; after a daemon restart they are absent until the worker reports again.
+An overload poll is a wait for the same signed request; a backoff follows a failed exchange
+or unavailable route.
 
 The same recovery applies to every member. A server may be absent for hours just as a laptop
 may be asleep. On daemon start, wake from sleep, network change or Fabric recovery, a member
@@ -345,6 +391,56 @@ backlog drains. The other side need not open a second connection or wait for its
 An absent member is shown with its last exchange time, and doctor and delivery attention wait
 for contact before judging its routes. Invalid signatures, rejected membership and corrupt
 records remain faults.
+
+## Exchange deadlines and overload
+
+Each HTTP request retains a 20-second caller deadline. After authentication, the responder
+allows 15 seconds of backend receive, projection/wake and export work before returning either
+the ordinary signed exchange or HTTP 503 with a signed `PeerResponse` value:
+
+```json
+{"code":"replication-overloaded","retry_after_ms":5000}
+```
+
+The response HMAC and member signature bind the body to the exact request digest, as for
+existing signed errors. The convenience `Retry-After: 5` header is not authoritative; callers
+use the verified body and clamp the delay to 5–30 seconds. Neither a 503 nor an unsigned probe
+claims inventory equality or completed receipt. Accepted envelopes remain in the durable log.
+
+A responder admits at most four backend exchange jobs, with one in flight for each peer.
+Identical retries share that job; a different request from a busy peer gets overload without
+starting more work. The job survives a cancelled response and completes receive and export.
+A completed answer is retained until delivered or evicted when other peers need the bounded
+cache. Receipt remains idempotent if a lost or evicted answer must be recomputed. Once delivered,
+a later identical inventory starts a fresh export, so quiet peers still discover new envelopes.
+An undelivered completed answer has no time expiry; a later identical request can consume it
+before the following exchange obtains a fresh inventory. Failed jobs return a signed 500 and
+are removed so a retry can recompute them. Invalid request JSON still returns signed 422.
+Backend failures no longer synchronously record a responder-side failure before sending headers;
+the initiating worker records its failed exchange. Worker status reporting is best effort with
+a one-second timeout per phase or poll. Reported round-trip time includes overload polling.
+Local store operations run on blocking threads so their disk waits cannot block the response timer.
+
+New callers poll the identical signed body after authenticated overload, for at most 60 HTTP
+attempts or five minutes per logical request, whichever comes first. Exhausting this budget
+enters visible backoff for an alive peer. The compact/full-inventory algorithm still has at
+most four logical signed exchange phases; overload polls are additional HTTP attempts inside
+each phase. Checkpoint manifest paging and local daemon operations keep their separate limits.
+Ordinary successful exchange payloads, inventory proofs and the peer API version are unchanged.
+Older callers understand the existing signed non-success response envelope and safely retry
+with their existing failure policy; overload polling and the shorter alive-peer retry policy
+require an upgraded initiating worker. Older responders continue answering ordinary requests
+without needing new fields. Worker status uses a separate local API endpoint: an older daemon
+returns 404, which the worker ignores, rather than mistaking status updates for failures.
+
+The isolated slow-export proofs use a 25-second export, beyond the original HTTP deadline:
+`sync::worker::tests::slow_export_returns_signed_overload_and_preserves_interrupted_receipt`
+checks signed overload, cancellation after durable receipt, one admission despite retries and
+both directions' notes. `authenticated_overload_polls_have_separate_time_and_request_bounds`
+checks the polling limit with an injected clock. The real daemon fixture
+`fleet::rejoin_slow_exports_preserve_live_claims_and_show_overload_retry` extends the checkpoint
+starvation fixture with slow exports, CLI phase/deadline checks and later live notes in both
+directions. The original normal-path fixture continues asserting at most four HTTP requests.
 
 ## Protocol
 
@@ -367,7 +463,7 @@ checkpoint, its earliest differing ranges may contain only payloadless checkpoin
 The worker runs at most one additional two-phase full-inventory round: it clears the summary's
 range digests, retaining the inventory digest, then sends the reverse difference proved by the
 peer's complete identity list. A bare digest never proves an empty inventory. There are at most
-four signed exchange requests in total. Existing checkpoint-manifest paging can make additional
+four logical signed exchange phases in total (four HTTP requests without overload). Existing checkpoint-manifest paging can make additional
 signed requests under its separate limits. Payload page limits, the 64 MiB exchange body cap,
 envelope admission and checkpoint certificate verification remain unchanged. The exceptional
 full comparison costs O(inventory), rather than the compact listing's bounded identity prefix.

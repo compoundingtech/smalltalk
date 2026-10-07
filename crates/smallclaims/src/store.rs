@@ -49,7 +49,7 @@ pub mod principals;
 pub mod projection_digest;
 pub mod runtime;
 
-pub use runtime::Runtime;
+pub use runtime::{IncrementalProjection, ReplayProgress, Runtime};
 
 pub use canonical::{CANONICAL_ORDER, CANONICAL_ORDER_DESC, canonical_sql};
 pub use checkpoint::{
@@ -68,6 +68,337 @@ pub use checkpoint_agreement::{
     first_verifications, newest_seals, participants as checkpoint_participants, stable_checkpoints,
 };
 pub use checkpoint_trim::{CheckpointManifestNeed, TRIM_CHUNK_ENVELOPES, TrimFault};
+
+/// A committed projection frontier plus optional work inside its current transaction.
+#[derive(Clone, Copy, Debug)]
+pub struct ProjectionProgress {
+    pub phase: &'static str,
+    pub frontier: u64,
+    pub target: u64,
+    pub processed: Option<u64>,
+    pub total: Option<u64>,
+}
+
+/// Keep diagnostics on one bounded line even when an error code or caller phase is untrusted.
+fn full_replay_log_line(phase: &str, reason: &str, frontier: u64, target: u64) -> String {
+    fn bounded(value: &str) -> String {
+        value
+            .chars()
+            .take(128)
+            .map(|c| if c.is_control() { '?' } else { c })
+            .collect()
+    }
+    format!(
+        "st: projection full replay phase={} reason={} frontier={frontier} target={target}",
+        bounded(phase),
+        bounded(reason)
+    )
+}
+
+const PROJECTION_DIAGNOSTIC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+const PROJECTION_DIAGNOSTIC_SLOTS: usize = 16;
+
+#[derive(Default)]
+struct ProjectionDiagnosticRate {
+    last_logged: Option<std::time::Instant>,
+    suppressed: u64,
+}
+
+impl ProjectionDiagnosticRate {
+    fn observe(&mut self, now: std::time::Instant) -> Option<u64> {
+        if self.last_logged.is_some_and(|last| {
+            now.saturating_duration_since(last) < PROJECTION_DIAGNOSTIC_INTERVAL
+        }) {
+            self.suppressed = self.suppressed.saturating_add(1);
+            return None;
+        }
+        self.last_logged = Some(now);
+        Some(std::mem::take(&mut self.suppressed))
+    }
+}
+
+#[derive(Default)]
+struct ProjectionDiagnosticState {
+    slots: Vec<(String, String, ProjectionDiagnosticRate)>,
+    overflow: ProjectionDiagnosticRate,
+}
+
+#[derive(Default)]
+struct ProjectionDiagnosticEmission {
+    suppressed: u64,
+    overflow: bool,
+}
+
+impl ProjectionDiagnosticState {
+    // Keys use only bounded stage/code prefixes, never claim or subject identifiers. Keep
+    // the first 16 keys; all subsequent keys share one overflow bucket without eviction.
+    // Counts measure suppressed reporter calls, not distinct errors. They are process-local
+    // and emitted only on a later allowed error; there is no scheduled flush or retry.
+    fn observe(
+        &mut self,
+        stage: &str,
+        code: &str,
+        now: std::time::Instant,
+    ) -> Option<ProjectionDiagnosticEmission> {
+        let stage: String = stage.chars().take(128).collect();
+        let code: String = code.chars().take(128).collect();
+        if let Some((_, _, rate)) = self
+            .slots
+            .iter_mut()
+            .find(|(s, c, _)| s == &stage && c == &code)
+        {
+            return rate
+                .observe(now)
+                .map(|suppressed| ProjectionDiagnosticEmission {
+                    suppressed,
+                    overflow: false,
+                });
+        }
+        if self.slots.len() < PROJECTION_DIAGNOSTIC_SLOTS {
+            let mut rate = ProjectionDiagnosticRate::default();
+            let suppressed = rate.observe(now)?;
+            self.slots.push((stage, code, rate));
+            return Some(ProjectionDiagnosticEmission {
+                suppressed,
+                overflow: false,
+            });
+        }
+        self.overflow
+            .observe(now)
+            .map(|suppressed| ProjectionDiagnosticEmission {
+                suppressed,
+                overflow: true,
+            })
+    }
+}
+
+/// One bounded, escaped diagnostic; only named identifiers are admitted from error details.
+/// Original exception text can quote input fragments (notably serde desired-decode errors);
+/// this preserves the error for diagnosis and does not provide general payload redaction.
+/// The persistent graph health message remains unchanged. Missing context stays explicit.
+fn projection_failure_log_line(
+    phase: &str,
+    code: &str,
+    message: &str,
+    details: &serde_json::Map<String, Value>,
+    frontier: u64,
+    target: u64,
+    emission: ProjectionDiagnosticEmission,
+) -> String {
+    fn bounded(value: &str, limit: usize) -> String {
+        value.chars().take(limit).collect()
+    }
+    let field = |name: &str| {
+        details
+            .get(name)
+            .and_then(Value::as_str)
+            .map(|s| bounded(s, 256))
+    };
+    let diagnostic = json!({
+        "phase": bounded(phase, 128), "code": bounded(code, 128),
+        "error": bounded(message, 4096), "error_truncated": message.chars().take(4097).count()>4096,
+        "stage": field("projection_stage"), "claim_id": field("projection_claim_id"),
+        "subject": field("projection_subject"), "operation_id": field("projection_operation_id"),
+        "frontier": frontier, "target": target,
+        "suppressed_errors": emission.suppressed, "rate_bucket_overflow": emission.overflow,
+        "context_truncated": details.get("projection_context_truncated").and_then(Value::as_bool).unwrap_or(false)
+            || phase.chars().take(129).count()>128 || code.chars().take(129).count()>128
+            || ["projection_stage", "projection_claim_id", "projection_subject", "projection_operation_id"].iter()
+                .any(|name| details.get(*name).and_then(Value::as_str).is_some_and(|value| value.chars().take(257).count()>256)),
+    });
+    format!("st: projection failure detail {diagnostic}")
+}
+
+#[cfg(test)]
+mod projection_failure_diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn diagnostic_rate_keeps_first_error_and_reports_reset_counts_by_stage_and_code() {
+        let now = std::time::Instant::now();
+        let mut state = ProjectionDiagnosticState::default();
+        assert_eq!(
+            state.observe("decode", "internal", now).unwrap().suppressed,
+            0
+        );
+        assert!(state.observe("decode", "internal", now).is_none());
+        assert!(
+            state
+                .observe(
+                    "decode",
+                    "internal",
+                    now + std::time::Duration::from_secs(59)
+                )
+                .is_none()
+        );
+        assert_eq!(
+            state
+                .observe("registry", "internal", now)
+                .unwrap()
+                .suppressed,
+            0
+        );
+        assert_eq!(
+            state.observe("decode", "conflict", now).unwrap().suppressed,
+            0
+        );
+        let next = now + PROJECTION_DIAGNOSTIC_INTERVAL;
+        assert_eq!(
+            state
+                .observe("decode", "internal", next)
+                .unwrap()
+                .suppressed,
+            2
+        );
+        assert!(state.observe("decode", "internal", next).is_none());
+        assert_eq!(
+            state
+                .observe("decode", "internal", next + PROJECTION_DIAGNOSTIC_INTERVAL)
+                .unwrap()
+                .suppressed,
+            1
+        );
+    }
+
+    #[test]
+    fn diagnostic_suppression_saturates_without_wrapping() {
+        let now = std::time::Instant::now();
+        let mut rate = ProjectionDiagnosticRate {
+            last_logged: Some(now),
+            suppressed: u64::MAX,
+        };
+        assert!(rate.observe(now).is_none());
+        assert_eq!(rate.suppressed, u64::MAX);
+        assert_eq!(
+            rate.observe(now + PROJECTION_DIAGNOSTIC_INTERVAL),
+            Some(u64::MAX)
+        );
+        assert_eq!(rate.suppressed, 0);
+    }
+
+    #[test]
+    fn diagnostic_keys_are_bounded_and_extra_keys_share_one_overflow_bucket() {
+        let now = std::time::Instant::now();
+        let mut state = ProjectionDiagnosticState::default();
+        let prefix = "é".repeat(128);
+        assert!(
+            !state
+                .observe(&format!("{prefix}first"), "internal", now)
+                .unwrap()
+                .overflow
+        );
+        assert!(
+            state
+                .observe(&format!("{prefix}second"), "internal", now)
+                .is_none()
+        );
+        for slot in 1..PROJECTION_DIAGNOSTIC_SLOTS {
+            assert!(
+                !state
+                    .observe(&slot.to_string(), "internal", now)
+                    .unwrap()
+                    .overflow
+            );
+        }
+        let first = state.observe("overflow-first", "internal", now).unwrap();
+        assert!(first.overflow);
+        assert_eq!(first.suppressed, 0);
+        for slot in 0..100 {
+            assert!(
+                state
+                    .observe(&format!("overflow-{slot}"), "different-code", now)
+                    .is_none()
+            );
+        }
+        let next = state
+            .observe(
+                "another-key",
+                "another-code",
+                now + PROJECTION_DIAGNOSTIC_INTERVAL,
+            )
+            .unwrap();
+        assert!(next.overflow);
+        assert_eq!(next.suppressed, 100);
+        assert_eq!(state.slots.len(), PROJECTION_DIAGNOSTIC_SLOTS);
+        assert!(state.slots.iter().all(|(stage, code, _)| stage.chars().count() <= 128 && code.chars().count() <= 128));
+        assert_eq!(state.overflow.suppressed, 0);
+    }
+
+    #[test]
+    fn diagnostic_reporter_releases_its_mutex_before_the_sink_and_preserves_error() {
+        let store = Store::open_memory("node", Arc::new(runtime::Plain)).unwrap();
+        let error = St3Error::new("internal", "original error with input fragment")
+            .with_detail("projection_stage", "decode");
+        let mut lines = Vec::new();
+        let mut sink = |line: &str| {
+            assert!(store.projection_diagnostics.try_lock().is_ok());
+            lines.push(line.to_owned());
+        };
+        store.log_projection_failure(&error, "receive", 7, 9, &mut sink);
+        store.log_projection_failure(&error, "receive", 7, 9, &mut sink);
+        {
+            let mut state = store.projection_diagnostics.lock().unwrap();
+            state.slots[0].2.last_logged =
+                Some(std::time::Instant::now() - PROJECTION_DIAGNOSTIC_INTERVAL);
+        }
+        store.log_projection_failure(&error, "receive", 7, 9, &mut sink);
+        assert_eq!(lines.len(), 2);
+        for (line, suppressed) in lines.iter().zip([0, 1]) {
+            let value: Value =
+                serde_json::from_str(line.strip_prefix("st: projection failure detail ").unwrap())
+                    .unwrap();
+            assert_eq!(value["error"], error.message);
+            assert_eq!(value["suppressed_errors"], suppressed);
+            assert_eq!(value["rate_bucket_overflow"], false);
+        }
+    }
+
+    #[test]
+    fn error_diagnostic_is_escaped_bounded_and_does_not_copy_extra_details() {
+        let details = serde_json::Map::from_iter([
+            ("projection_claim_id".into(), json!("claim")),
+            ("projection_subject".into(), json!("subject\nnext")),
+            ("secret-payload".into(), json!("never copy")),
+        ]);
+        let line = projection_failure_log_line(
+            "phase\nnext",
+            "internal",
+            &"é".repeat(5000),
+            &details,
+            7,
+            9,
+            ProjectionDiagnosticEmission::default(),
+        );
+        assert_eq!(line.lines().count(), 1);
+        let value: Value =
+            serde_json::from_str(line.strip_prefix("st: projection failure detail ").unwrap())
+                .unwrap();
+        assert_eq!(value["error"].as_str().unwrap().chars().count(), 4096);
+        assert_eq!(value["error_truncated"], true);
+        assert_eq!(value["claim_id"], "claim");
+        assert_eq!(value["subject"], "subject\nnext");
+        assert_eq!(value["operation_id"], Value::Null);
+        assert!(!line.contains("never copy"));
+        let short = projection_failure_log_line(
+            "phase",
+            "internal",
+            "exact original SQL error",
+            &serde_json::Map::new(),
+            7,
+            9,
+            ProjectionDiagnosticEmission::default(),
+        );
+        let value: Value = serde_json::from_str(
+            short
+                .strip_prefix("st: projection failure detail ")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(value["error"], "exact original SQL error");
+        assert_eq!(value["error_truncated"], false);
+        assert_eq!(value["claim_id"], Value::Null);
+    }
+}
 
 /// The graph's tables: the claim log and its batches, operations, documents and blobs, replica
 /// envelopes and records, peers, fleet invites and checkpoints. A runtime adds its own.
@@ -367,12 +698,16 @@ pub struct Store {
     pub replication_sync: Mutex<BTreeMap<String, PeerSyncProgress>>,
     /// Held while replicated envelopes are admitted; see `validate_replication_backlog`.
     pub admission: Mutex<()>,
+    /// The membership last folded, and the `fleet_generation` it was folded at.
+    pub membership_cache: Mutex<Option<(i64, crate::fleet::Membership)>>,
     /// Serializes projection passes while they lend the writer back between chunks.
     pub projection: Mutex<()>,
     pub replication_timers: ReplicationTimers,
     /// Low bit means deferred; each new deferral advances the generation by two so an
     /// older projection pass cannot clear a newer admission or catch-up deferral.
     replication_projection_state: AtomicU64,
+    /// Only limits new error detail lines; it never caches projection results or decisions.
+    projection_diagnostics: Mutex<ProjectionDiagnosticState>,
     /// When this process last projected replicated claims, in Unix milliseconds.
     pub last_replication_projection_unix_ms: AtomicU64,
     /// The heals this node asks its peers, and when it last replayed its graph for one.
@@ -493,6 +828,7 @@ impl Store {
         reject_old_schema(connection)?;
         runtime.migrate_schema(connection)?;
         connection.execute_batch(SCHEMA)?;
+        connection.execute_batch(&fleet_generation_schema())?;
         inventory_generation::initialize(connection)?;
         connection.execute_batch(principals::PRINCIPAL_SCHEMA)?;
         runtime.create_schema(connection)?;
@@ -521,14 +857,43 @@ impl Store {
         // Opening cannot seal recent work: the caller has not loaded its signing keys yet.
         // Resume at the first batch still needing an envelope, so a restart seals it with
         // the same person and agent keys instead of permanently losing its delegation signatures.
-        let seeded_batch_rowid = connection.query_row(
-            "SELECT COALESCE(
-                (SELECT MIN(batches.rowid)-1 FROM batches WHERE NOT EXISTS (
-                    SELECT 1 FROM replica_envelopes WHERE batch_id=batches.id)),
-                (SELECT MAX(rowid) FROM batches), 0)",
+        //
+        // Finding that batch meant probing the envelope table once per batch, 611,000 probes: 3 to
+        // 9 s on every start. Sealing stores how far it has gone in `meta` in the transaction
+        // that seals, so a start reads it. It is a lower bound that is always safe: sealing only
+        // seals batches that still lack an envelope, so a cursor behind the truth costs a longer
+        // range, never a missed batch. A store without the cursor, once, finds it the slow way.
+        let max_rowid: i64 = connection.query_row(
+            "SELECT COALESCE(MAX(rowid), 0) FROM batches",
             [],
             |row| row.get(0),
         )?;
+        let stored_cursor: Option<i64> = connection
+            .query_row(
+                "SELECT value FROM meta WHERE key='seeded_batch_rowid'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|value| value.parse().ok());
+        let seeded_batch_rowid = match stored_cursor {
+            Some(cursor) => cursor.min(max_rowid),
+            None => {
+                let found: i64 = connection.query_row(
+                    "SELECT COALESCE(
+                        (SELECT MIN(batches.rowid)-1 FROM batches WHERE NOT EXISTS (
+                            SELECT 1 FROM replica_envelopes WHERE batch_id=batches.id)),
+                        (SELECT MAX(rowid) FROM batches), 0)",
+                    [],
+                    |row| row.get(0),
+                )?;
+                connection.execute(
+                    "INSERT OR REPLACE INTO meta(key,value) VALUES('seeded_batch_rowid', ?1)",
+                    [found.to_string()],
+                )?;
+                found
+            }
+        };
         let index = current_index(&connection)?;
         // Older stores have no admission watermark. Startup recovery projects this index
         // before serving; subsequent admission chunks update it in their own transaction.
@@ -547,9 +912,11 @@ impl Store {
             replication_snapshot_build: Mutex::new(()),
             replication_sync: Mutex::new(BTreeMap::new()),
             admission: Mutex::new(()),
+            membership_cache: Mutex::new(None),
             projection: Mutex::new(()),
             replication_timers: ReplicationTimers::default(),
             replication_projection_state: AtomicU64::new(0),
+            projection_diagnostics: Mutex::new(ProjectionDiagnosticState::default()),
             last_replication_projection_unix_ms: AtomicU64::new(0),
             heal: Mutex::default(),
             member_key: std::sync::RwLock::new(None),
@@ -661,6 +1028,7 @@ pub struct PeerSyncProgress {
     pub heal_started_at_unix_ms: Option<u128>,
     pub heal_backoff_ms: u128,
     pub heal: Option<ReplicationHealReport>,
+    pub worker: Option<crate::replication::ReplicationWorkerStatus>,
     /// How many envelopes this node held when it took the last measurement.
     pub measured_inventory_envelopes: u64,
 }
@@ -1399,10 +1767,39 @@ impl Store {
 
     /// The current fleet membership, folded from admitted `fleet.*` claims.
     pub fn fleet_membership(&self) -> Result<crate::fleet::Membership> {
+        // Membership is a function of the fleet claims, their envelopes' signatures and the
+        // anchor, and triggers advance `fleet_generation` whenever any of them changes. Fold it
+        // when the generation moved, not on every call: folding is hundreds of statements, and
+        // callers ask on every graph change, a few times a second.
+        let generation = |connection: &Connection| -> Result<i64> {
+            Ok(connection.query_row(
+                "SELECT value FROM fleet_generation WHERE id=1",
+                [],
+                |row| row.get(0),
+            )?)
+        };
+        {
+            let current = generation(&self.readers.get())?;
+            let cache = self
+                .membership_cache
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some((folded_at, membership)) = cache.as_ref()
+                && *folded_at == current
+            {
+                return Ok(membership.clone());
+            }
+        }
         // A local claim counts only once its batch is an envelope with this node's signature.
         self.replication_snapshot()?;
         let connection = self.readers.get();
-        fleet_membership_tx(&connection)
+        let folded_at = generation(&connection)?;
+        let membership = fleet_membership_tx(&connection)?;
+        *self
+            .membership_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some((folded_at, membership.clone()));
+        Ok(membership)
     }
 
     /// Whether transport observations about `peer` belong in the graph. A dial-out member is
@@ -1736,6 +2133,61 @@ pub fn max_envelope_rowid(connection: &Connection) -> Result<i64> {
 
 /// Fold the admitted `fleet.*` claims from the pinned anchor. A store without an anchor has an
 /// empty membership, in which every writer is legacy.
+/// A counter that moves whenever fleet membership could: a fleet claim, the envelope that carries
+/// it, a signature on that envelope, or the anchor. `fleet_membership` re-folds only when it moved.
+fn fleet_generation_schema() -> String {
+    let bump = "UPDATE fleet_generation SET value=value+1 WHERE id=1;";
+    let carries_fleet_claims = |envelope: &str| {
+        format!(
+            "EXISTS (SELECT 1 FROM claims WHERE batch_id={envelope}.batch_id \
+             AND kind IN ({FLEET_CLAIM_KINDS}))"
+        )
+    };
+    let signs_fleet_claims = |signature: &str| {
+        format!(
+            "EXISTS (SELECT 1 FROM replica_envelopes AS envelopes \
+             JOIN claims ON claims.batch_id=envelopes.batch_id \
+             WHERE envelopes.writer={signature}.writer AND envelopes.sequence={signature}.sequence \
+             AND envelopes.envelope_hash={signature}.envelope_hash \
+             AND claims.kind IN ({FLEET_CLAIM_KINDS}))"
+        )
+    };
+    format!(
+        "CREATE TABLE IF NOT EXISTS fleet_generation (
+             id INTEGER PRIMARY KEY CHECK(id=1), value INTEGER NOT NULL);
+         INSERT OR IGNORE INTO fleet_generation(id, value) VALUES (1, 0);
+         CREATE TRIGGER IF NOT EXISTS fleet_generation_claim_insert AFTER INSERT ON claims
+         WHEN NEW.kind IN ({FLEET_CLAIM_KINDS}) BEGIN {bump} END;
+         CREATE TRIGGER IF NOT EXISTS fleet_generation_claim_delete AFTER DELETE ON claims
+         WHEN OLD.kind IN ({FLEET_CLAIM_KINDS}) BEGIN {bump} END;
+         CREATE TRIGGER IF NOT EXISTS fleet_generation_claim_update
+         AFTER UPDATE OF kind, batch_id, body ON claims
+         WHEN NEW.kind IN ({FLEET_CLAIM_KINDS}) OR OLD.kind IN ({FLEET_CLAIM_KINDS})
+         BEGIN {bump} END;
+         CREATE TRIGGER IF NOT EXISTS fleet_generation_envelope_insert AFTER INSERT ON replica_envelopes
+         WHEN NEW.batch_id IS NOT NULL AND {insert_envelope} BEGIN {bump} END;
+         CREATE TRIGGER IF NOT EXISTS fleet_generation_envelope_update
+         AFTER UPDATE OF batch_id ON replica_envelopes
+         WHEN NEW.batch_id IS NOT NULL AND {update_envelope} BEGIN {bump} END;
+         CREATE TRIGGER IF NOT EXISTS fleet_generation_signature_insert
+         AFTER INSERT ON replica_envelope_signatures
+         WHEN {insert_signature} BEGIN {bump} END;
+         CREATE TRIGGER IF NOT EXISTS fleet_generation_signature_delete
+         AFTER DELETE ON replica_envelope_signatures
+         WHEN {delete_signature} BEGIN {bump} END;
+         CREATE TRIGGER IF NOT EXISTS fleet_generation_anchor_insert AFTER INSERT ON meta
+         WHEN NEW.key='fleet_anchor_key' BEGIN {bump} END;
+         CREATE TRIGGER IF NOT EXISTS fleet_generation_anchor_update AFTER UPDATE ON meta
+         WHEN NEW.key='fleet_anchor_key' OR OLD.key='fleet_anchor_key' BEGIN {bump} END;
+         CREATE TRIGGER IF NOT EXISTS fleet_generation_anchor_delete AFTER DELETE ON meta
+         WHEN OLD.key='fleet_anchor_key' BEGIN {bump} END;",
+        insert_envelope = carries_fleet_claims("NEW"),
+        update_envelope = carries_fleet_claims("NEW"),
+        insert_signature = signs_fleet_claims("NEW"),
+        delete_signature = signs_fleet_claims("OLD"),
+    )
+}
+
 pub fn fleet_membership_tx(connection: &Connection) -> Result<crate::fleet::Membership> {
     fleet_membership_tx_with_local_signer(connection, None)
 }
@@ -3002,6 +3454,13 @@ pub const REPLICATION_SYNC_STALE_MS: u128 = 300_000;
 /// A peer counts as up for this long after its last exchange in either direction.
 pub const PEER_UP_MS: u128 = 90_000;
 
+/// Nominal lifetime of replicated up evidence, with room for quiet sync and relay delays.
+pub const TRANSPORT_LINK_MAX_AGE_MS: u128 = 2 * 60 * 60 * 1_000;
+/// Refresh a stable up at most once per 15 minutes: at most 96 claims per directed link/day.
+pub const TRANSPORT_LINK_REFRESH_MS: u128 = 15 * 60 * 1_000;
+/// Allow bounded observer/reader clock skew; farther-future evidence is unusable.
+pub const TRANSPORT_LINK_CLOCK_SKEW_MS: u128 = 5 * 60 * 1_000;
+
 /// Healthy peers exchange at least once per 30-second quiet interval. Once this long has passed
 /// since the last exchange and an attempt since then failed, the peer is not up: it missed an
 /// exchange, and the one this node tried did not happen. A failure sooner than this can be a
@@ -4256,6 +4715,18 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// The id of a subject's newest claim in canonical order: a seek of the newest time block,
+    /// not a read of every claim of the subject.
+    pub fn latest_claim_id(&self, subject: &str) -> Result<Option<String>> {
+        crate::touched::note_read(|| subject.to_owned());
+        let connection = self.readers.get();
+        connection
+            .prepare_cached(&canonical_sql(LATEST_CLAIM_QUERY))?
+            .query_row([subject], |row| row.get(0))
+            .optional()
+            .map_err(Into::into)
+    }
+
     /// Append a claim this node writes, through the runtime that knows its kind.
     pub fn append_claim(&self, input: &ClaimInput) -> Result<ClaimRecord, St3Error> {
         self.append_claim_outcome(input).map(|(claim, _)| claim)
@@ -4781,6 +5252,10 @@ impl Store {
                 Some(&|claim: &principals::Unsealed<'_>| self.sign_unsealed(claim)),
             )?;
             self.sign_own_envelopes_range_tx(&transaction, Some(seeded_through), Some(through))?;
+            transaction.execute(
+                "INSERT OR REPLACE INTO meta(key,value) VALUES('seeded_batch_rowid', ?1)",
+                [through.to_string()],
+            )?;
             transaction.commit()?;
             self.seeded_batch_rowid.store(through, Ordering::Release);
             // The FIFO writer services any already queued request before the next loan.
@@ -5472,26 +5947,9 @@ impl Store {
                 )
                 .optional()?
                 .is_none();
-            let mut statement = connection.prepare(
-                "WITH retry_ids AS (
-                     SELECT writer, sequence, envelope_hash FROM replica_envelopes
-                     WHERE receipt_state='pending'
-                     UNION
-                     SELECT writer, sequence, envelope_hash FROM replica_records
-                     WHERE state='unknown'
-                        OR (state='invalid' AND error_code='invalid-replicated-claim'
-                            AND error_message LIKE '%violates unknown-claim-field:%')
-                        OR (?1 AND state='invalid' AND error_code='claim-hash-mismatch')
-                 )
-                 SELECT envelopes.writer, envelopes.sequence, envelopes.envelope_hash,
-                        envelopes.previous_hash, envelopes.accepted_at_unix_ms, envelopes.payload
-                 FROM retry_ids JOIN replica_envelopes AS envelopes
-                   ON envelopes.writer=retry_ids.writer AND envelopes.sequence=retry_ids.sequence
-                  AND envelopes.envelope_hash=retry_ids.envelope_hash
-                 ORDER BY envelopes.writer, envelopes.sequence, envelopes.envelope_hash",
-            )?;
+            let mut statement = connection.prepare(&admission_retry_query(retry_hash_mismatches))?;
             let envelopes = statement
-                .query_map([retry_hash_mismatches], |row| {
+                .query_map([], |row| {
                     Ok(ReplicaEnvelope {
                         writer: row.get(0)?,
                         sequence: row.get(1)?,
@@ -5507,7 +5965,12 @@ impl Store {
             (retry_hash_mismatches, envelopes)
         };
         let mut outcome = ReplicationAdmission::default();
-        let mut membership = fleet_membership_tx(&self.connection.write())?;
+        // Membership is a few hundred statements on the writer; with nothing to admit, skip it.
+        let mut membership = if envelopes.is_empty() {
+            Default::default()
+        } else {
+            fleet_membership_tx(&self.connection.write())?
+        };
         let mut pending = envelopes;
         // Admitting one envelope can admit a membership claim that decides another envelope,
         // so held envelopes get another pass whenever membership changes.
@@ -5655,25 +6118,113 @@ impl Store {
     }
 
     pub fn project_replication_backlog(&self) -> Result<bool> {
-        self.project_replication_backlog_chunks(|| {}, || {})
+        self.project_replication_backlog_in_phase("replication")
+    }
+
+    /// Identify the caller's phase in the always-on full-replay diagnostic.
+    pub fn project_replication_backlog_in_phase(&self, phase: &str) -> Result<bool> {
+        self.project_replication_backlog_chunks(
+            || {},
+            || {},
+            phase,
+            |line| eprintln!("{line}"),
+            |_| {},
+        )
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn project_replication_backlog_with_log(
+        &self,
+        phase: &str,
+        log: impl FnMut(&str),
+    ) -> Result<bool> {
+        self.project_replication_backlog_chunks(|| {}, || {}, phase, log, |_| {})
+    }
+
+    /// Publish bounded observations on the projection thread; observers must not read the store.
+    pub fn project_replication_backlog_with_progress(
+        &self,
+        phase: &str,
+        progress: impl FnMut(ProjectionProgress),
+    ) -> Result<bool> {
+        self.project_replication_backlog_chunks(
+            || {},
+            || {},
+            phase,
+            |line| eprintln!("{line}"),
+            progress,
+        )
     }
 
     /// Exercise reads and queued writes between committed projection chunks.
     #[cfg(any(test, feature = "test-support"))]
     pub fn project_replication_backlog_with_yield(&self, between: impl FnMut()) -> Result<bool> {
-        self.project_replication_backlog_chunks(between, || {})
+        self.project_replication_backlog_chunks(
+            between,
+            || {},
+            "replication",
+            |line| eprintln!("{line}"),
+            |_| {},
+        )
     }
 
     /// Force an admission or deferral after the final index read, before clearing its state.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn project_replication_backlog_before_clear(&self, before_clear: impl FnMut()) -> Result<bool> {
-        self.project_replication_backlog_chunks(|| {}, before_clear)
+    pub fn project_replication_backlog_before_clear(
+        &self,
+        before_clear: impl FnMut(),
+    ) -> Result<bool> {
+        self.project_replication_backlog_chunks(
+            || {},
+            before_clear,
+            "replication",
+            |line| eprintln!("{line}"),
+            |_| {},
+        )
+    }
+
+    fn log_projection_failure(
+        &self,
+        error: &St3Error,
+        phase: &str,
+        frontier: u64,
+        target: u64,
+        log: &mut impl FnMut(&str),
+    ) {
+        let stage = error
+            .details
+            .get("projection_stage")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let emission = {
+            let mut state = self
+                .projection_diagnostics
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            state.observe(stage, error.code, std::time::Instant::now())
+        };
+        // Release the diagnostic mutex before formatting or invoking the caller's log sink.
+        // The caller still holds its existing projection transaction at this boundary.
+        if let Some(emission) = emission {
+            log(&projection_failure_log_line(
+                phase,
+                error.code,
+                &error.message,
+                &error.details,
+                frontier,
+                target,
+                emission,
+            ));
+        }
     }
 
     fn project_replication_backlog_chunks(
         &self,
         mut between: impl FnMut(),
         mut before_clear: impl FnMut(),
+        phase: &str,
+        mut log: impl FnMut(&str),
+        mut progress: impl FnMut(ProjectionProgress),
     ) -> Result<bool> {
         let _projecting = self
             .projection
@@ -5708,6 +6259,13 @@ impl Store {
                     |row| row.get::<_, Option<u64>>(0),
                 )?
                 .unwrap_or(target.max(frontier));
+            progress(ProjectionProgress {
+                phase: "project-incremental",
+                frontier,
+                target,
+                processed: None,
+                total: None,
+            });
             let result = (|| -> Result<bool, St3Error> {
                 // An incremental projection that fails is rolled back and replaced by a full replay,
                 // which quarantines the claim it cannot project instead of failing the graph.
@@ -5715,7 +6273,7 @@ impl Store {
                     .execute_batch("SAVEPOINT project_incremental")
                     .map_err(internal)?;
                 let incremental = crate::profile::span("projection/incremental");
-                let projected =
+                let fallback_reason =
                     match self
                         .runtime
                         .project_incremental(&transaction, &self.origin, through)
@@ -5724,9 +6282,29 @@ impl Store {
                             transaction
                                 .execute_batch("RELEASE project_incremental")
                                 .map_err(internal)?;
-                            projected
+                            match projected {
+                                IncrementalProjection::Projected => None,
+                                IncrementalProjection::Replay(reason) => Some(reason.to_owned()),
+                                IncrementalProjection::ReplayWithContext { reason, details } => {
+                                    let message = details
+                                        .get("projection_error")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or(reason)
+                                        .to_owned();
+                                    let error = St3Error {
+                                        code: reason,
+                                        message,
+                                        details,
+                                    };
+                                    self.log_projection_failure(
+                                        &error, phase, frontier, target, &mut log,
+                                    );
+                                    Some(reason.to_owned())
+                                }
+                            }
                         }
                         Err(error) => {
+                            self.log_projection_failure(&error, phase, frontier, target, &mut log);
                             crate::profile::note(&format!(
                                 "replay: incremental failed: {}",
                                 error.code
@@ -5736,20 +6314,37 @@ impl Store {
                                     "ROLLBACK TO project_incremental; RELEASE project_incremental",
                                 )
                                 .map_err(internal)?;
-                            false
+                            Some(format!("incremental-error:{}", error.code))
                         }
                     };
                 drop(incremental);
-                if !projected {
+                let projected = fallback_reason.is_none();
+                if let Some(reason) = fallback_reason {
+                    log(&full_replay_log_line(phase, &reason, frontier, target));
                     #[cfg(any(test, feature = "test-support"))]
                     FULL_REPLAYS.with(|replays| replays.set(replays.get() + 1));
                     let _replay = crate::profile::span("projection/full-replay");
                     crate::profile::note("projection: full replay");
-                    self.runtime.replay_from_nothing(&transaction)?;
+                    self.runtime
+                        .replay_from_nothing_with_progress(&transaction, &mut |stage| {
+                            progress(ProjectionProgress {
+                                phase: stage.phase,
+                                frontier,
+                                target,
+                                processed: stage.processed,
+                                total: stage.total,
+                            });
+                        })?;
                 } else {
                     crate::profile::note("projection: incremental");
                 }
-                self.runtime.after_projection(&transaction)?;
+                self.runtime
+                    .after_projection(&transaction)
+                    .map_err(|error| {
+                        let error = error.with_detail("projection_stage", "after-projection");
+                        self.log_projection_failure(&error, phase, frontier, target, &mut log);
+                        error
+                    })?;
                 Ok(!projected)
             })();
             match result {
@@ -5769,6 +6364,13 @@ impl Store {
                     params![through, now_ms().to_string()],
                 )?;
                     transaction.commit()?;
+                    progress(ProjectionProgress {
+                        phase: "projection-committed",
+                        frontier: through,
+                        target,
+                        processed: None,
+                        total: None,
+                    });
                     // Snapshot while admission is excluded by the writer. Admission marks
                     // deferred before its commit, so sampling during one could otherwise
                     // mistake its not-yet-committed claims for an empty backlog.
@@ -6069,10 +6671,23 @@ impl Store {
     /// The transport links the fleet currently observes as up, as `(observer, observed)` node
     /// names: each observer's latest observation of each peer, from every replicated node.
     pub fn transport_links(&self) -> Result<Vec<(String, String)>> {
+        self.transport_links_at(now_ms())
+    }
+
+    /// Evaluate route evidence at an explicit time, using the observation's original timestamp,
+    /// never its local receipt time. Dial-out members cannot carry bidirectional owner routes.
+    pub fn transport_links_at(&self, now: u128) -> Result<Vec<(String, String)>> {
+        let membership = self.fleet_view_sealed()?;
+        let dial_out = |name: &str| {
+            membership.members.iter().any(|member| {
+                member.name == name && member.state == "current" && member.mode == "dial-out"
+            })
+        };
         let connection = self.readers.get();
         let mut statement = connection.prepare_cached(&canonical_sql(
-            "SELECT origin, subject, json_extract(body, '$.fields.status') FROM (
-                SELECT origin, subject, body,
+            "SELECT origin, subject, json_extract(body, '$.fields.status'),
+                    accepted_at_unix_ms, json_extract(body, '$.fields.last_success_at') FROM (
+                SELECT origin, subject, body, accepted_at_unix_ms,
                     ROW_NUMBER() OVER (PARTITION BY origin, subject ORDER BY CANONICAL_DESC(claims)) AS canonical_rank
                 FROM claims WHERE kind='transport.observed'
              ) WHERE canonical_rank=1 ORDER BY origin, subject",
@@ -6082,14 +6697,29 @@ impl Store {
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<u64>>(4)?,
             ))
         })?;
         let mut links = Vec::new();
         for row in rows {
-            let (observer, subject, status) = row?;
+            let (observer, subject, status, accepted_at, last_success_at) = row?;
             if let (Some(observed), Some("up")) = (subject.strip_prefix("host/"), status.as_deref())
             {
-                links.push((observer, observed.to_owned()));
+                // Older observations may lack last_success_at; their original claim time
+                // still bounds them. A newly replicated old success must not become fresh.
+                let observed_at = last_success_at
+                    .map(u128::from)
+                    .or_else(|| accepted_at.parse().ok());
+                if observed_at.is_some_and(|at| {
+                    at <= now.saturating_add(TRANSPORT_LINK_CLOCK_SKEW_MS)
+                        && now.saturating_sub(at)
+                            < TRANSPORT_LINK_MAX_AGE_MS + TRANSPORT_LINK_CLOCK_SKEW_MS
+                }) && !dial_out(&observer)
+                    && !dial_out(observed)
+                {
+                    links.push((observer, observed.to_owned()));
+                }
             }
         }
         Ok(links)
@@ -6110,17 +6740,35 @@ impl Store {
         };
         let reason = if status == "unknown" { None } else { reason };
         let subject = format!("host/{peer}");
-        let already_current = self
-            .latest_claim(&subject, Some("transport.observed"))?
-            .and_then(|claim| {
-                claim
-                    .body
-                    .pointer("/fields/status")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
-            .as_deref()
-            == Some(status);
+        let now = now_ms();
+        // Another member's observation of this peer cannot renew this node's evidence.
+        let latest: Option<(String, String)> = self
+            .readers
+            .get()
+            .query_row(
+                &canonical_sql(
+                    "SELECT body, accepted_at_unix_ms FROM claims
+                WHERE subject=?1 AND kind='transport.observed' AND origin=?2
+                ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+                ),
+                params![subject, self.origin],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let already_current = latest.is_some_and(|(body, accepted_at)| {
+            let body: Value = serde_json::from_str(&body).unwrap_or_default();
+            let observed_at = body
+                .pointer("/fields/last_success_at")
+                .and_then(Value::as_u64)
+                .map(u128::from)
+                .or_else(|| accepted_at.parse().ok());
+            body.pointer("/fields/status").and_then(Value::as_str) == Some(status)
+                && (status != "up"
+                    || observed_at.is_some_and(|at| {
+                        at <= now.saturating_add(TRANSPORT_LINK_CLOCK_SKEW_MS)
+                            && now.saturating_sub(at) < TRANSPORT_LINK_REFRESH_MS
+                    }))
+        });
         if already_current {
             return Ok(());
         }
@@ -6166,7 +6814,7 @@ impl Store {
     }
 
     /// When this replica last exchanged records with `peer`. The peer row records every
-    /// success, while the `transport.observed` claim changes only with the peer's status.
+    /// success, while an unchanged up claim is refreshed only at its bounded interval.
     pub fn replication_peer_last_success(&self, peer: &str) -> Result<Option<u128>> {
         let connection = self.readers.get();
         Ok(connection
@@ -6214,6 +6862,20 @@ impl Store {
             .unwrap_or_else(PoisonError::into_inner)
             .values()
             .any(|progress| progress.view(now).is_some_and(|sync| sync.diverged))
+    }
+
+    /// Update host-local worker status without writing the graph.
+    pub fn record_replication_worker(
+        &self,
+        peer: &str,
+        worker: crate::replication::ReplicationWorkerStatus,
+    ) {
+        self.replication_sync
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(peer.to_owned())
+            .or_default()
+            .worker = Some(worker);
     }
 
     /// The latest sync measurement for each configured peer that has one.
@@ -6345,6 +7007,7 @@ impl Store {
                         let updated_at = row.get::<_, String>(6)?.parse::<u128>().ok();
                         Ok((
                             ReplicationPeerStatus {
+                                worker: None,
                                 peer: peer.clone(),
                                 status: row.get(0)?,
                                 last_success_at_unix_ms: row
@@ -6368,6 +7031,7 @@ impl Store {
                 .optional()?
                 .unwrap_or((
                     ReplicationPeerStatus {
+                        worker: None,
                         peer: peer.clone(),
                         status: "unknown".into(),
                         last_success_at_unix_ms: None,
@@ -6412,6 +7076,12 @@ impl Store {
                 status.refusal_reason = Some(reason);
                 status.last_error = None;
             }
+            status.worker = self
+                .replication_sync
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(peer)
+                .and_then(|progress| progress.worker.clone());
             status.sync = sync.get(peer).cloned();
             // A comparison can finish after the peer row's receipt timestamp. Once that
             // peer is last-seen after a failed exchange, its cached measurement is stale
@@ -6613,6 +7283,41 @@ pub fn normalize_actor(value: &str, default_kind: &str) -> String {
     } else {
         format!("{default_kind}/{value}")
     }
+}
+
+/// The envelopes admission looks at again: pending ones, and records that wait for a newer build
+/// or failed for a reason a newer build may fix. One index seek per branch. A single
+/// `WHERE state='unknown' OR (state='invalid' ...)` made SQLite scan every replica record, and the
+/// join then scanned every envelope: seconds on the writer, on every receive, with nothing
+/// pending. The hash-mismatch branch exists only until its one-time retry has run.
+pub fn admission_retry_query(retry_hash_mismatches: bool) -> String {
+    let hash_mismatches = if retry_hash_mismatches {
+        "UNION
+             SELECT writer, sequence, envelope_hash FROM replica_records
+             WHERE state='invalid' AND error_code='claim-hash-mismatch'"
+    } else {
+        ""
+    };
+    format!(
+        "WITH retry_ids AS (
+             SELECT writer, sequence, envelope_hash FROM replica_envelopes
+             WHERE receipt_state='pending'
+             UNION
+             SELECT writer, sequence, envelope_hash FROM replica_records
+             WHERE state='unknown'
+             UNION
+             SELECT writer, sequence, envelope_hash FROM replica_records
+             WHERE state='invalid' AND error_code='invalid-replicated-claim'
+               AND error_message LIKE '%violates unknown-claim-field:%'
+             {hash_mismatches}
+         )
+         SELECT envelopes.writer, envelopes.sequence, envelopes.envelope_hash,
+                envelopes.previous_hash, envelopes.accepted_at_unix_ms, envelopes.payload
+         FROM retry_ids CROSS JOIN replica_envelopes AS envelopes
+           ON envelopes.writer=retry_ids.writer AND envelopes.sequence=retry_ids.sequence
+          AND envelopes.envelope_hash=retry_ids.envelope_hash
+         ORDER BY envelopes.writer, envelopes.sequence, envelopes.envelope_hash"
+    )
 }
 
 /// Subject `?1`'s newest claim of kind `?2` in canonical order. See [`Store::latest_claim`].
@@ -7285,4 +7990,15 @@ pub fn append_claim_record_tx(
         predecessors: predecessors.to_vec(),
         accepted_at_unix_ms: now,
     })
+}
+
+#[cfg(test)]
+mod replay_log_tests {
+    #[test]
+    fn replay_log_is_bounded_and_single_line() {
+        let line = super::full_replay_log_line(&"phase\n".repeat(200), &"reason\r\t".repeat(200), u64::MAX, u64::MAX);
+        assert!(!line.contains(['\n', '\r', '\t']));
+        assert!(line.len() < 1200);
+        assert!(line.contains(&format!("frontier={} target={}", u64::MAX, u64::MAX)));
+    }
 }

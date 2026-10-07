@@ -1,4 +1,4 @@
-import type { Agent } from '../../clients/typescript/st3-client';
+import type { Agent, Mission } from '../../clients/typescript/st3-client';
 import { ago } from './presentation';
 import type { SessionView } from '@smalltalk/st3-views';
 import { harnessColor, theme } from './theme';
@@ -24,6 +24,8 @@ export type AgentRowView = {
   activity: string;
   /** The graph path under the name. */
   path: string;
+  /** What the step it holds last reported (`st work progress`), on one line: the status read first. */
+  progress?: string;
   host: string;
   parent?: string;
 };
@@ -132,6 +134,18 @@ export const AGENT_LEGEND: ReadonlyArray<{ state: AgentState; word: string }> = 
   { state: 'unknown', word: 'unmanaged' },
 ];
 
+/** What a step last reported, on one line; the step run's id names it in whichever run holds it. */
+export function stepProgress(missions: Mission[], stepId: string): string | undefined {
+  for (const mission of missions) {
+    for (const run of mission.run_details ?? []) {
+      const step = (run.steps ?? []).find(candidate => candidate.id === stepId);
+      const line = step?.last_progress?.split(/\s+/).filter(Boolean).join(' ');
+      if (step) return line || undefined;
+    }
+  }
+  return undefined;
+}
+
 function host(id: string | null | undefined): string {
   return id ? id.replace(/^host\//, '') : '?';
 }
@@ -140,8 +154,9 @@ function host(id: string | null | undefined): string {
  * Every seat st declares, then every running session st found but did not start. Undeclared
  * sessions are named `driver in workspace` and belong to the gateway's host.
  */
-export function agentRows(agents: Agent[], sessions: SessionView[], gatewayHost: string, now = Date.now()): AgentRowView[] {
+export function agentRows(agents: Agent[], sessions: SessionView[], gatewayHost: string, now = Date.now(), missions: Mission[] = []): AgentRowView[] {
   const declared = agents.map((agent): AgentRowView => ({
+    progress: agent.current_work?.[0] ? stepProgress(missions, agent.current_work[0].id) : undefined,
     id: agent.id,
     target: agent.id,
     name: agentName(agent),

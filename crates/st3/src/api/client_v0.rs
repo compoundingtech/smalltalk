@@ -6,6 +6,8 @@ use std::collections::BTreeSet;
 pub(super) mod raw_terminal;
 pub(super) mod resources;
 pub(super) mod search;
+pub(super) mod arrangements;
+pub(super) mod conversation_blocks;
 pub(super) mod subjects;
 
 const TERMINAL_SUBPROTOCOL: &str = "st3.client.terminal.v0";
@@ -32,6 +34,8 @@ struct CollectionSubscribe {
     collection: String,
     limit: Option<usize>,
     person: Option<String>,
+    /// Follow one arrangement instead of the owner's bounded prefix window.
+    subject: Option<String>,
     actor: Option<String>,
     status: Option<String>,
     /// A terminal subscription names the terminal, the incarnation `terminal.attach` fenced,
@@ -73,6 +77,10 @@ const ATTENTION_CLOCK_INTERVAL: Duration = Duration::from_secs(30);
 fn collection_ignores(collection: &str, kind: &str) -> bool {
     if collection == "subjects" { return false; }
     if collection == "glasses" { return !kind.starts_with("glass."); }
+    if collection == "arrangements" {
+        return !kind.starts_with("arrangement.")
+            && !matches!(kind, "custom.client.pairing-completed" | "custom.client.pairing-revoked");
+    }
     matches!(kind, "daemon.diagnostic" | "transport.observed" | "workspace.observed")
         || (kind == "harness.usage" && collection != "agents")
 }
@@ -124,12 +132,15 @@ async fn collection_items(
     }
     if !matches!(
         request.collection.as_str(),
-        "missions" | "attention" | "agents" | "work" | "glasses"
+        "missions" | "attention" | "agents" | "work" | "glasses" | "arrangements"
     ) {
         return Err(validation("unknown collection subscription"));
     }
     if request.status.is_some() && request.collection != "agents" {
         return Err(validation("status filters are supported for agents only"));
+    }
+    if request.subject.is_some() && request.collection != "arrangements" {
+        return Err(validation("subject filters are supported for arrangements only"));
     }
     let limit = request.limit.unwrap_or(CLIENT_DEFAULT_PAGE_ITEMS);
     if !(1..=CLIENT_MAX_PAGE_ITEMS).contains(&limit) {
@@ -140,6 +151,20 @@ async fn collection_items(
             return Err(validation("glasses select the session person"));
         }
         Some(glass_person(session, false)?)
+    } else if request.collection == "arrangements" {
+        if request.actor.is_some() {
+            return Err(validation("arrangements select an explicit person, not an actor"));
+        }
+        let current_session = revalidate_session(state, session)?;
+        let person = arrangements::person(&current_session, request.person.as_deref(), false)?;
+        if let Some(subject) = &request.subject {
+            let owner = st3_schema::arrangements::owner(subject)
+                .map_err(|error| validation(error.message))?;
+            if owner != person {
+                return Err(validation("selected arrangement owner must match person"));
+            }
+        }
+        Some(person)
     } else if request.collection == "attention" {
         person_filter(session, request.person.as_deref())?
     } else {
@@ -147,10 +172,11 @@ async fn collection_items(
     };
     let state = state.clone();
     let actor = request.actor.clone();
+    let subject = request.subject.clone();
     let status = request.status.clone();
     let collection = request.collection.clone();
     let custom_forms = session.custom_forms;
-    let (snapshot, mut items, has_more) = super::blocking_store(move || {
+    let (snapshot, mut items, mut has_more) = super::blocking_store(move || {
         // Keep the physical read slot even if its awaiting subscription is canceled.
         let _read_permit = read_permit;
         let store = state.store.clone();
@@ -169,6 +195,13 @@ async fn collection_items(
                 }
                 "glasses" => {
                     store.glasses(person.as_deref().expect("authenticated glass owner"), index)?
+                }
+                "arrangements" => {
+                    if let Some(subject) = &subject {
+                        store.arrangement(subject, index)?.into_iter().collect()
+                    } else {
+                        store.arrangements(person.as_deref().expect("explicit arrangement owner"), index)?
+                    }
                 }
                 "attention" => client_attention_resources(&store, person.as_deref(), false)?,
                 "agents" => client_agent_resources(&store, false, &at, index)?,
@@ -191,6 +224,11 @@ async fn collection_items(
     })
     .await?;
     items.truncate(limit);
+    if request.collection == "arrangements" {
+        let end = arrangements::window_end(&items, 0, items.len())?;
+        has_more |= end < items.len();
+        items.truncate(end);
+    }
     Ok((snapshot, items, has_more))
 }
 
@@ -363,7 +401,7 @@ fn conversation_owner_host(
             .as_ref()
             .is_none_or(|relay| !relay.reaches(owner))
         {
-            return Err(remote_unavailable(owner));
+            return Err(conversation_blocks::availability(remote_unavailable_for_owner(state, owner)));
         }
     }
     Ok(remote)
@@ -381,7 +419,7 @@ async fn conversation_page(
         let relay = state
             .client_relay
             .as_ref()
-            .ok_or_else(|| remote_unavailable(owner))?;
+            .ok_or_else(|| conversation_blocks::availability(remote_unavailable_for_owner(state, owner)))?;
         return relay
             .read(
                 owner,
@@ -396,7 +434,11 @@ async fn conversation_page(
                 },
             )
             .await
-            .map_err(|error| remote_read_error(owner, error));
+            .map(|mut value| {
+                conversation_blocks::legacy(&mut value, session);
+                value
+            })
+            .map_err(|error| conversation_blocks::availability(remote_read_error(owner, error)));
     }
     let (state, session, session_id) = (state.clone(), session.clone(), session_id.to_owned());
     tokio::task::spawn_blocking(move || {
@@ -429,7 +471,7 @@ async fn conversation_changes_value(
         let relay = state
             .client_relay
             .as_ref()
-            .ok_or_else(|| remote_unavailable(owner))?;
+            .ok_or_else(|| conversation_blocks::availability(remote_unavailable_for_owner(state, owner)))?;
         return relay
             .read(
                 owner,
@@ -444,7 +486,11 @@ async fn conversation_changes_value(
                 },
             )
             .await
-            .map_err(|error| remote_read_error(owner, error));
+            .map(|mut value| {
+                conversation_blocks::legacy(&mut value, session);
+                value
+            })
+            .map_err(|error| conversation_blocks::availability(remote_read_error(owner, error)));
     }
     conversation_changes_local(state, session, session_id, after, wait_ms).await
 }
@@ -745,7 +791,8 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                 if index > weighed {
                     let claims = state.store.claims_page(None, None, weighed, index.checked_add(1), false, 10_000).map(|page| page.claims).unwrap_or_default();
                     let glasses_changed = subscriptions.values().any(|s| matches!(s.request.collection.as_str(), "glasses" | "subjects")) && state.store.glasses_changed(weighed, index).unwrap_or(true);
-                    reread_due |= glasses_changed || claims.len() >= 10_000 || subscriptions.values().any(|subscription| {
+                    let arrangements_changed = subscriptions.values().any(|s| s.request.collection == "arrangements") && state.store.arrangements_changed(weighed, index).unwrap_or(true);
+                    reread_due |= glasses_changed || arrangements_changed || claims.len() >= 10_000 || subscriptions.values().any(|subscription| {
                         claims.iter().any(|claim| !collection_ignores(&subscription.request.collection, &claim.kind))
                     });
                     weighed = index;
@@ -756,8 +803,8 @@ async fn collection_stream_socket_with_reader<F, Fut>(
             () = tokio::time::sleep_until(last_reread + COLLECTION_REREAD_INTERVAL), if !command_waiting && reread_due => {
                 refresh.extend(subscriptions.keys().cloned());
             }
-            _ = attention_clock.tick(), if !command_waiting && subscriptions.values().any(|s| matches!(s.request.collection.as_str(), "attention" | "agents")) => {
-                refresh.extend(subscriptions.iter().filter(|(_, s)| matches!(s.request.collection.as_str(), "attention" | "agents")).map(|(id, _)| id.clone()));
+            _ = attention_clock.tick(), if !command_waiting && subscriptions.values().any(|s| matches!(s.request.collection.as_str(), "attention" | "agents" | "arrangements")) => {
+                refresh.extend(subscriptions.iter().filter(|(_, s)| matches!(s.request.collection.as_str(), "attention" | "agents" | "arrangements")).map(|(id, _)| id.clone()));
             }
             () = tokio::time::sleep(subjects::expiry_delay(&session)), if !command_waiting && subscriptions.values().any(|s| s.request.collection == "subjects") => {
                 refresh.extend(subscriptions.iter().filter(|(_, s)| s.request.collection == "subjects").map(|(id, _)| id.clone()));
@@ -1155,6 +1202,8 @@ const ALL_SCOPES: &[&str] = &[
     "read.declarations",
     "read.glasses",
     "control.glasses",
+    "read.arrangements",
+    "control.arrangements",
     "terminal.read",
     "terminal.control",
     "control.attention",
@@ -1169,11 +1218,14 @@ const LIMITED_PAIRING_SCOPES: &[&str] = &[
     "read.projections",
     "read.glasses",
     "control.glasses",
+    "read.arrangements",
+    "control.arrangements",
     "terminal.read",
     "control.attention",
     "control.launches",
 ];
 const ACTIONS: &[&str] = &[
+    "arrangement.edit",
     "attention.resolve",
     "review.approve",
     "review.reject",
@@ -1230,6 +1282,7 @@ const ACTIONS: &[&str] = &[
 ];
 const AVAILABLE_ACTIONS: &[&str] = &[
     "custom.reply",
+    "arrangement.edit",
     "review.approve",
     "review.reject",
     "review.request-changes",
@@ -1289,6 +1342,7 @@ pub(super) struct ClientSession {
     pub(super) authority_actor: String,
     pub(super) transport: &'static str,
     pub(super) custom_forms: bool,
+    pub(super) conversation_blocks: bool,
     scopes: std::collections::BTreeSet<String>,
     /// Server-derived authority retained by native-subject subscriptions, never a client assertion.
     pairing_binding: Option<subjects::PairingBinding>,
@@ -1302,6 +1356,7 @@ impl ClientSession {
             authority_actor: authority_actor.into(),
             transport,
             custom_forms: true,
+            conversation_blocks: false,
             scopes: std::collections::BTreeSet::new(),
             pairing_binding: None,
         }
@@ -1323,6 +1378,7 @@ impl ClientSession {
                 authority_actor: "client/local/read-only".into(),
                 transport: "unix",
                 custom_forms,
+                conversation_blocks: false,
                 scopes: ["read.projections", "terminal.read"]
                     .into_iter()
                     .map(str::to_owned)
@@ -1337,6 +1393,7 @@ impl ClientSession {
             authority_actor: person.into(),
             transport: "unix",
             custom_forms,
+            conversation_blocks: false,
             scopes: ALL_SCOPES.iter().map(|scope| (*scope).to_owned()).collect(),
             pairing_binding: None,
         })
@@ -1348,6 +1405,7 @@ impl ClientSession {
             authority_actor: "client/pairing/completion".into(),
             transport: "fabric-loopback",
             custom_forms: false,
+            conversation_blocks: false,
             scopes: std::collections::BTreeSet::new(),
             pairing_binding: None,
         }
@@ -1390,6 +1448,7 @@ pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
     capabilities.push(json!({"id":"custom-subjects", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"owned-sets", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"glasses", "version":2, "state":if glass_person(session, false).is_ok() && glass_person(session, true).is_ok() { "granted" } else { "ungranted" }}));
+    capabilities.push(json!({"id":"arrangements", "version":1, "state":if session.allows("read.arrangements") && acting_party(session) { "granted" } else { "ungranted" }}));
     capabilities.extend(ACTIONS.iter().map(|action| {
         let scope = action_scope(action).expect("registered client action has a scope");
         let state = if !AVAILABLE_ACTIONS.contains(action) {
@@ -1407,6 +1466,7 @@ pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
         json!({ "id": action, "version": 0, "state": state })
     }));
     capabilities.push(json!({"id":"device-key-proofs", "version":1, "state":"granted"}));
+    capabilities.push(json!({"id":"conversation-blocks", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities
 }
 
@@ -1457,6 +1517,15 @@ pub(super) fn authenticate(
         .is_some_and(|value| {
             value.split(',').any(|feature| feature.trim() == "custom-subjects.v1")
         });
+    let conversation_blocks = request
+        .headers()
+        .get("x-st3-features")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|features| {
+            features
+                .split(',')
+                .any(|feature| feature.trim() == "conversation-blocks.v1")
+        });
     let Some(value) = request.headers().get(AUTHORIZATION) else {
         if transport == "unix" {
             let person = request
@@ -1465,6 +1534,7 @@ pub(super) fn authenticate(
                 .and_then(|value| value.to_str().ok());
             let mut session = ClientSession::local(person)?;
             session.custom_forms = custom_forms;
+            session.conversation_blocks = conversation_blocks;
             return Ok(session);
         }
         let pairing_completion = request.method() == axum::http::Method::POST
@@ -1496,60 +1566,8 @@ pub(super) fn authenticate(
     let Some(paired) = paired else {
         return Err(forbidden("the client credential is unknown or expired"));
     };
-    let revoked = state
-        .store
-        .claims_for_subject_kind_at(
-            &paired.subject,
-            "custom.client.pairing-revoked",
-            None,
-            true,
-            1,
-        )
-        .map_err(ApiError::internal)?
-        .claims
-        .first()
-        .is_some_and(|claim| claim.store_index > paired.store_index);
-    let expires_at = paired
-        .body
-        .pointer("/fields/expires_at_unix_ms")
-        .and_then(Value::as_u64)
-        .map(u128::from)
-        .unwrap_or_default();
-    if revoked || expires_at <= client_now_ms() {
-        return Err(forbidden("the client credential was revoked or expired"));
-    }
-    let actor = paired
-        .body
-        .pointer("/fields/session_actor")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ApiError::internal("a paired client has no derived actor"))?;
-    let authority_actor = paired
-        .body
-        .pointer("/fields/person_id")
-        .and_then(Value::as_str)
-        .filter(|actor| actor.starts_with("person/") && actor.matches('/').count() == 1)
-        .ok_or_else(|| ApiError::internal("a paired client has no concrete delegated person"))?;
-    let scopes = paired
-        .body
-        .pointer("/fields/scopes")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(str::to_owned)
-        .collect();
-    let session = ClientSession {
-        actor: actor.into(),
-        authority_actor: authority_actor.into(),
-        transport,
-        custom_forms,
-        scopes,
-        pairing_binding: Some(subjects::PairingBinding {
-            claim_id: paired.id.clone(),
-            subject: paired.subject.clone(),
-            expires_at_unix_ms: expires_at,
-        }),
-    };
+    let mut session = paired_client_session(state, paired, transport, custom_forms)?;
+    session.conversation_blocks = conversation_blocks;
     if request.method() == axum::http::Method::GET {
         let scope = if request
             .uri()
@@ -1565,6 +1583,80 @@ pub(super) fn authenticate(
         require_scope(&session, scope)?;
     }
     Ok(session)
+}
+
+fn paired_client_session(
+    state: &AppState,
+    paired: &ClaimRecord,
+    transport: &'static str,
+    custom_forms: bool,
+) -> Result<ClientSession, ApiError> {
+    let revoked = state.store.claims_for_subject_kind_at(
+        &paired.subject, "custom.client.pairing-revoked", None, true, 1,
+    ).map_err(ApiError::internal)?.claims.first()
+        .is_some_and(|claim| claim.store_index > paired.store_index);
+    let expires_at = paired.body.pointer("/fields/expires_at_unix_ms")
+        .and_then(Value::as_u64).map(u128::from).unwrap_or_default();
+    if revoked || expires_at <= client_now_ms() {
+        return Err(forbidden("the client credential was revoked or expired"));
+    }
+    let actor = paired.body.pointer("/fields/session_actor").and_then(Value::as_str)
+        .ok_or_else(|| ApiError::internal("a paired client has no derived actor"))?;
+    let authority_actor = paired.body.pointer("/fields/person_id").and_then(Value::as_str)
+        .filter(|actor| actor.starts_with("person/") && actor.matches('/').count() == 1)
+        .ok_or_else(|| ApiError::internal("a paired client has no concrete delegated person"))?;
+    let scopes = paired
+        .body
+        .pointer("/fields/scopes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect();
+    Ok(ClientSession {
+        actor: actor.into(),
+        authority_actor: authority_actor.into(),
+        transport,
+        custom_forms,
+        conversation_blocks: false,
+        scopes,
+        pairing_binding: Some(subjects::PairingBinding {
+            claim_id: paired.id.clone(),
+            subject: paired.subject.clone(),
+            expires_at_unix_ms: expires_at,
+        }),
+    })
+}
+
+/// Held collection sockets carry no bearer secret. Re-resolve their session grant at each
+/// arrangement read, using the same expiration/revocation checks as HTTP authentication.
+fn revalidate_session(state: &AppState, session: &ClientSession) -> Result<ClientSession, ApiError> {
+    if session.transport == "unix" && acting_party(session) {
+        return Ok(session.clone());
+    }
+    let pairings = state
+        .store
+        .claims_for_kind_at("custom.client.pairing-completed", None, true, 10_000)
+        .map_err(ApiError::internal)?;
+    let paired = pairings
+        .claims
+        .iter()
+        .find(|claim| {
+            claim
+                .body
+                .pointer("/fields/session_actor")
+                .and_then(Value::as_str)
+                == Some(session.actor.as_str())
+        })
+        .ok_or_else(|| forbidden("the client session grant is absent"))?;
+    let mut current =
+        paired_client_session(state, paired, session.transport, session.custom_forms)?;
+    current.conversation_blocks = session.conversation_blocks;
+    if current.authority_actor != session.authority_actor {
+        return Err(forbidden("the client session authority changed"));
+    }
+    Ok(current)
 }
 
 pub(super) fn require_scope(session: &ClientSession, scope: &str) -> Result<(), ApiError> {
@@ -1679,7 +1771,9 @@ fn mission_list_cards(store: &Store, ids: &[String]) -> anyhow::Result<Vec<Value
             let run_id=run["id"].as_str().expect("run header id");
             let (total,done,steps)=store.mission_step_preview(run_id)?;
             let terminal=matches!(run["status"].as_str(),Some("completed"|"failed"|"cancelled"));
+            let scheduler_fault=store.reconcile_fault(run_id, crate::reconcile::FIRST_READINESS_FAULT_SCOPE)?;
             let must_act=if terminal {"nobody"} else if attention.contains(run_id) {"you"}
+                else if scheduler_fault.is_some() {"blocked"}
                 else if steps.iter().any(|s| matches!(s.status.as_str(),"ready"|"claimed"|"working")
                     && (s.assigned_to.is_some() || s.claimant.is_some() || !s.available_to.is_empty())) {"agent"}
                 else if steps.iter().any(|s| s.status=="blocked") {"blocked"} else {"system"};
@@ -1687,7 +1781,7 @@ fn mission_list_cards(store: &Store, ids: &[String]) -> anyhow::Result<Vec<Value
                 "id":step.subject,"path":step.step,"title":step.title,"state":client_work_state(&step.status),
                 "attempt":step.attempt,"assignee":step.assigned_to,"claimant":step.claimant,
                 "agentless":step.agentless,"since":client_timestamp(step.updated_at_unix_ms),
-                "blocked_reason":step.blocked_reason,"blockers":step.blockers,
+                "blocked_reason":step.blocked_reason.as_deref().or_else(|| scheduler_fault.as_deref().filter(|_| step.status=="pending")),"blockers":step.blockers,
                 "goals":step.goals,"constraints":step.constraints
             })).collect::<Vec<_>>();
             let current=shown.iter().filter(|s| matches!(s["state"].as_str(),Some("ready"|"claimed"|"verifying"|"blocked")))
@@ -1696,10 +1790,12 @@ fn mission_list_cards(store: &Store, ids: &[String]) -> anyhow::Result<Vec<Value
                 "id":run["id"],"generation_id":run["generation_id"],"requester":run["requester"],
                 "status":run["status"],"phase":run["phase"],"progress":{"done":done,"total":total},
                 "current_steps":current,"must_act":must_act,
+                "blocker":scheduler_fault.map(|reason| json!({"step":steps.first().map(|step| &step.subject),"reason":reason,"scope":crate::reconcile::FIRST_READINESS_FAULT_SCOPE})),
                 "state_since":client_timestamp(run["updated_at_unix_ms"].as_u64().unwrap_or(0) as u128),
                 "steps":shown
             }))
         }).collect::<anyhow::Result<Vec<_>>>()?;
+        let state=if details.iter().any(|run| run["blocker"]["scope"]==crate::reconcile::FIRST_READINESS_FAULT_SCOPE) {"blocked"} else {state};
         let must_act=["you","agent","blocked","system"].into_iter()
             .find(|kind| details.iter().any(|run| run["must_act"]==*kind)).unwrap_or(if active>0 {"system"} else {"nobody"});
         let generations=newest.iter().map(|r| (r["id"].as_str().unwrap().to_owned(),r["generation_id"].clone()))
@@ -1938,6 +2034,8 @@ fn mission_resources_filtered(
                             "nobody"
                         } else if human_attention_runs.contains(run.subject.as_str()) {
                             "you"
+                        } else if run.scheduler_fault.is_some() {
+                            "blocked"
                         } else if run.steps.iter().any(|step| {
                             matches!(step.status.as_str(), "ready" | "claimed" | "working")
                                 && (step.assigned_to.is_some()
@@ -1969,10 +2067,12 @@ fn mission_resources_filtered(
                                 "at": client_timestamp(outcome.at_unix_ms),
                             })
                         });
-                    let blocker =
+                    let blocker = run.scheduler_fault.as_ref().map(|reason| json!({
+                        "step": run.steps.first().map(|step| &step.subject), "reason": reason, "scope": crate::reconcile::FIRST_READINESS_FAULT_SCOPE,
+                    })).or_else(||
                         run.steps.iter().find(|step| step.status == "blocked").map(
                             |step| json!({"step": step.subject, "reason": step.blocked_reason}),
-                        );
+                        ));
                     // A mission carries the steps of its open runs and its latest run, and its
                     // detail carries every run's steps, so a client never joins work to missions.
                     let shows_steps = selected_id.is_some()
@@ -2010,7 +2110,7 @@ fn mission_resources_filtered(
                                     "agentless": step.agentless,
                                     "since": client_timestamp(step.updated_at_unix_ms),
                                     "last_progress": step.progress_summary,
-                                    "blocked_reason": step.blocked_reason,
+                                    "blocked_reason": step.blocked_reason.as_deref().or_else(|| run.scheduler_fault.as_deref().filter(|_| step.status == "pending")),
                                     "blockers": step.blockers,
                                     "goals": step.goals,
                                     "constraints": step.constraints,
@@ -2045,6 +2145,7 @@ fn mission_resources_filtered(
                     }))
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
+            let state = if run_details.iter().any(|run| run["blocker"]["scope"] == crate::reconcile::FIRST_READINESS_FAULT_SCOPE) { "blocked" } else { state };
             let must_act = ["you", "agent", "blocked", "system"]
                 .into_iter()
                 .find(|kind| run_details.iter().any(|run| run["must_act"] == *kind))
@@ -2109,14 +2210,33 @@ fn runtime_resources(
     snapshot: &ClientSnapshot,
     session: &ClientSession,
 ) -> anyhow::Result<Vec<Value>> {
+    runtime_resources_for_owner(state, history, snapshot, session, None)
+}
+
+fn runtime_resources_for_owner(
+    state: &AppState,
+    history: bool,
+    snapshot: &ClientSnapshot,
+    session: &ClientSession,
+    owner: Option<&str>,
+) -> anyhow::Result<Vec<Value>> {
     // Runtime authority must come from the same status reduction used by every
     // other control path. A raw claim ordered last by this replica's ingest
     // index is not necessarily the causally current runtime observation.
-    let status = state.store.status_for_claim_kind_at(
-        "runtime.observed",
-        Some(snapshot.store_index),
-        history,
-    )?;
+    // Exact owner reads reduce just that subject at this snapshot.
+    let status = if let Some(owner) = owner {
+        state.store.status_for_subject_names_at(
+            BTreeSet::from([owner.to_owned()]),
+            snapshot.store_index,
+            history,
+        )?
+    } else {
+        state.store.status_for_claim_kind_at(
+            "runtime.observed",
+            Some(snapshot.store_index),
+            history,
+        )?
+    };
     // Each runtime's declaration and observation time, in one statement apiece for the list.
     let desired_tokens = state.store.selected_desired_tokens(
         &status
@@ -2990,6 +3110,8 @@ pub(super) async fn missions(
                 actor: query.actor.clone(),
                 owner_run: query.owner_run.clone(),
                 status: query.status.clone(),
+                owner: None,
+                state: None,
                 native_only: query.native_only,
                 items_digest: "sql-page".into(),
                 before_index: None,
@@ -3278,14 +3400,30 @@ pub(super) async fn terminals(
 ) -> Result<ClientPageResponse, ApiError> {
     require_scope(&session, "read.projections")?;
     let history = query.history;
+    let owner = query.owner.clone();
+    let terminal_state = query.state.clone();
     client_snapshot_page(
         &state,
         snapshot,
         "terminals",
         &query,
         move |state, snapshot| {
-            let mut items = runtime_resources(state, history, snapshot, &session)?;
-            items.retain(|item| item.get("terminal_id").is_some_and(Value::is_string));
+            let mut items = runtime_resources_for_owner(
+                state,
+                history,
+                snapshot,
+                &session,
+                owner.as_deref(),
+            )?;
+            items.retain(|item| {
+                item.get("terminal_id").is_some_and(Value::is_string)
+                    && owner
+                        .as_deref()
+                        .is_none_or(|owner| item["owner_id"] == owner)
+                    && terminal_state
+                        .as_deref()
+                        .is_none_or(|state| item["state"] == state)
+            });
             Ok(items)
         },
     )
@@ -3737,7 +3875,50 @@ fn session_messages(
 
 /// A message's timeline body: who wrote to whom, about what, so a client can draw Small Talk
 /// apart from the harness's own turns.
-fn session_message_body(claim: &ClaimRecord) -> Value {
+/// Who signed a message a person wrote and whether it checks: the verdict st recorded, and the
+/// device the signing key was granted to, by the label the person gave it when it paired. A
+/// message an agent wrote carries none: its key is the node's, and only people's words need
+/// their provenance shown.
+pub(super) fn message_provenance(state: &AppState, claim: &ClaimRecord) -> Option<Value> {
+    let fields = claim.body.get("fields").unwrap_or(&claim.body);
+    if !fields
+        .get("from")
+        .and_then(Value::as_str)?
+        .starts_with("person/")
+    {
+        return None;
+    }
+    let verdict = state.store.claim_verdict(&claim.id).ok()?;
+    let mut provenance = json!({"verdict": verdict.name()});
+    if let smallclaims::principal::Verdict::Held(reason)
+    | smallclaims::principal::Verdict::Invalid(reason) = &verdict
+    {
+        provenance["reason"] = json!(reason);
+    }
+    if let Some(signature) = state.store.claim_signature(&claim.id).ok().flatten() {
+        provenance["signer"] = json!(signature.signer);
+        provenance["key"] = json!(signature.key);
+        let label = signature
+            .chain
+            .first()
+            .and_then(|grant| state.store.claim_by_id(grant).ok().flatten())
+            .and_then(|grant| key_grant_label(&grant.body));
+        if let Some(label) = label {
+            provenance["device"] = json!(label);
+        }
+    }
+    Some(provenance)
+}
+
+/// The label a device gave its key when it paired, from the grant claim's body.
+fn key_grant_label(body: &Value) -> Option<String> {
+    body.pointer("/fields/label")
+        .and_then(Value::as_str)
+        .filter(|label| !label.trim().is_empty())
+        .map(str::to_owned)
+}
+
+fn session_message_body(state: &AppState, claim: &ClaimRecord) -> Value {
     let fields = claim.body.get("fields").unwrap_or(&claim.body);
     let mut body = json!({
         "message_id": claim.subject,
@@ -3747,6 +3928,9 @@ fn session_message_body(claim: &ClaimRecord) -> Value {
     });
     if let Some(title) = fields.get("title").and_then(Value::as_str) {
         body["title"] = Value::String(title.to_owned());
+    }
+    if let Some(provenance) = message_provenance(state, claim) {
+        body["provenance"] = provenance;
     }
     if let Some(tags) = fields.get("tags").and_then(Value::as_array)
         && !tags.is_empty()
@@ -3792,7 +3976,7 @@ fn native_timeline_page(
             let stamp = client_timestamp(claim.accepted_at_unix_ms);
             let digest = hex::encode(Sha256::digest(claim.id.as_bytes()));
             let base = claim.store_index.saturating_mul(4);
-            items.push(json!({"id":format!("timeline-entry/{}/{}-message", session_id.trim_start_matches("session/"), &digest[..16]), "sequence":base, "revision":1, "timestamp":stamp, "role":role, "type":"message", "final":true, "body":session_message_body(&claim)}));
+            items.push(json!({"id":format!("timeline-entry/{}/{}-message", session_id.trim_start_matches("session/"), &digest[..16]), "sequence":base, "revision":1, "timestamp":stamp, "role":role, "type":"message", "final":true, "body":session_message_body(state, &claim)}));
             items.push(json!({"id":format!("timeline-entry/{}/{}-content", session_id.trim_start_matches("session/"), &digest[..16]), "sequence":base+1, "revision":1, "timestamp":stamp, "role":role, "type":"content", "final":true, "body":{"media_type":"text/plain","text":fields.get("content").and_then(Value::as_str).unwrap_or_default()}}));
         }
         items.sort_by(|a, b| {
@@ -3919,7 +4103,7 @@ fn managed_transcript(
 /// but could not read it, the entry names the file, so the failure can be reported.
 fn transcript_notice(session_id: &str, managed: &ManagedTranscript, reason: &str) -> Value {
     let anchor = &managed.anchor;
-    let mut details = json!({ "driver": managed.driver, "claim_id": anchor.id });
+    let mut details = json!({ "driver": managed.driver, "claim_id": anchor.id, "availability":"transcript-unavailable" });
     match &managed.transcript {
         Ok(external) => {
             details["transcript"] = Value::String(external.transcript.display().to_string());
@@ -4203,6 +4387,11 @@ pub(super) fn timeline_value(
             Vec::new(),
             query,
         )?;
+        for item in &mut page.items {
+            if !session.conversation_blocks && let Some(body) = item["body"].as_object_mut() {
+                body.remove("blocks");
+            }
+        }
         page.items.reverse();
         return Ok(Json(json!({
             "kind": "timeline-page",
@@ -4219,7 +4408,12 @@ pub(super) fn timeline_value(
             &session_id,
         )
         .map_err(ApiError::internal)?;
-        let items = external_conversation_items(conversation, &session_id)?;
+        let items = match conversation {
+            Some(crate::external_sessions::ExternalConversation::Readable(external)) => {
+                conversation_blocks::read(&external, session, &session_id)?
+            }
+            other => external_conversation_items(other, &session_id)?,
+        };
         return native_timeline_page(state, snapshot, &session_id, query, items);
     };
     let owner = owner.as_str();
@@ -4230,14 +4424,14 @@ pub(super) fn timeline_value(
     if let Some(incarnation) = incarnation
         && let Some(managed) = managed_transcript(state, owner, incarnation)?
     {
-        let read = managed
-            .transcript
-            .as_ref()
-            .map_err(|missing| missing.reason.clone())
-            .and_then(|external| {
-                crate::external_sessions::normalized_timeline(external)
-                    .map_err(|error| format!("the transcript could not be read: {error:#}"))
-            });
+        let read = match managed.transcript.as_ref() {
+            Ok(external) => match conversation_blocks::read(external, session, &session_id) {
+                Ok(items) => Ok(items),
+                Err(error) if error.status == StatusCode::TOO_MANY_REQUESTS => return Err(error),
+                Err(error) => Err(format!("the transcript could not be read: {}", error.message)),
+            },
+            Err(missing) => Err(missing.reason.clone()),
+        };
         match read {
             Ok(items) => return native_timeline_page(state, snapshot, &session_id, query, items),
             Err(reason) => {
@@ -4569,7 +4763,7 @@ pub(super) fn timeline_value(
             items.push(json!({
                 "id": entry_id(&claim, "message"), "sequence": base_sequence,
                 "revision": 1, "timestamp": timestamp, "role": role, "type": "message",
-                "final": true, "body": session_message_body(&claim)
+                "final": true, "body": session_message_body(state, &claim)
             }));
             items.push(json!({
                 "id": entry_id(&claim, "content"), "sequence": base_sequence + 1,
@@ -5201,12 +5395,12 @@ pub(super) async fn conversation_changes(
             let relay = state
                 .client_relay
                 .as_ref()
-                .ok_or_else(|| remote_unavailable(&owner))?;
-            let value = relay
+                .ok_or_else(|| conversation_blocks::availability(remote_unavailable_for_owner(&state, &owner)))?;
+            let mut value = relay
                 .read(
                     &owner,
                     &crate::peer::ClientReadRequest {
-                        authority_actor: session.authority_actor,
+                        authority_actor: session.authority_actor.clone(),
                         relay: None,
                         request: crate::peer::ClientReadOperation::ConversationChanges {
                             session_id,
@@ -5216,7 +5410,10 @@ pub(super) async fn conversation_changes(
                     },
                 )
                 .await
-                .map_err(|error| remote_read_error(&owner, error))?;
+                .map_err(|error| {
+                    conversation_blocks::availability(remote_read_error(&owner, error))
+                })?;
+            conversation_blocks::legacy(&mut value, &session);
             return Ok(Json(value));
         }
     }
@@ -5271,7 +5468,7 @@ pub(super) async fn conversation_stream(
             .as_ref()
             .is_none_or(|relay| !relay.reaches(owner))
         {
-            return Err(remote_unavailable(owner));
+            return Err(conversation_blocks::availability(remote_unavailable_for_owner(&state, owner)));
         }
     } else {
         conversation_read_now(&state, &session, &session_id, query.after.as_deref())?;
@@ -5301,7 +5498,7 @@ async fn conversation_stream_socket(
                 let relay = state
                     .client_relay
                     .as_ref()
-                    .ok_or_else(|| remote_unavailable(owner))?;
+                    .ok_or_else(|| conversation_blocks::availability(remote_unavailable_for_owner(&state, owner)))?;
                 relay
                     .read(
                         owner,
@@ -5316,7 +5513,9 @@ async fn conversation_stream_socket(
                         },
                     )
                     .await
-                    .map_err(|error| remote_read_error(owner, error))
+                    .map_err(|error| {
+                        conversation_blocks::availability(remote_read_error(owner, error))
+                    })
             } else {
                 conversation_changes_local(
                     &state,
@@ -5330,13 +5529,14 @@ async fn conversation_stream_socket(
         };
         tokio::pin!(read);
         let value = tokio::select! { value = &mut read => value, message = socket.recv() => { if matches!(message, None | Some(Err(_)) | Some(Ok(WsMessage::Close(_)))) { return; } else { continue; } } };
-        let value = match value {
+        let mut value = match value {
             Ok(value) => value,
             Err(error) => {
                 close_terminal_stream_with_error(&mut socket, &error).await;
                 return;
             }
         };
+        conversation_blocks::legacy(&mut value, &session);
         let next = value["next_cursor"].as_str().map(str::to_owned);
         if after.is_none()
             || value["items"]
@@ -5817,9 +6017,16 @@ pub(super) async fn pairing_begin(
         })
         .map_err(ApiError::bad)?;
     signal_changed(&state);
-    Ok(Json(
-        json!({ "kind": "pairing-challenge", "pairing_id": pairing_id, "code": code, "expires_at": client_timestamp(expires_at) }),
-    ))
+    let mut challenge = json!({ "kind": "pairing-challenge", "pairing_id": pairing_id, "code": code, "expires_at": client_timestamp(expires_at) });
+    if let Some((key, _)) = state
+        .store
+        .person_root_grant(&session.authority_actor)
+        .map_err(ApiError::bad)?
+    {
+        challenge["person_root_fingerprint"] =
+            json!(st3_client::device::person_root_fingerprint(&key).map_err(ApiError::internal)?);
+    }
+    Ok(Json(challenge))
 }
 
 #[derive(Deserialize)]
@@ -5831,6 +6038,43 @@ pub(super) struct PairingComplete {
     /// Where the device keeps its signing key: `secure-enclave` or `software`.
     #[serde(default)]
     key_storage: Option<String>,
+}
+
+fn pairing_root_proof(state: &AppState, person: &str) -> Result<Option<Value>, ApiError> {
+    let Some((_, id)) = state
+        .store
+        .person_root_grant(person)
+        .map_err(ApiError::bad)?
+    else {
+        return Ok(None);
+    };
+    state
+        .store
+        .seal_local_batches()
+        .map_err(ApiError::internal)?;
+    let cannot_prove = || {
+        validation(
+            "the member cannot produce a verifiable person-root grant; the pairing code was not consumed. Inspect the member's signing history",
+        )
+    };
+    let grant = state
+        .store
+        .claim_by_id(&id)
+        .map_err(ApiError::internal)?
+        .ok_or_else(cannot_prove)?;
+    let signature = state
+        .store
+        .claim_signature(&id)
+        .map_err(ApiError::internal)?
+        .ok_or_else(cannot_prove)?;
+    let proof = json!({
+        "id": grant.id, "batch_id": grant.batch_id, "subject": grant.subject,
+        "kind": grant.kind, "origin": grant.origin, "actor": grant.actor,
+        "body": grant.body, "predecessors": grant.predecessors, "signature": signature,
+    });
+    st3_client::device::verify_person_root_key_proof(person, &proof, None)
+        .map_err(|_| cannot_prove())?;
+    Ok(Some(proof))
 }
 
 /// A device's signing key, when its public key is one: `p256:` and the base64url of an
@@ -6030,6 +6274,12 @@ pub(super) async fn pairing_complete(
         }
         None => None,
     };
+    // Observers receive only the existing public root receipt, never device signing authority.
+    let root_proof = if enrollment.is_none() {
+        pairing_root_proof(&state, &person_id)?
+    } else {
+        None
+    };
     let completed = state.store.append_claim(&ClaimInput {
         subject: begun.subject.clone(),
         kind: "custom.client.pairing-completed".into(),
@@ -6072,6 +6322,9 @@ pub(super) async fn pairing_complete(
     if let Some((chain, proofs)) = enrollment {
         session["device_key_chain"] = json!(chain);
         session["device_key_proofs"] = json!(proofs);
+    }
+    if let Some(proof) = root_proof {
+        session["person_root_key_proof"] = proof;
     }
     Ok(Json(session))
 }
@@ -6126,7 +6379,7 @@ fn remote_terminal_live_session(
         .as_ref()
         .is_none_or(|relay| !relay.reaches(&owner_host_id))
     {
-        return Err(remote_unavailable(&owner_host_id));
+        return Err(remote_unavailable_for_owner(state, &owner_host_id));
     }
     let actual = selected
         .actual
@@ -6328,7 +6581,7 @@ pub(super) async fn terminal_screen(
             let relay = state
                 .client_relay
                 .as_ref()
-                .ok_or_else(|| remote_unavailable(&host))?;
+                .ok_or_else(|| remote_unavailable_for_owner(&state, &host))?;
             if !acting_party(&session) {
                 return Err(forbidden(
                     "remote terminal screen requires a concrete person or agent",
@@ -6593,7 +6846,7 @@ async fn remote_terminal_stream_socket(
     incarnation: String,
 ) {
     let Some(relay) = state.client_relay.as_ref() else {
-        sink.fail(&remote_unavailable(&owner)).await;
+        sink.fail(&remote_unavailable_for_owner(&state, &owner)).await;
         return;
     };
     let terminal_id = client_detail_id("terminal", &id);
@@ -6832,7 +7085,7 @@ fn terminal_attachment_response(
             .as_ref()
             .is_none_or(|relay| !relay.reaches(owner_host_id))
     {
-        return Err(remote_unavailable(owner_host_id));
+        return Err(remote_unavailable_for_owner(state, owner_host_id));
     }
     let latest = claims
         .last()
@@ -7332,6 +7585,7 @@ fn action_scope(action: &str) -> Option<&'static str> {
             }
         }
         "pairing" => "control.pairing",
+        "arrangement" => "control.arrangements",
         _ => return None,
     })
 }
@@ -7352,21 +7606,62 @@ fn validate_message_session(
     session_id: &str,
 ) -> Result<(), ApiError> {
     let recipient = normalize_message_party(recipient);
-    let current_session = client_agent_resources(
-        &state.store,
-        false,
-        &snapshot.created_at,
-        snapshot.store_index,
-    )
-    .map_err(ApiError::internal)?
-    .into_iter()
-    .find(|agent| agent["id"] == recipient)
-    .and_then(|agent| agent["current_session_id"].as_str().map(str::to_owned))
-    .ok_or_else(|| {
-        validation(format!(
-            "message recipient `{recipient}` has no current normalized session"
-        ))
-    })?;
+    // Match the card's current-session fence without building cards, work queues, usage,
+    // todo lists or delivery overlays for the fleet.
+    let status = state
+        .store
+        .status_for_subject_names_at(
+            BTreeSet::from([recipient.clone()]),
+            snapshot.store_index,
+            false,
+        )
+        .map_err(ApiError::internal)?;
+    let current_session = status
+        .subjects
+        .into_iter()
+        .find(|subject| {
+            subject.subject == recipient
+                && subject.subject.starts_with("agent/")
+                && subject.projection.layer == "current"
+        })
+        .map(|subject| -> anyhow::Result<Option<String>> {
+            let moving = subject
+                .desired_token
+                .as_deref()
+                .map(|token| {
+                    crate::placement::handoff(
+                        &state.store,
+                        &subject.subject,
+                        token,
+                        snapshot.store_index,
+                    )
+                })
+                .transpose()?
+                .flatten()
+                .is_some_and(|handoff| handoff.phase != "running");
+            let fields = subject
+                .actual
+                .as_ref()
+                .map(|actual| actual.get("fields").unwrap_or(actual));
+            let incarnation = fields
+                .filter(|_| !moving)
+                .and_then(|fields| fields.get("incarnation_id"))
+                .and_then(Value::as_str);
+            let runtime = fields
+                .and_then(|fields| fields.get("runtime_id"))
+                .and_then(Value::as_str);
+            Ok(incarnation
+                .or(runtime)
+                .map(|identity| managed_session_id(&subject.subject, identity)))
+        })
+        .transpose()
+        .map_err(ApiError::internal)?
+        .flatten()
+        .ok_or_else(|| {
+            validation(format!(
+                "message recipient `{recipient}` has no current normalized session"
+            ))
+        })?;
     if current_session != session_id {
         return Err(stale(format!(
             "session `{session_id}` is not the current session for `{recipient}`"
@@ -7629,6 +7924,16 @@ fn validate_launch_fence(state: &AppState, target: &str, fence: &Fence) -> Resul
     Ok(())
 }
 
+/// Raw and key input to a terminal: the keys a person types, which no screen they did not see can
+/// make unsafe to send, unlike a whole line with its Enter.
+fn terminal_keys_unfenced(request: &ActionRequest) -> bool {
+    request.action_type == "terminal.input"
+        && matches!(
+            request.parameters.get("mode").and_then(Value::as_str),
+            Some("raw" | "key")
+        )
+}
+
 fn validate_fence(state: &AppState, fence: &Fence) -> Result<(), ApiError> {
     let parsed = fence
         .snapshot_id
@@ -7667,12 +7972,12 @@ fn validate_fence(state: &AppState, fence: &Fence) -> Result<(), ApiError> {
                 .map_err(import_lookup_error)?
                 .map(|session| session.revision)
         } else {
+            // The newest claim's id, by a seek: reading and sorting every claim of the subject
+            // was 0.4 s for a busy seat (4.4 s cold) on every fenced action.
             state
                 .store
-                .claims_for(subject, None)
+                .latest_claim_id(subject)
                 .map_err(ApiError::internal)?
-                .last()
-                .map(|claim| claim.id.clone())
         };
         if current.as_deref() != Some(revision) {
             return Err(stale(format!(
@@ -7872,7 +8177,7 @@ async fn create_agent(
             .client_relay
             .as_ref()
             .filter(|relay| relay.reaches(&client_host_id(&host)))
-            .ok_or_else(|| remote_unavailable(&client_host_id(&host)))?;
+            .ok_or_else(|| remote_unavailable_for_owner(state, &client_host_id(&host)))?;
         let value = relay
             .read(
                 &client_host_id(&host),
@@ -7986,6 +8291,7 @@ async fn dispatch_action(
                 State(state.clone()),
                 AxumPath(target),
                 Json(ReviewRequest {
+                    delegation: None,
                     decision: match decision {
                         "review.approve" => "approved",
                         "review.request-changes" => "changes-requested",
@@ -8060,6 +8366,7 @@ async fn dispatch_action(
                 .store
                 .finish_person_step(
                     &PersonStepResponse {
+                        delegation: None,
                         subject: target,
                         actor: authority_actor.clone(),
                         summary: parameter_string(p, "summary")?,
@@ -8168,6 +8475,7 @@ async fn dispatch_action(
                 State(state.clone()),
                 AxumPath(target),
                 Json(MessageLifecycleRequest {
+                    delegation: None,
                     lifecycle: lifecycle.into(),
                     actor: Some(authority_actor.clone()),
                     transport: None,
@@ -8542,15 +8850,11 @@ async fn dispatch_action(
             let target = terminal_subject(&parameter_string(p, "terminal_id")?);
             let rows = p
                 .get("rows")
-                .and_then(Value::as_u64)
-                .and_then(|value| u16::try_from(value).ok())
-                .filter(|value| *value != 0)
+                .and_then(st3_schema::terminal_dimension)
                 .ok_or_else(|| validation("terminal resize rows must fit a positive u16"))?;
             let columns = p
                 .get("columns")
-                .and_then(Value::as_u64)
-                .and_then(|value| u16::try_from(value).ok())
-                .filter(|value| *value != 0)
+                .and_then(st3_schema::terminal_dimension)
                 .ok_or_else(|| validation("terminal resize columns must fit a positive u16"))?;
             let live = live_session(state, &target, request.fence.runtime_incarnation.as_deref())?;
             if !live.terminal {
@@ -9064,14 +9368,36 @@ pub(super) async fn action(
             remote_terminal_live_session(&state, &terminal_subject(&terminal_id), incarnation)?;
         if live.owner_host_id != client_host_id(&state.node) {
             validate_fence(&state, &request.fence)?;
-            let expected_sequence = request
-                .fence
-                .terminal_sequence
-                .ok_or_else(|| validation("terminal control requires a sequence fence"))?;
             let relay = state
                 .client_relay
                 .as_ref()
-                .ok_or_else(|| remote_unavailable(&live.owner_host_id))?;
+                .ok_or_else(|| remote_unavailable_for_owner(&state, &live.owner_host_id))?;
+            // Typing keys needs no screen fence (see the local case below). The owner still wants
+            // a sequence, so one is read from it now: there is no stale window to lose.
+            let expected_sequence = if terminal_keys_unfenced(&request) {
+                let screen = relay
+                    .read(
+                        &live.owner_host_id,
+                        &crate::peer::ClientReadRequest {
+                            authority_actor: session.authority_actor.clone(),
+                            relay: None,
+                            request: crate::peer::ClientReadOperation::TerminalScreen {
+                                terminal_id: client_detail_id("terminal", &terminal_id),
+                                facts: false,
+                            },
+                        },
+                    )
+                    .await
+                    .map_err(|error| remote_read_error(&live.owner_host_id, error))?;
+                screen["next_sequence"]
+                    .as_u64()
+                    .ok_or_else(|| validation("the terminal gave no sequence"))?
+            } else {
+                request
+                    .fence
+                    .terminal_sequence
+                    .ok_or_else(|| validation("terminal control requires a sequence fence"))?
+            };
             let mut value = relay
                 .read(
                     &live.owner_host_id,
@@ -9105,10 +9431,22 @@ pub(super) async fn action(
             .runtime_incarnation
             .as_deref()
             .ok_or_else(|| validation("terminal control requires an incarnation fence"))?;
-        let expected = request
-            .fence
-            .terminal_sequence
-            .ok_or_else(|| validation("terminal control requires a sequence fence"))?;
+        // Typing keys into a terminal whose screen moves on its own (an agent's spinner, a log)
+        // can never match the sequence a client read a moment before: the screen changes between
+        // the read and the key. The incarnation fence is what keeps keys from reaching a
+        // restarted program, so raw and key input need no sequence; a line sent with Enter and a
+        // resize still do (Nathan, 2026-10-06: the phone could not type into an attached terminal).
+        let unfenced = terminal_keys_unfenced(&request);
+        let expected = if unfenced {
+            request.fence.terminal_sequence
+        } else {
+            Some(
+                request
+                    .fence
+                    .terminal_sequence
+                    .ok_or_else(|| validation("terminal control requires a sequence fence"))?,
+            )
+        };
         let screen = terminal_screen_value(
             &state,
             &terminal_id,
@@ -9117,12 +9455,21 @@ pub(super) async fn action(
             Duration::ZERO,
         )
         .await?;
-        if screen["next_sequence"].as_u64() != Some(expected) {
+        if !unfenced && screen["next_sequence"].as_u64() != expected {
             return Err(stale("the terminal sequence fence is stale"));
         }
     }
     let mut reconciled_attachment = None;
-    let fence_result = validate_fence(&state, &request.fence);
+    let mut checked_fence = request.fence.clone();
+    if request.action_type == "arrangement.edit" {
+        // Layout revisions merge; fenced retirement and graph/launch identity revisions
+        // are checked in the writer transaction. Attention episodes and external filesystem
+        // sessions retain projected preflight checks (external state is outside SQLite).
+        checked_fence.subject_revisions.retain(|subject, _| {
+            subject.starts_with("attention/") || subject.starts_with("session/external-")
+        });
+    }
+    let fence_result = validate_fence(&state, &checked_fence);
     if let Err(error) = fence_result {
         if request.action_type == "terminal.attach" {
             reconciled_attachment =
@@ -9154,7 +9501,7 @@ pub(super) async fn action(
             let relay = state
                 .client_relay
                 .as_ref()
-                .ok_or_else(|| remote_unavailable(&live.owner_host_id))?;
+                .ok_or_else(|| remote_unavailable_for_owner(&state, &live.owner_host_id))?;
             let screen = relay
                 .read(
                     &live.owner_host_id,
@@ -9181,6 +9528,11 @@ pub(super) async fn action(
     } else {
         None
     };
+    let arrangement_claim = if request.action_type == "arrangement.edit" {
+        Some(arrangements::edit(&state, &session, &request).await?)
+    } else {
+        None
+    };
     let affected = if let Some(attachment) = &terminal_attachment {
         vec![
             attachment["attachment_id"]
@@ -9188,6 +9540,8 @@ pub(super) async fn action(
                 .ok_or_else(|| ApiError::internal("terminal attachment has no ID"))?
                 .to_owned(),
         ]
+    } else if let Some(claim) = &arrangement_claim {
+        vec![claim.subject.clone()]
     } else {
         dispatch_action(&state, &snapshot, &session, &request).await?
     };
@@ -9195,6 +9549,9 @@ pub(super) async fn action(
     let mut result = json!({ "kind": "action-result", "action_id": request.id, "operation_id": operation_id, "status": "completed", "affected_ids": affected });
     if let Some(attachment) = terminal_attachment {
         result["terminal_attachment"] = attachment;
+    }
+    if let Some(claim) = arrangement_claim {
+        result["arrangement_revision"] = json!(claim.id);
     }
     let mut persisted_result = result.clone();
     persisted_result
@@ -10285,7 +10642,7 @@ mod tests {
             .claims_for(&sent.subject, Some("message.sent"))
             .unwrap()
             .remove(0);
-        let body = session_message_body(&claim);
+        let body = session_message_body(&state, &claim);
         assert_eq!(
             body["attachments"],
             json!([{
@@ -10318,7 +10675,30 @@ mod tests {
             .claims_for(&plain.subject, Some("message.sent"))
             .unwrap()
             .remove(0);
-        assert!(session_message_body(&claim).get("attachments").is_none());
+        assert!(session_message_body(&state, &claim).get("attachments").is_none());
+        // What a person wrote carries its provenance (here no signature: the fixture seals
+        // nothing); what an agent wrote carries none.
+        let provenance = session_message_body(&state, &claim)["provenance"].clone();
+        assert_eq!(provenance["verdict"], "unsigned", "{provenance}");
+        assert!(provenance.get("signer").is_none());
+        let agent_claim = state
+            .store
+            .claims_for(&plain.subject, Some("message.sent"))
+            .unwrap()
+            .remove(0);
+        let mut agent_claim = agent_claim;
+        agent_claim.body["fields"]["from"] = json!("agent/terminal-test.seat");
+        assert!(session_message_body(&state, &agent_claim).get("provenance").is_none());
+    }
+
+    #[test]
+    fn a_devices_label_is_read_from_its_key_grant() {
+        assert_eq!(
+            key_grant_label(&json!({"fields": {"label": "example phone (secure enclave)", "role": "device"}})).as_deref(),
+            Some("example phone (secure enclave)")
+        );
+        assert_eq!(key_grant_label(&json!({"fields": {"role": "device"}})), None);
+        assert_eq!(key_grant_label(&json!({"fields": {"label": "  "}})), None);
     }
 
     #[tokio::test]
@@ -10511,7 +10891,7 @@ mod tests {
         assert!(!report.to_string().contains("person/operator"));
     }
 
-    fn test_state_named(root: &Path, node: &str) -> AppState {
+    pub(super) fn test_state_named(root: &Path, node: &str) -> AppState {
         AppState {
             store: Arc::new(Store::open(&root.join("graph.db"), node).unwrap()),
             notify: Arc::new(Notify::new()),
@@ -10872,6 +11252,14 @@ subscription "watch/source" {
         assert_eq!(checkout.base, "main");
         assert_eq!(checkout.branch, "example/parser");
         assert!(checkout.remove_at_run_end);
+        let projected =
+            client_agent_resources(&state.store, false, "now", state.store.index().unwrap())
+                .unwrap();
+        assert_eq!(projected[0]["workspace"], "/work/parser");
+        assert_eq!(
+            projected[0]["checkout"],
+            json!({"repository":"/work/repo", "base":"main", "branch":"example/parser"})
+        );
         let read = host_repositories(
             State(state.clone()),
             Extension(session.clone()),
@@ -12665,7 +13053,7 @@ mission "example/zero-run" state="ready" {
         assert!(external.process.is_none());
 
         let mut state = test_state_named(root.path(), "import-test");
-        state.native_session_home = Some(home);
+        state.native_session_home = Some(home.clone());
         let session = ClientSession::local(Some("person/tester")).unwrap();
         let request = ActionRequest {
             api_version: CLIENT_API_VERSION.into(),
@@ -12734,6 +13122,25 @@ mission "example/zero-run" state="ready" {
             .expect("the imported durable seat is declared");
         assert_eq!(imported.kind, "agent");
         assert!(imported.owner_run.is_none());
+        let member = imported.member.as_ref().unwrap();
+        assert_eq!(
+            member.environment[crate::suspension::RESUME_ENV],
+            "native-import-test"
+        );
+        assert_eq!(
+            member.environment["CODEX_HOME"],
+            std::fs::canonicalize(home.join(".codex"))
+                .unwrap()
+                .to_string_lossy()
+        );
+        let crate::model::LaunchSpec::Argv(argv) = &member.launch else {
+            panic!("the imported seat needs a typed native launch");
+        };
+        assert!(
+            !argv
+                .iter()
+                .any(|arg| arg == "resume" || arg == "native-import-test")
+        );
         let session_file = state
             .store
             .latest_claim(&affected[1], Some("harness.session-file"))
@@ -13445,6 +13852,78 @@ mission "example/zero-run" state="ready" {
         }
         let gap = conversation_read_now(&owner, &session, &session_id, Some(&cursor)).unwrap_err();
         assert_eq!(gap.code, "cursor-gap");
+    }
+
+    #[test]
+    fn message_session_validation_reads_only_the_recipient_and_preserves_session_fences() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "session-point-node");
+        for (subject, incarnation) in [
+            ("agent/session-point-owner", Some("point-runtime:i2")),
+            ("agent/session-point-legacy", None),
+            ("agent/session-point-empty", None),
+        ] {
+            let mut fields = BTreeMap::from([
+                ("status".into(), json!("running")),
+                ("terminal".into(), json!(false)),
+            ]);
+            if subject != "agent/session-point-empty" {
+                fields.insert("runtime_id".into(), json!("point-runtime"));
+            }
+            if let Some(incarnation) = incarnation {
+                fields.insert("incarnation_id".into(), json!(incarnation));
+            }
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "runtime.observed".into(),
+                    actor: Some(subject.into()),
+                    fields,
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(subject.into()),
+                })
+                .unwrap();
+        }
+        let snapshot = new_client_snapshot(&state);
+        // The old fleet-card path would decode this unrelated card's invalid harness overlay.
+        state
+            .store
+            .cached_agent_resources(snapshot.store_index, false, |_| {
+                Ok(vec![json!({"id":"agent/unrelated", "_status_source":true})])
+            })
+            .unwrap();
+        let owner_session = managed_session_id("agent/session-point-owner", "point-runtime:i2");
+        validate_message_session(&state, &snapshot, "session-point-owner", &owner_session).unwrap();
+        let legacy_session = managed_session_id("agent/session-point-legacy", "point-runtime");
+        validate_message_session(
+            &state,
+            &snapshot,
+            "agent/session-point-legacy",
+            &legacy_session,
+        )
+        .unwrap();
+        let wrong_runtime = managed_session_id("agent/session-point-owner", "point-runtime");
+        assert_eq!(
+            validate_message_session(
+                &state,
+                &snapshot,
+                "agent/session-point-owner",
+                &wrong_runtime
+            )
+            .unwrap_err()
+            .code,
+            "stale-fence"
+        );
+        for subject in ["agent/session-point-empty", "agent/missing", "person/alex"] {
+            assert_eq!(
+                validate_message_session(&state, &snapshot, subject, &owner_session)
+                    .unwrap_err()
+                    .code,
+                "validation-failed"
+            );
+        }
     }
 
     #[tokio::test]
@@ -15510,6 +15989,26 @@ mission "example/zero-run" state="ready" {
             .unwrap_err();
             assert_eq!(error.code, "stale-fence");
         }
+        // Typed keys need no screen fence: the screen has moved on since `fence` read it, yet raw
+        // keys land, with the sequence or without it. A line with its Enter still needs it.
+        for (key, fence) in [
+            ("fence-raw", fence.clone()),
+            ("fence-raw-no-sequence", Fence { terminal_sequence: None, ..fence.clone() }),
+        ] {
+            let _ = action(
+                State(state.clone()),
+                Extension(snapshot.clone()),
+                Extension(session.clone()),
+                Json(request(
+                    "terminal.input",
+                    key,
+                    fence,
+                    json!({"terminal_id":"terminal/agent/fence-test","mode":"raw","value":"aw=="}),
+                )),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("raw input must not need a screen fence: {error:?}"));
+        }
         let mut foreign = fence.clone();
         foreign.snapshot_id = foreign.snapshot_id.replacen(&state.node, "another-host", 1);
         assert!(validate_fence(&state, &foreign).is_err());
@@ -15830,6 +16329,7 @@ mission "example/zero-run" state="ready" {
             authority_actor: "person/alex".into(),
             transport: "paired",
             custom_forms: false,
+            conversation_blocks: false,
             scopes: ["terminal.read".into()].into_iter().collect(),
             pairing_binding: None,
         };
@@ -15926,7 +16426,7 @@ mission "example/zero-run" state="ready" {
         assert_eq!(indeterminate["operational"]["actionable"], false);
     }
     #[test]
-    fn status_freshness_refreshes_after_the_agent_cache_without_resetting_since() {
+    fn status_freshness_uses_cached_card_time_without_resetting_since() {
         let root = tempfile::tempdir().unwrap();
         let state = test_state_named(root.path(), "status-cache");
         let subject = "agent/cedar";
@@ -15942,9 +16442,19 @@ mission "example/zero-run" state="ready" {
         let index = state.store.index().unwrap();
         let before = client_agent_resources(&state.store, false, "", index).unwrap();
         let before = before.iter().find(|item| item["id"] == subject).unwrap();
-        assert_eq!(before["observation"], "stale");
-        assert_eq!(before["harness_state"], "indeterminate");
+        // The quick read uses the cached card's receipt time. The backdated payload time is
+        // deliberately no longer recovered by a separate per-request history query.
+        assert_eq!(before["observation"], "current");
+        assert_eq!(before["harness_state"], "idle");
         assert!(before.get("_status_source").is_none());
+        let mut aged = vec![before.clone()];
+        let mut cached_harness = state.store.observed_harness_at(subject, index).unwrap().unwrap();
+        cached_harness.observed_at_unix_ms = client_now_ms() - 91_000;
+        aged[0]["_status_source"] = json!(cached_harness);
+        overlay_agent_resources(&state.store, &mut aged, "").unwrap();
+        assert_eq!(aged[0]["observation"], "stale");
+        assert_eq!(aged[0]["harness_state"], "indeterminate");
+        assert_eq!(aged[0]["since"], before["since"]);
         append("harness.observed", json!({"state":"idle", "driver":"codex", "incarnation_id":"one", "observed_at_ms":client_now_ms() as u64}));
         assert_eq!(state.store.index().unwrap(), index, "same state stays local within the publish interval");
         let after = client_agent_resources(&state.store, false, "", index).unwrap();

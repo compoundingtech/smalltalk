@@ -8,13 +8,22 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use serde_json::{Value, json};
 
-use super::{Check, Measurement, PROBE_TIMEOUT, Scratch, fixture, measurement};
+use super::{Check, Measurement, PROBE_TIMEOUT, ProbeDiagnostic, Scratch, fixture, measurement};
 
 pub(super) fn probe(
     binary: &Path,
     extension: &Path,
     scratch: &Scratch,
-) -> Result<Vec<Measurement>> {
+) -> Result<(Vec<Measurement>, Option<ProbeDiagnostic>)> {
+    probe_until(binary, extension, scratch, PROBE_TIMEOUT)
+}
+
+fn probe_until(
+    binary: &Path,
+    extension: &Path,
+    scratch: &Scratch,
+    timeout: Duration,
+) -> Result<(Vec<Measurement>, Option<ProbeDiagnostic>)> {
     let model = fixture::Model::start(true)?;
     // The model is configured before extension loading: selecting a bundled provider first and
     // replacing it later could send a fixture prompt to an external API. Both configuration file
@@ -24,14 +33,17 @@ pub(super) fn probe(
         "models":[{"id":"fixture","name":"fixture","reasoning":false,"input":["text"],
             "contextWindow":100000,"maxTokens":1000}]
     }}});
-    fs::write(
-        scratch.path("agent/models.yml"),
-        serde_json::to_vec(&config)?,
-    )?;
-    fs::write(
-        scratch.path("agent/models.json"),
-        serde_json::to_vec(&config)?,
-    )?;
+    // A managed launcher may clear PI_CODING_AGENT_DIR. Use OMP's default isolated
+    // profile as well, so it still discovers the loopback-only provider after that reset.
+    for directory in ["agent", "home/.omp/agent"] {
+        fs::create_dir_all(scratch.path(directory))?;
+        for name in ["models.yml", "models.json"] {
+            fs::write(
+                scratch.path(&format!("{directory}/{name}")),
+                serde_json::to_vec(&config)?,
+            )?;
+        }
+    }
     fs::write(scratch.path("probe.ts"), include_str!("omp-probe.ts"))?;
     // A channel protocol peer, not a fake ExtensionAPI: the shipped adapter opens the child,
     // binds its real session, receives the nonce and calls the installed sendUserMessage itself.
@@ -61,6 +73,8 @@ pub(super) fn probe(
             "-e",
         ])
         .arg(extension)
+        .arg("--session-dir")
+        .arg(scratch.path("sessions"))
         .arg("-e")
         .arg(scratch.path("probe.ts"))
         .args(["--provider", "admission", "--model", "fixture"])
@@ -68,9 +82,11 @@ pub(super) fn probe(
         .env("ST_ADMISSION_CHANNEL_TRACE", scratch.path("channel.jsonl"))
         .env("ST_OMP_CHANNEL_BIN", scratch.path("channel"))
         .env("ST_OMP_CHANNEL_CATALOG", scratch.path("workspace"))
-        .env("ST_OMP_CHANNEL_IDENTITY", "fixture.omp");
+        .env("ST_OMP_CHANNEL_IDENTITY", "fixture.omp")
+        .env("ST_AGENT", "admission.fixture");
+    let started = Instant::now();
     let mut process = scratch.spawn(&mut command, "omp")?;
-    let deadline = Instant::now() + PROBE_TIMEOUT;
+    let deadline = started + timeout;
     let mut answered = std::collections::BTreeSet::new();
     loop {
         // A capture can end with a partial line while the provider writes. Parse only completed
@@ -94,11 +110,33 @@ pub(super) fn probe(
         let events = complete_lines(&scratch.capture("events.jsonl")?)?;
         let channel = complete_lines(&scratch.capture("channel.jsonl")?)?;
         let result = evaluate(&events, &channel, &model.nonce, model.consumed());
-        if result.iter().all(|m| m.passed)
-            || Instant::now() >= deadline
-            || process.0.try_wait()?.is_some()
-        {
-            return Ok(result);
+        if result.iter().all(|m| m.passed) {
+            return Ok((result, None));
+        }
+        let exit = process.0.try_wait()?;
+        if exit.is_some() || Instant::now() >= deadline {
+            let refused = exit.is_some()
+                && !events.iter().any(|event| event["type"] == "extension_load");
+            let phase = if refused {
+                "launch"
+            } else {
+                result.iter().find(|m| !m.passed).unwrap().check.as_str()
+            };
+            let diagnostic = ProbeDiagnostic {
+                phase: phase.into(),
+                outcome: if refused {
+                    "launch-refused"
+                } else if exit.is_some() {
+                    "exit"
+                } else {
+                    "timeout"
+                }.into(),
+                exit_code: exit.and_then(|status| status.code()),
+                elapsed_ms: started.elapsed().as_millis() as u64,
+                stderr_tail: scratch.stderr_tail("omp.stderr")?,
+                detail: format!("required {phase} evidence was not observed"),
+            };
+            return Ok((result, Some(diagnostic)));
         }
         thread::sleep(Duration::from_millis(25));
     }
@@ -219,6 +257,26 @@ fn content_has(content: &Value, text: &str) -> bool {
 mod tests {
     use super::*;
     use crate::harness_admission::tests::measured_omp;
+
+    #[test]
+    fn timed_out_startup_retains_stderr_and_distinguishes_exit() {
+        let scratch = Scratch::new().unwrap();
+        let sh = super::super::resolve_executable("sh").unwrap();
+        let binary = scratch.path("slow-omp");
+        fs::write(&binary, format!(
+            "#!{}\necho 'cold startup is still running' >&2\nsleep 60\n", sh.display(),
+        )).unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let (measurements, diagnostic) = probe_until(
+            &binary, &scratch.path("extension.ts"), &scratch, Duration::from_millis(200),
+        ).unwrap();
+        assert!(measurements.iter().all(|m| !m.passed));
+        let diagnostic = diagnostic.unwrap();
+        assert_eq!(diagnostic.outcome, "timeout");
+        assert_eq!(diagnostic.exit_code, None);
+        assert_eq!(diagnostic.phase, "extensionLoad");
+        assert_eq!(diagnostic.stderr_tail, "cold startup is still running\n");
+    }
 
     #[test]
     fn measured_installed_capture_requires_consumption_beyond_channel_ack() {

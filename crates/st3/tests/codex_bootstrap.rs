@@ -242,6 +242,23 @@ async fn delayed_delivery_control_holds_visible_native_input_and_recovers_once()
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
     delayed.store(true, Ordering::SeqCst);
+    // Idle drivers do not poll control. Unread native mail must make the failed read visible.
+    let receipt: st3::model::MessageSendReceipt = client
+        .post(
+            "/v1/messages",
+            &st3::model::MessageSendRequest {
+                idempotency_key: "delayed-handoff".into(),
+                from: "person/eval".into(),
+                to: SUBJECT.into(),
+                content: "An invented delayed-control signal.".into(),
+                title: None,
+                in_reply_to: None,
+                tags: vec![],
+                attachments: vec![],
+            },
+        )
+        .await
+        .unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         let agent: Value = client
@@ -262,22 +279,6 @@ async fn delayed_delivery_control_holds_visible_native_input_and_recovers_once()
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let receipt: st3::model::MessageSendReceipt = client
-        .post(
-            "/v1/messages",
-            &st3::model::MessageSendRequest {
-                idempotency_key: "delayed-handoff".into(),
-                from: "person/eval".into(),
-                to: SUBJECT.into(),
-                content: "An invented delayed-control signal.".into(),
-                title: None,
-                in_reply_to: None,
-                tags: vec![],
-                attachments: vec![],
-            },
-        )
-        .await
-        .unwrap();
     let reference = receipt.message.subject;
     let receipts = root.join("receipts-agent-eval-codex-bootstrap.jsonl");
     let offers = || -> usize {
@@ -333,20 +334,34 @@ async fn delayed_delivery_control_holds_visible_native_input_and_recovers_once()
         "the provider did not record the recovered offer",
     )
     .await;
-    let agent: Value = client
-        .get(&format!("/v1/client/agents/{SUBJECT}"))
-        .await
-        .unwrap();
-    assert_eq!(agent["delivery"]["state"], healthy["delivery"]["state"]);
-    assert_eq!(agent["delivery"]["reason"], healthy["delivery"]["reason"]);
-    // More control and mailbox cycles must neither replay the input nor duplicate its receipts.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let agent: Value = client
+            .get(&format!("/v1/client/agents/{SUBJECT}"))
+            .await
+            .unwrap();
+        if agent["delivery"]["state"] == healthy["delivery"]["state"]
+            && agent["delivery"]["reason"] == healthy["delivery"]["reason"]
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "recovered idle control did not restore readiness: {agent}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Allow consumption to reach the mailbox, then observe further idle driver cycles.
+    // No control poll is needed once the native receipt marks the only message read.
+    tokio::time::sleep(Duration::from_secs(2)).await;
     let before = reads.load(Ordering::SeqCst);
-    until(
-        || reads.load(Ordering::SeqCst) >= before + 4,
-        "recovered control stopped refreshing",
-    )
-    .await;
-    assert_eq!(offers(), 1);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        before,
+        "idle control resumed polling"
+    );
+    assert_eq!(offers(), 1, "idle mailbox cycles replayed native input");
     for kind in ["message.staged", "message.delivered", "message.read"] {
         assert_eq!(
             store.claims_for(&reference, Some(kind)).unwrap().len(),

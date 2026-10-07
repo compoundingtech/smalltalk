@@ -44,6 +44,22 @@
       "behavior": "stale fence refused; accepted after restart; replay after restart has no duplicate writes"
     },
     {
+      "action": "arrangement.edit",
+      "tests": [
+        "crates/st3/src/api/client_v0/arrangements.rs::arrangement_actions_merge_layout_fences_replay_receipts_and_preserve_owner",
+        "crates/st3/src/api/client_v0/arrangements.rs::arrangement_edit_recovers_receipt_gap_without_accepting_a_changed_action_id",
+        "crates/st3/src/api/client_v0/arrangements.rs::arrangement_actions_accept_current_projected_launch_fences_and_refuse_stale_ones",
+        "crates/st3/src/api/client_v0/arrangements.rs::arrangement_retire_fences_refuse_concurrent_edits_and_replay_receipts",
+        "crates/st3/src/api/client_v0/arrangements.rs::arrangement_fenced_retire_recovers_receipt_gap",
+        "crates/st3/src/api/client_v0/arrangements.rs::arrangement_create_race_returns_typed_exists_and_exact_retry_receipt",
+        "crates/st3/src/api/client_v0/arrangements.rs::arrangement_folder_race_and_validation_refusals_stay_typed",
+        "crates/st3/src/api/client_v0/arrangements.rs::selected_arrangement_survives_byte_window_edits_and_retirement",
+        "crates/st3/src/store/arrangements_tests.rs::owner_admission_real_agent_and_atomic_identity_fences",
+        "crates/st3/src/store/arrangements_tests.rs::heads_survive_reopen_and_an_upgrade_backfills_once"
+      ],
+      "behavior": "real API handler and store tests: stale layout fences merge; fenced retirement compares the current revision and refuses concurrent edits without writes; unfenced retirement remains unconditional; stale authority and launch fences refuse without edits; replay preserves receipts and rejects changed action identity; fenced retirement recovers receipt gaps; agent attribution preserves person ownership; projected heads survive reopen, upgrade backfill and replication"
+    },
+    {
       "action": "attention.resolve",
       "tests": [
         "crates/st3/tests/action_coverage.rs::unavailable_actions_refuse_before_and_after_restart_without_writes"
@@ -551,6 +567,14 @@
         "crates/st3/tests/action_coverage.rs::cli_human_reviews_act_on_the_current_card_after_restart"
       ],
       "verification": "real CLI over private Unix socket; current source review and durable verdict"
+    },
+    {
+      "command": "st attention discuss",
+      "description": "Chat about an item: send a message to the agent involved, titled after the item, with a reference to what it is about. This is what \"Chat about this\" does in stui",
+      "tests": [
+        "crates/st3/tests/client_v0_cli.rs::attention_discuss_sends_the_message_stui_chat_about_this_sends"
+      ],
+      "verification": "real CLI over private Unix socket; the agent reads the message with the item named"
     },
     {
       "command": "st attention ls",
@@ -1982,6 +2006,14 @@
       "verification": "shared API restart case"
     },
     {
+      "command": "st work delegation",
+      "description": "Replace or revoke the person's allowed delegation list with decision evidence",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_delegation_policy_and_answers_preserve_identity_across_restart"
+      ],
+      "verification": "real CLI over private Unix socket; disk store reopened between actions"
+    },
+    {
       "command": "st work done",
       "description": "Complete a person-assigned step with a response",
       "tests": [
@@ -2184,7 +2216,7 @@
         "crates/stui/src/ui/live.rs::live_sends_retries_discussions_and_creation_survive_daemon_restarts",
         "crates/st3/tests/action_coverage.rs::messages_survive_stale_fences_and_restarts"
       ],
-      "verification": "live UI adapter plus daemon restart"
+      "verification": "live UI adapter plus daemon restart; conversation thread replies preserve in_reply_to and retry receipts"
     },
     {
       "effect": "CancelRun",
@@ -2205,7 +2237,7 @@
     {
       "effect": "TerminalKey",
       "tests": [
-        "crates/stui/src/ui/pty.rs::keys_are_the_bytes_a_terminal_sends",
+        "crates/stui/src/ui/pty.rs::protocol_modes_control_key_encoding",
         "crates/st3/tests/action_coverage.rs::terminal_controls_survive_stale_screens_and_daemon_restarts"
       ],
       "verification": "UI reducer and corresponding real daemon action; local effects have no graph fence"

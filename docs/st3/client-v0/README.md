@@ -365,6 +365,47 @@ become explicit payload-free unsupported-schema values; known malformed payloads
 Use the native `subjects` collection for bounded current windows, described in
 [`collections.md`](collections.md); retained history remains on these paged HTTP reads.
 
+#### Native source cost and retention
+
+The native family read model is host-local derived state, not an authorization cache. The
+claim tables remain authoritative; every candidate still passes the existing identity,
+audience, field-disclosure, and canonical-head policies in one pinned SQLite read snapshot.
+
+The original family query bounded its output but not its work: `DISTINCT subject` walked
+every claim of the selected family, and the continuation fingerprint counted that same
+history. The cost probe for `GET /v1/client/subjects?family=agent&limit=20` reported
+116,908 → 443,091 SQLite VM steps as retained claims grew from 2,406 → 23,785, while
+answer bytes grew only from 30,128 → 36,113. Limiting the result or waiving the cost gate
+would not fix those history-linear reads.
+
+`native_source_ranges` instead maintains radix-16 retained-source counts and extrema for
+each subject, source, kind selector, and recorded-actor selector. Family enumeration seeks
+one root row per subject in each source, then merges independently bounded candidate
+pages. Current-fence fingerprints read root aggregates; older fences decompose into at
+most sixteen ranges of at most fifteen complete radix nodes. Read work depends on
+selected subject cardinality and bounded range nodes, not claims per subject. The model
+has seventeen levels for SQLite's integer positions; append work updates the relevant
+selector scopes, and removal work recomputes extrema bottom-up from at most sixteen
+children per node. Startup backfills each level with grouped source reads only once.
+
+Append, checkpoint deletion, local retention deletion, and repair admission changes update
+the model in the same source transaction, so pruning or repairing an unseen ref below an
+original fence expires its continuation. Later appends, deletions above either fence, and
+mutations outside the selected literal prefix or recorded actor do not expire it. Local
+observation IDs order their nondecreasing `after_store_index`: writes capture the graph's
+committed high water under the writer lock, and checkpoint pruning cannot decrease that
+watermark. An indexed graph-position seek therefore intersects the local ID and graph
+fences exactly before reading the local range aggregates.
+
+The fingerprint still hashes the original selector/fence-specific retained counts and
+extrema using the existing v1 encoding; rebuilding the read model alone does not invalidate
+an otherwise usable cursor. No request cache, global invalidation generation, replicated
+projection digest, or public source count is introduced. Source-contract tests compare
+the aggregates and cursor hashes with direct fenced source queries across radix
+boundaries, pruning, repair/readmission, and rebuild; the unchanged daemon cost probe
+remains the end-to-end performance gate.
+
+
 ### Applied subject definitions
 
 `GET /v1/client/subject-definition?subject=agent%2Fexample%2Fworker` reads exactly one agent's
@@ -657,8 +698,12 @@ pages and updates are bounded by the negotiated byte and item limits.
 
 Pi-family native replay recognizes OMP's message-level `role: "toolResult"` records: the
 `toolCallId` correlates the result with its call, `isError` selects error or success status, and
-the result's text content is retained. Legacy tool-result blocks inside message content remain
-supported.
+the result's text content is retained. Native result `details` objects are merged verbatim into
+the normalized `tool_output` block's optional open `metadata`, preserving `wallTimeMs`,
+`timeoutSeconds`, zero/fractional values, original units, and future fields. There is no
+`tool_result` body metadata field; the complete native record remains unchanged in its
+`source_record` block. Legacy tool-result blocks inside message content remain supported and
+use the same block metadata shape.
 
 External process sessions remain listed even when st cannot identify a native transcript.
 Opening their timeline returns a non-retryable `unsupported-capability` error with
@@ -734,7 +779,7 @@ The v0 action discriminators are:
 | Lanes | `lane.join`, `lane.leave`, `lane.move`, `lane.mark`, `lane.approve` | snapshot; the lane must be open and a named entry or anchor must be in it |
 | Runtimes | `runtime.stop`, `runtime.restart`, `runtime.reset`, `runtime.context-clear`, `runtime.signal` | runtime incarnation; stop, restart, and reset also require `runtime_desired_revision` from the runtime resource |
 | Agent desired state | `agent.stop`, `agent.start` | snapshot and `runtime_desired_revision`, the agent's selected desired claim ID; no runtime incarnation required |
-| Terminals | `terminal.input`, `terminal.resize`, `terminal.attach`, `terminal.detach` | runtime incarnation; input and resize also require the screen sequence |
+| Terminals | `terminal.input`, `terminal.resize`, `terminal.attach`, `terminal.detach` | runtime incarnation; resize and a line of input (`mode` `line`) also require the screen sequence; raw and key input do not |
 | Pairing | `pairing.begin`, `pairing.complete`, `pairing.revoke` | pairing/device revision where applicable |
 
 `runtime.stop` publishes a stop for the selected member. `runtime.restart` terminates the current
@@ -967,7 +1012,13 @@ client needs to encode keys and pastes (`alternate_screen`, `application_cursor`
 line per row, and `next_sequence`, an opaque numeric screen fence for input and resize. Compare
 it for equality; it is not a graph index or an ordered event counter. Unrelated graph writes do
 not change it. A terminal action may use an older snapshot from the same host, while incarnation
-and explicit revision fences still apply. Attach/detach do not require a screen sequence fence.
+and explicit revision fences still apply. Attach/detach do not require a screen sequence fence, and
+neither does `terminal.input` in `raw` or `key` mode: keys a person types cannot be made unsafe by a
+screen they did not see, and a program that redraws itself (a spinner) moves the sequence between
+any read and any send, so a client that must match it can never type. A client may send such input
+with no `terminal_sequence`; one that still sends it is not checked against it. A daemon older than
+this refuses such input with "terminal control requires a sequence fence", and the client then reads
+the screen and sends its sequence as before.
 `revision` digests the rest of
 the screen: equal revisions mean equal screens, and a stream never sends the same revision twice.
 The optional `kitty_keyboard` mode carries the active Kitty keyboard enhancement bitmask.
@@ -1041,6 +1092,18 @@ Read-only terminal scope permits screens but rejects input and resize. Screen pa
 negotiated byte limits: at most 200 lines and 4096 bytes of text per line, with explicit
 `redacted` and `truncated` markers.
 
+### Launch size
+
+A client that draws seats in a pane of fixed size publishes it as a claim on the person, so a seat
+st launches later starts at that size and the first attach needs no resize:
+`POST /v1/claims` with `{"subject":"person/NAME","kind":"terminal.launch-geometry",
+"actor":"person/NAME","fields":{"rows":ROWS,"columns":COLUMNS}}`. Only the person may write it,
+and `rows` and `columns` must each fit a positive u16. At every terminal launch the reconciler
+reads the newest such claim for its configured `person` and starts `pty run` with
+`--rows ROWS --cols COLUMNS`; without a configured person or a claim, pty picks its own size. The
+claim does not wake the reconciler, and a running seat keeps its size: resize it with
+`terminal.resize`.
+
 ### Raw PTY transport
 
 `POST /v1/client/terminals/{id}/raw-attachments` accepts
@@ -1063,6 +1126,10 @@ PTY's atomic SCREEN replay followed by live DATA, GEOMETRY and EXIT unchanged. T
 one PTY connection for the transport lifetime. ATTACH and RESIZE therefore participate in normal
 per-axis min-wins geometry with other persistent writers; PEEK cannot send input, resize, upgrade
 to ATTACH, or contribute geometry. DETACH and closing the transport release the connection.
+After ATTACH, an empty PTY frame of type 11 (`ResetInputModes`) can recover the daemon's
+input modes without writing reset bytes to the child. PEEK connections and nonempty reset
+frames are refused. The normal screen/history survive, and the daemon broadcasts the reset
+as DATA. Older PTY daemons ignore this extension.
 Raw clients cannot issue PTY lifecycle/CAS or ancestry-management commands through this capability.
 Bounded chunks and socket backpressure preserve every byte; slow consumers do not skip output.
 
@@ -1183,8 +1250,7 @@ order, and each old tab’s title goes to its first pane. The original claims an
 and replay. A subsequent version-1 write stores the new body and records the old revision it
 replaced. New client writes require the version-1 shape and bounds. An empty legacy body at
 the old byte limit can project slightly above 64 KiB; the next write must fit the current limit.
-The response ceiling is
-8 MiB, allowing a complete 100-glass subscription window at these bounds.
+The negotiated client response ceiling is 1 MiB.
 
 Local creation is refused when the member already sees 100 live glasses. Concurrent creates
 on separate members are all retained as immutable claims. After synchronization, the earliest
@@ -1210,6 +1276,172 @@ Generated clients expose Rust `list_glasses`, `get_glass`, `put_glass`, `delete_
 `putGlass`, `deleteGlass`, and `glassesStream`. Each supplies typed bodies and recursive layouts.
 Mutation methods take an explicit idempotency key so a retry uses the original key and input.
 Member daemons replicate the claims; paired clients read them through a member gateway.
+
+## Person arrangements
+
+An arrangement is shared sidebar organization, not a private pane workspace. Discover
+`arrangements` capability version 1 and the `read.arrangements` / `control.arrangements`
+scopes. Glass identity, pane bodies, and privacy are unchanged. Authenticated persons and
+trusted fleet agents read and write in today's free mode as their **real actor**; an agent
+never impersonates the owner. Ownership is permanently the person in
+`arrangement/person/NAME/lowercase-UUIDv7`, independent of run or session lifetime.
+Restriction belongs to the upstream principals/grants system, not an arrangement-specific
+opt-in or ACL. Anonymous access is refused. A paired person selects only their own
+collection; a trusted local fleet agent explicitly selects a fleet person.
+
+Generic status views omit arrangements, like glasses; current arrangement reads use the dedicated client routes, and later arrangement edits do not invalidate historical status frontiers.
+
+Read `GET /v1/client/arrangements?person=person%2FNAME` (ordinary cursor/limit pagination)
+or `GET /v1/client/arrangements/{person_name}/{uuid}`. The owner selector is mandatory:
+an agent identity is not an implicit collection owner. Lists contain typed `Arrangement`
+resources in an ordinary page. Live details contain `id`, `kind: "arrangement"`, `owner`,
+`revision`, `updated_at`, `deleted: false`, and this versioned body:
+
+```ts
+type Register<T> = { value: T; revision: string }; // winning ClaimId
+type ArrangementBody = {
+  version: 1;
+  name: Register<string>;
+  folders: Record<string, {
+    name: Register<string>;
+    position: Register<{ parent: string | null; key: string }>;
+    tombstone: Register<true> | null;
+  }>;
+  placements: Record<string, Register<{ folder: string | null; key: string }>>;
+};
+```
+
+Existing phone pairings lack `read.arrangements` and must be re-paired to read arrangements.
+
+Folder IDs are stable lowercase UUIDv7. Placement keys are graph subjects, never PTY or
+session IDs. An optional `resolved: {parents, folders}` supplies effective folder parents
+and placement folders; null means root/unfiled. It does not rewrite raw registers.
+Names are nonblank, contain no control characters, and are bounded to 256 UTF-8 bytes; canonical base-62 fractional-indexing
+keys are bounded to 128 bytes (for example `a0`, `a1`, `Zz`). Integer-part lengths must
+be canonical and fractional suffixes cannot end in zero. Each edit has 1–1,024 operations
+and its compact UTF-8 JSON operations array is at most 1 MiB, locally and on replication.
+Local full projected resources (including headers, register revisions and resolved
+locations) are bounded to 512 KiB (`max_arrangement_resource_bytes`), 1,024 folders
+(including tombstones), and 4,096 placements. Local creation admits at most 100 live
+arrangements per person. These cumulative quotas apply only to local admission, not to
+a remotely replicated concurrent union. Heads retain that union without arrival-dependent
+dropping or canonical-cap truncation. Retirement bypasses cumulative overflow so an
+oversized remote union can still be retired. Per-operation shape, name, key, ID and claim
+bounds still apply on replication. Clients must not treat a lexical JSON Schema key
+pattern as the full fractional-key validator.
+
+Submit `POST /v1/client/actions` with `type: "arrangement.edit"` and typed parameters
+`{subject, owner, operations}`. `owner` is required on every edit and must equal the
+immutable person in the subject. Operations are tagged by `op`:
+
+| `op` | Required fields besides `op` |
+| --- | --- |
+| `create` | `name` |
+| `rename` | `name` |
+| `folder.create` | `id`, `name`, `parent: null \| folder ID`, `key` |
+| `folder.rename` | `id`, `name` |
+| `folder.move` | `id`, `parent: null \| folder ID`, `key` |
+| `folder.delete` | `id` |
+| `subject.place` | `subject`, `folder: null \| folder ID`, `key` |
+| `retire` | none |
+
+Each atomic edit may touch a register at most once; retirement must be its only operation.
+
+Creation declares the name and may atomically include folders and placements. Null
+placement folders unfile subjects; changing the key reorders them. Include any necessary
+rekeys in the same atomic edit. Only touched registers change: stale layout revisions
+merge rather than replace unrelated fields. For layout edits, the target arrangement's
+entry in `fence.subject_revisions` is a layout base, not a compare-and-swap precondition.
+For `retire`, that entry instead requires the current arrangement revision to match in
+the writer transaction: a mismatch returns `stale-fence` and appends nothing. An unfenced
+retire is unconditional. To fold a duplicate losslessly, read it, fold its contents into
+the winner, then retire it fenced on the revision read; on refusal, reread and refold.
+The existing action ID, snapshot fence, and session-scoped idempotency key remain required;
+stale graph identity/authority and launch revision fences for other subjects refuse the edit
+atomically in the writer transaction. Attention episodes and external native-session revisions
+retain the existing projected preflight checks; external filesystem state is not governed by
+SQLite admission and cannot be made transactionally atomic with graph writes.
+Retry of the same action identity, parameters and key returns the saved receipt, even
+after later edits or retirement. Fences are excluded from request identity: they may
+be refreshed after refusal, and accepted retries replay before fence validation.
+Changing other input with the same key returns `idempotency-conflict`. A completed
+result's `affected_ids` names only the arrangement and `arrangement_revision` identifies
+the accepted claim, not a promise that its registers will remain winners.
+A second `create` for an existing arrangement under a different idempotency key returns
+typed `arrangement-exists` with `retryable: false`; clients can distinguish a create
+race from an internal failure. Exact retries of the original create return its receipt.
+Folder creation reusing a live or tombstoned ID returns `arrangement-folder-exists`.
+Generated clients preserve the following admission/validation codes as typed,
+non-retryable refusals rather than `internal`; callers do not parse error wording:
+
+| Category | Codes |
+| --- | --- |
+| Create race | `arrangement-exists`, `arrangement-folder-exists` |
+| Lifecycle/structure | `arrangement-retired`, `arrangement-folder-deleted`, `arrangement-cycle` |
+| Bounds/authority | `arrangement-limit`, `arrangement-body-too-large`, `arrangement-owner-forbidden` |
+| Validation | `invalid-arrangement-subject`, `invalid-arrangement-action`, `invalid-arrangement-operations`, `invalid-arrangement-folder`, `invalid-arrangement-name`, `invalid-arrangement-key`, `invalid-subject-reference` |
+
+The ordinary `not-found`, `forbidden`, `stale-fence` and `idempotency-conflict` codes
+retain their existing meanings.
+
+`arrangement.edited` claims are durable. Each register uses canonical maximum
+`(accepted_at_unix_ms, batch origin, replica_sequence, batch_id, record position, claim_id)`,
+including the canonical legacy position fallback, rather than client HLC or arrival
+order. Offline writes therefore order by admission. Rename and move survive each other.
+Folder tombstones are remove-wins and final for that folder ID; they retain position
+and never delete subjects. Children and placements resolve through deleted folders to
+the nearest live ancestor, or root; unknown folders resolve root/unfiled. Missing roster
+subjects retain their placement for their return. Local self/descendant moves are refused.
+Concurrent cycles cut the greatest canonical position-register winner (folder ID
+tie-break) to root. Sort siblings by `(key, folder_id)` and members by `(key, subject)`.
+Retirement is permanent for an arrangement ID; it disappears from live reads and streams.
+Ending a reference never retires an arrangement or deletes a referenced subject.
+
+Admission transactions materialize register heads, tombstones and owner-indexed current
+rows. List/detail and write validation read these heads, never edit history. Replay may
+rebuild them once; projection digests and checkpoint proofs include the same read answers.
+There is **no new checkpoint drop rule**: agent-authored edits are durable too.
+
+Subscribe on `st3.client.collections.v0` with
+`{kind: "subscribe", id, collection: "arrangements", person: "person/NAME", limit: 100}`.
+Person is required and grants are checked on every read. Bounded authoritative snapshots,
+full resource upserts, removed IDs, complete order, and reconnect snapshots follow the
+ordinary collection contract.
+An optional `subject: ArrangementId` selects only that arrangement (zero or one items,
+`has_more: false`), so a selected Sidebar cannot fall outside a busy owner's byte/count
+window. Its owner must equal `person`; mismatches are refused. Snapshots, upserts and
+retirement removals retain the ordinary collection semantics. Omitting the filter
+keeps owner-wide prefix windows unchanged.
+Arrangement list and stream windows also fit a byte budget: the 1,048,576-byte response
+ceiling reserves 128,000 bytes for the envelope. A byte-shortened window sets `has_more`
+and retains full resources, not truncated registers or placements. A replicated full
+resource above the remaining 920,576-byte budget returns explicit `validation-failed`
+rather than silently omitting part of its layout. Detail reads enforce the same single
+resource bound. Reconnect takes a new authoritative bounded snapshot; paired-session
+revocation, grant changes and expiry are checked again on each read.
+
+Generated Rust exposes `arrangements_list`, `arrangements_get`, `arrangement_edit`, and
+`CollectionStream::subscribe_arrangements`; TypeScript exposes `arrangementsList`,
+`arrangementsGet`, `arrangementEdit`, and `CollectionStream.subscribeArrangements`;
+Swift exposes `arrangementsList`, `arrangementsGet`, `arrangementEdit`, and
+`arrangementsStream`. Detail methods take the person name and UUID separately.
+All three arrangements stream helpers accept an optional `subject`; Rust takes
+`subject: Option<&str>` after `limit`, TypeScript takes `subject?: ArrangementId`
+after `limit`, and Swift takes `subject: String? = nil`.
+Rust operations reuse `st3_schema::arrangements::Operation`; TypeScript and Swift have
+typed operation unions, not arbitrary JSON bodies. Regenerate all clients with
+`cargo run -p st3-client-codegen`; verify freshness with
+`cargo run -p st3-client-codegen -- --check`.
+
+Fractal migration is client-owned: discover capability, pause legacy writers, fold old
+`custom.fractal.sidebar` HLC history once, and durably stage the snapshot, target ID,
+exact typed operations and idempotency key. Preserve stable IDs, import order (keys are
+re-derived), tombstones and placements. Fractal sorts legacy siblings by `(key, ID)` and
+deterministically derives canonical fractional keys for each folder and placement list.
+Retry that exact staged request until acknowledged and readable, then switch
+exclusively to arrangements. Old stamps remain provenance, not live ordering. Keep staged
+state on failure, leave immutable custom history, and never dual-write. There is no
+upstream Fractal-specific importer.
 
 ## Agent and plain-shell creation
 
@@ -1266,9 +1498,19 @@ for its crash boundary.
 Rust exposes `agent_create`, `terminal_create`, `terminal_end`; TypeScript and Swift expose
 `agentCreate`, `terminalCreate`, `terminalEnd` with generated typed parameter bodies.
 
+A timeline message body whose sender is a person carries `provenance`: the `verdict` every member
+recorded for the message's signature (`verified`, `unsigned`, `held` or `invalid`, with a `reason` for
+the last two), and for a signed one the `signer`, the `key` and the `device` the key was granted to,
+by the label it was given when it paired (`example phone (secure enclave)`). Clients show it beside the
+sender; an `unsigned` message is usually just older than signing and shows nothing. An agent's
+message carries none. `GET /v1/messages/read/{id}` (`st conversations read`) and `st subject show`
+for a message give the same object.
+
 Messages tagged `dictated` carry a delivery-only line explaining that voice transcription may
 contain mistakes. The stored text and body digest stay unchanged. Timeline message bodies carry
 the message's optional `tags` array so clients can mark dictation without inspecting its text.
+
+Agent projections include optional `workspace` and `checkout {repository, base, branch}` from the declaration, so clients can label a new seat before it launches. These describe the requested checkout; `state` and `fault` report whether launch succeeded. Older daemons omit the metadata. Both new-agent forms consume `host.repositories`, permit an absolute path typed on the selected host, keep the base editable, and leave an empty repository as a plain workspace. Their wire parameters and worktree label share `fixtures/clients/agent-launch.json`.
 
 The agent resource exposes observed harness status as `harness_state`, `since` (RFC 3339),
 and `observation: current | stale | missing`. `since` is the start of that state in that
@@ -1290,3 +1532,94 @@ updates use the existing agents collection stream, including clock-driven stalen
 Same-state observations remain local except for a freshness publication at most once a minute.
 That publication preserves `since` and does not add a history transition. Freshness uses the
 source observation time, so replaying old evidence cannot make a stale seat current.
+
+## Exact terminal lookup
+
+`GET /v1/client/terminals?owner=agent%2Fexample%2Fworker&state=running` matches the
+exact `owner_id` and projected `state` before the page limit. Owner lookup reduces only
+that subject at the selected snapshot rather than scanning the fleet. Both query fields are
+optional and combine with AND; there is no prefix or short-name resolution. An unknown
+owner returns an empty page. State filtering uses the projected state, including
+`unreachable` when runtime authority is unavailable. `history=true` (CLI `--all`)
+retains its existing meaning; filters do not add stopped history by themselves.
+
+The CLI equivalent is `st terminals ls --owner agent/example/worker --state running --json`.
+Rust exposes `terminals_list_filtered`, Swift `terminalsListFiltered`, and TypeScript
+`terminalsListFiltered`. Existing list methods, ordering, default limit (50), maximum
+limit (200), and unfiltered paging are unchanged. Filtered pages echo `owner` and `state`
+in `value.filters`; other collections ignore these terminal-only fields without acknowledging
+them or binding their cursors to them. Terminal cursors bind those values, so every
+continuation must repeat them.
+Changing or dropping a filter while continuing returns `page-cursor-expired`.
+
+This is an additive client read contract change: the operations manifest documents the
+optional query fields; resource schemas, API versions, capabilities and stored claims
+are unchanged. Old clients still list new servers normally. New filtered client methods
+refuse an older server that omits the requested filter acknowledgment, with an upgrade
+message, instead of returning an unfiltered page or scanning pages on the client.
+A running projection is replicated evidence, not a successful PTY handshake: callers
+must still use the existing incarnation-fenced attachment routes to attach.
+
+The real-daemon mixed-build regression is a **manual proof**, not a CI gate: run
+
+```sh
+ST3_TERMINALS_COMPAT_BIN=/path/to/older/st3 cargo test -p st3 --test integration fleet::terminal_owner_filters_are_safe_across_mixed_builds -- --ignored --exact
+```
+
+Choose a binary built before these terminal filters. The fake legacy-server refusal
+and escaping test, server filter/paging tests, and TypeScript client checks run in CI.
+
+### Owner-native conversation blocks
+
+With `X-St3-Features: conversation-blocks.v1`, native timeline entries include
+optional `body.blocks`. Top-level timeline types stay unchanged for old Swift/iOS
+and stui decoders. Block kinds are open strings; an unrecognized native block keeps
+its complete JSON in `payload.raw` before transport bounding. Reasoning explicitly
+present in the harness transcript and full structured tool arguments are shown
+without secret or token filtering. Without the feature, the server returns known
+text/tool/status bodies with visible size-limit notices. Old clients can read those
+fallbacks but do not fetch images or expand a chunked remainder.
+
+`read.projections` authorizes **raw native conversation content**, including full
+arguments, output, reasoning shown by the harness, unknown JSON and images. It is
+the existing scope for pages, deltas and owner forwarding, and also governs
+`GET /v1/client/conversations/{id}/content/{reference}/chunk?offset=N`. Terminal
+write or message-attachment scopes are not required. A local read-only Unix client
+already has this scope; a paired client needs it in its active delegated grant.
+
+Image pixels stay off timeline pages. Blocks and nested native images carry opaque
+owner references. Every fetch verifies the authorized session, entry/revision and
+native source identity; no client-supplied file path or image URL is accepted. The
+ref encrypts the owner-located source descriptor, so native chunks do not inventory
+other sessions and the path is not exposed. Managed chunks also recheck the current
+owner binding. A
+chunk contains base64 `data`, `media_type`, `offset`, total `size` and nullable
+`next_offset`. Chunks hold at most 256 KiB of decoded bytes; native image reads are
+limited to 32 MiB, with explicit errors. Transcript URLs are never fetched by the owner. Oversized JSON
+payloads show an 8 KiB UTF-8 prefix labelled as truncated JSON text, and a reference
+recovers the full valid JSON. The existing 1 MB page bound still applies.
+
+Edited records, replacement, managed binding changes and owner restarts invalidate references;
+append-only growth preserves existing refs:
+HTTP 410 `conversation-content-invalidated`, `retryable: true`, and
+`details.full_resync: true` tell the client to reload before fetching again. A
+reachable owner with unreadable/missing bytes returns `transcript-unavailable`;
+unreachable owner reads retain `remote-unavailable` and carry
+`details.availability: owner-unavailable`. The managed transcript notice similarly
+labels `transcript-unavailable`; retiring its stored-history fallback is owned by
+the separate no-agent-history mission. This contract adds no durable content class,
+claim kind, retention rule, spool, or image blob copy.
+
+Native conversation `read.projections` grants full transcript, chunk and image access,
+including secrets in exposed reasoning, tool arguments/output and unknown JSON.
+Local people and agents, anonymous local read-only Unix readers, and default paired
+phones and wall displays have this access. No content is scrubbed. Refs die on a
+daemon restart; clients must reload the timeline. Four expensive owner timeline/chunk
+reads can run concurrently; busy reads return HTTP 429 `rate-limited`, including
+managed timeline reads. Clients must back off and retry.
+Known blocks can use `payload: {body_ref: true}` to refer to the containing fallback
+body without duplicating its bytes. Content refs authenticate one native record;
+chunk reads do not rebuild the session. The owner never requests transcript HTTP(S)
+URLs. External images use an `image_link` block for explicit client opening; file
+reads are restricted to content-addressed files in the bound Pi/OMP blob store. MIME comes from passive image
+signatures, with SVG/HTML/unrecognized bytes returned only as opaque octets.

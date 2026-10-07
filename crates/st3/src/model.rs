@@ -133,6 +133,10 @@ pub struct MemberSpec {
     pub restart_intensity: RestartIntensity,
     pub shutdown_timeout_ms: u64,
     pub driver: Option<String>,
+    /// The size a terminal seat starts at: the configured person's `terminal.launch-geometry`,
+    /// read at each launch. Never declared, so never a launch change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_size: Option<st_runtime::TerminalSize>,
 }
 
 impl MemberSpec {
@@ -756,6 +760,8 @@ pub struct NormalizedIntent {
     pub subjects: BTreeMap<String, DesiredSubject>,
     #[serde(default)]
     pub missions: BTreeMap<String, MissionSpec>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mission_provenance: BTreeMap<String, st3_schema::provenance::Provenance>,
     #[serde(default)]
     pub mission_runs: BTreeMap<String, MissionRunDeclaration>,
     #[serde(default)]
@@ -1082,6 +1088,8 @@ pub struct MissionResponse {
     pub warnings: Vec<String>,
     pub subject_tokens: BTreeMap<String, Vec<String>>,
     pub mission_revisions: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mission_provenance: BTreeMap<String, st3_schema::provenance::Provenance>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1600,6 +1608,8 @@ pub struct EventRecord {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ReviewRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<DelegationProof>,
     pub decision: String,
     #[serde(default)]
     pub reason: Option<String>,
@@ -1753,6 +1763,8 @@ pub struct SubscriptionRequestDecision {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AttentionResolveRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<DelegationProof>,
     pub outcome: String,
     #[serde(default)]
     pub reason: Option<String>,
@@ -1849,6 +1861,8 @@ pub struct MessageSendRequest {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MessageLifecycleRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<DelegationProof>,
     pub lifecycle: String,
     #[serde(default)]
     pub actor: Option<String>,
@@ -2163,6 +2177,8 @@ pub struct MissionDefinitionView {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MissionRunView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<st3_schema::provenance::Provenance>,
     pub subject: String,
     pub id: String,
     pub mission: String,
@@ -2199,6 +2215,9 @@ pub struct MissionRunView {
     /// Unresolved exit-code field gates on terminal execs, computed for mission details.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stuck_gates: Vec<String>,
+    /// An unresolved scheduler fault on this run, with its observed first-readiness wait.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler_fault: Option<String>,
 }
 
 /// Who set a finished run's outcome, from what, and why.
@@ -2543,6 +2562,8 @@ pub struct PersonAskRequest {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PersonStepResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<DelegationProof>,
     pub subject: String,
     pub actor: String,
     pub summary: String,
@@ -2559,6 +2580,9 @@ pub struct PersonStepResponse {
 /// A person's response to an ask, as data: the typed answer when the ask was structured.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct PersonAnswerView {
+    /// The person whose prior instruction the respondent recorded, when delegated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acted_for: Option<String>,
     pub ask: String,
     /// `completed` when the person answered, `cancelled` when the ask was withdrawn.
     pub status: String,
@@ -2570,6 +2594,29 @@ pub struct PersonAnswerView {
     pub answer: Option<Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<String>,
+}
+
+/// Evidence for recording a person's instruction without using their actor identity.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DelegationProof {
+    pub person: String,
+    pub policy: String,
+    pub message: String,
+    pub quote: String,
+    /// Exact asking claim, human gate request, or message's original sent claim.
+    pub episode: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DelegationPolicyRequest {
+    pub person: String,
+    pub actor: String,
+    /// Replace the entire list; an empty list revokes delegation.
+    pub actions: Vec<String>,
+    pub evidence: Vec<String>,
+    pub idempotency_key: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2652,6 +2699,8 @@ pub struct RevisionProposalView {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RevisionSubmissionView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<st3_schema::provenance::Provenance>,
     pub status: String,
     pub mission_run: MissionRunView,
     #[serde(default, skip_serializing_if = "Option::is_none")]

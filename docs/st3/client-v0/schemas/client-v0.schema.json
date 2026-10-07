@@ -55,8 +55,8 @@
     "AgentState": {"anyOf": [{"enum": ["desired", "starting", "running", "waiting", "stopped", "failed", "suspended"]}, {"type": "string"}], "description": "Desired/observed agent seat state. `suspended`: the seat was stopped at a quiet boundary and resumes its own native session; see `suspension`."},
     "AgentReachability": {"anyOf": [{"enum": ["local", "remote", "unreachable", "unknown", "reachable", "indeterminate"]}, {"type": "string"}], "description": "Whether the daemon can currently reach the agent runtime."},
     "TimelineStatus": {"anyOf": [{"enum": ["queued", "running", "waiting", "completed", "failed", "cancelled"]}, {"type": "string"}], "description": "Run status reported in a timeline `status` entry."},
-    "ErrorCode": {"anyOf": [{"enum": ["attention-migrated", "not-found", "forbidden", "unsupported-capability", "validation-failed", "idempotency-conflict", "stale-fence", "cursor-gap", "page-cursor-expired", "rate-limited", "runtime-not-local", "runtime-authority-indeterminate", "remote-unavailable", "terminal-unavailable", "terminal-ended", "timeline-history-incomplete", "blob-too-large", "unsupported-media-type", "blob-content-mismatch", "blob-quota-exceeded", "blob-not-found", "blob-expired", "internal"]}, {"type": "string"}], "description": "Versioned safe error code; unknown codes fall back to `retryable`."},
-    "UnknownResource": {"allOf": [{"$ref": "#/$defs/ResourceHeader"}, {"type": "object", "properties": {"kind": {"type": "string", "not": {"enum": ["attention", "message", "launch", "launch-variant", "launch-decision", "launch-approval", "mission", "work", "agent", "runtime", "observer", "subscription", "lane", "machine", "device", "operation", "history", "session", "glass", "owned-set"]}}}}]},
+    "ErrorCode": {"anyOf": [{"enum": ["attention-migrated", "arrangement-exists", "arrangement-folder-exists", "arrangement-retired", "arrangement-limit", "arrangement-folder-deleted", "arrangement-cycle", "arrangement-body-too-large", "arrangement-owner-forbidden", "invalid-arrangement-subject", "invalid-arrangement-action", "invalid-arrangement-operations", "invalid-arrangement-folder", "invalid-arrangement-name", "invalid-arrangement-key", "invalid-subject-reference", "not-found", "forbidden", "unsupported-capability", "validation-failed", "idempotency-conflict", "stale-fence", "cursor-gap", "page-cursor-expired", "rate-limited", "runtime-not-local", "runtime-authority-indeterminate", "remote-unavailable", "terminal-unavailable", "terminal-ended", "timeline-history-incomplete", "conversation-content-invalidated", "transcript-unavailable", "blob-too-large", "unsupported-media-type", "blob-content-mismatch", "blob-quota-exceeded", "blob-not-found", "blob-expired", "internal"]}, {"type": "string"}], "description": "Versioned safe error code; unknown codes fall back to `retryable`. Arrangement admission and validation refusals are non-retryable."},
+    "UnknownResource": {"allOf": [{"$ref": "#/$defs/ResourceHeader"}, {"type": "object", "properties": {"kind": {"type": "string", "not": {"enum": ["attention", "message", "launch", "launch-variant", "launch-decision", "launch-approval", "mission", "work", "agent", "runtime", "observer", "subscription", "lane", "machine", "device", "operation", "history", "session", "glass", "arrangement", "owned-set"]}}}}]},
     "OwnedSet": {"allOf": [{"$ref": "#/$defs/ResourceHeader"}, {"type": "object", "required": ["kind", "claim", "receipt", "blockers", "members_status", "visibility"], "properties": {"kind": {"const": "owned-set"}, "claim": {"type": "string"}, "receipt": {"type": "object"}, "blockers": {"type": "array", "items": {"type": "string"}}, "members_status": {"type": "array", "items": {"type": "object"}}, "visibility": {"type": "object"}, "commit_status": {"type": ["object", "null"]}}}]},
     "GlassLayout": {"oneOf": [{"type": "object", "additionalProperties": false, "required": ["tabs"], "properties": {"tabs": {"type": "array", "maxItems": 1024, "items": {"$ref": "#/$defs/GlassTab"}}}}, {"type": "object", "additionalProperties": false, "required": ["split", "children"], "properties": {"split": {"enum": ["right", "below"]}, "ratio": {"type": "number", "minimum": 0.1, "maximum": 0.9, "description": "First child share; absent means 0.5. Requires glasses capability version 2."}, "children": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"$ref": "#/$defs/GlassLayout"}}}}]},
     "GlassTab": {"type": "object", "additionalProperties": false, "required": ["pane"], "properties": {"title": {"type": "string"}, "pane": {"type": "string", "minLength": 1}}},
@@ -64,6 +64,25 @@
     "Glass": {"allOf": [{"$ref": "#/$defs/ResourceHeader"}, {"type": "object", "required": ["kind", "body", "deleted", "base_revision", "replaced_revision"], "properties": {"kind": {"const": "glass"}, "body": {"oneOf": [{"$ref": "#/$defs/GlassBody"}, {"type": "null"}]}, "deleted": {"type": "boolean"}, "base_revision": {"type": ["string", "null"]}, "replaced_revision": {"type": ["string", "null"]}}}]},
     "GlassPut": {"type": "object", "additionalProperties": false, "required": ["body", "base_revision"], "properties": {"body": {"$ref": "#/$defs/GlassBody"}, "base_revision": {"type": ["string", "null"]}}},
     "GlassDelete": {"type": "object", "additionalProperties": false, "required": ["base_revision"], "properties": {"base_revision": {"type": ["string", "null"]}}},
+    "ArrangementSubject": {"type": "string", "pattern": "^(?!pty/|session/)[a-z][a-z0-9-]*/[^\\s]+$", "description": "Registered stable graph subject; pty and session subjects are not sidebar placement identities."},
+    "ArrangementPerson": {"type": "string", "pattern": "^person/[^/\\s]+$"},
+    "ArrangementId": {"type": "string", "pattern": "^arrangement/person/[^/\\s]+/[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"},
+    "ArrangementFolderId": {"type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"},
+    "ArrangementName": {"type": "string", "minLength": 1, "maxLength": 256, "description": "Nonblank name; admission additionally enforces 256 UTF-8 bytes."},
+    "ArrangementKey": {"type": "string", "minLength": 2, "maxLength": 128, "pattern": "^[A-Za-z][0-9A-Za-z]+$", "description": "Canonical base-62 fractional-indexing key. Admission validates integer-part length and nonzero-ending fractional suffix, not merely this lexical envelope."},
+    "ArrangementPosition": {"type": "object", "additionalProperties": false, "required": ["parent", "key"], "properties": {"parent": {"oneOf": [{"$ref": "#/$defs/ArrangementFolderId"}, {"type": "null"}]}, "key": {"$ref": "#/$defs/ArrangementKey"}}},
+    "ArrangementPlacement": {"type": "object", "additionalProperties": false, "required": ["folder", "key"], "properties": {"folder": {"oneOf": [{"$ref": "#/$defs/ArrangementFolderId"}, {"type": "null"}]}, "key": {"$ref": "#/$defs/ArrangementKey"}}},
+    "ArrangementNameRegister": {"type": "object", "additionalProperties": false, "required": ["value", "revision"], "properties": {"value": {"$ref": "#/$defs/ArrangementName"}, "revision": {"$ref": "#/$defs/Revision"}}},
+    "ArrangementPositionRegister": {"type": "object", "additionalProperties": false, "required": ["value", "revision"], "properties": {"value": {"$ref": "#/$defs/ArrangementPosition"}, "revision": {"$ref": "#/$defs/Revision"}}},
+    "ArrangementPlacementRegister": {"type": "object", "additionalProperties": false, "required": ["value", "revision"], "properties": {"value": {"$ref": "#/$defs/ArrangementPlacement"}, "revision": {"$ref": "#/$defs/Revision"}}},
+    "ArrangementTombstoneRegister": {"type": "object", "additionalProperties": false, "required": ["value", "revision"], "properties": {"value": {"const": true}, "revision": {"$ref": "#/$defs/Revision"}}},
+    "ArrangementFolder": {"type": "object", "additionalProperties": false, "required": ["name", "position", "tombstone"], "properties": {"name": {"$ref": "#/$defs/ArrangementNameRegister"}, "position": {"$ref": "#/$defs/ArrangementPositionRegister"}, "tombstone": {"oneOf": [{"$ref": "#/$defs/ArrangementTombstoneRegister"}, {"type": "null"}]}}},
+    "ArrangementBody": {"type": "object", "additionalProperties": false, "required": ["version", "name", "folders", "placements"], "properties": {"version": {"const": 1}, "name": {"$ref": "#/$defs/ArrangementNameRegister"}, "folders": {"type": "object", "propertyNames": {"$ref": "#/$defs/ArrangementFolderId"}, "additionalProperties": {"$ref": "#/$defs/ArrangementFolder"}}, "placements": {"type": "object", "propertyNames": {"$ref": "#/$defs/ArrangementSubject"}, "additionalProperties": {"$ref": "#/$defs/ArrangementPlacementRegister"}}}},
+    "ArrangementResolved": {"type": "object", "additionalProperties": false, "required": ["parents", "folders"], "properties": {"parents": {"type": "object", "additionalProperties": {"oneOf": [{"$ref": "#/$defs/ArrangementFolderId"}, {"type": "null"}]}}, "folders": {"type": "object", "additionalProperties": {"oneOf": [{"$ref": "#/$defs/ArrangementFolderId"}, {"type": "null"}]}}}},
+    "Arrangement": {"allOf": [{"$ref": "#/$defs/ResourceHeader"}, {"type": "object", "required": ["kind", "owner", "body", "deleted"], "properties": {"kind": {"const": "arrangement"}, "owner": {"$ref": "#/$defs/ArrangementPerson"}, "body": {"$ref": "#/$defs/ArrangementBody"}, "deleted": {"const": false}, "resolved": {"$ref": "#/$defs/ArrangementResolved"}}}]},
+    "ArrangementOperation": {"oneOf": [{"type": "object", "additionalProperties": false, "required": ["op", "name"], "properties": {"op": {"const": "create"}, "name": {"$ref": "#/$defs/ArrangementName"}}}, {"type": "object", "additionalProperties": false, "required": ["op", "name"], "properties": {"op": {"const": "rename"}, "name": {"$ref": "#/$defs/ArrangementName"}}}, {"type": "object", "additionalProperties": false, "required": ["op", "id", "name", "parent", "key"], "properties": {"op": {"const": "folder.create"}, "id": {"$ref": "#/$defs/ArrangementFolderId"}, "name": {"$ref": "#/$defs/ArrangementName"}, "parent": {"oneOf": [{"$ref": "#/$defs/ArrangementFolderId"}, {"type": "null"}]}, "key": {"$ref": "#/$defs/ArrangementKey"}}}, {"type": "object", "additionalProperties": false, "required": ["op", "id", "name"], "properties": {"op": {"const": "folder.rename"}, "id": {"$ref": "#/$defs/ArrangementFolderId"}, "name": {"$ref": "#/$defs/ArrangementName"}}}, {"type": "object", "additionalProperties": false, "required": ["op", "id", "parent", "key"], "properties": {"op": {"const": "folder.move"}, "id": {"$ref": "#/$defs/ArrangementFolderId"}, "parent": {"oneOf": [{"$ref": "#/$defs/ArrangementFolderId"}, {"type": "null"}]}, "key": {"$ref": "#/$defs/ArrangementKey"}}}, {"type": "object", "additionalProperties": false, "required": ["op", "id"], "properties": {"op": {"const": "folder.delete"}, "id": {"$ref": "#/$defs/ArrangementFolderId"}}}, {"type": "object", "additionalProperties": false, "required": ["op", "subject", "folder", "key"], "properties": {"op": {"const": "subject.place"}, "subject": {"$ref": "#/$defs/ArrangementSubject"}, "folder": {"oneOf": [{"$ref": "#/$defs/ArrangementFolderId"}, {"type": "null"}]}, "key": {"$ref": "#/$defs/ArrangementKey"}}}, {"type": "object", "additionalProperties": false, "required": ["op"], "properties": {"op": {"const": "retire"}}}]},
+    "ArrangementEditParameters": {"type": "object", "additionalProperties": false, "required": ["subject", "owner", "operations"], "properties": {"subject": {"$ref": "#/$defs/ArrangementId"}, "owner": {"$ref": "#/$defs/ArrangementPerson"}, "operations": {"type": "array", "minItems": 1, "maxItems": 1024, "items": {"$ref": "#/$defs/ArrangementOperation"}}}},
+    "ArrangementPage": {"type": "object", "additionalProperties": false, "required": ["kind", "collection", "filters", "items", "page"], "properties": {"kind": {"const": "page"}, "collection": {"const": "arrangements"}, "filters": {"type": "object", "additionalProperties": {"type": "string"}}, "items": {"type": "array", "items": {"$ref": "#/$defs/Arrangement"}}, "page": {"$ref": "#/$defs/PageInfo"}, "sync": {"$ref": "#/$defs/SyncNotice"}, "replicated": {"$ref": "#/$defs/ReplicatedNotice"}}},
     "Id": { "x-st-ref": "*", "description": "Subject reference `family/rest`.", "type": "string", "pattern": "^[a-z][a-z0-9-]*/[^\\s]+$" },
     "Timestamp": { "x-st-codec": "timestamp", "description": "RFC 3339 UTC instant; servers emit millisecond precision with `Z`.", "examples": ["2026-10-01T10:00:00.000Z"], "type": "string", "format": "date-time" },
     "Cursor": { "x-st-brand": "Cursor", "description": "Opaque, snapshot-bound page/event cursor.", "type": "string", "minLength": 8, "maxLength": 2048 },
@@ -190,7 +209,15 @@
             "max_glass_body_bytes": { "type": "integer", "minimum": 1 },
             "max_glasses": { "type": "integer", "minimum": 1 },
             "max_glass_depth": { "type": "integer", "minimum": 1 },
-            "max_glass_nodes": { "type": "integer", "minimum": 1 }
+            "max_glass_nodes": { "type": "integer", "minimum": 1 },
+            "max_arrangement_body_bytes": { "type": "integer", "minimum": 1 },
+            "max_arrangement_resource_bytes": { "type": "integer", "minimum": 1 },
+            "max_arrangements": { "type": "integer", "minimum": 1 },
+            "max_arrangement_name_bytes": { "type": "integer", "minimum": 1 },
+            "max_arrangement_key_bytes": { "type": "integer", "minimum": 1 },
+            "max_arrangement_operations": { "type": "integer", "minimum": 1 },
+            "max_arrangement_folders": { "type": "integer", "minimum": 1 },
+            "max_arrangement_placements": { "type": "integer", "minimum": 1 }
           }
         },
         "event_cursor": { "$ref": "#/$defs/Cursor" },
@@ -216,7 +243,7 @@
       "required": ["id", "kind", "revision", "updated_at"],
       "properties": {
         "id": { "$ref": "#/$defs/Id" },
-        "kind": {"anyOf": [{"enum": ["attention", "message", "launch", "launch-variant", "launch-decision", "launch-approval", "mission", "work", "agent", "runtime", "observer", "subscription", "lane", "machine", "device", "operation", "history", "session", "glass"]}, {"type": "string"}], "description": "Resource family."},
+        "kind": {"anyOf": [{"enum": ["attention", "message", "launch", "launch-variant", "launch-decision", "launch-approval", "mission", "work", "agent", "runtime", "observer", "subscription", "lane", "machine", "device", "operation", "history", "session", "glass", "arrangement"]}, {"type": "string"}], "description": "Resource family."},
         "revision": { "$ref": "#/$defs/Revision" },
         "updated_at": { "$ref": "#/$defs/Timestamp" },
         "operational": { "$ref": "#/$defs/Operational" }
@@ -1031,11 +1058,14 @@
             "subagents": { "type": "array", "items": { "$ref": "#/$defs/AgentSubagent" }, "description": "The subagents this seat's harness runs now, oldest first: recorded, not ended, with a lease that runs past this read. An older daemon omits the field." },
             "handoff": {"oneOf": [{"$ref": "#/$defs/AgentHandoff"}, {"type": "null"}], "description": "Placement handoff phase; the destination waits for former hosts to acknowledge their stopped runtimes."},
             "rollout": { "type": ["object", "null"], "description": "Durable owned-seat cutover, incarnation and native-session fences, phase, deadline and blockers. Omitted by older daemons." },
+            "workspace": { "type": ["string", "null"], "description": "The declared workspace on the owning host." },
+            "checkout": { "oneOf": [{ "$ref": "#/$defs/AgentCheckout" }, { "type": "null" }], "description": "The requested Git worktree repository, base and branch. Present before launch; it does not assert that checkout succeeded." },
             "suspension": { "oneOf": [{ "$ref": "#/$defs/AgentSuspension" }, { "type": "null" }], "description": "The seat's latest suspend or resume and its phase. An older daemon omits the field." }
           }
         }
       ]
     },
+    "AgentCheckout": { "type": "object", "additionalProperties": false, "required": ["repository", "base", "branch"], "properties": { "repository": { "type": "string" }, "base": { "type": "string" }, "branch": { "type": "string" } } },
     "AgentTodo": {
       "type": "object",
       "additionalProperties": false,
@@ -1566,7 +1596,7 @@
       }
     },
     "Resource": {
-      "oneOf": [{"$ref": "#/$defs/Attention"}, {"$ref": "#/$defs/Message"}, {"$ref": "#/$defs/Launch"}, {"$ref": "#/$defs/LaunchVariant"}, {"$ref": "#/$defs/LaunchDecision"}, {"$ref": "#/$defs/LaunchApproval"}, {"$ref": "#/$defs/Mission"}, {"$ref": "#/$defs/Work"}, {"$ref": "#/$defs/Agent"}, {"$ref": "#/$defs/Runtime"}, {"$ref": "#/$defs/Observer"}, {"$ref": "#/$defs/Subscription"}, {"$ref": "#/$defs/Lane"}, {"$ref": "#/$defs/Machine"}, {"$ref": "#/$defs/Device"}, {"$ref": "#/$defs/Operation"}, {"$ref": "#/$defs/History"}, {"$ref": "#/$defs/Session"}, {"$ref": "#/$defs/Glass"}, {"$ref": "#/$defs/OwnedSet"}, {"$ref": "#/$defs/UnknownResource"}]
+      "oneOf": [{"$ref": "#/$defs/Attention"}, {"$ref": "#/$defs/Message"}, {"$ref": "#/$defs/Launch"}, {"$ref": "#/$defs/LaunchVariant"}, {"$ref": "#/$defs/LaunchDecision"}, {"$ref": "#/$defs/LaunchApproval"}, {"$ref": "#/$defs/Mission"}, {"$ref": "#/$defs/Work"}, {"$ref": "#/$defs/Agent"}, {"$ref": "#/$defs/Runtime"}, {"$ref": "#/$defs/Observer"}, {"$ref": "#/$defs/Subscription"}, {"$ref": "#/$defs/Lane"}, {"$ref": "#/$defs/Machine"}, {"$ref": "#/$defs/Device"}, {"$ref": "#/$defs/Operation"}, {"$ref": "#/$defs/History"}, {"$ref": "#/$defs/Session"}, {"$ref": "#/$defs/Glass"}, {"$ref": "#/$defs/Arrangement"}, {"$ref": "#/$defs/OwnedSet"}, {"$ref": "#/$defs/UnknownResource"}]
     },
     "GoldenResourceSet": {
       "type": "array",
@@ -1622,6 +1652,9 @@
         "diverged_since": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] }
       }
     },
+    "TimelineBlock": {"type": "object", "additionalProperties": false, "required": ["id", "kind", "source_type", "payload"], "properties": {"id": {"type": "string"}, "kind": {"type": "string", "description": "text, reasoning, tool_call, tool_output, image, image_link, job, subagent, ask, status, error, document, source_record, raw_text, unknown; future kinds remain readable as JSON"}, "source_type": {"type": "string"}, "visibility": {"type": "string", "description": "UI hint: visible (default), internal or hidden-by-harness; never an access restriction"}, "metadata": {"type": "object", "description": "Source-supplied metadata including timing (wallTimeMs, timeoutSeconds); preserve names, units, values and future fields"}, "payload": {"description": "Native JSON; {body_ref:true} refers to the containing known fallback body without duplication"}, "continuation": {"$ref": "#/$defs/ConversationContentRef"}}},
+    "ConversationContentRef": {"type": "object", "additionalProperties": false, "required": ["ref", "media_type"], "properties": {"ref": {"type": "string"}, "media_type": {"type": "string"}, "size": {"type": "integer", "minimum": 0}, "reason": {"type": "string"}}},
+    "ConversationContentChunk": {"type": "object", "additionalProperties": false, "required": ["kind", "ref", "media_type", "offset", "size", "data"], "properties": {"kind": {"const": "conversation-content-chunk"}, "ref": {"type": "string"}, "media_type": {"type": "string"}, "offset": {"type": "integer", "minimum": 0}, "size": {"type": "integer", "minimum": 0}, "data": {"type": "string", "description": "Base64 bytes"}, "next_offset": {"type": ["integer", "null"], "minimum": 0}}},
     "TimelineEntry": {
       "description": "One conversation timeline entry. `replace` keeps id, sequence, role and type; `finalize` makes it immutable.",
       "type": "object",
@@ -1649,74 +1682,26 @@
         { "if": { "properties": { "type": { "const": "truncation" } } }, "then": { "properties": { "body": { "$ref": "#/$defs/TimelineTruncationBody" } } } }
       ]
     },
-    "TimelineMessageBody": {
-      "type": "object", "additionalProperties": false, "required": ["message_id"],
-      "properties": { "message_id": { "type": "string" }, "reply_to": { "type": ["string", "null"] }, "from": { "$ref": "#/$defs/ParticipantRef" }, "to": { "$ref": "#/$defs/ParticipantRef" }, "title": { "type": "string" }, "tags": { "type": "array", "items": { "type": "string" } }, "attachments": { "type": "array", "items": { "$ref": "#/$defs/Attachment" } } }
-    },
-    "TimelineContentBody": {
-      "type": "object", "additionalProperties": false, "required": ["media_type"],
-      "properties": { "media_type": { "type": "string" }, "text": { "type": "string" }, "attachment_id": { "$ref": "#/$defs/Id" } },
-      "anyOf": [{ "required": ["text"] }, { "required": ["attachment_id"] }]
-    },
-    "TimelineToolCallBody": {
-      "type": "object", "additionalProperties": false, "required": ["call_id", "name", "arguments"],
-      "properties": { "call_id": { "type": "string" }, "name": { "type": "string" }, "arguments": {} }
-    },
-    "TimelineToolResultBody": {
-      "type": "object", "additionalProperties": false, "required": ["call_id", "status", "media_type", "content"],
-      "properties": { "call_id": { "type": "string" }, "status": { "enum": ["success", "error"] }, "media_type": { "type": "string" }, "content": {} }
-    },
-    "TimelineStatusBody": {
-      "type": "object", "additionalProperties": false, "required": ["status"],
-      "properties": { "status": {"$ref": "#/$defs/TimelineStatus"}, "detail": { "type": "string" } }
-    },
-    "TimelineErrorBody": {
-      "type": "object", "additionalProperties": false, "required": ["code", "message", "retryable", "details"],
-      "properties": { "code": { "type": "string" }, "message": { "type": "string" }, "retryable": { "type": "boolean" }, "details": { "type": "object" } }
-    },
-    "TimelineUsageBody": {
-      "type": "object", "additionalProperties": false, "required": ["semantics", "driver", "attribution"],
+    "TimelineMessageBody": {"type": "object", "additionalProperties": false, "required": ["message_id"], "properties": {"message_id": {"type": "string"}, "reply_to": {"type": ["string", "null"]}, "from": {"$ref": "#/$defs/ParticipantRef"}, "to": {"$ref": "#/$defs/ParticipantRef"}, "title": {"type": "string"}, "tags": {"type": "array", "items": {"type": "string"}}, "attachments": {"type": "array", "items": {"$ref": "#/$defs/Attachment"}}, "provenance": {"$ref": "#/$defs/MessageProvenance"}, "blocks": {"type": "array", "items": {"$ref": "#/$defs/TimelineBlock"}}}},
+    "MessageProvenance": {
+      "type": "object", "additionalProperties": false, "required": ["verdict"],
+      "description": "Who signed a message a person wrote, and whether the signature checks. Only messages whose sender is a person carry it; an agent's message does not.",
       "properties": {
-        "semantics": { "enum": ["context_occupancy", "session_cumulative", "response"] },
-        "driver": { "type": "string" },
-        "model": { "type": "string" },
-        "input_tokens": { "type": "integer", "minimum": 0 },
-        "output_tokens": { "type": "integer", "minimum": 0 },
-        "cached_tokens": { "type": "integer", "minimum": 0 },
-        "cache_write_tokens": { "type": "integer", "minimum": 0 },
-        "turn_id": { "type": "string" },
-        "total_tokens": { "type": "integer", "minimum": 0 },
-        "context_used_tokens": { "type": "integer", "minimum": 0 },
-        "context_window_tokens": { "type": "integer", "minimum": 0 },
-        "context_used_percent": { "type": "number", "minimum": 0 },
-        "compactions": { "type": "integer", "minimum": 0 },
-        "last_compaction_ms": { "type": "integer", "minimum": 0 },
-        "last_compaction_trigger": { "enum": ["manual", "auto", "threshold", "overflow", "idle", "unknown"] },
-        "cost": { "type": "number", "minimum": 0 },
-        "currency": { "type": "string" },
-        "attribution": {
-          "type": "object", "additionalProperties": false, "required": ["agent_id"],
-          "properties": {
-            "agent_id": { "$ref": "#/$defs/Id" },
-            "mission_run_id": { "type": ["string", "null"] },
-            "generation_id": { "type": ["string", "null"] },
-            "step_id": { "type": ["string", "null"] }
-          }
-        }
-      },
-      "allOf": [
-        { "if": { "properties": { "semantics": { "const": "context_occupancy" } } }, "then": { "anyOf": [{ "required": ["context_used_tokens"] }, { "required": ["context_window_tokens"] }, { "required": ["context_used_percent"] }, { "required": ["compactions"] }] } },
-        { "if": { "properties": { "semantics": { "enum": ["session_cumulative", "response"] } } }, "then": { "required": ["total_tokens"] } }
-      ]
+        "verdict": { "enum": ["verified", "unsigned", "held", "invalid"], "description": "What every member concluded when the claim arrived: `verified` its chain reaches a trust root, `unsigned` it carries no signature (written before signing), `held` a delegation in its chain has not arrived yet, `invalid` it is not acceptable (see reason)." },
+        "reason": { "type": "string", "description": "Why a held or invalid signature is so." },
+        "signer": { "$ref": "#/$defs/ParticipantRef", "description": "The person who signed, which may be a device that speaks for them." },
+        "key": { "type": "string", "description": "The public key that signed (`p256:…` or a bare Ed25519 key)." },
+        "device": { "type": "string", "description": "The device the key was granted to, by the label it was given when it paired, such as `example phone (secure enclave)`. Absent for a key with no label." }
+      }
     },
-    "TimelineRedactionBody": {
-      "type": "object", "additionalProperties": false, "required": ["reason", "withheld_bytes"],
-      "properties": { "reason": { "type": "string" }, "withheld_bytes": { "type": "integer", "minimum": 0 }, "withheld_items": { "type": "integer", "minimum": 0 } }
-    },
-    "TimelineTruncationBody": {
-      "type": "object", "additionalProperties": false, "required": ["reason", "omitted_from_sequence", "omitted_to_sequence"],
-      "properties": { "reason": { "type": "string" }, "omitted_from_sequence": { "type": "integer", "minimum": 0 }, "omitted_to_sequence": { "type": "integer", "minimum": 0 }, "continuation_cursor": { "$ref": "#/$defs/Cursor" } }
-    },
+    "TimelineContentBody": {"type": "object", "additionalProperties": false, "required": ["media_type"], "properties": {"media_type": {"type": "string"}, "text": {"type": "string"}, "attachment_id": {"$ref": "#/$defs/Id"}, "blocks": {"type": "array", "items": {"$ref": "#/$defs/TimelineBlock"}}}, "anyOf": [{"required": ["text"]}, {"required": ["attachment_id"]}]},
+    "TimelineToolCallBody": {"type": "object", "additionalProperties": false, "required": ["call_id", "name", "arguments"], "properties": {"call_id": {"type": "string"}, "name": {"type": "string"}, "arguments": {}, "blocks": {"type": "array", "items": {"$ref": "#/$defs/TimelineBlock"}}}},
+    "TimelineToolResultBody": {"type": "object", "additionalProperties": false, "required": ["call_id", "status", "media_type", "content"], "properties": {"call_id": {"type": "string"}, "status": {"enum": ["success", "error"]}, "media_type": {"type": "string"}, "content": {}, "blocks": {"type": "array", "items": {"$ref": "#/$defs/TimelineBlock"}}}},
+    "TimelineStatusBody": {"type": "object", "additionalProperties": false, "required": ["status"], "properties": {"status": {"$ref": "#/$defs/TimelineStatus"}, "detail": {"type": "string"}, "blocks": {"type": "array", "items": {"$ref": "#/$defs/TimelineBlock"}}}},
+    "TimelineErrorBody": {"type": "object", "additionalProperties": false, "required": ["code", "message", "retryable", "details"], "properties": {"code": {"type": "string"}, "message": {"type": "string"}, "retryable": {"type": "boolean"}, "details": {"type": "object"}, "blocks": {"type": "array", "items": {"$ref": "#/$defs/TimelineBlock"}}}},
+    "TimelineUsageBody": {"type": "object", "additionalProperties": false, "required": ["semantics", "driver", "attribution"], "properties": {"semantics": {"enum": ["context_occupancy", "session_cumulative", "response"]}, "driver": {"type": "string"}, "model": {"type": "string"}, "input_tokens": {"type": "integer", "minimum": 0}, "output_tokens": {"type": "integer", "minimum": 0}, "cached_tokens": {"type": "integer", "minimum": 0}, "cache_write_tokens": {"type": "integer", "minimum": 0}, "turn_id": {"type": "string"}, "total_tokens": {"type": "integer", "minimum": 0}, "context_used_tokens": {"type": "integer", "minimum": 0}, "context_window_tokens": {"type": "integer", "minimum": 0}, "context_used_percent": {"type": "number", "minimum": 0}, "compactions": {"type": "integer", "minimum": 0}, "last_compaction_ms": {"type": "integer", "minimum": 0}, "last_compaction_trigger": {"enum": ["manual", "auto", "threshold", "overflow", "idle", "unknown"]}, "cost": {"type": "number", "minimum": 0}, "currency": {"type": "string"}, "attribution": {"type": "object", "additionalProperties": false, "required": ["agent_id"], "properties": {"agent_id": {"$ref": "#/$defs/Id"}, "mission_run_id": {"type": ["string", "null"]}, "generation_id": {"type": ["string", "null"]}, "step_id": {"type": ["string", "null"]}}}, "blocks": {"type": "array", "items": {"$ref": "#/$defs/TimelineBlock"}}}, "allOf": [{"if": {"properties": {"semantics": {"const": "context_occupancy"}}}, "then": {"anyOf": [{"required": ["context_used_tokens"]}, {"required": ["context_window_tokens"]}, {"required": ["context_used_percent"]}, {"required": ["compactions"]}]}}, {"if": {"properties": {"semantics": {"enum": ["session_cumulative", "response"]}}}, "then": {"required": ["total_tokens"]}}]},
+    "TimelineRedactionBody": {"type": "object", "additionalProperties": false, "required": ["reason", "withheld_bytes"], "properties": {"reason": {"type": "string"}, "withheld_bytes": {"type": "integer", "minimum": 0}, "withheld_items": {"type": "integer", "minimum": 0}, "blocks": {"type": "array", "items": {"$ref": "#/$defs/TimelineBlock"}}}},
+    "TimelineTruncationBody": {"type": "object", "additionalProperties": false, "required": ["reason", "omitted_from_sequence", "omitted_to_sequence"], "properties": {"reason": {"type": "string"}, "omitted_from_sequence": {"type": "integer", "minimum": 0}, "omitted_to_sequence": {"type": "integer", "minimum": 0}, "continuation_cursor": {"$ref": "#/$defs/Cursor"}, "blocks": {"type": "array", "items": {"$ref": "#/$defs/TimelineBlock"}}}},
     "TimelinePage": {
       "type": "object",
       "additionalProperties": false,
@@ -1814,7 +1799,7 @@
         "api_version": { "const": "st3.client.v0" },
         "id": { "$ref": "#/$defs/Id" },
         "type": {
-          "enum": ["custom.reply", "attention.resolve", "review.approve", "review.reject", "review.request-changes", "message.send", "message.read", "message.close", "launch.create", "launch.revise", "launch.preview", "launch.approve", "launch.cancel", "mission.start", "mission.revise", "mission.approve-revision", "mission.cancel-revision", "mission.cancel", "session.import", "work.ask", "work.done", "work.cancel-ask", "work.claim", "work.renew", "work.progress", "work.complete", "work.fail", "work.release", "work.retry", "work.publish-mission", "agent.create", "agent.stop", "agent.start", "agent.suspend", "agent.resume", "terminal.create", "terminal.end", "agent.queue-move", "lane.join", "lane.leave", "lane.move", "lane.mark", "lane.approve", "runtime.stop", "runtime.restart", "runtime.reset", "runtime.context-clear", "runtime.signal", "terminal.input", "terminal.resize", "terminal.attach", "terminal.detach", "pairing.revoke"]
+          "enum": ["arrangement.edit", "custom.reply", "attention.resolve", "review.approve", "review.reject", "review.request-changes", "message.send", "message.read", "message.close", "launch.create", "launch.revise", "launch.preview", "launch.approve", "launch.cancel", "mission.start", "mission.revise", "mission.approve-revision", "mission.cancel-revision", "mission.cancel", "session.import", "work.ask", "work.done", "work.cancel-ask", "work.claim", "work.renew", "work.progress", "work.complete", "work.fail", "work.release", "work.retry", "work.publish-mission", "agent.create", "agent.stop", "agent.start", "agent.suspend", "agent.resume", "terminal.create", "terminal.end", "agent.queue-move", "lane.join", "lane.leave", "lane.move", "lane.mark", "lane.approve", "runtime.stop", "runtime.restart", "runtime.reset", "runtime.context-clear", "runtime.signal", "terminal.input", "terminal.resize", "terminal.attach", "terminal.detach", "pairing.revoke"]
         },
         "idempotency_key": { "x-st-brand": "IdempotencyKey", "type": "string", "minLength": 16, "maxLength": 256 },
         "fence": { "$ref": "#/$defs/Fence" },
@@ -1906,6 +1891,7 @@
         "status": {"enum": ["completed", "cancelled"]},
         "summary": {"type": "string"},
         "respondent": {"$ref": "#/$defs/Id"},
+        "acted_for": {"$ref": "#/$defs/Id", "description": "The person whose prior instruction the agent respondent recorded."},
         "answered_at_unix_ms": {"type": "integer", "minimum": 0},
         "answer": {"$ref": "#/$defs/PersonAnswer"},
         "evidence": {"type": "array", "items": {"$ref": "#/$defs/Id"}}
@@ -1918,6 +1904,7 @@
     "ActionRequest": {
       "allOf": [{ "$ref": "#/$defs/ActionCommon" }],
       "oneOf": [
+        {"properties": {"type": {"const": "arrangement.edit"}, "parameters": {"$ref": "#/$defs/ArrangementEditParameters"}}},
         {"properties": {"type": {"const": "custom.reply"}, "parameters": {"$ref": "#/$defs/CustomReplyParameters"}}},
         {"properties": {"type": {"const": "agent.create"}, "parameters": {"$ref": "#/$defs/AgentCreateParameters"}}},
         {"properties": {"type": {"const": "agent.stop"}, "fence": {"allOf": [{"$ref": "#/$defs/Fence"}, {"required": ["runtime_desired_revision"]}]}, "parameters": {"$ref": "#/$defs/AgentStopParameters"}}},
@@ -2166,7 +2153,8 @@
         "status": { "enum": ["accepted", "completed", "rejected"] },
         "affected_ids": { "type": "array", "items": { "$ref": "#/$defs/Id" }, "uniqueItems": true },
         "snapshot_id": { "$ref": "#/$defs/Id" },
-        "terminal_attachment": { "oneOf": [{ "$ref": "#/$defs/TerminalAttachment" }, { "type": "null" }] }
+        "terminal_attachment": { "oneOf": [{ "$ref": "#/$defs/TerminalAttachment" }, { "type": "null" }] },
+        "arrangement_revision": { "$ref": "#/$defs/Revision" }
       }
     },
     "PairingBegin": {
@@ -2195,7 +2183,8 @@
         "kind": { "const": "pairing-challenge" },
         "pairing_id": { "$ref": "#/$defs/Id" },
         "code": { "type": "string", "pattern": "^[A-Z2-9]{8}$" },
-        "expires_at": { "$ref": "#/$defs/Timestamp" }
+        "expires_at": { "$ref": "#/$defs/Timestamp" },
+        "person_root_fingerprint": { "type": "string", "pattern": "^sha256:[A-Za-z0-9_-]{43}$" }
       }
     },
     "PairingComplete": {
@@ -2222,7 +2211,8 @@
         "scopes": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
         "expires_at": { "$ref": "#/$defs/Timestamp" },
         "device_key_chain": { "type": "array", "items": { "type": "string" } },
-        "device_key_proofs": { "type": "array", "items": { "type": "object" }, "maxItems": 2 }
+        "device_key_proofs": { "type": "array", "items": { "type": "object" }, "maxItems": 2 },
+        "person_root_key_proof": { "type": "object" }
       }
     },
     "DeviceSignature": {
@@ -2390,7 +2380,7 @@
         "details": { "type": "object" }
       }
     },
-    "CollectionName": { "enum": ["missions", "attention", "agents", "work", "glasses"] },
+    "CollectionName": { "enum": ["missions", "attention", "agents", "work", "glasses", "arrangements"] },
     "CollectionCommand": {
       "oneOf": [
         {
@@ -2400,11 +2390,24 @@
           "properties": {
             "kind": { "const": "subscribe" },
             "id": { "type": "string", "minLength": 1, "maxLength": 128 },
-            "collection": { "$ref": "#/$defs/CollectionName" },
+            "collection": { "enum": ["missions", "attention", "agents", "work", "glasses"] },
             "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
             "person": { "type": ["string", "null"] },
             "actor": { "type": ["string", "null"] },
             "status": { "type": ["string", "null"] }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id", "collection", "person"],
+          "properties": {
+            "kind": { "const": "subscribe" },
+            "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "collection": { "const": "arrangements" },
+            "person": { "$ref": "#/$defs/ArrangementPerson" },
+            "subject": { "$ref": "#/$defs/ArrangementId", "description": "Follow only this arrangement; its owner must equal person." },
+            "limit": { "type": "integer", "minimum": 1, "maximum": 200 }
           }
         },
         {

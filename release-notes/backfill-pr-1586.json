@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "summary": "#1586: OMP native transcript binding",
+  "commits": ["1790cb664ec17f3088112161cd27987c9b598add"],
+  "replay": {"status": "none", "detail": "No new projection invalidation or startup replay trigger in the merged OMP native transcript binding change."},
+  "schema": {"status": "none", "detail": "No database table, index, trigger or migration change in OMP native transcript binding; SQLite user_version is unchanged."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digest/drop policy are unchanged; this change adds no sealing coordination requirement."},
+  "compatibility": {"status": "changed", "detail": "OMP session and ready frames now supply the native transcript path through the existing optional sessionFile field when its getter is available. An absent getter does not block readiness; no new channel schema is introduced."},
+  "downtime": {"status": "changed", "detail": "Restarting an affected OMP seat temporarily interrupts that seat while its new incarnation starts and binds. Other seats and the daemon API need no additional stop for this repair; no repair duration was measured."},
+  "manual": {"status": "changed", "detail": "Already-running OMP seats with a pathless transcript binding need a restart with the new hook asset. Their old native-session report is idempotency-pinned per incarnation/session and cannot heal in place. Restart the affected seat, then verify its transcript opens in the client; daemon upgrade alone does not repair that saved binding."},
+  "recovery": {"status": "none", "detail": "No additional recovery procedure introduced by this change. Preserve graph state, keys and configuration and follow the standard roll-forward guidance; this note does not qualify binary-only downgrade of the whole release."}
+}

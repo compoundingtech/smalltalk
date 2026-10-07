@@ -3,14 +3,16 @@ import { API_VERSION } from './Models.generated.ts';
 import type {
     AgentDeclaration, Glass, GlassPut, GlassDelete, ActionOf, ActionRequest, ActionResult, AgentQueue, StatusHistory, BlobChunk, BlobUpload, Capabilities, DocumentContent, EnvelopeOf,
     ResourcesFilter, ResourcesPage,
+    Arrangement, ArrangementId, ArrangementPage,
     PublicationDefinition, SubjectDefinition, SubjectSchemas, AgentWorkspace, UsagePeriod, MailBacklog, ClientConnections, CollectionName, CollectionFrame, HostRepositories,
-    ConversationChanges, ConversationSearch, ErrorEnvelope, EventPage, Page, PairingBegin, PairingChallenge,
+    ConversationContentChunk, ConversationChanges, ConversationSearch, ErrorEnvelope, EventPage, Page, PairingBegin, PairingChallenge,
     PairingComplete, PairedSession, Resource, Snapshot, TerminalScreen, TimelinePage,
 } from './Models.generated.ts';
 import { decodeSubjectProjection, decodeSubjectsPage, decodeSubjectClaimsPage, decodeSubjectHistoryPage, decodeSubjectSchemas, decodeSubjectCollectionFrame } from './Subjects.generated.ts';
 import type { SubjectProjectionResult, SubjectsPageResult, SubjectClaimsPageResult, SubjectHistoryPageResult, SubjectCollectionFrameResult, SubjectsSelector } from './Subjects.generated.ts';
 
 export type PageOptions = { cursor?: string; limit?: number };
+export type TerminalListOptions = PageOptions & { history?: boolean; owner?: string; state?: string };
 export type ListOptions = PageOptions & { history?: boolean; owner_run?: string; actor?: string; status?: string; native_only?: boolean };
 export type EventOptions = { after?: string; limit?: number; wait_ms?: number };
 export type ClientOptions = {
@@ -66,7 +68,8 @@ export type CollectionStreamOptions = {
 export type CollectionStream = {
     /** Hold a window of up to `limit` (1–200) current items. A held ID is replaced. */
     subscribeGlasses(id: string): void;
-    subscribe(id: string, collection: CollectionName, limit?: number, filters?: CollectionFilters): void;
+    subscribeArrangements(id: string, person: string, limit?: number, subject?: ArrangementId): void;
+    subscribe(id: string, collection: Exclude<CollectionName, 'arrangements'>, limit?: number, filters?: CollectionFilters): void;
     subscribeSubjects(id: string, selector: SubjectsSelector, limit?: number): void;
     /** Follow a terminal with the incarnation and single-use capability `terminal.attach` returned. */
     subscribeTerminal(id: string, terminal: string, incarnation: string | null | undefined, capability: string): void;
@@ -162,7 +165,7 @@ export class St3Client {
 
     private async request<T>(method: 'GET' | 'POST' | 'PUT' | 'DELETE', path: string, body?: unknown, idempotencyKey?: string, raw?: { contentType: string }): Promise<EnvelopeOf<T>> {
         const credential = await this.credential?.();
-        const headers: Record<string, string> = { Accept: 'application/json', 'x-st3-features': 'custom-subjects.v1' };
+        const headers: Record<string, string> = { Accept: 'application/json', 'x-st3-features': 'custom-subjects.v1, conversation-blocks.v1' };
         if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey;
         if (credential) headers.Authorization = `Bearer ${credential}`;
         if (this.client) headers['x-st3-client'] = this.client;
@@ -262,7 +265,7 @@ export class St3Client {
         const url = new URL(`${this.baseUrl}/v1/client/terminals/${encodeURIComponent(routedId(id))}/stream`);
         url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
         if (options.incarnation) url.searchParams.set('incarnation', options.incarnation);
-        const headers: Record<string, string> = { 'x-st3-features': 'custom-subjects.v1' };
+        const headers: Record<string, string> = { 'x-st3-features': 'custom-subjects.v1, conversation-blocks.v1' };
         if (credential) headers.Authorization = `Bearer ${credential}`;
         if (this.client) headers['x-st3-client'] = this.client;
         const socket = (options.socket ?? defaultTerminalSocket)(url.toString(), [TERMINAL_SUBPROTOCOL, `st3.cap.${options.streamCapability}`], headers);
@@ -289,7 +292,7 @@ export class St3Client {
         const url = new URL(`${this.baseUrl}/v1/client/conversations/${encodeURIComponent(routedId(id))}/stream`);
         url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
         if (options.after) url.searchParams.set('after', options.after);
-        const headers: Record<string, string> = { 'x-st3-features': 'custom-subjects.v1' };
+        const headers: Record<string, string> = { 'x-st3-features': 'custom-subjects.v1, conversation-blocks.v1' };
         if (credential) headers.Authorization = `Bearer ${credential}`;
         if (this.client) headers['x-st3-client'] = this.client;
         const socket = (options.socket ?? defaultTerminalSocket)(url.toString(), [CONVERSATION_SUBPROTOCOL], headers);
@@ -314,7 +317,7 @@ export class St3Client {
         const credential = await this.credential?.();
         const url = new URL(`${this.baseUrl}/v1/client/collections/stream`);
         url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
-        const headers: Record<string, string> = { 'x-st3-features': 'custom-subjects.v1' };
+        const headers: Record<string, string> = { 'x-st3-features': 'custom-subjects.v1, conversation-blocks.v1' };
         if (credential) headers.Authorization = `Bearer ${credential}`;
         if (this.client) headers['x-st3-client'] = this.client;
         const socket = (options.socket ?? (defaultTerminalSocket as unknown as CollectionSocketFactory))(url.toString(), [COLLECTIONS_SUBPROTOCOL], headers);
@@ -341,6 +344,7 @@ export class St3Client {
         socket.onerror = () => end(new Error('The collections socket failed'));
         return {
             subscribeGlasses: id => send({kind: 'subscribe', id, collection: 'glasses', limit: 100}),
+            subscribeArrangements: (id, person, limit = 100, subject) => send({kind: 'subscribe', id, collection: 'arrangements', person, limit, ...(subject === undefined ? {} : {subject})}),
             subscribe: (id, collection, limit, filters = {}) => send({ kind: 'subscribe', id, collection, ...(limit === undefined ? {} : { limit }), ...filters }),
             subscribeSubjects: (id, selector, limit) => {
                 bounded(limit, 200, 'limit');
@@ -359,6 +363,17 @@ export class St3Client {
     getGlass(id: string): Promise<EnvelopeOf<Glass>> { return this.get(`/v1/client/glasses/${encodeURIComponent(id.split('/').pop()!)}`); }
     putGlass(id: string, request: GlassPut, idempotencyKey: string): Promise<EnvelopeOf<Glass>> { return this.request('PUT', `/v1/client/glasses/${encodeURIComponent(id.split('/').pop()!)}`, request, idempotencyKey); }
     deleteGlass(id: string, request: GlassDelete, idempotencyKey: string): Promise<EnvelopeOf<Glass>> { return this.request('DELETE', `/v1/client/glasses/${encodeURIComponent(id.split('/').pop()!)}`, request, idempotencyKey); }
+    /** Exact server-side filters; refuses older servers that ignore them. */
+    async terminalsListFiltered(options: TerminalListOptions = {}): Promise<EnvelopeOf<Page>> {
+        const response: EnvelopeOf<Page> = await this.get('/v1/client/terminals' + query(options));
+        for (const name of ['owner', 'state'] as const) {
+            if (options[name] !== undefined && response.value.filters[name] !== options[name]) {
+                throw new Error(`The server does not support the terminal ${name} filter; upgrade the server`);
+            }
+        }
+        return response;
+    }
+
     async customSubjectsList(options: PageOptions & { kind?: string; version?: number } = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/custom-subjects' + query(options)); }
     async customSubjectsGet(id: string): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/custom-subjects/${encodeURIComponent(routedId(id))}`); }
     async hostRepositories(id: string): Promise<EnvelopeOf<HostRepositories>> { return this.get(`/v1/client/hosts/${encodeURIComponent(routedId(id))}/repositories`); }
@@ -415,9 +430,12 @@ export class St3Client {
     async sessionsGet(id: string): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/sessions/${encodeURIComponent(routedId(id))}`); }
     async conversationSearch(text: string, options: { agent?: string; since?: string; cursor?: string; limit?: number } = {}): Promise<EnvelopeOf<ConversationSearch>> { return this.get('/v1/client/conversations/search' + query({ text, ...options })); }
     async timelineList(id: string, options: PageOptions = {}): Promise<EnvelopeOf<TimelinePage>> { return this.get(`/v1/client/sessions/${encodeURIComponent(routedId(id))}/timeline` + query(options)); }
+    async conversationContentChunk(id: string, reference: string, offset = 0): Promise<EnvelopeOf<ConversationContentChunk>> { return this.get(`/v1/client/conversations/${encodeURIComponent(id)}/content/${encodeURIComponent(reference)}/chunk` + query({offset})); }
     async conversationChanges(id: string, options: { after?: string; wait_ms?: number } = {}): Promise<EnvelopeOf<ConversationChanges>> { return this.get(`/v1/client/conversations/${encodeURIComponent(routedId(id))}/changes` + query(options)); }
     async eventsList(options: EventOptions = {}): Promise<EnvelopeOf<EventPage>> { return this.get('/v1/client/events' + query(options), 'events'); }
     async terminalScreen(id: string): Promise<EnvelopeOf<TerminalScreen>> { return this.get(`/v1/client/terminals/${encodeURIComponent(routedId(id))}/screen`); }
+    async arrangementsList(person: string, options: PageOptions = {}): Promise<EnvelopeOf<ArrangementPage>> { return this.get('/v1/client/arrangements' + query({ person, ...options })); }
+    async arrangementsGet(personName: string, uuid: string): Promise<EnvelopeOf<Arrangement>> { return this.get(`/v1/client/arrangements/${encodeURIComponent(personName)}/${encodeURIComponent(uuid)}`); }
     async glassesList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/glasses' + query(options)); }
     async glassesGet(id: string): Promise<EnvelopeOf<Glass>> { return this.get(`/v1/client/glasses/${encodeURIComponent(routedId(id))}`); }
     async agentCreate(input: Omit<ActionOf<'agent.create'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'agent.create' } as ActionOf<'agent.create'>); }
@@ -426,6 +444,7 @@ export class St3Client {
     async agentStart(input: Omit<ActionOf<'agent.start'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'agent.start' } as ActionOf<'agent.start'>); }
     async agentStop(input: Omit<ActionOf<'agent.stop'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'agent.stop' } as ActionOf<'agent.stop'>); }
     async agentSuspend(input: Omit<ActionOf<'agent.suspend'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'agent.suspend' } as ActionOf<'agent.suspend'>); }
+    async arrangementEdit(input: Omit<ActionOf<'arrangement.edit'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'arrangement.edit' } as ActionOf<'arrangement.edit'>); }
     async attentionResolve(input: Omit<ActionOf<'attention.resolve'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'attention.resolve' } as ActionOf<'attention.resolve'>); }
     async customReply(input: Omit<ActionOf<'custom.reply'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'custom.reply' } as ActionOf<'custom.reply'>); }
     async laneApprove(input: Omit<ActionOf<'lane.approve'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'lane.approve' } as ActionOf<'lane.approve'>); }

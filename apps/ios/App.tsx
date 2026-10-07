@@ -87,7 +87,7 @@ function tabBarHidden(route: RouteProp<TabParams>): boolean {
 }
 
 function Main({ proofSession = false }: { proofSession?: boolean }) {
-  const { credential, url, order, data, caps, actions, setTreeView, requestScroll, glassesOn } = useStore();
+  const { pairDraft, credential, url, order, data, caps, actions, setTreeView, requestScroll, glassesOn } = useStore();
   const homeCount = homeRows(data.attention, caps?.session_actor).length;
   const paired = !!url && !!credential;
 
@@ -123,7 +123,7 @@ function Main({ proofSession = false }: { proofSession?: boolean }) {
     return () => subscription.remove();
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  if (!paired) {
+  if (!paired || pairDraft) {
     return <Stack.Navigator screenOptions={stackOptions}>
       <Stack.Screen name="HomeRoot" component={PairScreen} options={{ title: 'Pair this device' }} />
     </Stack.Navigator>;

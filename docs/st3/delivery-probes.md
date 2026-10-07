@@ -142,6 +142,14 @@ Shorter test intervals make the outage proof bounded; production uses the
 stand-in, requiring Node.js; probe recipients remain dedicated Python consumers.
 The native proof runs in the normal Linux Cargo test suite.
 
+An argv probe seat can start its native channel before reconciliation publishes
+that seat's running incarnation. A fresh pi-family channel records `starting` for
+the selected incarnation before binding, using the typed harness startup handshake.
+The daemon still allocates no mailbox ownership and permits no delivery or receipts
+until that incarnation is running; a stopped incarnation remains fenced. The native
+regression holds the real PTY launcher's return for two seconds to exercise this gap,
+then uses the existing delivery, outage, recovery and exactly-once read assertions.
+
 The probe's private `events.jsonl` pairs every channel start and exit by channel ID
 and PID. Exit records include whether the native hello arrived, the inherited runtime
 incarnation and ownership sequence, and separately timed observations of the agent's

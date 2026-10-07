@@ -26,6 +26,9 @@
 //! measures replication receive and export as the replication worker calls them, and the deletes
 //! of a checkpoint trim, per deleted row.
 //!
+//! Arrangement probes keep one live resource's register heads fixed while its edit history grows
+//! with the generated scale, so both the owner-selected list and detail must be history-independent.
+//!
 //! - `ST_COST_SCALES` sets the two generated scales, smaller first. The default is `0.01,0.1`.
 //! - `ST_BENCH_DIR` keeps generated stores for the next run, as for `daemon_bench`.
 //! - `ST_COST_REPORT` writes the measurements as JSON to that path.
@@ -40,6 +43,7 @@ use serde_json::{Value, json};
 use smallclaims::sqlite::work::{self, SqliteWork};
 use st3::api::AppState;
 use st3::client::Client;
+use st3::model::ClaimInput;
 use st3::store::Store;
 use tokio::sync::{Notify, watch};
 
@@ -52,6 +56,8 @@ const GROWTH: f64 = 3.0;
 
 /// Work differences this small pass whatever their ratio: a few rows more or less.
 const SLACK: u64 = 5_000;
+
+const ADAPTER_ACTOR: &str = "agent/bench/cost/adapter";
 
 /// Requests whose work already grows with the store on main, measured on 2026-10-03 at
 /// 341f7ad9, each with the growth it may reach: half again its measured ratio, so it cannot get
@@ -182,6 +188,10 @@ const NOT_MEASURED: &[(&str, &str)] = &[
         "POST /v1/internal/replication/peer-failure",
         "records a transport failure; no store read",
     ),
+    (
+        "POST /v1/internal/replication/worker-status",
+        "updates host-local worker memory; no store read or graph write",
+    ),
     // Checkpoints: the trim is measured directly, per deleted row.
     (
         "POST /v1/checkpoint/plan",
@@ -281,6 +291,10 @@ const NOT_MEASURED: &[(&str, &str)] = &[
     (
         "GET /v1/client/blobs/{id}",
         "image bytes, outside the graph",
+    ),
+    (
+        "GET /v1/client/conversations/{id}/content/{reference}/chunk",
+        "requires owner-native transcript content; scope, bounded chunk and revision invalidation are covered by conversation_blocks tests",
     ),
     (
         "GET /v1/client/blobs/{id}/chunk",
@@ -398,6 +412,19 @@ const fn direct(route: &'static str, call: Direct) -> Probe {
 }
 
 const PROBES: &[Probe] = &[
+    get(
+        "GET /v1/client/adapter/deliveries",
+        "/v1/client/adapter/deliveries?after={adapter_frontier}&wait_ms=0",
+    ),
+    post(
+        "POST /v1/client/adapter/import",
+        "/v1/client/adapter/import",
+        |fixture, attempt| json!({
+            "from":"external/discord/user/404", "to":fixture.subjects.seats[0],
+            "content":"Invented provider import", "attachments":[],
+            "idempotency_key":format!("cost-adapter-import-{attempt}"),
+        }),
+    ),
     post(
         "POST /v1/schema/registrations",
         "/v1/schema/registrations",
@@ -438,6 +465,14 @@ const PROBES: &[Probe] = &[
     get(
         "GET /v1/client/sets/{*id}",
         "/v1/client/sets/bench/cost/fixture",
+    ),
+    get(
+        "GET /v1/client/arrangements",
+        "/v1/client/arrangements?person=person%2Fada",
+    ),
+    get(
+        "GET /v1/client/arrangements/{person_name}/{uuid}",
+        ARRANGEMENT_PATH,
     ),
     post("POST /v1/sets/preview", "/v1/sets/preview", |_, attempt| {
         owned_set_request(&format!("preview-{attempt}"))
@@ -883,6 +918,15 @@ const PROBES: &[Probe] = &[
             "idempotency_key": format!("cost-ask-{attempt}"),
         })
     }),
+    post("POST /v1/work/delegation", "/v1/work/delegation", |fixture, attempt| {
+        json!({
+            "person": "person/bench-operator",
+            "actor": "person/bench-operator",
+            "actions": ["answer-ask"],
+            "evidence": [fixture.items["claim"]],
+            "idempotency_key": format!("cost-delegation-{attempt}"),
+        })
+    }),
     post("POST /v1/work/done", "/v1/work/done", |fixture, attempt| {
         json!({
             "subject": fixture.asks.get(attempt).cloned().unwrap_or_default(),
@@ -993,6 +1037,51 @@ const SEAT_RUNTIME: &str = "cost-seat-0-runtime";
 
 /// The same agent list, after one seat changes at each scale.
 const COLD_AGENTS: &str = "GET /v1/client/agents (after harness observation)";
+const ARRANGEMENT_OWNER: &str = "person/ada";
+const ARRANGEMENT_SUBJECT: &str = "arrangement/person/ada/019a0000-0000-7000-8000-000000000001";
+const ARRANGEMENT_PATH: &str = "/v1/client/arrangements/ada/019a0000-0000-7000-8000-000000000001";
+const ARRANGEMENT_FOLDER: &str = "019a0000-0000-7000-8000-000000000010";
+const ARRANGEMENT_PLACEMENT: &str = "agent/fleet/fixture-cost-arrangements/seat";
+
+/// Grow only durable history, not the live answer, to catch reads that fold old edits.
+fn seed_arrangement(store: &Store, scale: f64) -> String {
+    let append = |key: &str, operations: Value| {
+        store
+            .append_claim(&ClaimInput {
+                subject: ARRANGEMENT_SUBJECT.into(),
+                kind: "arrangement.edited".into(),
+                actor: Some(ARRANGEMENT_OWNER.into()),
+                fields: serde_json::from_value(json!({
+                    "owner": ARRANGEMENT_OWNER,
+                    "operations": operations,
+                }))
+                .unwrap(),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: Some(key.into()),
+            })
+            .expect("the arrangement cost fixture must publish")
+            .id
+    };
+    append(
+        "cost-arrangement-create",
+        json!([
+            {"op":"create","name":"Invented arrangement"},
+            {"op":"folder.create","id":ARRANGEMENT_FOLDER,"name":"Work","parent":null,"key":"a0"},
+            {"op":"subject.place","subject":ARRANGEMENT_PLACEMENT,"folder":ARRANGEMENT_FOLDER,"key":"a0"},
+        ]),
+    );
+    for edit in 0..((scale * 10_000.0).round() as usize).max(1) {
+        append(
+            &format!("cost-arrangement-history-{edit}"),
+            json!([{"op":"rename","name":format!("Invented revision {edit}")}]),
+        );
+    }
+    append(
+        "cost-arrangement-current",
+        json!([{"op":"rename","name":"Invented arrangement"}]),
+    )
+}
 
 /// The replication summary a peer asks for each exchange; a route of its own above would answer
 /// the same request.
@@ -1464,6 +1553,12 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
         daemon.append_claim(&started).unwrap();
     }
     sync(&peer, PEER, &store);
+    let arrangement_revision = {
+        let store = store.clone();
+        tokio::task::spawn_blocking(move || seed_arrangement(&store, scale))
+            .await
+            .unwrap()
+    };
     let claims = store.index().unwrap();
 
     let socket = root.join("st3.sock");
@@ -1493,6 +1588,7 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
     let client = Client::unix(&socket);
     // Client reads come from a person, as stui and the app make them.
     let person = Client::unix_as(&socket, "person/bench-operator").unwrap();
+    let arrangement_person = Client::unix_as(&socket, ARRANGEMENT_OWNER).unwrap();
     let subjects = {
         let store = store.clone();
         tokio::task::spawn_blocking(move || fleet_subjects(&store, 3))
@@ -1512,6 +1608,40 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
         store.append_claim(&running).unwrap();
     }
     let mut fixture = fixture(&person, &client, subjects).await;
+    // Exercise successful enrolled imports and a fixed-size incremental reply page,
+    // rather than measuring a refused request or a historical mailbox scan.
+    let adapter = Client::unix_agent(&socket, ADAPTER_ACTOR).unwrap();
+    let adapter_kdl = format!(
+        "version 2\nagent \"bench/cost/adapter\" {{ workspace {:?}; argv \"/usr/bin/true\"; restart \"never\"; tags st3.adapter.source=\"external/discord/user/404\" st3.adapter.target={:?} }}\n",
+        root.to_str().unwrap(), fixture.subjects.seats[0],
+    );
+    let intent = st3::parse_intent(&adapter_kdl, NODE).unwrap();
+    let preview = store.mission(&intent, st3::model::IntentInput {
+        kdl: adapter_kdl, source_name: None,
+    }).unwrap();
+    store.apply_as(&intent, &preview.subject_tokens, "cost-adapter-enrollment", Some("person/bench-operator")).unwrap();
+    let incoming: Value = adapter.post("/v1/client/adapter/import", &json!({
+        "from":"external/discord/user/404", "to":fixture.subjects.seats[0],
+        "content":"Invented provider seed", "attachments":[],
+        "idempotency_key":"cost-adapter-seed",
+    })).await.expect("enrolled adapter seed import must succeed");
+    fixture.items.insert("adapter_frontier", store.index().unwrap().to_string());
+    store.append_claim(&ClaimInput {
+        subject:"message/cost-adapter-reply".into(), kind:"message.sent".into(),
+        actor:Some(fixture.subjects.seats[0].clone()),
+        fields:serde_json::from_value(json!({
+            "from":fixture.subjects.seats[0], "to":"external/discord/user/404",
+            "content":"Invented provider reply", "status":"sent",
+            "in_reply_to":incoming["subject"],
+        })).unwrap(),
+        evidence:vec![], expected_subject:None, idempotency_key:None,
+    }).unwrap();
+    let delivery: Value = adapter.get(&format!(
+        "/v1/client/adapter/deliveries?after={}&wait_ms=0",
+        fixture.items["adapter_frontier"],
+    )).await.expect("enrolled adapter delivery fixture must succeed");
+    assert_eq!(delivery["items"].as_array().unwrap().len(), 1);
+    assert_eq!(delivery["items"][0]["in_reply_to"], incoming["subject"]);
     // An offline source needs no live runtime: publish its exact departure before measuring
     // the operator's recorded exception, against both generated store sizes.
     for host in ["amber", "cobalt"] {
@@ -1554,6 +1684,27 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
         .await
         .expect("the owned-set detail probe must read a live fixture");
     assert_eq!(selected["receipt"]["source"]["sequence"], 1);
+    let selected: Value = arrangement_person
+        .get(ARRANGEMENT_PATH)
+        .await
+        .expect("the arrangement detail probe must read a live fixture");
+    assert_eq!(selected["id"], ARRANGEMENT_SUBJECT);
+    assert_eq!(selected["owner"], ARRANGEMENT_OWNER);
+    assert_eq!(selected["revision"], arrangement_revision);
+    assert_eq!(selected["body"]["name"]["value"], "Invented arrangement");
+    assert_eq!(
+        selected["body"]["folders"][ARRANGEMENT_FOLDER]["name"]["value"],
+        "Work"
+    );
+    assert_eq!(
+        selected["body"]["placements"][ARRANGEMENT_PLACEMENT]["value"],
+        json!({"folder":ARRANGEMENT_FOLDER,"key":"a0"})
+    );
+    let page: Value = arrangement_person
+        .get("/v1/client/arrangements?person=person%2Fada")
+        .await
+        .expect("the arrangement list probe must read the selected owner's fixture");
+    assert_eq!(page["items"], json!([selected]));
 
     prepare_custom_fixture(&store, &mut fixture, scale);
 
@@ -1579,7 +1730,11 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
             } else {
                 let path = fixture.fill(probe.path, attempt);
                 let body = probe.body.map(|body| body(&fixture, attempt));
-                let client = if path.starts_with("/v1/client/") {
+                let client = if path.starts_with("/v1/client/arrangements") {
+                    arrangement_person.clone()
+                } else if path.starts_with("/v1/client/adapter/") {
+                    adapter.clone()
+                } else if path.starts_with("/v1/client/") {
                     person.clone()
                 } else {
                     client.clone()
@@ -1601,11 +1756,12 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
             println!("{}: {samples:?}", probe.route);
         }
         let cost = Cost::least(&samples);
-        // A missing item answers an error the same way at both scales; only a broken request fails.
+        // Other probes may select a missing generated item; the seeded arrangement must succeed.
         let cost = Cost {
-            error: cost
-                .error
-                .filter(|error| !error.contains("not-found") && !error.contains("404")),
+            error: cost.error.filter(|error| {
+                probe.route.starts_with("GET /v1/client/arrangements")
+                    || (!error.contains("not-found") && !error.contains("404"))
+            }),
             ..cost
         };
         costs.insert(probe.route.to_owned(), cost);

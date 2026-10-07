@@ -846,6 +846,7 @@ fn rollout_pending_person_work_can_resume_and_finish_while_new_work_waits() {
             seat.store
                 .finish_person_step(
                     &crate::model::PersonStepResponse {
+                        delegation: None,
                         subject: ask.subject.clone(),
                         actor: "person/operator".into(),
                         summary: "The north bed".into(),

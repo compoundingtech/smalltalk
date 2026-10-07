@@ -23,6 +23,8 @@ pub enum Hit {
     SidebarSection(usize),
     /// Glasses: the top bar's usage slot, which shows and hides the sidebar's Usage.
     Usage,
+    /// Glasses: the top bar's connection word ("live"): this machine, or why it is not reached.
+    Connection,
     Tab(usize),
     Row(usize),
     Key(char),
@@ -50,12 +52,15 @@ pub enum Hit {
     PaletteSection(usize),
     /// Open the new agent form.
     NewAgent,
+    Repository(String),
     /// Glasses: open or close Home over the glass.
     Home,
     /// A link: copied to the person's clipboard, wherever their terminal is.
     Link(String),
     /// Glasses: split the focused group, to the right (`true`) or below.
     Split(bool),
+    /// Glasses: a row of the right-click menu.
+    Menu(super::glass::MenuAction),
     /// Glasses: show a group's tab (group 0's tab 0 is Home).
     GlassTab(usize, usize),
     /// Glasses: open the palette for a new tab in a group.

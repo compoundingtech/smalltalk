@@ -245,6 +245,7 @@ fn parse_mission(
     let children = node
         .children()
         .ok_or_else(|| St3Error::new("empty-mission", format!("mission `{id}` has no steps")))?;
+    unique_named_child(children, "provenance")?;
     let mut inputs = BTreeMap::new();
     for input_node in children
         .nodes()
@@ -281,6 +282,17 @@ fn parse_mission(
     let mut revision_owners = Vec::new();
     for child in children.nodes() {
         match child.name().value() {
+            "provenance" if require_state => {
+                // Validated here, carried separately by NormalizedIntent: never hash metadata
+                // into MissionSpec, which older daemons must still project.
+                crate::provenance::parse_block(child)?;
+            }
+            "provenance" => {
+                return Err(St3Error::new(
+                    "invalid-mission-provenance",
+                    "provenance belongs on a top-level named mission",
+                ));
+            }
             "goal" => goals.push(plain_string(child)?),
             "constraint" => push_constraint(&mut constraints, child, &format!("mission `{id}`"))?,
             "input" => {}

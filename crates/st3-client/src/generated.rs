@@ -52,6 +52,21 @@ pub enum ErrorCode {
     Forbidden,
     UnsupportedCapability,
     AttentionMigrated,
+    ArrangementExists,
+    ArrangementFolderExists,
+    ArrangementRetired,
+    ArrangementLimit,
+    ArrangementFolderDeleted,
+    ArrangementCycle,
+    ArrangementBodyTooLarge,
+    ArrangementOwnerForbidden,
+    InvalidArrangementSubject,
+    InvalidArrangementAction,
+    InvalidArrangementOperations,
+    InvalidArrangementFolder,
+    InvalidArrangementName,
+    InvalidArrangementKey,
+    InvalidSubjectReference,
     ValidationFailed,
     IdempotencyConflict,
     StaleFence,
@@ -64,6 +79,8 @@ pub enum ErrorCode {
     TerminalUnavailable,
     TerminalEnded,
     TimelineHistoryIncomplete,
+    ConversationContentInvalidated,
+    TranscriptUnavailable,
     BlobTooLarge,
     UnsupportedMediaType,
     BlobContentMismatch,
@@ -103,6 +120,14 @@ pub struct Limits {
     pub max_glasses: Option<usize>,
     pub max_glass_depth: Option<usize>,
     pub max_glass_nodes: Option<usize>,
+    pub max_arrangement_body_bytes: Option<usize>,
+    pub max_arrangement_resource_bytes: Option<usize>,
+    pub max_arrangements: Option<usize>,
+    pub max_arrangement_name_bytes: Option<usize>,
+    pub max_arrangement_key_bytes: Option<usize>,
+    pub max_arrangement_operations: Option<usize>,
+    pub max_arrangement_folders: Option<usize>,
+    pub max_arrangement_placements: Option<usize>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -1095,6 +1120,11 @@ pub struct Agent {
     /// The seat's latest suspend or resume and its phase. An older daemon omits it.
     #[serde(default)]
     pub suspension: Option<AgentSuspension>,
+    /// The requested Git checkout; omitted by older daemons.
+    #[serde(default)]
+    pub checkout: Option<AgentCheckout>,
+    #[serde(default)]
+    pub workspace: Option<String>,
     /// Placement handoff phase and the sources still holding its fence.
     #[serde(default)]
     pub handoff: Option<AgentHandoff>,
@@ -1110,6 +1140,12 @@ pub struct AgentHandoff {
     #[serde(default)]
     pub overridden_sources: Vec<String>,
     pub desired_token: String,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct AgentCheckout {
+    pub repository: String,
+    pub base: String,
+    pub branch: String,
 }
 /// The latest accepted harness todo observation, including its provenance and freshness.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -1571,6 +1607,7 @@ pub enum Resource {
     History(History),
     Session(Session),
     Glass(Glass),
+    Arrangement(Arrangement),
     OwnedSet(OwnedSet),
     /// A kind this client does not know, from a member newer than it. It keeps the header and
     /// the whole resource as sent, so an older client skips it or shows it plainly instead of
@@ -1600,6 +1637,7 @@ pub const KNOWN_RESOURCE_KINDS: &[&str] = &[
     "history",
     "session",
     "glass",
+    "arrangement",
     "owned-set",
 ];
 
@@ -1663,6 +1701,7 @@ impl Resource {
             Self::History(v) => &v.header,
             Self::Session(v) => &v.header,
             Self::Glass(v) => &v.header,
+            Self::Arrangement(v) => &v.header,
             Self::OwnedSet(v) => &v.header,
             Self::Unknown(v) => &v.header,
         }
@@ -1749,9 +1788,9 @@ pub enum TimelineType {
 #[derive(Clone, Debug, PartialEq)]
 pub enum TimelineBody {
     Message(Box<TimelineMessageBody>),
-    Content(TimelineContentBody),
-    ToolCall(TimelineToolCallBody),
-    ToolResult(TimelineToolResultBody),
+    Content(Box<TimelineContentBody>),
+    ToolCall(Box<TimelineToolCallBody>),
+    ToolResult(Box<TimelineToolResultBody>),
     Status(TimelineStatusBody),
     Error(TimelineErrorBody),
     Usage(Box<TimelineUsageBody>),
@@ -1885,6 +1924,27 @@ pub struct TimelineMessageBody {
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<Attachment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocks: Vec<TimelineBlock>,
+    /// Who signed a message a person wrote, and whether it checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<MessageProvenance>,
+}
+
+/// Who signed a message a person wrote, and whether the signature checks: `verified`, `unsigned`,
+/// `held` (a delegation in its chain has not arrived) or `invalid` (see `reason`).
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MessageProvenance {
+    pub verdict: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// The device the key was granted to, by the label it was given when it paired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1894,6 +1954,8 @@ pub struct TimelineContentBody {
     pub text: Option<String>,
     #[serde(default)]
     pub attachment_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocks: Vec<TimelineBlock>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -1901,6 +1963,8 @@ pub struct TimelineToolCallBody {
     pub call_id: String,
     pub name: String,
     pub arguments: Value,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocks: Vec<TimelineBlock>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -1909,6 +1973,8 @@ pub struct TimelineToolResultBody {
     pub status: TimelineToolStatus,
     pub media_type: String,
     pub content: Value,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocks: Vec<TimelineBlock>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1925,6 +1991,8 @@ pub struct TimelineStatusBody {
     pub status: TimelineStatus,
     #[serde(default)]
     pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocks: Vec<TimelineBlock>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1946,6 +2014,8 @@ pub struct TimelineErrorBody {
     pub message: String,
     pub retryable: bool,
     pub details: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocks: Vec<TimelineBlock>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -1983,6 +2053,8 @@ pub struct TimelineUsageBody {
     #[serde(default)]
     pub currency: Option<String>,
     pub attribution: TimelineAttribution,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocks: Vec<TimelineBlock>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -2009,6 +2081,8 @@ pub struct TimelineRedactionBody {
     pub withheld_bytes: u64,
     #[serde(default)]
     pub withheld_items: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocks: Vec<TimelineBlock>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -2018,6 +2092,8 @@ pub struct TimelineTruncationBody {
     pub omitted_to_sequence: u64,
     #[serde(default)]
     pub continuation_cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocks: Vec<TimelineBlock>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -2087,6 +2163,8 @@ pub struct Fence {
 pub enum ActionType {
     #[serde(rename = "custom.reply")]
     CustomReply,
+    #[serde(rename = "arrangement.edit")]
+    ArrangementEdit,
     #[serde(rename = "attention.resolve")]
     AttentionResolve,
     #[serde(rename = "review.approve")]
@@ -2304,6 +2382,20 @@ impl ActionRequest {
         Self::new(
             id,
             ActionType::AgentSuspend,
+            idempotency_key,
+            fence,
+            &parameters,
+        )
+    }
+    pub fn arrangement_edit(
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: ArrangementEditParameters,
+    ) -> Result<Self, serde_json::Error> {
+        Self::new(
+            id,
+            ActionType::ArrangementEdit,
             idempotency_key,
             fence,
             &parameters,
@@ -3080,6 +3172,8 @@ pub struct PersonAnswerRecord {
     pub status: String,
     pub summary: String,
     pub respondent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acted_for: Option<String>,
     pub answered_at_unix_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answer: Option<PersonAnswer>,
@@ -3340,6 +3434,8 @@ pub struct ActionResult {
     pub snapshot_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_attachment: Option<TerminalAttachment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arrangement_revision: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -3391,6 +3487,8 @@ pub struct PairingChallenge {
     pub pairing_id: String,
     pub code: String,
     pub expires_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub person_root_fingerprint: Option<String>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct PairingComplete {
@@ -3417,6 +3515,8 @@ pub struct PairedSession {
     /// Public grant content and signatures, in the same order as device_key_chain.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub device_key_proofs: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub person_root_key_proof: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -3618,6 +3718,48 @@ pub struct GlassDelete {
     pub base_revision: Option<String>,
 }
 
+/// The durable claim operation type is shared with admission, not duplicated here.
+pub type ArrangementOperation = st3_schema::arrangements::Operation;
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ArrangementEditParameters {
+    pub subject: String,
+    pub owner: String,
+    pub operations: Vec<ArrangementOperation>,
+}
+pub type ArrangementRegister<T> = st3_schema::arrangements::Register<T>;
+pub type ArrangementPosition = st3_schema::arrangements::Position;
+pub type ArrangementPlacement = st3_schema::arrangements::Placement;
+pub type ArrangementFolder = st3_schema::arrangements::Folder;
+pub type ArrangementBody = st3_schema::arrangements::Body;
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ArrangementResolved {
+    pub parents: std::collections::BTreeMap<String, Option<String>>,
+    pub folders: std::collections::BTreeMap<String, Option<String>>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct Arrangement {
+    #[serde(flatten)]
+    pub header: ResourceHeader,
+    pub owner: String,
+    pub body: ArrangementBody,
+    pub deleted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved: Option<ArrangementResolved>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ArrangementPage {
+    pub kind: String,
+    pub collection: String,
+    #[serde(default)]
+    pub filters: BTreeMap<String, String>,
+    pub items: Vec<Arrangement>,
+    pub page: PageInfo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync: Option<SyncNotice>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replicated: Option<ReplicatedNotice>,
+}
+
 /// Repositories already used by a host's declared agents, read from replicated graph evidence.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct HostRepositories {
@@ -3639,4 +3781,39 @@ pub struct CustomReplyParameters {
     pub revision: String,
     pub episode: String,
     pub fields: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TimelineBlock {
+    pub id: String,
+    pub kind: String,
+    pub source_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
+    pub payload: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<ConversationContentRef>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConversationContentRef {
+    #[serde(rename = "ref")]
+    pub reference: String,
+    pub media_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConversationContentChunk {
+    pub kind: String,
+    #[serde(rename = "ref")]
+    pub reference: String,
+    pub media_type: String,
+    pub offset: u64,
+    pub size: u64,
+    pub data: String,
+    pub next_offset: Option<u64>,
 }

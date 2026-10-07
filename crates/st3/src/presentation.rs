@@ -135,6 +135,9 @@ pub(crate) fn render_mission_run(
         );
     }
     let _ = writeln!(output, "REVISION  {}", selected.revision);
+    if let Some(provenance) = &selected.provenance {
+        output.push_str(&st3::provenance::render(provenance));
+    }
     let _ = writeln!(output, "GENERATION {}", selected.generation);
     let _ = writeln!(output, "WORKSPACE {}", selected.workspace);
     let _ = writeln!(output, "REQUESTER {}", selected.requester);
@@ -164,6 +167,9 @@ pub(crate) fn render_mission_run(
     }
     for run in &visible_runs {
         append_named_list(&mut output, "STUCK GATES", &run.stuck_gates, style);
+        if let Some(fault) = &run.scheduler_fault {
+            let _ = writeln!(output, "SCHEDULER FAULT  {fault}");
+        }
     }
     if !selected.inputs.is_empty() {
         let _ = writeln!(output);
@@ -1444,6 +1450,7 @@ mod tests {
 
     fn run(subject: &str, parent: Option<&str>, steps: Vec<StepRunView>) -> MissionRunView {
         MissionRunView {
+            provenance: None,
             subject: subject.into(),
             id: subject
                 .strip_prefix("mission-run/")
@@ -1479,6 +1486,7 @@ mod tests {
             steps,
             loops: Vec::new(),
             stuck_gates: Vec::new(),
+            scheduler_fault: None,
         }
     }
 

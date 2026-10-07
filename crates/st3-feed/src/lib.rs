@@ -29,6 +29,13 @@ use tokio::time::Instant;
 /// How many current items each window holds. st sends at most 200.
 pub const WINDOW: usize = 200;
 
+/// How often the stream's own quiet time is looked at; nothing is sent to look.
+const QUIET_CHECK: Duration = Duration::from_secs(2);
+/// How long a stream may say nothing before it is pinged.
+const QUIET_BEFORE_PING: Duration = Duration::from_secs(10);
+/// How long after a ping its pong, or anything else, may take before the socket is dropped.
+const PONG_WAIT: Duration = Duration::from_secs(8);
+
 /// The waits between attempts to reach st again, reset once st answers.
 const RETRY_DELAYS: [Duration; 5] = [
     Duration::from_secs(1),
@@ -333,10 +340,13 @@ async fn connected(
     failures: &mut usize,
 ) -> Ended {
     // A blackholed network, or a wedged daemon, can leave a socket open and silent while the
-    // views say live. A bounded read every 10 s notices, on this host too; one slow answer from
-    // a busy daemon is not enough to drop everything: it is asked again at once, and only two
-    // misses in a row drop the socket. It never resends a mutation.
-    let mut probe = tokio::time::interval(Duration::from_secs(10));
+    // views say live. Nothing is asked of st while the stream speaks: any frame is proof of
+    // life. Once it has been quiet for a while, a WebSocket ping (answered without running a
+    // request) is sent; only when neither a frame nor its pong arrives is the socket dropped,
+    // so one slow answer from a busy daemon never rereads every window.
+    let heard = stream.heard();
+    let mut pinged: Option<Instant> = None;
+    let mut probe = tokio::time::interval(QUIET_CHECK);
     probe.tick().await;
     // Glasses are followed only where st grants them in the shape this stui reads (splits of
     // tab groups, version 1); elsewhere stui keeps them on the device. A member still on the
@@ -399,25 +409,28 @@ async fn connected(
         let window_at = window_retries.next();
         tokio::select! {
             _ = probe.tick() => {
-                let mut answered = false;
-                for _ in 0..2 {
-                    match tokio::time::timeout(Duration::from_secs(5), client.capabilities()).await {
-                        Ok(Ok(_)) => {
-                            answered = true;
-                            break;
+                let quiet = heard.quiet_for();
+                if quiet < QUIET_BEFORE_PING {
+                    pinged = None;
+                    *failures = 0;
+                } else {
+                    match pinged {
+                        None => {
+                            if let Err(error) = stream.ping().await {
+                                return Ended::Dropped(error.plain());
+                            }
+                            pinged = Some(Instant::now());
                         }
-                        Ok(Err(error)) if !error.is_transient() => return Ended::Dropped(error.plain()),
-                        Ok(Err(_)) | Err(_) => {}
+                        Some(at) if at.elapsed() >= PONG_WAIT => {
+                            return Ended::Dropped(if remote {
+                                "the member stopped answering".into()
+                            } else {
+                                "st stopped answering".into()
+                            });
+                        }
+                        Some(_) => {}
                     }
                 }
-                if !answered {
-                    return Ended::Dropped(if remote {
-                        "the member stopped answering".into()
-                    } else {
-                        "st stopped answering".into()
-                    });
-                }
-                *failures = 0;
             }
             event = stream.next_event() => {
                 let event = match event {
@@ -458,11 +471,13 @@ async fn connected(
                             return Ended::Closed;
                         }
                     }
+                    // st asks for a window again (its cursor fell behind a floor, or the graph moved
+                    // under it). Asked at once and again on every resync, that is a loop and, at an
+                    // upgrade, a herd; so each is asked after a wait that grows and is jittered, and
+                    // one good snapshot resets the wait.
                     CollectionEvent::Resync { id, .. } => {
-                        if let Some(window) = Window::from_id(&id)
-                            && let Err(error) = stream.subscribe(window.id(), window.id(), window.limit(), None, None).await
-                        {
-                            return Ended::Dropped(error.to_string());
+                        if let Some(window) = Window::from_id(&id) {
+                            window_retries.failed(window, Instant::now());
                         }
                     }
                     CollectionEvent::Conversation { id, session_id, replace, items, has_more } => {
@@ -597,6 +612,14 @@ async fn connected(
     }
 }
 
+/// Up to half of `wait` more, so many clients told to ask again at once do not all ask together.
+fn jitter(wait: Duration) -> Duration {
+    let spread = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| u64::from(since.subsec_nanos()) % 1000);
+    wait.mul_f64(spread as f64 / 2000.0)
+}
+
 /// Windows st stopped sending, and when to ask for each again.
 #[derive(Default)]
 struct WindowRetries {
@@ -609,10 +632,8 @@ impl WindowRetries {
     /// its first failure since it last loaded, the one worth telling the person about.
     fn failed(&mut self, window: Window, now: Instant) -> bool {
         let failures = self.failures.entry(window).or_default();
-        self.at.insert(
-            window,
-            now + RETRY_DELAYS[(*failures).min(RETRY_DELAYS.len() - 1)],
-        );
+        let wait = RETRY_DELAYS[(*failures).min(RETRY_DELAYS.len() - 1)];
+        self.at.insert(window, now + wait + jitter(wait));
         *failures += 1;
         *failures == 1
     }
@@ -991,15 +1012,18 @@ mod tests {
             retries.failed(Window::Agents, start),
             "the first failure is said"
         );
-        assert_eq!(retries.next(), Some(start + RETRY_DELAYS[0]));
+        // The wait is the step's, plus up to half of it so clients do not all ask together.
+        let first = retries.next().unwrap();
+        assert!(first >= start + RETRY_DELAYS[0] && first <= start + RETRY_DELAYS[0] * 3 / 2);
         assert!(retries.due(start).is_empty());
-        assert_eq!(retries.due(start + RETRY_DELAYS[0]), vec![Window::Agents]);
+        assert_eq!(retries.due(start + RETRY_DELAYS[0] * 2), vec![Window::Agents]);
         assert_eq!(retries.next(), None, "asked again; it waits for an answer");
         assert!(
             !retries.failed(Window::Agents, start),
             "later failures are quiet"
         );
-        assert_eq!(retries.next(), Some(start + RETRY_DELAYS[1]));
+        let second = retries.next().unwrap();
+        assert!(second >= start + RETRY_DELAYS[1] && second <= start + RETRY_DELAYS[1] * 3 / 2);
         retries.loaded(Window::Agents);
         assert_eq!(retries.next(), None);
         assert!(
@@ -1023,6 +1047,29 @@ mod tests {
                 details: Default::default(),
             }),
         )
+    }
+
+    #[test]
+    fn a_window_st_asks_for_again_waits_longer_each_time_and_a_snapshot_resets_it() {
+        let mut retries = WindowRetries::default();
+        let now = Instant::now();
+        let mut last = Duration::ZERO;
+        for (index, base) in RETRY_DELAYS.iter().enumerate() {
+            retries.failed(Window::Missions, now);
+            let wait = retries.next().unwrap() - now;
+            assert!(
+                wait >= *base && wait <= *base + *base / 2,
+                "try {index}: {wait:?} for a base of {base:?}"
+            );
+            assert!(wait >= last, "the wait only grows");
+            last = *base;
+            // Nothing is asked again before it is due.
+            assert!(retries.due(now).is_empty());
+        }
+        retries.loaded(Window::Missions);
+        assert!(retries.next().is_none(), "a snapshot clears the wait");
+        retries.failed(Window::Missions, now);
+        assert!(retries.next().unwrap() - now < RETRY_DELAYS[0] * 2, "and starts it over");
     }
 
     #[test]

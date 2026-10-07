@@ -943,7 +943,9 @@ pub(super) fn plan_tx(
     let declaration_diffs = declarations::diffs(
         transaction,
         &intent,
-        changes.iter().filter(|(_, change)| change.as_str() != "unchanged")
+        changes
+            .iter()
+            .filter(|(_, change)| change.as_str() != "unchanged")
             .map(|(subject, _)| subject.as_str()),
         Some(current_index(transaction).map_err(internal)?),
     )?;

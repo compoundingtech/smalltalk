@@ -70,6 +70,11 @@ pub const CLIENT_READ_FORWARD_PATH: &str = "/v1/internal/client-read/forward";
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "operation", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ClientReadOperation {
+    ConversationContent {
+        session_id: String,
+        reference: String,
+        offset: u64,
+    },
     ConversationChanges {
         session_id: String,
         after: Option<String>,
@@ -183,7 +188,7 @@ impl ClientReadRejected {
     }
 
     /// A read that could not reach its owner for `reason`: `no-route`, `dial-failed`,
-    /// `timed-out`, `refused`, `hop-limit`, `transport-error` or `owner-error`.
+    /// `timed-out`, `refused`, `hop-limit`, `transport-error`, `owner-error` or `dial-out-owner`.
     pub fn unreachable(reason: &str, message: impl Into<String>) -> Self {
         let mut rejected = Self::new(
             "remote-unavailable",
@@ -197,6 +202,20 @@ impl ClientReadRejected {
     /// The reason a read could not reach its owner, if this says.
     pub fn reason(&self) -> Option<&str> {
         self.details.get("reason").and_then(Value::as_str)
+    }
+
+    pub(crate) fn dial_out_owner(host: &str) -> Self {
+        let mut rejected = Self::unreachable(
+            "dial-out-owner",
+            format!(
+                "unreachable: dial-out owner {host} has no inbound route; cached data remains usable"
+            ),
+        );
+        rejected.details.insert("owner_host_id".into(), host.into());
+        rejected
+            .details
+            .insert("attempts".into(), serde_json::json!([]));
+        rejected
     }
 }
 
@@ -214,6 +233,7 @@ impl std::error::Error for ClientReadRejected {}
 
 /// Up links as `(observer, observed)`, and when they were read.
 type ObservedLinks = (std::time::Instant, Arc<[(String, String)]>);
+type ObservedMembership = (std::time::Instant, Arc<FleetView>);
 
 /// A paired gateway uses this for bounded owner-local client operations. The peer worker
 /// authenticates both ends and the owner daemon rechecks the requested resource and fences.
@@ -232,6 +252,8 @@ pub struct ClientRelay {
     links: Option<Arc<Store>>,
     /// The links last read from that store, and when, so a busy gateway reads them rarely.
     observed: Arc<std::sync::Mutex<Option<ObservedLinks>>>,
+    /// Reuse sealed membership across per-item reachability checks for the same short TTL.
+    membership: Arc<std::sync::Mutex<Option<ObservedMembership>>>,
     fabric: Option<Fabric>,
     legacy: bool,
     /// When each owner last refused this node's reads as stale, for provenance.
@@ -255,6 +277,32 @@ pub struct ClientReadProvenance {
 }
 
 impl ClientRelay {
+    fn fleet_view(&self) -> Arc<FleetView> {
+        let Some(store) = &self.links else {
+            return Arc::default();
+        };
+        let mut cached = self
+            .membership
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((read_at, view)) = cached.as_ref()
+            && read_at.elapsed() < CLIENT_READ_LINKS_TTL
+        {
+            return view.clone();
+        }
+        let view = Arc::new(store.fleet_view_sealed().unwrap_or_default());
+        *cached = Some((std::time::Instant::now(), view.clone()));
+        view
+    }
+
+    pub(crate) fn is_dial_out_owner(&self, host: &str) -> bool {
+        host.strip_prefix("host/").is_some_and(|name| {
+            self.fleet_view().members.iter().any(|member| {
+                member.name == name && member.state == "current" && member.mode == "dial-out"
+            })
+        })
+    }
+
     /// Choose routes by the transport observations in this store.
     pub fn with_links(mut self, store: Arc<Store>) -> Self {
         self.links = Some(store);
@@ -266,6 +314,7 @@ impl ClientRelay {
     pub fn reaches(&self, host_id: &str) -> bool {
         host_id.strip_prefix("host/").is_some_and(|name| {
             name != self.node
+                && !self.is_dial_out_owner(host_id)
                 && (self
                     .peers
                     .iter()
@@ -297,11 +346,14 @@ impl ClientRelay {
     /// peer, then the peers with the shortest observed path to it. With no observation of the
     /// target at all, every peer is worth a try. Nodes the read already passed are never chosen.
     fn next_hops(&self, target: &str, visited: &[String]) -> Vec<PeerConfig> {
-        let view = self
-            .links
-            .as_ref()
-            .and_then(|store| store.fleet_view_sealed().ok())
-            .unwrap_or_default();
+        let view = self.fleet_view();
+        // Sync from a dial-out member supplies no reverse owner-RPC or PTY transport.
+        // In particular, dropping its old links must not enable the unseen-owner fallback.
+        if view.members.iter().any(|member| {
+            member.name == target && member.state == "current" && member.mode == "dial-out"
+        }) {
+            return Vec::new();
+        }
         let local = LocalTransports {
             fabric: self.fabric.is_some(),
             tailscale: local_addresses()
@@ -371,6 +423,7 @@ impl ClientRelay {
             links: None,
             legacy: config.fleet.as_ref().is_none_or(|file| file.legacy_peers),
             observed: Arc::default(),
+            membership: Arc::default(),
             fence_conflicts: Arc::default(),
             fabric: resolve_tool(
                 config
@@ -519,6 +572,10 @@ impl ClientRelay {
         path: Vec<String>,
         hops_left: u8,
     ) -> Result<(serde_json::Value, PeerConfig)> {
+        let host = format!("host/{target}");
+        if self.is_dial_out_owner(&host) {
+            return Err(ClientReadRejected::dial_out_owner(&host).into());
+        }
         let mut attempts = Vec::new();
         let mut last_reason = None;
         for peer in self.next_hops(target, &path) {
@@ -716,6 +773,9 @@ impl ClientRelay {
         mode: st3_client::RawTerminalMode,
     ) -> Result<tokio::net::UnixStream> {
         let target = host.strip_prefix("host/").context("invalid owner host")?;
+        if self.is_dial_out_owner(host) {
+            return Err(ClientReadRejected::dial_out_owner(host).into());
+        }
         let mode = match mode {
             st3_client::RawTerminalMode::Attach => "attach",
             st3_client::RawTerminalMode::Peek => "peek",
@@ -749,6 +809,7 @@ impl ClientRelay {
                     let port = request.uri().port_u16().unwrap_or(80);
                     let tcp_span = profile.as_ref().map(|op| op.wall_span("raw/tcp-dial"));
                     let tcp = tokio::net::TcpStream::connect((host, port)).await?;
+                    tcp.set_nodelay(true)?;
                     drop(tcp_span);
                     let upgrade_span = profile.as_ref().map(|op| op.wall_span("raw/peer-upgrade"));
                     let result = tokio_tungstenite::client_async_with_config(request, tcp, Some(config)).await?;
@@ -1016,6 +1077,13 @@ async fn receive_client_read(
         }
         let client = st3_client::Client::unix_as(state.backend().socket(), &request.authority_actor);
         match request.request {
+            ClientReadOperation::ConversationContent {
+                session_id,
+                reference,
+                offset,
+            } => Ok(serde_json::to_value(
+                client.conversation_content_chunk(&session_id, &reference, offset).await?.value,
+            )?),
             ClientReadOperation::ConversationChanges {
                 session_id,
                 after,
@@ -1214,6 +1282,7 @@ async fn receive_client_read(
                         Some(st3_client::ClientError::Api(code, message, details)) => {
                             let status = match code {
                                 st3_client::ErrorCode::PageCursorExpired
+                                | st3_client::ErrorCode::ConversationContentInvalidated
                                 | st3_client::ErrorCode::CursorGap
                                 | st3_client::ErrorCode::BlobExpired => StatusCode::GONE,
                                 st3_client::ErrorCode::NotFound
@@ -1434,6 +1503,24 @@ impl Backend for MainBackend {
         self.client.get("/v1/internal/fleet/membership").await
     }
 
+    async fn record_worker(
+        &self,
+        peer: &str,
+        worker: smallclaims::replication::ReplicationWorkerStatus,
+    ) -> Result<()> {
+        let _: Value = self
+            .client
+            .post(
+                "/v1/internal/replication/worker-status",
+                &smallclaims::replication::ReplicationWorkerStatusRequest {
+                    peer: peer.to_owned(),
+                    worker,
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn record_failure(&self, peer: &str, status: &str, error: &str) -> Result<()> {
         let _: serde_json::Value = self
             .client
@@ -1558,6 +1645,7 @@ mod tests {
     }
 
     include!("peer/raw_terminal_tests.rs");
+    include!("peer/stale_link_tests.rs");
 
     #[tokio::test]
     async fn a_gateway_streams_a_remote_terminal_through_owner_long_polls() {
@@ -2929,6 +3017,195 @@ mod tests {
         assert!(
             message.is_some_and(|message| message.contains("conversation-owner")),
             "the message names the owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_fetches_authenticated_owner_record_chunks_and_propagates_invalidation() {
+        let owner_root = tempfile::tempdir().unwrap();
+        let gateway_root = tempfile::tempdir().unwrap();
+        let make_state = |root: &Path, node: &str| crate::api::AppState {
+            store: Arc::new(Store::open(&root.join("graph.db"), node).unwrap()),
+            notify: Arc::new(tokio::sync::Notify::new()),
+            event_notify: watch::channel(0_u64).0,
+            node: node.into(),
+            state_dir: root.to_path_buf(),
+            pty_root: root.join("pty"),
+            pty_binary: root.join("unused-pty"),
+            fleet_id: None,
+            configured_peers: Vec::new(),
+            client_relay: None,
+            native_session_home: None,
+            planner_default: crate::model::PlannerSpec::default(),
+        };
+        let mut owner = make_state(owner_root.path(), "conversation-owner");
+        let mut gateway = make_state(gateway_root.path(), "conversation-gateway");
+        let agent = "agent/conversation-peer";
+        let incarnation = "conversation-runtime:i1";
+        owner
+            .store
+            .append_claim(&ClaimInput {
+                subject: agent.into(),
+                kind: "runtime.observed".into(),
+                actor: Some(agent.into()),
+                fields: BTreeMap::from([
+                    (
+                        "runtime_id".into(),
+                        serde_json::json!("conversation-runtime"),
+                    ),
+                    ("incarnation_id".into(), serde_json::json!(incarnation)),
+                    ("status".into(), serde_json::json!("running")),
+                    ("terminal".into(), serde_json::json!(false)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("conversation-peer-runtime".into()),
+            })
+            .unwrap();
+        owner.native_session_home = Some(owner_root.path().to_path_buf());
+        let native_path = owner_root.path().join("native.jsonl");
+        let raw = serde_json::json!({"type":"future","token":"invented-forwarded-token","large":"x".repeat(10000)});
+        fs::write(&native_path, format!("{}\n{}\n", serde_json::json!({"type":"session","id":"native-forwarded","cwd":"/work/invented","timestamp":"2026-10-06T12:00:00Z"}), serde_json::json!({"type":"message","message":{"role":"assistant","content":[raw.clone()]}}))).unwrap();
+        for (kind, fields) in [
+            (
+                "harness.observed",
+                BTreeMap::from([
+                    ("state".into(), serde_json::json!("idle")),
+                    ("driver".into(), serde_json::json!("omp")),
+                    ("incarnation_id".into(), serde_json::json!(incarnation)),
+                ]),
+            ),
+            (
+                "harness.session-file",
+                BTreeMap::from([
+                    ("harness".into(), serde_json::json!("omp")),
+                    ("agent".into(), serde_json::json!(agent)),
+                    ("incarnation_id".into(), serde_json::json!(incarnation)),
+                    ("path".into(), serde_json::json!(native_path)),
+                    ("session_id".into(), serde_json::json!("native-forwarded")),
+                ]),
+            ),
+        ] {
+            owner
+                .store
+                .append_claim(&ClaimInput {
+                    subject: agent.into(),
+                    kind: kind.into(),
+                    actor: Some(agent.into()),
+                    fields,
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+        gateway
+            .store
+            .import_replication(
+                "conversation-owner",
+                &owner.store.export_replication(0).unwrap(),
+            )
+            .unwrap();
+        let session_id = format!(
+            "session/{}",
+            &hex::encode(sha2::Sha256::digest(
+                format!("{agent}:{incarnation}").as_bytes()
+            ))[..24]
+        );
+        let owner_socket = owner_root.path().join("st3.sock");
+        let served_owner = owner_socket.clone();
+        let owner_app = crate::api::router(owner.clone());
+        tokio::spawn(async move { crate::api::serve_unix(&served_owner, owner_app).await });
+        let peer = PeerState::new(
+            MainBackend::new(owner_socket.to_path_buf()),
+            "conversation-owner".into(),
+            FleetAuth::test("fleet-test", &[7; 32]),
+            FleetContext::legacy(BTreeSet::from(["conversation-gateway".into()])),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, peer_router(peer, smalltalk_routes())).await });
+        let secret = gateway_root.path().join("fleet-secret");
+        fs::write(&secret, [7_u8; 32]).unwrap();
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+        gateway.client_relay = ClientRelay::from_config(&Config {
+            node: "conversation-gateway".into(),
+            fleet_id: Some("fleet-test".into()),
+            shared_secret_file: Some(secret),
+            peers: vec![PeerConfig {
+                name: "conversation-owner".into(),
+                url: format!("http://{address}"),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        let gateway_socket = gateway_root.path().join("st3.sock");
+        let served_gateway = gateway_socket.clone();
+        tokio::spawn(async move {
+            crate::api::serve_unix(&served_gateway, crate::api::router(gateway)).await
+        });
+        for socket in [&owner_socket, &gateway_socket] {
+            for _ in 0..200 {
+                if tokio::net::UnixStream::connect(socket).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        let client = st3_client::Client::unix_as(&gateway_socket, "person/example");
+        let page = client
+            .timeline(&session_id, None, None)
+            .await
+            .unwrap()
+            .value;
+        let token = page
+            .items
+            .iter()
+            .find_map(|item| match &item.body {
+                st3_client::TimelineBody::Content(body) => body
+                    .blocks
+                    .first()
+                    .and_then(|block| block.continuation.as_ref())
+                    .map(|continuation| continuation.reference.clone()),
+                _ => None,
+            })
+            .expect("negotiated owner continuation");
+        let chunk = client
+            .conversation_content_chunk(&session_id, &token, 0)
+            .await
+            .unwrap()
+            .value;
+        use base64::Engine as _;
+        let decoded: Value = serde_json::from_slice(
+            &base64::engine::general_purpose::STANDARD
+                .decode(&chunk.data)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(decoded, serde_json::json!({"raw":raw}));
+        use std::io::Write as _;
+        writeln!(fs::OpenOptions::new().append(true).open(&native_path).unwrap(), "{}", serde_json::json!({"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"later"}]}})).unwrap();
+        assert!(
+            client
+                .conversation_content_chunk(&session_id, &token, 0)
+                .await
+                .is_ok()
+        );
+        fs::write(&native_path, format!("{}\n{}\n", serde_json::json!({"type":"session","id":"native-forwarded","cwd":"/work/invented","timestamp":"2026-10-06T12:00:00Z"}), serde_json::json!({"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"edited"}]}}))).unwrap();
+        let error = client
+            .conversation_content_chunk(&session_id, &token, 0)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                st3_client::ClientError::Api(
+                    st3_client::ErrorCode::ConversationContentInvalidated,
+                    _,
+                    _
+                )
+            ),
+            "{error}"
         );
     }
 

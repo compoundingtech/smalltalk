@@ -1076,46 +1076,101 @@ fn rollout_signed_partition_heal_keeps_the_winning_owner_operation_and_status() 
     let stores = signed_fleet();
     for from in &stores {
         from.append_claim(&ClaimInput {
-            subject: format!("daemon/{}", from.origin), kind: "daemon.started".into(), actor: None,
-            fields: serde_json::from_value(json!({"status":"running","features":{"owned_sets":1,"seat_rollout":1}})).unwrap(),
-            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
-        }).unwrap();
-        for to in &stores { signed_share(from, to); }
+            subject: format!("daemon/{}", from.origin),
+            kind: "daemon.started".into(),
+            actor: None,
+            fields: serde_json::from_value(
+                json!({"status":"running","features":{"owned_sets":1,"seat_rollout":1}}),
+            )
+            .unwrap(),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+        for to in &stores {
+            signed_share(from, to);
+        }
     }
     let (amber, cobalt, ivory) = (&stores[0], &stores[1], &stores[2]);
-    let native = |model: &str| crate::graph::parse_owned_set_intent(&format!(
-        "version 2\nagent \"garden/orchard\" {{ host \"amber\"; workspace \".\"; harness \"claude\" {{ model {model:?}; }} }}"), "amber").unwrap();
+    let native = |model: &str| {
+        crate::graph::parse_owned_set_intent(&format!(
+        "version 2\nagent \"garden/orchard\" {{ host \"amber\"; workspace \".\"; harness \"claude\" {{ model {model:?}; }} }}"), "amber").unwrap()
+    };
     apply(amber, &native("initial"), 10);
-    let old = amber.desired_subjects_named(&["agent/garden/orchard".into()]).unwrap().remove(0).member.unwrap();
+    let old = amber
+        .desired_subjects_named(&["agent/garden/orchard".into()])
+        .unwrap()
+        .remove(0)
+        .member
+        .unwrap();
     amber.append_claim(&ClaimInput {
         subject: "agent/garden/orchard".into(), kind: "runtime.observed".into(), actor: Some("person/operator".into()),
         fields: serde_json::from_value(json!({"status":"running","host":"amber","runtime_id":old.runtime_id,"incarnation_id":"original-one"})).unwrap(),
         evidence: Vec::new(), expected_subject: None, idempotency_key: None,
     }).unwrap();
-    signed_share(amber, cobalt); signed_share(amber, ivory);
+    signed_share(amber, cobalt);
+    signed_share(amber, ivory);
     let policy = crate::rollout::Policy::when_idle(1_800_000, false);
     for (store, sequence, model) in [(amber, 30, "winner"), (cobalt, 20, "stale")] {
-        let mut opts = options(store, sequence); opts.rollout = Some(policy.clone());
+        let mut opts = options(store, sequence);
+        opts.rollout = Some(policy.clone());
         let input = native(model);
         let preview = store.owned_set_preview(&input, &opts).unwrap();
         assert!(preview.blockers.is_empty(), "{:?}", preview.blockers);
         opts.expected_subjects = preview.expected_subjects;
-        store.apply_owned_set(&input, &opts, &format!("partition-{sequence}"), "person/operator").unwrap();
+        store
+            .apply_owned_set(
+                &input,
+                &opts,
+                &format!("partition-{sequence}"),
+                "person/operator",
+            )
+            .unwrap();
     }
-    let token = amber.selected_desired_token("agent/garden/orchard").unwrap().unwrap();
-    let request = amber.request_rollout("agent/garden/orchard", &token, &old, "original-one", "person/operator", &policy, "winner-operation").unwrap();
+    let token = amber
+        .selected_desired_token("agent/garden/orchard")
+        .unwrap()
+        .unwrap();
+    let request = amber
+        .request_rollout(
+            "agent/garden/orchard",
+            &token,
+            &old,
+            "original-one",
+            "person/operator",
+            &policy,
+            "winner-operation",
+        )
+        .unwrap();
     let operation = amber.rollout("agent/garden/orchard").unwrap().unwrap();
-    crate::rollout::phase(amber, "agent/garden/orchard", &operation, "held", Some("busy at deadline"), &["claimed-work".into()]).unwrap();
-    signed_share(cobalt, ivory); signed_share(amber, ivory);
-    signed_share(cobalt, amber); signed_share(amber, cobalt);
+    crate::rollout::phase(
+        amber,
+        "agent/garden/orchard",
+        &operation,
+        "held",
+        Some("busy at deadline"),
+        &["claimed-work".into()],
+    )
+    .unwrap();
+    signed_share(cobalt, ivory);
+    signed_share(amber, ivory);
+    signed_share(cobalt, amber);
+    signed_share(amber, cobalt);
     for store in &stores {
-        let selected = store.rollout_selection("agent/garden/orchard").unwrap().unwrap();
+        let selected = store
+            .rollout_selection("agent/garden/orchard")
+            .unwrap()
+            .unwrap();
         let operation = store.rollout("agent/garden/orchard").unwrap().unwrap();
         assert_eq!(selected.source.sequence, 30);
         assert_eq!(operation.id, request.id);
         assert_eq!(operation.phase, "held");
         assert_eq!(operation.old_incarnation, "original-one");
-        assert_eq!(operation.deadline_unix_ms, operation.requested_at_unix_ms + 1_800_000);
+        assert_eq!(
+            operation.deadline_unix_ms,
+            operation.requested_at_unix_ms + 1_800_000
+        );
         assert_eq!(operation.blocking, vec!["claimed-work"]);
     }
 }

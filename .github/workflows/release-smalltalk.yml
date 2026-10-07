@@ -16,6 +16,7 @@ on:
       - build.rs
       - crates/st-drivers/src/version.rs
       - scripts/release-smalltalk*
+      - scripts/release_notes*
       - scripts/ci-build-snapshot*
       - scripts/ci-cache-audit*
       - scripts/ci-perf-cache
@@ -51,6 +52,7 @@ jobs:
           scripts/install-test
           scripts/install-release-test
           python3 scripts/install-macos-test
+          python3 scripts/release_notes_test.py
 
       - name: Report job cache coverage
         if: always()
@@ -113,6 +115,7 @@ jobs:
           scripts/install-release-test
           python3 scripts/install-macos-test
           python3 scripts/release-smalltalk-test
+          python3 scripts/release_notes_test.py
 
       - name: Build, package, and test extracted tools
         run: "scripts/release-smalltalk '${{ matrix.target }}' dist"
@@ -122,8 +125,27 @@ jobs:
         env:
           CI_SNAPSHOT_PIPELINE: ${{ github.workflow_sha }}
         run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" pack'
-      - name: Retain the same-source build snapshot
+      - id: build-snapshot-upload
+        name: Retain the same-source build snapshot
         if: "!cancelled() && steps.build-snapshot-save.outputs.publish == 'true'"
+        continue-on-error: true
+        timeout-minutes: 5
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.build-snapshot-save.outputs.name }}
+          path: "${{ runner.temp }}/ci-build-snapshot/build.tar.zst"
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: error
+          overwrite: true
+      - name: Wait before retrying build snapshot retention
+        if: "!cancelled() && steps.build-snapshot-upload.outcome == 'failure'"
+        timeout-minutes: 1
+        shell: bash
+        run: 'echo "::warning::Build snapshot upload failed; retrying once in 15 seconds."; sleep 15'
+      - name: Retry retaining the same-source build snapshot
+        if: "!cancelled() && steps.build-snapshot-upload.outcome == 'failure'"
+        timeout-minutes: 5
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.build-snapshot-save.outputs.name }}
@@ -206,13 +228,14 @@ jobs:
           set -euo pipefail
           git fetch origin "refs/tags/$TAG"
           test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$SOURCE_SHA"
+          python3 scripts/release_notes.py --source "$SOURCE_SHA" --tag "$TAG" --output dist/RELEASE-NOTES.md --manifest dist/UPGRADE-IMPACT.json
           cd dist
           sha256sum --check SHA256SUMS
           python3 ../scripts/release-smalltalk-manifest.py "$SOURCE_SHA"
           # Refuse to replace any existing release or its assets. A partial draft stays private
           # for inspection; delete that draft before retrying, never move the tag.
           gh release create "$TAG" --verify-tag --draft --title "Smalltalk $TAG" \
-            --notes-file RELEASE-NOTES.md ./*.tar.gz ./*.sha256 SHA256SUMS RELEASE.json
+            --notes-file RELEASE-NOTES.md ./*.tar.gz ./*.sha256 SHA256SUMS RELEASE.json UPGRADE-IMPACT.json
           gh release edit "$TAG" --draft=false
 
       - name: Report job cache coverage

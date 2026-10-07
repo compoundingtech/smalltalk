@@ -55,9 +55,13 @@ fi
 test "$(git -C "$pty_source" remote get-url origin)" = "$pty_url"
 test "$(git -C "$pty_source" rev-parse HEAD)" = "$pty_rev"
 test -z "$(GIT_OPTIONAL_LOCKS=0 git -C "$pty_source" status --porcelain)"
+# Path crates keep the same artifact names across pinned workspace revisions. A warm
+# cache can consider an older crate fresh when restored source timestamps precede
+# its dep-info. Give each runtime pin its own artifacts, still within the cache root.
+pty_build_dir="$build_dir/pty-runtime/$pty_rev"
 AGENT_SPEC_REVISION="$pty_rev" cargo build --release --locked --manifest-path "$pty_source/Cargo.toml" \
-  --target-dir "$build_dir" --target "$target" -p pty --bin pty
-install -m 0755 "$build_dir/$target/release/pty" "$work/$package/bin/pty"
+  --target-dir "$pty_build_dir" --target "$target" -p pty --bin pty
+install -m 0755 "$pty_build_dir/$target/release/pty" "$work/$package/bin/pty"
 if [[ $target == *apple* ]]; then
   # stui's speech helper needs Swift with the macOS 26 SDK; without one the release ships without
   # voice in stui, and says so.

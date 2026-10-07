@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "summary": "#1535: trace and mission follow retry behavior",
+  "commits": [
+    "8806a49d61a54a9ec17913ca71b2564ee3f7049c"
+  ],
+  "replay": {
+    "status": "none",
+    "detail": "No new projection invalidation or startup replay trigger in the merged trace and mission follow retry behavior change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database table, index, trigger or migration change in trace and mission follow retry behavior; SQLite user_version is unchanged."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules and digest/drop policy are unchanged; this change adds no sealing coordination requirement."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Trace and mission follow viewers now retain their view and retry transient request deadlines rather than immediately exiting with status 2. Deadline retries back off up to 60 seconds; typed daemon outages stop after five continuous minutes. Authorization and validation refusals still exit immediately. Ordinary commands, writes, server APIs, schemas and claim formats are unchanged; scripts depending on immediate timeout exit should account for the new retry period."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional upgrade service stop or measured outage introduced by trace and mission follow retry behavior; the standard daemon/client restart procedure still applies."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No data repair or configuration conversion required for existing installations by trace and mission follow retry behavior."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No additional recovery procedure introduced by this change. Preserve graph state, keys and configuration and follow the standard roll-forward guidance; this note does not qualify binary-only downgrade of the whole release."
+  }
+}

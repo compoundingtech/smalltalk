@@ -88,7 +88,7 @@ pub(super) fn all_help_requested(arguments: &[std::ffi::OsString]) -> bool {
 pub(super) fn root_help(all: bool) -> String {
     let command = Cli::command();
     let mut output = String::from(
-        "See what needs you:\n  st now\n\nStart an agent and talk to it:\n  st agents new NAME --harness claude --attach\n\nSee what is running:\n  st missions ls\n  st agents ls\n\nUsage: st [OPTIONS] <COMMAND>\n",
+        "See what needs you:\n  st now\n\nStart an agent and talk to it:\n  st agents new NAME --harness claude --attach\n\nSee what is running:\n  st missions ls\n  st agents ls\n\nFrom an agent seat:\n  st skill\n  st work ls --as \"$ST_AGENT\"\n\nRecord an authorized job:\n  Claim an existing step first, or st work start TITLE --as \"$ST_AGENT\".\n  Use a finite mission for dependencies, verification gates or review.\n\nUsage: st [OPTIONS] <COMMAND>\n",
     );
     for (heading, names) in GROUPS {
         if *heading == "Plumbing" && !all {
@@ -246,7 +246,7 @@ pub(super) fn pairing_next_steps(person: &str) -> String {
         &[
             (
                 "Complete on the device",
-                "st devices complete MEMBER_URL PAIRING_ID".to_owned(),
+                "st devices complete MEMBER_URL PAIRING_ID --fingerprint SHA256".to_owned(),
             ),
             ("Show paired devices", format!("st devices --as {person}")),
             (

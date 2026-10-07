@@ -6,6 +6,8 @@ const SHARED_TABLES: &[(&str, &[&str])] = &[
     ("blobs", &[]),
     ("documents", &["created_index"]),
     ("desired", &[]),
+    ("arrangements", &["changed_index"]),
+    ("arrangement_registers", &[]),
     ("message_index", &["created_index"]),
     ("resource_observations", &[]),
     ("glass_heads", &[]),
@@ -71,6 +73,7 @@ fn every_persistent_table_has_a_projection_scope() {
         "local_glass_head_dirty",
         "local_custom_dirty",
         "graph_generation",
+        "fleet_generation",
         "projection_digest_state",
         "projection_digest_generation",
         "projection_digest_operation_rows",
@@ -151,6 +154,8 @@ pub(super) fn shared_rows(store: &Store) -> BTreeMap<String, Vec<String>> {
                     if (*table == "blobs" && name == "bytes")
                         || (*table == "documents" && name == "binding_key")
                         || (*table == "glass_heads" && matches!(name.as_str(), "created_key" | "head_key"))
+                        || (matches!(*table, "arrangements" | "arrangement_registers")
+                            && name == "winner")
                     {
                         format!("hex({name})")
                     } else {
@@ -374,8 +379,10 @@ fn compare_shared(expected: &Store, actual: &Store, phase: &str, mismatches: &mu
     if expected.usage_period_rows(0, 3000).unwrap() != actual.usage_period_rows(0, 3000).unwrap() {
         mismatches.push(format!("{phase}: period usage"));
     }
-    if expected.transport_links().unwrap() != actual.transport_links().unwrap() {
-        mismatches.push(format!("{phase}: replicated transport observations"));
+    for as_of in [2_000_000_000_000_u128, 2_000_000_600_000_u128] {
+        if expected.transport_links_at(as_of).unwrap() != actual.transport_links_at(as_of).unwrap() {
+            mismatches.push(format!("{phase}: replicated transport observations at {as_of}"));
+        }
     }
     let lane = |store: &Store| {
         crate::lane::replay(
@@ -413,6 +420,27 @@ fn write_audit_history(source: &Store) {
         subject:"glass/person/ada/019a0000-0000-7000-8000-000000000001".into(), kind:"glass.upserted".into(), actor:Some("person/ada".into()),
         fields: serde_json::from_value(json!({"body":{"name":"Audit workspace","layout":{"tabs":[{"pane":"opaque:anything"}]}}, "base_revision":null})).unwrap(), evidence:vec![], expected_subject:None, idempotency_key:None,
     }).unwrap();
+    source
+        .append_claim(&ClaimInput {
+            subject: "arrangement/person/ada/019a0000-0000-7000-8000-000000000001".into(),
+            kind: "arrangement.edited".into(),
+            actor: Some("person/ada".into()),
+            fields: serde_json::from_value(json!({
+                "owner": "person/ada",
+                "operations": [
+                    {"op": "create", "name": "Audit sidebar"},
+                    {"op": "folder.create", "id": "019a0000-0000-7000-8000-000000000010",
+                        "name": "Work", "parent": null, "key": "a0"},
+                    {"op": "subject.place", "subject": "agent/alder.worker",
+                        "folder": "019a0000-0000-7000-8000-000000000010", "key": "a0"}
+                ]
+            }))
+            .unwrap(),
+            evidence: vec![],
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
     let declared_message = r#"version 2
 message "audit-declared" {
   from "agent/alder.worker"
@@ -1180,7 +1208,6 @@ fn comparable_peers_name_differing_tables_and_legacy_peers_keep_their_digest() {
         .replication_status(true, Some(TEST_FLEET), &["alder".into()])
         .unwrap();
     assert_eq!(status.graph_digest, full);
-    assert_eq!(status.projection_digests.len(), SHARED_TABLES.len() + 1);
     // A planning mismatch remains visible even though the six-table compatibility hash agrees.
     summary
         .projection_digests

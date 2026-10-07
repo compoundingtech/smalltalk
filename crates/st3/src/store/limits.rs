@@ -266,9 +266,7 @@ impl Store {
                 if let Some(binding) = &binding
                     && let crate::accounts::Binding::Account(name) = &binding.binding
                 {
-                    if limit.driver == binding.driver
-                        && limit.account_ref.as_ref() == Some(name)
-                    {
+                    if limit.driver == binding.driver && limit.account_ref.as_ref() == Some(name) {
                         reading = Some(limit);
                         break;
                     }
@@ -722,22 +720,40 @@ mod tests {
         let stale = "agent/alder.stale";
         read(&store, busy, Some("claude/aaaa"), 97.0, now);
         read(&store, stale, Some("claude/aaaa"), 45.0, now + 1);
-        assert_eq!(store.account_limits().unwrap()[0].weekly_percent, Some(97.0));
+        assert_eq!(
+            store.account_limits().unwrap()[0].weekly_percent,
+            Some(97.0)
+        );
         // Arrival order cannot override source time, even outside the maximum's window.
         read(&store, stale, Some("claude/aaaa"), 8.0, now - 2 * HOUR);
-        assert_eq!(store.account_limits().unwrap()[0].weekly_percent, Some(97.0));
+        assert_eq!(
+            store.account_limits().unwrap()[0].weekly_percent,
+            Some(97.0)
+        );
         read(&store, stale, Some("claude/aaaa"), 46.0, now + HOUR + 1);
-        assert_eq!(store.account_limits().unwrap()[0].weekly_percent, Some(46.0));
+        assert_eq!(
+            store.account_limits().unwrap()[0].weekly_percent,
+            Some(46.0)
+        );
 
-        let mut next = store.latest_claim(busy, Some("harness.limits")).unwrap().unwrap();
+        let mut next = store
+            .latest_claim(busy, Some("harness.limits"))
+            .unwrap()
+            .unwrap();
         next.body["fields"]["weekly_resets_at_unix_ms"] = json!(1_800_600_000_000_u64);
         next.body["fields"]["weekly_percent"] = json!(2.0);
         next.body["fields"]["measured_at_unix_ms"] = json!((now + HOUR + 2) as u64);
-        store.append_claim(&ClaimInput {
-            subject: busy.into(), kind: "harness.limits".into(), actor: Some(busy.into()),
-            fields: serde_json::from_value(next.body["fields"].clone()).unwrap(),
-            evidence: vec![], expected_subject: None, idempotency_key: None,
-        }).unwrap();
+        store
+            .append_claim(&ClaimInput {
+                subject: busy.into(),
+                kind: "harness.limits".into(),
+                actor: Some(busy.into()),
+                fields: serde_json::from_value(next.body["fields"].clone()).unwrap(),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
         // An old producer re-publishes the previous reset with an even newer timestamp.
         read(&store, stale, Some("claude/aaaa"), 99.0, now + HOUR + 3);
         let limit = &store.account_limits().unwrap()[0];
@@ -1117,8 +1133,14 @@ agent "other" { workspace "/tmp"; harness "codex" { account-pool "person/ada"; }
         read_account(&store, "agent/alder.other", "ada/two", "", 20.0, now + 1);
         let limits = store.account_limits().unwrap();
         assert_eq!(limits.len(), 2);
-        let first = limits.iter().find(|limit| limit.account_ref.as_deref() == Some("ada/one")).unwrap();
-        let second = limits.iter().find(|limit| limit.account_ref.as_deref() == Some("ada/two")).unwrap();
+        let first = limits
+            .iter()
+            .find(|limit| limit.account_ref.as_deref() == Some("ada/one"))
+            .unwrap();
+        let second = limits
+            .iter()
+            .find(|limit| limit.account_ref.as_deref() == Some("ada/two"))
+            .unwrap();
         assert_eq!(first.weekly_percent, Some(97.0));
         assert_eq!(second.weekly_percent, Some(20.0));
         let outcome = store.enforce_account_limits(&policy(), now + 2).unwrap();

@@ -113,6 +113,7 @@ pub enum Reason {
     LaunchConfigurationRejected,
     VersionProbeFailed,
     UnsupportedVersion,
+    AdmissionLaunchRefused,
     AdmissionExtensionLoad,
     AdmissionApiContract,
     AdmissionLifecycle,
@@ -152,10 +153,11 @@ pub enum Reason {
 }
 
 impl Reason {
-    pub const ALL: [Self; 37] = [
+    pub const ALL: [Self; 38] = [
         Self::LaunchConfigurationRejected,
         Self::VersionProbeFailed,
         Self::UnsupportedVersion,
+        Self::AdmissionLaunchRefused,
         Self::AdmissionExtensionLoad,
         Self::AdmissionApiContract,
         Self::AdmissionLifecycle,
@@ -197,6 +199,7 @@ impl Reason {
             Self::LaunchConfigurationRejected => "launchConfigurationRejected",
             Self::VersionProbeFailed => "versionProbeFailed",
             Self::UnsupportedVersion => "unsupportedVersion",
+            Self::AdmissionLaunchRefused => "admissionLaunchRefused",
             Self::AdmissionExtensionLoad => "admissionExtensionLoad",
             Self::AdmissionApiContract => "admissionApiContract",
             Self::AdmissionLifecycle => "admissionLifecycle",
@@ -242,7 +245,8 @@ impl Reason {
         match self {
             Self::LaunchConfigurationRejected => Stage::Launch,
             Self::VersionProbeFailed | Self::UnsupportedVersion => Stage::VersionGate,
-            Self::AdmissionExtensionLoad
+            Self::AdmissionLaunchRefused
+            | Self::AdmissionExtensionLoad
             | Self::AdmissionApiContract
             | Self::AdmissionLifecycle
             | Self::AdmissionIdleEdge
@@ -281,7 +285,8 @@ impl Reason {
             Self::VersionProbeFailed | Self::UnsupportedVersion => {
                 matches!(source, Source::VersionProbe)
             }
-            Self::AdmissionExtensionLoad
+            Self::AdmissionLaunchRefused
+            | Self::AdmissionExtensionLoad
             | Self::AdmissionApiContract
             | Self::AdmissionLifecycle
             | Self::AdmissionIdleEdge

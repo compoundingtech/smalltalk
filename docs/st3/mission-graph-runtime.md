@@ -10,6 +10,41 @@ A mission is an immutable definition in the claims graph. Publishing a mission d
 
 A mission run has one stable subject. Each immutable run generation binds that run to one exact mission revision.
 
+## First readiness under load
+
+The origin-local reconciler evaluates active mission runs with all-pending current generations
+first, newest first within each group. Each pass takes a finite snapshot and evaluates every
+needed run in it, including older runs and cleanup. New arrivals join the next snapshot. This
+protects a new run's first readiness from earlier runs' gate-result writes without changing
+dependencies, baselines, assignment eligibility, leases, or readiness epochs. It cannot preempt
+a writer operation or reconciliation stage already in progress, or bound the new run's own gates.
+If a pass admits K new runs before older work, that older work waits for those K evaluations;
+it remains in the same pass. Newer child runs are also visited before their parents. A parent
+and child may need another pass to observe each other's transitions, with the same fences.
+
+When the evaluator reaches satisfied first-readiness predicates after **120,000 ms (two minutes)**
+with every current step still pending at epoch zero, it records `reconcile.fault` on that run with
+scope `scheduler/first-readiness`. The reason names the run and the wait observed at detection.
+The clock starts at the latest creation time of the run and its current steps, so a new generation
+gets its own grace period. This diagnosis happens at the actual admission boundary, after mission
+and step baselines, dependency, backoff, and assignment checks; ordinary predicate blockers do
+not become scheduler faults. It reports late evaluation when the evaluator reaches the run,
+including after a stalled writer returns.
+Until the evaluator reaches that boundary, even a run delayed for twelve minutes can still
+appear as `waiting` without a scheduler blocker. This change adds no independent writer watchdog.
+
+The fault is recorded once while open, including across daemon restarts. Elapsed time alone does
+not replace it. The ready state is written before the diagnosis. Diagnostic and recovery errors
+are logged without failing admission or execution. The next evaluation records recovery when
+the run no longer waits for first readiness, and termination also closes the fault. Its durable
+fault and recovery history remain available. An open fault appears immediately in `st missions show
+mission-run/EXAMPLE`, `st doctor` (`mission-first-readiness`), and the mission blocker in stui.
+The leaf mission-run response adds optional `scheduler_fault`. Mission client views project
+`state: "blocked"` while the fault is open and set `run.blocker.scope` to
+`"scheduler/first-readiness"` with the fault reason. Pending steps also show that reason. These
+faults do not create operator attention items, so a restart diagnosing many late runs does not
+page the operator for each run. Ordinary reconciliation faults retain their existing attention behavior.
+
 ## Core rules
 
 - A mission has `draft`, `ready`, or `retired` state.
@@ -1492,6 +1527,7 @@ The seat's bare `fresh-context` node starts a new harness session before each st
 A seat's bare `handles-faults` node makes it the fleet's fault agent: it receives each fault that no step assignee or agent requester owns, such as a failed loop on a run a person requested. When several live seats carry it, the first by subject takes them. Faults never go to a person's attention.
 
 Two seat faults reach that owner so a seat that cannot start is never found by looking. A seat parked by the crash-loop guard is a fault that carries the driver's last `harness.diagnostic` (its code and reason). A seat that is declared to run but that no runtime observation has ever described for ten minutes, which `st agents ls` shows as `desired`, is a fault too ("An agent seat has not started", with the same diagnostic, or the note that the driver never ran). Both end when the seat's runtime is observed or its declaration changes. A mission's seat reaches the run's requester first, like any other fault.
+Codex compares the model ID and effort returned by a saved-thread resume with the declaration exactly. If Codex normalizes a declared model alias to a different ID, the driver fails before binding; three failed starts park the seat under the Codex crash-loop guard until its declaration changes.
 Typed harnesses always run their real interactive TUI in a PTY. Claude always loads the native st
 channel. Use `exec {}` for non-interactive provider commands.
 

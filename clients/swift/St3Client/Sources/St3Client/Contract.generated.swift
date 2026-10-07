@@ -9,6 +9,7 @@ public enum ActionType: String, Codable, CaseIterable, Sendable {
     case agentStart = "agent.start"
     case agentStop = "agent.stop"
     case agentSuspend = "agent.suspend"
+    case arrangementEdit = "arrangement.edit"
     case attentionResolve = "attention.resolve"
     case customReply = "custom.reply"
     case laneApprove = "lane.approve"
@@ -116,9 +117,12 @@ public enum ReadOperation: String, CaseIterable, Sendable {
     case sessionsGet = "sessions.get"
     case conversationSearch = "conversation.search"
     case timelineList = "timeline.list"
+    case conversationContentChunk = "conversation-content.chunk"
     case conversationChanges = "conversation.changes"
     case eventsList = "events.list"
     case terminalScreen = "terminal.screen"
+    case arrangementsList = "arrangements.list"
+    case arrangementsGet = "arrangements.get"
     case glassesList = "glasses.list"
     case glassesGet = "glasses.get"
 }
@@ -181,9 +185,12 @@ public let st3ClientReadPaths: [ReadOperation: String] = [
     .sessionsGet: "/v1/client/sessions/{id}",
     .conversationSearch: "/v1/client/conversations/search",
     .timelineList: "/v1/client/sessions/{id}/timeline",
+    .conversationContentChunk: "/v1/client/conversations/{id}/content/{reference}/chunk",
     .conversationChanges: "/v1/client/conversations/{id}/changes",
     .eventsList: "/v1/client/events",
     .terminalScreen: "/v1/client/terminals/{id}/screen",
+    .arrangementsList: "/v1/client/arrangements",
+    .arrangementsGet: "/v1/client/arrangements/{person_name}/{uuid}",
     .glassesList: "/v1/client/glasses",
     .glassesGet: "/v1/client/glasses/{id}",
 ]

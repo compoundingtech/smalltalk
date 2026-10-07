@@ -1,233 +1,180 @@
-# Terminal tab input and replies
+# Terminal tab input, replies and images
 
-This is the **baseline before terminal input fixes**. It is measured through real PTYs,
-including the packaged PTY session daemon, with the same `Ui`, crossterm decoder,
-`NativeTerminal`, alacritty parser, and painter used by stui. The only invented part of the
-UI is its graph data. No display server or real agent/person graph is involved.
+Terminal tabs use the real PTY session daemon for durable terminal state and query
+replies. stui renders text and history with alacritty_terminal, and uses the pinned
+PTY engine for negotiated keyboard/mouse encoding and decoded image placements.
+The outer terminal owns its own input decoding and clipboard. Child queries are
+answered once for the pane; they are not forwarded to the outer screen.
 
-[`copper_probe.py`](../crates/stui/tests/copper_probe.py) is an invented raw terminal program.
-It emits requested mode changes and queries, logs every input byte as hex, and logs SIGWINCH
-geometry. File control keeps test commands out of its input log.
-[`terminal_tab_probe.py`](../crates/stui/tests/terminal_tab_probe.py) drives the outer PTY and
-observes both the program log and a transparent tap of the real session socket. The 544-scenario
-[byte matrix](../crates/stui/tests/fixtures/terminal-tab-baseline.json) records every scenario;
-known failures in that matrix describe the baseline, rather than desired terminal behavior.
-Future fixes should update the affected expectations and keep the scenario coverage.
+The regression test runs the production Ui, crossterm decoder, attachment and
+painter in a real outer PTY, with an invented raw program in a second real PTY.
+[`copper_probe.py`](../crates/stui/tests/copper_probe.py) logs every input byte and
+SIGWINCH. [`terminal_tab_probe.py`](../crates/stui/tests/terminal_tab_probe.py)
+records the [current matrix](../crates/stui/tests/fixtures/terminal-tab-current.json).
+The [original matrix](../crates/stui/tests/fixtures/terminal-tab-baseline.json) and
+[program receipts](../crates/stui/tests/fixtures/terminal-tab-program-baseline.json)
+retain the reproduction before fixes.
 
-## Wheel reproduction and cause
+The top bar's bottom border occupies one row in both layouts. Terminal panes begin
+below it and have one fewer content row at the same window size; the current
+fixtures record that geometry.
 
-The wheel sends **no bytes** in the terminal tab, on either screen, in all the tested mouse
-modes and encodings. Chawan, Helix, Vim, and less all show the same failure on an invented
-200-line local document; the [real-program receipt](../crates/stui/tests/fixtures/terminal-tab-program-baseline.json)
-records the modes and bytes. Keyboard scrolling changes each program's screen, so the programs
-are alive and their input connections work.
+## Wheel and mouse
 
-The first fault is in the UI routing, before `NativeTerminal::wheel`: `draw_terminal` draws
-the native terminal without registering a `FramePane`. `Ui::mouse` locates the target of a
-wheel event in `frame.panes`; it finds no terminal and never calls `wheel`. Mouse button
-reports take a different path through `terminal_mouse` and do arrive. Looking only at the
-alternate-screen check in `wheel` misses this fault.
+The original wheel failure occurred before the encoder: `draw_terminal` did not
+register a `FramePane`, so UI wheel routing found no terminal. The fixed pane is
+registered. Mouse reporting now works on either screen with actual pane-relative
+coordinates and modifiers. Mode 1003 button/wheel codes also correct the underlying
+PTY encoder's inappropriate motion bit.
 
-There are further faults behind that routing failure: `wheel` requires alternate screen
-for mouse reporting, emits coordinates `1;1` and discards modifiers, and emits arrows on
-alternate screen even with mode 1007 disabled. These are confirmed in source; the tab probe
-currently cannot reach that code through wheel input. The fixes need to cover both layers.
+With several attached terminals in splits, the wheel reaches the pane under the
+pointer without moving keyboard focus. Focus reports and the cursor follow the
+focused terminal; selection overrides reset when another terminal gets focus.
+Hidden terminals release their own image resources even while their sessions stay
+attached behind other tabs.
 
-| Real program | Modes observed | Wheel bytes / screen change | Keyboard bytes / screen change |
-| --- | --- | --- | --- |
-| Chawan 0.4.4 | Alternate screen, mouse 1002, SGR, bracketed paste | None / no | `j` / yes |
-| Helix 25.07.1 | Alternate screen, mouse 1003, SGR, focus, bracketed paste | None / no | `CSI B` / yes |
-| Vim 9.2.1001 (`-Nu NONE -n`, `set mouse=a`) | Alternate screen, application cursor, mouse 1002, SGR, focus, bracketed paste | None / no | `SS3 B` / yes |
-| less 710 | Alternate screen, application cursor, no mouse | None / no | `SS3 B` / yes |
-
-## What reaches the program
-
-`CSI` means `ESC [`; `SS3` means `ESC O`. Mouse coordinates below are relative to the pane,
-one-based. Keyboard modifiers use xterm's parameter `1 + Shift + 2×Alt + 4×Ctrl`.
-The matrix exercises all eight combinations, with both normal and application cursor mode.
-
-| Input / mode requested by child | Observed bytes or action | Gap / reason |
+| Request or input | Terminal tab behavior | Limit or ownership |
 | --- | --- | --- |
-| Wheel, main or alternate screen; no mouse, 1000, 1002, or 1003; legacy, 1005, 1006, or 1015; all modifiers; up/down | No bytes | Terminal absent from wheel hit rectangles; local history also does not scroll by wheel |
-| Alternate scroll 1007 enabled/disabled, application cursor enabled/disabled | No wheel bytes in all combinations | Same routing fault; underlying `wheel` also ignores 1007 |
-| Mouse 1000 clicks/releases, left/middle/right | Reports reach child | Does not request drags |
-| Mouse 1002 drags | Button motion reports reach child | Hover remains absent |
-| Mouse 1003 drags and hover | Button drags arrive; hover sends nothing | `mouse_bytes` has no `Moved` arm |
-| Mouse without tracking mode | No reports; left drag selects locally | Selection is stui's |
-| Mouse Alt/Ctrl and Alt+Ctrl | Modifier bits 8/16/24 reach clicks and drags | Wheel loses them behind routing fault |
-| Mouse Shift and every combination containing Shift | No child reports; local selection | Explicit selection override in `terminal_mouse` |
-| Pixel mouse 1016 (terminal-browser) | Click remains `CSI <0;5;3M` in cell coordinates | Daemon reports 1016 set, but stui has no pixel mouse encoder |
-| SGR encoding 1006 | `CSI <button;x;y M` (press/drag), `CSI <button;x;y m` (release) | Correct pane-relative positions for buttons |
-| Legacy mouse encoding | `ESC [ M`, code+32, x+32, y+32 | Coordinates clamp at 223 |
-| UTF-8 mouse encoding 1005 | Legacy bytes even past column 223 | Mode tracked, but encoder ignores `UTF8_MOUSE`; large coordinate becomes `ff` |
-| urxvt encoding 1015 | Legacy mouse bytes | alacritty mode parser/encoder do not implement 1015; daemon can nevertheless report it set |
-| Arrows, Home/End without modifiers | `CSI A/B/C/D/H/F`; application mode uses `SS3` | Supported |
-| Arrows, Home/End with modifiers | `CSI 1;modifier A/B/C/D/H/F` | Supported, including Ctrl+Alt+Shift |
-| Insert/Delete, PageUp/PageDown | `CSI 2/3/5/6 ~`, modified form adds `;modifier` | Shift+PageUp/PageDown is owned by stui history |
-| F1–F4 | `SS3 P/Q/R/S`; modified form `CSI 1;modifier P/Q/R/S` | Supported |
-| F5–F12 | `CSI 15/17/18/19/20/21/23/24 ~`, with modifier when present | Supported |
-| Text, Unicode, Shift text | UTF-8 text; character case preserved | Supported |
-| Ctrl letter, Ctrl+Shift letter | C0 byte, e.g. Ctrl+A = `01` | Shift distinction lost in legacy encoding |
-| Alt letter, Ctrl+Alt(+Shift) letter | ESC prefix, then text or C0 byte | Shift distinction lost for Ctrl combinations |
-| Enter, Ctrl+Enter, Shift+Enter | `0d` in all three cases | Shift+Enter and Ctrl+Enter collapse even when the outer decoder distinguishes them |
-| Alt+Enter | `1b 0d` | Supported |
-| Tab, Shift+Tab | `09`, `CSI Z` | Supported while terminal focused |
-| Backspace, Ctrl+Backspace, Alt+Backspace | `7f`, `08`, `1b 7f` | Legacy `08` decodes as Ctrl+H |
-| Lone Escape, followed later by `a` | `1b`, then separately `61`; Escape arrives within one second | No extra inner escape delay; outer crossterm timing applies |
-| Escape and `a` together | `1b 61` (Alt+A) | Legacy escape/Alt ambiguity remains |
-| Numeric keypad, normal/application mode | Ordinary digits/operators and CR | Application keypad mode is not used by `key_bytes` |
-| Enhanced keypad input | Digits/operators and CR, flattened to ordinary keys | Crossterm's keypad state is ignored by encoder |
-| Kitty keyboard protocol (`CSI >31u`) | Shift+Enter still CR; Ctrl+Alt+Shift+A still ESC + `01` | Inner alacritty config disables kitty keyboard; encoder is always legacy |
-| Kitty press / repeat / release events | Press becomes ordinary text; repeat and release disappear | `Ui::key` accepts only `KeyEventKind::Press`, and re-encodes it as legacy |
-| modifyOtherKeys (`CSI >4;2m`) | Same legacy encoding | Mode is not stored or used by stui |
-| Bracketed paste 2004 enabled | `CSI 200~`, payload, `CSI 201~` | LF and CRLF normalize to CR |
-| Paste with 2004 disabled | Payload only | Same newline normalization |
-| Focus 1004 enabled/disabled, incoming focus-in/out | No bytes in either state | Guard does not enable outer focus reports; event dispatch ignores focus events |
-| Resize while child runs | Child receives SIGWINCH and pane rows/columns | Confirmed against `TIOCGWINSZ`, not just UI geometry |
+| Wheel with mouse 1000/1002/1003 | Three wheel reports, on main or alternate screen | Alt/Option, Shift and selection mode hold it locally |
+| Wheel without mouse, alternate screen and 1007 enabled | Three arrows; application cursor mode uses SS3 | Disabling 1007 stops this translation |
+| Wheel otherwise | Scrolls stui history | There is no horizontal history axis |
+| Click/release, drag, hover | Respect tracking mode; hover only under 1003 | The UI keeps selection overrides |
+| SGR 1006 | CSI <button;x;y M/m with pane cells | Modifiers preserved when program owns mouse |
+| Legacy encoding | X10 byte reports within representable coordinates | Out-of-range positions omitted; use 1006 |
+| UTF-8 1005, urxvt 1015 | Negotiated UTF-8 / decimal reports | Input comes through the outer terminal's decoder |
+| Pixel mouse 1016 | Coordinates at the cell center, scaled by cell metrics | Measured font metrics with kitty; otherwise 8×16 estimate |
+| Resize | Kernel PTY size and SIGWINCH match pane | 2048 additionally emits an in-band resize report |
+
+The optional real-program checks use disposable configuration and a local 200-line
+document. Chawan 0.4.4, Helix 25.07.1, Vim 9.2.1001 and less 710 receive wheel input
+and change their screen. Chawan/Helix/Vim receive mouse wheel reports; less receives
+application-cursor down arrows. No display server, window or person's graph is used.
+The [current receipts](../crates/stui/tests/fixtures/terminal-tab-program-current.json)
+record the wheel and keyboard bytes.
+
+## Keyboard, paste, focus and selection
+
+`CSI` means ESC [; `SS3` means ESC O. The child's modes determine the encoding,
+independently of the outer terminal's modes.
+
+| Input or mode | Behavior | Limit or ownership |
+| --- | --- | --- |
+| Arrows, Home/End, PageUp/PageDown, Insert/Delete, F1–F12 | Normal/application cursor forms and modifier combinations | Shift+PageUp/PageDown scroll local history |
+| Text, Unicode, Ctrl/Alt/Shift combinations | Legacy bytes or enhanced encoding as negotiated | Legacy terminals cannot distinguish every chord |
+| Enter variants, Tab/Shift+Tab, Backspace | Modifiers preserved when the selected protocol can express them | Plain Tab remains program input |
+| Escape alone / Escape then text | Outer decoder's timing; no added inner delay | Legacy Escape+letter remains indistinguishable from Alt+letter |
+| Kitty keyboard | Flags, press/repeat/release and associated text honored | Original physical/layout alternate key data is unavailable after crossterm decoding |
+| modifyOtherKeys | Engine encodes requested level; state query answered | Negotiation is separate from kitty keyboard |
+| Keypad | Keypad identity retained when the outer terminal reports it | Ordinary digit bytes cannot identify a physical keypad |
+| Bracketed paste 2004 | Adds delimiters only when requested | LF/CRLF normalize to CR, as before |
+| Focus 1004 | Outer focus in/out forwarded when requested | Palette and tab focus transitions also update the program |
+| Drag without program mouse | Selects and copies through OSC 52 | Actual clipboard acceptance depends on outer terminal settings |
+| Alt/Option+drag | Selects locally even with program mouse | Works when kitty keeps Shift for itself |
+| Shift+drag | Local selection when delivered to stui | Kitty's default mapping keeps this gesture outside stui |
+| Ctrl+Alt+S | Toggles selection mode, withholding mouse from child | Footer shows how to resume program mouse |
+| Ctrl+Alt+R | Resets input modes and returns to normal screen, retaining normal text/history | Clears both kitty stacks, mouse, focus, paste, keypad and resize-reporting modes |
+| Ctrl+Alt+click on OSC 8 link | Copies destination through OSC 52 | No outer-screen hyperlink coordinates or browser launch |
+
+Recovery is output-side control of the daemon, rather than reset escape bytes typed
+into the shell. It is shared with other attached clients and survives reconnect.
+It requires the pinned PTY version; older daemons ignore the extension. The
+[dependency decision](https://github.com/compoundingtech/pty/blob/main/docs/decisions/0016-embedded-surfaces-can-recover-input-modes.md)
+records this boundary.
+
+Ctrl+\ always detaches, including through the palette, and is never sent to the
+child. Legacy Ctrl+4 is its crossterm alias. Ctrl+K (or Command+K) opens the palette.
+The selection/reset chords and Shift+PageUp/PageDown stay stui's, including their
+repeat/release events. In an agent terminal Ctrl+C/D require two presses within two
+seconds; a shell receives them immediately. The existing focused-terminal exception
+for other space controls stays: Ctrl+Q/S/H/T/V/X/W/O, plain Tab/Shift+Tab and Alt+arrows
+reach the program; their space actions apply after detaching.
 
 ## Queries and program output
 
-The **session daemon**, rather than the outer terminal, answers the child's queries.
-`Requests::send_event` drops alacritty's reply events to avoid duplicate replies. The baseline
-uses the repository's pinned `pty` revision `ef0aaf9`. An older packaged revision `15ca74f`
-was also measured: it gives the same wheel failure but does not answer the size queries.
-That distinction matters when diagnosing a program that waits for a reply.
-
-| Child request | Observed answer / output | Owner or remaining gap |
+| Request | Reply or effect | Owner / limit |
 | --- | --- | --- |
-| DA1 `CSI c` | `CSI ?62;22c` | Daemon; advertises ANSI color, not sixel |
-| DA2 `CSI >c` | `CSI >0;382;0c` | Daemon |
-| XTVERSION `CSI >0q` | `DCS >\|pty(0.8) ST` | Daemon identity, not outer terminal identity |
-| DSR `CSI 5n` | `CSI 0n` | Daemon |
-| Cursor position `CSI 6n` | `CSI 1;1R` after home | Daemon cursor position |
-| Window pixels `CSI 14t` | `CSI 4;576;944t` for a 36×118 pane | Daemon estimates 16×8 cell pixels, not measured outer pixels |
-| Cell pixels `CSI 16t` | `CSI 6;16;8t` | Same estimate |
-| Window cells `CSI 18t` | `CSI 8;36;118t` | Actual child PTY geometry |
-| Screen cells `CSI 19t` | No answer | Neither daemon nor stui supplies it |
-| OSC 10 / 11 color query | `rgb:c0c0/c0c0/c0c0` / `rgb:0000/0000/0000`, terminated by ST | Daemon constants; not the outer palette |
-| DECRQM mode queries | `CSI ?mode;1$y` when set, `;2$y` when reset | Daemon tracks 1, 66, 1000/1002/1003/1004/1005/1006/1007/1015/1016, 1049, 2004, 2026, 2031, 2048; 5522 returns unsupported (`;0$y`); may disagree with stui's implementation |
-| Kitty keyboard query `CSI ?u` | `CSI ?0u` after reset; `CSI ?31u` after enabling flags 31 | Daemon advertises flags stui's legacy input encoder does not honor |
-| modifyOtherKeys query `CSI ?4m` | No answer even after setting level 2 | No query-reply path |
-| OSC 52 clipboard write | Requested text decodes to `copper` | Native request reaches stui; live UI copies it through outer OSC 52 |
-| OSC 52 clipboard read | No answer | Intentional refusal to read the person's clipboard |
-| OSC 8 hyperlink | Link text appears | URL metadata is not painted or made clickable by native painter |
-| OSC 0 title | Title appears in terminal/tab header | Used as the probe's output acknowledgment |
-| Cursor shapes (`CSI Ps SP q`), hide/show | Block, underline, bar and blinking variants recognized; hidden cursor omitted | Native painter returns requested cursor style to live UI |
-| Bell | Bell request recognized | Live UI flashes it when looking elsewhere |
-| Synchronized output 2026 | Text appears after end-sync | Parser buffers synchronized output, with timeout recovery |
-| Kitty graphics query | `APC Gi=31;OK ST` | **False end-to-end advertisement:** daemon accepts graphics, but stui does not display them |
-| Kitty image transmission/display | No graphics bytes reach outer PTY | Native parser/painter retains text cells only |
-| Sixel XTSMGRAPHICS query | No answer | No sixel negotiation path |
-| Sixel image output | No sixel bytes reach outer PTY | No native image decoding/painting path |
+| DA1 / DA2 / XTVERSION | CSI ?62;22c / CSI >0;382;0c / pty(0.8) | Daemon identity; sixel is not advertised |
+| DSR / cursor position | CSI 0n / pane-relative CSI row;col R | Daemon's cursor |
+| Window pixels 14t / cell pixels 16t | Virtual window / cell pixel dimensions | Declared kitty font metrics, otherwise estimate |
+| Window cells 18t / screen cells 19t | CSI 8;rows;cols t / CSI 9;rows;cols t | Virtual pane, not outer monitor |
+| DECRQM | Set/reset state; unsupported modes return status 0 | 5522 extended clipboard is unsupported |
+| Kitty keyboard query / modifyOtherKeys query | Active flags / current level | Daemon; no second client answer |
+| OSC 10/11 and indexed color queries | Fixed virtual palette replies, ST terminated | Default foreground c0c0, background 0000; no outer palette query |
+| OSC 52 write | Copies decoded text through outer OSC 52 | No clipboard reads |
+| OSC 52 read | Empty reply | Refusal remains bounded; program does not wait indefinitely |
+| OSC 8 / OSC 0 | Link metadata retained / title updates tab header | Link destination can be copied locally |
+| Cursor shape / visibility | Block, underline, bar and blinking forms | Uses the outer cursor only on an unobscured focused pane |
+| Bell | Recorded; live UI flashes when unfocused | No host audio |
+| Synchronized output 2026 | Buffered until end-sync or parser timeout | Recovery also clears it |
+| Kitty graphics query | Accepted inline transmission reports OK | Pixel rendering in kitty; cell fallback elsewhere |
+| File/shared-memory graphics query | Refused | Child falls back to portable inline data |
+| Sixel / XTSMGRAPHICS | Unsupported, no sixel advertisement | See remaining gaps |
 
-A color-query reply did not appear as stray visible text in these isolated runs. It reaches
-the raw probe as input, which is the correct direction. This does not reproduce or explain
-all possible attach/echo configurations; forwarding queries to the outer terminal would
-risk a second reply because the daemon already answers them.
+The isolated color probe produces no stray visible OSC 11 reply. Replies go to
+child input. Forwarding the same query to the outer terminal would introduce a
+second answer with different geometry or defaults.
 
-### Images: what is missing
+## Images and terminal-browser
 
-Conversation thumbnails use `Picker::from_query_stdio` and ratatui-image, but that picker is
-not connected to a native terminal program's image stream. Passing APC/DCS bytes straight
-through would place images in outer-screen coordinates and leave them behind after pane
-movement or tab changes. A complete bridge needs access to decoded image data and placement
-state, pane-relative positioning and clipping, and a resource lifecycle that moves, hides,
-and deletes placements on resize, scroll, detach, and tab switches. It also needs to control
-the daemon's capability replies so the child only learns a protocol the complete tab path
-can support. Today neither kitty nor sixel support should be claimed for terminal tabs.
+Inline kitty images are decoded by the same PTY engine used for durable replay.
+stui reads owned image bytes and resolved placements, clips them to the terminal
+pane, applies source crops and cell/pixel offsets, and remaps child ids to ids it
+owns. Both direct and Unicode-placeholder placements render as outer kitty virtual
+placements. Text-cell frame diffs move and clear the visible placeholders on
+scroll, pane movement, resize, overlays and tab switches. Hidden/dropped panes and
+replaced placements delete only the compositor's own stored image ids.
+Child placeholders whose images have been deleted are blanked, even if their text
+remains in history or reflows back into the pane; child image ids never reach the
+outer terminal.
 
-## terminal-browser reproduction
+Transmission is independent of the first placeholder cell, so an overlay or a hole
+cannot swallow it. Original placeholder colors mask holes and other images.
+Negative-z images preserve nonblank text. On outer terminals without kitty, ordinary
+halfblock cells provide a pane-safe fallback. The decoder storage is capped at
+32 MiB; each image and the total visible composition are capped at 16 million pixels.
 
-The official Linux **terminal-browser 0.13.4** bundle ran against the same real terminal tab,
-with Electron's headless Ozone backend, an invented local HTML document, isolated storage,
-and no display connection. `TERM=xterm-kitty` selected its kitty renderer; this does not
-emulate or launch kitty. The [receipt](../crates/stui/tests/fixtures/terminal-browser-baseline.json)
-records actual output: 71 graphics APCs from the live app, **zero** at the outer PTY, no wheel
-input, and Ctrl+Alt+Shift+A arriving as legacy `ESC 01`. Frame counts vary with run duration.
+The official Linux terminal-browser 0.13.4 bundle was exercised with headless Ozone,
+a local HTML document, isolated storage and no display connection. Its medium
+probes are refused and it automatically falls back to inline compressed frames.
+The fixed path emits image APCs into the outer PTY, forwards pixel mouse wheel
+reports and preserves Ctrl+Alt+Shift+A as CSI 97;8u. Counts vary with frame duration.
+The optional [runner](../crates/stui/tests/terminal_browser_probe.py) records the
+actual bytes. Its [release source](https://github.com/zenbu-labs/terminal-browser/blob/v0.13.4/pixel/engine/crates/pixel-core/src/terminal.rs)
+requests graphics, mouse 1003/1006/1016, focus, paste, enhanced keyboard, resize,
+colors and extended clipboard; the byte matrix independently covers these requests.
+The [current browser receipt](../crates/stui/tests/fixtures/terminal-browser-current.json)
+shows both child and outer graphics. Chawan with `buffer.images=true` on
+`https://new.space` also emits inline PNG frames that reach the outer PTY and produce
+pane-contained image cells; its [image receipt](../crates/stui/tests/fixtures/terminal-tab-chawan-images.json)
+records that check. Network content and frame counts can change.
 
-The app enabled 1003, 1006, 1016, 1004, 2004, 2048, 2031, synchronized output, and kitty flags
-1 then 27. Its [release source](https://github.com/zenbu-labs/terminal-browser/blob/v0.13.4/pixel/engine/crates/pixel-core/src/terminal.rs)
-also probes keyboard support, pixel mouse, extended clipboard 5522, graphics transport,
-cell size, and colors. The session daemon consumes query bytes when replying, so the
-transparent output tap's request list contains the mode changes that it passes onward.
+## Remaining gaps
 
-| terminal-browser requirement | Gap confirmed by the byte matrix / real app |
+| Gap | Why it stays |
 | --- | --- |
-| Kitty image frames | App emits frames, but native tab drops every frame before outer rendering |
-| Pixel mouse 1016 | Daemon claims it; clicks still use cells, wheel is lost |
-| Kitty keyboard flags 27, repeat/release | Legacy encoding loses modifiers; repeat/release disappear |
-| Focus 1004 | Focus events are not forwarded |
-| Clipboard 5522 | DECRQM reports unsupported |
-| Colors and color-change mode 2031 | Fixed daemon colors; no outer palette or color-change event path |
-| In-band resize 2048 | Daemon claims mode set; ordinary SIGWINCH is verified, an in-band pixel report is not |
-
-Use the optional [`terminal_browser_probe.py`](../crates/stui/tests/terminal_browser_probe.py)
-with an already installed Linux bundle. It starts the daemon directly to avoid CLI host
-AppArmor setup, forces headless operation, and closes only its own temporary session:
-
-```sh
-python3 crates/stui/tests/terminal_browser_probe.py --worker TEST_EXECUTABLE \
-  --app /path/to/terminal-browser-bundle --record /tmp/browser-probe.json
-```
-
-The download was checked against the release SHA-256. On a Nix host the downloaded Electron
-needed a compatible ELF interpreter/RPATH and libstdc++/libgbm; `--library-path` supplies
-those app libraries without changing the worker's environment. This optional check is not a
-CI dependency; the CI byte matrix independently covers these protocol requests.
-
-## Selection and mode recovery
-
-| Situation | Current behavior | Remaining gap |
-| --- | --- | --- |
-| Child has no mouse tracking | Left drag selects and copies through stui | Available |
-| Child has mouse tracking, Shift+drag reaches stui | Local selection overrides reporting | Depends on the outer terminal delivering Shift |
-| Kitty with its default mouse mapping | Kitty keeps Shift+drag for its own selection | stui cannot receive that gesture |
-| Alt/Option+drag while child has mouse tracking | Forwarded as an Alt-modified mouse report | No dependable local-selection override |
-| Selection-toggle chord and footer hint | Absent | A stui-owned toggle and hint are needed |
-| Recover modes after a crashed child | No user-facing terminal-mode reset | Need to reset parser/daemon mouse, keyboard and paste state without removing detach |
-
-Kitty documents that Shift selects in the outer terminal even when an application has
-requested mouse reporting ([overview](https://sw.kovidgoyal.net/kitty/overview/),
-[mouse configuration](https://sw.kovidgoyal.net/kitty/conf/#mouse-actions)). The PTY matrix
-can inject Shift and verify stui's override, but cannot prove that a terminal application
-will deliver it. The follow-on fix needs Alt/Option selection, an explicit selection toggle,
-and mode recovery; this baseline does not claim those exist.
-
-## Keys stui owns
-
-Ctrl+\\ always detaches and is never sent to the child. Crossterm reports legacy `1c` as
-Ctrl+4; that alias is also the exit route. Shift+PageUp/PageDown scroll stui's terminal
-history. Shift+mouse selects/copies even while the child requested tracking. In an agent
-terminal, the first Ctrl+C or Ctrl+D arms a two-second confirmation; the second sends it.
-A shell terminal receives those two chords immediately.
-
-The space controls are Ctrl+K (palette), Ctrl+Q (quit), Ctrl+S (sidebar), Ctrl+H (Home),
-Ctrl+T/V/X/W (tabs/splits), Ctrl+O (zoom), Tab/Shift+Tab, and Alt+arrows. **In the current
-focused terminal path these are passed to the child**, because `glass_key` returns before
-handling space shortcuts. Their usual space actions apply after detaching. The byte matrix
-records this existing exception explicitly; it should not be mistaken for proof that a
-future input encoder may take over stui's navigation or remove the unconditional exit.
+| Sixel decoding and capability negotiation | No sixel decoder in the pinned engine; not advertised. Kitty inline frames are the supported pixel path |
+| File, temporary-file and shared-memory image media | Paths belong to the child host and cannot safely be read by a remote surface; inline transport and replay work across hosts |
+| Animation commands and sophisticated negative-z background compositing | This compositor paints resolved static frames, replacement images and text; no animation timeline or per-cell background blending API |
+| Extended clipboard 5522 / clipboard reads | Deliberately unsupported; reads return empty rather than accessing the person's clipboard |
+| Physical key identity and layout alternate keys | Crossterm exposes logical keys and keypad state, not all original kitty fields; cannot recreate information the outer decoder discarded |
+| Precise pointer pixels | Outer crossterm reports cells; cell-center coordinates are the available resolution |
+| Dynamic outer palette and color-change notifications | The session owns fixed virtual colors; it cannot mirror every attached outer terminal's theme |
+| Outer terminals that consume Option/Shift gestures or refuse OSC 52 | Selection toggle avoids gesture dependence; clipboard policy belongs to that terminal |
 
 ## Reproduce
 
-The normal CI test requires the real `pty` package and Python 3. Both are supplied by the
-repository's CI environment. Run outside an agent seat environment:
+Use the Nix development shell, whose PTY package and Python are CI inputs, and run
+outside an agent seat environment:
 
 ```sh
-cargo nextest run -p stui --bin stui -E 'test(terminal_tab_probe_baseline)'
+cargo nextest run -p stui --bin stui -E 'test(terminal_tab_protocols)'
+python3 crates/stui/tests/terminal_tab_probe.py --worker TEST_EXECUTABLE --record /tmp/tab.json
+python3 crates/stui/tests/terminal_browser_probe.py --worker TEST_EXECUTABLE \
+  --app /path/to/terminal-browser-bundle --record /tmp/browser.json
 ```
 
-The ignored `terminal_tab_probe_worker` is a subprocess worker, not a skipped coverage test.
-The active baseline test launches it with a harness-owned outer PTY. To inspect new results,
-use that test executable's path from `cargo nextest list --message-format json`:
-
-```sh
-python3 crates/stui/tests/terminal_tab_probe.py --worker TEST_EXECUTABLE --record /tmp/probe.json
-python3 crates/stui/tests/terminal_tab_probe.py --worker TEST_EXECUTABLE --check \
-  --program cha=/path/to/cha --program hx=/path/to/hx \
-  --program vim=/path/to/vim --program less=/path/to/less
-```
-
-The real-app checks use disposable config/cache/state directories and invented local files.
-They do not require fetching a website. Review baseline changes as byte-level behavior changes;
-do not regenerate a baseline simply to silence an unexpected result.
+The ignored worker is launched by the active regression test with its own controlling
+PTY. It is not skipped coverage. Optional real programs use `--program NAME=PATH`.
+The browser runner starts its daemon directly, avoiding CLI host setup, and closes
+only its temporary processes. The release download was SHA-256 checked; on Nix its
+Electron binary needed an owned ELF interpreter/RPATH patch and optional library path.

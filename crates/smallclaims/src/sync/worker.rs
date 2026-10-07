@@ -38,6 +38,34 @@ use crate::replication::{
 use crate::store::{CheckpointManifest, CheckpointManifestPage, CheckpointManifestRequest};
 
 const REPLICATION_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(20);
+// Leave five seconds for signing, serialization and transport before the caller's deadline.
+const EXCHANGE_RESPONSE_BUDGET: Duration = Duration::from_secs(15);
+const EXCHANGE_POLL_BUDGET: Duration = Duration::from_secs(300);
+const OVERLOAD_RETRY: Duration = Duration::from_secs(5);
+const MAX_EXCHANGE_JOBS: usize = 4;
+const MAX_OVERLOAD_POLLS: usize = 60;
+
+struct ExchangeJobs {
+    peers: std::sync::Mutex<BTreeMap<String, ExchangeJob>>,
+    permits: Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for ExchangeJobs {
+    fn default() -> Self {
+        Self {
+            peers: Default::default(),
+            permits: Arc::new(tokio::sync::Semaphore::new(MAX_EXCHANGE_JOBS)),
+        }
+    }
+}
+
+type ExchangeAnswer = Result<crate::replication::ReplicationExportResponse, String>;
+
+struct ExchangeJob {
+    digest: String,
+    answer: watch::Receiver<Option<ExchangeAnswer>>,
+}
+
 const REPLICATION_WAKE_COALESCE: Duration = Duration::from_secs(1);
 const PEER_PROBE_INTERVAL: Duration = Duration::from_secs(3);
 const PEER_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -133,6 +161,7 @@ pub struct FleetContext {
     /// healthy anti-entropy exchanges or cancelling their coalescing window.
     activity: Arc<std::sync::RwLock<BTreeMap<String, tokio::time::Instant>>>,
     activity_changed: watch::Sender<u64>,
+    exchange_jobs: Arc<ExchangeJobs>,
 }
 
 impl FleetContext {
@@ -159,6 +188,7 @@ impl FleetContext {
             online: Arc::default(),
             activity: Arc::default(),
             activity_changed: watch::channel(0).0,
+            exchange_jobs: Arc::default(),
         }
     }
 
@@ -191,6 +221,7 @@ impl FleetContext {
             online: Arc::default(),
             activity: Arc::default(),
             activity_changed: watch::channel(0).0,
+            exchange_jobs: Arc::default(),
         }
     }
 
@@ -410,6 +441,7 @@ pub async fn run<B: Backend>(
         online: Arc::default(),
         activity: Arc::default(),
         activity_changed: watch::channel(0).0,
+        exchange_jobs: Arc::default(),
     };
     tokio::spawn(keep_connectivity_current(fleet.clone()));
     if let Some(fabric) = fabric.clone() {
@@ -513,6 +545,12 @@ pub async fn run<B: Backend>(
         std::future::pending::<()>().await;
         return Ok(());
     };
+    use axum::serve::ListenerExt as _;
+    let listener = listener.tap_io(|tcp| {
+        if let Err(error) = tcp.set_nodelay(true) {
+            eprintln!("st: could not disable Nagle on peer socket: {error}");
+        }
+    });
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -605,6 +643,12 @@ async fn keep_tailnet_current(
                     bound.insert(address);
                     let app = app.clone();
                     tokio::spawn(async move {
+                        use axum::serve::ListenerExt as _;
+                        let listener = listener.tap_io(|tcp| {
+                            if let Err(error) = tcp.set_nodelay(true) {
+                                eprintln!("st: could not disable Nagle on peer socket: {error}");
+                            }
+                        });
                         let _ = axum::serve(listener, app).await;
                     });
                 }
@@ -940,6 +984,7 @@ async fn dial_peer<B: Backend>(
     let mut route = 0_usize;
     let mut last_http_success = None;
     let mut refused = Vec::<(Route, tokio::time::Instant)>::new();
+    let mut last_attempt_unix_ms = crate::store::now_ms();
     loop {
         // A removed node stops dialing; `st3 doctor` says what to do next.
         if fleet.is_removed() {
@@ -1015,6 +1060,7 @@ async fn dial_peer<B: Backend>(
         // Retry waits must retain signs of life received during this attempt, including
         // an inbound request that arrives just before the outbound request fails.
         let attempt_started = tokio::time::Instant::now();
+        let attempt_unix_ms = crate::store::now_ms();
         let selected = {
             let routes = routes.borrow_and_update();
             let now = tokio::time::Instant::now();
@@ -1025,12 +1071,22 @@ async fn dial_peer<B: Backend>(
         };
         if selected.is_none() && !refused.is_empty() {
             let deadline = refused.iter().map(|(_, until)| *until).min().unwrap();
+            record_worker(
+                &backend,
+                &name,
+                "backoff",
+                last_attempt_unix_ms,
+                Some(deadline.saturating_duration_since(tokio::time::Instant::now())),
+            )
+            .await;
             tokio::select! {
                 _ = tokio::time::sleep_until(deadline) => {}
                 _ = routes.changed() => { refused.clear(); }
             }
             continue;
         }
+        last_attempt_unix_ms = attempt_unix_ms;
+        record_worker(&backend, &name, "exchange", attempt_unix_ms, None).await;
         let is_http = matches!(selected, Some(Route::Http(_)));
         let url = match selected {
             Some(Route::Http(url)) => Some(url),
@@ -1066,8 +1122,12 @@ async fn dial_peer<B: Backend>(
         };
         let Some(url) = url else {
             route = route.wrapping_add(1);
+            let delay = retry_delay(backoff.next(), &fleet, &name);
+            record_worker(&backend, &name, "backoff", attempt_unix_ms, Some(delay)).await;
             if wait_peer_retry(
-                backoff.next(),
+                &backend,
+                attempt_unix_ms,
+                delay,
                 &mut routes,
                 &mut inbound_changes,
                 &mut activity_changes,
@@ -1096,8 +1156,10 @@ async fn dial_peer<B: Backend>(
                 backoff = PeerBackoff::default();
                 must_send = false;
                 if heal_now {
+                    record_worker(&backend, &name, "heal", attempt_unix_ms, None).await;
                     heal(&backend, &node, &peer, &auth, &fleet).await;
                 }
+                record_worker(&backend, &name, "idle", attempt_unix_ms, None).await;
                 if moved {
                     // One exchange carries a bounded batch. Keep going at once while envelopes
                     // still move instead of leaving the rest of a backlog to the timer, or to
@@ -1130,7 +1192,10 @@ async fn dial_peer<B: Backend>(
                 // a fresh stream, and try the next route.
                 http = replication_http_client();
                 route = route.wrapping_add(1);
-                let status = if error.to_string().contains("signature")
+                let overloaded = error.is::<PeerOverloaded>();
+                let status = if overloaded {
+                    "overloaded"
+                } else if error.to_string().contains("signature")
                     || error.to_string().contains("fleet")
                 {
                     "auth-failed"
@@ -1140,15 +1205,23 @@ async fn dial_peer<B: Backend>(
                 let _ = backend
                     .record_failure(&peer.name, status, &error.to_string())
                     .await;
+                let delay = retry_delay(backoff.next(), &fleet, &name);
+                record_worker(&backend, &name, "backoff", attempt_unix_ms, Some(delay)).await;
                 if wait_peer_retry(
-                    backoff.next(),
+                    &backend,
+                    attempt_unix_ms,
+                    delay,
                     &mut routes,
                     &mut inbound_changes,
                     &mut activity_changes,
                     &mut connectivity,
                     &fleet,
                     &name,
-                    attempt_started,
+                    if overloaded {
+                        tokio::time::Instant::now()
+                    } else {
+                        attempt_started
+                    },
                     last_http_success.as_ref(),
                     &http,
                 )
@@ -1158,6 +1231,43 @@ async fn dial_peer<B: Backend>(
                 }
             }
         }
+    }
+}
+
+async fn record_worker<B: Backend>(
+    backend: &B,
+    peer: &str,
+    phase: &str,
+    last_attempt: u128,
+    delay: Option<Duration>,
+) {
+    // Visibility must not turn a blocked daemon read into a longer replication deadline.
+    let _ = tokio::time::timeout(
+        Duration::from_secs(1),
+        backend.record_worker(
+            peer,
+            crate::replication::ReplicationWorkerStatus {
+                phase: phase.into(),
+                last_attempt_at_unix_ms: last_attempt,
+                next_retry_at_unix_ms: delay
+                    .map(|delay| crate::store::now_ms() + delay.as_millis()),
+            },
+        ),
+    )
+    .await;
+}
+
+fn retry_delay(delay: Duration, fleet: &FleetContext, name: &str) -> Duration {
+    if fleet
+        .activity
+        .read()
+        .expect("activity lock poisoned")
+        .get(name)
+        .is_some_and(|at| at.elapsed() < PEER_PROBE_WINDOW)
+    {
+        delay.min(Duration::from_secs(30))
+    } else {
+        delay
     }
 }
 
@@ -1197,7 +1307,9 @@ impl PeerBackoff {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn wait_peer_retry(
+async fn wait_peer_retry<B: Backend>(
+    backend: &B,
+    last_attempt_unix_ms: u128,
     delay: Duration,
     routes: &mut watch::Receiver<Vec<Route>>,
     inbound_changes: &mut watch::Receiver<u64>,
@@ -1210,7 +1322,7 @@ async fn wait_peer_retry(
     http: &reqwest::Client,
 ) -> bool {
     let started = tokio::time::Instant::now();
-    let deadline = started + delay;
+    let mut deadline = started + delay;
     let mut next_probe = started + PEER_PROBE_INTERVAL;
     loop {
         // Check before sleeping as well as after notification: watch channels coalesce
@@ -1237,7 +1349,15 @@ async fn wait_peer_retry(
             return true;
         }
         let probe_url = last_http_success
-            .filter(|(_, at)| at.elapsed() < PEER_PROBE_WINDOW)
+            .filter(|(_, at)| {
+                at.elapsed() < PEER_PROBE_WINDOW
+                    || fleet
+                        .activity
+                        .read()
+                        .expect("activity lock poisoned")
+                        .get(name)
+                        .is_some_and(|at| at.elapsed() < PEER_PROBE_WINDOW)
+            })
             .filter(|(url, _)| {
                 routes
                     .borrow()
@@ -1265,8 +1385,16 @@ async fn wait_peer_retry(
             }, if probe_url.is_some() => {
                 next_probe = tokio::time::Instant::now() + PEER_PROBE_INTERVAL;
                 if alive {
-                    fleet.note_activity(name);
-                    return true;
+                    // Transport is alive, but another expensive exchange has just failed.
+                    // Retain backoff and allow at most one attempt every 30 seconds at the cap.
+                    // A cheap probe is not authenticated activity. It must not refresh
+                    // its own eligibility window and keep a failing peer hot indefinitely.
+                    let capped = started + Duration::from_secs(30);
+                    if capped < deadline {
+                        deadline = capped;
+                        record_worker(backend, name, "backoff", last_attempt_unix_ms,
+                            Some(deadline.saturating_duration_since(tokio::time::Instant::now()))).await;
+                    }
                 }
             }
         }
@@ -1336,44 +1464,122 @@ async fn receive_exchange<B: Backend>(
     // Authentication proves the connection returned before inventory processing finishes.
     state.fleet.note_activity(&sender.name);
     let relay = sender.name;
-    let result = async {
-        let request: ReplicationExchange =
-            serde_json::from_slice(&body).context("decode the replication exchange")?;
-        let received = state
-            .backend
-            .receive(&relay, state.auth.fleet_id(), &request, None)
-            .await?;
-        if received.changed {
-            state.backend.changed().await;
-            refresh_fleet_view(&state.backend, &state.fleet).await;
+    let mut answer = {
+        let mut jobs = state
+            .fleet
+            .exchange_jobs
+            .peers
+            .lock()
+            .expect("exchange jobs lock poisoned");
+        if jobs
+            .get(&relay)
+            .is_some_and(|job| job.answer.has_changed().is_err() && job.answer.borrow().is_none())
+        {
+            jobs.remove(&relay);
         }
-        if received.receipt.received != 0 {
-            state
-                .outbound_notify
-                .send_modify(|generation| *generation = generation.saturating_add(1));
+        if let Some(job) = jobs.get(&relay)
+            && job.digest != request_digest
+            && job.answer.borrow().is_none()
+        {
+            return signed_overload(&state, &request_digest);
         }
-        let response = state
-            .backend
-            .export(
-                state.auth.fleet_id(),
-                &request.inventory,
-                false,
-                &request.signature_requests,
-            )
-            .await?;
-        let authority_digest = response.exchange.authority_digest.clone();
-        let response = signed_response(
-            &state,
-            &request_digest,
-            response.store_index,
-            response.exchange,
-        )?;
-        let response = deflate_response(response, accepts_deflate(&headers)).await?;
-        Ok::<_, anyhow::Error>((response, authority_digest))
-    }
+        let reuse = jobs
+            .get(&relay)
+            .is_some_and(|job| job.digest == request_digest);
+        if !reuse {
+            let Ok(permit) = state
+                .fleet
+                .exchange_jobs
+                .permits
+                .clone()
+                .try_acquire_owned()
+            else {
+                return signed_overload(&state, &request_digest);
+            };
+            let request: ReplicationExchange = match serde_json::from_slice(&body) {
+                Ok(request) => request,
+                Err(_) => {
+                    return signed_error_response(
+                        &state,
+                        &request_digest,
+                        0,
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "invalid replication exchange",
+                    )
+                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+                }
+            };
+            // Bound retained answers as well as active backend work. Completed answers may be
+            // recomputed safely: envelope receipt is idempotent.
+            if jobs.len() >= MAX_EXCHANGE_JOBS {
+                jobs.retain(|_, job| job.answer.borrow().is_none());
+            }
+            let (done, answer) = watch::channel(None);
+            jobs.insert(
+                relay.clone(),
+                ExchangeJob {
+                    digest: request_digest.clone(),
+                    answer,
+                },
+            );
+            let state = state.clone();
+            let relay = relay.clone();
+            tokio::spawn(async move {
+                let _permit = permit;
+                let result = async {
+                    let received = state
+                        .backend
+                        .receive(&relay, state.auth.fleet_id(), &request, None)
+                        .await?;
+                    if received.changed {
+                        state.backend.changed().await;
+                        refresh_fleet_view(&state.backend, &state.fleet).await;
+                    }
+                    if received.receipt.received != 0 {
+                        state
+                            .outbound_notify
+                            .send_modify(|generation| *generation = generation.saturating_add(1));
+                    }
+                    let response = state
+                        .backend
+                        .export(
+                            state.auth.fleet_id(),
+                            &request.inventory,
+                            false,
+                            &request.signature_requests,
+                        )
+                        .await?;
+
+                    Ok::<_, anyhow::Error>(response)
+                }
+                .await
+                .map_err(|error| format!("replication request failed: {error:#}"));
+                done.send_replace(Some(result));
+            });
+        }
+        jobs.get(&relay).unwrap().answer.clone()
+    };
+    let ready = tokio::time::timeout(EXCHANGE_RESPONSE_BUDGET, async {
+        loop {
+            if let Some(result) = answer.borrow_and_update().clone() {
+                break Some(result);
+            }
+            if answer.changed().await.is_err() {
+                break None;
+            }
+        }
+    })
     .await;
-    match result {
-        Ok((response, authority_digest)) => {
+    match ready {
+        Ok(Some(Ok(export))) => {
+            finish_exchange_job(&state.fleet, &relay, &answer);
+            let authority_digest = export.exchange.authority_digest.clone();
+            let response =
+                match signed_response(&state, &request_digest, export.store_index, export.exchange)
+                {
+                    Ok(response) => response,
+                    Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                };
             state
                 .fleet
                 .inbound_authority
@@ -1385,29 +1591,81 @@ async fn receive_exchange<B: Backend>(
                 .inbound
                 .write()
                 .expect("inbound lock poisoned")
-                .insert(relay.clone(), tokio::time::Instant::now());
+                .insert(relay, tokio::time::Instant::now());
             state
                 .fleet
                 .inbound_changed
                 .send_modify(|generation| *generation = generation.wrapping_add(1));
-            response
+            deflate_response(response, accepts_deflate(&headers))
+                .await
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }
-        Err(error) => {
-            let message = format!("replication request failed: {error:#}");
-            let _ = state.backend.record_failure(&relay, "down", &message).await;
+        Ok(Some(Err(message))) => {
+            // Let the next request retry a failed job. Reporting failure must never delay headers.
+            finish_exchange_job(&state.fleet, &relay, &answer);
             signed_error_response(
                 &state,
                 &request_digest,
                 0,
-                StatusCode::UNPROCESSABLE_ENTITY,
+                StatusCode::INTERNAL_SERVER_ERROR,
                 &message,
             )
-            .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, message).into_response())
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }
+        Ok(None) => {
+            finish_exchange_job(&state.fleet, &relay, &answer);
+            signed_error_response(
+                &state,
+                &request_digest,
+                0,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "replication backend job ended without an answer",
+            )
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        }
+        Err(_) => signed_overload(&state, &request_digest),
     }
 }
 
-/// A peer's heal question, answered from this node's claims by the main daemon.
+fn finish_exchange_job(
+    fleet: &FleetContext,
+    relay: &str,
+    answer: &watch::Receiver<Option<ExchangeAnswer>>,
+) {
+    let mut jobs = fleet
+        .exchange_jobs
+        .peers
+        .lock()
+        .expect("exchange jobs lock poisoned");
+    // Concurrent retries can finish after a newer request has already started.
+    if jobs
+        .get(relay)
+        .is_some_and(|job| job.answer.same_channel(answer))
+    {
+        jobs.remove(relay);
+    }
+}
+
+fn signed_overload<B>(state: &PeerState<B>, request_digest: &str) -> Response {
+    let result = signed_response_for(
+        state,
+        EXCHANGE_PATH,
+        request_digest,
+        0,
+        serde_json::json!({"code": "replication-overloaded", "retry_after_ms": OVERLOAD_RETRY.as_millis()}),
+    );
+    match result {
+        Ok(mut response) => {
+            *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+            response
+                .headers_mut()
+                .insert("retry-after", HeaderValue::from_static("5"));
+            response
+        }
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
 async fn receive_heal<B: Backend>(
     State(state): State<PeerState<B>>,
     headers: HeaderMap,
@@ -1836,7 +2094,7 @@ pub async fn exchange<B: Backend>(
         }
         let started = std::time::Instant::now();
         let (remote, peer_inflates) =
-            post_signed(http, peer, node, auth, fleet, &query, false).await?;
+            post_signed(http, backend, peer, node, auth, fleet, &query, false).await?;
         let round_trip = started.elapsed();
         let different = remote.inventory.digest != query.inventory.digest;
         let received = backend
@@ -1866,7 +2124,7 @@ pub async fn exchange<B: Backend>(
             let started = std::time::Instant::now();
             // A peer that says it takes compressed requests gets a large push compressed.
             let (response, _) =
-                post_signed(http, peer, node, auth, fleet, &push, peer_inflates).await?;
+                post_signed(http, backend, peer, node, auth, fleet, &push, peer_inflates).await?;
             let round_trip = started.elapsed();
             // The peer stores a push before it answers, so its inventory moved if the push landed.
             pushed =
@@ -2032,10 +2290,24 @@ pub async fn heal<B: Backend>(
     backend.changed().await;
 }
 
+#[derive(Debug)]
+struct PeerOverloaded {
+    retry_after: Duration,
+}
+
+impl std::fmt::Display for PeerOverloaded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("authenticated peer is overloaded")
+    }
+}
+impl std::error::Error for PeerOverloaded {}
+
 /// Send one signed exchange, compressed when `compress` is set and the body is large, and return
 /// the peer's verified answer and whether the peer takes compressed requests.
-async fn post_signed(
+#[allow(clippy::too_many_arguments)]
+async fn post_signed<B: Backend>(
     http: &reqwest::Client,
+    backend: &B,
     peer: &PeerConfig,
     node: &str,
     auth: &FleetAuth,
@@ -2043,17 +2315,54 @@ async fn post_signed(
     exchange: &ReplicationExchange,
     compress: bool,
 ) -> Result<(ReplicationExchange, bool)> {
-    post_signed_to(
-        http,
-        peer,
-        node,
-        auth,
-        fleet,
-        EXCHANGE_PATH,
-        exchange,
-        compress,
-    )
-    .await
+    let deadline = tokio::time::Instant::now() + EXCHANGE_POLL_BUDGET;
+    let attempted = crate::store::now_ms();
+    for _ in 0..MAX_OVERLOAD_POLLS {
+        record_worker(backend, &peer.name, "exchange", attempted, None).await;
+        let result = match tokio::time::timeout_at(
+            deadline,
+            post_signed_to(
+                http,
+                peer,
+                node,
+                auth,
+                fleet,
+                EXCHANGE_PATH,
+                exchange,
+                compress,
+            ),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                return Err(PeerOverloaded {
+                    retry_after: OVERLOAD_RETRY,
+                }
+                .into());
+            }
+        };
+        match result {
+            Err(error) if error.is::<PeerOverloaded>() => {
+                let delay = error.downcast_ref::<PeerOverloaded>().unwrap().retry_after;
+                record_worker(backend, &peer.name, "overload", attempted, Some(delay)).await;
+                if tokio::time::timeout_at(deadline, tokio::time::sleep(delay))
+                    .await
+                    .is_err()
+                {
+                    return Err(PeerOverloaded {
+                        retry_after: OVERLOAD_RETRY,
+                    }
+                    .into());
+                }
+            }
+            result => return result,
+        }
+    }
+    Err(PeerOverloaded {
+        retry_after: OVERLOAD_RETRY,
+    }
+    .into())
 }
 
 /// Send one signed request to a peer path and return the peer's verified answer, as
@@ -2143,6 +2452,25 @@ async fn post_signed_to<B: Serialize, R: serde::de::DeserializeOwned>(
             .as_ref()
             .and_then(|value| value["code"].as_str())
             .unwrap_or_default();
+        if path == EXCHANGE_PATH
+            && status == StatusCode::SERVICE_UNAVAILABLE
+            && code == "replication-overloaded"
+        {
+            fleet
+                .activity
+                .write()
+                .expect("activity lock poisoned")
+                .insert(peer.name.clone(), tokio::time::Instant::now());
+            let millis = refusal
+                .as_ref()
+                .and_then(|value| value["retry_after_ms"].as_u64())
+                .unwrap_or(5000)
+                .clamp(5000, 30_000);
+            return Err(PeerOverloaded {
+                retry_after: Duration::from_millis(millis),
+            }
+            .into());
+        }
         let about_us = refusal
             .as_ref()
             .and_then(|value| value["member_key"].as_str())

@@ -7,8 +7,8 @@ message.
     run BINARY EVIDENCE_DIR HARNESS SCENARIO [--bound SECONDS] [--scratch DIR] [--replacement-binary BINARY]
 
 `HARNESS` is `claude`, `codex`, `pi`, `omp` or `opencode`. `SCENARIO` is `fresh`, `restart`,
-`daemon-restart`, `reexec`, `concurrent` or `suspend`; `run --help` says what each does. Each
-stand-in keeps its sessions the way its harness does, so `suspend` proves that a resumed seat comes
+`daemon-restart`, `reexec`, `concurrent`, `suspend` or (Codex only) `import`; `run --help` says
+what each does. Each stand-in keeps its sessions the way its harness does, so `suspend` proves that a resumed seat comes
 back on the session it suspended on, holds hour-old mail, and consumes recent never-offered
 mail exactly once. The Rust wrapper
 `crates/st3/tests/boot_canaries.rs` runs every pair as its own test in the required Linux gate.
@@ -49,6 +49,10 @@ Re-execution must preserve the provider processes as well as the seat incarnatio
 rolling upgrade, give `run` the predecessor binary and use `--replacement-binary` for the new
 binary with the `reexec` scenario. That mode allows predecessor catalogs, but checks their bytes
 remain unchanged after adoption and a new message reaches the same provider session.
+
+The Codex `import` scenario imports a saved rollout from a symlinked home while the daemon
+environment names a stale copy in another home. Its first launch and explicit restart must bind
+the exact selected ID, claim work and read mail using the pinned originating `CODEX_HOME`.
 
 ## What is real and what is not
 

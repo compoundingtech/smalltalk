@@ -597,6 +597,23 @@ impl Store {
         Ok(chain)
     }
 
+    /// Public trust anchor for local pairing, from the exact root enrollment uses.
+    /// Returns no key on legacy unsigned nodes. Never exposes private key material.
+    pub fn person_root_grant(&self, person: &str) -> Result<Option<(String, String)>, St3Error> {
+        if Family::of(person) != Some(Family::Person) {
+            return Err(St3Error::new(
+                "invalid-person",
+                "only a person pairs devices",
+            ));
+        }
+        self.ensure_principal_key(person)?;
+        Ok(self.held_root(person).and_then(|root| {
+            root.chain
+                .first()
+                .map(|grant| (root.key.public().to_owned(), grant.clone()))
+        }))
+    }
+
     /// Withdraw a device key of `person`, as the node.
     pub fn revoke_device_key(&self, person: &str, key: &str, reason: &str) -> Result<(), St3Error> {
         self.append_claim(&ClaimInput {
@@ -671,7 +688,7 @@ impl Store {
     /// Make sure this node holds a signing key for `actor` when it is a person or an agent,
     /// minting one and writing its delegation the first time. Without a node key nothing is
     /// minted, and claims stay unsigned as before.
-    pub(crate) fn ensure_principal_key(&self, actor: &str) -> Result<(), St3Error> {
+    pub fn ensure_principal_key(&self, actor: &str) -> Result<(), St3Error> {
         let family = match Family::of(actor) {
             Some(family @ (Family::Person | Family::Agent)) => family,
             _ => return Ok(()),

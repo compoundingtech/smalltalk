@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "summary": "#1555: authenticated replication overload handling",
+  "commits": ["945803e77b9ecc79ff89e5c96f9a029802765569"],
+  "replay": {"status": "none", "detail": "No new projection invalidation or startup replay trigger in the merged authenticated replication overload handling change."},
+  "schema": {"status": "none", "detail": "No database table, index, trigger or migration change in authenticated replication overload handling; SQLite user_version is unchanged."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digest/drop policy are unchanged; this change adds no sealing coordination requirement."},
+  "compatibility": {"status": "changed", "detail": "Signed replication can return authenticated replication-overloaded/503 after a 15-second backend work budget. New initiating workers poll the same signed request with verified 5-30 second delays, bounded by 60 attempts or five minutes per logical request. Old workers understand the signed error envelope but retain their old retry policy. Successful exchange payloads, request signatures and peer API version are unchanged; new host-local worker status is ignored by older daemons."},
+  "downtime": {"status": "changed", "detail": "Under load replication may report overload/backoff while accepted envelopes remain durable. New workers retry rather than reporting completed inventory; a healthy local API does not prove peers are caught up. These retry budgets are not restart-to-API measurements or an upper bound on whole-fleet convergence."},
+  "manual": {"status": "changed", "detail": "Upgrade initiating members to obtain bounded overload polling and shorter authenticated-peer retries. Inspect st replication status and projection health after restart; do not reset state or rejoin a member solely because an exchange reports overload."},
+  "recovery": {"status": "none", "detail": "No additional recovery procedure introduced by this change. Preserve graph state, keys and configuration and follow the standard roll-forward guidance; this note does not qualify binary-only downgrade of the whole release."}
+}

@@ -179,7 +179,7 @@ fn blob_parts(id: &str) -> Result<String, ApiError> {
     })
 }
 
-fn read_error(host: &str, error: anyhow::Error) -> ApiError {
+fn read_error(state: &AppState, host: &str, error: anyhow::Error) -> ApiError {
     match error.downcast_ref::<ClientReadRejected>() {
         Some(rejected) if rejected.code != "remote-unavailable" => ApiError {
             status: StatusCode::from_u16(rejected.status).unwrap_or(StatusCode::BAD_GATEWAY),
@@ -187,7 +187,7 @@ fn read_error(host: &str, error: anyhow::Error) -> ApiError {
             message: rejected.message.clone(),
             details: Box::default(),
         },
-        _ => remote_unavailable(host),
+        _ => remote_unavailable_for_owner(state, host),
     }
 }
 
@@ -228,7 +228,7 @@ async fn ensure_local(
     let relay = state
         .client_relay
         .as_ref()
-        .ok_or_else(|| remote_unavailable(&attachment.origin))?;
+        .ok_or_else(|| remote_unavailable_for_owner(state, &attachment.origin))?;
     let message = message.map(message_subject).unwrap_or_default();
     let mut bytes = Vec::new();
     loop {
@@ -246,17 +246,17 @@ async fn ensure_local(
                 },
             )
             .await
-            .map_err(|error| read_error(&attachment.origin, error))?;
+            .map_err(|error| read_error(state, &attachment.origin, error))?;
         let size = value["size"].as_u64().unwrap_or(u64::MAX);
         let chunk = value["data"]
             .as_str()
             .and_then(|data| base64::engine::general_purpose::STANDARD.decode(data).ok())
-            .ok_or_else(|| remote_unavailable(&attachment.origin))?;
+            .ok_or_else(|| remote_unavailable_for_owner(state, &attachment.origin))?;
         if size > MAX_BLOB_BYTES as u64
             || chunk.is_empty() && (bytes.len() as u64) < size
             || bytes.len() + chunk.len() > MAX_BLOB_BYTES
         {
-            return Err(remote_unavailable(&attachment.origin));
+            return Err(remote_unavailable_for_owner(state, &attachment.origin));
         }
         bytes.extend_from_slice(&chunk);
         if bytes.len() as u64 >= size {
@@ -439,6 +439,89 @@ mod tests {
     use super::*;
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
+
+    #[tokio::test]
+    async fn adapter_import_keeps_external_sender_and_upload_owner_separate() {
+        let root = tempfile::tempdir().unwrap();
+        let state = crate::api::tests::state(root.path());
+        let actor = "agent/example/bridge";
+        let source = r#"version 2
+agent "example/bridge" {
+  workspace "/tmp"
+  argv "/usr/bin/true"
+  tags st3.adapter.sources="external/discord/user/404,external/discord/user/606" st3.adapter.target="agent/example/test"
+}"#.to_owned();
+        let intent = crate::graph::parse_test_intent(&source, "node").unwrap();
+        let planned = state.store.mission(&intent, crate::model::IntentInput { kdl: source, source_name: None }).unwrap();
+        state.store.apply(&intent, &planned.subject_tokens, "adapter-route").unwrap();
+        let app = router_for_transport(state.clone(), ClientTransportBoundary::Unix);
+        let image = png(32, 7);
+        let (status, _, bytes) = call(&app, "POST", "/v1/client/blobs", actor, Some("image/png"), image.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{}", json_of(&bytes));
+        let blob = json_of(&bytes)["value"]["blob"].as_str().unwrap().to_owned();
+        let payload = json!({"idempotency_key":"adapter-image-505", "from":"external/discord/user/404", "to":"agent/example/test", "content":"image from Discord", "attachments":[{"blob":blob,"media_type":"image/png"}]});
+        let (ordinary_status, _, _) = call(&app, "POST", "/v1/messages", actor, Some("application/json"), serde_json::to_vec(&payload).unwrap()).await;
+        assert_ne!(ordinary_status, StatusCode::OK, "ordinary sends must not bypass adapter enrollment");
+        let (status, _, bytes) = call(&app, "POST", "/v1/client/adapter/import", actor, Some("application/json"), serde_json::to_vec(&payload).unwrap()).await;
+        assert_eq!(status, StatusCode::OK, "{}", json_of(&bytes));
+        let value = json_of(&bytes);
+        assert_eq!(value["value"]["from"], "external/discord/user/404");
+        assert_eq!(value["value"]["attachments"][0]["sha256"], hex::encode(Sha256::digest(&image)));
+        let id = value["value"]["subject"].clone();
+        let (_, _, repeated) = call(&app, "POST", "/v1/client/adapter/import", actor, Some("application/json"), serde_json::to_vec(&payload).unwrap()).await;
+        assert_eq!(json_of(&repeated)["value"]["subject"], id);
+        let mut conflicting = payload.clone();
+        conflicting["from"] = json!("external/discord/user/606");
+        let (status, _, _) = call(&app, "POST", "/v1/client/adapter/import", actor, Some("application/json"), serde_json::to_vec(&conflicting).unwrap()).await;
+        assert_ne!(status, StatusCode::OK, "a retry must not change its enrolled sender");
+        let second = json!({"idempotency_key":"second-account-707", "from":"external/discord/user/606", "to":"agent/example/test", "content":"another enrolled account"});
+        let (status, _, bytes) = call(&app, "POST", "/v1/client/adapter/import", actor, Some("application/json"), serde_json::to_vec(&second).unwrap()).await;
+        assert_eq!(status, StatusCode::OK, "{}", json_of(&bytes));
+        assert_eq!(json_of(&bytes)["value"]["from"], "external/discord/user/606");
+        for (from, to, caller) in [("person/alex", "agent/example/test", actor), ("external/discord/user/999", "agent/example/test", actor), ("external/discord/user/404", "agent/example/other", actor), ("external/discord/user/404", "agent/example/test", "agent/example/other")] {
+            let changed = json!({"idempotency_key":"refused", "from":from,"to":to,"content":"do not import"});
+            let (status, _, _) = call(&app, "POST", "/v1/client/adapter/import", caller, Some("application/json"), serde_json::to_vec(&changed).unwrap()).await;
+            assert_ne!(status, StatusCode::OK);
+        }
+        let refused = format!("message/{}", &hex::encode(Sha256::digest(b"refused"))[..16]);
+        assert!(state.store.message(&refused).unwrap().is_none());
+        let after = state.store.index().unwrap();
+        let waiting_app = app.clone();
+        let waiting = tokio::spawn(async move {
+            call(&waiting_app, "GET", &format!("/v1/client/adapter/deliveries?after={after}&wait_ms=1000"), actor, None, Vec::new()).await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let reply = json!({"idempotency_key":"adapter-reply-606","from":"agent/example/test","to":"external/discord/user/404","content":"streamed reply","in_reply_to":id});
+        let (status, _, bytes) = call(&app, "POST", "/v1/messages", "agent/example/test", Some("application/json"), serde_json::to_vec(&reply).unwrap()).await;
+        assert_eq!(status, StatusCode::OK, "{}", json_of(&bytes));
+        let (status, _, bytes) = waiting.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", json_of(&bytes));
+        let page = json_of(&bytes);
+        assert_eq!(page["value"]["items"][0]["content"], "streamed reply");
+        let cursor = page["value"]["cursor"].as_u64().unwrap();
+        let (_, _, replay) = call(&app, "GET", &format!("/v1/client/adapter/deliveries?after={after}"), actor, None, Vec::new()).await;
+        assert_eq!(json_of(&replay)["value"]["items"], page["value"]["items"]);
+        let (_, _, quiet) = call(&app, "GET", &format!("/v1/client/adapter/deliveries?after={cursor}&wait_ms=1"), actor, None, Vec::new()).await;
+        assert_eq!(json_of(&quiet)["value"]["items"], json!([]));
+        let waiting_app = app.clone();
+        let started = Instant::now();
+        let unrelated_wait = tokio::spawn(async move {
+            call(&waiting_app, "GET", &format!("/v1/client/adapter/deliveries?after={cursor}&wait_ms=100"), actor, None, Vec::new()).await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        state.store.append_claim(&ClaimInput {
+            subject: "resource/example/unrelated".into(), kind: "resource.observed".into(), actor: Some(actor.into()),
+            fields: BTreeMap::from([("kind".into(), json!("custom.example.notification")), ("facts".into(), json!({}))]),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: Some("unrelated-wake".into()),
+        }).unwrap();
+        signal_visible_change(&state);
+        let (status, _, bytes) = unrelated_wait.await.unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json_of(&bytes)["value"]["items"], json!([]));
+        assert!(started.elapsed() >= Duration::from_millis(100), "unrelated writes must not end the delivery wait");
+        let (status, _, _) = call(&app, "GET", "/v1/client/adapter/deliveries", "agent/example/other", None, Vec::new()).await;
+        assert_ne!(status, StatusCode::OK);
+    }
 
     /// The smallest bytes that sniff as a PNG, padded to `length`.
     fn png(length: usize, seed: u8) -> Vec<u8> {

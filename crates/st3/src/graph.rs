@@ -282,6 +282,7 @@ fn parse_intent_with_owner(
             "`subgraph` is not part of st KDL; publish declarations directly after `version 2`",
         ));
     }
+    let mission_provenance = crate::provenance::parse(&document)?;
     let missions = crate::mission::parse_missions(&document, default_host)?;
     let mut context = ParseContext {
         default_host: default_host.to_owned(),
@@ -316,6 +317,7 @@ fn parse_intent_with_owner(
         source_hash,
         subjects: context.subjects,
         missions,
+        mission_provenance,
         mission_runs: context.mission_runs,
         planning_sessions: context.planning_sessions,
         resource_refreshes: context.resource_refreshes,
@@ -382,9 +384,10 @@ fn resolve_node_documents(node: &mut KdlNode, bindings: &BTreeMap<String, String
         }
     }
     let gate = node.name().value() == "gate";
+    let mission = node.name().value() == "mission";
     if let Some(children) = node.children_mut() {
         for child in children.nodes_mut() {
-            if !(gate && is_document_gate(child)) {
+            if !(gate && is_document_gate(child) || mission && child.name().value() == "provenance") {
                 resolve_node_documents(child, bindings);
             }
         }
@@ -1340,6 +1343,7 @@ fn parse_agent(
             restart_intensity: restart_intensity.clone(),
             shutdown_timeout_ms,
             driver: None,
+            terminal_size: None,
         });
     }
 
@@ -2508,6 +2512,7 @@ fn driver_member(
         restart_intensity,
         shutdown_timeout_ms,
         driver: Some(name),
+        terminal_size: None,
     })
 }
 
@@ -2598,6 +2603,7 @@ fn task_member(
         restart_intensity,
         shutdown_timeout_ms,
         driver: None,
+        terminal_size: None,
     })
 }
 
@@ -4754,8 +4760,9 @@ fn collect_document_refs(node: &KdlNode, output: &mut BTreeSet<String>) -> Resul
     }
     if let Some(children) = node.children() {
         let gate = node.name().value() == "gate";
+        let mission = node.name().value() == "mission";
         for child in children.nodes() {
-            if !(gate && is_document_gate(child)) {
+            if !(gate && is_document_gate(child) || mission && child.name().value() == "provenance") {
                 collect_document_refs(child, output)?;
             }
         }

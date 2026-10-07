@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { Feed } from './feed.ts';
+import { Feed, shouldProbe } from './feed.ts';
 import { ForegroundGate } from './foreground.ts';
 import { fakeClient } from './fakeFeed.mjs';
 
@@ -61,9 +61,12 @@ const subscribed = socket => socket.sent.filter(command => command.kind === 'sub
   assert.deepEqual(seen.windows.agents.ids, ['agent/one']);
   assert.deepEqual(seen.connection, ['connecting', 'live'], 'a socket goes live once, at its first snapshot');
 
-  // A resync asks for that window again, and only that one.
+  // A resync asks for that window again, and only that one; after a wait, so a resync that
+  // keeps coming is not a loop and many clients do not ask at the same instant.
   const before = sockets[0].sent.length;
   sockets[0].frame({ kind: 'resync', id: 'missions' });
+  assert.deepEqual(sockets[0].sent.slice(before), [], 'not at once');
+  await settle(60);
   assert.deepEqual(sockets[0].sent.slice(before), [{ kind: 'subscribe', id: 'missions', collection: 'missions', limit: 200 }]);
 
   // Idle: nothing is read or sent while no frame arrives.
@@ -241,3 +244,8 @@ const subscribed = socket => socket.sent.filter(command => command.kind === 'sub
   feed.close();
 }
 
+
+// st is asked nothing while the stream speaks; only a quiet stream is probed (Nathan, 2026-10-06).
+assert.equal(shouldProbe(1_000, 5_000), false);
+assert.equal(shouldProbe(1_000, 10_999), false);
+assert.equal(shouldProbe(1_000, 11_000), true);

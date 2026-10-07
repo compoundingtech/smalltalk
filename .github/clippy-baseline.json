@@ -65,7 +65,7 @@
       "clippy::manual_checked_ops": 1,
       "clippy::too_many_arguments": 1,
       "clippy::type_complexity": 1,
-      "dead_code": 4,
+      "dead_code": 3,
       "unused_assignments": 1
     }
   },
