@@ -389,9 +389,10 @@ cardinality and bounded range nodes, not claims per subject.
 Normal appends update only the root's two or three selector rows, rather than every
 ancestor of each source position. Crossing a sixteen-position boundary seals the previous
 block from at most sixteen source rows; crossing larger radix boundaries combines at most
-sixteen completed child nodes, bottom-up. Sparse positions and pruning do not require
-filling gaps. The source log's indexed greatest position supplies the frontier, so there is
-no separately written high-water cache. Historical readmission updates completed ancestors;
+sixteen completed child nodes, bottom-up. An outer boundary gate runs before any child
+seek, so an uncrossed level never scans its partial block. Sparse positions and pruning
+do not require filling gaps. The source log's indexed greatest position supplies the frontier,
+so there is no separately written high-water cache. Historical readmission updates completed ancestors;
 removals correct existing ancestors and recompute extrema only when a boundary is removed.
 Grouped source reads backfill only populated closed levels and the root once on open.
 

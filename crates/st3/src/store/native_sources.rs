@@ -115,6 +115,10 @@ fn seal_sql(source: u8, position: &str) -> String {
         let shift = level * 4;
         let node = format!("({previous} >> {shift})");
         let crossed = format!("{node} < ({position} >> {shift})");
+        // Keep the zero/one-row boundary gate outside the source/child seek.
+        // A WHERE predicate on child rows can scan an unclosed ancestor's entire
+        // candidate range before rejecting it on every leaf-block boundary.
+        // CROSS JOIN fixes the gate as the outer loop, without materializing it.
         if level == 1 {
             // At most sixteen source positions, including sparse/pruned blocks.
             // Replacing, rather than incrementing, also makes re-sealing a block
@@ -122,11 +126,12 @@ fn seal_sql(source: u8, position: &str) -> String {
             for (actor_scope, actor, kind, predicate) in scopes("record") {
                 sql.push_str(&format!(
                     "INSERT INTO native_source_ranges_v2
-                     SELECT {source},{actor_scope},{actor},{kind},1,{node},
+                     SELECT {source},{actor_scope},{actor},{kind},1,closed.node,
                             record.subject,COUNT(*),MIN(record.{column}),MAX(record.{column})
-                     FROM {table} record NOT INDEXED
-                     WHERE record.{column} BETWEEN ({node} << 4) AND ({node} << 4)+15
-                       AND {predicate} AND {} AND {crossed}
+                     FROM (SELECT {node} AS node WHERE {crossed}) closed
+                     CROSS JOIN {table} record NOT INDEXED
+                     WHERE record.{column} BETWEEN (closed.node << 4) AND (closed.node << 4)+15
+                       AND {predicate} AND {}
                      GROUP BY {actor},{kind},record.subject
                      ON CONFLICT(source,actor_scope,actor,kind,level,node,subject)
                      DO UPDATE SET count=excluded.count,
@@ -139,11 +144,12 @@ fn seal_sql(source: u8, position: &str) -> String {
             let child_level = level - 1;
             sql.push_str(&format!(
                 "INSERT INTO native_source_ranges_v2
-                 SELECT source,actor_scope,actor,kind,{level},{node},subject,
+                 SELECT source,actor_scope,actor,kind,{level},closed.node,subject,
                         SUM(count),MIN(first_position),MAX(last_position)
-                 FROM native_source_ranges_v2 INDEXED BY native_source_ranges_v2_position
-                 WHERE source={source} AND level={child_level}
-                   AND node BETWEEN {node}*16 AND {node}*16+15 AND {crossed}
+                 FROM (SELECT {node} AS node WHERE {crossed}) closed
+                 CROSS JOIN native_source_ranges_v2 child INDEXED BY native_source_ranges_v2_position
+                 WHERE child.source={source} AND child.level={child_level}
+                   AND child.node BETWEEN closed.node*16 AND closed.node*16+15
                  GROUP BY actor_scope,actor,kind,subject
                  ON CONFLICT(source,actor_scope,actor,kind,level,node,subject)
                  DO UPDATE SET count=excluded.count,
@@ -839,6 +845,41 @@ mod tests {
                 membership(&connection, 0, 17, &selection).unwrap(),
                 membership(&connection, 1, 17, &selection).unwrap(),
             ]
+        );
+    }
+
+    #[test]
+    fn sealing_a_leaf_does_not_scan_uncrossed_ancestor_ranges() {
+        let mut connection = source_connection();
+        initialize(&mut connection);
+        let mut statement = connection
+            .prepare(
+                "INSERT INTO claims(id,subject,kind,actor)
+             VALUES(?1,?2,'resource.observed','person/example')",
+            )
+            .unwrap();
+        let mut small = 0;
+        let mut large = 0;
+        for position in 1..=4080 {
+            statement.reset_status(rusqlite::StatementStatus::VmStep);
+            statement
+                .execute(params![
+                    format!("claim-{position}"),
+                    format!("resource/example-{}", position % 20),
+                ])
+                .unwrap();
+            if position == 1040 {
+                small = statement.get_status(rusqlite::StatementStatus::VmStep);
+            } else if position == 4080 {
+                large = statement.get_status(rusqlite::StatementStatus::VmStep);
+            }
+        }
+        // Both appends close one leaf, but not a radix-256 ancestor. Subject
+        // cardinality and the number of newly aggregated positions are fixed.
+        assert!(small > 0);
+        assert!(
+            large <= small * 2,
+            "uncrossed-node work grew with history: {small} -> {large}"
         );
     }
 
