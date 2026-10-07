@@ -6420,18 +6420,54 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
         .filter(|(_, subjects)| subjects.len() > 1)
         .map(|(runtime, subjects)| format!("{runtime}: {}", subjects.join(", ")))
         .collect::<Vec<_>>();
+    let mut ownership_problems = duplicates
+        .iter()
+        .map(|item| format!("duplicate runtime owners: {item}"))
+        .collect::<Vec<_>>();
+    let local_live_ptys = pty_snapshot
+        .as_ref()
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| item.status == "running")
+                .map(|item| item.name.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let exec_runtime =
+        st_runtime::ExecRuntime::new(state.state_dir.join("exec"), state.state_dir.join("logs"));
+    for subject in &desired {
+        let Some(member) = subject
+            .member
+            .as_ref()
+            .filter(|member| member.host != state.node)
+        else {
+            continue;
+        };
+        let local_live = if member.terminal {
+            local_live_ptys.contains(&member.runtime_id)
+        } else {
+            matches!(
+                exec_runtime.observe(&member.runtime_id),
+                Ok(Some(st_runtime::ExecObservation::Running(_)))
+            )
+        };
+        if local_live {
+            ownership_problems.push(format!("local runtime {} for {} is placed on host/{} instead of host/{}; restore the same state directory's stable node identity before moving or restarting the seat", member.runtime_id, subject.subject, member.host, state.node));
+        }
+    }
     checks.push(DoctorCheck {
         name: "runtime-ownership".into(),
-        status: if duplicates.is_empty() {
+        status: if ownership_problems.is_empty() {
             "pass"
         } else {
             "fail"
         }
         .into(),
-        message: if duplicates.is_empty() {
-            "each desired member has a unique runtime ID".into()
+        message: if ownership_problems.is_empty() {
+            "each desired member has a unique runtime ID and live local runtimes match their placement".into()
         } else {
-            format!("duplicate runtime owners: {}", duplicates.join("; "))
+            ownership_problems.join("; ")
         },
     });
     checks.push(claude_hooks_check(state, &desired)?);
@@ -6448,6 +6484,7 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
     let mut desired_runtime_ids = desired
         .iter()
         .filter(|subject| !terminal_owned.contains(&subject.subject))
+        .filter(|subject| subject.member.as_ref().is_some_and(|member| member.host == state.node))
         .filter_map(|subject| {
             subject
                 .member
@@ -6456,7 +6493,8 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
         })
         .collect::<std::collections::BTreeSet<_>>();
     for subject in &desired {
-        if terminal_owned.contains(&subject.subject) {
+        if terminal_owned.contains(&subject.subject)
+            || !subject.member.as_ref().is_some_and(|member| member.host == state.node) {
             continue;
         }
         if let Some(runtime_id) = state
@@ -18126,6 +18164,76 @@ agent "good" {{ workspace {:?}; command "true" }}
                 assert!(check.is_none());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn doctor_flags_local_foreign_placement_and_exempts_actual_remote_runtimes() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let source = format!(
+            "version 2\nagent \"example/orphan\" {{ host \"orchid\"; command \"true\"; workspace {:?} }}\nagent \"example/remote\" {{ host \"fern\"; command \"true\"; workspace {:?} }}\n",
+            root.path().display().to_string(),
+            root.path().display().to_string()
+        );
+        let intent = crate::graph::parse_intent(&source, "node").unwrap();
+        state
+            .store
+            .apply_internal(&intent, "doctor-orphan")
+            .unwrap();
+        let orphan = state
+            .store
+            .desired_subject_with_writer("agent/example/orphan")
+            .unwrap()
+            .unwrap()
+            .0
+            .member
+            .unwrap();
+        fs::create_dir_all(&state.pty_root).unwrap();
+        let _socket = std::os::unix::net::UnixListener::bind(
+            state.pty_root.join(format!("{}.sock", orphan.runtime_id)),
+        )
+        .unwrap();
+        fs::write(
+            state.pty_root.join(format!("{}.pid", orphan.runtime_id)),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+        fs::write(state.pty_root.join(format!("{}.json", orphan.runtime_id)), json!({"createdAt":"2026-10-01T00:00:00Z","tags":{"st3.subject":"agent/example/orphan"}}).to_string()).unwrap();
+        let report = doctor_report(&state).unwrap().0;
+        let ownership = report
+            .checks
+            .iter()
+            .find(|c| c.name == "runtime-ownership")
+            .unwrap();
+        assert_eq!(ownership.status, "fail", "{ownership:?}");
+        assert!(
+            ownership.message.contains("host/orchid"),
+            "{}",
+            ownership.message
+        );
+        assert!(!ownership.message.contains("fern"), "{}", ownership.message);
+        let drift = report
+            .checks
+            .iter()
+            .find(|c| c.name == "runtime-drift")
+            .unwrap();
+        assert_eq!(drift.status, "warn");
+        assert!(drift.message.contains(&orphan.runtime_id));
+        fs::remove_file(state.pty_root.join(format!("{}.pid", orphan.runtime_id))).unwrap();
+        drop(_socket);
+        fs::remove_file(state.pty_root.join(format!("{}.sock", orphan.runtime_id))).unwrap();
+        fs::remove_file(state.pty_root.join(format!("{}.json", orphan.runtime_id))).unwrap();
+        let report = doctor_report(&state).unwrap().0;
+        assert_eq!(
+            report
+                .checks
+                .iter()
+                .find(|c| c.name == "runtime-ownership")
+                .unwrap()
+                .status,
+            "pass",
+            "remote placement alone is valid"
+        );
     }
 
     #[tokio::test]

@@ -570,6 +570,23 @@ fn install_with_claude(marketplace: &Path) -> Result<()> {
 }
 
 fn install_st3_with_claude(marketplace: &Path) -> Result<()> {
+    // Check before any marketplace/plugin side effects: install itself enables user scope.
+    let disable_help = Command::new("claude")
+        .args(["plugin", "disable", "--help"])
+        .output()
+        .context("check Claude plugin disable support")?;
+    let help = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&disable_help.stdout),
+        String::from_utf8_lossy(&disable_help.stderr)
+    );
+    anyhow::ensure!(
+        disable_help.status.success()
+            && help.lines().any(|line| {
+                line.trim_start().starts_with("Usage:") && line.contains("plugin disable")
+            }),
+        "Claude must support `plugin disable` before installing st-channel; update Claude first"
+    );
     match st3_marketplace_registration()? {
         Some(entry) if marketplace_entry_matches(&entry, marketplace) => {
             run_claude(&["plugin", "marketplace", "update", ST3_MARKETPLACE])?;
@@ -604,6 +621,15 @@ fn install_st3_with_claude(marketplace: &Path) -> Result<()> {
         "--scope",
         "user",
         "--yes",
+    ])?;
+    // Keep assets available to the per-seat --settings selection without enabling the
+    // channel in every ordinary Claude session. Never touch local/project enablement.
+    run_claude(&[
+        "plugin",
+        "disable",
+        &format!("{ST3_PLUGIN}@{ST3_MARKETPLACE}"),
+        "--scope",
+        "user",
     ])
 }
 
