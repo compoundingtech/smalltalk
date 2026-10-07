@@ -14,6 +14,7 @@ pub struct SmalltalkRuntime {
     /// Simulate different build registries on isolated nodes in compatibility tests.
     #[cfg(test)]
     pub(crate) claim_registry: std::sync::OnceLock<st3_schema::Registry>,
+    pub(crate) conversation_owners: Mutex<VecDeque<(u64, Arc<conversation_reads::Owners>)>>,
     pub(crate) actual_cache: Mutex<HashMap<String, (u64, Option<Value>)>>,
     /// Immutable placement ancestry, keyed by the selected declaration claim.
     pub(crate) placement_cache: Mutex<HashMap<String, Option<Arc<crate::placement::Fence>>>>,
@@ -187,6 +188,7 @@ impl Runtime for SmalltalkRuntime {
         cache.statuses.clear();
         cache.card_statuses.clear();
         drop(cache);
+        self.conversation_owners.lock().unwrap_or_else(PoisonError::into_inner).clear();
         self.agent_status_cache
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

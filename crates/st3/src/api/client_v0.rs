@@ -3797,41 +3797,13 @@ fn session_messages(
     incarnation: Option<&str>,
     before: Option<u64>,
 ) -> Result<Vec<ClaimRecord>, ApiError> {
-    // The incarnation's life: from its first runtime observation to the next incarnation's.
-    let (mut started, mut ended) = (None::<u128>, None::<u128>);
-    if let Some(incarnation) = incarnation {
-        let observed = state
-            .store
-            .claims_for(owner, Some("runtime.observed"))
-            .map_err(ApiError::internal)?;
-        let of = |claim: &ClaimRecord| {
-            claim
-                .body
-                .pointer("/fields/incarnation_id")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        };
-        started = observed
-            .iter()
-            .filter(|claim| of(claim).as_deref() == Some(incarnation))
-            .map(|claim| claim.accepted_at_unix_ms)
-            .min();
-        if let Some(started) = started {
-            ended = observed
-                .iter()
-                .filter(|claim| {
-                    claim.accepted_at_unix_ms > started
-                        && of(claim).is_some_and(|other| other != incarnation)
-                })
-                .map(|claim| claim.accepted_at_unix_ms)
-                .min();
-        }
-    }
-    let mut messages = state
-        .store
-        .claims_for_kind_at("message.sent", before, true, 10_000)
-        .map_err(ApiError::internal)?
-        .claims;
+    let (started, ended) = match incarnation {
+        Some(incarnation) => state.store.conversation_runtime_span(owner, incarnation)
+            .map_err(ApiError::internal)?,
+        None => (None, None),
+    };
+    let mut messages = state.store.conversation_messages_at(owner, before, 0)
+        .map_err(ApiError::internal)?;
     messages.retain(|claim| {
         let fields = claim.body.get("fields").unwrap_or(&claim.body);
         let from = fields.get("from").and_then(Value::as_str);
@@ -4837,28 +4809,11 @@ fn conversation_cursor(
 
 pub(super) fn conversation_session_id(state: &AppState, id: &str) -> Result<String, ApiError> {
     if id.starts_with("agent/") {
-        let status = state
-            .store
-            .status_for_subject_prefix_at("agent/", None, true)
-            .map_err(ApiError::internal)?;
-        let subject = status
-            .subjects
-            .into_iter()
-            .find(|subject| subject.subject == id)
+        let frontier = state.store.index().map_err(ApiError::internal)?;
+        let owners = state.store.conversation_owners_at(frontier).map_err(ApiError::internal)?;
+        let owner = owners.get(id)
             .ok_or_else(|| ApiError::not_found(format!("agent `{id}` does not exist")))?;
-        let fields = subject
-            .actual
-            .as_ref()
-            .map(|actual| actual.get("fields").unwrap_or(actual));
-        let incarnation = fields
-            .and_then(|fields| fields.get("incarnation_id"))
-            .and_then(Value::as_str)
-            .or(subject.projection.runtime_incarnation.as_deref())
-            .or_else(|| {
-                fields
-                    .and_then(|fields| fields.get("runtime_id"))
-                    .and_then(Value::as_str)
-            })
+        let incarnation = owner.incarnation.as_deref().or(owner.runtime.as_deref())
             .ok_or_else(|| validation("the agent has no current session"))?;
         return Ok(client_session_id(id, incarnation));
     }
@@ -5013,23 +4968,12 @@ fn conversation_read_now_unbounded(
                 }
             }
         }
-        for claim in state
-            .store
-            .claims_for_kind_at("message.sent", None, true, 10_000)
-            .map_err(ApiError::internal)?
-            .claims
-        {
+        for claim in owner.as_deref().map(|owner| {
+            state.store.conversation_messages_at(owner, snapshot.store_index.checked_add(1), store_index)
+        }).transpose().map_err(ApiError::internal)?.unwrap_or_default() {
             let fields = claim.body.get("fields").unwrap_or(&claim.body);
-            if claim.store_index > store_index
-                && fields
-                    .get("session_id")
-                    .and_then(Value::as_str)
-                    .is_none_or(|message_session| message_session == session_id)
-                && owner.as_deref().is_some_and(|owner| {
-                    fields.get("from").and_then(Value::as_str) == Some(owner)
-                        || fields.get("to").and_then(Value::as_str) == Some(owner)
-                })
-            {
+            if fields.get("session_id").and_then(Value::as_str)
+                .is_none_or(|message_session| message_session == session_id) {
                 changed_indexes.insert(claim.store_index);
                 message_indexes.insert(claim.store_index);
             }
@@ -13628,6 +13572,10 @@ mission "example/zero-run" state="ready" {
             .unwrap();
         let session_id = managed_session_id(agent, incarnation);
         assert_eq!(conversation_session_id(&owner, agent).unwrap(), session_id);
+        let before_alias = crate::store::STATEMENTS_RUN.with(std::cell::Cell::get);
+        assert_eq!(conversation_session_id(&owner, agent).unwrap(), session_id);
+        let alias_queries = crate::store::STATEMENTS_RUN.with(std::cell::Cell::get) - before_alias;
+        assert!(alias_queries <= 3, "a warm agent alias must not reduce fleet history: {alias_queries}");
         let session = ClientSession::local(Some("person/example")).unwrap();
         let origin = super::super::managed_session_owner_at(
             &follower.store,
