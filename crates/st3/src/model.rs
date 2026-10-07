@@ -1388,7 +1388,13 @@ pub struct SubjectStatus {
     pub harness: Option<CurrentHarnessView>,
     pub conflicts: Vec<String>,
     pub claims: Vec<String>,
-    pub owner_run: Option<String>,
+    /// The bounded claims facts a `Summary` claims reduction carries instead of the full
+    /// vector above: the canonically-latest claim id, the claim count at the cut, and — once
+    /// the count passes [`SESSION_CLAIMS`] — the window's last canonical id. Never
+    /// serialized: public status responses always carry the full vector in `claims`.
+    #[serde(skip)]
+    pub claims_summary: ClaimsSummary,
+     pub owner_run: Option<String>,
     pub gap: Option<String>,
     pub reachability: String,
     pub reason: Option<String>,
@@ -1396,6 +1402,20 @@ pub struct SubjectStatus {
     pub under: Vec<UnderSpec>,
     #[serde(default)]
     pub projection: OperationalAnnotation,
+}
+
+/// How many of a subject's claims, oldest first, date its session in the session list.
+pub const SESSION_CLAIMS: usize = 10_000;
+
+/// The bounded per-subject claims facts internal reducers read instead of the full canonical
+/// id vector: the canonically-latest claim id (an agent card's fallback revision), the claim
+/// count at the cut, and the session-dating window's last canonical id once the count passes
+/// it. Filled only by reductions asked for a summary; `Default` elsewhere.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClaimsSummary {
+    pub latest: Option<String>,
+    pub count: usize,
+    pub session_boundary: Option<String>,
 }
 
 /// The status conditions `st trace wait --for` accepts, which an attention request can also use

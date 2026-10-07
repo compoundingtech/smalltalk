@@ -184,7 +184,10 @@ history cursor is not an exception for choosing a shared reason.
 | 18785 | `validate_message_transition` | Shared | Shared message lifecycle validation; newest arrival can authorize/reject the wrong transition. |
 | 19017 | `latest_claim_id_tx` | Shared | Shared predecessor selection for new durable claims. Evidence identity must not depend on arrival. |
 | 19470 | `current_harness_at` | Shared | Shared replicated harness/work activity reduction; local host overlays are separate. Work activity still compares physical indexes against runtime/harness indexes. |
-| 19525 | `claim_ids_at` | Shared | Shared evidence/optimistic-fence identity set at a local frontier; serialized ordering must be stable. |
+| 20722 | `claim_ids_at` | Shared | Shared evidence/optimistic-fence identity set at a local frontier; serialized ordering must be stable. Full-vector source for public status responses and apply fences only. |
+| 20789 | `canonical_tie_group_at` | Shared | Shared canonical ordering inside one accepted-time group; the summary reduction resolves keys only here, never per history row. |
+| 20816 | `window_boundary_at` | Shared | Shared session-dating window boundary; canonical resolution applies only to the group the window edge falls inside. |
+| 20851 | `claims_summary_at` | Shared | Shared bounded claims summary (latest, count, window boundary) for internal status reductions; proven equal to the full vector at every cut. |
 | 19546 | `desired_conflicts_at` | Shared | Shared conflict set at a local frontier; membership is commutative, but returned ordering is observable. |
 | 19825 | `pending_human_reviews_tx` | Shared | Shared human gate/review source ordering and pending state. |
 | 19866 | `attention_request_view_tx` | Shared | Shared legacy ask/resolution selection; equal acceptance times lack writer/sequence/position ties. |

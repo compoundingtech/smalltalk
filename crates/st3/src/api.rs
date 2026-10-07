@@ -2272,7 +2272,12 @@ fn client_agent_resources_uncached(
     history: bool,
     snapshot_index: u64,
 ) -> anyhow::Result<Vec<Value>> {
-    let status = store.status_for_subject_prefix_at("agent/", Some(snapshot_index), history)?;
+    let status = store.status_for_subject_prefix_at(
+        "agent/",
+        Some(snapshot_index),
+        history,
+        crate::store::ClaimsReduction::Summary,
+    )?;
     client_agent_resources_from_status(store, history, snapshot_index, None, status)
 }
 
@@ -2521,7 +2526,7 @@ fn client_agent_resources_from_status(
             let revision = subject
                 .desired_revision
                 .clone()
-                .or_else(|| subject.claims.last().cloned())
+                .or_else(|| subject.claims_summary.latest.clone())
                 .unwrap_or_else(|| format!("agent/{}", subject.subject));
             let queue = work_queues
                 .get(&subject.subject)
@@ -2613,7 +2618,12 @@ fn managed_session_owner_at(
     snapshot_index: u64,
     session_id: &str,
 ) -> anyhow::Result<Option<(String, Option<String>, Option<String>)>> {
-    let status = store.status_for_subject_prefix_at("agent/", Some(snapshot_index), true)?;
+    let status = store.status_for_subject_prefix_at(
+        "agent/",
+        Some(snapshot_index),
+        true,
+        crate::store::ClaimsReduction::Summary,
+    )?;
     for subject in status.subjects {
         if !subject.subject.starts_with("agent/") && subject.kind.as_deref() != Some("agent") {
             continue;
@@ -2643,8 +2653,6 @@ fn managed_session_owner_at(
     Ok(None)
 }
 
-/// How many of a subject's claims, oldest first, date its session in the session list.
-const SESSION_CLAIMS: usize = 10_000;
 
 fn client_session_resources(
     store: &Arc<Store>,
@@ -2767,7 +2775,12 @@ fn managed_session_resources(
     at: &str,
     snapshot_index: u64,
 ) -> anyhow::Result<(Vec<Value>, BTreeSet<String>)> {
-    let status = store.status_for_subject_prefix_at("agent/", Some(snapshot_index), history)?;
+    let status = store.status_for_subject_prefix_at(
+        "agent/",
+        Some(snapshot_index),
+        history,
+        crate::store::ClaimsReduction::Summary,
+    )?;
     let mut sessions = Vec::new();
     for subject in status
         .subjects
@@ -2809,18 +2822,16 @@ fn managed_session_resources(
             _ => "waiting",
         };
         // A session is dated by the subject's first SESSION_CLAIMS claims, the page this list
-        // once read whole and filtered, so a subject with more keeps the dates it had.
-        let through_claim = subject
-            .claims
-            .get(SESSION_CLAIMS - 1)
-            .filter(|_| subject.claims.len() > SESSION_CLAIMS);
+        // once read whole and filtered, so a subject with more keeps the dates it had. The
+        // summary's boundary is set exactly while the count passes the window.
+        let through_claim = subject.claims_summary.session_boundary.clone();
         let mut accepted_times = store
             .runtime_claim_span_at(
                 &subject.subject,
                 incarnation,
                 runtime,
                 snapshot_index,
-                through_claim.map(String::as_str),
+                through_claim.as_deref(),
             )?
             .map(|(first, last)| vec![first, last])
             .unwrap_or_default();
@@ -20518,7 +20529,12 @@ mission "wake" state="ready" {
                 let cards = client_agent_resources_selected(store, false, index, None)?;
                 assert_eq!(Sha256::digest(serde_json::to_vec(&cards)?),
                     Sha256::digest(serde_json::to_vec(&full)?));
-                let status = store.status_for_subject_prefix_at("agent/", Some(index), false)?;
+                let status = store.status_for_subject_prefix_at(
+                    "agent/",
+                    Some(index),
+                    false,
+                    crate::store::ClaimsReduction::Full,
+                )?;
                 let declared = status.subjects.iter().find(|s| s.subject == "agent/node.declared").unwrap();
                 assert_eq!(cards.iter().find(|c| c["id"] == declared.subject).unwrap()["revision"],
                     declared.desired_revision.as_ref().unwrap().as_str());
