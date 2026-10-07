@@ -776,7 +776,9 @@ message "live-declaration" { from "agent/eval.worker"; to "agent/eval.worker"; c
 "#, "node").unwrap();
         state.store.apply_internal(&intent, "stream-declaration").unwrap();
         signal_changed(&state);
-        let messages = match next(&mut socket).await {
+        let delivered_frame = tokio::time::timeout(MAILBOX_RECHECK / 2, next(&mut socket))
+            .await.expect("the native mailbox did not offer the live declaration");
+        let messages = match delivered_frame {
             Frame::Mailbox { messages } => messages,
             other => panic!("expected queued declaration, got {other:?}"),
         };
