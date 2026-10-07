@@ -18379,8 +18379,7 @@ impl NativeObservations {
         driver: &str,
         ready: &mut bool,
     ) -> Result<bool> {
-        self.drain(client, subject, driver, ready).await?;
-        Ok(false)
+        self.drain_events(client, subject, driver, ready, true).await
     }
 
     async fn drain(
@@ -18390,8 +18389,19 @@ impl NativeObservations {
         driver: &str,
         ready: &mut bool,
     ) -> Result<()> {
+        self.drain_events(client, subject, driver, ready, false).await.map(|_| ())
+    }
+
+    async fn drain_events(
+        &mut self,
+        client: &Client,
+        subject: &str,
+        driver: &str,
+        ready: &mut bool,
+        wait_for_completion: bool,
+    ) -> Result<bool> {
         if !self.enabled {
-            return Ok(());
+            return Ok(false);
         }
         self.retry_pending = true;
         // Bound a wake's work so a backlog does not hold back native delivery.
@@ -18431,6 +18441,29 @@ impl NativeObservations {
                     };
                     let observed = st_drivers::harness_state::read_raw_at(&raw, None, decode_at);
                     if event.runtime_incarnation == self.runtime && source_driver == driver {
+                        // The wrapper writes its terminal receipt before its blocking task
+                        // returns. Publishing it now would fence our mailbox before the task's
+                        // actual success/failure can reach the normal exit-report path. Keep
+                        // this event unacknowledged until that path drains it. Exitless hook
+                        // observations and predecessor/foreign provider records still publish.
+                        if wait_for_completion
+                            && event.kind == "harness-state"
+                            && observed.state == st_drivers::harness_state::Activity::Ended
+                            && observed.exit.is_some()
+                            && observed.evidence_incarnation.is_some()
+                            && st_drivers::harness_events::read_runtime_state(&self.dir, &self.runtime)?
+                                .is_some_and(|current| {
+                                    let current = st_drivers::harness_state::read_raw_at(
+                                        &current, None, event.queued_at_ms,
+                                    );
+                                    current.evidence_incarnation == observed.evidence_incarnation
+                                        && current.ownership_sequence == observed.ownership_sequence
+                                        && current.transition_sequence == observed.transition_sequence
+                                        && current.exit == observed.exit
+                                })
+                        {
+                            return Ok(true);
+                        }
                         // Admission precedes the provider claim. Only a state event fenced to
                         // this runtime can expose its diagnostic; an old snapshot cannot fence
                         // a successor. Refused omp launches are handled on the exit path.
@@ -18568,7 +18601,7 @@ impl NativeObservations {
         }
         self.retry_pending = events.len() == 64;
         self.initial_wake = self.retry_pending;
-        Ok(())
+        Ok(false)
     }
 }
 
