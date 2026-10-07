@@ -17615,6 +17615,13 @@ mission "receipt-wait" state="ready" {
                  json!({"lifecycle":"delivered","actor":"person/test","idempotency_key":format!("receipt:{id}")}))
             };
             let (status, receipt) = json_request(app.clone(), &path, body.clone()).await;
+            if generic {
+                assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{receipt}");
+                assert_eq!(receipt["code"], "claim-write-forbidden");
+                assert!(tokio::time::timeout(Duration::from_millis(50), state.notify.notified()).await.is_err());
+                assert!(state.store.latest_claim(&format!("message/{id}"), Some("message.delivered")).unwrap().is_none());
+                continue;
+            }
             assert_eq!(status, StatusCode::OK, "{receipt}");
             tokio::time::timeout(Duration::from_millis(50), state.notify.notified()).await
                 .expect("actual declared-message delivery must wake the waiting step");

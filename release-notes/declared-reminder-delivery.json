@@ -10,8 +10,14 @@
     "detail": "No schema change."
   },
   "rules": {
-    "status": "none",
-    "detail": "Checkpoint timing uses the existing shared fold; declaration waits retain their execution budget."
+    "status": "changed",
+    "transitions": [
+      [
+        12,
+        13
+      ]
+    ],
+    "detail": "Rules version 13 gives blocked declaration waits their active execution-budget semantics in the shared checkpoint timing fold. Nodes with the older digest do not agree on a new checkpoint under the changed rules."
   },
   "compatibility": {
     "status": "none",

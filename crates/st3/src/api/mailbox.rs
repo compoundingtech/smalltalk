@@ -784,7 +784,7 @@ message "live-declaration" { from "agent/eval.worker"; to "agent/eval.worker"; c
         assert_eq!(messages[0].subject, "message/live-declaration");
         assert_eq!(messages[0].status, "sent");
         assert!(state.store.latest_claim(&messages[0].subject, Some("message.delivered")).unwrap().is_none());
-        let receipt: ClaimRecord = client.post("/v1/mailbox/receipt", &Receipt {
+        let receipt: ClaimRecord = client.post("/v1/mailbox/receipts", &Receipt {
             fence, message: messages[0].subject.clone(), lifecycle: "delivered".into(),
         }).await.unwrap();
         assert_eq!(receipt.kind, "message.delivered");

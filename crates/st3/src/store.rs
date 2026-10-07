@@ -44152,6 +44152,58 @@ version 2
     }
 
     #[test]
+    fn declaration_wait_timing_survives_checkpoint_replay() {
+        let store = Store::open_memory("source").unwrap();
+        let intent = crate::graph::parse_test_intent(r#"version 2
+mission "declaration-timing" state="ready" {
+  goal "Keep declaration waits within their execution budget."
+  step "send" timeout="1h" { agentless }
+}"#, "source").unwrap();
+        store.apply_internal(&intent, "declaration-timing-mission").unwrap();
+        let run = store.create_mission_run(&MissionRunRequest {
+            mission: "declaration-timing".into(), revision: None, workspace: "/tmp".into(),
+            requester: Some("person/test".into()), mode: Some("run".into()),
+            inputs: BTreeMap::new(), idempotency_key: "declaration-timing-run".into(),
+        }).unwrap();
+        let step = &run.steps[0].subject;
+        store.set_step_state(step, "working", None).unwrap();
+        store.set_step_state(step, "blocked", Some(crate::model::DECLARATIONS_PENDING)).unwrap();
+        let cut = now_ms() + 1_000;
+        let original = {
+            let connection = store.readers.get();
+            let mut view = step_run_row_tx(&connection, step).unwrap().unwrap();
+            enrich_step_queue_at(&connection, &mut view, cut).unwrap();
+            view
+        };
+        assert_eq!(original.status, "blocked");
+        assert!(original.execution_started_at_unix_ms.is_some());
+        assert!(original.execution_elapsed_ms >= 1_000);
+        let root = tempfile::tempdir().unwrap();
+        let copy = root.path().join("checkpoint-replay.sqlite3");
+        store.copy_store_to(&copy).unwrap();
+        let mut connection = Connection::open(copy).unwrap();
+        projection_digest::register(&connection).unwrap();
+        let transaction = connection.transaction().unwrap();
+        checkpoint_rules::replay_from_nothing(&transaction).unwrap();
+        transaction.commit().unwrap();
+        let mut restored = step_run_row_tx(&connection, step).unwrap().unwrap();
+        enrich_step_queue_at(&connection, &mut restored, cut).unwrap();
+        assert_eq!(restored.status, original.status);
+        assert_eq!(restored.blocked_reason, original.blocked_reason);
+        assert_eq!(restored.execution_started_at_unix_ms, original.execution_started_at_unix_ms);
+        assert_eq!(restored.execution_elapsed_ms, original.execution_elapsed_ms);
+        assert_eq!(graph_digest_of(&store), projection_digest::root(&projection_digest::tables(&connection).unwrap()));
+        // Ordinary worker blockers still close their interval; only the explicit
+        // reconciler-owned declaration wait keeps consuming time.
+        let events = vec![
+            ("step-run.state".into(), json!({"fields":{"status":"working"}}), 100),
+            ("step-run.state".into(), json!({"fields":{"status":"blocked","reason":"provider approval"}}), 200),
+        ];
+        assert_eq!(fold_step_timing(&events, 1, 500, false), (None, 100));
+        assert_eq!(RULES_VERSION, 13);
+    }
+
+    #[test]
     fn execution_timing_counts_only_claimed_intervals_and_resets_per_attempt() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("execution-timing.sqlite3");
