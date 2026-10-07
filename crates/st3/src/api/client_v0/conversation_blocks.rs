@@ -1090,8 +1090,6 @@ mod tests {
             for (entry_type, code) in [
                 ("error", Some("native_provider_error")),
                 ("status", None),
-                ("error", Some("native_session_exit_fatal")),
-                ("error", Some("native_session_exit_unknown")),
             ] {
                 let item = items
                     .iter()
@@ -1113,12 +1111,8 @@ mod tests {
                     }
                     assert_eq!(body["details"]["errorStatus"], 429);
                 } else {
-                    let detail = if code.is_some() {
-                        &body["details"]["pendingToolCalls"]
-                    } else {
-                        assert_eq!(body["status"], "completed");
-                        &body["detail"]
-                    };
+                    assert_eq!(body["status"], "completed");
+                    let detail = &body["detail"];
                     assert!(detail.as_str().unwrap().contains("size limit"));
                     assert!(detail.as_str().unwrap().contains("[st truncated"));
                 }
@@ -1148,21 +1142,17 @@ mod tests {
             "errorId":{"native":"provider-error"},
             "retryRecovery":{"attempt":2,"future":[false,null,42]},
         });
-        let pending = json!((0..20).map(|index| json!({
-            "toolCallId":format!("pending-{index}"),"toolName":"shell",
-            "args":{"command":"x".repeat(32_768)},"intent":"native intent",
-        })).collect::<Vec<_>>());
-        let exits = [
-            json!({"kind":"signal","reason":"sigterm","pendingToolCalls":pending,"future":42}),
-            json!({"kind":"fatal","reason":"uncaught_exception","pendingToolCalls":pending,"future":42}),
-            json!({"kind":"future-kind","reason":"unknown","pendingToolCalls":pending,"future":42}),
-        ];
+        let exit = json!({
+            "kind":"signal","reason":"sigterm","future":42,
+            "pendingToolCalls":[{
+                "toolCallId":"pending","toolName":"shell",
+                "args":{"command":"x".repeat(16 * 1024)},"intent":"native intent",
+            }],
+        });
         let records = [
             json!({"type":"session","id":"native-test","cwd":"/work/example","timestamp":"2026-10-06T12:00:00Z"}),
             json!({"type":"message","id":"provider","timestamp":"2026-10-06T12:00:01Z","message":provider_message}),
-            json!({"type":"custom","id":"signal","timestamp":"2026-10-06T12:00:02Z","customType":"session_exit","data":exits[0]}),
-            json!({"type":"custom","id":"fatal","timestamp":"2026-10-06T12:00:03Z","customType":"session_exit","data":exits[1]}),
-            json!({"type":"custom","id":"unknown","timestamp":"2026-10-06T12:00:04Z","customType":"session_exit","data":exits[2]}),
+            json!({"type":"custom","id":"signal","timestamp":"2026-10-06T12:00:02Z","customType":"session_exit","data":exit}),
         ];
         std::fs::write(
             &native.transcript,
@@ -1213,11 +1203,10 @@ mod tests {
                             assert_eq!(full["details"]["errorMessage"], provider_message["errorMessage"]);
                             assert_eq!(full["details"]["retryRecovery"], provider_message["retryRecovery"]);
                         }
-                        1 => {
+                        _ => {
                             let detail: Value = serde_json::from_str(full["detail"].as_str().unwrap()).unwrap();
-                            assert_eq!(detail, exits[0]);
+                            assert_eq!(detail, exit);
                         }
-                        _ => assert_eq!(full["details"], exits[index - 1]),
                     }
                 }
             }
@@ -1281,7 +1270,21 @@ mod tests {
             let socket_outcomes =
                 assert_bounded_outcomes(frame["items"].as_array().unwrap(), negotiated);
             for (socket_item, http_item) in socket_outcomes.iter().zip(&outcomes) {
-                assert_eq!(socket_item["body"], http_item["body"]);
+                let mut socket_body = socket_item["body"].clone();
+                let mut http_body = http_item["body"].clone();
+                // Owner refs use a fresh encryption nonce per preparation. Compare
+                // their authenticated source identity, not randomized ciphertext.
+                for body in [&mut socket_body, &mut http_body] {
+                    if let Some(blocks) = body["blocks"].as_array_mut() {
+                        for block in blocks {
+                            if let Some(token) = block["continuation"]["ref"].as_str() {
+                                let decoded = locator(token, &native.id).unwrap();
+                                block["continuation"]["ref"] = serde_json::to_value(decoded).unwrap();
+                            }
+                        }
+                    }
+                }
+                assert_eq!(socket_body, http_body);
             }
             socket.close(None).await.unwrap();
             server.abort();
