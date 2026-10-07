@@ -1629,9 +1629,10 @@ fn install_timing_log(path: PathBuf) {
     st3_client::set_observer(move |observation| {
         let at_ms = started.elapsed().as_millis() as u64;
         let line = match observation {
-            st3_client::Observation::Request { method, route, status, took } => serde_json::json!({
+            st3_client::Observation::Request { method, route, outcome, status, took } => serde_json::json!({
                 "at_ms": at_ms, "type": "request", "method": method, "route": route,
-                "status": status, "took_ms": took.as_secs_f64() * 1000.0,
+                "outcome": format!("{outcome:?}"), "status": status,
+                "took_ms": took.as_secs_f64() * 1000.0,
             }),
             st3_client::Observation::Frame { id, kind, bytes, since_subscribe } => serde_json::json!({
                 "at_ms": at_ms, "type": "frame", "id": id, "kind": kind, "bytes": bytes,

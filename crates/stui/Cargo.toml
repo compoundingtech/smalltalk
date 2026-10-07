@@ -41,6 +41,11 @@ pty-core = { git = "https://github.com/compoundingtech/pty", rev = "b9d02f3468b7
 name = "stui"
 path = "src/main.rs"
 
+# Its own tests run with the crate's, so the timing log it writes stays valid JSON.
+[[example]]
+name = "phone_client"
+test = true
+
 [dev-dependencies]
 smallclaims = { path = "../smallclaims" }
 st3 = { path = "../st3" }

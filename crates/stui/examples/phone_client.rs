@@ -13,6 +13,23 @@ use std::time::{Duration, Instant};
 
 use st3_client::{Client, set_client_name};
 
+/// One JSON line for an observation: routes, outcomes, statuses, sizes and durations, with every
+/// string escaped by serde_json, never contents.
+fn timing_line(at_ms: u64, observation: &st3_client::Observation<'_>) -> String {
+    match observation {
+        st3_client::Observation::Request { method, route, outcome, status, took } => serde_json::json!({
+            "at_ms": at_ms, "type": "request", "method": method, "route": route,
+            "outcome": format!("{outcome:?}"), "status": status,
+            "took_ms": took.as_secs_f64() * 1000.0,
+        }),
+        st3_client::Observation::Frame { id, kind, bytes, since_subscribe } => serde_json::json!({
+            "at_ms": at_ms, "type": "frame", "id": id, "kind": kind, "bytes": bytes,
+            "since_subscribe_ms": since_subscribe.map(|d| d.as_secs_f64() * 1000.0),
+        }),
+    }
+    .to_string()
+}
+
 #[tokio::main]
 async fn main() {
     let mut seconds = 180_u64;
@@ -37,18 +54,7 @@ async fn main() {
             std::fs::OpenOptions::new().create(true).append(true).open(path).expect("timing log"),
         );
         st3_client::set_observer(move |observation| {
-            let at_ms = started.elapsed().as_millis() as u64;
-            let line = match observation {
-                st3_client::Observation::Request { method, route, status, took } => format!(
-                    "{{\"at_ms\":{at_ms},\"type\":\"request\",\"method\":\"{method}\",\"route\":\"{route}\",\"status\":{},\"took_ms\":{:.3}}}",
-                    status.map_or("null".into(), |s| s.to_string()),
-                    took.as_secs_f64() * 1000.0
-                ),
-                st3_client::Observation::Frame { id, kind, bytes, since_subscribe } => format!(
-                    "{{\"at_ms\":{at_ms},\"type\":\"frame\",\"id\":\"{id}\",\"kind\":\"{kind}\",\"bytes\":{bytes},\"since_subscribe_ms\":{}}}",
-                    since_subscribe.map_or("null".into(), |d| format!("{:.3}", d.as_secs_f64() * 1000.0))
-                ),
-            };
+            let line = timing_line(started.elapsed().as_millis() as u64, observation);
             if let Ok(mut file) = file.lock() {
                 let _ = writeln!(file, "{line}");
             }
@@ -93,4 +99,24 @@ async fn main() {
         }
     }
     println!("phone client done: {frames} frames, {probes} capability probes");
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn identifiers_with_quotes_and_backslashes_stay_one_valid_json_line() {
+        let line = super::timing_line(
+            7,
+            &st3_client::Observation::Frame {
+                id: "a\"b\\c\nd",
+                kind: "snap\"shot",
+                bytes: 3,
+                since_subscribe: None,
+            },
+        );
+        assert!(!line.contains('\n'));
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed["id"], "a\"b\\c\nd");
+        assert_eq!(parsed["kind"], "snap\"shot");
+    }
 }
