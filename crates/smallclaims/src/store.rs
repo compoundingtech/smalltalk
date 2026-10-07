@@ -1602,6 +1602,9 @@ pub fn selected_index(current: u64, requested: Option<u64>) -> Result<u64, St3Er
 }
 
 pub fn claim_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClaimRecord> {
+    if crate::read_budget::check().is_err() {
+        return Err(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_INTERRUPT), None));
+    }
     let body = row.get::<_, String>(7)?;
     let predecessors = row.get::<_, String>(8)?;
     let accepted = row.get::<_, String>(9)?;
@@ -4784,12 +4787,11 @@ impl Store {
         // pin, and returns the connection to the pool.
         let pinned = PinnedRead {
             pool: &self.readers,
-            connection: Some(Rc::new(
-                guard
-                    .connection
-                    .take()
-                    .expect("an unpinned read guard holds a pooled connection"),
-            )),
+            previous: PINNED_READER.with(|slot| slot.borrow_mut().take()),
+            connection: Some(match guard.connection.take() {
+                Some(connection) => Rc::new(connection),
+                None => guard.pinned.take().expect("a request loan holds its connection"),
+            }),
         };
         drop(guard);
         let connection = pinned

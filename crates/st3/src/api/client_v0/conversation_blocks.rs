@@ -687,7 +687,7 @@ pub(super) async fn chunk_local(
     let _slot = read_slot(&READ_SLOTS)?;
     let request_state = state.clone();
     let request_session = session_id.to_owned();
-    let (bytes, media) = tokio::task::spawn_blocking(move || -> Result<_, ApiError> {
+    let (bytes, media) = crate::api::read_deadline::spawn_blocking(move || -> Result<_, ApiError> {
         let native = request_session.starts_with("session/external-");
         let source = if native {
             locator.source.session(&request_session)

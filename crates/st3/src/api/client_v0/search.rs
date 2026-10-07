@@ -468,7 +468,7 @@ pub(in crate::api) async fn search(
     while held.lock().unwrap().indexed_at.is_none() && start.elapsed() < Duration::from_secs(2) {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    tokio::task::spawn_blocking(move || search_page(&state, &query, cursor, held, binding, limit))
+    crate::api::read_deadline::spawn_blocking(move || search_page(&state, &query, cursor, held, binding, limit))
         .await
         .map_err(ApiError::internal)?
 }
@@ -594,7 +594,7 @@ mod tests {
         let held = index_for(state, &session).unwrap();
         let runtime = tokio::runtime::Handle::current();
         let state = state.clone();
-        tokio::task::spawn_blocking(move || refresh(&state, &session, &held, &runtime))
+        crate::api::read_deadline::spawn_blocking(move || refresh(&state, &session, &held, &runtime))
             .await
             .unwrap()
             .unwrap();
