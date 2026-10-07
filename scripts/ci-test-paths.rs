@@ -23,7 +23,7 @@ pub(crate) fn resolve(
             (None, None) if !archive => Ok(compiled.to_owned()),
             _ => Err("both archive workspace identities are required"),
         }
-    } else if name.starts_with("CARGO_BIN_EXE_") {
+    } else if name.starts_with("CARGO_BIN_EXE_") || name == "CARGO_TARGET_TMPDIR" {
         match executable {
             Some(path) => Ok(path.to_owned()),
             None if !archive => Ok(compiled.to_owned()),
@@ -34,22 +34,27 @@ pub(crate) fn resolve(
     }
 }
 
+#[allow(unused_macros)]
 macro_rules! test_env {
-    ($name:literal) => {
+    ($name:expr) => {
         test_env!($name, "")
     };
-    ($name:literal, $suffix:literal) => {{
+    ($name:expr, $suffix:literal) => {{
         static VALUE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
         VALUE
             .get_or_init(|| {
                 let build = std::env::var("CI_TEST_BUILD_WORKSPACE").ok();
                 let current = std::env::var("CI_TEST_WORKSPACE").ok();
-                let executable = $name.strip_prefix("CARGO_BIN_EXE_").and_then(|name| {
-                    std::env::var(format!("NEXTEST_BIN_EXE_{}", name.replace('-', "_")))
-                        .or_else(|_| std::env::var(format!("NEXTEST_BIN_EXE_{name}")))
-                        .or_else(|_| std::env::var($name))
-                        .ok()
-                });
+                let executable = if $name == "CARGO_TARGET_TMPDIR" {
+                    std::env::var("CI_TEST_TARGET_TMPDIR").ok()
+                } else {
+                    $name.strip_prefix("CARGO_BIN_EXE_").and_then(|name| {
+                        std::env::var(format!("NEXTEST_BIN_EXE_{}", name.replace('-', "_")))
+                            .or_else(|_| std::env::var(format!("NEXTEST_BIN_EXE_{name}")))
+                            .or_else(|_| std::env::var($name))
+                            .ok()
+                    })
+                };
                 let value = crate::ci_test_paths::resolve(
                     $name,
                     env!($name),
@@ -63,6 +68,13 @@ macro_rules! test_env {
             })
             .as_str()
     }};
+}
+
+#[allow(unused_macros)]
+macro_rules! test_bin {
+    ($name:literal) => {
+        std::path::Path::new(test_env!(concat!("CARGO_BIN_EXE_", $name)))
+    };
 }
 
 #[cfg(test)]
@@ -103,7 +115,11 @@ mod tests {
 
     #[test]
     fn ordinary_cargo_test_retains_the_original_paths() {
-        for name in ["CARGO_MANIFEST_DIR", "CARGO_BIN_EXE_st2"] {
+        for name in [
+            "CARGO_MANIFEST_DIR",
+            "CARGO_BIN_EXE_st2",
+            "CARGO_TARGET_TMPDIR",
+        ] {
             assert_eq!(
                 resolve(name, "/original", None, None, None, false).unwrap(),
                 "/original"
@@ -137,6 +153,7 @@ mod tests {
         );
         assert!(resolve("CARGO_MANIFEST_DIR", "/build/crate", None, None, None, true).is_err());
         assert!(resolve("CARGO_BIN_EXE_st2", "/old/st2", None, None, None, true).is_err());
+        assert!(resolve("CARGO_TARGET_TMPDIR", "/old/target", None, None, None, true).is_err());
         assert!(resolve("CARGO_PKG_VERSION", "1", None, None, None, false).is_err());
     }
 }

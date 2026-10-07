@@ -209,7 +209,7 @@ fn seat_driver(root: &Path, socket: &Path, index: usize) -> Child {
         std::fs::create_dir_all(root.join(directory)).unwrap();
     }
     let (runtime_id, _) = seat(index);
-    st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
+    st3::test_support::command(test_bin!("st3-fixture"))
         // Its own process group, so stopping the seat also stops the stand-in provider.
         .process_group(0)
         .current_dir(root.join("workspace"))

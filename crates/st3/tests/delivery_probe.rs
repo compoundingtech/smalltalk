@@ -10,7 +10,7 @@ fn native_delivery_probe_alerts_and_recovers_without_model_turns() {
     let repo = PathBuf::from(test_env!("CARGO_MANIFEST_DIR")).join("../..");
     let scratch = tempfile::Builder::new()
         .prefix("delivery-probe-scratch-")
-        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .tempdir_in(test_env!("CARGO_TARGET_TMPDIR"))
         .unwrap();
     let result = st3::test_support::command("setsid")
         .args(["-f", "env", "-u", "ST_AGENT", "python3"])

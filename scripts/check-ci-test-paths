@@ -1,0 +1,22 @@
+#!/usr/bin/env python3
+"""Keep test executable/fixture/temp paths relocatable across archive runners."""
+import re
+from pathlib import Path
+ROOT = Path(__file__).resolve().parent.parent
+# Only the shared helper may deliberately use compile-time fallbacks. Production codegen's
+# manifest identity is not an archived test path and is outside this test-support scope.
+pattern = re.compile(r'cargo_bin!|env!\s*\(\s*"(?:CARGO_BIN_EXE_[^"]*|CARGO_MANIFEST_DIR|CARGO_TARGET_TMPDIR)"')
+violations = []
+for crate in (ROOT / 'crates').iterdir():
+    paths = list((crate / 'tests').rglob('*.rs'))
+    paths += list((crate / 'src').rglob('*.rs'))
+    for path in paths:
+        if path.relative_to(ROOT).as_posix() == 'crates/st3-client-codegen/src/main.rs':
+            continue  # Production generator root; never executed from the test archive.
+        for number, line in enumerate(path.read_text().splitlines(), 1):
+            # test_env! is the deliberate relocation macro, not raw env!.
+            if pattern.search(line.replace('test_env!', 'relocated!')):
+                violations.append(f'{path.relative_to(ROOT)}:{number}')
+if violations:
+    raise SystemExit('unrelocated test paths: ' + ', '.join(violations))
+print('Test path guard passed: no raw cargo_bin!/compiled manifest/binary/temp paths')

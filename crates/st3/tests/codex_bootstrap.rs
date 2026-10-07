@@ -151,7 +151,7 @@ async fn delayed_delivery_control_holds_visible_native_input_and_recovers_once()
     // this control-read proof from accidentally exercising driver re-execution.
     let binary_dir = tempfile::Builder::new()
         .prefix("delivery-control-binary-")
-        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .tempdir_in(test_env!("CARGO_TARGET_TMPDIR"))
         .unwrap();
     let binary = binary_dir.path().join("st3-fixture");
     std::fs::copy(test_env!("CARGO_BIN_EXE_st3-fixture"), &binary).unwrap();

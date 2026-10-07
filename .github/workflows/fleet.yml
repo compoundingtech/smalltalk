@@ -332,7 +332,7 @@ jobs:
         run: 'bash scripts/ci-nix-cache use || echo "::warning::the local Nix cache is unavailable; this run builds everything"'
       - name: Check runner selection and generated files
         shell: bash
-        run: "nix develop '.#genie' -c bash -c 'python3 scripts/check-ci-runner-test && python3 scripts/ci-mail-redelivery-canaries-test && python3 scripts/ci-test-partitions-test && python3 scripts/ci-test-archive-test && python3 scripts/ci-queue-watch-test && python3 scripts/check-main-ci-test && python3 scripts/ci-perf-cache-test && python3 scripts/ci-cache-audit-test && genie --check'"
+        run: "nix develop '.#genie' -c bash -c 'python3 scripts/check-ci-runner-test && python3 scripts/ci-mail-redelivery-canaries-test && python3 scripts/ci-test-partitions-test && python3 scripts/ci-test-archive-test && python3 scripts/check-ci-test-paths && python3 scripts/ci-queue-watch-test && python3 scripts/check-main-ci-test && python3 scripts/ci-perf-cache-test && python3 scripts/ci-cache-audit-test && genie --check'"
       - name: Save Nix outputs
         if: success() && env.CI_LOCAL_CACHES != '1'
         run: bash scripts/ci-nix-cache save
@@ -446,6 +446,7 @@ jobs:
     outputs:
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
       manifest-sha256: ${{ steps.archive.outputs.manifest-sha256 }}
+      producer-attempt: ${{ steps.archive.outputs.producer-attempt }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -534,6 +535,41 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 3
+      - id: build-snapshot-save
+        name: Keep valid same-source build outputs
+        if: "!cancelled()"
+        env:
+          CI_SNAPSHOT_PIPELINE: ${{ github.workflow_sha }}
+        run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" pack'
+      - id: build-snapshot-upload
+        name: Retain the same-source build snapshot
+        if: "!cancelled() && steps.build-snapshot-save.outputs.publish == 'true'"
+        continue-on-error: true
+        timeout-minutes: 5
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.build-snapshot-save.outputs.name }}
+          path: "${{ runner.temp }}/ci-build-snapshot/build.tar.zst"
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: error
+          overwrite: true
+      - name: Wait before retrying build snapshot retention
+        if: "!cancelled() && steps.build-snapshot-upload.outcome == 'failure'"
+        timeout-minutes: 1
+        shell: bash
+        run: 'echo "::warning::Build snapshot upload failed; retrying once in 15 seconds."; sleep 15'
+      - name: Retry retaining the same-source build snapshot
+        if: "!cancelled() && steps.build-snapshot-upload.outcome == 'failure'"
+        timeout-minutes: 5
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.build-snapshot-save.outputs.name }}
+          path: "${{ runner.temp }}/ci-build-snapshot/build.tar.zst"
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: error
+          overwrite: true
       - name: Report job cache coverage
         if: always()
         shell: bash
@@ -543,7 +579,7 @@ jobs:
   linux-tests:
     name: linux-tests
     needs: [pick-runner, linux-test-build]
-    if: ${{ !cancelled() && needs.linux-test-build.result == 'success' }}
+    if: ${{ !cancelled() }}
     runs-on: ${{ fromJSON(needs.pick-runner.outputs.ci1 || format('["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1","namespace-features:github.run-id={0}"]', github.run_id)) }}
     timeout-minutes: 120
     defaults:
@@ -558,6 +594,10 @@ jobs:
       CI_TEST_THREADS: "8"
       CI_CACHE_DEV_SHELL: default
     steps:
+      - name: Require the shared test producer to succeed
+        env:
+          PRODUCER_RESULT: ${{ needs.linux-test-build.result }}
+        run: '[ "$PRODUCER_RESULT" = success ] || { echo "::error::shared test producer failed or was skipped"; exit 1; }'
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -616,12 +656,14 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           artifact-ids: ${{ needs.linux-test-build.outputs.artifact-id }}
+          merge-multiple: true
           path: "${{ runner.temp }}/ci-test-archives"
       - name: Verify source, hashes and extract test archives
         shell: bash
         run: nix develop -c python3 scripts/ci-test-archive consume
         env:
           CI_TEST_ARCHIVE_MANIFEST_SHA256: ${{ needs.linux-test-build.outputs.manifest-sha256 }}
+          CI_TEST_ARCHIVE_PRODUCER_ATTEMPT: ${{ needs.linux-test-build.outputs.producer-attempt }}
       - name: Install matching rendered hooks
         shell: bash
         run: nix develop -c bash scripts/ci-install-built-hooks
@@ -655,7 +697,7 @@ jobs:
   linux-tests-shard-2:
     name: linux-tests-shard-2
     needs: [pick-runner, linux-test-build]
-    if: ${{ !cancelled() && needs.linux-test-build.result == 'success' }}
+    if: ${{ !cancelled() }}
     runs-on: ${{ fromJSON(needs.pick-runner.outputs.ci1_secondary || format('["nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1","namespace-features:github.run-id={0}"]', github.run_id)) }}
     timeout-minutes: 120
     defaults:
@@ -670,6 +712,10 @@ jobs:
       CI_TEST_THREADS: "8"
       CI_CACHE_DEV_SHELL: default
     steps:
+      - name: Require the shared test producer to succeed
+        env:
+          PRODUCER_RESULT: ${{ needs.linux-test-build.result }}
+        run: '[ "$PRODUCER_RESULT" = success ] || { echo "::error::shared test producer failed or was skipped"; exit 1; }'
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -728,12 +774,14 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           artifact-ids: ${{ needs.linux-test-build.outputs.artifact-id }}
+          merge-multiple: true
           path: "${{ runner.temp }}/ci-test-archives"
       - name: Verify source, hashes and extract test archives
         shell: bash
         run: nix develop -c python3 scripts/ci-test-archive consume
         env:
           CI_TEST_ARCHIVE_MANIFEST_SHA256: ${{ needs.linux-test-build.outputs.manifest-sha256 }}
+          CI_TEST_ARCHIVE_PRODUCER_ATTEMPT: ${{ needs.linux-test-build.outputs.producer-attempt }}
       - name: Install matching rendered hooks
         shell: bash
         run: nix develop -c bash scripts/ci-install-built-hooks
@@ -1053,6 +1101,10 @@ jobs:
       CI_TEST_THREADS: "8"
       CI_CACHE_DEV_SHELL: default
     steps:
+      - name: Require the shared test producer to succeed
+        env:
+          PRODUCER_RESULT: ${{ needs.linux-test-build.result }}
+        run: '[ "$PRODUCER_RESULT" = success ] || { echo "::error::shared test producer failed or was skipped"; exit 1; }'
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -1111,12 +1163,14 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           artifact-ids: ${{ needs.linux-test-build.outputs.artifact-id }}
+          merge-multiple: true
           path: "${{ runner.temp }}/ci-test-archives"
       - name: Verify source, hashes and extract test archives
         shell: bash
         run: nix develop -c python3 scripts/ci-test-archive consume
         env:
           CI_TEST_ARCHIVE_MANIFEST_SHA256: ${{ needs.linux-test-build.outputs.manifest-sha256 }}
+          CI_TEST_ARCHIVE_PRODUCER_ATTEMPT: ${{ needs.linux-test-build.outputs.producer-attempt }}
       - name: Install matching rendered hooks
         shell: bash
         run: nix develop -c bash scripts/ci-install-built-hooks
@@ -1186,11 +1240,12 @@ jobs:
           CACHE_ENTRIES: '[{"name":"Restore the local Nix cache","outcome":"${{ steps.nix-cache.outcome }}","hit":"${{ steps.nix-cache.outputs.cache-hit }}","matched":"${{ steps.nix-cache.outputs.cache-matched-key }}","opaqueFallback":false,"sourceOnly":false,"avoidable":"","lookup":false}]'
         run: 'python3 "${CI_CACHE_AUDIT_SCRIPT:-scripts/ci-cache-audit}"'
     needs: [pick-runner, linux-test-build]
-    if: ${{ !cancelled() && needs.linux-test-build.result == 'success' }}
+    if: ${{ !cancelled() }}
   linux-gate:
     name: linux-gate
     needs:
       - pick-runner
+      - linux-test-build
       - upgrade-impact
       - linux-tests
       - linux-tests-shard-2
@@ -1203,7 +1258,7 @@ jobs:
     steps:
       - name: Require every Linux stage to pass
         env:
-          RESULTS: "${{ needs.upgrade-impact.result }} ${{ needs.linux-tests.result }} ${{ needs.linux-tests-shard-2.result }} ${{ needs.linux-clippy.result }} ${{ needs.linux-fleet-compat.result }} ${{ needs.mail-redelivery-canaries.result }}"
+          RESULTS: "${{ needs.linux-test-build.result }} ${{ needs.upgrade-impact.result }} ${{ needs.linux-tests.result }} ${{ needs.linux-tests-shard-2.result }} ${{ needs.linux-clippy.result }} ${{ needs.linux-fleet-compat.result }} ${{ needs.mail-redelivery-canaries.result }}"
         run: |
           echo "stage results: $RESULTS"
           for result in $RESULTS; do
@@ -1378,7 +1433,7 @@ jobs:
   isolation-vm:
     name: isolation-vm
     needs: [pick-runner, linux-test-build]
-    if: ${{ !cancelled() && needs.linux-test-build.result == 'success' }}
+    if: ${{ !cancelled() }}
     runs-on: ["namespace-profile-linux-x86-64;job.priority=1;github.run-id=${{ github.run_id }}"]
     timeout-minutes: 60
     defaults:
@@ -1390,27 +1445,14 @@ jobs:
       CARGO_INCREMENTAL: "0"
       CI_CACHE_DEV_SHELL: default
     steps:
+      - name: Require the shared test producer to succeed
+        env:
+          PRODUCER_RESULT: ${{ needs.linux-test-build.result }}
+        run: '[ "$PRODUCER_RESULT" = success ] || { echo "::error::shared test producer failed or was skipped"; exit 1; }'
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Probe KVM
-        run: |
-          if [ ! -e /dev/kvm ]; then
-            echo "::error::/dev/kvm is missing: this runner profile offers no nested virtualization"
-            exit 1
-          fi
-          if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then sudo chmod 0666 /dev/kvm; fi
-          python3 - <<'EOF'
-          import fcntl, os
-          fd = os.open("/dev/kvm", os.O_RDWR | os.O_CLOEXEC)
-          version = fcntl.ioctl(fd, 0xAE00)  # KVM_GET_API_VERSION
-          vm = fcntl.ioctl(fd, 0xAE01, 0)  # KVM_CREATE_VM
-          assert version == 12, f"unexpected KVM API version {version}"
-          os.close(vm)
-          print(f"KVM API {version}: created a VM")
-          EOF
-          printf 'KVM: \x60%s\x60, CPU virtualization flag %s, VM creation succeeded\n\n| Phase | Elapsed |\n| --- | --- |\n' "$(ls -l /dev/kvm)" "$(grep -m1 -oE 'vmx|svm' /proc/cpuinfo || echo none)" >> "$GITHUB_STEP_SUMMARY"
       - name: Use the runner's own caches
         run: |
           if [ -n "${CI_LOCAL_CARGO_HOME:-}" ]; then echo CI_LOCAL_CACHES=1 >> "$GITHUB_ENV"; fi
@@ -1465,15 +1507,34 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           artifact-ids: ${{ needs.linux-test-build.outputs.artifact-id }}
+          merge-multiple: true
           path: "${{ runner.temp }}/ci-test-archives"
       - name: Verify source, hashes and extract test archives
         shell: bash
         run: nix develop -c python3 scripts/ci-test-archive consume
         env:
           CI_TEST_ARCHIVE_MANIFEST_SHA256: ${{ needs.linux-test-build.outputs.manifest-sha256 }}
+          CI_TEST_ARCHIVE_PRODUCER_ATTEMPT: ${{ needs.linux-test-build.outputs.producer-attempt }}
       - name: Install matching rendered hooks
         shell: bash
         run: nix develop -c bash scripts/ci-install-built-hooks
+      - name: Probe KVM
+        run: |
+          if [ ! -e /dev/kvm ]; then
+            echo "::error::/dev/kvm is missing: this runner profile offers no nested virtualization"
+            exit 1
+          fi
+          if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then sudo chmod 0666 /dev/kvm; fi
+          python3 - <<'EOF'
+          import fcntl, os
+          fd = os.open("/dev/kvm", os.O_RDWR | os.O_CLOEXEC)
+          version = fcntl.ioctl(fd, 0xAE00)  # KVM_GET_API_VERSION
+          vm = fcntl.ioctl(fd, 0xAE01, 0)  # KVM_CREATE_VM
+          assert version == 12, f"unexpected KVM API version {version}"
+          os.close(vm)
+          print(f"KVM API {version}: created a VM")
+          EOF
+          printf 'KVM: \x60%s\x60, CPU virtualization flag %s, VM creation succeeded\n\n| Phase | Elapsed |\n| --- | --- |\n' "$(ls -l /dev/kvm)" "$(grep -m1 -oE 'vmx|svm' /proc/cpuinfo || echo none)" >> "$GITHUB_STEP_SUMMARY"
       - name: Build the NixOS VM test driver
         run: |
           start=$SECONDS
@@ -1484,6 +1545,7 @@ jobs:
           ST_ISOLATION_ARCHIVE: "${{ runner.temp }}/ci-test-archives/st2.tar.zst"
           ST_ISOLATION_WORKSPACE: ${{ github.workspace }}
           ST_ISOLATION_TIMINGS: "${{ runner.temp }}/vm-timings.json"
+          ST_ISOLATION_BUILD_WORKSPACE: ${{ env.CI_TEST_BUILD_WORKSPACE }}
         run: |
           start=$SECONDS
           mkdir -p "$RUNNER_TEMP/vm-out"
@@ -1497,7 +1559,7 @@ jobs:
           printf '| sekrets VM driver build | %ss |\n' "$((SECONDS - start))" >> "$GITHUB_STEP_SUMMARY"
       - name: Run the sekrets gateway test in the VM
         env:
-          ST_SEKRETS_BINARY: "${{ runner.temp }}/ci-test-extracted/workspace/target/debug/st3"
+          ST_SEKRETS_BINARY: ${{ env.CI_SEKRETS_BINARY }}
         run: |
           start=$SECONDS
           mkdir -p "$RUNNER_TEMP/sekrets-vm-out"
@@ -1506,41 +1568,6 @@ jobs:
       - name: Save Nix outputs
         if: success() && env.CI_LOCAL_CACHES != '1'
         run: bash scripts/ci-nix-cache save
-      - id: build-snapshot-save
-        name: Keep valid same-source build outputs
-        if: "!cancelled()"
-        env:
-          CI_SNAPSHOT_PIPELINE: ${{ github.workflow_sha }}
-        run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" pack'
-      - id: build-snapshot-upload
-        name: Retain the same-source build snapshot
-        if: "!cancelled() && steps.build-snapshot-save.outputs.publish == 'true'"
-        continue-on-error: true
-        timeout-minutes: 5
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.build-snapshot-save.outputs.name }}
-          path: "${{ runner.temp }}/ci-build-snapshot/build.tar.zst"
-          compression-level: 0
-          retention-days: 3
-          if-no-files-found: error
-          overwrite: true
-      - name: Wait before retrying build snapshot retention
-        if: "!cancelled() && steps.build-snapshot-upload.outcome == 'failure'"
-        timeout-minutes: 1
-        shell: bash
-        run: 'echo "::warning::Build snapshot upload failed; retrying once in 15 seconds."; sleep 15'
-      - name: Retry retaining the same-source build snapshot
-        if: "!cancelled() && steps.build-snapshot-upload.outcome == 'failure'"
-        timeout-minutes: 5
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.build-snapshot-save.outputs.name }}
-          path: "${{ runner.temp }}/ci-build-snapshot/build.tar.zst"
-          compression-level: 0
-          retention-days: 3
-          if-no-files-found: error
-          overwrite: true
       - name: Report job cache coverage
         if: always()
         shell: bash

@@ -279,6 +279,9 @@ done`,
 
 /** Archive consumers restore tools/fixtures, never Cargo targets or another job's build snapshot. */
 export const testArchiveConsumerSetup = [
+  { name: "Require the shared test producer to succeed",
+    env: { PRODUCER_RESULT: "${{ needs.linux-test-build.result }}" },
+    run: '[ "$PRODUCER_RESULT" = success ] || { echo "::error::shared test producer failed or was skipped"; exit 1; }' },
   ...commonSetupSteps.filter((step: any) => step.id !== 'cargo-cache'
     && step !== buildSnapshotRestore && step !== buildSnapshotPrepare),
   ...testBuildSteps.slice(0, 2),
@@ -287,12 +290,14 @@ export const testArchiveConsumerSetup = [
     uses: 'actions/download-artifact@v4',
     with: {
       'artifact-ids': '${{ needs.linux-test-build.outputs.artifact-id }}',
+      'merge-multiple': true,
       path: '${{ runner.temp }}/ci-test-archives',
     },
   },
   { ...nixDevelopStep({ name: 'Verify source, hashes and extract test archives',
     command: ['python3', 'scripts/ci-test-archive', 'consume'] }),
-    env: { CI_TEST_ARCHIVE_MANIFEST_SHA256: '${{ needs.linux-test-build.outputs.manifest-sha256 }}' } },
+    env: { CI_TEST_ARCHIVE_MANIFEST_SHA256: '${{ needs.linux-test-build.outputs.manifest-sha256 }}',
+      CI_TEST_ARCHIVE_PRODUCER_ATTEMPT: '${{ needs.linux-test-build.outputs.producer-attempt }}' } },
   testBuildSteps[3],
 ]
 
