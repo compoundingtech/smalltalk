@@ -4541,17 +4541,17 @@ fn main() -> ExitCode {
         Err(error) => exit_usage_error(error),
     };
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| exit_usage_error(error));
-    if let Command::Doctor(args) = &cli.command {
-        if args.offline_audit.is_some() {
-            // Full audits run before the async runtime, client, telemetry or networking.
-            return match run_offline_doctor(args, cli.json) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(error) => {
-                    eprintln!("st: {error:#}");
-                    ExitCode::from(2)
-                }
-            };
-        }
+    if let Command::Doctor(args) = &cli.command
+        && args.offline_audit.is_some()
+    {
+        // Full audits run before the async runtime, client, telemetry or networking.
+        return match run_offline_doctor(args, cli.json) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("st: {error:#}");
+                ExitCode::from(2)
+            }
+        };
     }
     if let Command::Up(args) = &cli.command {
         record_daemon_commands(args);
@@ -4585,8 +4585,8 @@ fn run_offline_doctor(args: &DoctorArgs, json_output: bool) -> Result<()> {
     // SAFETY: this command executes before threads start; the signal callback only sets an
     // atomic flag. Copy loops and SQLite progress handlers observe it and unwind temp guards.
     unsafe {
-        libc::signal(libc::SIGINT, interrupt as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, interrupt as libc::sighandler_t);
+        libc::signal(libc::SIGINT, interrupt as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, interrupt as *const () as libc::sighandler_t);
     }
     let scratch = tempfile::Builder::new()
         .prefix("st3-offline-command-")
@@ -11049,24 +11049,23 @@ async fn run_replication(
             let response = client
                 .get::<st3::store::CheckpointStatusView>("/v1/checkpoint/status")
                 .await;
-            if let Err(error) = &response {
-                if let Some((_, "diagnostic-evidence-incomplete", message, details)) =
+            if let Err(error) = &response
+                && let Some((_, "diagnostic-evidence-incomplete", message, details)) =
                     st3::client::api_error_parts(error)
-                {
-                    if json_output {
-                        print_value(
-                            &json!({"status":"unknown", "message":message, "details":details}),
-                            true,
-                        )?;
-                    } else {
-                        let comparison = details
-                            .get("comparison_state")
-                            .and_then(Value::as_str)
-                            .unwrap_or("unavailable");
-                        eprintln!("unknown\tcheckpoint-status\t{comparison}: {message}");
-                    }
-                    return Err(CommandExit(2).into());
+            {
+                if json_output {
+                    print_value(
+                        &json!({"status":"unknown", "message":message, "details":details}),
+                        true,
+                    )?;
+                } else {
+                    let comparison = details
+                        .get("comparison_state")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unavailable");
+                    eprintln!("unknown\tcheckpoint-status\t{comparison}: {message}");
                 }
+                return Err(CommandExit(2).into());
             }
             let status = response?;
             if json_output {
@@ -23085,7 +23084,6 @@ fn unique_pairs(values: Vec<(String, String)>, kind: &str) -> Result<BTreeMap<St
 mod tests {
     use super::*;
 
-    // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
     #[test]
     fn offline_doctor_parses_only_explicit_local_audit_options() {
         let cli = Cli::try_parse_from([
@@ -23124,6 +23122,7 @@ mod tests {
         assert!(Cli::try_parse_from(["st3", "doctor"]).is_ok());
     }
 
+    // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
     #[test]
     fn omp_pending_ask_retry_is_bound_to_the_expected_call_and_sent_once_across_reexec() {
         let mut state = PiChannelResume::default();

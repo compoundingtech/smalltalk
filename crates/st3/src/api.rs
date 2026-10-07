@@ -64,6 +64,7 @@ mod client_presence;
 mod client_v0;
 mod custom;
 mod delivery_presence;
+#[cfg(test)]
 mod delivery_probes;
 mod github_watch;
 mod harness_events;
@@ -5712,6 +5713,7 @@ fn descriptor_usage_check(soft: u64, hard: u64, usage: Option<u64>) -> DoctorChe
     }
 }
 
+#[cfg(test)]
 fn first_readiness_scheduler_check(store: &Store, node: &str) -> DoctorCheck {
     let (status, message) = match store.open_reconcile_faults(node) {
         Ok(faults) => {
@@ -5813,6 +5815,7 @@ fn github_usage_checks(usage: &crate::resource::GithubUsageReport, now: u128) ->
 /// Every person's open attention items that have waited more than a day, oldest first.
 /// Every person's attention, then every fault under the agent that owns it, so an old fault
 /// that no agent took up still shows in doctor.
+#[cfg(test)]
 fn doctor_attention_items(
     store: &Store,
     now: u128,
@@ -5827,6 +5830,7 @@ fn doctor_attention_items(
     Ok(items)
 }
 
+#[cfg(test)]
 fn stale_attention_check(items: &[crate::model::AttentionItemView], now: u128) -> DoctorCheck {
     const DAY_MS: u128 = 86_400_000;
     const LISTED: usize = 20;
@@ -5874,53 +5878,16 @@ fn stale_attention_check(items: &[crate::model::AttentionItemView], now: u128) -
     }
 }
 
-fn build_tools_check(tools: &crate::environment::BuildTools) -> DoctorCheck {
-    use crate::environment::LinkResult;
-    let mut problems = Vec::new();
-    if !tools.missing.is_empty() {
-        problems.push(format!(
-            "missing from the login PATH: {}",
-            tools.missing.join(", ")
-        ));
-    }
-    match &tools.link {
-        LinkResult::Linked => {}
-        LinkResult::NotAttempted => {
-            problems.push("no small crate was linked because cargo or rustc is missing".into());
-        }
-        LinkResult::Failed(error) => problems.push(format!("a small crate did not link: {error}")),
-    }
-    if problems.is_empty() {
-        return DoctorCheck {
-            name: "build-tools".into(),
-            status: "pass".into(),
-            message: format!(
-                "{} are on the login PATH, and a small crate links",
-                tools.found.join(", ")
-            ),
-        };
-    }
-    DoctorCheck {
-        name: "build-tools".into(),
-        status: "warn".into(),
-        message: format!(
-            "{}; install what is missing, or export its directory from the account's shell startup files",
-            problems.join("; ")
-        ),
-    }
-}
-
 fn daemon_pty(state: &AppState) -> anyhow::Result<st_runtime::PtyRuntime> {
     Ok(st_runtime::PtyRuntime::new(state.pty_root.clone())
         .with_binary(state.pty_binary.to_string_lossy())
         .with_environment(crate::environment::snapshot()?))
 }
 
-/// The references already in the graph that no longer resolve. Publication refuses new ones, so
-/// each of these was published before that check, or its target was removed later.
 /// Every Claude seat this host runs needs its hooks to run st3, and each running Claude session
 /// needs the native-session binding its SessionStart hook writes; without it st cannot find the
 /// seat's transcript.
+#[cfg(test)]
 fn claude_hooks_check(
     state: &AppState,
     desired: &[crate::model::DesiredSubject],
@@ -5999,6 +5966,7 @@ fn claude_hooks_check(
     })
 }
 
+#[cfg(test)]
 fn is_executable_file(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::metadata(path)
@@ -6007,6 +5975,7 @@ fn is_executable_file(path: &Path) -> bool {
 
 /// How many claims' signatures verify. Verdicts are recorded, not enforced: a held or invalid
 /// one warns, and unsigned claims (written before signing, or by an older build) are counted.
+#[cfg(test)]
 fn claim_signatures_check(counts: &std::collections::BTreeMap<String, u64>) -> DoctorCheck {
     let count = |verdict: &str| counts.get(verdict).copied().unwrap_or_default();
     let (held, invalid) = (count("held"), count("invalid"));
@@ -6027,6 +5996,9 @@ fn claim_signatures_check(counts: &std::collections::BTreeMap<String, u64>) -> D
     }
 }
 
+/// The references already in the graph that no longer resolve. Publication refuses new ones, so
+/// each of these was published before that check, or its target was removed later.
+#[cfg(test)]
 fn graph_references_check(unresolved: &[String]) -> DoctorCheck {
     const LISTED: usize = 20;
     let mut listed = unresolved.iter().take(LISTED).cloned().collect::<Vec<_>>();
@@ -6058,6 +6030,7 @@ fn graph_references_check(unresolved: &[String]) -> DoctorCheck {
     }
 }
 
+#[cfg(test)]
 fn unread_current_seat_counts(
     store: &Store,
     recipients: &BTreeSet<&str>,
@@ -6092,6 +6065,7 @@ fn unread_current_seat_counts(
     }
     Ok((pending, accepted))
 }
+#[cfg(test)]
 fn terminal_exec_gates_check(store: &Store) -> anyhow::Result<DoctorCheck> {
     fn has_exit_code_gate(mission: &crate::model::MissionSpec) -> bool {
         let has_gate = |gates: &[crate::model::GateSpec]| {
@@ -6216,7 +6190,7 @@ fn current_doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiErro
 
 /// The full diagnostic reducer is retained only as an oracle for fixture tests. Production
 /// full-store audits use the explicit private-copy command, never a diagnostic HTTP read.
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
     let mut checks = Vec::new();
     match state.store.index() {
@@ -7342,6 +7316,7 @@ async fn replication_heal_next(
 }
 
 /// A span such as `45s`, `12m` or `3h` for a doctor message.
+#[cfg(test)]
 fn elapsed_words(ms: u128) -> String {
     let seconds = ms / 1_000;
     match seconds {

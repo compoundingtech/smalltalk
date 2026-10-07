@@ -65,12 +65,15 @@ impl AuditBudget<'_> {
     }
 }
 
-struct ProgressGuard<'a, 'b>(&'a Connection, &'b AuditBudget<'b>);
+struct ProgressGuard<'a, 'b> {
+    connection: &'a Connection,
+    _budget: &'b AuditBudget<'b>,
+}
 impl Drop for ProgressGuard<'_, '_> {
     fn drop(&mut self) {
         // SAFETY: the connection outlives this guard, and removal retains no callback data.
         unsafe {
-            rusqlite::ffi::sqlite3_progress_handler(self.0.handle(), 0, None, std::ptr::null_mut());
+            rusqlite::ffi::sqlite3_progress_handler(self.connection.handle(), 0, None, std::ptr::null_mut());
         }
     }
 }
@@ -92,7 +95,10 @@ fn progress<'a, 'b>(
             std::ptr::from_ref(budget).cast_mut().cast(),
         );
     }
-    ProgressGuard(connection, budget)
+    ProgressGuard {
+        connection,
+        _budget: budget,
+    }
 }
 
 fn copy_input(file: &mut std::fs::File, target: &Path, budget: &AuditBudget<'_>) -> Result<()> {
