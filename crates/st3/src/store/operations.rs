@@ -5,6 +5,40 @@ fn short(value: &str) -> String {
     value.chars().take(2_000).collect()
 }
 
+fn recently_ended_mission_valid_until(
+    connection: &Connection,
+    ids: &str,
+    now: u128,
+) -> Result<Option<u128>> {
+    let mut statement = connection.prepare(
+        "WITH latest AS (
+            SELECT mission_id,status,updated_at_unix_ms,ROW_NUMBER() OVER (
+                PARTITION BY mission_id ORDER BY created_at_unix_ms DESC,id DESC
+            ) AS position FROM mission_runs
+            WHERE mission_id IN (SELECT CASE WHEN value LIKE 'mission/%'
+                THEN substr(value,9) ELSE value END FROM json_each(?1))
+         )
+         SELECT latest.updated_at_unix_ms FROM latest
+         LEFT JOIN mission_definitions def ON def.mission_id=latest.mission_id
+         WHERE latest.position=1 AND latest.status IN ('failed','cancelled')
+           AND COALESCE(def.state,'')<>'retired'
+           AND NOT EXISTS (SELECT 1 FROM mission_runs active
+               WHERE active.mission_id=latest.mission_id AND active.status IN ('running','standing'))",
+    )?;
+    let mut until = None;
+    for updated in statement.query_map([ids], |row| row.get::<_, String>(0))? {
+        // Membership includes equality with the 24-hour cutoff. It disappears one
+        // millisecond later; an overflowing boundary cannot occur in a u128 cut.
+        if let Some(boundary) = updated?.parse::<u128>()?.checked_add(RECENTLY_ENDED_MS)
+            .and_then(|last_included| last_included.checked_add(1))
+            && boundary > now
+        {
+            until = Some(until.map_or(boundary, |held: u128| held.min(boundary)));
+        }
+    }
+    Ok(until)
+}
+
 impl Store {
     /// Counts all runs; previews only the newest runs and the newest failures.
     pub fn mission_overview(&self, mission: &str, limit: usize) -> Result<Value> {
@@ -139,11 +173,11 @@ impl Store {
 
     /// Exclusive clock fence for collection cards at `now`, with the graph held unchanged.
     ///
-    /// Cards observe effective leases and person asks becoming current at their acceptance
-    /// time. They do not enrich steps with wakes or execution timing: `not_before`, mission
-    /// deadlines and step timeout budgets only change these cards after a graph write.
-    /// Only the selected missions' newest three runs and their first twenty steps appear
-    /// in these collection cards. Mission IDs may include the `mission/` prefix.
+    /// Cards observe effective leases, future person asks and the recently-ended mission
+    /// membership cutoff. They do not enrich steps with wakes or execution timing:
+    /// `not_before`, mission deadlines and step timeout budgets only change these cards
+    /// after a graph write. Selected IDs include the page's has_more lookahead; only the
+    /// newest three runs and first twenty steps are rendered. IDs may have a `mission/` prefix.
     pub(crate) fn mission_collection_valid_until(
         &self,
         ids: &[String],
@@ -194,7 +228,7 @@ impl Store {
                 || before.blocked_reason != after.blocked_reason
                 || before.blockers != after.blockers)
         };
-        let mut until = None;
+        let mut until = recently_ended_mission_valid_until(&connection, &ids, now)?;
         for step in steps.values() {
             if let Some(expiry) = step.claim_expires_at_unix_ms.filter(|expiry| *expiry > now)
                 && until.is_none_or(|earliest| expiry < earliest)

@@ -3089,8 +3089,18 @@ impl Store {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<String>> {
+        self.mission_collection_ids_at(history, offset, limit, now_ms())
+    }
+
+    pub(crate) fn mission_collection_ids_at(
+        &self,
+        history: bool,
+        offset: usize,
+        limit: usize,
+        at_unix_ms: u128,
+    ) -> Result<Vec<String>> {
         Ok(self
-            .mission_collection_page(history, offset, limit, None)?
+            .mission_collection_page_at(history, offset, limit, None, at_unix_ms)?
             .into_iter()
             .map(|(id, _)| id)
             .collect())
@@ -3103,7 +3113,18 @@ impl Store {
         limit: usize,
         after: Option<&(u128, String)>,
     ) -> Result<Vec<(String, u128)>> {
-        let ended_since = recently_ended_since();
+        self.mission_collection_page_at(history, offset, limit, after, now_ms())
+    }
+
+    pub(crate) fn mission_collection_page_at(
+        &self,
+        history: bool,
+        offset: usize,
+        limit: usize,
+        after: Option<&(u128, String)>,
+        at_unix_ms: u128,
+    ) -> Result<Vec<(String, u128)>> {
+        let ended_since = at_unix_ms.saturating_sub(RECENTLY_ENDED_MS);
         let connection = self.readers.get();
         let mut statement = connection.prepare(
             "WITH ids AS (
