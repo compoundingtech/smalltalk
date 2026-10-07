@@ -420,6 +420,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
     let app = Router::new()
         .route("/v1/health", get(health))
         .route("/v1/client/capabilities", get(client_capabilities))
+        .route(crate::peer::CLIENT_READ_OWNER_PATH, post(client_v0::client_read_owner))
         .route("/v1/client/sets", get(owned_sets::list))
         .route("/v1/client/sets/{*id}", get(owned_sets::get))
         .route("/v1/client/arrangements", get(client_v0::arrangements::list))
@@ -2709,11 +2710,13 @@ fn managed_session_id(owner: &str, identity: &str) -> String {
     format!("session/{}", &digest[..24])
 }
 
+type ManagedSessionOwner = (String, Option<String>, Option<String>);
+
 fn managed_session_owner_at(
     store: &Store,
     snapshot_index: u64,
     session_id: &str,
-) -> anyhow::Result<Option<(String, Option<String>, Option<String>)>> {
+) -> anyhow::Result<Option<ManagedSessionOwner>> {
     let status = store.status_for_subject_prefix_at("agent/", Some(snapshot_index), true)?;
     for subject in status.subjects {
         if !subject.subject.starts_with("agent/") && subject.kind.as_deref() != Some("agent") {
@@ -2742,6 +2745,63 @@ fn managed_session_owner_at(
         }
     }
     Ok(None)
+}
+
+/// A hint only selects an exact lookup; the current identity must still hash to this session.
+fn managed_session_owner_at_with_hint(
+    store: &Store,
+    snapshot_index: u64,
+    session_id: &str,
+    hint: Option<&str>,
+) -> anyhow::Result<Option<ManagedSessionOwner>> {
+    if let Some(hint) = hint
+        && let Some(owner) =
+            managed_session_owner_for_subject_at(store, snapshot_index, session_id, hint)?
+    {
+        return Ok(Some(owner));
+    }
+    managed_session_owner_at(store, snapshot_index, session_id)
+}
+
+fn managed_session_owner_for_subject_at(
+    store: &Store,
+    snapshot_index: u64,
+    session_id: &str,
+    owner: &str,
+) -> anyhow::Result<Option<ManagedSessionOwner>> {
+    let Some(subject) = store
+        .status_history(Some(owner), None, Some(snapshot_index))?
+        .subjects
+        .into_iter()
+        .next()
+    else {
+        return Ok(None);
+    };
+    if !subject.subject.starts_with("agent/") && subject.kind.as_deref() != Some("agent") {
+        return Ok(None);
+    }
+    let fields = subject
+        .actual
+        .as_ref()
+        .map(|actual| actual.get("fields").unwrap_or(actual));
+    let incarnation = fields
+        .and_then(|fields| fields.get("incarnation_id"))
+        .and_then(Value::as_str)
+        .or(subject.projection.runtime_incarnation.as_deref());
+    let runtime = fields
+        .and_then(|fields| fields.get("runtime_id"))
+        .and_then(Value::as_str);
+    let Some(identity) = incarnation.or(runtime) else {
+        return Ok(None);
+    };
+    if managed_session_id(&subject.subject, identity) != session_id {
+        return Ok(None);
+    }
+    Ok(Some((
+        subject.subject,
+        incarnation.map(str::to_owned),
+        subject.actual_origin,
+    )))
 }
 
 /// How many of a subject's claims, oldest first, date its session in the session list.
@@ -4215,9 +4275,15 @@ async fn client_sessions_detail(
     if let Some(id) = id.strip_suffix("/timeline") {
         // An agent's timeline is its current session's: st resolves it, not the client.
         let session_id = client_v0::conversation_session_id(&state, id)?;
+        let managed = managed_session_owner_at_with_hint(
+            &state.store, snapshot.store_index, &session_id,
+            id.starts_with("agent/").then_some(id).or(session.conversation_subject_hint()),
+        ).map_err(ApiError::internal)?;
+        if let Some((owner, _, _)) = &managed {
+            session.remember_conversation_subject(owner.clone());
+        }
         let id = session_id.as_str();
-        let managed = managed_session_owner_at(&state.store, snapshot.store_index, &session_id)
-            .map_err(ApiError::internal)?;
+        client_v0::require_scope(&session, "read.projections")?;
         if let Some((_, _, origin)) = managed {
             let remote_host = origin
                 .as_deref()
@@ -4235,7 +4301,7 @@ async fn client_sessions_detail(
                     )));
                 }
                 let mut value = relay
-                    .read(
+                    .read_with_subject_hint(
                         &remote_host,
                         &crate::peer::ClientReadRequest {
                             authority_actor: session.authority_actor.clone(),
@@ -4246,6 +4312,7 @@ async fn client_sessions_detail(
                                 cursor: query.cursor.clone(),
                             },
                         },
+                        session.conversation_subject_hint(),
                     )
                     .await
                     .map_err(|error| {
@@ -4275,10 +4342,16 @@ async fn client_sessions_detail(
     )
 }
 
+#[derive(Deserialize, Default)]
+struct ForwardClientReadQuery {
+    conversation_subject_hint: Option<String>,
+}
+
 /// Carry on a client read a peer relayed to this node because it is on the way to the owner.
 /// The owner's refusal travels back as it was given; a missing route is `remote-unavailable`.
 async fn forward_client_read(
     State(state): State<AppState>,
+    Query(query): Query<ForwardClientReadQuery>,
     Json(request): Json<crate::peer::ClientReadRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let target = request
@@ -4289,7 +4362,7 @@ async fn forward_client_read(
         .client_relay
         .as_ref()
         .ok_or_else(|| remote_unavailable_for_owner(&state, &target))?;
-    relay.forward(&request).await.map(Json).map_err(|error| {
+    relay.forward_with_subject_hint(&request, query.conversation_subject_hint.as_deref()).await.map(Json).map_err(|error| {
         match error.downcast_ref::<crate::peer::ClientReadRejected>() {
             Some(rejected) => ApiError {
                 status: StatusCode::from_u16(rejected.status).unwrap_or(StatusCode::CONFLICT),
@@ -14431,6 +14504,52 @@ mod tests {
     use axum::body::to_bytes;
     use axum::http::Request;
     use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn conversation_subject_hint_owner_route_uses_client_prefix_authentication() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        state.store.append_claim(&ClaimInput {
+            subject: "agent/hinted".into(), kind: "runtime.observed".into(),
+            actor: Some("agent/hinted".into()),
+            fields: serde_json::from_value(json!({"status":"running", "incarnation_id":"first"})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let session_id = managed_session_id("agent/hinted", "first");
+        let socket = root.path().join("api.sock");
+        let server_socket = socket.clone();
+        let server = tokio::spawn(async move {
+            serve_unix(&server_socket, router(state)).await.unwrap();
+        });
+        let client = reqwest::Client::builder().unix_socket(socket.clone()).build().unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !socket.exists() {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let request = crate::peer::ClientReadOwnerRequest {
+            request: crate::peer::ClientReadRequest {
+                authority_actor: "person/example".into(), relay: None,
+                request: crate::peer::ClientReadOperation::Timeline {
+                    session_id: session_id.clone(), limit: 10, cursor: None,
+                },
+            },
+            subject_hint: "agent/forged".into(),
+        };
+        let url = format!("http://localhost{}", crate::peer::CLIENT_READ_OWNER_PATH);
+        // No Unix actor header authenticates the ordinary read-only actor, not the body's person.
+        let denied = client.post(&url).json(&request).send().await.unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        let denied: Value = denied.json().await.unwrap();
+        assert_eq!(denied["code"], "forbidden");
+        let accepted = client.post(&url).header(client_v0::LOCAL_PERSON_HEADER, "person/example")
+            .json(&request).send().await.unwrap();
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let accepted: Value = accepted.json().await.unwrap();
+        assert_eq!(accepted["value"]["session_id"], session_id);
+        assert_eq!(accepted["value"]["kind"], "timeline-page");
+        server.abort();
+    }
 
     #[tokio::test]
     async fn resources_page_keeps_rows_when_sync_forecast_is_unrepresentable() {
