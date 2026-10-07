@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Read terminal runtime authority without reducing unrelated subject history",
+  "replay": { "status": "none", "detail": "Existing projections and claims are read unchanged; no replay is required." },
+  "schema": { "status": "none", "detail": "No database schema or replicated claim change." },
+  "rules": { "status": "none", "detail": "Single-origin runtime-only histories use canonical indexed field reads preserving omitted and explicitly null fields. Mixed-kind and multi-origin histories retain the existing actual fold and causal source-selection helpers. Eligibility, fields and unknown-authority guards share a read snapshot. Checkpoint rules are unchanged." },
+  "compatibility": { "status": "none", "detail": "Terminal authorization and refusal ordering remain unchanged. Owner-local reads retain desired-member terminal and driver precedence. Capability issue and consume behavior is unchanged." },
+  "downtime": { "status": "none", "detail": "No interruption beyond the ordinary daemon restart; restart duration was not measured." },
+  "manual": { "status": "none", "detail": "No migration or manual action is required." },
+  "recovery": { "status": "none", "detail": "An older binary can read the unchanged store without recovery." }
+}

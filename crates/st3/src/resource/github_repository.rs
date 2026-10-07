@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
+use crate::github_http::GithubAuth;
 use super::{
     GITHUB_AUTH_REMEDY, GithubListing, ObservationRequest, ProviderObservation, github_cache_for,
     github_client, github_graphql, github_json, github_listing,
@@ -959,11 +960,11 @@ fn newest_updated_at<'a>(values: impl IntoIterator<Item = &'a Value>) -> Option<
 pub(super) async fn observe_at(
     request: ObservationRequest,
     api_base: &str,
-    token: Option<&str>,
+    token: Option<&GithubAuth>,
 ) -> Result<ProviderObservation> {
     let cache_for = github_cache_for(&request);
     let token = token
-        .filter(|value| !value.trim().is_empty())
+        .filter(|value| value.is_valid())
         .context(GITHUB_AUTH_REMEDY)?;
     let (owner, repository) = request
         .locator
@@ -1393,7 +1394,7 @@ pub(super) async fn observe_at(
 async fn open_pull_requests(
     client: &reqwest::Client,
     api_base: &str,
-    token: &str,
+    token: &GithubAuth,
     cache_for: Duration,
     locator: &str,
     (owner, repository): (&str, &str),
@@ -1550,7 +1551,7 @@ async fn open_pull_requests(
 async fn required_by_base(
     client: &reqwest::Client,
     api_base: &str,
-    token: &str,
+    token: &GithubAuth,
     cache_for: Duration,
     (owner, repository): (&str, &str),
     base: &str,
@@ -1968,7 +1969,7 @@ mod tests {
         let first = observe_at(
             request(&["pull_requests", "issues"], None, None),
             &base,
-            Some("test"),
+            Some(&GithubAuth::test("test")),
         )
         .await
         .unwrap();
@@ -2011,7 +2012,7 @@ mod tests {
                 Some(first.facts.clone()),
             ),
             &base,
-            Some("test"),
+            Some(&GithubAuth::test("test")),
         )
         .await
         .unwrap();
@@ -2031,7 +2032,7 @@ mod tests {
                 Some(closed.facts),
             ),
             &base,
-            Some("test"),
+            Some(&GithubAuth::test("test")),
         )
         .await
         .unwrap();
@@ -2071,7 +2072,7 @@ mod tests {
                 Some(final_read.facts),
             ),
             &base,
-            Some("test"),
+            Some(&GithubAuth::test("test")),
         )
         .await
         .unwrap();
@@ -2100,7 +2101,7 @@ mod tests {
         github.open_pull_requests(json!([]));
         github.resolved_nodes(json!([{"id": "I_orchid", "state": "OPEN", "number": 1,
             "url": "https://github.com/acme/garden/issues/1"}]));
-        let first = observe_at(request(&["issues"], None, None), &base, Some("test"))
+        let first = observe_at(request(&["issues"], None, None), &base, Some(&GithubAuth::test("test")))
             .await
             .unwrap();
         github.take_requests();
@@ -2111,7 +2112,7 @@ mod tests {
         let moved = observe_at(
             request(&["issues"], first.cursor.as_deref(), Some(first.facts)),
             &base,
-            Some("test"),
+            Some(&GithubAuth::test("test")),
         )
         .await
         .unwrap();
@@ -2142,7 +2143,7 @@ mod tests {
         let closed = observe_at(
             request(&["issues"], moved.cursor.as_deref(), Some(moved.facts)),
             &base,
-            Some("test"),
+            Some(&GithubAuth::test("test")),
         )
         .await
         .unwrap();
@@ -2176,7 +2177,7 @@ mod tests {
         let first = observe_at(
             request(&["pull_requests", "issues"], None, None),
             &base,
-            Some("test"),
+            Some(&GithubAuth::test("test")),
         )
         .await
         .unwrap();
@@ -2204,7 +2205,7 @@ mod tests {
                 Some(first.facts),
             ),
             &base,
-            Some("test"),
+            Some(&GithubAuth::test("test")),
         )
         .await
         .unwrap();
@@ -2244,7 +2245,7 @@ mod tests {
         let moved = observe_at(
             request(&["pull_requests"], None, Some(json!({"repository_id": 7}))),
             &base,
-            Some("test"),
+            Some(&GithubAuth::test("test")),
         )
         .await
         .unwrap();
@@ -2276,7 +2277,7 @@ mod tests {
         let moved = observe_at(
             request(&["issues"], None, Some(json!({"repository_id": 7}))),
             &base,
-            Some("test"),
+            Some(&GithubAuth::test("test")),
         )
         .await
         .unwrap();
@@ -2340,7 +2341,7 @@ mod tests {
         let spender = "observer/orchid-one-poll".to_owned();
         let first = spend_as(
             spender.clone(),
-            observe_at(request(&fields, None, None), &base, Some("orchid-token")),
+            observe_at(request(&fields, None, None), &base, Some(&GithubAuth::test("orchid-token"))),
         )
         .await
         .unwrap();
@@ -2395,7 +2396,7 @@ mod tests {
             observe_at(
                 request(&fields, first.cursor.as_deref(), Some(first.facts.clone())),
                 &base,
-                Some("orchid-token"),
+                Some(&GithubAuth::test("orchid-token")),
             ),
         )
         .await
@@ -2417,7 +2418,7 @@ mod tests {
                     Some(json!({"repository_id": 7})),
                 ),
                 &base,
-                Some("orchid-token"),
+                Some(&GithubAuth::test("orchid-token")),
             ),
         )
         .await
@@ -2444,7 +2445,7 @@ mod tests {
         let settled = observe_at(
             request(&fields, third.cursor.as_deref(), None),
             &base,
-            Some("orchid-token"),
+            Some(&GithubAuth::test("orchid-token")),
         )
         .await
         .unwrap();
@@ -2456,7 +2457,7 @@ mod tests {
         let quiet = observe_at(
             request(&fields, settled.cursor.as_deref(), None),
             &base,
-            Some("orchid-token"),
+            Some(&GithubAuth::test("orchid-token")),
         )
         .await
         .unwrap();
@@ -2526,7 +2527,7 @@ mod tests {
                 Some(json!({"repository_id": 7})),
             ),
             &base,
-            Some("orchid-token"),
+            Some(&GithubAuth::test("orchid-token")),
         )
         .await
         .unwrap();
@@ -2622,7 +2623,7 @@ mod tests {
                 Some(json!({"repository_id": 7})),
             ),
             &base,
-            Some("orchid-token"),
+            Some(&GithubAuth::test("orchid-token")),
         )
         .await
         .unwrap();
@@ -2653,7 +2654,7 @@ mod tests {
                 Some(json!({"repository_id": 7})),
             ),
             &base,
-            Some("orchid-token"),
+            Some(&GithubAuth::test("orchid-token")),
         )
         .await
         .unwrap();
@@ -2775,7 +2776,7 @@ mod tests {
         let observed = observe_at(
             request(&["pull_requests"], None, None),
             &base,
-            Some("orchid-token"),
+            Some(&GithubAuth::test("orchid-token")),
         )
         .await
         .expect("an unreadable rule never fails the observation");
@@ -2823,7 +2824,7 @@ mod tests {
         let first = observe_at(
             request(&["pull_requests"], None, None),
             &base,
-            Some("orchid-token"),
+            Some(&GithubAuth::test("orchid-token")),
         )
         .await
         .unwrap();
@@ -2845,7 +2846,7 @@ mod tests {
         let rerun = observe_at(
             request(&["pull_requests"], first.cursor.as_deref(), None),
             &base,
-            Some("orchid-token"),
+            Some(&GithubAuth::test("orchid-token")),
         )
         .await
         .unwrap();
@@ -2869,7 +2870,7 @@ mod tests {
         let first = observe_at(
             request(&["pull_requests"], None, None),
             &base,
-            Some("orchid-token"),
+            Some(&GithubAuth::test("orchid-token")),
         )
         .await
         .unwrap();
@@ -2895,7 +2896,7 @@ mod tests {
         let opened = observe_at(
             request(&["pull_requests"], first.cursor.as_deref(), None),
             &base,
-            Some("orchid-token"),
+            Some(&GithubAuth::test("orchid-token")),
         )
         .await
         .unwrap();
@@ -2925,7 +2926,7 @@ mod tests {
         let first = observe_at(
             request(&["pull_requests"], None, None),
             &base,
-            Some("orchid-token"),
+            Some(&GithubAuth::test("orchid-token")),
         )
         .await
         .unwrap();
@@ -2950,7 +2951,7 @@ mod tests {
         let within = observe_at(
             request(&["pull_requests"], first.cursor.as_deref(), None),
             &base,
-            Some("orchid-token"),
+            Some(&GithubAuth::test("orchid-token")),
         )
         .await
         .unwrap();
@@ -2970,7 +2971,7 @@ mod tests {
         let after = observe_at(
             request(&["pull_requests"], within.cursor.as_deref(), None),
             &base,
-            Some("orchid-token"),
+            Some(&GithubAuth::test("orchid-token")),
         )
         .await
         .unwrap();
@@ -2998,7 +2999,7 @@ mod tests {
         let observed = observe_at(
             request(&["issues"], None, None),
             &base,
-            Some("orchid-token"),
+            Some(&GithubAuth::test("orchid-token")),
         )
         .await
         .unwrap();
@@ -3032,7 +3033,7 @@ mod tests {
         let observed = observe_at(
             request(&["pull_requests"], Some("a3f1c0ffee"), Some(legacy)),
             &base,
-            Some("orchid-token"),
+            Some(&GithubAuth::test("orchid-token")),
         )
         .await
         .unwrap();
@@ -3049,7 +3050,7 @@ mod tests {
         let error = observe_at(
             request(&["issues"], None, Some(json!({"repository_id": 7}))),
             &base,
-            Some("orchid-token"),
+            Some(&GithubAuth::test("orchid-token")),
         )
         .await
         .unwrap_err();

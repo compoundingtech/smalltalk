@@ -38,6 +38,21 @@ mod placement;
 
 /// The actor of every attention request the reconciler raises.
 const RECONCILER_ACTOR: &str = "agent/st3/reconciler";
+const OWNERSHIP_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Both skipped and executed items passed their guard; rejection never authorizes reporting.
+enum ReconcileItemOutcome {
+    Skipped,
+    Executed(Result<()>),
+    Rejected,
+    GuardFailed,
+}
+
+#[derive(Default)]
+struct OwnershipErrorLog {
+    last: Option<std::time::Instant>,
+    suppressed: u64,
+}
 const HARNESS_READINESS_DEADLINE_MS: u128 = 60_000;
 const WORK_WAKE_RETRY_MS: u128 = 15_000;
 // A mechanical gate may run for minutes. Each poll reruns the entire host reconciliation
@@ -732,6 +747,10 @@ fn first_readiness_since(run: &MissionRunView) -> u128 {
         .max(run.created_at_unix_ms)
 }
 
+type MemberWake = (DesiredSubject, String, MemberSpec);
+#[cfg(test)]
+type WorkWakeObserveHook = Box<dyn FnOnce(&crate::incremental::Incremental, bool) + Send>;
+
 pub struct Reconciler<R = NativeRuntime> {
     store: Arc<Store>,
     runtime: Arc<R>,
@@ -793,6 +812,8 @@ pub struct Reconciler<R = NativeRuntime> {
     faults: Mutex<Option<BTreeMap<(String, String), String>>>,
     /// Faults that could not be recorded in the graph during the current pass.
     unrecorded_faults: Mutex<Vec<String>>,
+    /// Bound ownership-error logging across all candidates without caching guard results.
+    ownership_error_log: Mutex<OwnershipErrorLog>,
     /// Step-timeout faults this reconciler has already raised, so a pass records each once.
     step_timeout_faults: Mutex<BTreeSet<String>>,
     /// Broken-gate attention episodes this reconciler has already raised, so a pass that finds a
@@ -807,7 +828,7 @@ pub struct Reconciler<R = NativeRuntime> {
     /// Why each member failed its last render, kept while render is skipped.
     render_failures: Mutex<BTreeMap<String, String>>,
     /// The work wake each live agent's last evaluation queued, queued again while it is skipped.
-    member_wakes: Mutex<HashMap<String, (String, String, MemberSpec)>>,
+    member_wakes: Mutex<HashMap<String, MemberWake>>,
     /// How often a skipped member's terminal screen is looked at again for a prompt.
     screen_poll_every_ms: u128,
     fault_injection: Option<Arc<dyn FaultInjection>>,
@@ -829,6 +850,9 @@ pub struct Reconciler<R = NativeRuntime> {
     /// cannot hide inside a test that expects a clean pass.
     #[cfg(test)]
     raised_faults: Mutex<Option<Vec<String>>>,
+    /// Publish during a unit test after the work feed was observed, before wake selection.
+    #[cfg(test)]
+    after_work_wake_observe: Mutex<Option<WorkWakeObserveHook>>,
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -923,6 +947,7 @@ impl Reconciler<NativeRuntime> {
             resource_provider: Arc::new(RegisteredResourceProvider),
             faults: Mutex::new(None),
             unrecorded_faults: Mutex::new(Vec::new()),
+            ownership_error_log: Mutex::new(OwnershipErrorLog::default()),
             step_timeout_faults: Mutex::new(BTreeSet::new()),
             raised_broken_gates: Mutex::new(BTreeSet::new()),
             gate_recheck_base_ms: GATE_RECHECK_BASE_MS,
@@ -942,6 +967,8 @@ impl Reconciler<NativeRuntime> {
             cleanup_deadline: CLEANUP_DEADLINE,
             #[cfg(test)]
             raised_faults: Mutex::new(Some(Vec::new())),
+            #[cfg(test)]
+            after_work_wake_observe: Mutex::new(None),
         })
     }
 }
@@ -990,6 +1017,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             resource_provider: Arc::new(RegisteredResourceProvider),
             faults: Mutex::new(None),
             unrecorded_faults: Mutex::new(Vec::new()),
+            ownership_error_log: Mutex::new(OwnershipErrorLog::default()),
             step_timeout_faults: Mutex::new(BTreeSet::new()),
             raised_broken_gates: Mutex::new(BTreeSet::new()),
             gate_recheck_base_ms: GATE_RECHECK_BASE_MS,
@@ -1009,6 +1037,8 @@ impl<R: RuntimeControl> Reconciler<R> {
             cleanup_deadline: CLEANUP_DEADLINE,
             #[cfg(test)]
             raised_faults: Mutex::new(Some(Vec::new())),
+            #[cfg(test)]
+            after_work_wake_observe: Mutex::new(None),
         }
     }
 
@@ -1999,11 +2029,16 @@ impl<R: RuntimeControl> Reconciler<R> {
         }));
 
         let active = desired.iter().collect::<Vec<_>>();
+        let eligible = match self.store.owned_desired_subjects(&desired) {
+            Ok(eligible) => eligible,
+            Err(error) => {
+                self.report_ownership_error("snapshot", &self.host, &error);
+                BTreeSet::new()
+            }
+        };
+        let eligible = |subject: &DesiredSubject| eligible.contains(&subject.subject);
         let mut member_errors = BTreeMap::new();
         for subject in &active {
-            if self.store.owned_desired_guard(subject).is_err() {
-                continue;
-            }
             if subject.kind == "stop" {
                 continue;
             }
@@ -2014,6 +2049,9 @@ impl<R: RuntimeControl> Reconciler<R> {
             else {
                 continue;
             };
+            if !eligible(subject) || !self.owned_desired_ready(subject) {
+                continue;
+            }
             let workspace = Path::new(&member.workspace);
             let checkout = (subject.kind == "agent")
                 .then(|| Checkout::from_desired(&subject.desired))
@@ -2053,8 +2091,15 @@ impl<R: RuntimeControl> Reconciler<R> {
         let renderable = active
             .iter()
             .copied()
+            .filter(|subject| {
+                subject.kind != "stop"
+                    && subject
+                        .member
+                        .as_ref()
+                        .is_some_and(|member| member.host == self.host)
+            })
             .filter(|subject| !member_errors.contains_key(&subject.subject))
-            .filter(|subject| self.store.owned_desired_guard(subject).is_ok())
+            .filter(|subject| eligible(subject))
             .collect::<Vec<_>>();
         // A live member is evaluated again when a claim it read, its runtime, its exec state or
         // its screen changed, when its time came, or when its workspace or render failed.
@@ -2226,7 +2271,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         drop(unreadable_span);
         let members_span = crate::profile::span("pass/members");
         for subject in &active {
-            if self.store.owned_desired_guard(subject).is_err() {
+            if !eligible(subject) {
                 continue;
             }
             // Retire this host's process even when the desired host or selected actual
@@ -2238,6 +2283,12 @@ impl<R: RuntimeControl> Reconciler<R> {
                 let item = format!("away:{}", subject.subject);
                 stops.insert(item.clone());
                 if self.needs_item(&item, !skip_stops) || !skip_stops {
+                    // An authority change skips this prepared candidate silently, as the old
+                    // pass guard did; it is not a runtime fault or a successful evaluation.
+                    if !self.owned_desired_ready(subject) {
+                        stops.remove(&item);
+                        continue;
+                    }
                     let ((result, due), reads) = smallclaims::touched::record(|| {
                         smallclaims::touched::record_due(|| {
                             caught(|| self.reconcile_placement_away(subject, ptys.as_ref()))
@@ -2250,6 +2301,9 @@ impl<R: RuntimeControl> Reconciler<R> {
                 }
             }
             if subject.kind == "stop" {
+                if !self.owned_desired_ready(subject) {
+                    continue;
+                }
                 let _member_span = crate::profile::span("pass/member stop");
                 let item = format!("stop:{}", subject.subject);
                 stops.insert(item.clone());
@@ -2286,6 +2340,12 @@ impl<R: RuntimeControl> Reconciler<R> {
                 {
                     work_message_agents.push(wake.clone());
                 }
+                continue;
+            }
+            // Cached wakes carry their declaration to the late wake guard. Check here only
+            // when evaluating the member, avoiding another history read for a clean member.
+            if !self.owned_desired_ready(subject) {
+                members.remove(&item);
                 continue;
             }
             let queued_before = work_message_agents.len();
@@ -2337,7 +2397,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                                 .map_or_else(|| member.clone(), |(_, old)| old);
                                 // Deferring cutover must not stop ready work reaching the incumbent.
                                 work_message_agents.push((
-                                    subject.subject.clone(),
+                                    (**subject).clone(),
                                     incarnation.to_owned(),
                                     old,
                                 ));
@@ -2444,7 +2504,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                                     && let Some(incarnation) = observation.incarnation_id.as_deref()
                                 {
                                     work_message_agents.push((
-                                        subject.subject.clone(),
+                                        (**subject).clone(),
                                         incarnation.to_owned(),
                                         member.clone(),
                                     ));
@@ -2626,7 +2686,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             // is recorded with that delivery.
             let deferred = work_message_agents
                 .last()
-                .is_some_and(|(agent, _, _)| agent == &subject.subject);
+                .is_some_and(|(declaration, _, _)| declaration.subject == subject.subject);
             if deferred {
                 if let Err(error) = result {
                     deferred_member_faults.insert(subject.subject.clone(), error);
@@ -2710,18 +2770,37 @@ impl<R: RuntimeControl> Reconciler<R> {
         // cancelled, so see their changes first.
         self.incremental.observe(&self.store)?;
         let skip_wakes = self.skip_unneeded && !self.incremental.take_full_pass("wake", now_ms());
+        #[cfg(test)]
+        if let Some(after) = self.after_work_wake_observe.lock().unwrap().take() {
+            after(&self.incremental, skip_wakes);
+        }
         let mut wakes = BTreeSet::new();
-        for (agent, incarnation, member) in work_message_agents {
+        for (declaration, incarnation, member) in work_message_agents {
+            let agent = &declaration.subject;
             let item = format!("wake:{agent}@{incarnation}");
             wakes.insert(item.clone());
-            let result = self.reconcile_item("wake", &item, skip_wakes, || {
-                self.reconcile_work_messages(&agent, &incarnation, Some(&member))
-            });
-            let result = match deferred_member_faults.remove(&agent) {
+            let result = self.reconcile_guarded_item(
+                "wake",
+                &item,
+                skip_wakes,
+                || self.owned_desired_check(&declaration),
+                || self.reconcile_work_messages(agent, &incarnation, Some(&member)),
+            );
+            let result = match result {
+                ReconcileItemOutcome::Rejected | ReconcileItemOutcome::GuardFailed => {
+                    // Authority rejection is a silent skip, not a member fault or recovery.
+                    wakes.remove(&item);
+                    continue;
+                }
+                // Preserve the existing skipped-wake reporting policy only after a fresh guard.
+                ReconcileItemOutcome::Skipped => Ok(()),
+                ReconcileItemOutcome::Executed(result) => result,
+            };
+            let result = match deferred_member_faults.remove(agent) {
                 Some(error) => Err(error),
                 None => result,
             };
-            if let Err(error) = self.record_member_reconcile_result(&agent, result) {
+            if let Err(error) = self.record_member_reconcile_result(agent, result) {
                 diagnostic_errors.push(format!("{agent}: {error:#}"));
             }
         }
@@ -3779,15 +3858,89 @@ impl<R: RuntimeControl> Reconciler<R> {
         skip: bool,
         work: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
+        match self.reconcile_guarded_item(section, item, skip, || Ok(true), work) {
+            ReconcileItemOutcome::Skipped => Ok(()),
+            ReconcileItemOutcome::Executed(result) => result,
+            ReconcileItemOutcome::Rejected | ReconcileItemOutcome::GuardFailed => {
+                unreachable!("the unconditional guard cannot fail")
+            }
+        }
+    }
+
+    /// Expected authority rejections are silent; storage failures keep their error identity.
+    fn owned_desired_check(&self, declaration: &DesiredSubject) -> Result<bool> {
+        match self.store.owned_desired_guard(declaration) {
+            Ok(()) => Ok(true),
+            Err(error)
+                if matches!(
+                    error.code,
+                    "owned-set-pending" | "owned-set-conflict" | "stale-set-member"
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn owned_desired_ready(&self, declaration: &DesiredSubject) -> bool {
+        match self.owned_desired_check(declaration) {
+            Ok(ready) => ready,
+            Err(error) => {
+                self.report_ownership_error("member", &declaration.subject, &error);
+                false
+            }
+        }
+    }
+
+    fn report_ownership_error(&self, section: &str, item: &str, error: &dyn std::fmt::Display) {
+        let now = std::time::Instant::now();
+        let mut log = self
+            .ownership_error_log
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if log
+            .last
+            .is_some_and(|last| now.duration_since(last) < OWNERSHIP_ERROR_LOG_INTERVAL)
+        {
+            log.suppressed = log.suppressed.saturating_add(1);
+            return;
+        }
+        log.last = Some(now);
+        let suppressed_errors = std::mem::take(&mut log.suppressed);
+        drop(log);
+        tracing::error!(section, item, error = %error, suppressed_errors, diagnostic_interval_s = OWNERSHIP_ERROR_LOG_INTERVAL.as_secs(), "reconciler ownership read failed; candidates fenced");
+    }
+
+    /// Check captured declaration authority inside the item's read recorder before effects.
+    /// A clean skip still checks authority: callers can record a result without doing work.
+    /// Rejection and skipping leave the previous evaluation untouched.
+    fn reconcile_guarded_item(
+        &self,
+        section: &'static str,
+        item: &str,
+        skip: bool,
+        guard: impl FnOnce() -> Result<bool>,
+        work: impl FnOnce() -> Result<()>,
+    ) -> ReconcileItemOutcome {
         let _clock = smallclaims::store::clock_snapshot();
         let needed = self.needs_item(item, !skip);
-        if skip && !needed {
-            return Ok(());
-        }
         let cpu_started = crate::incremental::thread_cpu();
         let wrote_mark = smallclaims::touched::wrote_len();
-        let ((result, due), reads) =
-            smallclaims::touched::record(|| smallclaims::touched::record_due(|| caught(work)));
+        let ((result, due), reads) = smallclaims::touched::record(|| {
+            smallclaims::touched::record_due(|| match guard() {
+                Ok(false) => ReconcileItemOutcome::Rejected,
+                Ok(true) if skip && !needed => ReconcileItemOutcome::Skipped,
+                Ok(true) => ReconcileItemOutcome::Executed(caught(work)),
+                Err(error) => {
+                    self.report_ownership_error(section, item, &error);
+                    ReconcileItemOutcome::GuardFailed
+                }
+            })
+        });
+        let ReconcileItemOutcome::Executed(ref outcome) = result else {
+            return result;
+        };
         crate::performance::record_evaluation(
             section,
             needed,
@@ -3800,7 +3953,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
         }
         // A failed delivery is tried again on the next pass, as before.
-        if result.is_ok() {
+        if outcome.is_ok() {
             self.incremental.evaluated(item, reads, due);
         }
         result
@@ -3945,17 +4098,34 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .collect::<Vec<_>>();
             attempts.sort_by_key(|(at, _)| *at);
             let acknowledged = work_wake_acknowledged(&attempts, harness.as_ref());
-            if acknowledged {
+            let idle_unclaimed_deadline = harness
+                .as_ref()
+                .filter(|harness| acknowledged && matches!(harness.state.as_str(), "ready" | "idle"))
+                .and_then(|_| attempts.last())
+                .map(|(last, _)| last.saturating_add(WORK_WAKE_EXHAUST_GRACE_MS));
+            if acknowledged && idle_unclaimed_deadline.is_none_or(|due| now < due) {
+                if let Some(due) = idle_unclaimed_deadline {
+                    smallclaims::touched::note_due(due);
+                }
                 continue;
             }
             let attempt_count = u32::try_from(attempts.len()).unwrap_or(u32::MAX);
-            match work_wake_decision(
-                attempt_count,
-                attempts.last().map(|(last, _)| *last),
-                attempts.first().map(|(first, _)| *first),
-                acknowledged,
-                now_ms(),
-            ) {
+            let decision = if acknowledged {
+                // A consumed wake is delivery proof, not a held work lease. Do not
+                // interrupt a working turn, but surface ready work left unclaimed
+                // after the assignee has returned idle. One fenced diagnostic;
+                // no repeated wake or unbounded retry is introduced here.
+                WorkWakeDecision::Exhaust
+            } else {
+                work_wake_decision(
+                    attempt_count,
+                    attempts.last().map(|(last, _)| *last),
+                    attempts.first().map(|(first, _)| *first),
+                    false,
+                    now,
+                )
+            };
+            match decision {
                 WorkWakeDecision::Request(wake_attempt) => {
                     append_work_wake_message(
                         &self.store,
@@ -3971,10 +4141,11 @@ impl<R: RuntimeControl> Reconciler<R> {
                     self.signal_changed();
                 }
                 WorkWakeDecision::Exhaust => {
-                    let reason = format!(
-                        "`{agent}` did not start a turn or claim `{}` after {attempt_count} supported driver wake attempts",
-                        step.subject
-                    );
+                    let reason = if acknowledged {
+                        format!("`{agent}` consumed a supported work wake but is idle with `{}` still unclaimed after the readiness grace", step.subject)
+                    } else {
+                        format!("`{agent}` did not start a turn or claim `{}` after {attempt_count} supported driver wake attempts", step.subject)
+                    };
                     let diagnostic_key =
                         format!("work-wake-exhausted:{agent}:{tag_value}:{attempt_count}");
                     if self.store.operation_claim(&diagnostic_key)?.is_none() {
@@ -11475,6 +11646,16 @@ impl<R: RuntimeControl> Reconciler<R> {
     /// for a lasting reason is failed so the schedule can fire again. A request that waits for
     /// something this host has not received yet stays pending, and the schedule records why.
     fn reconcile_schedule_work(&self, schedule: &DesiredSubject) -> Result<()> {
+        self.reconcile_schedule_work_with_start(schedule, |request, parent, schedule, occurrence| {
+            self.store.create_scheduled_mission_run(request, parent, schedule, occurrence)
+        })
+    }
+
+    fn reconcile_schedule_work_with_start(
+        &self, schedule: &DesiredSubject,
+        mut start: impl FnMut(&MissionRunRequest, Option<&MissionRunView>, &str, u64)
+            -> Result<MissionRunView, crate::model::St3Error>,
+    ) -> Result<()> {
         self.store
             .owned_desired_guard(schedule)
             .map_err(anyhow::Error::new)?;
@@ -11616,7 +11797,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             } else {
                 match &schedule.owner_run {
                     Some(owner) => match self.store.mission_run(owner)? {
-                        Some(parent) => self.store.create_scheduled_mission_run(
+                        Some(parent) => start(
                             &request_value,
                             Some(&parent),
                             &schedule.subject,
@@ -11630,7 +11811,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                             continue;
                         }
                     },
-                    None => self.store.create_scheduled_mission_run(
+                    None => start(
                         &request_value,
                         None,
                         &schedule.subject,
@@ -11735,6 +11916,17 @@ impl<R: RuntimeControl> Reconciler<R> {
         &self,
         item: &DesiredSubject,
         held: &[crate::model::AttentionRequestView],
+    ) -> Result<()> {
+        self.reconcile_subscription_mission_with_start(item, held,
+            |request, parent, subscription, resource, discovery| {
+                self.store.create_subscription_mission_run(request, parent, subscription, resource, discovery)
+            })
+    }
+
+    fn reconcile_subscription_mission_with_start(
+        &self, item: &DesiredSubject, held: &[crate::model::AttentionRequestView],
+        mut start: impl FnMut(&MissionRunRequest, Option<&MissionRunView>, &str, &str, &str)
+            -> Result<MissionRunView, crate::model::St3Error>,
     ) -> Result<()> {
         let Some(spec) = crate::graph::subscription_spec(&item.desired) else {
             return Ok(());
@@ -11952,7 +12144,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 },
                 None => None,
             };
-            let created = self.store.create_subscription_mission_run(&request_value, parent.as_ref(), &item.subject, resource, discovery);
+            let created = start(&request_value, parent.as_ref(), &item.subject, resource, discovery);
             let run = match created {
                 Ok(run) => run,
                 Err(error) if matches!(error.code, "stale-ref-head" | "stale-pull-request" | "completed-subscription-snapshot") => {
@@ -14374,12 +14566,12 @@ fn step_path_of_subject(subject: &str) -> Option<&str> {
 
 /// Whether a mission run could not start only because this host lacks a claim that replication
 /// can still deliver, such as a mission revision, an owner run, or an input's claim published on
-/// another host.
+/// another host, or because transient SQLite contention prevented the start.
 fn start_waits_for_replication(error: &crate::model::St3Error) -> bool {
     matches!(
         error.code,
         "missing-mission" | "missing-mission-run" | "missing-resource-input-version" | "internal"
-    )
+    ) || error.is_sqlite_contention()
 }
 
 /// Run `item`, turning a panic into an error so one item cannot end the reconciler task.
@@ -14682,12 +14874,14 @@ fn work_wake_deadline(
         })
         .filter(|wake| {
             matches!(wake.assignee_state.as_str(), "ready" | "working" | "idle")
-                && wake.acknowledged_by.is_none()
+                && (wake.acknowledged_by.is_none()
+                    || matches!(wake.assignee_state.as_str(), "ready" | "idle"))
                 && wake.failure.is_none()
                 && wake.attempts <= WORK_WAKE_MAX_ATTEMPTS
         })
         .map(|wake| {
-            let delay = if wake.attempts == WORK_WAKE_MAX_ATTEMPTS {
+            let delay = if wake.acknowledged_by.is_some()
+                || wake.attempts == WORK_WAKE_MAX_ATTEMPTS {
                 // Reconcile once more after startup grace to record a genuine
                 // exhaustion even when no other graph event arrives.
                 WORK_WAKE_EXHAUST_GRACE_MS
@@ -15360,6 +15554,7 @@ mod tests {
     mod differential;
     mod first_readiness_tests;
     mod incremental_deadlines;
+    mod ownership_guard_tests;
     mod pull_request_run_tests;
     mod ref_watch_tests;
     mod rollout_tests;
@@ -15531,6 +15726,7 @@ exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
     #[derive(Default)]
     struct FakeRuntime {
         snapshot_error: Mutex<bool>,
+        before_observe_exec: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         ptys: Mutex<Vec<RuntimeObservation>>,
         execs: Mutex<HashMap<String, RuntimeObservation>>,
         logs: Mutex<HashMap<String, String>>,
@@ -15597,6 +15793,9 @@ exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
             Ok(self.ptys.lock().unwrap().clone())
         }
         fn observe_exec(&self, runtime_id: &str) -> Result<Option<RuntimeObservation>> {
+            if let Some(before) = self.before_observe_exec.lock().unwrap().take() {
+                before();
+            }
             if let Some(at) = self.observe_at.lock().unwrap().take() {
                 smallclaims::store::set_thread_clock(Some(at));
             }
@@ -21892,6 +22091,96 @@ mission "scheduled-cycle" state="ready" {
             .unwrap()
             .revision
     }
+    #[test]
+    fn scheduled_start_contention_waits_without_durable_failure_then_starts() {
+        use serde_json::json;
+        for code in [rusqlite::ffi::SQLITE_BUSY, rusqlite::ffi::SQLITE_LOCKED] {
+            let root = tempfile::tempdir().unwrap();
+            let store = Arc::new(Store::open_memory("node").unwrap());
+            let revision = scheduled_mission_revision(&store);
+            apply_source(&store, &format!(r#"version 2
+schedule "cycle" {{ every "7d"; anchor "2030-01-01T00:00:00Z"
+  work {{ mission "scheduled-cycle@{revision}"; workspace "{}" }}
+}}"#, root.path().display()), "cycle");
+            let request = store.append_claim(&ClaimInput {
+                subject: "schedule/cycle".into(), kind: "schedule.work-requested".into(), actor: None,
+                fields: BTreeMap::from([
+                    ("revision".into(), json!("node")), ("occurrence".into(), json!(4)),
+                    ("mission".into(), json!("mission/scheduled-cycle")),
+                    ("mission_revision".into(), json!(revision)),
+                    ("workspace".into(), json!(root.path().to_string_lossy())), ("inputs".into(), json!({})),
+                ]), evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+            let reconciler = Reconciler::new(store.clone(), Arc::new(FakeRuntime::default()), "node".into(), Arc::new(Notify::new()));
+            let schedule = store.desired_subjects().unwrap().into_iter().find(|s| s.subject == "schedule/cycle").unwrap();
+            let mut called = 0;
+            assert!(reconciler.reconcile_schedule_work_with_start(&schedule, |_, _, _, _| {
+                called += 1;
+                Err(smallclaims::error::internal(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None)))
+            }).is_err());
+            assert_eq!(called, 1);
+            assert!(store.claims_for(&schedule.subject, Some("schedule.work-failed")).unwrap().is_empty());
+            assert!(store.claims_for(&schedule.subject, Some("schedule.work-started")).unwrap().is_empty());
+            assert_eq!(store.pending_schedule_work_requests(&schedule.subject).unwrap()[0].id, request.id);
+            reconciler.reconcile_schedule_work(&schedule).unwrap();
+            let starts = store.claims_for(&schedule.subject, Some("schedule.work-started")).unwrap();
+            assert_eq!(starts.len(), 1);
+            assert_eq!(starts[0].body["fields"]["request"], request.id);
+            assert!(store.claims_for(&schedule.subject, Some("schedule.work-failed")).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn subscription_start_contention_waits_without_durable_failure_then_starts() {
+        use serde_json::json;
+        for code in [rusqlite::ffi::SQLITE_BUSY, rusqlite::ffi::SQLITE_LOCKED] {
+            let root = tempfile::tempdir().unwrap();
+            let store = Arc::new(Store::open_memory("node").unwrap());
+            apply_source(&store, r#"version 2
+mission "review" state="ready" {
+  input "source" kind="resource"
+  completion { when "all-steps-exhausted" }
+  goal "Review one item."
+  step "review" { agentless }
+}"#, "review");
+            let revision = store.mission_spec("review", None).unwrap().unwrap().revision;
+            apply_source(&store, &format!(r#"version 2
+resource "repo" {{ kind "vcs.repository" }}
+observer "repo" {{ resource "resource/repo"; provider "github.repository"; locator "example/repo"; field "issues" }}
+subscription "reviews" {{ observer "observer/repo"; on "issues"
+ delivery "mission" {{ mission "review@{revision}"; resource "source"; workspace "{}" }}
+}}"#, root.path().display()), "subscription");
+            let discovery = store.append_claim(&ClaimInput {
+                subject: "resource/repo".into(), kind: "resource.observed".into(), actor: None,
+                fields: BTreeMap::from([("kind".into(), json!("vcs.repository"))]), evidence: Vec::new(),
+                expected_subject: None, idempotency_key: None,
+            }).unwrap();
+            let request = store.append_claim(&ClaimInput {
+                subject: "subscription/reviews".into(), kind: "subscription.mission-requested".into(), actor: None,
+                fields: BTreeMap::from([
+                    ("mission".into(), json!("mission/review")), ("mission_revision".into(), json!(revision)),
+                    ("resource".into(), json!("resource/repo")), ("resource_input".into(), json!("source")),
+                    ("workspace".into(), json!(root.path().to_string_lossy())), ("discovery".into(), json!(discovery.id)),
+                ]), evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+            let reconciler = Reconciler::new(store.clone(), Arc::new(FakeRuntime::default()), "node".into(), Arc::new(Notify::new()));
+            let item = store.desired_subjects().unwrap().into_iter().find(|s| s.subject == "subscription/reviews").unwrap();
+            let mut called = 0;
+            assert!(reconciler.reconcile_subscription_mission_with_start(&item, &[], |_, _, _, _, _| {
+                called += 1;
+                Err(smallclaims::error::internal(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None)))
+            }).is_err());
+            assert_eq!(called, 1);
+            assert!(store.claims_for(&item.subject, Some("subscription.mission-failed")).unwrap().is_empty());
+            assert_eq!(store.pending_subscription_mission_requests(&item.subject).unwrap()[0].id, request.id);
+            reconciler.reconcile_subscription_mission(&item, &[]).unwrap();
+            let starts = store.claims_for(&item.subject, Some("subscription.mission-started")).unwrap();
+            assert_eq!(starts.len(), 1);
+            assert_eq!(starts[0].body["fields"]["request"], request.id);
+            assert!(store.claims_for(&item.subject, Some("subscription.mission-failed")).unwrap().is_empty());
+        }
+    }
+
     #[test]
     fn scheduled_work_requests_on_two_members_converge() {
         let root = tempfile::tempdir().unwrap();
@@ -34038,7 +34327,7 @@ agent "plain" {{ workspace {:?}; harness "claude" {{}} }}
     }
 
     #[test]
-    fn a_new_desired_revision_that_becomes_ready_resolves_the_codex_crash_loop_alert() {
+    fn a_new_revision_resolves_a_codex_normalized_model_mismatch_crash_loop() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let workspace = tempfile::tempdir().unwrap();
         let source = |model: &str| {
@@ -34059,8 +34348,17 @@ agent "plain" {{ workspace {:?}; harness "claude" {{}} }}
             Arc::new(Notify::new()),
         );
         reconciler
-            .raise_codex_crash_loop("agent/node.worker", &token_a, "the start failed")
+            .raise_codex_crash_loop(
+                "agent/node.worker",
+                &token_a,
+                "declared gpt-6.1-sol but resume returned gpt-6.1-sol-2026-10-06",
+            )
             .unwrap();
+        assert!(
+            reconciler
+                .codex_crash_loop_raised("agent/node.worker", &token_a)
+                .unwrap()
+        );
         assert_eq!(store.fault_items(Some("person/alex")).unwrap().len(), 1);
 
         // A person revises the declaration, and the new revision's incarnation becomes ready.
@@ -35467,6 +35765,20 @@ agent "worker" { workspace "/tmp"; command "true"; restart "never" }
             ),
             Some(1_000 + WORK_WAKE_RETRY_MS)
         );
+        let mut consumed = work[0].clone();
+        consumed.wake.as_mut().unwrap().acknowledged_by = Some("consumed".into());
+        assert_eq!(work_wake_deadline(&[consumed.clone()],
+            &BTreeSet::from(["agent/remote.worker".into()]), &BTreeMap::new(), 2_000),
+            Some(1_000 + WORK_WAKE_EXHAUST_GRACE_MS),
+            "a consumed wake cannot silently leave ready work on an idle seat");
+        consumed.wake.as_mut().unwrap().assignee_state = "working".into();
+        assert_eq!(work_wake_deadline(&[consumed.clone()],
+            &BTreeSet::from(["agent/remote.worker".into()]), &BTreeMap::new(), 2_000), None,
+            "do not interrupt a live working turn");
+        consumed.wake.as_mut().unwrap().assignee_state = "idle".into();
+        consumed.wake.as_mut().unwrap().failure = Some("already reported".into());
+        assert_eq!(work_wake_deadline(&[consumed],
+            &BTreeSet::from(["agent/remote.worker".into()]), &BTreeMap::new(), 2_000), None);
         let mut exhausted = work[0].clone();
         exhausted.wake.as_mut().unwrap().attempts = WORK_WAKE_MAX_ATTEMPTS;
         assert_eq!(
@@ -35788,7 +36100,10 @@ mission "gated" state="ready" {
 
     impl SeatQueueFixture {
         fn new() -> Self {
-            let store = Arc::new(Store::open_memory("node").unwrap());
+            Self::with_store(Arc::new(Store::open_memory("node").unwrap()))
+        }
+
+        fn with_store(store: Arc<Store>) -> Self {
             apply_source(&store, SEAT_QUEUE_SOURCE, "seat-queue-missions");
             let desired = store
                 .desired_subjects()
@@ -35939,6 +36254,194 @@ mission "gated" state="ready" {
                 )
                 .map(|_| ())
         }
+    }
+
+    #[test]
+    fn expired_lease_rearms_consumed_wake_in_the_same_incarnation() {
+        let seat = SeatQueueFixture::new();
+        let run = seat.start("queued", "expired-consumed-wake-run");
+        let subject = SeatQueueFixture::step(&run, "work");
+        let old = seat.store.step_run(&subject).unwrap().unwrap();
+        let wake = seat.store.messages(Some(SEAT), false).unwrap().remove(0);
+        for (kind, status) in [
+            ("message.delivered", "delivered"),
+            ("message.read", "read"),
+            ("message.closed", "closed"),
+        ] {
+            seat.store
+                .append_claim(&ClaimInput {
+                    subject: wake.subject.clone(),
+                    kind: kind.into(),
+                    actor: Some(SEAT.into()),
+                    fields: BTreeMap::from([("status".into(), Value::String(status.into()))]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("expired-consumed-wake-{status}")),
+                })
+                .unwrap();
+        }
+        seat.work(&subject, "claim", "expiry-first-claim").unwrap();
+        // Reuse the Store's canonical expired-renewal fixture: a normal append
+        // re-applies the local live lease overlay, so it cannot model expiry.
+        crate::store::expire_work_lease_by_claim(&seat.store, &subject, SEAT, "seat-one");
+        let ready = seat.store.step_run(&subject).unwrap().unwrap();
+        assert_eq!(ready.status, "ready");
+        assert_eq!(ready.readiness_epoch, old.readiness_epoch + 1);
+        assert!(ready.claimant.is_none());
+        let renewal_count = seat
+            .store
+            .claims_for(&subject, Some("work.renewed"))
+            .unwrap()
+            .len();
+        assert_eq!(
+            seat.work(&subject, "renew", "expired-holder-late-renewal")
+                .unwrap_err()
+                .code,
+            "work-not-claimed",
+            "old holder cannot renew its expired lease"
+        );
+        assert_eq!(
+            seat.store
+                .claims_for(&subject, Some("work.renewed"))
+                .unwrap()
+                .len(),
+            renewal_count,
+            "the rejected request must not append an old-epoch renewal"
+        );
+        seat.reconciler.reconcile_once().unwrap();
+        assert_eq!(
+            seat.store
+                .step_run(&subject)
+                .unwrap()
+                .unwrap()
+                .readiness_epoch,
+            ready.readiness_epoch,
+            "durable repair must not advance the epoch twice"
+        );
+        let messages = seat.store.messages(Some(SEAT), true).unwrap();
+        let fresh = messages
+            .iter()
+            .filter(|message| {
+                work_message_target(message).is_some_and(|(step, _, epoch, _)| {
+                    step == subject && epoch == ready.readiness_epoch
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            fresh.len(),
+            1,
+            "old consumed wake must not suppress recovery"
+        );
+        seat.reconciler.reconcile_once().unwrap();
+        assert_eq!(
+            seat.store.messages(Some(SEAT), true).unwrap().len(),
+            messages.len()
+        );
+        seat.work(&subject, "claim", "expiry-reclaim").unwrap();
+        let reclaimed = seat.store.step_run(&subject).unwrap().unwrap();
+        assert_eq!(reclaimed.readiness_epoch, ready.readiness_epoch);
+        assert_eq!(reclaimed.claim_incarnation.as_deref(), Some("seat-one"));
+    }
+
+    #[test]
+    fn consumed_wake_with_idle_unclaimed_work_raises_one_diagnostic() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("idle-unclaimed.sqlite");
+        let seat = SeatQueueFixture::with_store(Arc::new(Store::open(&database, "node").unwrap()));
+        let run = seat.start("queued", "idle-unclaimed-run");
+        let subject = SeatQueueFixture::step(&run, "work");
+        let wake = seat.store.messages(Some(SEAT), false).unwrap().remove(0);
+        for (kind, status) in [
+            ("message.delivered", "delivered"),
+            ("message.read", "read"),
+            ("message.closed", "closed"),
+        ] {
+            seat.store
+                .append_claim(&ClaimInput {
+                    subject: wake.subject.clone(),
+                    kind: kind.into(),
+                    actor: Some(SEAT.into()),
+                    fields: BTreeMap::from([("status".into(), Value::String(status.into()))]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("idle-unclaimed-{status}")),
+                })
+                .unwrap();
+        }
+        // Age only this isolated fixture's wake. No wall-clock sleep is needed
+        // to exercise the actual reconciliation and diagnostic path.
+        let sent = seat
+            .store
+            .latest_claim(&wake.subject, Some("message.sent"))
+            .unwrap()
+            .unwrap();
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        crate::store::configure_projection_writer(&connection).unwrap();
+        connection
+            .execute(
+                "UPDATE claims SET accepted_at_unix_ms=?1 WHERE id=?2",
+                rusqlite::params![
+                    (now_ms() - WORK_WAKE_EXHAUST_GRACE_MS - 1).to_string(),
+                    sent.id
+                ],
+            )
+            .unwrap();
+        let observe = |state: &str| {
+            seat.store
+                .append_claim(&ClaimInput {
+                    subject: SEAT.into(),
+                    kind: "harness.observed".into(),
+                    actor: Some(SEAT.into()),
+                    fields: BTreeMap::from([
+                        ("state".into(), Value::String(state.into())),
+                        ("driver".into(), Value::String("codex".into())),
+                        ("incarnation_id".into(), Value::String("seat-one".into())),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("idle-unclaimed-{state}")),
+                })
+                .unwrap();
+        };
+        let faults = || {
+            seat.store
+                .claims_for(SEAT, Some("harness.diagnostic"))
+                .unwrap()
+                .into_iter()
+                .filter(|claim| {
+                    claim.body["fields"]["code"].as_str() == Some("work-wake-exhausted")
+                })
+                .collect::<Vec<_>>()
+        };
+        observe("working");
+        seat.reconciler
+            .reconcile_work_messages(SEAT, "seat-one", None)
+            .unwrap();
+        assert!(faults().is_empty(), "do not interrupt a working turn");
+        observe("idle");
+        seat.reconciler
+            .reconcile_work_messages(SEAT, "seat-one", None)
+            .unwrap();
+        let first = faults();
+        assert_eq!(first.len(), 1);
+        assert_eq!(
+            first[0].body["fields"]["step_run"].as_str(),
+            Some(subject.as_str())
+        );
+        assert_eq!(first[0].body["evidence"], serde_json::json!([sent.id]));
+        seat.reconciler
+            .reconcile_work_messages(SEAT, "seat-one", None)
+            .unwrap();
+        assert_eq!(faults().len(), 1, "one diagnostic per readiness episode");
+        assert_eq!(
+            seat.store.messages(Some(SEAT), true).unwrap().len(),
+            1,
+            "consumption is delivery proof; do not resend it indefinitely"
+        );
+        assert_eq!(
+            seat.store.step_run(&subject).unwrap().unwrap().status,
+            "ready"
+        );
     }
 
     #[test]

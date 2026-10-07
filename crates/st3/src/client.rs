@@ -62,6 +62,8 @@ pub enum FollowTestReply {
     Timeout,
     Disconnect,
     Error(u16),
+    MissingRoute,
+    CursorGap { floor: u64, frontier: u64 },
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -407,6 +409,21 @@ impl Client {
         Ok(client)
     }
 
+    /// Name a program seat over the trusted Unix boundary. The daemon still fences
+    /// the caller to its bound harness and checks the seat's enrollment.
+    pub fn unix_agent(path: impl Into<PathBuf>, agent: impl Into<String>) -> Result<Self> {
+        let agent = agent.into();
+        anyhow::ensure!(
+            agent.starts_with("agent/") && agent.split('/').all(|part| {
+                !part.is_empty() && part.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+            }),
+            "Unix agent authority must be one concrete `agent/<id>` subject"
+        );
+        let mut client = Self::unix(path);
+        client.person = Some(agent);
+        Ok(client)
+    }
+
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
         let first_page = path.starts_with("/v1/client/") && !request_has_page_cursor(path);
         for attempt in 0..3 {
@@ -564,6 +581,10 @@ impl Client {
                 FollowTestReply::Timeout => (serde_json::Value::Null, deadline * 2),
                 FollowTestReply::Disconnect => return Err(DaemonUnreachable::response("fixture", "no response").into()),
                 FollowTestReply::Error(status) => return Err(api_error(status, br#"{"code":"fixture-refusal","message":"fixture read refused"}"#)),
+                FollowTestReply::MissingRoute => return Err(api_error(404,b"")),
+                FollowTestReply::CursorGap {floor,frontier} => return Err(api_error(410,&serde_json::to_vec(&serde_json::json!({
+                    "code":"cursor-gap","message":"cursor expired","details":{"resume_floor":floor,"frontier":frontier,"full_resync":true}
+                })).unwrap())),
             };
             if !delay.is_zero() {
                 tokio::time::timeout(deadline, tokio::time::sleep(delay)).await
@@ -919,6 +940,13 @@ pub fn is_not_found(error: &anyhow::Error) -> bool {
         .is_some_and(|error| error.status == 404 || error.code == "not-found")
 }
 
+/// An unimplemented route on an older daemon, distinct from a typed subject/auth refusal.
+pub fn is_missing_route(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<UnexpectedResponse>()
+        .is_some_and(|error| error.status == 404)
+}
+
 /// The HTTP status an API call failed with, including an answer without an error body.
 pub fn http_status(error: &anyhow::Error) -> Option<u16> {
     error
@@ -1241,7 +1269,9 @@ fn request_deadline(path: &str, deadlines: ClientDeadlines) -> Duration {
     {
         // A dry run copies the store and replays it twice; status reads what is sealed.
         Duration::from_secs(30 * 60)
-    } else if path.starts_with("/v1/events?") && path.contains("wait=true") {
+    } else if (path.starts_with("/v1/events?") || path.starts_with("/v1/events/page?"))
+        && path.contains("wait=true")
+    {
         deadlines.event
     } else {
         deadlines.request
@@ -2168,6 +2198,12 @@ mod tests {
             .unwrap();
         assert_eq!(named["person"], "person/alex");
         assert!(Client::unix_as(&socket, "person/alex\r\nx-forged: yes").is_err());
+        let agent: Value = Client::unix_agent(&socket, "agent/example/bridge")
+            .unwrap().get("/v1/person").await.unwrap();
+        assert_eq!(agent["person"], "agent/example/bridge");
+        assert!(Client::unix_agent(&socket, "person/alex").is_err());
+        assert!(Client::unix_agent(&socket, "agent/example\r\nx-forged: yes").is_err());
+        assert!(Client::unix_agent(&socket, "agent/").is_err());
         server.abort();
     }
 

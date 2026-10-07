@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "summary": "#1458: preserve Pi/OMP native tool result details and bound timeline display values",
+  "commits": [
+    "e42273a3e9ad8ab1e6e2a3650a0f740a0ff7dc74"
+  ],
+  "replay": {
+    "status": "none",
+    "detail": "No daemon startup graph replay or projection invalidation is added. Native transcript reads normalize the supplied result details without rewriting the source records."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No SQLite migration, startup DDL or persisted graph schema change is introduced. Result details remain in owner-local native transcripts."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules, claim vocabulary or fleet sealing coordination requirement changes."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Pi and OMP native tool results merge their supplied details into the tool_output block's optional open metadata, retaining original field names, units, zero/fractional values and future fields; these are source-supplied values, not inferred measurements or tool arguments. Long strings and large nested values in metadata and error/status message, details and detail fields are clipped on a display copy with a visible size-limit marker. An entry that still exceeds the response budget becomes a visible native-entry-too-large error while retaining its identity and ordering. Negotiated conversation-block clients can fetch original values through existing owner content continuations, subject to existing access, read-window and reference-validity limits; a payload continuation takes precedence over a metadata continuation. Clients without negotiated blocks receive the same visible clipping and oversized-entry error without continuation blocks. Native source records remain unchanged; no API or capability version bump is introduced."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional upgrade service stop or measured outage is introduced; normal member restarts apply."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No required configuration change, transcript conversion or data repair is introduced. Existing conversation-block negotiation and owner content access apply to the new metadata and display behavior."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No additional graph recovery procedure or downgrade support is introduced. Clipping changes display copies and preserves native source values; use existing owner content reads for exact referenced values and normal release roll-forward guidance for state compatibility."
+  }
+}

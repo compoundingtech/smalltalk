@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "summary": "#1541: agent workflow guidance and CLI help",
+  "commits": ["b0ea99f34d13181eec4772dddd76cbd99de23a19"],
+  "replay": {"status": "none", "detail": "No new projection invalidation or startup replay trigger in the merged agent workflow guidance and CLI help change."},
+  "schema": {"status": "none", "detail": "No database table, index, trigger or migration change in agent workflow guidance and CLI help; SQLite user_version is unchanged."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digest/drop policy are unchanged; this change adds no sealing coordination requirement."},
+  "compatibility": {"status": "none", "detail": "Agent workflow guidance and cli help changes presentation or UI interaction only; stored claims and daemon wire contracts are unchanged."},
+  "downtime": {"status": "none", "detail": "No additional upgrade service stop or measured outage introduced by agent workflow guidance and CLI help; the standard daemon/client restart procedure still applies."},
+  "manual": {"status": "none", "detail": "No data repair or configuration conversion required for existing installations by agent workflow guidance and CLI help."},
+  "recovery": {"status": "none", "detail": "No additional recovery procedure introduced by this change. Preserve graph state, keys and configuration and follow the standard roll-forward guidance; this note does not qualify binary-only downgrade of the whole release."}
+}

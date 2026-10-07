@@ -179,6 +179,20 @@ impl Checkout {
             .stderr(Stdio::piped())
             .spawn()
             .context("run git")?;
+        // Drain both pipes while git runs: a pipe holds 64 KiB, and a listing of a repository
+        // with hundreds of worktrees is longer, so git would block writing it while this waited
+        // for it to exit (the seat "did not start" because `worktree list` timed out).
+        let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+            std::thread::spawn(move || {
+                let mut text = String::new();
+                if let Some(mut pipe) = pipe {
+                    let _ = pipe.read_to_string(&mut text);
+                }
+                text
+            })
+        };
+        let stdout_reader = drain(child.stdout.take().map(|pipe| Box::new(pipe) as _));
+        let stderr_reader = drain(child.stderr.take().map(|pipe| Box::new(pipe) as _));
         let deadline = Instant::now() + timeout;
         let status = loop {
             if let Some(status) = child.try_wait()? {
@@ -195,14 +209,8 @@ impl Checkout {
             }
             std::thread::sleep(Duration::from_millis(20));
         };
-        let mut stdout = String::new();
-        let mut stderr = String::new();
-        if let Some(mut pipe) = child.stdout.take() {
-            pipe.read_to_string(&mut stdout)?;
-        }
-        if let Some(mut pipe) = child.stderr.take() {
-            pipe.read_to_string(&mut stderr)?;
-        }
+        let stdout = stdout_reader.join().unwrap_or_default();
+        let stderr = stderr_reader.join().unwrap_or_default();
         anyhow::ensure!(
             status.success(),
             "git {} failed: {}",
@@ -299,6 +307,37 @@ mod tests {
             Checkout::from_desired(&serde_json::json!({"name": "agent", "children": []})),
             None
         );
+    }
+
+    #[test]
+    fn git_output_longer_than_a_pipe_does_not_stall_the_checkout() {
+        // A repository with hundreds of worktrees lists more than the 64 KiB a pipe holds; git
+        // blocked writing it while st3 waited for it to exit, and no seat of that repository
+        // could start (2026-10-07).
+        let root = tempfile::tempdir().unwrap();
+        let repository = repository(root.path());
+        let big = root.path().join("big");
+        std::fs::write(&big, "x".repeat(300_000)).unwrap();
+        let hashed = crate::test_support::git()
+            .arg("-C")
+            .arg(&repository)
+            .args(["hash-object", "-w"])
+            .arg(&big)
+            .output()
+            .unwrap();
+        let object = String::from_utf8(hashed.stdout).unwrap().trim().to_owned();
+        let checkout = Checkout {
+            repository,
+            base: "origin/main".into(),
+            branch: "example/parser".into(),
+            remove_at_run_end: false,
+        };
+        let started = Instant::now();
+        let printed = checkout
+            .git(&["cat-file", "-p", &object], Duration::from_secs(20))
+            .unwrap();
+        assert_eq!(printed.len(), 300_000);
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 
     #[test]

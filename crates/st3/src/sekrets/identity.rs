@@ -120,9 +120,9 @@ pub fn check_statement(
     if (now_unix_ms - statement.issued_at_unix_ms).abs() > ATTESTATION_WINDOW_MS {
         return Err("attestation is stale".into());
     }
-    if !statement.agent.starts_with("agent/") {
+    if !(statement.agent.starts_with("agent/") || statement.agent.starts_with("host/")) {
         return Err(format!(
-            "attestation names {}, not an agent",
+            "attestation names {}, not an agent or a node",
             statement.agent
         ));
     }

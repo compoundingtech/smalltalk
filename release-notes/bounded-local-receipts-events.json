@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "summary": "Bound local response retention and replace copied event payloads with admitted claim positions and paged continuation",
+  "replay": {
+    "status": "none",
+    "detail": "This change does not request a graph replay. Valid cache/ response associations on routine work claims use incremental projection; publication operations, malformed metadata and existing conflict/repair guards retain their previous handling. Existing event eligibility migrates in transactions of at most 64 rows; claim bodies remain canonical and are read through a view. Existing startup and repair projection behavior remains unchanged."
+  },
+  "schema": {
+    "status": "changed",
+    "detail": "Schema 16 upgrades to 17. Local response rows gain a seven-day deadline and explicit safe-retry classification, plus a local meta watermark preserving every receipt already present at upgrade. No indexes are added, dropped or changed. Event payloads drain in 64-row transactions into a payload-free membership table with its embedded primary key; events becomes a read-only claim join. Upgrade is forward-only; canonical claim bodies are never rewritten.",
+    "transitions": [
+      [
+        16,
+        17
+      ]
+    ]
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules version 11 and its claim-retention description remain unchanged. Local response expiry does not delete replicated claims or checkpoint tombstones. Canonical deletion updates the local event resync floor and membership in the same transaction."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "New effect claims carry durable caller-operation metadata. Late document retries recover the original binding; other associated writes return terminal HTTP 409 idempotency-key-expired rather than executing twice. Quiet renewals keep their ownership fences; compound publications retain existing operation identities. Clients never reuse keys. Legacy receipts remain in this PR; issue 1741 schedules their deletion deployment+30 days as a legacy retry exception. Event pages retain global last-scanned continuation before and after migration and explicit 410 cursor-gap. Empty advancing wait pages pause up to 250 ms within the caller deadline, preserving eligible events. Default trace follow starts at the observed frontier. Existing claim vocabulary, checkpoint rules and peer replication remain; mixed-build release validation is still required. Caller keys share one namespace across actors and nodes; use globally unique keys. Revision approval can refuse a retry between its approval commit and response storage. Older peers retain their old work-operation replay guard until upgraded; two-node incremental controls apply to updated builds. The paged event route uses the existing wait-derived server deadline envelope only for wait=true, with ordinary budgets for each bounded query; floor and page are read atomically under the query cancellation wrapper."
+  },
+  "downtime": {
+    "status": "unknown",
+    "detail": "A normal daemon restart is required. The shared migration worker runs in 64-row transactions with 20 ms pauses and reports total duration including retries, row/chunk counts and writer-call cost. The PR records a qualified private 5.9 GB copied-store measurement separately from upgrade-under-load and steady-after-confirmed-migration load cases. Both load cases preserve workload, budgets and baseline inputs, and include migration costs in their reports. Restart-to-API/health, cold-cache guarantees and whole-fleet p99 acceptance are not established."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Capture the supported database and identity backup in docs/upgrading-st.md before schema 17. Install matching CLI and daemon through docs/st3/seat-deploys.md. Operations records the actual deployment timestamp and legacy cleanup due date (30 days later) in issue 1741. Late associated retries either recover their original document result or stop with idempotency-key-expired; inspect the committed outcome, and use a fresh key only for a deliberately new action. Raw cursor gaps require explicit resync; trace prints the continuation command."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "Older binaries reject schema 17; downgrade requires restoring the supported matching pre-upgrade backup. Busy/locked worker failures retry with bounded backoff, permanent errors stop visibly. They never erase canonical history or reset cursors. A terminal idempotency-key-expired response means the effect already committed: do not automatically replace the key and retry. Legacy receipt deletion occurs only in the separately dated deployment+30-day follow-up."
+  }
+}

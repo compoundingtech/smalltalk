@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "summary": "#1530: local startup readiness and replay progress",
+  "commits": ["469e963365d73101e0009878ebd9fe321086610f"],
+  "replay": {"status": "none", "detail": "Adds observation around existing startup and replay stages; it does not invalidate projections or introduce a new replay trigger. A full fallback still finishes its write transaction before API listeners bind; progress counts during base replay describe uncommitted work."},
+  "schema": {"status": "none", "detail": "No database table, index, trigger or migration change in local startup readiness and replay progress; SQLite user_version is unchanged."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digest/drop policy are unchanged; this change adds no sealing coordination requirement."},
+  "compatibility": {"status": "changed", "detail": "On Linux, st doctor and st service status can read local startup readiness before the API exists. Doctor JSON adds startup. Announcing command clients return promptly after a failed connection during live full replay, while ordinary startup preserves --daemon-wait and long-lived drivers retain retries. macOS/non-Linux use existing API/outage checks; HTTP schemas and error codes are unchanged."},
+  "downtime": {"status": "unknown", "detail": "Readiness reporting does not make the API available during recovery. Full replay can still cause a minutes-long interruption; no duration for an arbitrary populated store is established here. Inspect the local startup phase and daemon fallback log, then wait for API and projection health."},
+  "manual": {"status": "changed", "detail": "During an unavailable daemon on Linux, use st doctor or st service status to inspect the startup phase instead of treating service-manager active as API readiness. API_SOCKET.readiness.json and .readiness.lock are private rebuildable observations, not backup graph state; stale unlocked files are ignored."},
+  "recovery": {"status": "none", "detail": "No additional recovery procedure introduced by this change. Preserve graph state, keys and configuration and follow the standard roll-forward guidance; this note does not qualify binary-only downgrade of the whole release."}
+}

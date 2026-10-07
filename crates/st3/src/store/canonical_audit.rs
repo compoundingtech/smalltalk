@@ -40,7 +40,7 @@ fn every_persistent_table_has_a_projection_scope() {
         "claims",
         "idempotency",
         "mission_run_requests",
-        "events",
+        "event_positions",
         "peer_cursors",
         "peer_replica_cursors",
         "replica_envelopes",
@@ -67,12 +67,15 @@ fn every_persistent_table_has_a_projection_scope() {
         "local_usage_responses",
         "local_limit_stops",
         "local_seat_accounts",
+        "account_limit_readings",
+        "account_limit_seats",
         "local_latest_slots",
         "local_resource_projection_pending",
         "local_glass_head_pending",
         "local_glass_head_dirty",
         "local_custom_dirty",
         "graph_generation",
+        "fleet_generation",
         "projection_digest_state",
         "projection_digest_generation",
         "projection_digest_operation_rows",
@@ -91,7 +94,7 @@ fn every_persistent_table_has_a_projection_scope() {
         "checkpoint_claims",
         "checkpoints",
     ];
-    let classified = SHARED_TABLES
+    let mut classified = SHARED_TABLES
         .iter()
         .map(|(name, _)| *name)
         .chain(exceptions)
@@ -111,6 +114,9 @@ fn every_persistent_table_has_a_projection_scope() {
         .unwrap()
         .collect::<rusqlite::Result<BTreeSet<_>>>()
         .unwrap();
+    if tables.contains("local_event_payloads") {
+        classified.insert("local_event_payloads".into());
+    }
     assert_eq!(
         tables, classified,
         "classify new tables and include shared logical rows in both ordering and digest tests"

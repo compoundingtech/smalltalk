@@ -371,13 +371,20 @@ impl FrameGate {
             Some(st3_client::RawTerminalMode::Peek) if !self.attached => tag == MessageType::Peek,
             Some(st3_client::RawTerminalMode::Attach) => matches!(
                 tag,
-                MessageType::Data | MessageType::Resize | MessageType::Detach | MessageType::Status
+                MessageType::Data
+                    | MessageType::Resize
+                    | MessageType::Detach
+                    | MessageType::Status
+                    | MessageType::ResetInputModes
             ),
             Some(st3_client::RawTerminalMode::Peek) => {
                 matches!(tag, MessageType::Detach | MessageType::Status)
             }
         };
-        if !allowed || length > 16 * 1024 * 1024 {
+        if !allowed
+            || length > 16 * 1024 * 1024
+            || (tag == MessageType::ResetInputModes && length != 0)
+        {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "PTY frame exceeds raw terminal capability",
@@ -428,6 +435,10 @@ mod tests {
             encode_attach(1, 1),
             encode_data(b"must-not-reach-child"),
             encode_resize(1, 1),
+            pty_core::protocol::encode_packet(
+                pty_core::protocol::MessageType::ResetInputModes,
+                &[],
+            ),
         ] {
             let (mut bridge, mut owner) = tokio::io::duplex(128);
             let mut gate = FrameGate::new(Some(RawTerminalMode::Peek));
@@ -468,5 +479,37 @@ mod tests {
         let mut forbidden = Vec::new();
         owner.read_to_end(&mut forbidden).await.unwrap();
         assert_eq!(forbidden, b"");
+    }
+    #[tokio::test]
+    async fn attached_writer_can_recover_modes_but_cannot_add_a_payload() {
+        let (mut bridge, mut owner) = tokio::io::duplex(128);
+        let mut gate = FrameGate::new(Some(RawTerminalMode::Attach));
+        let attach = encode_attach(24, 80);
+        let reset = pty_core::protocol::encode_packet(
+            pty_core::protocol::MessageType::ResetInputModes,
+            &[],
+        );
+        gate.write(&mut bridge, &attach).await.unwrap();
+        gate.write(&mut bridge, &reset[..2]).await.unwrap();
+        gate.write(&mut bridge, &reset[2..]).await.unwrap();
+        let expected = [attach, reset].concat();
+        let mut bytes = vec![0; expected.len()];
+        owner.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(bytes, expected);
+        let malformed = pty_core::protocol::encode_packet(
+            pty_core::protocol::MessageType::ResetInputModes,
+            b"child input",
+        );
+        assert_eq!(
+            gate.write(&mut bridge, &malformed)
+                .await
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        drop(bridge);
+        let mut forbidden = Vec::new();
+        owner.read_to_end(&mut forbidden).await.unwrap();
+        assert!(forbidden.is_empty());
     }
 }

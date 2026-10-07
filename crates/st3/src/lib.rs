@@ -34,6 +34,8 @@ pub mod hooks;
 pub mod incremental;
 pub mod lane;
 pub mod mailbox;
+/// Bounded local maintenance workers shared by daemon startup and lifecycle fixtures.
+pub mod maintenance;
 pub(crate) mod memory;
 pub mod mission;
 pub mod model;
@@ -85,3 +87,6 @@ pub mod terminal_fabric;
 
 pub use graph::{parse_intent, validate_mission_runtimes};
 pub use model::{NormalizedIntent, St3Error};
+
+/// Shared authentication and transport for daemon GitHub callers.
+mod github_http;

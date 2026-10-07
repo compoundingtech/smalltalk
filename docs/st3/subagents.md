@@ -35,6 +35,12 @@ harness records:
   for ten seconds ends as `interrupted`.
 - A new session or `SessionEnd` ends the session's subagents.
 
+`SessionStart` is the native session boundary. Once the ledger knows that session, child,
+turn and end hooks must name it; a late hook from another session or a hook without session
+evidence changes nothing. A child start also requires its native session ID.
+The ledger trusts `SessionStart` as a boundary; its caller must admit that hook from the
+current runtime. This guard does not authenticate a delayed predecessor `SessionStart`.
+
 A running seat keeps the settings it started with, so it records subagents from its next restart.
 
 **Codex.** The control connection reads the parent thread's `subAgentActivity` items and
@@ -96,6 +102,12 @@ subagents through the real hooks, with no model. `crates/st3/tests/subagents_sea
 covers:
 
 - appear then end, Claude's phantom stop, and many subagents at once;
+- a background child that outlives its parent's turn and initial lease, with an idle parent,
+  continued lease renewal, API/card/tree visibility, and delivery through the real MCP channel;
+- natural background completion that clears that visibility exactly once;
+- a stand-in whose effective settings omit child hooks: it records a launch without a running
+  identity or child claims, even while its background task runs;
+- stale native-session hooks that cannot end, relabel or interrupt the current child;
 - an interrupted subagent and a session that ended;
 - a daemon restart in between;
 - a frozen seat whose lease runs out, and a killed seat that its restart closes;

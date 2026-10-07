@@ -30,6 +30,7 @@ HERE = Path(__file__).resolve().parent
 KILLED = "agent/eval/killed"
 RESTARTED = "agent/eval/restarted"
 STOPPED = "agent/eval/stopped"
+OLD_SETTINGS = "agent/eval/old-hook-settings"
 LEASE_MS = 6000
 
 
@@ -205,6 +206,33 @@ class Seat:
         return until(lambda: [row for row in self.receipts() if row["event"] == "ready" and row["at"] > after],
                      timeout, f"{self.subject}: the stand-in never started")[-1]
 
+    def restarted_driver_ready(self, previous_incarnation, session, ledger_path, timeout=30):
+        """The stand-in's ready receipt precedes the driver's current harness observation."""
+        card, ledger = None, None
+        def ready():
+            nonlocal card, ledger
+            card = self.node.api("/v1/client/agents/" + self.subject) or {}
+            try:
+                ledger = json.loads(ledger_path.read_text())
+            except (ValueError, FileNotFoundError) as error:
+                ledger = {"read_error": str(error)}
+                return None
+            if (card.get("state") == "running"
+                    and card.get("harness_state") in ("ready", "working", "idle")
+                    and card.get("incarnation_id")
+                    and card["incarnation_id"] != previous_incarnation
+                    # The card's current_session_id is a managed session/hash, not Claude's UUID.
+                    and ledger.get("incarnation") == card["incarnation_id"]
+                    and ledger.get("session_id") == session):
+                return card
+        try:
+            return until(ready, timeout,
+                         f"{self.subject}: the restarted driver never became ready for session {session}")
+        except Failure as error:
+            fail(f"{error}; previous incarnation: {previous_incarnation}; "
+                 f"last card: {json.dumps(card)}; ledger: {json.dumps(ledger)}; "
+                 f"stand-in receipts: {json.dumps(self.receipts())}")
+
     def claims(self):
         """The seat's subagent claims, oldest first, a trace page at a time."""
         rows, after = [], 0
@@ -251,7 +279,48 @@ def shown(node, seat, subagent, description):
     expect(f"SUBAGENT     {description}" in card, f"st agents show:\n{card}")
     tree = node.cli("agents", "tree")
     expect(f"─ {description}" in tree, f"st agents tree:\n{tree}")
-    return row
+    return {"subagent": row, "card": card, "tree": tree}
+
+
+def old_settings_capture(node, seat, checks):
+    """Removing the child hooks reproduces a captured launch without a running identity.
+
+    This models the reported effective settings; it does not claim to reproduce the unknown
+    October 4 launch binary. The current driver and publisher still run in this control.
+    """
+    settings = [row for row in seat.receipts() if row["event"] == "effective-settings"][-1]
+    expect(settings["old_settings_model"], "old-settings control did not remove the hooks")
+    expect("PreToolUse" in settings["hooks"], "the launch hook is missing from the control")
+    expect(not any(event in settings["hooks"] for event in ("SubagentStart", "SubagentStop")),
+           f"the old-settings control still registers child hooks: {settings}")
+    seat.control("spawn", id="legacy-child", description="launch captured without child hooks")
+    seat.control("turn-end", running=["legacy-child"])
+    applied = seat.applied()[-1]
+    expect(applied["running"] == ["legacy-child"], "the control child did not actually run")
+    time.sleep(2)
+    ledger_path = Path(settings["agent_dir"]) / "harness-subagents"
+    ledger = json.loads(ledger_path.read_text())
+    expect(not ledger["running"] and not ledger["ended"], f"unexpected child identity: {ledger}")
+    expect(any(launch.get("description") == "launch captured without child hooks"
+               for launch in ledger["launches"]), "the control never captured the launch")
+    expect(not seat.claims(), "missing hooks nevertheless published a child")
+    expect(not (ledger_path.parent / ".harness-subagents-published").exists(),
+           "an empty publisher unexpectedly wrote its open/closed map")
+    parent = node.api("/v1/client/agents/" + seat.subject) or {}
+    expect(parent.get("harness_state") == "idle" and not parent.get("subagents"),
+           f"old-settings parent projection: {parent}")
+    seat.control("finish", id="legacy-child", responses=[{"output": 1}])
+    seat.applied()
+    time.sleep(2)
+    expect(not seat.claims(), "missing stop hook nevertheless published an end")
+    checks["old_settings_launch_only_negative_control"] = {
+        "effective_settings": settings,
+        "stand_in_child_running": applied["running"],
+        "ledger": ledger,
+        "parent_activity": parent["harness_state"],
+        "subagents": parent.get("subagents"),
+        "limit": "Current binary with isolated reduced effective settings; old launch build unknown.",
+    }
 
 
 def worker_scenarios(node, worker, run, checks):
@@ -297,12 +366,38 @@ def worker_scenarios(node, worker, run, checks):
     until(lambda: len([claim for claim in worker.claims() if claim["kind"] == "subagent.appeared"
                        and fields(claim)["subagent_id"].startswith("many-")]) == 20,
           90, "not every one of many subagents appeared")
+    worker.control("turn-end", running=[f"many-{index}" for index in range(20)])
+    worker.applied()
+    many = until(lambda: (card if (card := node.api("/v1/client/agents/" + worker.subject))
+                          and card.get("harness_state") == "idle"
+                          and len(card.get("subagents", [])) == 20 else None),
+                 30, "the idle parent did not show all twenty live children")
+    many_card = node.cli("agents", "show", worker.subject)
+    many_tree = node.cli("agents", "tree")
+    expect(many_card.count("SUBAGENT     one of many") == 20, f"many-child card:\n{many_card}")
+    expect(many_tree.count("─ one of many") == 20, f"many-child tree:\n{many_tree}")
+    checks["many_children_under_idle_parent"] = {
+        "parent_activity": many["harness_state"], "subagents": many["subagents"],
+        "card": many_card, "tree": many_tree,
+    }
     worker.control("finish-many", prefix="many-", count=20, responses=[{"output": 1}])
     until(lambda: len([claim for claim in worker.claims() if claim["kind"] == "subagent.ended"
                        and fields(claim)["subagent_id"].startswith("many-")
                        and fields(claim)["outcome"] == "completed"]) == 20,
           90, "not every one of many subagents ended")
     checks["many"] = 20
+    cleared = until(lambda: (card if (card := node.api("/v1/client/agents/" + worker.subject))
+                             and not card.get("subagents") else None),
+                    30, "completed children remain in the many-child API")
+    cleared_card = node.cli("agents", "show", worker.subject)
+    cleared_tree = node.cli("agents", "tree")
+    expect("one of many" not in cleared_card,
+           "completed children remain on the many-child card")
+    expect("one of many" not in cleared_tree, "completed children remain in the tree")
+    checks["many_children_cleared"] = {
+        "parent_activity": cleared["harness_state"], "subagents": cleared.get("subagents"),
+        "card": cleared_card, "tree": cleared_tree,
+    }
 
     # A turn that ended without the subagent's stop, and a session that ended.
     worker.control("spawn", id="w2", description="cut short")
@@ -322,9 +417,12 @@ def worker_scenarios(node, worker, run, checks):
     worker.control("spawn", id="w5", description="ends while st is down")
     worker.appeared("w4")
     worker.appeared("w5")
+    worker.control("turn-end", running=["w4", "w5"])
+    worker.applied()
     node.stop_daemon()
     worker.control("finish", id="w5", responses=[{"output": 7}])
     worker.control("spawn", id="w6", description="starts while st is down")
+    worker.control("turn-end", running=["w4", "w6"])
     worker.applied()
     node.start()
     ended = worker.ended("w5")
@@ -351,47 +449,132 @@ def worker_scenarios(node, worker, run, checks):
 
 
 def killed_scenarios(node, seat, checks):
-    # A running subagent is renewed before its lease runs out.
+    # The parent's turn ends while its child runs. Child leases must keep renewing without
+    # changing parent activity or holding its mail. Stay past both the shortened lease and
+    # the ledger's ten-second unlisted grace to distinguish the two lifetime boundaries.
     seat.control("spawn", id="k1", description="outlives its first lease")
-    seat.appeared("k1")
-    time.sleep(LEASE_MS / 1000 * 1.5)
+    appeared = seat.appeared("k1")
+    seat.control("turn-end", running=["k1"])
+    seat.applied()
+    parent = until(lambda: (card if (card := node.api("/v1/client/agents/" + seat.subject))
+                            and card.get("harness_state") == "idle" else None),
+                   30, "the parent never became idle while its child ran")
+    shown_before = shown(node, seat, "k1", "outlives its first lease")
+    settings = [row for row in seat.receipts() if row["event"] == "effective-settings"][-1]
+    ledger_path = Path(settings["agent_dir"]) / "harness-subagents"
+    owned = json.loads(ledger_path.read_text())
+    seat.control("foreign-hooks", id="k1")
+    seat.applied()
+    after_foreign = json.loads(ledger_path.read_text())
+    expect(after_foreign == owned, f"foreign hooks mutated the owned ledger: {after_foreign}")
+    authority = [row for row in seat.receipts() if row["event"] == "foreign-hook-authority"][-1]
+    checks["foreign_claude_hooks_preserve_owned_child"] = {
+        "native_session": owned.get("session_id"), "running_ids": sorted(owned["running"]),
+        "ledger_unchanged": True,
+        "wrapper_authority": authority,
+    }
+    body = "mail remains deliverable while a background child runs"
+    node.cli("conversations", "send", seat.subject, "--from", "person/eval",
+             "--subject", "background child mail proof", "--body", body)
+    delivered = until(lambda: [row for row in seat.receipts()
+                               if row["event"] == "mcp-frame"
+                               and row.get("frame", {}).get("method") == "notifications/claude/channel"
+                               and body in json.dumps(row["frame"])],
+                      30, "the idle parent did not receive mail while its child ran")[-1]
+    time.sleep(max(12, LEASE_MS / 1000 * 2))
     renewed = seat.of("subagent.renewed", "k1")
     expect(renewed and not seat.of("subagent.ended", "k1"), f"k1 was not renewed: {seat.claims()}")
+    expect(max(fields(claim)["lease_expires_at_unix_ms"] for claim in renewed)
+           > appeared["lease_expires_at_unix_ms"], "the child's initial lease was never extended")
+    after = node.api("/v1/client/agents/" + seat.subject) or {}
+    expect(after.get("harness_state") == "idle", f"child changed parent activity: {after}")
+    shown_after = shown(node, seat, "k1", "outlives its first lease")
+    checks["background_child_under_idle_parent"] = {
+        "initial_lease": appeared["lease_expires_at_unix_ms"],
+        "renewed_lease": max(fields(claim)["lease_expires_at_unix_ms"] for claim in renewed),
+        "parent_activity_before": parent["harness_state"],
+        "parent_activity_after": after["harness_state"],
+        "mail_delivery": delivered,
+        "presentation_before": shown_before,
+        "presentation_after_renewal": shown_after,
+    }
     checks["renewals_while_running"] = len(renewed)
 
+    # An authoritative child stop completes it once and clears child visibility. A new parent
+    # Stop reads that child's usage without turning the parent's model activity into working.
+    seat.control("finish", id="k1", responses=[{"input": 0, "output": 7}])
+    seat.control("turn-end", running=[])
+    seat.applied()
+    completed = seat.ended("k1")
+    expect(completed.get("outcome") == "completed" and completed.get("total_tokens") == 7,
+           f"background completion: {completed}")
+    cleared = until(lambda: (card if (card := node.api("/v1/client/agents/" + seat.subject))
+                             and not card.get("subagents") else None),
+                    30, "the completed background child remained visible")
+    expect(cleared.get("harness_state") == "idle", f"completion changed parent activity: {cleared}")
+    expect("outlives its first lease" not in node.cli("agents", "show", seat.subject),
+           "the completed background child remained on its card")
+    expect("outlives its first lease" not in node.cli("agents", "tree"),
+           "the completed background child remained in the tree")
+    expect(len(seat.of("subagent.ended", "k1")) == 1, "background child completed twice")
+    checks["background_child_completed_and_cleared"] = {
+        "ended": completed, "parent_activity": cleared["harness_state"],
+        "subagents": cleared.get("subagents"),
+        "card": node.cli("agents", "show", seat.subject), "tree": node.cli("agents", "tree"),
+    }
+
     # A frozen seat renews nothing: the lease runs out and st ends the subagent.
+    seat.control("spawn", id="frozen", description="lease expires while its driver is frozen")
+    seat.appeared("frozen")
     harness = ("driver claude", "/bin/claude")
     frozen = [pid for part in harness for pid in seat.node.signal_seat(KILLED, signal.SIGSTOP, only=part)]
     expect(frozen, "no seat process to freeze")
     try:
-        ended = seat.ended("k1", timeout=LEASE_MS / 1000 * 4)
+        ended = seat.ended("frozen", timeout=LEASE_MS / 1000 * 4)
     finally:
         for part in harness:
             seat.node.signal_seat(KILLED, signal.SIGCONT, only=part)
-    expect(ended.get("outcome") == "expired", f"k1 end: {ended}")
+    expect(ended.get("outcome") == "expired", f"frozen end: {ended}")
     # Thawed, the harness still runs it and then stops it: st records nothing more for it.
-    seat.control("finish", id="k1", responses=[{"output": 1}])
+    seat.control("finish", id="frozen", responses=[{"output": 1}])
     time.sleep(3)
-    expect(len(seat.of("subagent.ended", "k1")) == 1, f"k1 ended twice: {seat.of('subagent.ended', 'k1')}")
-    later = [claim for claim in seat.of("subagent.renewed", "k1")
-             if claim.get("store_index", 0) > max(c.get("store_index", 0) for c in seat.of("subagent.ended", "k1"))]
-    expect(not later, f"k1 was renewed after it ended: {later}")
+    expect(len(seat.of("subagent.ended", "frozen")) == 1,
+           f"frozen ended twice: {seat.of('subagent.ended', 'frozen')}")
+    for child in ("k1", "frozen"):
+        later = [claim for claim in seat.of("subagent.renewed", child)
+                 if claim.get("store_index", 0) > max(c.get("store_index", 0)
+                                                    for c in seat.of("subagent.ended", child))]
+        expect(not later, f"{child} was renewed after it ended: {later}")
     checks["expired"] = ended
 
     # A killed seat records no end: its short lease runs out, or its restart closes it first.
     seat.control("spawn", id="k2", description="dies with its seat")
-    seat.appeared("k2")
+    previous_incarnation = seat.appeared("k2")["incarnation_id"]
     killed_at = time.time()
     kill_seat(seat)
     ended = seat.ended("k2", timeout=90)
     expect(ended.get("outcome") in ("expired", "harness-exited"), f"k2 end: {ended}")
-    seat.ready(after=killed_at)
+    restarted = seat.ready(after=killed_at)
     checks["killed_seat"] = ended
 
-    # A killed harness: its driver records the end.
+    # Wait before starting k3's short lease: a stand-in receipt alone does not prove that
+    # the restarted driver is ready to observe its harness exiting.
+    driver = seat.restarted_driver_ready(previous_incarnation, restarted["session"], ledger_path)
+    checks["killed_harness_ready"] = {
+        "previous_incarnation": previous_incarnation,
+        "incarnation": driver["incarnation_id"], "session": restarted["session"],
+        "managed_session": driver.get("current_session_id"),
+        "harness_state": driver["harness_state"], "stand_in": restarted,
+    }
+
+    # A killed harness: its ready driver records the end for this incarnation.
     seat.control("spawn", id="k3", description="dies with its harness")
-    seat.appeared("k3")
-    seat.node.signal_seat(KILLED, signal.SIGKILL, only="/bin/claude")
+    appeared = seat.appeared("k3")
+    expect(appeared.get("incarnation_id") == driver["incarnation_id"]
+           and appeared.get("session_id") == restarted["session"],
+           f"k3 appeared outside the ready incarnation/session: {appeared}")
+    killed = seat.node.signal_seat(KILLED, signal.SIGKILL, only="/bin/claude")
+    expect(restarted["pid"] in killed, "the ready harness was not killed")
     ended = seat.ended("k3", timeout=60)
     expect(ended.get("outcome") == "harness-exited", f"k3 end: {ended}")
     checks["killed_harness"] = ended
@@ -412,6 +595,17 @@ def restarted_scenarios(node, seat, checks):
     expect(ended.get("outcome") == "harness-exited", f"r1 end: {ended}")
     seat.ready(after=killed_at)
     checks["restart_closes"] = ended
+    cleared = until(lambda: (card if (card := node.api("/v1/client/agents/" + seat.subject))
+                             and not card.get("subagents") else None),
+                    30, "the restarted parent retained its predecessor's child")
+    card = node.cli("agents", "show", seat.subject)
+    tree = node.cli("agents", "tree")
+    expect("dies with its seat" not in card and "dies with its seat" not in tree,
+           "the restarted parent shows a phantom child")
+    checks["restart_has_no_phantom_child"] = {
+        "parent_activity": cleared["harness_state"], "subagents": cleared.get("subagents"),
+        "card": card, "tree": tree,
+    }
 
 
 def stopped_scenarios(node, seat, checks):
@@ -455,6 +649,7 @@ def run(args, root, evidence):
         killed = Seat(node, KILLED, root / "ws-killed")
         restarted = Seat(node, RESTARTED, root / "ws-restarted")
         stopped = Seat(node, STOPPED, root / "ws-stopped")
+        old_settings = Seat(node, OLD_SETTINGS, root / "ws-old-settings")
         (root / "seats.kdl").write_text(f'''version 2
 agent "killed" {{
   identity "eval/killed"
@@ -474,6 +669,12 @@ agent "stopped" {{
   workspace "{stopped.workspace}"
   harness "claude" {{}}
 }}
+agent "old-hook-settings" {{
+  identity "eval/old-hook-settings"
+  workspace "{old_settings.workspace}"
+  env {{ ST3_SUBAGENTS_EVAL_OLD_SETTINGS "1" }}
+  harness "claude" {{}}
+}}
 ''')
         node.cli("agents", "apply", str(root / "seats.kdl"), "--as", "person/eval")
         (root / "ws-worker").mkdir()
@@ -491,15 +692,17 @@ mission "eval/subagents" state="ready" {{
 }}
 ''')
         node.cli("missions", "publish", str(root / "mission.kdl"), "--as", "person/eval")
-        started = json.loads(node.cli("missions", "start", "eval/subagents", "--id", "eval-subagents",
+        run_id = "eval/subagents/c1"
+        started = json.loads(node.cli("missions", "start", "eval/subagents", "--id", run_id,
                                       "--workspace", str(root / "ws-worker"), "--as", "person/eval", "--json"))
-        run_subject = started.get("subject") or "mission-run/eval-subagents"
-        worker_subject = "agent/eval-subagents/worker"
+        run_subject = started.get("subject") or f"mission-run/{run_id}"
+        worker_subject = f"agent/{run_id}/worker"
         worker = Seat(node, worker_subject, root / "ws-worker")
-        seats = [worker, killed, restarted, stopped]
+        seats = [worker, killed, restarted, stopped, old_settings]
         for seat in seats:
             seat.ready()
         checks["seats"] = [seat.subject for seat in seats]
+        old_settings_capture(node, old_settings, checks)
         stopped_scenarios(node, stopped, checks)
         killed_scenarios(node, killed, checks)
         restarted_scenarios(node, restarted, checks)

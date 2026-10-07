@@ -14,6 +14,8 @@ pub(crate) use github_repository::{RECENT_COMMENTS, merge_recent_comments, recen
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
+use crate::github_http::GithubAuth;
+
 #[derive(Clone, Debug)]
 pub struct ObservationRequest {
     pub provider: String,
@@ -293,11 +295,11 @@ fn parse_github_ref_locator(locator: &str) -> Result<GithubRefLocator> {
 }
 
 async fn observe_github_ref(request: ObservationRequest) -> Result<ProviderObservation> {
-    let token = github_token().await?;
+    let token = github_auth().await?;
     observe_github_ref_at(request, &github_api_base(), &token).await
 }
 
-async fn observe_github_ref_at(request: ObservationRequest, api: &str, token: &str) -> Result<ProviderObservation> {
+async fn observe_github_ref_at(request: ObservationRequest, api: &str, token: &GithubAuth) -> Result<ProviderObservation> {
     let cache_for = github_cache_for(&request);
     let locator = parse_github_ref_locator(&request.locator)?;
     let client = github_client();
@@ -414,14 +416,14 @@ fn normalize_github_ref(
 }
 
 async fn observe_github_repository(request: ObservationRequest) -> Result<ProviderObservation> {
-    let token = github_token().await?;
+    let token = github_auth().await?;
     observe_github_repository_at(request, &github_api_base(), Some(&token)).await
 }
 
 async fn observe_github_repository_at(
     request: ObservationRequest,
     api_base: &str,
-    token: Option<&str>,
+    token: Option<&GithubAuth>,
 ) -> Result<ProviderObservation> {
     github_repository::observe_at(request, api_base, token).await
 }
@@ -724,7 +726,7 @@ fn record_github_response(status: reqwest::StatusCode, headers: &reqwest::header
 async fn github_json(
     client: &reqwest::Client,
     url: String,
-    token: &str,
+    token: &GithubAuth,
     cache_for: Duration,
 ) -> Result<GithubPayload> {
     let entry = {
@@ -746,12 +748,11 @@ async fn github_json(
     let mut request = client
         .get(&url)
         .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .bearer_auth(token);
+        .header("X-GitHub-Api-Version", "2022-11-28");
     if let Some(etag) = cached.as_ref().and_then(|payload| payload.etag.as_deref()) {
         request = request.header(reqwest::header::IF_NONE_MATCH, etag);
     }
-    let response = request.send().await?;
+    let response = crate::github_http::send(request, token).await?;
     record_github_response(response.status(), response.headers());
     let response = github_response(response).await?;
     if response.status() == reqwest::StatusCode::NOT_MODIFIED {
@@ -780,7 +781,7 @@ async fn github_json(
 async fn github_pages(
     client: &reqwest::Client,
     url: String,
-    token: &str,
+    token: &GithubAuth,
     cache_for: Duration,
 ) -> Result<Vec<Value>> {
     Ok(
@@ -804,7 +805,7 @@ pub(crate) struct GithubListing {
 async fn github_listing(
     client: &reqwest::Client,
     url: String,
-    token: &str,
+    token: &GithubAuth,
     cache_for: Duration,
     pages: usize,
     resumable: bool,
@@ -842,17 +843,15 @@ async fn github_listing(
 async fn github_graphql(
     client: &reqwest::Client,
     api_base: &str,
-    token: &str,
+    token: &GithubAuth,
     query: &str,
     variables: Value,
 ) -> Result<Value> {
-    let response = client
+    let request = client
         .post(format!("{api_base}/graphql"))
         .header("Accept", "application/vnd.github+json")
-        .bearer_auth(token)
-        .json(&json!({"query": query, "variables": variables}))
-        .send()
-        .await?;
+        .json(&json!({"query": query, "variables": variables}));
+    let response = crate::github_http::send(request, token).await?;
     record_github_response(response.status(), response.headers());
     let response = github_response(response).await?;
     let headers = response.headers().clone();
@@ -887,49 +886,14 @@ async fn github_graphql(
         .context("the GitHub GraphQL response has no data")
 }
 
-pub(crate) const GITHUB_AUTH_REMEDY: &str = "GitHub observers have no token; run `gh auth login` as the daemon account or export GH_TOKEN/GITHUB_TOKEN in that account's login-shell startup files. Check the daemon PATH with `st doctor`. No anonymous request was sent; authentication is checked again on the next poll.";
+pub(crate) const GITHUB_AUTH_REMEDY: &str = "GitHub observers have no token; run `gh auth login` as the daemon account or export GH_TOKEN/GITHUB_TOKEN in that account's login-shell startup files. Check the daemon PATH with `st doctor`. No anonymous request was sent; failed or rejected credentials are checked again after a 30-second refresh backoff. HTTP requests are never retried.";
 
-pub(crate) async fn github_token() -> Result<String> {
-    static TOKEN: OnceLock<tokio::sync::Mutex<Option<(Instant, String)>>> = OnceLock::new();
-    let cache = TOKEN.get_or_init(|| tokio::sync::Mutex::new(None));
-    let mut cached = cache.lock().await;
-    if let Some((checked_at, token)) = cached.as_ref()
-        && checked_at.elapsed() < Duration::from_secs(180)
-    {
-        return Ok(token.clone());
-    }
-    let environment = tokio::task::spawn_blocking(crate::environment::snapshot).await??;
-    let token = lookup_github_token(&environment)
-        .await
-        .context(GITHUB_AUTH_REMEDY)?;
-    *cached = Some((Instant::now(), token.clone()));
-    Ok(token)
-}
+pub(crate) use crate::github_http::github_auth;
 
-async fn lookup_github_token(
-    environment: &std::collections::BTreeMap<String, String>,
-) -> Result<String> {
-    if let Some(token) = ["GH_TOKEN", "GITHUB_TOKEN"]
-        .into_iter()
-        .filter_map(|name| environment.get(name))
-        .find(|value| !value.trim().is_empty())
-    {
-        return Ok(token.clone());
-    }
-    let mut command =
-        tokio::process::Command::from(crate::environment::command_in("gh", environment)?);
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        command.args(["auth", "token"]).kill_on_drop(true).output(),
-    )
-    .await
-    .context("GitHub credential lookup timed out")??;
-    // gh stderr can contain sensitive data. Only report a fixed, actionable error.
-    anyhow::ensure!(output.status.success(), "gh auth token failed");
-    let token = String::from_utf8(output.stdout).context("gh returned a non-UTF-8 token")?;
-    let token = token.trim();
-    anyhow::ensure!(!token.is_empty(), "gh returned an empty token");
-    Ok(token.to_owned())
+/// Select the daemon's GitHub source before its first request. Configuration is immutable
+/// for this process; token-file contents are revalidated when the file changes.
+pub fn configure_github(config: &crate::config::GithubConfig) -> Result<()> {
+    crate::github_http::configure(config)
 }
 
 /// An st agent on this host and the workspace it works in.
@@ -1074,18 +1038,18 @@ fn observe_local_file(request: ObservationRequest) -> Result<ProviderObservation
 }
 
 async fn observe_github_pull_request(request: ObservationRequest) -> Result<ProviderObservation> {
-    let token = github_token().await?;
+    let token = github_auth().await?;
     observe_github_pull_request_at(request, &github_api_base(), Some(&token)).await
 }
 
 async fn observe_github_pull_request_at(
     request: ObservationRequest,
     api_base: &str,
-    token: Option<&str>,
+    token: Option<&GithubAuth>,
 ) -> Result<ProviderObservation> {
     let cache_for = github_cache_for(&request);
     let token = token
-        .filter(|value| !value.trim().is_empty())
+        .filter(|value| value.is_valid())
         .context(GITHUB_AUTH_REMEDY)?;
     let (repository, number) = request
         .locator
@@ -1209,19 +1173,19 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let environment =
             std::collections::BTreeMap::from([("PATH".into(), root.path().display().to_string())]);
-        assert!(lookup_github_token(&environment).await.is_err());
+        assert!(crate::github_http::lookup_github_token(&environment).await.is_err());
         let gh = root.path().join("gh");
         std::fs::write(&gh, "#!/bin/sh\nexit 1\n").unwrap();
         std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(lookup_github_token(&environment).await.is_err());
+        assert!(crate::github_http::lookup_github_token(&environment).await.is_err());
         for token in ["orchid-first", "orchid-rotated"] {
             std::fs::write(&gh, format!("#!/bin/sh\nprintf '%s' '{token}'\n")).unwrap();
-            assert_eq!(lookup_github_token(&environment).await.unwrap(), token);
+            assert_eq!(crate::github_http::lookup_github_token(&environment).await.unwrap(), token);
         }
         let mut exported = environment;
         exported.insert("GH_TOKEN".into(), "orchid-exported".into());
         assert_eq!(
-            lookup_github_token(&exported).await.unwrap(),
+            crate::github_http::lookup_github_token(&exported).await.unwrap(),
             "orchid-exported"
         );
     }
@@ -1239,7 +1203,9 @@ mod tests {
             every_ms: None,
             refresh: false,
         };
-        for token in [None, Some(""), Some(" ")] {
+        let empty = GithubAuth::test("");
+        let blank = GithubAuth::test(" ");
+        for token in [None, Some(&empty), Some(&blank)] {
             let error = observe_github_repository_at(request.clone(), &base, token)
                 .await
                 .unwrap_err();
@@ -1405,7 +1371,7 @@ mod tests {
         };
         let observed = tokio::time::timeout(
             Duration::from_secs(10),
-            observe_github_repository_at(request, &base, Some("test")),
+            observe_github_repository_at(request, &base, Some(&GithubAuth::test("test"))),
         )
         .await
         .expect("the request did not time out");
@@ -1438,9 +1404,9 @@ mod tests {
         });
         let request = || ObservationRequest { provider:"github.ref".into(), locator:"acme/garden@main".into(), fields:BTreeSet::from(["head".into()]),
             cursor:None, previous_facts:None, every_ms:Some(GITHUB_REF_WATCH_MS), refresh:true };
-        let first = observe_github_ref_at(request(), &base, "fixture-token").await.unwrap();
-        let unchanged = observe_github_ref_at(request(), &base, "fixture-token").await.unwrap();
-        let changed = observe_github_ref_at(request(), &base, "fixture-token").await.unwrap();
+        let first = observe_github_ref_at(request(), &base, &GithubAuth::test("fixture-token")).await.unwrap();
+        let unchanged = observe_github_ref_at(request(), &base, &GithubAuth::test("fixture-token")).await.unwrap();
+        let changed = observe_github_ref_at(request(), &base, &GithubAuth::test("fixture-token")).await.unwrap();
         assert_eq!(first.facts, unchanged.facts); assert_eq!(first.cursor, unchanged.cursor);
         assert_ne!(changed.cursor, unchanged.cursor);
         assert_eq!(changed.facts["head"], "b".repeat(40));
@@ -1486,7 +1452,7 @@ mod tests {
                     refresh: false,
                 },
                 &base,
-                Some("orchid-test-token"),
+                Some(&GithubAuth::test("orchid-test-token")),
             )
             .await
             .unwrap();

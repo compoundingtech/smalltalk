@@ -26,7 +26,7 @@ Choose a tag from the repository's Releases page, then download the archive for 
 and its `.sha256` file. For example, with GitHub CLI:
 
 ```sh
-tag=v0.3.0 # replace with the release you want
+tag=v0.3.16 # example: choose a release and read its Upgrade impact first
 archive=smalltalk-x86_64-unknown-linux-gnu.tar.gz
 # On Apple Silicon: archive=smalltalk-aarch64-apple-darwin.tar.gz
 gh release download "$tag" --repo compoundingtech/smalltalk \
@@ -38,9 +38,19 @@ tar -xzf "$archive"
 
 Put the chosen bin directory on `PATH`. The installer stages all four tools and the `st` link,
 then replaces each by rename; existing processes retain their old executable. It does not restart
-anything or erase state. On macOS it installs `st3` and `stui` in the fixed `~/Applications/SmallTalk.app` bundle, registers it with Launch Services, and updates existing daemon/replication LaunchAgent paths. Configure `ST_MACOS_SIGNING_IDENTITY` and optionally `ST_MACOS_SIGNING_TEAM` for persistent signing; no identity uses ad-hoc signing. A configured missing identity fails rather than falling back. See [macOS installation and signing](macos-installation.md). Keep the previous archive to roll back using the
-same procedure. A first daemon install uses `st service install`. For an existing daemon, schedule
-`st service restart` after installation and verify `st doctor --strict` and peer health. Restarting
+anything or erase state. On macOS it installs `st3` and `stui` in the fixed `~/Applications/SmallTalk.app` bundle, registers it with Launch Services, and updates existing daemon/replication LaunchAgent paths. Configure `ST_MACOS_SIGNING_IDENTITY` and optionally `ST_MACOS_SIGNING_TEAM` for persistent signing; no identity uses ad-hoc signing. A configured missing identity fails rather than falling back. See [macOS installation and signing](macos-installation.md). Keep the previous archive as recovery material. Installing it again is a supported rollback
+only when its database, claim and driver contracts can read the current state; see
+[upgrade and recovery](../upgrading-st.md#swap-back-or-roll-forward) and the
+[0.x compatibility policy](compatibility.md). Forward-only migrations require roll-forward
+unless the release explicitly documents a downgrade. Before upgrading a healthy populated
+store, make a [claim backup](backups.md) and preserve excluded local data separately.
+
+Run `st service install` after the first install or a changed executable path; it refreshes
+service definitions and restarts daemon and replication services. `st service restart` suffices
+when those definitions already point at the intended binaries. Schedule that restart, compare
+`st --version --json` with the daemon's `machine_version` in `st doctor --json`, and verify peer
+health. `st doctor --strict` also treats warnings as failures: inspect each warning rather than
+assuming an optional-tool warning means that the API is unavailable. Restarting
 invalidates an ongoing continuous soak window, so coordinate that separately from downloading or
 installing files.
 
@@ -94,7 +104,8 @@ Daily, manual dispatch, and tag publication use the same source-pinned **Upgrade
 section before the change list, and attach `UPGRADE-IMPACT.json`. It describes replay,
 database changes, checkpoint rules/fleet coordination, client and harness compatibility,
 service interruption, manual steps, and recovery. Missing classifications stop publication;
-main builds and merges continue. See [release impact authoring](release-impact.md) for
+main builds continue. PRs above the documented [adoption boundary](release-impact.md)
+also need a fresh valid fragment before merging. See [release impact authoring](release-impact.md) for
 committed fragments, measurements, historical backfills, and a notes-only preview.
 
 Tag names are labels, not embedded package versions: use `BUILD.json`/`RELEASE.json` for exact

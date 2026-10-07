@@ -319,6 +319,24 @@ async fn assert_raw_terminal_transport(
     }).await.unwrap();
     assert_eq!(uploaded, upload);
 
+    if mode == RawTerminalMode::Attach {
+        let recovery = pty_packet(11, &[]);
+        stream.write_all(&recovery[..3]).await.unwrap();
+        stream.write_all(&recovery[3..]).await.unwrap();
+        let mut forwarded = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while forwarded.len() < recovery.len() {
+                forwarded.extend(input.recv().await.unwrap());
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            forwarded, recovery,
+            "recovery crosses both gateway transports unchanged"
+        );
+    }
+
     let output = b"\0\xff\x1b[?1049h\x1b[38;2;1;2;3mraw\r\n";
     pty.write(output);
     replay.extend_from_slice(output);

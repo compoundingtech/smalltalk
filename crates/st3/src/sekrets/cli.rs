@@ -380,6 +380,7 @@ fn describe(caller: &CallerView) -> String {
     match caller {
         CallerView::Person { person } => format!("{person}, from a login session"),
         CallerView::Agent { agent, person } => format!("{agent}, working for {person}"),
+        CallerView::Host { node, person } => format!("{node}'s st, working for {person}"),
         CallerView::Unidentified { person, reason } => {
             format!("unidentified process of {person}: {reason}")
         }

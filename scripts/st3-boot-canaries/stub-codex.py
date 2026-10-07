@@ -193,6 +193,10 @@ class AppServer:
         params = message.get("params") or {}
         if method == "initialize":
             self.send(client, {"id": ident, "result": {"userAgent": "codex-stub"}})
+        elif method == "config/read":
+            self.send(client, {"id": ident, "result": {
+                "config": {"approval_policy": None},
+                "origins": {"approval_policy": None}}})
         elif method == "thread/start":
             if not self.thread_id:
                 self.thread_id = str(uuid.uuid4())
@@ -212,7 +216,20 @@ class AppServer:
                 if requested != self.thread_id:
                     stubmodel.receipt("thread", id=requested, resumed=True)
                 self.thread_id = requested
-                self.send(client, {"id": ident, "result": {"thread": self.thread()}})
+                result = {"thread": self.thread()}
+                for setting in ("approvalPolicy", "approvalsReviewer", "model"):
+                    if setting in params:
+                        result[setting] = params[setting]
+                if "sandbox" in params:
+                    result["sandbox"] = {"type": {
+                        "read-only": "readOnly",
+                        "workspace-write": "workspaceWrite",
+                        "danger-full-access": "dangerFullAccess",
+                    }[params["sandbox"]]}
+                effort = params.get("config", {}).get("model_reasoning_effort")
+                if effort is not None:
+                    result["reasoningEffort"] = effort
+                self.send(client, {"id": ident, "result": result})
         elif method == "account/read":
             self.send(client, {"id": ident, "result": {"account": {"type": "apiKey"}}})
         elif method == "thread/read":
