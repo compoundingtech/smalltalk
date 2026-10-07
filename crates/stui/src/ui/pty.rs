@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 /// Lines kept above the screen to scroll back through.
 const HISTORY: usize = 10_000;
 /// The most wheel reports sent to a program at once.
-const WHEEL_REPORTS: usize = 6;
+const WHEEL_REPORTS: usize = 24;
 /// How long the first screen may take to arrive.
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -355,8 +355,7 @@ impl NativeTerminal {
         let mode = self.mode();
         if !local && mode.intersects(TermMode::MOUSE_MODE) {
             if let Some(mouse) = protocol_mouse(mouse, column, row) {
-                // A terminal sends one report per wheel notch, whatever the lines it scrolls.
-                self.send(Input::Mouse(mouse, 1));
+                self.send(Input::Mouse(mouse, lines.unsigned_abs() as usize));
             }
         } else if matches!(
             mouse.kind,
@@ -674,7 +673,7 @@ fn run(
     loop {
         // Wheel reports that queued up while the program drew are sent as one write, and at
         // most `WHEEL_REPORTS` of them: a program redraws for each, and a long flick must not
-        // queue minutes of redraws behind it.
+        // queue minutes of redraws behind it. A single notch is still three reports.
         let mut wheel: Option<(Vec<u8>, usize)> = None;
         loop {
             let input = inputs.try_recv();
@@ -1356,7 +1355,7 @@ mod tests {
                 .collect::<String>()
                 .contains("line 29")
         });
-        // A program that asked for the mouse gets one report per notch, not one per line.
+        // A program that asked for the mouse gets a notch's reports, and a flick's are capped.
         daemon
             .write_all(&encode_packet(MessageType::Data, b"\x1b[?1000h\x1b[?1006h"))
             .unwrap();
@@ -1370,7 +1369,7 @@ mod tests {
         terminal.wheel(3, notch, 0, 0, false);
         let data = next(&mut daemon, &mut packets);
         assert_eq!(data.type_, MessageType::Data);
-        assert_eq!(data.payload, b"\x1b[<64;1;1M");
+        assert_eq!(data.payload, b"\x1b[<64;1;1M".repeat(3));
         daemon
             .write_all(&encode_packet(MessageType::Data, b"\x1b[?1000l\x1b[?1006l"))
             .unwrap();
