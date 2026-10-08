@@ -144,6 +144,22 @@ pub struct Certificate {
 /// canonical order. A writer that comes back and seals ends its own excusal. An excusal that
 /// is not a person's counts for nothing.
 pub fn excused_writers(claims: &[CheckpointClaim]) -> BTreeSet<String> {
+    excused_writers_with_rules(claims, None)
+}
+
+/// The runtime's excusals end only when a returning writer can seal or verify with the same
+/// rules. A stale build's checkpoint work remains visible but cannot resume participation.
+pub fn excused_writers_for_rules(
+    claims: &[CheckpointClaim],
+    rules_digest: &str,
+) -> BTreeSet<String> {
+    excused_writers_with_rules(claims, Some(rules_digest))
+}
+
+fn excused_writers_with_rules(
+    claims: &[CheckpointClaim],
+    rules_digest: Option<&str>,
+) -> BTreeSet<String> {
     let mut excused = BTreeSet::new();
     for claim in claims {
         if claim.kind == CHECKPOINT_EXCUSED {
@@ -154,7 +170,16 @@ pub fn excused_writers(claims: &[CheckpointClaim]) -> BTreeSet<String> {
             if by_person && let Some(writer) = claim.text("writer") {
                 excused.insert(writer.to_owned());
             }
-        } else if claim.is_checkpoint_work() {
+        } else if excused.contains(&claim.writer)
+            && claim.is_checkpoint_work()
+            && rules_digest.is_none_or(|rules| {
+                claim.seal_terms().is_some_and(|terms| {
+                    terms.rules_digest == rules && terms.participants.contains(&claim.writer)
+                }) || claim.verified_terms().is_some_and(|terms| {
+                    terms.rules_digest == rules && terms.participants.contains(&claim.writer)
+                })
+            })
+        {
             excused.remove(&claim.writer);
         }
     }
@@ -171,6 +196,26 @@ pub fn participants(
     claims: &[CheckpointClaim],
 ) -> BTreeSet<String> {
     let excused = excused_writers(claims);
+    participants_with_excusals(known, left, claims, &excused)
+}
+
+/// Participant selection for a runtime whose rules must match a returning writer's work.
+pub fn participants_for_rules(
+    known: &BTreeSet<String>,
+    left: &BTreeSet<String>,
+    claims: &[CheckpointClaim],
+    rules_digest: &str,
+) -> BTreeSet<String> {
+    let excused = excused_writers_for_rules(claims, rules_digest);
+    participants_with_excusals(known, left, claims, &excused)
+}
+
+fn participants_with_excusals(
+    known: &BTreeSet<String>,
+    left: &BTreeSet<String>,
+    claims: &[CheckpointClaim],
+    excused: &BTreeSet<String>,
+) -> BTreeSet<String> {
     let named = claims
         .iter()
         .filter(|claim| claim.is_checkpoint_work())
@@ -580,7 +625,15 @@ impl Store {
     ) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
         let known = self.checkpoint_known_writers(configured_peers)?;
         let left = self.checkpoint_left_writers()?;
-        Ok((participants(&known, &left, claims), left))
+        Ok((
+            participants_for_rules(
+                &known,
+                &left,
+                claims,
+                &self.runtime.checkpoint_rules_digest(),
+            ),
+            left,
+        ))
     }
 
     /// Record that this node sealed or verified a checkpoint. From here on it never writes a
@@ -1074,7 +1127,7 @@ impl Store {
             trimmed,
             halted: self.checkpoint_halted()?,
             pending,
-            excused: excused_writers(&claims),
+            excused: excused_writers_for_rules(&claims, &self.runtime.checkpoint_rules_digest()),
             participants,
             left,
         })
