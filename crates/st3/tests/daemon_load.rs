@@ -141,6 +141,10 @@ struct Report {
     roster_subscribers: usize,
     #[serde(default)]
     roster_change_frames: usize,
+    /// Rosters the daemon folded again card by card during the timed load, by why: each one
+    /// is every card refolded rather than only the changed ones.
+    #[serde(default)]
+    roster_full_folds: BTreeMap<String, u64>,
     #[serde(default)]
     regime: String,
     #[serde(default)]
@@ -601,6 +605,12 @@ fn print(report: &Report) {
         "agents roster: {}/{} concurrent subscribers with correct snapshots; {} validated change frames; window limit {}",
         report.roster_subscribers, ROSTER_SUBSCRIBERS, report.roster_change_frames, ROSTER_LIMIT
     );
+    let full_folds = report.roster_full_folds.values().sum::<u64>();
+    println!(
+        "agents roster full refolds: {full_folds} ({:.1}/min) {:?}",
+        full_folds as f64 * 60.0 / report.seconds.max(1.0),
+        report.roster_full_folds
+    );
     println!(
         "{:<28} {:>7} {:>8} {:>8} {:>8} {:>8}",
         "request", "n", "p50 ms", "p99 ms", "max ms", "budget"
@@ -930,6 +940,7 @@ fn run(
         assert!(!migration_pending_at_load_start);
     }
     let cpu_before = (process_cpu(), load_cpu(&peer_threads));
+    let full_folds_before = context.store.agent_roster_chunked_assemblies();
     let cursor = context.store.index().unwrap();
     let started = Instant::now();
     load.block_on(async {
@@ -1163,6 +1174,10 @@ fn run(
     });
     let elapsed = started.elapsed().as_secs_f64();
     let cpu_after = (process_cpu(), load_cpu(&peer_threads));
+    let roster_full_folds = context.store.agent_roster_chunked_assemblies().into_iter()
+        .map(|(why, count)| (why.clone(), count - full_folds_before.get(&why).copied().unwrap_or(0)))
+        .filter(|(_, count)| *count > 0)
+        .collect::<BTreeMap<_, _>>();
     let daemon_cpu = (cpu_after.0 - cpu_before.0) - (cpu_after.1 - cpu_before.1);
 
     let migration_pending_at_load_end = context.store.event_payload_migration_pending().unwrap();
@@ -1206,6 +1221,7 @@ fn run(
         long_poll_seats: long_poll_seats.load(Ordering::Relaxed),
         roster_subscribers,
         roster_change_frames: roster_change_frames.load(Ordering::Relaxed),
+        roster_full_folds,
         regime: regime.name().into(),
         actual_ci_checkout: std::env::var("GITHUB_SHA").ok(),
         event_migration,
