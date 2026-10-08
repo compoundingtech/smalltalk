@@ -15,21 +15,206 @@ never authority. Prints only a few status lines, never terminal contents.
 
 `--keys` takes text sent as typed, with `\\x1b`, `\\r` and `\\x0b` (Ctrl+K) escapes understood,
 for example to open the palette and choose an agent: --keys '\\x0bstui\\r'.
-"""
 
+Measuring a send. `--events FILE` writes JSON lines with wall-clock epoch milliseconds and this
+process's monotonic milliseconds for: the start, each `--keys` write (index and byte count, never
+the keys), and, with `--say MARKER`, the typing, the composer echo, the Enter, and the moment the
+marker is visible in the conversation. MARKER must be an invented ID (8 to 64 of A-Z a-z 0-9 . _ -):
+it is typed into the message box, the box's echo is noted, Enter is sent as its own write, and the
+marker counts as visible only when it is on the screen at a place other than the box's echo and the
+box has cleared. That is the sender's conversation showing the message, including the entry stui
+draws before st acknowledges it: compare its time with the message.send request in the `--timing`
+log to tell that from an acknowledged one. If the echo or the visible marker never comes within
+`--visible-timeout` seconds the exit status is 3 or 4 and the events say which. Screen contents
+are never logged; the screen is rebuilt here only to find the marker.
+"""
 import argparse
+import codecs
 import fcntl
+import json
 import os
 import pty
+import re
 import select
 import signal
 import struct
 import subprocess
+import sys
 import termios
 import time
+import unicodedata
+
+MARKER = re.compile(r"^[A-Za-z0-9._-]{8,64}$")
 
 
-def main() -> None:
+class Screen:
+    """The text of a terminal, rebuilt from the bytes written to it: enough of an emulator to find
+    where a marker is. Partial escape sequences and partial UTF-8 across reads are carried over."""
+
+    def __init__(self, rows: int, columns: int) -> None:
+        self.rows, self.columns = rows, columns
+        self.grid = [[" "] * columns for _ in range(rows)]
+        self.row = self.column = 0
+        self.state = "ground"
+        self.params = ""
+        self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
+
+    def feed(self, data: bytes) -> None:
+        for char in self.decoder.decode(data):
+            self._char(char)
+
+    def _char(self, char: str) -> None:
+        state = self.state
+        if state == "ground":
+            if char == "\x1b":
+                self.state = "esc"
+            elif char == "\r":
+                self.column = 0
+            elif char == "\n":
+                self.row = min(self.row + 1, self.rows - 1)
+            elif char == "\b":
+                self.column = max(self.column - 1, 0)
+            elif char == "\t":
+                self.column = min((self.column // 8 + 1) * 8, self.columns - 1)
+            elif char >= " " and char != "\x7f":
+                self._put(char)
+        elif state == "esc":
+            if char == "[":
+                self.state, self.params = "csi", ""
+            elif char in "]PX^_":
+                self.state = "string"
+            else:
+                self.state = "ground"
+        elif state == "csi":
+            if "\x40" <= char <= "\x7e":
+                self._csi(char, self.params)
+                self.state = "ground"
+            else:
+                self.params += char
+        elif state == "string":
+            # OSC, DCS, APC end at BEL or ESC \.
+            if char == "\x07":
+                self.state = "ground"
+            elif char == "\x1b":
+                self.state = "string-esc"
+        elif state == "string-esc":
+            self.state = "ground" if char == "\\" else "string"
+
+    def _put(self, char: str) -> None:
+        wide = unicodedata.east_asian_width(char) in ("W", "F")
+        if self.column >= self.columns:
+            return
+        self.grid[self.row][self.column] = char
+        if wide and self.column + 1 < self.columns:
+            self.grid[self.row][self.column + 1] = ""
+        self.column = min(self.column + (2 if wide else 1), self.columns)
+
+    def _numbers(self, params: str, default: int) -> list[int]:
+        cleaned = params.lstrip("?>=!")
+        parts = cleaned.split(";") if cleaned else []
+        return [int(part) if part.isdigit() else default for part in parts] or [default]
+
+    def _csi(self, final: str, params: str) -> None:
+        if params[:1] and params[:1] in "?>=!<":
+            return  # private modes (alternate screen, synchronized update, keyboard flags)
+        first = self._numbers(params, 1)[0]
+        if final in "Hf":
+            numbers = self._numbers(params, 1)
+            self.row = min(max(numbers[0] - 1, 0), self.rows - 1)
+            self.column = min(max((numbers[1] if len(numbers) > 1 else 1) - 1, 0), self.columns - 1)
+        elif final == "A":
+            self.row = max(self.row - first, 0)
+        elif final == "B":
+            self.row = min(self.row + first, self.rows - 1)
+        elif final == "C":
+            self.column = min(self.column + first, self.columns - 1)
+        elif final == "D":
+            self.column = max(self.column - first, 0)
+        elif final == "G":
+            self.column = min(max(first - 1, 0), self.columns - 1)
+        elif final == "d":
+            self.row = min(max(first - 1, 0), self.rows - 1)
+        elif final == "K":
+            mode = self._numbers(params, 0)[0]
+            lo, hi = {0: (self.column, self.columns), 1: (0, self.column + 1), 2: (0, self.columns)}.get(mode, (0, 0))
+            for x in range(lo, hi):
+                self.grid[self.row][x] = " "
+        elif final == "J":
+            mode = self._numbers(params, 0)[0]
+            if mode in (2, 3):
+                self.grid = [[" "] * self.columns for _ in range(self.rows)]
+            elif mode == 0:
+                for x in range(self.column, self.columns):
+                    self.grid[self.row][x] = " "
+                for y in range(self.row + 1, self.rows):
+                    self.grid[y] = [" "] * self.columns
+            elif mode == 1:
+                for x in range(0, self.column + 1):
+                    self.grid[self.row][x] = " "
+                for y in range(0, self.row):
+                    self.grid[y] = [" "] * self.columns
+        elif final == "X":
+            for x in range(self.column, min(self.column + first, self.columns)):
+                self.grid[self.row][x] = " "
+
+    def lines(self) -> list[str]:
+        return ["".join(cell for cell in line) for line in self.grid]
+
+    def rows_with(self, marker: str) -> list[int]:
+        return [index for index, line in enumerate(self.lines()) if marker in line]
+
+
+class Events:
+    """JSON lines of wall-clock and monotonic milliseconds for what this runner does."""
+
+    def __init__(self, path: str | None) -> None:
+        self.file = open(path, "a") if path else None
+        self.origin = time.monotonic()
+
+    def now(self) -> dict:
+        return {"epoch_ms": int(time.time() * 1000), "mono_ms": round((time.monotonic() - self.origin) * 1000, 1)}
+
+    def write(self, event: str, **fields) -> None:
+        if self.file:
+            self.file.write(json.dumps({"type": event, **self.now(), **fields}) + "\n")
+            self.file.flush()
+
+
+def say(screen: Screen, write, pump, events: Events, marker: str, timeout: float) -> int:
+    """Type `marker`, see its echo in the box, send Enter alone, and wait for it to show in the
+    conversation. Returns 0, 3 (never visible) or 4 (never echoed)."""
+    write(marker.encode())
+    events.write("typed", bytes=len(marker))
+    deadline = time.monotonic() + timeout
+    echo: list[int] = []
+    while time.monotonic() < deadline and not echo:
+        pump(0.05)
+        echo = screen.rows_with(marker)
+    if not echo:
+        events.write("echo_timeout", seconds=timeout)
+        return 4
+    events.write("echo_seen", rows=echo)
+    write(b"\r")
+    sent = time.monotonic()
+    events.write("send_key")
+    deadline = sent + timeout
+    while time.monotonic() < deadline:
+        pump(0.02)
+        rows = screen.rows_with(marker)
+        # Visible in the conversation: on the screen, somewhere other than where the box echoed it.
+        if rows and not set(rows) & set(echo):
+            events.write(
+                "visible",
+                latency_ms=round((time.monotonic() - sent) * 1000, 1),
+                rows=rows,
+                state="after-enter, before any acknowledgement unless the message.send request already finished: compare with the timing log",
+            )
+            return 0
+    events.write("visible_timeout", seconds=timeout)
+    return 3
+
+
+def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", default="target/release/stui")
     parser.add_argument("--seconds", type=float, default=180)
@@ -38,8 +223,15 @@ def main() -> None:
     parser.add_argument("--columns", type=int, default=160)
     parser.add_argument("--keys", action="append", default=[])
     parser.add_argument("--timing", help="append JSON lines of this client's request and frame timings (routes, statuses, sizes, durations; never contents)")
+    parser.add_argument("--events", help="append JSON lines of this runner's own wall-clock and monotonic times (start, key writes, the marker's typing, echo, send and visibility)")
+    parser.add_argument("--say", help="type this invented marker into the open conversation's box and send it; see --events")
+    parser.add_argument("--visible-timeout", type=float, default=10)
+    parser.add_argument("--start-wait", type=float, default=5, help="seconds to let stui start and draw before any keys")
     arguments = parser.parse_args()
+    if arguments.say is not None and not MARKER.match(arguments.say):
+        parser.error("--say takes an invented ID of 8 to 64 characters from A-Z a-z 0-9 . _ -, never prose")
 
+    events = Events(arguments.events)
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", arguments.rows, arguments.columns, 0, 0))
     env = os.environ.copy()
@@ -48,15 +240,18 @@ def main() -> None:
     env.pop("ST_AGENT", None)
     if arguments.timing:
         env["STUI_TIMING_LOG"] = arguments.timing
+    events.write("start", binary_label=arguments.label)
     process = subprocess.Popen([arguments.binary], stdin=slave, stdout=slave, stderr=slave, env=env)
     os.close(slave)
     received = 0
+    screen = Screen(arguments.rows, arguments.columns)
+    status = 0
 
     def pump(seconds: float) -> None:
         nonlocal received
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline and process.poll() is None:
-            ready, _, _ = select.select([master], [], [], 0.2)
+            ready, _, _ = select.select([master], [], [], min(0.2, max(deadline - time.monotonic(), 0)))
             if not ready:
                 continue
             try:
@@ -64,14 +259,22 @@ def main() -> None:
             except OSError:
                 return
             received += len(chunk)
+            screen.feed(chunk)
             if b"\x1b[c" in chunk:
                 os.write(master, b"\x1b[?62;c")
 
+    def write(data: bytes) -> None:
+        os.write(master, data)
+
     try:
-        pump(5)
-        for keys in arguments.keys:
-            os.write(master, keys.encode().decode("unicode_escape").encode("latin-1"))
+        pump(arguments.start_wait)
+        for index, keys in enumerate(arguments.keys):
+            data = keys.encode().decode("unicode_escape").encode("latin-1")
+            events.write("keys", index=index, bytes=len(data))
+            write(data)
             pump(1.5)
+        if arguments.say is not None:
+            status = say(screen, write, pump, events, arguments.say, arguments.visible_timeout)
         print(f"test client up: pid {process.pid}, label {arguments.label!r}, idle for {arguments.seconds:g}s", flush=True)
         pump(arguments.seconds)
         if process.poll() is None:
@@ -86,6 +289,8 @@ def main() -> None:
                 process.kill()
         os.close(master)
     print(f"test client done: exit {process.returncode}, {received} bytes drawn", flush=True)
+    return status
 
 
-main()
+if __name__ == "__main__":
+    sys.exit(main())
