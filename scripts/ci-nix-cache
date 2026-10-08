@@ -71,8 +71,11 @@ case "$cmd" in
     [ -e "$RUNNER_TEMP/vm-driver" ] && roots+=("$RUNNER_TEMP/vm-driver")
     # Performance keeps its small devShell closure as well as downloads, avoiding cold tool setup.
     [ -n "${CI_PERF_SHELL_ROOT:-}" ] && roots+=("$CI_PERF_SHELL_ROOT")
-    [ -e "$RUNNER_TEMP/baseline" ] && roots+=("$RUNNER_TEMP/baseline")
-    [ -n "${ST3_MESSAGING_COMPAT_BIN:-}" ] && roots+=("${ST3_MESSAGING_COMPAT_BIN%/bin/st3}")
+    # Native release downloads are not store paths. Only the sandbox's packaged
+    # messaging baseline belongs in this Nix cache.
+    if [[ "${ST3_MESSAGING_COMPAT_BIN:-}" == /nix/store/* ]]; then
+      roots+=("${ST3_MESSAGING_COMPAT_BIN%/bin/st3}")
+    fi
     [ -n "${ST2_VISTA_COMPONENT:-}" ] && roots+=("${ST2_VISTA_COMPONENT%%/share/*}")
     if [ "${#roots[@]}" -gt 0 ]; then
       printf 'Nix cache: closures of %s\n' "${roots[*]}"

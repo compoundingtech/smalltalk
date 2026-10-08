@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+"""Exercise release selection, freshness, archive provenance and postpublish PR policy offline."""
+import base64
+import copy
+import hashlib
+import importlib.machinery
+import importlib.util
+import io
+import json
+from pathlib import Path
+import shutil
+import tarfile
+import tempfile
+import unittest
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def load(name, filename):
+    loader = importlib.machinery.SourceFileLoader(name, str(ROOT / 'scripts' / filename))
+    spec = importlib.util.spec_from_loader(name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+baseline = load('compat_release', 'compat-baseline-release')
+daily = load('compat_daily', 'release-smalltalk-daily')
+SOURCE = 'a' * 40
+
+
+def release(tag, day, **kwargs):
+    return {'tag_name': tag, 'published_at': f'2026-10-{day:02d}T00:00:00Z', 'id': day,
+            'draft': False, 'prerelease': False, **kwargs}
+
+
+def pin(tag='v0.3.17', reason=None):
+    return {'commit': SOURCE, 'tag': tag, 'why': baseline.POLICY, 'exception_reason': reason,
+            'bundles': {target: {
+                'url': f'https://github.com/compoundingtech/smalltalk/releases/download/{tag}/smalltalk-{target}.tar.gz',
+                'sha256': 'b' * 64} for target in baseline.TARGETS}}
+
+
+class Policy(unittest.TestCase):
+    def setUp(self):
+        self.releases = baseline.stable_releases([release('v0.3.16', 6), release('v0.3.18', 8), release('v0.3.17', 7)])
+
+    def test_actual_published_stable_order_not_version_or_unpublished_tag(self):
+        rows = [release('v0.3.99', 9, draft=True), release('v0.4.0', 10, prerelease=True),
+                release('v0.4.0-rc.1', 11), release('nightly', 12),
+                release('v0.3.18', 8), release('v0.3.17', 13)]
+        self.assertEqual([r['tag_name'] for r in baseline.stable_releases(rows)], ['v0.3.17', 'v0.3.18'])
+
+    def test_release_list_paginates_without_arbitrary_limit(self):
+        with patch.object(baseline, 'run', return_value=json.dumps([[release('v0.3.18', 8)], [release('v0.3.17', 7)]])) as run:
+            self.assertEqual(len(baseline.published_releases()), 2)
+        self.assertIn('--paginate', run.call_args.args)
+        self.assertIn('--slurp', run.call_args.args)
+
+    def test_current_and_one_behind_pass(self):
+        baseline.check({'fleet': pin('v0.3.18'), 'messaging': pin()}, self.releases)
+
+    def test_policy_why_is_not_an_exception(self):
+        with self.assertRaisesRegex(baseline.BaselineError, '2 published stable releases behind'):
+            baseline.check({'fleet': pin('v0.3.16')}, self.releases)
+
+    def test_explicit_older_hold_passes_both_gates(self):
+        with patch('sys.stdout', new=io.StringIO()):
+            baseline.check({'fleet': pin('v0.3.16', 'Temporary protocol repair; remove after the channel fix lands.')},
+                           self.releases, require_latest=True)
+
+    def test_blank_reason_and_missing_schema_fail(self):
+        for reason in ('', '  ', False):
+            with self.assertRaisesRegex(baseline.BaselineError, 'exception_reason'):
+                baseline.check({'fleet': pin(reason=reason)}, self.releases)
+        old = pin()
+        del old['exception_reason']
+        with self.assertRaisesRegex(baseline.BaselineError, 'expected commit'):
+            baseline.check({'fleet': old}, self.releases)
+
+    def test_release_requires_latest_and_unpublished_pin_fails_even_with_hold(self):
+        with self.assertRaisesRegex(baseline.BaselineError, '1 published stable releases behind'):
+            baseline.check({'fleet': pin()}, self.releases, require_latest=True)
+        with self.assertRaisesRegex(baseline.BaselineError, 'not a published stable release'):
+            baseline.check({'fleet': pin('v0.3.99', 'Hold')}, self.releases)
+
+    def test_both_normal_pins_advance_and_hold_survives(self):
+        pins = {path: pin('v0.3.16') for path in baseline.BASELINES}
+        self.assertEqual(set(baseline.changes(pins, pin())), set(baseline.BASELINES))
+        pins[baseline.BASELINES[1]]['exception_reason'] = 'Temporary channel boundary; remove after repair.'
+        updates = baseline.changes(pins, pin())
+        self.assertEqual(set(updates), {baseline.BASELINES[0]})
+        self.assertIsNone(json.loads(updates[baseline.BASELINES[0]])['exception_reason'])
+
+
+class Archives(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.dist = Path(self.temporary.name)
+        self.records = []
+        for target in baseline.TARGETS:
+            package = f'smalltalk-{target}'
+            build = {'source': SOURCE, 'target': target}
+            data = json.dumps(build).encode()
+            with tarfile.open(self.dist / f'{package}.tar.gz', 'w:gz') as archive:
+                member = tarfile.TarInfo(f'{package}/BUILD.json')
+                member.size = len(data)
+                archive.addfile(member, io.BytesIO(data))
+            self.records.append(build)
+        (self.dist / 'RELEASE.json').write_text(json.dumps({'source': SOURCE, 'builds': self.records}))
+        self.sums()
+
+    def sums(self):
+        (self.dist / 'SHA256SUMS').write_text(''.join(
+            f'{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n'
+            for path in sorted(self.dist.glob('*.tar.gz'))))
+
+    def download(self, *args, **kwargs):
+        self.assertEqual(args[:3], ('gh', 'release', 'download'))
+        destination = Path(args[args.index('--dir') + 1])
+        for path in self.dist.iterdir():
+            shutil.copyfile(path, destination / path.name)
+        return ''
+
+    def read_pin(self, api=None):
+        with patch.object(baseline, 'run', side_effect=self.download), \
+             patch.object(baseline, 'api', side_effect=api or (lambda _: {'object': {'type': 'commit', 'sha': SOURCE}})):
+            return baseline.release_pin('v0.3.17', [release('v0.3.17', 7)])
+
+    def test_exact_source_annotated_tag_and_archive_sha(self):
+        refs = iter([{'object': {'type': 'tag', 'sha': 'c' * 40}}, {'object': {'type': 'commit', 'sha': SOURCE}}])
+        value = self.read_pin(lambda _: next(refs))
+        self.assertEqual(value['commit'], SOURCE)
+        for target in baseline.TARGETS:
+            digest = hashlib.sha256((self.dist / f'smalltalk-{target}.tar.gz').read_bytes()).hexdigest()
+            self.assertEqual(value['bundles'][target]['sha256'], digest)
+        baseline.validate(value, 'fixture')
+
+    def test_corruption_fails_before_repin(self):
+        archive = next(self.dist.glob('*.tar.gz'))
+        archive.write_bytes(b'corrupt')
+        with self.assertRaisesRegex(baseline.BaselineError, 'checksum mismatch'):
+            self.read_pin()
+
+    def test_manifest_source_must_match_tag_not_target_commitish(self):
+        with self.assertRaisesRegex(baseline.BaselineError, 'dereferenced tag'):
+            self.read_pin(lambda _: {'object': {'type': 'commit', 'sha': 'd' * 40}})
+
+    def test_archive_source_must_match_manifest_even_if_checksum_matches(self):
+        package = f'smalltalk-{baseline.TARGETS[0]}'
+        data = json.dumps({'source': 'e' * 40, 'target': baseline.TARGETS[0]}).encode()
+        with tarfile.open(self.dist / f'{package}.tar.gz', 'w:gz') as archive:
+            member = tarfile.TarInfo(f'{package}/BUILD.json')
+            member.size = len(data)
+            archive.addfile(member, io.BytesIO(data))
+        self.sums()
+        with self.assertRaisesRegex(baseline.BaselineError, 'wrong source or target'):
+            self.read_pin()
+
+
+class Publication(unittest.TestCase):
+    def test_postpublish_pr_changes_main_not_release_and_dispatches_without_merge(self):
+        calls = []
+        main = 'c' * 40
+        def api(endpoint, payload=None):
+            calls.append((endpoint, payload))
+            if '/git/ref/heads/main' in endpoint:
+                return {'object': {'sha': main}}
+            if '/contents/' in endpoint:
+                self.assertTrue(endpoint.endswith(f'?ref={main}'))
+                return {'content': base64.b64encode(baseline.encoded(pin('v0.3.16')).encode()).decode()}
+            if '/pulls?' in endpoint or '/matching-refs/' in endpoint:
+                return []
+            if endpoint.endswith(f'/git/commits/{main}'):
+                return {'tree': {'sha': 'd' * 40}}
+            if endpoint.endswith('/git/trees'):
+                self.assertEqual({entry['path'] for entry in payload['tree']},
+                                 {*baseline.BASELINES, 'release-notes/compat-baselines-v0.3.17.json'})
+                return {'sha': 'e' * 40}
+            if endpoint.endswith('/git/commits'):
+                self.assertEqual(payload['parents'], [main])
+                return {'sha': 'f' * 40}
+            if endpoint.endswith('/git/refs'):
+                self.assertEqual(payload['ref'], 'refs/heads/compat-baselines/v0.3.17')
+                return {}
+            if endpoint.endswith('/pulls'):
+                self.assertTrue(payload['draft'])
+                self.assertEqual(payload['base'], 'main')
+                return {'html_url': 'https://github.com/compoundingtech/smalltalk/pull/123', 'number': 123}
+            if endpoint.endswith('/issues/123/labels'):
+                self.assertEqual(payload['labels'], ['type:chore', 'area:ci', 'origin:agent'])
+                return []
+            self.fail(endpoint)
+        with patch.object(baseline, 'api', side_effect=api), patch.object(baseline, 'run') as run, \
+             patch('sys.stdout', new=io.StringIO()):
+            baseline.advance('v0.3.17', pin())
+        self.assertEqual([call.args[3] for call in run.call_args_list], ['fleet.yml', 'public-repo.yml'])
+        self.assertFalse(any('merge' in endpoint for endpoint, _ in calls))
+
+    def test_baseline_only_delta_does_not_start_endless_daily_releases(self):
+        calls = []
+        def run(*args, **kwargs):
+            calls.append(args)
+            if args[:2] == ('git', 'rev-parse'):
+                return 'b' * 40
+            if args[:2] == ('git', 'diff'):
+                return '\n'.join((*baseline.BASELINES, 'release-notes/compat-baselines-v0.3.17.json'))
+            return ''
+        with patch.object(daily, 'run', side_effect=run), \
+             patch.object(daily, 'newest_verified_main_run', return_value=(1, SOURCE)), \
+             patch.object(daily, 'latest_release_tag', return_value='v0.3.17'), \
+             patch.object(daily.subprocess, 'run') as process, patch('sys.stdout', new=io.StringIO()), \
+             patch('sys.argv', ['release-smalltalk-daily']):
+            process.return_value.returncode = 1
+            self.assertEqual(daily.main(), 0)
+        self.assertTrue(any(args[-2:] == ('advance', 'v0.3.17') for args in calls))
+        self.assertFalse(any(args[0] == 'gh' for args in calls))
+
+
+if __name__ == '__main__':
+    unittest.main()

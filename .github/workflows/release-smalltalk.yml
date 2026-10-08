@@ -17,6 +17,8 @@ on:
       - crates/st-drivers/src/version.rs
       - scripts/release-smalltalk*
       - scripts/release_notes*
+      - scripts/compat-baseline-release*
+      - .github/*-compat-baseline.json
       - scripts/ci-build-snapshot*
       - scripts/ci-cache-audit*
       - scripts/ci-perf-cache
@@ -57,6 +59,7 @@ jobs:
           scripts/install-release-test
           python3 scripts/install-macos-test
           python3 scripts/release_notes_test.py
+          python3 scripts/compat-baseline-release-test
 
       - name: Report job cache coverage
         if: always()
@@ -220,6 +223,8 @@ jobs:
       ]
     permissions:
       contents: write
+      pull-requests: write
+      actions: write
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
@@ -238,6 +243,7 @@ jobs:
           set -euo pipefail
           git fetch origin "refs/tags/$TAG"
           test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$SOURCE_SHA"
+          python3 scripts/compat-baseline-release check --source "$SOURCE_SHA" --require-latest
           python3 scripts/release_notes.py --source "$SOURCE_SHA" --tag "$TAG" --output dist/RELEASE-NOTES.md --manifest dist/UPGRADE-IMPACT.json
           cd dist
           sha256sum --check SHA256SUMS
@@ -247,6 +253,7 @@ jobs:
           gh release create "$TAG" --verify-tag --draft --title "Smalltalk $TAG" \
             --notes-file RELEASE-NOTES.md ./*.tar.gz ./*.sha256 SHA256SUMS RELEASE.json UPGRADE-IMPACT.json
           gh release edit "$TAG" --draft=false
+          python3 ../scripts/compat-baseline-release advance "$TAG"
 
       - name: Report job cache coverage
         if: always()

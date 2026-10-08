@@ -10,13 +10,7 @@ case "${1:?usage: scripts/ci-cache-warm tests|clippy|fleet-compat|genie|isolatio
     cargo build --locked -p st3-client-codegen
     ;;
   fleet-compat)
-    baseline=$(jq -er .commit .github/fleet-compat-baseline.json)
-    for attempt in 1 2 3; do
-      BASELINE="$baseline" nix build --impure --out-link "$RUNNER_TEMP/baseline" --print-build-logs --expr '
-        ((builtins.getFlake "github:compoundingtech/smalltalk/${builtins.getEnv "BASELINE"}")
-          .packages.${builtins.currentSystem}.st3).overrideAttrs (_: { doCheck = false; })' && break
-      [ "$attempt" -lt 3 ] || exit 1
-    done
+    python3 scripts/compat-baseline fleet "$RUNNER_TEMP/baseline"
     cargo test -p st3 --locked --test integration --no-run
     ;;
   genie) true ;; # nix develop .#genie has already populated the shell.

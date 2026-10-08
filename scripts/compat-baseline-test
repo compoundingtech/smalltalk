@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+"""Native bundle pin validation, using a real local archive and no network."""
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+from pathlib import Path
+import sys
+import tarfile
+import tempfile
+import unittest
+from unittest.mock import patch
+
+loader = importlib.machinery.SourceFileLoader("compat_baseline", str(Path(__file__).with_name("compat-baseline")))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+
+
+class BundleTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.target = "x86_64-unknown-linux-gnu"
+        self.package = self.root / f"smalltalk-{self.target}"
+        (self.package / "bin").mkdir(parents=True)
+        binary = self.package / "bin/st3"
+        binary.write_text("#!/bin/sh\nexit 0\n")
+        binary.chmod(0o755)
+        self.commit = "a" * 40
+        (self.package / "BUILD.json").write_text(json.dumps({"source": self.commit, "target": self.target}))
+        archive = self.root / "bundle.tar.gz"
+        with tarfile.open(archive, "w:gz") as stream:
+            stream.add(self.package, arcname=self.package.name)
+        self.pin = {"commit": self.commit, "tag": "v0.3.17", "bundles": {self.target: {
+            "url": archive.as_uri(), "sha256": hashlib.sha256(archive.read_bytes()).hexdigest()}}}
+        (self.root / ".github").mkdir()
+        self.output = self.root / "output"
+
+    def run_loader(self):
+        (self.root / ".github/fleet-compat-baseline.json").write_text(json.dumps(self.pin))
+        with patch.object(module, "REPO", self.root), patch.object(module.platform, "system", return_value="Linux"), \
+             patch.object(module.platform, "machine", return_value="x86_64"), \
+             patch.object(sys, "argv", ["compat-baseline", "fleet", str(self.output)]):
+            module.main()
+
+    def test_checksum_verified_archive_is_reused(self):
+        self.run_loader()
+        with patch.object(module.urllib.request, "urlopen", side_effect=AssertionError("cache miss")):
+            self.run_loader()
+        self.assertTrue((self.output / self.pin["bundles"][self.target]["sha256"] / self.package.name / "bin/st3").is_file())
+
+    def test_checksum_mismatch_does_not_publish(self):
+        self.pin["bundles"][self.target]["sha256"] = "0" * 64
+        with self.assertRaisesRegex(ValueError, "SHA-256 mismatch"):
+            self.run_loader()
+        self.assertEqual([], list(self.output.iterdir()))
+
+    def test_source_mismatch_does_not_publish(self):
+        self.pin["commit"] = "b" * 40
+        with self.assertRaisesRegex(ValueError, "source/target"):
+            self.run_loader()
+        self.assertEqual([], list(self.output.iterdir()))
+
+
+if __name__ == "__main__":
+    unittest.main()

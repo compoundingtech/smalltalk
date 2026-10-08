@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""Check the published-release window, repin locally, or propose the postpublish main update.
+
+Uses Python's standard library and gh. advance never merges or enrolls its PR.
+"""
+import argparse
+import base64
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tarfile
+import tempfile
+
+ROOT = Path(__file__).resolve().parent.parent
+BASELINES = ('.github/fleet-compat-baseline.json', '.github/messaging-compat-baseline.json')
+TARGETS = ('x86_64-unknown-linux-gnu', 'aarch64-apple-darwin')
+STABLE = re.compile(r'v\d+\.\d+\.\d+')
+SHA = re.compile(r'[0-9a-f]{40}')
+DIGEST = re.compile(r'[0-9a-f]{64}')
+POLICY = 'Rolling previous-published-release compatibility baseline; advance after each stable release.'
+
+
+class BaselineError(ValueError):
+    pass
+
+
+def run(*args, cwd=ROOT, input=None):
+    return subprocess.run(args, cwd=cwd, input=input, text=True, capture_output=True,
+                          check=True).stdout.strip()
+
+
+def api(endpoint, payload=None):
+    args = ['gh', 'api', endpoint]
+    if payload is not None:
+        args += ['--method', 'POST', '--input', '-']
+    return json.loads(run(*args, input=json.dumps(payload) if payload is not None else None))
+
+
+def repository():
+    return os.environ.get('GH_REPO', 'compoundingtech/smalltalk')
+
+
+def stable_releases(rows):
+    releases = [row for row in rows if not row['draft'] and not row['prerelease']
+                and STABLE.fullmatch(row['tag_name'])]
+    releases.sort(key=lambda row: (row['published_at'], row['id']), reverse=True)
+    if not releases:
+        raise BaselineError('No published stable releases found')
+    return releases
+
+
+def published_releases():
+    pages = json.loads(run('gh', 'api', '--paginate', '--slurp',
+                           f'repos/{repository()}/releases?per_page=100'))
+    return stable_releases([row for page in pages for row in page])
+
+
+def validate(pin, label):
+    if not isinstance(pin, dict) or set(pin) != {'commit', 'tag', 'why', 'exception_reason', 'bundles'}:
+        raise BaselineError(f'{label}: expected commit, tag, why, exception_reason and bundles')
+    if not isinstance(pin['commit'], str) or not SHA.fullmatch(pin['commit']):
+        raise BaselineError(f'{label}: commit must be a full 40-character source SHA')
+    if not isinstance(pin['tag'], str) or not STABLE.fullmatch(pin['tag']):
+        raise BaselineError(f'{label}: tag must be a stable vMAJOR.MINOR.PATCH release')
+    if not isinstance(pin['why'], str) or not pin['why'].strip():
+        raise BaselineError(f'{label}: why must describe the policy')
+    reason = pin['exception_reason']
+    if reason is not None and (not isinstance(reason, str) or not reason.strip()):
+        raise BaselineError(f'{label}: exception_reason must be null or an explicit nonempty temporary reason')
+    if not isinstance(pin['bundles'], dict) or set(pin['bundles']) != set(TARGETS):
+        raise BaselineError(f'{label}: bundles must cover both native release targets')
+    for target, bundle in pin['bundles'].items():
+        expected = f'https://github.com/{repository()}/releases/download/{pin["tag"]}/smalltalk-{target}.tar.gz'
+        if (not isinstance(bundle, dict) or set(bundle) != {'url', 'sha256'}
+                or bundle['url'] != expected or not isinstance(bundle['sha256'], str)
+                or not DIGEST.fullmatch(bundle['sha256'])):
+            raise BaselineError(f'{label}: {target} needs the tagged archive URL and hex SHA256')
+
+
+def check(pins, releases, require_latest=False):
+    tags = [row['tag_name'] for row in releases]
+    for path, pin in pins.items():
+        validate(pin, path)
+        if pin['tag'] not in tags:
+            raise BaselineError(f'{path}: {pin["tag"]} is not a published stable release')
+        behind = tags.index(pin['tag'])
+        if behind > (0 if require_latest else 1) and pin['exception_reason'] is None:
+            raise BaselineError(f'{path}: {pin["tag"]} is {behind} published stable releases behind '
+                                f'{tags[0]}; merge the postpublish baseline PR or record a temporary exception_reason')
+        if behind and pin['exception_reason'] is not None:
+            print(f'{path}: temporary hold at {pin["tag"]}: {pin["exception_reason"]}')
+
+
+def read_pins(source=None):
+    return {path: json.loads(run('git', 'show', f'{source}:{path}') if source
+                             else (ROOT / path).read_text()) for path in BASELINES}
+
+
+def release_pin(tag, releases):
+    if tag not in {row['tag_name'] for row in releases}:
+        raise BaselineError(f'{tag} is not a published stable release')
+    with tempfile.TemporaryDirectory(prefix='smalltalk-compat-release-') as temporary:
+        dist = Path(temporary)
+        run('gh', 'release', 'download', tag, '--repo', repository(), '--dir', str(dist),
+            '--pattern', 'RELEASE.json', '--pattern', 'SHA256SUMS', '--pattern', 'smalltalk-*.tar.gz')
+        manifest = json.loads((dist / 'RELEASE.json').read_text())
+        source = manifest['source']
+        if not isinstance(source, str) or not SHA.fullmatch(source):
+            raise BaselineError(f'{tag}: RELEASE.json lacks an exact source SHA')
+        # RELEASE.json records the artifact source; target_commitish can merely be "main".
+        ref = api(f'repos/{repository()}/git/ref/tags/{tag}')['object']
+        while ref['type'] == 'tag':
+            ref = api(f'repos/{repository()}/git/tags/{ref["sha"]}')['object']
+        if ref['type'] != 'commit' or ref['sha'] != source:
+            raise BaselineError(f'{tag}: release manifest source does not match the dereferenced tag')
+        sums = {}
+        for line in (dist / 'SHA256SUMS').read_text().splitlines():
+            digest, filename = line.split(maxsplit=1)
+            sums[filename.lstrip('*')] = digest
+        bundles = {}
+        for target in TARGETS:
+            package = f'smalltalk-{target}'
+            archive = dist / f'{package}.tar.gz'
+            checksum = hashlib.sha256()
+            with archive.open('rb') as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+                    checksum.update(chunk)
+            digest = checksum.hexdigest()
+            if sums.get(archive.name) != digest:
+                raise BaselineError(f'{tag}: checksum mismatch for {archive.name}')
+            with tarfile.open(archive) as handle:
+                build = json.load(handle.extractfile(f'{package}/BUILD.json'))
+            if build['source'] != source or build['target'] != target:
+                raise BaselineError(f'{tag}: wrong source or target in {archive.name}')
+            bundles[target] = {
+                'url': f'https://github.com/{repository()}/releases/download/{tag}/{archive.name}',
+                'sha256': digest,
+            }
+    return {'commit': source, 'tag': tag, 'why': POLICY, 'exception_reason': None, 'bundles': bundles}
+
+
+def encoded(pin):
+    return json.dumps(pin, indent=2) + '\n'
+
+
+def changes(pins, pin):
+    # An explicit temporary hold is a human policy choice, not an automation reset.
+    return {path: encoded(pin) for path, current in pins.items()
+            if current['exception_reason'] is None and current != pin}
+
+
+def impact(tag):
+    fragment = {'version': 1, 'summary': f'Roll compatibility baselines forward to {tag}'}
+    for field in ('replay', 'schema', 'rules', 'compatibility', 'downtime', 'manual', 'recovery'):
+        fragment[field] = {'status': 'none', 'detail': 'Compatibility test inputs only; no runtime contract or operator change.'}
+    return json.dumps(fragment, indent=2) + '\n'
+
+
+def advance(tag, pin):
+    repo = repository()
+    main = api(f'repos/{repo}/git/ref/heads/main')['object']['sha']
+    pins = {path: json.loads(base64.b64decode(api(f'repos/{repo}/contents/{path}?ref={main}')['content']))
+            for path in BASELINES}
+    for path, current in pins.items():
+        validate(current, path)
+    updates = changes(pins, pin)
+    if not updates:
+        print(f'{tag}: main baselines already current or explicitly held')
+        return
+    branch = f'compat-baselines/{tag}'
+    existing = api(f'repos/{repo}/pulls?state=open&head={repo.split("/")[0]}:{branch}')
+    if existing:
+        api(f'repos/{repo}/issues/{existing[0]["number"]}/labels',
+            {'labels': ['type:chore', 'area:ci', 'origin:agent']})
+        print(existing[0]['html_url'])
+        dispatch(branch)
+        return
+    updates[f'release-notes/compat-baselines-{tag}.json'] = impact(tag)
+    refs = api(f'repos/{repo}/git/matching-refs/heads/{branch}')
+    matching = [ref for ref in refs if ref['ref'] == f'refs/heads/{branch}']
+    if matching:
+        # Recover after branch creation succeeded but PR creation failed. Never overwrite a branch.
+        source = matching[0]['object']['sha']
+        for path, content in updates.items():
+            actual = base64.b64decode(api(f'repos/{repo}/contents/{path}?ref={source}')['content']).decode()
+            if actual != content:
+                raise BaselineError(f'{branch}: existing branch differs; inspect it before retrying')
+    else:
+        tree = api(f'repos/{repo}/git/commits/{main}')['tree']['sha']
+        tree = api(f'repos/{repo}/git/trees', {'base_tree': tree, 'tree': [
+            {'path': path, 'mode': '100644', 'type': 'blob', 'content': content}
+            for path, content in updates.items()]})['sha']
+        commit = api(f'repos/{repo}/git/commits', {
+            'message': f'Roll compatibility baselines forward to {tag}', 'tree': tree, 'parents': [main]})['sha']
+        api(f'repos/{repo}/git/refs', {'ref': f'refs/heads/{branch}', 'sha': commit})
+    body = (f'## Problem\nThe published {tag} must become the previous-release baseline for the next candidate.\n\n'
+            '## Goal\nAdvance both unheld compatibility baselines using the published archive checksums and exact source.\n\n'
+            '## Decisions\nUpdate main after publication, never the release commit itself. Preserve explicit temporary holds.\n\n'
+            '## Verification\nPublished archive SHA256SUMS, embedded BUILD.json and dereferenced tag source were checked. '
+            'Workspace CI is dispatched on this branch because GITHUB_TOKEN-created PRs do not trigger PR workflows.\n\n'
+            '## Complexity\nNo new dependencies.\n\n## Concerns\nHuman review and merge are required before another stable release. '
+            'No auto-merge or enrollment is enabled.\n\n## Friction & bottlenecks\nNone recorded.\n\n'
+            '## Follow-ups\nNone.\n\n## References\nSee docs/st3/compatibility.md and docs/ci.md.\n')
+    pr = api(f'repos/{repo}/pulls', {'head': branch, 'base': 'main', 'title': f'Roll compatibility baselines to {tag}',
+                                   'body': body, 'draft': True})
+    api(f'repos/{repo}/issues/{pr["number"]}/labels',
+        {'labels': ['type:chore', 'area:ci', 'origin:agent']})
+    print(pr['html_url'])
+    dispatch(branch)
+
+
+def dispatch(branch):
+    for workflow in ('fleet.yml', 'public-repo.yml'):
+        run('gh', 'workflow', 'run', workflow, '--repo', repository(), '--ref', branch)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    sub = parser.add_subparsers(dest='command', required=True)
+    sub.add_parser('latest', help='print the newest published stable release tag')
+    checker = sub.add_parser('check')
+    checker.add_argument('--source', help='check baselines in this exact Git source, not the working tree')
+    checker.add_argument('--require-latest', action='store_true', help='release preparation requires the latest baseline')
+    for command in ('repin', 'advance'):
+        sub.add_parser(command).add_argument('tag')
+    args = parser.parse_args()
+    releases = published_releases()
+    if args.command == 'latest':
+        print(releases[0]['tag_name'])
+    elif args.command == 'check':
+        check(read_pins(args.source), releases, args.require_latest)
+        print('Compatibility baselines satisfy the published stable release window')
+    else:
+        pin = release_pin(args.tag, releases)
+        if args.command == 'repin':
+            pins = read_pins()
+            for path, current in pins.items():
+                validate(current, path)
+            for path, content in changes(pins, pin).items():
+                (ROOT / path).write_text(content)
+        else:
+            if args.tag != releases[0]['tag_name']:
+                raise BaselineError('Only the latest published stable release may advance main baselines')
+            advance(args.tag, pin)
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (BaselineError, subprocess.CalledProcessError, OSError, ValueError, KeyError) as error:
+        detail = error.stderr.strip() if isinstance(error, subprocess.CalledProcessError) else str(error)
+        print(f'compat-baseline-release: {detail}', file=sys.stderr)
+        sys.exit(1)
