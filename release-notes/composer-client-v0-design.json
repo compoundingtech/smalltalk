@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "summary": "Propose client v0 composer delivery, queue removal, commands, model selection, durable identity, and exact-turn cancellation boundaries.",
+  "summary": "Propose client v0 composer delivery, queue removal, commands, model and independent effort selection, durable identity, exact-turn cancellation, and agent-associated workbench terminals.",
   "replay": {
     "status": "none",
     "detail": "Documentation only; no runtime or upgrade behavior changes."
