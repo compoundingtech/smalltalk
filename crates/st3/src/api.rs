@@ -3069,7 +3069,10 @@ fn snapshot_time_ms(timestamp: &str) -> u128 {
         .unwrap_or_default()
 }
 
-fn client_attention_actions(kind: &str, review_mode: Option<&str>) -> Vec<&'static str> {
+pub(crate) fn client_attention_actions(
+    kind: &str,
+    review_mode: Option<&str>,
+) -> Vec<&'static str> {
     if kind.starts_with("custom.") {
         return vec!["custom.reply"];
     }
@@ -3114,7 +3117,11 @@ fn insert_attention_target_states(
 
 /// An attention card's ID: its source, recipient and waiting episode. A source asked again
 /// (a human gate's new request, a person step's new episode) gets a new card.
-fn client_attention_id(subject: &str, person: &str, episode: &str) -> anyhow::Result<String> {
+pub(crate) fn client_attention_id(
+    subject: &str,
+    person: &str,
+    episode: &str,
+) -> anyhow::Result<String> {
     let identity = serde_json::to_vec(&(subject, person, episode))?;
     Ok(format!(
         "attention/{}",
@@ -3130,7 +3137,7 @@ fn client_attention_resources(
     client_attention_resources_at(store, person, _history, client_now_ms())
 }
 
-fn client_attention_resources_at(
+pub(crate) fn client_attention_resources_at(
     store: &Store,
     person: Option<&str>,
     _history: bool,
