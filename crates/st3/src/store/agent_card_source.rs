@@ -40,6 +40,24 @@ CREATE TABLE IF NOT EXISTS local_agent_card_source_local_cut(namespace TEXT NOT 
 pub(crate) struct Kernel {
     origin: String,
 }
+
+/// Repair consumption from this callback, never a source/readiness certificate. The caller
+/// must spend the remainder in the same transaction; rollback discards all derived changes.
+#[derive(Debug)]
+pub(crate) struct Applied {
+    pub namespace: Namespace,
+    pub changed: bool,
+    pub used: usize,
+    pub clock: Option<CapturedWorkClock>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct CapturedWorkClock {
+    pub revision: u64,
+    pub at: u128,
+    pub snapshot_index: u64,
+}
+
 impl Kernel {
     pub(crate) fn new(origin: &str) -> Self {
         Self {
@@ -901,7 +919,7 @@ impl Kernel {
         Ok(!work)
     }
 
-    fn maintain(&self, tx: &Transaction<'_>, ns: &Namespace) -> Result<bool> {
+    fn maintain(&self, tx: &Transaction<'_>, ns: &Namespace) -> Result<(bool, usize)> {
         let at = current_at(tx, ns)?;
         let mut used = 0;
         let mut changed = false;
@@ -1117,7 +1135,7 @@ impl Kernel {
             used <= WORK,
             "agent card shared maintenance budget exceeded"
         );
-        Ok(changed)
+        Ok((changed, used))
     }
 }
 
@@ -1151,6 +1169,26 @@ impl Operator for Kernel {
         Ok(())
     }
     fn apply(&self, tx: &Transaction<'_>, ns: &Namespace, rows: &[Mutation]) -> Result<bool> {
+        Ok(self.apply_with_work(tx, ns, rows)?.changed)
+    }
+    fn validate_publication(&self, tx: &Transaction<'_>, ns: &Namespace) -> Result<()> {
+        self.validate_complete_publication(tx, ns)
+    }
+    fn reclaim(&self, tx: &Transaction<'_>, ns: &Namespace, rows: usize) -> Result<bool> {
+        self.reclaim_page(tx, ns, rows)
+    }
+}
+
+impl Kernel {
+    /// A union operator can allocate the remaining shared repair budget directly from this
+    /// result. Live non-clock writes stage work and consume zero maintenance slots; staging
+    /// extraction may drain without a new clock, so its `clock` is explicitly absent.
+    pub(crate) fn apply_with_work(
+        &self,
+        tx: &Transaction<'_>,
+        ns: &Namespace,
+        rows: &[Mutation],
+    ) -> Result<Applied> {
         anyhow::ensure!(rows.len() <= WORK, "card physical apply page bound");
         shadow::apply(tx, ns, rows)?;
         tx.execute("INSERT INTO local_agent_card_source_clock VALUES(?1,'0',0,0,'','','',0) ON CONFLICT DO NOTHING",[ns.as_str()])?;
@@ -1182,12 +1220,33 @@ impl Operator for Kernel {
             [ns.as_str()],
             |r| r.get(0),
         )?;
-        if ready && !captured_clock {
-            return Ok(false);
+        let (changed, used) = if ready && !captured_clock {
+            (false, 0)
+        } else {
+            self.maintain(tx, ns)?
         };
-        self.maintain(tx, ns)
+        let clock = if captured_clock {
+            let (revision, at, snapshot_index): (u64, String, u64) = tx.query_row(
+                "SELECT revision,at,snapshot_index FROM local_agent_card_source_clock WHERE namespace=?1",
+                [ns.as_str()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            Some(CapturedWorkClock {
+                revision,
+                at: at.parse()?,
+                snapshot_index,
+            })
+        } else {
+            None
+        };
+        Ok(Applied {
+            namespace: ns.clone(),
+            changed,
+            used,
+            clock,
+        })
     }
-    fn validate_publication(&self, tx: &Transaction<'_>, ns: &Namespace) -> Result<()> {
+    fn validate_complete_publication(&self, tx: &Transaction<'_>, ns: &Namespace) -> Result<()> {
         let at = current_at(tx, ns)?;
         anyhow::ensure!(
             self.families_closed(tx, ns, at)?,
@@ -1212,7 +1271,7 @@ impl Operator for Kernel {
         );
         Ok(())
     }
-    fn reclaim(&self, tx: &Transaction<'_>, ns: &Namespace, rows: usize) -> Result<bool> {
+    fn reclaim_page(&self, tx: &Transaction<'_>, ns: &Namespace, rows: usize) -> Result<bool> {
         anyhow::ensure!(
             (1..=WORK).contains(&rows),
             "card namespace reclamation budget"
@@ -1357,9 +1416,41 @@ pub(crate) fn certify_coverage(
     cut: &smallclaims::ivm::SourceCut,
     captured_at: u128,
 ) -> Result<()> {
+    certify_coverage_for_source(
+        tx,
+        ns,
+        origin,
+        &agent_source::capture_fingerprint_for(origin)?,
+        position,
+        cut,
+        captured_at,
+    )
+}
+
+/// The composition owner supplies its complete, receiver-bound source descriptor. This
+/// comparison admits no source by itself: exact position, availability, captured clock,
+/// full agent dependency closure and producer evidence remain required independently.
+pub(crate) fn certify_coverage_for_source(
+    tx: &Transaction<'_>,
+    ns: &Namespace,
+    origin: &str,
+    expected_fingerprint: &str,
+    position: &SourcePosition,
+    cut: &smallclaims::ivm::SourceCut,
+    captured_at: u128,
+) -> Result<()> {
+    let receiver_fingerprint = agent_source::capture_fingerprint_for(origin)?;
+    let (_, receiver) = receiver_fingerprint
+        .rsplit_once(";receiver-sha256=")
+        .context("agent source receiver binding missing")?;
+    let (descriptor, bound_receiver) = expected_fingerprint
+        .rsplit_once(";receiver-sha256=")
+        .context("composed source receiver binding missing")?;
     anyhow::ensure!(
         position.source == agent_card_ivm::SOURCE
-            && position.fingerprint == agent_source::capture_fingerprint_for(origin)?,
+            && position.fingerprint == expected_fingerprint
+            && !descriptor.is_empty()
+            && bound_receiver == receiver,
         "agent card certified source binding mismatch"
     );
     anyhow::ensure!(
@@ -1536,3 +1627,7 @@ pub(crate) mod tests;
 #[cfg(test)]
 #[path = "agent_card_source/queue_controls.rs"]
 mod queue_controls;
+
+#[cfg(test)]
+#[path = "agent_card_source/work_controls.rs"]
+mod work_controls;
