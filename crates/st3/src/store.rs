@@ -9713,7 +9713,13 @@ impl Store {
         max_per_subject_kind: usize,
         chunk: usize,
     ) -> Result<usize> {
-        let chunk = chunk.max(1).min(i64::MAX as usize) as i64;
+        // A captured source page shares the transaction's quota with its maintenance clock.
+        let capture_limit = if self.has_agent_collection_source() {
+            128
+        } else {
+            usize::MAX
+        };
+        let chunk = chunk.max(1).min(capture_limit).min(i64::MAX as usize) as i64;
         let max_per_subject_kind = max_per_subject_kind.max(1).min(i64::MAX as usize) as i64;
         let mut deleted = 0;
         // The newest observation of a subject and kind always stays. Rows past retention go
@@ -9722,8 +9728,9 @@ impl Store {
         // rank every row of the table with a window function inside the writer's hold, every
         // chunk of every pass, even when nothing was due.
         loop {
-            let connection = self.connection.write();
-            let removed = connection.execute(
+            let mut connection = self.connection.write();
+            let transaction = connection.transaction()?;
+            let removed = transaction.execute(
                 "DELETE FROM local_observations WHERE id IN (
                     SELECT id FROM local_observations AS old
                     WHERE observed_at_unix_ms < ?1
@@ -9738,6 +9745,7 @@ impl Store {
                     chunk
                 ],
             )?;
+            transaction.commit()?;
             drop(connection);
             deleted += removed;
             if (removed as i64) < chunk {
@@ -9760,9 +9768,10 @@ impl Store {
         };
         for (subject, kind) in over_cap {
             loop {
-                let connection = self.connection.write();
+                let mut connection = self.connection.write();
+                let transaction = connection.transaction()?;
                 // The newest id past the cap: rank `cap + 1` from the newest.
-                let boundary: Option<i64> = connection
+                let boundary: Option<i64> = transaction
                     .query_row(
                         "SELECT id FROM local_observations WHERE subject=?1 AND kind=?2
                          ORDER BY id DESC LIMIT 1 OFFSET ?3",
@@ -9773,13 +9782,14 @@ impl Store {
                 let Some(boundary) = boundary else {
                     break;
                 };
-                let removed = connection.execute(
+                let removed = transaction.execute(
                     "DELETE FROM local_observations WHERE id IN (
                         SELECT id FROM local_observations
                         WHERE subject=?1 AND kind=?2 AND id<=?3 ORDER BY id LIMIT ?4
                      )",
                     params![subject, kind, boundary, chunk],
                 )?;
+                transaction.commit()?;
                 drop(connection);
                 deleted += removed;
                 if (removed as i64) < chunk {

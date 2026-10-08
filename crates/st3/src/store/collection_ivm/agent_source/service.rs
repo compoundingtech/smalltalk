@@ -463,8 +463,7 @@ impl Service {
             if behind {
                 // Invoke the actual native projector. Never rewrite its frontier metadata.
                 // Its captured legacy replacements must still drain before publication.
-                store.project_replication_backlog()?;
-                return Ok(true);
+                return store.project_replication_backlog();
             }
         }
         let job = self
@@ -888,6 +887,77 @@ mod tests {
             "source did not close: job={:?}, capture={:?}",
             job.map(|job| service.installer.progress(&c, &job).unwrap()),
             super::super::super::status(&c).unwrap()
+        );
+    }
+
+    #[test]
+    fn observation_retention_and_count_trim_keep_managed_capture_bounded() {
+        let _lock = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let directory = tempfile::tempdir().unwrap();
+        let store =
+            Store::open_with_agent_collections(&directory.path().join("trim.sqlite"), "node")
+                .unwrap();
+        settle(&store);
+        let append = |entry: usize| {
+            store
+                .append_claim(&crate::model::ClaimInput {
+                    subject: "agent/node.trim".into(),
+                    kind: "harness.timeline".into(),
+                    actor: Some("agent/node.trim".into()),
+                    fields: BTreeMap::from([
+                        ("operation".into(), serde_json::json!("append")),
+                        (
+                            "entry_id".into(),
+                            serde_json::json!(format!("entry-{entry}")),
+                        ),
+                        ("revision".into(), serde_json::json!(1)),
+                        ("role".into(), serde_json::json!("assistant")),
+                        ("entry_type".into(), serde_json::json!("content")),
+                        ("final".into(), serde_json::json!(true)),
+                        (
+                            "body".into(),
+                            serde_json::json!({"media_type":"text/plain","text":"trim control"}),
+                        ),
+                        ("driver".into(), serde_json::json!("codex")),
+                        ("incarnation_id".into(), serde_json::json!("inc-trim")),
+                        ("sequence".into(), serde_json::json!(entry)),
+                    ]),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: Some(format!("trim:{entry}")),
+                })
+                .unwrap();
+        };
+        for entry in 0..260 {
+            append(entry);
+        }
+        assert_eq!(
+            store
+                .trim_local_observations(u128::MAX, 5000, 5000)
+                .unwrap(),
+            259
+        );
+        assert!(super::super::super::scope::readable(&store.readers.get()).unwrap());
+        settle(&store);
+        for entry in 260..520 {
+            append(entry);
+        }
+        assert_eq!(store.trim_local_observations(0, 2, 5000).unwrap(), 259);
+        assert!(super::super::super::scope::readable(&store.readers.get()).unwrap());
+        settle(&store);
+        assert_eq!(
+            store
+                .readers
+                .get()
+                .query_row(
+                    "SELECT COUNT(*) FROM local_observations WHERE subject='agent/node.trim'",
+                    [],
+                    |r| r.get::<_, u64>(0),
+                )
+                .unwrap(),
+            2
         );
     }
 

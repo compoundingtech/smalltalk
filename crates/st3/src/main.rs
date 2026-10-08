@@ -5616,7 +5616,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
                 let outcome=tokio::task::spawn_blocking(move ||store.maintain_agent_collections()).await;
                 let error=match outcome {Ok(Ok(pending))=> {more=pending;None},Ok(Err(error))=> {more=false;Some(error.to_string())},Err(error)=> {more=false;Some(error.to_string())}};
                 if let Some(error)=error && last_error.elapsed()>=Duration::from_secs(8) {
-                    tracing::warn!(%error,"native agent collection source remains unavailable");
+                    eprintln!("st3: native agent collection source remains unavailable: {error}");
                     last_error=std::time::Instant::now();
                 }
             }

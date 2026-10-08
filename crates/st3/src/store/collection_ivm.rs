@@ -383,7 +383,7 @@ fn enqueue(
     );
     format!(
         r#"
- UPDATE st3_ivm_capture_state SET gap=COALESCE(gap,'source mutation outside managed transaction')
+ UPDATE st3_ivm_capture_state SET gap=COALESCE(gap,'source mutation outside managed transaction: {name}')
  WHERE singleton=1 AND guarded=1 AND managed=0;
  UPDATE st3_ivm_capture_state SET gap=COALESCE(gap,'source capture quota exceeded')
  WHERE singleton=1 AND ({condition}) AND (rows>={MAX_ROWS} OR length(CAST({payload} AS BLOB))>{MAX_PAYLOAD}
