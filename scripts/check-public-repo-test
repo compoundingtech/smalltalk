@@ -13,7 +13,7 @@ class PublicRepositoryCheck(unittest.TestCase):
 
     def test_public_examples(self):
         self.assertEqual(self.findings(
-            'host/example-linux /home/example/src /Users/example/src '
+            'host/example-linux /home/example/src /Users/example/src /home/ada/work '
             'person/alex person%2Falex agent/example/worker agent%2Fexample%2Fworker '
             'agent/fleet/fixture-web/standing/web agent%2Ffleet%2Ffixture-web%2Fworker'
         ), [])

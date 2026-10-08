@@ -31,7 +31,7 @@ native debug binary may require a newer glibc; package metadata does not establi
 compatibility with an older guest. `--strict-release` additionally checks clean
 version stderr, release version wording and absence of installed stui.
 
-The setup scenario checks config merge, person/node, automatic self-install,
+The setup scenario checks config merge, person and node, automatic self-install,
 fresh login PATH, actual user service, doctor, plain-st TUI, idempotence and reboot
 behavior. The PTY removes ST_AGENT, answers the device-attributes query, waits for
 the working-count frame marker, selects Home/Now via the command palette and
