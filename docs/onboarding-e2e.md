@@ -100,3 +100,8 @@ An existing equivalent Docker image can be selected with `--image onb-sysd`
 and initial absence of development tools and providers. Coordinate the shared
 one-container slot with other manual testers; the runner's host lock serializes
 its own invocations. Real VM instructions are in [onboarding-vm-runbook.md](onboarding-vm-runbook.md).
+
+For macOS, use `scripts/onboarding-mac-test` or `--backend tart` and follow
+[onboarding-mac-runbook.md](onboarding-mac-runbook.md). Its first-run/setup/no-harness
+cases use a prepared clean Apple Silicon base, native app/signature/launchd checks
+and a GUI-login reboot check. Linux-only and provider-phase options are rejected.

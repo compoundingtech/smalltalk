@@ -1,0 +1,75 @@
+Host: Linux x86_64
+No Tart or native macOS execution.
+
+$ python3 scripts/onboarding-fixtures/test_macos.py -v
+test_cleanup_stops_before_delete_and_keep_preserves_owned_vm (__main__.MacGuards.test_cleanup_stops_before_delete_and_keep_preserves_owned_vm) ... ok
+test_failed_clone_never_deletes_existing_base (__main__.MacGuards.test_failed_clone_never_deletes_existing_base) ... ok
+test_failure_after_clone_removes_only_owned_unique_vm (__main__.MacGuards.test_failure_after_clone_removes_only_owned_unique_vm) ... ok
+test_gui_not_ready_does_not_count_as_boot_success (__main__.MacGuards.test_gui_not_ready_does_not_count_as_boot_success) ... ok
+test_launchd_state_requires_actual_daemon_and_running_flags (__main__.MacGuards.test_launchd_state_requires_actual_daemon_and_running_flags) ... ok
+test_manual_alias_refuses_ci_without_creating_output (__main__.MacGuards.test_manual_alias_refuses_ci_without_creating_output) ... ok
+test_ssh_is_noninteractive_and_transfer_path_is_shell_quoted (__main__.MacGuards.test_ssh_is_noninteractive_and_transfer_path_is_shell_quoted) ... ok
+test_wrong_archive_target_refused_before_clone (__main__.MacGuards.test_wrong_archive_target_refused_before_clone) ... ok
+
+----------------------------------------------------------------------
+Ran 8 tests in 0.102s
+
+OK
+
+Exit 0
+
+$ python3 scripts/onboarding-fixtures/test_rig.py -v
+test_archive_traversal_rejected (__main__.RigChecks.test_archive_traversal_rejected) ... ok
+test_bad_hash_rejected_before_machine_creation (__main__.RigChecks.test_bad_hash_rejected_before_machine_creation) ... ok
+test_fixture_cannot_start_before_consent (__main__.RigChecks.test_fixture_cannot_start_before_consent) ... ok
+test_mission_identity_ignores_runtime_changes (__main__.RigChecks.test_mission_identity_ignores_runtime_changes) ... ok
+test_packaged_selectors_resolve_the_native_mcp_after_consent (__main__.RigChecks.test_packaged_selectors_resolve_the_native_mcp_after_consent) ... ok
+test_vm_refused_in_ci_before_output_creation (__main__.RigChecks.test_vm_refused_in_ci_before_output_creation) ... ok
+
+----------------------------------------------------------------------
+Ran 6 tests in 0.359s
+
+OK
+
+Exit 0
+
+$ python3 scripts/check-public-repo-test
+.......
+----------------------------------------------------------------------
+Ran 7 tests in 0.001s
+
+OK
+
+Exit 0
+
+$ python3 scripts/check-public-repo
+public repository check passed
+
+Exit 0
+
+$ python3 -m py_compile scripts/onboarding-e2e scripts/onboarding-fixtures/macos.py
+
+Exit 0
+
+$ git diff --check
+
+Exit 0
+
+
+$ scripts/onboarding-mac-test --archive /tmp/candidate.tar.gz --out NEW_TEMP_DIRECTORY
+usage: onboarding-mac-test [-h]
+                           [--scenario {baseline,setup,first-run,no-harness,claude-policy-absent,claude-policy-present,codex,both,no-gh,gh-logged-out,gh-broken,no-manager,hostname-localhost,hostname-spaces,hostname-long,existing-store,linger-on,linger-off}]
+                           [--ubuntu {22.04,24.04}] [--archive ARCHIVE]
+                           [--sha256 SHA256] --out OUT
+                           [--backend {docker,incus,external,tart}]
+                           [--tart-image TART_IMAGE] [--ssh-key SSH_KEY]
+                           [--macos-signing-identity MACOS_SIGNING_IDENTITY]
+                           [--macos-signing-team MACOS_SIGNING_TEAM]
+                           [--image IMAGE] [--fixtures FIXTURES]
+                           [--strict-release] [--harness-only]
+                           [--require-wrap-up]
+                           [--mission-timeout MISSION_TIMEOUT] [--no-reboot]
+                           [--keep]
+                           [{baseline,setup}]
+onboarding-mac-test: error: Tart requires an Apple Silicon Mac with tart and ssh; see the manual Mac runbook. No VM was started
+Exit 2; no output directory or VM created.

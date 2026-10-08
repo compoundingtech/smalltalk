@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Add a manual macOS onboarding runner, Tart backend and fresh-Mac runbook",
+  "replay": {
+    "status": "none",
+    "detail": "Manual test tooling, evidence and documentation only; no production replay behavior changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No production database or wire schema changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Manual test tooling only; no production rules or repository guard changes."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No production executable or runtime compatibility changes; the rig records candidate compatibility results."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No deployment or running-service change is required."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No user upgrade action is required. Fresh-Mac base preparation and native testing remain optional person-run work."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No production recovery behavior changes; the rig removes only its own disposable test instances."
+  }
+}

@@ -97,5 +97,6 @@ scenario limits are in [onboarding-e2e.md](onboarding-e2e.md).
 
 Docker restart is a container restart. Incus boot, polkit, guest kernel/cgroups,
 SSH login behavior and host provisioning remain untested until a person runs this
-VM pass. macOS/launchd, permissions, signing, the app bundle and Tart belong to the
-later fresh-mac-prep step; this Linux runner does not claim Mac coverage.
+VM pass. The macOS variant and Tart backend are prepared in
+[onboarding-mac-runbook.md](onboarding-mac-runbook.md). Their native launchd, privacy,
+signing, app-bundle and reboot checks remain untested until the manual Mac pass.
