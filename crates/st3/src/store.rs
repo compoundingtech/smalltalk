@@ -4549,8 +4549,13 @@ impl Store {
     /// wake and definition history. Its loops and outcome are left empty.
     pub fn mission_run_steps(&self, run: &str, summaries: bool) -> Result<Option<MissionRunView>> {
         let run = run.strip_prefix("mission-run/").unwrap_or(run);
+        smallclaims::touched::note_read(|| format!("mission-run/{run}"));
         let connection = self.readers.get();
-        Ok(mission_run_steps_view_tx(&connection, run, summaries).optional()?)
+        let view = mission_run_steps_view_tx(&connection, run, summaries).optional()?;
+        if let Some(view) = &view {
+            note_run_view_reads(view);
+        }
+        Ok(view)
     }
 
     /// `run`, a header with its current generation's steps as `mission_run_summaries_for_missions`
@@ -6388,6 +6393,18 @@ impl Store {
         let view = mission_run_view_for_reconcile_tx(&connection, id)?;
         note_run_view_reads(&view);
         Ok(view)
+    }
+
+    /// Hydrate the reconcile view and retain its pinned definition for evaluation.
+    /// Empty runs load the definition lazily in the evaluator, after cleanup checks.
+    pub(crate) fn mission_run_for_evaluation(
+        &self,
+        id: &str,
+    ) -> Result<(MissionRunView, Option<MissionSpec>)> {
+        let connection = self.readers.get();
+        let (view, mission) = mission_run_view_and_definition_tx(&connection, id, false)?;
+        note_run_view_reads(&view);
+        Ok((view, mission))
     }
 
     /// What changed after store index `index` and local observation `local`, and the indexes the
@@ -30288,7 +30305,10 @@ fn enrich_step_queue_for_reconcile_at(
     person_work::enrich_responses(connection, view)
 }
 
-fn enrich_step_definition(connection: &Connection, view: &mut StepRunView) -> rusqlite::Result<()> {
+fn pinned_generation_mission_tx(
+    connection: &Connection,
+    generation: &str,
+) -> rusqlite::Result<Option<MissionSpec>> {
     let body = connection
         .query_row(
             "SELECT mission_revisions.body
@@ -30298,27 +30318,36 @@ fn enrich_step_definition(connection: &Connection, view: &mut StepRunView) -> ru
                ON mission_revisions.mission_id=mission_runs.mission_id
               AND mission_revisions.revision=run_generations.revision
              WHERE run_generations.id=?1",
-            [generation_id_from_subject(&view.generation)],
+            [generation_id_from_subject(generation)],
             |row| row.get::<_, String>(0),
         )
         .optional()?;
-    let Some(body) = body else {
-        return Ok(());
-    };
-    let mission = serde_json::from_str::<MissionSpec>(&body).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(
-            body.len(),
-            rusqlite::types::Type::Text,
-            Box::new(error),
-        )
-    })?;
-    if let Some(step) = crate::mission::find_step(&mission, &view.step) {
+    body.map(|body| {
+        serde_json::from_str::<MissionSpec>(&body).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                body.len(),
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })
+    })
+    .transpose()
+}
+
+fn enrich_step_definition(connection: &Connection, view: &mut StepRunView) -> rusqlite::Result<()> {
+    if let Some(mission) = pinned_generation_mission_tx(connection, &view.generation)? {
+        apply_step_definition(view, &mission);
+    }
+    Ok(())
+}
+
+fn apply_step_definition(view: &mut StepRunView, mission: &MissionSpec) {
+    if let Some(step) = crate::mission::find_step(mission, &view.step) {
         view.queue.clone_from(&step.queue);
         view.queue_position = step.queue_position;
         view.timeout_ms = step.timeout_ms;
         view.fresh_context = step.fresh_context;
     }
-    Ok(())
 }
 
 /// Keep the tree's queue labels and order without work presentation enrichment.
@@ -30330,29 +30359,9 @@ fn enrich_run_step_queues_tx(
     if view.steps.is_empty() {
         return Ok(());
     }
-    let body = connection
-        .query_row(
-            "SELECT mission_revisions.body
-             FROM run_generations
-             JOIN mission_runs ON mission_runs.id=run_generations.run_id
-             JOIN mission_revisions
-               ON mission_revisions.mission_id=mission_runs.mission_id
-              AND mission_revisions.revision=run_generations.revision
-             WHERE run_generations.id=?1",
-            [generation_id_from_subject(&view.generation)],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
-    let Some(body) = body else {
+    let Some(mission) = pinned_generation_mission_tx(connection, &view.generation)? else {
         return Ok(());
     };
-    let mission = serde_json::from_str::<MissionSpec>(&body).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(
-            body.len(),
-            rusqlite::types::Type::Text,
-            Box::new(error),
-        )
-    })?;
     for view in &mut view.steps {
         if let Some(step) = crate::mission::find_step(&mission, &view.step) {
             view.queue.clone_from(&step.queue);
@@ -31810,6 +31819,14 @@ fn mission_run_view_with_enrichment_tx(
     run_id: &str,
     presentation: bool,
 ) -> rusqlite::Result<MissionRunView> {
+    mission_run_view_and_definition_tx(connection, run_id, presentation).map(|(view, _)| view)
+}
+
+fn mission_run_view_and_definition_tx(
+    connection: &Connection,
+    run_id: &str,
+    presentation: bool,
+) -> rusqlite::Result<(MissionRunView, Option<MissionSpec>)> {
     let mut view = mission_run_header_tx(connection, run_id)?;
     let mut statement = connection.prepare(
         "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
@@ -31822,11 +31839,22 @@ fn mission_run_view_with_enrichment_tx(
             step_run_from_row,
         )?
         .collect::<Result<Vec<_>, _>>()?;
+    let mission = if presentation || view.steps.is_empty() {
+        None
+    } else {
+        pinned_generation_mission_tx(connection, &view.generation)?
+    };
     for step in &mut view.steps {
         if presentation {
             enrich_step_queue(connection, step)?;
         } else {
-            enrich_step_queue_for_reconcile_at(connection, step, now_ms())?;
+            let snapshot_unix_ms = now_ms();
+            apply_effective_step_state(connection, step, snapshot_unix_ms)?;
+            if let Some(mission) = &mission {
+                apply_step_definition(step, mission);
+            }
+            adhoc_work::enrich_handoff(connection, step, snapshot_unix_ms)?;
+            person_work::enrich_responses(connection, step)?;
             let (started, elapsed) = step_execution_timing_at(
                 connection,
                 &step.subject,
@@ -31847,7 +31875,7 @@ fn mission_run_view_with_enrichment_tx(
     if presentation {
         view.scheduler_fault = first_readiness_fault_tx(connection, &view.subject)?;
     }
-    Ok(view)
+    Ok((view, mission))
 }
 
 /// The outcome someone set on a finished run: its latest state claim when that claim moved it
@@ -32274,6 +32302,10 @@ mod tests {
     use crate::graph::parse_test_intent as parse_intent;
     use crate::model::{ReplicationHealAnswer, ReplicationHealQuery, ReplicationHealStep};
     use proptest::prelude::*;
+
+    mod mission_eval_reuse_tests {
+        include!("store/mission_eval_reuse_tests.rs");
+    }
 
     const TEST_FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
 
