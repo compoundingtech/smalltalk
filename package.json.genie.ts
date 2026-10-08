@@ -8,6 +8,7 @@ import { packageJson } from './repos/effect-utils/genie/external.ts'
 export const workspaceMembers = [
   'clients/typescript/st3-client',
   'clients/typescript/st3-views',
+  'clients/typescript/st3-scenarios',
   'apps/ios',
 ] as const
 

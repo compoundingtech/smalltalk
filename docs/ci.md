@@ -379,6 +379,7 @@ workflow-level path filters. `linux-gate` does not depend on them.
   SHAs, failed fetches and failed diffs fail closed; `workflow_dispatch` forces execution.
   Relevant paths are `apps/fractal-web/**`, `packages/fractal-ui/**`,
   `clients/typescript/st3-client/**`, `clients/typescript/st3-views/**`,
+  `clients/typescript/st3-scenarios/**`, `fixtures/scenarios/**`,
   `crates/st3-client*/**`, `crates/st3-schema/**`, `docs/st3/client-v0/**`,
   root `package.json*`, `pnpm-workspace.yaml*`, `pnpm-lock.yaml`,
   `pnpm-install-contract.json*`, `.npmrc`, root `tsconfig*.json*`, `.buckroot*`,
