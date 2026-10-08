@@ -3038,10 +3038,20 @@ impl Store {
         // is sufficient to discover the cards moved by a deadline without dropping the fleet.
         let previous = cache.iter()
             .filter(|entry| entry.index <= index && entry.local <= local && entry.history == history)
-            // Exact windows advance only their own coverage. A fleet projection (or a
-            // different selected window) must not turn a one-row read into a fleet refold.
-            .filter(|entry| selected.is_none_or(|names| entry.covered.as_ref() == Some(names)))
-            .max_by_key(|entry| (entry.index, entry.local)).cloned();
+            // A selected read may borrow a matching fleet/superset projection, but its
+            // delta source must contain only selected rows before inspecting changes.
+            .filter(|entry| selected.is_none_or(|names| entry.covered.as_ref()
+                .is_none_or(|covered| names.is_subset(covered))))
+            .max_by_key(|entry| (entry.index, entry.local,
+                selected.is_some() && entry.covered.as_ref() == selected)).cloned()
+            .map(|mut entry| {
+                if let Some(names) = selected
+                    && entry.covered.as_ref() != Some(names) {
+                    entry.items = Arc::new(select(&entry.items));
+                    entry.covered = Some(names.clone());
+                }
+                entry
+            });
         drop(cache);
         let entry = crate::performance::task("roster/build",
         || -> Result<runtime::AgentResourcesEntry> {

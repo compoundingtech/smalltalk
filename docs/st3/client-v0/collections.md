@@ -42,8 +42,11 @@ grant as a fleet subscription.
 
 Exact windows construct only the selected card and reuse the existing changed-agent
 key hints for subsequent reads. Unrelated agent changes neither refold the selected
-card nor emit a change frame. They do not build a fleet roster. The existing HTTP
-`GET /v1/client/agents/{id}` detail read shares the selected-card projection; it does
+card nor emit a change frame. They do not build a fleet roster.
+These guarantees also hold when a fleet projection is already warm before the
+exact subscription starts.
+
+The existing HTTP `GET /v1/client/agents/{id}` detail read shares the selected-card projection; it does
 not require a fleet list read first.
 An exact selector requires a daemon implementing this contract. Older daemons may
 ignore unknown fields and return a fleet window; do not rely on `agent` until the

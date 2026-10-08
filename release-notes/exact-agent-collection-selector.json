@@ -1,7 +1,7 @@
 {
   "version": 1,
   "summary": "Let a web client follow one exact agent card without subscribing to the fleet roster",
-  "replay": {"status": "none", "detail": "No replay or projection rebuild. Existing current-agent card semantics and changed-agent dependency hints are reused."},
+  "replay": {"status": "none", "detail": "No replay or projection rebuild. Existing current-agent card semantics and changed-agent dependency hints are reused. Warm fleet rows remain reusable; exact-agent deltas narrow their source coverage before advancing."},
   "schema": {"status": "changed", "detail": "The public client-v0 CollectionCommand schema adds an optional full agent ID selector to agents subscriptions. No database tables, columns, indexes or claim schemas change."},
   "rules": {"status": "none", "detail": "Checkpoint rules, digests and fleet coordination are unchanged."},
   "compatibility": {"status": "changed", "detail": "Agents subscriptions may select agent for a zero-or-one current-card window, intersected with status. Omitting agent preserves fleet windows. Rust CollectionStream::subscribe adds an optional agent argument; repository callers are migrated. Swift exposes agentsStream with an optional agent selector, and TypeScript collection filters and generated command models expose agent. Clients must use an upgraded daemon before relying on the selector: older daemons ignore unknown subscription fields."},

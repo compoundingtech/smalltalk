@@ -10361,6 +10361,15 @@ mod tests {
 
     #[tokio::test]
     async fn exact_agent_selector_stream_ignores_other_agent_and_delivers_selected_changes() {
+        exact_agent_selector_stream_fixture(false).await;
+    }
+
+    #[tokio::test]
+    async fn exact_agent_selector_stream_fleet_first_ignores_other_agent_and_delivers_selected_changes() {
+        exact_agent_selector_stream_fixture(true).await;
+    }
+
+    async fn exact_agent_selector_stream_fixture(fleet_first: bool) {
         use futures_util::{SinkExt as _, StreamExt as _};
         use tokio_tungstenite::tungstenite::Message;
         let root = tempfile::tempdir().unwrap();
@@ -10371,6 +10380,16 @@ mod tests {
             agent_selector_observe(&state, agent, "harness.observed",
                 json!({"state":"idle","driver":"codex","incarnation_id":"one"}));
         }
+        let warmed_counts = if fleet_first {
+            let cards = state.store.read_snapshot(|index| {
+                client_agent_resources_cached(&state.store, false, index)
+            }).unwrap();
+            assert_eq!(cards.len(), 2);
+            Some((state.store.agent_resources_refolded_cards_for_test(),
+                state.store.agent_resources_builds_for_test()))
+        } else {
+            None
+        };
         let writer = state.clone();
         let (completed, mut completions) = tokio::sync::mpsc::unbounded_channel();
         let app = axum::Router::new().route("/stream", axum::routing::get(
@@ -10412,6 +10431,9 @@ mod tests {
         completions.recv().await.unwrap();
         let folded = writer.store.agent_resources_refolded_cards_for_test();
         let builds = writer.store.agent_resources_builds_for_test();
+        if let Some(counts) = warmed_counts {
+            assert_eq!((folded, builds), counts, "the selected snapshot must borrow the warm fleet rows");
+        }
         agent_selector_observe(&writer, "agent/a", "harness.observed",
             json!({"state":"working","driver":"codex","incarnation_id":"one"}));
         signal_changed(&writer);
