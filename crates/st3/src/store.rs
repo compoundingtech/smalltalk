@@ -9685,7 +9685,6 @@ impl Store {
                 }
                 if receipt_attached { repair_operations_tx(transaction,&[opaque_cache_key(idempotency_key)]).map_err(internal)?; }
                 owned_sets::project_tx(transaction)?;
-                #[cfg(test)]
                 client_messages::flush(transaction).map_err(internal)?;
                 let store_index = current_index_tx(transaction).map_err(internal)?;
                 let response = ApplyResponse {
@@ -11925,7 +11924,6 @@ impl Store {
                 .query_map([run_id], |row| row.get::<_, String>(0))?
                 .collect::<Result<Vec<_>, _>>()?
         };
-        #[cfg(test)]
         client_messages::flush(&transaction)?;
         transaction.commit()?;
         Ok(residue)
@@ -11935,7 +11933,6 @@ impl Store {
         let mut connection = self.connection.write();
         let transaction = connection.transaction()?;
         let removed = transaction.execute("DELETE FROM desired WHERE owner_run=?1", [owner_run])?;
-        #[cfg(test)]
         client_messages::flush(&transaction)?;
         transaction.commit()?;
         Ok(removed)
@@ -20367,7 +20364,6 @@ pub(crate) fn append_claim_tx(
     if kind == "message.sent" {
         agent_messages::flush(transaction)?;
     }
-    #[cfg(test)]
     if subject.starts_with("message/") {
         client_messages::flush(transaction)?;
     }
@@ -27825,7 +27821,6 @@ fn select_desired_repair_tx(
             desired.owner_step,
         ],
     )?;
-    #[cfg(test)]
     client_messages::flush(transaction)?;
     Ok(())
 }
@@ -53656,7 +53651,6 @@ impl Store {
         project_replicated_mission_runs(&transaction)?;
         rebuild_planning_tx(&transaction).map_err(internal)?;
         custom::flush(&transaction).map_err(internal)?;
-        #[cfg(test)]
         client_messages::flush(&transaction).map_err(internal)?;
         let accepted_heads = replica_heads(&transaction).map_err(internal)?;
         let accepted_through = accepted_heads.get(&input.peer).copied().unwrap_or(0);

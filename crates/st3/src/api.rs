@@ -25601,3 +25601,5 @@ mod work_incarnation_tests;
 mod client_messages_tests;
 #[cfg(test)]
 mod client_messages_cursor_tests;
+#[cfg(test)]
+mod client_messages_selector_tests;
