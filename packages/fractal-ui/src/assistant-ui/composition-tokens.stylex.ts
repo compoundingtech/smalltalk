@@ -116,6 +116,7 @@ export const geometryVars = stylex.defineVars({
   menuMin: '208px', sectionTitle: '18px', dialogTitle: '20px', switchSelectedLeft: 'calc(100% - 16px)',
   sidebarThree: '68px', workExpandedMax: 'min(18rem, 50dvh)', timelineStub: '16px',
   transcriptFrameHeight: '640px',
+  threadViewportMin: '96px',
   estimatedMessageHeight: '160px',
 
 })
@@ -133,6 +134,7 @@ export const geometryNumbers = {
   resizeStep: 8, resizeStepLarge: 32, splitMinRatio: 0.1, splitMaxRatio: 0.9,
   tooltipOffset: 6, contextOffset: 8, scrollEndTolerance: 1,
   estimatedMessageHeight: 160,
+  threadViewportMin: 96,
 } as const
 
 export const motionVars = stylex.defineVars({
