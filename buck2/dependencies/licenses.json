@@ -2,11 +2,16 @@
   "generated": "Do not edit; run nix develop .#web -c python3 scripts/ci-fractal-web-licenses",
   "source": "pnpm-lock.yaml packages; installed package.json license (legacy licenses fallback); missing manifests from lock-integrity-verified npm archives",
   "schemaVersion": 1,
-  "lockfileSha256": "17ae586468bb7868ae70b8400a6c0e0daca30065cb215e5ba019ad3e62a15c4f",
+  "lockfileSha256": "89aeadb59b0975baeb1d641696cdb28e05f5ee4d7b2a725fb29c2f3bd79fdb08",
   "packages": [
     {
       "name": "@adobe/css-tools",
       "version": "4.5.0",
+      "license": "MIT"
+    },
+    {
+      "name": "@asamuzakjp/css-color",
+      "version": "3.2.0",
       "license": "MIT"
     },
     {
@@ -357,6 +362,31 @@
     {
       "name": "@babel/types",
       "version": "7.29.8",
+      "license": "MIT"
+    },
+    {
+      "name": "@csstools/color-helpers",
+      "version": "5.1.0",
+      "license": "MIT-0"
+    },
+    {
+      "name": "@csstools/css-calc",
+      "version": "2.1.4",
+      "license": "MIT"
+    },
+    {
+      "name": "@csstools/css-color-parser",
+      "version": "3.1.0",
+      "license": "MIT"
+    },
+    {
+      "name": "@csstools/css-parser-algorithms",
+      "version": "3.0.5",
+      "license": "MIT"
+    },
+    {
+      "name": "@csstools/css-tokenizer",
+      "version": "3.0.4",
       "license": "MIT"
     },
     {
@@ -2415,8 +2445,18 @@
       "license": "MIT"
     },
     {
+      "name": "cssstyle",
+      "version": "4.6.0",
+      "license": "MIT"
+    },
+    {
       "name": "csstype",
       "version": "3.2.3",
+      "license": "MIT"
+    },
+    {
+      "name": "data-urls",
+      "version": "5.0.0",
       "license": "MIT"
     },
     {
@@ -2432,6 +2472,11 @@
     {
       "name": "debug",
       "version": "4.4.3",
+      "license": "MIT"
+    },
+    {
+      "name": "decimal.js",
+      "version": "10.6.0",
       "license": "MIT"
     },
     {
@@ -2558,6 +2603,11 @@
       "name": "enhanced-resolve",
       "version": "5.26.0",
       "license": "MIT"
+    },
+    {
+      "name": "entities",
+      "version": "6.0.1",
+      "license": "BSD-2-Clause"
     },
     {
       "name": "error-stack-parser",
@@ -2915,6 +2965,11 @@
       "license": "ISC"
     },
     {
+      "name": "html-encoding-sniffer",
+      "version": "4.0.0",
+      "license": "MIT"
+    },
+    {
       "name": "html-url-attributes",
       "version": "3.0.1",
       "license": "MIT"
@@ -2925,8 +2980,18 @@
       "license": "MIT"
     },
     {
+      "name": "http-proxy-agent",
+      "version": "7.0.2",
+      "license": "MIT"
+    },
+    {
       "name": "https-proxy-agent",
       "version": "7.0.6",
+      "license": "MIT"
+    },
+    {
+      "name": "iconv-lite",
+      "version": "0.6.3",
       "license": "MIT"
     },
     {
@@ -3020,6 +3085,11 @@
       "license": "MIT"
     },
     {
+      "name": "is-potential-custom-element-name",
+      "version": "1.0.1",
+      "license": "MIT"
+    },
+    {
       "name": "is-wsl",
       "version": "2.2.0",
       "license": "MIT"
@@ -3078,6 +3148,11 @@
       "name": "jsc-safe-url",
       "version": "0.2.4",
       "license": "0BSD"
+    },
+    {
+      "name": "jsdom",
+      "version": "26.1.0",
+      "license": "MIT"
     },
     {
       "name": "jsesc",
@@ -3810,6 +3885,11 @@
       "license": "MIT"
     },
     {
+      "name": "nwsapi",
+      "version": "2.2.28",
+      "license": "MIT"
+    },
+    {
       "name": "ob1",
       "version": "0.84.5",
       "license": "MIT"
@@ -3877,6 +3957,11 @@
     {
       "name": "parse-png",
       "version": "2.1.0",
+      "license": "MIT"
+    },
+    {
+      "name": "parse5",
+      "version": "7.3.0",
       "license": "MIT"
     },
     {
@@ -3977,6 +4062,11 @@
     {
       "name": "property-information",
       "version": "7.2.0",
+      "license": "MIT"
+    },
+    {
+      "name": "punycode",
+      "version": "2.3.1",
       "license": "MIT"
     },
     {
@@ -4200,6 +4290,11 @@
       "license": "MIT"
     },
     {
+      "name": "rrweb-cssom",
+      "version": "0.8.0",
+      "license": "MIT"
+    },
+    {
       "name": "run-applescript",
       "version": "7.1.0",
       "license": "MIT"
@@ -4215,6 +4310,11 @@
       "license": "MIT"
     },
     {
+      "name": "safer-buffer",
+      "version": "2.1.2",
+      "license": "MIT"
+    },
+    {
       "name": "sandbox-cli-detector",
       "version": "0.2.0",
       "license": "MIT"
@@ -4223,6 +4323,11 @@
       "name": "sax",
       "version": "1.6.1",
       "license": "BlueOak-1.0.0"
+    },
+    {
+      "name": "saxes",
+      "version": "6.0.0",
+      "license": "ISC"
     },
     {
       "name": "scheduler",
@@ -4465,6 +4570,11 @@
       "license": "MIT"
     },
     {
+      "name": "symbol-tree",
+      "version": "3.2.4",
+      "license": "MIT"
+    },
+    {
       "name": "tailwindcss",
       "version": "4.2.2",
       "license": "MIT"
@@ -4525,6 +4635,16 @@
       "license": "MIT"
     },
     {
+      "name": "tldts",
+      "version": "6.1.86",
+      "license": "MIT"
+    },
+    {
+      "name": "tldts-core",
+      "version": "6.1.86",
+      "license": "MIT"
+    },
+    {
       "name": "tmpl",
       "version": "1.0.5",
       "license": "BSD-3-Clause"
@@ -4542,6 +4662,16 @@
     {
       "name": "toqr",
       "version": "0.1.1",
+      "license": "MIT"
+    },
+    {
+      "name": "tough-cookie",
+      "version": "5.1.2",
+      "license": "BSD-3-Clause"
+    },
+    {
+      "name": "tr46",
+      "version": "5.1.1",
       "license": "MIT"
     },
     {
@@ -4750,6 +4880,11 @@
       "license": "MIT"
     },
     {
+      "name": "w3c-xmlserializer",
+      "version": "5.0.0",
+      "license": "MIT"
+    },
+    {
       "name": "walker",
       "version": "1.0.8",
       "license": "Apache-2.0"
@@ -4765,13 +4900,33 @@
       "license": "MIT"
     },
     {
+      "name": "webidl-conversions",
+      "version": "7.0.0",
+      "license": "BSD-2-Clause"
+    },
+    {
       "name": "webpack-virtual-modules",
       "version": "0.6.2",
       "license": "MIT"
     },
     {
+      "name": "whatwg-encoding",
+      "version": "3.1.1",
+      "license": "MIT"
+    },
+    {
       "name": "whatwg-fetch",
       "version": "3.6.20",
+      "license": "MIT"
+    },
+    {
+      "name": "whatwg-mimetype",
+      "version": "4.0.0",
+      "license": "MIT"
+    },
+    {
+      "name": "whatwg-url",
+      "version": "14.2.0",
       "license": "MIT"
     },
     {
@@ -4815,6 +4970,11 @@
       "license": "Apache-2.0"
     },
     {
+      "name": "xml-name-validator",
+      "version": "5.0.0",
+      "license": "Apache-2.0"
+    },
+    {
       "name": "xml2js",
       "version": "0.6.0",
       "license": "MIT"
@@ -4827,6 +4987,11 @@
     {
       "name": "xmlbuilder",
       "version": "15.1.1",
+      "license": "MIT"
+    },
+    {
+      "name": "xmlchars",
+      "version": "2.2.0",
       "license": "MIT"
     },
     {

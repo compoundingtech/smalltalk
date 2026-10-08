@@ -18,10 +18,13 @@ const source = vi.hoisted(() => ({
   sync: undefined as FeedSyncObservation | undefined,
   conversation: vi.fn(),
   conversationSync: vi.fn(),
+  feedInterest: vi.fn(),
 }))
 vi.mock('../data/react.tsx', () => ({
   useConversation: (ref: string) => { source.conversation(ref); return source.feed },
   useConversationSync: (ref: string) => { source.conversationSync(ref); return source.sync },
+  useDataSource: () => ({ conversationInterest: undefined }),
+  useFeedInterest: source.feedInterest,
   useNow: () => 1000,
 }))
 
@@ -38,12 +41,14 @@ describe('ConversationPane kit rendering', () => {
     source.sync = { status: { _tag: 'Live', since: 100 }, observedAt: 100 }
     source.conversation.mockClear()
     source.conversationSync.mockClear()
+    source.feedInterest.mockClear()
   })
 
   it('renders the real kit transcript for the selected follow, with no composer or live spinner', () => {
     const html = render()
     expect(source.conversation).toHaveBeenCalledWith('agent/selected')
     expect(source.conversationSync).toHaveBeenCalledWith('agent/selected')
+    expect(source.feedInterest).toHaveBeenCalledWith({ interest: undefined, visible: true })
     expect(html).toContain('aria-label="Conversation"')
     expect(html).toContain('data-testid="transcript-scroll"')
     // A read-only pane keeps the kit's neutral empty copy; it never invites a send.

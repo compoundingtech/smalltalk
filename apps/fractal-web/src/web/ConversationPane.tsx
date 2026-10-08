@@ -1,11 +1,17 @@
+import * as React from 'react'
 import { EmptyState, Note } from '@smalltalk/fractal-ui'
 import { EmbraceRuntimeProvider, EmbraceThread as Transcript } from '@smalltalk/fractal-ui/assistant-ui'
 import { SyncLine } from '@smalltalk/fractal-ui/assistant-ui/sync'
-import { useConversation, useConversationSync, useNow } from '../data/react.tsx'
+import { useConversation, useConversationSync, useDataSource, useFeedInterest, useNow } from '../data/react.tsx'
 import { mapConversationFeed, mapConversationSync, transcriptRuntimeOptions } from './conversationTranscript.ts'
 
 /** The selected follow owns content and sync; the kit owns every rendered element. */
 export const ConversationPane = ({ agentRef }: { readonly agentRef: string }) => {
+  const source = useDataSource()
+  // A cold or deep-linked route must follow on mount; the pane is keyed by agent ref, so
+  // switching agents releases the previous conversation's demand with this component.
+  const interest = React.useMemo(() => source.conversationInterest?.(agentRef), [source, agentRef])
+  useFeedInterest({ interest, visible: true })
   const feed = mapConversationFeed(useConversation(agentRef))
   const sync = mapConversationSync(useConversationSync(agentRef), useNow())
   return <>
