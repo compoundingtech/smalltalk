@@ -105,3 +105,33 @@ For macOS, use `scripts/onboarding-mac-test` or `--backend tart` and follow
 [onboarding-mac-runbook.md](onboarding-mac-runbook.md). Its first-run/setup/no-harness
 cases use a prepared clean Apple Silicon base, native app/signature/launchd checks
 and a GUI-login reboot check. Linux-only and provider-phase options are rejected.
+
+The full expert phase adds two focused scenarios:
+
+- `expert-lifecycle`: a fresh Codex first-run waits for the focused `Message Expert`
+  composer hint with `type or click` before navigating Home. It requires a reachable
+  built-in expert and the exact graph wake read, stops the expert, explicitly
+  cancels `mission-run/st/onboarding`, and repeats ordinary setup twice. The expert
+  must stay stopped/unreachable with one historical run. `setup --onboarding` must
+  then restore it with a different observed incarnation and add exactly one UUID
+  run alongside cancelled history; the restored expert must read a new exact wake.
+- `claude-pre-channel`: `setup --harness claude --claude-channel false` must preserve
+  the selected Claude harness, print its inline development route and start the
+  built-in expert without the user plugin. The original incarnation must read a
+  wake through `server:st3`; user `claude-channel install --no-policy` followed by
+  `agents restart` must produce a different reachable incarnation using the
+  installed development plugin, accept its consent, and read a new exact wake.
+
+These cases require the expert-seat candidate and reject `--harness-only`.
+Historical run counts use `missions show` overview fields, including cancelled
+runs. The Claude adapter records `ST3_INCARNATION` on every receipt; an old process's
+read cannot satisfy the post-restart assertion. The native Claude fixture respects
+`CLAUDE_CONFIG_DIR` so the managed transcript is available for resume. Fixtures
+read/claim only; a plumbing pass does not prove later gate content or wrap-up.
+
+```sh
+scripts/onboarding-e2e --scenario expert-lifecycle --scenario claude-pre-channel \
+  --scenario claude-policy-absent --scenario claude-policy-present --scenario codex \
+  --ubuntu 24.04 --image onb-sysd2404 --archive /tmp/expert-candidate.tar.gz \
+  --sha256 HEX --out /tmp/expert-proof
+```

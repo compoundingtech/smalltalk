@@ -58,7 +58,8 @@ receipt("started", argv=argv)
 resumed = option(argv, "--resume")
 session_id = resumed or str(uuid.uuid4())
 cwd = str(Path.cwd())
-projects = Path.home() / ".claude/projects" / re.sub(r"[^A-Za-z0-9]", "-", cwd)
+config_root = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
+projects = config_root / "projects" / re.sub(r"[^A-Za-z0-9]", "-", cwd)
 projects.mkdir(parents=True, exist_ok=True)
 transcript = projects / f"{session_id}.jsonl"
 if resumed and not transcript.is_file():
