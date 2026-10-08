@@ -166,6 +166,7 @@ class Node:
                     "XDG_STATE_HOME": str(self.root / "home/state"),
                     "XDG_CONFIG_HOME": str(self.root / "home/config"),
                     "ST3_ENDPOINT": str(self.endpoint), "ST3_DAEMON_WAIT": "0",
+                    "ST3_TEST_ADMITTED_REPORTS": str(self.root / "admitted-reports.jsonl"),
                     "PATH": f"{self.root / 'bin'}:{env['PATH']}"}
         # Only inherit an actual user manager. A synthetic runtime directory makes
         # systemd-run attempt scopes on runners that have no user bus.
@@ -263,7 +264,9 @@ class Node:
                 if f"ST3_ENDPOINT={self.endpoint}".encode() not in env or b"ST_AGENT=agent/eval/fault-probe" not in env:
                     continue
                 argv = (proc / "cmdline").read_bytes().replace(b"\0", b" ").decode()
-                rows.append({"pid": int(proc.name), "argv": argv, "image": os.readlink(proc / "exe")})
+                start_ticks = int((proc / "stat").read_text().rsplit(") ", 1)[1].split()[19])
+                rows.append({"pid": int(proc.name), "start_ticks": start_ticks,
+                             "argv": argv, "image": os.readlink(proc / "exe")})
             except (OSError, UnicodeError):
                 pass
         return rows
@@ -317,6 +320,49 @@ async def agent(node):
 async def current_channel(node):
     card = await agent(node)
     return card if (card.get("delivery") or {}).get("state") == "current" else None
+
+
+def admitted_reports(node):
+    path = node.root / "admitted-reports.jsonl"
+    if not path.exists():
+        return []
+    # The daemon appends one line while this reader may be sampling the file.
+    lines = path.read_text().splitlines(keepends=True)
+    return [json.loads(line) for line in lines if line.endswith("\n")]
+
+
+def matching_ready_report(reports, process, incarnation):
+    latest = next((row for row in reversed(reports)
+                   if row.get("subject") == "agent/eval/fault-probe"), None)
+    if latest and (latest.get("pid"), latest.get("start_ticks")) == (process["pid"], process["start_ticks"]) \
+            and latest.get("incarnation") == incarnation and latest.get("component") == "delivery" \
+            and latest.get("transport") == "omp-channel" and latest.get("ready") is True \
+            and latest.get("epoch", 0) > 0 and latest.get("token_sha256"):
+        return latest
+    return None
+
+
+def replacement_ready_report(reports, baseline, old_process, process, incarnation):
+    if (process["pid"], process["start_ticks"]) == (old_process["pid"], old_process["start_ticks"]):
+        return None
+    report = matching_ready_report(reports, process, incarnation)
+    return report if report and report["sequence"] > baseline["sequence"] \
+        and report["epoch"] > baseline["epoch"] \
+        and report["token_sha256"] != baseline["token_sha256"] else None
+
+
+async def current_replacement_channel(node, baseline, old_process, incarnation):
+    card = await current_channel(node)
+    if not card or card.get("incarnation_id") != incarnation:
+        return None
+    # Sample the live child and its latest admitted report AFTER the awaited card
+    # read. A receipt captured before that read may already be historical.
+    replacements = [row for row in node.seats() if " driver omp-channel " in row["argv"]]
+    if len(replacements) != 1:
+        return None
+    process = replacements[0]
+    report = replacement_ready_report(admitted_reports(node), baseline, old_process, process, incarnation)
+    return {"card": card, "process": process, "report": report} if report else None
 
 
 async def send(node, case):
@@ -576,10 +622,17 @@ agent "fault-probe" {{
             result["failed_sender_visible"] = (blocked_sender or {}).get("delivery", {}).get("state") == "waiting"
             (target.root / "ws/handoff-blocked").unlink()
         elif case == "channel-killed":
-            link.drop()
             channels = [row for row in before if " driver omp-channel " in row["argv"]]
             if len(channels) != 1:
                 raise RuntimeError(f"expected one channel, got {len(channels)}")
+            old_channel = channels[0]
+            async def admitted_before_kill():
+                return matching_ready_report(admitted_reports(target), old_channel,
+                                             before_card.get("incarnation_id"))
+            baseline_report = await until(admitted_before_kill, args.ready_seconds)
+            fault_started = now_ms()
+            fault_monotonic = time.monotonic()
+            link.drop()
             os.kill(channels[0]["pid"], signal.SIGKILL)
             subject = await send(source, case)
         elif case == "harness-restart":
@@ -595,12 +648,23 @@ agent "fault-probe" {{
         else:
             subject = await send(source, case)
         if case in RECOVERY_CASES and not link.enabled:
-            channel = await until(lambda: current_channel(target), args.ready_seconds)
+            if case == "channel-killed":
+                phase = "replacement-channel-readiness"
+                replacement_ready_receipt = await until(lambda: current_replacement_channel(
+                    target, baseline_report, old_channel, before_card.get("incarnation_id")), args.ready_seconds)
+                channel = replacement_ready_receipt["card"]
+            else:
+                channel = await until(lambda: current_channel(target), args.ready_seconds)
             channel_ready_at = now_ms()
             channel_incarnation = channel.get("incarnation_id")
             # Recovery starts when the blocked link is actually restored, not during its outage.
             cleared = now_ms()
             link.enabled = True
+            if case == "channel-killed":
+                write_json(directory / "replacement-ready.json", {
+                    "old_process": old_channel, "baseline_report": baseline_report,
+                    "replacement": replacement_ready_receipt, "link_restored_at_unix_ms": cleared,
+                })
         else:
             cleared = recovery_started if recovery_started is not None else now_ms()
         phase = "fault-observation"
@@ -714,7 +778,7 @@ agent "fault-probe" {{
                 finally:
                     await node.cleanup()
                     cleaned.add(id(node))
-                for log in ("daemon.log", "worker.log", "native.log", "ws/receipts.jsonl", "home/state/st3/driver-api-warnings.log"):
+                for log in ("daemon.log", "worker.log", "native.log", "admitted-reports.jsonl", "ws/receipts.jsonl", "home/state/st3/driver-api-warnings.log"):
                     path = node.root / log
                     if path.exists():
                         (directory / f"{node.name}-{Path(log).name}").write_text(path.read_text(errors="replace"))

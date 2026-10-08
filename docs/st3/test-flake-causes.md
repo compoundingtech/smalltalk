@@ -168,3 +168,42 @@ show. Two title acknowledgements span a new worker loop during the partial write
 The probe now publishes action files with rename, like its existing output
 requests. Production UI, input, image handling and PTY transport are unchanged.
 The original matrix, image lifecycle assertions and timeouts remain in force.
+## Replacement channel readiness
+
+The `messaging_faults::channel_killed` fixture formerly restored its blocked link
+as soon as the agent card's delivery state was `current`. That card can retain the
+killed channel's report for 45 seconds. The outer seat incarnation deliberately
+survives channel replacement, and the card omits the reporting PID and delivery
+epoch. A current card therefore does not establish replacement readiness.
+
+The fixture now records an accepted ready report from the old channel before the
+fault. After killing it, the link stays blocked until the daemon admits a later
+ready report from the replacement's PID and Linux process start ticks, under a
+new delivery epoch and binding identity in the same seat incarnation. The
+observation is enabled only in test-support builds, follows the durable mailbox
+ownership check and successful typed presence recording, and appends local evidence without a graph write or probe mail.
+Only a hash of the binding token is retained. Each predicate reads the ordinary
+card, then resamples the unique live child and its latest admitted ready report.
+No awaited operation separates the final tuple from link restoration.
+
+This is an isolated fixture witness from the unchanged reporting binary. The PID
+is report-supplied and birth ticks are sampled from `/proc`; the fence was current
+at its ownership check. The observation does not authenticate the PID as the
+stream peer or establish a perpetual ownership lease. A concurrent binding
+replacement without a new report requires a separate authoritative owner witness.
+
+Controls reject an old beat, a spawned child without a ready report, a not-ready
+report, mismatched birth identity, and stale or foreign binding data. Delayed
+card controls reject a later not-ready report or a dead/replaced child. Malformed
+typed reports neither replace a beat nor qualify recording. Durable
+mailbox controls independently reject superseded epochs, tokens, incarnations,
+and subjects before observing a report. The 10-second recovery limit, fixed
+duplicate-observation tails, native consumption and graph receipt checks, provider
+PID, shell and outer incarnation assertions remain unchanged.
+
+Merge-group run 37725762028 at `8bb7193f6041f09d10f6ec5623225bbdec31bc18`
+retained a 25,526 ms original-message delay, including 23 ms from staging to read.
+The readiness weakness is established by source review; its contribution to that
+historical delay and the missing earlier replication wake remain unqualified.
+Correcting this fixture barrier does not establish a historical peer-transport
+cause or acceptance of the separate replication retry change.
