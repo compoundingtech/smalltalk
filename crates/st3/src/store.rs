@@ -199,6 +199,11 @@ pub struct AgentWorkQueue {
     pub queued_work_count: u64,
 }
 
+pub(crate) struct MissionRunTreeRead {
+    pub runs: Vec<MissionRunView>,
+    pub definitions: BTreeMap<String, MissionSpec>,
+}
+
 const AGENT_WORK_PREVIEW_LIMIT: usize = 5;
 /// The most one `work extend` adds to a step attempt's execution budget.
 const MAX_STEP_EXTENSION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
@@ -3426,6 +3431,8 @@ impl Store {
             })?
             .map(|row| {
                 let (id, body) = row?;
+                #[cfg(test)]
+                STEP_DEFINITIONS_READ.with(|reads| reads.set(reads.get() + 1));
                 Ok((format!("mission-run/{id}"), serde_json::from_str(&body)?))
             })
             .collect()
@@ -6659,6 +6666,14 @@ impl Store {
     }
 
     pub fn mission_runs_for_root(&self, root: &str) -> Result<Vec<MissionRunView>> {
+        Ok(self.mission_runs_for_root_read(root, false)?.runs)
+    }
+
+    pub(crate) fn mission_run_tree_for_root(&self, root: &str) -> Result<MissionRunTreeRead> {
+        self.mission_runs_for_root_read(root, true)
+    }
+
+    fn mission_runs_for_root_read(&self, root: &str, definitions: bool) -> Result<MissionRunTreeRead> {
         let root = root.strip_prefix("mission-run/").unwrap_or(root);
         smallclaims::touched::note_read(|| format!("children:mission-run/{root}"));
         let connection = self.readers.get();
@@ -6668,21 +6683,39 @@ impl Store {
         let ids = statement
             .query_map([root], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
-        ids.into_iter()
+        let mut specs = BTreeMap::new();
+        let mut empty_active = Vec::new();
+        let runs = ids
+            .into_iter()
             .map(|id| {
                 // The legacy tree consumes step state, summaries and queue order, not
                 // each worker's wake, timing and harness presentation histories.
                 let mut view = mission_run_steps_view_tx(&connection, &id, true)?;
-                enrich_run_step_queues_tx(&connection, &mut view)?;
+                let mission = enrich_run_step_queues_tx(&connection, &mut view)?;
+                if definitions && matches!(view.status.as_str(), "running" | "standing" | "blocked") {
+                    if view.steps.is_empty() {
+                        // Queue enrichment does not read definitions for empty runs.
+                        // Their active diagnostics retain the original batch reader.
+                        empty_active.push(view.subject.clone());
+                    } else if let Some(mission) = mission {
+                        specs.insert(view.subject.clone(), mission);
+                    }
+                }
                 // Keep the run-level fields of the existing tree response.
-                view.provenance =
-                    crate::provenance::read(&connection, &view.mission, &view.revision)?;
+                view.provenance = crate::provenance::read(&connection, &view.mission, &view.revision)?;
                 view.loops = loop_run_views_tx(&connection, &view)?;
                 view.outcome = mission_run_outcome_tx(&connection, &view)?;
                 note_run_view_reads(&view);
                 Ok(view)
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        if !empty_active.is_empty() {
+            specs.extend(self.mission_specs_for_runs(&empty_active)?);
+        }
+        Ok(MissionRunTreeRead {
+            runs,
+            definitions: specs,
+        })
     }
 
     /// When a loop first executed: a worker's first claim, or the creation of a round
@@ -7166,9 +7199,28 @@ impl Store {
             })?
             .collect::<rusqlite::Result<BTreeMap<_, _>>>()?;
         let mut visible = Vec::with_capacity(views.len());
+        // Every sibling uses its generation's pinned definition. Reuse it only
+        // inside this read, retaining the same snapshot and enrichment order.
+        let mut definitions = BTreeMap::new();
         for mut view in views {
             if detailed {
-                enrich_step_queue_at(&connection, &mut view, snapshot_unix_ms)?;
+                enrich_step_queue_with_definition_at(
+                    &connection,
+                    &mut view,
+                    snapshot_unix_ms,
+                    |connection, view| {
+                        let definition = match definitions.entry(view.generation.clone()) {
+                            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                            std::collections::btree_map::Entry::Vacant(entry) => {
+                                entry.insert(read_step_definition(connection, &view.generation)?)
+                            }
+                        };
+                        if let Some(definition) = definition {
+                            apply_step_definition(view, definition);
+                        }
+                        Ok(())
+                    },
+                )?;
             } else {
                 enrich_step_queue_for_reconcile_at(&connection, &mut view, snapshot_unix_ms)?;
             }
@@ -25594,6 +25646,7 @@ thread_local! {
     pub(crate) static SUBJECT_REDUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Steps whose queue, timing and wake a read enriched, so a test can see a read's work.
     pub(crate) static STEPS_ENRICHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static STEP_DEFINITIONS_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -30209,6 +30262,20 @@ fn enrich_step_queue_at(
     view: &mut StepRunView,
     snapshot_unix_ms: u128,
 ) -> rusqlite::Result<()> {
+    enrich_step_queue_with_definition_at(
+        connection,
+        view,
+        snapshot_unix_ms,
+        enrich_step_definition,
+    )
+}
+
+fn enrich_step_queue_with_definition_at(
+    connection: &Connection,
+    view: &mut StepRunView,
+    snapshot_unix_ms: u128,
+    definition: impl FnOnce(&Connection, &mut StepRunView) -> rusqlite::Result<()>,
+) -> rusqlite::Result<()> {
     #[cfg(test)]
     STEPS_ENRICHED.with(|enriched| enriched.set(enriched.get() + 1));
     apply_effective_step_state(connection, view, snapshot_unix_ms)?;
@@ -30225,7 +30292,7 @@ fn enrich_step_queue_at(
         step_timeout_extension_at(connection, &view.subject, view.attempt, snapshot_unix_ms)?;
     enrich_step_summaries_at(connection, view, snapshot_unix_ms)?;
     enrich_step_wake_at(connection, view, snapshot_unix_ms)?;
-    enrich_step_definition(connection, view)?;
+    definition(connection, view)?;
     adhoc_work::enrich_handoff(connection, view, snapshot_unix_ms)?;
     person_work::enrich_responses(connection, view)
 }
@@ -30297,6 +30364,18 @@ fn enrich_step_queue_for_reconcile_at(
 }
 
 fn enrich_step_definition(connection: &Connection, view: &mut StepRunView) -> rusqlite::Result<()> {
+    if let Some(mission) = read_step_definition(connection, &view.generation)? {
+        apply_step_definition(view, &mission);
+    }
+    Ok(())
+}
+
+fn read_step_definition(
+    connection: &Connection,
+    generation: &str,
+) -> rusqlite::Result<Option<MissionSpec>> {
+    #[cfg(test)]
+    STEP_DEFINITIONS_READ.with(|reads| reads.set(reads.get() + 1));
     let body = connection
         .query_row(
             "SELECT mission_revisions.body
@@ -30306,12 +30385,12 @@ fn enrich_step_definition(connection: &Connection, view: &mut StepRunView) -> ru
                ON mission_revisions.mission_id=mission_runs.mission_id
               AND mission_revisions.revision=run_generations.revision
              WHERE run_generations.id=?1",
-            [generation_id_from_subject(&view.generation)],
+            [generation_id_from_subject(generation)],
             |row| row.get::<_, String>(0),
         )
         .optional()?;
     let Some(body) = body else {
-        return Ok(());
+        return Ok(None);
     };
     let mission = serde_json::from_str::<MissionSpec>(&body).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(
@@ -30320,13 +30399,16 @@ fn enrich_step_definition(connection: &Connection, view: &mut StepRunView) -> ru
             Box::new(error),
         )
     })?;
-    if let Some(step) = crate::mission::find_step(&mission, &view.step) {
+    Ok(Some(mission))
+}
+
+fn apply_step_definition(view: &mut StepRunView, mission: &MissionSpec) {
+    if let Some(step) = crate::mission::find_step(mission, &view.step) {
         view.queue.clone_from(&step.queue);
         view.queue_position = step.queue_position;
         view.timeout_ms = step.timeout_ms;
         view.fresh_context = step.fresh_context;
     }
-    Ok(())
 }
 
 /// Keep the tree's queue labels and order without work presentation enrichment.
@@ -30334,40 +30416,20 @@ fn enrich_step_definition(connection: &Connection, view: &mut StepRunView) -> ru
 fn enrich_run_step_queues_tx(
     connection: &Connection,
     view: &mut MissionRunView,
-) -> rusqlite::Result<()> {
+) -> rusqlite::Result<Option<MissionSpec>> {
     if view.steps.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
-    let body = connection
-        .query_row(
-            "SELECT mission_revisions.body
-             FROM run_generations
-             JOIN mission_runs ON mission_runs.id=run_generations.run_id
-             JOIN mission_revisions
-               ON mission_revisions.mission_id=mission_runs.mission_id
-              AND mission_revisions.revision=run_generations.revision
-             WHERE run_generations.id=?1",
-            [generation_id_from_subject(&view.generation)],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
-    let Some(body) = body else {
-        return Ok(());
+    let Some(mission) = read_step_definition(connection, &view.generation)? else {
+        return Ok(None);
     };
-    let mission = serde_json::from_str::<MissionSpec>(&body).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(
-            body.len(),
-            rusqlite::types::Type::Text,
-            Box::new(error),
-        )
-    })?;
     for view in &mut view.steps {
         if let Some(step) = crate::mission::find_step(&mission, &view.step) {
             view.queue.clone_from(&step.queue);
             view.queue_position = step.queue_position;
         }
     }
-    Ok(())
+    Ok(Some(mission))
 }
 
 fn fresh_context_ready_tx(
@@ -35001,6 +35063,202 @@ agent "test/empty" { command "true" }
             .next()
             .expect("published mission")
             .clone()
+    }
+
+    fn default_read_work_fixture(store: &Store, siblings: usize, key: &str) -> MissionRunView {
+        let steps = (0..siblings)
+            .map(|n| format!("step \"work-{n}\" timeout=\"2s\" {{ fresh-context }}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        publish_mission(
+            store,
+            &format!(
+                "version 2\nmission \"definition-read\" state=\"ready\" {{\n goal \"Read pinned sibling definitions.\"\n concurrent-runs max=8\n queue \"ordered\" {{ assigned-to \"agent/worker\"\n{steps}\n }}\n}}"
+            ),
+            &format!("{key}-publish"),
+        );
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "definition-read".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: key.into(),
+            })
+            .unwrap();
+        for step in &run.steps {
+            store.set_step_state(&step.subject, "ready", None).unwrap();
+        }
+        run
+    }
+
+    #[test]
+    fn default_read_work_reuses_one_definition_for_siblings_with_full_row_parity() {
+        for siblings in [4, 32] {
+            let store = Store::open_memory("node").unwrap();
+            default_read_work_fixture(&store, siblings, "siblings");
+            let at = now_ms();
+            store
+                .read_snapshot(|_| {
+                    STEP_DEFINITIONS_READ.with(|reads| reads.set(0));
+                    let rows = store.client_work_at_snapshot(Some("agent/worker"), false, at)?;
+                    assert_eq!(rows.len(), siblings);
+                    assert_eq!(STEP_DEFINITIONS_READ.with(std::cell::Cell::get), 1);
+                    for row in &rows {
+                        assert_eq!(row.timeout_ms, Some(2_000));
+                        assert!(row.fresh_context);
+                        let full = store
+                            .client_work_item_at_snapshot(&row.subject, Some("agent/worker"), at)?
+                            .unwrap();
+                        assert_eq!(serde_json::to_value(row)?, serde_json::to_value(full)?);
+                    }
+                    Ok(())
+                })
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn default_read_work_keeps_distinct_pinned_generations_and_no_cross_read_cache() {
+        let store = Store::open_memory("node").unwrap();
+        let old = default_read_work_fixture(&store, 3, "old");
+        publish_mission(
+            &store,
+            r#"version 2
+    mission "definition-read" state="ready" {
+     goal "Use a different pinned definition."
+     concurrent-runs max=8
+     queue "replacement" { assigned-to "agent/worker"
+      step "work-0" timeout="5s" { }
+      step "work-1" timeout="5s" { }
+      step "work-2" timeout="5s" { }
+     }
+    }"#,
+            "new-definition",
+        );
+        let new = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "definition-read".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "new".into(),
+            })
+            .unwrap();
+        for step in &new.steps {
+            store.set_step_state(&step.subject, "ready", None).unwrap();
+        }
+        for _ in 0..2 {
+            let at = now_ms();
+            store
+                .read_snapshot(|_| {
+                    STEP_DEFINITIONS_READ.with(|reads| reads.set(0));
+                    let rows = store.client_work_at_snapshot(None, false, at)?;
+                    assert_eq!(rows.len(), 6);
+                    assert_eq!(STEP_DEFINITIONS_READ.with(std::cell::Cell::get), 2);
+                    for row in &rows {
+                        let prior = row.generation == old.generation;
+                        assert_eq!(row.timeout_ms, Some(if prior { 2_000 } else { 5_000 }));
+                        assert_eq!(row.fresh_context, prior);
+                        assert_eq!(
+                            row.queue.as_deref(),
+                            Some(if prior { "ordered" } else { "replacement" })
+                        );
+                        let full = store
+                            .client_work_item_at_snapshot(&row.subject, None, at)?
+                            .unwrap();
+                        assert_eq!(serde_json::to_value(row)?, serde_json::to_value(full)?);
+                    }
+                    Ok(())
+                })
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn default_read_work_preserves_invalid_and_missing_pinned_definition_behavior() {
+        let store = Store::open_memory("node").unwrap();
+        let run = default_read_work_fixture(&store, 3, "broken");
+        // A completed read must never cache a definition into the next request.
+        store
+            .client_work_at_snapshot(None, false, now_ms())
+            .unwrap();
+        store
+            .connection
+            .write()
+            .execute(
+                "UPDATE mission_revisions SET body='not-json' WHERE mission_id='definition-read'",
+                [],
+            )
+            .unwrap();
+        let at = now_ms();
+        let full = store
+            .client_work_item_at_snapshot(&run.steps[0].subject, None, at)
+            .unwrap_err();
+        let list = store.client_work_at_snapshot(None, false, at).unwrap_err();
+        assert_eq!(list.to_string(), full.to_string());
+        store
+            .connection
+            .write()
+            .execute(
+                "DELETE FROM mission_revisions WHERE mission_id='definition-read'",
+                [],
+            )
+            .unwrap();
+        store
+            .read_snapshot(|_| {
+                STEP_DEFINITIONS_READ.with(|reads| reads.set(0));
+                let rows = store.client_work_at_snapshot(None, false, at)?;
+                assert_eq!(rows.len(), 3);
+                assert_eq!(STEP_DEFINITIONS_READ.with(std::cell::Cell::get), 1);
+                for row in &rows {
+                    let full = store
+                        .client_work_item_at_snapshot(&row.subject, None, at)?
+                        .unwrap();
+                    assert_eq!(serde_json::to_value(row)?, serde_json::to_value(full)?);
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn default_read_work_preserves_rows_after_replication_and_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("default-work.sqlite3");
+        let source = Store::open(&path, "node").unwrap();
+        default_read_work_fixture(&source, 4, "reopen");
+        let at = now_ms();
+        let expected = source.client_work_at_snapshot(None, false, at).unwrap();
+        let batch = source.export_replication(0).unwrap();
+        drop(source);
+        let reopened = Store::open(&path, "node").unwrap();
+        let replica = Store::open_memory("replica").unwrap();
+        replica.import_replication("node", &batch).unwrap();
+        for store in [&reopened, &replica] {
+            store
+                .read_snapshot(|_| {
+                    STEP_DEFINITIONS_READ.with(|reads| reads.set(0));
+                    let rows = store.client_work_at_snapshot(None, false, at)?;
+                    assert_eq!(STEP_DEFINITIONS_READ.with(std::cell::Cell::get), 1);
+                    assert_eq!(
+                        serde_json::to_value(&rows)?,
+                        serde_json::to_value(&expected)?
+                    );
+                    for row in &rows {
+                        let full = store
+                            .client_work_item_at_snapshot(&row.subject, None, at)?
+                            .unwrap();
+                        assert_eq!(serde_json::to_value(row)?, serde_json::to_value(full)?);
+                    }
+                    Ok(())
+                })
+                .unwrap();
+        }
     }
 
     #[test]
