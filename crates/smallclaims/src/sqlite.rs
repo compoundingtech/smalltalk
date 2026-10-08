@@ -1421,7 +1421,7 @@ pub mod work {
             use std::sync::Arc;
             let connection = Connection::open_in_memory().unwrap();
             connection
-                .execute_batch("CREATE TABLE claims(store_index INTEGER PRIMARY KEY)")
+                .execute_batch("CREATE TABLE claims(store_index INTEGER PRIMARY KEY AUTOINCREMENT)")
                 .unwrap();
             count(&connection);
             let writer = WriterConnection::new(connection, Arc::new(AtomicU64::new(0)));
