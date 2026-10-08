@@ -33,6 +33,15 @@ for _ in range(2):
     messages.append({'role': 'tool', 'tool_call_id': 'admission_call', 'content': 'fixture denied'})
 for name, key in [('ST_ADMISSION_TRACE', 'events'), ('ST_ADMISSION_CHANNEL_TRACE', 'channel')]:
     pathlib.Path(os.environ[name]).write_text(''.join(json.dumps(value) + '\n' for value in fixture[key]))
+if (root / 'hold-after-publication').exists():
+    # The probe kills this child after deciding. Keep it alive at the publication
+    # boundary so the malformed control cannot depend on child exit timing.
+    import time
+    deadline = time.monotonic() + 60
+    while not (root / 'release-publication').exists():
+        if time.monotonic() >= deadline:
+            raise RuntimeError('publication barrier was not released')
+        time.sleep(0.01)
 if (root / 'malformed').exists():
     with pathlib.Path(os.environ['ST_ADMISSION_TRACE']).open('a') as output:
         output.write('malformed\n')

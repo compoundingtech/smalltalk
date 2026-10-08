@@ -1239,6 +1239,7 @@ pub(crate) mod tests {
         let directory = tempfile::tempdir().unwrap();
         let binary = fake_omp(directory.path());
         fs::write(directory.path().join("malformed"), "").unwrap();
+        fs::write(directory.path().join("hold-after-publication"), "").unwrap();
         let scratch = Scratch::new().unwrap();
         let extension = directory.path().join("extension.ts");
         fs::write(&extension, "fixture").unwrap();
