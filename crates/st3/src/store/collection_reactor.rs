@@ -520,7 +520,9 @@ async fn run(store: Weak<Store>, registry: Arc<Registry>, stopped: Arc<AtomicBoo
                     }
                 }
                 Ok(Err(error)) => {
-                    if retryable_storage_failure(&error) {
+                    if retryable_storage_failure(&error)
+                        && !registry.unavailable[index].load(Ordering::Acquire)
+                    {
                         more = true;
                     } else {
                         failed.insert(index, retry);

@@ -532,6 +532,11 @@ fn hook_fault(fault: usize) -> Result<()> {
             None,
         )
         .into()),
+        4 => Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
+        )
+        .into()),
         _ => panic!("fixture hook panic"),
     }
 }
@@ -1034,7 +1039,7 @@ async fn refused_commit_never_exposes_cache_and_recovery_uses_same_reactor() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn after_commit_failures_refuse_committed_source_and_preserve_sibling() {
-    for fault in [1, 2, 3] {
+    for fault in [1, 2, 3, 4] {
         let root = tempfile::tempdir().unwrap();
         let broken = source(
             "fixture.after-fault",
@@ -1075,6 +1080,11 @@ async fn after_commit_failures_refuse_committed_source_and_preserve_sibling() {
         );
         replace(&store, sibling.source, 32);
         wait_for(|| output(&store, sibling.source) == Some(32)).await;
+        assert_eq!(
+            broken.captures.load(Ordering::SeqCst),
+            1,
+            "a fenced postcommit BUSY error must wait for explicit source recovery"
+        );
     }
 }
 
