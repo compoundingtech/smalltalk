@@ -246,6 +246,13 @@ fn the_daemon_keeps_its_budgets_under_a_busy_hosts_load() {
     );
 }
 
+/// CPU the daemon's request and task kinds were charged in its performance window, by kind.
+fn cpu_by_kind() -> BTreeMap<String, f64> {
+    smallclaims::performance::snapshot()["requests"].as_array().into_iter().flatten()
+        .filter_map(|row| Some((row["kind"].as_str()?.to_owned(), row["cpu_ms"].as_f64()?)))
+        .collect()
+}
+
 fn report_failures(report: &Report) -> Vec<String> {
     let mut failures = Vec::new();
     for (name, path) in &report.paths {
@@ -941,6 +948,7 @@ fn run(
     }
     let cpu_before = (process_cpu(), load_cpu(&peer_threads));
     let full_folds_before = context.store.agent_roster_chunked_assemblies();
+    let cpu_by_kind_before = cpu_by_kind();
     let cursor = context.store.index().unwrap();
     let started = Instant::now();
     load.block_on(async {
@@ -1174,6 +1182,14 @@ fn run(
     });
     let elapsed = started.elapsed().as_secs_f64();
     let cpu_after = (process_cpu(), load_cpu(&peer_threads));
+    let mut cpu_by_kind = cpu_by_kind().into_iter()
+        .map(|(kind, ms)| (ms - cpu_by_kind_before.get(&kind).copied().unwrap_or(0.0), kind))
+        .filter(|(ms, _)| *ms > 0.0)
+        .collect::<Vec<_>>();
+    cpu_by_kind.sort_by(|a, b| b.0.total_cmp(&a.0));
+    println!("daemon CPU during the load by kind (ms, top 12 of the 20 slowest kinds): {}",
+        cpu_by_kind.iter().take(12).map(|(ms, kind)| format!("{kind} {ms:.0}"))
+            .collect::<Vec<_>>().join(", "));
     let roster_full_folds = context.store.agent_roster_chunked_assemblies().into_iter()
         .map(|(why, count)| (why.clone(), count - full_folds_before.get(&why).copied().unwrap_or(0)))
         .filter(|(_, count)| *count > 0)

@@ -11068,7 +11068,8 @@ mission "queue-parity" state="ready" {
         assert_eq!(state.store.index().unwrap(), index);
         let revision = *published.borrow_and_update();
         // This page still shows the published roster, and asks for a newer one.
-        page().await.unwrap();
+        let (_, Json(stale)) = page().await.unwrap();
+        assert!(stale.items[0]["last_activity_at"].is_null());
         tokio::time::timeout(Duration::from_secs(5), published.wait_for(|now| *now > revision))
             .await.expect("a page asks the refresher for local activity").unwrap();
         let (snapshot, Json(after)) = page().await.unwrap();
