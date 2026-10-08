@@ -4,6 +4,7 @@ import { createRoot } from 'react-dom/client'
 import { setTheme } from '../ui-compat/foundations.ts'
 
 import { App } from './App.tsx'
+import { live } from './liveRuntime.ts'
 
 setTheme('system')
 
@@ -12,8 +13,10 @@ if (rootElement === null) {
   throw new Error('Root element not found')
 }
 
-createRoot(rootElement).render(
-  <StrictMode>
-    <App />
-  </StrictMode>,
-)
+void live.ready.then(() => {
+  createRoot(rootElement).render(
+    <StrictMode>
+      <App />
+    </StrictMode>,
+  )
+})

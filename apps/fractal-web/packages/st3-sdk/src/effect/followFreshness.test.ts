@@ -273,8 +273,9 @@ describe('follow freshness', () => {
         yield* Effect.promise(() => vi.advanceTimersByTimeAsync(1000))
         yield* settle
         expect(gateway.commands.filter(command => command.kind === 'subscribe' && command.conversation === ref)).toEqual([
-          { kind: 'subscribe', id, collection: 'conversation', conversation: ref },
-          { kind: 'subscribe', id: `${id}.2`, collection: 'conversation', conversation: ref },
+          // Each attempt carries its own first-frame trace context and generation wire id.
+          { kind: 'subscribe', id, collection: 'conversation', conversation: ref, trace: { traceparent: expect.stringMatching(/^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/) } },
+          { kind: 'subscribe', id: `${id}.2`, collection: 'conversation', conversation: ref, trace: { traceparent: expect.stringMatching(/^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/) } },
         ])
         expect(gateway.unsubscribed()).toEqual([id])
         expect(gateway.socket).toBe(socket)

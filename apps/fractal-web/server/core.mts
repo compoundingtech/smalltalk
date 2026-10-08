@@ -111,7 +111,7 @@ const makeBoundary = (options: MiddlewareOptions, assets?: { root: string; ident
           const parent = yield* Effect.currentSpan.pipe(Effect.orDie)
           const status = yield* gateway.upgrade(req, socket, head, parent)
           yield* Effect.annotateCurrentSpan('http.response.status_code', status)
-        }).pipe(Effect.withSpan('fractal.server.request', requestSpanOptions(req))), socket)
+        }).pipe(Effect.withSpan('fractal.server.request', requestSpanOptions(req, true))), socket)
       })().catch(() => socket.destroy())
     }
     options.server.on('upgrade', upgrade)

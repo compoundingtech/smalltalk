@@ -13,6 +13,7 @@ import { useFleet, useSubjectList, useConnection, useNow } from '../data/react.t
 import { persistedAtom } from '../state/persistence.ts'
 import { WorkbenchContextProvider, ResourcePanelProvider, MonitorDetailProvider, type OpenRequest } from '../shell/context.tsx'
 import type { ResourcePanelState } from '../shell/state.ts'
+import type { UxTelemetry } from '../telemetry/ux.ts'
 
 const sidebarRatio = persistedAtom({ key: 'round2.sidebarRatio', schema: Schema.Number, defaultValue: 256 / 1440 })
 const panelRatio = persistedAtom({ key: 'round2.panelRatio', schema: Schema.Number, defaultValue: 380 / 1440 })
@@ -40,7 +41,7 @@ const initialAgentFromUrl = () => {
 }
 
 /** One authoritative agent thread per workspace; local geometry never grants backend authority. */
-export function LiveAgentWorkspace() {
+export function LiveAgentWorkspace({ ux, onSelectConversation }: { readonly ux?: UxTelemetry; readonly onSelectConversation?: (ref: string) => void }) {
   const fleet = useFleet(), subjects = useSubjectList(), connection = useConnection(), now = useNow()
   const [storedAgent, setStoredAgent] = useAtom(selectedAgent)
   const [ratio, setRatio] = useAtom(sidebarRatio), [collapsed, setCollapsed] = useAtom(sidebarClosed), [scheme, setScheme] = useAtom(palette)
@@ -57,6 +58,9 @@ export function LiveAgentWorkspace() {
     hoverOwner.current = null
   }, [location])
   const agents = fleet._tag === 'Observed' ? fleet.value.agents : []
+  const rosterObserved = fleet._tag === 'Observed'
+  const shellCommit = React.useCallback((node: HTMLDivElement | null) => node === null ? undefined : ux?.shellCommitted(), [ux])
+  const rosterCommit = React.useCallback((node: HTMLElement | null) => node === null || !rosterObserved ? undefined : ux?.rosterCommitted(), [ux, rosterObserved])
   const current = initialAgentFromUrl() ?? (storedAgent || agents[0]?.ref || '')
   const agent = agents.find((row) => row.ref === current)
   const [headerSlot, setHeaderSlot] = React.useState<HTMLDivElement | null>(null)
@@ -75,6 +79,7 @@ export function LiveAgentWorkspace() {
     window.dispatchEvent(new PopStateEvent('popstate'))
   }
   const select = (ref: string) => {
+    if (ref !== current) onSelectConversation?.(ref)
     setDiffOpen(false)
     navigate(ref)
   }
@@ -109,7 +114,7 @@ export function LiveAgentWorkspace() {
       <ResourcePanelProvider value={{ state: resourcePanel, onChange: (change) => setResourcePanel((value) => ({ ...value, ...change })) }}>
         <MonitorDetailProvider value={{ size: 380, onSizeChange: (value) => setPanelFraction(value / viewport) }}>
           <ThreadHeaderSlotContext.Provider value={headerSlot}>
-            <div data-testid="live-agent-workspace" data-scheme={scheme} {...stylex.props(styles.app, styles.legacyBridge, liveLegacyTheme, scheme === 'dark' && assistantDarkTheme, scheme === 'dark' && liveComposerDarkTheme, liveAccentTheme, scheme === 'light' && compositionLightTheme)}>
+            <div ref={shellCommit} data-testid="live-agent-workspace" data-scheme={scheme} {...stylex.props(styles.app, styles.legacyBridge, liveLegacyTheme, scheme === 'dark' && assistantDarkTheme, scheme === 'dark' && liveComposerDarkTheme, liveAccentTheme, scheme === 'light' && compositionLightTheme)}>
               <aside aria-label="Agents" style={{ width: collapsed ? 40 : Math.min(width, maxSidebar) }} {...stylex.props(styles.sidebar)}>
                 <header {...stylex.props(styles.brand)}>
                   <Aria.Button aria-label={collapsed ? 'Expand agents' : 'Collapse agents'} onPress={() => setCollapsed(!collapsed)} {...stylex.props(styles.iconButton)}>
@@ -122,7 +127,7 @@ export function LiveAgentWorkspace() {
                     <Aria.SearchField aria-label="Search agents" value={search} onChange={setSearch} {...stylex.props(styles.search)}>
                       <Aria.Input placeholder="Search agents" {...stylex.props(styles.searchInput)} />
                     </Aria.SearchField>
-                    <nav aria-label="Agent roster" onMouseOverCapture={rememberHoverOwner} onFocusCapture={rememberHoverOwner} {...stylex.props(styles.roster)}>
+                    <nav ref={rosterCommit} aria-label="Agent roster" onMouseOverCapture={rememberHoverOwner} onFocusCapture={rememberHoverOwner} {...stylex.props(styles.roster)}>
                       {filtered.map((row) => (
                         <SidebarAgentRow key={row.ref} item={sidebarRow({ agent: row, stale, now })} now={now} variant="SR-2" layout="SR2-A" glyph="SG-1" extraSignals={[]} query={search} active={current === row.ref} onOpen={() => select(row.ref)} />
                       ))}

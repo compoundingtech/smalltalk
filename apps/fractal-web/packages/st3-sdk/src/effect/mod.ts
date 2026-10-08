@@ -17,6 +17,12 @@
  * not retry ambiguous delivery. Daemon refusals retain the complete error envelope and HTTP
  * status, separately from transport failures. `snapshot` reads fresh capabilities over HTTP,
  * bypassing cached discovery so the composer's fence refresh is authoritative.
+ *
+ * Tracing (`trace.ts`, `firstFrame.ts`): SDK HTTP calls run under their own `st3.*` span (a child
+ * of `parentSpan`) whose `traceparent` they carry; socket opens carry the caller's `traceContext`.
+ * Each subscribe attempt opens a bounded `wf.ux.first_frame` root (and an `st3.follow.subscribe`
+ * child of `parentSpan`) whose context the subscribe command carries.
+ * `adoptEarlyCollections` adopts the socket `index.html` opened before the bundle (`early.ts`).
  */
 import {
   type Resource as ResourceWire,
@@ -50,8 +56,11 @@ import * as Deferred from 'effect/Deferred'
 import * as Queue from 'effect/Queue'
 import * as Stream from 'effect/Stream'
 import * as SubscriptionRef from 'effect/SubscriptionRef'
+import type * as Tracer from 'effect/Tracer'
 
 import { makeAdmission } from './admission.ts'
+import { takeEarlyCollections } from './early.ts'
+import { makeFirstFrames, type FirstFrameAttempt, type FirstFrameOutcome } from './firstFrame.ts'
 import {
   type FollowFreshness,
   type FreshnessEvent,
@@ -63,10 +72,30 @@ import { type ConnectionState, type St3Diagnostic, makeChannel } from './socket.
 import { makeWindowIngest, type ProcessedWindow } from './windowIngest.ts'
 import type { SyncStatus } from './sync-status.ts'
 import { syncStatusFromFreshness, syncStatusFromFailure } from './sync-projection.ts'
+import { browserSocket, type TraceContext, traceContextOf, traceQuerySocket } from './trace.ts'
 
 export type { SyncStatus, SyncStage, StaleReason, SyncFailureCause } from './sync-status.ts'
 export * as SyncStatusSchema from './sync-status-schema.ts'
 export { syncStatusFromFreshness, syncStatusFromFailure } from './sync-projection.ts'
+export {
+  type TraceContext,
+  isValidTraceparent,
+  traceContextOf,
+  traceparentOf,
+  validTraceContext,
+  wrapTraceFetch,
+} from './trace.ts'
+export {
+  EARLY_COLLECTIONS_GLOBAL,
+  type EarlyBootstrap,
+  peekEarlyBootstrap,
+} from './early.ts'
+export {
+  FIRST_FRAME_BUDGET_PHASE,
+  FIRST_FRAME_SPAN,
+  FOLLOW_SUBSCRIBE_SPAN,
+  type FirstFrameOutcome,
+} from './firstFrame.ts'
 
 // Arrangement windows use the generated owner-scoped subscribeArrangements API.
 
@@ -270,7 +299,7 @@ export interface St3Options {
    * connect probe answers (v1 raises the cap to 16), before the first follow can open.
    */
   readonly conversationSlots?: number | 'advertised'
-  /** Test seam: the WebSocket the collections socket opens. */
+  /** Test seam: the WebSocket the collections socket opens (default: the browser `WebSocket`). */
   readonly socket?: CollectionSocketFactory
   /** Test seam: HTTP reads and actions. */
   readonly fetch?: typeof fetch
@@ -280,6 +309,18 @@ export interface St3Options {
   readonly onSubscribeSent?: (id: string) => void
   /** Actual-send callback with the canonical followKey; includes queued-open and resubscribe sends. */
   readonly onFollowSubscribeSent?: (event: FollowSubscribeSent) => void
+  /**
+   * The caller's active W3C context, read when each HTTP request starts and each socket opens
+   * (browser upgrades carry it as URL query parameters the gateway strips).
+   */
+  readonly traceContext?: () => TraceContext | undefined
+  /** The caller's active span; SDK spans (follow subscribes, HTTP reads/actions) become its children. */
+  readonly parentSpan?: () => Tracer.Span | undefined
+  /**
+   * Adopt the collections socket the `index.html` early-connect script opened, for the life of
+   * this layer: its roster subscribe answers the SDK's identical one, buffered frames replay.
+   */
+  readonly adoptEarlyCollections?: boolean
 }
 
 const decodeResource = decodeUnknownSync(Resource)
@@ -352,13 +393,72 @@ interface FollowProtocol<A> {
   readonly reset: () => void
 }
 
+/** A view of `stream` whose subscribe commands carry `trace`, read synchronously by the client. */
+const tracedStream = (
+  stream: CollectionStream,
+  trace: TraceContext,
+  setOutbound: (trace: TraceContext | undefined) => void,
+): CollectionStream => {
+  const issue =
+    <TArgs extends ReadonlyArray<unknown>>(send: (...args: TArgs) => void) =>
+    (...args: TArgs) => {
+      setOutbound(trace)
+      try {
+        send(...args)
+      } finally {
+        setOutbound(undefined)
+      }
+    }
+  return {
+    ...stream,
+    subscribe: issue(stream.subscribe),
+    subscribeGlasses: issue(stream.subscribeGlasses),
+    subscribeArrangements: issue(stream.subscribeArrangements),
+    subscribeTerminal: issue(stream.subscribeTerminal),
+    subscribeConversation: issue(stream.subscribeConversation),
+  }
+}
+
 const make = (options: St3Options) =>
   Effect.gen(function* () {
+    /** A subscribe's own attempt context while the client issues it; otherwise the caller's. */
+    let outbound: TraceContext | undefined
     const client = new St3Client({
       baseUrl: options.baseUrl,
       // Remove the browser receiver workaround after smalltalk#1040 / #1247 lands.
       fetchImpl: options.fetch ?? globalThis.fetch.bind(globalThis),
+      traceContext: () => outbound ?? options.traceContext?.(),
     })
+    const setOutbound = (trace: TraceContext | undefined) => {
+      outbound = trace
+    }
+    const firstFrames = makeFirstFrames({
+      tracer: yield* Effect.tracer,
+      ...(options.parentSpan === undefined ? {} : { parentSpan: options.parentSpan }),
+    })
+    /**
+     * One SDK HTTP call under its own `st3.*` span, a child of the caller's active span when it has
+     * one; the call's requests carry that span's `traceparent`, not the caller's.
+     */
+    const sdkRequest = <A, E>(name: string, request: (traced: St3Client) => Effect.Effect<A, E>) =>
+      Effect.suspend(() => {
+        const parent = options.parentSpan?.()
+        return Effect.currentSpan.pipe(
+          Effect.orDie,
+          Effect.flatMap((span) => request(client.withTraceContext(() => traceContextOf(span)))),
+          Effect.withSpan(name, parent === undefined ? {} : { parent }),
+        )
+      })
+    // Owned by this layer's scope from the take: released (closed) unless the client adopted it.
+    const early = options.adoptEarlyCollections === true
+      ? yield* Effect.acquireRelease(
+          Effect.sync(() => takeEarlyCollections()),
+          (taken) => Effect.sync(() => taken?.close()),
+        )
+      : undefined
+    const freshSocket = traceQuerySocket(options.socket ?? browserSocket)
+    const socket: CollectionSocketFactory = (url, protocols, headers) =>
+      early?.consume() ?? freshSocket(url, protocols, headers)
     const followKeys = new Map<string, string>()
     /** Per-follow freshness keyed by followKey while the follow's stream runs. */
     const freshnessTable = new Map<string, FollowFreshness>()
@@ -416,7 +516,7 @@ const make = (options: St3Options) =>
     }
     const channel = yield* makeChannel({
       client,
-      ...(options.socket === undefined ? {} : { socket: options.socket }),
+      socket,
       ...(options.onDiagnostics === undefined ? {} : { onDiagnostics: options.onDiagnostics }),
       ...(options.conversationSlots === 'advertised'
         ? {
@@ -499,7 +599,14 @@ const make = (options: St3Options) =>
           const emit = (event: FollowEvent<A>) => {
             Queue.offerUnsafe(queue, event)
           }
+          /** The current subscribe attempt's first-frame spans, until its first decoded frame. */
+          let attempt: FirstFrameAttempt | undefined
+          const endAttempt = (outcome: FirstFrameOutcome) => {
+            attempt?.end(outcome)
+            attempt = undefined
+          }
           const observe = (value: A, decodedSnapshot?: unknown) => {
+            endAttempt('observed')
             if (decodedSnapshot !== undefined) snapshot = decodedSnapshot
             lastLiveAt = Date.now()
             applyFreshness({ _tag: 'Frame' })
@@ -510,10 +617,12 @@ const make = (options: St3Options) =>
           // Status writes precede the terminal FollowEvent so no consumer teardown races a verdict.
           const fail = (error: FollowFailure, status = syncStatusFromFailure(error)) => {
             setSync(status)
+            endAttempt('failed')
             emit({ _tag: 'Failed', error })
             stop()
           }
           const stop = () => {
+            endAttempt('disposed')
             followKeys.delete(id)
             fresheners.delete(id)
             if (freshnessTable.get(key) === freshness) {
@@ -553,6 +662,7 @@ const make = (options: St3Options) =>
           open.set(key, {
             id,
             evict: () => {
+              endAttempt('disposed')
               applyFreshness({ _tag: 'Evicted' })
               emit({ _tag: 'Stale' })
               protocol.reset()
@@ -566,10 +676,21 @@ const make = (options: St3Options) =>
 
           const scope = yield* Effect.scope
           const context = yield* Effect.context()
-          const subscribe = (args: { readonly stream: CollectionStream; readonly id: string }) =>
-            protocol
-              .subscribe(args)
-              .pipe(Effect.catch((error) => Effect.sync(() => fail(error))))
+          const subscribe = ({ stream, id: wireId }: { readonly stream: CollectionStream; readonly id: string }) =>
+            Effect.suspend(() => {
+              endAttempt('superseded')
+              // The early-connect roster subscribe answers an identical first window subscribe.
+              const adopted = spec._tag === 'Window'
+                ? early?.wouldAdopt({ kind: 'subscribe', collection: spec.collection, limit: spec.limit, ...spec.filters })
+                : undefined
+              const current = firstFrames.begin({
+                kind: spec._tag === 'Window' ? 'window' : spec._tag === 'Conversation' ? 'conversation' : 'terminal',
+                label: spec._tag === 'Window' ? spec.collection : spec._tag.toLowerCase(),
+                ...(adopted === undefined ? {} : { adopted }),
+              })
+              attempt = current
+              return protocol.subscribe({ stream: tracedStream(stream, current.trace, setOutbound), id: wireId })
+            }).pipe(Effect.catch((error) => Effect.sync(() => fail(error))))
           let retryPending = false
           const retryLater = Effect.suspend(() => {
             if (retryPending) return Effect.void
@@ -589,6 +710,7 @@ const make = (options: St3Options) =>
               subscribe,
               onRejected: (message, code) => fail(new Rejected({ code, message })),
               onDrop: () => {
+                endAttempt('dropped')
                 protocol.reset()
                 applyFreshness({
                   _tag: 'SocketDropped',
@@ -825,56 +947,60 @@ const make = (options: St3Options) =>
           })),
         ),
       gatewaySyncStatus: SubscriptionRef.changes(channel.syncStatus).pipe(Stream.changes),
-      capabilities: Effect.tryPromise({
-        try: () => client.discover(),
-        catch: (error) => new Rejected({
-          code: error instanceof ClientError ? error.response.code : undefined,
-          message: error instanceof ClientError ? error.response.message : errorMessage(error),
-        }),
-      }).pipe(
-        Effect.flatMap((envelope) =>
-          Effect.try({
-            try: () => decodeCapabilities(envelope.value),
-            catch: (error) => new Rejected({ code: undefined, message: errorMessage(error) }),
-          }),
-        ),
-      ),
-      snapshot: Effect.tryPromise({
-        try: () => client.capabilities(),
-        catch: actionFailure,
-      }).pipe(
-        Effect.flatMap((envelope) =>
-          Effect.try({
-            try: () => decodeSnapshot(envelope.snapshot).id,
-            catch: actionFailure,
-          }),
-        ),
-        Effect.withSpan('st3.snapshot'),
-      ),
-      messageSend: Effect.fn('st3.messageSend')((request: MessageSendInput) =>
+      capabilities: sdkRequest('st3.capabilities', (traced) =>
         Effect.tryPromise({
-          try: () => {
-            const { tags, ...parameters } = request.parameters
-            return client.messageSend({
-              id: request.id,
-              idempotency_key: request.idempotency_key,
-              fence: request.fence,
-              parameters: {
-                ...parameters,
-                ...(tags === undefined ? {} : { tags: [...tags] }),
-              },
-            })
-          },
+          try: () => traced.discover(),
+          catch: (error) => new Rejected({
+            code: error instanceof ClientError ? error.response.code : undefined,
+            message: error instanceof ClientError ? error.response.message : errorMessage(error),
+          }),
+        }).pipe(
+          Effect.flatMap((envelope) =>
+            Effect.try({
+              try: () => decodeCapabilities(envelope.value),
+              catch: (error) => new Rejected({ code: undefined, message: errorMessage(error) }),
+            }),
+          ),
+        ),
+      ),
+      snapshot: sdkRequest('st3.snapshot', (traced) =>
+        Effect.tryPromise({
+          try: () => traced.capabilities(),
           catch: actionFailure,
         }).pipe(
           Effect.flatMap((envelope) =>
             Effect.try({
-              try: () => decodeActionResult(envelope.value),
+              try: () => decodeSnapshot(envelope.snapshot).id,
               catch: actionFailure,
             }),
           ),
         ),
       ),
+      messageSend: (request: MessageSendInput) =>
+        sdkRequest('st3.messageSend', (traced) =>
+          Effect.tryPromise({
+            try: () => {
+              const { tags, ...parameters } = request.parameters
+              return traced.messageSend({
+                id: request.id,
+                idempotency_key: request.idempotency_key,
+                fence: request.fence,
+                parameters: {
+                  ...parameters,
+                  ...(tags === undefined ? {} : { tags: [...tags] }),
+                },
+              })
+            },
+            catch: actionFailure,
+          }).pipe(
+            Effect.flatMap((envelope) =>
+              Effect.try({
+                try: () => decodeActionResult(envelope.value),
+                catch: actionFailure,
+              }),
+            ),
+          ),
+        ),
       followWindow,
       followConversation,
       followTerminal,

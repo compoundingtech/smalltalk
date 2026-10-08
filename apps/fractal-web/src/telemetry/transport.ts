@@ -1,9 +1,15 @@
 import * as Atom from 'effect/reactivity/Atom'
+import { wrapTraceFetch, type St3Options } from '@st3/sdk/effect'
 
 import { getDebug, incrDebug, setDebug } from './meters.tsx'
 
-/** Observe the actual SDK fetch boundary, not inferred Effect RPC activity. */
-export const instrumentFetch = (fetch: typeof globalThis.fetch): typeof globalThis.fetch => {
+/** Observe fetches and propagate UX context only to the admitted same-origin data boundary. */
+export const instrumentFetch = ({ fetchImpl, origin, traceContext }: {
+  readonly fetchImpl: typeof globalThis.fetch
+  readonly origin: string
+  readonly traceContext?: St3Options['traceContext']
+}): typeof globalThis.fetch => {
+  const fetch = traceContext === undefined ? fetchImpl : wrapTraceFetch({ fetchImpl, traceContext, baseUrl: origin })
   const samples: number[] = []
   let cursor = 0
   let inFlight = 0

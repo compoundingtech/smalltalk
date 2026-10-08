@@ -21,6 +21,7 @@ import type React from 'react'
 import { buildIdentity, deploymentId } from 'virtual:build-identity'
 
 import { makeSpanRing, type SpanRing } from './spanRing.ts'
+import { afterNextPaint, makeUxTelemetry, uxAttributeNames, uxSpanNames, type UxTelemetry } from './ux.ts'
 
 /** OpenTelemetry resource identity for browser spans emitted by wf. */
 export const serviceName = 'webfractal-web'
@@ -47,6 +48,7 @@ export interface TelemetryOptions {
 /** One browser telemetry instance: retained span ring, Effect tracer layer, profiler hook and DOM installation. */
 export interface Telemetry {
   readonly ring: SpanRing
+  readonly ux: UxTelemetry
   /** Provides the teed `Tracer` (and OTLP exporter when configured). */
   readonly layer: Layer.Layer<never>
   /** Root `React.Profiler` callback: marks commits so interactions can measure commit latency. */
@@ -95,6 +97,9 @@ const interactionTarget = (target: EventTarget | null): string => {
 }
 
 const exportedSpanNames: Readonly<Record<string, true>> = {
+  ...Object.fromEntries(uxSpanNames.map((name) => [name, true as const])),
+  'st3.follow.subscribe': true,
+  'st3.capabilities': true,
   'wf.ui.interaction': true,
   'wf.main.long_frame': true,
   'wf.page.vitals': true,
@@ -102,7 +107,9 @@ const exportedSpanNames: Readonly<Record<string, true>> = {
   'st3.messageSend': true,
 }
 const exportedAttributes: Readonly<Record<string, true>> = {
+  ...Object.fromEntries(uxAttributeNames.map((name) => [name, true as const])),
   'span.label': true,
+  'wf.ux.early': true,
   'wf.interaction.type': true,
   'wf.interaction.target': true,
   'wf.interaction.commit_observed': true,
@@ -141,28 +148,6 @@ interface LayoutShiftEntry extends PerformanceEntry {
 const toNanos = (performanceMs: number) =>
   BigInt(Math.round((performance.timeOrigin + performanceMs) * 1_000_000))
 
-const afterNextPaint = (f: () => void): (() => void) => {
-  let channel: MessageChannel | undefined
-  const frame = requestAnimationFrame(() => {
-    channel = new MessageChannel()
-    channel.port1.addEventListener(
-      'message',
-      () => {
-        channel?.port1.close()
-        channel?.port2.close()
-        f()
-      },
-      { once: true },
-    )
-    channel.port1.start()
-    channel.port2.postMessage(undefined)
-  })
-  return () => {
-    cancelAnimationFrame(frame)
-    channel?.port1.close()
-    channel?.port2.close()
-  }
-}
 
 const supportsEntryType = (type: string) => PerformanceObserver.supportedEntryTypes.includes(type)
 
@@ -180,9 +165,19 @@ export const makeTelemetry = (options: TelemetryOptions): Telemetry => {
         const span =
           options.production && !Object.hasOwn(exportedSpanNames, spanOptions.name)
             ? Tracer.nativeTracer.span(spanOptions)
-            : inner.span(options.production ? { ...spanOptions, links: [] } : spanOptions)
+            : inner.span(options.production ? {
+                ...spanOptions,
+                // First-frame roots link the early bootstrap, but never export link attributes/baggage.
+                links: spanOptions.name === 'wf.ux.first_frame' ? spanOptions.links.map(({ span }) => ({
+                  span: Tracer.externalSpan({ traceId: span.traceId, spanId: span.spanId, sampled: span.sampled }),
+                  attributes: {},
+                })) : [],
+              } : spanOptions)
         if (options.production) {
           const attribute = span.attribute.bind(span)
+          // SDK labels are fixed operation names, never a resource ref supplied by the caller.
+          if (span.name.startsWith('st3.') && Object.hasOwn(exportedSpanNames, span.name))
+            attribute('span.label', span.name.slice(4))
           Object.assign(span, {
             attribute: (key: string, value: unknown) => {
               if (Object.hasOwn(exportedAttributes, key) && !span.name.startsWith('st3.'))
@@ -212,6 +207,9 @@ export const makeTelemetry = (options: TelemetryOptions): Telemetry => {
       },
       ...(inner.context === undefined ? {} : { context: inner.context }),
     })
+  tracer = tee(Tracer.nativeTracer)
+  let ux: UxTelemetry | undefined
+  const getUx = () => ux ??= makeUxTelemetry({ tracer: () => tracer })
 
   const resource = {
     serviceName,
@@ -492,6 +490,7 @@ export const makeTelemetry = (options: TelemetryOptions): Telemetry => {
     uninstall = () => {
       uninstall = undefined
       for (const timer of timers.values()) clearTimeout(timer)
+      ux?.dispose()
       timers.clear()
       for (const cancel of paints) cancel()
       paints.clear()
@@ -505,5 +504,5 @@ export const makeTelemetry = (options: TelemetryOptions): Telemetry => {
     return uninstall
   }
 
-  return { ring, layer, onCommit, install }
+  return { ring, layer, onCommit, install, get ux() { return getUx() } }
 }
