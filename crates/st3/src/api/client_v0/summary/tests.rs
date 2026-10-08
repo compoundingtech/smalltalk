@@ -433,3 +433,188 @@ fn summary_does_not_hydrate_thousands_of_unstarted_definitions() {
         "unstarted definitions must not produce per-card queries: {statements}"
     );
 }
+
+#[test]
+fn summary_unread_person_updates_count_on_home_until_read() {
+    let root = tempfile::tempdir().unwrap();
+    let state = state(root.path());
+    let source = r#"version 2
+agent "summary-fixture.updater" { workspace "/tmp"; command "true"; restart always; }
+mission "summary-update-about" state="ready" {
+    goal "Provide requested fixture information";
+    step "build" { assigned-to "agent/summary-fixture.updater"; }
+}
+"#;
+    let intent = crate::graph::parse_internal_intent(source, "summary-fixture").unwrap();
+    state
+        .store
+        .apply_internal(&intent, "summary-update-publication")
+        .unwrap();
+    let run = state
+        .store
+        .create_mission_run(&crate::model::MissionRunRequest {
+            mission: "summary-update-about".into(),
+            revision: None,
+            workspace: root.path().display().to_string(),
+            requester: Some("person/avery".into()),
+            mode: None,
+            inputs: BTreeMap::new(),
+            idempotency_key: "summary-update-run".into(),
+        })
+        .unwrap();
+    let update = state
+        .store
+        .ask_person(
+            &serde_json::from_value(json!({
+                "person":"person/avery","actor":"agent/summary-fixture.updater",
+                "title":"Requested fixture information","reason":"Fixture work is available.",
+                "idempotency_key":"summary-update",
+                "request":{"version":1,"type":"update","about":run.subject}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    let count = |person| {
+        state
+            .store
+            .read_snapshot(|index| {
+                let now = client_now_ms();
+                let attention =
+                    client_attention_resources_at(&state.store, Some(person), false, now)?;
+                if person == "person/avery" && !attention.is_empty() {
+                    let item = attention
+                        .iter()
+                        .find(|item| item["source_id"] == update.subject)
+                        .unwrap();
+                    assert_eq!(item["attention_kind"], "person-step");
+                    assert_eq!(item["update"]["type"], "update");
+                    assert_eq!(item["state"], "open");
+                }
+                native(
+                    &state,
+                    &ClientSession::local(Some(person)).unwrap(),
+                    &request(None),
+                    &client_snapshot_at(&state, index),
+                    now,
+                    None,
+                    None,
+                )
+            })
+            .unwrap()[0]["needs_you"]
+            .as_u64()
+            .unwrap()
+    };
+    // Tier::Later affects display priority, not the accepted Home-count predicate.
+    assert_eq!(count("person/avery"), 1);
+    assert_eq!(count("person/other"), 0);
+    state
+        .store
+        .finish_person_step(
+            &crate::model::PersonStepResponse {
+                delegation: None,
+                subject: update.subject.clone(),
+                actor: "person/avery".into(),
+                summary: String::new(),
+                evidence: vec![],
+                episode: None,
+                idempotency_key: "summary-update-read".into(),
+                answer: Some(crate::person_request::AnswerInput {
+                    id: Some("read".into()),
+                    text: None,
+                }),
+            },
+            false,
+        )
+        .unwrap();
+    assert_eq!(count("person/avery"), 0);
+}
+
+#[test]
+fn summary_gate_does_not_reintroduce_an_out_of_grace_native_mission() {
+    let root = tempfile::tempdir().unwrap();
+    let state = state(root.path());
+    let source = "version 2\nmission \"summary-ended\" state=\"ready\" { goal \"Complete the fixture\"; step \"build\" { assigned-to \"agent/builder\"; } }\n";
+    let intent = crate::graph::parse_internal_intent(source, "summary-fixture").unwrap();
+    state
+        .store
+        .apply_internal(&intent, "summary-ended-publication")
+        .unwrap();
+    let run = state
+        .store
+        .create_mission_run(&crate::model::MissionRunRequest {
+            mission: "summary-ended".into(),
+            revision: None,
+            workspace: root.path().display().to_string(),
+            requester: Some("person/avery".into()),
+            mode: None,
+            inputs: BTreeMap::new(),
+            idempotency_key: "summary-ended-run".into(),
+        })
+        .unwrap();
+    state
+        .store
+        .set_mission_run_state(&run.subject, "cancelled", "terminal", Some("fixture ended"))
+        .unwrap();
+    let at = client_now_ms() + crate::store::RECENTLY_ENDED_MS + 1;
+    struct RestoreClock;
+    impl Drop for RestoreClock {
+        fn drop(&mut self) {
+            smallclaims::store::set_thread_clock(None);
+        }
+    }
+    smallclaims::store::set_thread_clock(Some(at));
+    let _clock = RestoreClock;
+    state
+        .store
+        .read_snapshot(|_| {
+            // Inject the hypothetical stale gate only into the presentation adapter:
+            // current native attention normally fences terminal owning work itself.
+            let gate: st3_client::Attention = serde_json::from_value(json!({
+                "id":"attention/summary-ended","kind":"attention","revision":"fixture",
+                "updated_at":client_timestamp(at),"attention_kind":"human-gate",
+                "source_id":"step-run/summary-ended/review","person_id":"person/avery",
+                "mission_id":"mission/summary-ended","title":"Fixture gate","detail":"Fixture",
+                "priority":"normal","state":"open","requested_at":client_timestamp(at)
+            }))?;
+            let project = |missions: &[st3_client::Mission]| {
+                st3_ui_model::missions::adapt(
+                    missions.iter(),
+                    std::iter::empty(),
+                    std::iter::once(&gate),
+                    "",
+                    &Display {
+                        mission_label: &|m| m.header.id.clone(),
+                        agent_label: &|a| a.name.clone(),
+                        age_label: &|_, _| String::new(),
+                        clean_text: &str::to_owned,
+                    },
+                )
+                .into_iter()
+                .filter(active)
+                .map(|m| m.id)
+                .collect::<BTreeSet<_>>()
+            };
+            let current_ids = state.store.mission_collection_ids(false, 0, 1000)?;
+            assert!(!current_ids.iter().any(|id| id == "mission/summary-ended"));
+            let full: Vec<st3_client::Mission> =
+                mission_list_cards_at(&state.store, &current_ids, at)?
+                    .into_iter()
+                    .map(serde_json::from_value)
+                    .collect::<Result<_, _>>()?;
+            let (lean, _) = state.store.client_summary_missions(at)?;
+            assert_eq!(project(&full), project(&lean));
+            assert!(project(&lean).is_empty());
+            let history_ids = state.store.mission_collection_ids(true, 0, 1000)?;
+            let history: Vec<st3_client::Mission> =
+                mission_list_cards_at(&state.store, &history_ids, at)?
+                    .into_iter()
+                    .map(serde_json::from_value)
+                    .collect::<Result<_, _>>()?;
+            assert!(
+                project(&history).contains("mission/summary-ended"),
+                "the gate affects a selected card but cannot add a missing current candidate"
+            );
+            Ok(())
+        })
+        .unwrap();
+}
