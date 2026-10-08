@@ -8,5 +8,5 @@ export const SidebarDuration = React.memo(function SidebarDuration({ row }: { re
   if (duration._tag === 'Unknown') return <span title="Duration unknown" aria-label="Duration unknown">—</span>
   const value = compactTime({ at: 0, now: duration.ms })
   const label = duration.scope === '24h-activity-span' ? '24h activity span' : 'Lifetime duration'
-  return <time dateTime={`PT${duration.ms / 1000}S`} title={`${label}: ${duration.ms} milliseconds`} aria-label={`${label}: ${value}`}>{value}{duration.scope === '24h-activity-span' ? '/24h' : ''}</time>
+  return <time dateTime={`PT${duration.ms / 1000}S`} title={`${label}: ${duration.ms} milliseconds`} aria-label={`${label}: ${value}`}>{value}{duration.scope === '24h-activity-span' && <span data-line1-drop="scope">/24h</span>}</time>
 })
