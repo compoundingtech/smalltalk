@@ -19,6 +19,7 @@ use tokio::sync::{Notify, watch};
 
 const SUBJECT: &str = "agent/eval.codex-bootstrap";
 const RUNTIME: &str = "codex-bootstrap";
+const TERMINAL: &str = "pty/person/eval/019a0000-0000-7000-8000-000000000001";
 
 fn runtime_claim(store: &Store, status: &str, incarnation: Option<&str>) {
     let mut fields = BTreeMap::from([
@@ -122,9 +123,10 @@ async fn delivery_recovery_control(mailbox_loss: bool, bound_shell: bool) {
         root,
     );
     if bound_shell {
-        source.push_str(
-            "\nterminal \"eval/codex-shell\" { command \"shell\"; restart \"never\"; }\n",
-        );
+        source.push_str(&format!(
+            "\nterminal {:?} {{ command \"shell\"; restart \"never\"; }}\n",
+            TERMINAL.strip_prefix("pty/").unwrap(),
+        ));
     }
     if mailbox_loss {
         source.push_str(&format!("\nmission \"mailbox-recovery\" state=\"ready\" {{ goal \"Keep queued work while a real native mailbox is deaf.\"; step \"queued\" {{ assigned-to \"{SUBJECT}\" }} }}\n"));
@@ -200,8 +202,19 @@ async fn delivery_recovery_control(mailbox_loss: bool, bound_shell: bool) {
                     }
                 }
                 let response = next.run(request).await;
-                if bind && response.status().is_success() {
-                    *capture.lock().unwrap() = Some(lease_evidence(&capture_root));
+                if bind {
+                    let (parts, body) = response.into_parts();
+                    let bytes = to_bytes(body, 1024 * 1024).await.unwrap();
+                    if parts.status.is_success() {
+                        *capture.lock().unwrap() = Some(lease_evidence(&capture_root));
+                    } else {
+                        eprintln!(
+                            "isolated Codex bind refusal: {} {}",
+                            parts.status,
+                            String::from_utf8_lossy(&bytes)
+                        );
+                    }
+                    return axum::response::Response::from_parts(parts, Body::from(bytes));
                 }
                 response
             }
@@ -241,12 +254,7 @@ async fn delivery_recovery_control(mailbox_loss: bool, bound_shell: bool) {
         ("ST_AGENT", SUBJECT.to_owned()),
         (
             "ST3_SUBJECT",
-            if bound_shell {
-                "pty/eval/codex-shell"
-            } else {
-                SUBJECT
-            }
-            .to_owned(),
+            if bound_shell { TERMINAL } else { SUBJECT }.to_owned(),
         ),
         ("ST3_BIN", binary.to_string_lossy().into_owned()),
         ("ST3_ENDPOINT", socket.to_string_lossy().into_owned()),
@@ -268,7 +276,7 @@ async fn delivery_recovery_control(mailbox_loss: bool, bound_shell: bool) {
                 "--tag",
                 "keep=true",
                 "--tag",
-                &format!("st3.subject={}", if bound_shell { "pty/eval/codex-shell" } else { SUBJECT }),
+                &format!("st3.subject={}", if bound_shell { TERMINAL } else { SUBJECT }),
             ]);
         for (key, value) in environment {
             command.arg("--env").arg(format!("{key}={value}"));
@@ -315,9 +323,9 @@ async fn delivery_recovery_control(mailbox_loss: bool, bound_shell: bool) {
     );
     let shell_generation = st_runtime::process_start_token(observation.pid.unwrap()).unwrap();
     let incarnation = if bound_shell {
-        let invocation = "d8c3d573-d6bd-45e5-b51f-698902ec9d4a";
+        let invocation = "019a0000-0000-7000-8000-000000000004";
         let source = format!(
-            "version 2\nagent \"eval.codex-bootstrap\" {{ harness \"codex\" {{}}; bind-terminal \"pty/eval/codex-shell\" incarnation={physical_incarnation:?} id={invocation:?}; }}"
+            "version 2\nagent \"eval.codex-bootstrap\" {{ harness \"codex\" {{}}; bind-terminal {TERMINAL:?} incarnation={physical_incarnation:?} id={invocation:?}; }}"
         );
         let intent = st3::graph::parse_intent(&source, "bootstrap").unwrap();
         let plan = store
@@ -749,6 +757,9 @@ async fn bootstrap_waits_for_reconciliation(status: &str, previous: Option<&str>
                 let (parts, body) = response.into_parts();
                 let bytes = to_bytes(body, 1024 * 1024).await.unwrap();
                 let value: Value = serde_json::from_slice(&bytes).unwrap();
+                if !parts.status.is_success() && value["code"] != "mailbox-session-starting" {
+                    eprintln!("isolated Codex bootstrap refusal: {} {value}", parts.status);
+                }
                 if value["code"] == "mailbox-session-starting" {
                     pending.fetch_add(1, Ordering::SeqCst);
                 }
