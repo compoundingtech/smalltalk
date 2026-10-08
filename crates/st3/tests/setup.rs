@@ -19,6 +19,7 @@ impl Fixture {
         for dir in ["home/.config/st3", "run", "archive", "bin"] {
             fs::create_dir_all(root.path().join(dir)).unwrap();
         }
+        symlink("/usr/bin/env", root.path().join("bin/env")).unwrap();
         Self {
             root,
             daemon_pid: None,
@@ -84,7 +85,6 @@ impl Fixture {
                 .find(|p| p.is_file())
                 .unwrap_or_else(|| panic!("test needs {name}"))
         };
-        symlink(search("env"), self.path("bin/env")).unwrap();
         fs::copy(env!("CARGO_BIN_EXE_st3-fixture"), self.path("archive/st3")).unwrap();
         fs::set_permissions(self.path("archive/st3"), fs::Permissions::from_mode(0o755)).unwrap();
         symlink(search("pty"), self.path("archive/pty")).unwrap();
@@ -140,6 +140,27 @@ fn flags_merge_config_without_prompting_and_invalid_names_do_not_write() {
         assert!(!output.status.success());
         assert_eq!(fs::read_to_string(&config).unwrap(), bytes);
     }
+}
+
+#[test]
+fn harness_probe_uses_login_path_order_and_flags_without_starting_a_seat() {
+    let fixture = Fixture::new();
+    let none = success(&fixture.setup_config_only(&[]));
+    assert!(none.contains("No supported harness is installed"), "{none}");
+    for harness in ["omp", "codex"] {
+        let path = fixture.path(&format!("bin/{harness}"));
+        fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let selected = success(&fixture.setup_config_only(&[]));
+    assert_eq!(selected.matches("Selected harness: codex").count(), 1);
+    assert!(!selected.contains("Which harness"));
+    assert!(success(&fixture.setup_config_only(&["--harness", "omp"])).contains("Selected harness: omp"));
+    assert!(success(&fixture.setup_config_only(&["--harness", "none"])).contains("Harness setup skipped"));
+    let missing = fixture.setup_config_only(&["--harness", "claude"]);
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("not installed on the daemon's login PATH"));
+    assert!(!fixture.path("home/.local/state/st3/claims.sqlite3").exists());
 }
 
 #[test]
@@ -219,6 +240,13 @@ fn archive_setup_installs_st_and_starts_one_isolated_daemon_without_gh_or_harnes
         toml::from_str(&fs::read_to_string(fixture.path("home/.config/st3/config.toml")).unwrap())
             .unwrap();
     assert_eq!(config["node"].as_str(), Some("studio"));
+    let before = Instant::now();
+    let missing = fixture.cli().args(["agents", "new", "fixture-missing", "--harness", "claude"]).output().unwrap();
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("not installed on the daemon's login PATH"));
+    assert!(before.elapsed() < Duration::from_secs(5), "missing harness must fail before waiting for a seat");
+    let agents = fixture.cli().args(["agents", "ls", "--json"]).output().unwrap();
+    assert!(!success(&agents).contains("fixture-missing"), "missing binary must not publish a restarting seat");
     let output = fixture
         .command(&fixture.path("home/.local/bin/st"))
         .args(["setup", "--yes", "--service", "false"])

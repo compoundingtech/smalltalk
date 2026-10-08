@@ -223,8 +223,12 @@ fn prepare_st3_channel_argv(
     if !requires_st3_channel(&argv) {
         return Ok(argv);
     }
-    match crate::claude_channel::verify_st3_installed() {
-        Ok(()) => select_st3_channel_plugin(argv, true),
+    match crate::claude_channel::verify_st3_plugin() {
+        Ok(()) => {
+            let approved = crate::claude_channel::st3_policy_available();
+            let argv = select_st3_channel_plugin(argv, true)?;
+            Ok(st3_plugin_admission_argv(argv, approved))
+        }
         Err(error) => {
             eprintln!(
                 "warning: the approved st3 Claude channel plugin is unavailable: {error:#}\n\
@@ -237,6 +241,19 @@ fn prepare_st3_channel_argv(
         }
     }
 }
+
+fn st3_plugin_admission_argv(mut argv: Vec<String>, approved: bool) -> Vec<String> {
+    if !approved {
+        for index in 0..argv.len().saturating_sub(1) {
+            if argv[index] == "--channels" && argv[index + 1] == crate::claude_channel::ST3_CHANNEL
+            {
+                argv[index] = "--dangerously-load-development-channels".into();
+            }
+        }
+    }
+    argv
+}
+
 
 /// Only the selected channel may own this seat's mailbox fence. User/project settings and
 /// older fleet declarations can still enable the previous st3 plugins after an upgrade.
@@ -2029,6 +2046,31 @@ mod tests {
     use super::*;
     use crate::harness_state::harness_state_path;
     use crate::provider_session::run_provider;
+
+    #[test]
+    fn st3_plugin_admission_uses_development_without_policy_and_preserves_other_channels() {
+        let args = vec![
+            "claude".into(),
+            "--channels".into(),
+            crate::claude_channel::ST3_CHANNEL.into(),
+            "--channels".into(),
+            "plugin:other@other".into(),
+            "boot prompt".into(),
+        ];
+        assert_eq!(st3_plugin_admission_argv(args.clone(), true), args);
+        let development = st3_plugin_admission_argv(args, false);
+        assert_eq!(
+            &development[1..3],
+            &[
+                "--dangerously-load-development-channels",
+                crate::claude_channel::ST3_CHANNEL
+            ]
+        );
+        assert_eq!(
+            &development[3..],
+            &["--channels", "plugin:other@other", "boot prompt"]
+        );
+    }
 
     #[test]
     fn duplicate_json_settings_keep_lifecycle_hooks_and_authored_plugins() {

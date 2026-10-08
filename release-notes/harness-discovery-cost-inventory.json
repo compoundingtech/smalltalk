@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Classify setup harness discovery in the daemon cost route inventory.",
+  "replay": {
+    "status": "none",
+    "detail": "Test inventory only; no production behavior, database, replication, command or operational change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Test inventory only; no production behavior, database, replication, command or operational change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Test inventory only; no production behavior, database, replication, command or operational change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Test inventory only; no production behavior, database, replication, command or operational change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Test inventory only; no production behavior, database, replication, command or operational change."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Test inventory only; no production behavior, database, replication, command or operational change."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Test inventory only; no production behavior, database, replication, command or operational change."
+  }
+}

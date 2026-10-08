@@ -3620,6 +3620,12 @@ async fn serve_creation_api(
         move |request: axum::extract::Request, next: axum::middleware::Next| {
             let store = store.clone();
             async move {
+                // This fixture supplies provider observations without launching a binary.
+                if request.uri().path() == "/v1/harnesses" {
+                    return axum::response::IntoResponse::into_response(axum::Json(serde_json::json!({
+                        "api_version": "st3.v1", "value": ["omp"]
+                    })));
+                }
                 let applied = matches!(
                     request.uri().path(),
                     "/v1/intent/apply" | "/v1/client/actions"

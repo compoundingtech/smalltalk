@@ -1779,7 +1779,8 @@
       "description": "Configure this machine and start st, with flags for unattended setup",
       "tests": [
         "crates/st3/tests/setup.rs::archive_setup_installs_st_and_starts_one_isolated_daemon_without_gh_or_harness",
-        "crates/st3/tests/setup.rs::flags_merge_config_without_prompting_and_invalid_names_do_not_write"
+        "crates/st3/tests/setup.rs::flags_merge_config_without_prompting_and_invalid_names_do_not_write",
+        "crates/st3/tests/setup.rs::harness_probe_uses_login_path_order_and_flags_without_starting_a_seat"
       ],
       "verification": "real CLI with an isolated HOME, state and sockets; no harness or gh"
     },

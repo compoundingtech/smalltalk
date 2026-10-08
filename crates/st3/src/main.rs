@@ -2631,11 +2631,11 @@ enum ServiceCommand {
 enum ClaudeChannelCommand {
     /// Install channel assets and approval policy; activate only in st seats.
     Install {
-        /// Install only plugin assets. An administrator will manage the machine policy.
+        /// Install user assets only; seats use development admission without machine policy.
         #[arg(long)]
         no_policy: bool,
     },
-    /// Verify the embedded files, Claude registration, plugin, and machine policy.
+    /// Verify user assets and report approved or development channel admission.
     Status,
     /// Remove the user plugin, marketplace, embedded files, and machine policy.
     Uninstall {
@@ -13050,6 +13050,23 @@ async fn run_agent_new(
     if args.print_kdl {
         print!("{kdl}");
         return Ok(());
+    }
+    let health: Value = client.get("/v1/health").await?;
+    let local = health["node"]
+        .as_str()
+        .context("the daemon health response has no node")?;
+    let host = args
+        .host
+        .as_deref()
+        .unwrap_or(local)
+        .trim_start_matches("host/");
+    if host == local || host == "local" {
+        let available: Vec<String> = client.get("/v1/harnesses").await?;
+        anyhow::ensure!(
+            available.contains(&args.harness),
+            "{} is not installed on the daemon's login PATH; install it and open a new login shell before creating a seat",
+            args.harness
+        );
     }
     let source_name = format!("st agents new {}", args.name);
     let preview: MissionResponse = client

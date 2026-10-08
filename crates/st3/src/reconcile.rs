@@ -259,7 +259,6 @@ fn calendar_occurrence(
     Ok((key, calendar_instant(zone, calendar.at_minute, next)?))
 }
 
-
 /// Keep the existing Claude regression cases exercising the shared driver classifier.
 #[cfg(test)]
 fn claude_login_expired(screen: &str) -> Option<&str> {
@@ -282,6 +281,22 @@ fn claude_trust_prompt(screen: &str) -> bool {
     ]
     .iter()
     .all(|phrase| screen.contains(phrase))
+}
+
+fn claude_development_channel_prompt(screen: &str) -> bool {
+    let screen = screen.split_whitespace().collect::<Vec<_>>().join(" ");
+    [
+        "WARNING: Loading development channels",
+        "--dangerously-load-development-channels",
+        "Channels:",
+        "❯ 1. I am using this for local development",
+        "2. Exit",
+        "Enter to confirm",
+        "Esc to cancel",
+    ]
+    .iter()
+    .all(|text| screen.contains(text))
+        && (screen.contains("plugin:st-channel@st") || screen.contains("server:st3"))
 }
 
 /// How long a resume that ended without a reason waits for its driver's typed refusal.
@@ -347,6 +362,18 @@ pub trait RuntimeControl: Send + Sync + 'static {
     fn remove(&self, runtime_id: &str, terminal: bool) -> Result<()>;
     fn screen(&self, runtime_id: &str) -> Result<String>;
     fn send_key(&self, runtime_id: &str, key: &str) -> Result<()>;
+    fn send_key_if(&self, runtime_id: &str, key: &str, incarnation: &str) -> Result<()> {
+        anyhow::ensure!(
+            self.snapshot_ptys()?
+                .iter()
+                .any(|o| o.runtime_id == runtime_id
+                    && o.incarnation_id.as_deref() == Some(incarnation)
+                    && o.status == "running"),
+            "the terminal incarnation changed before channel consent"
+        );
+        self.send_key(runtime_id, key)
+    }
+
     fn read_exec_log(&self, runtime_id: &str) -> Result<Option<String>>;
     /// Ends, without waiting, what a runtime that is not running left in its work scope: a build
     /// or test its harness started that outlived it.
@@ -598,6 +625,10 @@ impl RuntimeControl for NativeRuntime {
 
     fn send_key(&self, runtime_id: &str, key: &str) -> Result<()> {
         self.pty()?.send_key(runtime_id, key)
+    }
+
+    fn send_key_if(&self, runtime_id: &str, key: &str, incarnation: &str) -> Result<()> {
+        self.pty()?.send_key_if(runtime_id, key, Some(incarnation))
     }
 
     fn read_exec_log(&self, runtime_id: &str) -> Result<Option<String>> {
@@ -2549,6 +2580,12 @@ impl<R: RuntimeControl> Reconciler<R> {
                                     &observation,
                                     now_ms(),
                                 )?;
+                                self.reconcile_claude_channel_consent(
+                                    subject,
+                                    member,
+                                    &observation,
+                                    screen.as_deref(),
+                                )?;
                                 self.reconcile_driver_readiness(
                                     subject,
                                     member,
@@ -3628,6 +3665,74 @@ impl<R: RuntimeControl> Reconciler<R> {
     ) -> Result<(Option<String>, String)> {
         let (claim, key) = self.store.harness_login_episode_key(subject, incarnation)?;
         Ok((claim.map(|claim| claim.id), key))
+    }
+
+    /// Admit the measured st development-channel startup dialog once per incarnation.
+    fn reconcile_claude_channel_consent(
+        &self,
+        subject: &DesiredSubject,
+        member: &MemberSpec,
+        observation: &RuntimeObservation,
+        screen: Option<&str>,
+    ) -> Result<()> {
+        if subject.kind != "agent" || member.driver.as_deref() != Some("claude") || !member.terminal
+        {
+            return Ok(());
+        }
+        let Some(incarnation) = observation.incarnation_id.as_deref() else {
+            return Ok(());
+        };
+        if !screen.is_some_and(claude_development_channel_prompt)
+            || self
+                .store
+                .harness_was_ready(&subject.subject, incarnation)?
+        {
+            return Ok(());
+        }
+        let Some(runtime_claim) = self.running_runtime_claim(&subject.subject, incarnation)? else {
+            return Ok(());
+        };
+        if now_ms().saturating_sub(runtime_claim.accepted_at_unix_ms)
+            > HARNESS_READINESS_DEADLINE_MS
+            || self
+                .store
+                .claims_for(&subject.subject, Some("runtime.reconcile-decision"))?
+                .iter()
+                .any(|claim| {
+                    claim
+                        .body
+                        .pointer("/fields/decision")
+                        .and_then(Value::as_str)
+                        == Some("channel-consent")
+                        && claim.body.pointer("/fields/key").and_then(Value::as_str)
+                            == Some(incarnation)
+                })
+        {
+            return Ok(());
+        }
+        // Record the bounded attempt before input; replay must never press Return twice.
+        self.store.append_claim(&ClaimInput {
+            subject: subject.subject.clone(),
+            kind: "runtime.reconcile-decision".into(),
+            actor: None,
+            fields: BTreeMap::from([
+                ("key".into(), Value::String(incarnation.into())),
+                ("decision".into(), Value::String("channel-consent".into())),
+                (
+                    "reason".into(),
+                    Value::String("attempt the st development-channel startup consent once".into()),
+                ),
+            ]),
+            evidence: vec![runtime_claim.id],
+            expected_subject: None,
+            idempotency_key: Some(format!(
+                "claude-channel-consent:{}:{incarnation}",
+                subject.subject
+            )),
+        })?;
+        self.signal_changed();
+        self.runtime
+            .send_key_if(&member.runtime_id, "return", incarnation)
     }
 
     /// Claude's workspace trust prompt appears before any hook or channel can report the session,
@@ -22750,7 +22855,6 @@ schedule "orchard" {{
         );
     }
 
-
     #[tokio::test]
     async fn daily_calendar_reaches_once_and_preserves_durable_claim_key() {
         let store = Arc::new(Store::open_memory("node").unwrap());
@@ -22826,7 +22930,6 @@ schedule "daily" {{
         assert_eq!(reached[0].body["fields"]["occurrence"], key);
         assert_eq!(reached[0].body["fields"]["scheduled_at_unix_ms"], recorded);
     }
-
 
 
     #[test]
@@ -34716,6 +34819,86 @@ agent "plain" {{ workspace {:?}; harness "claude" {{}} }}
                 .as_deref(),
             Some("daemon/runtime")
         );
+    }
+
+    const DEVELOPMENT_CHANNEL_SCREEN: &str = "WARNING: Loading development channels\n--dangerously-load-development-channels is for local channel development only.\nPlease use --channels to run a list of approved channels.\nChannels: plugin:st-channel@st\n❯ 1. I am using this for local development\n  2. Exit\nEnter to confirm · Esc to cancel";
+
+    #[test]
+    fn development_channel_consent_is_once_before_readiness_and_checks_incarnation() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            "version 2\nagent \"seat\" { workspace \"/tmp\"; harness \"claude\" {} }",
+            "consent",
+        );
+        let desired = store.desired_subjects().unwrap().remove(0);
+        let member = desired.member.as_ref().unwrap();
+        let runtime = Arc::new(FakeRuntime::default());
+        let observation = running_observation(member, "one");
+        runtime.ptys.lock().unwrap().push(observation.clone());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        store
+            .append_claim(&ClaimInput {
+                subject: desired.subject.clone(),
+                kind: "runtime.observed".into(),
+                actor: None,
+                fields: member_fields(member, "running", Some("one"), true),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("consent-one-running".into()),
+            })
+            .unwrap();
+        assert!(super::claude_development_channel_prompt(
+            DEVELOPMENT_CHANNEL_SCREEN
+        ));
+        assert!(!super::claude_development_channel_prompt(
+            &DEVELOPMENT_CHANNEL_SCREEN.replace("❯ 1.", "1.")
+        ));
+        assert!(!super::claude_development_channel_prompt(
+            "I am using this for local development"
+        ));
+        for _ in 0..2 {
+            reconciler
+                .reconcile_claude_channel_consent(
+                    &desired,
+                    member,
+                    &observation,
+                    Some(DEVELOPMENT_CHANNEL_SCREEN),
+                )
+                .unwrap();
+        }
+        assert_eq!(*runtime.keys.lock().unwrap(), ["return"]);
+        assert_eq!(
+            store
+                .claims_for(&desired.subject, Some("runtime.reconcile-decision"))
+                .unwrap()
+                .len(),
+            1
+        );
+        mark_harness_ready(&store, &desired.subject, member, "claude", "ready");
+        let ready = running_observation(member, "ready");
+        runtime.ptys.lock().unwrap().clear();
+        runtime.ptys.lock().unwrap().push(ready.clone());
+        reconciler
+            .reconcile_claude_channel_consent(
+                &desired,
+                member,
+                &ready,
+                Some(DEVELOPMENT_CHANNEL_SCREEN),
+            )
+            .unwrap();
+        assert_eq!(*runtime.keys.lock().unwrap(), ["return"]);
+        assert!(
+            runtime
+                .send_key_if(&member.runtime_id, "return", "stale")
+                .is_err()
+        );
+        assert_eq!(*runtime.keys.lock().unwrap(), ["return"]);
     }
 
     fn mark_harness_ready(

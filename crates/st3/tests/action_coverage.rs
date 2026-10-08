@@ -208,7 +208,18 @@ impl Daemon {
         let socket = self.socket();
         let state = self.state.clone();
         self.server = Some(tokio::spawn(async move {
-            st3::api::serve_unix(&socket, st3::api::router(state)).await
+            // Provider lifecycle is simulated here; discovery must use the same fixture.
+            let router = st3::api::router(state).layer(axum::middleware::from_fn(
+                |request: axum::extract::Request, next: axum::middleware::Next| async move {
+                    if request.uri().path() == "/v1/harnesses" {
+                        return axum::response::IntoResponse::into_response(axum::Json(json!({
+                            "api_version": "st3.v1", "value": ["claude"]
+                        })));
+                    }
+                    next.run(request).await
+                },
+            ));
+            st3::api::serve_unix(&socket, router).await
         }));
         let mut last_error = None;
         for _ in 0..200 {
