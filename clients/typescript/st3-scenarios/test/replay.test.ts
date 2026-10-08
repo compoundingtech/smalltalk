@@ -294,6 +294,18 @@ describe('terminal dispatch', () => {
     expect(ending[0]).toBeInstanceOf(ClientError)
     expect(ending[0]).toMatchObject({ response: { code: 'terminal-unavailable', retryable: true } })
   })
+
+  it('preserves not-found for a missing terminal through the legacy terminalStream consumer', async () => {
+    const h = setup(base().with({ terminal: 'running' }))
+    const attachment = await h.attach()
+    const ending: Error[] = []
+    await h.client.terminalStream('terminal/scenario-missing', { socket: h.replay.socket,
+      streamCapability: attachment.stream_capability!, incarnation: attachment.runtime_incarnation,
+      onScreen: () => {}, onEnd: (error) => { if (error !== undefined) ending.push(error) } })
+    h.clock.advance(0)
+    expect(ending[0]).toBeInstanceOf(ClientError)
+    expect(ending[0]).toMatchObject({ response: { code: 'not-found', retryable: false } })
+  })
 })
 
 describe('sync dispatch', () => {
