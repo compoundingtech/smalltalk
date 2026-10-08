@@ -75,9 +75,9 @@ projects and tasks you give them accordingly.
 ## 3. Work with the expert
 
 When a usable harness is available, first-run setup creates `agent/st/expert` and
-starts `mission/st/onboarding`. The first launch opens the expert conversation in
-the terminal interface. Follow its guidance for your first mission; the expert stays
-available after onboarding.
+starts `mission/st/onboarding`. When setup publishes the expert during a plain `st`
+launch, the interface opens that conversation. You can also find it under Agents.
+Follow its guidance for your first mission; the expert stays available afterward.
 
 Home shows questions, decisions and failures that need you. Agents shows conversations
 and transcripts; Missions shows work and results. **Ctrl+K** opens the palette and

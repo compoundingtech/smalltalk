@@ -425,7 +425,7 @@ Each step records a checkpoint in `STATE/fleet/join.json`, so running `st fleet 
 continues from the last completed step:
 
 1. **Check.** Parse the code. Refuse if this store is bound to another fleet, or this machine is
-   already a member. Choose the name: `--name`, else the code's pinned name, else the configured
+   already a member. Choose the name: `--name`, else the code's pinned name, else the
    resolved node name from configuration and stable node identity. Join does not call
    `scutil`; macOS first-run setup uses it to suggest the machine name
    and persists that choice in config. Pass `--name` when the default is unsuitable. Refuse the name
