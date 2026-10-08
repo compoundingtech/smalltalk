@@ -791,6 +791,35 @@ mod tests {
     use crate::client::{Client, Endpoint};
     use tokio_tungstenite::tungstenite::Message;
 
+    // These snapshot/receipt controls model an already-admitted channel with a synthetic
+    // identity. Their explicit test-only routes do not claim production peer authentication;
+    // isolated native wrapper controls exercise the real kernel/process/provider boundary.
+    fn admitted_fixture_router(state: AppState, peer: NativeDeliveryPeer) -> Router {
+        let bind_state = state.clone();
+        let bind_peer = peer.clone();
+        let stream_state = state.clone();
+        let stream_peer = peer.clone();
+        Router::new()
+            .route("/v1/mailbox/bind", post(move |Json(request): Json<Fence>| {
+                let (state, peer) = (bind_state.clone(), bind_peer.clone());
+                async move {
+                    authorize(&request, Some(&peer))?;
+                    let fence = blocking_action(move || state.store.bind_mailbox(&request)).await?;
+                    Ok::<_, ApiError>(Json(json!({"api_version":"st3.v1","value":fence})))
+                }
+            }))
+            .route("/v1/mailbox", get(move |Query(fence): Query<Fence>, websocket: WebSocketUpgrade| {
+                let (state, peer) = (stream_state.clone(), stream_peer.clone());
+                async move {
+                    authorize(&fence, Some(&peer))?;
+                    state.store.check_mailbox(&fence).map_err(ApiError::bad)?;
+                    signal_local_change(&state);
+                    Ok::<_, ApiError>(websocket.on_upgrade(move |socket| stream_with_reader(state, fence, socket, raw_snapshot)))
+                }
+            }))
+            .fallback_service(router(state).layer(Extension(peer)))
+    }
+
     #[tokio::test]
     async fn attachment_checks_both_runtime_and_current_delivery_epoch() {
         let root = tempfile::tempdir().unwrap();
@@ -921,7 +950,7 @@ mod tests {
             pid: 37,
             archives_inbox: true,
         };
-        let app = router(state.clone()).layer(Extension(peer));
+        let app = admitted_fixture_router(state.clone(), peer);
         let path = root.path().join("daemon.sock");
         let server_path = path.clone();
         let server = tokio::spawn(async move { serve_unix(&server_path, app).await.unwrap() });
@@ -1253,7 +1282,7 @@ mod tests {
             pid: 37,
             archives_inbox: true,
         };
-        let app = router(state.clone()).layer(Extension(peer));
+        let app = admitted_fixture_router(state.clone(), peer);
         let path = root.path().join("daemon.sock");
         let start = || {
             let app = app.clone();
@@ -1490,7 +1519,7 @@ mod tests {
             pid: 37,
             archives_inbox: false,
         };
-        let app = router(state.clone()).layer(Extension(peer));
+        let app = admitted_fixture_router(state.clone(), peer);
         let path = root.path().join("daemon.sock");
         let server_path = path.clone();
         let server = tokio::spawn(async move { serve_unix(&server_path, app).await.unwrap() });
@@ -1521,7 +1550,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn every_harness_delivers_live_mail_and_receipts_over_a_real_unix_push_stream_without_files()
+    async fn admitted_transports_deliver_live_mail_and_receipts_over_a_real_unix_push_stream_without_files()
      {
         for transport in [
             "claude-channel",
@@ -1561,8 +1590,7 @@ mod tests {
             let lose_response = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let injection = lose_response.clone();
             let app =
-                router(state.clone())
-                    .layer(Extension(peer))
+                admitted_fixture_router(state.clone(), peer)
                     .layer(axum::middleware::from_fn(
                         move |request: axum::extract::Request, next: axum::middleware::Next| {
                             let injection = injection.clone();
