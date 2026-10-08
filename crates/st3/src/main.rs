@@ -9768,7 +9768,7 @@ async fn follow_conversation(
 ) -> Result<()> {
     let mut stream = client.collection_stream().await?;
     stream
-        .subscribe_conversation("conversation", target)
+        .subscribe_conversation_with_limit("conversation", target, limit)
         .await?;
     let mut seen = BTreeMap::new();
     let mut stalled: Option<String> = None;

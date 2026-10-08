@@ -120,6 +120,10 @@ A conversation is one more subscription too. Name an agent or a session:
 {"kind":"subscribe","id":"talk","collection":"conversation","conversation":"agent/ID"}
 ```
 
+The first frame carries the conversation's newest entries: 20 by default, or the
+subscribe's optional `limit` (1 through 200). Older history pages through the timeline
+endpoints' cursors; `has_more` says whether that history exists.
+
 An agent's conversation is its current session's timeline with the Smalltalk to or from the agent
 joined in. The first `conversation` frame carries `id`, `collection` (`conversation`),
 `session_id`, `replace: true`, the newest page of timeline `items`, and `has_more`. Later frames
