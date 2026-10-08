@@ -845,14 +845,28 @@ fn conversation_open_local(
     BEFORE_CONVERSATION_PAGE.with(|pause| {
         if let Some(pause) = pause.borrow_mut().take() { pause(); }
     });
-    let page = timeline_value(
-        state, &snapshot, session, session_id,
-        &ClientListQuery { limit: Some(200), ..Default::default() },
-    )?.0;
-    let native = native_latest_sequence(&page);
-    let cursor = conversation_cursor(
-        state, session_id, snapshot.store_index, local_position, native,
-    );
+    let (page, source_generation) =
+        match conversation_first_page_at_generation(state, &snapshot, session, session_id) {
+            Ok(page) => page,
+            Err(error) if error.status == StatusCode::TOO_MANY_REQUESTS => return Err(error),
+            // OPEN keeps the established managed-transcript availability notice and stored
+            // fallback. Successful native reads still capture page and generation together;
+            // change replay deliberately continues to surface native-read failures.
+            Err(error) => {
+                require_scope(session, "read.projections")?;
+                (timeline_first_page(
+                    state, &snapshot, session, session_id.to_owned(),
+                    &ClientListQuery { limit: Some(200), ..Default::default() },
+                    Some(error),
+                )?.0, 0)
+            }
+        };
+    let cursor = conversation_cursor(state, session_id, ConversationPosition {
+        store_index: snapshot.store_index,
+        local_position,
+        native_sequence: native_latest_sequence(&page),
+        source_generation,
+    });
     remember_cursor(&cursor, mark.transcript_seen);
     Ok((json!({"next_cursor":cursor}), page))
 }
@@ -5304,7 +5318,7 @@ pub(super) fn timeline_value(
         return Ok(Json(page_value));
     }
     crate::performance::task("conversation/first-page", || {
-        timeline_first_page(state, snapshot, session, session_id, query)
+        timeline_first_page(state, snapshot, session, session_id, query, None)
     })
 }
 
@@ -5314,6 +5328,7 @@ fn timeline_first_page(
     session: &ClientSession,
     session_id: String,
     query: &ClientListQuery,
+    native_read_error: Option<ApiError>,
 ) -> Result<Json<Value>, ApiError> {
     #[cfg(test)]
     if let Ok(mut rebuilds) = timeline_rebuilds().lock() {
@@ -5322,6 +5337,9 @@ fn timeline_first_page(
     let managed = super::managed_session_owner_at(&state.store, snapshot.store_index, &session_id)
         .map_err(ApiError::internal)?;
     let Some((owner, incarnation, _)) = managed else {
+        if let Some(error) = native_read_error {
+            return Err(error);
+        }
         let conversation = crate::external_sessions::find_conversation(
             state.native_session_home.as_deref(),
             &session_id,
@@ -5361,7 +5379,9 @@ fn timeline_first_page(
     if let Some(incarnation) = incarnation
         && let Some(managed) = managed_transcript(state, owner, incarnation)?
     {
-        let read = {
+        let read = if let Some(error) = native_read_error.as_ref() {
+            Err(format!("the transcript could not be read: {}", error.message))
+        } else {
             let _span = crate::profile::span("timeline/native-read");
             match managed.transcript.as_ref() {
                 Ok(external) => match if external.driver != crate::external_sessions::ExternalDriver::OpenCode {
@@ -5887,15 +5907,16 @@ fn conversation_read_now(
     })
 }
 
-fn conversation_read_now_unbounded(
+/// Read OPEN and change-replay pages through the same bounded fold, retaining the generation
+/// of the returned page without a second native read.
+fn conversation_first_page_at_generation(
     state: &AppState,
+    snapshot: &ClientSnapshot,
     session: &ClientSession,
     session_id: &str,
-    after: Option<&str>,
-) -> Result<Value, ApiError> {
-    let snapshot = new_client_snapshot(state);
+) -> Result<(Value, u64), ApiError> {
     let query = ClientListQuery { limit: Some(200), ..Default::default() };
-    let (page, source_generation) = match conversation_blocks::source(state, session_id) {
+    match conversation_blocks::source(state, session_id) {
         // Replay selects only its newest bounded projection, including for OpenCode.
         Ok(source) => {
             // Native replay bypasses timeline_first_page after the incremental-fold cutover.
@@ -5904,21 +5925,30 @@ fn conversation_read_now_unbounded(
                 *rebuilds.entry(session_id.to_owned()).or_default() += 1;
             }
             let (page, generation) = native_slice_page_at_generation(
-                state, &snapshot, session, session_id, &query, &source,
+                state, snapshot, session, session_id, &query, &source,
             )?;
-            // Line transcripts keep their generation across appends and move it on any
-            // in-place rewrite. OpenCode's generation digests the whole bounded timeline and
-            // moves on every append, so it cannot fence rewrites without turning each append
-            // into a full reload.
+            // OpenCode's generation moves on every append, so it cannot fence rewrites
+            // without turning each append into a full reload.
             let fence = if source.driver == crate::external_sessions::ExternalDriver::OpenCode {
                 0
             } else {
                 generation
             };
-            (page.0, fence)
+            Ok((page.0, fence))
         }
-        Err(_) => (timeline_value(state, &snapshot, session, session_id, &query)?.0, 0),
-    };
+        Err(_) => Ok((timeline_value(state, snapshot, session, session_id, &query)?.0, 0)),
+    }
+}
+
+fn conversation_read_now_unbounded(
+    state: &AppState,
+    session: &ClientSession,
+    session_id: &str,
+    after: Option<&str>,
+) -> Result<Value, ApiError> {
+    let snapshot = new_client_snapshot(state);
+    let (page, source_generation) =
+        conversation_first_page_at_generation(state, &snapshot, session, session_id)?;
     let all = page["items"]
         .as_array()
         .ok_or_else(|| ApiError::internal("the timeline has no items"))?;
@@ -15668,11 +15698,14 @@ mission "example/zero-run" state="ready" {
             .any(|item| item["id"] == "timeline-entry/open-local-frontier");
         assert!(!contains_local(&page));
         let cursor = start["next_cursor"].as_str().unwrap();
-        let (graph, local, native) = conversation_position(&state, &session_id, cursor).unwrap();
+        let position = conversation_position(&state, &session_id, cursor).unwrap();
         let latest_local = local_latest_position(&state).unwrap();
-        assert!(latest_local > local);
+        assert!(latest_local > position.local_position);
         // Control: the former post-snapshot local high-water silently skips this exact row.
-        let skipped = conversation_cursor(&state, &session_id, graph, latest_local, native);
+        let skipped = conversation_cursor(&state, &session_id, ConversationPosition {
+            local_position: latest_local,
+            ..position
+        });
         remember_cursor(&skipped, issued_transcript(cursor).unwrap());
         let lost = conversation_changes_local(&state, &session, &session_id, Some(&skipped), 0).await.unwrap();
         assert!(!contains_local(&lost));
@@ -16628,14 +16661,17 @@ mission "example/zero-run" state="ready" {
             &state, &new_client_snapshot(&state), &session, &session_id,
             &ClientListQuery { limit: Some(200), ..Default::default() },
         ).unwrap().0;
-        // Existing rows come from the timeline page; opening changes at the live edge
-        // only establishes the follower cursor and deliberately returns no rows.
-        let page = newest_page();
+        // Local OPEN captures the initial page and its generation-fenced cursor together.
+        let (opened, page) = conversation_open_local(&state, &session, &session_id).unwrap();
         let (failed_sequence, view) = error_view(&page).expect("the failed turn renders an error");
         assert_eq!(view["status"], "failed");
         assert_eq!(view["presentation"], "full");
-        let opened = conversation_read_now(&state, &session, &session_id, None).unwrap();
-        assert!(opened["items"].as_array().unwrap().is_empty(), "{opened}");
+        assert_ne!(
+            conversation_position(&state, &session_id, opened["next_cursor"].as_str().unwrap())
+                .unwrap().source_generation,
+            0,
+            "OPEN must fence the exact native page it delivered",
+        );
         // The retry's answer is a pure append: it stays an incremental delta.
         writeln!(std::fs::OpenOptions::new().append(true).open(&path).unwrap(), "{reply}").unwrap();
         let appended = conversation_read_now(
@@ -16666,8 +16702,7 @@ mission "example/zero-run" state="ready" {
             assert_eq!(view["status"], status);
             assert_eq!(view["presentation"], presentation);
             assert_eq!(view["message"], "synthetic socket closed");
-            let reopened = conversation_read_now(&state, &session, &session_id, None).unwrap();
-            assert!(reopened["items"].as_array().unwrap().is_empty(), "{reopened}");
+            let (reopened, _) = conversation_open_local(&state, &session, &session_id).unwrap();
             cursor = reopened["next_cursor"].as_str().unwrap().to_owned();
         }
         // With nothing rewritten since the reload, the follower resumes incrementally.
@@ -16941,6 +16976,38 @@ mission "example/zero-run" state="ready" {
                         .starts_with("transcript not bound: the transcript could not be read"),
                     "{notice:#}"
                 );
+                let (start, opened) =
+                    conversation_open_local(&state, &session, &session_id).unwrap();
+                let items = opened["items"].as_array().unwrap();
+                assert!(items.iter().any(|item|
+                    item["type"] == "message"
+                        && item["body"]["message_id"] == "message/managed-native"),
+                    "OPEN keeps the stored timeline: {opened:#}");
+                let opened_notice = items.iter()
+                    .find(|item| item["body"]["code"] == "transcript-not-bound")
+                    .expect("OPEN explains the unreadable managed transcript");
+                assert_eq!(opened_notice["body"], notice["body"]);
+                assert_eq!(
+                    conversation_position(&state, &session_id, start["next_cursor"].as_str().unwrap())
+                        .unwrap().source_generation,
+                    0,
+                    "a stored fallback must not claim a native generation",
+                );
+                let native_error = conversation_read_now(&state, &session, &session_id, None)
+                    .expect_err("change reads keep surfacing the native-read failure");
+                // Even if the file becomes readable after the failed native read, OPEN's
+                // fallback path must not retry it and deliver a native page with generation zero.
+                std::fs::set_permissions(&transcript, std::fs::Permissions::from_mode(0o600)).unwrap();
+                let fallback = timeline_first_page(
+                    &state, &new_client_snapshot(&state), &session, session_id.clone(),
+                    &ClientListQuery { limit: Some(200), ..Default::default() },
+                    Some(native_error),
+                ).unwrap().0;
+                assert!(!fallback["items"].as_array().unwrap().iter()
+                    .any(|item| item["body"]["text"] == "Exact managed transcript"
+                        || item["body"]["text"] == "Native reply"));
+                assert!(fallback["items"].as_array().unwrap().iter()
+                    .any(|item| item["body"]["code"] == "transcript-not-bound"));
             }
             std::fs::set_permissions(&transcript, std::fs::Permissions::from_mode(0o600)).unwrap();
         }

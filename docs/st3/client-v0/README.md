@@ -934,7 +934,13 @@ Conversation changes carry these projection notices when managed history changes
 the first operation that crosses the bound. An updated entry outside the materialized window
 causes the ordinary cursor-gap/newest-page refresh instead of an incomplete revision delta.
 Conversation cursors also bind the native line transcript's content generation.
-Appends preserve it. Settling an already-delivered OMP turn's `retryRecovery`
+Local conversation OPEN captures the page and its native generation in one bounded
+read. Its local-observation high-water precedes the graph snapshot, so concurrent
+rows remain replayable rather than being skipped by the initial cursor.
+If a managed native transcript cannot be read, OPEN keeps the stored timeline and
+its transcript-availability notice without retrying the native read. This fallback
+uses generation zero; native change reads still surface the read error.
+Appends preserve the native generation. Settling an already-delivered OMP turn's `retryRecovery`
 rewrites its native record and moves the generation; the next change read returns
 `cursor-gap` with `full_resync: true`, so followers reload the newest page with the
 updated error presentation. OpenCode's append-changing generation is not used as
