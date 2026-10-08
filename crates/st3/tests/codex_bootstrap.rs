@@ -57,7 +57,7 @@ async fn delayed_delivery_control_holds_visible_native_input_and_recovers_once()
     if st3::test_support::supervise_test() {
         return;
     }
-    delivery_recovery_control(false).await;
+    delivery_recovery_control(false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -65,7 +65,15 @@ async fn mailbox_reconnect_preserves_provider_and_consumes_queued_mail_once() {
     if st3::test_support::supervise_test() {
         return;
     }
-    delivery_recovery_control(true).await;
+    delivery_recovery_control(true, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bound_cold_codex_promotes_custody_delivers_once_and_returns_to_its_shell() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    delivery_recovery_control(true, true).await;
 }
 
 fn lease_evidence(root: &Path) -> Value {
@@ -82,7 +90,7 @@ fn lease_evidence(root: &Path) -> Value {
     ).unwrap()
 }
 
-async fn delivery_recovery_control(mailbox_loss: bool) {
+async fn delivery_recovery_control(mailbox_loss: bool, bound_shell: bool) {
     use std::sync::atomic::AtomicBool;
     let path = std::env::var_os("PATH").unwrap_or_default();
     let on_path = |name: &str| {
@@ -113,6 +121,11 @@ async fn delivery_recovery_control(mailbox_loss: bool) {
         "version 2\nagent \"eval.codex-bootstrap\" {{ host \"bootstrap\"; workspace {:?}; harness \"codex\" {{}} }}",
         root,
     );
+    if bound_shell {
+        source.push_str(
+            "\nterminal \"eval/codex-shell\" { command \"shell\"; restart \"never\"; }\n",
+        );
+    }
     if mailbox_loss {
         source.push_str(&format!("\nmission \"mailbox-recovery\" state=\"ready\" {{ goal \"Keep queued work while a real native mailbox is deaf.\"; step \"queued\" {{ assigned-to \"{SUBJECT}\" }} }}\n"));
     }
@@ -226,7 +239,15 @@ async fn delivery_recovery_control(mailbox_loss: bool) {
         ("HOME", root.to_string_lossy().into_owned()),
         ("PATH", path.to_string_lossy().into_owned()),
         ("ST_AGENT", SUBJECT.to_owned()),
-        ("ST3_SUBJECT", SUBJECT.to_owned()),
+        (
+            "ST3_SUBJECT",
+            if bound_shell {
+                "pty/eval/codex-shell"
+            } else {
+                SUBJECT
+            }
+            .to_owned(),
+        ),
         ("ST3_BIN", binary.to_string_lossy().into_owned()),
         ("ST3_ENDPOINT", socket.to_string_lossy().into_owned()),
         (
@@ -247,16 +268,18 @@ async fn delivery_recovery_control(mailbox_loss: bool) {
                 "--tag",
                 "keep=true",
                 "--tag",
-                &format!("st3.subject={SUBJECT}"),
+                &format!("st3.subject={}", if bound_shell { "pty/eval/codex-shell" } else { SUBJECT }),
             ]);
         for (key, value) in environment {
             command.arg("--env").arg(format!("{key}={value}"));
         }
+        if bound_shell {
+            command.args(["--", "bash", "--noprofile", "--norc", "-c",
+                "while [ ! -e \"$HOME/launch-bound-codex\" ]; do sleep 0.02; done; \"$ST3_BIN\" driver codex --subject \"$ST_AGENT\" -- \"$HOME/provider\"; printf '%s' \"$?\" > \"$HOME/driver-returned\"; while :; do sleep 1; done"]);
+        } else {
+            command.arg("--").arg(binary).args(["driver", "codex", "--subject", SUBJECT, "--"]).arg(provider);
+        }
         command
-            .arg("--")
-            .arg(binary)
-            .args(["driver", "codex", "--subject", SUBJECT, "--"])
-            .arg(provider)
             .output()
             .unwrap()
     })
@@ -267,28 +290,61 @@ async fn delivery_recovery_control(mailbox_loss: bool) {
         "{}",
         String::from_utf8_lossy(&result.stderr)
     );
-    until(
-        || {
-            store
-                .latest_claim(SUBJECT, Some("harness.observed"))
-                .unwrap()
-                .is_some()
-        },
-        "the driver did not publish startup",
-    )
-    .await;
+    if !bound_shell {
+        until(
+            || {
+                store
+                    .latest_claim(SUBJECT, Some("harness.observed"))
+                    .unwrap()
+                    .is_some()
+            },
+            "the driver did not publish startup",
+        )
+        .await;
+    }
     let observation = runtime
         .snapshot()
         .unwrap()
         .into_iter()
         .find(|p| p.name == RUNTIME)
         .unwrap();
-    let incarnation = format!(
+    let physical_incarnation = format!(
         "{}:{}",
         observation.pid.unwrap(),
         observation.created_at.unwrap()
     );
+    let shell_generation = st_runtime::process_start_token(observation.pid.unwrap()).unwrap();
+    let incarnation = if bound_shell {
+        let invocation = "d8c3d573-d6bd-45e5-b51f-698902ec9d4a";
+        let source = format!(
+            "version 2\nagent \"eval.codex-bootstrap\" {{ harness \"codex\" {{}}; bind-terminal \"pty/eval/codex-shell\" incarnation={physical_incarnation:?} id={invocation:?}; }}"
+        );
+        let intent = st3::graph::parse_intent(&source, "bootstrap").unwrap();
+        let plan = store
+            .mission(
+                &intent,
+                st3::model::IntentInput {
+                    kdl: source,
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply_as(
+                &intent,
+                &plan.subject_tokens,
+                "bind-cold-codex",
+                Some("person/eval"),
+            )
+            .unwrap();
+        format!("{physical_incarnation}:bound:{invocation}")
+    } else {
+        physical_incarnation.clone()
+    };
     runtime_claim(&store, "running", Some(&incarnation));
+    if bound_shell {
+        std::fs::write(root.join("launch-bound-codex"), b"launch").unwrap();
+    }
     let client = st3::client::Client::unix(&socket);
     // The in-process API and fixture driver have different executable inodes. Establish
     // the healthy assessment first, so recovery must restore it exactly, including that
@@ -534,7 +590,7 @@ async fn delivery_recovery_control(mailbox_loss: bool) {
                 observation.pid.unwrap(),
                 observation.created_at.unwrap()
             ),
-            incarnation
+            physical_incarnation
         );
         let recovered = store
             .claims_for(SUBJECT, Some("operational.recovered"))
@@ -558,6 +614,51 @@ async fn delivery_recovery_control(mailbox_loss: bool) {
         eprintln!(
             "isolated authenticated mailbox recovery: {}",
             root.display()
+        );
+    }
+    if bound_shell {
+        assert_ne!(
+            lease["pid"].as_u64().unwrap(),
+            u64::from(observation.pid.unwrap()),
+            "bootstrap must admit the wrapper child, not the shell"
+        );
+        let ready: Value = std::fs::read_to_string(&receipts)
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|row| row["event"] == "tui-ready")
+            .expect("original provider reached native readiness");
+        let pid = ready["pid"].as_u64().unwrap() as u32;
+        // Terminate only this model-free fixture's TUI; the wrapper's owned native exit
+        // must return to the same surviving physical shell.
+        assert!(
+            std::fs::read_to_string(format!("/proc/{pid}/environ"))
+                .unwrap()
+                .contains(root.to_str().unwrap())
+        );
+        assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGTERM) }, 0);
+        until(
+            || root.join("driver-returned").exists(),
+            "the bound wrapper did not return to its shell",
+        )
+        .await;
+        assert_eq!(
+            std::fs::read_to_string(root.join("driver-returned")).unwrap(),
+            "0"
+        );
+        assert_eq!(
+            st_runtime::process_start_token(observation.pid.unwrap()).unwrap(),
+            shell_generation
+        );
+        assert_eq!(
+            runtime
+                .snapshot()
+                .unwrap()
+                .into_iter()
+                .find(|p| p.name == RUNTIME)
+                .unwrap()
+                .status,
+            "running"
         );
     }
     server.abort();
@@ -608,6 +709,14 @@ async fn bootstrap_waits_for_reconciliation(status: &str, previous: Option<&str>
     let runtime = PtyRuntime::new(pty_root.clone()).with_binary(pty.to_string_lossy());
     let _cleanup = Cleanup(runtime.clone());
     let store = Arc::new(Store::open_memory("bootstrap").unwrap());
+    let source = format!(
+        "version 2\nagent \"eval.codex-bootstrap\" {{ host \"bootstrap\"; workspace {:?}; harness \"codex\" {{}} }}",
+        root.path()
+    );
+    let intent = st3::graph::parse_intent(&source, "bootstrap").unwrap();
+    store
+        .apply_internal(&intent, "bootstrap-declared-seat")
+        .unwrap();
     runtime_claim(&store, status, previous);
     let pending = Arc::new(AtomicUsize::new(0));
     let bound = Arc::new(AtomicUsize::new(0));

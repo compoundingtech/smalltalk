@@ -109,6 +109,93 @@ mod tests {
     }
 
     #[test]
+    fn uncertain_process_probes_preserve_the_canonical_capability() {
+        let store = fixture();
+        let owner = authority(1);
+        let bound = store
+            .bind_mailbox_with_lease(&request(), Some(&owner))
+            .unwrap();
+        let uncertain = [
+            anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::Other)),
+            anyhow::anyhow!("malformed process start token"),
+            anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        ];
+        for error in uncertain {
+            let result = channel_liveness(&owner, Err(error), || false);
+            assert_eq!(result, ChannelLiveness::Indeterminate);
+            let connection = store.connection.lock().unwrap();
+            assert!(admit_with_probe(&connection, &request(), &owner, |_| result).is_err());
+            let (held, _, _) = lease(&connection, &bound).unwrap().unwrap();
+            assert_eq!(
+                (&held.token, held.epoch, &held.incarnation),
+                (&bound.token, bound.epoch, &bound.incarnation)
+            );
+            let (epoch, count): (u64, u64) = connection.query_row(
+                "SELECT epoch,(SELECT COUNT(*) FROM local_mailbox_bindings) FROM local_mailbox_owners",
+                [], |row| Ok((row.get(0)?,row.get(1)?)),
+            ).unwrap();
+            assert_eq!((epoch, count), (bound.epoch, 1));
+        }
+        let missing = channel_liveness(
+            &owner,
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound).into()),
+            || true,
+        );
+        let reused = channel_liveness(&owner, Ok(owner.process_token + 1), || false);
+        for result in [missing, reused] {
+            assert_eq!(result, ChannelLiveness::Dead);
+            assert!(
+                admit_with_probe(
+                    &store.connection.lock().unwrap(),
+                    &request(),
+                    &owner,
+                    |_| result
+                )
+                .is_ok()
+            );
+        }
+        store.check_mailbox(&bound).unwrap();
+    }
+
+    #[test]
+    fn host_move_fences_reads_and_receipts_before_runtime_reconciliation() {
+        let store = fixture();
+        let owner = authority(1);
+        let fence = store
+            .bind_mailbox_with_lease(&request(), Some(&owner))
+            .unwrap();
+        let moved = crate::graph::parse_intent(
+            "version 2\nagent \"eval.worker\" { host \"other-node\"; workspace \"/tmp\"; harness \"omp\" {} }", "node").unwrap();
+        store.apply_internal(&moved, "host-move-fixture").unwrap();
+        assert_eq!(
+            store.check_mailbox(&fence).unwrap_err().code,
+            "stale-mailbox-session"
+        );
+        let receipt = ClaimInput {
+            subject: "message/host-move".into(),
+            kind: "message.staged".into(),
+            actor: Some(fence.subject.clone()),
+            fields: BTreeMap::from([("status".into(), json!("staged"))]),
+            evidence: vec![],
+            expected_subject: None,
+            idempotency_key: None,
+        };
+        assert_eq!(
+            store
+                .append_mailbox_receipt(&receipt, &fence)
+                .unwrap_err()
+                .code,
+            "stale-mailbox-session"
+        );
+        assert!(store.repair_mailbox(&fence, &owner).is_err());
+        let runtime = store.latest_actual_value(&fence.subject).unwrap().unwrap();
+        let fields = runtime.get("fields").unwrap_or(&runtime);
+        assert_eq!(fields["status"], "running");
+        assert_eq!(fields["incarnation_id"], "current");
+    }
+
+    #[test]
     fn repair_retains_exact_capability_but_never_rewinds_a_successor_or_revocation() {
         let store = fixture();
         let first = authority(1);
@@ -402,7 +489,11 @@ fn refused(reason: &str) -> St3Error {
     St3Error::new("stale-mailbox-session", reason)
 }
 
-pub(super) fn check_lease_fence(connection: &Connection, fence: &Fence) -> Result<(), St3Error> {
+pub(super) fn check_lease_fence(
+    connection: &Connection,
+    fence: &Fence,
+    host: &str,
+) -> Result<(), St3Error> {
     let Some((held, owner, revoked)) = lease(connection, fence)? else {
         return Ok(());
     };
@@ -425,6 +516,7 @@ pub(super) fn check_lease_fence(connection: &Connection, fence: &Fence) -> Resul
     if desired.kind == "stop"
         || member.as_ref().is_none_or(|member| {
             member.driver.as_deref() != Some(&owner.provider)
+                || member.host != host
                 || member
                     .terminal_binding
                     .as_ref()
@@ -475,15 +567,45 @@ pub(super) fn admit(
     authority: &Authority,
 ) -> Result<(), St3Error> {
     admit_with_probe(connection, request, authority, |owner| {
-        st_runtime::process_start_token(owner.pid).is_ok_and(|token| token == owner.process_token)
+        channel_liveness(owner, st_runtime::process_start_token(owner.pid), || {
+            (unsafe { libc::kill(owner.pid as i32, 0) }) != 0
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        })
     })
+}
+
+fn channel_liveness(
+    owner: &Authority,
+    birth: anyhow::Result<u64>,
+    absent: impl FnOnce() -> bool,
+) -> ChannelLiveness {
+    match birth {
+        Ok(token) if token == owner.process_token => ChannelLiveness::Alive,
+        Ok(_) => ChannelLiveness::Dead,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                && absent() =>
+        {
+            ChannelLiveness::Dead
+        }
+        Err(_) => ChannelLiveness::Indeterminate,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelLiveness {
+    Alive,
+    Dead,
+    Indeterminate,
 }
 
 fn admit_with_probe(
     connection: &Connection,
     request: &Fence,
     authority: &Authority,
-    alive: impl FnOnce(&Authority) -> bool,
+    liveness: impl FnOnce(&Authority) -> ChannelLiveness,
 ) -> Result<(), St3Error> {
     if authority.session.is_empty()
         || (authority.sequence == 0
@@ -549,7 +671,7 @@ fn admit_with_probe(
     if authority.provider != prior.provider
         || authority.sequence < prior.sequence
         || (authority.sequence == prior.sequence
-            && (authority.session != prior.session || alive(&prior)))
+            && (authority.session != prior.session || liveness(&prior) != ChannelLiveness::Dead))
     {
         return Err(refused(
             "another live channel holds this provider session's lease",
@@ -643,7 +765,7 @@ impl Store {
                 return Err(refused("fault publication belongs to a retired lease"));
             }
             if repaired {
-                check_mailbox_fence(connection, fence)?;
+                check_mailbox_fence(connection, fence, &self.origin)?;
             }
             if let Some(revision) = input.fields.get("source_revision").and_then(Value::as_str)
                 && current_desired_row(connection, &fence.subject)
@@ -688,7 +810,7 @@ impl Store {
             ));
         }
         check_mailbox_incarnation(&tx, fence)?;
-        check_mailbox_fence(&tx, fence)?;
+        check_mailbox_fence(&tx, fence, &self.origin)?;
         check_declaration(&tx, fence, authority, &self.origin)?;
         record(&tx, fence, authority)?;
         tx.commit().map_err(internal)
@@ -830,7 +952,7 @@ impl Store {
         if !binding {
             return Err(refused("the binding token was revoked"));
         }
-        if check_mailbox_fence(&tx, fence).is_ok() {
+        if check_mailbox_fence(&tx, fence, &self.origin).is_ok() {
             return Ok(false);
         }
         let owner_epoch: Option<u64> = tx
@@ -849,7 +971,7 @@ impl Store {
              ON CONFLICT(subject,component) DO UPDATE SET incarnation=excluded.incarnation,epoch=excluded.epoch",
             params![fence.subject,fence.component,fence.incarnation,fence.epoch],
         ).map_err(internal)?;
-        check_mailbox_fence(&tx, fence)?;
+        check_mailbox_fence(&tx, fence, &self.origin)?;
         tx.commit().map_err(internal)?;
         if let Some(wakes) = self.smalltalk.mailbox_wakes.get() {
             wakes.owner_changed(&fence.subject, &fence.component);

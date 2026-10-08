@@ -28,6 +28,42 @@ fn episode(fence: &Fence) -> String {
     )
 }
 
+/// Decode ownership at the record's own stamp: observation freshness cannot erase a
+/// terminal ownership decision. This grants custody only, never fresh activity or readiness.
+fn decode_provider_authority(raw: &[u8]) -> Result<st_drivers::harness_state::Observed, St3Error> {
+    use st_drivers::harness_state::{Activity, read_raw_at};
+    let record: Value =
+        serde_json::from_slice(raw).map_err(|_| refused("malformed provider authority"))?;
+    let stamp = record["writtenAtMs"]
+        .as_u64()
+        .ok_or_else(|| refused("missing provider authority stamp"))?;
+    let observed = read_raw_at(raw, None, stamp);
+    let placeholder =
+        record["state"] == "ended" && record["exit"].is_null() && record["reason"] == "superseded";
+    if observed
+        .evidence_incarnation
+        .as_deref()
+        .is_none_or(str::is_empty)
+        || observed
+            .ownership_sequence
+            .is_none_or(|sequence| sequence == 0)
+        || (observed.state == Activity::Unknown && !placeholder)
+    {
+        return Err(refused(
+            "the provider authority is terminal, malformed or unsupported",
+        ));
+    }
+    Ok(observed)
+}
+
+fn provider_authority(raw: &[u8]) -> Result<st_drivers::harness_state::Observed, St3Error> {
+    let observed = decode_provider_authority(raw)?;
+    if observed.state == st_drivers::harness_state::Activity::Ended {
+        return Err(refused("the provider authority is terminal"));
+    }
+    Ok(observed)
+}
+
 fn current_provider(
     state: &AppState,
     fence: &Fence,
@@ -37,7 +73,7 @@ fn current_provider(
     let raw = st_drivers::harness_events::read_runtime_state(agent_dir, &fence.incarnation)
         .map_err(internal)?
         .ok_or_else(|| refused("the provider source disappeared"))?;
-    let current = st_drivers::harness_state::read_raw_at(&raw, None, client_now_ms() as u64);
+    let current = provider_authority(&raw)?;
     if current.state == st_drivers::harness_state::Activity::Ended
         || current.harness.as_deref() != Some(&owner.provider)
         || current.evidence_incarnation.as_deref() != Some(&owner.session)
@@ -122,7 +158,7 @@ pub(super) fn loss_if_current(
     let bytes = st_drivers::harness_events::read_runtime_state(&agent_dir, &fence.incarnation)
         .map_err(internal)?
         .ok_or_else(|| refused("the current provider source is unavailable"))?;
-    let observed = st_drivers::harness_state::read_raw_at(&bytes, None, client_now_ms() as u64);
+    let observed = provider_authority(&bytes)?;
     if observed.state == st_drivers::harness_state::Activity::Ended
         || observed.harness.as_deref() != Some(&owner.provider)
     {
@@ -191,6 +227,22 @@ pub(super) fn repair_proven(
 }
 
 #[cfg(target_os = "linux")]
+fn runtime_parent(pid: u32) -> Option<u32> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit_once(") ")?
+        .1
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn runtime_parent(_pid: u32) -> Option<u32> {
+    None
+}
+
+#[cfg(target_os = "linux")]
 fn belongs_to_runtime(mut pid: u32, runtime_pid: u32) -> bool {
     let mut seen = BTreeSet::new();
     for _ in 0..128 {
@@ -200,11 +252,7 @@ fn belongs_to_runtime(mut pid: u32, runtime_pid: u32) -> bool {
         if pid <= 1 || !seen.insert(pid) {
             return false;
         }
-        let Some(parent) = fs::read_to_string(format!("/proc/{pid}/stat"))
-            .ok()
-            .and_then(|stat| stat.rsplit_once(") ").map(|(_, tail)| tail.to_owned()))
-            .and_then(|tail| tail.split_whitespace().nth(1)?.parse().ok())
-        else {
+        let Some(parent) = runtime_parent(pid) else {
             return false;
         };
         pid = parent;
@@ -223,7 +271,7 @@ pub(super) fn with_authority<T>(
     peer: &NativeDeliveryPeer,
     action: impl FnOnce(&Authority) -> Result<T, St3Error>,
 ) -> Result<T, St3Error> {
-    let (_, env) = local_process_arguments(peer.pid)
+    let (arguments, env) = local_process_arguments(peer.pid)
         .ok_or_else(|| refused("the authenticated channel process disappeared"))?;
     let var = |key: &str| {
         env.iter()
@@ -280,7 +328,14 @@ pub(super) fn with_authority<T>(
                 .zip(runtime.created_at.as_deref())
                 .is_some_and(|(pid, stamp)| format!("{pid}:{stamp}") == physical_incarnation)
                 && (runtime.name == member.runtime_id
-                    || runtime.tags.get("st3.subject") == Some(&fence.subject))
+                    || runtime.tags.get("st3.subject")
+                        == Some(
+                            member
+                                .terminal_binding
+                                .as_ref()
+                                .map(|binding| &binding.subject)
+                                .unwrap_or(&fence.subject),
+                        ))
         })
         .ok_or_else(|| refused("the exact physical runtime is unavailable"))?;
     let runtime_pid = physical
@@ -308,7 +363,7 @@ pub(super) fn with_authority<T>(
     let source =
         st_drivers::harness_events::read_bound_provider_state(&agent_dir).map_err(internal)?;
     if let Some((_, raw)) = &source {
-        let observed = st_drivers::harness_state::read_raw_at(raw, None, client_now_ms() as u64);
+        let observed = decode_provider_authority(raw)?;
         if observed.evidence_incarnation.is_none() || observed.ownership_sequence.is_none() {
             return Err(refused(
                 "the provider authority is malformed or unsupported",
@@ -319,7 +374,14 @@ pub(super) fn with_authority<T>(
         .filter(|(runtime, _)| runtime == &fence.incarnation)
         .map(|(_, raw)| raw);
     let Some(bytes) = bytes else {
-        if provider != "codex" || fence.component != "delivery" || peer.pid != runtime_pid {
+        let current_wrapper = peer.pid == runtime_pid
+            || (member.terminal_binding.is_some()
+                && runtime_parent(peer.pid) == Some(runtime_pid)
+                && arguments.windows(2).any(|pair| pair == ["driver", "codex"])
+                && arguments
+                    .windows(2)
+                    .any(|pair| pair[0] == "--subject" && pair[1] == fence.subject));
+        if provider != "codex" || fence.component != "delivery" || !current_wrapper {
             return Err(St3Error::new(
                 "mailbox-session-starting",
                 "waiting for provider ownership",
@@ -346,7 +408,7 @@ pub(super) fn with_authority<T>(
         state.store.mailbox_session_active(fence, &bootstrap)?;
         return action(&bootstrap);
     };
-    let observed = st_drivers::harness_state::read_raw_at(&bytes, None, client_now_ms() as u64);
+    let observed = provider_authority(&bytes)?;
     if observed.harness.as_deref() != Some(&provider)
         || observed.state == st_drivers::harness_state::Activity::Ended
     {
@@ -414,4 +476,118 @@ pub(super) fn with_authority<T>(
             .downcast::<St3Error>()
             .unwrap_or_else(|error| refused(error.to_string()))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_terminal_authority_survives_staleness_and_clock_skew_under_the_owner_lock() {
+        use st_drivers::{harness_events, harness_state};
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let intent = crate::graph::parse_intent(
+            "version 2\nagent \"eval.worker\" { host \"node\"; workspace \"/tmp\"; harness \"codex\" {} }", "node",
+        ).unwrap();
+        store
+            .apply_internal(&intent, "raw-terminal-fixture")
+            .unwrap();
+        crate::mailbox::tests::ready(&store, "current");
+        let state = AppState {
+            store: store.clone(),
+            notify: Arc::new(Notify::new()),
+            event_notify: watch::channel(0).0,
+            node: "node".into(),
+            state_dir: root.path().into(),
+            pty_root: root.path().join("pty"),
+            pty_binary: "pty".into(),
+            fleet_id: None,
+            configured_peers: vec![],
+            client_relay: None,
+            native_session_home: None,
+            planner_default: Default::default(),
+        };
+        let request = Fence::new("agent/eval.worker", "current", "delivery");
+        let agent_dir = source_agent_dir(&state, &request);
+        harness_events::enable(&agent_dir, "current").unwrap();
+        let sequence =
+            harness_state::claim(&agent_dir, "eval.worker", "codex", "provider").unwrap();
+        let owner = Authority {
+            provider: "codex".into(),
+            session: "provider".into(),
+            sequence,
+            pid: std::process::id(),
+            process_token: st_runtime::process_start_token(std::process::id()).unwrap(),
+        };
+        let fence = store
+            .bind_mailbox_with_lease(&request, Some(&owner))
+            .unwrap();
+        let mut record: Value = serde_json::from_slice(
+            &harness_events::read_runtime_state(&agent_dir, "current")
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        // The startup placeholder owns custody while proving no native activity.
+        assert!(provider_authority(&serde_json::to_vec(&record).unwrap()).is_ok());
+        let peer = NativeDeliveryPeer {
+            agent: fence.subject.clone(),
+            transport: "app-server",
+            pid: owner.pid,
+            archives_inbox: true,
+        };
+        let report = json!({"transport":"app-server","pid":peer.pid}).to_string();
+        let now = client_now_ms() as u64;
+        for stamp in [1, now.saturating_add(3_600_000)] {
+            record["writtenAtMs"] = json!(stamp);
+            record["state"] = json!("ended");
+            record["exit"] = json!("exit 0");
+            record["reason"] = Value::Null;
+            let raw = serde_json::to_vec(&record).unwrap();
+            assert_eq!(
+                harness_state::read_raw_at(&raw, None, now).state,
+                harness_state::Activity::Unknown
+            );
+            harness_events::write_snapshot(&agent_dir, "harness-state", &raw).unwrap();
+            for operation in ["bind", "repair"] {
+                let admitted = std::sync::atomic::AtomicBool::new(false);
+                let result = harness_state::with_current_ownership(
+                    &agent_dir,
+                    &owner.session,
+                    sequence,
+                    || {
+                        current_provider(&state, &fence, &agent_dir, &owner)?;
+                        admitted.store(true, std::sync::atomic::Ordering::SeqCst);
+                        if operation == "bind" {
+                            store.bind_mailbox_with_lease(&fence, Some(&owner))?;
+                        } else {
+                            store.repair_mailbox(&fence, &owner)?;
+                        }
+                        Ok(())
+                    },
+                );
+                assert!(result.is_err(), "{operation} admitted terminal authority");
+                assert!(!admitted.load(std::sync::atomic::Ordering::SeqCst));
+            }
+            assert_eq!(
+                admit_report(&state, &fence, &peer, &report)
+                    .unwrap_err()
+                    .code,
+                "stale-mailbox-session"
+            );
+            assert_eq!(
+                store.mailbox_lease_authority(&fence).unwrap(),
+                Some(owner.clone())
+            );
+            store.check_mailbox(&fence).unwrap(); // Graph remains running: raw terminal was decisive.
+        }
+        for state in ["unknown", "future-state"] {
+            record["state"] = json!(state);
+            record["exit"] = Value::Null;
+            let raw = serde_json::to_vec(&record).unwrap();
+            assert!(decode_provider_authority(&raw).is_err());
+        }
+        assert!(decode_provider_authority(b"{broken").is_err());
+    }
 }

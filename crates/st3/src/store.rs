@@ -15844,7 +15844,7 @@ impl Store {
             mailbox_lease::admit(&tx, request, authority)?;
         }
         if request.epoch != 0 {
-            check_mailbox_fence(&tx, request)?;
+            check_mailbox_fence(&tx, request, &self.origin)?;
             if let Some(authority) = authority {
                 mailbox_lease::record(&tx, request, authority)?;
                 tx.commit().map_err(internal)?;
@@ -15877,7 +15877,7 @@ impl Store {
             }
             bound.epoch = epoch;
             // Retired tokens cannot allocate another epoch and retake their successor's mailbox.
-            check_mailbox_fence(&tx, &bound)?;
+            check_mailbox_fence(&tx, &bound, &self.origin)?;
             if let Some(authority) = authority {
                 mailbox_lease::record(&tx, &bound, authority)?;
                 tx.commit().map_err(internal)?;
@@ -15922,7 +15922,7 @@ impl Store {
     }
 
     pub(crate) fn check_mailbox(&self, fence: &crate::mailbox::Fence) -> Result<(), St3Error> {
-        check_mailbox_fence(&self.readers.get(), fence)
+        check_mailbox_fence(&self.readers.get(), fence, &self.origin)
     }
 
     /// First observation of the current boot, including its index to distinguish messages
@@ -21329,9 +21329,10 @@ fn mailbox_owner_key(
 fn check_mailbox_fence(
     connection: &Connection,
     fence: &crate::mailbox::Fence,
+    host: &str,
 ) -> Result<(), St3Error> {
     check_mailbox_incarnation(connection, fence)?;
-    mailbox_lease::check_lease_fence(connection, fence)?;
+    mailbox_lease::check_lease_fence(connection, fence, host)?;
     let owner: Option<(String, u64)> = connection
         .prepare_cached(
             "SELECT owner.incarnation, owner.epoch FROM local_mailbox_owners owner
@@ -53813,7 +53814,7 @@ fn append_claim_with_admission(
             let outcome = (|| {
             check_harness_event_runtime(transaction, &input.subject, event_runtime)?;
             let settled_receipt = if let Some(fence) = fence {
-                check_mailbox_fence(transaction, fence)?;
+                check_mailbox_fence(transaction, fence, &graph.origin)?;
                 let index = transaction.query_row(
                     "SELECT MIN(store_index) FROM claims WHERE subject=?1 AND subject LIKE 'message/%'",
                     [&input.subject], |row| row.get::<_, Option<u64>>(0),
