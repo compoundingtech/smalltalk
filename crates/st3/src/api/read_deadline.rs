@@ -98,8 +98,7 @@ fn deadline(request: &Request<Body>) -> Option<Duration> {
     if let Some(wait_ms) = wait_ms {
         return Some(ORDINARY + Duration::from_millis(wait_ms));
     }
-    if forwarded
-        || export
+    if export
         || path.starts_with("/v1/internal/replication/checkpoint")
         || path == "/v1/checkpoint/plan"
         || path == "/v1/checkpoint/status"
@@ -112,7 +111,8 @@ fn deadline(request: &Request<Body>) -> Option<Duration> {
 }
 
 fn long_poll_route(route: &str) -> bool {
-    route == "/v1/events"
+    route == crate::peer::CLIENT_READ_FORWARD_PATH
+        || route == "/v1/events"
         || route == "/v1/events/page"
         || route == "/v1/client/events"
         || (route.starts_with("/v1/client/conversations/") && route.ends_with("/changes"))
@@ -152,12 +152,84 @@ impl<F> Drop for Budgeted<F> {
     }
 }
 
+fn forwarded_deadline(operation: &crate::peer::ClientReadOperation) -> Option<Duration> {
+    // This transport also carries terminal actions: cancelling their acknowledgement
+    // would turn a completed mutation into an apparently failed read.
+    use crate::peer::ClientReadOperation;
+    match operation {
+        ClientReadOperation::TerminalControl { .. } => None,
+        ClientReadOperation::ConversationChanges { .. }
+        | ClientReadOperation::TerminalScreenChange { .. } => Some(ORDINARY + operation.wait()),
+        ClientReadOperation::ConversationContent { .. }
+        | ClientReadOperation::Timeline { .. }
+        | ClientReadOperation::TerminalScreen { .. }
+        | ClientReadOperation::SeatSnapshot { .. }
+        | ClientReadOperation::AgentWorkspace { .. }
+        | ClientReadOperation::Blob { .. }
+        | ClientReadOperation::Messages { .. } => Some(ORDINARY),
+    }
+}
+
+fn timeout_response(state: &AppState, path: &str) -> Response {
+    let error = json!({"code":"read-deadline", "message":"the read exceeded its server deadline", "details":{}});
+    let request_id = super::new_request_id();
+    let value = if path.starts_with("/v1/client/") {
+        super::client_error_envelope(StatusCode::GATEWAY_TIMEOUT, &error, &request_id)
+    } else {
+        json!({"api_version":"st3.v1", "request_id":request_id,
+            "snapshot_host":state.node,
+            "store_index":state.store.index().unwrap_or_default(),
+            "code":"read-deadline", "message":"the read exceeded its server deadline", "details":{}})
+    };
+    (StatusCode::GATEWAY_TIMEOUT, Json(value)).into_response()
+}
+
+#[track_caller]
+fn body_timeout_response(state: &AppState) -> Response {
+    // Static route and phase only: never include the forwarded JSON or credentials.
+    eprintln!(
+        "st3: read cancelled route={:?} phase=request-body callsite={} deadline_elapsed=true",
+        crate::peer::CLIENT_READ_FORWARD_PATH,
+        std::panic::Location::caller(),
+    );
+    timeout_response(state, crate::peer::CLIENT_READ_FORWARD_PATH)
+}
+
 pub(super) async fn envelope(
     state: (AppState, ClientTransportBoundary),
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Response {
-    let Some(duration) = deadline(&request) else {
+    let started = std::time::Instant::now();
+    let mut duration = deadline(&request);
+    if request.method() == Method::POST
+        && request.uri().path() == crate::peer::CLIENT_READ_FORWARD_PATH
+    {
+        // The operation is in a bounded JSON body, not the URI. Include receiving
+        // it in the same budget, then return identical bytes to the normal extractor.
+        let (parts, body) = request.into_parts();
+        let bytes = match tokio::time::timeout(ORDINARY, axum::body::to_bytes(body, 16_384)).await {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(error)) => {
+                use std::error::Error;
+                let status = if error
+                    .source()
+                    .is_some_and(|source| source.is::<http_body_util::LengthLimitError>())
+                {
+                    StatusCode::PAYLOAD_TOO_LARGE
+                } else {
+                    StatusCode::BAD_REQUEST
+                };
+                return status.into_response();
+            }
+            Err(_) => return body_timeout_response(&state.0),
+        };
+        if let Ok(forwarded) = serde_json::from_slice::<crate::peer::ClientReadRequest>(&bytes) {
+            duration = forwarded_deadline(&forwarded.request);
+        }
+        request = Request::from_parts(parts, Body::from(bytes));
+    }
+    let Some(duration) = duration.map(|limit| limit.saturating_sub(started.elapsed())) else {
         return super::response_envelope_unbounded(axum::extract::State(state), request, next)
             .await;
     };
@@ -185,17 +257,7 @@ pub(super) async fn envelope(
         _ => {
             budget.cancel();
             let _ = budget.check();
-            let error = json!({"code":"read-deadline", "message":"the read exceeded its server deadline", "details":{}});
-            let request_id = super::new_request_id();
-            let value = if path.starts_with("/v1/client/") {
-                super::client_error_envelope(StatusCode::GATEWAY_TIMEOUT, &error, &request_id)
-            } else {
-                json!({"api_version":"st3.v1", "request_id":request_id,
-                    "snapshot_host":timeout_state.node,
-                    "store_index":timeout_state.store.index().unwrap_or_default(),
-                    "code":"read-deadline", "message":"the read exceeded its server deadline", "details":{}})
-            };
-            (StatusCode::GATEWAY_TIMEOUT, Json(value)).into_response()
+            timeout_response(&timeout_state, &path)
         }
     }
 }
@@ -403,6 +465,428 @@ mod tests {
         assert_eq!(
             deadline(&request(Method::POST, "/v1/internal/replication/receive")),
             None
+        );
+    }
+
+    #[test]
+    fn forwarded_reads_use_operation_budgets_and_terminal_actions_keep_acknowledgements() {
+        use crate::peer::ClientReadOperation;
+        let read = ClientReadOperation::Timeline {
+            session_id: "invented".into(),
+            limit: 20,
+            cursor: None,
+        };
+        assert_eq!(
+            deadline(&request(
+                Method::POST,
+                crate::peer::CLIENT_READ_FORWARD_PATH
+            )),
+            Some(ORDINARY)
+        );
+        assert_eq!(forwarded_deadline(&read), Some(ORDINARY));
+        for wait_ms in [0, 100, 10_000, u64::MAX] {
+            let read = ClientReadOperation::ConversationChanges {
+                session_id: "invented".into(),
+                after: None,
+                wait_ms,
+            };
+            assert_eq!(
+                forwarded_deadline(&read),
+                Some(ORDINARY + Duration::from_millis(wait_ms.min(10_000)))
+            );
+            let screen = ClientReadOperation::TerminalScreenChange {
+                terminal_id: "invented".into(),
+                after_revision: "before".into(),
+                wait_ms,
+                facts: false,
+            };
+            assert_eq!(forwarded_deadline(&screen), forwarded_deadline(&read));
+        }
+        let action = ClientReadOperation::TerminalControl {
+            action_id: "invented".into(),
+            idempotency_key: "invented".into(),
+            action_type: "close".into(),
+            terminal_id: "invented".into(),
+            runtime_incarnation: "invented".into(),
+            expected_sequence: 0,
+            parameters: json!({}),
+        };
+        assert_eq!(forwarded_deadline(&action), None);
+        // Heal-next is a mutating protocol step (readmission/replay), not an ordinary read.
+        assert_eq!(
+            deadline(&request(Method::POST, "/v1/internal/replication/heal/next")),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarded_long_poll_queries_cannot_spend_the_envelopes_wait_budget() {
+        let parent = ReadBudget::new(
+            crate::peer::CLIENT_READ_FORWARD_PATH,
+            ORDINARY + Duration::from_secs(10),
+        );
+        let work = read_budget::with(Some(parent.clone()), || {
+            spawn_blocking(|| read_budget::current().unwrap().remaining())
+        });
+        assert!(work.await.unwrap() <= ORDINARY);
+        assert!(parent.remaining() > ORDINARY);
+        assert!(!parent.expired());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forwarded_long_poll_keeps_its_allowed_wait_in_the_envelope() {
+        use axum::{Router, middleware::from_fn_with_state, routing::post};
+        use tower::ServiceExt;
+        let root = tempfile::tempdir().unwrap();
+        let state = super::super::tests::state(root.path());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let signals = Arc::new(std::sync::Mutex::new(Some((started_tx, finish_rx))));
+        let app = Router::new()
+            .route(
+                crate::peer::CLIENT_READ_FORWARD_PATH,
+                post(move || {
+                    let signals = signals.clone();
+                    async move {
+                        let (started, finish) = signals.lock().unwrap().take().unwrap();
+                        let _ = started.send(());
+                        finish.await.unwrap();
+                        Json(json!({"items": []}))
+                    }
+                }),
+            )
+            .layer(from_fn_with_state(
+                (state, ClientTransportBoundary::Unix),
+                super::super::response_envelope,
+            ));
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(crate::peer::CLIENT_READ_FORWARD_PATH)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&crate::peer::ClientReadRequest {
+                    authority_actor: "person/fixture".into(),
+                    relay: None,
+                    request: crate::peer::ClientReadOperation::ConversationChanges {
+                        session_id: "invented".into(),
+                        after: None,
+                        wait_ms: 10_000,
+                    },
+                })
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = tokio::spawn(app.oneshot(request));
+        started_rx.await.unwrap();
+        tokio::time::advance(ORDINARY + Duration::from_secs(1)).await;
+        assert!(!response.is_finished());
+        finish_tx.send(()).unwrap();
+        assert_eq!(response.await.unwrap().unwrap().status(), StatusCode::OK);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forwarded_read_timeout_drops_the_actual_handler_future() {
+        use axum::{Router, middleware::from_fn_with_state, routing::post};
+        use tower::ServiceExt;
+        let root = tempfile::tempdir().unwrap();
+        let state = super::super::tests::state(root.path());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let signals = Arc::new(std::sync::Mutex::new(Some((started_tx, dropped_tx))));
+        let app = Router::new()
+            .route(
+                crate::peer::CLIENT_READ_FORWARD_PATH,
+                post(move || {
+                    let signals = signals.clone();
+                    async move {
+                        struct Dropped(Option<tokio::sync::oneshot::Sender<()>>);
+                        impl Drop for Dropped {
+                            fn drop(&mut self) {
+                                if let Some(tx) = self.0.take() {
+                                    let _ = tx.send(());
+                                }
+                            }
+                        }
+                        let (started, dropped) = signals.lock().unwrap().take().unwrap();
+                        let _guard = Dropped(Some(dropped));
+                        let _ = started.send(());
+                        std::future::pending::<Response>().await
+                    }
+                }),
+            )
+            .layer(from_fn_with_state(
+                (state, ClientTransportBoundary::Unix),
+                super::super::response_envelope,
+            ));
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(crate::peer::CLIENT_READ_FORWARD_PATH)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&crate::peer::ClientReadRequest {
+                    authority_actor: "person/fixture".into(),
+                    relay: None,
+                    request: crate::peer::ClientReadOperation::Timeline {
+                        session_id: "invented".into(),
+                        limit: 20,
+                        cursor: None,
+                    },
+                })
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = tokio::spawn(app.oneshot(request));
+        started_rx.await.unwrap();
+        tokio::time::advance(ORDINARY + Duration::from_secs(1)).await;
+        assert_eq!(
+            response.await.unwrap().unwrap().status(),
+            StatusCode::GATEWAY_TIMEOUT
+        );
+        tokio::time::timeout(Duration::from_secs(1), dropped_rx)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forwarded_terminal_action_is_not_cut_by_the_read_deadline() {
+        use axum::{Router, middleware::from_fn_with_state, routing::post};
+        use tower::ServiceExt;
+        let root = tempfile::tempdir().unwrap();
+        let state = super::super::tests::state(root.path());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let signals = Arc::new(std::sync::Mutex::new(Some((started_tx, finish_rx))));
+        let app = Router::new()
+            .route(
+                crate::peer::CLIENT_READ_FORWARD_PATH,
+                post(move || {
+                    let signals = signals.clone();
+                    async move {
+                        let (started, finish) = signals.lock().unwrap().take().unwrap();
+                        let _ = started.send(());
+                        finish.await.unwrap();
+                        Json(json!({"acknowledged": true}))
+                    }
+                }),
+            )
+            .layer(from_fn_with_state(
+                (state, ClientTransportBoundary::Unix),
+                super::super::response_envelope,
+            ));
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(crate::peer::CLIENT_READ_FORWARD_PATH)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&crate::peer::ClientReadRequest {
+                    authority_actor: "person/fixture".into(),
+                    relay: None,
+                    request: crate::peer::ClientReadOperation::TerminalControl {
+                        action_id: "invented".into(),
+                        idempotency_key: "invented".into(),
+                        action_type: "close".into(),
+                        terminal_id: "invented".into(),
+                        runtime_incarnation: "invented".into(),
+                        expected_sequence: 0,
+                        parameters: json!({}),
+                    },
+                })
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = tokio::spawn(app.oneshot(request));
+        started_rx.await.unwrap();
+        tokio::time::advance(ORDINARY + Duration::from_secs(1)).await;
+        assert!(!response.is_finished());
+        finish_tx.send(()).unwrap();
+        assert_eq!(response.await.unwrap().unwrap().status(), StatusCode::OK);
+    }
+
+    fn forwarded_app(state: AppState) -> axum::Router {
+        use axum::{
+            Router, extract::DefaultBodyLimit, middleware::from_fn_with_state, routing::post,
+        };
+        Router::new()
+            .route(
+                crate::peer::CLIENT_READ_FORWARD_PATH,
+                post(super::super::forward_client_read).layer(DefaultBodyLimit::max(16_384)),
+            )
+            .with_state(state.clone())
+            .layer(from_fn_with_state(
+                (state, ClientTransportBoundary::Unix),
+                super::super::response_envelope,
+            ))
+    }
+
+    #[tokio::test]
+    async fn forwarded_real_handler_rejects_oversized_and_malformed_bodies() {
+        use tower::ServiceExt;
+        let root = tempfile::tempdir().unwrap();
+        let app = forwarded_app(super::super::tests::state(root.path()));
+        for (body, expected) in [
+            ("x".repeat(16_385), StatusCode::PAYLOAD_TOO_LARGE),
+            ("{".into(), StatusCode::BAD_REQUEST),
+        ] {
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(crate::peer::CLIENT_READ_FORWARD_PATH)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn forwarded_real_handler_preserves_long_poll_wait_through_a_signed_peer() {
+        use crate::peer::{
+            ClientReadOperation, ClientReadRequest, ClientReadRoute, ClientRelay, FleetAuth,
+        };
+        use axum::{Router, routing::post};
+        use std::os::unix::fs::PermissionsExt;
+        use tower::ServiceExt;
+        let root = tempfile::tempdir().unwrap();
+        let secret = root.path().join("fleet-secret");
+        std::fs::write(&secret, [5_u8; 32]).unwrap();
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let auth = FleetAuth::test("fleet-test", &[5; 32]);
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+        let seen = Arc::new(std::sync::Mutex::new(Some(seen_tx)));
+        let peer = Router::new().route(
+            "/v1/peer/client-read",
+            post(move |body: axum::body::Bytes| {
+                let auth = auth.clone();
+                let seen = seen.clone();
+                async move {
+                    let received: ClientReadRequest = serde_json::from_slice(&body).unwrap();
+                    seen.lock().unwrap().take().unwrap().send(received).unwrap();
+                    // Allowed owner wait plus ordinary work exceeds the 15-second query
+                    // budget, but fits in the forwarding envelope's 25-second budget.
+                    tokio::time::sleep(ORDINARY + Duration::from_secs(1)).await;
+                    let answer = serde_json::to_vec(&crate::model::ApiResponse {
+                        api_version: "st3.v1".into(),
+                        request_id: "invented".into(),
+                        snapshot_host: "far".into(),
+                        store_index: 0,
+                        value: json!({"items": []}),
+                    })
+                    .unwrap();
+                    let headers = auth
+                        .response_headers_for(
+                            "/v1/peer/client-read",
+                            "far",
+                            &answer,
+                            &FleetAuth::body_digest(&body),
+                        )
+                        .unwrap();
+                    let mut response = (StatusCode::OK, answer).into_response();
+                    response.headers_mut().insert(
+                        "content-type",
+                        axum::http::HeaderValue::from_static("application/json"),
+                    );
+                    response.headers_mut().extend(headers);
+                    response
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, peer).await.unwrap() });
+        let mut state = super::super::tests::state(root.path());
+        state.node = "middle".into();
+        state.client_relay = ClientRelay::from_config(&crate::config::Config {
+            node: "middle".into(),
+            fleet_id: Some("fleet-test".into()),
+            shared_secret_file: Some(secret),
+            peers: vec![crate::config::PeerConfig {
+                name: "far".into(),
+                url: format!("http://{address}"),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(crate::peer::CLIENT_READ_FORWARD_PATH)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&ClientReadRequest {
+                    authority_actor: "person/fixture".into(),
+                    relay: Some(ClientReadRoute {
+                        target: "host/far".into(),
+                        path: vec!["near".into()],
+                        hops_left: 3,
+                    }),
+                    request: ClientReadOperation::ConversationChanges {
+                        session_id: "invented".into(),
+                        after: None,
+                        wait_ms: 10_000,
+                    },
+                })
+                .unwrap(),
+            ))
+            .unwrap();
+        let started = std::time::Instant::now();
+        let response = forwarded_app(state).oneshot(request).await.unwrap();
+        server.abort();
+        let _ = server.await;
+        let seen = seen_rx.await.unwrap();
+        assert_eq!(seen.authority_actor, "person/fixture");
+        assert!(
+            seen.relay.is_none(),
+            "the last hop reaches the owner directly"
+        );
+        assert!(matches!(
+            seen.request,
+            ClientReadOperation::ConversationChanges {
+                wait_ms: 10_000,
+                ..
+            }
+        ));
+        assert!(started.elapsed() >= ORDINARY);
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 16_384)
+            .await
+            .unwrap();
+        let answer: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(answer["value"]["items"], json!([]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forwarded_request_body_wait_has_the_ordinary_deadline() {
+        use axum::{Router, middleware::from_fn_with_state, routing::post};
+        use tower::ServiceExt;
+        let root = tempfile::tempdir().unwrap();
+        let state = super::super::tests::state(root.path());
+        let app = Router::new()
+            .route(
+                crate::peer::CLIENT_READ_FORWARD_PATH,
+                post(|| async { StatusCode::OK }),
+            )
+            .layer(from_fn_with_state(
+                (state, ClientTransportBoundary::Unix),
+                super::super::response_envelope,
+            ));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let stream = futures_util::stream::once(async move {
+            let _ = started_tx.send(());
+            std::future::pending::<Result<axum::body::Bytes, std::io::Error>>().await
+        });
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(crate::peer::CLIENT_READ_FORWARD_PATH)
+            .body(Body::from_stream(stream))
+            .unwrap();
+        let response = tokio::spawn(app.oneshot(request));
+        started_rx.await.unwrap();
+        tokio::time::advance(ORDINARY + Duration::from_secs(1)).await;
+        assert_eq!(
+            response.await.unwrap().unwrap().status(),
+            StatusCode::GATEWAY_TIMEOUT
         );
     }
 

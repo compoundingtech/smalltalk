@@ -310,6 +310,8 @@ pub fn run(context: Context) -> Result<()> {
     } else {
         ratatui_image::picker::Picker::halfblocks()
     });
+    // Clickable addresses (OSC 8) where the terminal draws images, as kitty and its kin do.
+    let hyperlinks = super::attach::graphics_terminal();
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     terminal.hide_cursor()?;
     let started = Instant::now();
@@ -1209,7 +1211,16 @@ pub fn run(context: Context) -> Result<()> {
         ui.step_voice();
         ui.step_terminal_hold();
         execute!(io::stdout(), BeginSynchronizedUpdate)?;
-        terminal.draw(|frame| ui.render(frame))?;
+        let mut links = Vec::new();
+        terminal.draw(|frame| {
+            ui.render(frame);
+            if hyperlinks {
+                links = ui.link_cells(frame.buffer_mut());
+            }
+        })?;
+        if hyperlinks && !links.is_empty() {
+            super::hyperlinks::write_links(terminal.backend_mut(), &links)?;
+        }
         // The attached terminal's cursor shape (vim's bar while inserting), and the person's
         // own shape back once it is gone.
         let style = ui.cursor_style();

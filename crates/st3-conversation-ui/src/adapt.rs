@@ -530,6 +530,17 @@ fn usage_line(usage: &st3_client::TimelineUsageBody) -> String {
     line
 }
 
+/// omp's `custom` entries that only repeat what the conversation already shows: a tool call's
+/// start (its call is an entry of its own) and the end of the session. Other custom entries stay.
+const OMP_BOOKKEEPING_CUSTOM: &[&str] = &["tool_execution_start", "session_exit"];
+
+fn omp_bookkeeping(block: &st3_client::TimelineBlock) -> bool {
+    block.source_type == "custom"
+        && block.payload["raw"]["customType"]
+            .as_str()
+            .is_some_and(|kind| OMP_BOOKKEEPING_CUSTOM.contains(&kind))
+}
+
 /// Harness records that carry no conversation: the transcript's own titles and modes, and a
 /// reasoning step whose text the model did not share. Unknown records stay visible.
 const BOOKKEEPING_RECORDS: &[&str] = &[
@@ -588,7 +599,8 @@ fn is_bookkeeping(entry: &TimelineEntry, filters: &[crate::DisplayFilter]) -> bo
             shown.clone().next().is_some()
                 && shown.into_iter().all(|block| {
                     block.kind == "unknown"
-                        && BOOKKEEPING_RECORDS.contains(&block.source_type.as_str())
+                        && (BOOKKEEPING_RECORDS.contains(&block.source_type.as_str())
+                            || omp_bookkeeping(block))
                 })
         }
         _ => false,

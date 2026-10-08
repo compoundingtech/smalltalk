@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Share incremental agent roster projections across HTTP pages and concurrent WebSocket subscribers",
+  "replay": {"status": "none", "detail": "Only in-memory read caches and request admission change; no replay is introduced."},
+  "schema": {"status": "none", "detail": "No tables, indexes, triggers, migrations or schema version changes."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or digest changes; mixed builds retain the same graph semantics."},
+  "compatibility": {"status": "none", "detail": "Existing HTTP pagination, collection frames, authorization, snapshot fencing and per-read delivery overlays are preserved."},
+  "downtime": {"status": "none", "detail": "No additional service interruption beyond an ordinary binary upgrade restart."},
+  "manual": {"status": "none", "detail": "Existing installations require no configuration or state changes."},
+  "recovery": {"status": "none", "detail": "Caches are process-local and disposable; returning to the previous binary requires no database rollback."}
+}

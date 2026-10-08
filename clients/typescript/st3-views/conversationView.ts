@@ -88,13 +88,19 @@ const BOOKKEEPING_RECORDS = [
 ];
 
 // A reasoning step whose text the model did not share is bookkeeping too.
+// omp's `custom` entries that only repeat what the conversation shows: a tool call's start (its call is
+// an entry of its own) and the end of the session. Other custom entries stay visible.
+const OMP_BOOKKEEPING_CUSTOM = ['tool_execution_start', 'session_exit'];
+const ompBookkeeping = (block: Record<string, unknown>) =>
+  str(block.source_type) === 'custom' && OMP_BOOKKEEPING_CUSTOM.includes(str(record(record(block.payload).raw).customType) ?? '');
+
 function isBookkeeping(entry: Entry, filters: readonly DisplayFilter[]): boolean {
   if (!filters.includes('bookkeeping') || entry.type !== 'content') return false;
   const body = record(entry.body);
   const shown = (Array.isArray(body.blocks) ? body.blocks : []).map(record).filter(block => !['internal', 'hidden-by-harness'].includes(str(block.visibility) ?? ''));
   if (!shown.length) return false;
   if (entry.role === 'assistant') return shown.every(block => block.kind === 'reasoning' && !(str(record(block.payload).text) ?? '').trim());
-  if (entry.role === 'system') return shown.every(block => block.kind === 'unknown' && BOOKKEEPING_RECORDS.includes(str(block.source_type) ?? ''));
+  if (entry.role === 'system') return shown.every(block => block.kind === 'unknown' && (BOOKKEEPING_RECORDS.includes(str(block.source_type) ?? '') || ompBookkeeping(block)));
   return false;
 }
 

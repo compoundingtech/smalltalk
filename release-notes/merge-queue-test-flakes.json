@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Make mission-page query budgets and concurrent quick-agent fixtures deterministic",
+  "replay": {
+    "status": "none",
+    "detail": "The mission-page read is extracted without changing its queries or snapshot, and two tests change their validation/fixture. No replay behavior changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database tables, indexes, triggers, schema versions or migration code change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules, digests or fleet coordination behavior change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No client, protocol, provider or harness contract changes. The HTTP handler uses the same page read and the quick-agent idempotency implementation is unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "These test changes and behavior-preserving page-read extraction add no service interruption."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No installation steps or starting-state transitions are required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No runtime recovery or database swap-back behavior changes."
+  }
+}

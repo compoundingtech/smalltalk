@@ -173,6 +173,17 @@ pub trait Runtime: Send + Sync {
         subject: &str,
         cut: u128,
     ) -> Result<Value>;
+
+    /// Return the same proof answers, with optional bounded per-item source identities captured
+    /// during that read. Sources are diagnostic only and never enter the proof/digest contract.
+    fn checkpoint_subject_answers_with_sources(
+        &self,
+        connection: &Connection,
+        subject: &str,
+        cut: u128,
+    ) -> Result<(Value, super::checkpoint::CheckpointAnswerSources)> {
+        Ok((self.checkpoint_subject_answers(connection, subject, cut)?, Default::default()))
+    }
 }
 
 /// The runtime of a program that only keeps and syncs claims: it accepts every claim as it is,

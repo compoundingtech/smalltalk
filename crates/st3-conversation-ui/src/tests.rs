@@ -548,6 +548,10 @@ fn shared_transcripts_match_without_a_renderer() {
             include_str!("../../../fixtures/clients/transcripts/native-claude-run.json"),
             include_str!("../../../fixtures/clients/transcripts/native-claude-run.expected.json"),
         ),
+        (
+            include_str!("../../../fixtures/clients/transcripts/native-omp-run.json"),
+            include_str!("../../../fixtures/clients/transcripts/native-omp-run.expected.json"),
+        ),
     ] {
         let items = serde_json::from_str::<Vec<st3_client::TimelineEntry>>(input).unwrap();
         let mut entries =
@@ -561,6 +565,32 @@ fn shared_transcripts_match_without_a_renderer() {
             serde_json::from_str::<serde_json::Value>(expected).unwrap()
         );
     }
+}
+
+#[test]
+fn omp_bookkeeping_custom_entries_hide_and_other_custom_entries_stay() {
+    let items = serde_json::from_str::<Vec<st3_client::TimelineEntry>>(include_str!(
+        "../../../fixtures/clients/transcripts/native-omp-run.json"
+    ))
+    .unwrap();
+    let text = |entries: &[crate::Entry]| serde_json::to_string(entries).unwrap();
+    let shown = text(&adapt::conversation(&items, &Default::default()));
+    assert!(!shown.contains("unrecognized omp entry"), "{shown}");
+    // Shown unfiltered, the same records are there: nothing is dropped from the data.
+    let everything = text(&adapt::conversation_with_filters(&items, &Default::default(), crate::SHOW_EVERYTHING));
+    assert!(everything.contains("tool_execution_start") && everything.contains("session_exit"));
+    // A custom entry of another kind is not bookkeeping and stays.
+    let mut other = items.clone();
+    for entry in &mut other {
+        if let st3_client::TimelineBody::Content(content) = &mut entry.body {
+            for block in &mut content.blocks {
+                if block.source_type == "custom" {
+                    block.payload["raw"]["customType"] = "future_custom".into();
+                }
+            }
+        }
+    }
+    assert!(text(&adapt::conversation(&other, &Default::default())).contains("unrecognized omp entry"));
 }
 
 #[test]

@@ -300,6 +300,21 @@ pub struct CheckpointProof {
     pub mismatches: Vec<String>,
 }
 
+/// Source identity for an array item, used only for bounded scratch-proof failure diagnostics.
+/// It is excluded from reader answers, their digests and checkpoint certificates.
+#[derive(Clone, Debug)]
+pub struct CheckpointItemSource {
+    pub claim: String,
+    pub order: super::canonical::ClaimKey,
+}
+
+pub type CheckpointAnswerSources = BTreeMap<String, Vec<CheckpointItemSource>>;
+type ProofSources = BTreeMap<(String, String), Vec<CheckpointItemSource>>;
+
+// Reuse the existing bounded 60-second diagnostic limiter with one fixed stage/code bucket.
+// No source/subject IDs are keys, and suppressed failures have no flush, queue or retry.
+static CHECKPOINT_DIAGNOSTICS: std::sync::OnceLock<std::sync::Mutex<super::ProjectionDiagnosticState>> = std::sync::OnceLock::new();
+
 /// Record the tombstones of a checkpoint's drop. Recording them again changes nothing.
 pub fn record_checkpoint_tombstones_tx(
     transaction: &Transaction<'_>,
@@ -429,6 +444,115 @@ pub fn reader_answers(
         .collect()
 }
 
+fn reader_answers_with_sources(
+    runtime: &dyn Runtime,
+    connection: &Connection,
+    subjects: &BTreeSet<String>,
+    cut: u128,
+) -> Result<(BTreeMap<String, Value>, ProofSources)> {
+    let mut answers = BTreeMap::new();
+    let mut sources = BTreeMap::new();
+    for subject in subjects {
+        let (answer, item_sources) = runtime.checkpoint_subject_answers_with_sources(connection, subject, cut)?;
+        answers.insert(subject.clone(), answer);
+        for (reader, items) in item_sources {
+            sources.insert((subject.clone(), reader), items);
+        }
+    }
+    Ok((answers, sources))
+}
+
+fn status_history_mismatch_diagnostics(
+    sealed: &SealedSet,
+    plan: &DropPlan,
+    before: &BTreeMap<String, Value>,
+    after: &BTreeMap<String, Value>,
+    before_sources: &ProofSources,
+    after_sources: &ProofSources,
+) -> Vec<Value> {
+    fn text(value: Option<&Value>, limit: usize) -> Value {
+        value.and_then(Value::as_str).map_or(Value::Null, |text| json!(text.chars().take(limit).collect::<String>()))
+    }
+    fn preview(items: &[Value], sources: Option<&[CheckpointItemSource]>, start: usize, plan: &DropPlan) -> Vec<Value> {
+        items.iter().enumerate().skip(start).take(3).map(|(index, item)| {
+            let source = sources.and_then(|sources| sources.get(index));
+            json!({
+                "index":index, "source":source.map(|source| source.claim.chars().take(128).collect::<String>()),
+                "accepted_at_ms":source.map(|source| source.order.0),
+                "order":source.map(|source| (
+                    source.order.0, source.order.1.chars().take(256).collect::<String>(), source.order.2,
+                    source.order.3.chars().take(256).collect::<String>(), source.order.4,
+                    source.order.5.chars().take(128).collect::<String>())),
+                "dropped":source.map(|source| plan.claims.iter().any(|claim| claim.id == source.claim)),
+                "state":text(item.get("state"), 128),
+                "incarnation":text(item.get("runtime_incarnation"), 128),
+                "observed_at":text(item.get("observed_at"), 48), "reset":item.get("reset").and_then(Value::as_bool),
+            })
+        }).collect()
+    }
+    let mut diagnostics = Vec::new();
+    for (subject, answer) in before {
+        let Some(old) = answer.get("status_history").and_then(Value::as_array) else { continue; };
+        let Some(new) = after.get(subject).and_then(|answer| answer.get("status_history")).and_then(Value::as_array) else { continue; };
+        let Some(first) = (0..old.len().max(new.len())).find(|index| old.get(*index) != new.get(*index)) else { continue; };
+        let key = (subject.clone(), "status_history".to_owned());
+        diagnostics.push(json!({
+            "checkpoint":checkpoint_name(sealed.cut_unix_ms), "seal_rowid":sealed.seal_rowid,
+            "sealed_digest":plan.sealed_digest, "cut_unix_ms":sealed.cut_unix_ms,
+            "source_build":super::checkpoint_agreement::checkpoint_build().chars().take(256).collect::<String>(),
+            "rules_digest":plan.rules_digest, "drop_digest":plan.drop_digest,
+            "subject":subject.chars().take(256).collect::<String>(), "reader":"status_history",
+            "before_len":old.len(), "after_len":new.len(), "first_difference":first,
+            "before":preview(old, before_sources.get(&key).map(Vec::as_slice), first, plan),
+            "after":preview(new, after_sources.get(&key).map(Vec::as_slice), first, plan),
+        }));
+        if diagnostics.len() == 3 { break; }
+    }
+    diagnostics
+}
+
+#[test]
+fn status_history_diagnostics_bound_items_and_exclude_content() {
+    let items = (0..8).map(|index| json!({
+        "state":"working", "runtime_incarnation":"x".repeat(1000),
+        "observed_at":index.to_string(), "reset":false,
+        "body":"private transcript must not appear",
+    })).collect::<Vec<_>>();
+    let mut changed = items.clone();
+    changed.remove(2);
+    let subject = "agent/cedar".to_owned();
+    let before = BTreeMap::from([(subject.clone(), json!({"status_history":items}))]);
+    let after = BTreeMap::from([(subject.clone(), json!({"status_history":changed}))]);
+    let sources = BTreeMap::from([((subject, "status_history".to_owned()),
+        (0..8).map(|index| CheckpointItemSource {
+            claim:format!("claim-{index}"), order:(index, "cedar".into(), index as u64, "batch".into(), 0, format!("claim-{index}")),
+        }).collect::<Vec<_>>())]);
+    let sealed = SealedSet {
+        cut_unix_ms:DAY_MS, envelopes:Vec::new(), claims:Vec::new(), seal_rowid:7,
+        envelope_tombstones:Vec::new(), claim_tombstones:Vec::new(),
+    };
+    let plan = DropPlan {
+        cut_unix_ms:DAY_MS, rules_digest:"rules".into(), sealed_envelopes:0, sealed_claims:0,
+        sealed_digest:"sealed".into(), drop_digest:"drop".into(), retained_digest:"retained".into(),
+        envelopes:Vec::new(), claims:Vec::new(), by_kind:BTreeMap::new(),
+    };
+    let mut after_sources = sources.clone();
+    after_sources.values_mut().next().unwrap().remove(2);
+    let diagnostics = status_history_mismatch_diagnostics(&sealed, &plan, &before, &after, &sources, &after_sources);
+    assert_eq!(diagnostics.len(), 1);
+    let diagnostic = &diagnostics[0];
+    assert_eq!(diagnostic["first_difference"], 2);
+    assert_eq!(diagnostic["before_len"], 8);
+    assert_eq!(diagnostic["after_len"], 7);
+    assert_eq!(diagnostic["before"].as_array().unwrap().len(), 3);
+    assert_eq!(diagnostic["after"].as_array().unwrap().len(), 3);
+    assert_eq!(diagnostic["before"][0]["source"], "claim-2");
+    assert_eq!(diagnostic["after"][0]["source"], "claim-3");
+    assert_eq!(diagnostic["before"][0]["incarnation"].as_str().unwrap().len(), 128);
+    assert!(!diagnostic.to_string().contains("private transcript"));
+    assert!(status_history_mismatch_diagnostics(&sealed, &plan, &before, &before, &sources, &sources).is_empty());
+}
+
 pub fn answers_digest(answers: &BTreeMap<String, Value>) -> Result<String> {
     let mut digest = Sha256::new();
     digest.update(b"st3-checkpoint-readers-v1\0");
@@ -538,7 +662,7 @@ pub fn prove_on_copy(
     runtime.replay_checkpoint_projections(&transaction)?;
     let graph_digest_before = graph_digest(&transaction)?;
     let digests_before = projection_digest::tables(&transaction)?;
-    let before = reader_answers(runtime, &transaction, &subjects, sealed.cut_unix_ms)?;
+    let (before, before_sources) = reader_answers_with_sources(runtime, &transaction, &subjects, sealed.cut_unix_ms)?;
     // As a trim does: tombstones first, which readers that walk ancestry pass through.
     record_checkpoint_tombstones_tx(
         &transaction,
@@ -549,7 +673,7 @@ pub fn prove_on_copy(
     delete_dropped_rows_tx(&transaction, &plan.envelopes, &plan.claims)?;
     runtime.replay_checkpoint_projections(&transaction)?;
     let graph_digest_after = graph_digest(&transaction)?;
-    let after = reader_answers(runtime, &transaction, &subjects, sealed.cut_unix_ms)?;
+    let (after, after_sources) = reader_answers_with_sources(runtime, &transaction, &subjects, sealed.cut_unix_ms)?;
     let mut mismatches = answer_mismatches(&before, &after);
     if graph_digest_before != graph_digest_after {
         mismatches.splice(
@@ -571,6 +695,21 @@ pub fn prove_on_copy(
         passed: mismatches.is_empty(),
         mismatches,
     };
+    if !proof.passed {
+        let diagnostics = status_history_mismatch_diagnostics(sealed, plan, &before, &after, &before_sources, &after_sources);
+        if !diagnostics.is_empty() {
+            let emission = CHECKPOINT_DIAGNOSTICS.get_or_init(Default::default).lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .observe("checkpoint", "status-history-mismatch", std::time::Instant::now());
+            if let Some(emission) = emission {
+                for mut diagnostic in diagnostics {
+                    diagnostic["suppressed_proof_logs"] = json!(emission.suppressed);
+                    diagnostic["rate_bucket_overflow"] = json!(emission.overflow);
+                    eprintln!("st3: checkpoint reader mismatch {diagnostic}");
+                }
+            }
+        }
+    }
     transaction.rollback()?;
     Ok(proof)
 }

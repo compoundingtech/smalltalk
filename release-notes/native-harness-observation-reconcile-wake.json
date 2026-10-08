@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Wake reconciliation when native harness observations are admitted",
+  "replay": {
+    "status": "none",
+    "detail": "No replay, migration or rebuild. Native observation records and durable publications are unchanged."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No schema change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules and canonical folds are unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No wire, driver or client contract change. Exact native event replays and usage observations remain quiet."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "None."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "None."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "A native harness transition now wakes reconciliation once (same-state heartbeats remain quiet) so ready work and idle-unclaimed deadlines are re-evaluated. Existing work selection, permission fences, bounded wake attempts and five-minute diagnostic policy are unchanged."
+  }
+}
