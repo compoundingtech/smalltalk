@@ -4024,22 +4024,26 @@ fn session_messages(
     };
     let mut messages = state.store.conversation_messages_at(owner, before, 0)
         .map_err(ApiError::internal)?;
-    messages.retain(|claim| {
-        let fields = claim.body.get("fields").unwrap_or(&claim.body);
-        let from = fields.get("from").and_then(Value::as_str);
-        let to = fields.get("to").and_then(Value::as_str);
-        if from != Some(owner) && to != Some(owner) {
-            return false;
-        }
-        match fields.get("session_id").and_then(Value::as_str) {
-            Some(message_session) => message_session == session_id,
-            None => {
-                started.is_none_or(|started| claim.accepted_at_unix_ms >= started)
-                    && ended.is_none_or(|ended| claim.accepted_at_unix_ms < ended)
-            }
-        }
-    });
+    messages.retain(|claim| session_message_belongs(claim, owner, session_id, started, ended));
     Ok(messages)
+}
+
+fn session_message_belongs(
+    claim: &ClaimRecord,
+    owner: &str,
+    session_id: &str,
+    started: Option<u128>,
+    ended: Option<u128>,
+) -> bool {
+    let fields = claim.body.get("fields").unwrap_or(&claim.body);
+    if fields["from"].as_str() != Some(owner) && fields["to"].as_str() != Some(owner) {
+        return false;
+    }
+    match fields["session_id"].as_str() {
+        Some(message_session) => message_session == session_id,
+        None => started.is_none_or(|started| claim.accepted_at_unix_ms >= started)
+            && ended.is_none_or(|ended| claim.accepted_at_unix_ms < ended),
+    }
 }
 
 /// A message's timeline body: who wrote to whom, about what, so a client can draw Small Talk
@@ -4123,18 +4127,55 @@ fn native_timeline_page(
     session_id: &str,
     query: &ClientListQuery,
     mut items: Vec<Value>,
+    native_sequence: &mut u64,
 ) -> Result<Json<Value>, ApiError> {
+    // Advance replay over omitted native entries as well as the visible page,
+    // without changing the replay window for ordinary, uncorrelated transcripts.
+    *native_sequence = 0;
     if let Some((owner, incarnation, _)) =
         super::managed_session_owner_at(&state.store, snapshot.store_index, session_id)
             .map_err(ApiError::internal)?
     {
-        for claim in session_messages(
+        let messages = session_messages(
             state,
             &owner,
             session_id,
             incarnation.as_deref(),
             snapshot.store_index.checked_add(1),
-        )? {
+        )?;
+        let mut incoming = messages.iter().filter_map(|claim| {
+            let fields = claim.body.get("fields").unwrap_or(&claim.body);
+            (fields["to"].as_str() == Some(owner.as_str())
+                && fields["from"].as_str() != Some(owner.as_str()))
+                .then_some(claim.subject.as_str())
+        }).collect::<BTreeSet<_>>();
+        let future = post_snapshot_native_sends(
+            state, snapshot, &owner, session_id, incarnation.as_deref(), &items, &incoming,
+        )?;
+        incoming.extend(future.iter().filter_map(|claim| {
+            let fields = claim.body.get("fields").unwrap_or(&claim.body);
+            (fields["to"].as_str() == Some(owner.as_str())
+                && fields["from"].as_str() != Some(owner.as_str()))
+                .then_some(claim.subject.as_str())
+        }));
+        let codex_ids = items.iter()
+            .filter_map(|item| item.pointer("/_delivery_correlation/thread_id").and_then(Value::as_str))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|thread| {
+                (thread.to_owned(), incoming.iter().map(|subject| {
+                    st_drivers::codex_app_server::stable_client_user_message_id(&owner, thread, subject)
+                }).collect::<BTreeSet<_>>())
+            }).collect::<BTreeMap<_, _>>();
+        items.retain(|item| {
+            let echo = item.get("_delivery_correlation")
+                .is_some_and(|correlation| native_echo_matches(correlation, &incoming, &codex_ids));
+            if echo {
+                *native_sequence = (*native_sequence).max(item["sequence"].as_u64().unwrap_or(0));
+            }
+            !echo
+        });
+        for claim in messages {
             let fields = claim.body.get("fields").unwrap_or(&claim.body);
             let from = fields.get("from").and_then(Value::as_str);
             let role = if from == Some(owner.as_str()) {
@@ -4155,6 +4196,10 @@ fn native_timeline_page(
                 .then_with(|| a["sequence"].as_u64().cmp(&b["sequence"].as_u64()))
         });
     }
+    for item in &mut items {
+        item.as_object_mut().expect("native timeline entry is an object")
+            .remove("_delivery_correlation");
+    }
     items.reverse();
     let mut page = client_page(
         state,
@@ -4170,6 +4215,95 @@ fn native_timeline_page(
         "items": page.items,
         "page": page.page
     })))
+}
+
+fn post_snapshot_native_sends(
+    state: &AppState,
+    snapshot: &ClientSnapshot,
+    owner: &str,
+    session_id: &str,
+    incarnation: Option<&str>,
+    items: &[Value],
+    incoming: &BTreeSet<&str>,
+) -> Result<Vec<ClaimRecord>, ApiError> {
+    if !items.iter().any(|item| matches!(
+        item["_delivery_correlation"]["kind"].as_str(), Some("message" | "codex")
+    )) {
+        return Ok(Vec::new());
+    }
+    let through = state.store.index().map_err(ApiError::internal)?;
+    if through <= snapshot.store_index {
+        return Ok(Vec::new());
+    }
+    let (started, ended) = match incarnation {
+        Some(incarnation) => state.store.conversation_runtime_span(owner, incarnation)
+            .map_err(ApiError::internal)?,
+        None => (None, None),
+    };
+    let mut future = if items.iter().any(|item| item["_delivery_correlation"]["kind"] == "codex") {
+        let delta = state.store.conversation_message_delta_at(
+            owner, through.checked_add(1), snapshot.store_index, 256,
+        ).map_err(ApiError::internal)?;
+        let subjects = incoming.iter().copied()
+            .chain(delta.iter().filter_map(|claim| {
+                let fields = claim.body.get("fields").unwrap_or(&claim.body);
+                (session_message_belongs(claim, owner, session_id, started, ended)
+                    && fields["to"].as_str() == Some(owner)
+                    && fields["from"].as_str() != Some(owner))
+                    .then_some(claim.subject.as_str())
+            })).collect::<BTreeSet<_>>();
+        let unresolved = items.iter().filter_map(|item| item.get("_delivery_correlation"))
+            .filter(|correlation| correlation["kind"] == "codex")
+            .any(|correlation| {
+                let Some(thread) = correlation["thread_id"].as_str() else { return true };
+                let Some(id) = correlation["id"].as_str() else { return true };
+                !subjects.iter().any(|subject| {
+                    st_drivers::codex_app_server::stable_client_user_message_id(owner, thread, subject) == id
+                })
+            });
+        if delta.len() == 256 && unresolved {
+            return Err(ApiError {
+                status: StatusCode::GONE, code: "cursor-gap".into(),
+                message: "the native read crossed too many graph sends; refresh the conversation".into(),
+                details: Box::new(serde_json::Map::from_iter([("full_resync".into(), json!(true))])),
+            });
+        }
+        delta
+    } else {
+        Vec::new()
+    };
+    let subjects = items.iter()
+        .filter_map(|item| item.get("_delivery_correlation"))
+        .filter(|correlation| correlation["kind"] == "message")
+        .filter_map(|correlation| correlation["id"].as_str())
+        .collect::<BTreeSet<_>>();
+    for subject in subjects {
+        if incoming.contains(subject) || future.iter().any(|claim| claim.subject == subject) {
+            continue;
+        }
+        if let Some(claim) = state.store.latest_claim(subject, Some("message.sent"))
+            .map_err(ApiError::internal)?
+            && claim.store_index > snapshot.store_index
+        {
+            future.push(claim);
+        }
+    }
+    future.retain(|claim| session_message_belongs(claim, owner, session_id, started, ended));
+    Ok(future)
+}
+
+fn native_echo_matches(
+    correlation: &Value,
+    incoming: &BTreeSet<&str>,
+    codex_ids: &BTreeMap<String, BTreeSet<String>>,
+) -> bool {
+    match correlation["kind"].as_str() {
+        Some("message") => correlation["id"].as_str().is_some_and(|id| incoming.contains(id)),
+        Some("codex") => correlation["thread_id"].as_str()
+            .and_then(|thread| codex_ids.get(thread))
+            .is_some_and(|ids| correlation["id"].as_str().is_some_and(|id| ids.contains(id))),
+        _ => false,
+    }
 }
 
 /// What st3 established about a managed seat's native transcript.
@@ -4546,6 +4680,17 @@ pub(super) fn timeline_value(
     id: &str,
     query: &ClientListQuery,
 ) -> Result<Json<Value>, ApiError> {
+    timeline_value_with_native_sequence(state, snapshot, session, id, query, &mut 0)
+}
+
+fn timeline_value_with_native_sequence(
+    state: &AppState,
+    snapshot: &ClientSnapshot,
+    session: &ClientSession,
+    id: &str,
+    query: &ClientListQuery,
+    native_sequence: &mut u64,
+) -> Result<Json<Value>, ApiError> {
     require_scope(session, "read.projections")?;
     let session_id = client_detail_id("session", id);
     if query.cursor.is_some() {
@@ -4595,7 +4740,7 @@ fn timeline_first_page(
             }
             other => external_conversation_items(other, &session_id)?,
         };
-        return native_timeline_page(state, snapshot, &session_id, query, items);
+        return native_timeline_page(state, snapshot, &session_id, query, items, native_sequence);
     };
     let owner = owner.as_str();
     let incarnation = incarnation.as_deref();
@@ -4614,7 +4759,7 @@ fn timeline_first_page(
             Err(missing) => Err(missing.reason.clone()),
         };
         match read {
-            Ok(items) => return native_timeline_page(state, snapshot, &session_id, query, items),
+            Ok(items) => return native_timeline_page(state, snapshot, &session_id, query, items, native_sequence),
             Err(reason) => {
                 transcript_notice_entry = Some(transcript_notice(&session_id, &managed, &reason));
             }
@@ -5121,7 +5266,8 @@ fn conversation_read_now_unbounded(
         *rebuilds.entry(session_id.to_owned()).or_default() += 1;
     }
     let snapshot = new_client_snapshot(state);
-    let page = timeline_value(
+    let mut native_sequence = 0;
+    let page = timeline_value_with_native_sequence(
         state,
         &snapshot,
         session,
@@ -5130,6 +5276,7 @@ fn conversation_read_now_unbounded(
             limit: Some(200),
             ..Default::default()
         },
+        &mut native_sequence,
     )?
     .0;
     let all = page["items"]
@@ -5144,7 +5291,7 @@ fn conversation_read_now_unbounded(
         })
         .filter_map(|item| item["sequence"].as_u64())
         .max()
-        .unwrap_or(0);
+        .unwrap_or(0).max(native_sequence);
     let local_latest = state
         .store
         .local_observations_tail(1)
@@ -14623,8 +14770,138 @@ mission "example/zero-run" state="ready" {
         );
     }
 
+    #[tokio::test]
+    async fn timeline_send_identity_keeps_one_canonical_graph_row() {
+        use crate::external_sessions::{ExternalDriver, ExternalSession};
+        for driver in [ExternalDriver::Claude, ExternalDriver::Codex] {
+            let root = tempfile::tempdir().unwrap();
+            let state = test_state_named(root.path(), "send-identity");
+            let owner = "agent/send-identity";
+            let incarnation = "send-identity:i1";
+            state.store.append_claim(&ClaimInput {
+                subject: owner.into(), kind: "runtime.observed".into(), actor: Some(owner.into()),
+                fields: BTreeMap::from([
+                    ("status".into(), json!("running")), ("runtime_id".into(), json!("send-identity")),
+                    ("incarnation_id".into(), json!(incarnation)), ("terminal".into(), json!(false)),
+                ]),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+            let session_id = super::managed_session_id(owner, incarnation);
+            let session = ClientSession::local(Some("person/alex")).unwrap();
+            let snapshot = new_client_snapshot(&state);
+            let snapshot_before_send = snapshot.clone();
+            let request: ActionRequest = serde_json::from_value(json!({
+                "api_version": CLIENT_API_VERSION, "id": "action/send-identity", "type": "message.send",
+                "idempotency_key": "send-identity-client-key",
+                "fence": {"snapshot_id": snapshot.id, "subject_revisions": {}},
+                "parameters": {"to": owner, "session_id": session_id, "content": "Sent exactly once"},
+            })).unwrap();
+            let result = action(State(state.clone()), Extension(snapshot.clone()), Extension(session.clone()), Json(request))
+                .await.unwrap().0;
+            let message_id = result["affected_ids"][0].as_str().unwrap();
+            let snapshot = new_client_snapshot(&state);
+            let pending = native_timeline_page(&state, &snapshot, &session_id, &ClientListQuery::default(), Vec::new(), &mut 0).unwrap().0;
+            let graph = pending["items"].as_array().unwrap().iter().find(|item| item["type"] == "message").unwrap().clone();
+            assert_eq!(graph["body"]["message_id"], message_id);
+            let stamp = graph["timestamp"].as_str().unwrap();
+            let mut hash = Sha256::new();
+            hash.update(b"st.codex-client-user-message.v1");
+            for part in [owner, "native-send-identity", message_id] {
+                hash.update((part.len() as u64).to_be_bytes());
+                hash.update(part.as_bytes());
+            }
+            let client_id = format!("st:{:x}", hash.finalize());
+            let echo = match driver {
+                ExternalDriver::Claude => json!({
+                    "type": "user", "uuid": "native-echo", "timestamp": stamp,
+                    "message": {"role": "user", "content": [{"type": "text", "text": format!("[st3-delivery:{message_id}]\nSent exactly once")}]},
+                }),
+                ExternalDriver::Codex => json!({
+                    "type": "response_item", "timestamp": stamp,
+                    "payload": {"type": "message", "role": "user", "id": "native-echo", "clientId": client_id,
+                        "content": [{"type": "input_text", "text": "Sent exactly once"}]},
+                }),
+                ExternalDriver::Pi | ExternalDriver::Omp | ExternalDriver::OpenCode => unreachable!(),
+            };
+            let transcript = root.path().join("echo.jsonl");
+            std::fs::write(&transcript, format!("{echo}\n")).unwrap();
+            let source = ExternalSession {
+                id: session_id.clone(), revision: String::new(), driver,
+                native_id: "native-send-identity".into(), transcript, codex_home: None,
+                cwd: None, title: None, started_at_unix_ms: 0, updated_at_unix_ms: 0, process: None,
+            };
+            let native = conversation_blocks::read(&source, &session, &session_id).unwrap();
+            let reread = native_timeline_page(&state, &snapshot, &session_id, &ClientListQuery::default(), native, &mut 0).unwrap().0;
+            assert_eq!(reread["items"], pending["items"], "{driver:?}: native echo duplicated the graph send");
+            assert_eq!(reread["items"][0], graph);
+            // A send can land after capture while its native echo is already readable.
+            // Hide only the echo; the next graph delta supplies the canonical rows.
+            let mut native_position = 0;
+            let raced = native_timeline_page(&state, &snapshot_before_send, &session_id, &ClientListQuery::default(),
+                conversation_blocks::read(&source, &session, &session_id).unwrap(), &mut native_position).unwrap().0;
+            assert!(raced["items"].as_array().unwrap().is_empty(), "{driver:?}: {raced:#}");
+            assert!(native_position > 0, "suppressed native entries must advance replay");
+        }
+    }
+
     #[test]
-    fn managed_codex_session_renders_its_exact_native_chat_not_only_status() {
+    fn timeline_send_identity_bounds_codex_post_snapshot_reconciliation() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "send-identity-cap");
+        let snapshot = new_client_snapshot(&state);
+        let identity = |subject: &str| vec![json!({"_delivery_correlation": {
+            "kind":"codex", "thread_id":"native-cap",
+            "id":st_drivers::codex_app_server::stable_client_user_message_id("agent/cap", "native-cap", subject),
+        }})];
+        for number in 0..257 {
+            state.store.append_claim(&ClaimInput {
+                subject: format!("message/post-snapshot-{number}"), kind: "message.sent".into(),
+                actor: Some("person/alex".into()),
+                fields: BTreeMap::from([
+                    ("from".into(), json!("person/alex")), ("to".into(), json!("agent/cap")),
+                    ("session_id".into(), json!("session/cap")), ("content".into(), json!("send")),
+                    ("status".into(), json!("sent")),
+                ]),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+            if number == 254 {
+                let delta = post_snapshot_native_sends(&state, &snapshot, "agent/cap", "session/cap", None,
+                    &identity("message/post-snapshot-0"), &BTreeSet::new()).unwrap();
+                assert_eq!(delta.len(), 255);
+            }
+            if number == 255 {
+                let delta = post_snapshot_native_sends(&state, &snapshot, "agent/cap", "session/cap", None,
+                    &identity("message/post-snapshot-0"), &BTreeSet::new()).unwrap();
+                assert_eq!(delta.len(), 256, "an exact match at the cap is safe");
+            }
+        }
+        let items = identity("message/post-snapshot-0");
+        let error = post_snapshot_native_sends(&state, &snapshot, "agent/cap", "session/cap", None, &items, &BTreeSet::new())
+            .unwrap_err();
+        assert_eq!(error.code, "cursor-gap");
+        assert_eq!(error.details["full_resync"], true);
+        let resolved = post_snapshot_native_sends(&state, &snapshot, "agent/cap", "session/cap", None,
+            &identity("message/post-snapshot-256"), &BTreeSet::new()).unwrap();
+        assert_eq!(resolved.len(), 256);
+        let wrong_session = post_snapshot_native_sends(&state, &snapshot, "agent/cap", "session/other", None,
+            &identity("message/post-snapshot-256"), &BTreeSet::new()).unwrap_err();
+        assert_eq!(wrong_session.code, "cursor-gap");
+        let bounded = state.store.conversation_message_delta_at("agent/cap", None, snapshot.store_index, 2).unwrap();
+        assert_eq!(bounded.len(), 2);
+    }
+
+    #[test]
+    fn timeline_send_identity_requires_exact_message_and_codex_binding() {
+        let incoming = BTreeSet::from(["message/first", "message/second"]);
+        assert!(native_echo_matches(&json!({"kind":"message","id":"message/first"}), &incoming, &BTreeMap::new()));
+        assert!(!native_echo_matches(&json!({"kind":"message","id":"message/missing"}), &incoming, &BTreeMap::new()));
+        let codex = BTreeMap::from([("native-one".into(), BTreeSet::from(["st:client".into()]))]);
+        assert!(native_echo_matches(&json!({"kind":"codex","id":"st:client","thread_id":"native-one"}), &incoming, &codex));
+        assert!(!native_echo_matches(&json!({"kind":"codex","id":"st:client","thread_id":"native-other"}), &incoming, &codex));
+    }
+
+    #[tokio::test]
+    async fn managed_codex_session_renders_its_exact_native_chat_not_only_status_and_timeline_send_identity() {
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join("home");
         let transcript = home.join(".codex/sessions/2026/09/24/managed.jsonl");
@@ -14719,29 +14996,122 @@ mission "example/zero-run" state="ready" {
         }));
         let baseline = conversation_read_now(&state, &session, &session_id, None).unwrap();
         let baseline_cursor = baseline["next_cursor"].as_str().unwrap();
-        state
-            .store
-            .append_claim(&ClaimInput {
-                subject: "message/managed-native".into(),
-                kind: "message.sent".into(),
-                actor: Some("person/alex".into()),
-                fields: BTreeMap::from([
-                    ("from".into(), json!("person/alex")),
-                    ("to".into(), json!(owner)),
-                    ("session_id".into(), json!(session_id)),
-                    ("content".into(), json!("Native message")),
-                    ("status".into(), json!("sent")),
-                ]),
-                evidence: Vec::new(),
-                expected_subject: None,
-                idempotency_key: Some("managed-native-message".into()),
-            })
-            .unwrap();
+        use futures_util::StreamExt as _;
+        let socket_state = state.clone();
+        let socket_session = session.clone();
+        let socket_session_id = session_id.clone();
+        let app = axum::Router::new().route("/stream", axum::routing::get(
+            move |upgrade: WebSocketUpgrade, Query(query): Query<ConversationQuery>| {
+                let state = socket_state.clone();
+                let session = socket_session.clone();
+                let session_id = socket_session_id.clone();
+                async move {
+                    upgrade.on_upgrade(move |socket| conversation_stream_socket(
+                        socket, state, session, session_id, query.after, None,
+                    ))
+                }
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream?after={baseline_cursor}"))
+            .await.unwrap();
+        let request = json!({
+            "api_version": CLIENT_API_VERSION, "id": "action/native-message", "type": "message.send",
+            "idempotency_key": "managed-native-message",
+            "fence": {"snapshot_id": new_client_snapshot(&state).id, "subject_revisions": {}},
+            "parameters": {"to": owner, "session_id": session_id, "content": "Native message"},
+        });
+        let send_app = axum::Router::new().route("/send", axum::routing::post(action))
+            .layer(Extension(new_client_snapshot(&state)))
+            .layer(Extension(session.clone()))
+            .with_state(state.clone());
+        let response = send_app.oneshot(Request::builder().method("POST").uri("/send")
+            .header("content-type", "application/json")
+            .body(Body::from(request.to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let result: Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), CLIENT_MAX_RESPONSE_BYTES).await.unwrap()).unwrap();
+        let message_id = result["affected_ids"][0].as_str().unwrap();
         let message_update =
             conversation_read_now(&state, &session, &session_id, Some(baseline_cursor)).unwrap();
         assert_eq!(message_update["items"].as_array().unwrap().len(), 2);
         let message_cursor = message_update["next_cursor"].as_str().unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
+        let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(frame["value"]["items"], message_update["items"]);
+        assert_eq!(frame["value"]["items"][0]["body"]["message_id"], message_id);
+        let graft = frame["value"]["items"][0].clone();
+        let response = super::super::router(state.clone()).oneshot(Request::builder()
+            .uri(format!("/v1/client/sessions/{session_id}/timeline"))
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let http: Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), CLIENT_MAX_RESPONSE_BYTES).await.unwrap()).unwrap();
+        let http_graft = http["value"]["items"].as_array().unwrap().iter()
+            .find(|item| item["body"]["message_id"] == message_id).unwrap();
+        assert_eq!(http_graft["id"], graft["id"]);
+        assert_eq!(http_graft["body"]["message_id"], graft["body"]["message_id"]);
         use std::io::Write as _;
+        let pending_snapshot = new_client_snapshot(&state);
+        let pending_page = timeline_value(&state, &pending_snapshot, &session, &session_id, &ClientListQuery {
+            limit: Some(1), ..Default::default()
+        }).unwrap().0;
+        let mut hash = Sha256::new();
+        hash.update(b"st.codex-client-user-message.v1");
+        for part in [owner, native_id, message_id] {
+            hash.update((part.len() as u64).to_be_bytes());
+            hash.update(part.as_bytes());
+        }
+        let client_id = format!("st:{:x}", hash.finalize());
+        writeln!(std::fs::OpenOptions::new().append(true).open(&transcript).unwrap(), "{}", json!({
+            "type":"response_item", "timestamp": message_update["items"][0]["timestamp"],
+            "payload":{"type":"message", "role":"user", "id":"native-echo", "clientId":client_id,
+                "content":[{"type":"input_text", "text":"Native message"}]}
+        })).unwrap();
+        let echo_update = conversation_read_now(&state, &session, &session_id, Some(message_cursor)).unwrap();
+        assert!(echo_update["items"].as_array().unwrap().is_empty(), "{echo_update:#}");
+        let echo_cursor = echo_update["next_cursor"].as_str().unwrap();
+        assert!(conversation_position(&state, &session_id, echo_cursor).unwrap().2
+            > conversation_position(&state, &session_id, message_cursor).unwrap().2);
+        let reconnect = conversation_read_now(&state, &session, &session_id, Some(echo_cursor)).unwrap();
+        assert!(reconnect["items"].as_array().unwrap().is_empty());
+        assert_eq!(reconnect["next_cursor"], echo_update["next_cursor"]);
+        let reread = timeline_value(&state, &new_client_snapshot(&state), &session, &session_id, &ClientListQuery::default()).unwrap().0;
+        for item in message_update["items"].as_array().unwrap() {
+            assert!(reread["items"].as_array().unwrap().contains(item));
+        }
+        assert_eq!(reread["items"].as_array().unwrap().iter()
+            .filter(|item| item["role"] == "user" && item["type"] == "message").count(), 1);
+        let resumed_page = timeline_value(&state, &pending_snapshot, &session, &session_id, &ClientListQuery {
+            limit: Some(1), cursor: pending_page["page"]["next_cursor"].as_str().map(str::to_owned),
+            ..Default::default()
+        }).unwrap().0;
+        assert_eq!(resumed_page["items"][0], message_update["items"][0]);
+        assert_eq!(resumed_page["items"][0]["body"]["message_id"], message_id);
+        let fresh = conversation_read_now(&state, &session, &session_id, None).unwrap();
+        let fresh_update = conversation_read_now(&state, &session, &session_id, Some(fresh["next_cursor"].as_str().unwrap())).unwrap();
+        assert!(fresh_update["items"].as_array().unwrap().is_empty());
+        assert!(tokio::time::timeout(Duration::from_secs(1), socket.next()).await.is_err(),
+            "a suppressed echo must not emit another WS user row");
+        socket.close(None).await.unwrap();
+        // Reconnect from the pre-send cursor: the same canonical graft must replay,
+        // even though the harness has since persisted its correlated native echo.
+        let (mut replay_socket, _) = tokio_tungstenite::connect_async(
+            format!("ws://{address}/stream?after={baseline_cursor}")).await.unwrap();
+        let replay = tokio::time::timeout(Duration::from_secs(5), replay_socket.next())
+            .await.unwrap().unwrap().unwrap();
+        let replay: Value = serde_json::from_str(replay.to_text().unwrap()).unwrap();
+        let replay_graft = replay["value"]["items"].as_array().unwrap().iter()
+            .find(|item| item["body"]["message_id"] == message_id).unwrap();
+        assert_eq!(replay_graft["id"], graft["id"]);
+        assert_eq!(replay_graft["body"]["message_id"], graft["body"]["message_id"]);
+        assert_eq!(replay["value"]["items"].as_array().unwrap().iter()
+            .filter(|item| item["role"] == "user" && item["type"] == "message").count(), 1);
+        replay_socket.close(None).await.unwrap();
+        let (mut resumed_socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream?after={message_cursor}"))
+            .await.unwrap();
         writeln!(std::fs::OpenOptions::new().append(true).open(&transcript).unwrap(), "{}", json!({"type":"response_item","timestamp":"2026-09-24T12:00:02Z","payload":{"type":"message","role":"assistant","id":"later","content":[{"type":"output_text","text":"Native reply"}]}})).unwrap();
         let native_update =
             conversation_read_now(&state, &session, &session_id, Some(message_cursor)).unwrap();
@@ -14752,6 +15122,12 @@ mission "example/zero-run" state="ready" {
                 .iter()
                 .any(|item| item["body"]["text"] == "Native reply")
         );
+        let frame = tokio::time::timeout(Duration::from_secs(5), resumed_socket.next()).await.unwrap().unwrap().unwrap();
+        let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(frame["value"]["items"], native_update["items"]);
+        assert!(frame["value"]["items"].as_array().unwrap().iter().all(|item| item["role"] != "user"));
+        resumed_socket.close(None).await.unwrap();
+        server.abort();
         // A full replay page still resumes after hundreds of unrelated graph commits.
         let mut writer = std::fs::OpenOptions::new()
             .append(true)

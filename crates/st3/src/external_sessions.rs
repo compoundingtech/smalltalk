@@ -1143,6 +1143,13 @@ pub(crate) fn normalized_timeline(session: &ExternalSession) -> Result<Vec<Value
             }),
         ));
     }
+    if session.driver == ExternalDriver::Codex {
+        for item in &mut items {
+            if let Some(correlation) = item.get_mut("_delivery_correlation") {
+                correlation["thread_id"] = json!(session.native_id);
+            }
+        }
+    }
     items.sort_by_key(|item| item["sequence"].as_u64().unwrap_or(u64::MAX));
     Ok(items)
 }
@@ -1189,6 +1196,67 @@ fn normalize_native_line(
         "id":format!("native-{sequence}/source"), "kind":"source_record",
         "source_type":driver.as_str(), "visibility":"internal", "payload":{"raw":value}
     }));
+    if let Some(correlation) = native_delivery_correlation(driver, value) {
+        for item in &mut items[first..] {
+            item["_delivery_correlation"] = correlation.clone();
+        }
+    }
+}
+
+// Only typed native user envelopes can carry a delivery identity. This private hint is
+// consumed by the graph/native merger, never a public conversation field.
+fn native_delivery_correlation(driver: ExternalDriver, value: &Value) -> Option<Value> {
+    let (kind, id) = match driver {
+        ExternalDriver::Claude => {
+            let content = match value["type"].as_str() {
+                Some("user") => value.pointer("/message/content")?,
+                Some("attachment") if value["attachment"]["type"] == "queued_command" => {
+                    value.pointer("/attachment/prompt")?
+                }
+                _ => return None,
+            };
+            // The channel puts its marker at the start of the delivered prompt. Do not
+            // search quoted text, later parts, or arbitrary substrings for delivery markers.
+            let text = match content {
+                Value::String(text) => text.as_str(),
+                Value::Array(parts) => {
+                    let first = parts.first()?;
+                    if first["type"].as_str().is_some_and(|kind| kind != "text") {
+                        return None;
+                    }
+                    first["text"].as_str()?
+                }
+                _ => return None,
+            };
+            let marker = text.strip_prefix("[st3-delivery:")?;
+            let (id, suffix) = marker.split_once(']')?;
+            if !suffix.is_empty() && !suffix.starts_with('\n') {
+                return None;
+            }
+            ("message", id)
+        }
+        ExternalDriver::Codex
+            if value["type"] == "response_item"
+                && value["payload"]["type"] == "message"
+                && value["payload"]["role"] == "user" =>
+        {
+            let id = value
+                .pointer("/payload/clientId")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    value.pointer("/payload/clientUserMessageId").and_then(Value::as_str)
+                })?;
+            return (!id.is_empty()).then(|| json!({"kind":"codex", "id":id}));
+        }
+        _ => return None,
+    };
+    // Graph deliveries use their subject as the filename. Legacy filesystem deliveries
+    // and malformed marker strings cannot identify a graph message.
+    let subject = id.strip_prefix("message/")?;
+    if subject.is_empty() || id.chars().any(char::is_whitespace) || id.contains(['[', ']']) {
+        return None;
+    }
+    Some(json!({"kind":kind, "id":id}))
 }
 
 /// Recover a whole record glued behind a torn one.
@@ -3522,6 +3590,125 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timeline_send_identity_marks_every_native_user_entry_without_changing_projection() {
+        let subject = "message/client-send";
+        let marker = format!("[st3-delivery:{subject}]\nhello");
+        let cases = [
+            (
+                ExternalDriver::Claude,
+                json!({"type":"user","uuid":"claude-user","message":{"role":"user","content":[{"type":"text","text":marker},{"type":"image","source":{"type":"base64","data":"image"}}]}}),
+                json!({"kind":"message","id":subject}),
+            ),
+            (
+                ExternalDriver::Claude,
+                json!({"type":"attachment","uuid":"queued-user","attachment":{"type":"queued_command","prompt":marker}}),
+                json!({"kind":"message","id":subject}),
+            ),
+            (
+                ExternalDriver::Claude,
+                json!({"type":"user","message":{"content":marker}}),
+                json!({"kind":"message","id":subject}),
+            ),
+            (
+                ExternalDriver::Codex,
+                json!({"type":"response_item","payload":{"type":"message","role":"user","clientId":"st:client","content":[{"type":"input_text","text":"hello"},{"type":"input_image","image_url":"image"}]}}),
+                json!({"kind":"codex","id":"st:client"}),
+            ),
+            (
+                ExternalDriver::Codex,
+                json!({"type":"response_item","payload":{"type":"message","role":"user","clientUserMessageId":"st:client","content":"hello"}}),
+                json!({"kind":"codex","id":"st:client"}),
+            ),
+        ];
+        for (driver, value, expected) in cases {
+            let mut entries = Vec::new();
+            normalize_native_line(driver, &value, 16, &timestamp(0), &mut entries);
+            assert!(entries.len() >= 2);
+            for entry in &mut entries {
+                assert_eq!(entry["_delivery_correlation"], expected);
+                entry.as_object_mut().unwrap().remove("_delivery_correlation");
+            }
+            let mut projection = Vec::new();
+            match driver {
+                ExternalDriver::Pi | ExternalDriver::Omp => {
+                    normalize_omp(driver, &value, 16, &timestamp(0), &mut projection);
+                }
+                ExternalDriver::Claude => {
+                    normalize_claude(&value, 16, &timestamp(0), &mut projection);
+                }
+                ExternalDriver::Codex => {
+                    normalize_codex(&value, 16, &timestamp(0), &mut projection);
+                }
+                ExternalDriver::OpenCode => unreachable!(),
+            }
+            // The wrapper's pre-existing source record is the only projection difference.
+            entries[0]["body"]["blocks"].as_array_mut().unwrap().pop();
+            if projection[0]["body"].get("blocks").is_none() {
+                entries[0]["body"].as_object_mut().unwrap().remove("blocks");
+            }
+            assert_eq!(entries, projection);
+        }
+    }
+
+    #[test]
+    fn timeline_send_identity_ignores_absent_misleading_and_non_user_identities() {
+        let cases = [
+            (ExternalDriver::Pi, json!({"type":"message","meta":{"messageId":"message/client-send"},"message":{"role":"user","content":"hello"}})),
+            (ExternalDriver::Omp, json!({"type":"custom","id":"delivery","customType":"st3.delivery","data":{"messageIds":["message/client-send"]}})),
+            (ExternalDriver::Omp, json!({"type":"message","parentId":"delivery","message":{"role":"user","content":"hello"}})),
+            (ExternalDriver::Pi, json!({"type":"message","message":{"role":"user","content":"message/client-send"}})),
+            (ExternalDriver::Omp, json!({"type":"message","message":{"role":"user","meta":{"messageFilename":"legacy.md"},"content":"hello"}})),
+            (ExternalDriver::Pi, json!({"type":"message","meta":{"messageId":"legacy.md"},"message":{"role":"user","content":"hello"}})),
+            (ExternalDriver::Omp, json!({"type":"message","meta":{"messageFilename":"message/client-send"},"message":{"role":"assistant","content":"hello"}})),
+            (ExternalDriver::Pi, json!({"type":"message","meta":{"messageFilename":"message/client-send"},"message":{"role":"toolResult","content":"hello"}})),
+            (ExternalDriver::Claude, json!({"type":"assistant","message":{"content":"[st3-delivery:message/client-send]\nhello"}})),
+            (ExternalDriver::Claude, json!({"type":"user","message":{"content":"quoted [st3-delivery:message/client-send]\nhello"}})),
+            (ExternalDriver::Claude, json!({"type":"user","message":{"content":"[st3-delivery:message/client-send] incidental"}})),
+            (ExternalDriver::Claude, json!({"type":"user","message":{"content":"[st3-delivery:legacy.md]\nhello"}})),
+            (ExternalDriver::Claude, json!({"type":"user","message":{"content":"[st3-delivery:message/]\nhello"}})),
+            (ExternalDriver::Claude, json!({"type":"user","message":{"content":"[st3-delivery:message/has space]\nhello"}})),
+            (ExternalDriver::Claude, json!({"type":"user","message":{"content":[{"type":"text","text":"hello"},{"type":"text","text":"[st3-delivery:message/client-send]\nquoted"}]}})),
+            (ExternalDriver::Claude, json!({"type":"attachment","attachment":{"type":"other","prompt":"[st3-delivery:message/client-send]\nhello"}})),
+            (ExternalDriver::Codex, json!({"type":"response_item","payload":{"type":"message","role":"user","id":"st:client","content":"hello"}})),
+            (ExternalDriver::Codex, json!({"type":"response_item","clientId":"st:client","payload":{"type":"message","role":"user","content":"hello"}})),
+            (ExternalDriver::Codex, json!({"type":"response_item","payload":{"type":"message","role":"assistant","clientId":"st:client","content":"hello"}})),
+            (ExternalDriver::Codex, json!({"type":"response_item","payload":{"type":"message","role":"user","clientId":"","content":"hello"}})),
+        ];
+        for (driver, value) in cases {
+            let mut entries = Vec::new();
+            normalize_native_line(driver, &value, 16, &timestamp(0), &mut entries);
+            assert!(!entries.is_empty());
+            assert!(
+                entries.iter().all(|entry| entry.get("_delivery_correlation").is_none()),
+                "{driver:?}: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn timeline_send_identity_codex_includes_native_thread_at_timeline_boundary() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("session.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",",
+                "\"clientId\":\"st:client\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}]}}\n"
+            ),
+        )
+        .unwrap();
+        let session = transcript_session(ExternalDriver::Codex, &path);
+        let entries = normalized_timeline(&session).unwrap();
+        assert_eq!(entries.len(), 2);
+        for entry in entries {
+            assert_eq!(
+                entry["_delivery_correlation"],
+                json!({"kind":"codex","id":"st:client","thread_id":session.native_id})
+            );
+        }
+    }
 
     #[test]
     fn metadata_cache_refreshes_after_a_transcript_changes() {
