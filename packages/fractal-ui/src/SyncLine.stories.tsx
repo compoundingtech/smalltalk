@@ -71,7 +71,13 @@ const meta = {
 } satisfies Meta<SyncArgs>
 export default meta
 type Story = StoryObj<SyncArgs>
-export const AllStates: Story = { render: AllStatesStory }
+export const AllStates: Story = { render: AllStatesStory, play: async ({ canvasElement }) => {
+  const lines = canvasElement.querySelectorAll<HTMLElement>('[data-testid="sync-line"]')
+  if (lines.length === 0) throw new Error('Expected the full synchronization state matrix')
+  for (const line of lines) {
+    if (/\bst\b|\bobservation\b/i.test(line.innerText)) throw new Error(`Synchronization copy is not user-facing: ${line.innerText}`)
+  }
+} }
 export const UnknownReason: Story = { args: { sequence: syncObservations.findIndex(observation => observation.id === 'Stale · Unknown') } }
 export const UnknownReasonLastLive: Story = { args: { sequence: syncObservations.findIndex(observation => observation.id === 'Stale · Unknown · last live') } }
 export const LocalFailure: Story = { args: { sequence: syncObservations.findIndex(observation => observation.id === 'Failed · Local · cap') } }
@@ -118,9 +124,9 @@ export const TransitionSequence: Story = {
       if (syncLine({ status: reconnecting, label: 'agents', now: syncNow, observedAt: syncNow - 1999 }) !== undefined) throw new Error('Reconnecting surfaced before client-observed 2s delay')
       const unknownReason = { _tag: 'Stale', reason: { _tag: 'Unknown' } } as const
       const immediate = syncLine({ status: unknownReason, label: 'agents', now: syncNow, observedAt: syncNow })
-      if (immediate?.text !== 'Stale · observed 0s ago' || immediate.announce !== 'Stale') throw new Error('Unknown stale reason must show immediately without an invented cause')
+      if (immediate?.text !== 'Waiting for an update · 0s' || immediate.announce !== 'Waiting for an update') throw new Error('Unknown stale reason must show immediately without an invented cause')
       const knownLastLive = syncLine({ status: { ...unknownReason, lastLiveAt: syncNow - 3000 }, label: 'agents', now: syncNow, observedAt: syncNow })
-      if (knownLastLive?.text !== 'Stale · 3s since last live') throw new Error('Unknown cause must preserve an observed last-live age')
+      if (knownLastLive?.text !== 'Last updated 3s ago') throw new Error('Unknown cause must preserve an observed last-live age')
       const local = { _tag: 'Failed', cause: { _tag: 'Local', kind: 'subscription-limit' } } as const
       if (syncLine({ status: local, label: 'agents', now: syncNow, observedAt: syncNow })?.text !== "Couldn't load agents: too many active subscriptions; close an unused pane and retry") throw new Error('Absent cap must not be invented')
       if (syncLine({ status: { ...local, cause: { ...local.cause, detail: { cap: 0 } } }, label: 'agents', now: syncNow, observedAt: syncNow })?.text !== "Couldn't load agents: too many active subscriptions (cap 0); close an unused pane and retry") throw new Error('A reported zero cap is a known diagnostic fact')
