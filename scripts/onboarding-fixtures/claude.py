@@ -16,6 +16,12 @@ import tty
 
 import stubmodel
 
+# Each read must be attributable to the current provider incarnation after restart.
+original_receipt=stubmodel.receipt
+def incarnation_receipt(event,**fields):
+    original_receipt(event,incarnation=os.environ.get("ST3_INCARNATION"),**fields)
+stubmodel.receipt=incarnation_receipt
+
 argv=sys.argv[1:]
 state_path=Path.home()/".claude/onboarding-fixture.json"
 state=json.loads(state_path.read_text()) if state_path.exists() else {"marketplaces":[],"plugins":[]}
@@ -52,11 +58,16 @@ if argv[:1]==["plugin"]:
     sys.exit(0)
 
 stubmodel.receipt("provider-argv",argv=argv)
+selectors=[]
+for index,argument in enumerate(argv):
+    for flag in ("--channels","--dangerously-load-development-channels"):
+        if argument==flag and index+1<len(argv): selectors.extend(argv[index+1].split(","))
+        elif argument.startswith(flag+"="): selectors.extend(argument.split("=",1)[1].split(","))
 if any(a.startswith("--dangerously-load-development-channels") for a in argv):
     print("WARNING: Loading development channels\n\n"
           "--dangerously-load-development-channels is for local channel development only.\n"
           "Please use --channels to run a list of approved channels.\n\n"
-          "Channels: plugin:st-channel@st\n\n"
+          "Channels: "+", ".join(selectors)+"\n\n"
           "❯ 1. I am using this for local development\n  2. Exit\n\n"
           "Enter to confirm · Esc to cancel",flush=True)
     if not sys.stdin.isatty(): sys.exit("fixture consent requires a terminal")
@@ -77,11 +88,6 @@ if any(a.startswith("--dangerously-load-development-channels") for a in argv):
 
 # The shared Claude fixture supports an inline st3 MCP server. Resolve the installed
 # packaged plugin to that same server while retaining the original route receipt.
-selectors=[]
-for index,argument in enumerate(argv):
-    for flag in ("--channels","--dangerously-load-development-channels"):
-        if argument==flag and index+1<len(argv): selectors.extend(argv[index+1].split(","))
-        elif argument.startswith(flag+"="): selectors.extend(argument.split("=",1)[1].split(","))
 if "plugin:st-channel@st" in selectors and "--mcp-config" not in argv and not any(a.startswith("--mcp-config=") for a in argv):
     if "st-channel@st" not in state["plugins"]: sys.exit("fixture plugin absent")
     server={"command":os.environ["ST3_BIN"],"args":["driver","claude-mcp"]}

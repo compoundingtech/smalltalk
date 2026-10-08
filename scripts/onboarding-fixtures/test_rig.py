@@ -55,6 +55,33 @@ class RigChecks(unittest.TestCase):
         after["items"][0]["runs"].append("mission-run/two")
         self.assertNotEqual(rig.mission_runs(before),rig.mission_runs(after))
 
+    def test_read_receipt_must_match_wake_and_new_incarnation(self):
+        old={"event":"read","reference":"message/abc","exit":0,"incarnation":"old"}
+        self.assertFalse(rig.successful_read([old],"message/abc","new"))
+        self.assertFalse(rig.successful_read([{**old,"incarnation":"new"}],"message/def","new"))
+        self.assertFalse(rig.successful_read([{**old,"incarnation":"new","exit":2}],"message/abc","new"))
+        self.assertTrue(rig.successful_read([old,{**old,"incarnation":"new"}],"message/abc","new"))
+
+    def test_focus_probe_rejects_sidebar_and_unfocused_composer(self):
+        code='import os,tty; tty.setraw(0); os.write(1,b"\\x1b[?1049h working Expert sidebar Message Expert "+"·".encode()+b" click");\nwhile True:\n value=os.read(0,100)\n if b"\\x11" in value: os.write(1,b"\\x1b[?1049l"); break\n if b"home" in value: os.write(1,b"Now Nothing needs you")\n'
+        request={"argv":["python3","-c",code],"timeout":5,"expect_expert":True,"expert_focus_timeout":0.1}
+        r=subprocess.run(["python3","-c",rig.PTY_PROBE,json.dumps(request)],capture_output=True,text=True,timeout=8)
+        self.assertEqual(r.returncode,0)
+        value=json.loads(r.stdout)
+        self.assertFalse(value["expert_focused"])
+        self.assertTrue(value["home_navigation"])
+        self.assertTrue(value["restored"])
+
+    def test_focus_probe_accepts_focused_expert_before_navigation(self):
+        code='import os,tty; tty.setraw(0); os.write(1,b"\\x1b[?1049h working Message Expert "+"·".encode()+b" type or click");\nwhile True:\n value=os.read(0,100)\n if b"\\x11" in value: os.write(1,b"\\x1b[?1049l"); break\n if b"home" in value: os.write(1,b"Now Nothing needs you")\n'
+        request={"argv":["python3","-c",code],"timeout":5,"expect_expert":True,"expert_focus_timeout":0.1}
+        r=subprocess.run(["python3","-c",rig.PTY_PROBE,json.dumps(request)],capture_output=True,text=True,timeout=8)
+        self.assertEqual(r.returncode,0)
+        value=json.loads(r.stdout)
+        self.assertTrue(value["expert_focused"])
+        self.assertNotIn("Nothing needs you",value["initial_screen"])
+        self.assertTrue(value["home_frame"])
+
     def test_fixture_cannot_start_before_consent(self):
         with tempfile.TemporaryDirectory() as d:
             directory=Path(d)
@@ -63,7 +90,7 @@ class RigChecks(unittest.TestCase):
             shutil.copyfile(SCRIPTS/"onboarding-fixtures/claude.py",directory/"claude.py")
             master,slave=pty.openpty()
             process=subprocess.Popen(["python3",str(directory/"claude.py"),"--dangerously-load-development-channels=server:st3"],
-                cwd=d,env={**os.environ,"HOME":d,"ST_AGENT":"agent/fixture"},stdin=slave,stdout=slave,stderr=slave)
+                cwd=d,env={**os.environ,"HOME":d,"CLAUDE_CONFIG_DIR":str(directory/"managed"),"ST_AGENT":"agent/fixture","ST3_INCARNATION":"fixture-current"},stdin=slave,stdout=slave,stderr=slave)
             os.close(slave)
             receipt=directory/"receipts-agent-fixture.jsonl"
             def records():
@@ -78,6 +105,7 @@ class RigChecks(unittest.TestCase):
                 while time.monotonic()<deadline and not any(r["event"]=="started" for r in records()): time.sleep(0.05)
                 self.assertTrue(any(r["event"]=="development-consent" and r["accepted"] for r in records()))
                 self.assertTrue(any(r["event"]=="started" for r in records()))
+                self.assertTrue(all(r.get("incarnation")=="fixture-current" for r in records()))
             finally:
                 process.terminate(); process.wait(timeout=5); os.close(master)
 
@@ -112,5 +140,31 @@ class RigChecks(unittest.TestCase):
                 finally:
                     if process.poll() is None: process.terminate(); process.wait(timeout=5)
                     os.close(master)
+
+    def test_managed_claude_transcript_can_resume_after_restart(self):
+        with tempfile.TemporaryDirectory() as d:
+            directory=Path(d); config=directory/"managed"; home=directory/"home"; home.mkdir()
+            for name in ("stubmodel.py","stub-claude.py"):
+                shutil.copyfile(SCRIPTS/"st3-boot-canaries"/name,directory/name)
+            shutil.copyfile(SCRIPTS/"onboarding-fixtures/claude.py",directory/"claude.py")
+            env={**os.environ,"HOME":str(home),"CLAUDE_CONFIG_DIR":str(config),"ST_AGENT":"agent/fixture","ST3_INCARNATION":"before"}
+            receipt=directory/"receipts-agent-fixture.jsonl"
+            def records(): return [json.loads(line) for line in receipt.read_text().splitlines()] if receipt.exists() else []
+            process=subprocess.Popen(["python3",str(directory/"claude.py")],cwd=d,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+            try:
+                deadline=time.monotonic()+5
+                while time.monotonic()<deadline and not list(config.glob("projects/*/*.jsonl")): time.sleep(0.05)
+                transcripts=list(config.glob("projects/*/*.jsonl"))
+                self.assertEqual(len(transcripts),1)
+                session=transcripts[0].stem
+                self.assertFalse((home/".claude/projects").exists())
+            finally: process.terminate(); process.communicate(timeout=5)
+            process=subprocess.Popen(["python3",str(directory/"claude.py"),"--resume",session],cwd=d,env={**env,"ST3_INCARNATION":"after"},stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+            try:
+                deadline=time.monotonic()+5
+                while time.monotonic()<deadline and not any(r["event"]=="session" and r.get("resumed") for r in records()): time.sleep(0.05)
+                self.assertTrue(any(r["event"]=="session" and r.get("resumed") and r.get("incarnation")=="after" for r in records()))
+                self.assertFalse(any(r["event"]=="session-missing" for r in records()))
+            finally: process.terminate(); process.communicate(timeout=5)
 
 if __name__=="__main__": unittest.main()

@@ -41,7 +41,7 @@ env=dict(os.environ,TERM="xterm-256color")
 for key in ("ST_AGENT","ST3_INCARNATION","ST3_ENDPOINT"): env.pop(key,None)
 proc=subprocess.Popen(request["argv"],stdin=slave,stdout=slave,stderr=slave,env=env,start_new_session=True)
 os.close(slave)
-raw=bytearray(); handled=[]; frame=False; navigated=False; quit_sent=False; home_start=0
+raw=bytearray(); plain=b""; handled=[]; frame=False; navigated=False; quit_sent=False; home_start=0; initial_screen=""; expert_focused=False
 deadline=time.monotonic()+request.get("timeout",45)
 rules=[("Your name",b"ada\r"),("This machine's name",b"studio\r"),
        ("Keep st running in the background",b"\r"),("The st daemon is not running. Start it?",b"\r"),
@@ -59,10 +59,14 @@ while time.monotonic()<deadline:
     os.write(master,answer); handled.append(text)
   # Never answer passwords or provider login requests.
   if b"\x1b[?1049h" in raw and b" working" in plain and not frame:
-   frame=True; os.write(master,b"\x0b"); time.sleep(0.2); os.write(master,b"home"); time.sleep(0.2); os.write(master,b"\r")
-   navigated=True; home_start=len(raw); quit_at=time.monotonic()+2
-  if frame and not quit_sent and time.monotonic()>=quit_at:
-   os.write(master,b"\x11"); quit_sent=True
+   frame=True; frame_at=time.monotonic()
+ focused=bool(re.search(rb"Message Expert[ \t]*\xc2\xb7[ \t]*type or click",plain))
+ if frame and not navigated and (not request.get("expect_expert") or focused or time.monotonic()-frame_at>=request.get("expert_focus_timeout",15)):
+  initial_screen=plain.decode(errors="replace"); expert_focused=focused
+  os.write(master,b"\x0b"); time.sleep(0.2); os.write(master,b"home"); time.sleep(0.2); os.write(master,b"\r")
+  navigated=True; home_start=len(raw); quit_at=time.monotonic()+2
+ if navigated and not quit_sent and time.monotonic()>=quit_at:
+  os.write(master,b"\x11"); quit_sent=True
  if proc.poll() is not None: break
 if proc.poll() is None:
  os.killpg(proc.pid,signal.SIGTERM)
@@ -73,13 +77,13 @@ plain=re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]",b"",raw).decode(errors="replace")
 home=re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]",b"",raw[home_start:]).decode(errors="replace") if navigated else ""
 print(json.dumps({"argv":request["argv"],"exit":proc.returncode,"frame":frame,
  "home_navigation":navigated,"home_frame":any(s in home for s in ("Now","Nothing needs you","Checking what needs you")),"quit_sent":quit_sent,"answers":handled,
- "restored":b"\x1b[?1049l" in raw,"screen":plain}))
+ "expert_focused":expert_focused,"initial_screen":initial_screen,"restored":b"\x1b[?1049l" in raw,"screen":plain}))
 '''
 
 SCENARIOS = ("baseline", "setup", "first-run", "no-harness", "claude-policy-absent",
     "claude-policy-present", "codex", "both", "no-gh", "gh-logged-out", "gh-broken",
     "no-manager", "hostname-localhost", "hostname-spaces", "hostname-long",
-    "existing-store", "linger-on", "linger-off")
+    "existing-store", "linger-on", "linger-off", "expert-lifecycle", "claude-pre-channel")
 
 def command(argv, **kwargs):
     return subprocess.run(argv, capture_output=True, **kwargs)
@@ -198,6 +202,13 @@ def mission_runs(page):
     if not isinstance(page,dict) or not isinstance(page.get("items"),list): return None
     return sorted((item["id"], sorted(item.get("runs",[]))) for item in page["items"])
 
+def seat_incarnation(seat):
+    return (seat.get("incarnation_id") or seat.get("operational",{}).get("runtime_incarnation")) if isinstance(seat,dict) else None
+
+def successful_read(records,reference,incarnation=None):
+    return any(r.get("event")=="read" and r.get("reference")==reference and r.get("exit")==0
+        and (incarnation is None or r.get("incarnation")==incarnation) for r in records)
+
 class Run:
     def __init__(self,machine,out,archive,metadata):
         self.m,self.out,self.archive,self.metadata=machine,out,archive,metadata
@@ -235,8 +246,8 @@ class Run:
         try: return unwrap(json.loads(r["stdout"]))
         except ValueError: return None
 
-    def pty(self,title,argv):
-        request=json.dumps({"argv":argv,"timeout":55})
+    def pty(self,title,argv,**options):
+        request=json.dumps({"argv":argv,"timeout":55,**options})
         r=self.execute(title,shlex.join(["python3","-c",PTY_PROBE,request]),timeout=65)
         try: return json.loads(r["stdout"])
         except ValueError: return {"frame":False,"screen":self.output(r),"exit":r["exit"]}
@@ -298,13 +309,14 @@ class Run:
         if scenario in ("gh-logged-out","gh-broken"):
             body="#!/bin/sh\necho 'fixture gh unavailable' >&2\nexit "+("127" if scenario=="gh-broken" else "1")+"\n"
             self.execute("Logged-out/broken gh fixture","mkdir -p ~/.local/bin; printf %s "+shlex.quote(body)+" > ~/.local/bin/gh; chmod +x ~/.local/bin/gh")
-        if scenario in ("claude-policy-absent","claude-policy-present","codex","both","no-gh","gh-logged-out","gh-broken"):
+        if scenario in ("claude-policy-absent","claude-policy-present","codex","both","no-gh","gh-logged-out","gh-broken","expert-lifecycle","claude-pre-channel"):
             self.install_harnesses(scenario)
-        interactive=scenario in ("first-run","hostname-localhost","hostname-spaces","hostname-long","both")
+        interactive=scenario in ("first-run","hostname-localhost","hostname-spaces","hostname-long","both","expert-lifecycle")
         if not interactive:
             self.execute("Config merge sentinel","mkdir -p ~/.config/st3; printf '[checkpoint]\\nenabled = false\\n' > ~/.config/st3/config.toml")
         service="true"
         argv=[self.st,"setup","--person","ada","--node","studio","--yes","--service",service]
+        if scenario=="claude-pre-channel": argv += ["--harness","claude","--claude-channel","false"]
         if scenario=="existing-store":
             r=self.execute("Seed existing store",shlex.join(argv))
             if not self.check("seed-store",r["exit"]==0,"first setup creates real state before the second run"): return
@@ -316,19 +328,23 @@ class Run:
             if not self.check("existing-fleet-run",r["exit"]==0,"real unrelated run exists before setup repeats"): return
             existing_before=self.json_cli("Existing runs before setup","missions","ls","--all")
         if interactive:
-            p=self.pty("Scripted first terminal run",[self.st]); ok=p.get("frame",False)
+            p=self.pty("Scripted first terminal run",[self.st],expect_expert=scenario=="expert-lifecycle"); ok=p.get("frame",False)
             text=p.get("screen","")
             self.check("first-run-questions",all(x in p.get("answers",[]) for x in ("Your name","This machine's name","Keep st running in the background")),"name, machine and default service answered in PTY")
             if scenario=="both":
                 self.check("harness-choice",p.get("answers",[]).count("Which harness")==1,"several harnesses ask one choice; scripted selection is Claude")
+            if scenario=="expert-lifecycle":
+                self.check("expert-ui-focus",p.get("expert_focused",False),"focused Message Expert type-or-click composer hint appeared before navigation")
         else:
             r=self.execute("Setup flags",shlex.join(argv)); ok=r["exit"]==0; text=self.output(r)
         if not self.check("setup-success",ok,"real candidate setup completed"): return
-        if self.m.args.harness_only and scenario in ("claude-policy-absent","claude-policy-present","codex","both","no-gh","gh-logged-out","gh-broken"):
+        if scenario=="claude-pre-channel":
+            self.check("setup-inline-route","server:st3" in text and "--dangerously-load-development-channels" in text,"declining plugin installation retains Claude and explains inline development route")
+        if scenario in ("claude-policy-absent","claude-policy-present","codex","both","no-gh","gh-logged-out","gh-broken","expert-lifecycle","claude-pre-channel"):
             expected="claude" if scenario.startswith("claude-") or scenario=="both" else "codex"
             selected=re.findall(r"^Selected harness: (claude|codex|opencode|pi|omp)\s*$",text,re.M)
             self.check("setup-selected-harness",selected==[expected],"setup discovers/selects "+expected+" exactly once on daemon login PATH")
-            if scenario.startswith("claude-"):
+            if scenario.startswith("claude-policy-"):
                 flag="--channels" if scenario=="claude-policy-present" else "--dangerously-load-development-channels"
                 self.check("setup-channel-route",flag in text and "plugin:st-channel@st" in text,"setup explains its policy/development plugin route")
         if scenario=="existing-store":
@@ -357,8 +373,12 @@ class Run:
         p=self.pty("Plain st renders; palette selects Home/Now",[self.st])
         self.check("tui-frame",p.get("frame",False) and p.get("home_frame",False) and p.get("quit_sent",False) and p.get("restored",False) and p.get("exit")==0,"first frame, visible Home/Now, Ctrl+Q and terminal restoration")
         if scenario not in ("setup","first-run","hostname-localhost","hostname-spaces","hostname-long","no-manager","linger-on","linger-off","existing-store"):
-            if self.m.args.harness_only and scenario!="no-harness": self.harness_checks(scenario)
+            if scenario=="claude-pre-channel":
+                self.pre_channel_checks()
+                self.onboarding_checks(scenario)
+            elif self.m.args.harness_only and scenario!="no-harness": self.harness_checks(scenario)
             else: self.onboarding_checks(scenario)
+        if scenario=="expert-lifecycle": self.expert_lifecycle_checks()
         before=self.json_cli("Runs before rerun","missions","ls","--all")
         r=self.cli("Idempotent setup","setup","--person","ada","--node","studio","--yes","--service",service)
         after=self.json_cli("Runs after rerun","missions","ls","--all")
@@ -462,16 +482,10 @@ class Run:
                 time.sleep(1)
             self.check("expert-incarnation",ready,"expert has a reachable observed incarnation without a fault")
             runs=self.json_cli("Onboarding runs","missions","show","mission/st/onboarding")
-            self.check("onboarding-once",isinstance(runs,dict) and isinstance(runs.get("runs"),list) and len(runs["runs"])==1,"one built-in onboarding run")
-            # Provider receipts are the evidence of the selected route and mailbox consumption.
-            while True:
-                r=self.execute("Stub provider receipts","find ~ -name 'receipts-agent-st-expert.jsonl' -exec cat {} +")
-                records=[json.loads(line) for line in r["stdout"].splitlines() if line.startswith("{")]
-                read=any(x.get("event")=="read" and x.get("exit")==0 for x in records)
-                if read or time.monotonic()>=deadline: break
-                time.sleep(1)
-            self.check("expert-read-message",read,"native fixture successfully consumed a graph message")
-            receipts=r["stdout"]
+            self.check("onboarding-once",isinstance(runs,dict) and runs.get("total_runs")==1 and isinstance(runs.get("newest"),list) and len(runs["newest"])==1 and runs["newest"][0]["id"]=="mission-run/st/onboarding","one historical built-in onboarding run with the automatic ID")
+            read,records,reference=self.wake_and_read("agent/st/expert","Expert mailbox fixture")
+            self.check("expert-read-message",read,"native fixture successfully reads the exact graph wake "+str(reference))
+            receipts=json.dumps(records)
             if scenario.startswith("claude-policy"):
                 flag="--channels" if scenario.endswith("present") else "--dangerously-load-development-channels"
                 self.check("claude-route",flag in receipts,"correct policy/development route")
@@ -483,12 +497,85 @@ class Run:
                 deadline=time.monotonic()+self.m.args.mission_timeout
                 while True:
                     runs=self.json_cli("Mission completion","missions","show","mission/st/onboarding")
-                    done=isinstance(runs,dict) and any(x.get("status")=="completed" for x in runs.get("run_details",[]))
+                    done=isinstance(runs,dict) and any(x.get("status")=="completed" for x in runs.get("newest",[]))
                     if done or time.monotonic()>=deadline: break
                     time.sleep(2)
                 self.check("mission-wrap-up",done,"onboarding actually completed; native fixtures alone do not prove model behavior")
         r=self.cli("Plain Claude MCP without a subject","driver","claude-mcp",timeout=5)
         self.check("plain-mcp-idle",r["exit"]==0 and not r["stdout"],"no notifications or error outside a seat")
+
+    def wait_seat(self,subject,previous=None,stopped=False):
+        deadline=time.monotonic()+35
+        while True:
+            seat=self.json_cli("Observe "+subject,"agents","show",subject,"--all")
+            incarnation=seat_incarnation(seat)
+            ready=isinstance(seat,dict) and (seat.get("state")=="stopped" and seat.get("reachability")!="reachable" if stopped else
+                bool(incarnation and incarnation!=previous and seat.get("reachability")=="reachable" and not seat.get("fault")))
+            if ready or time.monotonic()>=deadline: return seat,bool(ready)
+            time.sleep(1)
+
+    def provider_receipts(self,subject):
+        filename="receipts-"+re.sub(r"[^A-Za-z0-9]","-",subject)+".jsonl"
+        r=self.execute("Provider receipts for "+subject,"find ~ -name "+shlex.quote(filename)+" -exec cat {} +")
+        return [json.loads(line) for line in r["stdout"].splitlines() if line.startswith("{")]
+
+    def wake_and_read(self,subject,title,incarnation=None):
+        r=self.cli(title,"conversations","send",subject,"--from","person/ada","--subject",title,"--body","Read this exact graph wake with st; this is a native protocol fixture.")
+        match=re.search(r"message/[0-9a-f]+",r["stdout"])
+        if r["exit"] or match is None: return False,[],None
+        reference=match.group(0); deadline=time.monotonic()+35
+        while True:
+            records=self.provider_receipts(subject)
+            read=successful_read(records,reference,incarnation)
+            if read or time.monotonic()>=deadline: return read,records,reference
+            time.sleep(1)
+
+    def expert_lifecycle_checks(self):
+        subject="agent/st/expert"
+        original,ready=self.wait_seat(subject)
+        if not self.check("lifecycle-original-seat",ready,"expert running before stop/cancel"): return
+        previous=seat_incarnation(original)
+        r=self.cli("Stop built-in expert","agents","stop",subject,"--as","person/ada")
+        stopped,ready=self.wait_seat(subject,stopped=True)
+        if not self.check("expert-stopped",r["exit"]==0 and ready,"explicit stop leaves expert stopped and unreachable"): return
+        r=self.cli("Cancel original onboarding run","missions","cancel","mission-run/st/onboarding","--reason","fixture","--as","person/ada")
+        overview=self.json_cli("Cancelled historical onboarding run","missions","show","mission/st/onboarding")
+        if not self.check("onboarding-cancelled",r["exit"]==0 and isinstance(overview,dict) and overview.get("total_runs")==1 and any(x["id"]=="mission-run/st/onboarding" and x.get("status")=="cancelled" for x in overview.get("newest",[])),"cancel is explicit and remains in historical run count"): return
+        for n in (1,2):
+            r=self.cli("Repeat setup with stopped expert "+str(n),"setup","--person","ada","--node","studio","--yes","--service","true")
+            seat,stopped=self.wait_seat(subject,stopped=True)
+            overview=self.json_cli("Historical runs after stopped setup "+str(n),"missions","show","mission/st/onboarding")
+            self.check("stopped-setup-"+str(n),r["exit"]==0 and stopped and isinstance(overview,dict) and overview.get("total_runs")==1 and any(x.get("id")=="mission-run/st/onboarding" for x in overview.get("newest",[])),"ordinary setup neither restarts stopped expert nor creates a run")
+        r=self.cli("Explicit onboarding rerun","setup","--person","ada","--node","studio","--yes","--service","true","--onboarding")
+        seat,ready=self.wait_seat(subject,previous=previous)
+        self.check("explicit-expert-restart",r["exit"]==0 and ready,"explicit onboarding restores expert with a different observed incarnation")
+        overview=self.json_cli("Historical runs after explicit onboarding","missions","show","mission/st/onboarding")
+        ids=[x["id"] for x in overview.get("newest",[])] if isinstance(overview,dict) else []
+        self.check("explicit-onboarding-run",isinstance(overview,dict) and overview.get("total_runs")==2 and len(ids)==2 and "mission-run/st/onboarding" in ids and any(x.startswith("mission-run/st/onboarding/") for x in ids),"explicit rerun adds exactly one UUID run alongside cancelled history")
+        read,records,reference=self.wake_and_read(subject,"Expert explicit-rerun mailbox fixture")
+        self.check("explicit-expert-read",ready and read,"restored expert reads the exact new wake "+str(reference))
+
+    def pre_channel_checks(self):
+        subject="agent/st/expert"
+        r=self.execute("No plugin before user installation","python3 -c "+shlex.quote('import json; from pathlib import Path; p=Path.home()/".claude/onboarding-fixture.json"; v=json.loads(p.read_text()) if p.exists() else {}; print(json.dumps(v)); assert "st-channel@st" not in v.get("plugins",[])'))
+        if not self.check("pre-channel-plugin-absent",r["exit"]==0,"expert launched while user plugin is absent"): return
+        original,ready=self.wait_seat(subject)
+        if not self.check("pre-channel-incarnation",ready,"pre-install Claude expert has a reachable observed incarnation"): return
+        previous=seat_incarnation(original)
+        read,records,reference=self.wake_and_read(subject,"Pre-install Claude mailbox fixture",previous)
+        argv=[x.get("argv",[]) for x in records if x.get("event")=="provider-argv" and x.get("incarnation")==previous]
+        self.check("pre-channel-inline-route",read and any("server:st3" in json.dumps(a) and "plugin:st-channel@st" not in json.dumps(a) for a in argv),"original incarnation reads through inline fallback with no installed plugin")
+        r=self.cli("User installs Claude channel without policy","claude-channel","install","--no-policy")
+        if not self.check("pre-channel-user-install",r["exit"]==0,"ordinary user installs channel without sudo policy"): return
+        r=self.cli("Restart existing Claude expert","agents","restart",subject,"--as","person/ada",timeout=45)
+        current,ready=self.wait_seat(subject,previous=previous)
+        if not self.check("pre-channel-new-incarnation",r["exit"]==0 and ready,"restart produces a different reachable incarnation without a fault"): return
+        incarnation=seat_incarnation(current)
+        read,records,reference=self.wake_and_read(subject,"Post-install restarted Claude mailbox fixture",incarnation)
+        self.check("pre-channel-new-read",read,"exact post-install wake is read by the new incarnation "+str(reference))
+        argv=[x.get("argv",[]) for x in records if x.get("event")=="provider-argv" and x.get("incarnation")==incarnation]
+        self.check("pre-channel-plugin-route",any("plugin:st-channel@st" in json.dumps(a) and "--dangerously-load-development-channels" in json.dumps(a) for a in argv),"restarted seat uses installed development plugin route")
+        self.check("pre-channel-new-consent",any(x.get("event")=="development-consent" and x.get("accepted") and x.get("incarnation")==incarnation for x in records),"driver accepted consent for the new incarnation")
 
     def reboot_check(self,baseline=False):
         if self.m.args.no_reboot or self.m.scenario=="no-manager": return
@@ -552,6 +639,7 @@ def main():
     scenarios=args.scenario or [args.mode or "setup"]
     if args.mode and args.scenario: parser.error("use mode or --scenario")
     if args.harness_only and args.require_wrap_up: parser.error("--harness-only and --require-wrap-up test different phases; choose one")
+    if args.harness_only and any(s in ("expert-lifecycle","claude-pre-channel") for s in scenarios): parser.error("expert lifecycle and pre-channel scenarios require full expert checks")
     if any(s!="baseline" for s in scenarios) and not args.archive: parser.error("candidate scenarios require --archive")
     if args.backend in ("incus","external") and any(os.environ.get(k) for k in ("CI","GITHUB_ACTIONS","BUILDKITE")):
         parser.error("real-machine backends are manual only and are refused in CI")
