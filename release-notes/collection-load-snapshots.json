@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "summary": "Measure mission, work and attention collection snapshots on the existing daemon_load subscribers",
+  "summary": "Add an opt-in collection-window load profile with snapshot budgets and full-card parity",
   "replay": {
     "status": "none",
     "detail": "Test workload only; production graph replay and startup are unchanged."
@@ -15,7 +15,7 @@
   },
   "compatibility": {
     "status": "none",
-    "detail": "No client protocol changes. Load report JSON gains optional per-collection counts; legacy reports deserialize with empty counts."
+    "detail": "No client protocol changes. Load reports include a profile identity and optional collection counts. Legacy reports retain the agents-only profile; comparisons reject mixed or different profiles."
   },
   "downtime": {
     "status": "none",
@@ -23,11 +23,11 @@
   },
   "manual": {
     "status": "none",
-    "detail": "Run the existing opt-in release daemon_load command to measure all four held collections. Subsequent view changes compare against the expanded workload baseline."
+    "detail": "The canonical release daemon_load command keeps its agents-only workload. Set ST_LOAD_PROFILE=collections-v1 explicitly for all four held collections and use a baseline from that same profile."
   },
   "recovery": {
     "status": "none",
-    "detail": "Reverting the test change restores the roster-only workload; no production database state changes."
+    "detail": "Unset ST_LOAD_PROFILE to use the canonical agents-only workload; no production database state changes."
   },
   "commits": [
     "5546adda6e903cc9090e7e63805505b487c14572",

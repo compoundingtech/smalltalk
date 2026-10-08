@@ -3,8 +3,9 @@
 //! daemon's CPU goes over its budget, or more than [`WORSE`] past main's baseline.
 //!
 //! ```sh
-//! ST_LOAD_GATE=1 TMPDIR=/var/tmp cargo test --release -p st3 --test integration \
-//!     daemon_load:: -- --nocapture
+//! ST_LOAD_GATE=1 cargo test --release -p st3 --features perf-load --test perf_load \
+//!     --locked daemon_load::the_daemon_keeps_its_budgets_under_a_busy_hosts_load \
+//!     -- --exact --nocapture --test-threads=1
 //! ```
 //!
 //! The mix ([`MIX`]) is the request kinds and rates a busy host's daemon counted in its
@@ -12,9 +13,10 @@
 //! events and claims, paging their mailboxes and reading their desired state, the replication
 //! worker exporting and receiving exchanges with a peer, lease renewals, status and work reads,
 //! and a person moving through stui. Thirty seats also hold event long-polls open, and 22 client
-//! WebSockets subscribe to agents, missions, work and attention together and stay subscribed. Only kinds and rates;
-//! no contents. Every collection snapshot has a 300 ms budget, including connect-to-snapshot
-//! measurement. Their HTTP correctness oracle runs afterward, not as a cache-warming pre-read.
+//! WebSockets hold agents windows. The opt-in collections profile holds missions, work and
+//! attention on those same sockets too. Only kinds and rates; no contents. Each initial
+//! snapshot has a 300 ms budget, including connect-to-snapshot measurement. Expanded-window
+//! full-card parity runs at a common quiescent cut after the CPU measurement.
 //!
 //! The daemon runs on its own runtime, and the load on another, so the CPU it reports is the
 //! daemon's: the process's CPU less the load threads' (and the peer store's writer, which stands
@@ -24,6 +26,8 @@
 //! - `ST_LOAD_SCALE` sets the generated store's scale. The default, `1`, is the busy host's size.
 //! - `ST_BENCH_DIR` keeps the generated store for the next run, as for `daemon_bench`.
 //! - `ST_LOAD_SECONDS` sets how long the load runs. The default is 120.
+//! - `ST_LOAD_PROFILE` selects `agents-v1` (the unchanged default workload) or `collections-v1`.
+//!   Reports carry this identity; mixed or different profiles cannot be compared.
 //! - `ST_LOAD_BASELINE` names main's reports to compare with, a file or a directory of them; the
 //!   comparison takes the worst of each. Without one only the budgets apply.
 //! - `ST_LOAD_REPORT` writes the steady report there, for the next comparison; the explicit
@@ -80,6 +84,41 @@ const ROSTER_SNAPSHOT: &str = "agents roster snapshot";
 const ROSTER_CONNECT_SNAPSHOT: &str = "agents roster connect+snapshot";
 const ROSTER_BUDGET: Duration = Duration::from_millis(300);
 const COLLECTIONS: [&str; 4] = ["agents", "missions", "work", "attention"];
+
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+enum LoadProfile {
+    #[default]
+    #[serde(rename = "agents-v1")]
+    Agents,
+    #[serde(rename = "collections-v1")]
+    Collections,
+}
+impl LoadProfile {
+    fn from_env() -> Self {
+        match std::env::var("ST_LOAD_PROFILE").as_deref() {
+            Err(std::env::VarError::NotPresent) | Ok("agents-v1") => Self::Agents,
+            Ok("collections-v1") => Self::Collections,
+            _ => panic!("ST_LOAD_PROFILE must be agents-v1 or collections-v1"),
+        }
+    }
+    fn collections(self) -> &'static [&'static str] {
+        match self {
+            Self::Agents => &["agents"],
+            Self::Collections => &COLLECTIONS,
+        }
+    }
+}
 
 fn snapshot_label(collection: &str, connection: bool) -> String {
     let name = if collection == "agents" {
@@ -147,6 +186,8 @@ const PERSON_READS: &[(&str, u64)] = &[
 /// The report a run writes and the next run compares with.
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct Report {
+    #[serde(default)]
+    profile: LoadProfile,
     scale: f64,
     claims: u64,
     seconds: f64,
@@ -192,6 +233,7 @@ struct PathReport {
 struct Baseline {
     report: Report,
     runs: usize,
+    profiles: BTreeSet<LoadProfile>,
 }
 
 #[test]
@@ -303,7 +345,12 @@ fn report_failures(report: &Report) -> Vec<String> {
             ));
         }
     }
-    for collection in ["missions", "work", "attention"] {
+    for &collection in report
+        .profile
+        .collections()
+        .iter()
+        .filter(|&&c| c != "agents")
+    {
         if report
             .collection_subscribers
             .get(collection)
@@ -372,6 +419,11 @@ fn worst_of(path: &Path) -> Option<Baseline> {
         .filter_map(|file| serde_json::from_slice::<Report>(&std::fs::read(file).ok()?).ok())
         .collect::<Vec<_>>();
     let mut worst = Report::default();
+    worst.profile = reports.first()?.profile;
+    let profiles = reports
+        .iter()
+        .map(|report| report.profile)
+        .collect::<BTreeSet<_>>();
     for report in &reports {
         worst.daemon_cores = worst.daemon_cores.max(report.daemon_cores);
         for (name, path) in &report.paths {
@@ -394,12 +446,24 @@ fn worst_of(path: &Path) -> Option<Baseline> {
     (!reports.is_empty()).then_some(Baseline {
         report: worst,
         runs: reports.len(),
+        profiles,
     })
 }
 
 /// Where any measured path or daemon CPU is more than [`WORSE`] past the baseline.
 /// Latency needs several main runs; CPU averages the whole workload and can compare immediately.
 fn compare(report: &Report, baseline: &Baseline) -> Vec<String> {
+    if report.profile != baseline.report.profile
+        || baseline
+            .profiles
+            .iter()
+            .any(|profile| *profile != report.profile)
+    {
+        return vec![format!(
+            "load profile mismatch: {:?} cannot compare with {:?} ({:?})",
+            report.profile, baseline.report.profile, baseline.profiles
+        )];
+    }
     let mut failures = Vec::new();
     if baseline.runs < BASELINE_RUNS {
         println!(
@@ -456,6 +520,7 @@ fn concurrent_roster_snapshots_use_the_budget_and_existing_baseline_comparison()
     let mut baseline = Baseline {
         report: Report::default(),
         runs: BASELINE_RUNS,
+        profiles: BTreeSet::new(),
     };
     for name in [ROSTER_SNAPSHOT, ROSTER_CONNECT_SNAPSHOT] {
         assert_eq!(budget(&budgets, name), Duration::from_millis(300));
@@ -503,6 +568,7 @@ fn infrequent_reads_still_fail_on_a_baseline_regression() {
     let mut baseline = Baseline {
         report: Report::default(),
         runs: BASELINE_RUNS,
+        profiles: BTreeSet::new(),
     };
     baseline.report.paths.insert(
         path.into(),
@@ -538,6 +604,7 @@ fn sparse_p99_tolerates_runner_noise_without_exempting_the_path() {
     let mut baseline = Baseline {
         report: Report::default(),
         runs: BASELINE_RUNS,
+        profiles: BTreeSet::new(),
     };
     // Observed failures across four PRs, plus the sparse tolerance's exact boundary.
     for (count, before, after) in [
@@ -584,6 +651,7 @@ fn latency_needs_five_main_runs_but_cpu_compares_during_bootstrap() {
             ..Report::default()
         },
         runs: BASELINE_RUNS - 1,
+        profiles: BTreeSet::new(),
     };
     baseline.report.paths.insert(
         name.into(),
@@ -643,14 +711,19 @@ fn print(report: &Report) {
     }
 
     println!(
-        "\n== load test: scale {}, {} claims, {:.0}s, daemon {:.2} cores",
-        report.scale, report.claims, report.seconds, report.daemon_cores
+        "\n== load test: {:?}, scale {}, {} claims, {:.0}s, daemon {:.2} cores",
+        report.profile, report.scale, report.claims, report.seconds, report.daemon_cores
     );
     println!(
         "agents roster: {}/{} concurrent subscribers with correct snapshots; {} validated change frames; window limit {}",
         report.roster_subscribers, ROSTER_SUBSCRIBERS, report.roster_change_frames, ROSTER_LIMIT
     );
-    for collection in ["missions", "work", "attention"] {
+    for &collection in report
+        .profile
+        .collections()
+        .iter()
+        .filter(|&&c| c != "agents")
+    {
         println!(
             "{collection}: {}/{} subscribers with correct snapshots; {} validated change frames",
             report
@@ -858,6 +931,7 @@ fn run(
     duration: Duration,
     regime: LoadRegime,
 ) -> Report {
+    let profile = LoadProfile::from_env();
     let work = tempfile::tempdir().unwrap();
     let root = work.path();
     let database = root.join("state/claims.sqlite3");
@@ -946,7 +1020,13 @@ fn run(
         )
         .unwrap(),
     );
-    daemon.spawn(reconciler.supervise());
+    let reconciler_task = if profile == LoadProfile::Collections {
+        // Own the actual producer task so post-measurement abort stops it.
+        // supervise() spawns a detached child when its wrapper is cancelled.
+        daemon.spawn(reconciler.run())
+    } else {
+        daemon.spawn(reconciler.supervise())
+    };
 
     let load = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -1124,7 +1204,7 @@ fn run(
             }));
         }
         let barrier = Arc::new(Barrier::new(ROSTER_SUBSCRIBERS));
-        let (snapshots, mut initial) = mpsc::channel(ROSTER_SUBSCRIBERS * COLLECTIONS.len());
+        let (snapshots, mut initial) = mpsc::channel(ROSTER_SUBSCRIBERS * profile.collections().len());
         let mut subscribers = Vec::new();
         for subscriber in 0..ROSTER_SUBSCRIBERS {
             let client = st3_client::Client::unix_as(&socket, "person/bench-operator");
@@ -1137,7 +1217,7 @@ fn run(
             );
             subscribers.push(tokio::spawn(async move {
                 if let Err(error) = collection_subscriber(
-                    client, subscriber, barrier, stopped, snapshots, changes,
+                    client, subscriber, barrier, stopped, snapshots, changes, profile,
                 )
                 .await
                 {
@@ -1151,20 +1231,24 @@ fn run(
         }
         drop(snapshots);
         let mut captured = Vec::with_capacity(ROSTER_SUBSCRIBERS);
-        while let Some(snapshot) = initial.recv().await {
-            captured.push(snapshot);
+        let collected = tokio::time::timeout(Duration::from_secs(65), async {
+            while let Some(snapshot) = initial.recv().await { captured.push(snapshot); }
+        }).await;
+        if collected.is_err() {
+            *failed.lock().unwrap().entry("collection initial phase did not finish".into()).or_default() += 1;
+            roster_stop.send_replace(true);
         }
         // Read HTTP oracles only after all initial frames: avoid warming any shared window.
         // Writes continue; compare stable identity/declaration fields rather than live state.
-        for collection in COLLECTIONS {
-            let oracle = context.person
+        for &collection in profile.collections() {
+            let oracle = if profile == LoadProfile::Collections { None } else { Some(context.person
                 .get::<Value>(&format!("/v1/client/{collection}?limit={ROSTER_LIMIT}"))
-                .await.map_err(|error| error.to_string());
+                .await.map_err(|error| error.to_string())) };
             for connection in [false, true] {
                 timings.lock().unwrap().entry(snapshot_label(collection, connection)).or_default();
             }
             match oracle {
-                Ok(oracle) => {
+                Some(Ok(oracle)) => {
                     for snapshot in captured.iter().filter(|snapshot| snapshot.collection == collection) {
                         match collection_matches_oracle(collection, &snapshot.frame, &oracle) {
                             Ok(()) => {
@@ -1179,8 +1263,18 @@ fn run(
                         }
                     }
                 }
-                Err(error) => {
+                Some(Err(error)) => {
                     *failed.lock().unwrap().entry(format!("{collection} snapshot: HTTP oracle: {error}")).or_default() += 1;
+                }
+                None => {
+                    // Busy initial frames are structurally checked in the subscriber.
+                    // Complete-card parity is bound to a quiescent cut after the CPU window.
+                    for snapshot in captured.iter().filter(|s|s.collection==collection) {
+                        *collection_subscribers.entry(collection.into()).or_default() += 1;
+                        let mut timings = timings.lock().unwrap();
+                        timings.get_mut(&snapshot_label(collection,false)).unwrap().push(snapshot.subscription);
+                        timings.get_mut(&snapshot_label(collection,true)).unwrap().push(snapshot.connection);
+                    }
                 }
             }
         }
@@ -1194,8 +1288,13 @@ fn run(
             let _ = poll.await;
         }
         roster_stop.send_replace(true);
-        for subscriber in subscribers {
-            if let Err(error) = subscriber.await {
+        for mut subscriber in subscribers {
+            let outcome = tokio::time::timeout(Duration::from_secs(2), &mut subscriber).await;
+            if outcome.is_err() {
+                subscriber.abort();
+                let _ = subscriber.await;
+                *failed.lock().unwrap().entry("collection subscriber shutdown timed out".into()).or_default() += 1;
+            } else if let Ok(Err(error)) = outcome {
                 *failed
                     .lock()
                     .unwrap()
@@ -1216,6 +1315,21 @@ fn run(
     let cpu_after = (process_cpu(), load_cpu(&peer_threads));
     let daemon_cpu = (cpu_after.0 - cpu_before.0) - (cpu_after.1 - cpu_before.1);
 
+    if profile == LoadProfile::Collections {
+        // Producers have stopped and their outstanding writes have drained. Stop
+        // the remaining timer producer before asking for a common oracle cut.
+        reconciler_task.abort();
+        if let Err(error) = daemon.block_on(reconciler_task) {
+            if !error.is_cancelled() {
+                *failed
+                    .lock()
+                    .unwrap()
+                    .entry(format!("reconciler producer: {error}"))
+                    .or_default() += 1;
+            }
+        }
+    }
+
     let migration_pending_at_load_end = context.store.event_payload_migration_pending().unwrap();
     if let Some(migration) = migration {
         event_migration = Some(daemon.block_on(async {
@@ -1228,6 +1342,15 @@ fn run(
     }
     assert!(event_migration.as_ref().unwrap().completed);
     assert!(!context.store.event_payload_migration_pending().unwrap());
+    if profile == LoadProfile::Collections {
+        if let Err(error) = load.block_on(verify_quiescent_windows(&socket)) {
+            *failed
+                .lock()
+                .unwrap()
+                .entry(format!("collection parity: {error}"))
+                .or_default() += 1;
+        }
+    }
     let timings = std::mem::take(&mut *timings.lock().unwrap());
     let budgets = MIX
         .iter()
@@ -1251,6 +1374,7 @@ fn run(
     let failed = std::mem::take(&mut *failed.lock().unwrap());
     let collection_change_frames = collection_change_frames.lock().unwrap().clone();
     Report {
+        profile,
         scale,
         claims,
         seconds: elapsed,
@@ -1286,6 +1410,7 @@ async fn collection_subscriber(
     mut stopped: watch::Receiver<bool>,
     snapshots: mpsc::Sender<CollectionSnapshot>,
     changes: Arc<Mutex<BTreeMap<String, usize>>>,
+    profile: LoadProfile,
 ) -> Result<(), String> {
     // Start handshakes together, then send subscriptions together once every handshake has
     // completed (or failed). Even a failed connector reaches the second barrier.
@@ -1296,45 +1421,66 @@ async fn collection_subscriber(
     let mut stream = opened
         .map_err(|_| "WebSocket handshake timed out".to_owned())?
         .map_err(|error| error.to_string())?;
-    let outcome = async {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let collections = profile.collections();
+    let initialize = async {
         let mut starts = BTreeMap::new();
-        for collection in COLLECTIONS {
+        for &collection in collections {
             let id = format!("load-{collection}-{subscriber}");
             starts.insert(collection, Instant::now());
-            tokio::time::timeout(Duration::from_secs(30),
-                stream.subscribe(&id, collection, ROSTER_LIMIT, None, None))
-                .await.map_err(|_| format!("{collection} subscribe timed out"))?
-                .map_err(|error| error.to_string())?;
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                stream.subscribe(&id, collection, ROSTER_LIMIT, None, None),
+            )
+            .await
+            .map_err(|_| format!("{collection} subscribe timed out"))?
+            .map_err(|error| error.to_string())?;
         }
         let mut windows = BTreeMap::<String, (BTreeSet<String>, u64)>::new();
         // A fast window can change while a slower window still awaits its first snapshot.
-        while windows.len() < COLLECTIONS.len() {
+        while windows.len() < collections.len() {
             let frame = tokio::time::timeout(Duration::from_secs(30), stream.next())
-                .await.map_err(|_| "initial snapshot timed out".to_owned())?
+                .await
+                .map_err(|_| "initial snapshot timed out".to_owned())?
                 .map_err(|error| error.to_string())?
                 .ok_or_else(|| "WebSocket closed before its snapshots".to_owned())?;
             let collection = frame["collection"].as_str().unwrap_or("");
-            if !COLLECTIONS.contains(&collection) {
+            if !collections.contains(&collection) {
                 return Err(format!("unexpected collection frame: {frame}"));
             }
             let id = format!("load-{collection}-{subscriber}");
             let initial = !windows.contains_key(collection);
             let (rows, index) = windows.entry(collection.into()).or_default();
             let next = apply_collection_frame(collection, &frame, &id, initial, rows)?;
-            if next < *index { return Err(format!("{collection} snapshot index moved backward")); }
+            if next < *index {
+                return Err(format!("{collection} snapshot index moved backward"));
+            }
             *index = next;
             if initial {
                 let took = starts[collection].elapsed();
                 let collection = collection.to_owned();
-                snapshots.send(CollectionSnapshot {
-                    collection, frame,
-                    subscription: took, connection: connection.elapsed(),
-                }).await.map_err(|_| "snapshot collector stopped".to_owned())?;
+                snapshots
+                    .send(CollectionSnapshot {
+                        collection,
+                        frame,
+                        subscription: took,
+                        connection: connection.elapsed(),
+                    })
+                    .await
+                    .map_err(|_| "snapshot collector stopped".to_owned())?;
             } else {
-                *changes.lock().unwrap().entry(collection.into()).or_default() += 1;
+                *changes
+                    .lock()
+                    .unwrap()
+                    .entry(collection.into())
+                    .or_default() += 1;
             }
         }
         drop(snapshots);
+        Ok(windows)
+    };
+    let outcome = async {
+        let mut windows = initial_phase(deadline, &mut stopped, initialize).await?;
         loop {
             tokio::select! {
                 result = stopped.changed() => {
@@ -1361,6 +1507,225 @@ async fn collection_subscriber(
         .await
         .map_err(|_| "WebSocket close timed out".to_owned())?;
     outcome
+}
+
+async fn initial_phase<T>(
+    deadline: tokio::time::Instant,
+    stopped: &mut watch::Receiver<bool>,
+    work: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    if *stopped.borrow() {
+        return Err("subscription cancelled".into());
+    }
+    tokio::select! {
+        biased;
+        _ = tokio::time::sleep_until(deadline) => Err("initial snapshot phase timed out".into()),
+        _ = stopped.changed() => Err("subscription cancelled".into()),
+        result = work => result,
+    }
+}
+
+#[tokio::test]
+async fn a_streaming_window_cannot_keep_a_missing_initial_window_alive() {
+    let (sender, mut frames) = mpsc::channel(1);
+    let producer = tokio::spawn(async move {
+        while sender.send("agents changes").await.is_ok() {
+            tokio::task::yield_now().await;
+        }
+    });
+    let (_stop, mut stopped) = watch::channel(false);
+    let work = async {
+        while frames.recv().await.is_some() {}
+        Ok(())
+    };
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(1),
+        initial_phase(
+            tokio::time::Instant::now() + Duration::from_millis(20),
+            &mut stopped,
+            work,
+        ),
+    )
+    .await;
+    producer.abort();
+    assert_eq!(
+        outcome.unwrap().unwrap_err(),
+        "initial snapshot phase timed out"
+    );
+}
+
+#[tokio::test]
+async fn cancellation_ends_a_pending_initial_phase() {
+    let (stop, mut stopped) = watch::channel(false);
+    let work = async { std::future::pending::<Result<(), String>>().await };
+    let canceller = tokio::spawn(async move {
+        tokio::task::yield_now().await;
+        stop.send_replace(true);
+    });
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(1),
+        initial_phase(
+            tokio::time::Instant::now() + Duration::from_secs(30),
+            &mut stopped,
+            work,
+        ),
+    )
+    .await;
+    canceller.await.unwrap();
+    assert_eq!(outcome.unwrap().unwrap_err(), "subscription cancelled");
+}
+
+#[test]
+fn report_profiles_preserve_legacy_default_and_reject_cross_workload_comparisons() {
+    assert_eq!(LoadProfile::default().collections(), &["agents"]);
+    let mut encoded = serde_json::to_value(Report::default()).unwrap();
+    encoded.as_object_mut().unwrap().remove("profile");
+    assert_eq!(
+        serde_json::from_value::<Report>(encoded).unwrap().profile,
+        LoadProfile::Agents
+    );
+    let report = Report {
+        profile: LoadProfile::Collections,
+        ..Report::default()
+    };
+    let baseline = Baseline {
+        report: Report::default(),
+        runs: BASELINE_RUNS,
+        profiles: BTreeSet::new(),
+    };
+    assert!(compare(&report, &baseline)[0].starts_with("load profile mismatch"));
+    let mixed = Baseline {
+        report: Report::default(),
+        runs: BASELINE_RUNS,
+        profiles: BTreeSet::from([LoadProfile::Agents, LoadProfile::Collections]),
+    };
+    assert!(compare(&Report::default(), &mixed)[0].starts_with("load profile mismatch"));
+    let failures = report_failures(&Report::default());
+    assert!(!failures.iter().any(|error| error.starts_with("missions:")
+        || error.starts_with("work:")
+        || error.starts_with("attention:")));
+}
+
+/// Calibrate every subscriber against raw complete HTTP cards outside the timed
+/// CPU window. Different graph/clock fences are churn, never parity evidence.
+async fn verify_quiescent_windows(socket: &Path) -> Result<(), String> {
+    let http = reqwest::Client::builder()
+        .unix_socket(socket)
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut jobs = tokio::task::JoinSet::new();
+    for subscriber in 0..ROSTER_SUBSCRIBERS {
+        let client = st3_client::Client::unix_as(socket, "person/bench-operator");
+        let http = http.clone();
+        jobs.spawn(async move {
+            for _ in 0..3 {
+                let mut stream = client
+                    .collection_stream()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                for collection in COLLECTIONS {
+                    stream
+                        .subscribe(
+                            &format!("parity-{collection}-{subscriber}"),
+                            collection,
+                            ROSTER_LIMIT,
+                            None,
+                            None,
+                        )
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+                let mut frames = BTreeMap::new();
+                while frames.len() < COLLECTIONS.len() {
+                    let frame = stream
+                        .next()
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .ok_or("parity socket closed")?;
+                    let collection = frame["collection"].as_str().unwrap_or("").to_owned();
+                    if !COLLECTIONS.contains(&collection.as_str()) {
+                        return Err("unexpected parity collection".into());
+                    }
+                    if frames.contains_key(&collection) {
+                        if frame["kind"] != "changes" {
+                            return Err("duplicate parity snapshot".into());
+                        }
+                        continue;
+                    }
+                    apply_collection_frame(
+                        &collection,
+                        &frame,
+                        &format!("parity-{collection}-{subscriber}"),
+                        true,
+                        &mut BTreeSet::new(),
+                    )?;
+                    frames.insert(collection, frame);
+                }
+                let mut same_cut = true;
+                for collection in COLLECTIONS {
+                    let envelope = http
+                        .get(format!(
+                            "http://localhost/v1/client/{collection}?limit={ROSTER_LIMIT}"
+                        ))
+                        .header("X-St3-Person", "person/bench-operator")
+                        .send()
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .error_for_status()
+                        .map_err(|e| e.to_string())?
+                        .json::<Value>()
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    same_cut &= collection_matches_bound_oracle(
+                        collection,
+                        &frames[collection],
+                        &envelope,
+                    )?;
+                }
+                tokio::time::timeout(Duration::from_secs(1), stream.close())
+                    .await
+                    .map_err(|_| "parity close timed out")?;
+                if same_cut {
+                    return Ok(());
+                }
+            }
+            Err(format!(
+                "subscriber {subscriber}: no common quiescent oracle cut"
+            ))
+        });
+    }
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(result) = jobs.join_next().await {
+            result.map_err(|e| e.to_string())??;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| "quiescent parity timed out".to_owned())?
+}
+
+fn collection_matches_bound_oracle(
+    collection: &str,
+    frame: &Value,
+    envelope: &Value,
+) -> Result<bool, String> {
+    let snapshot = <st3_client::Snapshot as serde::Deserialize>::deserialize(&frame["snapshot"])
+        .map_err(|e| e.to_string())?;
+    let oracle_snapshot =
+        <st3_client::Snapshot as serde::Deserialize>::deserialize(&envelope["snapshot"])
+            .map_err(|e| e.to_string())?;
+    if snapshot != oracle_snapshot {
+        return Ok(false);
+    }
+    let oracle = &envelope["value"];
+    collection_matches_oracle(collection, frame, oracle)?;
+    if frame["items"] != oracle["items"] {
+        return Err(format!(
+            "{collection}: complete cards/order differ at the same cut"
+        ));
+    }
+    Ok(true)
 }
 
 /// Validate typed public cards, not just any frame that happened to answer the subscription.
@@ -1620,6 +1985,20 @@ fn missions_and_work_snapshots_validate_cards_and_reconstruct_changes() {
             1
         );
         assert!(collection_matches_oracle(collection, &frame, &oracle).is_ok());
+        let envelope = json!({"snapshot":frame["snapshot"],"value":oracle});
+        assert_eq!(
+            collection_matches_bound_oracle(collection, &frame, &envelope),
+            Ok(true)
+        );
+        let mut changed_card = frame.clone();
+        changed_card["items"][0]["state"] = json!("completed");
+        assert!(collection_matches_bound_oracle(collection, &changed_card, &envelope).is_err());
+        let mut another_cut = envelope.clone();
+        another_cut["snapshot"]["store_index"] = json!(2);
+        assert_eq!(
+            collection_matches_bound_oracle(collection, &changed_card, &another_cut),
+            Ok(false)
+        );
         let mut invalid = frame.clone();
         invalid["items"][0]["kind"] = json!("agent");
         assert!(
@@ -1686,10 +2065,17 @@ fn missions_and_work_snapshots_validate_cards_and_reconstruct_changes() {
 
 #[test]
 fn missions_and_work_snapshots_have_budgets_and_require_all_subscribers() {
-    let mut report = Report::default();
+    let mut report = Report {
+        profile: LoadProfile::Collections,
+        ..Report::default()
+    };
     let mut baseline = Baseline {
-        report: Report::default(),
+        report: Report {
+            profile: LoadProfile::Collections,
+            ..Report::default()
+        },
         runs: BASELINE_RUNS,
+        profiles: BTreeSet::new(),
     };
     for collection in ["missions", "work", "attention"] {
         for connection in [false, true] {
