@@ -468,7 +468,7 @@ fn own_post_reactor(state: &AppState, fence: &Fence) -> tokio::sync::mpsc::Sende
                 store.close_mailbox_own_post_wake(&binding, &subject)
             }).await;
             match result {
-                Ok(Ok(true)) => signal_local_change(&state),
+                Ok(Ok(true)) => signal_message_changed(&state, "message.closed", false),
                 Ok(Ok(false)) => {},
                 // A changed message or retired connection cannot authorize maintenance.
                 // Durable notifications/timer rechecks handle later eligible identities.
@@ -2884,9 +2884,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_own_post_read_is_pure_and_background_closure_has_no_receipt() {
-        let store = Store::open_memory("node").unwrap();
+    #[tokio::test]
+    async fn an_own_post_read_is_pure_and_background_closure_has_no_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = super::super::tests::state(root.path());
+        state.store = Arc::new(Store::open_memory("node").unwrap());
+        let store = &state.store;
         crate::mailbox::tests::ready(&store, "session-1");
         let fence = store
             .bind_mailbox(&Fence::new("agent/eval.worker", "session-1", "delivery"))
@@ -2969,6 +2972,21 @@ mod tests {
         assert_eq!(store.index().unwrap(), before);
         assert_eq!(store.message(&wake.subject).unwrap().unwrap().status, "sent");
         assert!(store.close_mailbox_own_post_wake(&successor, &wake.subject).unwrap());
+
+        // The actual bounded actor must wake clients and replication after COMMIT,
+        // without making a housekeeping closure schedule a reconcile pass.
+        wake.subject = "message/own-post-actor".into();
+        store.append_claim(&wake).unwrap();
+        let wake_file = state.state_dir.join("replication.wake");
+        let _ = std::fs::remove_file(&wake_file);
+        let mut feed = state.event_notify.subscribe();
+        let actor = own_post_reactor(&state, &successor);
+        actor.try_send(wake.subject.clone()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), feed.changed()).await.unwrap().unwrap();
+        assert_eq!(store.message(&wake.subject).unwrap().unwrap().status, "closed");
+        assert!(wake_file.exists(), "a canonical closure must wake replication dialers");
+        assert!(tokio::time::timeout(Duration::from_millis(20), state.notify.notified()).await.is_err());
+        drop(actor);
 
     }
 

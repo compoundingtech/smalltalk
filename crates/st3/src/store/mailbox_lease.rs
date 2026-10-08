@@ -111,6 +111,42 @@ mod tests {
     }
 
     #[test]
+    fn fault_capture_refuses_failed_acquisition_without_waiting_and_preserves_a_pin() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("graph.db");
+        let saved = root.path().join("graph.saved");
+        let store = Arc::new(Store::open(&path, "node").unwrap());
+        let subjects = vec!["agent/absent".into()];
+        // A surviving pinned snapshot must not be discarded to open another reader.
+        store.read_snapshot(|cut| -> Result<()> {
+            let held = std::mem::take(&mut *store.readers.idle.lock().unwrap());
+            std::fs::rename(&path, &saved)?;
+            let result = store.mailbox_faults_for(&subjects, cut);
+            std::fs::rename(&saved, &path)?;
+            drop(held);
+            assert!(result?.is_empty());
+            Ok(())
+        }).unwrap();
+        // Outside a pin, deliberately make opening impossible with every idle reader
+        // retained. Observe a finite result before returning any reader to the pool.
+        let held = std::mem::take(&mut *store.readers.idle.lock().unwrap());
+        std::fs::rename(&path, &saved).unwrap();
+        let worker_store = store.clone();
+        let (sent, received) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            sent.send(worker_store.mailbox_faults_for(&subjects, 0).is_err()).unwrap();
+        });
+        let result = received.recv_timeout(std::time::Duration::from_secs(1));
+        std::fs::rename(&saved, &path).unwrap();
+        // Release readers even on failure, so the old waiting implementation cannot
+        // leave a hung control thread after the finite observation fails.
+        store.readers.idle.lock().unwrap().extend(held);
+        store.readers.returned.notify_all();
+        worker.join().unwrap();
+        assert_eq!(result.unwrap(), true, "failed acquisition must refuse promptly");
+    }
+
+    #[test]
     fn live_duplicates_and_pid_reuse_cannot_replace_or_receive_the_lease() {
         let store = fixture();
         let authority = authority(1);
@@ -1195,7 +1231,7 @@ impl Store {
         let checked = budget.clone();
         smallclaims::read_budget::with(Some(budget), || {
             checked.check()?;
-            let result = (|| -> Result<BTreeMap<String, String>> {
+            let read = || -> Result<BTreeMap<String, String>> {
             let connection = self.readers.get();
             let query = canonical_sql(
                 "WITH selected(subject) AS (SELECT DISTINCT value FROM json_each(?1)),
@@ -1239,7 +1275,12 @@ impl Store {
             }
             smallclaims::read_budget::check()?;
             Ok(faults)
-            })();
+            };
+            // Keep the authoritative existing snapshot; otherwise request_read acquires
+            // through try_get, which fails closed instead of waiting for a returned reader.
+            let pinned = smallclaims::sqlite::PINNED_READER.with(|slot|
+                slot.borrow().as_ref().is_some_and(|(key, _)| *key == self.readers.key()));
+            let result = if pinned { read() } else { self.readers.request_read(read)? };
             // Preserve the typed retryable deadline after restoring the parent scope,
             // including SQLite interruption before the first row could be decoded.
             checked.check()?;
