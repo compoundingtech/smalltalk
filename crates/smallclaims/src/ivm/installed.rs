@@ -36,6 +36,16 @@ pub enum Changed<'a> {
     Refresh,
 }
 
+/// Native source-owner evidence and event metadata for one prepared publication.
+/// These fields are checked, but their complete authority/local/source closure is
+/// supplied by the adapter, never inferred from a queue revision or graph MAX index.
+pub struct PreparedPublication<'a> {
+    pub expected_position: &'a SourcePosition,
+    pub cut: SourceCut,
+    pub changed: Changed<'a>,
+    pub now_ms: u64,
+}
+
 /// Live sync does not advance a fenced view or reject valid admission merely for missing output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SyncOutcome {
@@ -280,11 +290,14 @@ impl Views {
         tx: &Transaction<'_>,
         installer: &Installer,
         page: &super::install::prepared::PreparedPage,
-        expected_position: &SourcePosition,
-        cut: SourceCut,
-        changed: Changed<'_>,
-        now_ms: u64,
+        publication: PreparedPublication<'_>,
     ) -> Result<Outcome> {
+        let PreparedPublication {
+            expected_position,
+            cut,
+            changed,
+            now_ms,
+        } = publication;
         let view = page.view();
         self.check_installed(tx, installer, view, expected_position, cut)?;
         atomic(tx, || {

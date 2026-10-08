@@ -763,6 +763,7 @@ fn runtime_digest_binds_installed_source_and_preserves_legacy_bytes() {
 fn prepared_namespace_publication_and_pending_availability_are_atomic() {
     use rusqlite::types::Value as Sql;
     use smallclaims::ivm::install::prepared::{CaptureLimits, PublicationLimits};
+    use smallclaims::ivm::installed::PreparedPublication;
     let f = fixture();
     let mut writer = f.store.connection.write();
     let tx = writer.transaction().unwrap();
@@ -842,10 +843,12 @@ fn prepared_namespace_publication_and_pending_availability_are_atomic() {
                 &tx,
                 &f.installer,
                 &page,
-                &position,
-                cut(&f, 0),
-                Changed::Refresh,
-                2
+                PreparedPublication {
+                    expected_position: &position,
+                    cut: cut(&f, 0),
+                    changed: Changed::Refresh,
+                    now_ms: 2
+                },
             )
             .unwrap(),
         Outcome::Published
@@ -908,10 +911,12 @@ fn prepared_namespace_publication_and_pending_availability_are_atomic() {
                 &tx,
                 &f.installer,
                 &page,
-                &position,
-                cut(&f, 0),
-                Changed::Keys(&bad),
-                3
+                PreparedPublication {
+                    expected_position: &position,
+                    cut: cut(&f, 0),
+                    changed: Changed::Keys(&bad),
+                    now_ms: 3
+                },
             )
             .is_err()
     );
@@ -932,10 +937,12 @@ fn prepared_namespace_publication_and_pending_availability_are_atomic() {
             &tx,
             &f.installer,
             &page,
-            &position,
-            cut(&f, 0),
-            Changed::Keys(&keys),
-            4,
+            PreparedPublication {
+                expected_position: &position,
+                cut: cut(&f, 0),
+                changed: Changed::Keys(&keys),
+                now_ms: 4,
+            },
         )
         .unwrap();
     tx.commit().unwrap();
@@ -985,10 +992,12 @@ fn prepared_namespace_publication_and_pending_availability_are_atomic() {
             &tx,
             &f.installer,
             &page,
-            &position,
-            cut(&f, 0),
-            Changed::Keys(&[]),
-            5,
+            PreparedPublication {
+                expected_position: &position,
+                cut: cut(&f, 0),
+                changed: Changed::Keys(&[]),
+                now_ms: 5,
+            },
         )
         .unwrap();
     tx.commit().unwrap();
