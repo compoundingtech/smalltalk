@@ -2024,6 +2024,7 @@ async fn delayed_channel_initialization_preserves_activity(activity: &str, legac
     })
     .await;
     assert!(channel.try_wait().unwrap().unwrap().success());
+    assert_eq!(requests.lock().unwrap().len(), 1, "only the initialization transition may POST");
     let selected = daemon
         .store
         .current_harness("agent/quartz")
@@ -2069,6 +2070,103 @@ async fn delayed_channel_initialization_preserves_activity(activity: &str, legac
         after, activity,
         "late channel initialization replaced native activity"
     );
+}
+
+// Exercise the real provider wrapper, local hook spool, channel, API and Store.
+// The provider initializes MCP but deliberately has no SessionStart/Stop hooks.
+async fn channel_readiness_without_start_hook(native_activity: Option<bool>, late: bool) {
+    use sha2::{Digest as _, Sha256};
+    use st_drivers::harness_state::{Activity, BlockedOn, InputBuffer, Observation, Writer};
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let seat = "agent/grove/hookless-cedar";
+    let incarnation = "hookless-cedar:one";
+    let mut daemon = Daemon::new(root);
+    declare_claude(&daemon, seat);
+    daemon.observe_running(seat, incarnation);
+    daemon.start_isolated().await;
+    let provider = r#"
+import json, os, subprocess, sys, time
+channel = subprocess.Popen([sys.argv[1], 'driver', 'claude-mcp', '--subject', os.environ['ST_AGENT']],
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+channel.stdin.write(json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'initialize'}) + '\n')
+channel.stdin.flush()
+assert json.loads(channel.stdout.readline())['id'] == 1
+channel.stdin.write(json.dumps({'jsonrpc': '2.0', 'method': 'notifications/initialized'}) + '\n')
+channel.stdin.flush()
+time.sleep(300)
+"#;
+    let mut driver = TestSeat(Some(seat_command(root, &daemon.socket)
+        .env("ST_AGENT", seat)
+        .env("ST3_MAILBOX_TRANSPORT", "push")
+        .args(["driver", "claude", "--subject", seat, "--", "python3", "-c", provider,
+            env!("CARGO_BIN_EXE_st3-fixture")])
+        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped())
+        .spawn().unwrap()));
+    wait_until("hookless provider initializes its admitted channel", Duration::from_secs(10), || {
+        daemon.has_diagnostic(seat, incarnation, "claude-channel-attached")
+    }).await;
+    let dir = root.join("drivers")
+        .join(&hex::encode(Sha256::digest(seat.as_bytes()))[..24]).join("observations");
+    let owned = st_drivers::harness_state::read(
+        &st_drivers::harness_state::harness_state_path(&dir), None).unwrap();
+    let mut writer = Writer::new(&dir, "grove/hookless-cedar", "claude", Some("grove/hookless-cedar".into()))
+        .with_ownership(owned.evidence_incarnation.unwrap(), owned.ownership_sequence.unwrap());
+    let fallback_count = || daemon.store.claims_for(seat, None).unwrap().iter().filter(|c| {
+        c.kind == "harness.observed"
+            && c.body["fields"]["reason"] == "channelInitializedWithoutNativeState"
+    }).count();
+    assert_eq!(fallback_count(), 0, "readiness must wait for its grace");
+    if late || native_activity.is_none() {
+        wait_until("hookless channel becomes ready after the grace", Duration::from_secs(22), || {
+            daemon.store.current_harness(seat).unwrap().is_some_and(|h| h.state == "ready")
+        }).await;
+        assert_eq!(fallback_count(), 1);
+    }
+    if let Some(working) = native_activity {
+        let state = if working { "working" } else { "idle" };
+        writer.observe(Observation::new(
+            if working { Activity::Active } else { Activity::Idle },
+            BlockedOn::None, InputBuffer::Empty)).unwrap();
+        wait_until("the actual native hook state commits", Duration::from_secs(5), || {
+            daemon.store.current_harness(seat).unwrap().is_some_and(|h| h.state == state)
+        }).await;
+        // Cross the entire fallback grace for an early hook; late hooks only need
+        // subsequent driver ticks to demonstrate there is no recurring readiness POST.
+        tokio::time::sleep(Duration::from_secs(if late { 3 } else { 16 })).await;
+        assert_eq!(daemon.store.current_harness(seat).unwrap().unwrap().state, state);
+        assert_eq!(fallback_count(), usize::from(late));
+    } else {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(fallback_count(), 1, "steady ticks must not republish ready");
+    }
+    assert_alive(&mut driver, "hookless provider driver");
+    driver.stop();
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn initialized_hookless_claude_seat_becomes_ready() {
+    if st3::test_support::supervise_test() { return; }
+    channel_readiness_without_start_hook(None, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn initialized_claude_readiness_does_not_displace_late_idle() {
+    if st3::test_support::supervise_test() { return; }
+    channel_readiness_without_start_hook(Some(false), true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn initialized_claude_readiness_preserves_early_idle() {
+    if st3::test_support::supervise_test() { return; }
+    channel_readiness_without_start_hook(Some(false), false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn initialized_claude_readiness_preserves_early_working() {
+    if st3::test_support::supervise_test() { return; }
+    channel_readiness_without_start_hook(Some(true), false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
