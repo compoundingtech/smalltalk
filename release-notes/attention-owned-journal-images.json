@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Bind inactive attention journal prefixes to owned native OLD/NEW images",
+  "replay": {"status": "none", "detail": "No source bootstrap, historical replay or family reduction is installed."},
+  "schema": {"status": "none", "detail": "No table, index or trigger definition changes."},
+  "rules": {"status": "none", "detail": "Native admission and projection rules remain unchanged."},
+  "compatibility": {"status": "none", "detail": "The inactive helper borrows an established main READ cut and a PreparedPage, checks prefix locators and source snapshot identity, owns retained images, and decodes complete typed keys after snapshot release. REAL image cells and keys refuse pending exact native image fidelity. Logical work counters are not SQLite VM, allocation or elapsed-time qualification."},
+  "downtime": {"status": "none", "detail": "No Source factory, startup hook or production reader is registered."},
+  "manual": {"status": "none", "detail": "No existing installation action is required."},
+  "recovery": {"status": "none", "detail": "No read-time repair, retained-root fallback or Ready recovery is added. Complete native facts, exact REAL image fidelity, physical schema and lifetime eligibility, coverage, writer cleanup and bounded publication remain open prerequisites."}
+}

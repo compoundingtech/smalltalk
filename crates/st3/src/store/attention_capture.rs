@@ -10,6 +10,8 @@ use anyhow::{Result, ensure};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use smallclaims::ivm::install::{Installer, Mutation, SourcePosition, capture::Change};
 
+pub(crate) mod journal;
+
 const MAX_TABLES: usize = 32;
 const MAX_COLUMNS: usize = 64;
 const MAX_IMAGE: usize = 64 * 1024;
@@ -25,6 +27,7 @@ CREATE TABLE IF NOT EXISTS main.local_attention_native_images(
  native_table TEXT NOT NULL,body TEXT NOT NULL,bytes INTEGER NOT NULL,
  PRIMARY KEY(source,epoch,revision,side));";
 
+#[derive(Clone, Copy)]
 pub(crate) struct Table {
     pub name: &'static str,
     pub columns: &'static [&'static str],
@@ -356,6 +359,7 @@ pub(crate) struct NativeCapture {
     gap_main_sql: String,
     schema: Vec<(String, String)>,
     triggers: Vec<(String, String)>,
+    tables: Vec<Table>,
 }
 
 /// Serialized typed cells are decoded only after the reader snapshot is released.
@@ -506,6 +510,7 @@ impl NativeCapture {
             gap_main_sql: String::new(),
             schema: vec![],
             triggers: vec![],
+            tables: tables.to_vec(),
         };
         let source = literal(&position.source);
         let scope = format!(
