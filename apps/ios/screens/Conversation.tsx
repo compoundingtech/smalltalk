@@ -7,7 +7,7 @@ import { useHeaderHeight } from '@react-navigation/elements';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import type { TimelineEntry } from '../../../clients/typescript/st3-client';
 import type { ConversationContentRef } from '../../../clients/typescript/st3-client';
-import { contentImageUri, contentJsonText, loadConversationContent } from '@smalltalk/st3-views';
+import { contentImageUri, contentJsonValue, fetchedConversationEntries, loadConversationContent } from '@smalltalk/st3-views';
 import { checkoutLabel } from '../launcher';
 import { agentGlyph, agentModel, agentName, agentState, agentWord, harnessColor, harnessName, loginGuidance } from '../agentsView';
 import { Banners } from '../chrome';
@@ -401,31 +401,37 @@ const PendingView = memo(function PendingView({ pending }: { pending: Pending })
 const EntryView = memo(function EntryView(props: { entry: ConversationEntry; conversationId: string; open: boolean; onToggle: (id: string) => void; brief?: boolean; onOpenSession?: (sessionId: string, title: string) => void }) {
   return <View>
     <EntryBodyView {...props} />
-    {props.entry.content?.map(reference => <FetchedContent key={`${props.conversationId}:${reference.ref}`} conversationId={props.conversationId} reference={reference} />)}
+    {props.entry.content?.map(reference => <FetchedContent key={`${props.conversationId}:${reference.ref}`} conversationId={props.conversationId} reference={reference} entry={props.entry} onOpenSession={props.onOpenSession} />)}
   </View>;
 });
 
-// Explicit disclosure only. Fetched JSON is an adjunct, never a guessed replacement for a
-// payload: a continuation may instead name metadata/view or the whole body.
-function FetchedContent({ conversationId, reference }: { conversationId: string; reference: ConversationContentRef }) {
+// Explicit disclosure only. Identifiable bodies/payloads use the normal typed
+// output view; ambiguous metadata/view references retain a lossless JSON fallback.
+function FetchedContent({ conversationId, reference, entry, onOpenSession }: { conversationId: string; reference: ConversationContentRef; entry: ConversationEntry; onOpenSession?: (sessionId: string, title: string) => void }) {
   const { client } = useStore();
-  const [state, setState] = useState<{ kind: 'closed' } | { kind: 'loading' } | { kind: 'failed'; message: string } | { kind: 'json'; text: string } | { kind: 'image'; uri: string; size: number }>({ kind: 'closed' });
+  const [state, setState] = useState<{ kind: 'closed' } | { kind: 'loading' } | { kind: 'failed'; message: string } | { kind: 'json'; text: string } | { kind: 'typed'; entries: ConversationEntry[] } | { kind: 'image'; uri: string; size: number }>({ kind: 'closed' });
   const image = reference.reason === 'on-demand' || reference.media_type.startsWith('image/');
   const load = async () => {
     setState({ kind: 'loading' });
     try {
       if (!client) throw new Error('Connect to the server and try again.');
       const content = await loadConversationContent(reference, async (ref, offset) => (await client.conversationContentChunk(conversationId, ref, offset)).value);
-      setState(image ? { kind: 'image', uri: contentImageUri(content), size: content.bytes.length } : { kind: 'json', text: contentJsonText(content) });
+      if (image) setState({ kind: 'image', uri: contentImageUri(content), size: content.bytes.length });
+      else {
+        const value = contentJsonValue(content);
+        const entries = fetchedConversationEntries(entry, reference, value);
+        setState(entries?.length ? { kind: 'typed', entries } : { kind: 'json', text: JSON.stringify(value, null, 2) });
+      }
     } catch (error) { setState({ kind: 'failed', message: error instanceof Error ? error.message : String(error) }); }
   };
-  const expanded = state.kind === 'json' || state.kind === 'image';
+  const expanded = state.kind === 'json' || state.kind === 'typed' || state.kind === 'image';
   return <View style={styles.entry}>
     <Pressable accessibilityRole="button" accessibilityState={{ expanded, disabled: state.kind === 'loading' }} disabled={state.kind === 'loading'} onPress={() => expanded ? setState({ kind: 'closed' }) : void load()}>
       <T color={theme.accent}>{state.kind === 'loading' ? 'Loading…' : expanded ? 'Show less' : state.kind === 'failed' ? 'Retry loading' : image ? 'Load image' : 'Show all'}<T dim>{reference.size === undefined ? (image ? ' · size unknown until loaded' : '') : ` · ${megabytes(reference.size)}`}</T></T>
     </Pressable>
     {state.kind === 'failed' ? <T color={theme.red}>Could not load {image ? 'image' : 'full content'}: {state.message}</T> : null}
     {state.kind === 'json' ? <T selectable>{state.text}</T> : null}
+    {state.kind === 'typed' ? state.entries.map(shown => <EntryBodyView key={shown.id} entry={shown} open onToggle={() => setState({ kind: 'closed' })} onOpenSession={onOpenSession} />) : null}
     {state.kind === 'image' ? <View><T dim>{megabytes(state.size)}</T><Image accessibilityLabel="Fetched conversation image" source={{ uri: state.uri, cache: 'reload' }} style={styles.mailImage} resizeMode="contain" onError={() => setState({ kind: 'failed', message: 'The image could not be displayed. Try again.' })} /></View> : null}
   </View>;
 }

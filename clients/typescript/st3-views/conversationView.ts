@@ -15,7 +15,7 @@ export type Body =
   /** `delivered`: the recipient's harness has it, seen in the agent's own transcript. */
   | { kind: 'mail'; from: string; to: string; subject: string; text: string; delivered?: boolean; dictated?: boolean; signed?: string; images?: MailImage[] }
   | { kind: 'event'; text: string; tone: 'quiet' | 'warning' | 'fault' };
-export type ConversationEntry = { id: string; at: string; timestamp: string; body: Body; content?: ConversationContentRef[] };
+export type ConversationEntry = { id: string; at: string; timestamp: string; body: Body; content?: ConversationContentRef[]; contentSources?: Entry[] };
 
 // ------------------------------------------------------------ typed views (OMP parity)
 
@@ -302,13 +302,14 @@ export function toolTitle(name: string, args: unknown): string {
   return ['Bash', 'bash', 'shell', 'exec_command'].includes(name) ? `$ ${first}` : `${name} ${first}`;
 }
 
-export function toolOutput(content: unknown): string[] {
+export function toolOutput(content: unknown, full = false): string[] {
   let text: string;
   if (typeof content === 'string') text = content;
   else if (Array.isArray(content)) text = content.map(item => str(record(item).text) ?? str(item)).filter((part): part is string => part !== undefined).join('\n');
   else if (content == null) text = '';
   else text = str(record(content).text) ?? JSON.stringify(content);
-  return text ? text.split('\n').slice(0, 400) : [];
+  const lines = text ? text.split('\n') : [];
+  return full ? lines : lines.slice(0, 400);
 }
 
 function contentText(body: unknown): string {
@@ -392,13 +393,13 @@ function bashLine(view: BlockView): string | undefined {
 
 /** The lines a tool's typed output view shows, replacing the raw result text; `undefined` keeps
  * the raw text (views that add nothing, or a type this app does not know). */
-function viewOutput(view: BlockView, content: unknown): string[] | undefined {
+function viewOutput(view: BlockView, content: unknown, full = false): string[] | undefined {
   switch (view.type) {
     case 'bash': {
       const line = bashLine(view);
-      return line ? [...toolOutput(content), line] : toolOutput(content);
+      return line ? [...toolOutput(content, full), line] : toolOutput(content, full);
     }
-    case 'edit': return str(view.diff) !== undefined ? str(view.diff)!.split('\n') : toolOutput(content);
+    case 'edit': return str(view.diff) !== undefined ? str(view.diff)!.split('\n') : toolOutput(content, full);
     case 'todo': return Array.isArray(view.phases) ? todoLines(view) : undefined;
     case 'ask': return Array.isArray(view.answers) ? askLines(view) : undefined;
     case 'task': return [];
@@ -602,7 +603,7 @@ function mailImages(message: Record<string, unknown>): MailImage[] {
   });
 }
 
-export function conversationEntries(timeline: Entry[], names: Names, filters: readonly DisplayFilter[] = DEFAULT_FILTERS): ConversationEntry[] {
+export function conversationEntries(timeline: Entry[], names: Names, filters: readonly DisplayFilter[] = DEFAULT_FILTERS, fullOutput = false): ConversationEntry[] {
   if (!filters.length) return timeline.map(entry => ({id: entry.id, at: clock(entry.timestamp), timestamp: entry.timestamp, body: {kind: 'user', text: JSON.stringify(entry, null, 2)}}));
   // Provenance alone does not hide visible prose; only internal content has no row.
   if (filters.includes('internal-blocks')) timeline = timeline.filter(entry => {
@@ -639,7 +640,7 @@ export function conversationEntries(timeline: Entry[], names: Names, filters: re
   let mail: Record<string, unknown> | undefined;
   const push = (entry: Entry, id: string, body: Body) => {
     const content = contentReferences(entry.body);
-    stamped.push({ id, at: clock(entry.timestamp), timestamp: entry.timestamp, body, ...(content.length ? { content } : {}) });
+    stamped.push({ id, at: clock(entry.timestamp), timestamp: entry.timestamp, body, ...(content.length ? { content, contentSources: [entry] } : {}) });
   };
   // Entries arrive in st's order (applyConversation keeps them by time, then sequence).
   for (const entry of timeline) {
@@ -718,14 +719,17 @@ export function conversationEntries(timeline: Entry[], names: Names, filters: re
       }
       case 'tool_result': {
         const view = blockView(body.blocks, 'tool_output');
-        const output = view ? viewOutput(view, body.content) ?? toolOutput(body.content) : toolOutput(body.content);
+        const output = view ? viewOutput(view, body.content, fullOutput) ?? toolOutput(body.content, fullOutput) : toolOutput(body.content, fullOutput);
         const state: ToolState = body.status === 'error' || view?.is_error === true || view?.timed_out === true ? 'failed' : 'ok';
         const index = tools.get(str(body.call_id) ?? '');
         const call = index === undefined ? undefined : stamped[index];
         if (call?.body.kind === 'tool') {
           call.body = { ...call.body, state, output };
           const content = contentReferences(entry.body);
-          if (content.length) call.content = [...(call.content ?? []), ...content];
+          if (content.length) {
+            call.content = [...(call.content ?? []), ...content];
+            call.contentSources = [...(call.contentSources ?? []), entry];
+          }
         }
         else push(entry, entry.id, { kind: 'tool', title: 'tool result', state, output });
         // Each finished subagent is its own card, opening its child conversation when it has one.
@@ -830,3 +834,46 @@ export function staleLine(issue: string, loaded: boolean, lastFrame: number | nu
   const age = seconds < 60 ? `${seconds}s` : seconds < 3600 ? `${Math.floor(seconds / 60)}m` : `${Math.floor(seconds / 3600)}h`;
   return `${issue} · shown as of ${age} ago · trying again`;
 }
+
+const hasClippedValue = (value: unknown): boolean => typeof value === 'string'
+  ? value.includes('[st truncated this native timeline value')
+  : Array.isArray(value) ? value.some(hasClippedValue)
+  : value !== null && typeof value === 'object' ? Object.values(value).some(hasClippedValue) : false;
+
+/** Use the normal typed projection for an identifiable full body or an
+ * unambiguous clipped payload. Metadata/view subtrees and unknown JSON stay raw. */
+export const fetchedConversationEntries = (
+  entry: ConversationEntry, reference: ConversationContentRef, value: unknown,
+): ConversationEntry[] | undefined => {
+  const source = entry.contentSources?.find(source => {
+    const blocks = record(source.body).blocks;
+    return Array.isArray(blocks) && blocks.some(block => record(record(block).continuation).ref === reference.ref);
+  });
+  if (!source) return undefined;
+  const original = record(source.body);
+  const block = Array.isArray(original.blocks)
+    ? original.blocks.map(record).find(block => record(block.continuation).ref === reference.ref) : undefined;
+  if (!block) return undefined;
+  const payload = hasClippedValue(block.payload) && !hasClippedValue(block.metadata) && !hasClippedValue(block.view);
+  const full = record(value);
+  let body: unknown;
+  if (source.type === 'tool_result') {
+    if (full.call_id === original.call_id && typeof full.media_type === 'string'
+      && ['success', 'error', 'unknown'].includes(String(full.status)) && 'content' in full) body = full;
+    else if (payload) body = { ...original, content: value };
+    else return undefined;
+  } else if (source.type === 'tool_call') {
+    if (full.call_id === original.call_id && full.name === original.name && 'arguments' in full) body = full;
+    else if (payload) body = { ...original, arguments: value };
+    else return undefined;
+  } else if (source.type === 'content' && ['text', 'reasoning'].includes(String(block.kind))) {
+    if (typeof full.media_type === 'string' && typeof full.text === 'string') body = full;
+    else if (payload && typeof value === 'string') body = { ...original, text: value };
+    else return undefined;
+  } else return undefined;
+  return conversationEntries([{ ...source, body }], new Map(), DEFAULT_FILTERS, true).map(shown => {
+    const body = shown.body.kind === 'tool' && entry.body.kind === 'tool'
+      ? { ...shown.body, title: entry.body.title } : shown.body;
+    return { id: shown.id, at: shown.at, timestamp: shown.timestamp, body };
+  });
+};

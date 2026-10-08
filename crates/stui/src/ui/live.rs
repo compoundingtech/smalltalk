@@ -1275,10 +1275,6 @@ pub fn run(context: Context) -> Result<()> {
 
         if changed {
             ui.content.index(&timelines);
-            if extras.live {
-                ui.effects.extend(ui.content.request_expanded(&ui.conversation_state.expanded)
-                    .into_iter().map(Effect::LoadContent));
-            }
             extras.conversations = conversations(&model, &person, &timelines, &failed, &conversing);
             for entry in &pending {
                 if let Some(Load::Ready(entries)) = extras.conversations.get_mut(&entry.agent) {

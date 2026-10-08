@@ -1551,7 +1551,12 @@ Current stui and phone views use these existing references for explicit full-con
 loading. Expansion starts at offset zero and follows `next_offset` until it is null;
 the assembled JSON is the complete original value, not a suffix to splice into the
 clipped preview. A ref may cover a payload, an open metadata/view subtree, or the
-complete native body, so clients preserve fetched JSON without guessing its location.
+complete native body. An identifiable full tool body (same call identity), or a
+payload whose preview was clipped while metadata/view were not, uses the existing
+typed output adapter without its preview line limit. Ambiguous metadata/view
+subtrees and unknown values keep a lossless raw JSON fallback. Loading is explicit
+for that block; restoring expansion state or expanding all previews does not fetch
+full native values automatically.
 `continuation.size`, when present, describes that original value's encoded byte size.
 Native image refs initially use `application/octet-stream` and may omit size; the
 fetched chunks report the detected passive image media type and exact byte count.

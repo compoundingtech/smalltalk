@@ -17,16 +17,84 @@ pub struct Key {
 }
 
 struct Group {
-    preview: String,
+    block_index: usize,
     refs: Vec<(Key, ConversationContentRef)>,
 }
 
 enum Loaded {
     Loading,
     Failed(String),
-    Json { text: String, images: Vec<ConversationContentRef> },
+    Json { presentation: Presentation, images: Vec<ConversationContentRef> },
     Image { media_type: String, size: u64, image: image::DynamicImage },
 }
+
+enum Presentation {
+    Typed(Vec<st3_conversation_ui::Entry>),
+    Raw(String),
+}
+
+fn clipped(value: &Value) -> bool {
+    match value {
+        Value::String(text) => text.contains("[st truncated this native timeline value"),
+        Value::Array(values) => values.iter().any(clipped),
+        Value::Object(values) => values.values().any(clipped),
+        _ => false,
+    }
+}
+
+fn typed_content(source: &st3_client::TimelineEntry, block: &st3_client::TimelineBlock,
+    value: &Value, call: Option<&st3_client::TimelineEntry>) -> Option<Vec<st3_conversation_ui::Entry>> {
+    // Refs are opaque. A full body must decode as the source's body type and
+    // match its tool identity. Otherwise treat a clipped payload as a payload
+    // only when metadata/view were not clipped; ambiguous subtrees stay raw.
+    let payload = clipped(&block.payload)
+        && !block.metadata.as_ref().is_some_and(clipped)
+        && !block.view.as_ref().is_some_and(clipped);
+    let body = match &source.body {
+        TimelineBody::ToolResult(original) => {
+            if let Ok(full) = serde_json::from_value::<st3_client::TimelineToolResultBody>(value.clone())
+                && full.call_id == original.call_id
+            {
+                TimelineBody::ToolResult(Box::new(full))
+            } else if payload {
+                let mut full = original.clone();
+                full.content = value.clone();
+                TimelineBody::ToolResult(full)
+            } else { return None; }
+        }
+        TimelineBody::ToolCall(original) => {
+            if let Ok(full) = serde_json::from_value::<st3_client::TimelineToolCallBody>(value.clone())
+                && full.call_id == original.call_id && full.name == original.name
+            {
+                TimelineBody::ToolCall(Box::new(full))
+            } else if payload {
+                let mut full = original.clone();
+                full.arguments = value.clone();
+                TimelineBody::ToolCall(full)
+            } else { return None; }
+        }
+        TimelineBody::Content(original) if matches!(block.kind.as_str(), "text" | "reasoning") => {
+            if let Ok(full) = serde_json::from_value::<st3_client::TimelineContentBody>(value.clone()) {
+                TimelineBody::Content(Box::new(full))
+            } else if payload && value.is_string() {
+                let mut full = original.clone();
+                full.text = value.as_str().map(str::to_owned);
+                TimelineBody::Content(full)
+            } else { return None; }
+        }
+        _ => return None,
+    };
+    let full = st3_client::TimelineEntry {
+        id: source.id.clone(), sequence: source.sequence, revision: source.revision,
+        timestamp: source.timestamp.clone(), role: source.role.clone(), is_final: source.is_final, body,
+    };
+    let mut timeline = Vec::with_capacity(2);
+    if let Some(call) = call { timeline.push(call.clone()); }
+    timeline.push(full);
+    let entries = st3_conversation_ui::adapt::conversation_full(&timeline, &BTreeMap::new());
+    (!entries.is_empty()).then_some(entries)
+}
+
 pub fn has_images(blocks: &[st3_client::TimelineBlock]) -> bool {
     blocks.iter().any(|block| {
         block.kind == "image" || block.continuation.as_ref().is_some_and(|reference| {
@@ -42,6 +110,7 @@ pub fn has_images(blocks: &[st3_client::TimelineBlock]) -> bool {
 #[derive(Default)]
 pub struct Content {
     groups: BTreeMap<(String, String), Vec<Group>>,
+    sources: BTreeMap<String, BTreeMap<String, st3_client::TimelineEntry>>,
     loaded: BTreeMap<Key, Loaded>,
     shown: BTreeSet<Key>,
     protocols: RefCell<BTreeMap<Key, (u16, u16, ratatui_image::protocol::Protocol)>>,
@@ -77,25 +146,27 @@ fn image_refs(value: &Value, out: &mut Vec<ConversationContentRef>) {
 impl Content {
     pub fn index(&mut self, timelines: &BTreeMap<String, st3_conversation_ui::Timeline>) {
         self.groups.clear();
+        self.sources.clear();
         for (conversation, timeline) in timelines {
             let calls: BTreeMap<_, _> = timeline.items.iter().filter_map(|entry| {
                 if let TimelineBody::ToolCall(call) = &entry.body {
-                    Some((call.call_id.as_str(), entry.id.as_str()))
+                    Some((call.call_id.as_str(), entry))
                 } else { None }
             }).collect();
             for entry in &timeline.items {
+                let mut referenced = false;
                 let image_id = format!("{}#images", entry.id);
                 let (id, blocks) = match &entry.body {
                     TimelineBody::ToolCall(call) => (entry.id.as_str(), call.blocks.as_slice()),
                     TimelineBody::ToolResult(result) => (
-                        calls.get(result.call_id.as_str()).copied().unwrap_or(&entry.id),
+                        calls.get(result.call_id.as_str()).map_or(entry.id.as_str(), |call| call.id.as_str()),
                         result.blocks.as_slice(),
                     ),
                     TimelineBody::Content(content) if has_images(&content.blocks) => (image_id.as_str(), content.blocks.as_slice()),
                     TimelineBody::Content(content) => (entry.id.as_str(), content.blocks.as_slice()),
                     _ => continue,
                 };
-                for block in blocks {
+                for (block_index, block) in blocks.iter().enumerate() {
                     let mut refs = Vec::new();
                     if let Some(reference) = &block.continuation { refs.push(reference.clone()); }
                     image_refs(&block.payload, &mut refs);
@@ -111,12 +182,22 @@ impl Content {
                             }
                         }
                     }
+                    if references.is_empty() { continue; }
+                    referenced = true;
                     self.groups.entry((conversation.clone(), id.to_owned())).or_default().push(Group {
-                        preview: serde_json::to_string_pretty(&serde_json::json!({
-                            "payload": block.payload, "metadata": block.metadata, "view": block.view,
-                        })).expect("block JSON"),
+                        block_index,
                         refs: references,
                     });
+                }
+                if referenced {
+                    let sources = self.sources.entry(timeline.session_id.clone().unwrap_or_else(|| conversation.clone()))
+                        .or_default();
+                    sources.insert(entry.id.clone(), entry.clone());
+                    if let TimelineBody::ToolResult(result) = &entry.body
+                        && let Some(call) = calls.get(result.call_id.as_str())
+                    {
+                        sources.entry(call.id.clone()).or_insert_with(|| (*call).clone());
+                    }
                 }
             }
         }
@@ -133,18 +214,6 @@ impl Content {
             .map(|(owner, _)| owner.clone())
     }
 
-    pub fn request_expanded(&mut self, expanded: &HashSet<String>) -> Vec<Key> {
-        let owners: Vec<_> = self.groups.keys().filter(|(_, entry)| expanded.contains(entry)).cloned().collect();
-        let mut out = Vec::new();
-        for (conversation, entry) in owners {
-            let refs: Vec<_> = self.groups[&(conversation, entry)].iter().flat_map(|group| &group.refs)
-                .filter(|(key, reference)| !self.loaded.contains_key(key)
-                    && reference.reason.as_deref() != Some("on-demand") && !reference.media_type.starts_with("image/"))
-                .map(|(key, _)| key.clone()).collect();
-            for key in refs { if self.request(&key) { out.push(key); } }
-        }
-        out
-    }
 
     pub fn request_tool(&mut self, conversation: &str, entry: &str) -> Vec<Key> {
         let refs: Vec<_> = self.groups.get(&(conversation.to_owned(), entry.to_owned()))
@@ -167,7 +236,7 @@ impl Content {
         }
     }
 
-    fn request(&mut self, key: &Key) -> bool {
+    pub fn request(&mut self, key: &Key) -> bool {
         if matches!(self.loaded.get(key), Some(Loaded::Loading | Loaded::Json { .. } | Loaded::Image { .. })) {
             return false;
         }
@@ -207,7 +276,29 @@ impl Content {
                         Ok(value) => {
                             let mut images = Vec::new();
                             image_refs(&value, &mut images);
-                            Loaded::Json { text: serde_json::to_string_pretty(&value).expect("content JSON"), images }
+                            let source = self.sources.get(&key.conversation).and_then(|entries| entries.get(&key.entry));
+                            let group = self.groups.values().flatten().find(|group| group.refs.iter().any(|(candidate, _)| candidate == &key));
+                            let entries = source.zip(group).and_then(|(source, group)| {
+                                let blocks = match &source.body {
+                                    TimelineBody::ToolCall(body) => &body.blocks,
+                                    TimelineBody::ToolResult(body) => &body.blocks,
+                                    TimelineBody::Content(body) => &body.blocks,
+                                    _ => return None,
+                                };
+                                let call = match &source.body {
+                                    TimelineBody::ToolResult(result) => self.sources.get(&key.conversation)
+                                        .and_then(|sources| sources.values().find(|entry| {
+                                            matches!(&entry.body, TimelineBody::ToolCall(call) if call.call_id == result.call_id)
+                                        })),
+                                    _ => None,
+                                };
+                                blocks.get(group.block_index).and_then(|block| typed_content(source, block, &value, call))
+                            });
+                            let presentation = entries.map_or_else(
+                                || Presentation::Raw(serde_json::to_string_pretty(&value).expect("content JSON")),
+                                Presentation::Typed,
+                            );
+                            Loaded::Json { presentation, images }
                         }
                         Err(error) => Loaded::Failed(format!("Invalid content JSON: {error}")),
                     }
@@ -237,12 +328,8 @@ impl Content {
             let Some(groups) = self.groups.get(&(conversation.to_owned(), id.clone())) else { continue };
             let at = entries.get(index + 1).map_or(doc.lines.len(), |(_, line)| *line);
             let mut extra = Doc::new();
+            let mut replace = false;
             for group in groups {
-                if open && !group.preview.is_empty() {
-                    extra.line(Line::from(Span::styled("  payload / metadata / view", theme::dim())));
-                    extra.lines(text::wrap(&[text::run(text::sanitize(&group.preview), theme::fg(theme::TEXT))], width,
-                        &[text::run("  ", theme::dim())], &[text::run("  ", theme::dim())], None));
-                }
                 for (key, reference) in &group.refs {
                     let loaded = self.loaded.get(key);
                     let image = reference.reason.as_deref() == Some("on-demand")
@@ -268,32 +355,55 @@ impl Content {
                                 hit: Hit::InlineImage(key.clone()) });
                             for _ in 0..12 { extra.blank(); }
                         }
-                    } else if open {
-                        extra.line(Line::from(Span::styled("  Full referenced content (JSON)", theme::dim())));
-                        let text = match loaded {
-                            Some(Loaded::Json { text, .. }) => text.as_str(),
-                            Some(Loaded::Failed(error)) => error.as_str(),
-                            _ => "Loading full content…",
-                        };
-                        extra.lines(text::wrap(&[text::run(text::sanitize(text), theme::fg(theme::TEXT))], width,
-                            &[text::run("  ", theme::dim())], &[text::run("  ", theme::dim())], None));
+                    } else {
+                        match loaded {
+                            Some(Loaded::Json { presentation, .. }) if open => {
+                                match presentation {
+                                    Presentation::Typed(entries) => {
+                                        replace = true;
+                                        let expanded = entries.iter().map(|entry| entry.id.clone()).collect();
+                                        extra.append(super::conversation::Cache::default().render(
+                                            entries, width, &expanded, "", st3_conversation_ui::Density::Full,
+                                        ), 0);
+                                    }
+                                    Presentation::Raw(text) => {
+                                        extra.line(Line::from(Span::styled("  Full referenced content (JSON)", theme::dim())));
+                                        extra.lines(text::wrap(&[text::run(text::sanitize(text), theme::fg(theme::TEXT))], width,
+                                            &[text::run("  ", theme::dim())], &[text::run("  ", theme::dim())], None));
+                                    }
+                                }
+                            }
+                            Some(Loaded::Loading) => extra.line(Line::from(Span::styled("  Loading full output…", theme::dim()))),
+                            Some(Loaded::Json { .. }) => {}
+                            failed => {
+                                let label = match failed {
+                                    Some(Loaded::Failed(error)) => format!("  {error} · retry full output"),
+                                    _ => "  load full output · Ctrl+Enter".into(),
+                                };
+                                extra.targets.push(Target { line: extra.lines.len(), column: 0, width: width as u16,
+                                    hit: Hit::ContentOutput(key.clone()) });
+                                extra.line(Line::from(Span::styled(label, theme::fg(theme::LAVENDER))));
+                            }
+                        }
                     }
                 }
             }
-            if open {
+            if open && groups.iter().flat_map(|group| &group.refs).any(|(key, _)| self.loaded.contains_key(key)) {
                 extra.targets.push(Target { line: extra.lines.len(), column: 0, width: width as u16,
                     hit: Hit::ToggleTool(id.clone()) });
                 extra.line(Line::from(Span::styled("  collapse full content · Ctrl+Enter", theme::dim())));
             }
-            let count = extra.lines.len();
-            for target in &mut doc.targets { if target.line >= at { target.line += count; } }
-            for (_, line) in &mut doc.entries { if *line >= at { *line += count; } }
+            let start = if replace { entries[index].1 } else { at };
+            let shift = extra.lines.len() as isize - (at - start) as isize;
+            if replace { doc.targets.retain(|target| target.line < start || target.line >= at); }
+            for target in &mut doc.targets { if target.line >= at { target.line = target.line.saturating_add_signed(shift); } }
+            for (_, line) in &mut doc.entries { if *line >= at { *line = line.saturating_add_signed(shift); } }
             for (_, range) in &mut doc.messages {
-                if range.start >= at { range.start += count; }
-                if range.end >= at { range.end += count; }
+                if range.start >= at { range.start = range.start.saturating_add_signed(shift); }
+                if range.end >= at { range.end = range.end.saturating_add_signed(shift); }
             }
-            doc.lines.splice(at..at, extra.lines);
-            doc.targets.extend(extra.targets.into_iter().map(|mut target| { target.line += at; target }));
+            doc.lines.splice(start..at, extra.lines);
+            doc.targets.extend(extra.targets.into_iter().map(|mut target| { target.line += start; target }));
         }
     }
 
@@ -411,6 +521,90 @@ mod tests {
     fn words(doc: &Doc) -> String {
         doc.lines.iter().flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
             .collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn ordinary_task_blocks_preserve_the_baseline_and_never_offer_full_loading() {
+        let (mut content, mut timelines, _) = fixture(false);
+        let timeline = timelines.get_mut("agent/example").unwrap();
+        let TimelineBody::ToolCall(call) = &mut timeline.items[0].body else { panic!("tool call") };
+        call.name = "task".into();
+        call.blocks[0].continuation = None;
+        call.blocks[0].view = Some(serde_json::json!({"type":"task","agents":[{"id":"child","description":"a child task"}]}));
+        let mut bash = timeline.items[0].clone();
+        bash.id = "bash-call".into();
+        bash.body = TimelineBody::ToolCall(Box::new(st3_client::TimelineToolCallBody {
+            call_id: "bash-call".into(), name: "bash".into(),
+            arguments: serde_json::json!({"command":"printf E2E-BASH-ROW"}), blocks: vec![],
+        }));
+        timeline.items.push(bash);
+        let entries = super::super::adapt::conversation(&timeline.items, &BTreeMap::new());
+        content.index(&timelines);
+        for open in [false, true] {
+            let expanded = if open { entries.iter().map(|entry| entry.id.clone()).collect() } else { HashSet::new() };
+            let baseline = super::super::conversation::Cache::default().render(
+                &entries, 120, &expanded, "*", st3_conversation_ui::Density::Full);
+            let shown = words(&render(&content, &entries, open));
+            assert_eq!(shown, words(&baseline));
+            assert!(shown.contains("$ printf E2E-BASH-ROW"));
+            assert!(!shown.contains("collapse full content"));
+            assert!(!shown.contains("load full output"));
+        }
+        assert!(content.loaded.is_empty());
+        assert!(content.groups.is_empty());
+        assert!(content.request_tool("agent/example", "call").is_empty());
+    }
+
+    #[test]
+    fn persisted_expansion_does_not_fetch_or_show_full_content() {
+        let (content, _, entries) = fixture(false);
+        let shown = words(&render(&content, &entries, true));
+        assert!(shown.contains("load full output"));
+        assert!(!shown.contains("payload / metadata / view"));
+        assert!(!shown.contains("collapse full content"));
+        assert!(!shown.contains("Loading full"));
+        assert!(content.loaded.is_empty());
+    }
+
+    #[test]
+    fn fetched_tool_body_and_payload_use_typed_output_without_the_preview_line_limit() {
+        let output = (0..600).map(|index| format!("line-{index}")).collect::<Vec<_>>().join("\n");
+        for whole_body in [false, true] {
+            let (mut content, mut timelines, _) = fixture(false);
+            let timeline = timelines.get_mut("agent/example").unwrap();
+            let mut result = timeline.items[0].clone();
+            result.id = "result".into();
+            result.body = serde_json::from_value::<st3_client::TimelineBody>(serde_json::json!({
+                "type":"tool_result", "body":{
+                    "call_id":"c","status":"success","media_type":"text/plain",
+                    "content":"prefix\n[st truncated this native timeline value: size limit; 20000 bytes]",
+                    "blocks":[{"id":"result-block","kind":"tool_output","source_type":"native",
+                        "payload":"prefix\n[st truncated this native timeline value: size limit; 20000 bytes]",
+                        "view":{"type":"bash","exit_code":0},
+                        "continuation":{"ref":"result-ref","media_type":"application/json","reason":"size-limit"}}]
+                }
+            })).unwrap();
+            let TimelineBody::ToolCall(call) = &mut timeline.items[0].body else { panic!("tool call") };
+            call.name = "bash".into();
+            call.arguments = serde_json::json!({"command":"printf E2E-BASH-ROW"});
+            call.blocks.clear();
+            timeline.items.push(result);
+            let entries = super::super::adapt::conversation(&timeline.items, &BTreeMap::new());
+            content.index(&timelines);
+            let key = content.request_tool("agent/example", "call").pop().unwrap();
+            let value = if whole_body {
+                serde_json::json!({"call_id":"c","status":"success","media_type":"text/plain","content":output,
+                    "blocks":[{"id":"result-block","kind":"tool_output","source_type":"native","payload":{"body_ref":true},"view":{"type":"bash","exit_code":0}}]})
+            } else { serde_json::json!(output) };
+            content.complete(key.clone(), Ok(("application/json".into(), serde_json::to_vec(&value).unwrap())));
+            assert!(matches!(content.loaded.get(&key), Some(Loaded::Json { presentation: Presentation::Typed(_), .. })));
+            let shown = words(&render(&content, &entries, true));
+            assert!(shown.contains("$ printf E2E-BASH-ROW"));
+            assert!(shown.contains("line-599"));
+            assert!(!shown.contains("st truncated"));
+            assert!(!shown.contains("Full referenced content (JSON)"));
+            assert!(!shown.contains("\"content\""));
+        }
     }
 
     #[test]
@@ -539,7 +733,7 @@ mod tests {
         content.complete(key, Ok(("application/json".into(), br#"{"metadata-tail":"all metadata"}"#.to_vec())));
         let text = words(&render(&content, &entries, true));
         assert!(text.contains("all metadata"));
-        assert!(text.contains("clipped"));
+        assert!(text.contains("exec"));
         assert!(text.contains("Full referenced content"));
     }
 
