@@ -4,6 +4,7 @@ import { ActionBarPrimitive, MessagePrimitive, ThreadPrimitive, useAuiState } fr
 import { Button, ProgressBar } from 'react-aria-components'
 import type { ConversationItem, MessageItem, TextItem } from '../embrace-data/model'
 import { EmbraceScrollViewport } from '../EmbraceScrollViewport'
+import { RuntimeAdoptedIds } from '../EmbraceRuntime'
 import { WorkLogV1 } from '../taste/WorkLogV1'
 import { formatWorkDuration, workLogOutputLanguage, type WorkLogCall, type WorkLogTurn } from '../taste/work-log'
 import { SyncLine } from '../st3-views/SyncLine'
@@ -78,33 +79,69 @@ export function ToolDetailPreview({ call, onOpen }: { readonly call: WorkLogCall
   const remaining = Math.max(0, lines.length - Number(output.endsWith('\n')) - 4)
   return <div data-testid="tool-detail-preview" {...stylex.props(styles.preview)}><pre {...stylex.props(styles.output)}><code {...stylex.props(styles.outputCode)}><HighlightedSource code={onOpen === undefined ? output : lines.slice(0, 4).join('\n')} language={workLogOutputLanguage(call)} /></code></pre>{onOpen !== undefined && <div data-testid="tool-preview-actions" {...stylex.props(styles.previewActions)}>{remaining > 0 && <><span data-testid="tool-preview-remaining">+{remaining} {remaining === 1 ? 'line' : 'lines'}</span><span aria-hidden="true">·</span></>}<Button aria-label={`Open ${call.title} tool detail`} onPress={() => onOpen(call)} {...stylex.props(styles.previewOpen)}>Open</Button></div>}</div>
 }
-const PreparedTurn = React.memo(function PreparedTurn({ turn, onOpenTool, onRetryRun }: { turn: TranscriptTurn; onOpenTool: TranscriptProps['onOpenTool']; onRetryRun?: () => void }) {
+/** Source text an unadopted item can show without the runtime; absent when the item carries none. */
+const strandedText = (item: ConversationItem): string | undefined => {
+  switch (item._tag) {
+    case 'Text': case 'Reasoning': return item.text
+    case 'Message': return item.title
+    case 'Notice': return item.detail === undefined ? item.text : `${item.text}\n${item.detail}`
+    case 'Event': return `${item.title}\n${item.text}`
+    case 'Status': return item.detail
+    default: return undefined
+  }
+}
+/** Fallback for an item the runtime never adopted: visible in place, never silently dropped. */
+function StrandedItem({ item }: { readonly item: ConversationItem }) {
+  const text = strandedText(item)
+  return <div data-testid="transcript-stranded" data-item-id={item.id} data-item-kind={item._tag} {...stylex.props(styles.semantic)}><span {...stylex.props(styles.semanticText)}>{text === undefined || text.trim() === '' ? 'Couldn\u2019t display this entry' : text}</span></div>
+}
+const PreparedTurn = React.memo(function PreparedTurn({ turn, stranded, onOpenTool, onRetryRun }: { turn: TranscriptTurn; stranded?: ReadonlySet<string>; onOpenTool: TranscriptProps['onOpenTool']; onRetryRun?: () => void }) {
   const detail = React.useCallback((call: WorkLogCall) => <ToolDetailPreview call={call} onOpen={onOpenTool} />, [onOpenTool])
   const reasoning = turn.items.filter(item => item._tag === 'Reasoning')
   return <section data-testid="transcript-turn" data-item-id={turn.id} {...stylex.props(styles.turn)}>
-    {turn.prompt !== undefined && <ThreadPrimitive.Unstable_MessageById messageId={turn.prompt.id} components={messageComponents} />}
+    {turn.prompt !== undefined && (stranded?.has(turn.prompt.id) ? <StrandedItem item={turn.prompt} /> : <ThreadPrimitive.Unstable_MessageById messageId={turn.prompt.id} components={messageComponents} />)}
     {(turn.work.calls.length > 0 || reasoning.length > 0) && <WorkLogV1 turn={turn.work} ariaLabel={`Work log ${turn.id}`} listStyle={styles.workList} renderCallDetail={detail} previewCallDetail={!turn.work.running} interactiveCalls={onOpenTool !== undefined} hideLiveRow onRetry={onRetryRun} onOpenOutput={onOpenTool} expandedBody={reasoning.map(item => <ThinkingEntry key={item.id} text={item.text} streaming={item.streaming} />)} />}
-    {turn.items.filter(item => item._tag !== 'ToolCall' && item._tag !== 'Reasoning').map(item => <SenderCaption.Provider key={item.id} value={turn.senderCaptions?.[item.id]}><ThreadPrimitive.Unstable_MessageById messageId={item.id} components={messageComponents} /></SenderCaption.Provider>)}
+    {turn.items.filter(item => item._tag !== 'ToolCall' && item._tag !== 'Reasoning').map(item => stranded?.has(item.id) ? <StrandedItem key={item.id} item={item} /> : <SenderCaption.Provider key={item.id} value={turn.senderCaptions?.[item.id]}><ThreadPrimitive.Unstable_MessageById messageId={item.id} components={messageComponents} /></SenderCaption.Provider>)}
     {turn.work.running && <div data-testid="live-work" role="status" aria-label="Response in progress" {...stylex.props(styles.liveActivity)}><span aria-hidden="true">◌</span></div>}
   </section>
 })
 /** Locked U2·F3·Y3 presentation under the host's AssistantRuntimeProvider. */
 export function Transcript({ turns, title, sync, now, observedAt, onOpenTool, onRetrySync, onRetryRun, onRetrySend, resolveImage, onLoadImage, availability = { _tag: 'Available' }, history = { _tag: 'Complete' }, emptyState }: TranscriptProps) {
   const messages = useAuiState(state => state.thread.messages)
-  const committed = React.useMemo(() => {
-    const ids = new Set(messages.map(message => message.id))
-    return turns.flatMap(turn => {
-      if (turn.prompt !== undefined && !ids.has(turn.prompt.id)) return []
-      const pendingIndex = turn.items.findIndex(item => !ids.has(item.id))
+  // External-store runtimes adopt each snapshot in a passive effect, and the store publishes the
+  // adopted messages a task later. Recording the snapshot after its commit is the adoption epoch.
+  // An id is pending (deferred so the turn stays mounted) while its snapshot has not been through a
+  // commit or while the runtime holds it and the store has yet to publish it; once committed and
+  // absent from the runtime, it is stranded.
+  const [adoptionEpoch, setAdoptionEpoch] = React.useState<readonly TranscriptTurn[]>()
+  React.useEffect(() => setAdoptionEpoch(turns), [turns])
+  const runtimeIds = React.useContext(RuntimeAdoptedIds)
+  const { committed, stranded } = React.useMemo(() => {
+    const published = new Set(messages.map(message => message.id))
+    const settled = new Set(adoptionEpoch?.flatMap(turn => [...(turn.prompt === undefined ? [] : [turn.prompt.id]), ...turn.items.map(item => item.id)]))
+    const stranded = new Set<string>()
+    const visible = (id: string) => {
+      if (published.has(id)) return true
+      if (!settled.has(id) || runtimeIds?.has(id)) return false
+      stranded.add(id)
+      return true
+    }
+    const committed = turns.flatMap(turn => {
+      if (turn.prompt !== undefined && !visible(turn.prompt.id)) return []
+      const pendingIndex = turn.items.findIndex(item => !visible(item.id))
       if (pendingIndex === -1) return [turn]
-      // The runtime adopts appended items in an effect. Keep the existing turn
-      // mounted while waiting, and defer only its uncommitted suffix.
+      // Keep the existing turn mounted while waiting, and defer only its pending suffix.
       const items = turn.items.slice(0, pendingIndex)
       if (turn.prompt === undefined && items.length === 0) return []
       const itemIds = new Set(items.map(item => item.id))
       return [{ ...turn, items, work: { ...turn.work, calls: turn.work.calls.filter(call => itemIds.has(call.id)) } }]
     })
-  }, [messages, turns])
+    return { committed, stranded }
+  }, [messages, turns, adoptionEpoch, runtimeIds])
+  const strandedIds = [...stranded].join(', ')
+  React.useEffect(() => {
+    if (strandedIds !== '' && process.env.NODE_ENV !== 'production') console.warn(`Transcript: the runtime never adopted ${strandedIds}; showing a fallback row.`)
+  }, [strandedIds])
   const imageOptions = React.useMemo(() => ({ resolveImage, onLoadImage }), [resolveImage, onLoadImage])
   const running = [...committed].reverse().find(turn => turn.work.running)
   const progress = sync._tag === 'Progress' && sync.stage === 'reading' && sync.done !== undefined && sync.total !== undefined ? sync : undefined
@@ -122,7 +159,7 @@ export function Transcript({ turns, title, sync, now, observedAt, onOpenTool, on
     </header>
     <ErrorOverlayHost lane><EmbraceScrollViewport items={committed} data-testid="transcript-scroll" aria-label="Conversation history" tabIndex={0} {...stylex.props(styles.lane)} contentProps={stylex.props(styles.content)}>
       {history._tag === 'HasOlder' && <div data-testid="history-boundary" {...stylex.props(styles.historyBoundary)}><span {...stylex.props(styles.historyNote)}>Earlier messages not loaded</span>{history.onLoadEarlier !== undefined && <Button onPress={history.onLoadEarlier} {...stylex.props(styles.historyLoad)}>Load earlier messages</Button>}</div>}
-      {committed.length === 0 ? empty : <div {...stylex.props(styles.timeline)}>{committed.map(turn => <PreparedTurn key={turn.id} turn={turn} onOpenTool={onOpenTool} onRetryRun={onRetryRun} />)}</div>}
+      {committed.length === 0 ? empty : <div {...stylex.props(styles.timeline)}>{committed.map(turn => <PreparedTurn key={turn.id} turn={turn} stranded={turn.prompt !== undefined && stranded.has(turn.prompt.id) || turn.items.some(item => stranded.has(item.id)) ? stranded : undefined} onOpenTool={onOpenTool} onRetryRun={onRetryRun} />)}</div>}
     </EmbraceScrollViewport>{failure?.tone === 'error' && <ErrorOverlay id={`sync-${failure.text}`} title={failure.text} detail="History stays on screen." onRetry={onRetrySync} />}</ErrorOverlayHost>
   </ThreadPrimitive.Root></RetrySend.Provider></MarkdownImagePolicy.Provider>
 }
