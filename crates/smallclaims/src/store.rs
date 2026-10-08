@@ -40,6 +40,8 @@ use crate::sqlite::{
 mod projection_busy_tests;
 #[cfg(test)]
 mod receive_writer_tests;
+#[cfg(test)]
+mod membership_query_tests;
 mod binary_payloads;
 pub mod events;
 pub mod idempotency;
@@ -2251,8 +2253,47 @@ fn fleet_generation_schema() -> String {
     )
 }
 
+fn fleet_generation(connection: &Connection) -> Result<i64> {
+    Ok(connection
+        .prepare_cached("SELECT value FROM fleet_generation WHERE id=1")?
+        .query_row([], |row| row.get(0))?)
+}
+
+// Payload bytes are immutable at this exact hash except the lossless TEXT-to-BLOB
+// conversion. Recheck the retained header and checkpoint exclusion without decoding or
+// copying a potentially large payload on the writer. Ordinary validation still hashes it.
+fn admission_envelope_present(connection: &Connection, envelope: &ReplicaEnvelope) -> Result<bool> {
+    Ok(connection.prepare_cached(
+        "SELECT EXISTS(SELECT 1 FROM replica_envelopes
+         WHERE writer=?1 AND sequence=?2 AND envelope_hash=?3
+           AND previous_hash IS ?4 AND accepted_at_unix_ms=?5
+           AND NOT EXISTS(SELECT 1 FROM checkpoint_envelopes
+                          WHERE writer=?1 AND sequence=?2 AND envelope_hash=?3))"
+    )?.query_row(params![envelope.writer, envelope.sequence, envelope.hash,
+                        envelope.previous_hash, envelope.accepted_at_unix_ms.to_string()],
+                 |row| row.get(0))?)
+}
+
 pub fn fleet_membership_tx(connection: &Connection) -> Result<crate::fleet::Membership> {
     fleet_membership_tx_with_local_signer(connection, None)
+}
+
+// Keep signer aggregation correlated to the exact indexed envelope identity. Joining raw
+// signature rows into the outer query would multiply claim bodies for envelopes with many keys.
+fn fleet_claims_with_signers_query() -> String {
+    format!(
+        "SELECT claims.id, claims.kind, claims.subject, claims.body,
+                batches.origin, batches.replica_sequence, envelopes.envelope_hash,
+                (SELECT json_group_array(signatures.member_key)
+                 FROM replica_envelope_signatures AS signatures
+                 WHERE signatures.writer=batches.origin
+                   AND signatures.sequence=batches.replica_sequence
+                   AND signatures.envelope_hash=envelopes.envelope_hash)
+         FROM claims JOIN batches ON batches.id=claims.batch_id
+         LEFT JOIN replica_envelopes AS envelopes ON envelopes.batch_id=claims.batch_id
+         WHERE claims.kind IN ({FLEET_CLAIM_KINDS})
+         ORDER BY claims.id"
+    )
 }
 
 pub fn fleet_membership_tx_with_local_signer(
@@ -2262,14 +2303,7 @@ pub fn fleet_membership_tx_with_local_signer(
     let Some(anchor) = fleet_meta(connection, "fleet_anchor_key")? else {
         return Ok(crate::fleet::Membership::default());
     };
-    let mut statement = connection.prepare(&format!(
-        "SELECT claims.id, claims.kind, claims.subject, claims.body,
-                batches.origin, batches.replica_sequence, envelopes.envelope_hash
-         FROM claims JOIN batches ON batches.id=claims.batch_id
-         LEFT JOIN replica_envelopes AS envelopes ON envelopes.batch_id=claims.batch_id
-         WHERE claims.kind IN ({FLEET_CLAIM_KINDS})
-         ORDER BY claims.id"
-    ))?;
+    let mut statement = connection.prepare(&fleet_claims_with_signers_query())?;
     let rows = statement
         .query_map([], |row| {
             Ok((
@@ -2280,24 +2314,15 @@ pub fn fleet_membership_tx_with_local_signer(
                 row.get::<_, String>(4)?,
                 row.get::<_, u64>(5)?,
                 row.get::<_, Option<String>>(6)?,
+                row.get::<_, String>(7)?,
             ))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    drop(statement);
-    let mut signers_statement = connection.prepare(
-        "SELECT member_key FROM replica_envelope_signatures
-         WHERE writer=?1 AND sequence=?2 AND envelope_hash=?3",
-    )?;
-    let mut claims: Vec<crate::fleet::FleetClaim> = Vec::with_capacity(rows.len());
-    for (id, kind, subject, body, writer, sequence, envelope_hash) in rows {
-        let mut signers = match &envelope_hash {
-            Some(hash) => signers_statement
-                .query_map(params![writer, sequence, hash], |row| {
-                    row.get::<_, String>(0)
-                })?
-                .collect::<Result<BTreeSet<_>, _>>()?,
-            None => BTreeSet::new(),
-        };
+        })?;
+    // The indexed signer aggregate keeps one row per claim/envelope, including unsigned
+    // envelopes. Judging calls this on its writer transaction; avoid per-row SQL round trips.
+    let mut claims: Vec<crate::fleet::FleetClaim> = Vec::new();
+    for row in rows {
+        let (id, kind, subject, body, writer, sequence, envelope_hash, signers_json) = row?;
+        let mut signers = serde_json::from_str::<BTreeSet<String>>(&signers_json)?;
         // A locally appended batch has not been seeded into an envelope yet.
         // Its eventual signature uses this node's key; include it in the client
         // view without doing that write while a request is being served.
@@ -5885,12 +5910,16 @@ impl Store {
                 )
             })
             .collect::<Vec<_>>();
-        // The envelopes wait as pending in a savepoint of the writer's next batch; admission and
-        // projection take them from there. Keep the whole receipt atomic, but perform its
-        // immutable signature verification before queueing this writer job.
-        let (received, duplicate, signatures) = self
-            .connection
-            .batched(|transaction| -> Result<(usize, usize, usize), St3Error> {
+        // One authenticated page becomes pending atomically. It uses the same managed
+        // prepare/finalize/commit boundary, but lets queued foreground requests go first.
+        // Immutable signature verification stays outside the writer. The guard returns before
+        // any receipt counters, snapshot work or acknowledgement can observe success.
+        let (received, duplicate, signatures) = {
+            let mut connection = self.connection.write_background();
+            let transaction = connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(internal)?;
+            let counts = (|transaction: &Transaction<'_>| -> Result<(usize, usize, usize), St3Error> {
                 let mut received = 0;
                 let mut duplicate = 0;
                 let mut signatures = 0;
@@ -5978,8 +6007,10 @@ impl Store {
                     transaction.execute("DELETE FROM replication_refusals WHERE peer=?1", [relay]).map_err(internal)?;
                 }
                 Ok((received, duplicate, signatures))
-            })
-            .map_err(|error| St3Error::new("internal", error))??;
+            })(&transaction)?;
+            transaction.commit().map_err(internal)?;
+            counts
+        };
         drop(timing);
         self.replication_timers
             .exchanges
@@ -6110,6 +6141,17 @@ impl Store {
         })
     }
 
+    fn prepare_admission_membership(&self) -> Result<(i64, crate::fleet::Membership)> {
+        #[cfg(test)]
+        ADMISSION_MEMBERSHIP_FOLDS.with(|count| count.set(count.get() + 1));
+        let reader = self.readers.get();
+        let snapshot = reader.unchecked_transaction()?;
+        let generation = fleet_generation(&snapshot)?;
+        let membership = fleet_membership_tx(&snapshot)?;
+        // Drop the read transaction and lease before requesting a writer loan.
+        Ok((generation, membership))
+    }
+
     pub fn validate_replication_backlog(&self) -> Result<ReplicationAdmission> {
         // Seed and sign local batches first, so local membership claims decide admission.
         self.replication_snapshot()?;
@@ -6152,28 +6194,42 @@ impl Store {
             (retry_hash_mismatches, envelopes)
         };
         let mut outcome = ReplicationAdmission::default();
-        // Membership is a few hundred read statements; with nothing to admit, skip it.
-        let mut membership = if envelopes.is_empty() {
-            Default::default()
-        } else {
-            fleet_membership_tx(&self.readers.get())?
-        };
+        // Prepare the authority fold off the writer in one reader snapshot. A generation
+        // comparison inside each acquired transaction proves that fold still applies there.
+        let mut membership: Option<(i64, crate::fleet::Membership)> = None;
         let mut pending = envelopes;
         // Admitting one envelope can admit a membership claim that decides another envelope,
         // so held envelopes get another pass whenever membership changes.
         loop {
             let mut held = Vec::new();
             let mut membership_changed = false;
-            // One transaction, and so one disk flush, per chunk. A catch-up page holds thousands
-            // of envelopes, and admitting them in one transaction held the only writer for
-            // seconds, so every write behind it waited. Between chunks the writer serves what
-            // queued meanwhile. Each envelope is admitted in its own savepoint, so an invalid
-            // one is rolled back and recorded alone.
+            // One managed transaction per bounded chunk. Foreground requests can overtake
+            // queued chunks; active envelopes and commit/finalization remain indivisible.
+            // Each envelope is admitted in its own savepoint, so an invalid one is rolled back
+            // and recorded alone. Refresh authority off the writer whenever its generation moved.
             let mut next = 0;
             while next < pending.len() {
-                let mut connection = self.connection.write();
+                if membership.is_none() {
+                    membership = Some(self.prepare_admission_membership()?);
+                }
+                #[cfg(test)]
+                BEFORE_ADMISSION_LOAN.with(|hook| {
+                    if let Some(mut hook) = hook.borrow_mut().take() {
+                        hook();
+                    }
+                });
+                let mut connection = self.connection.write_background();
                 let mut pass = connection
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let (prepared_generation, prepared_membership) = membership.as_ref().unwrap();
+                if fleet_generation(&pass)? != *prepared_generation {
+                    // Foreground authority changes can overtake this loan. Release it and
+                    // prepare again without folding history on the writer or using stale roots.
+                    drop(pass);
+                    drop(connection);
+                    membership = None;
+                    continue;
+                }
                 let started = std::time::Instant::now();
                 let end = (next + ADMISSION_CHUNK_ENVELOPES).min(pending.len());
                 let first = next;
@@ -6183,8 +6239,13 @@ impl Store {
                     }
                     let envelope = &pending[next];
                     next += 1;
+                    // A checkpoint/repair may have removed the captured source while this
+                    // background loan waited. Never restore records from that stale payload.
+                    if !admission_envelope_present(&pass, envelope)? {
+                        continue;
+                    }
                     let started = std::time::Instant::now();
-                    let hold = fleet_admission_hold(&pass, &membership, envelope)?;
+                    let hold = fleet_admission_hold(&pass, prepared_membership, envelope)?;
                     outcome.verify += started.elapsed();
                     if let Some(reason) = hold {
                         hold_replica_envelope(&pass, envelope, reason)?;
@@ -6210,9 +6271,15 @@ impl Store {
                                     envelope.sequence,
                                     envelope.hash
                                 ])?;
-                            membership_changed |=
+                            let changes_membership =
                                 envelope_carries_fleet_claims(&savepoint, envelope)?;
+                            membership_changed |= changes_membership;
                             savepoint.commit()?;
+                            if changes_membership {
+                                // Re-fold off the writer before any later envelope uses the
+                                // authority introduced or removed by this admitted claim.
+                                break;
+                            }
                         }
                         Err(error) => {
                             savepoint.rollback()?;
@@ -6238,17 +6305,20 @@ impl Store {
                 outcome.held = held.len();
                 break;
             }
-            membership = fleet_membership_tx(&self.readers.get())?;
+            membership = None;
             pending = held;
         }
         self.replication_timers
             .verify
             .fetch_add(outcome.verify.as_nanos() as u64, Ordering::Relaxed);
         if retry_hash_mismatches {
-            self.connection.write().execute(
+            let mut connection = self.connection.write_background();
+            let transaction = connection.transaction()?;
+            transaction.execute(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES ('legacy_claim_hash_retried', ?1)",
                 [now_ms().to_string()],
             )?;
+            transaction.commit()?;
         }
         // Admitted claims, and any change to membership's trust roots, get their verdicts once
         // they are projected: judging here would hold the writer between admission and
@@ -8117,6 +8187,13 @@ thread_local! {
     pub static FULL_REPLAYS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Writer transactions this thread admitted replicated envelopes in.
     pub static ADMISSION_TRANSACTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static ADMISSION_MEMBERSHIP_FOLDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // One-shot deterministic control between preparing authority and acquiring its writer.
+    static BEFORE_ADMISSION_LOAN: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
 }
 
 pub fn apply_replication_repair_tx(
