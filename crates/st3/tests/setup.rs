@@ -252,6 +252,40 @@ fn setup_does_not_claim_managed_executables_or_no_install_runs() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn stopping_services_skips_absent_replication_but_preserves_installed_unit_errors() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let fixture = Fixture::new();
+    fs::write(fixture.path("bin/systemctl"), "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HOME/manager.log\"\nif [ \"$3\" = st3-replication.service ]; then echo 'replication stop denied' >&2; exit 7; fi\n").unwrap();
+    fs::set_permissions(
+        fixture.path("bin/systemctl"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let output = fixture.cli().args(["service", "stop"]).output().unwrap();
+    success(&output);
+    assert!(output.stderr.is_empty());
+    let log = fixture.path("home/manager.log");
+    assert_eq!(
+        fs::read_to_string(&log).unwrap(),
+        "--user stop st3.service\n"
+    );
+    fs::write(&log, "").unwrap();
+    let unit = fixture.path("home/.config/systemd/user/st3-replication.service");
+    fs::create_dir_all(unit.parent().unwrap()).unwrap();
+    fs::write(&unit, "installed replication unit").unwrap();
+    let output = fixture.cli().args(["service", "stop"]).output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("replication stop denied"));
+    assert_eq!(
+        fs::read_to_string(&log).unwrap(),
+        "--user stop st3-replication.service\n"
+    );
+}
+
 #[test]
 fn flags_merge_config_without_prompting_and_invalid_names_do_not_write() {
     let fixture = Fixture::new();
