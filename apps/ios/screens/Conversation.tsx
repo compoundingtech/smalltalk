@@ -6,6 +6,8 @@ import { useFocusEffect } from '@react-navigation/native';
 import { useHeaderHeight } from '@react-navigation/elements';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import type { TimelineEntry } from '../../../clients/typescript/st3-client';
+import type { ConversationContentRef } from '../../../clients/typescript/st3-client';
+import { contentImageUri, contentJsonText, loadConversationContent } from '@smalltalk/st3-views';
 import { checkoutLabel } from '../launcher';
 import { agentGlyph, agentModel, agentName, agentState, agentWord, harnessColor, harnessName, loginGuidance } from '../agentsView';
 import { Banners } from '../chrome';
@@ -308,7 +310,7 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
         : row.kind === 'bundle' ? <BundleView row={row} onToggle={toggle} />
         : row.kind === 'call' && !open.has(row.entry.id) ? <CallView entry={row.entry} tool={row.tool} onToggle={toggle} />
         // A long press opens the entry's text to select any part of it; iOS text selects only whole.
-        : <Pressable accessible={false} onLongPress={() => navigation.navigate('SelectText', { text: entryText(row.entry), title })} delayLongPress={350}><EntryView entry={row.entry} open={open.has(row.entry.id)} onToggle={toggle} brief={simpleOn && !finding} onOpenSession={openSession} /></Pressable>}
+        : <Pressable accessible={false} onLongPress={() => navigation.navigate('SelectText', { text: entryText(row.entry), title })} delayLongPress={350}><EntryView entry={row.entry} conversationId={timeline.sessionId ?? sessionId ?? target} open={open.has(row.entry.id)} onToggle={toggle} brief={simpleOn && !finding} onOpenSession={openSession} /></Pressable>}
       ListEmptyComponent={<View style={[styles.entry, { transform: [{ scaleY: -1 }] }]}>{unreadable ? <T color={theme.waiting} selectable>{unreadable}</T> : <T dim>{unresolved ? 'This process has no exact native session history.' : !loaded ? (issue ? `Not loaded yet: ${issue}. Trying again.` : status === 'online' ? 'Loading the conversation…' : 'Offline; this conversation has not been loaded yet.') : 'No conversation in the recent timeline.'}</T>}</View>}
       // Scrolled up, a new entry must not move what is being read, so the position is kept. At
       // the newest it must not be: the position-keeping scrolls to a new entry with an animation,
@@ -396,7 +398,39 @@ const PendingView = memo(function PendingView({ pending }: { pending: Pending })
   </View>;
 });
 
-const EntryView = memo(function EntryView({ entry, open, onToggle, brief = false, onOpenSession }: { entry: ConversationEntry; open: boolean; onToggle: (id: string) => void; brief?: boolean; onOpenSession?: (sessionId: string, title: string) => void }) {
+const EntryView = memo(function EntryView(props: { entry: ConversationEntry; conversationId: string; open: boolean; onToggle: (id: string) => void; brief?: boolean; onOpenSession?: (sessionId: string, title: string) => void }) {
+  return <View>
+    <EntryBodyView {...props} />
+    {props.entry.content?.map(reference => <FetchedContent key={`${props.conversationId}:${reference.ref}`} conversationId={props.conversationId} reference={reference} />)}
+  </View>;
+});
+
+// Explicit disclosure only. Fetched JSON is an adjunct, never a guessed replacement for a
+// payload: a continuation may instead name metadata/view or the whole body.
+function FetchedContent({ conversationId, reference }: { conversationId: string; reference: ConversationContentRef }) {
+  const { client } = useStore();
+  const [state, setState] = useState<{ kind: 'closed' } | { kind: 'loading' } | { kind: 'failed'; message: string } | { kind: 'json'; text: string } | { kind: 'image'; uri: string; size: number }>({ kind: 'closed' });
+  const image = reference.reason === 'on-demand' || reference.media_type.startsWith('image/');
+  const load = async () => {
+    setState({ kind: 'loading' });
+    try {
+      if (!client) throw new Error('Connect to the server and try again.');
+      const content = await loadConversationContent(reference, async (ref, offset) => (await client.conversationContentChunk(conversationId, ref, offset)).value);
+      setState(image ? { kind: 'image', uri: contentImageUri(content), size: content.bytes.length } : { kind: 'json', text: contentJsonText(content) });
+    } catch (error) { setState({ kind: 'failed', message: error instanceof Error ? error.message : String(error) }); }
+  };
+  const expanded = state.kind === 'json' || state.kind === 'image';
+  return <View style={styles.entry}>
+    <Pressable accessibilityRole="button" accessibilityState={{ expanded, disabled: state.kind === 'loading' }} disabled={state.kind === 'loading'} onPress={() => expanded ? setState({ kind: 'closed' }) : void load()}>
+      <T color={theme.accent}>{state.kind === 'loading' ? 'Loading…' : expanded ? 'Show less' : state.kind === 'failed' ? 'Retry loading' : image ? 'Load image' : 'Show all'}<T dim>{reference.size === undefined ? (image ? ' · size unknown until loaded' : '') : ` · ${megabytes(reference.size)}`}</T></T>
+    </Pressable>
+    {state.kind === 'failed' ? <T color={theme.red}>Could not load {image ? 'image' : 'full content'}: {state.message}</T> : null}
+    {state.kind === 'json' ? <T selectable>{state.text}</T> : null}
+    {state.kind === 'image' ? <View><T dim>{megabytes(state.size)}</T><Image accessibilityLabel="Fetched conversation image" source={{ uri: state.uri, cache: 'reload' }} style={styles.mailImage} resizeMode="contain" onError={() => setState({ kind: 'failed', message: 'The image could not be displayed. Try again.' })} /></View> : null}
+  </View>;
+}
+
+const EntryBodyView = memo(function EntryBodyView({ entry, open, onToggle, brief = false, onOpenSession }: { entry: ConversationEntry; open: boolean; onToggle: (id: string) => void; brief?: boolean; onOpenSession?: (sessionId: string, title: string) => void }) {
   const body = entry.body;
   switch (body.kind) {
     case 'user':
