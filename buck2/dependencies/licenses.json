@@ -2,7 +2,7 @@
   "generated": "Do not edit; run nix develop .#web -c python3 scripts/ci-fractal-web-licenses",
   "source": "pnpm-lock.yaml packages; installed package.json license (legacy licenses fallback); missing manifests from lock-integrity-verified npm archives",
   "schemaVersion": 1,
-  "lockfileSha256": "42ed83503f17861c418267ec4a8c843caf4984061ff636c3fb8f5ca2a0248731",
+  "lockfileSha256": "227a460f2d5f756cc85ba7dc7cd07b58eb5459a4b440818cbea3f8dcda38f72e",
   "packages": [
     {
       "name": "@adobe/css-tools",
@@ -1835,6 +1835,11 @@
       "license": "MIT"
     },
     {
+      "name": "@types/prismjs",
+      "version": "1.26.6",
+      "license": "MIT"
+    },
+    {
       "name": "@types/react",
       "version": "19.2.14",
       "license": "MIT"
@@ -2820,6 +2825,11 @@
       "license": "MIT"
     },
     {
+      "name": "hast-util-parse-selector",
+      "version": "4.0.0",
+      "license": "MIT"
+    },
+    {
       "name": "hast-util-to-jsx-runtime",
       "version": "2.3.6",
       "license": "MIT"
@@ -2827,6 +2837,11 @@
     {
       "name": "hast-util-whitespace",
       "version": "3.0.0",
+      "license": "MIT"
+    },
+    {
+      "name": "hastscript",
+      "version": "9.0.1",
       "license": "MIT"
     },
     {
@@ -4057,6 +4072,11 @@
     {
       "name": "redent",
       "version": "3.0.0",
+      "license": "MIT"
+    },
+    {
+      "name": "refractor",
+      "version": "5.0.0",
       "license": "MIT"
     },
     {

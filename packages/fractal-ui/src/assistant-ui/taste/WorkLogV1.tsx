@@ -3,6 +3,7 @@ import * as stylex from '@stylexjs/stylex'
 import { Button, Tooltip, TooltipTrigger } from 'react-aria-components'
 import { surfaceVars as surface, textVars as ink, borderVars as border, accentVars as accent, statusVars as status, typeVars as t, radiusVars as r, spaceVars as s, geometryVars as g } from '../composition-tokens.stylex'
 import { Icon } from '../composition/Icons'
+import { ErrorOverlay, useErrorOverlaySurface } from '../composition/ErrorOverlay'
 import type { WorkLogCall, WorkLogTurn } from './work-log'
 import { formatWorkDuration } from './work-log'
 /** Controlled work log. The host supplies verified facts; there is no demo fallback and no actions. */
@@ -13,16 +14,19 @@ export function WorkLogV1({ turn, listStyle, renderCallDetail }: {
   readonly listStyle?: stylex.StyleXStyles
   readonly renderCallDetail?: WorkLogCallDetailRenderer
 }) {
-  const [open, setOpen] = React.useState(false)
+  const overlayLayer = useErrorOverlaySurface()
   const settled = !turn.running && !turn.failed && !turn.interrupted
   const durationLabel = formatWorkDuration(turn.durationMs)
+  const [open, setOpen] = React.useState(false)
   const workLabel = `Worked${durationLabel ? ` for ${durationLabel}` : ''}`
   return <CallDetailRenderer.Provider value={renderCallDetail}><section aria-label="Work log" data-testid="work-log">
     {turn.running ? <div data-testid="live-work" {...stylex.props(styles.live)}><Icon name="spinner" spinning /><span>Working</span></div> : <>
       <Button isDisabled={!settled} aria-expanded={!settled || open} onPress={() => setOpen(value => !value)} {...stylex.props(styles.summary)}><span>{settled ? workLabel : turn.failed ? 'Run failed' : 'Run stopped'}</span><Icon name={!settled || open ? 'chevron-down' : 'chevron-right'} size={12} /></Button>
       {(!settled || open) && <CallList calls={turn.calls} listStyle={listStyle} />}
     </>}
-    {turn.failed && turn.failureNote !== undefined ? <div role="alert" {...stylex.props(styles.promoted)}><span {...stylex.props(styles.error)}><Icon name="x" size={14} /></span><span>{turn.failureNote}</span></div> : null}
+    {turn.failed && turn.failureNote !== undefined ? (overlayLayer !== null
+      ? <ErrorOverlay id={`work-failure-${turn.calls[0]?.id ?? 'turn'}`} title="Run failed." detail={turn.failureNote} />
+      : <div role="alert" {...stylex.props(styles.promoted)}><span {...stylex.props(styles.error)}><Icon name="x" size={14} /></span><span>{turn.failureNote}</span></div>) : null}
   </section></CallDetailRenderer.Provider>
 }
 function CallList({ calls: items, listStyle }: { calls: readonly WorkLogCall[]; listStyle?: stylex.StyleXStyles }) { return <div {...stylex.props(styles.list, listStyle)}>{items.map(call => <TimelineCall key={call.id} call={call} />)}</div> }
