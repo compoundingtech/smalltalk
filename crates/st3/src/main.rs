@@ -18182,8 +18182,9 @@ async fn drive_st2_native(
             }
             _ = work_interval.tick(), if !completion_announced => {
                 let tick: Result<()> = async {
-                    let minute = unix_minute()?;
-                    if renewed_minute != Some(minute) {
+                    if let Some(minute) = renewal_minute(subject)?
+                        && renewed_minute != Some(minute)
+                    {
                         renew_claimed_work(client, subject, minute).await?;
                         renewed_minute = Some(minute);
                     }
@@ -20059,9 +20060,11 @@ async fn run_pi_channel(
                         }
                     }
                 }
-                if renewed_minute != Some(minute) {
-                    match renew_claimed_work(client, subject, minute).await {
-                        Ok(()) => renewed_minute = Some(minute),
+                if let Some(renew_minute) = renewal_minute(subject)?
+                    && renewed_minute != Some(renew_minute)
+                {
+                    match renew_claimed_work(client, subject, renew_minute).await {
+                        Ok(()) => renewed_minute = Some(renew_minute),
                         Err(error) => warn_pi_channel(subject, &error, &mut last_warning),
                     }
                 }
@@ -21167,8 +21170,9 @@ async fn drive_codex_native(
             }
             _ = work_interval.tick() => {
                 let tick: Result<()> = async {
-                    let minute = unix_minute()?;
-                    if renewed_minute != Some(minute) {
+                    if let Some(minute) = renewal_minute(subject)?
+                        && renewed_minute != Some(minute)
+                    {
                         renew_claimed_work(client, subject, minute).await?;
                         renewed_minute = Some(minute);
                     }
@@ -21591,6 +21595,27 @@ fn work_claim_has_active_harness(
 
 fn unix_minute() -> Result<u64> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() / 60)
+}
+
+/// Seconds into each minute at which this seat renews its work leases, 0 to 49, fixed per seat.
+/// Every driver once renewed the moment the minute changed, so every running seat reached the
+/// daemon's single writer in the same second and the renewals queued behind one another there
+/// (about 45 of them, 2 to 70 ms each, an average wait of 800 ms and a tail of 2 s on hetz). A
+/// lease lasts ten minutes and is renewed every minute, so an offset inside the minute costs it
+/// nothing.
+fn renewal_offset_secs(subject: &str) -> u64 {
+    let digest = Sha256::digest(subject.as_bytes());
+    u64::from(u16::from_be_bytes([digest[0], digest[1]])) % 50
+}
+
+/// The minute this seat should renew in once `unix_secs` is past its offset in that minute.
+fn renewal_minute_at(subject: &str, unix_secs: u64) -> Option<u64> {
+    (unix_secs % 60 >= renewal_offset_secs(subject)).then_some(unix_secs / 60)
+}
+
+fn renewal_minute(subject: &str) -> Result<Option<u64>> {
+    let seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    Ok(renewal_minute_at(subject, seconds))
 }
 
 fn current_unix_ms() -> Result<u128> {
@@ -24233,6 +24258,36 @@ mod claude_attachment_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seats_renew_once_a_minute_each_at_its_own_second_not_all_on_the_minute_boundary() {
+        let seats: Vec<String> = (0..120).map(|n| format!("agent/fleet/example/seat-{n}")).collect();
+        let mut renewals_per_second = [0usize; 60];
+        for seat in &seats {
+            let offset = renewal_offset_secs(seat);
+            assert!(offset < 50, "{seat}: {offset}");
+            // A driver ticking each second from a minute's start renews exactly once in each
+            // minute, at its offset, and every minute is still covered.
+            let mut renewed = None;
+            let mut renewals = Vec::new();
+            for second in 0..180u64 {
+                if let Some(minute) = renewal_minute_at(seat, 1_000 * 60 + second)
+                    && renewed != Some(minute)
+                {
+                    renewed = Some(minute);
+                    renewals.push(second);
+                }
+            }
+            assert_eq!(renewals, vec![offset, 60 + offset, 120 + offset], "{seat}");
+            renewals_per_second[offset as usize] += 1;
+        }
+        let busiest = renewals_per_second.iter().max().copied().unwrap();
+        assert!(
+            busiest <= 8,
+            "120 seats should spread across the minute, not queue together: {renewals_per_second:?}"
+        );
+        assert!(renewals_per_second.iter().filter(|n| **n > 0).count() >= 35);
+    }
 
     // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
     #[test]
