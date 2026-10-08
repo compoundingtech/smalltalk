@@ -1841,7 +1841,8 @@ impl Store {
             }
         }
         // A local claim counts only once its batch is an envelope with this node's signature.
-        self.replication_snapshot()?;
+        // Membership needs that seal, but not the old six-table compatibility digest.
+        self.replication_snapshot_modern()?;
         let connection = self.readers.get();
         let folded_at = generation(&connection)?;
         let membership = fleet_membership_tx(&connection)?;

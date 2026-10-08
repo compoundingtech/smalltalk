@@ -44036,7 +44036,12 @@ version 2
         );
         let legacy = target.export_replication_summary(fleet).unwrap();
         assert!(!legacy.graph_digest.is_empty());
-        assert_eq!(GRAPH_DIGESTS_COMPUTED.with(std::cell::Cell::get), 1);
+        let full = legacy_graph_digest(
+            &target.connection.lock().unwrap(),
+            target.runtime.legacy_digest_tables(),
+        )
+        .unwrap();
+        assert_eq!(legacy.graph_digest, full);
     }
 
     #[test]
