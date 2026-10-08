@@ -802,6 +802,142 @@ mod tests {
         assert_eq!(get(path.replace("person%2Fada", "person%2Fgrace")).await.status(), StatusCode::FORBIDDEN);
     }
 
+    fn membership_repair_state(node: &str) -> AppState {
+        let root = std::path::PathBuf::from("/unused-membership-repair");
+        AppState {
+            store: Arc::new(Store::open_memory(node).unwrap()),
+            notify: Arc::new(Notify::new()),
+            event_notify: watch::channel(0_u64).0,
+            node: node.into(),
+            state_dir: root.clone(),
+            pty_root: root.join("pty"),
+            pty_binary: root.join("unused-pty"),
+            fleet_id: None,
+            configured_peers: Vec::new(),
+            client_relay: None,
+            native_session_home: None,
+            planner_default: crate::model::PlannerSpec::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn layout_held_windows_refresh_after_repair_without_membership_edit() {
+        let source = membership_repair_state("membership-window-repair-source");
+        let state = membership_repair_state("membership-window-repair-receiver");
+        let session = ClientSession::local(Some("person/ada")).unwrap();
+        create_v2(&source, &session).await;
+        declare_resource_member(&source, "resource/a");
+        declare_resource_member(&source, "resource/b");
+        // The retained older claim supplies A's old position after the newer A+B
+        // claim is repaired away; the repair must not append another layout edit.
+        let replacement = edit_memberships(&source, &session,
+            &membership_request(&source, "repair-older-a", json!([
+                {"op":"place","member":"resource/a","bucket":null,"key":"a2"}
+            ]))).await.unwrap();
+        let original = edit_memberships(&source, &session,
+            &membership_request(&source, "repair-newer-ab", json!([
+                {"op":"place","member":"resource/a","bucket":null,"key":"a1"},
+                {"op":"place","member":"resource/b","bucket":null,"key":"a0"}
+            ]))).await.unwrap();
+
+        const FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+        source.store.bind_fleet(FLEET).unwrap();
+        state.store.bind_fleet(FLEET).unwrap();
+        let exchange = source.store.export_replication_exchange(
+            FLEET, &crate::model::ReplicationInventory::default()).unwrap();
+        state.store.receive_replication_exchange(&source.node, FLEET, &exchange).unwrap();
+        state.store.validate_replication_backlog().unwrap();
+        state.store.apply_replication_repairs().unwrap();
+        assert!(state.store.project_replication_backlog().unwrap());
+        let record = state.store.replica_records(false).unwrap().into_iter()
+            .find(|record| record.claim_id.as_deref() == Some(original.id.as_str())).unwrap();
+        // As in the store repair fixtures, model a newer receiver registry
+        // rejecting a previously admitted claim. Do this before holding the window
+        // so only the authenticated repair can cause the observed invalidation.
+        state.store.connection.write().execute(
+            "UPDATE replica_records SET state='unknown' WHERE record_ref=?1",
+            [&record.record_ref]).unwrap();
+
+        let windows = collection_windows::Windows::attach(&state.store).unwrap();
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let subscription: CollectionSubscribe = serde_json::from_value(json!({
+            "kind":"subscribe","id":"repair-memberships","collection":"ordered-memberships",
+            "person":"person/ada","subject":SUBJECT,"limit":1
+        })).unwrap();
+        let (snapshot, first, has_more) = collection_items_with_windows(
+            &state, &session, &subscription, slots.clone().acquire_owned().await.unwrap(),
+            Some(windows.clone())).await.unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0]["member"], "resource/b");
+        assert!(has_more);
+        let (_, cached, cached_has_more) = collection_items_with_windows(
+            &state, &session, &subscription, slots.clone().acquire_owned().await.unwrap(),
+            Some(windows.clone())).await.unwrap();
+        assert_eq!(cached, first);
+        assert_eq!(cached_has_more, has_more);
+        assert_eq!(windows.builds(), 1);
+        let arrangement_subscription: CollectionSubscribe = serde_json::from_value(json!({
+            "kind":"subscribe","id":"repair-layout","collection":"arrangements",
+            "person":"person/ada","subject":SUBJECT,"limit":1
+        })).unwrap();
+        let (_, layout, _) = collection_items_with_windows(
+            &state, &session, &arrangement_subscription, slots.clone().acquire_owned().await.unwrap(),
+            Some(windows.clone())).await.unwrap();
+        assert_eq!(layout[0]["revision"], original.id);
+        let (_, cached_layout, _) = collection_items_with_windows(
+            &state, &session, &arrangement_subscription, slots.clone().acquire_owned().await.unwrap(),
+            Some(windows.clone())).await.unwrap();
+        assert_eq!(cached_layout, layout);
+        assert_eq!(windows.builds(), 2);
+
+        let path = "/v1/client/arrangements/ada/019a0000-0000-7000-8000-000000000001/memberships?person=person%2Fada&limit=1";
+        let response = crate::api::router(state.clone()).oneshot(Request::builder()
+            .uri(path).header(LOCAL_PERSON_HEADER, "person/ada")
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let page: st3_client::Envelope<st3_client::OrderedMembershipPage> = serde_json::from_slice(
+            &to_bytes(response.into_body(), CLIENT_MAX_RESPONSE_BYTES).await.unwrap()).unwrap();
+        assert_eq!(page.value.items[0].member, "resource/b");
+        let cursor = page.value.page.next_cursor.unwrap();
+        let before = windows.changes(&state.store).unwrap();
+        let index = state.store.index().unwrap();
+        let repair = state.store.repair_replica_record(
+            &record.record_ref, &replacement.id, "receiver rejects the original membership claim",
+            "person/ada", "repair-held-membership-window").unwrap();
+        assert_eq!(repair.kind, "record.repaired");
+        assert!(collection_ignores("ordered-memberships", &repair.kind));
+        assert_eq!(state.store.index().unwrap(), index + 1);
+        assert!(state.store.ordered_memberships_changed(index, index + 1).unwrap());
+        assert!(state.store.arrangements_changed(index, index + 1).unwrap());
+        let after = windows.changes(&state.store).unwrap();
+        assert!(collection_windows::Windows::changed("ordered-memberships", &before, &after));
+        assert!(collection_windows::Windows::changed("arrangements", &before, &after));
+
+        let (current, repaired, has_more) = collection_items_with_windows(
+            &state, &session, &subscription, slots.clone().acquire_owned().await.unwrap(),
+            Some(windows.clone())).await.unwrap();
+        assert_eq!(repaired.len(), 1);
+        assert_eq!(repaired[0]["member"], "resource/a");
+        assert_eq!(repaired[0]["position"]["key"], "a2");
+        assert!(!has_more);
+        assert!(current.store_index > snapshot.store_index);
+        assert_eq!(windows.builds(), 3);
+        let (_, repaired_layout, _) = collection_items_with_windows(
+            &state, &session, &arrangement_subscription, slots.acquire_owned().await.unwrap(),
+            Some(windows.clone())).await.unwrap();
+        assert_eq!(repaired_layout[0]["revision"], replacement.id);
+        assert_eq!(windows.builds(), 4);
+        assert!(state.store.arrangement(SUBJECT, snapshot.store_index).is_err());
+        assert_eq!(state.store.ordered_membership_count(SUBJECT).unwrap(), 1);
+        let stale = state.store.ordered_memberships(SUBJECT, snapshot.store_index, None, 10)
+            .unwrap_err();
+        assert!(stale.to_string().contains("snapshot frontier is stale"));
+        let response = crate::api::router(state.clone()).oneshot(Request::builder()
+            .uri(format!("{path}&cursor={cursor}")).header(LOCAL_PERSON_HEADER, "person/ada")
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::GONE);
+    }
+
     #[tokio::test]
     async fn membership_held_window_refills_on_lifecycle_only_declaration() {
         let root = tempfile::tempdir().unwrap();

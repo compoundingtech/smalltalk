@@ -168,7 +168,29 @@ pub(super) fn version(connection: &Connection, subject: &str) -> Result<u8> {
     ).optional()?.unwrap_or(1))
 }
 
+fn repair_index(connection: &Connection) -> Result<u64> {
+    Ok(connection.query_row(
+        "SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key='local_arrangement_repair_index'),0)",
+        [], |row| row.get(0),
+    )?)
+}
+
+/// Layout repair can remove the last arrangement row, so its local invalidation
+/// watermark must outlive the rebuilt rows and their surviving claim indexes.
+pub(super) fn repair_frontier(transaction: &Transaction<'_>, subject: &str) -> Result<()> {
+    let index = current_index(transaction)?;
+    transaction.execute(
+        "INSERT INTO meta(key,value) VALUES('local_arrangement_repair_index',?1)
+         ON CONFLICT(key) DO UPDATE SET value=CAST(MAX(CAST(meta.value AS INTEGER),CAST(excluded.value AS INTEGER)) AS TEXT)",
+        [index],
+    )?;
+    transaction.execute("UPDATE arrangements SET changed_index=MAX(changed_index,?2) WHERE subject=?1",
+        params![subject,index])?;
+    Ok(())
+}
+
 pub(super) fn arrangement_at(connection: &Connection, subject: &str, through: u64) -> Result<Option<Value>> {
+    anyhow::ensure!(repair_index(connection)? <= through, "arrangement snapshot frontier is stale after layout repair");
     let row = connection.query_row("SELECT owner,created,retired,revision,updated_at,changed_index FROM arrangements WHERE subject=?1", [subject], |row| Ok((row.get::<_,String>(0)?,row.get::<_,bool>(1)?,row.get::<_,bool>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?,row.get::<_,u64>(5)?))).optional()?;
     let Some((owner,created,retired,revision,time,index)) = row else { return Ok(None); };
     anyhow::ensure!(index <= through, "arrangement snapshot frontier is stale; read current heads in a read snapshot");
@@ -196,7 +218,7 @@ fn resource(subject: &str, owner: &str, revision: &str, time: u128, heads: &BTre
 }
 pub(super) fn arrangements_at(connection: &Connection, person: &str, through: u64) -> Result<Vec<Value>> {
     let changed: u64 = connection.query_row("SELECT COALESCE(MAX(changed_index),0) FROM arrangements WHERE owner=?1", [person], |row| row.get(0))?;
-    anyhow::ensure!(changed <= through, "arrangement collection snapshot frontier is stale; read current heads in a read snapshot");
+    anyhow::ensure!(changed.max(repair_index(connection)?) <= through, "arrangement collection snapshot frontier is stale; read current heads in a read snapshot");
     let mut statement = connection.prepare_cached("SELECT subject FROM arrangements WHERE owner=?1 AND created=1 AND retired=0 ORDER BY subject")?;
     let subjects = statement.query_map([person], |row| row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
     subjects.into_iter().filter_map(|subject| arrangement_at(connection,&subject,through).transpose()).collect()
@@ -300,7 +322,12 @@ impl Store {
         self.read_snapshot(|_| arrangement_at(&self.readers.get(),subject,through))
     }
     pub(crate) fn arrangements_changed(&self, after: u64, through: u64) -> Result<bool> {
-        Ok(self.readers.get().query_row("SELECT EXISTS(SELECT 1 FROM arrangements WHERE changed_index>?1 AND changed_index<=?2)",params![after,through.min(i64::MAX as u64)],|row| row.get(0))?)
+        Ok(self.readers.get().query_row(
+            "SELECT EXISTS(SELECT 1 FROM arrangements WHERE changed_index>?1 AND changed_index<=?2)
+             OR EXISTS(SELECT 1 FROM meta WHERE key='local_arrangement_repair_index'
+               AND CAST(value AS INTEGER)>?1 AND CAST(value AS INTEGER)<=?2)",
+            params![after,through.min(i64::MAX as u64)], |row| row.get(0),
+        )?)
     }
     pub fn edit_arrangement(&self, input: &ClaimInput, expected_subjects: &BTreeMap<String,String>) -> Result<ClaimRecord,St3Error> {
         if input.kind != "arrangement.edited" { return Err(St3Error::new("invalid-arrangement-operations","edit_arrangement requires arrangement.edited")); }

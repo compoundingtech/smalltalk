@@ -162,6 +162,11 @@ legacy layouts gain no synthetic register, and reads/admission use an indexed lo
 Repairing a retained arrangement or membership original rebuilds both dependent projections,
 including the container revision and reverse edges, so operations omitted by a replacement
 cannot remain visible. Incremental projection and rebuild both exclude repaired originals.
+Repairs advance local arrangement and membership invalidation watermarks stored in `meta`,
+even if the last arrangement or count row disappears. Bounded pages and held windows consult
+those watermarks after rebuild; they are not shared authority or digested projection fields. Repairing a referenced
+retained-claim member explicitly refreshes its lifecycle selection, because the repair does
+not mutate the original claims row or fire its lifecycle triggers.
 
 ## Every store_index order
 

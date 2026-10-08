@@ -205,6 +205,42 @@ pub(super) fn flush(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+/// A repair can remove the final count row. Keep its invalidation watermark locally,
+/// independent of rebuildable shared rows and their surviving claims' arrival indexes.
+pub(super) fn repair_frontier(transaction: &Transaction<'_>, subject: &str) -> Result<()> {
+    let index = current_index(transaction)?;
+    transaction.execute(
+        "INSERT INTO meta(key,value) VALUES('local_ordered_membership_repair_index',?1)
+         ON CONFLICT(key) DO UPDATE SET value=CAST(MAX(CAST(meta.value AS INTEGER),CAST(excluded.value AS INTEGER)) AS TEXT)",
+        [index],
+    )?;
+    transaction.execute(
+        "UPDATE ordered_membership_counts SET changed_index=MAX(changed_index,?2)
+         WHERE container=?1 OR container IN
+           (SELECT owner FROM declared_resource_edges WHERE target=?1 AND relation='ordered-membership')",
+        params![subject,index],
+    )?;
+    Ok(())
+}
+
+/// Retained-claim visibility is selected directly from unrepaired claim authority.
+/// Repair changes that selection without updating a claims row or firing its triggers.
+pub(super) fn member_repaired(transaction: &Transaction<'_>, subject: &str) -> Result<()> {
+    if !matches!(lifecycle::registry().subject(subject).map(|entry| entry.visibility),
+        Some(VisibilityPolicy::RetainedClaim)) { return Ok(()); }
+    let referenced: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM declared_resource_edges WHERE target=?1 AND relation='ordered-membership')",
+        [subject], |row| row.get(0),
+    )?;
+    if !referenced { return Ok(()); }
+    transaction.execute(
+        "INSERT INTO local_ordered_membership_pending(subject) VALUES(?1) ON CONFLICT(subject) DO NOTHING",
+        [subject],
+    )?;
+    flush(transaction)?;
+    repair_frontier(transaction, subject)
+}
+
 pub(super) fn project(transaction: &Transaction<'_>, claim: &ClaimRecord) -> Result<()> {
     let repaired: bool = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=?1)",
@@ -342,7 +378,9 @@ pub(super) fn items_at(connection: &Connection, container: &str, through: u64, a
         return Err(anyhow::Error::new(St3Error::new("invalid-arrangement-operations", "ordered membership reads require version 2; version-1 placements are not an empty membership collection")));
     }
     let changed: u64 = connection.query_row(
-        "SELECT COALESCE((SELECT changed_index FROM ordered_membership_counts WHERE container=?1),0)", [container], |row| row.get(0),
+        "SELECT MAX(COALESCE((SELECT changed_index FROM ordered_membership_counts WHERE container=?1),0),
+           COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key='local_ordered_membership_repair_index'),0))",
+        [container], |row| row.get(0),
     )?;
     anyhow::ensure!(changed <= through, "ordered membership snapshot frontier is stale");
     let read_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<Value> {
@@ -377,6 +415,11 @@ impl Store {
         Ok(self.readers.get().query_row("SELECT COALESCE((SELECT live_count FROM ordered_membership_counts WHERE container=?1),0)", [container], |row| row.get(0))?)
     }
     pub(crate) fn ordered_memberships_changed(&self, after: u64, through: u64) -> Result<bool> {
-        Ok(self.readers.get().query_row("SELECT EXISTS(SELECT 1 FROM ordered_membership_counts WHERE changed_index>?1 AND changed_index<=?2)", params![after,through.min(i64::MAX as u64)], |row| row.get(0))?)
+        Ok(self.readers.get().query_row(
+            "SELECT EXISTS(SELECT 1 FROM ordered_membership_counts WHERE changed_index>?1 AND changed_index<=?2)
+             OR EXISTS(SELECT 1 FROM meta WHERE key='local_ordered_membership_repair_index'
+               AND CAST(value AS INTEGER)>?1 AND CAST(value AS INTEGER)<=?2)",
+            params![after,through.min(i64::MAX as u64)], |row| row.get(0),
+        )?)
     }
 }

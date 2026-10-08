@@ -470,6 +470,134 @@ fn repaired_membership_original_retracts_omitted_pairs_and_shared_revision() {
 }
 
 #[test]
+fn membership_repair_invalidates_the_receiver_frontier_even_after_rebuild_and_heal() {
+    let source = Store::open_memory("membership-frontier-source").unwrap();
+    create(&source);
+    declare(&source, SEAT_A, "true", "frontier-declare-a");
+    declare(&source, SEAT_B, "true", "frontier-declare-b");
+    let replacement = edit(&source, json!([place(SEAT_A, None, "a0")]));
+    let original = edit(&source, json!([place(SEAT_A, None, "a9"), place(SEAT_B, None, "a1")]));
+    let receiver = Store::open_memory("membership-frontier-receiver").unwrap();
+    sync(&source, &receiver);
+    let before = receiver.index().unwrap();
+    assert_eq!(members(&receiver), vec![SEAT_B, SEAT_A]);
+    repair(&receiver, &original, &replacement, "repair-membership-frontier");
+    let repaired = receiver.index().unwrap();
+    assert!(repaired > before);
+    assert!(receiver.ordered_memberships_changed(before, repaired).unwrap());
+    let changed: u64 = receiver.readers.get().query_row(
+        "SELECT changed_index FROM ordered_membership_counts WHERE container=?1",
+        [CONTAINER], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(changed, repaired, "repair must invalidate at its own frontier, not the retained operation's index");
+    assert!(receiver.ordered_memberships(CONTAINER, before, None, 1000).is_err());
+    assert_eq!(members(&receiver), vec![SEAT_A]);
+    let expected = receiver.ordered_memberships(CONTAINER, repaired, None, 1000).unwrap();
+    let digests = layout_digests(&receiver);
+    for heal in [false, true] {
+        if heal {
+            assert!(receiver.replay_graph_for_heal().unwrap());
+        } else {
+            receiver.rebuild_claim_projections().unwrap();
+        }
+        assert_eq!(layout_digests(&receiver), digests, "local invalidation is not shared projection authority");
+        assert!(receiver.ordered_memberships_changed(before, repaired).unwrap());
+        assert!(receiver.ordered_memberships(CONTAINER, before, None, 1000).is_err());
+        assert_eq!(receiver.ordered_memberships(CONTAINER, repaired, None, 1000).unwrap(), expected);
+    }
+}
+
+#[test]
+fn creation_repair_invalidates_even_when_the_membership_count_row_disappears() {
+    let source = Store::open_memory("creation-frontier-source").unwrap();
+    create(&source);
+    let original = source.claims_for(CONTAINER, Some("arrangement.edited")).unwrap().remove(0);
+    let replacement = folder_edit(&source, json!([{"op":"rename","name":"Retained name"}]));
+    let receiver = Store::open_memory("creation-frontier-receiver").unwrap();
+    sync(&source, &receiver);
+    let before = receiver.index().unwrap();
+    assert!(receiver.ordered_memberships(CONTAINER, before, None, 1000).unwrap().is_empty());
+    repair(&receiver, &original, &replacement, "repair-creation-frontier");
+    let repaired = receiver.index().unwrap();
+    let counts: u64 = receiver.readers.get().query_row(
+        "SELECT COUNT(*) FROM ordered_membership_counts WHERE container=?1",
+        [CONTAINER], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(counts, 0, "retracting version-two creation removes its count row");
+    let digests = layout_digests(&receiver);
+    for heal in [None, Some(false), Some(true)] {
+        match heal {
+            None => {}
+            Some(false) => receiver.rebuild_claim_projections().unwrap(),
+            Some(true) => { assert!(receiver.replay_graph_for_heal().unwrap()); }
+        }
+        assert!(receiver.ordered_memberships_changed(before, repaired).unwrap());
+        assert!(receiver.arrangements_changed(before, repaired).unwrap());
+        assert!(receiver.arrangement(CONTAINER, before).is_err());
+        assert!(receiver.arrangements("person/ada", before).is_err());
+        assert!(receiver.arrangement(CONTAINER, repaired).unwrap().is_none());
+        assert!(receiver.ordered_memberships(CONTAINER, before, None, 1000).is_err());
+        // The surviving rename does not declare a container after its create is repaired.
+        // Strict reads must refuse the unknown ID, not return an empty membership page.
+        let error = receiver.ordered_memberships(CONTAINER, repaired, None, 1000).unwrap_err();
+        assert_eq!(error.downcast_ref::<St3Error>().unwrap().code, "not-found");
+        assert_eq!(layout_digests(&receiver), digests);
+    }
+}
+
+#[test]
+fn retained_claim_member_repair_refreshes_lifecycle_without_changing_its_pair() {
+    let source = Store::open_memory("retained-member-source").unwrap();
+    create(&source);
+    let member = "attention/membership-repair";
+    let replacement = source.append_claim(&claim(member, "attention.requested", json!({
+        "reviewer":"person/ada","title":"Retained request","reason":"Review the retained request",
+        "severity":"warning","targets":[]
+    }))).unwrap();
+    let original = source.append_claim(&claim(member, "attention.resolved", json!({
+        "request":replacement.id,"outcome":"resolved","reason":"Resolved by the selected newer claim"
+    }))).unwrap();
+    edit(&source, json!([place(member, None, "a0")]));
+    let receiver = Store::open_memory("retained-member-receiver").unwrap();
+    sync(&source, &receiver);
+    let retained = head(&receiver, member);
+    assert_eq!(lifecycle(&receiver, member), (true, original.id.clone()));
+    let before = receiver.index().unwrap();
+    repair(&receiver, &original, &replacement, "repair-retained-member");
+    let repaired = receiver.index().unwrap();
+    assert_eq!(lifecycle(&receiver, member), (true, replacement.id.clone()));
+    assert_ne!(lifecycle(&receiver, member).1, original.id);
+    assert_eq!(head(&receiver, member), retained);
+    assert_eq!(members(&receiver), vec![member]);
+    assert!(receiver.ordered_memberships_changed(before, repaired).unwrap());
+    assert!(receiver.ordered_memberships(CONTAINER, before, None, 1000).is_err());
+    let expected = rows(&receiver);
+    let digests = membership_digests(&receiver);
+    receive_and_project(&source, &receiver.origin, &exchange_from(&receiver, &source.replication_inventory().unwrap()));
+    let fresh = Store::open_memory("retained-member-fresh").unwrap();
+    sync(&receiver, &fresh);
+    for target in [&receiver, &source, &fresh] {
+        assert_eq!(lifecycle(target, member), (true, replacement.id.clone()));
+        assert_eq!(head(target, member), retained);
+        assert_eq!(rows(target), expected);
+        assert_eq!(membership_digests(target), digests);
+        target.rebuild_claim_projections().unwrap();
+        assert_eq!(membership_digests(target), digests);
+        assert_eq!(lifecycle(target, member), (true, replacement.id.clone()));
+        assert!(target.replay_graph_for_heal().unwrap());
+        assert_eq!(membership_digests(target), digests);
+        assert_eq!(head(target, member), retained);
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let (plan, proof) = receiver.plan_checkpoint(now_ms() + 1, directory.path()).unwrap();
+    assert!(proof.passed, "checkpoint replay witness must agree with incremental lifecycle repair");
+    receiver.apply_checkpoint_drop("checkpoint/retained-member-repair", &plan.envelopes, &plan.claims).unwrap();
+    assert_eq!(membership_digests(&receiver), digests);
+    assert_eq!(lifecycle(&receiver, member), (true, replacement.id));
+    assert_eq!(head(&receiver, member), retained);
+}
+
+#[test]
 fn repairing_legacy_creation_releases_only_unrepaired_v2_authority() {
     let legacy = Store::open_memory("legacy-repair-source").unwrap();
     let original = folder_edit(&legacy, json!([{"op":"create","name":"Legacy"}]));

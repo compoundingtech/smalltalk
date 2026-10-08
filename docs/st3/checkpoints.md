@@ -68,6 +68,10 @@ lifecycle dependencies and the shared reverse-edge projection to proof/replay. A
 hidden memberships and folder tombstones remain retained: no ordered-membership drop rule exists.
 Retiring a member changes visibility, not its retained pair position; redeclaring a reusable stable
 identity can restore that position.
+Repairing a retained member's selected claim refreshes its lifecycle dependency from
+unrepaired authority in the repair transaction, so incremental and replay witnesses agree.
+Local membership repair watermarks survive projection rebuilds but are excluded from
+shared checkpoint/digest answers.
 Different builds' rules digests must match exactly, not by version ordering: a mixed-version
 fleet waits at sealing until its participants use compatible rules, including during rollback.
 Verification also refuses seal terms whose rules digest differs from the running build, without

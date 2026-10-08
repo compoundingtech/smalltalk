@@ -227,16 +227,21 @@ impl Runtime for SmalltalkRuntime {
         replacement: &str,
     ) -> Result<()> {
         select_desired_repair_tx(transaction, repaired, replacement)?;
-        let layout_authority: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM claims WHERE id=?1 AND kind IN ('arrangement.edited','ordered-membership.edited'))",
-            [repaired], |row| row.get(0),
-        )?;
-        if layout_authority {
+        let original: Option<(String, String)> = transaction.query_row(
+            "SELECT subject,kind FROM claims WHERE id=?1",
+            [repaired], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+        let Some((subject, kind)) = original else { return Ok(()); };
+        if matches!(kind.as_str(), "arrangement.edited" | "ordered-membership.edited") {
             // Repair retracts every operation in the original, including pairs omitted
             // by its replacement and the arrangement's shared revision. Reuse the same
             // unrepaired-authority reducer as restart/checkpoint instead of partial undo.
             arrangements::rebuild(transaction)?;
             ordered_membership::rebuild(transaction)?;
+            arrangements::repair_frontier(transaction, &subject)?;
+            ordered_membership::repair_frontier(transaction, &subject)?;
+        } else {
+            ordered_membership::member_repaired(transaction, &subject)?;
         }
         Ok(())
     }
