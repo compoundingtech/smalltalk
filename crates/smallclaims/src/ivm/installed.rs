@@ -16,6 +16,17 @@ CREATE TABLE IF NOT EXISTS ivm_installed_bindings(
  source TEXT NOT NULL, source_fingerprint TEXT NOT NULL, source_epoch INTEGER NOT NULL,
  namespace TEXT, revision INTEGER NOT NULL, generation INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS ivm_installed_by_source ON ivm_installed_bindings(source,view);
+CREATE TRIGGER IF NOT EXISTS ivm_installed_source_status AFTER UPDATE ON ivm_install_sources
+WHEN (OLD.revision<>NEW.revision OR OLD.available<>NEW.available OR OLD.epoch<>NEW.epoch OR OLD.fingerprint<>NEW.fingerprint)
+ AND EXISTS(SELECT 1 FROM ivm_installed_bindings WHERE source=NEW.name)
+ AND EXISTS(SELECT 1 FROM ivm_install_deferred WHERE source=NEW.name)
+BEGIN
+ UPDATE ivm_status_frontier SET sequence=sequence+1 WHERE singleton=1;
+ INSERT INTO ivm_view_status(view,sequence) SELECT view,(SELECT sequence FROM ivm_status_frontier WHERE singleton=1)
+ FROM ivm_installed_bindings WHERE source=NEW.name
+ ON CONFLICT(view) DO UPDATE SET sequence=excluded.sequence;
+END;
 "#;
 
 /// Exact semantic keys (including removed/old memberships), or an explicit authorized
@@ -152,6 +163,12 @@ impl Views {
                 );
                 return Ok(());
             }
+            ensure!(
+                tx.query_row("SELECT COUNT(*) FROM ivm_installed_bindings", [], |r| r
+                    .get::<_, u64>(0))?
+                    < 256,
+                "installed view registry exceeds 256"
+            );
             tx.execute(
                 "INSERT INTO ivm_installed_bindings VALUES(?1,?2,?3,?4,?5,NULL,0,0)",
                 params![
@@ -255,6 +272,40 @@ impl Views {
         })
     }
 
+    /// Publish a precomputed page without operator callbacks. Partial progress remains
+    /// SourcePending; only a fully caught-up root is mirrored. The supplied graph cut is
+    /// separately certified by the native source owner, never inferred from the queue.
+    pub fn publish_prepared_installed(
+        &self,
+        tx: &Transaction<'_>,
+        installer: &Installer,
+        page: &super::install::prepared::PreparedPage,
+        expected_position: &SourcePosition,
+        cut: SourceCut,
+        changed: Changed<'_>,
+        now_ms: u64,
+    ) -> Result<Outcome> {
+        let view = page.view();
+        self.check_installed(tx, installer, view, expected_position, cut)?;
+        atomic(tx, || {
+            let outcome = installer.publish_prepared(tx, page, now_ms)?;
+            if outcome == Outcome::Published {
+                let root = installer.root(tx, view)?;
+                ensure!(
+                    root.namespace == *page.namespace(),
+                    "prepared published namespace mismatch"
+                );
+                self.mirror_installed(tx, view, &root, cut, Changed::Refresh, true)?;
+            } else if installer.status(tx, view)?.ready {
+                let root = installer.root(tx, view)?;
+                if root.namespace == *page.namespace() {
+                    self.mirror_installed(tx, view, &root, cut, changed, false)?;
+                }
+            }
+            Ok(outcome)
+        })
+    }
+
     /// Certify live maintenance of the SAME already-active namespace, in its source transaction.
     /// This never clears a later fence. Keys are complete semantic old/new memberships, not
     /// merely affected input keys. An explicit refresh wakes a bounded authorized window.
@@ -312,10 +363,10 @@ impl Views {
         changed: Changed<'_>,
         publication: bool,
     ) -> Result<()> {
-        let (namespace, generation): (Option<String>, u64) = tx.query_row(
-            "SELECT namespace,generation FROM ivm_installed_bindings WHERE view=?1",
+        let (namespace, generation, revision): (Option<String>, u64, u64) = tx.query_row(
+            "SELECT namespace,generation,revision FROM ivm_installed_bindings WHERE view=?1",
             [view],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
         ensure!(
             root.generation >= generation,
@@ -379,7 +430,10 @@ impl Views {
         for key in keys {
             note_key_change(tx, view, key)?;
         }
-        if publication || (delta > 0 && matches!(changed, Changed::Refresh)) {
+        if publication
+            || revision != root.revision
+            || (delta > 0 && matches!(changed, Changed::Refresh))
+        {
             tx.execute(
                 "UPDATE ivm_status_frontier SET sequence=sequence+1 WHERE singleton=1",
                 [],
