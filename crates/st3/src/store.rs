@@ -2734,15 +2734,15 @@ impl Store {
     ) -> Result<Option<AgentResourcesDelta>> {
         let connection = self.readers.get();
         let mut statement = connection.prepare_cached(
-            "SELECT subject, kind, actor, body FROM claims WHERE store_index>?1 AND store_index<=?2",
+            "SELECT subject, kind, actor FROM claims WHERE store_index>?1 AND store_index<=?2",
         )?;
         let mut delta = AgentResourcesDelta::default();
         let mut owners = BTreeSet::new();
         for row in statement.query_map(params![after, through], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?, row.get::<_, String>(3)?))
+                row.get::<_, Option<String>>(2)?))
         })? {
-            let (subject, kind, actor, body) = row?;
+            let (subject, kind, actor) = row?;
             if self.smalltalk.claim_registry().claim(&kind).is_none() {
                 return Ok(None);
             }
@@ -2788,14 +2788,16 @@ impl Store {
                 }
                 continue;
             }
-            if kind == "message.sent" && subject.starts_with("message/") {
-                // Message endpoints contribute to last_activity_at, even with no harness.
-                let body: Value = serde_json::from_str(&body)?;
-                for field in ["from", "to"] {
-                    if let Some(agent) = body["fields"][field].as_str().filter(|id| id.starts_with("agent/")) {
-                        delta.subjects.insert(agent.to_owned());
-                    }
-                }
+            if subject.starts_with("message/") && matches!(kind.as_str(),
+                "message.sent" | "message.staged" | "message.delivered" | "message.read" | "message.closed") {
+                // Sends affect activity; all lifecycle states affect a draining rollout's
+                // pending-delivery blocker, including replies through message ancestors.
+                // Receipts lack endpoints, so use the same message projection blockers read.
+                let Some(message) = self.message(&subject)? else {
+                    return Ok(None);
+                };
+                delta.subjects.extend([message.from, message.to].into_iter()
+                    .filter(|party| party.starts_with("agent/")));
                 continue;
             }
             // These projections touch neither card reductions nor queue/label inputs. Keep
@@ -2804,7 +2806,6 @@ impl Store {
                 "daemon.diagnostic" | "daemon.started" => subject.starts_with("daemon/"),
                 "glass.upserted" | "glass.deleted" => subject.starts_with("glass/"),
                 "arrangement.edited" => subject.starts_with("arrangement/"),
-                "message.staged" | "message.delivered" | "message.read" | "message.closed" => subject.starts_with("message/"),
                 "fleet.invite-created" | "fleet.invite-redeemed" | "fleet.invite-revoked" => subject.starts_with("fleet-invite/"),
                 "fleet.member-admitted" | "fleet.member-endpoints" | "fleet.member-left" | "fleet.member-removed" => subject.starts_with("host/"),
                 _ => false,

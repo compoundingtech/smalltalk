@@ -157,10 +157,25 @@ agent observations and registered agent claims update only their subject's card.
 changes refresh owned cards and diff roster membership; step/work changes map owners, assignees,
 claimants and activity actors. Queue-affecting claims refresh fleet queue selection and selected
 labels once, then compare all queue fields per card before refolding. Message sends refresh their
-agent endpoints because they contribute to activity timestamps. Other message receipts, daemon
-diagnostics, glasses, arrangements and fleet-only claims reuse the cards. Unknown kinds and
+agent endpoints because they contribute to activity timestamps. All message lifecycle receipts
+also refresh projected agent parties: draining rollout blockers read the message's delivery state,
+including ancestors of eligible replies. Receipt claims need not contain endpoint fields.
+Daemon diagnostics, glasses, arrangements and fleet-only claims reuse the cards. Unknown kinds and
 unclassified structural changes conservatively cold-build. Authorization is checked before reuse,
 and local delivery presence stays a per-read overlay rather than graph-cached authority.
+
+The reuse allowlist includes transitive rollout, suspension, fault and placement dependencies:
+
+| Claims | Card read | Delta mapping |
+| --- | --- | --- |
+| `message.sent` | activity and rollout delivery blockers | projected agent sender/recipient |
+| `message.staged`, `message.delivered`, `message.read`, `message.closed` | rollout delivery blockers and eligible reply ancestry | projected agent sender/recipient; cold if no message projection exists |
+| `daemon.diagnostic`, `daemon.started` | none; diagnostic reports are separate from agent reconcile faults | empty, guarded to daemon subjects |
+| `glass.upserted`, `glass.deleted` | none; glass projection is not a card or blocker input | empty, guarded to glass subjects |
+| `arrangement.edited` | none; arrangement projection is not a card or blocker input | empty, guarded to arrangement subjects |
+| `fleet.invite-created`, `fleet.invite-redeemed`, `fleet.invite-revoked` | none | empty, guarded to invitation subjects |
+| `fleet.member-admitted`, `fleet.member-endpoints`, `fleet.member-left`, `fleet.member-removed` | none; host metadata is declaration-derived and placement fences do not read peer liveness | empty, guarded to host subjects |
+
 Shared cards are built only from current, independently time-fenced queue metadata. A
 pagination continuation applies its frozen ordering/host/queue refs to the response clone
 after reading the shared cards; frozen pagination cuts must never seed the shared projection.

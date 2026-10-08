@@ -21863,6 +21863,7 @@ mission "wake" state="ready" {
         store: Store,
         intent: crate::model::NormalizedIntent,
         subjects: Vec<String>,
+        draining_subjects: Vec<String>,
         runs: Vec<crate::model::MissionRunView>,
     }
 
@@ -21920,6 +21921,198 @@ mission "wake" state="ready" {
                 summary: Some(format!("Fixture {action}.")), reason: None,
                 evidence: Vec::new(), idempotency_key: key.into(),
             }).unwrap();
+    }
+
+    fn roster_fixture_message_claim(
+        store: &Store, message: &str, actor: &str, lifecycle: &str, fields: Value,
+    ) {
+        store.append_claim(&ClaimInput {
+            subject: message.into(), kind: format!("message.{lifecycle}"), actor: Some(actor.into()),
+            fields: serde_json::from_value(fields).unwrap(), evidence: Vec::new(),
+            expected_subject: None, idempotency_key: None,
+        }).unwrap();
+    }
+
+    fn roster_fixture_message_receipt(store: &Store, message: &str, lifecycle: &str) {
+        let recipient = store.message(message).unwrap().unwrap().to;
+        let fields = if lifecycle == "staged" {
+            json!({"status":lifecycle,"recipient":recipient})
+        } else {
+            json!({"status":lifecycle})
+        };
+        // Native receipts name the recipient actor, not from/to endpoint fields.
+        roster_fixture_message_claim(store, message, &recipient, lifecycle, fields);
+    }
+
+    fn roster_fixture_draining_seats(fixture: &RosterClaimsFixture) -> Vec<String> {
+        use crate::store::owned_sets::{Options, Source};
+        let store = &fixture.store;
+        let subjects = (0..3).map(|agent| format!("agent/roster-draining/seat-{agent}"))
+            .collect::<Vec<_>>();
+        for sequence in 1..=2 {
+            let mut source = String::from("version 2\n");
+            for agent in 0..3 {
+                source.push_str(&format!(
+                    "agent \"roster-draining/seat-{agent}\" {{ rollout \"manual\"; host \"node\"; \
+                    workspace \"/tmp\"; harness \"claude\" {{ model \"fixture-{sequence}\"; }} }}\n"
+                ));
+            }
+            let input = crate::graph::parse_owned_set_intent(&source, "node").unwrap();
+            let mut options = Options {
+                set: "roster-draining".into(),
+                source: Source {
+                    repository: "fixture/roster".into(), r#ref: "refs/heads/main".into(),
+                    sha: format!("{sequence:040x}"), sequence,
+                },
+                expected_set: store.owned_sets().unwrap().first()
+                    .map_or("absent".into(), |set| set.revision.clone()),
+                rollout: None, adopt: Default::default(), allow_empty: false,
+                confirm_retire: None, expected_subjects: Default::default(),
+            };
+            let preview = store.owned_set_preview(&input, &options).unwrap();
+            assert!(preview.blockers.is_empty(), "{:?}", preview.blockers);
+            options.confirm_retire = Some(preview.digest);
+            options.expected_subjects = preview.expected_subjects;
+            store.apply_owned_set(&input, &options, &format!("roster-draining-publish-{sequence}"),
+                "person/test").unwrap();
+            if sequence == 1 {
+                for (agent, subject) in subjects.iter().enumerate() {
+                    let incarnation = format!("roster-draining-incarnation-{agent}");
+                    let token = store.selected_desired_token(subject).unwrap().unwrap();
+                    for (kind, fields) in [
+                        ("runtime.observed", json!({"status":"running","runtime_id":subject,
+                            "host":"node","incarnation_id":incarnation})),
+                        ("runtime.action.succeeded", json!({"action":"start",
+                            "desired_token":token,"incarnation_id":incarnation})),
+                        ("harness.observed", json!({"state":"idle","driver":"claude",
+                            "incarnation_id":incarnation,"quiescent":true,"blocking":[]})),
+                        ("harness.session-file", json!({"harness":"claude",
+                            "session_id":format!("roster-draining-native-{agent}"),
+                            "incarnation_id":incarnation,"path":"/tmp/roster-draining-session"})),
+                        ("harness.todo.observed", {
+                            let mut todo = roster_fixture_todo(agent, 0);
+                            todo["harness"] = json!("claude");
+                            todo["session_id"] = json!(format!("roster-draining-native-{agent}"));
+                            todo["incarnation_id"] = json!(incarnation);
+                            todo
+                        }),
+                        ("harness.usage", json!({"semantics":"response","driver":"claude",
+                            "incarnation_id":incarnation,"model":"fixture-1",
+                            "input_tokens":10,"output_tokens":5,"total_tokens":15})),
+                    ] {
+                        roster_fixture_append(store, subject, kind, fields);
+                    }
+                    // Replies to a pre-drain outgoing message remain eligible during draining.
+                    roster_fixture_message_claim(store, &format!("message/roster-draining-parent-{agent}"),
+                        subject, "sent", json!({"status":"sent","from":subject,"to":"person/test",
+                            "content":"Fixture question."}));
+                }
+            }
+        }
+        for (agent, subject) in subjects.iter().enumerate() {
+            let incarnation = format!("roster-draining-incarnation-{agent}");
+            let selected = store.rollout_selection(subject).unwrap().unwrap();
+            assert!(selected.manual);
+            let (_, old) = crate::rollout::launched_member(store, subject, &incarnation)
+                .unwrap().unwrap();
+            store.request_rollout(subject, &selected.desired_token, &old, &incarnation,
+                "person/test", &crate::rollout::Policy::when_idle(1_800_000, false),
+                &format!("roster-draining-request-{agent}")).unwrap();
+            assert_eq!(store.rollout(subject).unwrap().unwrap().phase, "draining");
+        }
+        subjects
+    }
+
+    fn roster_fixture_pending_delivery(cards: &[Value], subject: &str) -> bool {
+        let card = cards.iter().find(|card| card["id"] == subject).unwrap();
+        assert_eq!(card["rollout"]["phase"], "draining");
+        assert!(!card["todo"].is_null());
+        assert!(!card["usage"].is_null());
+        card["rollout"]["blocking"].as_array().unwrap().iter()
+            .any(|blocker| blocker == "pending-delivery")
+    }
+
+    fn roster_fixture_checked_messages(
+        fixture: &RosterClaimsFixture, subjects: &[String], pending: bool,
+    ) {
+        let store = &fixture.store;
+        let index = store.index().unwrap();
+        for history in [false, true] {
+            let mut cold = client_agent_resources_uncached(store, history, index).unwrap();
+            add_agent_todos(store, &mut cold, index).unwrap();
+            for subject in subjects {
+                assert_eq!(roster_fixture_pending_delivery(&cold, subject), pending);
+            }
+            let selected = subjects.iter().cloned().collect::<BTreeSet<_>>();
+            let cached_selected = store.cached_agent_resources_for(index, history, Some(&selected), |changed| {
+                let mut cards = client_agent_resources_selected(store, history, index, changed)?;
+                add_agent_todos(store, &mut cards, index)?;
+                Ok(cards)
+            }).unwrap();
+            let expected = cold.iter().filter(|card|
+                selected.contains(card["id"].as_str().unwrap())).cloned().collect::<Vec<_>>();
+            assert_eq!(cached_selected, expected, "selected history={history}");
+            let cached = client_agent_resources_cached(store, history, index).unwrap();
+            assert_eq!(cached, cold, "full history={history}");
+        }
+    }
+
+    #[test]
+    fn agent_roster_draining_message_read_and_closed_match_cold_json() {
+        let _clock = RosterFixtureClock::at(1_900_000_000_000);
+        for initial_status in ["sent", "staged", "delivered"] {
+            for terminal_status in ["read", "closed"] {
+                let fixture = roster_claims_fixture();
+                let subjects = roster_fixture_draining_seats(&fixture);
+                for (agent, subject) in subjects.iter().enumerate() {
+                    let message = format!("message/roster-draining-reply-{agent}");
+                    roster_fixture_message_claim(&fixture.store, &message, "person/test", "sent",
+                        json!({"status":"sent","from":"person/test","to":subject,"content":"Fixture reply.",
+                            "in_reply_to":format!("message/roster-draining-parent-{agent}")}));
+                    if initial_status != "sent" {
+                        roster_fixture_message_receipt(&fixture.store, &message, "staged");
+                    }
+                    if initial_status == "delivered" {
+                        roster_fixture_message_receipt(&fixture.store, &message, "delivered");
+                    }
+                }
+                // Warm selected and full caches with the actual pending-delivery blocker.
+                roster_fixture_checked_messages(&fixture, &subjects, true);
+                for agent in 0..subjects.len() {
+                    let message = format!("message/roster-draining-reply-{agent}");
+                    if initial_status != "delivered" {
+                        roster_fixture_message_receipt(&fixture.store, &message, "delivered");
+                    }
+                    roster_fixture_message_receipt(&fixture.store, &message, "read");
+                    if terminal_status == "closed" {
+                        roster_fixture_message_receipt(&fixture.store, &message, "closed");
+                    }
+                    assert_eq!(fixture.store.message(&message).unwrap().unwrap().status, terminal_status);
+                }
+                roster_fixture_checked_messages(&fixture, &subjects, false);
+            }
+        }
+    }
+
+    #[test]
+    fn agent_roster_draining_message_staged_and_delivered_match_cold_json() {
+        let _clock = RosterFixtureClock::at(1_900_000_000_000);
+        for receipt in ["staged", "delivered"] {
+            let fixture = roster_claims_fixture();
+            let subjects = roster_fixture_draining_seats(&fixture);
+            for (agent, subject) in subjects.iter().enumerate() {
+                roster_fixture_message_claim(&fixture.store, &format!("message/roster-held-{agent}"),
+                    "person/test", "sent", json!({"status":"sent","from":"person/test","to":subject,
+                        "content":"Independent held message."}));
+            }
+            // Independent sent messages are held; a receipt makes them drain blockers.
+            roster_fixture_checked_messages(&fixture, &subjects, false);
+            for agent in 0..subjects.len() {
+                roster_fixture_message_receipt(&fixture.store,
+                    &format!("message/roster-held-{agent}"), receipt);
+            }
+            roster_fixture_checked_messages(&fixture, &subjects, true);
+        }
     }
 
     fn roster_fixture_todo(agent: usize, revision: usize) -> Value {
@@ -21984,7 +22177,7 @@ mission "wake" state="ready" {
             }
         }
         roster_fixture_apply(&store, &intent, "roster-claims-owners");
-        let fixture = RosterClaimsFixture { store, intent, subjects, runs };
+        let fixture = RosterClaimsFixture { store, intent, subjects, draining_subjects: Vec::new(), runs };
         for agent in (0..60).step_by(2) {
             roster_fixture_work(&fixture, agent, "claim", &format!("roster-initial-claim-{agent}"));
         }
@@ -22092,7 +22285,7 @@ mission "wake" state="ready" {
                 // Probe two disjoint pages before the complete roster: selected cache coverage
                 // must grow without leaking other rows or seeding frozen pagination metadata.
                 for remainder in [turn % 3, (turn + 1) % 3] {
-                    let selected = fixture.subjects.iter().enumerate()
+                    let selected = fixture.subjects.iter().chain(&fixture.draining_subjects).enumerate()
                         .filter(|(agent, _)| agent % 3 == remainder)
                         .map(|(_, subject)| subject.clone()).collect::<BTreeSet<_>>();
                     let cached = store.cached_agent_resources_for(index, history, Some(&selected), |changed| {
@@ -22130,6 +22323,7 @@ mission "wake" state="ready" {
         fn agent_roster_seeded_claim_sequences_match_cold_json(seed in 1u64..u64::MAX) {
             let _clock = RosterFixtureClock::at(1_900_000_000_000);
             let mut fixture = roster_claims_fixture();
+            fixture.draining_subjects = roster_fixture_draining_seats(&fixture);
             let initial = fixture.store.index().unwrap();
             roster_fixture_checked_cut(&fixture, initial, seed, 0);
             let mut random = seed;
@@ -22138,7 +22332,7 @@ mission "wake" state="ready" {
             for round in 0..2 {
                 // Shuffle a complete operation deck, rather than relying on chance to cover
                 // a dependency. The seed chooses order, subjects and selected-page coverage.
-                let mut operations = (0..23).collect::<Vec<_>>();
+                let mut operations = (0..27).collect::<Vec<_>>();
                 for position in (1..operations.len()).rev() {
                     let swap = (roster_fixture_random(&mut random) % (position + 1) as u64) as usize;
                     operations.swap(position, swap);
@@ -22262,6 +22456,29 @@ mission "wake" state="ready" {
                                 json!(smallclaims::store::now_ms() as u64));
                             store.append_claim(&timeline).unwrap();
                         }
+                        23..=26 => {
+                            let draining_agent = (roster_fixture_random(&mut random)
+                                % fixture.draining_subjects.len() as u64) as usize;
+                            let recipient = &fixture.draining_subjects[draining_agent];
+                            let message = format!("message/{key}-lifecycle");
+                            roster_fixture_message_claim(store, &message, "person/test", "sent",
+                                json!({"status":"sent","from":"person/test","to":recipient,
+                                    "content":format!("Fixture lifecycle {turn}"),
+                                    "in_reply_to":format!("message/roster-draining-parent-{draining_agent}")}));
+                            let receipts = ["staged", "delivered", "read", "closed"];
+                            let target = operation - 23;
+                            // Establish a schema-valid predecessor for this deck operation.
+                            for receipt in &receipts[..target] {
+                                roster_fixture_message_receipt(store, &message, receipt);
+                            }
+                            roster_fixture_checked_cut(&fixture, store.index().unwrap(), seed, turn);
+                            // Compare the target transition and its remaining lifecycle separately:
+                            // no later message can mask an earlier stale pending-delivery card.
+                            for receipt in &receipts[target..] {
+                                roster_fixture_message_receipt(store, &message, receipt);
+                                roster_fixture_checked_cut(&fixture, store.index().unwrap(), seed, turn);
+                            }
+                        }
                         _ => unreachable!(),
                     }
                     turn += 1;
@@ -22273,7 +22490,7 @@ mission "wake" state="ready" {
                     }
                 }
             }
-            assert_eq!(exercised.len(), 23);
+            assert_eq!(exercised.len(), 27);
             let cards = checked_agent_cache(&fixture.store, true, fixture.store.index().unwrap());
             assert!(cards.iter().any(|card| !card["todo"].is_null()),
                 "fixture must compare actual todo snapshots, not absent fields");
