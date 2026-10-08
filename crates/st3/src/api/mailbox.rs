@@ -476,7 +476,7 @@ async fn stream(state: AppState, fence: Fence, socket: WebSocket, peer: NativeDe
         timer.tick().await;
         Some(((), timer))
     });
-    let stream = stream_with_timers_inner(state.clone(), fence.clone(), socket, raw_snapshot, safety, heartbeat, native.then(|| peer.clone()));
+    let stream = stream_with_timers_inner(state.clone(), fence.clone(), socket, raw_snapshot, safety, heartbeat, StreamControl::new(native.then(|| peer.clone())));
     #[cfg(not(feature = "test-support"))]
     stream.await;
     #[cfg(feature = "test-support")]
@@ -564,17 +564,37 @@ async fn stream_with_timers<F, S, H>(
     S: futures_util::Stream<Item = ()> + Send + 'static,
     H: futures_util::Stream<Item = ()> + Send + 'static,
 {
-    stream_with_timers_inner(state, fence, socket, read, safety, heartbeat, None).await;
+    stream_with_timers_inner(state, fence, socket, read, safety, heartbeat, StreamControl::new(None)).await;
+}
+
+struct StreamControl {
+    peer: Option<NativeDeliveryPeer>,
+    #[cfg(test)]
+    dirty_gate: Option<Arc<FixtureDirtyGate>>,
+}
+impl StreamControl {
+    fn new(peer: Option<NativeDeliveryPeer>) -> Self {
+        Self { peer, #[cfg(test)] dirty_gate: None }
+    }
+}
+
+// Unit controls can pause snapshot processing while the real subscription and
+// incoming-report handler remain live. Installed servers never have this gate.
+#[cfg(test)]
+struct FixtureDirtyGate {
+    allowed: std::sync::atomic::AtomicBool,
+    notifications: std::sync::atomic::AtomicUsize,
 }
 
 async fn stream_with_timers_inner<F, S, H>(
     state: AppState, fence: Fence, mut socket: WebSocket, read: F, safety: S, heartbeat: H,
-    peer: Option<NativeDeliveryPeer>,
+    control: StreamControl,
 ) where
     F: Fn(&Store, &Fence) -> anyhow::Result<Snapshot> + Clone + Send + 'static,
     S: futures_util::Stream<Item = ()> + Send + 'static,
     H: futures_util::Stream<Item = ()> + Send + 'static,
 {
+    let peer = control.peer;
     futures_util::pin_mut!(safety, heartbeat);
     let since = client_now_ms();
     let through = match state.store.index() {
@@ -596,7 +616,12 @@ async fn stream_with_timers_inner<F, S, H>(
     let mut dirty = true;
     let mut last: Option<(crate::store::MailboxWatermark, Snapshot)> = None;
     loop {
-        if dirty {
+        #[cfg(test)]
+        let process_dirty = control.dirty_gate.as_ref().is_none_or(|gate|
+            gate.allowed.load(std::sync::atomic::Ordering::SeqCst));
+        #[cfg(not(test))]
+        let process_dirty = true;
+        if dirty && process_dirty {
             // A later close notification may record another loss after this connection's
             // first proof. Durable wakes (and the bounded safety heartbeat) let its current
             // consumed nonce repair that episode too, without reoffering native work.
@@ -740,7 +765,14 @@ async fn stream_with_timers_inner<F, S, H>(
             dirty = false;
         }
         tokio::select! {
-            event = subscription.changed.changed() => { if event.is_err() { return; } dirty = true; },
+            event = subscription.changed.changed() => {
+                if event.is_err() { return; }
+                #[cfg(test)]
+                if let Some(gate) = &control.dirty_gate {
+                    gate.notifications.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                dirty = true;
+            },
             tick = safety.next() => { if tick.is_none() { return; } dirty = true; },
             incoming = socket.recv() => match incoming {
                 Some(Ok(WsMessage::Text(report))) => {
@@ -2019,6 +2051,7 @@ mod tests {
     }
 
     struct ControlledStream {
+        dirty_gate: Arc<FixtureDirtyGate>,
         socket: tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>,
         recheck: tokio::sync::mpsc::UnboundedSender<()>,
         heartbeat: tokio::sync::mpsc::UnboundedSender<()>,
@@ -2038,6 +2071,11 @@ mod tests {
         let heartbeats = Arc::new(std::sync::Mutex::new(Some(heartbeats)));
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counted = reads.clone();
+        let dirty_gate = Arc::new(FixtureDirtyGate {
+            allowed: std::sync::atomic::AtomicBool::new(true),
+            notifications: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let fixture_gate = dirty_gate.clone();
         let app = Router::new()
             .route(
                 "/v1/mailbox",
@@ -2048,6 +2086,7 @@ mod tests {
                         let receiver = receiver.lock().unwrap().take().unwrap();
                         let heartbeats = heartbeats.lock().unwrap().take().unwrap();
                         let counted = counted.clone();
+                        let fixture_gate = fixture_gate.clone();
                         async move {
                             websocket.on_upgrade(move |socket| {
                                 let ticks = futures_util::stream::unfold(
@@ -2056,7 +2095,7 @@ mod tests {
                                         receiver.recv().await.map(|()| ((), receiver))
                                     },
                                 );
-                                stream_with_timers(
+                                stream_with_timers_inner(
                                     state,
                                     fence,
                                     socket,
@@ -2071,6 +2110,7 @@ mod tests {
                                             receiver.recv().await.map(|()| ((), receiver))
                                         },
                                     ),
+                                    StreamControl { peer: None, dirty_gate: Some(fixture_gate) },
                                 )
                             })
                         }
@@ -2097,6 +2137,7 @@ mod tests {
         if matches!(initial, Frame::Seat { .. }) { initial = next(&mut socket).await; }
         assert!(matches!(initial, Frame::Mailbox { messages } if messages.is_empty()));
         ControlledStream {
+            dirty_gate,
             socket,
             recheck,
             heartbeat,
@@ -2107,6 +2148,16 @@ mod tests {
 
     #[tokio::test]
     async fn argv_bound_stream_refuses_changed_declaration_reads_and_reports() {
+        argv_changed_stream_control(true).await;
+    }
+
+    #[tokio::test]
+    async fn argv_desired_change_wakes_and_fences_bound_stream() {
+        argv_changed_stream_control(false).await;
+    }
+
+    async fn argv_changed_stream_control(hold_dirty: bool) {
+        use std::sync::atomic::Ordering::SeqCst;
         for change in ["stop", "host", "native", "argv"] {
             let root = tempfile::tempdir().unwrap();
             let mut state = super::super::tests::state(root.path());
@@ -2136,10 +2187,13 @@ mod tests {
                 assert!(tokio::time::Instant::now()<deadline,"unchanged argv report was not admitted");
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            // Hold both fixture timers and remove only this fixture's wake route.
-            // The incoming report must recheck authority without a reconnect or
-            // runtime reconciler/snapshot notification doing it first.
-            state.store.miss_mailbox_owner_for_test(&subject,"delivery");
+            stream.socket.send(Message::Ping(vec![0].into())).await.unwrap();
+            expect_pong(&mut stream.socket, &[0]).await;
+            let notifications = stream.dirty_gate.notifications.load(SeqCst);
+            let reads = stream.reads.load(SeqCst);
+            // Keep every wake route intact, but hold dirty processing so neither
+            // subject/owner notifications nor a resync/timer can rescue this check.
+            stream.dirty_gate.allowed.store(!hold_dirty, SeqCst);
             let replacement = match change {
                 "stop" => format!("version 2\nstop {subject:?}"),
                 "host" => format!("version 2\nagent {name:?} {{ host \"other\"; workspace \"/tmp\"; argv \"python3\" \"probe\"; }}"),
@@ -2151,19 +2205,36 @@ mod tests {
             state.store.apply_internal(&intent,"argv-stream-changed").unwrap();
             assert_eq!(state.store.latest_claim(&subject,Some("runtime.observed")).unwrap().unwrap().id,runtime.id);
             assert!(raw_snapshot(&state.store,&fence).is_err());
+            if !hold_dirty {
+                assert!(matches!(next(&mut stream.socket).await, Frame::Fenced { .. }));
+                continue;
+            }
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while stream.dirty_gate.notifications.load(SeqCst) == notifications {
+                    tokio::task::yield_now().await;
+                }
+            }).await.expect("healthy desired-change dispatcher did not reach the stream");
+            stream.recheck.send(()).unwrap();
+            stream.heartbeat.send(()).unwrap();
             stream.socket.send(report("must-not-be-recorded")).await.unwrap();
             stream.socket.send(Message::Ping(vec![1].into())).await.unwrap();
-            tokio::time::timeout(Duration::from_secs(2),async {
-                loop {
-                    let frame=stream.socket.next().await.unwrap().unwrap();
-                    if matches!(frame,Message::Pong(_)) { break; }
-                    if let Message::Text(raw)=frame
-                        && matches!(serde_json::from_str::<Frame>(&raw),Ok(Frame::Fenced { .. })) { break; }
-                }
-            }).await.expect("report processing was not observed");
+            expect_pong(&mut stream.socket, &[1]).await;
+            assert_eq!(stream.reads.load(SeqCst), reads, "dirty snapshot processing must remain held");
             assert_eq!(delivery_presence::assess_current(&subject,"omp",Some("current")).reason.as_deref(),Some(original.as_str()));
             assert!(state.store.mailbox_lease_authority(&fence).unwrap().is_none());
         }
+    }
+
+    async fn expect_pong(socket: &mut tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>, payload: &[u8]) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match socket.next().await.expect("stream closed before report acknowledgement").unwrap() {
+                    Message::Pong(bytes) if bytes.as_ref() == payload => return,
+                    Message::Ping(_) | Message::Pong(_) => {},
+                    other => panic!("expected post-report Pong, received {other:?}"),
+                }
+            }
+        }).await.expect("report processing was not observed");
     }
 
     #[tokio::test]
