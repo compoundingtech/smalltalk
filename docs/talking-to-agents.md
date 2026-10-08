@@ -16,7 +16,11 @@ Enter the returned pairing ID and code in the app with your paired-only gateway 
 
 Large native tool output is a preview, not the complete result. In stui, use
 **Ctrl+Up/Down** to focus a tool or image and **Ctrl+Enter** to expand or collapse tool
-output; **Ctrl+U**, outside the composer, loads or hides its native images inline
+output. **o** in the classic view, or **Ctrl+E** in glasses, expands all tool rows and
+loads visible clipped output one value at a time. Scrolling another clipped row into
+view loads it next; offscreen rows are not prefetched. Already loaded rows stay in
+memory when scrolled away, until collapsed. Restoring saved expansion state does not
+start loading. **Ctrl+U**, outside the composer, loads or hides native images inline
 using the terminal's image renderer. **Ctrl+O** keeps its pane-zoom action. On the phone,
 **Show all** loads the clipped result and **Show less** collapses it; **Load image**
 displays the fetched image inline. Image media type and byte size

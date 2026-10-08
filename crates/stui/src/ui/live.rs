@@ -384,6 +384,8 @@ pub fn run(context: Context) -> Result<()> {
     // one was on screen keeps it followed.
     let mut missions_sent = false;
     let mut missions_until: Option<Instant> = None;
+    let mut content_reads = super::content::Reads::default();
+    let mut repositories_asked: Option<String> = None;
     // When usage was last asked for and over how many hours, and whether that read is out.
     let mut usage_read: Option<(Instant, u64)> = None;
     // When the connected clients were last read, while the fleet shows, and whether a read is out.
@@ -613,6 +615,7 @@ pub fn run(context: Context) -> Result<()> {
         while let Ok(result) = fetched.try_recv() {
             match result {
                 Fetched::Content(key, result) => {
+                    content_reads.complete(&key);
                     ui.content.complete(key, result);
                 }
                 Fetched::Read(id, result) => {
@@ -1047,12 +1050,7 @@ pub fn run(context: Context) -> Result<()> {
             ui.note_acted(&effect);
             match effect {
                 Effect::LoadContent(key) => {
-                    let client = client.clone();
-                    let tx = fetched_tx.clone();
-                    runtime.spawn(async move {
-                        let result = super::content::fetch(&client, &key).await;
-                        let _ = tx.send(Fetched::Content(key, result));
-                    });
+                    content_reads.enqueue(key);
                 }
                 Effect::OpenTerminal { agent } => {
                     // The PTY session's own bytes, through st's raw stream to whichever host owns
@@ -1356,6 +1354,16 @@ pub fn run(context: Context) -> Result<()> {
         })?;
         if hyperlinks && !links.is_empty() {
             super::hyperlinks::write_links(terminal.backend_mut(), &links)?;
+        }
+        if extras.live
+            && let Some(key) = ui.next_content_read(&mut content_reads)
+        {
+            let client = client.clone();
+            let tx = fetched_tx.clone();
+            runtime.spawn(async move {
+                let result = super::content::fetch(&client, &key).await;
+                let _ = tx.send(Fetched::Content(key, result));
+            });
         }
         // The attached terminal's cursor shape (vim's bar while inserting), and the person's
         // own shape back once it is gone.
