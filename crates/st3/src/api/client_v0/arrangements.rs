@@ -330,7 +330,7 @@ mod tests {
             {"op":"create","name":"Sidebar"},
             {"op":"subject.place","subject":"agent/missing/seat","folder":null,"key":"a0"}
         ]));
-        action(State(state.clone()), Extension(new_client_snapshot(&state)),
+        let _ = action(State(state.clone()), Extension(new_client_snapshot(&state)),
             Extension(session.clone()), Json(creation)).await.unwrap();
         let migration = request(&state, "migration-cutover", json!([{"op":"membership.migrate"}]));
         let first = action(State(state.clone()), Extension(new_client_snapshot(&state)),
@@ -349,7 +349,7 @@ mod tests {
             Extension(session), Json(request(&state, "migration-old-write", json!([
                 {"op":"subject.place","subject":"agent/missing/seat","folder":null,"key":"a9"}
             ])))).await.unwrap_err();
-        assert_eq!(error.code, st3_client::ErrorCode::InvalidArrangementOperations);
+        assert_eq!(error.code, "invalid-arrangement-operations");
         assert_eq!(state.store.index().unwrap(), index);
     }
 
