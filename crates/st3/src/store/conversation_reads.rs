@@ -13,6 +13,7 @@ pub(super) type Owners = BTreeMap<String, Owner>;
 
 #[cfg(test)]
 thread_local! {
+    static BEFORE_OWNER_PUBLISH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static BEFORE_MESSAGE_DECODE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
@@ -22,7 +23,7 @@ impl Store {
     /// native transcript I/O, display preparation, or a long-poll wait.
     pub(crate) fn conversation_owners_at(&self, through: u64) -> Result<Arc<Owners>> {
         selected_index(self.index()?, Some(through)).map_err(anyhow::Error::new)?;
-        let previous = {
+        let (generation, previous) = {
             let cache = self
                 .smalltalk
                 .conversation_owners
@@ -31,17 +32,23 @@ impl Store {
             if let Some((_, owners)) = cache.iter().find(|(at, _)| *at == through) {
                 return Ok(Arc::clone(owners));
             }
-            cache
+            let previous = cache
                 .iter()
                 .filter(|(at, _)| *at < through)
                 .max_by_key(|(at, _)| *at)
-                .map(|(at, owners)| (*at, Arc::clone(owners)))
+                .map(|(at, owners)| (*at, Arc::clone(owners)));
+            (
+                self.smalltalk
+                    .conversation_owner_generation
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                previous,
+            )
         };
         // Harness reports do not change a runtime identity. Copy only small metadata while the
         // SELECT is live. Rebuild a large catch-up instead of retaining an unbounded delta.
         let changed = previous
             .as_ref()
-            .map(|(after, _)| -> Result<_> {
+            .map(|(after, owners)| -> Result<_> {
                 let connection = self.readers.get();
                 let rows = connection
                     .prepare_cached(
@@ -56,13 +63,14 @@ impl Store {
                     rows.into_iter()
                         .filter(|(name, kind)| {
                             name.starts_with("agent/")
-                                && !kind.starts_with("harness.")
-                                && !matches!(
-                                    kind.as_str(),
-                                    "intent.desired"
-                                        | "runtime.readiness-deadline-reached"
-                                        | "reconcile.fault"
-                                )
+                                && (!owners.contains_key(name)
+                                    || (!kind.starts_with("harness.")
+                                        && !matches!(
+                                            kind.as_str(),
+                                            "intent.desired"
+                                                | "runtime.readiness-deadline-reached"
+                                                | "reconcile.fault"
+                                        )))
                         })
                         .map(|(name, _)| name)
                         .collect::<BTreeSet<_>>()
@@ -133,11 +141,27 @@ impl Store {
             );
         }
         let owners = Arc::new(owners);
+        #[cfg(test)]
+        BEFORE_OWNER_PUBLISH.with(|pause| {
+            if let Some(pause) = pause.borrow_mut().take() {
+                pause();
+            }
+        });
         let mut cache = self
             .smalltalk
             .conversation_owners
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        // A repair may have cleared the cache while this build released its SQL readers.
+        // The generation is changed under this same lock, so an older build cannot republish.
+        if self
+            .smalltalk
+            .conversation_owner_generation
+            .load(std::sync::atomic::Ordering::Relaxed)
+            != generation
+        {
+            return Ok(owners);
+        }
         if let Some((_, published)) = cache.iter().find(|(at, _)| *at == through) {
             return Ok(Arc::clone(published));
         }
@@ -420,6 +444,99 @@ mod tests {
             *store.conversation_owners_at(nulled).unwrap(),
             oracle(&store, nulled)
         );
+    }
+
+    #[test]
+    fn conversation_owner_new_declarations_and_harness_only_agents_match_cold_reads() {
+        let store = Store::open_memory("node").unwrap();
+        append(
+            &store,
+            "agent/alder",
+            "runtime.observed",
+            json!({"status":"running","incarnation_id":"first","runtime_id":"pty"}),
+        );
+        store
+            .conversation_owners_at(store.index().unwrap())
+            .unwrap();
+        store
+            .connection
+            .batched(|tx| -> Result<()> {
+                append_claim_tx(
+                    tx,
+                    "node",
+                    "agent/birch",
+                    "intent.desired",
+                    None,
+                    &json!({"subject":"agent/birch","kind":"agent","desired":{}}),
+                    &[],
+                    None,
+                )?;
+                append_claim_tx(
+                    tx,
+                    "node",
+                    "agent/cedar",
+                    "harness.observed",
+                    None,
+                    &json!({"fields":{"state":"idle"}}),
+                    &[],
+                    None,
+                )?;
+                Ok(())
+            })
+            .unwrap()
+            .unwrap();
+        let frontier = store.index().unwrap();
+        let warm = store.conversation_owners_at(frontier).unwrap();
+        assert!(warm.contains_key("agent/birch"));
+        assert!(warm.contains_key("agent/cedar"));
+        assert_eq!(*warm, oracle(&store, frontier));
+        store.forget_current_views();
+        let cold = store.conversation_owners_at(frontier).unwrap();
+        assert_eq!(*warm, *cold);
+    }
+
+    #[test]
+    fn conversation_owner_build_before_repair_cannot_repopulate_the_cleared_cache() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        append(
+            &store,
+            "agent/alder",
+            "runtime.observed",
+            json!({"status":"running","incarnation_id":"first","runtime_id":"pty"}),
+        );
+        let frontier = store.index().unwrap();
+        let (ready_send, ready) = std::sync::mpsc::channel();
+        let (resume_send, resume) = std::sync::mpsc::channel();
+        let reader = store.clone();
+        let worker = std::thread::spawn(move || {
+            BEFORE_OWNER_PUBLISH.with(|pause| {
+                *pause.borrow_mut() = Some(Box::new(move || {
+                    ready_send.send(()).unwrap();
+                    resume
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .unwrap();
+                }));
+            });
+            reader.conversation_owners_at(frontier).unwrap()
+        });
+        ready
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        store.forget_current_views();
+        resume_send.send(()).unwrap();
+        let result = worker.join().unwrap();
+        assert!(
+            store
+                .smalltalk
+                .conversation_owners
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "an in-flight build republished a pre-repair cache entry"
+        );
+        assert_eq!(*result, oracle(&store, frontier));
+        assert_eq!(*store.conversation_owners_at(frontier).unwrap(), *result);
+        assert_eq!(store.smalltalk.conversation_owners.lock().unwrap().len(), 1);
     }
 
     #[test]

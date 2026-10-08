@@ -393,8 +393,12 @@ claim frontiers. A changed read folds only agents whose actual-state claims chan
 harness-only and unrelated commits do not repeat agent status/history reductions.
 Catch-up copies at most 4,097 small subject/kind rows before releasing the statement;
 a gap beyond 4,096 rebuilds the identity map. The map contains routing metadata,
-not conversation bytes. Mixed origins and other actual kinds retain the existing
-canonical identity reduction for that agent. This is not a history-independent
+not conversation bytes. A newly seen agent enters the map even when its first
+claim is only a declaration or harness report, so warm and cold reads agree that
+it exists without a current session. Projection repair/trim advances a generation
+under the cache lock; a build started before that reset cannot republish its result.
+Mixed origins and other actual kinds retain the existing canonical identity
+reduction for that agent. This is not a history-independent
 cold-read proof or a replacement for the shared incremental read-model mechanism.
 
 Message reads preserve the newest 10,000 fleet-send window, but existing endpoint

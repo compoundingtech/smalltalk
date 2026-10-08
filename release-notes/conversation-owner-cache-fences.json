@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Keep warm conversation owner lookup consistent for newly seen agents and fence cache publication across projection repair",
+  "replay": {
+    "status": "none",
+    "detail": "No replay or change to retained claims or conversations."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Only volatile routing metadata changes; no new database index, table or schema version."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No claim kind, checkpoint rule, digest or retention change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "A warm lookup of an agent with only a declaration or harness report now returns the existing no-current-session response, matching cold lookup, instead of incorrectly reporting that the agent does not exist. No client contract or generated file changes."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Normal rolling deployment applies; no additional startup migration or rebuild beyond the existing volatile cache."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No operator or user action required."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "A projection repair or trim clears the volatile owner cache and invalidates publication by an earlier in-flight build, so later reads rebuild routing metadata from the repaired claims."
+  }
+}
