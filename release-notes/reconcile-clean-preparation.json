@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Skip unchanged reconciliation preparation and retain faults until work is evaluated",
+  "replay": {
+    "status": "none",
+    "detail": "No replay, migration or rebuild."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No graph or database schema change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Admission, canonical ordering and checkpoint rules are unchanged."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "An entirely unevaluated member and wake no longer publish member-recovered for a retained fault. Actual evaluated member or wake results still publish through the fresh captured-declaration authority fence. Profile spans add sql_count and reconciliation trigger classes."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "None beyond the normal daemon binary replacement."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "None."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "Unchanged local members skip workspace preparation until dependencies change, a deadline is due, runtime availability changes or the 60-second safety pass runs. Known render failures remain eligible. Actual member failures survive clean wake skips; actual success recovers only with current authority. Each effect guard reuses receipt rows within its own coherent read snapshot and preserves rejection and storage-error behavior."
+  }
+}
