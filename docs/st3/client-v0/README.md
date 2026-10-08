@@ -32,6 +32,9 @@ The collections socket's `CollectionCommand` and `CollectionFrame` definitions l
 schema as HTTP resources. The operation manifest's `streams` section names its route, protocol,
 command/frame definitions, and subscription bound; see [collections](collections.md).
 
+Proposed frame-level tracing: [Trace context on subscribe and command frames](trace-frame-context-design.md)
+(design question for Nathan; not part of the implemented wire contract).
+
 ### Mission run timing
 
 `GET /v1/client/missions/{id}` requires `read.projections`, like other projection reads.
