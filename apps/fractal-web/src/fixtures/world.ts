@@ -89,10 +89,10 @@ export interface WorldPerson {
 }
 
 /** The human operator who owns the fleet and answers escalations. */
-export const operator: WorldPerson = { ref: 'person/sam', name: 'Sam Okafor', handle: 'sokafor' }
+export const operator: WorldPerson = { ref: 'person/operator', name: 'Sam Okafor', handle: 'sokafor' }
 /** A second reviewer on pull requests. */
 export const reviewer: WorldPerson = {
-  ref: 'person/priya',
+  ref: 'person/reviewer',
   name: 'Priya Natarajan',
   handle: 'pnatarajan',
 }
