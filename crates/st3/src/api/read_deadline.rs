@@ -743,8 +743,10 @@ mod tests {
             Duration::from_secs(5), app.oneshot(request(Method::GET, "/v1/probe")),
         ).await;
         state.store.append_claim(&crate::model::ClaimInput {
-            subject: "custom/admission".into(), kind: "custom.test.recorded".into(), actor: None,
-            fields: std::collections::BTreeMap::new(), evidence: Vec::new(),
+            subject: "agent/admission-wake".into(), kind: "runtime.observed".into(), actor: None,
+            fields: serde_json::from_value(json!({
+                "status": "running", "runtime_id": "admission-wake", "incarnation_id": "one",
+            })).unwrap(), evidence: Vec::new(),
             expected_subject: None, idempotency_key: None,
         }).unwrap();
         super::super::signal_visible_change(&state);

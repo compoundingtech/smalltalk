@@ -10719,15 +10719,15 @@ mod tests {
             semaphore.clone().acquire_owned().await.unwrap(), windows.clone()).await.unwrap();
         // Saturate the single reader slot from a plain thread, as an escaped long reader would.
         let (release, held) = std::sync::mpsc::channel::<()>();
+        let (entered, started) = std::sync::mpsc::channel::<()>();
         let holder_store = state.store.clone();
         let holder = std::thread::spawn(move || {
             holder_store.readers.request_read(|| {
+                entered.send(()).unwrap();
                 held.recv_timeout(std::time::Duration::from_secs(30)).ok();
             })
         });
-        while state.store.readers.usage().open == 0 {
-            tokio::task::yield_now().await;
-        }
+        started.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
         assert!(state.store.readers.try_admit_read().is_none(),
             "the holder owns the only reader slot");
         let task_state = state.clone();

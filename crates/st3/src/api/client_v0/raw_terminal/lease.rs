@@ -742,15 +742,15 @@ mod tests {
         let sibling = acquire(&state, &session);
         let store = state.store.clone();
         let (release, held) = std::sync::mpsc::channel::<()>();
+        let (entered, started) = std::sync::mpsc::channel::<()>();
         let holder_store = store.clone();
         let holder = std::thread::spawn(move || {
             holder_store.readers.request_read(|| {
+                entered.send(()).unwrap();
                 held.recv_timeout(std::time::Duration::from_secs(30)).ok();
             })
         });
-        while store.readers.usage().open == 0 {
-            tokio::task::yield_now().await;
-        }
+        started.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
         assert!(
             store.readers.try_admit_read().is_none(),
             "the holder owns the only admission slot"
