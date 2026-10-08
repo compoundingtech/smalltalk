@@ -444,7 +444,12 @@ impl Service {
             "source gap requires explicit fresh namespace recovery"
         );
         if store.replication_projection_deferred() {
-            return Ok(false);
+            // Opted-in rows bypass the legacy reads that can finish deferred projection.
+            // Run the actual native projector, honoring its catch-up interval; its successful
+            // commit is still only one prerequisite of complete namespace publication.
+            return Ok(store
+                .project_replication_backlog_unless_catching_up()?
+                .unwrap_or(false));
         }
         let recovering = *self
             .recovery
@@ -613,6 +618,32 @@ impl Service {
             .get(job)
             .cloned()
             .context("staging identity not observed; restart requires fresh qualified namespace")
+    }
+    #[cfg(test)]
+    pub(crate) fn diagnostic(&self, store: &Store) -> Result<String> {
+        let job = self
+            .job
+            .lock()
+            .map_err(|_| anyhow::anyhow!("source job lock poisoned"))?
+            .clone();
+        store.read_snapshot(|_| {
+            let c = store.readers.get();
+            let namespace = match &job {
+                Some(job) => self.handle(job),
+                None => self.installer.root(&c, cards::VIEW).map(|r| r.namespace),
+            };
+            Ok(format!(
+                "deferred={}, cut={:?}, namespace={:?}, footprint={:?}",
+                store.replication_projection_deferred(),
+                self.current_cut(&c, store),
+                namespace.as_ref().map(Namespace::as_str),
+                namespace
+                    .as_ref()
+                    .ok()
+                    .map(|ns| kernel::footprint(&c, ns, &self.receiver)
+                        .map(|f| (f.files.len(), f.earliest_monotonic_deadline)))
+            ))
+        })
     }
     fn tick(&self, store: &Store, reason: clock::Reason) -> Result<()> {
         store
@@ -884,10 +915,62 @@ mod tests {
         let service = store.smalltalk.ivm_agent_service.get().unwrap();
         let job = service.job.lock().unwrap().clone();
         panic!(
-            "source did not close: job={:?}, capture={:?}",
+            "source did not close: job={:?}, capture={:?}, {}",
             job.map(|job| service.installer.progress(&c, &job).unwrap()),
-            super::super::super::status(&c).unwrap()
+            super::super::super::status(&c).unwrap(),
+            service.diagnostic(store).unwrap(),
         );
+    }
+
+    #[test]
+    fn deferred_replica_projection_is_maintained_before_source_publication() {
+        let _lock = TEST_LOCK.blocking_lock();
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open_with_agent_collections(
+            &directory.path().join("deferred.sqlite"),
+            "receiver",
+        )
+        .unwrap();
+        settle(&store);
+        let sender = Store::open_memory("sender").unwrap();
+        let fleet = "fixture-agent-source";
+        sender.bind_fleet(fleet).unwrap();
+        store.bind_fleet(fleet).unwrap();
+        sender
+            .append_claim(&crate::model::ClaimInput {
+                subject: "agent/sender.amber".into(),
+                kind: "runtime.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([("status".into(), serde_json::json!("running"))]),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let exchange = sender
+            .export_replication_exchange(
+                fleet,
+                &smallclaims::store::ReplicationInventory::default(),
+            )
+            .unwrap();
+        store
+            .receive_replication_exchange("sender", fleet, &exchange)
+            .unwrap();
+        store.validate_replication_backlog().unwrap();
+        assert!(store.replication_projection_deferred());
+        assert!(
+            !store
+                .smalltalk
+                .ivm_agent_service
+                .get()
+                .unwrap()
+                .current_boundary(&store)
+                .unwrap()
+        );
+        // No native GET, direct projector call or frontier assignment drives this closure.
+        settle(&store);
+        assert!(!store.replication_projection_deferred());
+        assert_eq!(store.projected_through(), store.index().unwrap());
     }
 
     #[test]
