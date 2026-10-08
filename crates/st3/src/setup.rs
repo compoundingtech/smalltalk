@@ -164,6 +164,9 @@ pub async fn run(args: SetupArgs) -> Result<Config> {
     // Validate every answer before writing, including the persisted machine identity.
     merge_config(&path, &config)?;
     println!("Saved {}", path.display());
+    if let Some(kib) = crate::read_cache::override_kib() {
+        println!("Read cache: {kib} KiB per reader.");
+    }
     let current_exe = std::env::current_exe()?;
     let executable = if install {
         install_binaries(&current_exe)?
@@ -506,6 +509,9 @@ async fn start_daemon(
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
+    if let Some(kib) = crate::read_cache::override_kib() {
+        command.env("SMALLCLAIMS_READ_CACHE_KIB", kib.to_string());
+    }
     // SAFETY: setsid is async-signal-safe; no allocation or environment changes after fork.
     unsafe {
         command.pre_exec(|| {
