@@ -4446,6 +4446,7 @@ dependencies = [
  "st3-client",
  "st3-conversation-ui",
  "st3-schema",
+ "st3-ui-model",
  "tar",
  "tempfile",
  "tokio",
