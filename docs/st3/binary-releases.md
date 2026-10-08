@@ -10,9 +10,9 @@ last one (see [Daily releases](#daily-releases)). Each release contains:
 - One `.sha256` checksum per archive, combined `SHA256SUMS`, and `RELEASE.json` with the exact
   source commit, target, Rust compiler version, and PTY runtime revision.
 
-Each archive has `bin/st3`, `bin/st` (a relative symlink to `st3`), `bin/st3-migrate`,
-and `bin/pty`, plus `install.sh`, `install-macos.py`, `BUILD.json`, and this guide. PTY is built from the exact
-`flake.lock` runtime revision; this is distinct from the `pty-core` library dependency. These
+Each archive has `bin/st3`, `bin/st` (a relative symlink to `st3`), `bin/pty`, plus `install.sh`, `install-macos.py`, `BUILD.json`, and this guide. PTY is built from the exact
+`flake.lock` runtime revision; this is distinct from the `pty-core` library dependency. Linux builds link against glibc 2.35 with pinned Zig 0.15.2, so optional newer
+libc functions do not add GLIBC_2.39 requirements or loader noise. These
 archives need neither Nix nor Rust installed. Harness CLIs and their logins remain separate.
 
 ## Install or update
@@ -22,21 +22,28 @@ If a populated v0.3.4 store may have unsigned delegation grants, follow the
 keys first. A build containing prevention #1269 can sign preserved unsealed work; it retains
 signature warnings from already-sealed affected payloads.
 
-Choose a tag from the repository's Releases page, then download the archive for your machine
-and its `.sha256` file. For example, with GitHub CLI:
+Install the latest release with curl; neither GitHub CLI nor Rust is required:
 
 ```sh
-tag=v0.3.16 # example: choose a release and read its Upgrade impact first
-archive=smalltalk-x86_64-unknown-linux-gnu.tar.gz
-# On Apple Silicon: archive=smalltalk-aarch64-apple-darwin.tar.gz
-gh release download "$tag" --repo compoundingtech/smalltalk \
-  --pattern "$archive" --pattern "$archive.sha256"
-shasum -a 256 -c "$archive.sha256"
-tar -xzf "$archive"
-"./${archive%.tar.gz}/install.sh" --bin-dir "$HOME/.local/bin"
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/compoundingtech/smalltalk/main/install.sh | sh
 ```
 
-Put the chosen bin directory on `PATH`. The installer stages all four tools and the `st` link,
+The script detects Linux x86_64 or Apple Silicon macOS, downloads the archive and
+its SHA256 checksum, verifies it before installation, then runs `st`. It restores
+terminal input for the `curl | sh` form. To select an exact release or install
+without opening the interface:
+
+```sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/compoundingtech/smalltalk/main/install.sh -o install.sh
+sh install.sh --tag v0.3.18 --no-run
+```
+
+An extracted archive can also be installed with `./install.sh --bin-dir
+"$HOME/.local/bin"`; add `--quiet` to suppress installer notices. The archive's
+command payload is `st3`, the relative `st` link, and `pty`. The source migration
+tool remains available as the separate `st3-migrate` Cargo package.
+
+Put the chosen bin directory on `PATH`. The installer stages both tools and the `st` link,
 then replaces each by rename; existing processes retain their old executable. It does not restart
 anything or erase state. On macOS it installs `st3` in the fixed `~/Applications/SmallTalk.app` bundle, registers it with Launch Services, and updates existing daemon/replication LaunchAgent paths. Configure `ST_MACOS_SIGNING_IDENTITY` and optionally `ST_MACOS_SIGNING_TEAM` for persistent signing; no identity uses ad-hoc signing. A configured missing identity fails rather than falling back. See [macOS installation and signing](macos-installation.md). Keep the previous archive as recovery material. Installing it again is a supported rollback
 only when its database, claim and driver contracts can read the current state; see
@@ -108,8 +115,12 @@ main builds continue. PRs above the documented [adoption boundary](release-impac
 also need a fresh valid fragment before merging. See [release impact authoring](release-impact.md) for
 committed fragments, measurements, historical backfills, and a notes-only preview.
 
-Tag names are labels, not embedded package versions: use `BUILD.json`/`RELEASE.json` for exact
-source identity. Tag the tested commit (with this workflow in its tree); pushing a tag does not
+Archive builds carry a clean release stamp: `st --version` reports the package
+version and source revision with `(release)`, and JSON exposes the same machine
+version. A tag build uses its semantic tag version; untagged main builds use the
+Cargo package version and exact revision. Daily publication reuses those tested
+bytes, so its later tag is a label rather than an embedded version. Use
+`BUILD.json`/`RELEASE.json` for exact source identity. Tag the tested commit (with this workflow in its tree); pushing a tag does not
 wait for unrelated CI runs. Tags made with another workflow's default `GITHUB_TOKEN` do not
 trigger another push workflow, and GitHub does not emit tag push events for a push of more than
 three tags: push release tags individually from a person or app credential.

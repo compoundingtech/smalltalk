@@ -11,7 +11,7 @@ chmod +x "$work/platform-bin/uname"
 export PATH="$work/platform-bin:$PATH"
 mkdir -p "$work/package/bin" "$work/installed"
 cp "$repo/scripts/install-release" "$work/package/install.sh"
-for binary in st3 st3-migrate pty; do
+for binary in st3 pty; do
   printf '#!/bin/sh\necho new-%s\n' "$binary" > "$work/package/bin/$binary"
   chmod +x "$work/package/bin/$binary"
   printf 'old\n' > "$work/installed/$binary"
@@ -21,7 +21,7 @@ ln -s /missing/old-ui "$work/installed/stui"
 "$work/package/install.sh" --bin-dir "$work/installed"
 test "$(readlink "$work/installed/st")" = st3
 test "$("$work/installed/st")" = new-st3
-for binary in st3 st3-migrate pty; do
+for binary in st3 pty; do
   test "$("$work/installed/$binary")" = "new-$binary"
 done
 test ! -e "$work/installed/stui"
@@ -35,3 +35,5 @@ mkdir -p "$work/blocked/st"
 if "$work/package/install.sh" --bin-dir "$work/blocked"; then exit 1; fi
 test ! -e "$work/blocked/st3"
 echo 'Release installer tests passed'
+
+"$repo/scripts/download-install-test"

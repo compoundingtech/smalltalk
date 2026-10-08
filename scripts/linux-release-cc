@@ -1,0 +1,4 @@
+#!/usr/bin/env sh
+# Use the oldest supported Linux libc for both C dependencies and the Rust linker.
+set -eu
+exec zig cc -target x86_64-linux-gnu.2.35 "$@"

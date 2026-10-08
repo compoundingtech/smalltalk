@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Install verified Small Talk archives with one command and report source-pinned release versions.",
+  "replay": {
+    "status": "none",
+    "detail": "No projection or replay changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database or migration changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint or fleet rule changes."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Release archives contain st3, st linked to st3, and pty as their command payload. st3-migrate remains a separate source tool. Linux builds target glibc2.35 with pinned Zig0.15.2, avoiding newer weak-symbol version requirements. Native archive builds use a clean release stamp; ordinary local and Nix stamps retain their prior formats."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "The archive installer replaces binaries without restarting services. The one-line installer then invokes st; existing setup behavior determines startup."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Use the root install.sh for platform detection, download, SHA256 verification, installation and opening st. --tag selects a release; --no-run only installs. Extracted archive installers also accept --quiet. No gh, Rust, Nix or password prompt is required to download and install."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No new persistent state changes. Existing source-pinned upgrade impact and rollback compatibility requirements continue to apply; retained older archives remain recovery material only when their state contracts permit rollback."
+  }
+}

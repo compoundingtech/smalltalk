@@ -8,7 +8,7 @@ if [[ ${1:-} == --dry-run ]]; then
   dry_run=true
   shift
 fi
-binaries=(st3 st3-migrate)
+binaries=(st3)
 runtime_binaries=("${binaries[@]}" pty)
 target=${1:?expected Rust target}
 out=${2:?expected output directory}
@@ -19,7 +19,7 @@ esac
 repo=$(cd "$(dirname "$0")/.." && pwd)
 cd "$repo"
 if $dry_run; then
-  printf 'cargo build --release --locked --target %s -p st3 -p st3-migrate\n' "$target"
+  printf 'cargo build --release --locked --target %s -p st3\n' "$target"
   printf 'stage bin/%s\n' "${runtime_binaries[@]}"
   printf 'link bin/st -> st3\narchive %s/smalltalk-%s.tar.gz\n' "$out" "$target"
   printf 'verify manifest, install in isolated destination, run st ui PTY smoke\n'
@@ -43,14 +43,17 @@ json.dump(pin, open(sys.argv[1], 'w'))
 PY
 pty_rev=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["rev"])' "$work/pin.json")
 pty_url=$(python3 -c 'import json,sys; p=json.load(open(sys.argv[1])); print("https://github.com/"+p["owner"]+"/"+p["repo"]+".git")' "$work/pin.json")
-# .cargo/config.toml links local Linux builds with mold, which release runners do not have.
-# An empty CARGO_ENCODED_RUSTFLAGS takes precedence over config rustflags, so releases link
-# with the platform's default linker, for both builds below.
-# Native releases use build.rs's local stamp from this source checkout. Do not let an
-# inherited Nix stamp identify a different source than the release's BUILD.json.
-unset CLI_BUILD_STAMP
+# Stamp the exact clean source, replacing any inherited stamp from a different checkout.
+export CLI_BUILD_STAMP=$(python3 scripts/release-build-stamp.py)
+# Ignore local mold flags. Linux links against the oldest supported glibc, including
+# C dependencies and PTY, so optional newer Rust symbols stay unversioned weak imports.
 export CARGO_ENCODED_RUSTFLAGS=
-cargo build --release --locked --target "$target" -p st3 -p st3-migrate
+if [[ $target == *linux* ]]; then
+  test "$(zig version)" = 0.15.2
+  export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$repo/scripts/linux-release-cc"
+  export CC_x86_64_unknown_linux_gnu="$repo/scripts/linux-release-cc"
+fi
+cargo build --release --locked --target "$target" -p st3
 build_dir=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
 for binary in "${binaries[@]}"; do
   install -m 0755 "$build_dir/$target/release/$binary" "$work/$package/bin/$binary"
@@ -98,8 +101,9 @@ cp docs/st3/macos-installation.md "$work/$package/macos-installation.md"
 
 for binary in "${runtime_binaries[@]}"; do
   path="$work/$package/bin/$binary"
-  file "$path"
+  if command -v file >/dev/null 2>&1; then file "$path"; fi
   if [[ $target == *linux* ]]; then
+    python3 scripts/check-linux-release.py "$path"
     readelf --program-headers "$path" > "$work/headers"
     if grep -F '/nix/store/' "$work/headers"; then exit 1; fi
     ldd "$path" > "$work/links"
@@ -117,6 +121,8 @@ import json, os, subprocess, sys
 json.dump({'source': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
            'target': sys.argv[2], 'pty_revision': sys.argv[3],
            'tag': os.environ.get('RELEASE_TAG'),
+           'build_stamp': json.loads(os.environ['CLI_BUILD_STAMP']),
+           'glibc_baseline': '2.35' if sys.argv[2].endswith('linux-gnu') else None,
            'rustc': subprocess.check_output(['rustc', '--version'], text=True).strip()},
           open(sys.argv[1], 'w'), indent=2)
 PY
@@ -132,16 +138,15 @@ ST_MACOS_INSTALL_HOME="$work/install-home" ST_MACOS_APP_PATH="$work/installed/Sm
 (cd "$work/extracted" && "$work/installed/st" --version --json) > "$work/version.json"
 python3 - "$work/version.json" <<'PY_VERSION'
 import json, subprocess, sys, tomllib
-base = tomllib.load(open('Cargo.toml', 'rb'))['package']['version']
-rev = subprocess.check_output(['git', 'rev-parse', '--short', 'HEAD'], text=True).strip()
-expected = f'{base}+local.{rev}'
+import os
+stamp = json.loads(os.environ['CLI_BUILD_STAMP'])
+expected = stamp['version'] + '+' + stamp['rev']
 actual = json.load(open(sys.argv[1]))['machine_version']
 assert actual == expected, f'installed version {actual!r}, expected {expected!r}'
 PY_VERSION
 "$work/installed/st3" --version
 "$work/installed/st3" --help >/dev/null
 "$work/installed/st" --help >/dev/null
-"$work/installed/st3-migrate" --help >/dev/null
 "$work/installed/pty" --version
 env -u ST_AGENT HOME="$work/install-home" XDG_CONFIG_HOME="$work/install-home/.config" \
   XDG_CACHE_HOME="$work/install-home/.cache" XDG_STATE_HOME="$work/install-home/.local/state" \

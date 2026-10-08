@@ -3,14 +3,16 @@
 set -Eeuo pipefail
 source_dir=$(cd "$(dirname "$0")" && pwd)/bin
 bin_dir="${ST_MACOS_BIN_DIR:-$HOME/.local/bin}"
+quiet=false
 while (($#)); do
   case $1 in
     --bin-dir) bin_dir=${2:?--bin-dir needs a directory}; shift 2 ;;
-    -h | --help) echo 'Usage: ./install.sh [--bin-dir DIRECTORY]'; exit 0 ;;
+    --quiet) quiet=true; shift ;;
+    -h | --help) echo 'Usage: ./install.sh [--bin-dir DIRECTORY] [--quiet]'; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
-binaries=(st3 st3-migrate pty)
+binaries=(st3 pty)
 for binary in "${binaries[@]}"; do
   [[ -f $source_dir/$binary && -x $source_dir/$binary ]] || {
     echo "missing executable: $binary" >&2; exit 1;
@@ -38,5 +40,7 @@ for name in "${binaries[@]}" st; do
 done
 # Retire the old executable; no alias or shim remains.
 rm -f -- "$bin_dir/stui"
-printf 'Installed st3, st -> st3, st3-migrate, and pty in %s\n' "$bin_dir"
-echo 'Running services were not restarted.'
+if ! $quiet; then
+  printf 'Installed st3, st -> st3, and pty in %s\n' "$bin_dir"
+  echo 'Running services were not restarted.'
+fi
