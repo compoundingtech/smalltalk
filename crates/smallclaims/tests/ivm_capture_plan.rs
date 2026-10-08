@@ -207,7 +207,7 @@ fn pending_and_gap_fence_previously_published_root_without_advancing_applied_pre
             .unwrap(),
         0
     );
-    db.execute_batch(plan.gap_sql()).unwrap();
+    db.execute_batch(plan.gap_main_sql()).unwrap();
     assert_eq!(
         installer.status(&db, "cards").unwrap().status_revision,
         fenced.status_revision
@@ -523,7 +523,7 @@ fn descriptor_and_explicit_gap_cannot_create_ready_or_execute_body_sql() {
             .capture_plan(&db, &pos, "composite", &["b", "a"])
             .is_err()
     );
-    db.execute_batch(plan.gap_sql()).unwrap();
+    db.execute_batch(plan.gap_main_sql()).unwrap();
     assert!(installer.position(&db, "native").is_err());
     assert_eq!(installer.progress(&db, &job).unwrap().phase, "stopped");
     assert_eq!(
@@ -668,4 +668,143 @@ fn installed_native_capture_wakes_same_publisher_only_after_committed_source_rev
         1
     );
     assert_eq!(journal(&store.readers.get()).len(), 1);
+}
+
+#[test]
+fn main_capture_descriptor_scalars_and_trigger_ignore_temp_shadows() {
+    let (db, installer, _, _) = fixture(8);
+    let pos = installer.position(&db, "native").unwrap();
+    db.execute_batch(
+        "CREATE TEMP TABLE native(other TEXT PRIMARY KEY, id TEXT);
+         CREATE TEMP TABLE ivm_install_sources AS SELECT * FROM main.ivm_install_sources;
+         CREATE TEMP TABLE ivm_install_deferred AS SELECT * FROM main.ivm_install_deferred;
+         CREATE TEMP TABLE ivm_install_journal AS SELECT * FROM main.ivm_install_journal;
+         CREATE TEMP TABLE ivm_install_jobs AS SELECT * FROM main.ivm_install_jobs;
+         CREATE TEMP TABLE ivm_install_roots AS SELECT * FROM main.ivm_install_roots;
+         UPDATE temp.ivm_install_sources SET revision=999,available=0;
+         UPDATE temp.ivm_install_deferred SET row_limit=0;",
+    )
+    .unwrap();
+    assert!(
+        installer
+            .capture_plan(&db, &pos, "native", &["other"])
+            .is_err()
+    );
+    let plan = installer
+        .capture_plan(&db, &pos, "native", &["id"])
+        .unwrap();
+    assert_eq!(
+        db.query_row(&format!("SELECT {}", plan.revision_sql()), [], |r| r
+            .get::<_, u64>(0))
+            .unwrap(),
+        0
+    );
+    assert!(
+        db.query_row(&format!("SELECT {}", plan.available_sql()), [], |r| r
+            .get::<_, bool>(0))
+            .unwrap()
+    );
+    db.execute_batch(&format!(
+        "CREATE TRIGGER main.native_main_insert AFTER INSERT ON main.native BEGIN {} {} END;",
+        plan.append_sql(Change::Insert),
+        images(&plan, "NEW", 1),
+    ))
+    .unwrap();
+    db.execute("INSERT INTO main.native VALUES('actual',X'01')", [])
+        .unwrap();
+    assert_eq!(
+        db.query_row("SELECT revision FROM main.ivm_install_sources", [], |r| r
+            .get::<_, u64>(
+            0
+        ))
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.query_row("SELECT COUNT(*) FROM main.ivm_install_journal", [], |r| r
+            .get::<_, u64>(
+            0
+        ))
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT COUNT(*) FROM main.images WHERE revision=1 AND side=1",
+            [],
+            |r| r.get::<_, u64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.query_row("SELECT revision FROM temp.ivm_install_sources", [], |r| r
+            .get::<_, u64>(
+            0
+        ))
+        .unwrap(),
+        999
+    );
+    assert_eq!(
+        db.query_row("SELECT COUNT(*) FROM temp.ivm_install_journal", [], |r| r
+            .get::<_, u64>(
+            0
+        ))
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        db.query_row("SELECT capturing FROM temp.ivm_install_deferred", [], |r| r
+            .get::<_, u64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn coverage_gap_has_separate_main_statement_and_main_trigger_forms() {
+    for in_trigger in [false, true] {
+        let (db, _, plan, _) = fixture(8);
+        db.execute_batch(
+            "CREATE TEMP TABLE ivm_install_sources AS SELECT * FROM main.ivm_install_sources;
+             CREATE TEMP TABLE ivm_install_roots AS SELECT * FROM main.ivm_install_roots;
+             CREATE TEMP TABLE ivm_install_jobs AS SELECT * FROM main.ivm_install_jobs;",
+        )
+        .unwrap();
+        if in_trigger {
+            db.execute_batch(&format!(
+                "CREATE TRIGGER main.native_main_gap AFTER INSERT ON main.native BEGIN {} END;",
+                plan.gap_sql(),
+            ))
+            .unwrap();
+            db.execute("INSERT INTO main.native VALUES('gap',X'01')", [])
+                .unwrap();
+        } else {
+            db.execute_batch(plan.gap_main_sql()).unwrap();
+        }
+        assert!(
+            !db.query_row("SELECT available FROM main.ivm_install_sources", [], |r| {
+                r.get::<_, bool>(0)
+            })
+            .unwrap()
+        );
+        assert!(
+            db.query_row("SELECT available FROM temp.ivm_install_sources", [], |r| {
+                r.get::<_, bool>(0)
+            })
+            .unwrap()
+        );
+        assert_eq!(
+            db.query_row("SELECT phase FROM main.ivm_install_jobs", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "stopped"
+        );
+        assert_eq!(
+            db.query_row("SELECT phase FROM temp.ivm_install_jobs", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "scan"
+        );
+    }
 }

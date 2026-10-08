@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Bind explicit native CapturePlan setup and scalar metadata to main",
+  "replay": {"status": "none", "detail": "No replay, rebuild or automatic source installation."},
+  "schema": {"status": "none", "detail": "No persistent schema or trigger installation."},
+  "rules": {"status": "none", "detail": "No source admission, authority or canonical ordering change."},
+  "compatibility": {"status": "changed", "detail": "CapturePlan validates main table columns and main source/deferred metadata despite TEMP shadows. Its scalar expressions and subqueries target main. Existing trigger DML remains an ordinary-main-trigger-only fragment; gap_main_sql is additive for execution outside triggers."},
+  "downtime": {"status": "none", "detail": "No native production activation or default Store path change."},
+  "manual": {"status": "changed", "detail": "Owners must install ordinary main-schema triggers with explicit main targets. Use gap_main_sql outside triggers; physical schema, complete coverage and lifetime validation remain source-owned."},
+  "recovery": {"status": "none", "detail": "No automatic recovery or Ready restoration; storage failures still require source transaction rollback."}
+}

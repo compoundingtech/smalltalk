@@ -12,8 +12,15 @@ source identities are escaped SQL literals capped at 4 KiB. Generated/virtual
 tables and alternate unique keys are unsupported. Each append fragment is capped
 at 256 KiB of compiled SQL.
 
-The owner embeds `append_sql(Change::Insert/Delete/Replacement)` in an AFTER
-trigger. Only actual PK cells are read: no body expressions, normalization,
+The owner embeds `append_sql(Change::Insert/Delete/Replacement)` in an ordinary
+main-schema AFTER trigger, with an explicit main-schema target. TEMP triggers
+and execution of append fragments outside a trigger are unsupported. SQLite
+requires unqualified trigger DML targets; their main binding follows that ordinary
+trigger, while subqueries and scalar expressions explicitly target main. Setup
+validates the main table columns and reads main source/deferred metadata even if
+TEMP tables share their names. This binding does not validate physical schema
+lifetime or prove absence of extra trigger work. Only actual PK cells are read:
+no body expressions, normalization,
 extraction, operator or validation callback runs. The key is JSON
 `["table", [typed_primary_key_cells]]`; INTEGER, REAL and TEXT retain their JSON
 types, and BLOB is `{"$blob":"UPPERCASE_HEX"}`. Null/nonfinite/oversized keys
@@ -36,8 +43,11 @@ capturing flag, configured queue counters and active installation backlog. Sourc
 fingerprint, epoch and exact capture limits must match the compiled plan. Queue
 exhaustion or incompatible metadata fences roots/jobs; subsequent valid source
 writes remain admitted but cannot claim Ready. The source revision saturates at
-i64::MAX and fences there. `gap_sql()` supplies the same explicit bounded source
-fence for uncovered source-owner scope. It never clears a fence or sets Ready.
+i64::MAX and fences there. `gap_sql()` supplies a fence fragment for an ordinary
+main-schema trigger; outside a trigger, use `gap_main_sql()` in the same source
+transaction so TEMP metadata cannot redirect the fence. Neither clears a fence
+or sets Ready. Both carry the same fixed reason; this does not bound work on
+unvalidated or replaced metadata.
 SQLite/storage failures propagate and require rollback of the source transaction.
 
 This is not a native source certificate. Owners must supply complete OLD/NEW

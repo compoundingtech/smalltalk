@@ -13,7 +13,7 @@ pub enum Change {
 }
 
 /// Owned SQL compiled during explicit source setup, never from caller SQL expressions.
-/// Embed `append_sql` in the corresponding AFTER trigger, before retaining its images.
+/// Embed `append_sql` in an ordinary main-schema AFTER trigger, before retaining images.
 /// The fragments share the Installer's only revision authority and mutation journal.
 #[derive(Clone, Debug)]
 pub struct CapturePlan {
@@ -23,6 +23,7 @@ pub struct CapturePlan {
     revision: String,
     available: String,
     gap: String,
+    main_gap: String,
 }
 impl CapturePlan {
     pub fn append_sql(&self, change: Change) -> &str {
@@ -40,10 +41,16 @@ impl CapturePlan {
     pub fn available_sql(&self) -> &str {
         &self.available
     }
-    /// Fence this source, roots and installation jobs for an owner-detected coverage gap.
+    /// Main-trigger fragment fencing this source, roots and jobs for a coverage gap.
+    /// Its DML targets must be unqualified under SQLite's trigger syntax. Embed only in
+    /// an ordinary main-schema trigger; use `gap_main_sql` outside a trigger.
     /// No revision append or Ready restoration. This literal reason is deliberately bounded.
     pub fn gap_sql(&self) -> &str {
         &self.gap
+    }
+    /// Main-qualified coverage fence for execution outside a trigger, in the source transaction.
+    pub fn gap_main_sql(&self) -> &str {
+        &self.main_gap
     }
 }
 
@@ -60,10 +67,6 @@ impl Installer {
         key: &[&str],
     ) -> Result<CapturePlan> {
         ensure!(
-            self.position(db, &expected.source)? == *expected,
-            "capture source changed"
-        );
-        ensure!(
             self.operators.len() <= 256,
             "capture registry exceeds bound"
         );
@@ -74,6 +77,12 @@ impl Installer {
                 && !expected.fingerprint.contains('\0'),
             "capture source identity exceeds bound"
         );
+        let current: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM main.ivm_install_sources WHERE name=?1 AND fingerprint=?2 AND epoch=?3 AND revision=?4 AND available=1)",
+            rusqlite::params![expected.source, expected.fingerprint, expected.epoch, expected.revision],
+            |r| r.get(0),
+        )?;
+        ensure!(current, "capture source changed");
         identifier(table)?;
         ensure!(
             !table.starts_with("ivm_")
@@ -92,7 +101,7 @@ impl Installer {
         )?;
         ensure!(kind == "table", "capture virtual/shadow table unsupported");
         let mut statement =
-            db.prepare("SELECT name,pk,hidden FROM pragma_table_xinfo(?1) LIMIT 129")?;
+            db.prepare("SELECT name,pk,hidden FROM pragma_table_xinfo(?1,'main') LIMIT 129")?;
         let fields = statement
             .query_map([table], |r| {
                 Ok((
@@ -113,7 +122,7 @@ impl Installer {
             "capture requires full ordered primary key"
         );
         let limits = db.query_row(
-            "SELECT row_limit,byte_limit,reference_limit,capturing FROM ivm_install_deferred WHERE source=?1",
+            "SELECT row_limit,byte_limit,reference_limit,capturing FROM main.ivm_install_deferred WHERE source=?1",
             [&expected.source], |r| Ok((r.get::<_,u64>(0)?, r.get::<_,u64>(1)?,
                 r.get::<_,usize>(2)?, r.get::<_,i64>(3)?)))?;
         ensure!(
@@ -130,10 +139,11 @@ impl Installer {
             expected.epoch
         );
         let available = format!(
-            "(SELECT COALESCE(MAX(available=1),0) FROM ivm_install_sources WHERE {identity})"
+            "(SELECT COALESCE(MAX(available=1),0) FROM main.ivm_install_sources WHERE {identity})"
         );
-        let revision = format!("(SELECT revision FROM ivm_install_sources WHERE {identity})");
-        let gap = fence(&source);
+        let revision = format!("(SELECT revision FROM main.ivm_install_sources WHERE {identity})");
+        let gap = fence(&source, "");
+        let main_gap = fence(&source, "main.");
         let compile = |change| append(table, key, change, &source, &identity, limits);
         let plan = CapturePlan {
             insert: compile(Change::Insert),
@@ -142,6 +152,7 @@ impl Installer {
             available,
             revision,
             gap,
+            main_gap,
         };
         ensure!(
             [&plan.insert, &plan.delete, &plan.replacement]
@@ -243,13 +254,13 @@ fn payload(table: &str, key: &[&str], change: Change, revision: &str) -> String 
         "CASE WHEN {same} AND ({key_sql}) IS NOT NULL AND length(CAST(({key_sql}) AS BLOB))<=1024 THEN json_object('key',({key_sql})||'','old',{old},'new',{new}) ELSE NULL END"
     )
 }
-fn fence(source: &str) -> String {
+fn fence(source: &str, schema: &str) -> String {
     let reason = "deferred trigger capture gap; explicit recovery required";
     format!(
-        "UPDATE ivm_install_sources SET available=0 WHERE name={source};\n\
-        UPDATE ivm_install_roots SET ready=0,status_revision=status_revision+1,error='{reason}' \
+        "UPDATE {schema}ivm_install_sources SET available=0 WHERE name={source};\n\
+        UPDATE {schema}ivm_install_roots SET ready=0,status_revision=status_revision+1,error='{reason}' \
         WHERE source={source} AND (ready<>0 OR error IS NOT '{reason}');\n\
-        UPDATE ivm_install_jobs SET phase='stopped',error='{reason}' WHERE source={source} AND phase IN ('scan','catchup');\n"
+        UPDATE {schema}ivm_install_jobs SET phase='stopped',error='{reason}' WHERE source={source} AND phase IN ('scan','catchup');\n"
     )
 }
 fn append(
@@ -263,7 +274,7 @@ fn append(
     let next = payload(table, key, change, "revision+1");
     let current = payload(table, key, change, "revision");
     let config = format!(
-        "EXISTS(SELECT 1 FROM ivm_install_deferred WHERE source={source} AND row_limit={} AND byte_limit={} AND reference_limit={} AND capturing=0)",
+        "EXISTS(SELECT 1 FROM main.ivm_install_deferred WHERE source={source} AND row_limit={} AND byte_limit={} AND reference_limit={} AND capturing=0)",
         limits.0, limits.1, limits.2
     );
     let reason = "deferred trigger capture gap; explicit recovery required";
@@ -274,13 +285,13 @@ fn append(
         AND ({next}) IS NOT NULL AND length(CAST(({next}) AS BLOB))<= {} \
         AND length(CAST(({next}) AS BLOB))<= {}-journal_bytes THEN 1 ELSE 0 END,\
       revision=CASE WHEN revision<9223372036854775807 THEN revision+1 ELSE revision END WHERE name={source};\n\
-    UPDATE ivm_install_deferred SET capturing=1 WHERE source={source} AND EXISTS(SELECT 1 FROM ivm_install_sources WHERE {identity} AND available=1);\n\
-    INSERT INTO ivm_install_journal(source,revision,payload,bytes) SELECT name,revision,({current}),length(CAST(({current}) AS BLOB)) FROM ivm_install_sources WHERE {identity} AND available=1;\n\
+    UPDATE ivm_install_deferred SET capturing=1 WHERE source={source} AND EXISTS(SELECT 1 FROM main.ivm_install_sources WHERE {identity} AND available=1);\n\
+    INSERT INTO ivm_install_journal(source,revision,payload,bytes) SELECT name,revision,({current}),length(CAST(({current}) AS BLOB)) FROM main.ivm_install_sources WHERE {identity} AND available=1;\n\
     UPDATE ivm_install_deferred SET capturing=0 WHERE source={source};\n\
-    UPDATE ivm_install_jobs SET queued_rows=queued_rows+1,queued_bytes=queued_bytes+(SELECT bytes FROM ivm_install_journal WHERE source={source} AND revision=(SELECT revision FROM ivm_install_sources WHERE name={source})) WHERE source={source} AND phase IN ('scan','catchup') AND EXISTS(SELECT 1 FROM ivm_install_sources WHERE {identity} AND available=1);\n\
-    UPDATE ivm_install_sources SET journal_rows=journal_rows+1,journal_bytes=journal_bytes+(SELECT bytes FROM ivm_install_journal WHERE source={source} AND revision=ivm_install_sources.revision) WHERE {identity} AND available=1;\n\
-    UPDATE ivm_install_roots SET ready=0,status_revision=status_revision+1,error='{reason}' WHERE source={source} AND (ready<>0 OR error IS NOT '{reason}') AND EXISTS(SELECT 1 FROM ivm_install_sources WHERE name={source} AND available=0);\n\
-    UPDATE ivm_install_jobs SET phase='stopped',error='{reason}' WHERE source={source} AND phase IN ('scan','catchup') AND EXISTS(SELECT 1 FROM ivm_install_sources WHERE name={source} AND available=0);\n",
+    UPDATE ivm_install_jobs SET queued_rows=queued_rows+1,queued_bytes=queued_bytes+(SELECT bytes FROM main.ivm_install_journal WHERE source={source} AND revision=(SELECT revision FROM main.ivm_install_sources WHERE name={source})) WHERE source={source} AND phase IN ('scan','catchup') AND EXISTS(SELECT 1 FROM main.ivm_install_sources WHERE {identity} AND available=1);\n\
+    UPDATE ivm_install_sources SET journal_rows=journal_rows+1,journal_bytes=journal_bytes+(SELECT bytes FROM main.ivm_install_journal WHERE source={source} AND revision=ivm_install_sources.revision) WHERE {identity} AND available=1;\n\
+    UPDATE ivm_install_roots SET ready=0,status_revision=status_revision+1,error='{reason}' WHERE source={source} AND (ready<>0 OR error IS NOT '{reason}') AND EXISTS(SELECT 1 FROM main.ivm_install_sources WHERE name={source} AND available=0);\n\
+    UPDATE ivm_install_jobs SET phase='stopped',error='{reason}' WHERE source={source} AND phase IN ('scan','catchup') AND EXISTS(SELECT 1 FROM main.ivm_install_sources WHERE name={source} AND available=0);\n",
         limits.0, limits.2, limits.1
     )
 }
