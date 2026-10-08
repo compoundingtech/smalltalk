@@ -53795,6 +53795,8 @@ fn append_claim_with_subject_fences(
     append_claim_with_admission(graph, input, fence, event_runtime, expected_subjects, observer_completion, None)
 }
 
+type ClaimAdmission<'a> = dyn Fn(&Connection) -> Result<(), St3Error> + Sync + 'a;
+
 fn append_claim_with_admission(
     graph: &GraphStore,
     input: &ClaimInput,
@@ -53802,7 +53804,7 @@ fn append_claim_with_admission(
     event_runtime: Option<&str>,
     expected_subjects: Option<&BTreeMap<String, String>>,
     observer_completion: Option<(&str, &str, &(dyn Fn() -> bool + Sync))>,
-    admission: Option<&(dyn Fn(&Connection) -> Result<(), St3Error> + Sync)>,
+    admission: Option<&ClaimAdmission<'_>>,
 ) -> Result<(ClaimRecord, bool), St3Error> {
     validate_claim_input(input)?;
     if local_retention(&input.kind)

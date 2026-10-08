@@ -456,24 +456,26 @@ async fn delivery_recovery_control(mailbox_loss: bool, bound_shell: bool) {
         .await
         .unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while !mailbox_loss {
-        let agent: Value = client
-            .get(&format!("/v1/client/agents/{SUBJECT}"))
-            .await
-            .unwrap();
-        if agent["delivery"]["state"] == "stale"
-            && agent["delivery"]["reason"]
-                .as_str()
-                .is_some_and(|reason| reason.starts_with("delivery-control-unavailable:"))
-        {
-            assert_eq!(agent["state"], "waiting");
-            break;
+    if !mailbox_loss {
+        loop {
+            let agent: Value = client
+                .get(&format!("/v1/client/agents/{SUBJECT}"))
+                .await
+                .unwrap();
+            if agent["delivery"]["state"] == "stale"
+                && agent["delivery"]["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.starts_with("delivery-control-unavailable:"))
+            {
+                assert_eq!(agent["state"], "waiting");
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "held seat lost its visible reason: {agent}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "held seat lost its visible reason: {agent}"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let reference = receipt.message.subject;
     let receipts = root.join("receipts-agent-eval-codex-bootstrap.jsonl");
