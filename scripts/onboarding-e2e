@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import json
 import os
+import platform
 from pathlib import Path, PurePosixPath
 import re
 import shlex
@@ -716,7 +717,11 @@ def main():
     parser.add_argument("--archive",help="release URL or local archive; local input needs adjacent .sha256")
     parser.add_argument("--sha256",help="expected archive hash, for an immutable local candidate")
     parser.add_argument("--out",type=Path,required=True)
-    parser.add_argument("--backend",choices=("docker","incus","external"),default="external" if Path(sys.argv[0]).name=="onboarding-vm-test" else "docker")
+    parser.add_argument("--backend",choices=("docker","incus","external","tart"),default="tart" if Path(sys.argv[0]).name=="onboarding-mac-test" else "external" if Path(sys.argv[0]).name=="onboarding-vm-test" else "docker")
+    parser.add_argument("--tart-image",help="person-prepared clean local macOS VM; cloned, never modified")
+    parser.add_argument("--ssh-key",type=Path,help="key authorized for ada in the clean Tart base; password authentication is disabled")
+    parser.add_argument("--macos-signing-identity",help="optional explicit signing identity already in guest keychain")
+    parser.add_argument("--macos-signing-team",help="optional expected signing team; requires explicit identity")
     parser.add_argument("--image",help="prebuilt Docker image implementing the embedded clean-systemd recipe")
     parser.add_argument("--fixtures",type=Path,default=Path(__file__).resolve().parent/"st3-boot-canaries")
     parser.add_argument("--strict-release",action="store_true")
@@ -732,8 +737,19 @@ def main():
     if args.harness_only and args.require_wrap_up: parser.error("--harness-only and --require-wrap-up test different phases; choose one")
     if args.harness_only and any(s in ("expert-lifecycle","claude-pre-channel") for s in scenarios): parser.error("expert lifecycle and pre-channel scenarios require full expert checks")
     if any(s!="baseline" for s in scenarios) and not args.archive: parser.error("candidate scenarios require --archive")
-    if args.backend in ("incus","external") and any(os.environ.get(k) for k in ("CI","GITHUB_ACTIONS","BUILDKITE")):
+    if args.backend in ("incus","external","tart") and any(os.environ.get(k) for k in ("CI","GITHUB_ACTIONS","BUILDKITE")):
         parser.error("real-machine backends are manual only and are refused in CI")
+    if args.backend=="tart":
+        if platform.system()!="Darwin" or platform.machine()!="arm64" or not shutil.which("tart") or not shutil.which("ssh"):
+            parser.error("Tart requires an Apple Silicon Mac with tart and ssh; see the manual Mac runbook. No VM was started")
+        if not args.archive or not args.tart_image or not args.ssh_key or not args.ssh_key.is_file():
+            parser.error("Tart requires --archive, --tart-image and an existing --ssh-key")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}",args.tart_image):
+            parser.error("--tart-image must name a prepared local base VM")
+        if args.ubuntu or any(s not in ("setup","first-run","no-harness") for s in scenarios) or args.harness_only or args.require_wrap_up:
+            parser.error("Tart supports setup, first-run and no-harness; omit Linux/provider-phase options")
+        if args.macos_signing_team and not args.macos_signing_identity:
+            parser.error("a macOS signing team requires an explicit identity")
     if args.backend=="incus" and (not shutil.which("incus") or not os.access("/dev/kvm",os.R_OK|os.W_OK)):
         parser.error("Incus or /dev/kvm access unavailable; see the manual runbook. No password is requested")
     if args.backend=="external" and (not os.environ.get("ST_VM_EXEC") or not args.ubuntu): parser.error("external backend requires ST_VM_EXEC and --ubuntu for the actual guest release")
@@ -741,17 +757,27 @@ def main():
     if args.out.exists(): parser.error("output directory already exists")
     failed=False
     # Shared host slot: every matrix scenario is sequential, never concurrent.
-    lock=open("/tmp/st-onboarding-container.lock","a")
-    fcntl.flock(lock,fcntl.LOCK_EX)
-    with tempfile.TemporaryDirectory(prefix="st-onboarding-archive-") as directory:
+    with open("/tmp/st-onboarding-container.lock","a") as lock, tempfile.TemporaryDirectory(prefix="st-onboarding-archive-") as directory:
+        fcntl.flock(lock,fcntl.LOCK_EX)
         try: archive,metadata=load_archive(args,directory)
         except (OSError,ValueError,RuntimeError,tarfile.TarError,StopIteration,KeyError) as error:
             parser.error("invalid archive: "+str(error))
+        if args.backend=="tart":
+            if metadata["build"].get("target")!="aarch64-apple-darwin":
+                parser.error("Tart requires an aarch64-apple-darwin archive; no VM was started")
+            with tarfile.open(archive) as t:
+                for name in ("install.sh","install-macos.py"):
+                    if metadata["package"]+"/"+name not in t.getnames():
+                        parser.error("Mac archive is missing "+name+"; no VM was started")
         if any(s in SMALL_MEMORY for s in scenarios):
             for key in ("reader_cache_default_kib","reader_cache_retained_readers"):
                 value=metadata["build"].get(key)
                 if type(value) is not int or value<=0: parser.error("small-machine requires positive "+key+" in the pinned BUILD.json; no container was started")
         args.out.mkdir(parents=True)
+        if args.backend=="tart":
+            sys.path.insert(0,str(Path(__file__).resolve().parent/"onboarding-fixtures"))
+            from macos import run_tart
+            return run_tart(args,archive,metadata,PTY_PROBE)
         for ubuntu in args.ubuntu or ["22.04","24.04"]:
             for scenario in scenarios:
                 machine=Machine(args,ubuntu,scenario)
