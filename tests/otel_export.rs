@@ -16,7 +16,7 @@ use std::process::{Command, Output};
 /// no-export case, `env -u` removes the endpoint that otelite injects into its child while leaving
 /// the receiver live to catch any unintended traffic.
 fn run_with_capture(otelite: &Path, out_dir: &Path, catalog: &Path, export: bool) -> Output {
-    let bin = env!("CARGO_BIN_EXE_st2");
+    let bin = test_env!("CARGO_BIN_EXE_st2");
     let bin_dir = Path::new(bin).parent().unwrap();
     let path = format!(
         "{}:{}",

@@ -14,13 +14,12 @@ use sha2::{Digest as _, Sha256};
 use support::{CommandOwnedChildGroupExt as _, OwnedChildGroup};
 
 fn st2() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_st2"))
+    Command::new(test_env!("CARGO_BIN_EXE_st2"))
 }
 
-const DEMO_WASM_SRC: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/crates/agent-spec/tests/fixtures/demo_resolver.wasm"
-);
+fn demo_wasm_src() -> &'static str {
+    test_env!("CARGO_MANIFEST_DIR", "/crates/agent-spec/tests/fixtures/demo_resolver.wasm")
+}
 
 fn agent(identity: &str, retired: bool) -> String {
     format!("agent \"{identity}\" {{\n  host \"host\"\n  retired #{retired}\n  argv \"true\"\n}}\n")
@@ -1529,7 +1528,7 @@ fn raw_preimage_repairs_catalogs_with_unadmitted_profile_modules() {
         let desired = temp.path().join(format!("raw-module-desired-{case}"));
         write_agent(&desired, "worker", false);
         fs::create_dir(desired.join("resolvers")).unwrap();
-        fs::copy(DEMO_WASM_SRC, desired.join("resolvers/repaired.wasm")).unwrap();
+        fs::copy(demo_wasm_src(), desired.join("resolvers/repaired.wasm")).unwrap();
         fs::write(
             desired.join("catalog.kdl"),
             profile_catalog_config(&[("dev.example.goal", "resolvers/repaired.wasm")]),
@@ -1642,7 +1641,7 @@ fn prepared_profile_bundle_applies_and_loads_from_live_catalog() {
     let source = temp.path().join("source");
     write_agent(&source, "worker", false);
     fs::create_dir(source.join("resolvers")).unwrap();
-    fs::copy(DEMO_WASM_SRC, source.join("resolvers/goal.wasm")).unwrap();
+    fs::copy(demo_wasm_src(), source.join("resolvers/goal.wasm")).unwrap();
     fs::write(
         source.join("catalog.kdl"),
         profile_catalog_config(&[("dev.example.goal", "resolvers/goal.wasm")]),
@@ -1659,7 +1658,7 @@ fn prepared_profile_bundle_applies_and_loads_from_live_catalog() {
     );
     assert_eq!(
         fs::read(catalog.join("resolvers/goal.wasm")).unwrap(),
-        fs::read(DEMO_WASM_SRC).unwrap()
+        fs::read(demo_wasm_src()).unwrap()
     );
     let registry = st2::catalog::declared_profiles(&catalog).unwrap();
     assert_eq!(
@@ -2089,9 +2088,9 @@ profile "dev.example.observe" {{
     write_agent(&desired, "worker", false);
     fs::create_dir_all(desired.join("resolvers")).unwrap();
     fs::create_dir_all(desired.join("providers")).unwrap();
-    fs::copy(DEMO_WASM_SRC, desired.join("resolvers/observe.wasm")).unwrap();
+    fs::copy(demo_wasm_src(), desired.join("resolvers/observe.wasm")).unwrap();
     fs::copy(
-        DEMO_WASM_SRC,
+        demo_wasm_src(),
         desired.join("providers/observe.component.wasm"),
     )
     .unwrap();
@@ -2148,7 +2147,7 @@ profile "dev.example.observe" {{
     );
     assert_eq!(
         fs::read(catalog.join("providers/observe.component.wasm")).unwrap(),
-        fs::read(DEMO_WASM_SRC).unwrap()
+        fs::read(demo_wasm_src()).unwrap()
     );
 }
 
@@ -2165,7 +2164,7 @@ fn raw_preimage_accepts_valid_bytes_and_wrong_cas_preserves_declarations() {
     let workspace = agent_dir(&valid, "worker").join(".workspace");
     fs::create_dir(&workspace).unwrap();
     fs::create_dir_all(valid.join("resolvers")).unwrap();
-    fs::copy(DEMO_WASM_SRC, valid.join("resolvers/observe.wasm")).unwrap();
+    fs::copy(demo_wasm_src(), valid.join("resolvers/observe.wasm")).unwrap();
     fs::write(
         valid.join("catalog.kdl"),
         profile_catalog_config(&[("dev.example.observe", "resolvers/observe.wasm")]),
@@ -2215,7 +2214,7 @@ fn raw_preimage_accepts_valid_bytes_and_wrong_cas_preserves_declarations() {
     assert_eq!(stale_module_apply["status"], "applied");
     assert_eq!(
         fs::read(valid.join("resolvers/observe.wasm")).unwrap(),
-        fs::read(DEMO_WASM_SRC).unwrap()
+        fs::read(demo_wasm_src()).unwrap()
     );
     assert!(workspace.is_dir());
 
@@ -2238,7 +2237,7 @@ fn raw_preimage_accepts_valid_bytes_and_wrong_cas_preserves_declarations() {
     fs::write(&module_alias, b"mutated alias").unwrap();
     assert_eq!(
         fs::read(&live_module).unwrap(),
-        fs::read(DEMO_WASM_SRC).unwrap()
+        fs::read(demo_wasm_src()).unwrap()
     );
 
     let invalid = temp.path().join("invalid");

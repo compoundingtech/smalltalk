@@ -15,7 +15,9 @@ use serde_json::{Value, json};
 use st3::client::Client;
 use st3::model::ClaimInput;
 
-const ST3: &str = env!("CARGO_BIN_EXE_st3-fixture");
+fn st3() -> &'static str {
+    test_env!("CARGO_BIN_EXE_st3-fixture")
+}
 const PERSON: &str = "person/fleet-tester";
 const NOTE: &str = "custom.fleet-test.note";
 
@@ -83,7 +85,7 @@ impl Node {
         }
         Self {
             name: name.into(),
-            binary: PathBuf::from(ST3),
+            binary: PathBuf::from(st3()),
             root,
             port: free_port(),
             env: Vec::new(),
@@ -184,7 +186,7 @@ impl Node {
     async fn start(&mut self) {
         let pty = self.root.join("bin/pty");
         let log = |name: &str| fs::File::create(self.root.join(name)).unwrap();
-        let up: Vec<&str> = if self.binary == Path::new(ST3) {
+        let up: Vec<&str> = if self.binary == Path::new(st3()) {
             vec!["up", "--pty-binary", pty.to_str().unwrap()]
         } else {
             vec!["up"]
@@ -3073,7 +3075,7 @@ fn fleet_workflows_have_no_path_filter() {
     if st3::test_support::supervise_test() {
         return;
     }
-    let workflows = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows");
+    let workflows = Path::new(test_env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows");
     let compat = fs::read_to_string(workflows.join("fleet.yml")).unwrap();
     // The Linux gate runs the fleet compatibility stage from this script.
     let stages = fs::read_to_string(workflows.join("../../scripts/ci-linux")).unwrap();
@@ -4075,7 +4077,7 @@ async fn suspended_seat_moves_between_two_daemons_with_its_workspace_and_convers
             }
         }
     }
-    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let repo = PathBuf::from(test_env!("CARGO_MANIFEST_DIR")).join("../..");
     let pty = st_runtime::resolve_executable("pty", &std::env::vars().collect()).unwrap();
     let node_program = st_runtime::resolve_executable("node", &std::env::vars().collect()).unwrap();
     let mut cleanup = SeatCleanup { pty: pty.clone(), roots: Vec::new() };
@@ -4409,7 +4411,7 @@ mission "orchard/release" state="ready" {
         "{status}"
     );
     older.stop();
-    older.binary = PathBuf::from(ST3);
+    older.binary = PathBuf::from(st3());
     older.start().await;
     wait_until("upgraded daemon reads the retained sidecar", 60, || async {
         older

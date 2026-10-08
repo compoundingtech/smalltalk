@@ -17,7 +17,7 @@ fn write_agent(root: &Path) {
 }
 
 fn st2(root: &Path, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_st2"))
+    Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .arg("--catalog")
         .arg(root)
         .args(args)
@@ -109,7 +109,7 @@ fn stream_add_emit_and_rm_are_one_real_cli_workflow() {
 fn a_direct_adapter_launch_executes_the_exact_event_cli_contract() {
     let catalog = tempfile::tempdir().unwrap();
     write_agent(catalog.path());
-    let binary = env!("CARGO_BIN_EXE_st2");
+    let binary = test_env!("CARGO_BIN_EXE_st2");
     let add = st2(
         catalog.path(),
         &[
@@ -446,7 +446,7 @@ fn failed_source_publish_after_stop_keeps_declaration_relaunchable() {
             .errors
             .is_empty()
     );
-    let failed = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let failed = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .arg("--catalog")
         .arg(catalog.path())
         .args([
@@ -527,7 +527,7 @@ fn external_stream_removal_performs_no_runtime_operation() {
         .success()
     );
 
-    let remove = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let remove = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .arg("--catalog")
         .arg(catalog.path())
         .args([

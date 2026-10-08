@@ -311,7 +311,7 @@ mod tests {
         };
         // The hermetic contraction gate belongs to dotfiles/flakes/external/omp: invoke this
         // same standalone probe on every OMP pin bump, including patches. No version assertion.
-        let probe = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let probe = Path::new(test_env!("CARGO_MANIFEST_DIR"))
             .join("fixtures/omp-resume/native-reopen-probe.py");
         let output = std::process::Command::new("python3")
             .arg(probe)

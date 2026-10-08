@@ -12,6 +12,11 @@
 //! declared task running and delivers native messages. Harness-specific behavior stays explicit in
 //! each declaration's command, environment, hooks, and workspace materialization block.
 
+#[cfg(test)]
+#[macro_use]
+#[path = "../../../scripts/ci-test-paths.rs"]
+mod ci_test_paths;
+
 pub mod account;
 pub mod catalog;
 pub mod catalog_archive;

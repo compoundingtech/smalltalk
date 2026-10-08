@@ -420,7 +420,7 @@ fn write_fake_codex(
 fn the_boot_canary_codex_stub_schemas_are_what_the_protocol_gate_admits() {
     let schemas = compatible_protocol_schemas();
     let directory =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/st3-boot-canaries/codex-schemas");
+        Path::new(test_env!("CARGO_MANIFEST_DIR")).join("../../scripts/st3-boot-canaries/codex-schemas");
     for (filename, schema) in [
         (
             "codex_app_server_protocol.v2.schemas.json",

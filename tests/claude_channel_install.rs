@@ -4,7 +4,7 @@
 //! `src/claude_channel.rs` tests.
 
 fn st2() -> std::process::Command {
-    std::process::Command::new(env!("CARGO_BIN_EXE_st2"))
+    std::process::Command::new(test_env!("CARGO_BIN_EXE_st2"))
 }
 
 #[test]

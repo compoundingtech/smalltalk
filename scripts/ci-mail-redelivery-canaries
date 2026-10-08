@@ -21,11 +21,17 @@ REQUIRED = {
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--package-only", action="store_true", help="local focused build of st3 only")
+    parser.add_argument("--package-only", action="store_true", help="local compatibility: build only st3")
     args = parser.parse_args()
-    selection = ["-p", "st3", "--lib", "--test", "integration"] if args.package_only else ["--workspace", "--exclude", "st2"]
+    selection = ["-p", "st3"] if args.package_only else ["--workspace", "--exclude", "st2"]
     filters = " or ".join(f"test(={name})" for name in sorted(REQUIRED))
     common = selection + ["--locked", "--profile", "ci", "-E", filters]
+    if os.environ.get("CI_TEST_EXTRACTED"):
+        target = Path(os.environ['CI_TEST_EXTRACTED']) / 'workspace/target'
+        common = ["--binaries-metadata", str(target / 'nextest/binaries-metadata.json'),
+                  "--cargo-metadata", str(target / 'nextest/cargo-metadata.json'),
+                  "--target-dir-remap", str(target), "--workspace-remap", os.environ['CI_TEST_WORKSPACE'],
+                  "--profile", "ci", "-E", filters]
     listed = subprocess.check_output(["cargo", "nextest", "list", *common, "--message-format", "json"], text=True)
     suites = json.loads(listed)["rust-suites"]
     selected = {name for suite in suites.values() for name, test in suite["testcases"].items()

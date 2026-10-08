@@ -1,4 +1,8 @@
 //! The actual stui binary on a daemon-less device, talking only to isolated members.
+#[macro_use]
+#[path = "../../../scripts/ci-test-paths.rs"]
+mod ci_test_paths;
+
 use alacritty_terminal::{
     event::{Event, EventListener},
     grid::Dimensions,
@@ -65,7 +69,7 @@ impl Tui {
                 pixel_height: 0,
             })
             .unwrap();
-        let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_stui"));
+        let mut command = CommandBuilder::new(test_env!("CARGO_BIN_EXE_stui"));
         // This proves pairing and control, read off the classic layout's screens.
         command.arg("--classic");
         command.env_clear();
@@ -224,7 +228,7 @@ async fn pair(root: &Path, local: &Client, url: &str) {
 }
 
 async fn complete_challenge(root: &Path, url: &str, challenge: &st3_client::PairingChallenge) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_stui"))
+    let mut child = Command::new(test_env!("CARGO_BIN_EXE_stui"))
         .args([
             "pair",
             url,

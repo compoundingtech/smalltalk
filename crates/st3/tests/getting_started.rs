@@ -81,7 +81,7 @@ impl Newcomer {
     }
 
     fn command(root: &Path) -> Command {
-        let mut command = st3::test_support::command(env!("CARGO_BIN_EXE_st3-fixture"));
+        let mut command = st3::test_support::command(test_env!("CARGO_BIN_EXE_st3-fixture"));
         command
             .env_clear()
             .env("PATH", Self::path(root))
