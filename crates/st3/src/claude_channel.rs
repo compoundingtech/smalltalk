@@ -101,13 +101,14 @@ pub async fn run(
             },
             chunk = input_rx.recv() => match chunk {
                 Some(st_drivers::reexec::StdinChunk::Bytes(bytes)) => {
+                    let was_initialized = state.initialized;
                     state.lines.push(&bytes);
                     while let Some(line) = state.lines.next_line() {
                         if let Some(response) = request(&line, &mut state.initialized)? {
                             write(&mut stdout, &response).await?;
                         }
                     }
-                    if state.initialized {
+                    if !was_initialized && state.initialized {
                         // Channel initialization is component evidence, not provider activity.
                         let _: Result<ClaimRecord> = client.post(
                             "/v1/claims", &channel_initialization_claim(&state.fence),

@@ -1057,3 +1057,142 @@ async fn claude_attachment_publication_does_not_clear_other_harness_axes() {
         f.unchanged_owner();
     }
 }
+
+// These deterministic deadline/admission controls use the existing publisher endpoint
+// model plus the real local spool and Store. The integration controls separately launch
+// the actual model-free provider/channel and exercise production mailbox admission.
+#[tokio::test]
+async fn hookless_readiness_grace_and_ack_survive_graceful_resume() {
+    let mut f = Fixture::new().await;
+    let dir = f._root.path().join("observations");
+    st_drivers::harness_events::enable(&dir, &f.control.owner.incarnation).unwrap();
+    let mut observations = NativeObservations::start(&dir, &f.control.owner.incarnation).unwrap();
+    f.state.claude_readiness_fallback.initialized_at_ms = Some(1);
+    publish_claude_readiness_fallback(
+        &f.client,
+        &f.mailbox,
+        &mut observations,
+        &mut f.state,
+        15_000,
+    )
+    .await
+    .unwrap();
+    assert!(f.control.requests.lock().unwrap().is_empty());
+    assert!(!f.state.ready);
+    publish_claude_readiness_fallback(
+        &f.client,
+        &f.mailbox,
+        &mut observations,
+        &mut f.state,
+        15_001,
+    )
+    .await
+    .unwrap();
+    assert!(f.state.ready);
+    assert_eq!(
+        f.control
+            .store
+            .current_harness(&f.control.owner.subject)
+            .unwrap()
+            .unwrap()
+            .state,
+        "ready"
+    );
+    assert_eq!(f.control.requests.lock().unwrap().len(), 1);
+    f.state = serde_json::from_slice(&serde_json::to_vec(&f.state).unwrap()).unwrap();
+    publish_claude_readiness_fallback(
+        &f.client,
+        &f.mailbox,
+        &mut observations,
+        &mut f.state,
+        99_000,
+    )
+    .await
+    .unwrap();
+    assert_eq!(f.control.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn hookless_readiness_never_bypasses_absent_or_rejected_attachment() {
+    for mode in 0..3 {
+        let mut f = Fixture::new().await;
+        let dir = f._root.path().join("observations");
+        st_drivers::harness_events::enable(&dir, &f.control.owner.incarnation).unwrap();
+        let mut observations =
+            NativeObservations::start(&dir, &f.control.owner.incarnation).unwrap();
+        f.state.claude_readiness_fallback.initialized_at_ms = Some(1);
+        f.control
+            .attachment
+            .store(if mode == 0 { 0 } else { 1 }, Ordering::SeqCst);
+        if mode == 1 {
+            f.control.binding_live.store(false, Ordering::SeqCst);
+        }
+        if mode == 2 {
+            f.mailbox.fence.token = "superseded-token".into();
+        }
+        let outcome = publish_claude_readiness_fallback(
+            &f.client,
+            &f.mailbox,
+            &mut observations,
+            &mut f.state,
+            15_001,
+        )
+        .await;
+        assert_eq!(outcome.is_err(), mode != 0);
+        assert!(!f.state.ready);
+        assert!(
+            f.state
+                .claude_readiness_fallback
+                .initialized_at_ms
+                .is_none()
+        );
+        assert!(f.control.requests.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn hookless_readiness_never_bypasses_native_blocked_ended_or_unknown_state() {
+    use st_drivers::harness_state::{Activity, BlockedOn, InputBuffer, Observation, Writer};
+    for activity in [Activity::Blocked, Activity::Ended, Activity::Unknown] {
+        let mut f = Fixture::new().await;
+        let dir = f._root.path().join("observations");
+        st_drivers::harness_events::enable(&dir, &f.control.owner.incarnation).unwrap();
+        let mut observations =
+            NativeObservations::start(&dir, &f.control.owner.incarnation).unwrap();
+        let seq =
+            st_drivers::harness_state::claim(&dir, "example/quartz", "claude", "provider").unwrap();
+        Writer::new(&dir, "example/quartz", "claude", None)
+            .with_ownership("provider", seq)
+            .observe(Observation::new(
+                activity,
+                BlockedOn::Human,
+                InputBuffer::Unknown,
+            ))
+            .unwrap();
+        let now = current_unix_ms().unwrap() as u64;
+        f.state.claude_readiness_fallback.initialized_at_ms = Some(now - 15_000);
+        publish_claude_readiness_fallback(
+            &f.client,
+            &f.mailbox,
+            &mut observations,
+            &mut f.state,
+            now,
+        )
+        .await
+        .unwrap();
+        assert!(f.state.claude_readiness_fallback.native_state_seen);
+        assert!(!f.state.ready);
+        f.state = serde_json::from_slice(&serde_json::to_vec(&f.state).unwrap()).unwrap();
+        observations = NativeObservations::start(&dir, &f.control.owner.incarnation).unwrap();
+        publish_claude_readiness_fallback(
+            &f.client,
+            &f.mailbox,
+            &mut observations,
+            &mut f.state,
+            now + 15_000,
+        )
+        .await
+        .unwrap();
+        assert!(f.control.requests.lock().unwrap().is_empty());
+    }
+}
