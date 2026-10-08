@@ -109,6 +109,35 @@ pub struct Context {
     /// `stui --glasses` / `--glass NAME`: open glasses instead of the sidebar layout, at the
     /// named glass or the last one used on this device.
     pub glass: Option<Option<String>>,
+    pub initial_subject: Option<String>,
+}
+
+// Setup's initial destination waits for a live inventory, rather than cached agent data.
+// Consume it after the first ready inventory so later updates leave the person's focus alone.
+pub(super) fn focus_initial_subject(
+    ui: &mut Ui,
+    subject: &mut Option<String>,
+    agents_live: bool,
+    glasses_ready: bool,
+) {
+    if !agents_live || !glasses_ready || !matches!(ui.world.link, super::view::Link::Live) {
+        return;
+    }
+    let Some(id) = subject.take() else {
+        return;
+    };
+    if !ui.world.agents.items().iter().any(|agent| agent.id == id) {
+        return;
+    }
+    ui.open(&id);
+}
+
+fn cancel_initial_subject(subject: &mut Option<String>, input: &Event) {
+    if matches!(input, Event::Key(_) | Event::Paste(_))
+        || matches!(input, Event::Mouse(mouse) if mouse.kind != crossterm::event::MouseEventKind::Moved)
+    {
+        *subject = None;
+    }
 }
 
 /// The terminal the feed follows for the open terminal view.
@@ -252,9 +281,13 @@ pub fn run(context: Context) -> Result<()> {
         cache_path,
         cached,
         glass,
+        mut initial_subject,
     } = context;
     let (fetched_tx, fetched) = mpsc::channel::<Fetched>();
     let mut model = cached.unwrap_or_default();
+    let mut agents_live = false;
+    // The feed announces a granted glasses window before sending any core window.
+    let mut glasses_ready = true;
     // The attention window is already this person's; nothing else names the actor.
     model.actor = person.clone();
     let mut extras = Extras::default();
@@ -366,8 +399,13 @@ pub fn run(context: Context) -> Result<()> {
         }
         while let Ok(update) = incoming.try_recv() {
             match update {
-                feed::Update::GlassesVersion(version) => super::set_glasses_version(version),
+                feed::Update::GlassesVersion(version) => {
+                    super::set_glasses_version(version);
+                    glasses_ready = ui.glasses.is_none();
+                }
                 feed::Update::Connected(member) => {
+                    agents_live = false;
+                    glasses_ready = true;
                     client = member;
                     extras.live = false;
                     attached = None;
@@ -381,6 +419,7 @@ pub fn run(context: Context) -> Result<()> {
                     items,
                     ..
                 } => {
+                    glasses_ready = true;
                     ui.glasses_from_graph(
                         items
                             .into_iter()
@@ -413,7 +452,10 @@ pub fn run(context: Context) -> Result<()> {
                     match window {
                         Window::Attention => model.now = collection,
                         Window::Missions => model.missions = collection,
-                        Window::Agents => model.agents = collection,
+                        Window::Agents => {
+                            model.agents = collection;
+                            agents_live = true;
+                        }
                         Window::Glasses => {}
                     }
                     extras.live = true;
@@ -1200,6 +1242,7 @@ pub fn run(context: Context) -> Result<()> {
                 }
             }
             ui.set_world(adapt::world(&model, &person, &extras));
+            focus_initial_subject(&mut ui, &mut initial_subject, agents_live, glasses_ready);
             changed = false;
             if last_cache_save.elapsed() >= Duration::from_secs(60) {
                 save_cache(cache_path.as_deref(), &person, &model);
@@ -1302,16 +1345,19 @@ pub fn run(context: Context) -> Result<()> {
         super::hover::poll_input(
             Duration::from_millis(if flowing { 16 } else { 80 }),
             &stopping,
-            |input| match input {
-                Event::Key(key)
-                    if !extras.live
-                        && key.code == crossterm::event::KeyCode::Char('r')
-                        && !ui.editing =>
-                {
-                    let _ = commands.send(Command::Reconnect);
-                    true
+            |input| {
+                cancel_initial_subject(&mut initial_subject, &input);
+                match input {
+                    Event::Key(key)
+                        if !extras.live
+                            && key.code == crossterm::event::KeyCode::Char('r')
+                            && !ui.editing =>
+                    {
+                        let _ = commands.send(Command::Reconnect);
+                        true
+                    }
+                    input => ui.input_event(input),
                 }
-                input => ui.input_event(input),
             },
         )?;
     }
@@ -2184,6 +2230,91 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn initial_subject_waits_for_live_inventory_and_opens_only_once() {
+        for spaces in [false, true] {
+            let mut world = super::super::demo::world();
+            let mut expert = world.agents.items()[0].clone();
+            expert.id = "agent/st/expert".into();
+            expert.name = "Expert".into();
+            let other = world.agents.items()[0].id.clone();
+            let mut ui = Ui::new(world.clone());
+            if spaces {
+                ui.glasses = Some(super::super::glass::Glasses::open(None, None));
+                ui.show_focused();
+                ui.open_home();
+            }
+            let before = ui.focus();
+            let mut requested = Some(expert.id.clone());
+            focus_initial_subject(&mut ui, &mut requested, false, true);
+            assert_eq!(
+                ui.focus(), before,
+                "waiting inventory must not open another agent"
+            );
+            assert!(requested.is_some());
+            world.agents = Load::Ready(vec![world.agents.items()[0].clone(), expert.clone()]);
+            ui.set_world(world.clone());
+            let before = ui.focus();
+            focus_initial_subject(&mut ui, &mut requested, false, true);
+            assert_eq!(
+                ui.focus(), before,
+                "cached inventory must not consume the request"
+            );
+            focus_initial_subject(&mut ui, &mut requested, true, true);
+            assert_eq!(ui.focus(), (1, Some(expert.id.clone())));
+            assert_eq!(ui.live_conversations()[0], expert.id);
+            assert!(!ui.home_open());
+            assert!(requested.is_none());
+            ui.open(&other);
+            ui.set_world(world);
+            focus_initial_subject(&mut ui, &mut requested, true, true);
+            assert_eq!(
+                ui.focus(), (1, Some(other)),
+                "later updates preserve navigation"
+            );
+        }
+    }
+
+    #[test]
+    fn initial_subject_is_cancelled_by_navigation_or_a_missing_live_agent() {
+        let mut ui = Ui::new(super::super::demo::world());
+        let mut missing = Some("agent/st/expert".to_owned());
+        let before = ui.focus();
+        focus_initial_subject(&mut ui, &mut missing, true, true);
+        assert!(missing.is_none());
+        assert_eq!(ui.focus(), before);
+        let inputs = [
+            Event::Key(crossterm::event::KeyCode::Down.into()),
+            Event::Paste("hello".into()),
+            Event::Mouse(crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: 5, row: 5, modifiers: crossterm::event::KeyModifiers::NONE,
+            }),
+        ];
+        for input in inputs {
+            let mut subject = Some(ui.world.agents.items()[0].id.clone());
+            cancel_initial_subject(&mut subject, &Event::Resize(120, 32));
+            assert!(subject.is_some());
+            cancel_initial_subject(&mut subject, &input);
+            focus_initial_subject(&mut ui, &mut subject, true, true);
+            assert_eq!(ui.focus(), before);
+            assert!(subject.is_none());
+        }
+    }
+
+    #[test]
+    fn no_initial_subject_preserves_the_restored_space() {
+        let mut ui = Ui::new(super::super::demo::world());
+        ui.glasses = Some(super::super::glass::Glasses::open(None, None));
+        let agent = ui.world.agents.items()[0].id.clone();
+        ui.open(&agent);
+        ui.open_home();
+        let before = ui.focus();
+        focus_initial_subject(&mut ui, &mut None, true, true);
+        assert_eq!(ui.focus(), before);
+        assert!(ui.home_open());
+    }
 
     #[tokio::test]
     async fn live_sends_retries_discussions_and_creation_survive_daemon_restarts() {
