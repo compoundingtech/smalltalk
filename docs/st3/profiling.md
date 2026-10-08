@@ -4,6 +4,27 @@ A daemon that answers slowly is usually waiting, not computing: for the store's 
 one of its read connections, or for SQLite. The daemon can account for its own time so that a slow
 request names what it waited for and who held it.
 
+`GET /v1/client/request-latency` reports completed response-envelope timings without enabling
+profiling. Its `routes` array retains mixed route totals (`scope: "route"`) and adds independent
+`scope: "work-action"` rows for POST claim, renew, progress, complete, fail, release and extend.
+An action row has a static route such as `/v1/work/renew/{*subject}`, `method: "POST"` and
+`action: "renew"`; it retains no subject, body or token. Action samples are subsets of the mixed
+route totals, so do not add counts across scopes. The seven action buckets are independent of the
+256 general-route limit.
+
+Each row's `count` is its completed-response count since this process started, including error
+responses. Percentiles use its last at most 512 completions (`recent_count`), in whole milliseconds.
+Renew and claim have separate counts and percentile samples. `duration_scope: "response-envelope"`
+includes handler queueing, request work, durable admission and envelope serialization; it does not
+subtract writer wait or report only a hierarchy component. This is server completion time, not
+network delivery time. Abandoned and still-running requests have no sample. Existing long-poll
+route durations include deliberate waiting.
+
+For a deployed latency receipt, retain the process/source identity and before/after count delta.
+A low-volume tail can include requests from before the measurement window, and a restart resets
+these in-memory counters. The endpoint alone supplies no queue-versus-work breakdown; the phase
+profiling below supplies that context separately.
+
 Person-ask reconciliation checks for retained `work.person-asked` claims on a read connection
 after importing legacy asks. When there are none, it skips the writer queue so an empty stage
 does not delay the rest of the reconcile pass behind unrelated writes. When asks exist, their
