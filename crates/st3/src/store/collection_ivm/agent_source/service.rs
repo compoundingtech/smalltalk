@@ -1121,14 +1121,66 @@ mod tests {
             "SELECT EXISTS(SELECT 1 FROM local_agent_card_source_native WHERE agent='agent/node.amber' AND needed=1)", [], |r| r.get::<_, bool>(0),
         ).unwrap(), "native dependency predicate must remain held while capture is current");
         let service = store.smalltalk.ivm_agent_service.get().unwrap();
+        // A no-progress dependency wait is idle only while its genuine producer
+        // certificates are current. Their presentation deadline is one second;
+        // scheduler contention can carry an arbitrary count of probes past it.
+        // Obtain a usable current interval through ordinary capture/commit, never
+        // by extending a certificate or assigning source/namespace readiness.
+        let mut interval = false;
+        for _ in 0..4 {
+            let deadline: u64 = store.readers.get().query_row(
+                "SELECT MIN(next_deadline_ms) FROM local_agent_delivery_presence WHERE recipient='agent/node.amber' AND state='ready'",
+                [], |row| row.get(0),
+            ).unwrap();
+            let now = now_ms_u64().unwrap();
+            if deadline.saturating_sub(now) >= 250 {
+                interval = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(
+                deadline.saturating_sub(now).saturating_add(2),
+            ));
+            for driver in super::super::super::delivery::DRIVERS {
+                let captured =
+                    crate::api::delivery_presence::source::capture("agent/node.amber", driver)
+                        .unwrap();
+                super::super::super::delivery::commit(&store, &captured).unwrap();
+            }
+            let mut waiting = false;
+            for _ in 0..128 {
+                if !store.maintain_agent_collections().unwrap() {
+                    waiting = true;
+                    break;
+                }
+            }
+            assert!(
+                waiting,
+                "genuine recapture must return to finite dependency waiting"
+            );
+        }
+        assert!(
+            interval,
+            "no current producer interval for the idle assertion"
+        );
         let revision = service
             .installer
             .position(&store.readers.get(), SOURCE)
             .unwrap()
             .revision;
-        for _ in 0..32 {
+        let started = std::time::Instant::now();
+        let mut probes = 0;
+        while probes < 32 && started.elapsed() < std::time::Duration::from_millis(100) {
+            let deadline: u64 = store.readers.get().query_row(
+                "SELECT MIN(next_deadline_ms) FROM local_agent_delivery_presence WHERE recipient='agent/node.amber' AND state='ready'",
+                [], |row| row.get(0),
+            ).unwrap();
+            if deadline.saturating_sub(now_ms_u64().unwrap()) < 100 {
+                break;
+            }
             assert!(!store.maintain_agent_collections().unwrap());
+            probes += 1;
         }
+        assert!(probes > 0, "idle assertion must exercise the actual pump");
         assert_eq!(
             service
                 .installer
@@ -1147,7 +1199,6 @@ mod tests {
                 .unwrap()
         );
     }
-
     #[test]
     fn local_cut_larger_than_one_page_finishes_without_extra_input() {
         let _lock = TEST_LOCK.blocking_lock();
