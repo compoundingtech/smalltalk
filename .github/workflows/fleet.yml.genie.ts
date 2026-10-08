@@ -1,4 +1,4 @@
-import { buildSnapshotSave } from './build-snapshot.ts'
+import { buildSnapshotSave, optionalQueueCacheSave } from './build-snapshot.ts'
 import { auditCaches } from './cache-audit.ts'
 import { readFileSync } from 'node:fs'
 import {
@@ -80,7 +80,7 @@ const linuxStageJob = ({
     nixDevelopStep({ name: description ?? 'Run nextest', command: ['bash', 'scripts/ci-linux', stage] }),
     {
       name: 'Save Nix outputs to the local Nix cache',
-      if: "success() && env.CI_LOCAL_CACHES != '1'",
+      if: `success() && env.CI_LOCAL_CACHES != '1' && ${optionalQueueCacheSave}`,
       run: 'bash scripts/ci-nix-cache save || echo "::warning::could not save the local Nix cache"',
     },
     ...(setup === testArchiveConsumerSetup ? [] : buildSnapshotSave),
@@ -202,7 +202,7 @@ printf '\\n\\x60\\x60\\x60\\n' >> "$GITHUB_STEP_SUMMARY"`,
       steps: [
         ...commonSetupSteps.filter((step) => !('id' in step && step.id === 'cargo-cache')),
         nixDevelopStep({ name: 'Check runner selection and generated files', flake: '.#genie', command: ['bash', '-c', 'python3 scripts/check-ci-runner-test && python3 scripts/ci-mail-redelivery-canaries-test && python3 scripts/ci-test-partitions-test && python3 scripts/ci-test-archive-test && python3 scripts/check-ci-test-paths && python3 scripts/ci-queue-watch-test && python3 scripts/check-main-ci-test && python3 scripts/ci-perf-cache-test && python3 scripts/ci-cache-audit-test && genie --check'] }),
-        { name: 'Save Nix outputs', if: "success() && env.CI_LOCAL_CACHES != '1'", run: 'bash scripts/ci-nix-cache save' },
+        { name: 'Save Nix outputs', if: `success() && env.CI_LOCAL_CACHES != '1' && ${optionalQueueCacheSave}`, run: 'bash scripts/ci-nix-cache save' },
         ...buildSnapshotSave,
       ],
     },
@@ -429,7 +429,7 @@ mkdir -p "$RUNNER_TEMP/sekrets-vm-out"
 "$RUNNER_TEMP/sekrets-vm-driver/bin/nixos-test-driver" --output_directory "$RUNNER_TEMP/sekrets-vm-out"
 printf '| sekrets VM test | %ss |\\n' "$((SECONDS - start))" >> "$GITHUB_STEP_SUMMARY"`,
         },
-        { name: 'Save Nix outputs', if: "success() && env.CI_LOCAL_CACHES != '1'", run: 'bash scripts/ci-nix-cache save' },
+        { name: 'Save Nix outputs', if: `success() && env.CI_LOCAL_CACHES != '1' && ${optionalQueueCacheSave}`, run: 'bash scripts/ci-nix-cache save' },
       ],
     },
   },

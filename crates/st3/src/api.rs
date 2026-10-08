@@ -72,6 +72,7 @@ mod mailbox;
 mod mail_backlog;
 mod read_deadline;
 mod owned_sets;
+mod request_latency;
 mod terminal_view;
 mod work_response;
 
@@ -919,6 +920,7 @@ async fn response_envelope_unbounded(
         .into_response();
     }
     let started = Instant::now();
+    let request_method = request.method().clone();
     let request_path = request.uri().path().to_owned();
     let request_route = request
         .extensions()
@@ -1050,7 +1052,13 @@ async fn response_envelope_unbounded(
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.starts_with("application/json"))
     {
-        record_request_latency(&request_route, &request_path, &caller, started);
+        record_request_latency(
+            &request_method,
+            &request_route,
+            &request_path,
+            &caller,
+            started,
+        );
         if let Some(profile) = profile {
             profile.finish();
         }
@@ -1122,7 +1130,13 @@ async fn response_envelope_unbounded(
     };
     let body = serde_json::to_vec(&envelope).unwrap_or_else(|_| b"{}".to_vec());
     parts.headers.remove(axum::http::header::CONTENT_LENGTH);
-    record_request_latency(&request_route, &request_path, &caller, started);
+    record_request_latency(
+        &request_method,
+        &request_route,
+        &request_path,
+        &caller,
+        started,
+    );
     if let Some(profile) = profile {
         profile.enveloped(enveloping.elapsed(), body.len());
         profile.finish();
@@ -1130,60 +1144,29 @@ async fn response_envelope_unbounded(
     Response::from_parts(parts, Body::from(body))
 }
 
-#[derive(Default)]
-struct RouteLatency {
-    count: u64,
-    recent_ms: VecDeque<u64>,
-}
+static REQUEST_LATENCY: OnceLock<Mutex<request_latency::Meter>> = OnceLock::new();
 
-static REQUEST_LATENCY: OnceLock<Mutex<BTreeMap<String, RouteLatency>>> = OnceLock::new();
-
-fn request_latency() -> &'static Mutex<BTreeMap<String, RouteLatency>> {
-    REQUEST_LATENCY.get_or_init(|| Mutex::new(BTreeMap::new()))
+fn request_latency() -> &'static Mutex<request_latency::Meter> {
+    REQUEST_LATENCY.get_or_init(|| Mutex::new(request_latency::Meter::default()))
 }
 
 fn request_latency_snapshot() -> Vec<Value> {
-    let routes = request_latency().lock().unwrap();
-    routes
-        .iter()
-        .map(|(route, latency)| {
-            let mut sorted = latency.recent_ms.iter().copied().collect::<Vec<_>>();
-            sorted.sort_unstable();
-            let percentile = |percent: usize| {
-                sorted
-                    .get(
-                        ((sorted.len().saturating_mul(percent).saturating_add(99)) / 100)
-                            .saturating_sub(1),
-                    )
-                    .copied()
-                    .unwrap_or_default()
-            };
-            json!({
-                "route": route,
-                "count": latency.count,
-                "recent_count": sorted.len(),
-                "p50_ms": percentile(50),
-                "p99_ms": percentile(99),
-                "max_ms": sorted.last().copied().unwrap_or_default(),
-            })
-        })
-        .collect()
+    request_latency().lock().unwrap().snapshot()
 }
 
-fn record_request_latency(route: &str, path: &str, caller: &str, started: Instant) {
+fn record_request_latency(
+    method: &axum::http::Method,
+    route: &str,
+    path: &str,
+    caller: &str,
+    started: Instant,
+) {
     let elapsed = started.elapsed();
     crate::performance::record_request(route, Some(caller), elapsed);
-    {
-        let mut routes = request_latency().lock().unwrap();
-        if routes.len() < 256 || routes.contains_key(route) {
-            let sample = routes.entry(route.to_owned()).or_default();
-            sample.count = sample.count.saturating_add(1);
-            if sample.recent_ms.len() == 512 {
-                sample.recent_ms.pop_front();
-            }
-            sample.recent_ms.push_back(elapsed.as_millis() as u64);
-        }
-    }
+    request_latency()
+        .lock()
+        .unwrap()
+        .record(method, route, path, elapsed);
     if elapsed < Duration::from_secs(1) {
         return;
     }
@@ -15561,6 +15544,7 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         let state = state(root.path());
         let before = state.store.index().unwrap();
         record_request_latency(
+            &axum::http::Method::GET,
             "/v1/client/agents",
             "/v1/client/agents",
             "stui",

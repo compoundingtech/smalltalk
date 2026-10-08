@@ -794,3 +794,5 @@ Use the PR Checks tab or `gh run view RUN_ID --log-failed`. The Linux job upload
 even on failure. Inspect each stage's log and timing, the selected suite and checked merge SHA.
 A passing retry is a flaky outcome in the nextest log. A queued Namespace job with no runner
 is infrastructure readiness, not a successful check; the merge queue keeps the entry waiting.
+
+During an outage, `CI_OUTAGE_FAST_QUEUE=on` skips optional Nix-cache saves and same-source build-snapshot publication on merge-group runs. Required checks, cache restores, the producer test archive, logs, cache coverage and PR/main cache publication continue. Set the variable back to `off` when Speed ends the outage; an unset variable also preserves normal publication. The temporary ruleset build concurrency is six; restore its prior value of two at outage end without changing the other ruleset fields.
