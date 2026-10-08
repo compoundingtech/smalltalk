@@ -1,5 +1,5 @@
 use super::*;
-use smallclaims::ivm::install::{Installer, Limits, Root, ScanPage};
+use smallclaims::ivm::install::{Installer, Limits, ScanPage};
 
 pub(crate) fn context(store: &Store) -> Namespace {
     context_for(store, "fixture.agent-card.context")
@@ -222,23 +222,21 @@ pub(crate) fn drain(store: &Store, ns: &Namespace, kernel: &Kernel) {
 }
 pub(crate) fn rows(store: &Store, ns: &Namespace, at: u128) -> Vec<Value> {
     let c = store.readers.get();
-    let root = Root {
-        namespace: ns.clone(),
-        epoch: 0,
-        revision: 0,
-        generation: 0,
-        status_revision: 0,
-    };
-    agent_card_ivm::current_rows(
-        &c,
-        &root,
-        200,
-        None,
-        &BTreeMap::new(),
-        &crate::api::client_timestamp(at),
-    )
-    .unwrap()
-    .0
+    // Read provisional rows with the genuine scan Namespace. No published Root or
+    // source/coverage certificate exists in these component controls.
+    let window = agent_card_ivm::ranked_window(&c, ns, 200, false, None).unwrap();
+    assert!(!window.has_more);
+    window
+        .keys
+        .iter()
+        .map(|key| {
+            let mut row = agent_card_ivm::row(&c, ns, key).unwrap().unwrap();
+            if key.request_time {
+                row["updated_at"] = json!(crate::api::client_timestamp(at));
+            }
+            row
+        })
+        .collect()
 }
 fn compare(store: &Store, ns: &Namespace, at: u128) {
     let index = current_index(&store.readers.get()).unwrap();
