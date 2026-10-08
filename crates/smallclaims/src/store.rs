@@ -5738,7 +5738,7 @@ impl Store {
         let snapshot = self.replication_snapshot_with_legacy(legacy)?;
         let _timing = time_stage(&self.replication_timers.export);
         let signature_requests = self.replication_signature_requests()?;
-        Ok(ReplicationExchange {
+        let mut exchange = ReplicationExchange {
             peer: self.origin.clone(),
             fleet_id: fleet_id.to_owned(),
             schema_digest: self.runtime.schema_digest(),
@@ -5759,7 +5759,9 @@ impl Store {
             envelopes: Vec::new(),
             signature_requests,
             signatures: Vec::new(),
-        })
+        };
+        fit_replication_exchange_body(&mut exchange, crate::sync::MAX_EXCHANGE_BYTES)?;
+        Ok(exchange)
     }
 
     pub fn export_replication_exchange(
