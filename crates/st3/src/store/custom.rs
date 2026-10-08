@@ -809,52 +809,7 @@ impl Store {
         };
         rows.into_iter()
             .map(|(text, at)| {
-                let body: Value = serde_json::from_str(&text)?;
-                let a = &body["attention"];
-                Ok(AttentionItemView {
-                    episode: a["episode"].as_str().unwrap_or_default().into(),
-                    priority: "normal".into(),
-                    kind: format!(
-                        "custom.{}",
-                        body["registered_kind"].as_str().unwrap_or_default()
-                    ),
-                    review_mode: None,
-                    subject: body["id"].as_str().unwrap_or_default().into(),
-                    person: a["recipient"].as_str().unwrap_or_default().into(),
-                    requester_id: body["owner"].as_str().map(str::to_owned),
-                    launch_id: None,
-                    variant_id: None,
-                    message_id: None,
-                    title: a["title"].as_str().unwrap_or_default().into(),
-                    detail: a["detail"].as_str().unwrap_or_default().into(),
-                    request: None,
-                    mission: None,
-                    mission_run: None,
-                    step: None,
-                    targets: vec![],
-                    requested_at_unix_ms: at.parse().unwrap_or(0),
-                    actions: vec![attention_action(
-                        "reply",
-                        &[
-                            "st",
-                            "subject",
-                            "reply",
-                            body["id"].as_str().unwrap_or_default(),
-                            "--fields-file",
-                            "REPLY.json",
-                            "--registration",
-                            body["registration"].as_str().unwrap_or_default(),
-                            "--revision",
-                            body["revision"].as_str().unwrap_or_default(),
-                            "--episode",
-                            a["episode"].as_str().unwrap_or_default(),
-                            "--idempotency-key",
-                            "REPLY-KEY",
-                            "--as",
-                            a["recipient"].as_str().unwrap_or_default(),
-                        ],
-                    )],
-                })
+                attention_item(&serde_json::from_str(&text)?, at.parse().unwrap_or(0))
             })
             .collect()
     }
@@ -894,6 +849,55 @@ impl Store {
         }).map_err(internal)?
     }
 }
+/// One canonical custom source, shared by the collection reader and keyed maintenance.
+pub(super) fn attention_item(body: &Value, at: u128) -> Result<AttentionItemView> {
+    let a = &body["attention"];
+    Ok(AttentionItemView {
+        episode: a["episode"].as_str().unwrap_or_default().into(),
+        priority: "normal".into(),
+        kind: format!(
+            "custom.{}",
+            body["registered_kind"].as_str().unwrap_or_default()
+        ),
+        review_mode: None,
+        subject: body["id"].as_str().unwrap_or_default().into(),
+        person: a["recipient"].as_str().unwrap_or_default().into(),
+        requester_id: body["owner"].as_str().map(str::to_owned),
+        launch_id: None,
+        variant_id: None,
+        message_id: None,
+        title: a["title"].as_str().unwrap_or_default().into(),
+        detail: a["detail"].as_str().unwrap_or_default().into(),
+        request: None,
+        mission: None,
+        mission_run: None,
+        step: None,
+        targets: vec![],
+        requested_at_unix_ms: at,
+        actions: vec![attention_action(
+            "reply",
+            &[
+                "st",
+                "subject",
+                "reply",
+                body["id"].as_str().unwrap_or_default(),
+                "--fields-file",
+                "REPLY.json",
+                "--registration",
+                body["registration"].as_str().unwrap_or_default(),
+                "--revision",
+                body["revision"].as_str().unwrap_or_default(),
+                "--episode",
+                a["episode"].as_str().unwrap_or_default(),
+                "--idempotency-key",
+                "REPLY-KEY",
+                "--as",
+                a["recipient"].as_str().unwrap_or_default(),
+            ],
+        )],
+    })
+}
+
 fn source(connection: &Connection, subject: &str) -> Result<Option<Value>> {
     let text: Option<String> = connection
         .query_row(
