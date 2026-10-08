@@ -142,10 +142,14 @@ every subject's status read into a scan of its historical JSON bodies. The opera
 TEXT affinity is removed in that join so SQLite can seek the JSON-expression index.
 
 The agent-card cache holds its mutex only while selecting or publishing immutable cached
-rows, not while building cards. HTTP agent pages and WS roster windows share one asynchronous
-admission per store, acquired before opening SQLite snapshots. Followers therefore pin no old
-WAL read mark while another reader builds the projection. The worker retains admission through
-completion even if its caller disconnects.
+rows, not while building cards. HTTP agent pages and WS roster windows first probe read-only
+caches inside a fresh, authorized SQLite snapshot. An exact, lease-valid warm hit bypasses the
+store-wide roster admission even while an unrelated cold reader holds it. A miss releases its
+snapshot before awaiting admission, then opens a new snapshot and rechecks authority and caches.
+Cold HTTP first pages build shallow refs and selected cards under one admission and one snapshot;
+warm first pages need neither admission nor a second snapshot. The existing same-key WS window
+admission remains in place for authority fencing. The cold worker retains store admission through
+completion even if its caller disconnects, so waiting followers pin no old WAL read mark.
 
 Eight immutable graph-index/local-frontier/history cuts are retained. HTTP pages lazily fill missing subjects into
 the same projection used by the complete WS roster, without reducing unrelated cards. Local
@@ -164,14 +168,36 @@ Both shallow refs and the full-card projection also expire at the earliest curre
 work-lease deadline. Expired work becomes ready (or disappears from a revision-draining queue)
 without a new claim; an expired entry must rebuild, not advance incrementally from stale queues.
 The deadline scan runs only on full rebuilds and reads unfinished steps; safe card-local
-advances carry the prior deadline forward. Warm hits add no SQL. The outer shared agents
+advances carry the prior deadline forward. Shallow-ref warm hits add no SQL; full-card probes
+read the relevant local frontier before selecting cached rows. The outer shared agents
 WS window inherits the same fence, so it cannot hide an expired full-card projection.
 HTTP reads see expiry immediately; live WS subscribers see the transition on the next
 existing 30-second authority/freshness tick. That existing live-stream bound is unchanged.
 
-The local-observation frontier is read by an indexed seek inside the same SQLite snapshot.
-A same-index local transcript append updates the affected card's `last_activity_at` for both
-HTTP and WS; ignoring local rows here would make a shared warm roster instant but stale.
+The relevant local-observation frontier is the largest agent `harness.timeline` row ID visible
+inside the same SQLite snapshot with `after_store_index` at or before the requested graph cut,
+or zero when none exists. A partial covering index, `local_observations_roster_frontier_index`,
+contains only those rows. The reverse lookup skips newer heartbeat rows entirely, without
+assuming row IDs and graph indices are monotonic; an old cut still steps over newer agent
+timeline rows in the index. Existing stores create the index automatically on their next open,
+without a schema-version bump or replay migration. Initial creation took 0.171 seconds on
+an offline 1.78 GB store copy with 161,048 local observations (118,115 indexed agent timeline
+rows), using SQLite 3.53.3. The 8,701-row synthetic fixture took 0.516 ms; these isolated
+index-creation timings do not measure end-to-end startup or predict other stores.
+Heartbeat-only `harness.observed`, local telemetry and non-agent timeline appends leave cached
+cards reusable. Every agent timeline entry type advances the frontier, including usage entries,
+because managed-session recency reads the latest timeline row even when last activity does not.
+Replicated status and usage changes retain their graph-index invalidation. A same-index local
+content transcript append misses the read-only getter
+and updates the affected card's `last_activity_at` when rebuilt for both HTTP and WS; ignoring
+timeline rows here would make a shared warm roster instant but stale. Read-only getters never
+build, require selected-subject coverage, and pin immutable rows without filtering or cloning them.
+
+Cache relevance does not filter the existing `changed()` notification signal. Local
+heartbeat and timeline publications still wake every existing event subscriber; a heartbeat
+can then reuse the roster rows, while timeline activity misses and refreshes them. The normal
+`agent_roster_cache_reuse_preserves_changed_for_existing_subscribers` regression checks both
+publications with two subscribers.
 
 The performance report exposes each roster stage under bounded task labels:
 `roster/admission-wait` (waiting for the shared admission or an in-flight build),
@@ -183,6 +209,16 @@ incremental-update costs with `cargo test -p st3 --lib agent_roster_snapshot_fix
 --ignored --nocapture`. It is a serial fixture micro-measure, not a load benchmark. CI's
 `perf-load` workload holds concurrent agents WS subscribers and measures first-snapshot
 latency against the roster's 300 ms budget.
+
+Normal tests include a small cached-versus-uncached roster comparison before and after local
+timeline activity, in both history modes. Run the heartbeat-only fixture with
+`cargo test -p st3 --lib agent_roster_heartbeat_only_local_stream_hit_rate -- --nocapture`:
+it prints append/probe/hit counts, hit rate and elapsed time, requires every heartbeat probe to
+reuse the same immutable rows, and requires a subsequent timeline append to miss before rebuild.
+The normal warm HTTP fixture
+`warm_agent_http_page_bypasses_unrelated_cold_roster_admission` holds store admission while reading
+a cached first page and prints its elapsed time. These are deterministic cache/admission
+regressions with diagnostic timings, not production latency guarantees.
 
 Every five seconds a dedicated native thread attempts a passive WAL checkpoint outside the
 writer queue. Once every frame is backfilled, it attempts `TRUNCATE` with zero busy timeout.

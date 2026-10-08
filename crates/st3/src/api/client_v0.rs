@@ -200,11 +200,7 @@ async fn collection_items_with_windows(
         Some(prepared) => Some(prepared.admit().await),
         None => None,
     };
-    let roster_admission = if request.collection == "agents" {
-        Some(state.store.admit_agent_resources().await)
-    } else {
-        None
-    };
+    let mut physical_guards = Some((read_permit, admission));
     let state = state.clone();
     let session = session.clone();
     let request = request.clone();
@@ -214,11 +210,29 @@ async fn collection_items_with_windows(
     let collection = request.collection.clone();
     let custom_forms = session.custom_forms;
     let arrangement_window = collection == "arrangements";
-    let (snapshot, mut items, mut has_more) = super::blocking_store(move || {
-        crate::profile::task(collection_window_label(&collection), || {
-            // Keep the physical read slot even if its awaiting subscription is canceled.
-            let _read_permit = read_permit;
-            let _admission = admission;
+    let mut admitted = collection != "agents";
+    let (snapshot, mut items, mut has_more) = loop {
+        let roster_admission = if collection == "agents" && admitted {
+            Some(state.store.admit_agent_resources().await)
+        } else {
+            None
+        };
+        let state = state.clone();
+        let session = session.clone();
+        let request = request.clone();
+        let actor = actor.clone();
+        let subject = subject.clone();
+        let status = status.clone();
+        let collection = collection.clone();
+        let person = person.clone();
+        let prepared = prepared.clone();
+        let windows = windows.clone();
+        let (read_permit, admission) = physical_guards.take()
+            .expect("physical roster read guards");
+        let (result, read_permit, admission) = super::blocking_store(move || {
+        // The worker owns both guards until its physical snapshot finishes, including
+        // after caller cancellation. A miss returns them without allocating shared guards.
+        let result = crate::profile::task(collection_window_label(&collection), || {
             let _roster_admission = roster_admission;
             let store = state.store.clone();
             let commits = windows.as_ref().map(|windows| windows.commits());
@@ -249,6 +263,14 @@ async fn collection_items_with_windows(
                 };
                 let snapshot = client_snapshot_at(&state, index);
                 let at = snapshot.created_at.clone();
+                let cached_agents = if collection == "agents" && !admitted {
+                    let Some(cards) = store.agent_resources_cached_at(index, false, None)? else {
+                        return Ok(Ok(None));
+                    };
+                    Some(cards)
+                } else {
+                    None
+                };
                 let compute = || {
                     let mut items = match collection.as_str() {
                         "missions" => {
@@ -277,7 +299,10 @@ async fn collection_items_with_windows(
                         "attention" => {
                             client_attention_resources_at(&store, person.as_deref(), false, now)?
                         }
-                        "agents" => client_agent_resources_cached(&store, false, index)?,
+                        "agents" => match &cached_agents {
+                            Some(cards) => (**cards).clone(),
+                            None => client_agent_resources_cached(&store, false, index)?,
+                        },
                         "work" => client_work_resources(
                             &store,
                             actor.as_deref(),
@@ -323,11 +348,17 @@ async fn collection_items_with_windows(
                     has_more = items.len() > limit;
                     items.truncate(limit);
                 }
-                Ok(Ok((snapshot, items, has_more)))
+                Ok(Ok(Some((snapshot, items, has_more))))
             })
-        })
-    })
-    .await??;
+        });
+        Ok((result?, read_permit, admission))
+    }).await?;
+        physical_guards = Some((read_permit, admission));
+        if let Some(rows) = result? {
+            break rows;
+        }
+        admitted = true;
+    };
     items.truncate(limit);
     if arrangement_window {
         let end = arrangements::window_end(&items, 0, items.len())?;
@@ -10083,6 +10114,37 @@ mod tests {
         let mut bad_retry = frame.clone();
         bad_retry["retryable"] = json!("yes");
         assert!(!validator.is_valid(&bad_retry));
+    }
+
+    #[tokio::test]
+    async fn agent_roster_warm_ws_read_bypasses_a_cold_builder_admission() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        state.store.append_claim(&ClaimInput {
+            subject: "agent/admission-roster".into(), kind: "runtime.observed".into(),
+            actor: None, fields: serde_json::from_value(json!({"status":"running",
+                "runtime_id":"admission-roster", "incarnation_id":"one"})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let request: CollectionSubscribe = serde_json::from_value(json!({
+            "kind":"subscribe", "id":"warm-roster", "collection":"agents", "limit":200,
+        })).unwrap();
+        let session = ClientSession::local(None).unwrap();
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let windows = collection_windows::Windows::attach(&state.store);
+        let (_, expected, _) = collection_items_with_windows(&state, &session, &request,
+            semaphore.clone().acquire_owned().await.unwrap(), windows.clone()).await.unwrap();
+        let builds = state.store.agent_resources_builds_for_test();
+        let _cold_builder = state.store.admit_agent_resources().await;
+        let start = std::time::Instant::now();
+        let (_, actual, _) = tokio::time::timeout(std::time::Duration::from_secs(1),
+            collection_items_with_windows(&state, &session, &request,
+                semaphore.acquire_owned().await.unwrap(), windows)).await
+            .expect("warm WS roster must not wait for a cold builder").unwrap();
+        println!("warm WS roster under held cold-build admission: {:.3} ms",
+            start.elapsed().as_secs_f64() * 1000.0);
+        assert_eq!(actual, expected);
+        assert_eq!(state.store.agent_resources_builds_for_test(), builds);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
