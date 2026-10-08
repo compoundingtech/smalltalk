@@ -831,9 +831,9 @@ impl Runner for PtyCli {
         // immediate `pty run` fails "id already in use". Reap the lingering corpse + brief backoff +
         // retry closes the window WITHIN the pass, instead of leaving `--once` to error and relying on a
         // later loop cycle to self-heal (loop mode did; `--once` had one shot). Bounded; on a persistent
-        // failure it surfaces the exit status without copying value-bearing launcher output.
+        // failure it surfaces a closed diagnostic kind and exit status, never launcher output.
         const SPAWN_ATTEMPTS: u32 = 4;
-        let mut last_err = String::new();
+        let mut last_failure = None;
         for attempt in 0..SPAWN_ATTEMPTS {
             let mut cmd = crate::isolate::wrap(&unit, program.as_os_str(), &arg_refs);
             apply_command_env(&inner, &mut cmd);
@@ -849,8 +849,11 @@ impl Runner for PtyCli {
                 stderr.trim()
             };
             let corpse_race = detail.contains("already in use");
-            // Claims and traces receive only the exit status, never launcher output.
-            last_err = out.status.to_string();
+            let kind = crate::pty_launch_environment::classify_pty_launch_failure(
+                &out.stderr,
+                &out.stdout,
+            );
+            last_failure = Some((kind, out.status));
             if !corpse_race || attempt + 1 == SPAWN_ATTEMPTS {
                 break;
             }
@@ -862,7 +865,12 @@ impl Runner for PtyCli {
                 .output();
             std::thread::sleep(Duration::from_millis(100 * u64::from(attempt + 1)));
         }
-        anyhow::bail!("spawning pty '{}' failed: {last_err}", target.pty_id);
+        let (kind, status) = last_failure.expect("PTY spawn attempts are nonzero");
+        anyhow::bail!(
+            "spawning pty '{}' failed: {} ({status})",
+            target.pty_id,
+            kind.as_str(),
+        );
     }
 
     fn patch_presentation(&self, presentation: &PtyPresentation) -> anyhow::Result<()> {

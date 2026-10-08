@@ -3,7 +3,7 @@
   "summary": "Seat environment values travel in the launcher's inherited environment instead of process command lines: PTY launches pass variable names only, and transient scope units carry a fixed description.",
   "replay": {
     "status": "none",
-    "detail": "No claim replay or projection migration. Environment values use inherited transport plus name-only --env flags. Runtime-owned PTY_ROOT wins; deprecated PTY_SESSION_DIR is ignored with a name-only diagnostic. Scope descriptions are fixed and launcher failure reasons expose exit status, not captured output."
+    "detail": "No claim replay or projection migration. Environment values use inherited transport plus name-only --env flags. Runtime-owned PTY_ROOT wins; deprecated PTY_SESSION_DIR is ignored with a name-only diagnostic. Scope descriptions are fixed and launcher failure reasons expose a closed diagnostic kind and exit status, not captured output."
   },
   "schema": {
     "status": "none",
@@ -15,7 +15,7 @@
   },
   "compatibility": {
     "status": "changed",
-    "detail": "The pinned PTY revision adds name-only `--env NAME` and owner-only registry records; KEY=VALUE is unchanged. The PTY binary and daemon must ship together: an old PTY binary meeting a new daemon refuses the launch (exit 1), reported by the daemon as a value-free failure summary rather than copied launcher output. A new PTY binary with an old daemon keeps working. Seat overlays cannot override canonical or legacy PTY placement controls."
+    "detail": "The pinned PTY revision adds name-only `--env NAME` and owner-only registry records; KEY=VALUE is unchanged. The PTY binary and daemon must ship together: an old PTY binary meeting a new daemon refuses the launch (exit 1), reported as launcher-incompatible plus exit status rather than copied output. A new PTY binary with an old daemon keeps working. Seat overlays cannot override canonical or legacy PTY placement controls."
   },
   "manual": {
     "status": "changed",

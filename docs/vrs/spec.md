@@ -928,9 +928,21 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   wins, and `PTY_SESSION_DIR` is removed after the overlay (including inherited
   values). Declared legacy placement is ignored with a name-only diagnostic.
   Spawn and observation share a registry; other member-environment precedence
-  is unchanged. Launcher stdout/stderr is used only to classify the existing
-  retry case. Failure reasons contain an exit status, never captured output
-  that could echo environment values into replicated claims or traces.
+  is unchanged. Captured launcher output is classified privately. PTY launch
+  failure reasons contain a closed diagnostic kind plus exit status, never
+  captured text that could echo environment values into replicated claims or
+  traces. The kinds, in matching priority order, are:
+
+  - `launcher-incompatible`: the older name-only-rejecting `Invalid env format`
+    / `Use --env KEY=VALUE` diagnostic (not the new parser's name-only grammar).
+  - `placement-conflict`: conflicting canonical/legacy roots or an overlong root.
+  - `session-in-use`: the existing occupied-ID diagnostic; retry behavior remains
+    unchanged.
+  - `spawn-failed`: recognized daemon exit/start or publication-timeout diagnostics.
+  - `unknown`: anything unrecognized, including undecodable output.
+
+  These are diagnostic categories, not a guarantee of the underlying root cause.
+  No raw-output file or journal sink is added.
 
   This mechanism does not sanitize explicitly authored argv or tag expansions.
   Seat-declared environment values stored in replicated graph claims remain a

@@ -80,9 +80,14 @@ legacy variable is removed (also from inherited environments). Declared legacy
 placement receives a value-free, name-only diagnostic. Other resolved
 environment precedence remains unchanged.
 
-Captured launcher output can echo environment values. It is used only for the
-existing retry classification; failure reasons expose exit status rather than
-copying stdout/stderr into replicated claims and claim-trace output.
+Captured launcher output can echo environment values. It is classified privately;
+launch failure reasons expose a closed diagnostic kind plus exit status rather
+than copying stdout/stderr into replicated claims and claim-trace output.
+Kinds are `launcher-incompatible`, `placement-conflict`, `session-in-use`,
+`spawn-failed`, and `unknown`; the implementation specification records their
+matching signatures and priority. The older name-only-rejecting launcher is
+therefore distinguishable from other exit-1 failures without exposing its text.
+No raw-output file or journal sink is added.
 
 Both scope wrappers also pin the description to the unit name instead of
 systemd's default full command line. The amended outer argument order is:

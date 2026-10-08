@@ -3290,6 +3290,15 @@ fn spawn_failure_reason_never_contains_launcher_output() {
     assert!(reason.contains("spawning pty"));
     assert!(reason.contains("23"));
     assert!(!reason.contains(SECRET));
+    std::fs::write(
+        &executable,
+        "#!/bin/sh\nprintf 'Invalid env format: \"NAME\". Use --env KEY=VALUE\\n%s\\n' \"$SEAT_TOKEN\" >&2\nexit 1\n",
+    ).unwrap();
+    let reason = format!("{:#}", cli.spawn(&task, temporary.path()).unwrap_err());
+    assert!(reason.contains("launcher-incompatible"));
+    assert!(reason.contains("exit status: 1"));
+    assert!(!reason.contains(SECRET));
+    assert!(!reason.contains("Invalid env format"));
     // Observation/cleanup failures can also become replicated action reasons.
     std::fs::write(
         &executable,

@@ -407,7 +407,7 @@ impl PtyRuntime {
             .map(OsString::as_os_str)
             .collect::<Vec<_>>();
         const ATTEMPTS: u32 = 4;
-        let mut last_error = String::new();
+        let mut last_failure = None;
         for attempt in 0..ATTEMPTS {
             let mut command =
                 crate::wrap_isolated(&unit, std::ffi::OsStr::new(&self.binary), &argument_refs);
@@ -430,10 +430,14 @@ impl PtyRuntime {
                 crate::protect_servers(std::slice::from_ref(&published));
                 return Ok(());
             }
-            // Launcher output can echo environment values. Use it only for retry
-            // classification, never in an error that becomes a replicated claim.
+            // Classify captured output privately; only the closed kind and status
+            // can become a replicated failure reason.
+            let kind = crate::pty_launch_environment::classify_pty_launch_failure(
+                &output.stderr,
+                &output.stdout,
+            );
             let id_in_use = String::from_utf8_lossy(&output.stderr).contains("already in use");
-            last_error = output.status.to_string();
+            last_failure = Some((kind, output.status));
             if !id_in_use || attempt + 1 == ATTEMPTS {
                 break;
             }
@@ -449,7 +453,8 @@ impl PtyRuntime {
             std::thread::sleep(Duration::from_millis(100 * u64::from(attempt + 1)));
         }
         let _ = std::fs::remove_file(&fence);
-        anyhow::bail!("spawn PTY failed: {last_error}")
+        let (kind, status) = last_failure.expect("PTY spawn attempts are nonzero");
+        anyhow::bail!("spawn PTY failed: {} ({status})", kind.as_str())
     }
 
     fn acquire_spawn_lock(&self, id: &str) -> Result<File> {
@@ -1615,6 +1620,29 @@ exit 0
         assert!(reason.contains("spawn PTY failed"));
         assert!(reason.contains("23"));
         assert!(!reason.contains(SECRET));
+    }
+
+    #[test]
+    fn spawn_reports_an_incompatible_launcher_without_its_output() {
+        let root = tempfile::tempdir().unwrap();
+        let binary = fake_pty(
+            root.path(),
+            "fake-pty-old-launcher",
+            "  printf 'Invalid env format: \"NAME\". Use --env KEY=VALUE\\n%s\\n' \"$SEAT_TOKEN\" >&2\n  exit 1",
+        );
+        let runtime =
+            PtyRuntime::new(root.path().join("registry")).with_binary(binary.to_string_lossy());
+        const SECRET: &str = "synthetic-old-launcher-secret-836e";
+        let error = spawn_work(
+            &runtime,
+            root.path(),
+            &BTreeMap::from([("SEAT_TOKEN".into(), SECRET.into())]),
+        ).unwrap_err();
+        let reason = format!("{error:#}");
+        assert!(reason.contains("launcher-incompatible"));
+        assert!(reason.contains("exit status: 1"));
+        assert!(!reason.contains(SECRET));
+        assert!(!reason.contains("Invalid env format"));
     }
 
     #[test]
