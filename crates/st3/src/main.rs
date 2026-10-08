@@ -30433,10 +30433,11 @@ mission "review" state="ready" {
         let client = Client::new(st3::client::Endpoint::Http(format!("http://{address}")));
         let mut observations = NativeObservations::start(root.path(), "runtime-a").unwrap();
         let mut ready = false;
-        observations
-            .drain(&client, "agent/garden/orchard", "claude", &mut ready)
+        // Live prompt publication must not announce provider terminal completion.
+        assert!(!observations
+            .drain_live(&client, "agent/garden/orchard", "claude", &mut ready)
             .await
-            .unwrap();
+            .unwrap());
         assert_eq!(
             store
                 .attention_snapshot(Some("person/ada"), now_ms())
@@ -30465,10 +30466,11 @@ mission "review" state="ready" {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].payload["state"], "unavailable");
         assert!(pending[0].payload["how"].is_null());
-        observations
-            .drain(&client, "agent/garden/orchard", "claude", &mut ready)
+        // Live prompt publication must not announce provider terminal completion.
+        assert!(!observations
+            .drain_live(&client, "agent/garden/orchard", "claude", &mut ready)
             .await
-            .unwrap();
+            .unwrap());
         assert!(
             store
                 .attention_snapshot(Some("person/ada"), now_ms())
