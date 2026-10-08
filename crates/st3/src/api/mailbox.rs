@@ -2203,6 +2203,9 @@ mod tests {
             };
             let intent = crate::graph::parse_intent(&replacement,"node").unwrap();
             state.store.apply_internal(&intent,"argv-stream-changed").unwrap();
+            // Direct Store writes do not publish the API post-commit feed. Supply
+            // the same committed-change signal used by production callers.
+            signal_changed(&state);
             assert_eq!(state.store.latest_claim(&subject,Some("runtime.observed")).unwrap().unwrap().id,runtime.id);
             assert!(raw_snapshot(&state.store,&fence).is_err());
             if !hold_dirty {
@@ -2214,6 +2217,7 @@ mod tests {
                     tokio::task::yield_now().await;
                 }
             }).await.expect("healthy desired-change dispatcher did not reach the stream");
+            assert_eq!(state.store.mailbox_wake_health().status, "pass");
             stream.recheck.send(()).unwrap();
             stream.heartbeat.send(()).unwrap();
             stream.socket.send(report("must-not-be-recorded")).await.unwrap();
