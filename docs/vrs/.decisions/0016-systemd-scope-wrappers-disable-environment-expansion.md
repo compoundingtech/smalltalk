@@ -82,3 +82,9 @@ pass-throughs.
   program-and-argv path.
 - Scope lifetime and I/O behavior are unchanged. The supporting live evidence
   is recorded in the [systemd scope argv experiment](../.experiments/2026-09-05-systemd-scope-argv-transparency.md).
+
+The [systemd 249 compatibility experiment](../.experiments/2026-10-08-systemd-249-scope-compatibility.md)
+records legacy option rejection, exact raw argv and inherited execution context,
+sibling-scope survival, unreachable-manager fallback, and a native driver seat
+reply before and after daemon service restart. Its supplied-runtime boundary
+is explicit; native stock Ubuntu 22.04 installation is not established.
