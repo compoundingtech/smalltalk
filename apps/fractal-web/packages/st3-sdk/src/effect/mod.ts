@@ -528,6 +528,7 @@ const make = (options: St3Options) =>
           }
           const stop = () => {
             followKeys.delete(id)
+            sentSerials.delete(id)
             fresheners.delete(id)
             if (freshnessTable.get(key) === freshness) {
               freshnessTable.delete(key)

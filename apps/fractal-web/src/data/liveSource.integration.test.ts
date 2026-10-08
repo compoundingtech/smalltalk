@@ -141,16 +141,14 @@ class Gateway {
             { status: 403, headers: { 'content-type': 'application/json' } },
           )
         }
-        const followed = this.commands.findLast(
-          (command) => command.kind === 'subscribe' && command.collection === 'conversation',
+        const followed = this.commands.some(
+          (command) =>
+            command.kind === 'subscribe' &&
+            command.collection === 'conversation' &&
+            command.conversation === action.parameters.to,
         )
-        if (
-          followed?.kind !== 'subscribe' ||
-          followed.collection !== 'conversation' ||
-          action.parameters.to !== followed.conversation
-        ) {
-          throw new Error('Message addressed to a different agent than the followed conversation')
-        }
+        if (!followed)
+          throw new Error('Message addressed to a conversation that was never followed')
         value = {
           kind: 'action-result',
           action_id: action.id,
@@ -813,6 +811,58 @@ describe('optimistic conversation sends', () => {
           _tag: 'Observed', value: { items: [
             { _tag: 'Text', text: 'hello', sendState: { _tag: 'Sent' } },
           ] },
+        })
+      }),
+    ),
+  )
+
+  it.live('retires a send that settles after its follow was evicted on the next fresh window', () =>
+    withGateway((live, gateway) =>
+      Effect.gen(function* () {
+        const unmountInterest = live.registry.mount(live.source.conversationInterest!(agent.id))
+        const conversation = live.source.conversation(agent.id)
+        const unmountConversation = live.registry.mount(conversation)
+        yield* settle
+        let resolvePost!: () => void
+        gateway.sendGate = new Promise<void>((resolve) => { resolvePost = resolve })
+        const sending = live.source.attachments!.send(request)
+        yield* Effect.promise(() => gateway.nextAction())
+        // The reader leaves while the POST is in flight; two more conversations exceed the
+        // two-slot budget, so the evicted follow run ends before the send settles.
+        unmountConversation()
+        unmountInterest()
+        const unmountOtherInterest = live.registry.mount(live.source.conversationInterest!('agent/other'))
+        const unmountOther = live.registry.mount(live.source.conversation('agent/other'))
+        const unmountThirdInterest = live.registry.mount(live.source.conversationInterest!('agent/third'))
+        const unmountThird = live.registry.mount(live.source.conversation('agent/third'))
+        yield* settle
+        resolvePost()
+        expect((yield* Effect.promise(() => sending))._tag).toBe('Success')
+        unmountOther()
+        unmountOtherInterest()
+        unmountThird()
+        unmountThirdInterest()
+        // Returning mounts a subscription opened after completion; its first window is
+        // authoritative, retires the outbox row, and reports the whole page as changed.
+        live.registry.mount(live.source.conversationInterest!(agent.id))
+        live.registry.mount(conversation)
+        yield* settle
+        gateway.send({
+          kind: 'conversation', id: gateway.subscription('conversation').id,
+          collection: 'conversation', session_id: 'session/example',
+          replace: true, has_more: false,
+          items: [
+            { id: 'timeline-entry/resumed/content', sequence: 1, revision: 1,
+              type: 'content', role: 'assistant', final: true, timestamp: snapshot.created_at,
+              body: { media_type: 'text/plain', text: 'resumed' } },
+          ],
+        })
+        yield* settle
+        expect(live.registry.get(conversation)).toMatchObject({
+          _tag: 'Observed', value: {
+            items: [{ _tag: 'Text', id: 'timeline-entry/resumed/content', text: 'resumed' }],
+            change: { index: 0 },
+          },
         })
       }),
     ),

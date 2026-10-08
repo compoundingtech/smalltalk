@@ -750,4 +750,18 @@ describe('follow freshness', () => {
       }),
     ))
 
+
+  it('forgets a follow subscribe serial when its run ends', () =>
+    run({ maxFollows: 4 }, () =>
+      Effect.gen(function* () {
+        const st3 = yield* St3
+        const ref = 'agent/serial-end'
+        const follow = yield* mountConversation(ref)
+        yield* settle
+        expect(st3.subscribeSerial({ _tag: 'Conversation', ref })).toBe(1)
+        yield* follow.interrupt
+        yield* settle
+        expect(st3.subscribeSerial({ _tag: 'Conversation', ref })).toBeUndefined()
+      }),
+    ))
 })

@@ -416,6 +416,14 @@ export class LiveTimeline {
     this.dirtyFrom = Math.min(this.dirtyFrom, call)
   }
 
+  /** Message identities the window currently shows, without consuming projection state. */
+  shownMessageIds(): Set<string> {
+    const shown = new Set<string>()
+    for (const entry of this.ordered)
+      if (entry.type === 'message' && !isTurnHeader(entry)) shown.add(entry.body.message_id)
+    return shown
+  }
+
   /** Re-projects from the lowest touched position; free when nothing changed. */
   project(): TimelineProjection {
     if (this.reindex) this.rebuildIndex()
@@ -432,11 +440,7 @@ export class LiveTimeline {
     const changedFrom = this.itemsBefore[from] ?? this.items.length
     const items = this.items.slice(0, changedFrom)
     this.itemsBefore.length = from
-    const shown = new Set(
-      this.ordered.flatMap((entry) =>
-        entry.type === 'message' && !isTurnHeader(entry) ? [entry.body.message_id] : [],
-      ),
-    )
+    const shown = this.shownMessageIds()
     // Both st projections stamp a mail pair from one claim: identical timestamp, message
     // at `store_index*4`, content at `+1`. That structure survives split pages and native
     // interleaving, unlike array adjacency.
