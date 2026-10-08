@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Add an opt-in collection-window load profile with bounded initialization and full-card parity",
+  "replay": {
+    "status": "none",
+    "detail": "Test workload only; production graph replay and startup are unchanged."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No production or checkpoint schema changes; generated load fixture schema is unchanged."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules, admission policy, writer behavior or fleet coordination changes."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No client protocol changes. Load reports include a profile identity and optional collection counts. Legacy reports retain the agents-only profile; comparisons reject mixed or different profiles. Socket initialization finishes and releases its borrow before the receive loop starts."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No serving code changes or deployment restart required by this measurement change."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "The canonical release daemon_load command keeps its agents-only workload. Set ST_LOAD_PROFILE=collections-v1 explicitly for all four held collections and use a baseline from that same profile."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Unset ST_LOAD_PROFILE to use the canonical agents-only workload; no production database state changes."
+  }
+}
