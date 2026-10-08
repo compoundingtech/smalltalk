@@ -474,11 +474,24 @@ Storage metrics are not sampled.
 A scoped thread-local `Option<Arc<WriterWait>>` shares a request accumulator across
 handler, store, action, and API blocking sections. Two relaxed atomics sum writer ACK
 wait in nanoseconds and count writer operations. Outer handler completion records
-`st.writer.wait_ms` (total ACK wait converted to milliseconds) and `st.writer.ops`
-(operation count) on the existing SERVER request span. Each scope restores the previous
-accumulator, including nested blocking sections; writer calls do not create child spans
+`st.writer.wait_ms` (total ACK wait converted to milliseconds, only when at least 1 ms)
+and `st.writer.ops` (operation count, including zero) on the existing SERVER request span.
+Each scope restores the previous accumulator, including nested blocking sections;
+writer calls do not create child spans
 or perform per-operation span-context lookup. This preserves the single-span request
 shape and adds no in-process sampling.
+
+The daemon idle-WAL worker emits a detached INTERNAL `st.db.checkpoint` root only
+when TRUNCATE was attempted or the result is abnormal. It uses the OTel API with
+an explicit empty parent context, retaining the attempt's start time without constructing
+a span for ordinary idle passes. `span.label` and `db.operation.name` are
+`checkpoint.truncate` for TRUNCATE attempts, otherwise `checkpoint.passive`;
+`db.system.name=sqlite`. A TRUNCATE result records `st.db.wal.checkpoint.duration`
+in seconds, reusing the existing instrument vocabulary without adding a metric.
+Failures, PASSIVE durations at least 1000 ms, writer waits or TRUNCATE durations
+at least 100 ms, and at least three consecutive no-progress pinned-WAL samples
+mark the root ERROR. Successful ordinary TRUNCATE leaves status UNSET.
+Span emission is independent of the diagnostic log buckets and has no links.
 
 ### Attribute and context policy
 
@@ -502,6 +515,11 @@ The daemon request proof checks caller trace continuity, `service.name=st-daemon
 the single-span shape (phase attributes present, no admission/handler child spans), and
 that a healthy request exports no below-WARN log record. A unit test pins the batch queue
 bounds.
+The storage-stage receiver proof exports request totals at 0, 0.999, 1, and 1.001 ms,
+checks the 1 ms attribute boundary and unchanged operation counts, and forces a real
+TRUNCATE using unpinned WAL frames in an isolated store. It checks ordinary passes emit
+no root, abnormal/failure results are ERROR, and roots remain parentless even with
+both an entered tracing span and an attached OTel context.
 The CLI shutdown helper is tested with an exporter that never returns from shutdown:
 the caller reports a receive timeout and writes the negative cache within the 50 ms
 deadline plus 200 ms of scheduling/filesystem tolerance. The process-level black-hole

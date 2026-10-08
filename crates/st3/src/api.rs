@@ -1162,9 +1162,7 @@ async fn response_envelope_unbounded(
                         handler_started.elapsed().as_millis() as i64,
                     );
                     if let Some(writer_wait) = writer_wait.as_ref() {
-                        let (wait_ms, ops) = writer_wait.totals();
-                        server.record("st.writer.wait_ms", wait_ms);
-                        server.record("st.writer.ops", i64::try_from(ops).unwrap_or(i64::MAX));
+                        crate::otel::record_writer_wait(server, writer_wait.totals());
                     }
                 }
                 response

@@ -309,6 +309,50 @@ pub fn record_http_request_duration(
     );
 }
 
+/// Request totals stay on the SERVER span, without sub-millisecond noise.
+pub fn record_writer_wait(server: &tracing::Span, (wait_ms, ops): (f64, u64)) {
+    if wait_ms >= 1.0 {
+        server.record("st.writer.wait_ms", wait_ms);
+    }
+    server.record("st.writer.ops", i64::try_from(ops).unwrap_or(i64::MAX));
+}
+
+/// Retrospective span: ordinary passes never construct a span. The explicit empty
+/// parent prevents both tracing and OTel ambient contexts from parenting the root.
+pub fn record_wal_checkpoint(
+    started: SystemTime,
+    report: Option<&smallclaims::sqlite::WalCheckpointReport>,
+    abnormal: bool,
+) {
+    use opentelemetry::trace::{Span as _, Tracer as _};
+    if !export_enabled()
+        || (!abnormal && report.is_some_and(|report| report.truncate_ms.is_none()))
+    {
+        return;
+    }
+    let truncate = report.is_some_and(|report| report.truncate_ms.is_some());
+    let operation = if truncate { "checkpoint.truncate" } else { "checkpoint.passive" };
+    let tracer = opentelemetry::global::tracer("st3");
+    let mut span = tracer
+        .span_builder("st.db.checkpoint")
+        .with_start_time(started)
+        .with_attributes([
+            KeyValue::new("span.label", operation),
+            KeyValue::new("db.system.name", "sqlite"),
+            KeyValue::new("db.operation.name", operation),
+        ])
+        .start_with_context(&tracer, &opentelemetry::Context::new());
+    if let Some(report) = report
+        && let Some(ms) = report.truncate_ms
+    {
+        span.set_attribute(KeyValue::new("st.db.wal.checkpoint.duration", ms as f64 / 1000.));
+    }
+    if abnormal || report.is_none() {
+        span.set_status(opentelemetry::trace::Status::error("abnormal checkpoint"));
+    }
+    span.end();
+}
+
 pub struct Telemetry {
     tracer_provider: Option<SdkTracerProvider>,
     meter_provider: Option<SdkMeterProvider>,

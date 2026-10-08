@@ -764,7 +764,7 @@ fn daemon_write_request_exports_storage_metrics() {
                     && string_attribute(span, "http.route") == Some("/v1/claims")
                     && int_attribute(span, "st.writer.ops").is_some_and(|ops| ops >= 1)
                     && double_attribute(span, "st.writer.wait_ms")
-                        .is_some_and(|wait| wait >= 0.0)
+                        .is_none_or(|wait| wait >= 1.0)
             })
     });
 }
@@ -829,5 +829,94 @@ fn daemon_normal_request_exports_no_log_stream() {
             !below_warn,
             "a non-diagnostic (below-WARN) log record was exported:\n{line}"
         );
+    }
+}
+
+// Run the gate proof in its own process, so SDK globals cannot leak between tests.
+#[cfg(target_os = "linux")]
+#[test]
+fn storage_stage_gates_export_detached_roots() {
+    const CHILD: &str = "ST3_OTEL_STORAGE_STAGE_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+        use opentelemetry::trace::TraceContextExt as _;
+        let mut telemetry = st3::otel::Telemetry::init(st3::otel::Unit::Daemon, None);
+        assert!(telemetry.enabled());
+        for wait in [0.0, 0.999, 1.0, 1.001] {
+            let server = tracing::info_span!(
+                "writer gate", otel.kind = "server",
+                "st.writer.wait_ms" = tracing::field::Empty,
+                "st.writer.ops" = tracing::field::Empty,
+            );
+            st3::otel::record_writer_wait(&server, (wait, 2));
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claims.sqlite3");
+        let store = st3::store::Store::open(&path, "otel-test").unwrap();
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        // Real WAL frames with no reader pin deterministically take the TRUNCATE branch.
+        connection.execute_batch(
+            "CREATE TABLE otel_checkpoint_proof(value INTEGER); INSERT INTO otel_checkpoint_proof VALUES (1);"
+        ).unwrap();
+        let started = std::time::SystemTime::now();
+        let truncated = store.checkpoint_idle_wal_report(&connection).unwrap();
+        assert!(truncated.truncate_ms.is_some() && truncated.recycled);
+        st3::otel::record_wal_checkpoint(started, Some(&truncated), false);
+        let ordinary = store.checkpoint_idle_wal_report(&connection).unwrap();
+        assert!(ordinary.truncate_ms.is_none());
+        st3::otel::record_wal_checkpoint(std::time::SystemTime::now(), Some(&ordinary), false);
+        let ambient = tracing::info_span!("ambient checkpoint");
+        let ambient_context = ambient.context();
+        let _entered = ambient.enter();
+        let _attached = ambient_context.attach();
+        // Repeat both gates under a tracing span and an attached OTel context.
+        st3::otel::record_wal_checkpoint(std::time::SystemTime::now(), Some(&ordinary), false);
+        st3::otel::record_wal_checkpoint(std::time::SystemTime::now(), Some(&truncated), false);
+        st3::otel::record_wal_checkpoint(std::time::SystemTime::now(), Some(&ordinary), true);
+        st3::otel::record_wal_checkpoint(std::time::SystemTime::now(), None, true);
+        let current = opentelemetry::Context::current();
+        assert!(current.span().span_context().is_valid());
+        drop(_attached);
+        drop(_entered);
+        drop(ambient);
+        telemetry.shutdown();
+        return;
+    }
+    let Some(collector) = otelite("storage_stage_gates_export_detached_roots") else {
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    let output = isolated_command(&collector, root.path())
+        .env(CHILD, "1")
+        .args(["run", "--out"]).arg(root.path().join("capture"))
+        .args(["--protocol", "http/json", "--"])
+        .arg(std::env::current_exe().unwrap())
+        .args(["otel_export::storage_stage_gates_export_detached_roots", "--exact", "--nocapture"])
+        .output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let traces = std::fs::read_to_string(root.path().join("capture/traces.ndjson")).unwrap();
+    let spans: Vec<Value> = traces.lines().flat_map(|line| {
+        let request: Value = serde_json::from_str(line).unwrap();
+        request["resourceSpans"].as_array().unwrap().iter()
+            .flat_map(|batch| batch["scopeSpans"].as_array().unwrap())
+            .flat_map(|scope| scope["spans"].as_array().unwrap())
+            .cloned().collect::<Vec<_>>()
+    }).collect();
+    let writers: Vec<_> = spans.iter().filter(|span| span["name"] == "writer gate").collect();
+    assert_eq!(writers.len(), 4, "{traces}");
+    let waits: Vec<_> = writers.iter().filter_map(|span| double_attribute(span, "st.writer.wait_ms")).collect();
+    assert_eq!(waits.len(), 2, "{traces}");
+    assert!(waits.contains(&1.0) && waits.contains(&1.001), "{traces}");
+    assert!(writers.iter().all(|span| int_attribute(span, "st.writer.ops") == Some(2)));
+    let checkpoints: Vec<_> = spans.iter().filter(|span| span["name"] == "st.db.checkpoint").collect();
+    assert_eq!(checkpoints.len(), 4, "ordinary passes must emit none: {traces}");
+    assert_eq!(checkpoints.iter().filter(|span| span["status"]["code"] == 2).count(), 2, "{traces}");
+    assert_eq!(checkpoints.iter().filter(|span| string_attribute(span, "db.operation.name") == Some("checkpoint.truncate")).count(), 2);
+    let ambient = spans.iter().find(|span| span["name"] == "ambient checkpoint").unwrap();
+    for span in checkpoints {
+        assert!(span["parentSpanId"].as_str().is_none_or(|id| id.is_empty() || id == "0000000000000000"), "{span}");
+        assert_ne!(span["traceId"], ambient["traceId"], "{span}");
+        assert!(span["links"].as_array().is_none_or(Vec::is_empty), "{span}");
+        assert_eq!(string_attribute(span, "db.system.name"), Some("sqlite"));
     }
 }
