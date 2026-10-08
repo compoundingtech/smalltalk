@@ -3551,6 +3551,17 @@ fn detect_host_returns_a_nonempty_short_name() {
     assert!(!h.contains('.'), "short name only, got {h}");
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn detect_host_matches_kernel_hostname() {
+    let full = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap();
+    let short = full.trim().split('.').next().unwrap();
+    let expected = if short.is_empty() { "localhost" } else { short };
+    let host = detect_host();
+    assert!(!host.is_empty());
+    assert_eq!(host, expected);
+}
+
 #[test]
 fn task_observation_of_missing_pty_root_is_complete_and_does_not_create_it() {
     let tmp = tempfile::tempdir().unwrap();

@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Allow outage merge groups to finish without optional cache publication",
+  "replay": {
+    "status": "none",
+    "detail": "No projection replay change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database or migration changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint or admission rules change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No daemon, client or harness protocol changes."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No service deployment or downtime introduced."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Required checks and logs remain; disable the outage variable to restore optional cache saves."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "CI_OUTAGE_FAST_QUEUE=on skips optional merge-group Nix saves and same-source build-snapshot publication only. Cache reads, shared keys, member eligibility, required checks and producer test archives remain unchanged. Set off at outage end; restore temporary ruleset max_entries_to_build from six to two."
+  }
+}

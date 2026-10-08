@@ -1,5 +1,23 @@
 # Merge queue test flakes
 
+## Malformed OMP admission fixture
+
+`harness_admission::tests::malformed_probe_cannot_inherit_other_passing_evidence`
+could admit its synthetic child because the fixture published complete passing event
+and channel streams before appending the malformed event. The real probe accepts once
+all required evidence is present, so it could finish within that passing prefix.
+
+The fixture now assembles the malformed record into the event payload and atomically
+publishes each complete capture. Passing channel evidence can only appear after the
+complete malformed event stream is visible. The negative control holds the child alive
+after publication, forcing the old passing-prefix schedule independently of child exit.
+The passing-cache control uses the same hold and still admits valid evidence and reuses
+its cache. Production probe, identity, refusal and cache behavior are unchanged.
+
+The first hosted failure at source `9038d22e` and its later passing retry remain separate.
+The forced schedule qualifies the fixture defect; the hosted log does not retain the
+producer interleave needed to attribute that specific attempt.
+
 ## Terminal tab protocol observation
 
 `ui::terminal_tab::terminal_tab_protocols` appends Ctrl-B, Ctrl-A, Ctrl-B after each
@@ -129,3 +147,24 @@ quiescent differential and missing-read tests continue to exercise full-pass aud
 No production reconciler behavior changes. An attempted control before member
 classification was caught by the existing second change-feed refresh and did not
 reproduce the hosted mid-evaluation panic; it is not claimed as cause proof.
+
+## Terminal probe action publication
+
+Merge-group run 37736805982 at `c49892de8f5d44b842f08689e956fae8e98f410b`
+contains the earlier input-barrier fix, but its terminal protocol probe first
+attempt timed out waiting for image hiding: the last status retained a focused
+terminal and two image cells. The later passing retry remains separate evidence.
+The log does not retain the worker's output or the action file, so it does not
+establish the historical timeout's cause.
+
+The fixture has an independently reproducible publication race. Python creates
+`ui-action` before writing `hide` or `show`; the Rust worker immediately reads and
+removes any existing action file. If it reads a prefix, it panics on the unknown
+action and leaves the last status unchanged. A forced split-write control lets the
+real worker run while only the first byte has been written; the old publication
+path fails, while staging and renaming the complete file preserves both hide and
+show. Two title acknowledgements span a new worker loop during the partial write.
+
+The probe now publishes action files with rename, like its existing output
+requests. Production UI, input, image handling and PTY transport are unchanged.
+The original matrix, image lifecycle assertions and timeouts remain in force.

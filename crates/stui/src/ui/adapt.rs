@@ -25,6 +25,10 @@ pub struct Extras {
     /// Why a window has not loaded though st was asked (its source is not ready, or refused),
     /// until it loads: the screen says so instead of showing a spinner forever.
     pub window_errors: BTreeMap<String, String>,
+    /// Whether the missions window is followed and has loaded.
+    pub missions_followed: bool,
+    /// st's own counts, when it serves them.
+    pub summary: Option<st3_client::Summary>,
 }
 
 fn now() -> String {
@@ -164,6 +168,8 @@ pub fn world(model: &Model, person: &str, extras: &Extras) -> World {
         link,
         diverged,
         stale,
+        missions_followed: extras.missions_followed,
+        active_missions: extras.summary.as_ref().map(|summary| summary.active_missions as usize),
         attention: loaded_or_why(model.now.snapshot.is_some(), attention, extras.window_errors.get("Attention")),
         agents: loaded_or_why(model.agents.snapshot.is_some(), agents(model, &missions), extras.window_errors.get("Agents")),
         missions: loaded_or_why(model.missions.snapshot.is_some(), missions, extras.window_errors.get("Missions")),
