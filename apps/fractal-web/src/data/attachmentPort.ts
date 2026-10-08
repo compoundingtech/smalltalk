@@ -1,8 +1,9 @@
 import type { St3Client } from '@smalltalk/st3-client'
+import type { ActionResult } from '@smalltalk/st3-client/schema'
 import * as Native from '@smalltalk/st3-client/schema'
 
 import { conversationPortFailure, hasConversationCapability } from './conversationPort.ts'
-import type { AttachmentPort } from './source.ts'
+import type { AttachmentPort, ConversationPortResult, MessageSendAction } from './source.ts'
 
 /** Upload, chunk reads and sending use the same gateway client, never a synthetic delivery. */
 export const gatewayAttachments = (client: St3Client): AttachmentPort => ({
@@ -45,12 +46,28 @@ export const gatewayAttachments = (client: St3Client): AttachmentPort => ({
       return conversationPortFailure(cause)
     }
   },
-  send: async (request) => {
-    const idempotencyKey = request.idempotency_key ?? crypto.randomUUID()
+  send: async (request) =>
+    gatewayMessageSend(client)({
+      api_version: request.api_version,
+      type: request.type,
+      id: request.id,
+      fence: request.fence,
+      parameters: request.parameters,
+      idempotency_key: request._tag === 'Resend' ? request.idempotencyKey : crypto.randomUUID(),
+    }),
+})
+
+/**
+ * Submit one message action whose idempotency key the caller already chose. Optimistic
+ * senders derive the message identity from that key, so it must be single-sourced.
+ */
+export const gatewayMessageSend =
+  (client: St3Client) =>
+  async (request: MessageSendAction): Promise<ConversationPortResult<ActionResult>> => {
     let attachments: readonly Native.AttachmentInput[]
     // Validate the actual generated action contract (including max four PNG/JPEG/GIF/WebP references).
     try {
-      const action = Native.decodeUnknownSync(Native.ActionRequest)({ ...request, idempotency_key: idempotencyKey })
+      const action = Native.decodeUnknownSync(Native.ActionRequest)(request)
       if (action.type !== 'message.send') {
         return { _tag: 'Refused', reason: 'invalid', detail: 'Attachment sending requires a message.send action.' }
       }
@@ -66,7 +83,7 @@ export const gatewayAttachments = (client: St3Client): AttachmentPort => ({
       }
       const response = await client.messageSend({
         id: request.id,
-        idempotency_key: idempotencyKey,
+        idempotency_key: request.idempotency_key,
         fence: request.fence,
         parameters: {
           ...request.parameters,
@@ -78,5 +95,4 @@ export const gatewayAttachments = (client: St3Client): AttachmentPort => ({
     } catch (cause) {
       return conversationPortFailure(cause)
     }
-  },
-})
+  }

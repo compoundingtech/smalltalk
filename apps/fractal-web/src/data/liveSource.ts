@@ -27,7 +27,7 @@ import { gatewayResources } from '../resources/agent/source.ts'
 import { instrumentFetch } from '../telemetry/transport.ts'
 import { unavailableTerminalHistory } from '../terminal/historySource.ts'
 import { gatewayTerminalResize } from '../terminal/terminal-resize-port.ts'
-import { gatewayAttachments } from './attachmentPort.ts'
+import { gatewayAttachments, gatewayMessageSend } from './attachmentPort.ts'
 import { gatewayContentSearch } from './contentSearchPort.ts'
 import { makeFrameIngest } from './frameIngest.ts'
 import { nativeAgentFetch } from './nativeAgentFetch.ts'
@@ -480,6 +480,7 @@ export const liveSource = ({
       ),
   })
   const attention = attentionRetained.atom
+  const submitMessage = gatewayMessageSend(client)
 
   // Atom.family is weakly memoized. Keep the 24 recent snapshot controllers explicitly.
   const visibleConversations = new Map<string, boolean>()
@@ -540,7 +541,7 @@ export const liveSource = ({
       changedFrom = Infinity
     }
     const send: AttachmentPort['send'] = async (request) => {
-      const idempotencyKey = request.idempotency_key ?? crypto.randomUUID()
+      const idempotencyKey = request._tag === 'Resend' ? request.idempotencyKey : crypto.randomUUID()
       const id = `pending/${idempotencyKey}`
       const local: PendingSend = {
         item: {
@@ -556,10 +557,10 @@ export const liveSource = ({
         },
         messageIds: [],
       }
-      // A fresh client key paints immediately: Enter must not wait for any await.
-      // A deliberate resubmission names mail the stream may already show, so its
-      // authoritative identity is reconciled before any optimistic row can duplicate it.
-      if (request.idempotency_key === undefined) {
+      // A first send paints immediately: Enter must not wait for any await. An explicit
+      // Resend names mail the stream may already show, so its authoritative identity is
+      // reconciled before any optimistic row can duplicate it.
+      if (request._tag === 'Send') {
         pending.set(id, local)
         publishPending()
       }
@@ -568,12 +569,21 @@ export const liveSource = ({
         // Resolve this before POST so an echo that wins the HTTP race still replaces its outbox item.
         const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(idempotencyKey)))
         local.messageIds = [`message/${[...hash.slice(0, 8)].map((byte) => byte.toString(16).padStart(2, '0')).join('')}`]
-        if (request.idempotency_key !== undefined) {
-          if (shownMessageIds().has(local.messageIds[0]!)) return attachments.send({ ...request, idempotency_key: idempotencyKey })
+        const submit = () =>
+          submitMessage({
+            api_version: request.api_version,
+            type: request.type,
+            id: request.id,
+            fence: request.fence,
+            parameters: request.parameters,
+            idempotency_key: idempotencyKey,
+          })
+        if (request._tag === 'Resend' && shownMessageIds().has(local.messageIds[0]!)) return submit()
+        if (request._tag === 'Resend') {
           pending.set(id, local)
           publishPending()
         }
-        const result = await attachments.send({ ...request, idempotency_key: idempotencyKey })
+        const result = await submit()
         if (result._tag === 'Success' && result.value.status === 'rejected') {
           local.item = { ...local.item, sendState: { _tag: 'Failed', reason: 'rejected', detail: 'The message action was rejected.' } }
         } else if (result._tag === 'Refused') {
