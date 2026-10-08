@@ -16,6 +16,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   type ConversationChunk,
   type FollowEvent,
+  type FollowSpec,
   followKey,
   St3,
   type SyncStatus,
@@ -24,6 +25,9 @@ import {
 } from './mod.ts'
 import type { FollowFreshness } from './freshness.ts'
 import type { St3Diagnostic } from './socket.ts'
+
+/** Collections a window follow can name; the wire CollectionName also carries unfollowable ones. */
+type WindowCollection = Extract<FollowSpec, { readonly _tag: 'Window' }>['collection']
 
 const snapshot: Snapshot = {
   id: 'snapshot/1',
@@ -184,7 +188,7 @@ const watchFollow = <A>(
   })
 
 const mountWindow = (
-  collection: CollectionName,
+  collection: WindowCollection,
 ): Effect.Effect<Mounted<WindowValue>, never, St3 | Scope.Scope> =>
   Effect.gen(function* () {
     const st3 = yield* St3
@@ -207,7 +211,7 @@ const mountConversation = (
     )
   })
 
-const windowSpec = (collection: CollectionName) =>
+const windowSpec = (collection: WindowCollection) =>
   ({ _tag: 'Window', collection, limit: 50 }) as const
 
 const runEffect = (

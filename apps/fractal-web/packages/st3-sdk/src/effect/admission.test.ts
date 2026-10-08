@@ -3,7 +3,7 @@
  * keep their slot, which one is evicted, and what each consumer's stream sees.
  */
 import type { Capability, CollectionFrame, CollectionSocket } from '@smalltalk/st3-client'
-import type { CollectionName, Snapshot } from '@smalltalk/st3-client'
+import type { CollectionName, Mission, Snapshot } from '@smalltalk/st3-client'
 import { decodeUnknownSync, Mission as MissionCodec } from '@smalltalk/st3-client/schema'
 import * as Effect from 'effect/Effect'
 import * as Fiber from 'effect/Fiber'
@@ -20,6 +20,9 @@ import {
   St3Live,
   type WindowValue,
 } from './mod.ts'
+
+/** Collections a window follow can name; the wire CollectionName also carries unfollowable ones. */
+type WindowCollection = Extract<FollowSpec, { readonly _tag: 'Window' }>['collection']
 
 const API_VERSION = 'st3.client.v0'
 const snapshot: Snapshot = {
@@ -116,7 +119,7 @@ class FakeGateway {
   }
 }
 
-const windowSpec = (collection: CollectionName): Extract<FollowSpec, { _tag: 'Window' }> => ({
+const windowSpec = (collection: WindowCollection): Extract<FollowSpec, { _tag: 'Window' }> => ({
   _tag: 'Window',
   collection,
   limit: 50,
@@ -192,7 +195,7 @@ describe('follow admission', () => {
         // The wire type permits any number, but decoding requires a nonnegative attempt.
         // A person assignee is valid: mission step ownership uses ActorRef, not AgentRef.
         const mission = (attempt: number) => ({
-          kind: 'mission' as const, id: 'mission/example', revision: '1',
+          kind: 'mission', id: 'mission/example', revision: '1',
           updated_at: snapshot.created_at, title: 'Example', state: 'running',
           mission_revision: '1', runs: [], run_generations: {},
           run_details: [{
@@ -204,7 +207,7 @@ describe('follow admission', () => {
               since: snapshot.created_at, assignee: 'person/example',
             }],
           }],
-        })
+        } satisfies Mission)
         const decodeMission = decodeUnknownSync(MissionCodec)
         expect(() => decodeMission(mission(1))).not.toThrow()
         const row = mission(-1)
@@ -221,7 +224,7 @@ describe('follow admission', () => {
         expect(diagnostics.filter((event) => String(event._tag) === 'RowDecode')).toEqual([
           { _tag: 'RowDecode', collection: 'missions', rowId: row.id, revision: '1' },
         ])
-        gateway.send({ kind: 'resync', id: gateway.idOf('missions'), reason: 'test' })
+        gateway.send({ kind: 'resync', id: gateway.idOf('missions'), code: 'internal', message: 'Retry' })
         yield* settle
         send('1', 'After resync')
         yield* settle
