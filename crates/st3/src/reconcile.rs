@@ -10214,10 +10214,31 @@ impl<R: RuntimeControl> Reconciler<R> {
         let source = crate::mission::interpolate_kdl(source, &variables)?;
         let mut intent = crate::graph::parse_execution_intent(&source, &self.host, &run.id)?;
         if assigned_agents_only {
-            intent.subjects.retain(|subject, desired| {
+            let selected_agent = |subject: &str, desired: &DesiredSubject| {
                 desired.kind == "agent"
-                    && (view.assigned_to.as_deref() == Some(subject.as_str())
+                    && (view.assigned_to.as_deref() == Some(subject)
                         || view.available_to.iter().any(|agent| agent == subject))
+            };
+            // Publish a selected agent's synthesized targets before it can start, without
+            // bringing forward other agents, resources, or execution declarations.
+            let uri_targets = intent.subjects.iter()
+                .filter(|(subject, desired)| selected_agent(subject, desired))
+                .flat_map(|(_, desired)| {
+                    desired.desired.get("resources").and_then(Value::as_array)
+                        .into_iter().flatten()
+                })
+                .filter(|edge| edge["kind"] == "uri")
+                .filter_map(|edge| edge["subject"].as_str().map(str::to_owned))
+                .collect::<BTreeSet<_>>();
+            intent.subjects.retain(|subject, desired| {
+                selected_agent(subject, desired)
+                    || (uri_targets.contains(subject)
+                        && desired.kind == "resource"
+                        && subject.starts_with("resource/uri/")
+                        && desired.owner_run.is_none()
+                        && desired.owner_generation.is_none()
+                        && desired.owner_step.is_none()
+                        && crate::graph::declared_uri(&desired.desired).is_some())
             });
         }
         self.keep_stops_by_hand(&mut intent, run)?;
@@ -10225,6 +10246,9 @@ impl<R: RuntimeControl> Reconciler<R> {
             return Ok(false);
         }
         for subject in intent.subjects.values_mut() {
+            if subject.kind == "resource" && crate::graph::declared_uri(&subject.desired).is_some() {
+                continue;
+            }
             subject.owner_run = Some(run.subject.clone());
             subject.owner_generation = Some(run.generation.clone());
             subject.owner_step = Some(view.subject.clone());
@@ -10431,6 +10455,9 @@ impl<R: RuntimeControl> Reconciler<R> {
         });
         self.keep_stops_by_hand(&mut intent, run)?;
         for subject in intent.subjects.values_mut() {
+            if subject.kind == "resource" && crate::graph::declared_uri(&subject.desired).is_some() {
+                continue;
+            }
             subject.owner_run = Some(run.subject.clone());
             subject.owner_generation = Some(run.generation.clone());
             subject.owner_step = None;
@@ -16913,6 +16940,131 @@ version 2
         );
     }
 
+    #[test]
+    fn shared_uri_resources_survive_run_discard_and_eval_cleanup_without_rewrites() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"
+version 2
+agent "shared/reader" {
+  workspace "/tmp"
+  command "true"
+  restart "never"
+  resource "issue" uri="https://github.com/example/project/issues/42"
+  resource "mission-worker" uri="urn:example:one" reason="mission-worker"
+  resource "agent/mission-worker" uri="urn:example:two" reason="agent/mission-worker"
+  resource "step-worker" uri="urn:example:three" reason="step-worker"
+  resource "agent/step-worker" subject="resource/worker" reason="agent/step-worker"
+}
+mission "shared-resource" state="ready" timeout="1m" {
+  concurrent-runs max=4
+  goal "Work on the same issue without owning its shared reference."
+  agent "mission-worker" {
+    workspace "/tmp"
+    command "true"
+    restart "never"
+    resource "issue" uri="https://github.com/example/project/issues/42"
+    resource "mission-worker" uri="urn:example:one" reason="mission-worker"
+    resource "agent/mission-worker" uri="urn:example:two" reason="agent/mission-worker"
+    resource "step-worker" uri="urn:example:three" reason="step-worker"
+    resource "agent/step-worker" subject="resource/worker" reason="agent/step-worker"
+  }
+  step "work" {
+    assigned-to "agent/${ST_MISSION_RUN}/step-worker"
+    agent "step-worker" {
+      workspace "/tmp"
+      command "true"
+      restart "never"
+      resource "issue" uri="https://github.com/example/project/issues/42"
+      resource "mission-worker" uri="urn:example:one" reason="mission-worker"
+      resource "agent/mission-worker" uri="urn:example:two" reason="agent/mission-worker"
+      resource "step-worker" uri="urn:example:three" reason="step-worker"
+      resource "agent/step-worker" subject="resource/worker" reason="agent/step-worker"
+    }
+  }
+}
+"#,
+            "publish-shared-uri",
+        );
+        let (_, reader) = store.agent_declaration("agent/shared/reader", None).unwrap().unwrap();
+        let references = crate::graph::declared_resources(&reader);
+        let resource = &references[0].subject;
+        let original = store.claims_for(resource, Some("intent.desired")).unwrap();
+        let original_ids = original.iter().map(|claim| claim.id.clone()).collect::<Vec<_>>();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        let mut runs = Vec::new();
+        for (mode, key) in [
+            ("run", "shared-run-first"),
+            ("run", "shared-run-second"),
+            ("eval", "shared-eval-first"),
+            ("eval", "shared-eval-second"),
+        ] {
+            let run = store.create_mission_run(&crate::model::MissionRunRequest {
+                mission: "shared-resource".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some(mode.into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: key.into(),
+            }).unwrap();
+            for _ in 0..3 {
+                reconciler.reconcile_once().unwrap();
+            }
+            let declared = store.desired_subjects_for_owner_run(&run.subject).unwrap();
+            for local in ["mission-worker", "step-worker"] {
+                let worker = declared.iter()
+                    .find(|desired| desired.subject == format!("agent/{}/{local}", run.id))
+                    .unwrap();
+                assert_eq!(crate::graph::declared_resources(&worker.desired), references);
+            }
+            let shared = store.desired_subjects_named(std::slice::from_ref(resource)).unwrap();
+            assert_eq!(shared[0].owner_run, None);
+            assert_eq!(shared[0].owner_generation, None);
+            assert_eq!(shared[0].owner_step, None);
+            assert_eq!(
+                store.claims_for(resource, Some("intent.desired")).unwrap()
+                    .iter().map(|claim| claim.id.clone()).collect::<Vec<_>>(),
+                original_ids,
+                "materializing another run must not rewrite the shared URI subject",
+            );
+            runs.push((mode, run));
+        }
+        for (mode, run) in runs {
+            if mode == "eval" {
+                assert!(store.retire_eval_owned_desired(&run.subject).unwrap().is_empty());
+            } else {
+                assert!(store.discard_desired_owned_by(&run.subject).unwrap() >= 2);
+            }
+            assert!(store.desired_subjects_for_owner_run(&run.subject).unwrap().is_empty());
+            let uris = store.declared_resource_uris(&references).unwrap();
+            assert_eq!(
+                uris.get(resource).map(String::as_str),
+                Some("https://github.com/example/project/issues/42"),
+                "another seat's URI must still resolve after each run's cleanup",
+            );
+            let client = crate::api::client_declared_resources(&references, &uris);
+            assert_eq!(client[0]["uri"], "https://github.com/example/project/issues/42");
+            let kdl = crate::graph::render_agent_desired_kdl(&reader, &uris).unwrap();
+            let restored = parse_intent(&kdl, "node").unwrap();
+            assert_eq!(
+                crate::graph::declared_resources(&restored.subjects["agent/shared/reader"].desired),
+                references,
+            );
+        }
+        assert_eq!(
+            store.claims_for(resource, Some("intent.desired")).unwrap()
+                .iter().map(|claim| claim.id.clone()).collect::<Vec<_>>(),
+            original_ids,
+        );
+    }
+
     #[tokio::test]
     async fn materialized_step_declarations_wake_member_reconciliation() {
         let store = Arc::new(Store::open_memory("node").unwrap());
@@ -18079,7 +18231,18 @@ mission "self-assigned" state="ready" {
   goal "Bring up the judge before offering its work."
   step "judge" {
     assigned-to "agent/${ST_MISSION_RUN}/judge"
-    agent "judge" { workspace "/tmp"; command "true"; restart "never" }
+    agent "judge" {
+      workspace "/tmp"
+      command "true"
+      restart "never"
+      resource "judge" uri="urn:example:assigned" reason="judge"
+      resource "agent/judge" uri="urn:example:assigned-two" reason="agent/judge"
+    }
+    agent "bystander" {
+      workspace "/tmp"
+      command "true"
+      resource "unrelated" uri="urn:example:unrelated"
+    }
   }
 }
 "#,
@@ -18112,6 +18275,18 @@ mission "self-assigned" state="ready" {
         assert!(store.desired_subjects().unwrap().iter().any(|desired| {
             desired.subject == format!("agent/{}/judge", run.id)
                 && desired.owner_step.as_deref() == Some(judge.subject.as_str())
+        }));
+        let (_, desired) = store.agent_declaration(&format!("agent/{}/judge", run.id), None)
+            .unwrap().unwrap();
+        let edges = crate::graph::declared_resources(&desired);
+        let uris = store.declared_resource_uris(&edges).unwrap();
+        assert_eq!(uris[&edges[0].subject], "urn:example:assigned");
+        assert_eq!(uris[&edges[1].subject], "urn:example:assigned-two");
+        let published = store.desired_subjects().unwrap();
+        assert!(published.iter().all(|subject| {
+            subject.subject != format!("agent/{}/bystander", run.id)
+                && crate::graph::declared_uri(&subject.desired)
+                    != Some("urn:example:unrelated")
         }));
     }
 
@@ -21011,6 +21186,44 @@ agent "test/worker" {
     }
 
     #[test]
+    fn declared_resource_edits_do_not_relaunch_an_exited_restart_never_seat() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = |resource: &str| format!(
+            "version 2\nagent \"test/worker\" {{ workspace \"/tmp\"; command \"true\"; restart \"never\"\n{resource}\n}}\n"
+        );
+        apply_source(&store, &source(""), "resource-seat");
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store.clone(), runtime.clone(), "node".into(), Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        let launch = reconciler.launch_token("agent/test/worker").unwrap();
+        let runtime_id = runtime.starts.lock().unwrap()[0].clone();
+        runtime.ptys.lock().unwrap().push(RuntimeObservation {
+            runtime_id: runtime_id.clone(),
+            terminal: true,
+            status: "exited".into(),
+            exit_code: Some(0),
+            incarnation_id: Some("finished-resource-seat".into()),
+        });
+        reconciler.reconcile_once().unwrap();
+        for (key, resource) in [
+            ("add-resource", "resource \"notes\" uri=\"https://example.com/notes\""),
+            ("remove-resource", ""),
+        ] {
+            apply_source(&store, &source(resource), key);
+            reconciler.reconcile_once().unwrap();
+            assert_eq!(reconciler.launch_token("agent/test/worker").unwrap(), launch);
+            assert_eq!(
+                runtime.starts.lock().unwrap().as_slice(),
+                std::slice::from_ref(&runtime_id),
+                "{key} must not relaunch an exited restart-never seat",
+            );
+            assert!(runtime.stops.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
     fn a_relabel_of_an_older_launch_runs_again_after_another_revision_launched() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         apply_source(&store, r#"version 2
@@ -21516,6 +21729,19 @@ agent "worker" {
         store.rename_agent("agent/node.worker", Some("Renamed"), "rename-exhausted").unwrap();
         reconciler.reconcile_once().unwrap();
         assert_eq!(runtime.starts.lock().unwrap().len(), 1);
+        for (key, resource) in [
+            ("add-exhausted-resource", "resource \"notes\" uri=\"https://example.com/notes\""),
+            ("remove-exhausted-resource", ""),
+        ] {
+            let edited = source.replace(
+                "command \"true\"",
+                &format!("command \"true\"\n{resource}"),
+            );
+            apply_source(&store, &edited, key);
+            reconciler.reconcile_once().unwrap();
+            assert_eq!(reconciler.launch_token("agent/node.worker").unwrap(), desired_token);
+            assert_eq!(runtime.starts.lock().unwrap().len(), 1, "{key} must preserve the exhausted budget");
+        }
         store
             .append_claim(&ClaimInput {
                 subject: "agent/node.worker".into(),
@@ -21630,6 +21856,20 @@ agent "worker" {
         store.rename_agent("agent/node.worker", Some("Renamed"), "rename-parked").unwrap();
         reconciler.reconcile_once().unwrap();
         assert_eq!(runtime.starts.lock().unwrap().len(), 3, "a rename must not unpark the seat");
+        let launch = reconciler.launch_token("agent/node.worker").unwrap();
+        for (key, resource) in [
+            ("add-parked-resource", "resource \"notes\" uri=\"https://example.com/notes\""),
+            ("remove-parked-resource", ""),
+        ] {
+            let source = format!(
+                "version 2\nagent \"worker\" {{ workspace \"/tmp\"; command \"true\"; restart \"always\"\n{resource}\n}}\n"
+            );
+            apply_source(&store, &source, key);
+            reconciler.reconcile_once().unwrap();
+            assert_eq!(reconciler.launch_token("agent/node.worker").unwrap(), launch);
+            assert_eq!(runtime.starts.lock().unwrap().len(), 3, "{key} must not unpark the seat");
+            assert!(reconciler.runtime_crash_loop_raised("agent/node.worker", &launch).unwrap());
+        }
     }
 
     #[test]

@@ -31,6 +31,7 @@ Mixed storage tables below are classified by their logical shared fields; local 
 | `local_blobs` | Local | Staged upload bytes awaiting a durable claim reference. Promotion into `blobs` commits with the referencing claim. |
 | `documents` | Shared projection | Shared immutable name/hash binding, binding_claim_id and materialized canonical binding_key. created_index is a local arrival cursor; latest selection and history order use the indexed binding_key. |
 | `desired` | Shared projection | Shared selected declaration, ancestry/conflicts, ownership and full canonical body; existing ancestry/revision/id selection is deterministic and must be preserved. |
+| `declared_resource_edges` | Shared projection | Indexed owner/name/target/reason edges derived from selected seat and mission declarations; every logical column participates in projection digests. |
 | `idempotency` | Local | Local opaque HTTP/operation response cache with local indexes; shared operation identity is operations plus checkpoint_claims. |
 | `mission_run_requests` | Local | Local original request-hash cache paired with idempotency; run identities in this legacy API are origin-scoped. |
 | `events` | Local view | Canonical claim payloads joined to local admitted membership by arrival index. |

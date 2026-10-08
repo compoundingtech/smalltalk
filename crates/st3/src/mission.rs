@@ -194,7 +194,7 @@ fn insert_mission(
 fn parse_mission(
     node: &KdlNode,
     default_host: &str,
-    require_state: bool,
+    top_level: bool,
     default_completion: bool,
 ) -> Result<MissionSpec, St3Error> {
     reject_type(node)?;
@@ -211,7 +211,7 @@ fn parse_mission(
     let id = first_string(node)?;
     validate_id(&id, "mission")?;
     let authored_state = property_string(node, "state")?;
-    if require_state && authored_state.is_none() {
+    if top_level && authored_state.is_none() {
         return Err(St3Error::new(
             "missing-mission-state",
             format!("mission `{id}` needs an explicit state"),
@@ -279,10 +279,12 @@ fn parse_mission(
     let mut baseline_names = BTreeSet::new();
     let mut gate_names = BTreeSet::new();
     let mut declarations = Vec::new();
+    let mut resources = Vec::new();
+    let mut resource_names = BTreeSet::new();
     let mut revision_owners = Vec::new();
     for child in children.nodes() {
         match child.name().value() {
-            "provenance" if require_state => {
+            "provenance" if top_level => {
                 // Validated here, carried separately by NormalizedIntent: never hash metadata
                 // into MissionSpec, which older daemons must still project.
                 crate::provenance::parse_block(child)?;
@@ -296,6 +298,24 @@ fn parse_mission(
             "goal" => goals.push(plain_string(child)?),
             "constraint" => push_constraint(&mut constraints, child, &format!("mission `{id}`"))?,
             "input" => {}
+            "resource" if crate::graph::is_resource_reference(child) => {
+                // The publication makes each URI a desired subject; a nested or loop body is
+                // never published on its own, so its resources would name nothing.
+                if !top_level {
+                    return Err(St3Error::new(
+                        "nested-mission-resource",
+                        format!("mission `{id}` is nested; name resources on the top-level mission"),
+                    ));
+                }
+                let (reference, _) = crate::graph::parse_declared_resource(child)?;
+                if !resource_names.insert(reference.name.clone()) {
+                    return Err(St3Error::new(
+                        "duplicate-resource-name",
+                        format!("mission `{id}` repeats resource `{}`", reference.name),
+                    ));
+                }
+                resources.push(reference);
+            }
             "concurrent-runs" => {
                 if concurrent_runs_seen {
                     return Err(St3Error::new(
@@ -494,6 +514,7 @@ fn parse_mission(
         id,
         state,
         revision: String::new(),
+        resources,
         inputs,
         max_active_runs,
         timeout_ms,

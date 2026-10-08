@@ -237,6 +237,74 @@ and waits for a new running incarnation, even when the declaration says `restart
 and an inspection command. Restart requires an active seat declaration; start a stopped
 seat first.
 
+## Declared resources
+
+A seat or a top-level mission names the resources it works with as `resource` children:
+
+```kdl
+version 2
+
+agent "ada/client" {
+  harness "omp"
+  resource "goal" uri="agent-goal://orchid/ada%2Fclient" reason="seat goal"
+  resource "worktree" uri="worktree://orchid/workspace/client"
+}
+
+mission "ada/release" state="ready" {
+  goal "Release the client."
+  resource "tracker" uri="https://github.com/compoundingtech/smalltalk/issues/752"
+  step "ship" {
+    agentless
+    goal "Ship it."
+  }
+}
+```
+
+Each name is unique within its declaration. `uri` is an absolute URI of any scheme, up to 4096
+bytes, and is kept byte for byte; st does not open it or start an observer. Use percent escapes
+for whitespace and non-ASCII characters. `reason` is optional and, when present, must not be blank.
+These `resource` children accept no child block.
+
+A named resource is an ordinary addressable smallclaims subject in the graph, not a list kept
+beside it. The publication declares `resource/uri/SHA256`, where `SHA256` is the lowercase hex
+SHA-256 of the exact URI's bytes, of kind `uri.reference` with an immutable `uri`. There is no URI
+normalization: spelling differences, including percent-escape case, produce different subjects.
+Every declaration of the same exact URI shares one subject, regardless of its local name or
+reason, and no run owns it. The seat or mission stores only typed edges `{name, subject, kind, reason?}`;
+the URI lives on the referenced subject. Client v0 resolves these edges and shows them read-only
+as `resources` on agents and missions. `resource "tracker" subject="resource/github/example/issue/1"`
+instead names an existing or not-yet-replicated graph resource without declaring or fetching it.
+Exactly one of `uri` and `subject` is required. `st subject show AGENT --kdl` writes URI edges
+back with `uri=` when their locator is available and degrades to `subject=` when it is not,
+so incomplete replication never prevents reading the declaration. Explicit subject references
+remain `subject=` even when the referenced resource has a URI.
+
+Reapplying a seat declaration or publishing a new mission revision replaces that owner's edge
+list. Omitting a resource drops its edge, not the shared subject or another owner's references.
+Changing a resource's URI points the edge at a different subject; it does not mutate the old
+subject's URI. A nested or loop mission body cannot name resources, because only a published
+top-level mission declares them.
+
+An owned-set publication (`st apply --set NAME`) publishes these shared URI targets alongside
+its declarations, but excludes them from the set's membership and ownership. Dropping edges
+or retiring the seats and missions that name them never retires the targets.
+
+Mission-only planning candidates, run revisions, and produced-mission outputs publish the
+shared URI targets synthesized from that mission's own references. They still reject explicit
+immediate declarations, including an explicit declaration of the same URI target.
+Run materialization preserves the complete authored resource metadata: names, reasons, and
+explicit subject targets are not run-local aliases. For example, `worker` and `agent/worker`
+remain distinct resource names even when the mission declares a local agent named `worker`.
+An assigned step-local agent's URI targets are published with its declaration before member
+startup; this early phase does not publish other agents' targets or unrelated execution state.
+
+To inspect incoming edges, run `st subject show RESOURCE --references` (add the global
+`--json` flag for JSON), or request `GET /v1/resource-references/{subject}`. Each incoming
+reference contains `owner`, local `name`, and nullable `reason`. The lookup covers current agent
+declarations and selected published mission definitions, including references to unavailable
+targets. Its target-indexed SQLite projection is derived from those declarations, backfilled for
+existing stores, and maintained as replicated selection and replay change the graph.
+
 ## Ordered queue authoring
 
 Use `queue` when source order is an intentional one-at-a-time workflow.

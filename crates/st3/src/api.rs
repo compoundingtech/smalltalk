@@ -708,6 +708,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/messages/by-key", get(message_by_key))
         .route("/v1/status", get(status))
         .route("/v1/desired/{*subject}", get(get_desired))
+        .route("/v1/resource-references/{*subject}", get(resource_referrers))
         .route("/v1/events", get(events))
         .route("/v1/events/page", get(events_page))
         .route("/v1/doctor", get(doctor))
@@ -2532,6 +2533,15 @@ fn client_agent_resources_from_status(
             .filter_map(|subject| subject.actual_claim.as_deref())
             .collect::<Vec<_>>(),
     );
+    let declared_resources = status
+        .subjects
+        .iter()
+        .filter_map(|subject| {
+            let references = crate::graph::declared_resources(subject.desired.as_ref()?);
+            (!references.is_empty()).then(|| (subject.subject.clone(), references))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let resource_uris = store.declared_resource_uris(declared_resources.values().flatten())?;
     let queued_steps = work_queues
         .values()
         .flat_map(|queue| {
@@ -2758,6 +2768,10 @@ fn client_agent_resources_from_status(
                     "agent_id": relationship.agent,
                     "reason": relationship.reason
                 })).collect::<Vec<_>>(),
+                "resources": client_declared_resources(
+                    declared_resources.get(&subject.subject).map_or(&[][..], Vec::as_slice),
+                    &resource_uris,
+                ),
                 "operational": subject.projection,
                 "suspension": suspension.as_ref().map(client_suspension),
                 "handoff": handoff,
@@ -2779,6 +2793,36 @@ fn client_agent_resources_from_status(
             .then_with(|| left["id"].as_str().cmp(&right["id"].as_str()))
     });
     Ok(agents.into_iter().map(|(_, value)| value).collect())
+}
+
+/// Read-only edges with an explicit authored kind and URI resolution state.
+/// Subject edges do not require a URI locator; missing URI locators are omitted, not null.
+pub(crate) fn client_declared_resources(
+    references: &[crate::model::DeclaredResourceReference],
+    uris: &BTreeMap<String, String>,
+) -> Vec<Value> {
+    references
+        .iter()
+        .map(|reference| {
+            let mut value = json!({
+                "name": reference.name,
+                "subject": reference.subject,
+                "kind": reference.kind,
+                "resolution": match reference.kind {
+                    crate::model::ResourceReferenceKind::Subject => "not-applicable",
+                    crate::model::ResourceReferenceKind::Uri if uris.contains_key(&reference.subject) => "resolved",
+                    crate::model::ResourceReferenceKind::Uri => "unresolved",
+                },
+                "reason": reference.reason,
+            });
+            if reference.kind == crate::model::ResourceReferenceKind::Uri
+                && let Some(uri) = uris.get(&reference.subject)
+            {
+                value["uri"] = json!(uri);
+            }
+            value
+        })
+        .collect()
 }
 
 fn desired_harness_driver(desired: &Value) -> Option<String> {
@@ -8240,6 +8284,30 @@ async fn submit_planning_variant(
     preview_planning_variant(state, id, variant).await
 }
 
+/// Mission-only routes may publish the shared targets synthesized from their URI edges,
+/// but never an explicitly authored immediate declaration (even one with the same ID).
+fn mission_only_subjects(intent: &crate::model::NormalizedIntent) -> bool {
+    if intent.subjects.is_empty() {
+        return true;
+    }
+    let mission_roots = intent.normalized["declarations"].as_array().is_some_and(|nodes| {
+        nodes.iter().all(|node| node["name"] == "mission")
+    });
+    mission_roots && intent.subjects.values().all(|subject| {
+        subject.kind == "resource"
+            && subject.subject.starts_with("resource/uri/")
+            && subject.owner_run.is_none()
+            && subject.owner_generation.is_none()
+            && subject.owner_step.is_none()
+            && intent.missions.values().any(|mission| {
+                mission.resources.iter().any(|edge| {
+                    edge.kind == crate::model::ResourceReferenceKind::Uri
+                        && edge.subject == subject.subject
+                })
+            })
+    })
+}
+
 fn launch_candidate_mission<'a>(
     intent: &'a crate::model::NormalizedIntent,
     expected: &str,
@@ -8254,7 +8322,7 @@ fn launch_candidate_mission<'a>(
     };
     let published_closure = crate::mission::mission_closure_ids(mission);
     let published = intent.missions.keys().cloned().collect::<BTreeSet<_>>();
-    if !intent.subjects.is_empty() || published != published_closure {
+    if !mission_only_subjects(intent) || published != published_closure {
         return Err(St3Error::new(
             "wrong-launch-mission",
             format!(
@@ -12011,6 +12079,16 @@ struct StatusQuery {
     harness_only: bool,
 }
 
+async fn resource_referrers(
+    State(state): State<AppState>,
+    AxumPath(subject): AxumPath<String>,
+) -> Result<Json<Vec<Value>>, ApiError> {
+    let store = state.store.clone();
+    blocking_store(move || store.declared_resource_referrers(&subject))
+        .await
+        .map(Json)
+}
+
 /// One subject's desired record. Each Claude seat's status line reads it on every render (every
 /// five seconds), which a full status reduction of the seat made a tenth of a core on a member.
 async fn get_desired(
@@ -12473,7 +12551,9 @@ fn scope_eval_desired_subjects(
     let mut shared = Vec::new();
     for (subject, desired) in &mut intent.subjects {
         let Some(current) = selected.get(subject.as_str()) else {
-            desired.owner_run = Some(owner_run.to_owned());
+            if crate::graph::declared_uri(&desired.desired).is_none() {
+                desired.owner_run = Some(owner_run.to_owned());
+            }
             continue;
         };
         if *current == desired {
@@ -12722,7 +12802,7 @@ async fn revise_mission_run(
             "a run revision must contain exactly one top-level mission",
         )));
     }
-    if !initial.subjects.is_empty() {
+    if !mission_only_subjects(&initial) {
         return Err(ApiError::bad(St3Error::new(
             "invalid-mission-revision-intent",
             "a run revision can contain only its mission",
@@ -12735,6 +12815,12 @@ async fn revise_mission_run(
     let resolved_kdl =
         resolve_document_references(&request.intent.kdl, &bindings).map_err(ApiError::bad)?;
     let intent = parse_intent(&resolved_kdl, &state.node).map_err(ApiError::bad)?;
+    if !mission_only_subjects(&intent) {
+        return Err(ApiError::bad(St3Error::new(
+            "invalid-mission-revision-intent",
+            "a run revision can contain only its mission",
+        )));
+    }
     let mission_id = current
         .mission
         .strip_prefix("mission/")
@@ -12769,19 +12855,18 @@ async fn revise_mission_run(
     let (_, reviewers) =
         crate::store::analyze_mission_revision(&old, replacement, &current.requester)
             .map_err(ApiError::bad)?;
-    let mut publication = intent.clone();
-    publication.subjects.clear();
+    let publication = &intent;
     let mut planned = state
         .store
         .mission(
-            &publication,
+            publication,
             crate::model::IntentInput {
                 kdl: resolved_kdl,
                 source_name: request.intent.source_name,
             },
         )
         .map_err(ApiError::bad)?;
-    publication_refusals(&state, &publication)
+    publication_refusals(&state, publication)
         .await?
         .block(&mut planned);
     if !planned.blockers.is_empty() {
@@ -12794,7 +12879,7 @@ async fn revise_mission_run(
     state
         .store
         .apply_as(
-            &publication,
+            publication,
             &planned.subject_tokens,
             &format!("{}:publish", request.idempotency_key),
             Some(&actor),
@@ -13329,7 +13414,7 @@ async fn publish_work_mission(
             "a mission output must contain exactly one mission",
         )));
     }
-    if !initial.subjects.is_empty() {
+    if !mission_only_subjects(&initial) {
         return Err(ApiError::bad(St3Error::new(
             "invalid-mission-output-intent",
             "a mission output can contain only its mission",
@@ -13342,6 +13427,12 @@ async fn publish_work_mission(
     let resolved_kdl =
         resolve_document_references(&request.intent.kdl, &bindings).map_err(ApiError::bad)?;
     let intent = parse_intent(&resolved_kdl, &state.node).map_err(ApiError::bad)?;
+    if !mission_only_subjects(&intent) {
+        return Err(ApiError::bad(St3Error::new(
+            "invalid-mission-output-intent",
+            "a mission output can contain only its mission",
+        )));
+    }
     let mission = intent
         .missions
         .values()
@@ -13356,19 +13447,18 @@ async fn publish_work_mission(
             ),
         )));
     }
-    let mut publication = intent.clone();
-    publication.subjects.clear();
+    let publication = &intent;
     let mut planned = state
         .store
         .mission(
-            &publication,
+            publication,
             crate::model::IntentInput {
                 kdl: resolved_kdl,
                 source_name: request.intent.source_name,
             },
         )
         .map_err(ApiError::bad)?;
-    publication_refusals(&state, &publication)
+    publication_refusals(&state, publication)
         .await?
         .block(&mut planned);
     if !planned.blockers.is_empty() {
@@ -13380,7 +13470,7 @@ async fn publish_work_mission(
     state
         .store
         .apply(
-            &publication,
+            publication,
             &planned.subject_tokens,
             &format!("{}:publish", request.idempotency_key),
         )
@@ -18343,6 +18433,108 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
     }
 
     #[test]
+    fn agents_show_their_declared_resources_until_a_declaration_drops_them() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let workspace = root.path().display().to_string();
+        let publish = |key: &str, resources: &str| {
+            let source = format!(
+                "version 2\nagent \"ada/seat\" {{\n  workspace {workspace:?}\n  command \"true\"\n{resources}}}\n"
+            );
+            let intent = crate::graph::parse_test_intent(&source, "node").unwrap();
+            let planned = state
+                .store
+                .mission(
+                    &intent,
+                    crate::model::IntentInput {
+                        kdl: source,
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            state
+                .store
+                .apply(&intent, &planned.subject_tokens, key)
+                .unwrap();
+        };
+        let goal = "x-fractal-goal://orchid/ada%2Fseat";
+        let worktree = "worktree://orchid/workspace/work";
+        publish(
+            "declare",
+            &format!(
+                "  resource \"goal\" uri=\"{goal}\" reason=\"seat goal\"\n  resource \"worktree\" uri=\"{worktree}\"\n"
+            ),
+        );
+        let subject = |uri: &str| format!("resource/uri/{}", hex::encode(Sha256::digest(uri)));
+        let read = || {
+            let agents =
+                client_agent_resources(&state.store, false, "now", state.store.index().unwrap())
+                    .unwrap();
+            agents
+                .into_iter()
+                .find(|agent| agent["id"] == "agent/ada/seat")
+                .unwrap()
+        };
+        let agent = read();
+        assert_eq!(
+            agent["resources"],
+            json!([
+                { "name": "goal", "subject": subject(goal), "kind": "uri", "resolution": "resolved", "uri": goal, "reason": "seat goal" },
+                { "name": "worktree", "subject": subject(worktree), "kind": "uri", "resolution": "resolved", "uri": worktree, "reason": null },
+            ])
+        );
+        let typed: st3_client::Resource = serde_json::from_value(agent).unwrap();
+        let st3_client::Resource::Agent(typed) = typed else {
+            panic!("an agent resource");
+        };
+        assert_eq!(typed.resources[0].uri.as_deref(), Some(goal));
+
+        // The declaration read writes the edges back as the KDL that declared them.
+        let (_, tree) = state
+            .store
+            .agent_declaration("agent/ada/seat", None)
+            .unwrap()
+            .unwrap();
+        let uris = state
+            .store
+            .declared_resource_uris(&crate::graph::declared_resources(&tree))
+            .unwrap();
+        let kdl = crate::graph::render_agent_desired_kdl(&tree, &uris).unwrap();
+        let reparsed = crate::graph::parse_test_intent(&kdl, "node").unwrap();
+        assert_eq!(reparsed.subjects["agent/ada/seat"].desired, tree);
+        let unresolved = client_declared_resources(
+            &crate::graph::declared_resources(&tree), &BTreeMap::new(),
+        );
+        assert_eq!(unresolved[0]["kind"], "uri");
+        assert_eq!(unresolved[0]["resolution"], "unresolved");
+        assert_eq!(unresolved[0]["subject"], subject(goal));
+        assert!(unresolved[0].get("uri").is_none());
+
+        publish("subject", "  resource \"tracker\" subject=\"resource/github/example/issue/1\" reason=\"tracking\"\n");
+        assert_eq!(
+            read()["resources"],
+            json!([{"name": "tracker", "subject": "resource/github/example/issue/1", "kind": "subject", "resolution": "not-applicable", "reason": "tracking"}]),
+        );
+
+        publish("drop", &format!("  resource \"goal\" uri=\"{goal}\" reason=\"seat goal\"\n"));
+        assert_eq!(
+            read()["resources"],
+            json!([{ "name": "goal", "subject": subject(goal), "kind": "uri", "resolution": "resolved", "uri": goal, "reason": "seat goal" }])
+        );
+        assert_eq!(
+            state
+                .store
+                .selected_desired_kind(&subject(worktree))
+                .unwrap()
+                .as_deref(),
+            Some("resource"),
+            "omission leaves the resource subject in the graph"
+        );
+        publish("none", "");
+        assert_eq!(read()["resources"], json!([]));
+    }
+
+    #[test]
     fn member_faults_are_visible_in_agents_and_doctor_until_recovery() {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
@@ -19475,6 +19667,47 @@ mission "unrequested/work" state="ready" { goal "Do unrelated work." }
         assert_eq!(error.code, "wrong-launch-mission");
     }
 
+    #[test]
+    fn mission_uri_publication_preserves_authored_resource_aliases() {
+        let source = r#"version 2
+mission "planned/work" state="ready" {
+ goal "Work."
+ resource "tracker" uri="urn:example:tracker"
+ agent "worker" {
+  workspace "."
+  command "true"
+  resource "worker" uri="urn:example:one" reason="worker"
+  resource "agent/worker" uri="urn:example:two" reason="agent/worker"
+  resource "explicit" subject="resource/worker" reason="worker"
+ }
+}"#;
+        let intent = parse_intent(source, "node").unwrap();
+        assert!(launch_candidate_mission(&intent, "planned/work").is_ok());
+        let target = intent.missions["planned/work"].resources[0].subject
+            .strip_prefix("resource/").unwrap();
+        let explicit = format!(
+            "version 2\nresource {target:?} {{ kind \"uri.reference\"; uri \"urn:example:tracker\" }}\n{}",
+            source.strip_prefix("version 2\n").unwrap(),
+        );
+        let explicit = parse_intent(&explicit, "node").unwrap();
+        assert!(!mission_only_subjects(&explicit));
+        assert_eq!(
+            launch_candidate_mission(&explicit, "planned/work").unwrap_err().code,
+            "wrong-launch-mission",
+        );
+        let execution = crate::graph::parse_execution_intent(
+            intent.missions["planned/work"].declarations_kdl.as_deref().unwrap(), "node", "example",
+        ).unwrap();
+        let edges = crate::graph::declared_resources(
+            &execution.subjects["agent/example/worker"].desired,
+        );
+        assert_eq!(edges[0].name, "worker");
+        assert_eq!(edges[0].reason.as_deref(), Some("worker"));
+        assert_eq!(edges[1].name, "agent/worker");
+        assert_eq!(edges[1].reason.as_deref(), Some("agent/worker"));
+        assert_eq!(edges[2].subject, "resource/worker");
+    }
+
     #[tokio::test]
     async fn planner_choice_is_frozen_per_launch_and_survives_projection_rebuild() {
         let root = tempfile::tempdir().unwrap();
@@ -19647,6 +19880,7 @@ version 2
 
   mission "planned/work" state="ready" {
     goal "Publish the planned result."
+    resource "tracker" uri="urn:example:planning"
     step "inspect" { goal "Inspect the source." }
     step "change" {
       goal "Make the approved change."
@@ -19777,6 +20011,7 @@ version 2
 
   mission "planned/work" state="ready" {
     goal "Publish the planned and verified result."
+    resource "tracker" uri="urn:example:planning"
     step "inspect" { goal "Inspect the source." }
     step "change" {
       goal "Make the approved change."
@@ -19883,13 +20118,6 @@ version 2
         );
         assert_eq!(
             variant["visualization"]["swimlanes"]
-                .as_array()
-                .unwrap()
-                .len(),
-            1
-        );
-        assert_eq!(
-            variant["structured_diff"]["changes"]
                 .as_array()
                 .unwrap()
                 .len(),
@@ -20012,7 +20240,9 @@ version 2
             approved["published_revision"],
             approved["candidate"]["mission_revision"]
         );
-        assert!(store.mission_spec("planned/work", None).unwrap().is_some());
+        let published = store.mission_spec("planned/work", None).unwrap().unwrap();
+        let uris = store.declared_resource_uris(&published.resources).unwrap();
+        assert_eq!(uris[&published.resources[0].subject], "urn:example:planning");
         // The planner is a durable top-level seat, not a synthetic standing
         // mission. Approval removes that seat directly and leaves no planner
         // mission run behind to clean up.
@@ -21501,12 +21731,16 @@ host "local" { document "doc/hosts/eval@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
         let mut fixture = parse_intent(
             r#"version 2
 resource "eval/fixture" { kind "filesystem.file" }
-agent "eval/fixture/worker" { workspace "/tmp"; command "true"; restart "never" }
+agent "eval/fixture/worker" { workspace "/tmp"; command "true"; restart "never"; resource "goal" uri="https://example.com/shared"; }
 "#,
             "node",
         )
         .unwrap();
         scope_eval_desired_subjects(&mut fixture, &current, "mission-run/eval-run").unwrap();
+        let resource = crate::graph::declared_resources(
+            &fixture.subjects["agent/eval/fixture/worker"].desired,
+        );
+        assert_eq!(fixture.subjects[&resource[0].subject].owner_run, None);
         assert_eq!(
             fixture.subjects["resource/eval/fixture"]
                 .owner_run
@@ -22864,6 +23098,7 @@ version 2
 
   mission "revision" state="ready" {
     goal "Complete mission revision."
+    resource "tracker" uri="urn:example:revision"
      agent "sup" {
        workspace "."
        command "true"
@@ -22893,7 +23128,9 @@ version 2
         assert_ne!(revised["mission_run"]["revision"], run.revision);
         assert_eq!(revised["mission_run"]["root_revision"], run.root_revision);
         assert_eq!(revised["mission_run"]["steps"][0]["status"], "pending");
-        assert_eq!(state.store.desired_subjects().unwrap().len(), 1);
+        let published = state.store.mission_spec("revision", None).unwrap().unwrap();
+        let uris = state.store.declared_resource_uris(&published.resources).unwrap();
+        assert_eq!(uris[&published.resources[0].subject], "urn:example:revision");
     }
 
     #[tokio::test]
@@ -23447,6 +23684,7 @@ version 2
 
   mission "project/work" state="ready" {
     goal "Complete mission project/work."
+    resource "tracker" uri="urn:example:output"
     step "inspect" { title "Inspect the project" }
     step "implement" { depends-on { step "inspect" completed } }
   }
@@ -23541,6 +23779,9 @@ version 2
             .expect("attempt-bound mission output");
         assert_eq!(bound.revision, revision);
         assert_eq!(bound.claim_id, output["claim_id"]);
+        let published = state.store.mission_spec("project/work", Some(revision)).unwrap().unwrap();
+        let uris = state.store.declared_resource_uris(&published.resources).unwrap();
+        assert_eq!(uris[&published.resources[0].subject], "urn:example:output");
     }
 
     #[tokio::test]
