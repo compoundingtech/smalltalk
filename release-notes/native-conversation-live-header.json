@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Native conversation headers read live seat working state, model, context, cost and todos; header-only updates reach long polls and sockets, and register-only agents appear in history cards.",
+  "replay": {
+    "status": "none",
+    "detail": "The header consumer reads existing live-register, observed-harness, todo and retained numeric usage projections. No additional claim replay or projection rebuild is required. Undeclared cards retain canonical graph revisions when available, with register-aware fallback revisions for register-only seats."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "The consumer adds no database schema, migrations or generated client wire fields beyond the prerequisite live-register changes. It uses the existing conversation-blocks.v1 header object."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No additional checkpoint, retention or fleet coordination rules change. Working state respects observed-harness diagnostic fences and read-time freshness; todo observations respect session and incarnation staleness."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Long-poll and conversation socket responses may carry a header update with no timeline items. A present empty header object (header:{}) retracts prior live fields; an omitted header on a quiet poll leaves them unchanged. Clients that ignore empty headers can retain stale indicators until they replace or reopen the conversation; updated stui and phone consumers handle retractions."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No coordinated outage or API interruption is required."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No configuration change is required. Use updated conversation clients to receive header-only updates and clear fields when an empty header arrives."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "The consumer introduces no stored conversation or header history and no additional rollback procedure. Conversation-view data remains in memory; existing live-register and numeric usage ownership is unchanged."
+  }
+}
