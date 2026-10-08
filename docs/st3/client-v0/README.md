@@ -1556,6 +1556,10 @@ the occupancy fields (`context_used_tokens`, `context_window_tokens`, `model`) a
 numeric spend (`cost`, `currency`); lifetime token totals are not context occupancy.
 Working/idle is shown only for the session's running incarnation and positively known
 `working` or `idle`/`ready` activity, never stale, unknown, blocked, or unauthenticated state.
+Activity uses the observed-harness reducer (not work-progress inference), including its
+authentication, trust, update, and channel diagnostic fences and read-time 90-second
+freshness check. Header-only changes and empty-header retractions are also forwarded on
+the conversation collection socket.
 Todo phases map `name`/`tasks` to the header's `phase`/`items`; the existing todo projection's
 session/incarnation `stale` fence prevents an old binding from overriding transcript data.
 Each field retains its source observation time (falling back to acceptance time), with

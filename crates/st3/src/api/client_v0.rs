@@ -559,6 +559,7 @@ async fn follow_conversation(
                     if changes["items"]
                         .as_array()
                         .is_some_and(|items| !items.is_empty())
+                        || changes.get("header").is_some()
                     {
                         let mut frame = json!({"kind":"conversation", "id":id, "collection":"conversation", "session_id":session_id, "replace":false, "items":changes["items"]});
                         if let Some(header) = changes.get("header") {
@@ -10346,6 +10347,72 @@ mod tests {
         assert_eq!(frames[1]["upserts"][0]["id"], "mission/during-read");
         assert_eq!(frames[1]["order"], json!(["mission/during-read"]));
         assert_ne!(frames[0]["snapshot"], frames[1]["snapshot"]);
+        socket.close(None).await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn conversation_socket_forwards_header_only_updates_and_retractions() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "header-socket");
+        let agent = "agent/header-socket";
+        let incarnation = "header-socket:one";
+        let append = |kind: &str, fields: Value| {
+            state.store.append_claim(&ClaimInput {
+                subject: agent.into(), kind: kind.into(), actor: Some(agent.into()),
+                fields: serde_json::from_value(fields).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap()
+        };
+        append("runtime.observed", json!({
+            "status": "running", "runtime_id": "header-socket", "incarnation_id": incarnation,
+            "terminal": false,
+        }));
+        let socket_state = state.clone();
+        let app = axum::Router::new().route("/stream",
+            axum::routing::get(move |upgrade: WebSocketUpgrade| {
+                let state = socket_state.clone();
+                async move {
+                    let mut session = ClientSession::local(None).unwrap();
+                    session.conversation_blocks = true;
+                    upgrade.on_upgrade(move |socket| collection_stream_socket_with_reader(
+                        socket, state, session, None,
+                        |state, session, request, permit| async move {
+                            collection_items(&state, &session, &request, permit).await
+                        },
+                    ))
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream"))
+            .await.unwrap();
+        socket.send(tokio_tungstenite::tungstenite::Message::Text(
+            json!({"kind": "subscribe", "id": "chat", "collection": "conversation",
+                "conversation": agent}).to_string().into())).await.unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await.unwrap().unwrap().unwrap();
+        let first: Value = serde_json::from_str(first.to_text().unwrap()).unwrap();
+        assert_eq!(first["replace"], true, "{first}");
+        for activity in ["working", "idle", "indeterminate"] {
+            append("harness.observed", json!({
+                "state": activity, "driver": "omp", "incarnation_id": incarnation,
+            }));
+            signal_local_change(&state);
+            let frame = tokio::time::timeout(Duration::from_secs(2), socket.next())
+                .await.expect("the socket dropped a header-only change").unwrap().unwrap();
+            let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            assert_eq!(frame["replace"], false, "{frame}");
+            assert!(frame["items"].as_array().unwrap().is_empty(), "{frame}");
+            if activity == "indeterminate" {
+                assert_eq!(frame["header"], json!({}));
+            } else {
+                assert_eq!(frame["header"]["working"]["value"], activity == "working");
+            }
+            assert_collection_frame_conforms(&frame);
+        }
         socket.close(None).await.unwrap();
         server.abort();
     }

@@ -1062,7 +1062,7 @@ fn new_request_id() -> String {
     )
 }
 
-fn client_now_ms() -> u128 {
+pub(crate) fn client_now_ms() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
