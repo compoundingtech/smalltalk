@@ -113,6 +113,39 @@ fn success(output: &Output) -> String {
     String::from_utf8(output.stdout.clone()).unwrap()
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn detached_daemon_receives_the_selected_reader_cache() {
+    let mut fixture = Fixture::new();
+    fixture.unpack_archive();
+    let output = fixture
+        .command(&fixture.path("archive/st"))
+        .env("SMALLCLAIMS_READ_CACHE_KIB", "1024")
+        .args([
+            "setup",
+            "--person",
+            "ada",
+            "--node",
+            "studio",
+            "--yes",
+            "--install",
+            "false",
+            "--service",
+            "false",
+        ])
+        .output()
+        .unwrap();
+    let stdout = success(&output);
+    assert!(stdout.contains("Read cache: 1024 KiB per reader."));
+    let pid = fixture.capture_pid();
+    let environ = fs::read(format!("/proc/{pid}/environ")).unwrap();
+    assert!(
+        environ
+            .split(|byte| *byte == 0)
+            .any(|value| value == b"SMALLCLAIMS_READ_CACHE_KIB=1024")
+    );
+}
+
 #[test]
 fn archive_setup_records_its_files_for_uninstall_in_the_selected_data_home() {
     if st3::test_support::supervise_test() {
