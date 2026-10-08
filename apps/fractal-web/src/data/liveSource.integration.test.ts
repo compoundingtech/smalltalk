@@ -50,6 +50,12 @@ class Gateway {
   sendGate: Promise<void> | undefined
   rejectSend = false
   readonly messageActions: AttachmentSendRequest[] = []
+  /** Resolves once the gateway has derived the send action's message identity. */
+  readonly nextAction = () =>
+    this.echoMessageId !== ''
+      ? Promise.resolve()
+      : new Promise<void>((resolve) => this.actionArrivals.push(resolve))
+  private readonly actionArrivals: Array<() => void> = []
   echoMessageId = ''
 
   readonly fetch: typeof fetch = async (input, init) => {
@@ -118,6 +124,7 @@ class Gateway {
         this.messageActions.push(action)
         const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(action.idempotency_key)))
         this.echoMessageId = `message/${[...hash.slice(0, 8)].map((byte) => byte.toString(16).padStart(2, '0')).join('')}`
+        this.actionArrivals.splice(0).forEach((arrived) => arrived())
         await this.sendGate
         if (this.transportFailure) throw new TypeError('Gateway disconnected')
         if (this.messageGrant !== 'granted') {
@@ -510,7 +517,7 @@ describe('optimistic conversation sends', () => {
           yield* settle
           let resolvePost!: () => void
           gateway.sendGate = new Promise<void>((resolve) => { resolvePost = resolve })
-          const sending = live.source.attachments.send(request)
+          const sending = live.source.attachments!.send(request)
           // No microtask, timer or animation frame occurs between send and this read.
           expect(live.registry.get(conversation)).toMatchObject({
             _tag: 'Observed', value: { items: [
@@ -528,9 +535,11 @@ describe('optimistic conversation sends', () => {
               { _tag: 'Text', text: 'hello', sendState: { _tag: 'Pending' } },
             ] },
           })
+          // The identity is only knowable once the gateway sees the client-chosen key.
           if (echoFirst) {
-            yield* settle
+            yield* Effect.promise(() => gateway.nextAction())
             expect(gateway.echoMessageId).toMatch(/^message\/[0-9a-f]{16}$/)
+            yield* settle
             gateway.mailEcho()
             yield* settle
             expect(live.registry.get(conversation)).toMatchObject({
@@ -568,7 +577,7 @@ describe('optimistic conversation sends', () => {
           gateway.rejectSend = failure === 'rejected'
           gateway.transportFailure = failure === 'failed'
           gateway.messageGrant = failure === 'ungranted' ? 'ungranted' : 'granted'
-          yield* Effect.promise(() => live.source.attachments.send(request))
+          yield* Effect.promise(() => live.source.attachments!.send(request))
           expect(live.registry.get(conversation)).toMatchObject({
             _tag: 'Observed', value: { items: [
               { _tag: 'Text', role: 'user', text: 'hello', sendState: { _tag: 'Failed', reason: failure } },
@@ -578,4 +587,33 @@ describe('optimistic conversation sends', () => {
       ),
     )
   }
+
+  it.live('normalizes wire-null attachment names in the optimistic row', () =>
+    withGateway((live, gateway) =>
+      Effect.gen(function* () {
+        live.registry.mount(live.source.conversationInterest!(agent.id))
+        const conversation = live.source.conversation(agent.id)
+        live.registry.mount(conversation)
+        yield* settle
+        const sending = live.source.attachments!.send({
+          ...request,
+          parameters: {
+            ...request.parameters,
+            content: '',
+            attachments: [{ blob: `blob/${'b'.repeat(64)}`, media_type: 'image/webp', name: null }],
+          },
+        })
+        const observed = live.registry.get(conversation)
+        expect(observed).toMatchObject({ _tag: 'Observed' })
+        // Exact equality: a wire-null name must be absent, never published as null.
+        if (observed._tag === 'Observed')
+          expect(observed.value.items[0]).toEqual({
+            _tag: 'Text', id: expect.stringMatching(/^pending\//), role: 'user', text: '',
+            attachments: [{ id: `blob/${'b'.repeat(64)}`, mediaType: 'image/webp' }],
+            streaming: false, at: expect.any(String), sendState: { _tag: 'Pending' },
+          })
+        expect(yield* Effect.promise(() => sending)).toMatchObject({ _tag: 'Success' })
+      }),
+    ),
+  )
 })

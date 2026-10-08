@@ -540,8 +540,10 @@ export const liveSource = ({
           _tag: 'Text', id, role: 'user',
           text: request.parameters.content ?? '',
           attachments: request.parameters.attachments.map((attachment) => ({
-            id: attachment.blob, mediaType: attachment.media_type,
-            ...(attachment.name === undefined ? {} : { name: attachment.name }),
+            id: attachment.blob,
+            mediaType: attachment.media_type,
+            // The encoded wire side carries `name: null`; the view model has no null names.
+            ...(typeof attachment.name === 'string' ? { name: attachment.name } : {}),
           })),
           streaming: false, at: new Date().toISOString(), sendState: { _tag: 'Pending' },
         },
