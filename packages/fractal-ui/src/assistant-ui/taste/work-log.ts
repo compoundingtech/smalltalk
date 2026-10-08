@@ -61,11 +61,14 @@ export function workLogTurnFromItems(items: readonly ConversationItem[], facts: 
     const input = typeof call.input === 'object' && call.input !== null ? call.input as Record<string, unknown> : undefined
     const path = [input?.['path'], input?.['file_path'], input?.['filePath']].find((value): value is string => typeof value === 'string' && value.length > 0)
     const media = call.result?.mediaType?.split(';')[0]?.trim().toLowerCase()
+    const filename = path?.split('/').at(-1) ?? ''
+    const dot = filename.lastIndexOf('.')
+    const extension = dot > 0 ? filename.slice(dot + 1).toLowerCase() : undefined
     return [{
       id: call.id, kind, title: call.name, argsSummary: summarizeArgs(call.input),
       status: call.status, startedAt: call.at, endedAt: call.result?.at,
       detail: typeof call.result?.content === 'string' ? call.result.content : undefined,
-      outputLanguage: media === undefined ? kind === 'run' ? 'bash' : kind === 'read' ? path?.split('.').at(-1) : undefined : outputMediaLanguages[media],
+      outputLanguage: (media === undefined ? undefined : outputMediaLanguages[media]) ?? (kind === 'run' ? 'bash' : kind === 'read' ? extension : undefined),
       changedPath: kind === 'edit' && call.callSeen && call.status === 'success' ? path : undefined,
     }]
   })
