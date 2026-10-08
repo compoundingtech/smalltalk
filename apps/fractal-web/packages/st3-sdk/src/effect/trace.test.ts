@@ -1,6 +1,6 @@
-import { expect, it } from 'vitest'
+import { expect, it, vi } from 'vitest'
 
-import { wrapTraceFetch } from './trace.ts'
+import { browserSocket, wrapTraceFetch } from './trace.ts'
 
 const TRACEPARENT = '00-0123456789abcdef0123456789abcdef-0123456789abcdef-01'
 
@@ -53,4 +53,18 @@ it('reads the context per request, keeps a caller traceparent, and drops invalid
     ['00-11111111111111111111111111111111-1111111111111111-01', null],
     [null, null],
   ])
+})
+
+it('closes a native browser socket synchronously without the prohibited reserved 1001 code', () => {
+  const close = vi.fn((code?: number) => {
+    if (code === 1001) throw new DOMException('reserved close code', 'InvalidAccessError')
+  })
+  vi.stubGlobal('WebSocket', class { close = close })
+  try {
+    const socket = browserSocket('ws://gateway.test/collections', [], {})
+    socket.close(1001)
+    expect(close).toHaveBeenCalledExactlyOnceWith()
+  } finally {
+    vi.unstubAllGlobals()
+  }
 })

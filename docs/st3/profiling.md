@@ -643,10 +643,12 @@ independent root linked to the bootstrap trace, rather than adopting an unrelate
 Browser fixtures exercise early-send ordering and committed-paint completion; SDK/server tests
 assert trace-ID continuity.
 
-On `pagehide`, the source synchronously sends close code 1001 on its collection socket before
-starting asynchronous disposal. A persisted (back/forward-cache) page closes the wire but retains
-its scope; persisted `pageshow` reconnects and resubscribes its existing interests. These lifecycle
-handlers add no timers. The early unclaimed socket also closes synchronously on pagehide.
+On `pagehide`, the source synchronously closes its collection socket before starting asynchronous
+disposal. Custom SDK sockets receive code 1001; native browser APIs prohibit that reserved code,
+so their adapters use no-argument close (an empty close frame, reported as 1005 by a server).
+A persisted (back/forward-cache) page retains its scope; persisted `pageshow` reconnects and
+resubscribes its existing interests. These lifecycle handlers add no timers. The early unclaimed
+socket also closes synchronously on pagehide.
 
 The browser proof commands require `playwright-cli` on `PATH` and the locked workspace
 dependencies installed:
@@ -660,7 +662,9 @@ The early-connect proof controls module delivery, then imports the actual main e
 renders the real shell, and checks that the SDK took the one initial socket without sending
 a second roster subscribe. It then dispatches persisted page-transition events to exercise
 retained-scope reconnect, and performs a real browser reload. The test server requires each
-1001 close frame before the next roster subscribe. The persisted events test the handlers,
+close frame before the next roster subscribe. It expects an empty native close frame on simulated
+pagehide; real navigation may additionally use the browser's own 1001 close. The persisted events
+test the handlers,
 not browser-specific back/forward-cache eligibility. This proves the early path while a bundle
 is loading; it does not promise that every network's WebSocket handshake outruns an already-cached
 bundle. Both commands close their ephemeral servers and browser sessions in `finally`.

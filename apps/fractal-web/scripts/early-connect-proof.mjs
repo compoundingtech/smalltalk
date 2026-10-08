@@ -161,7 +161,7 @@ server.on('upgrade', (req, socket) => {
     }, (code) => {
       lifecycleOrder.push(`close:${ordinal}:${code}`)
       observed.emit(`close:${ordinal}`, code)
-      socket.end(Buffer.from([0x88, 0x02, code >> 8, code & 0xff]))
+      socket.end(code === 1005 ? Buffer.from([0x88, 0]) : Buffer.from([0x88, 0x02, code >> 8, code & 0xff]))
     })
   })
 })
@@ -189,7 +189,7 @@ try {
       await opening
       const cachedClose = nextEvent('close:0')
       await run([`-s=${session}`, 'eval', `() => window.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: true }))`])
-      expect(await cachedClose === 1001, 'persisted pagehide did not send close 1001')
+      expect(await cachedClose === 1005, 'persisted pagehide did not synchronously send an empty close frame')
       const restoredRoster = nextEvent('roster:1')
       await run([`-s=${session}`, 'eval', `() => window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true }))`])
       await restoredRoster
@@ -197,7 +197,7 @@ try {
       const newRoster = nextEvent('roster:2')
       const newReport = nextEvent('report:2')
       await run([`-s=${session}`, 'reload'])
-      expect(await navigationClose === 1001, 'navigation pagehide did not send close 1001')
+      expect([1005, 1001].includes(await navigationClose), 'navigation pagehide did not send a close frame')
       await newRoster
       await newReport
       return initial
@@ -227,8 +227,8 @@ expect(result?.subscribeSentAt !== undefined && result.subscribeSentAt < result.
 expect((result?.framesAtTake ?? 0) >= 1, 'the snapshot was not buffered for adoption')
 expect(result?.earlyTaken === true, 'the real SDK did not take the early socket')
 expect(result?.actualShellRendered === true, 'the real main bundle did not render the shell')
-expect(lifecycleOrder.indexOf('close:0:1001') < lifecycleOrder.indexOf('roster:1'), 'bfcache restore subscribed before old close')
-expect(lifecycleOrder.indexOf('close:1:1001') < lifecycleOrder.indexOf('roster:2'), 'new document subscribed before old close')
+expect(lifecycleOrder.indexOf('close:0:1005') >= 0 && lifecycleOrder.indexOf('close:0:1005') < lifecycleOrder.indexOf('roster:1'), 'bfcache restore subscribed before old close')
+expect(lifecycleOrder.findIndex((event) => event.startsWith('close:1:')) >= 0 && lifecycleOrder.findIndex((event) => event.startsWith('close:1:')) < lifecycleOrder.indexOf('roster:2'), 'new document subscribed before old close')
 
 console.log(JSON.stringify({ events, lifecycleOrder, connections, subscribes, result }, null, 2))
 if (failures.length > 0) {
@@ -236,4 +236,4 @@ if (failures.length > 0) {
   process.exit(1)
 }
 console.log('PASS early roster subscribe precedes actual main-module evaluation and SDK adoption')
-console.log('PASS synchronous pagehide close 1001 precedes restore and next-document roster subscribes')
+console.log('PASS synchronous pagehide close frame precedes restore and next-document roster subscribes (native browser API cannot send reserved code 1001)')
