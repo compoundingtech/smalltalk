@@ -744,7 +744,12 @@ impl Client {
             self.deadlines.terminal_handshake,
             tokio_tungstenite::client_async(url, stream),
         )
-        .await??;
+        .await?
+        .map_err(|error| match error {
+            tokio_tungstenite::tungstenite::Error::Http(response) =>
+                api_error(response.status().as_u16(), response.body().as_deref().unwrap_or_default()),
+            error => error.into(),
+        })?;
         Ok(socket)
     }
 

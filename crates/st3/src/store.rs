@@ -9,6 +9,7 @@ mod authored_pull_requests_tests;
 mod glasses;
 pub(crate) mod mailbox_wakes;
 mod mailbox_changes;
+mod mailbox_lease;
 #[cfg(test)]
 mod message_send_tests;
 pub mod owned_sets;
@@ -608,6 +609,29 @@ CREATE TABLE IF NOT EXISTS local_mailbox_bindings (
     component TEXT NOT NULL,
     incarnation TEXT NOT NULL,
     epoch INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS local_mailbox_argv_bindings (
+    token TEXT PRIMARY KEY,
+    subject TEXT NOT NULL,
+    component TEXT NOT NULL,
+    incarnation TEXT NOT NULL,
+    epoch INTEGER NOT NULL,
+    member TEXT NOT NULL
+);
+-- Authenticated process/session custody, independent of the connection binding.
+CREATE TABLE IF NOT EXISTS local_mailbox_leases (
+    subject TEXT NOT NULL,
+    component TEXT NOT NULL,
+    incarnation TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    session TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    pid INTEGER NOT NULL,
+    process_token TEXT NOT NULL,
+    token TEXT NOT NULL,
+    epoch INTEGER NOT NULL,
+    revoked INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(subject, component)
 );
 CREATE TABLE IF NOT EXISTS local_work_lease_renewals (
     subject TEXT PRIMARY KEY,
@@ -9832,7 +9856,8 @@ impl Store {
         }
         self.graph.ensure_principal_key(input.actor.as_deref().unwrap())?;
         let signature = serde_json::to_string(signature).map_err(internal)?;
-        append_claim_with_signature(&self.graph, input, None, None, None, None, Some(&signature))
+        append_claim_with_commit_context(&self.graph, input, None, None, None, None,
+            ClaimCommitContext { signature: Some(&signature), ..Default::default() })
     }
 
     pub(crate) fn append_claim_outcome(
@@ -15942,11 +15967,67 @@ impl Store {
         &self,
         request: &crate::mailbox::Fence,
     ) -> Result<crate::mailbox::Fence, St3Error> {
+        self.bind_mailbox_with_lease(request, None)
+    }
+
+    pub(crate) fn bind_mailbox_with_lease(
+        &self,
+        request: &crate::mailbox::Fence,
+        authority: Option<&crate::mailbox::Authority>,
+    ) -> Result<crate::mailbox::Fence, St3Error> {
+        self.bind_mailbox_with_lease_checked(request, authority, &|| Ok(()))
+    }
+
+    /// Recheck captured physical custody under the writer, before any capability mutation.
+    pub(crate) fn bind_mailbox_with_lease_checked(
+        &self,
+        request: &crate::mailbox::Fence,
+        authority: Option<&crate::mailbox::Authority>,
+        validate: &dyn Fn() -> Result<(), St3Error>,
+    ) -> Result<crate::mailbox::Fence, St3Error> {
+        self.bind_mailbox_with_admission_checked(request, authority, None, validate)
+    }
+
+    /// Explicit argv-only transports retain their legacy protocol, never provider custody.
+    pub(crate) fn bind_argv_mailbox_checked(
+        &self,
+        request: &crate::mailbox::Fence,
+        member: &crate::model::MemberSpec,
+        validate: &dyn Fn() -> Result<(), St3Error>,
+    ) -> Result<crate::mailbox::Fence, St3Error> {
+        self.bind_mailbox_with_admission_checked(request, None, Some(member), validate)
+    }
+
+    fn bind_mailbox_with_admission_checked(
+        &self,
+        request: &crate::mailbox::Fence,
+        authority: Option<&crate::mailbox::Authority>,
+        argv_member: Option<&crate::model::MemberSpec>,
+        validate: &dyn Fn() -> Result<(), St3Error>,
+    ) -> Result<crate::mailbox::Fence, St3Error> {
         let mut connection = self.connection.write();
         let tx = connection.transaction().map_err(internal)?;
         check_mailbox_incarnation(&tx, request)?;
+        if let Some(member) = argv_member {
+            mailbox_lease::check_argv_declaration(&tx, request, member, &self.origin)?;
+        }
+        validate()?;
+        if let Some(authority) = authority {
+            mailbox_lease::refuse_argv_native_adoption(&tx, request)?;
+            mailbox_lease::check_declaration(&tx, request, authority, &self.origin)?;
+            mailbox_lease::admit(&tx, request, authority)?;
+        }
         if request.epoch != 0 {
-            check_mailbox_fence(&tx, request)?;
+            check_mailbox_fence(&tx, request, &self.origin)?;
+            if let Some(authority) = authority {
+                mailbox_lease::record(&tx, request, authority)?;
+            }
+            if let Some(member) = argv_member {
+                mailbox_lease::record_argv_binding(&tx, request, member)?;
+            }
+            if authority.is_some() || argv_member.is_some() {
+                tx.commit().map_err(internal)?;
+            }
             return Ok(request.clone());
         }
         if request.token.is_empty() || request.token.len() > 128 {
@@ -15975,9 +16056,21 @@ impl Store {
             }
             bound.epoch = epoch;
             // Retired tokens cannot allocate another epoch and retake their successor's mailbox.
-            check_mailbox_fence(&tx, &bound)?;
+            check_mailbox_fence(&tx, &bound, &self.origin)?;
+            if let Some(authority) = authority {
+                mailbox_lease::record(&tx, &bound, authority)?;
+            }
+            if let Some(member) = argv_member {
+                mailbox_lease::record_argv_binding(&tx, &bound, member)?;
+            }
+            if authority.is_some() || argv_member.is_some() {
+                tx.commit().map_err(internal)?;
+            }
             return Ok(bound);
         }
+        // A revoked argv capability must not be recreated even if its binding row
+        // was removed; its durable authenticated designation remains terminal.
+        mailbox_lease::refuse_argv_native_adoption(&tx, request)?;
         let previous: Option<u64> = tx
             .query_row(
                 "SELECT epoch FROM local_mailbox_owners WHERE subject=?1 AND component=?2",
@@ -16005,6 +16098,12 @@ impl Store {
         tx.execute("INSERT INTO local_mailbox_owners VALUES (?1,?2,?3,?4)
             ON CONFLICT(subject,component) DO UPDATE SET incarnation=excluded.incarnation, epoch=excluded.epoch",
             params![bound.subject, bound.component, bound.incarnation, bound.epoch]).map_err(internal)?;
+        if let Some(authority) = authority {
+            mailbox_lease::record(&tx, &bound, authority)?;
+        }
+        if let Some(member) = argv_member {
+            mailbox_lease::record_argv_binding(&tx, &bound, member)?;
+        }
         tx.commit().map_err(internal)?;
         if let Some(wakes) = self.smalltalk.mailbox_wakes.get() {
             wakes.owner_changed(&bound.subject, &bound.component);
@@ -16013,7 +16112,7 @@ impl Store {
     }
 
     pub(crate) fn check_mailbox(&self, fence: &crate::mailbox::Fence) -> Result<(), St3Error> {
-        check_mailbox_fence(&self.readers.get(), fence)
+        check_mailbox_fence(&self.readers.get(), fence, &self.origin)
     }
 
     /// First observation of the current boot, including its index to distinguish messages
@@ -21427,8 +21526,10 @@ fn mailbox_owner_key(
 fn check_mailbox_fence(
     connection: &Connection,
     fence: &crate::mailbox::Fence,
+    host: &str,
 ) -> Result<(), St3Error> {
     check_mailbox_incarnation(connection, fence)?;
+    mailbox_lease::check_lease_fence(connection, fence, host)?;
     let owner: Option<(String, u64)> = connection
         .prepare_cached(
             "SELECT owner.incarnation, owner.epoch FROM local_mailbox_owners owner
@@ -54270,17 +54371,25 @@ fn append_claim_with_subject_fences(
     expected_subjects: Option<&BTreeMap<String, String>>,
     observer_completion: Option<(&str, &str, &(dyn Fn() -> bool + Sync))>,
 ) -> Result<(ClaimRecord, bool), St3Error> {
-    append_claim_with_signature(graph, input, fence, event_runtime, expected_subjects, observer_completion, None)
+    append_claim_with_commit_context(graph, input, fence, event_runtime, expected_subjects, observer_completion, Default::default())
 }
 
-fn append_claim_with_signature(
+type ClaimAdmission<'a> = dyn Fn(&Connection) -> Result<(), St3Error> + Sync + 'a;
+
+#[derive(Default)]
+struct ClaimCommitContext<'a> {
+    admission: Option<&'a ClaimAdmission<'a>>,
+    signature: Option<&'a str>,
+}
+
+fn append_claim_with_commit_context(
     graph: &GraphStore,
     input: &ClaimInput,
     fence: Option<&crate::mailbox::Fence>,
     event_runtime: Option<&str>,
     expected_subjects: Option<&BTreeMap<String, String>>,
     observer_completion: Option<(&str, &str, &(dyn Fn() -> bool + Sync))>,
-    signature: Option<&str>,
+    context: ClaimCommitContext<'_>,
 ) -> Result<(ClaimRecord, bool), St3Error> {
     validate_claim_input(input)?;
     if local_retention(&input.kind)
@@ -54296,10 +54405,11 @@ fn append_claim_with_signature(
     // batch commits.
     graph.connection
         .batched(|transaction| -> Result<(ClaimRecord, bool), St3Error> {
+            if let Some(admission) = context.admission { admission(transaction)?; }
             if let Some((subject, revision, current)) = observer_completion {
                 check_observer_completion(transaction, subject, revision, Some(current))?;
             }
-            if let Some(signature) = signature {
+            if let Some(signature) = context.signature {
                 transaction.execute(
                     "INSERT OR REPLACE INTO expected_claim_signatures(subject,kind,actor,signature) VALUES (?1,?2,?3,?4)",
                     params![input.subject,input.kind,input.actor,signature],
@@ -54308,7 +54418,7 @@ fn append_claim_with_signature(
             let outcome = (|| {
             check_harness_event_runtime(transaction, &input.subject, event_runtime)?;
             let settled_receipt = if let Some(fence) = fence {
-                check_mailbox_fence(transaction, fence)?;
+                check_mailbox_fence(transaction, fence, &graph.origin)?;
                 let index = transaction.query_row(
                     "SELECT MIN(store_index) FROM claims WHERE subject=?1 AND subject LIKE 'message/%'",
                     [&input.subject], |row| row.get::<_, Option<u64>>(0),
@@ -54552,7 +54662,7 @@ fn append_claim_with_signature(
             if let Some((subject, revision, current)) = observer_completion {
                 check_observer_completion(transaction, subject, revision, Some(current))?;
             }
-            if signature.is_some() {
+            if context.signature.is_some() {
                 // An idempotent repeat does not append/consume a signature. Remove its
                 // temporary expectation before commit; any failure rolls it back with the message.
                 transaction.execute(
