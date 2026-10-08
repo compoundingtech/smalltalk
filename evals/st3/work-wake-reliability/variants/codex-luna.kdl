@@ -11,7 +11,7 @@ mission "eval/work-wake-reliability" state="ready" timeout="40m" {
     harness "codex" {
       model "gpt-6-luna"
       effort "medium"
-      args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+      args "--dangerously-bypass-approvals-and-sandbox"
     }
     restart "always"
     restart {

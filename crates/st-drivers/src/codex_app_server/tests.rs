@@ -8112,3 +8112,58 @@ fn native_codex_login_recovery_requires_a_successful_current_thread_turn() {
         None
     );
 }
+
+#[test]
+fn codex_before_approve_for_me_gets_the_flags_seats_ran_with_before() {
+    // 0.147 is the first release with the flag; 0.131 the first with the hook-trust flag.
+    assert_eq!(legacy_permission_flags((0, 147)), None);
+    assert_eq!(legacy_permission_flags((0, 160)), None);
+    assert_eq!(legacy_permission_flags((1, 0)), None);
+    assert_eq!(
+        legacy_permission_flags((0, 146)),
+        Some(vec![
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--dangerously-bypass-hook-trust"
+        ])
+    );
+    assert_eq!(
+        legacy_permission_flags((0, 131)),
+        Some(vec![
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--dangerously-bypass-hook-trust"
+        ])
+    );
+    assert_eq!(
+        legacy_permission_flags((0, 130)),
+        Some(vec!["--dangerously-bypass-approvals-and-sandbox"])
+    );
+}
+
+#[test]
+fn the_st_bridge_is_added_only_for_st3_seats_and_never_over_an_authored_one() {
+    let authored = |parts: &[&str]| parts.iter().map(|part| part.to_string()).collect::<Vec<_>>();
+    let seat = Some("agent/fleet/example/seat");
+    assert!(st_bridge_overrides(None, &authored(&["--approve-for-me"])).is_empty());
+    assert!(st_bridge_overrides(Some("person/nathan"), &authored(&[])).is_empty());
+    assert!(st_bridge_overrides(Some("agent/"), &authored(&[])).is_empty());
+    let overrides = st_bridge_overrides(seat, &authored(&["--approve-for-me"]));
+    assert!(overrides.iter().any(|value| value.contains("codex-bridge")));
+    assert!(
+        overrides
+            .iter()
+            .any(|value| value.contains("--subject=agent/fleet/example/seat"))
+    );
+    assert!(
+        st_bridge_overrides(seat, &authored(&["-c", "mcp_servers.st.command=\"mine\""])).is_empty()
+    );
+}
+
+#[test]
+fn the_printed_codex_banner_yields_the_release_the_flag_choice_keys_on() {
+    let release = crate::harness_version::find_release("codex-cli 0.160.1\n", "codex")
+        .map(|(_, release)| release.series());
+    assert_eq!(release, Some((0, 160)));
+    let older = crate::harness_version::find_release("codex-cli 0.146.2\n", "codex")
+        .map(|(_, release)| release.series());
+    assert_eq!(older, Some((0, 146)));
+}

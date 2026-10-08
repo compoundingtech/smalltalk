@@ -11,7 +11,7 @@ mission "eval/cross-harness-message-wake" state="ready" timeout="40m" {
     harness "codex" {
       model "gpt-6-sol"
       effort "medium"
-      args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+      args "--dangerously-bypass-approvals-and-sandbox"
     }
     restart "never"
     env {
@@ -41,7 +41,7 @@ mission "eval/cross-harness-message-wake" state="ready" timeout="40m" {
     harness "codex" {
       model "gpt-6-luna"
       effort "medium"
-      args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+      args "--dangerously-bypass-approvals-and-sandbox"
     }
     restart "never"
     env {
@@ -56,7 +56,7 @@ mission "eval/cross-harness-message-wake" state="ready" timeout="40m" {
     harness "codex" {
       model "gpt-6-luna"
       effort "medium"
-      args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+      args "--dangerously-bypass-approvals-and-sandbox"
     }
     restart "never"
     env {

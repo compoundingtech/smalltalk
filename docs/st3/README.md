@@ -52,6 +52,9 @@ Use these documents for implementation details:
   on the seat, with a lease, and ends them when their harness, session or seat goes away.
 - [Model accounts](accounts.md) explains how a person declares several Claude and Codex accounts, how a
   seat binds one or a pool, and how a pooled seat at its limit restarts on another account.
+- [Codex access](codex-access.md) explains how a Codex seat runs under `--approve-for-me` with a scoped
+  st tool bridge instead of full access, what each permission level measured, and why the hook-trust
+  flag is gone.
 - [Sekrets](sekrets.md) explains the opt-in gateway that runs any CLI with a credential no seat
   can read: profiles, policies, grants, how it tells a seat from its person, and its sandbox.
 - [Command recorder](command-recorder.md) explains how every `git` and `gh` call st starts is

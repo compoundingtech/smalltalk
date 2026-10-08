@@ -16,7 +16,7 @@ mission "eval/automatic-github-intake/review" state="ready" {
     harness "codex" {
       model "gpt-5.6-sol"
       effort "high"
-      args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+      args "--dangerously-bypass-approvals-and-sandbox"
     }
     restart "always"
   }

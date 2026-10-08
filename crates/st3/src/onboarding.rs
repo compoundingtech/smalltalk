@@ -376,7 +376,10 @@ mod tests {
             );
             match *harness {
                 "claude" => assert!(source.contains("--dangerously-skip-permissions")),
-                "codex" => assert!(source.contains("--dangerously-bypass-approvals-and-sandbox")),
+                "codex" => {
+                    assert!(source.contains("--approve-for-me"));
+                    assert!(!source.contains("--dangerously-bypass"));
+                }
                 _ => {}
             }
         }

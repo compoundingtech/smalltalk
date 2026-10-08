@@ -4426,7 +4426,7 @@ struct FeedbackReviewArgs {
 
 #[derive(Args)]
 struct DriverArgs {
-    #[arg(value_parser = ["claude", "claude-mcp", "codex", "pi", "pi-channel", "omp", "omp-channel", "opencode", "exec"])]
+    #[arg(value_parser = ["claude", "claude-mcp", "codex", "codex-bridge", "pi", "pi-channel", "omp", "omp-channel", "opencode", "exec"])]
     driver: String,
     #[arg(long, env = "ST_AGENT")]
     subject: Option<String>,
@@ -17154,6 +17154,26 @@ fn parse_publication_actor(actor: &str) -> std::result::Result<String, String> {
 }
 
 async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -> Result<()> {
+    if args.driver == "codex-bridge" {
+        anyhow::ensure!(
+            args.argv.is_empty(),
+            "the Codex tool bridge takes no provider argv"
+        );
+        let subject = args
+            .subject
+            .as_deref()
+            .filter(|subject| !subject.trim().is_empty())
+            .context("the Codex tool bridge needs the seat it acts for")?;
+        // Calls go back through this same executable, so the bridge follows a deploy.
+        let executable = match std::env::var("ST3_BIN") {
+            Ok(path) if !path.trim().is_empty() => path,
+            _ => std::env::current_exe()
+                .context("locating the st executable")?
+                .to_string_lossy()
+                .into_owned(),
+        };
+        return st_drivers::codex_bridge::run(subject, &executable);
+    }
     if args.driver == "claude-mcp" {
         anyhow::ensure!(
             args.argv.is_empty(),

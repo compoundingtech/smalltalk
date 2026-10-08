@@ -10,7 +10,7 @@ version 2
         agent "pool.codex" {
           workspace "${ST_WORKSPACE}"
           harness "codex" {
-            args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+            args "--dangerously-bypass-approvals-and-sandbox"
           }
         }
         agent "pool.claude" {

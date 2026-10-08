@@ -705,7 +705,7 @@ async fn onboarding_publication_is_graph_decided_and_preserves_stopped_expert() 
     assert!(
         serde_json::to_string(expert)
             .unwrap()
-            .contains("--dangerously-bypass-approvals-and-sandbox")
+            .contains("--approve-for-me")
     );
     let guides: st3::model::DocumentListResponse = client
         .get("/v1/documents?name=doc%2Fst%2Fguide")

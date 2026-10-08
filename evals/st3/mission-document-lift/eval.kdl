@@ -14,7 +14,7 @@ version 2
           harness "codex" {
             model "gpt-5.6-sol"
             effort "medium"
-            args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+            args "--dangerously-bypass-approvals-and-sandbox"
           }
           restart "never"
           env { CATALOG "${ST_WORKSPACE}"; ST_ROOT "${ST_WORKSPACE}/.st3-messages"; ST3_MESSAGE_ROOT "${ST_WORKSPACE}/.st3-messages" }

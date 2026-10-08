@@ -84,10 +84,10 @@ pub fn agent_document(
                 CLAUDE_SEAT_SETTINGS,
             ]
         }
-        "codex" => &[
-            "--dangerously-bypass-approvals-and-sandbox",
-            "--dangerously-bypass-hook-trust",
-        ],
+        // The workspace-write sandbox with automatic review of anything it blocks, plus the st
+        // tool bridge the driver adds at launch. A Codex older than 0.147 does not have the flag;
+        // its driver launches such a seat with the full-access flags instead.
+        "codex" => &["--approve-for-me"],
         _ => &[],
     };
     let mut harness = kdl_node("harness", [args.harness.as_str()]);
@@ -446,5 +446,25 @@ mod tests {
                 assert_eq!(&native[3..], &["--", "--literal\ntext"]);
             }
         }
+    }
+
+    #[test]
+    fn codex_seats_start_with_automatic_review_and_no_hook_trust_bypass() {
+        let args = st3_client::AgentCreateParameters {
+            name: "worker".into(),
+            harness: "codex".into(),
+            ..Default::default()
+        };
+        let source = agent_document(&args, "/srv/work", true, None);
+        let intent = crate::graph::parse_intent(&source, "example").unwrap();
+        let member = intent.subjects.values().next().unwrap().member.as_ref().unwrap();
+        let crate::model::LaunchSpec::Argv(argv) = &member.launch else {
+            panic!()
+        };
+        assert!(argv.iter().any(|argument| argument == "--approve-for-me"), "{argv:?}");
+        assert!(
+            !argv.iter().any(|argument| argument.starts_with("--dangerously-bypass")),
+            "{argv:?}"
+        );
     }
 }
