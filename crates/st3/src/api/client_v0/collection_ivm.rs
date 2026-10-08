@@ -563,9 +563,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let views = Arc::new(Views::new(vec![Box::new(FixtureView)]).unwrap());
         let mut state = super::super::tests::test_state_named(root.path(), "alder");
-        state.store = Arc::new(Store::open_with_ivm_views(
-            &root.path().join("ivm.db"), "alder", views.clone(),
-        ).unwrap());
+        state.store = Arc::new(
+            Store::open_with_ivm_views(&root.path().join("ivm.db"), "alder", views.clone())
+                .unwrap(),
+        );
         replace(&state.store, &views, "row/a", 1, Some("a1"));
         let covered = Arc::new(AtomicBool::new(true));
         let coverage = covered.clone();
@@ -579,36 +580,71 @@ mod tests {
                 Ok((vec![json!({"id":"row/a","value":"a1"})], false))
             }),
         });
-        let sources = Sources::from_store(state.store.clone(),
-            BTreeMap::from([("work".into(), adapter.clone())])).unwrap().unwrap();
-        let request: CollectionSubscribe = serde_json::from_value(
-            json!({"kind":"subscribe","id":"held","collection":"work"}),
-        ).unwrap();
+        let sources = Sources::from_store(
+            state.store.clone(),
+            BTreeMap::from([("work".into(), adapter.clone())]),
+        )
+        .unwrap()
+        .unwrap();
+        let request: CollectionSubscribe =
+            serde_json::from_value(json!({"kind":"subscribe","id":"held","collection":"work"}))
+                .unwrap();
         let session = ClientSession::local(Some("person/avery")).unwrap();
         let slots = Arc::new(tokio::sync::Semaphore::new(1));
-        let initial = read(state.clone(), session.clone(), request.clone(),
-            slots.clone().acquire_owned().await.unwrap(), sources.clone(), adapter.clone(),
-            Held::default()).await.unwrap();
+        let initial = read(
+            state.clone(),
+            session.clone(),
+            request.clone(),
+            slots.clone().acquire_owned().await.unwrap(),
+            sources.clone(),
+            adapter.clone(),
+            Held::default(),
+        )
+        .await
+        .unwrap();
         assert!(matches!(initial.output, Output::Window(_)));
         let cursor = initial.delivered.unwrap();
         assert_eq!(count.load(Ordering::SeqCst), 1);
         // Registry and graph prefix are unchanged and Ready. Only the source owner's
         // independent native coverage now refuses this cut, which has no changed keys.
         covered.store(false, Ordering::SeqCst);
-        let refused = read(state.clone(), session.clone(), request.clone(),
-            slots.clone().acquire_owned().await.unwrap(), sources.clone(), adapter.clone(),
-            Held { cursor: Some(cursor.clone()), rows: Arc::new(BTreeMap::new()) }).await;
-        assert!(refused.is_err(), "a silent cut must not acknowledge uncovered native state");
+        let refused = read(
+            state.clone(),
+            session.clone(),
+            request.clone(),
+            slots.clone().acquire_owned().await.unwrap(),
+            sources.clone(),
+            adapter.clone(),
+            Held {
+                cursor: Some(cursor.clone()),
+                rows: Arc::new(BTreeMap::new()),
+            },
+        )
+        .await;
+        assert!(
+            refused.is_err(),
+            "a silent cut must not acknowledge uncovered native state"
+        );
         assert_eq!(count.load(Ordering::SeqCst), 1);
         covered.store(true, Ordering::SeqCst);
-        let restored = read(state, session, request, slots.acquire_owned().await.unwrap(),
-            sources, adapter, Held { cursor: Some(cursor), rows: Arc::new(BTreeMap::new()) })
-            .await.unwrap();
+        let restored = read(
+            state,
+            session,
+            request,
+            slots.acquire_owned().await.unwrap(),
+            sources,
+            adapter,
+            Held {
+                cursor: Some(cursor),
+                rows: Arc::new(BTreeMap::new()),
+            },
+        )
+        .await
+        .unwrap();
         assert!(matches!(restored.output, Output::Silent));
         assert!(restored.delivered.is_some());
         assert_eq!(count.load(Ordering::SeqCst), 1);
     }
-
     #[tokio::test]
     async fn source_admission_gap_and_person_refusal_never_read_rows() {
         let root = tempfile::tempdir().unwrap();
