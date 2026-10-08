@@ -66,6 +66,19 @@ Only an actual replacement page with explicit pagination evidence establishes an
 conversation. Newer deltas do not change the older-history boundary. `hasOlder` reports
 that boundary, not an available fetch operation.
 
+### Web follow budgets and synchronization
+
+Conversation follows have a bounded LRU lane. The advertised subscription budget reserves
+four shared slots for the three standing windows and a terminal; older capability sets
+use the conservative budget. Invisible warm follows continue folding until eviction,
+which unsubscribes them; selecting an evicted conversation starts a new follow.
+
+The SDK publishes `SyncStatus` v2 for each follow and the gateway. `Requested` means the
+subscribe was sent, and `Live` requires decoded protocol data, not merely an open socket.
+Reconnect, resync, eviction and failure carry only observed evidence. The data layer
+retains trusted content through failed reads but removes authorization-revoked rows.
+Status consumers share their follow's lifetime, and last content never manufactures Live.
+
 ## Header
 
 The header's right side names the host and person, led by the connection: `● live`, a spinner

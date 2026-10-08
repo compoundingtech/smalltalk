@@ -29,7 +29,7 @@ import type {
 import type { ErrorEnvelope } from '@smalltalk/st3-client'
 import type { MessageSendInput } from '@st3/sdk/effect'
 import type { ConnectionState } from '@st3/sdk/effect'
-import type { FeedSync } from './feedSync.ts'
+import type { FeedSync, FeedSyncObservation } from './feedSync.ts'
 import * as Atom from 'effect/reactivity/Atom'
 
 import type { ConversationItem } from '../conversation/model.ts'
@@ -234,6 +234,8 @@ export interface DataSource {
   readonly usage: MonitorSource
   /** Live client-observed state kept separate from the feature-facing feed projection. */
   readonly sync?: {
+    /** Protocol-decoded observations, not merely an open socket. */
+    readonly gateway: Atom.Atom<FeedSyncObservation>
     readonly agents: Atom.Atom<FeedSync<readonly AgentRow[]>>
     readonly missions: Atom.Atom<FeedSync<readonly Mission[]>>
     readonly attention: Atom.Atom<FeedSync<readonly Attention[]>>

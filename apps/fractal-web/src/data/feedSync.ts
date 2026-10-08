@@ -1,23 +1,10 @@
-import type { FollowFailure } from '@st3/sdk/effect'
+import type { SyncStatus } from '@st3/sdk/effect'
+import * as Equal from 'effect/Equal'
 import * as Option from 'effect/Option'
 
-export type FeedSyncFailure =
-  | FollowFailure
-  | { readonly _tag: 'ConnectionRejected'; readonly message: string }
-
-export type FeedSyncStatus =
-  | { readonly _tag: 'Connecting'; readonly attempt: number }
-  | { readonly _tag: 'Requested' }
-  | { readonly _tag: 'Live' }
-  | { readonly _tag: 'Stale'; readonly code?: string; readonly message?: string }
-  | {
-      readonly _tag: 'Failed'
-      readonly failure: FeedSyncFailure
-    }
-
 export interface FeedSyncObservation {
-  readonly status: FeedSyncStatus
-  /** Local epoch milliseconds when this status transition was observed. */
+  readonly status: SyncStatus
+  /** Local epoch milliseconds when this status or progress stage was first observed. */
   readonly observedAt: number
 }
 
@@ -27,45 +14,37 @@ export interface FeedSync<TValue> {
   readonly sync: FeedSyncObservation
 }
 
-const statusKey = (status: FeedSyncStatus): string => {
-  switch (status._tag) {
-    case 'Connecting':
-      return 'Connecting:' + status.attempt
-    case 'Requested':
-    case 'Live':
-      return status._tag
-    case 'Stale':
-      return 'Stale:' + (status.code ?? '') + ':' + (status.message ?? '')
-    case 'Failed': {
-      const failure = status.failure
-      if (failure._tag === 'SubscriptionLimit') return 'Failed:SubscriptionLimit:' + failure.cap
-      if (failure._tag === 'ConnectionRejected') return 'Failed:ConnectionRejected:' + failure.message
-      const code = 'code' in failure ? failure.code ?? '' : ''
-      const message = 'message' in failure ? failure.message : ''
-      return 'Failed:' + failure._tag + ':' + code + ':' + message
-    }
-  }
-}
+const statusKey = (status: SyncStatus): string =>
+  status._tag === 'Progress'
+    ? `${status._tag}/${status.stage}`
+    : status._tag === 'Stale'
+      ? `${status._tag}/${status.reason._tag}`
+      : status._tag
 
 export const initialFeedSync = <TValue>(now: number, attempt = 1): FeedSync<TValue> => ({
   last: Option.none(),
-  sync: { status: { _tag: 'Connecting', attempt }, observedAt: now },
+  sync: { status: { _tag: 'Connecting', attempt, since: now }, observedAt: now },
 })
 
+/** Preserve SDK facts, including updated timestamps/details within the same observed stage. */
 export const transitionFeedSync = <TValue>(
   current: FeedSync<TValue>,
-  status: FeedSyncStatus,
+  status: SyncStatus,
   now: number,
 ): FeedSync<TValue> =>
-  statusKey(current.sync.status) === statusKey(status)
+  Equal.equals(current.sync.status, status)
     ? current
-    : { ...current, sync: { status, observedAt: now } }
+    : {
+        ...current,
+        sync: {
+          status,
+          observedAt: statusKey(current.sync.status) === statusKey(status) ? current.sync.observedAt : now,
+        },
+      }
 
+/** Recording retained content never manufactures Live: only the SDK status stream owns that verdict. */
 export const observeFeedSync = <TValue>(
   current: FeedSync<TValue>,
   value: TValue,
   now: number,
-): FeedSync<TValue> => {
-  const next = transitionFeedSync(current, { _tag: 'Live' }, now)
-  return { ...next, last: Option.some({ value, observedAt: now }) }
-}
+): FeedSync<TValue> => ({ ...current, last: Option.some({ value, observedAt: now }) })

@@ -10,6 +10,8 @@ import {
   type ConnectionState,
   followKey,
   type St3Options,
+  type SyncStatus,
+  syncStatusFromFailure,
 } from '@st3/sdk/effect'
 import { Effect, Fiber, Layer, ManagedRuntime, Metric, Option, Stream } from 'effect'
 import * as Atom from 'effect/reactivity/Atom'
@@ -33,8 +35,6 @@ import {
   observeFeedSync,
   transitionFeedSync,
   type FeedSync,
-  type FeedSyncFailure,
-  type FeedSyncStatus,
 } from './feedSync.ts'
 import {
   type ConversationPage,
@@ -80,10 +80,6 @@ export const liveSource = ({
     fetchImpl: options.fetch ?? globalThis.fetch.bind(globalThis),
   }))
   const deniedReaders = new Set<(message: string) => void>()
-  const feedSyncCallbacks = new Map<string, {
-    readonly requested: () => void
-    readonly failed: (failure: FeedSyncFailure) => void
-  }>()
   let readRejection: string | undefined
   let connectionAttempt = 1
   const noGrants: Grants = {
@@ -96,6 +92,11 @@ export const liveSource = ({
   setDebug('Wf.activeFollows', 0)
   setDebug('Wf.followCap', options.maxFollows)
   setDebug('Wf.conversationEntries', 0)
+  if (options.conversationSlots !== undefined)
+    setDebug('Wf.conversationSlots', options.conversationSlots)
+  // Each sync-status consumer is owned by the corresponding follow fiber.
+  let freshnessConsumers = 0
+  setDebug('Wf.freshnessConsumers', 0)
   const client = new St3Client({
     baseUrl,
     // Remove the browser receiver workaround after smalltalk#1040 / #1247 lands.
@@ -117,19 +118,11 @@ export const liveSource = ({
     St3Live({
       ...options,
       fetch,
-      onFollowSubscribeSent: (event) => {
-        feedSyncCallbacks.get(event.key)?.requested()
-        options.onFollowSubscribeSent?.(event)
-      },
       onDiagnostics: (event) => {
         switch (event._tag) {
           case 'Connection':
             if (event.state._tag === 'Reconnecting') connectionAttempt = event.state.attempt
             setDebug('Wf.socketLive', event.state._tag === 'Live' ? 1 : 0)
-            if (event.state._tag === 'Rejected') {
-              for (const callbacks of feedSyncCallbacks.values())
-                callbacks.failed({ _tag: 'ConnectionRejected', message: event.state.message })
-            }
             if (event.state._tag === 'Rejected') {
               readRejection = event.state.message
               registry.set(readRefusal, event.state.message)
@@ -141,6 +134,8 @@ export const liveSource = ({
           case 'Follows':
             setDebug('Wf.activeFollows', event.active)
             setDebug('Wf.followCap', event.cap)
+            if (event.conversationSlots !== undefined)
+              setDebug('Wf.conversationSlots', event.conversationSlots)
             break
           case 'Frame':
             incrDebug('Wf.frames')
@@ -196,7 +191,14 @@ export const liveSource = ({
     if (readRejection !== undefined)
       syncLatest = transitionFeedSync(
         syncLatest,
-        { _tag: 'Failed', failure: { _tag: 'ConnectionRejected', message: readRejection } },
+        {
+          _tag: 'Failed',
+          cause: {
+            _tag: 'Local',
+            kind: 'connection-rejected',
+            detail: { message: readRejection },
+          },
+        },
         Date.now(),
       )
     const syncData = Atom.keepAlive(Atom.make<FeedSync<A>>(syncLatest))
@@ -206,8 +208,12 @@ export const liveSource = ({
       let active = true
       if (readRejection !== undefined)
         latest = unavailable({ reason: 'ungranted', detail: readRejection })
-      else if (latest._tag === 'Observed') latest = { ...latest, freshness: 'stale' }
+      else if (latest._tag === 'Observed') {
+        latest = { ...latest, freshness: 'stale' }
+        syncLatest = transitionFeedSync(syncLatest, { _tag: 'Stale', reason: { _tag: 'Unknown' } }, Date.now())
+      }
       registry.set(data, latest)
+      registry.set(syncData, syncLatest)
       const commit = () => {
         if (active) {
           if (latest._tag === 'Observed') onCommit?.(latest.value)
@@ -215,16 +221,18 @@ export const liveSource = ({
           registry.set(syncData, syncLatest)
         }
       }
-      const setSync = (status: FeedSyncStatus) => {
+      const setSync = (status: SyncStatus) => {
+        if (terminalFailure && status._tag !== 'Failed') return
         syncLatest = transitionFeedSync(syncLatest, status, Date.now())
+        if (status._tag !== 'Live' && latest._tag === 'Observed')
+          latest = { ...latest, freshness: 'stale' }
         ingest.accept({ key: commit, value: commit })
       }
-      let syncKey: string | undefined
-      let syncCallbacks: {
-        readonly requested: () => void
-        readonly failed: (failure: FeedSyncFailure) => void
-      } | undefined
       const deny = (message: string) => {
+        setSync({
+          _tag: 'Failed',
+          cause: { _tag: 'Local', kind: 'connection-rejected', detail: { message } },
+        })
         latest = unavailable({ reason: 'ungranted', detail: message })
         ingest.accept({ key: commit, value: commit })
       }
@@ -235,43 +243,63 @@ export const liveSource = ({
       const resolving = resolve(get)
       const previous = previousFiber
       spec = undefined
+      let freshnessFiber: Fiber.Fiber<void, unknown> | undefined
       const fiber = runtime.runFork(
         Effect.gen(function* () {
           // Release the old socket slot before binding the replacement owner.
           if (previous !== undefined) yield* Fiber.interrupt(previous)
           if (readRejection !== undefined) {
-            setSync({ _tag: 'Failed', failure: { _tag: 'ConnectionRejected', message: readRejection } })
+            setSync({
+              _tag: 'Failed',
+              cause: {
+                _tag: 'Local',
+                kind: 'connection-rejected',
+                detail: { message: readRejection },
+              },
+            })
             return
           }
           const st3 = yield* St3
           const boundSpec = yield* resolving
           spec = boundSpec
-          syncKey = followKey(boundSpec)
-          const callbacks = {
-            requested: () => setSync({ _tag: 'Requested' }),
-            failed: (failure: FeedSyncFailure) =>
-              setSync({ _tag: 'Failed', failure }),
-          }
-          syncCallbacks = callbacks
-          feedSyncCallbacks.set(syncKey, callbacks)
+          const key = followKey(boundSpec)
+          freshnessFiber = runtime.runFork(
+            Effect.gen(function* () {
+              freshnessConsumers += 1
+              setDebug('Wf.freshnessConsumers', freshnessConsumers)
+              yield* st3.followSyncStatus(key).pipe(
+                Stream.runForEach((status) =>
+                  Effect.sync(() => {
+                    if (!active || readRejection !== undefined) return
+                    setSync(status)
+                  }),
+                ),
+              )
+            }).pipe(
+              Effect.ensuring(
+                Effect.sync(() => {
+                  freshnessConsumers -= 1
+                  setDebug('Wf.freshnessConsumers', freshnessConsumers)
+                }),
+              ),
+            ),
+          )
           yield* st3.setVisible(boundSpec, visible)
           yield* follow({ st3, spec: boundSpec }).pipe(
             Stream.runForEach((event) =>
               Effect.sync(() => {
                 if (!active || readRejection !== undefined) return
                 if (event._tag === 'Observed') {
-                  latest = observed({ value: event.value })
+                            latest = observed({ value: event.value })
                   syncLatest = observeFeedSync(syncLatest, event.value, Date.now())
                 } else if (event._tag === 'Failed') {
-                  syncLatest = transitionFeedSync(syncLatest, { _tag: 'Failed', failure: event.error }, Date.now())
+                  syncLatest = transitionFeedSync(syncLatest, syncStatusFromFailure(event.error), Date.now())
                   terminalFailure = true
-                  // Keep only previously decoded rows, never fabricate missing claims.
-                  // The daemon's integrity failure stays visible and remains non-retryable.
-                  const incompleteHistory =
-                    event.error._tag === 'Rejected' &&
-                    event.error.code === 'timeline-history-incomplete'
+                            // Keep verified content for failed reads, but never display revoked private rows.
+                  const authorizationRefusal =
+                    (event.error._tag === 'Rejected' || event.error._tag === 'Attach') && event.error.code === 'forbidden'
                   latest =
-                    spec?._tag === 'Conversation' && incompleteHistory && latest._tag === 'Observed'
+                    latest._tag === 'Observed' && !authorizationRefusal
                       ? {
                           ...latest,
                           freshness: 'stale',
@@ -281,18 +309,11 @@ export const liveSource = ({
                           },
                         }
                       : unavailable({
-                          reason:
-                            event.error._tag === 'Rejected' && !incompleteHistory
-                              ? 'ungranted'
-                              : 'failed',
+                          reason: authorizationRefusal ? 'ungranted' : 'failed',
                           detail: event.error.message,
                         })
                 } else {
-                  syncLatest = transitionFeedSync(syncLatest, {
-                    _tag: 'Stale',
-                    ...(event.code === undefined ? {} : { code: event.code }),
-                    ...(event.message === undefined ? {} : { message: event.message }),
-                  }, Date.now())
+                  // SDK sync status owns the verdict; this event only degrades retained content.
                   if (latest._tag === 'Observed') latest = { ...latest, freshness: 'stale' }
                 }
                 ingest.accept({ key: commit, value: commit })
@@ -305,14 +326,23 @@ export const liveSource = ({
               if (!active || readRejection !== undefined) return
 
               terminalFailure = true
-              latest = unavailable({ reason: 'failed', detail: error.message })
-              ingest.accept({ key: commit, value: commit })
+              syncLatest = transitionFeedSync(syncLatest, syncStatusFromFailure(error), Date.now())
+              latest = latest._tag === 'Observed'
+                ? { ...latest, freshness: 'stale', error: { reason: 'failed', detail: error.message } }
+                : unavailable({ reason: 'failed', detail: error.message })
+                    ingest.accept({ key: commit, value: commit })
             }),
           ),
           Effect.ensuring(
-            Effect.sync(() => {
-              if (active) ended = true
-            }),
+            Effect.suspend(() =>
+              (freshnessFiber === undefined ? Effect.void : Fiber.interrupt(freshnessFiber)).pipe(
+                Effect.andThen(
+                  Effect.sync(() => {
+                    if (active) ended = true
+                  }),
+                ),
+              ),
+            ),
           ),
         ),
       )
@@ -320,8 +350,6 @@ export const liveSource = ({
       get.addFinalizer(() => {
         active = false
         deniedReaders.delete(deny)
-        if (syncKey !== undefined && feedSyncCallbacks.get(syncKey) === syncCallbacks)
-          feedSyncCallbacks.delete(syncKey)
         fiber.interruptUnsafe()
       })
       return latest
@@ -556,6 +584,23 @@ export const liveSource = ({
       return { _tag: 'Connecting', attempt: 1 }
     }),
   )
+  const gatewaySync = Atom.keepAlive(
+    Atom.make((get) => {
+      let current = initialFeedSync<never>(Date.now())
+      const fiber = runtime.runFork(
+        Effect.flatMap(St3, (st3) =>
+          st3.gatewaySyncStatus.pipe(
+            Stream.runForEach((status) => Effect.sync(() => {
+              current = transitionFeedSync(current, status, Date.now())
+              get.setSelf(current.sync)
+            })),
+          ),
+        ),
+      )
+      get.addFinalizer(() => fiber.interruptUnsafe())
+      return current.sync
+    }),
+  )
   const grants = Atom.keepAlive(
     Atom.make((get): Grants => {
       if (readRejection !== undefined) return noGrants
@@ -632,6 +677,7 @@ export const liveSource = ({
       ),
       usage: undeclared,
       sync: {
+        gateway: gatewaySync,
         agents: agentsRetained.sync,
         missions: missionsRetained.sync,
         attention: attentionRetained.sync,
