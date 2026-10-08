@@ -313,3 +313,241 @@ fn preverification_cannot_restore_a_checkpointed_payload_or_signature() {
         assert_eq!(count, 0);
     }
 }
+
+#[test]
+fn admission_rechecks_authority_when_a_foreground_change_overtakes_its_preparation() {
+    let source = node("birch");
+    let target = node("cedar");
+    let exchange = page(&source, &target, 1);
+    target
+        .receive_replication_exchange("birch", FLEET, &exchange)
+        .unwrap();
+    let (prepared, preparing) = mpsc::sync_channel(1);
+    let (resume, resumed) = mpsc::sync_channel(1);
+    let admitting = target.clone();
+    let admission = std::thread::spawn(move || {
+        BEFORE_ADMISSION_LOAN.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                prepared.send(()).unwrap();
+                resumed.recv_timeout(Duration::from_secs(10)).unwrap();
+            }));
+        });
+        admitting.validate_replication_backlog().unwrap()
+    });
+    preparing.recv_timeout(Duration::from_secs(5)).unwrap();
+    // The prepared fold treated birch as legacy. Establish a signed anchor admission for
+    // birch before its loan: the old unsigned page must now wait for that exact member key.
+    let (key, _) = MemberKey::generate().unwrap();
+    let key = Arc::new(key);
+    target.set_member_key(Some(key.clone())).unwrap();
+    target.pin_fleet_anchor(key.public()).unwrap();
+    target
+        .append_claim(&ClaimInput {
+            subject: "host/birch".into(),
+            kind: "fleet.member-admitted".into(),
+            actor: None,
+            fields: BTreeMap::from([
+                ("fleet_id".into(), Value::String(FLEET.into())),
+                ("member_key".into(), Value::String(key.public().into())),
+                ("via".into(), Value::String("anchor".into())),
+                ("mode".into(), Value::String("listening".into())),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+    let membership = target.fleet_membership().unwrap();
+    assert!(matches!(
+        membership.window("birch", exchange.envelopes[0].sequence),
+        crate::fleet::Window::Keyed(_)
+    ));
+    resume.send(()).unwrap();
+    let outcome = admission.join().unwrap();
+    assert_eq!((outcome.valid, outcome.held), (0, 1));
+    assert_eq!(
+        target
+            .readers
+            .get()
+            .query_row(
+                "SELECT reason FROM replica_envelope_holds WHERE writer='birch'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "unsigned"
+    );
+    // A fresh exact signature then admits the same durable payload, rather than losing it.
+    let envelope = &exchange.envelopes[0];
+    let mut retry = exchange.clone();
+    retry.signatures.push(ReplicaEnvelopeSignature {
+        writer: envelope.writer.clone(),
+        sequence: envelope.sequence,
+        hash: envelope.hash.clone(),
+        member_key: key.public().into(),
+        signature: key.sign(&crate::fleet::envelope_signature_message(
+            FLEET,
+            &envelope.writer,
+            envelope.sequence,
+            &envelope.hash,
+        )),
+    });
+    assert_eq!(
+        target
+            .receive_replication_exchange("birch", FLEET, &retry)
+            .unwrap()
+            .received,
+        0
+    );
+    assert_eq!(target.validate_replication_backlog().unwrap().valid, 1);
+}
+
+#[test]
+fn admission_does_not_restore_source_dropped_before_its_background_loan() {
+    let source = node("birch");
+    let target = node("cedar");
+    let exchange = page(&source, &target, 1);
+    target
+        .receive_replication_exchange("birch", FLEET, &exchange)
+        .unwrap();
+    let (prepared, preparing) = mpsc::sync_channel(1);
+    let (resume, resumed) = mpsc::sync_channel(1);
+    let admitting = target.clone();
+    let admission = std::thread::spawn(move || {
+        BEFORE_ADMISSION_LOAN.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                prepared.send(()).unwrap();
+                resumed.recv_timeout(Duration::from_secs(10)).unwrap();
+            }));
+        });
+        admitting.validate_replication_backlog().unwrap()
+    });
+    preparing.recv_timeout(Duration::from_secs(5)).unwrap();
+    let envelope = &exchange.envelopes[0];
+    // Synthetic retained exclusion; certificate adoption itself has separate controls.
+    {
+        let mut writer = target.connection.write();
+        let tx = writer.transaction().unwrap();
+        tx.execute(
+            "INSERT INTO checkpoint_envelopes VALUES(?1,?2,?3,?4,'checkpoint/test')",
+            params![
+                envelope.writer,
+                envelope.sequence,
+                envelope.hash,
+                envelope.accepted_at_unix_ms as i64
+            ],
+        )
+        .unwrap();
+        tx.execute(
+            "DELETE FROM replica_envelopes WHERE writer=?1 AND sequence=?2 AND envelope_hash=?3",
+            params![envelope.writer, envelope.sequence, envelope.hash],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+    resume.send(()).unwrap();
+    assert_eq!(admission.join().unwrap().valid, 0);
+    for table in [
+        "claims",
+        "replica_records",
+        "replica_envelope_holds",
+        "replica_envelopes",
+    ] {
+        assert_eq!(
+            target
+                .readers
+                .get()
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
+                    .get::<_, usize>(0))
+                .unwrap(),
+            0,
+            "restored {table}"
+        );
+    }
+}
+
+#[test]
+fn admission_reuses_a_generation_checked_fold_across_unchanged_pages() {
+    let source = node("birch");
+    let target = node("cedar");
+    let exchange = page(&source, &target, 33);
+    target
+        .receive_replication_exchange("birch", FLEET, &exchange)
+        .unwrap();
+    ADMISSION_MEMBERSHIP_FOLDS.with(|count| count.set(0));
+    ADMISSION_TRANSACTIONS.with(|count| count.set(0));
+    assert_eq!(target.validate_replication_backlog().unwrap().valid, 33);
+    ADMISSION_TRANSACTIONS.with(|count| assert!(count.get() >= 5));
+    ADMISSION_MEMBERSHIP_FOLDS.with(|count| {
+        assert_eq!(
+            count.get(),
+            1,
+            "unchanged pages must not repeat the full membership fold"
+        )
+    });
+}
+
+#[test]
+fn background_receipt_finalizer_failure_rolls_back_the_whole_page_and_retry() {
+    let source = node("birch");
+    let target = node("cedar");
+    let exchange = page(&source, &target, 3);
+    let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let failing = fail.clone();
+    target
+        .connection
+        .install_transaction_finalizer(move |tx| {
+            let received: bool =
+                tx.query_row("SELECT EXISTS(SELECT 1 FROM replica_envelopes)", [], |r| {
+                    r.get(0)
+                })?;
+            anyhow::ensure!(
+                !received || !failing.load(Ordering::Acquire),
+                "injected receipt finalizer failure"
+            );
+            Ok(())
+        })
+        .unwrap();
+    assert!(
+        target
+            .receive_replication_exchange("birch", FLEET, &exchange)
+            .is_err()
+    );
+    for table in ["replica_envelopes", "replication_peers"] {
+        assert_eq!(
+            target
+                .readers
+                .get()
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
+                    .get::<_, usize>(0))
+                .unwrap(),
+            0
+        );
+    }
+    assert_eq!(
+        target.replication_timers.exchanges.load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        target
+            .replication_timers
+            .envelopes_received
+            .load(Ordering::Relaxed),
+        0
+    );
+    fail.store(false, Ordering::Release);
+    assert_eq!(
+        target
+            .receive_replication_exchange("birch", FLEET, &exchange)
+            .unwrap()
+            .received,
+        3
+    );
+    assert_eq!(
+        target
+            .receive_replication_exchange("birch", FLEET, &exchange)
+            .unwrap()
+            .received,
+        0
+    );
+}
