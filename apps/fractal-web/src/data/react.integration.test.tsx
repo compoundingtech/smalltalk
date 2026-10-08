@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 import {
   Agent,
   Attention,
@@ -10,10 +11,18 @@ import * as AtomRegistry from 'effect/reactivity/AtomRegistry'
 import * as React from 'react'
 import { flushSync } from 'react-dom'
 import { createRoot } from 'react-dom/client'
-import { expect, it } from 'vitest'
+import { expect, it, vi } from 'vitest'
+// Node tests stub only the CSS runtime; render identity and feed equality are under test.
+vi.mock('@stylexjs/stylex', () => ({
+  create: (styles: unknown) => styles,
+  defineVars: (variables: unknown) => variables,
+  createTheme: () => ({}),
+  keyframes: () => 'test-animation',
+  props: () => ({}),
+}))
 
 import { sameFolderFleet } from '../shell/AgentFolders.tsx'
-import { useAgentSignalFacts } from '../shell/AgentUsageFacts.ts'
+import { useAgentAttentionCounts } from '../shell/AgentAttention.tsx'
 import { WorkbenchContextProvider, useOpen, type SubjectSummary } from '../shell/context.tsx'
 import { defaultFilters } from '../shell/sidebar/state.ts'
 import { fixtureSource, type FixtureProjections } from './fixtureSource.ts'
@@ -82,7 +91,7 @@ it('updates only the changed row, not the manual collection, opened agent or ter
   const Row = ({ refId }: { readonly refId: 'first' | 'second' }) => {
     renders[refId]++
     const feed = useAgent(`agent/${refId}`)
-    const facts = useAgentSignalFacts(`agent/${refId}`)
+    const facts = useAgentAttentionCounts(`agent/${refId}`)
     return (
       <p>
         {feed._tag === 'Observed' ? feed.value?.name : feed._tag}:{facts.decisions}
@@ -205,18 +214,18 @@ it('invalidates folder membership/order only for active filter dependencies', ()
   const project = createProjections()
   const fleet = project.fleetFromAgents([first, second])
   const left = observed({ value: fleet })
+  // The contextual fleet-agent type keeps union tags literal; an untyped literal widens
+  // `_tag`/`activity` to string and the feed stops being a Feed<Fleet>.
+  const changed: Fleet['agents'][number] = {
+    ...fleet.agents[0]!,
+    activity: 'waiting',
+    description: 'Changed description',
+    lastActivityAt: { _tag: 'Known', value: 1 },
+  }
   const right = observed({
     value: {
       ...fleet,
-      agents: [
-        {
-          ...fleet.agents[0]!,
-          activity: 'waiting' as const,
-          description: 'Changed description',
-          lastActivityAt: { _tag: 'Known', value: 1 },
-        },
-        fleet.agents[1]!,
-      ],
+      agents: [changed, fleet.agents[1]!],
     },
   })
   expect(sameFolderFleet(left, right, defaultFilters)).toBe(true)
