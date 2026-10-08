@@ -1,0 +1,106 @@
+{
+  "classification": "Corrected final variant1 FAILED native channel admission before model/count calls; variant2 NOT RUN after mechanical failure; every semantic gate UNTESTED",
+  "authorization": "message/8e24f29a039633b0 delegates owner message/48c3f411b5471516",
+  "controls_ref": "doc/fleet/smalltalk/onboarding/2026-10-08d/content-final-corrected-controls@51ca21c3d9774ed558cdabd6111e1d12ed6dd80b4334970e2883e4959b26f4b2",
+  "controls_source": "e07858087891e3836a90bfff09d6ee0f67df3571",
+  "controls_file_sha256": {
+    "scripts/onboarding-e2e": "c36ff4d0e11ff490523e2b0261efd5853abd70834997e67836b2679008056766",
+    "scripts/onboarding-content-eval": "38f1007ae7e7f5483ab33a2a995ba7245c7d054632e44eb5a7e80733b37343da",
+    "scripts/onboarding-fixtures/claude_eval_broker.py": "fd19add042da991a9855f280d8522c59c982d61129bcfb241a9c0702c274b0bb",
+    "scripts/onboarding-fixtures/claude_welcome.py": "2a8333ff970c46e84809e33d1baff052b8a0e928c8d0f6bc4f159f7994c5858b",
+    "scripts/onboarding-fixtures/content_persona.py": "e4053cf8288222a00120e299b9c72939227cfa1fcc51b4252db98eec40325dcb",
+    "scripts/onboarding-fixtures/count-native-tool-result.json": "92568a8ce1876b493f1d83f1b532ed04d4445c891d9ddf18dde3e9470e4871bc",
+    "scripts/onboarding-fixtures/test_content_eval.py": "cbe8a71a41e6014e6562c557054d564523c3b9170180ca9523600f55ddf1ef0a"
+  },
+  "offline_tests": 30,
+  "new_raw_outcome_ref": "doc/fleet/smalltalk/onboarding/2026-10-08d/content-final-corrected-outcome-1@6586bf7468f93740141e017790dd7b98e1b99254ceb01a3af3bfd8afb46a74f2",
+  "raw_storage": {
+    "encoding": "gzip+base64 JSON envelope; decompress then verify original raw bundle SHA256",
+    "raw_bundle_sha256": "cf6217e01ab66914ae897e5314b1bb350c2d6baf8000843733e1c1c018cba958"
+  },
+  "previous_failed_outcomes": {
+    "paid-1": "doc/fleet/smalltalk/onboarding/2026-10-08d/content-native-failed-1@90b658e1af33f453ce220a95e991e24e0fbcec384a529e430f83f0fcd1e84e6e",
+    "paid-2": "doc/fleet/smalltalk/onboarding/2026-10-08d/content-native-failed-2@d09dbc8b2bbbb9b5f4af1c79fff151371a63e2f6b58cbddc73259ff29465a672",
+    "execution-summary": "doc/fleet/smalltalk/onboarding/2026-10-08d/content-native-execution-summary@ba140222229916f81ddfa35843016439dd35e20c77c0afc03b7e7405264c8bc5",
+    "preparation": "doc/fleet/smalltalk/onboarding/2026-10-08d/content-native-preparation@9cb1f37b2ed0814aafa3091f3a26c5643da5b4444eb94ea6a72dc66c3c25c510"
+  },
+  "previous_summary_ref": "doc/fleet/smalltalk/onboarding/2026-10-08d/content-native-failed-summary@192ccfc2defa4bc4546e1a31165a51524d152c8190d55008b7b6c90a89232fbc",
+  "plain_native_enabled_mcp_ref": "doc/fleet/smalltalk/onboarding/2026-10-08d/content-plain-proof@efb398a096ff9e74b6039eddb8fc76dc8af59d7f795fc424133658927a760abc",
+  "candidate_source": "500159eb2f487e87e074efb0740b9579dde12ac5",
+  "archive_sha256": "ecaaaa9f88ff33ff5bd0c4e71dcbded6b8711d1029c97780c0092b4e7d56f500",
+  "native_claude_version": "2.1.293",
+  "native_claude_sha256": "8968405e26db478af44eabc4635ab5ca557057b702a54460a59c13e1b253e978",
+  "new_usage": {
+    "model_calls": 0,
+    "count_calls": 0,
+    "upstream_calls": 25,
+    "upstream_kind": "successful native metadata requests only",
+    "usage_cost_usd": 0.0
+  },
+  "combined_usage": {
+    "model_calls": 2,
+    "upstream_calls": 83,
+    "paid_messages": 2,
+    "count_preflights": 4,
+    "metadata": 77,
+    "usage_cost_usd": 0.070646,
+    "basis": "(6 * 1 + 55612 * 1.25 + 225 * 5) / 1000000 USD; published Haiku4.5 rates times actual provider usage, not an invoice",
+    "invoice": false
+  },
+  "native_welcome": "Actual native theme/security/trust/Bypass consent actions completed; native preferences observed, no fabricated marker or model prompt.",
+  "root_cause": "UNKNOWN. Actual native managed terminal explicitly reports Channels are not currently available with the st development-plugin selector. Same normal Anthropic endpoint/private HTTPS proxy route as the earlier paid attempts. No inference that API keys universally lack channels or that the proxy alone caused this failure.",
+  "semantic_results": {
+    "hello": "UNTESTED",
+    "tour": "UNTESTED",
+    "first-mission": "UNTESTED",
+    "your-project": "UNTESTED",
+    "keep-running": "UNTESTED",
+    "phone": "UNTESTED",
+    "second-machine": "UNTESTED",
+    "github": "UNTESTED",
+    "wrap-up": "UNTESTED"
+  },
+  "person_answers": 0,
+  "sample_review": false,
+  "count_correction_provider_verified": false,
+  "stop_action": {
+    "controller_exit": 130,
+    "method": "SIGINT once to own controller after read-only native admission failure observation. Existing finally cleanup ran; no managed-seat key input or repair/restart."
+  },
+  "second_variant": {
+    "state": "NOT RUN",
+    "reason": "Stop pair rather than repeat a mechanical admission failure; no extra paid retry or diagnostic authorized"
+  },
+  "limits": [
+    "No further run or provider diagnostic/model call executed",
+    "No authorization inferred for another attempt",
+    "Native Codex auth/evals pending",
+    "No model-content evaluation result from corrected final attempt",
+    "No real VM, native macOS or all-found integration matrix result"
+  ],
+  "slot_release": "message/05aefa02a718c2da",
+  "summary_ref": "doc/fleet/smalltalk/onboarding/2026-10-08d/content-final-corrected-outcome-summary@751a891c8cb0e4a0df8a4c3847b33cb2a9552f213a9322467c8ece72576b3007",
+  "cleanup": {
+    "stopped_and_cancelled_exit_codes": [
+      0,
+      0
+    ],
+    "removed_guest": "st-onboarding-3a16bd10d674",
+    "container_absence": {
+      "argv": [
+        "docker",
+        "ps",
+        "-a",
+        "--filter",
+        "name=st-onboarding",
+        "--format",
+        "{{.Names}} {{.Status}}"
+      ],
+      "exit": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    "privacy_before_and_after": "PASS",
+    "immutable_raw_bundle_retrieval": "PASS: gzip decoded; bundle and every original file SHA256 verified"
+  }
+}
