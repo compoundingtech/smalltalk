@@ -1,5 +1,22 @@
 # Merge queue test flakes
 
+## Terminal tab protocol observation
+
+`ui::terminal_tab::terminal_tab_protocols` appends Ctrl-B, Ctrl-A, Ctrl-B after each
+input case and waits for the native program log to end in that barrier. Searching the
+entire accumulated log can match across cases: the previous trailing Ctrl-B, an `a`
+event in the current case, and the new barrier's first Ctrl-B. The kitty pattern accepts
+other modifiers and event kinds for the middle `a`; legacy Ctrl-Shift-A encodes Ctrl-A.
+That premature match starts before the current case and produces an empty byte slice.
+
+A native run with the pinned PTY dependency reproduced empty Ctrl-Shift-A and key-repeat
+rows even though the transparent transport tap and program log both retained the correct
+bytes. Controlled split-barrier observations reproduce the premature match directly.
+Both input and query observations now search only from the current case's input offset.
+The committed byte matrix, native protocols, deadlines and product code are unchanged.
+The earlier hosted empty key-release row is consistent with this overlap, but its summary
+alone cannot prove the transport boundary of that particular attempt.
+
 The correctness suite must enforce observable results and deterministic work budgets.
 Elapsed-time thresholds belong in Performance, where runner load and timing are measured
 explicitly. Retrying a correctness test does not repair its cause.
