@@ -2928,6 +2928,40 @@ impl Store {
             .and_then(|entry| entry.valid_until_unix_ms)
     }
 
+    /// Register the one task that keeps the complete roster published, and return its wake.
+    /// `None` when one is already registered.
+    pub(crate) fn start_agent_roster_refresher(&self) -> Option<Arc<tokio::sync::Notify>> {
+        let wake = Arc::new(tokio::sync::Notify::new());
+        self.smalltalk.agent_roster_refresh.set(Arc::clone(&wake)).ok()?;
+        Some(wake)
+    }
+
+    /// Ask the refresher, if one runs, to publish the roster at the newest cut. Requests made
+    /// while it folds coalesce into one more refresh.
+    pub(crate) fn request_agent_roster_refresh(&self) {
+        if let Some(wake) = self.smalltalk.agent_roster_refresh.get() {
+            wake.notify_one();
+        }
+    }
+
+    /// The newest complete current roster published at or before `index`, with its own graph
+    /// index, while a refresher keeps advancing it. A reader serves these rows under that
+    /// index's snapshot, never under its own newer one, and wakes the refresher. Without a
+    /// refresher there is none: readers then fold exactly their own cut, as before.
+    pub(crate) fn published_agent_roster(&self, index: u64) -> Option<(u64, Arc<Vec<Value>>)> {
+        self.smalltalk.agent_roster_refresh.get()?;
+        self.smalltalk.agent_resources_cache.lock()
+            .expect("agent resources cache poisoned").iter()
+            .filter(|entry| !entry.history && entry.covered.is_none() && entry.index <= index)
+            .max_by_key(|entry| (entry.index, entry.local))
+            .map(|entry| (entry.index, Arc::clone(&entry.items)))
+    }
+
+    /// Follows the graph index of the newest complete current roster.
+    pub(crate) fn subscribe_agent_roster(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.smalltalk.agent_roster_published.subscribe()
+    }
+
     /// Queue selection changes at lease expiry even when the claim frontier is unchanged.
     /// Scan only on a cache miss, inside the same SQLite snapshot as the queue projection.
     fn agent_queue_valid_until(&self, now: u128) -> Result<Option<u128>> {
@@ -3171,6 +3205,7 @@ impl Store {
         let published = cache.iter().filter(valid).find(|entry| {
             agent_resources_entry_hits(entry, now, index, local, history, selected)
         }).map(|entry| Arc::clone(&entry.items));
+        let complete = !history && entry.covered.is_none();
         let items = if let Some(published) = published { published } else {
             cache.retain(|entry| entry.index != index || entry.local != local || entry.history != history);
             let items = Arc::clone(&entry.items);
@@ -3179,6 +3214,13 @@ impl Store {
             items
         };
         drop(cache);
+        if complete {
+            self.smalltalk.agent_roster_published.send_if_modified(|published| {
+                let newer = index > *published;
+                *published = (*published).max(index);
+                newer
+            });
+        }
         Ok(select(&items))
     }
 

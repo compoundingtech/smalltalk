@@ -5904,6 +5904,8 @@ async fn run_up(args: UpArgs) -> Result<()> {
     st3::api::start_operation_report(&state);
     // Nor does the first session list wait to read every native transcript's header.
     st3::api::start_native_session_discovery(&state);
+    // Nor does the first agents roster read fold every agent's card.
+    st3::api::start_agent_roster(&state);
     startup.phase("bind-listeners");
     let bound = std::sync::atomic::AtomicUsize::new(0);
     let ready = || {

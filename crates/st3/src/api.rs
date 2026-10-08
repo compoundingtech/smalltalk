@@ -4234,6 +4234,7 @@ async fn client_agents(
 ) -> Result<ClientPageResponse, ApiError> {
     // A warm request never queues behind a cold projection. Drop the probe's SQLite
     // snapshot before waiting, then recheck all cache fences in the admitted snapshot.
+    let first_current_page = (query.cursor.is_none() && !query.history).then(|| query.clone());
     for admitted in [false, true] {
         let admission = if admitted {
             Some(state.store.admit_agent_resources().await)
@@ -4259,8 +4260,57 @@ async fn client_agents(
         if let Some(page) = result {
             return Ok(page);
         }
+        if let Some(query) = first_current_page.as_ref().filter(|_| !admitted) {
+            let reader = state.clone();
+            let query = query.clone();
+            if let Some(page) =
+                blocking_store(move || Ok(client_agents_published_page(&reader, &query))).await??
+            {
+                return Ok(page);
+            }
+        }
     }
     unreachable!("an admitted roster read always builds missing cards")
+}
+
+/// A first page of the newest published roster, under the snapshot it was folded at, for a
+/// current read that missed its own cut while a refresher keeps the roster published.
+fn client_agents_published_page(
+    state: &AppState,
+    query: &ClientListQuery,
+) -> Result<Option<ClientPageResponse>, ApiError> {
+    let store = &state.store;
+    let index = store.index().map_err(ApiError::internal)?;
+    let Some((index, cards)) = store.published_agent_roster(index) else {
+        return Ok(None);
+    };
+    store.request_agent_roster_refresh();
+    let snapshot = client_snapshot_at(state, index);
+    if let Some(status) = query.status.as_deref() {
+        let mut cards = (*cards).clone();
+        overlay_agent_resources(store, &mut cards, &snapshot.created_at)
+            .map_err(ApiError::internal)?;
+        cards.retain(|card| card["state"].as_str() == Some(status));
+        let page = client_page_read(state, &snapshot, "agents", cards, query, true)?;
+        return Ok(Some((Extension(snapshot), Json(page))));
+    }
+    // Continuations keep the same membership, order and queue metadata as the exact path's
+    // refs, and fold their own page at this snapshot.
+    let refs = cards.iter().map(|card| {
+        let mut reference = serde_json::Map::new();
+        for field in ["id", "name", "host_id"].into_iter().chain(AGENT_QUEUE_FIELDS) {
+            reference.insert(field.to_owned(), card[field].clone());
+        }
+        Value::Object(reference)
+    }).collect();
+    let mut page = client_page_read(state, &snapshot, "agents", refs, query, true)?;
+    let selected = page.items.iter().filter_map(|item| item["id"].as_str())
+        .collect::<BTreeSet<_>>();
+    let cards = cards.iter()
+        .filter(|card| card["id"].as_str().is_some_and(|id| selected.contains(id)))
+        .cloned().collect();
+    page.items = client_agent_cards_from_cached(store, cards, &page.items, &snapshot.created_at)?;
+    Ok(Some((Extension(snapshot), Json(page))))
 }
 
 fn client_agents_page_at(
@@ -5138,6 +5188,45 @@ pub fn start_operation_report(state: &AppState) {
 /// instead of walking the transcript trees, so a cold tree cannot hold those requests.
 pub fn start_native_session_discovery(state: &AppState) {
     crate::external_sessions::start_history_inventory(state.native_session_home.as_deref());
+}
+
+/// The shortest pause between two roster refreshes. A refresh also pauses as long as it took,
+/// so refreshing never takes more than about half a core however often readers ask.
+const AGENT_ROSTER_REFRESH_PAUSE: Duration = Duration::from_millis(250);
+
+/// Keep the complete agents roster published off the request path, starting with a fold as the
+/// daemon starts. A roster read that misses its exact cut serves the newest publication under
+/// that publication's own snapshot and wakes this one task, so readers neither fold the fleet's
+/// cards nor wait behind a fold once the first has published. Each refresh reuses the previous
+/// publication and refolds only the cards whose claims changed, when it can tell which.
+pub fn start_agent_roster(state: &AppState) {
+    let Some(wake) = state.store.start_agent_roster_refresher() else {
+        return;
+    };
+    let store = state.store.clone();
+    tokio::spawn(async move {
+        loop {
+            let started = tokio::time::Instant::now();
+            let admission = store.admit_agent_resources().await;
+            let reader = store.clone();
+            let refreshed = tokio::task::spawn_blocking(move || {
+                let _admission = admission;
+                crate::performance::task("roster/refresh", || {
+                    reader.read_snapshot(|index| {
+                        client_agent_resources_cached(&reader, false, index).map(drop)
+                    })
+                })
+            })
+            .await;
+            match refreshed {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => eprintln!("st3: agents roster refresh failed: {error:#}"),
+                Err(error) => eprintln!("st3: agents roster refresh stopped: {error}"),
+            }
+            tokio::time::sleep(started.elapsed().max(AGENT_ROSTER_REFRESH_PAUSE)).await;
+            wake.notified().await;
+        }
+    });
 }
 
 /// The local daemon binds a Unix peer to the harness identity inherited by that peer or one of
