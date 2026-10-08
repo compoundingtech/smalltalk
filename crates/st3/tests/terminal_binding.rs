@@ -467,5 +467,5 @@ read -r _
     let _ = diagnostics.await.unwrap();
 }
 
-#[path = "terminal_completion_controls.rs"]
+#[path = "terminal_binding/completion_controls.rs"]
 mod completion_controls;
