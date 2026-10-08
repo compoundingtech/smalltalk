@@ -1683,6 +1683,49 @@ mod tests {
             .unwrap();
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn modern_peers_complete_a_round_without_a_legacy_graph_snapshot() {
+        let fleet = "1f91ca65-7793-48cc-866e-ac15690130e1";
+        let auth = FleetAuth::test(fleet, &[6; 32]);
+        let source = Arc::new(Store::open_memory("source").unwrap());
+        let target = Arc::new(Store::open_memory("target").unwrap());
+        source.bind_fleet(fleet).unwrap();
+        target.bind_fleet(fleet).unwrap();
+        *source.replication_snapshot.lock().unwrap() = None;
+        *target.replication_snapshot.lock().unwrap() = None;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let state = PeerState::new(
+            Local(target.clone()),
+            "target".into(),
+            auth.clone(),
+            FleetContext::legacy(BTreeSet::from(["source".into()])),
+        );
+        let server = tokio::spawn(axum::serve(listener, peer_router(state, Router::new())).into_future());
+        let peer = PeerConfig {
+            name: "target".into(),
+            url: format!("http://{address}"),
+        };
+        exchange(
+            &replication_http_client(),
+            &Local(source.clone()),
+            "source",
+            &peer,
+            &auth,
+            &FleetContext::legacy(BTreeSet::from(["target".into()])),
+        )
+        .await
+        .unwrap();
+        for store in [&source, &target] {
+            let cache = store.replication_snapshot.lock().unwrap();
+            let snapshot = cache.as_ref().expect("the exchange built a snapshot");
+            assert!(snapshot.legacy_graph_digest.is_empty());
+            assert!(!snapshot.projection_digests.is_empty());
+        }
+        server.abort();
+    }
+
     fn member_context(
         store: &Store,
         own: &MemberKey,

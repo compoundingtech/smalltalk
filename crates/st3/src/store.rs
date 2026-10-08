@@ -44004,7 +44004,11 @@ version 2
         target
             .receive_replication_exchange("source", fleet, &exchange)
             .unwrap();
+        target.validate_replication_backlog().unwrap();
         assert_eq!(GRAPH_DIGESTS_COMPUTED.with(std::cell::Cell::get), 0);
+        let legacy = target.export_replication_summary(fleet).unwrap();
+        assert!(!legacy.graph_digest.is_empty());
+        assert_eq!(GRAPH_DIGESTS_COMPUTED.with(std::cell::Cell::get), 1);
     }
 
     #[test]

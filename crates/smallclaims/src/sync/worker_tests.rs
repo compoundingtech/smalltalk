@@ -31,6 +31,60 @@ fn plain_open(path: &Path, origin: &str) -> anyhow::Result<Store> {
     Ok(store)
 }
 
+#[test]
+fn modern_digest_domain_requires_both_peer_signals_and_the_complete_table_set() {
+    let local = ReplicationExchange {
+        peer: "alder".into(),
+        fleet_id: "fleet/example".into(),
+        schema_digest: "schema/example".into(),
+        authority_digest: "authority/example".into(),
+        graph_digest: String::new(),
+        projection_digests: BTreeMap::from([
+            ("claims".into(), "a".repeat(64)),
+            ("records".into(), "b".repeat(64)),
+        ]),
+        inventory: ReplicationInventory::default(),
+        envelopes: Vec::new(),
+        signature_requests: Vec::new(),
+        signatures: Vec::new(),
+    };
+    let mut remote = local.clone();
+    remote.peer = "birch".into();
+    assert!(comparable_modern_exchange(&local, &remote));
+    assert!(!needs_legacy_retry(&local, &Ok((remote.clone(), false))));
+    remote.graph_digest = "legacy".into();
+    assert!(!comparable_modern_exchange(&local, &remote));
+    assert!(needs_legacy_retry(&local, &Ok((remote.clone(), false))));
+    remote.graph_digest.clear();
+    remote.projection_digests.remove("records");
+    assert!(!comparable_modern_exchange(&local, &remote));
+    remote.projection_digests = local.projection_digests.clone();
+    remote.projection_digests.insert("claims".into(), String::new());
+    assert!(!comparable_modern_exchange(&local, &remote));
+    remote.projection_digests = local.projection_digests.clone();
+    remote.schema_digest = "other-schema".into();
+    assert!(!comparable_modern_exchange(&local, &remote));
+    assert!(!needs_legacy_retry(
+        &local,
+        &Err(RemovedFromFleet {
+            code: "member-removed".into(),
+            message: "signed refusal".into(),
+        }
+        .into())
+    ));
+    assert!(!needs_legacy_retry(
+        &local,
+        &Err(PeerOverloaded {
+            retry_after: Duration::from_secs(5),
+        }
+        .into())
+    ));
+    assert!(!needs_legacy_retry(
+        &local,
+        &Err(anyhow::anyhow!("authentication failed"))
+    ));
+}
+
 /// Different checkpoint lineages leave payloadless ranges that can never settle through
 /// envelope transport. Both live writers already have a shared range, so a summary alone
 /// cannot prove either of their later gaps.
@@ -959,6 +1013,8 @@ fn a_current_worker_refusal_keeps_its_notice_and_settings_durable() {
 
 #[tokio::test]
 async fn members_exchange_with_signatures_and_a_removed_member_is_refused() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     let fleet = "3b241101-e2bb-4255-8caf-4136c566a962";
     let secret = [9_u8; 32];
     let anchor = Arc::new(MemberKey::generate().unwrap().0);
@@ -998,8 +1054,19 @@ async fn members_exchange_with_signatures_and_a_removed_member_is_refused() {
         fleet: a_fleet.clone(),
         outbound_notify: watch::channel(0_u64).0,
     };
+    let requests = Arc::new(AtomicUsize::new(0));
+    let counted = requests.clone();
+    let router = peer_router(state, Router::new()).layer(axum::middleware::from_fn(
+        move |request: Request<Body>, next: axum::middleware::Next| {
+            let counted = counted.clone();
+            async move {
+                counted.fetch_add(1, Ordering::Relaxed);
+                next.run(request).await
+            }
+        },
+    ));
     let server = tokio::spawn(async move {
-        axum::serve(listener, peer_router(state, Router::new()))
+        axum::serve(listener, router)
             .await
             .unwrap();
     });
@@ -1044,6 +1111,7 @@ async fn members_exchange_with_signatures_and_a_removed_member_is_refused() {
     );
     *a_fleet.view.write().unwrap() = a.fleet_view().unwrap();
     *b_fleet.view.write().unwrap() = b.fleet_view().unwrap();
+    let before_refusal = requests.load(Ordering::Relaxed);
     let refused = exchange(&http, &Local(b.clone()), "b", &peer, &b_auth, &b_fleet)
         .await
         .unwrap_err();
@@ -1051,6 +1119,11 @@ async fn members_exchange_with_signatures_and_a_removed_member_is_refused() {
         .downcast_ref::<RemovedFromFleet>()
         .expect("a signed refusal naming b's key");
     assert_eq!(removed.code, "member-removed");
+    assert_eq!(
+        requests.load(Ordering::Relaxed),
+        before_refusal + 1,
+        "a signed removal must not start a legacy compatibility retry"
+    );
 
     // Another machine without a key, posing as b or as an unknown name, is refused too.
     // It accepts a's answers as a legacy config peer, so it sees a's refusal itself.

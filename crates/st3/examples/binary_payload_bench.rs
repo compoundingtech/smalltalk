@@ -90,7 +90,7 @@ fn main() -> anyhow::Result<()> {
     );
     let mut remote = ReplicationInventory {
         digest: "0".repeat(64),
-        buckets: source.replication_snapshot()?.buckets.clone(),
+        buckets: source.replication_snapshot()?.buckets.as_ref().clone(),
         ..Default::default()
     };
     if let Some(bucket) = remote.buckets.first_mut() {

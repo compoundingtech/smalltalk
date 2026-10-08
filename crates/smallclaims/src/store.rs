@@ -5685,7 +5685,11 @@ impl Store {
             fleet_id: fleet_id.to_owned(),
             schema_digest: self.runtime.schema_digest(),
             authority_digest: snapshot.authority_digest.clone(),
-            graph_digest: snapshot.legacy_graph_digest.clone(),
+            graph_digest: if legacy {
+                snapshot.legacy_graph_digest.clone()
+            } else {
+                String::new()
+            },
             projection_digests: snapshot.projection_digests.clone(),
             inventory: ReplicationInventory {
                 digest: snapshot.inventory.digest.clone(),
@@ -5782,7 +5786,11 @@ impl Store {
                 fleet_id: fleet_id.to_owned(),
                 schema_digest: self.runtime.schema_digest(),
                 authority_digest: snapshot.authority_digest.clone(),
-                graph_digest: snapshot.legacy_graph_digest.clone(),
+                graph_digest: if legacy {
+                    snapshot.legacy_graph_digest.clone()
+                } else {
+                    String::new()
+                },
                 projection_digests: snapshot.projection_digests.clone(),
                 inventory: ReplicationInventory {
                     digest: snapshot.inventory.digest.clone(),
@@ -5824,7 +5832,11 @@ impl Store {
             fleet_id: fleet_id.to_owned(),
             schema_digest: self.runtime.schema_digest(),
             authority_digest: snapshot.authority_digest.clone(),
-            graph_digest: snapshot.legacy_graph_digest.clone(),
+            graph_digest: if legacy {
+                snapshot.legacy_graph_digest.clone()
+            } else {
+                String::new()
+            },
             projection_digests: snapshot.projection_digests.clone(),
             inventory: ReplicationInventory {
                 accepts: Some(replication_accepts()),
@@ -6192,7 +6204,7 @@ impl Store {
 
     pub fn validate_replication_backlog(&self) -> Result<ReplicationAdmission> {
         // Seed and sign local batches first, so local membership claims decide admission.
-        self.replication_snapshot()?;
+        self.replication_snapshot_modern()?;
         // Admission lends the writer back between chunks, so two must not run at once and
         // admit the same pending envelopes.
         let _admitting = self
