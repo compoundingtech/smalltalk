@@ -2199,6 +2199,7 @@ fn client_agent_resources_cached(
 // Freeze membership, ordering and the inexpensive declaration/queue metadata. The expensive
 // status, usage, fault and activity reductions are needed only for the returned page.
 fn client_agent_page_refs(store: &Store, history: bool, index: u64) -> anyhow::Result<Vec<Value>> {
+    let _phase = crate::profile::span("agents/page-refs");
     store.cached_agent_page_refs(index, history, || client_agent_page_refs_uncached(store, history, index))
 }
 
@@ -2272,6 +2273,7 @@ fn client_agent_cards_for_page(
     refs: &[Value],
     at: &str,
 ) -> Result<Vec<Value>, ApiError> {
+    let _phase = crate::profile::span("agents/page-cards");
     let selected = refs
         .iter()
         .filter_map(|r| r["id"].as_str().map(str::to_owned))
@@ -2302,6 +2304,7 @@ fn client_agent_cards_from_cached(
     refs: &[Value],
     at: &str,
 ) -> Result<Vec<Value>, ApiError> {
+    let _phase = crate::profile::span("agents/cached-card-overlay");
     if cards.len() != refs.len() {
         return Err(client_page_expired(
             "agent page membership is no longer available; restart pagination",
@@ -2351,6 +2354,7 @@ fn add_agent_todos(store: &Store, items: &mut [Value], index: u64) -> anyhow::Re
 }
 
 fn overlay_agent_resources(store: &Store, items: &mut [Value], at: &str) -> anyhow::Result<()> {
+    let _phase = crate::profile::span("agents/local-overlays");
     let local_host = client_host_id(store.origin());
     for item in items.iter_mut() {
         if item.get("updated_at").and_then(Value::as_str) == Some("") {
@@ -2408,6 +2412,7 @@ fn client_suspension(suspension: &crate::suspension::Suspension) -> Value {
 /// Each seat's running subagents: open, with a lease that runs past this read. A lease runs out
 /// without a claim, so this is read per request rather than cached with the agents.
 fn overlay_subagents(store: &Store, items: &mut [Value]) -> anyhow::Result<()> {
+    let _phase = crate::profile::span("agents/subagents");
     let mut running = BTreeMap::<String, Vec<Value>>::new();
     for subagent in store.running_subagents(client_now_ms() as u64)? {
         running
@@ -2457,6 +2462,7 @@ fn overlay_delivery_presence(item: &mut Value, local_host: &str) {
     let Some(recipient) = item.get("id").and_then(Value::as_str) else {
         return;
     };
+    let _phase = crate::profile::span("agents/delivery-assessment");
     let assessment = delivery_presence::assess(recipient, &driver);
     if assessment.stale() {
         item["state"] = Value::String("waiting".into());
@@ -2539,6 +2545,7 @@ fn client_agent_resources_from_status(
     changed: Option<(&BTreeSet<String>, &[Value])>,
     status: StatusResponse,
 ) -> anyhow::Result<Vec<Value>> {
+    let _phase = crate::profile::span("agents/card-render");
     // The delta builder supplies either unchanged cards or freshly diffed queue metadata.
     // Both let the card fold reuse queues without a second fleet scan.
     let retain_queues = changed.is_some_and(|(subjects, previous)| {
@@ -2574,7 +2581,9 @@ fn client_agent_resources_from_status(
             Some((desired.subject, (client_host_id(&member.host), member.workspace, checkout)))
         })
         .collect::<BTreeMap<_, _>>();
+    let usage_phase = crate::profile::span("agents/usage");
     let usage_summaries = store.usage_summaries_at(&agent_subjects, Some(snapshot_index))?;
+    drop(usage_phase);
     let member_faults = store.member_reconcile_faults_for(&agent_subjects, snapshot_index)?;
     // Cards without a harness need only their actual claim's acceptance time, not its body.
     // Keep the existing per-claim fallback if the bulk metadata read cannot be completed.
@@ -2607,7 +2616,9 @@ fn client_agent_resources_from_status(
         })
         .filter(|subject| history || subject.projection.layer == "current")
         .map(|mut subject| -> anyhow::Result<(String, Value)> {
+            let harness_phase = crate::profile::span("agents/observed-harness");
             subject.harness = store.observed_harness_at(&subject.subject, snapshot_index)?;
+            drop(harness_phase);
             let fault = member_faults.get(&subject.subject);
             let fields = subject
                 .actual
@@ -4221,9 +4232,14 @@ async fn client_agents(
 ) -> Result<ClientPageResponse, ApiError> {
     // A warm request never queues behind a cold projection. Drop the probe's SQLite
     // snapshot before waiting, then recheck all cache fences in the admitted snapshot.
+    let route_profile = crate::profile::current();
     for admitted in [false, true] {
         let admission = if admitted {
-            Some(state.store.admit_agent_resources().await)
+            let waiting = route_profile.as_ref()
+                .map(|op| op.wall_span("agents/roster-admission"));
+            let guard = state.store.admit_agent_resources().await;
+            drop(waiting);
+            Some(guard)
         } else {
             None
         };
@@ -4232,6 +4248,11 @@ async fn client_agents(
         let query = query.clone();
         let result = blocking_store(move || {
             let _admission = admission;
+            let _phase = crate::profile::span(if admitted {
+                "agents/admitted-read"
+            } else {
+                "agents/warm-probe"
+            });
             reader.store.clone().read_snapshot(|index| {
                 let snapshot = if query.cursor.is_some() {
                     snapshot

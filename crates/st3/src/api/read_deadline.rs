@@ -314,7 +314,29 @@ where
     });
     let worker_budget = budget.clone();
     let store = STORE.with(|slot| slot.borrow().clone());
+    // This operation-bound wall span includes queueing before the worker starts.
+    // Do not enter the profile here: work() already enters it, and nested entries
+    // would double-count thread CPU. Reader admission is measured before work().
+    let agents_profile = budget
+        .as_ref()
+        .filter(|budget| budget.route() == "/v1/client/agents")
+        .and_then(|_| crate::profile::current());
+    let queue_phase = agents_profile.as_ref().map(|op| {
+        op.wall_span(if query {
+            "agents/blocking-pool-queue"
+        } else {
+            "agents/handler-pool-queue"
+        })
+    });
     let task = tokio::task::spawn_blocking(move || {
+        drop(queue_phase);
+        let reader_phase = agents_profile
+            .as_ref()
+            .map(|op| op.wall_span("agents/reader-admission"));
+        let work = move || {
+            drop(reader_phase);
+            work()
+        };
         with_store(store.clone(), || {
             read_budget::with(worker_budget.clone(), || {
                 if let Some(budget) = &worker_budget {

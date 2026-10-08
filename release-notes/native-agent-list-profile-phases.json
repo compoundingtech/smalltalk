@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Attribute the native agents-list request to roster admission, blocking and reader admission, caches, card reduction and local overlays using existing opt-in operation profiling.",
+  "replay": {
+    "status": "none",
+    "detail": "No claim or projection computation change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No schema change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No authority or checkpoint rule change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "The list, filters, pagination and full card remain unchanged. Only bounded labels in existing opt-in profile records are added."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No new daemon activation or mandatory restart mechanism. Deployment follows the ordinary binary rollout."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Existing ST3_PROFILE_DIR controls profiling. No new collector or profiling setting."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Earlier binaries ignore these new profile phase labels. No data migration or certificate change."
+  }
+}

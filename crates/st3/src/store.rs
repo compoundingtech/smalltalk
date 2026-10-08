@@ -2951,6 +2951,7 @@ impl Store {
         history: bool,
         build: impl FnOnce() -> Result<Vec<Value>>,
     ) -> Result<Vec<Value>> {
+        let _phase = crate::profile::span("agents/refs-cache");
         let now = now_ms();
         let valid = |entry: &&runtime::AgentResourcesEntry| {
             entry.valid_until_unix_ms.is_none_or(|expiry| now < expiry)
@@ -2991,6 +2992,7 @@ impl Store {
         selected: Option<&BTreeSet<String>>,
         build: impl FnOnce(Option<(&BTreeSet<String>, &[Value])>) -> Result<Vec<Value>>,
     ) -> Result<Vec<Value>> {
+        let _phase = crate::profile::span("agents/card-cache");
         // Cold presentation reads current desired/queue tables even for historical status
         // cuts. Do not reuse rows from an older physical projection for those requests.
         if index < current_index(&self.readers.get())? {
@@ -3018,8 +3020,10 @@ impl Store {
         let select = |items: &[Value]| items.iter().filter(|item| {
             selected.is_none_or(|names| names.contains(item["id"].as_str().unwrap_or_default()))
         }).cloned().collect::<Vec<_>>();
+        let cache_wait = crate::profile::span("agents/cache-lock-wait");
         let cache = self.smalltalk.agent_resources_cache.lock()
             .expect("agent resources cache poisoned");
+        drop(cache_wait);
         if let Some(entry) = cache.iter().filter(valid).find(|entry| {
             agent_resources_entry_hits(entry, now, index, local, history, selected)
         }) {
@@ -3035,6 +3039,7 @@ impl Store {
         drop(cache);
         let entry = crate::performance::task("roster/build",
         || -> Result<runtime::AgentResourcesEntry> {
+        let _build_phase = crate::profile::span("agents/roster-build");
         let previous = match previous {
             Some(entry) if entry.index == index => Some((entry, AgentResourcesDelta::default())),
             Some(entry) => self.changed_agent_resources(entry.index, index, &entry.items)?
@@ -3159,8 +3164,10 @@ impl Store {
             }
         }
         })?;
+        let cache_wait = crate::profile::span("agents/cache-publish-lock-wait");
         let mut cache = self.smalltalk.agent_resources_cache.lock()
             .expect("agent resources cache poisoned");
+        drop(cache_wait);
         // All endpoint callers hold admission. Direct internal readers may still race; never
         // replace a complete published projection with a partial one.
         let published = cache.iter().filter(valid).find(|entry| {
@@ -3188,6 +3195,7 @@ impl Store {
         history: bool,
         selected: Option<&BTreeSet<String>>,
     ) -> Result<Option<Arc<Vec<Value>>>> {
+        let _phase = crate::profile::span("agents/card-cache-probe");
         if index < current_index(&self.readers.get())? {
             return Ok(None);
         }
