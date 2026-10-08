@@ -2617,6 +2617,13 @@ fn roster_local_frontier(connection: &Connection, index: u64) -> Result<u64> {
     Ok(connection.query_row(ROSTER_LOCAL_FRONTIER, [index], |row| row.get::<_, u64>(0))?)
 }
 
+#[derive(Default)]
+struct AgentResourcesDelta {
+    subjects: BTreeSet<String>,
+    queues: bool,
+    membership: bool,
+}
+
 /// The exact cache-hit contract shared by the building path and the read-only warm pin: one
 /// graph cut, one roster-relevant local frontier, one history mode, a queue lease window that
 /// has not ended, and coverage of every requested subject.
@@ -2726,43 +2733,114 @@ impl Store {
         append_latest_observation(&self.graph, input, now)
     }
 
-    /// Agent-local observations change only their subject's card. Other claims can change
-    /// membership, owners, queues or labels and conservatively require a full rebuild.
+    /// Classify the bounded claim interval by the dependencies that cards actually read.
+    /// Unknown or structural claims still cold-build; queue changes are diffed separately.
     fn changed_agent_resources(
         &self,
         after: u64,
         through: u64,
-    ) -> Result<Option<BTreeSet<String>>> {
+        previous: &[Value],
+    ) -> Result<Option<AgentResourcesDelta>> {
         let connection = self.readers.get();
         let mut statement = connection.prepare_cached(
-            "SELECT subject, kind FROM claims WHERE store_index>?1 AND store_index<=?2",
+            "SELECT subject, kind, actor FROM claims WHERE store_index>?1 AND store_index<=?2",
         )?;
-        let mut subjects = BTreeSet::new();
+        let mut delta = AgentResourcesDelta::default();
+        let mut owners = BTreeSet::new();
         for row in statement.query_map(params![after, through], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?))
         })? {
-            let (subject, kind) = row?;
-            if kind == "daemon.diagnostic" {
+            let (subject, kind, actor) = row?;
+            if self.smalltalk.claim_registry().claim(&kind).is_none() {
+                return Ok(None);
+            }
+            if subject.starts_with("agent/") {
+                // All registered agent claims can affect the subject's actual reduction or
+                // undeclared fallback revision, even kinds not shown as individual fields.
+                delta.queues |= kind == "agent.queue.moved";
+                delta.membership |= matches!(kind.as_str(), "intent.desired" | "runtime.observed");
+                delta.subjects.insert(subject);
                 continue;
             }
-            if subject.starts_with("agent/")
-                && matches!(
-                    kind.as_str(),
-                    "runtime.observed"
-                        | "harness.observed"
-                        | "harness.diagnostic"
-                        | "harness.timeline"
-                        | "harness.todo.observed"
-                        | "harness.session-file"
-                        | "harness.usage"
-                )
-            {
-                subjects.insert(subject);
-            } else {
+            let owner = match kind.as_str() {
+                "mission-run.created" | "mission-run.state" if subject.starts_with("mission-run/") => true,
+                "run-generation.created" | "run-generation.state" | "run-generation.superseded"
+                    if subject.starts_with("run-generation/") => true,
+                "intent.desired" if subject.starts_with("mission-run/") || subject.starts_with("run-generation/") => true,
+                _ => false,
+            };
+            let step = subject.starts_with("step-run/") && matches!(kind.as_str(),
+                "step-run.state" | "step-run.retried" | "step-run.carried"
+                | "work.claimed" | "work.renewed" | "work.progress" | "work.submitted"
+                | "work.failed" | "work.released" | "work.extended"
+                | "work.person-asked" | "work.person-done" | "work.person-cancelled");
+            if owner || step {
+                delta.queues = true;
+                delta.membership |= owner;
+                owners.insert(subject.clone());
+                if step {
+                    let mut agents = connection.prepare_cached(
+                        "SELECT assignee,lease_owner FROM step_runs WHERE subject=?1",
+                    )?;
+                    for row in agents.query_map([&subject], |row| {
+                        Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?))
+                    })? {
+                        let (assignee, claimant) = row?;
+                        delta.subjects.extend(assignee.into_iter().chain(claimant)
+                            .filter(|agent| agent.starts_with("agent/")));
+                    }
+                    // Progress/submission activity is keyed by actor, not the current assignee.
+                    if matches!(kind.as_str(), "work.progress" | "work.submitted") {
+                        delta.subjects.extend(actor.filter(|actor| actor.starts_with("agent/")));
+                    }
+                }
+                continue;
+            }
+            if subject.starts_with("message/") && matches!(kind.as_str(),
+                "message.sent" | "message.staged" | "message.delivered" | "message.read" | "message.closed") {
+                // Sends affect activity; all lifecycle states affect a draining rollout's
+                // pending-delivery blocker, including replies through message ancestors.
+                // Receipts lack endpoints, so use the same message projection blockers read.
+                let Some(message) = self.message(&subject)? else {
+                    return Ok(None);
+                };
+                delta.subjects.extend([message.from, message.to].into_iter()
+                    .filter(|party| party.starts_with("agent/")));
+                continue;
+            }
+            // These projections touch neither card reductions nor queue/label inputs. Keep
+            // the subject guards: a claim on an agent also changes its fallback revision.
+            let irrelevant = match kind.as_str() {
+                "daemon.diagnostic" | "daemon.started" => subject.starts_with("daemon/"),
+                "glass.upserted" | "glass.deleted" => subject.starts_with("glass/"),
+                "arrangement.edited" => subject.starts_with("arrangement/"),
+                "fleet.invite-created" | "fleet.invite-redeemed" | "fleet.invite-revoked" => subject.starts_with("fleet-invite/"),
+                "fleet.member-admitted" | "fleet.member-endpoints" | "fleet.member-left" | "fleet.member-removed" => subject.starts_with("host/"),
+                _ => false,
+            };
+            if !irrelevant {
                 return Ok(None);
             }
         }
-        Ok(Some(subjects))
+        if !owners.is_empty() {
+            // Existing cards carry their historical ownership; current declarations also
+            // find agents newly made visible by an owner transition.
+            delta.subjects.extend(previous.iter().filter(|item| {
+                item["owner_run_id"].as_str().is_some_and(|owner| owners.contains(owner))
+                    || item["operational"]["owner_generation"].as_str().is_some_and(|owner| owners.contains(owner))
+            }).filter_map(|item| item["id"].as_str().map(str::to_owned)));
+            let owners = serde_json::to_string(&owners)?;
+            let mut statement = connection.prepare_cached(
+                "SELECT subject FROM desired WHERE subject LIKE 'agent/%'
+                 AND (owner_run IN (SELECT value FROM json_each(?1))
+                   OR owner_generation IN (SELECT value FROM json_each(?1))
+                   OR owner_step IN (SELECT value FROM json_each(?1)))",
+            )?;
+            delta.subjects.extend(statement.query_map([owners], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<BTreeSet<_>>>()?);
+        }
+        Ok(Some(delta))
     }
 
     /// An allow-list for shallow refs, narrower than card-local invalidation: runtime status
@@ -2819,6 +2897,11 @@ impl Store {
     #[cfg(test)]
     pub(crate) fn agent_resources_builds_for_test(&self) -> usize {
         self.smalltalk.agent_resources_builds.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn agent_resources_refolded_cards_for_test(&self) -> usize {
+        self.smalltalk.agent_resources_refolded_cards.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub(crate) fn cached_agent_resources(
@@ -2897,10 +2980,8 @@ impl Store {
         Ok((*items).clone())
     }
 
-    /// Bounded immutable projections shared by pages and streams. Pages fill only missing
-    /// subjects; a complete stream projection subsumes them. Local agent timeline rows advance
-    /// only affected cards — heartbeats never move the frontier — and historical cuts never
-    /// borrow newer rows.
+    /// Bounded immutable projections shared by pages and streams. Delta claims, membership
+    /// differences, local activity and queue deadlines refold only affected cards.
     pub(crate) fn cached_agent_resources_for(
         &self,
         index: u64,
@@ -2908,6 +2989,19 @@ impl Store {
         selected: Option<&BTreeSet<String>>,
         build: impl FnOnce(Option<(&BTreeSet<String>, &[Value])>) -> Result<Vec<Value>>,
     ) -> Result<Vec<Value>> {
+        // Cold presentation reads current desired/queue tables even for historical status
+        // cuts. Do not reuse rows from an older physical projection for those requests.
+        if index < current_index(&self.readers.get())? {
+            let mut items = crate::performance::task("roster/card-projection",
+                || build(selected.map(|names| (names, &[][..]))))?;
+            #[cfg(test)]
+            self.smalltalk.agent_resources_refolded_cards.fetch_add(
+                items.len(), std::sync::atomic::Ordering::Relaxed,
+            );
+            items.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str())
+                .then_with(|| a["id"].as_str().cmp(&b["id"].as_str())));
+            return Ok(items);
+        }
         let now = now_ms();
         let valid = |entry: &&runtime::AgentResourcesEntry| {
             entry.valid_until_unix_ms.is_none_or(|expiry| now < expiry)
@@ -2931,20 +3025,38 @@ impl Store {
             drop(cache);
             return crate::performance::task("roster/cache-hit", || Ok(select(&items)));
         }
-        let previous = cache.iter().filter(valid)
+        // Expired entries are diff sources only, never hits: refreshing their queue metadata
+        // is sufficient to discover the cards moved by a deadline without dropping the fleet.
+        let previous = cache.iter()
             .filter(|entry| entry.index <= index && entry.local <= local && entry.history == history)
             .max_by_key(|entry| (entry.index, entry.local)).cloned();
         drop(cache);
         let entry = crate::performance::task("roster/build",
         || -> Result<runtime::AgentResourcesEntry> {
         let previous = match previous {
-            Some(entry) if entry.index == index => Some((entry, BTreeSet::new())),
-            Some(entry) => self.changed_agent_resources(entry.index, index)?
-                .map(|changed| (entry, changed)),
+            Some(entry) if entry.index == index => Some((entry, AgentResourcesDelta::default())),
+            Some(entry) => self.changed_agent_resources(entry.index, index, &entry.items)?
+                .map(|delta| (entry, delta)),
             None => None,
         };
         match previous {
-            Some((previous, mut changed)) => {
+            Some((previous, delta)) => {
+                let mut changed = delta.subjects;
+                if delta.membership {
+                    let connection = self.readers.get();
+                    let names = connection.prepare_cached(RANGE_SUBJECTS)?
+                        .query_map(params![index, "agent/", "agent0"], |row| row.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+                    let mut names = if history { names } else {
+                        self.current_view_candidates(&connection, names, index, true)?
+                    };
+                    if let Some(covered) = &previous.covered {
+                        names.retain(|name| covered.contains(name));
+                    }
+                    let old = previous.items.iter().filter_map(|item| item["id"].as_str().map(str::to_owned))
+                        .collect::<BTreeSet<_>>();
+                    changed.extend(names.symmetric_difference(&old).cloned());
+                }
                 if previous.local != local {
                     let connection = self.readers.get();
                     let mut statement = connection.prepare_cached(
@@ -2973,13 +3085,36 @@ impl Store {
                         None
                     }
                 };
+                let refresh_queues = delta.queues
+                    || previous.valid_until_unix_ms.is_some_and(|expiry| now >= expiry)
+                    || changed.iter().any(|name| !previous.items.iter().any(|item| item["id"].as_str() == Some(name.as_str())));
+                let mut queue_metadata = None;
+                let valid_until_unix_ms = if refresh_queues {
+                    let names = previous.items.iter().filter_map(|item| item["id"].as_str().map(str::to_owned))
+                        .chain(changed.iter().cloned()).collect::<BTreeSet<_>>();
+                    let metadata = crate::performance::task("roster/queue-diff",
+                        || crate::api::agent_queue_metadata(self, &names))?;
+                    let by_id = metadata.iter().map(|item| (item["id"].as_str().unwrap_or_default(), item))
+                        .collect::<BTreeMap<_, _>>();
+                    for old in previous.items.iter() {
+                        let name = old["id"].as_str().unwrap_or_default();
+                        if let Some(new) = by_id.get(name)
+                            && crate::api::AGENT_QUEUE_FIELDS.iter().any(|field| old[*field] != new[*field]) {
+                            changed.insert(name.to_owned());
+                        }
+                    }
+                    queue_metadata = Some(metadata);
+                    self.agent_queue_valid_until(now)?
+                } else {
+                    previous.valid_until_unix_ms
+                };
                 // Coverage gaps join `changed`, so an empty set means no card this cut can see
                 // moved at all: the previous rows already are this cut's projection, and the
                 // heartbeat or fleet-only claim between two reads costs no clone, sort or build.
                 if changed.is_empty() {
                     return Ok(runtime::AgentResourcesEntry {
                         index, local, history, covered,
-                        valid_until_unix_ms: previous.valid_until_unix_ms,
+                        valid_until_unix_ms,
                         items: Arc::clone(&previous.items),
                     });
                 }
@@ -2988,13 +3123,18 @@ impl Store {
                 let mut items = previous.items.iter()
                     .filter(|item| !changed.contains(item["id"].as_str().unwrap_or_default()))
                     .cloned().collect::<Vec<_>>();
-                items.extend(crate::performance::task("roster/card-projection",
-                    || build(Some((&changed, &previous.items))))?);
+                let rebuilt = crate::performance::task("roster/card-projection",
+                    || build(Some((&changed, queue_metadata.as_deref().unwrap_or(&previous.items)))))?;
+                #[cfg(test)]
+                self.smalltalk.agent_resources_refolded_cards.fetch_add(
+                    rebuilt.len(), std::sync::atomic::Ordering::Relaxed,
+                );
+                items.extend(rebuilt);
                 items.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str())
                     .then_with(|| a["id"].as_str().cmp(&b["id"].as_str())));
                 Ok(runtime::AgentResourcesEntry {
                     index, local, history, covered,
-                    valid_until_unix_ms: previous.valid_until_unix_ms,
+                    valid_until_unix_ms,
                     items: Arc::new(items),
                 })
             }
@@ -3003,6 +3143,10 @@ impl Store {
                 self.smalltalk.agent_resources_builds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let mut items = crate::performance::task("roster/card-projection",
                     || build(selected.map(|names| (names, &[][..]))))?;
+                #[cfg(test)]
+                self.smalltalk.agent_resources_refolded_cards.fetch_add(
+                    items.len(), std::sync::atomic::Ordering::Relaxed,
+                );
                 items.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str())
                     .then_with(|| a["id"].as_str().cmp(&b["id"].as_str())));
                 Ok(runtime::AgentResourcesEntry {
@@ -3042,6 +3186,9 @@ impl Store {
         history: bool,
         selected: Option<&BTreeSet<String>>,
     ) -> Result<Option<Arc<Vec<Value>>>> {
+        if index < current_index(&self.readers.get())? {
+            return Ok(None);
+        }
         let now = now_ms();
         let local = crate::performance::task("roster/frontier-read", || {
             roster_local_frontier(&self.readers.get(), index)

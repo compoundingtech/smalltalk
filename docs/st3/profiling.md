@@ -153,9 +153,29 @@ completion even if its caller disconnects, so waiting followers pin no old WAL r
 
 Eight immutable graph-index/local-frontier/history cuts are retained. HTTP pages lazily fill missing subjects into
 the same projection used by the complete WS roster, without reducing unrelated cards. Local
-agent observations update only affected cards; daemon diagnostics reuse rows; other claims
-conservatively invalidate the projection. Authorization is checked before reuse, and local
-delivery presence stays a per-read overlay rather than graph-cached authority.
+agent observations and registered agent claims update only their subject's card. Run and generation
+changes refresh owned cards and diff roster membership; step/work changes map owners, assignees,
+claimants and activity actors. Queue-affecting claims refresh fleet queue selection and selected
+labels once, then compare all queue fields per card before refolding. Message sends refresh their
+agent endpoints because they contribute to activity timestamps. All message lifecycle receipts
+also refresh projected agent parties: draining rollout blockers read the message's delivery state,
+including ancestors of eligible replies. Receipt claims need not contain endpoint fields.
+Daemon diagnostics, glasses, arrangements and fleet-only claims reuse the cards. Unknown kinds and
+unclassified structural changes conservatively cold-build. Authorization is checked before reuse,
+and local delivery presence stays a per-read overlay rather than graph-cached authority.
+
+The reuse allowlist includes transitive rollout, suspension, fault and placement dependencies:
+
+| Claims | Card read | Delta mapping |
+| --- | --- | --- |
+| `message.sent` | activity and rollout delivery blockers | projected agent sender/recipient |
+| `message.staged`, `message.delivered`, `message.read`, `message.closed` | rollout delivery blockers and eligible reply ancestry | projected agent sender/recipient; cold if no message projection exists |
+| `daemon.diagnostic`, `daemon.started` | none; diagnostic reports are separate from agent reconcile faults | empty, guarded to daemon subjects |
+| `glass.upserted`, `glass.deleted` | none; glass projection is not a card or blocker input | empty, guarded to glass subjects |
+| `arrangement.edited` | none; arrangement projection is not a card or blocker input | empty, guarded to arrangement subjects |
+| `fleet.invite-created`, `fleet.invite-redeemed`, `fleet.invite-revoked` | none | empty, guarded to invitation subjects |
+| `fleet.member-admitted`, `fleet.member-endpoints`, `fleet.member-left`, `fleet.member-removed` | none; host metadata is declaration-derived and placement fences do not read peer liveness | empty, guarded to host subjects |
+
 Shared cards are built only from current, independently time-fenced queue metadata. A
 pagination continuation applies its frozen ordering/host/queue refs to the response clone
 after reading the shared cards; frozen pagination cuts must never seed the shared projection.
@@ -164,15 +184,32 @@ Warm pages reuse those refs rather than scanning all fleet work. An explicit all
 existing-agent harness observations and daemon diagnostics leaves them valid; every other
 claim rebuilds them. Runtime status can move an undeclared or stopped agent into history,
 so even an existing agent's `runtime.observed` rebuilds shallow refs.
-Both shallow refs and the full-card projection also expire at the earliest current-generation
+Both shallow refs and the full-card projection expire at the earliest current-generation
 work-lease deadline. Expired work becomes ready (or disappears from a revision-draining queue)
-without a new claim; an expired entry must rebuild, not advance incrementally from stale queues.
-The deadline scan runs only on full rebuilds and reads unfinished steps; safe card-local
-advances carry the prior deadline forward. Shallow-ref warm hits add no SQL; full-card probes
+without a new claim. Full-card refreshes retain expired rows only as diff sources, never as warm
+hits: `roster/queue-diff` scans queue selection and labels once and refolds only cards whose queue
+fields changed. It also refreshes the next deadline. Shallow refs still rebuild after expiry.
+Safe card-local advances carry the prior deadline forward. Shallow-ref warm hits add no SQL;
+full-card probes
 read the relevant local frontier before selecting cached rows. The outer shared agents
 WS window inherits the same fence, so it cannot hide an expired full-card projection.
 HTTP reads see expiry immediately; live WS subscribers see the transition on the next
 existing 30-second authority/freshness tick. That existing live-stream bound is unchanged.
+
+Historical status cuts read queue and declaration presentation from the caller's current SQLite
+projection, just as cold cards do. When the requested graph index precedes that physical
+projection's frontier, full-card reads bypass shared cached rows and cold-build selected coverage;
+they do not borrow stale queue fields from an earlier physical snapshot.
+
+The isolated 60-agent, six-mission, 60-step fixture counts canonical claim kinds and local samples:
+`cargo test -p st3 --lib agent_roster_typical_claim_kind_baseline -- --nocapture`.
+Its frozen pre-incremental classification distinguishes the old cold fallback from the current
+selected-card build count. Full JSON parity, including queues, todos and usage, is checked by
+`agent_roster_seeded_claim_sequences_match_cold_json` with reproducible proptest sequences,
+both history modes, selected coverage, historical cuts and injected-clock lease expiry.
+The ignored `agent_roster_one_step_claim_fixture_timing` reports cold/incremental wall times and
+the number of refolded cards after one work claim; run it explicitly with `--ignored --nocapture`.
+These debug-profile fixtures are not deployed latency or loaded-host benchmarks.
 
 The relevant local-observation frontier is the largest agent `harness.timeline` row ID visible
 inside the same SQLite snapshot with `after_store_index` at or before the requested graph cut,
