@@ -4152,6 +4152,19 @@ fn native_slice_page(
     query: &ClientListQuery,
     source: &crate::external_sessions::ExternalSession,
 ) -> Result<Json<Value>, ApiError> {
+    native_slice_page_at_generation(state, snapshot, session, session_id, query, source)
+        .map(|(page, _)| page)
+}
+
+/// [`native_slice_page`] together with the source content generation it was read at.
+fn native_slice_page_at_generation(
+    state: &AppState,
+    snapshot: &ClientSnapshot,
+    session: &ClientSession,
+    session_id: &str,
+    query: &ClientListQuery,
+    source: &crate::external_sessions::ExternalSession,
+) -> Result<(Json<Value>, u64), ApiError> {
     let cursor = query.cursor.as_deref().map(decode_native_page_cursor).transpose()?;
     let source_basis = conversation_blocks::basis(source)?;
     let order = native_timeline_order(state, snapshot, session_id)?;
@@ -4292,7 +4305,7 @@ fn native_slice_page(
     if let Some(header) = header {
         page_value["header"] = header;
     }
-    Ok(Json(page_value))
+    Ok((Json(page_value), native.generation))
 }
 
 /// What st3 established about a managed seat's native transcript.
@@ -5173,20 +5186,27 @@ pub(super) struct ConversationQuery {
     wait_ms: Option<u64>,
 }
 
-fn conversation_cursor(
-    state: &AppState,
-    session_id: &str,
+/// Where a conversation follower stands. `source_generation` fences the native transcript:
+/// appends keep it, while an in-place rewrite of already-delivered records (for example an
+/// OMP retry settling a failed turn's `retryRecovery`) moves it. Such a rewrite changes
+/// entries the follower already holds without a new sequence, so the follower must reload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ConversationPosition {
     store_index: u64,
     local_position: u64,
     native_sequence: u64,
-) -> String {
+    source_generation: u64,
+}
+
+fn conversation_cursor(state: &AppState, session_id: &str, position: ConversationPosition) -> String {
     format!(
-        "conversation-cursor/{}/{}/{}.{}.{}",
+        "conversation-cursor/{}/{}/{}.{}.{}.{}",
         state.node,
         session_id.trim_start_matches("session/"),
-        store_index,
-        local_position,
-        native_sequence
+        position.store_index,
+        position.local_position,
+        position.native_sequence,
+        position.source_generation
     )
 }
 
@@ -5239,7 +5259,7 @@ fn conversation_position(
     state: &AppState,
     session_id: &str,
     after: &str,
-) -> Result<(u64, u64, u64), ApiError> {
+) -> Result<ConversationPosition, ApiError> {
     let prefix = format!(
         "conversation-cursor/{}/{}/",
         state.node,
@@ -5249,11 +5269,12 @@ fn conversation_position(
         .strip_prefix(&prefix)
         .and_then(|part| {
             let mut parts = part.split('.');
-            let result = (
-                parts.next()?.parse().ok()?,
-                parts.next()?.parse().ok()?,
-                parts.next()?.parse().ok()?,
-            );
+            let result = ConversationPosition {
+                store_index: parts.next()?.parse().ok()?,
+                local_position: parts.next()?.parse().ok()?,
+                native_sequence: parts.next()?.parse().ok()?,
+                source_generation: parts.next()?.parse().ok()?,
+            };
             parts.next().is_none().then_some(result)
         })
         .ok_or_else(|| ApiError {
@@ -5279,11 +5300,25 @@ fn conversation_read_now(
     }
     let snapshot = new_client_snapshot(state);
     let query = ClientListQuery { limit: Some(200), ..Default::default() };
-    let page = match conversation_blocks::source(state, session_id) {
+    let (page, source_generation) = match conversation_blocks::source(state, session_id) {
         // Replay selects only its newest bounded projection, including for OpenCode.
-        Ok(source) => native_slice_page(state, &snapshot, session, session_id, &query, &source),
-        Err(_) => timeline_value(state, &snapshot, session, session_id, &query),
-    }?.0;
+        Ok(source) => {
+            let (page, generation) = native_slice_page_at_generation(
+                state, &snapshot, session, session_id, &query, &source,
+            )?;
+            // Line transcripts keep their generation across appends and move it on any
+            // in-place rewrite. OpenCode's generation digests the whole bounded timeline and
+            // moves on every append, so it cannot fence rewrites without turning each append
+            // into a full reload.
+            let fence = if source.driver == crate::external_sessions::ExternalDriver::OpenCode {
+                0
+            } else {
+                generation
+            };
+            (page.0, fence)
+        }
+        Err(_) => (timeline_value(state, &snapshot, session, session_id, &query)?.0, 0),
+    };
     let all = page["items"]
         .as_array()
         .ok_or_else(|| ApiError::internal("the timeline has no items"))?;
@@ -5307,10 +5342,10 @@ fn conversation_read_now(
     let position = after
         .map(|cursor| conversation_position(state, session_id, cursor))
         .transpose()?;
-    if let Some((store_index, local_position, native_sequence)) = position {
-        if store_index > snapshot.store_index
-            || local_position > local_latest
-            || native_sequence > native_latest
+    if let Some(position) = position {
+        if position.store_index > snapshot.store_index
+            || position.local_position > local_latest
+            || position.native_sequence > native_latest
         {
             return Err(ApiError {
                 status: StatusCode::GONE,
@@ -5322,12 +5357,25 @@ fn conversation_read_now(
                 )])),
             });
         }
+        if position.source_generation != source_generation {
+            // Already-delivered entries changed in place under unchanged sequences, which a
+            // sequence-filtered delta cannot carry: send the authoritative newest page.
+            return Err(ApiError {
+                status: StatusCode::GONE,
+                code: "cursor-gap".into(),
+                message: "the transcript was rewritten in place; refresh the newest conversation page".into(),
+                details: Box::new(serde_json::Map::from_iter([(
+                    "full_resync".into(),
+                    Value::Bool(true),
+                )])),
+            });
+        }
     }
     let mut changed_indexes = BTreeSet::new();
     let mut explicit_ids = BTreeSet::new();
     let mut message_indexes = BTreeSet::new();
     let mut retention_changed = false;
-    if let Some((store_index, local_position, _)) = position {
+    if let Some(ConversationPosition { store_index, local_position, .. }) = position {
         let owner = super::managed_session_owner_at(&state.store, snapshot.store_index, session_id)
             .map_err(ApiError::internal)?
             .map(|managed| managed.0);
@@ -5408,7 +5456,7 @@ fn conversation_read_now(
     let mut items = all
         .iter()
         .filter(|item| {
-            let Some((_, _, native_sequence)) = position else {
+            let Some(ConversationPosition { native_sequence, .. }) = position else {
                 return false;
             };
             let id = item["id"].as_str().unwrap_or_default();
@@ -5453,7 +5501,7 @@ fn conversation_read_now(
         .iter()
         .any(|id| !items.iter().any(|item| item["id"].as_str() == Some(id)))
         || (all.len() == 200
-            && position.is_some_and(|(_, _, native)| {
+            && position.is_some_and(|ConversationPosition { native_sequence: native, .. }| {
                 native_oldest.is_some_and(|first| first > native)
             }))
     {
@@ -5467,7 +5515,13 @@ fn conversation_read_now(
             )])),
         });
     }
-    let mut value = json!({"kind":"conversation-changes", "session_id":session_id, "items":items, "next_cursor":conversation_cursor(state, session_id, snapshot.store_index, local_latest, native_latest)});
+    let next_cursor = conversation_cursor(state, session_id, ConversationPosition {
+        store_index: snapshot.store_index,
+        local_position: local_latest,
+        native_sequence: native_latest,
+        source_generation,
+    });
+    let mut value = json!({"kind":"conversation-changes", "session_id":session_id, "items":items, "next_cursor":next_cursor});
     if let Some(header) = page.get("header") {
         value["header"] = header.clone();
     }
@@ -5637,7 +5691,7 @@ async fn conversation_changes_local(
     let mut quiet = None;
     if let Some(cursor) = after
         && let Some(seen) = issued_transcript(cursor)
-        && let Ok((store_index, local_position, _)) =
+        && let Ok(ConversationPosition { store_index, local_position, .. }) =
             conversation_position(state, session_id, cursor)
     {
         let mut since = ConversationMark {
@@ -5682,14 +5736,12 @@ async fn conversation_changes_local(
                 // Nothing concerned it: move the cursor past what was checked without a read.
                 let mut value = value;
                 if let Some(cursor) = value["next_cursor"].as_str() {
-                    let (_, _, native) = conversation_position(state, session_id, cursor)?;
-                    let next = conversation_cursor(
-                        state,
-                        session_id,
-                        mark.store_index,
-                        mark.local_position,
-                        native,
-                    );
+                    let checked = ConversationPosition {
+                        store_index: mark.store_index,
+                        local_position: mark.local_position,
+                        ..conversation_position(state, session_id, cursor)?
+                    };
+                    let next = conversation_cursor(state, session_id, checked);
                     remember_cursor(&next, mark.transcript_seen);
                     value["next_cursor"] = Value::String(next);
                 }
@@ -13730,7 +13782,12 @@ mission "example/zero-run" state="ready" {
         assert_eq!(rebuilds(), 2);
         // A cursor this member did not give out (another member's, or one from before a
         // restart) is read as before.
-        let unknown = conversation_cursor(&owner, &session_id, 0, 0, 0);
+        let unknown = conversation_cursor(&owner, &session_id, ConversationPosition {
+            store_index: 0,
+            local_position: 0,
+            native_sequence: 0,
+            source_generation: 0,
+        });
         conversation_changes_local(&owner, &session, &session_id, Some(&unknown), 0)
             .await
             .unwrap();
@@ -14427,6 +14484,84 @@ mission "example/zero-run" state="ready" {
         let texts: Vec<_> = fresh["items"].as_array().unwrap().iter()
             .filter_map(|item| item["body"]["text"].as_str()).collect();
         assert_eq!(texts, ["replaced"]);
+    }
+
+    #[test]
+    fn conversation_followers_reload_when_retry_recovery_rewrites_a_delivered_error() {
+        use std::io::Write as _;
+        let root = tempfile::tempdir().unwrap();
+        let mut state = test_state_named(root.path(), "retry-recovery-follower");
+        state.native_session_home = Some(root.path().to_path_buf());
+        let path = root.path().join(".omp/agent/sessions/example/retry-follow.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let session_id = format!(
+            "session/external-{}",
+            &hex::encode(Sha256::digest(b"omp:retry-follow"))[..24]
+        );
+        let header = json!({"type":"session","id":"retry-follow","cwd":"/work/example","timestamp":"2026-10-06T12:00:00Z"});
+        let question = json!({"type":"message","id":"question","timestamp":"2026-10-06T12:00:01Z",
+            "message":{"role":"user","content":[{"type":"text","text":"synthetic question"}]}});
+        let failed = |retry: Option<Value>| {
+            let mut record = json!({"type":"message","id":"failed-turn","timestamp":"2026-10-06T12:00:02Z",
+                "message":{"role":"assistant","content":[{"type":"text","text":"synthetic partial answer"}],
+                    "provider":"synthetic-provider","model":"synthetic-model",
+                    "stopReason":"error","errorMessage":"synthetic socket closed"}});
+            if let Some(retry) = retry {
+                record["message"]["retryRecovery"] = retry;
+            }
+            record
+        };
+        let reply = json!({"type":"message","id":"retried-turn","timestamp":"2026-10-06T12:00:03Z",
+            "message":{"role":"assistant","content":[{"type":"text","text":"synthetic retried answer"}],"stopReason":"stop"}});
+        std::fs::write(&path, format!("{header}\n{question}\n{}\n", failed(None))).unwrap();
+        let mut session = ClientSession::local(Some("person/alex")).unwrap();
+        session.conversation_blocks = true;
+        let error_view = |value: &Value| {
+            value["items"].as_array().unwrap().iter().find_map(|item| {
+                item["body"]["blocks"].as_array()?.iter()
+                    .find(|block| block["view"]["type"] == "assistant_error")
+                    .map(|block| (item["sequence"].as_u64().unwrap(), block["view"].clone()))
+            })
+        };
+        let opened = conversation_read_now(&state, &session, &session_id, None).unwrap();
+        let (failed_sequence, view) = error_view(&opened).expect("the failed turn renders an error");
+        assert_eq!(view["status"], "failed");
+        assert_eq!(view["presentation"], "full");
+        // The retry's answer is a pure append: it stays an incremental delta.
+        writeln!(std::fs::OpenOptions::new().append(true).open(&path).unwrap(), "{reply}").unwrap();
+        let appended = conversation_read_now(
+            &state, &session, &session_id, opened["next_cursor"].as_str(),
+        ).unwrap();
+        assert!(appended["items"].as_array().unwrap().iter()
+            .any(|item| item.to_string().contains("synthetic retried answer")), "{appended}");
+        assert!(error_view(&appended).is_none(), "an append does not resend the failed turn");
+        // Settling the retry rewrites the already-delivered failed record in place; its
+        // sequence does not move, so a sequence-filtered delta could never carry it.
+        let mut cursor = appended["next_cursor"].as_str().unwrap().to_owned();
+        for (status, presentation) in [("recovered", "compact-recovered"), ("superseded", "none")] {
+            let retry = json!({"kind":"auto-retry","status":status,"attempt":1,
+                "recovery":"plain","note":"error; retried"});
+            std::fs::write(
+                &path,
+                format!("{header}\n{question}\n{}\n{reply}\n", failed(Some(retry))),
+            ).unwrap();
+            let gap = conversation_read_now(&state, &session, &session_id, Some(&cursor))
+                .unwrap_err();
+            assert_eq!(gap.status, StatusCode::GONE);
+            assert_eq!(gap.code, "cursor-gap");
+            assert_eq!(gap.details["full_resync"], true);
+            // The follower's reload carries the updated presentation under the same sequence.
+            let reloaded = conversation_read_now(&state, &session, &session_id, None).unwrap();
+            let (sequence, view) = error_view(&reloaded).expect("the settled turn keeps its error block");
+            assert_eq!(sequence, failed_sequence);
+            assert_eq!(view["status"], status);
+            assert_eq!(view["presentation"], presentation);
+            assert_eq!(view["message"], "synthetic socket closed");
+            cursor = reloaded["next_cursor"].as_str().unwrap().to_owned();
+        }
+        // With nothing rewritten since the reload, the follower resumes incrementally.
+        let quiet = conversation_read_now(&state, &session, &session_id, Some(&cursor)).unwrap();
+        assert!(quiet["items"].as_array().unwrap().is_empty(), "{quiet}");
     }
 
     #[test]

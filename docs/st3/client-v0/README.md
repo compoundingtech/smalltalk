@@ -802,6 +802,12 @@ oldest scroll-back boundary when local observations have advanced independently.
 Conversation changes carry these projection notices when managed history changes, including
 the first operation that crosses the bound. An updated entry outside the materialized window
 causes the ordinary cursor-gap/newest-page refresh instead of an incomplete revision delta.
+Conversation cursors also bind the native line transcript's content generation.
+Appends preserve it. Settling an already-delivered OMP turn's `retryRecovery`
+rewrites its native record and moves the generation; the next change read returns
+`cursor-gap` with `full_resync: true`, so followers reload the newest page with the
+updated error presentation. OpenCode's append-changing generation is not used as
+this fence. Old-format conversation cursors similarly require a fresh page.
 Changes to typed truncation entries also refresh the authoritative newest page, clearing an
 obsolete prefix-unavailable notice when an interval establishes complete prefix coverage.
 These session-stable projection notices are not evidence of overlap between a refreshed newest
@@ -1591,9 +1597,13 @@ inactive screens, offscreen terminal entries and covered panes do not authorize
 automatic reads. stui uses the same one-read-at-a-time queue, and Ctrl+U explicitly
 hides/shows a tool's images; hidden images stay hidden through redraws and scrolls.
 Unsupported terminals retain explicit loading instead of automatic fetching.
-Phone shows a Load/Retry action only after failure. Image reads and decoded pixels
-remain memory-only and are released with their retained timeline entries; late
-responses cannot resurrect a hidden or discarded image.
+Phone shows a Load/Retry action only after failure. Its viewport owns one sequential
+image-read queue through all chunks. Offscreen/re-entry reuses a pending request
+instead of starting a duplicate; revoked or disposed requests hold the slot until
+they settle because the content transport has no abort capability. Queued invisible
+images never fetch. Image reads and decoded pixels remain memory-only and are
+released with their retained timeline entries; late responses cannot resurrect a
+hidden or discarded image.
 
 
 Edited records, replacement, managed binding changes and owner restarts invalidate references;
