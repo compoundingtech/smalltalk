@@ -272,6 +272,7 @@ impl Windows {
             "conversation_blocks":session.conversation_blocks,
             "collection":request.collection, "limit":request.limit.unwrap_or(CLIENT_DEFAULT_PAGE_ITEMS),
             "person":request.person, "subject":request.subject, "filter_actor":request.actor, "status":request.status,
+            "filter":request.filter,
         }).to_string()
     }
 

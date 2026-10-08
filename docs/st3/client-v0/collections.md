@@ -22,7 +22,17 @@ Collections are `missions`, `attention`, `agents`, `work`, `glasses`, and `arran
 plus `terminal` and `conversation` (below). The optional `actor` filter applies to work,
 `person` to attention, and `status` to agents. For `arrangements`, `person: "person/NAME"`
 is required: agents explicitly select a fleet person's collection, never an inferred
-owner. Each read checks `read.arrangements` and the selected person's access. For example:
+owner. The optional `filter` on missions, attention, agents, work, and glasses is a
+case-insensitive literal substring of an item's id, name, or title, with a maximum of 256
+UTF-8 bytes. The server rejects larger filters instead of truncating them. It applies the filter
+before selecting the bounded window; `has_more` counts only matching items. Empty or null
+text selects the same items as omission. Keep it when reconnecting or replacing a subscription:
+
+```json
+{"kind":"subscribe","id":"missions-tab","collection":"missions","limit":50,"filter":"release review"}
+```
+
+Each arrangement read checks `read.arrangements` and the selected person's access. For example:
 
 ```json
 {"kind":"subscribe","id":"sidebar","collection":"arrangements","person":"person/ada","limit":100}

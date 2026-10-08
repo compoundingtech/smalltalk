@@ -29,6 +29,13 @@ steps stand in for rows read, since SQLite's statement counters have no rows-rea
                       answer byte (floored at 256). A table scan should not be the way a small
                       answer is found.
 
+History detectors, from the history report (crates/st3/tests/daemon_history.rs): the same store
+measured twice with the same current state, once with a short past and once with a past ten times
+longer. A correct read costs the same on both.
+  history-steps       VM steps grew by more than 1.5x (and by more than 5,000) with the longer past.
+  history-statements  statements grew by more than 1.5x (and by more than 10).
+  history-scan        full-scan steps grew by more than 1.5x (and by more than 2,000).
+
 Only a route that was measured at both scales without an error is judged. A budget entry for a
 route that failed or was not measured is kept and reported as not judged, never as fixed.
 """
@@ -70,6 +77,50 @@ def repeats_per_item(repeat, units):
         return False
     units = units or [1]
     return repeat >= max(units) or any(u >= 5 and u <= repeat <= 5 * u for u in units)
+
+
+HISTORY_GROWTH = 1.5
+HISTORY_SLACK = {"vm_steps": 5_000, "statements": 10, "fullscan_steps": 2_000}
+HISTORY_DETECTORS = {
+    "vm_steps": "history-steps",
+    "statements": "history-statements",
+    "fullscan_steps": "history-scan",
+}
+
+
+def history_judged(history):
+    short, long = history.get("short", {}), history.get("long", {})
+    judged, failed = set(), {}
+    for route, after in long.items():
+        before = short.get(route)
+        if before is None:
+            continue
+        error = after.get("error") or before.get("error")
+        if error:
+            failed[route] = str(error)
+        else:
+            judged.add(route)
+    return judged, failed
+
+
+def history_findings(history):
+    """Routes that cost more with the same current state and a longer past."""
+    found = []
+    short, long = history.get("short", {}), history.get("long", {})
+    judged, _ = history_judged(history)
+    for route in sorted(judged):
+        for field, detector in HISTORY_DETECTORS.items():
+            before, after = short[route].get(field, 0), long[route].get(field, 0)
+            if after > HISTORY_GROWTH * before and after > before + HISTORY_SLACK[field]:
+                found.append(
+                    {
+                        "route": route,
+                        "detector": detector,
+                        "value": round(after / max(before, 1), 2),
+                        "detail": f"{field} {before} -> {after} with the past {history.get('history', ['?', '?'])[0]} -> {history.get('history', ['?', '?'])[1]} observations",
+                    }
+                )
+    return found
 
 
 def per_byte(cost, field):
@@ -225,6 +276,7 @@ def render(found, stale, unjudged=(), failed=None):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("report", help="the JSON file ST_COST_REPORT wrote")
+    parser.add_argument("--history", help="the JSON file ST_HISTORY_REPORT wrote, if any")
     parser.add_argument("--budget", default=".github/sql-advisory-budget.json")
     parser.add_argument("--summary", default=os.environ.get("GITHUB_STEP_SUMMARY"))
     args = parser.parse_args(argv)
@@ -232,7 +284,14 @@ def main(argv=None):
         report = json.load(open(args.report))
         budget = json.load(open(args.budget)) if os.path.exists(args.budget) else {}
         judged, failed = judged_routes(report)
-        found, stale, unjudged = classify(findings(report), budget, judged)
+        every = findings(report)
+        if args.history:
+            history = json.load(open(args.history))
+            history_routes, history_failed = history_judged(history)
+            judged |= history_routes
+            failed = {**history_failed, **failed}
+            every += history_findings(history)
+        found, stale, unjudged = classify(every, budget, judged)
         text = render(found, stale, unjudged, failed)
     except Exception as error:  # Advisory: a broken report must not break the build.
         text = f"## Advisory SQL report\n\nThe report could not be built: {error}\n"

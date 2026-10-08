@@ -27,7 +27,7 @@ not (
   ))
   or (package(=st-drivers) and kind(lib)
     and test(/^(catalog[^:]*|resync|resource_profile_supervisor)::/))
-  or (package(=st3) and test(/^daemon_(cost|load)::/))
+  or (package(=st3) and test(/^daemon_(cost|load|history)::/))
 )
 '''
 

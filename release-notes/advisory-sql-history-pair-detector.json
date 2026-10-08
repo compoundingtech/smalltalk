@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Add the advisory history-pair check: does a request cost more when the same current state has a longer past?",
+  "replay": {"status": "none", "detail": "No replay or rebuild. Test code and an offline report script; the daemon is unchanged."},
+  "schema": {"status": "none", "detail": "No tables, columns, indexes or triggers."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged."},
+  "compatibility": {"status": "none", "detail": "No client, wire or harness contract change."},
+  "downtime": {"status": "none", "detail": "None."},
+  "manual": {"status": "none", "detail": "No manual step."},
+  "recovery": {"status": "none", "detail": "Nothing to recover: a new test in the integration binary, excluded from the normal test jobs like the cost check, that writes a report and asserts nothing about it, and a script that reads it and always exits zero."}
+}

@@ -1598,7 +1598,7 @@
       "properties": {
         "kind": { "const": "page" },
         "collection": { "type": "string", "not": { "const": "resources" } },
-        "filters": { "type": "object", "additionalProperties": { "type": "string" } },
+        "filters": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Effective collection filters. A nonempty filter query is echoed exactly as filters.filter." },
         "items": { "type": "array", "items": { "$ref": "#/$defs/Resource" } },
         "page": { "$ref": "#/$defs/PageInfo" },
         "sync": { "$ref": "#/$defs/SyncNotice" },
@@ -2381,7 +2381,8 @@
             "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
             "person": { "type": ["string", "null"] },
             "actor": { "type": ["string", "null"] },
-            "status": { "type": ["string", "null"] }
+            "status": { "type": ["string", "null"] },
+            "filter": { "type": ["string", "null"], "maxLength": 256, "description": "Case-insensitive literal substring of an id, name, or title, matched before the collection window limit. At most 256 UTF-8 bytes; the server enforces the byte limit in addition to this character-count upper bound. Empty or null matches all items." }
           }
         },
         {
