@@ -44,6 +44,11 @@ they refuse busy seats. The built-in expert stays available after onboarding, an
 setup does not resurrect it after the person stops it. `st setup --onboarding`
 explicitly starts another onboarding run.
 
+Stopping the expert does not cancel its mission. To start a fresh lesson, cancel the
+old active onboarding run through Missions first, then use `st setup --onboarding`.
+Ordinary setup preserves stopped seats and all previous runs. The first plain `st`
+opens the expert conversation once; subsequent navigation remains yours.
+
 ## Home and the terminal interface
 
 Plain `st` opens the terminal interface. Home shows decisions, approvals, questions
@@ -94,3 +99,120 @@ Message agent/st/expert for later questions, and use `st --help` and nested comm
 help for the installed build's current syntax. This curated guide draws on the
 repository's getting-started, talking-to-agents, seat-lifecycle, mission graph runtime
 and troubleshooting guides; it does not require a checkout to read them.
+
+## The expert's onboarding workflow
+
+Read the claimed step and its current `person_answers` with `st work show STEP
+--json`. Use the run's actual requester, generation, attempt and workspace; never
+substitute the example person/ada for a configured person. The person answers on
+Home, and `work ask` yields the worker lease. Ask one clear question at a time, give
+its purpose, and stop doing dependent work until that answer arrives. Do not answer
+as the person, infer consent from silence, or hide a request in the harness terminal.
+
+For choices, write a private JSON request file with this shape:
+
+```json
+{"version":1,"type":"choice","question":"Would you like to pair a phone now?","why_person":"Only you can choose whether to connect your phone.","answers":[{"id":"enable","label":"Pair now","consequence":"We will pair your phone and check its connection."},{"id":"skip","label":"Skip","consequence":"Continue without a phone; this run will not ask again."}]}
+```
+
+Then use `st work ask --for PERSON --step STEP --request FILE --as agent/st/expert
+--idempotency-key KEY`. Read `work ask --help` for the installed version. Use a key
+containing the current run, generation, step, attempt and question name. Reusing it
+recovers the same request; use a new question key only when a help or decline answer
+requires another question. After the ask, release the turn and wait for its graph
+wake. On resumption, read the step before interpreting an answer.
+
+The tour choice uses IDs `tour-seen` and `help`. The phone, second-machine and GitHub
+choices each use `enable` and `skip`. A skip belongs to its own step and this run;
+it does not skip another step. Even without hardware or gh, offer the skip answer
+on Home instead of manufacturing it. Optional enable may be changed to skip through
+a new person question if setup cannot proceed. On macOS, the permissions choice
+uses `permissions-seen` and `help` after showing `st service permissions`.
+
+For a decision, use `type: "decision"` and two answers:
+`{"id":"accept","label":"Start","outcome":"accept","consequence":"Start the work shown above."}`
+and `{"id":"decline","label":"Revise","outcome":"decline","consequence":"Revise the plan before anything starts."}`.
+Include the proposed work in the question, and a `why_person` explaining the
+decision. Only `accept` authorizes the shown sample or project seat. For the project
+directory and harness, first ask a `feedback` request; show the resulting absolute
+directory, harness and proposed seat name together in the subsequent decision.
+The provider login and model choice belong to the person's provider account.
+
+### A garden note with a real review
+
+Create `garden-note` beneath this onboarding run's workspace. Write a short invented
+garden note there and publish its text with `st documents put FILE --as doc/NAME`.
+Substitute that returned immutable reference and the actual run requester into this
+private sample KDL. Use a distinct mission name containing the current generation
+so old sample runs cannot satisfy a new lesson:
+
+```kdl
+version 2
+mission "st/onboarding/garden-example" state="ready" {
+  goal "Review a private note about the garden."
+  step "review-note" {
+    agentless
+    goal "Read the invented garden note and decide whether to accept it."
+    gate "the person approves the note" type="human" {
+      reviewer "person/ada"
+      question "Is this private garden note ready?"
+      review "doc/garden/note@REPLACE_WITH_RETURNED_HASH"
+    }
+  }
+}
+```
+
+Show the draft and KDL to the person. Preview with `st apply FILE --dry-run --as
+agent/st/expert --workspace SCRATCH` before asking the decision on Home. Do not use
+`--check` on arbitrary commands before inspecting them. After accept, publish with
+`st apply FILE --as agent/st/expert --workspace SCRATCH` and start the exact published
+revision with `st missions start MISSION --revision REVISION --workspace SCRATCH
+--as agent/st/expert`. Record the returned run ID. The sample needs no extra provider
+seat: its one agentless step waits for the human review, which appears on Home.
+Explain the mission, step, gate, evidence document and review while the person
+answers. Read `st missions show RUN --json`; do not claim success until its current
+run is completed. Do not revise its mission after it completes and before checking
+the lesson, because the gate compares the revision that ran with the sample spec.
+
+### Evidence checked by the bundled gates
+
+The `first-mission`, `your-project`, macOS `keep-running`, and `wrap-up` steps put a
+small JSON document at `doc/st/onboarding/RUN/STEP`. RUN is the bare full run ID,
+without `mission-run/`; retain its slashes. The evidence always includes:
+
+```json
+{"version":1,"run":"st/onboarding/example","generation":"example-generation","attempt":1,"sample_run":"st/onboarding/garden-example/one"}
+```
+
+Replace every example value with the current graph value. For `first-mission`,
+include `sample_run` as above. For `your-project`, replace it with `agent`, `message`
+and `workspace` containing the new seat subject, its first message subject and the
+approved absolute directory. After showing macOS permissions, use
+`"permissions_shown":true`. For `wrap-up`, use `"summary":"..."` listing the checked
+objects, how to message the expert, and any optional skips. Keep evidence under
+8192 bytes. Do not put unrelated fields into this checked JSON; store longer notes
+as a separate evidence document. Publish via `st documents put FILE --as doc/NAME`
+and cite the returned immutable reference in `work complete`.
+
+Each gate runs `st gate onboarding STEP --run RUN --generation GENERATION --attempt
+ATTEMPT`. It exits 0 for checked facts, 1 for facts not yet present and 3 for broken
+checks or malformed evidence. A document alone is not completion: the garden run
+must have completed its actual person review; a project seat must have a healthy
+incarnation and a recipient read claim. Stale generation or attempt evidence cannot
+pass. Run a gate directly to see its diagnosis before submitting a step. A preview
+with `apply --dry-run --check` uses a synthetic run and normally reports not yet;
+that is valid and writes no onboarding progress.
+
+For keeping work running, an installed active service is required. On Linux, read
+`loginctl show-user --property=Linger --value`; when it is not `yes`, give the person
+the exact `loginctl enable-linger USER` command for their own terminal. They may
+need system authorization. The expert must neither run sudo nor ask for a password.
+A normal shell terminal can help; do not assume a setup tab can preload commands.
+On macOS, show the permissions guidance and wait for the person's acknowledgement;
+this acknowledges the guidance, not an automatically verified OS permission grant.
+
+The final gate checks that the eight preceding steps completed and the built-in
+expert remains a persistent seat. Complete `wrap-up` normally; completion of the
+run follows that step, so never wait for the run to complete before submitting it.
+Keep the expert available for later questions. Do not automatically stop or suspend
+it, create another onboarding run, repeat skipped questions or enable observers.

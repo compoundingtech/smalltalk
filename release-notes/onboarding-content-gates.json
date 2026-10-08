@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "The bundled onboarding mission checks its nine lessons against current graph facts and person answers, with private sample work and optional phone, fleet and GitHub choices.",
+  "replay": {
+    "status": "none",
+    "detail": "Existing runs retain their pinned mission and guide revisions. No replay or historical run interpretation changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Checks use existing mission, document, status, message, device and fleet APIs. No database, claim or client wire schema changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No replication or checkpoint rule changes."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Add the read-only st gate onboarding STEP --run RUN --generation GENERATION --attempt ATTEMPT command. Newly published built-in onboarding revisions use it. It returns the existing gate exit statuses: 0 pass, 1 not yet, 3 broken."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No restart or downtime is required for existing seats or runs."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "The person answers lesson requests and sample reviews on Home. Optional phone, fleet and GitHub choices can each be skipped. Keeping work running requires an active user service and Linux lingering, or acknowledgement of macOS permission guidance. st never types a password or runs sudo."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No store migration. Existing cancelled or completed onboarding history still prevents automatic reruns; st setup --onboarding starts a new revision intentionally once active work ends."
+  }
+}

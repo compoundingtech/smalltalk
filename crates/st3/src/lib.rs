@@ -75,6 +75,8 @@ pub mod service;
 /// First-run configuration and human-only daemon startup.
 pub mod setup;
 pub mod onboarding;
+/// Read-only checks for the bundled onboarding mission.
+pub mod onboarding_checks;
 /// The st agent skill bundled in this binary and installed for each harness.
 pub mod skill;
 pub mod startup;

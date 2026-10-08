@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""Retain exact dry-run receipts; the private daemon is always stopped."""
+import argparse, hashlib, json, os, pathlib, signal, subprocess, tempfile, time
+parser = argparse.ArgumentParser(description="Check bundled onboarding gates in a private HOME and daemon; no providers or services are started.")
+parser.add_argument('--binary', type=pathlib.Path, required=True)
+parser.add_argument('--pty', type=pathlib.Path, required=True)
+parser.add_argument('--out', type=pathlib.Path)
+args = parser.parse_args()
+source = pathlib.Path(__file__).resolve().parent.parent
+binary = args.binary.resolve()
+pty_binary = args.pty.resolve()
+if args.out:
+    root = args.out.resolve()
+    root.mkdir(mode=0o700, parents=True, exist_ok=False)
+else:
+    root = pathlib.Path(tempfile.mkdtemp(prefix='onboarding-content-check-'))
+for name in ['home/.config/st3', 'state', 'run', 'scratch']:
+    (root/name).mkdir(parents=True, exist_ok=True)
+os.chmod(root/'run', 0o700)
+config = root/'home/.config/st3/config.toml'
+config.write_text('node = "studio"\nperson = "person/ada"\nstate_dir = '+json.dumps(str(root/'state'))+'\nsocket = '+json.dumps(str(root/'run/st3.sock'))+'\nclient_gateway_socket = '+json.dumps(str(root/'run/client.sock'))+'\n')
+env = {'HOME':str(root/'home'),'USER':'ada','XDG_RUNTIME_DIR':str(root/'run'),'XDG_CONFIG_HOME':str(root/'home/.config'),'XDG_STATE_HOME':str(root/'home/.local/state'),'PATH':str(binary.parent)+':'+os.environ['PATH'],'TERM':'xterm-256color','ST3_BIN':str(binary)}
+def cli(*args, timeout=90):
+    command = [str(binary),'--endpoint',str(root/'run/st3.sock'),*args]
+    result = subprocess.run(command, env=env, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+    return {'argv':command,'exit':result.returncode,'stdout':result.stdout.decode(errors='replace'),'stderr':result.stderr.decode(errors='replace')}
+log = (root/'daemon.log').open('wb')
+daemon = subprocess.Popen([str(binary),'up','--config',str(config),'--pty-binary',str(pty_binary)], env=env, cwd=root, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+records=[]
+try:
+    for attempt in range(100):
+        if (root/'run/st3.sock').exists():
+            probe=cli('--json','machines',timeout=5)
+            if probe['exit']==0: break
+        if daemon.poll() is not None: raise RuntimeError('private daemon exited: '+str(daemon.returncode))
+        time.sleep(.1)
+    else: raise RuntimeError('private daemon did not become ready')
+    guide = source/'docs/st3/onboarding-guide.md'
+    records.append(cli('documents','put',str(guide),'--as','doc/st/guide'))
+    assert records[-1]['exit']==0, records[-1]
+    digest=hashlib.sha256(guide.read_bytes()).hexdigest()
+    mission=root/'onboarding.kdl'
+    template=(source/'crates/st3/src/builtins/onboarding.kdl').read_text().replace('@GUIDE@','doc/st/guide@'+digest)
+    # Include an eligible expert in the preview only; dry-run never starts this declaration.
+    declaration='agent \"st/expert\" { workspace '+json.dumps(str(root/'scratch'))+'; harness \"codex\" {} }\n'
+    mission.write_text(template.replace('version 2\n','version 2\n'+declaration,1))
+    records.append(cli('apply',str(mission),'--dry-run','--check','--workspace',str(root/'scratch'),'--as','person/ada',timeout=150))
+    dry=records[-1]
+    (root/'dry-run.stdout').write_text(dry['stdout']); (root/'dry-run.stderr').write_text(dry['stderr'])
+    assert dry['exit']==0, 'dry-run returned '+str(dry['exit'])+'; see '+str(root/'dry-run.stderr')
+    assert dry['stderr'].count('not yet')==9 and 'broken' not in dry['stderr'].lower(), dry['stderr']
+    records.append(cli('gate','onboarding','hello','--run','st/onboarding/absent','--generation','absent','--attempt','1'))
+    assert records[-1]['exit']==1 and 'not yet:' in records[-1]['stdout'], records[-1]
+    records.append(cli('--json','missions','show','st/onboarding'))
+    assert records[-1]['exit']!=0, 'dry-run unexpectedly published the onboarding mission'
+    (root/'receipt.json').write_text(json.dumps({'guide_sha256':digest,'records':records,'paid_provider':False,'provider_seats':False},indent=2)+'\n')
+    print(json.dumps({'root':str(root),'checks':'nine not-yet gates; exit 0 preview; absent run exit 1; no mission publication','guide_sha256':digest}))
+finally:
+    if daemon.poll() is None: os.killpg(daemon.pid,signal.SIGTERM)
+    try: daemon.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        os.killpg(daemon.pid,signal.SIGKILL);daemon.wait()
+    log.close()
+    (root/'partial-receipt.json').write_text(json.dumps(records,indent=2)+'\n')

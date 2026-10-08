@@ -993,6 +993,17 @@
       "verification": "real CLI with private HTTP fixture covers pass/wait/broken and obsolete refs across daemon restarts"
     },
     {
+      "command": "st gate onboarding",
+      "description": "Check the current bundled onboarding run against graph facts and current person answers",
+      "tests": [
+        "crates/st3/src/onboarding_checks.rs::skips_require_the_current_person_step_generation_and_attempt",
+        "crates/st3/src/onboarding_checks.rs::sample_completion_requires_approval_and_the_revision_person_review",
+        "crates/st3/src/onboarding_checks.rs::project_needs_a_current_seat_and_recipient_read_across_claim_pages",
+        "crates/st3/src/onboarding_checks.rs::doctor_failure_and_early_wrap_up_cannot_pass"
+      ],
+      "verification": "read-only checks over private API fixtures cover current/stale contexts, wrong-person and cancelled skips, completed samples without reviews, malformed evidence and paginated recipient reads; paid provider evals tracked separately"
+    },
+    {
       "command": "st gh comment",
       "tests": [
         "crates/st3/tests/fleet.rs::action_coverage_github_watch_cli_uses_private_http_and_survives_restart"
