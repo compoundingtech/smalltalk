@@ -32,7 +32,7 @@ fn start(store: &Store, key: &str) -> MissionRunView {
             mission: "orchid".into(),
             revision: None,
             workspace: "/tmp".into(),
-            requester: Some("person/gardener".into()),
+            requester: Some("person/lichen".into()),
             mode: None,
             inputs: BTreeMap::new(),
             idempotency_key: key.into(),
@@ -94,7 +94,7 @@ fn revision_carries_completed_start_seats_and_four_queued_builders() {
             .adopt_mission_revision(
                 &run.id,
                 &next,
-                "person/gardener",
+                "person/lichen",
                 "Update garden goal",
                 &format!("revise-{round}"),
             )
@@ -180,7 +180,7 @@ mission "orchid" state="ready" {
     settle(&reconciler);
     let current = store.mission_run(&run.id).unwrap().unwrap();
     assert_eq!(current.status, "blocked");
-    let faults = store.fault_items(Some("person/gardener")).unwrap();
+    let faults = store.fault_items(Some("person/lichen")).unwrap();
     let fault = faults.iter().find(|f| f.targets.contains(&run.generation)).unwrap_or_else(|| panic!("requester receives a missing-agent fault: items={faults:?}, claims={:?}, raised={:?}", store.claims_for(&run.subject, Some("operational.failure")).unwrap(), reconciler.raised_faults.lock().unwrap()));
     assert!(fault.targets.contains(&current.steps[0].subject));
     assert!(fault.detail.contains("eligible"));
@@ -218,7 +218,7 @@ mission "orchid" state="ready" {
     );
     assert!(
         !store
-            .fault_items(Some("person/gardener"))
+            .fault_items(Some("person/lichen"))
             .unwrap()
             .iter()
             .any(|f| f.targets.contains(&run.generation))
@@ -254,7 +254,7 @@ fn explicit_stop_survives_completed_declaration_carry_without_a_fault() {
             &intent,
             &plan.subject_tokens,
             "stop-amber",
-            Some("person/gardener"),
+            Some("person/lichen"),
         )
         .unwrap();
     let next = publish(&store, &source("Respect a stopped seat."), "second");
@@ -262,7 +262,7 @@ fn explicit_stop_survives_completed_declaration_carry_without_a_fault() {
         .adopt_mission_revision(
             &run.id,
             &next,
-            "person/gardener",
+            "person/lichen",
             "Update goal",
             "stop-cutover",
         )
@@ -307,7 +307,7 @@ fn changed_declarations_execute_again_and_removed_seats_retire() {
         .adopt_mission_revision(
             &run.id,
             &next,
-            "person/gardener",
+            "person/lichen",
             "Change declaring step explicitly",
             "change-cutover",
         )
@@ -377,7 +377,7 @@ fn unsafe_completed_exec_carry_refuses_and_rolls_back_generation_publication() {
         .adopt_mission_revision(
             &run.id,
             &next,
-            "person/gardener",
+            "person/lichen",
             "Must not replay exec",
             "refuse-cutover",
         )
@@ -468,7 +468,7 @@ fn completed_seat_carry_replays_canonical_desired_ownership() {
         .adopt_mission_revision(
             &run.id,
             &next,
-            "person/gardener",
+            "person/lichen",
             "Update goal",
             "replica-cutover",
         )
@@ -541,7 +541,7 @@ fn declared_revision_uses_the_same_atomic_completed_seat_carry() {
             &intent,
             &plan.subject_tokens,
             "declared-cutover",
-            Some("person/gardener"),
+            Some("person/lichen"),
         )
         .unwrap();
     let current = store.mission_run(&run.id).unwrap().unwrap();
@@ -677,7 +677,7 @@ fn completed_seat_owner_cards_survive_reopen_and_dirty_both_owner_steps() {
         .adopt_mission_revision(
             &run.id,
             &next,
-            "person/gardener",
+            "person/lichen",
             "Update goal",
             "reopen-cutover",
         )
@@ -794,7 +794,7 @@ mission "orchid" state="ready" {
             .claims_for(&run.subject, Some("operational.failure"))
             .unwrap();
         assert_eq!(failures.len(), round);
-        assert_eq!(store.fault_items(Some("person/gardener")).unwrap().len(), 1);
+        assert_eq!(store.fault_items(Some("person/lichen")).unwrap().len(), 1);
         let episode = &failures.last().unwrap().body["fields"]["episode"];
         assert!(
             episode
@@ -810,7 +810,7 @@ mission "orchid" state="ready" {
         settle(&reconciler);
         assert!(
             store
-                .fault_items(Some("person/gardener"))
+                .fault_items(Some("person/lichen"))
                 .unwrap()
                 .is_empty()
         );
@@ -835,7 +835,7 @@ mission "orchid" state="ready" {
     assert_eq!(store.index().unwrap(), index);
     assert!(
         store
-            .fault_items(Some("person/gardener"))
+            .fault_items(Some("person/lichen"))
             .unwrap()
             .is_empty()
     );
@@ -877,7 +877,7 @@ mission "orchid" state="ready" {
     );
     assert!(
         store
-            .fault_items(Some("person/gardener"))
+            .fault_items(Some("person/lichen"))
             .unwrap()
             .is_empty()
     );
@@ -902,7 +902,7 @@ mission "orchid" state="ready" {
     );
     settle(&reconciler);
     let predecessor = store.mission_run(&run.id).unwrap().unwrap();
-    assert_eq!(store.fault_items(Some("person/gardener")).unwrap().len(), 1);
+    assert_eq!(store.fault_items(Some("person/lichen")).unwrap().len(), 1);
     let next = publish(
         &store,
         &first.replace("Offer work to a missing seat.", "Revise missing work."),
@@ -912,7 +912,7 @@ mission "orchid" state="ready" {
         .adopt_mission_revision(
             &run.id,
             &next,
-            "person/gardener",
+            "person/lichen",
             "Change goal",
             "stale-cutover",
         )
@@ -926,12 +926,12 @@ mission "orchid" state="ready" {
     assert_eq!(store.index().unwrap(), index);
     assert!(
         store
-            .fault_items(Some("person/gardener"))
+            .fault_items(Some("person/lichen"))
             .unwrap()
             .is_empty()
     );
     settle(&reconciler);
-    let faults = store.fault_items(Some("person/gardener")).unwrap();
+    let faults = store.fault_items(Some("person/lichen")).unwrap();
     assert_eq!(faults.len(), 1);
     assert!(faults[0].targets.contains(&successor.generation));
     assert!(!faults[0].targets.contains(&predecessor.generation));
