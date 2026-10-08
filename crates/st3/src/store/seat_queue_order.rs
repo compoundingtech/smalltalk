@@ -5,6 +5,8 @@
 use super::*;
 use smallclaims::store::canonical::{ClaimKey, sortable_key};
 
+type NextEvent = (Vec<u8>, String, String, Option<String>, Option<String>);
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS local_seat_order_joins (
  namespace TEXT NOT NULL, agent TEXT NOT NULL, run TEXT NOT NULL, at BLOB NOT NULL CHECK(length(at)=16), live INTEGER NOT NULL,
@@ -540,7 +542,7 @@ pub(crate) fn page(
             .as_ref()
             .map(|(rank, _)| rank.as_slice())
             .unwrap_or(&[]);
-        let next: Option<(Vec<u8>, String, String, Option<String>, Option<String>)> = tx
+        let next: Option<NextEvent> = tx
             .query_row(NEXT, params![namespace, agent, from], |row| {
                 Ok((
                     row.get(0)?,

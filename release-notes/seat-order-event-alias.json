@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Name the seat order event tuple to satisfy the Clippy complexity check",
+  "replay": {
+    "status": "none",
+    "detail": "Private Rust type alias only; no SQL, ordering, fingerprint, source lifetime, readiness, wire, deployment or recovery behavior changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Private Rust type alias only; no SQL, ordering, fingerprint, source lifetime, readiness, wire, deployment or recovery behavior changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Private Rust type alias only; no SQL, ordering, fingerprint, source lifetime, readiness, wire, deployment or recovery behavior changes."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Private Rust type alias only; no SQL, ordering, fingerprint, source lifetime, readiness, wire, deployment or recovery behavior changes."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Private Rust type alias only; no SQL, ordering, fingerprint, source lifetime, readiness, wire, deployment or recovery behavior changes."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Private Rust type alias only; no SQL, ordering, fingerprint, source lifetime, readiness, wire, deployment or recovery behavior changes."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Private Rust type alias only; no SQL, ordering, fingerprint, source lifetime, readiness, wire, deployment or recovery behavior changes."
+  }
+}
