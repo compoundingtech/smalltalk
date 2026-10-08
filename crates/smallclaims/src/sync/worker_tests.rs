@@ -123,6 +123,7 @@ async fn checkpoint_tombstones_do_not_starve_later_live_ranges() {
                     query.inventory.buckets.is_empty(),
                     query.inventory.envelopes.len(),
                     query.envelopes.len(),
+                    query.graph_digest.is_empty(),
                 ));
                 next.run(Request::from_parts(parts, Body::from(bytes)))
                     .await
@@ -149,12 +150,16 @@ async fn checkpoint_tombstones_do_not_starve_later_live_ranges() {
     {
         let requests = requests.lock().unwrap();
         assert!(
-            requests.len() <= 4,
-            "one compact round plus at most one full round, never an unbounded retry"
+            requests.len() <= 6,
+            "one compact and one full round, each with at most one legacy retry"
         );
         assert!(
-            requests.contains(&(true, 0, 0)),
+            requests.iter().any(|request| request.0 && request.1 == 0 && request.2 == 0),
             "a bare digest cannot prove an empty inventory"
+        );
+        assert!(
+            requests.windows(2).any(|pair| pair[0].3 && !pair[1].3),
+            "a peer without projection digests must receive an exact legacy retry"
         );
     }
     for store in [&left, &right] {

@@ -5355,6 +5355,16 @@ impl Store {
     /// The replication snapshot with every local batch sealed into a signed envelope first. The
     /// exchange paths use it; they must offer peers everything this node wrote.
     pub fn replication_snapshot(&self) -> Result<Arc<ReplicationSnapshot>> {
+        self.replication_snapshot_with_legacy(true)
+    }
+
+    /// A modern peer compares the transactional projection digests. Its first exchange can
+    /// leave the six-table compatibility digest empty until an older peer is identified.
+    pub fn replication_snapshot_modern(&self) -> Result<Arc<ReplicationSnapshot>> {
+        self.replication_snapshot_with_legacy(false)
+    }
+
+    fn replication_snapshot_with_legacy(&self, legacy: bool) -> Result<Arc<ReplicationSnapshot>> {
         // A write that lands between sealing and reading would be counted by the projection
         // digests but not by the inventory, and a peer comparing graphs at equal inventories
         // would heal for nothing. Seal again until the snapshot holds no unsealed batch.
@@ -5362,7 +5372,7 @@ impl Store {
         let mut attempts = 0;
         loop {
             self.seal_local_batches()?;
-            snapshot = self.sealed_replication_snapshot()?;
+            snapshot = self.sealed_replication_snapshot_with_legacy(legacy)?;
             attempts += 1;
             if !snapshot.unsealed || attempts == 8 {
                 break;
@@ -5421,6 +5431,13 @@ impl Store {
     /// read such as `st replication status` uses it and never waits for the writer; a batch
     /// written since the last exchange shows once the next exchange seals it.
     pub fn sealed_replication_snapshot(&self) -> Result<Arc<ReplicationSnapshot>> {
+        self.sealed_replication_snapshot_with_legacy(true)
+    }
+
+    fn sealed_replication_snapshot_with_legacy(
+        &self,
+        legacy: bool,
+    ) -> Result<Arc<ReplicationSnapshot>> {
         let current = |store: &Self| -> Result<Option<Arc<ReplicationSnapshot>>> {
             let store_index = store.index()?;
             let replica_generation = store.replica_generation.load(Ordering::Acquire);
@@ -5445,6 +5462,7 @@ impl Store {
                         && snapshot.projection_generation == current_projection_generation
                         && snapshot.max_envelope_rowid == envelope_rowid
                         && snapshot.inventory_generation == inventory_generation
+                        && (!legacy || !snapshot.legacy_graph_digest.is_empty())
                 })
                 .cloned())
         };
@@ -5461,13 +5479,21 @@ impl Store {
         let _timing = time_stage(&self.replication_timers.snapshot);
         self.read_snapshot(|_| {
             let connection = self.readers.get();
-            self.build_replication_snapshot(&connection)
+            self.build_replication_snapshot_with_legacy(&connection, legacy)
         })
     }
 
     pub fn build_replication_snapshot(
         &self,
         connection: &Connection,
+    ) -> Result<Arc<ReplicationSnapshot>> {
+        self.build_replication_snapshot_with_legacy(connection, true)
+    }
+
+    fn build_replication_snapshot_with_legacy(
+        &self,
+        connection: &Connection,
+        legacy: bool,
     ) -> Result<Arc<ReplicationSnapshot>> {
         let previous = self
             .replication_snapshot
@@ -5479,7 +5505,10 @@ impl Store {
         let graph_generation = graph_generation(connection)?;
         let reusable_graph_digest = previous
             .as_ref()
-            .filter(|previous| previous.graph_generation == graph_generation)
+            .filter(|previous| {
+                previous.graph_generation == graph_generation
+                    && !previous.legacy_graph_digest.is_empty()
+            })
             .map(|previous| previous.legacy_graph_digest.clone());
         let inventory_generation = inventory_generation::current(connection)?;
         let full = |connection: &Connection| -> Result<_> {
@@ -5598,7 +5627,8 @@ impl Store {
         let authority_digest = inventory.digest.clone();
         let legacy_graph_digest = match reusable_graph_digest {
             Some(digest) => digest,
-            None => legacy_graph_digest(connection, self.runtime.legacy_digest_tables())?,
+            None if legacy => legacy_graph_digest(connection, self.runtime.legacy_digest_tables())?,
+            None => String::new(),
         };
         let projection_generation = projection_digest::generation(connection)?;
         let projection_digests = projection_digest::tables(connection)?;
@@ -5635,7 +5665,19 @@ impl Store {
     }
 
     pub fn export_replication_summary(&self, fleet_id: &str) -> Result<ReplicationExchange> {
-        let snapshot = self.replication_snapshot()?;
+        self.export_replication_summary_with_legacy(fleet_id, true)
+    }
+
+    pub fn export_replication_summary_modern(&self, fleet_id: &str) -> Result<ReplicationExchange> {
+        self.export_replication_summary_with_legacy(fleet_id, false)
+    }
+
+    fn export_replication_summary_with_legacy(
+        &self,
+        fleet_id: &str,
+        legacy: bool,
+    ) -> Result<ReplicationExchange> {
+        let snapshot = self.replication_snapshot_with_legacy(legacy)?;
         let _timing = time_stage(&self.replication_timers.export);
         let signature_requests = self.replication_signature_requests()?;
         Ok(ReplicationExchange {
@@ -5674,7 +5716,36 @@ impl Store {
         remote: &ReplicationInventory,
         signature_requests: &[ReplicaEnvelopeId],
     ) -> Result<ReplicationExchange> {
-        let mut exchange = self.export_replication_difference(fleet_id, remote)?;
+        self.export_replication_exchange_answering_with_legacy(
+            fleet_id,
+            remote,
+            signature_requests,
+            true,
+        )
+    }
+
+    pub fn export_replication_exchange_answering_modern(
+        &self,
+        fleet_id: &str,
+        remote: &ReplicationInventory,
+        signature_requests: &[ReplicaEnvelopeId],
+    ) -> Result<ReplicationExchange> {
+        self.export_replication_exchange_answering_with_legacy(
+            fleet_id,
+            remote,
+            signature_requests,
+            false,
+        )
+    }
+
+    fn export_replication_exchange_answering_with_legacy(
+        &self,
+        fleet_id: &str,
+        remote: &ReplicationInventory,
+        signature_requests: &[ReplicaEnvelopeId],
+        legacy: bool,
+    ) -> Result<ReplicationExchange> {
+        let mut exchange = self.export_replication_difference_with_legacy(fleet_id, remote, legacy)?;
         let _timing = time_stage(&self.replication_timers.export);
         exchange.signatures = self.replication_signatures_for(signature_requests)?;
         exchange.signature_requests = self.replication_signature_requests()?;
@@ -5686,7 +5757,16 @@ impl Store {
         fleet_id: &str,
         remote: &ReplicationInventory,
     ) -> Result<ReplicationExchange> {
-        let snapshot = self.replication_snapshot()?;
+        self.export_replication_difference_with_legacy(fleet_id, remote, true)
+    }
+
+    fn export_replication_difference_with_legacy(
+        &self,
+        fleet_id: &str,
+        remote: &ReplicationInventory,
+        legacy: bool,
+    ) -> Result<ReplicationExchange> {
+        let snapshot = self.replication_snapshot_with_legacy(legacy)?;
         let _timing = time_stage(&self.replication_timers.export);
         let same = !remote.digest.is_empty() && remote.digest == snapshot.inventory.digest;
         if !same && !remote.buckets.is_empty() {

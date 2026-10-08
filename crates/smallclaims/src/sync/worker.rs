@@ -1599,15 +1599,27 @@ async fn receive_exchange<B: Backend>(
                             .outbound_notify
                             .send_modify(|generation| *generation = generation.saturating_add(1));
                     }
-                    let response = state
-                        .backend
-                        .export(
-                            state.auth.fleet_id(),
-                            &request.inventory,
-                            false,
-                            &request.signature_requests,
-                        )
-                        .await?;
+                    let response = if request.projection_digests.is_empty() {
+                        state
+                            .backend
+                            .export(
+                                state.auth.fleet_id(),
+                                &request.inventory,
+                                false,
+                                &request.signature_requests,
+                            )
+                            .await?
+                    } else {
+                        state
+                            .backend
+                            .export_modern(
+                                state.auth.fleet_id(),
+                                &request.inventory,
+                                false,
+                                &request.signature_requests,
+                            )
+                            .await?
+                    };
 
                     Ok::<_, anyhow::Error>(response)
                 }
@@ -2138,10 +2150,10 @@ pub async fn exchange<B: Backend>(
     // cannot make progress. Payloadless checkpoint identities can differ indefinitely.
     for full_inventory in [false, true] {
         let first = backend
-            .export(auth.fleet_id(), &ReplicationInventory::default(), true, &[])
+            .export_modern(auth.fleet_id(), &ReplicationInventory::default(), true, &[])
             .await?
             .exchange;
-        let own_checkpoint = first.inventory.checkpoint.clone();
+        let mut own_checkpoint = first.inventory.checkpoint.clone();
         let mut query = ReplicationExchange {
             envelopes: Vec::new(),
             ..first
@@ -2152,9 +2164,32 @@ pub async fn exchange<B: Backend>(
             query.inventory.buckets.clear();
         }
         let started = std::time::Instant::now();
-        let (remote, peer_inflates) =
-            post_signed(http, backend, peer, node, auth, fleet, &query, false).await?;
-        let round_trip = started.elapsed();
+        let first_answer = post_signed(http, backend, peer, node, auth, fleet, &query, false).await;
+        let (remote, peer_inflates, round_trip) = if query.graph_digest.is_empty()
+            && first_answer
+                .as_ref()
+                .map_or(true, |(answer, _)| answer.projection_digests.is_empty())
+        {
+            // A peer without projection digests may compare only the old six-table digest.
+            // Its first answer is provisional: retry with the exact digest before accepting
+            // its receipt, a heal decision, or a completed round. Older peers can reject an
+            // empty digest outright; this retry covers that response too.
+            query = backend
+                .export(auth.fleet_id(), &ReplicationInventory::default(), true, &[])
+                .await?
+                .exchange;
+            own_checkpoint = query.inventory.checkpoint.clone();
+            if full_inventory {
+                query.inventory.buckets.clear();
+            }
+            let started = std::time::Instant::now();
+            let (answer, inflates) =
+                post_signed(http, backend, peer, node, auth, fleet, &query, false).await?;
+            (answer, inflates, started.elapsed())
+        } else {
+            let (answer, inflates) = first_answer?;
+            (answer, inflates, started.elapsed())
+        };
         let different = remote.inventory.digest != query.inventory.digest;
         let received = backend
             .receive(&peer.name, auth.fleet_id(), &remote, Some(round_trip))
@@ -2171,15 +2206,27 @@ pub async fn exchange<B: Backend>(
         // A follow-up also carries the signatures the peer asked for, even when both sides hold
         // the same envelopes.
         if different || !remote.signature_requests.is_empty() {
-            let push = backend
-                .export(
-                    auth.fleet_id(),
-                    &remote.inventory,
-                    false,
-                    &remote.signature_requests,
-                )
-                .await?
-                .exchange;
+            let push = if remote.projection_digests.is_empty() {
+                backend
+                    .export(
+                        auth.fleet_id(),
+                        &remote.inventory,
+                        false,
+                        &remote.signature_requests,
+                    )
+                    .await?
+                    .exchange
+            } else {
+                backend
+                    .export_modern(
+                        auth.fleet_id(),
+                        &remote.inventory,
+                        false,
+                        &remote.signature_requests,
+                    )
+                    .await?
+                    .exchange
+            };
             let started = std::time::Instant::now();
             // A peer that says it takes compressed requests gets a large push compressed.
             let (response, _) =

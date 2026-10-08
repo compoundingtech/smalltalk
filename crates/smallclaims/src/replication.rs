@@ -282,6 +282,10 @@ pub struct ReplicationExportRequest {
     pub inventory: ReplicationInventory,
     #[serde(default)]
     pub summary_only: bool,
+    /// The worker has a modern projection-digest exchange to send. An older peer is retried
+    /// with the exact compatibility digest before this worker completes the round.
+    #[serde(default)]
+    pub modern_only: bool,
     /// The other side's signature requests, to answer in the exported exchange.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub signature_requests: Vec<ReplicaEnvelopeId>,

@@ -7306,8 +7306,16 @@ async fn replication_export(
     }
     let store = state.store.clone();
     blocking_store(move || {
-        let exchange = if request.summary_only {
+        let exchange = if request.summary_only && request.modern_only {
+            store.export_replication_summary_modern(&request.fleet_id)?
+        } else if request.summary_only {
             store.export_replication_summary(&request.fleet_id)?
+        } else if request.modern_only {
+            store.export_replication_exchange_answering_modern(
+                &request.fleet_id,
+                &request.inventory,
+                &request.signature_requests,
+            )?
         } else {
             store.export_replication_exchange_answering(
                 &request.fleet_id,

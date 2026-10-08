@@ -1401,6 +1401,27 @@ impl MainBackend {
 }
 
 impl Backend for MainBackend {
+    async fn export_modern(
+        &self,
+        fleet_id: &str,
+        inventory: &ReplicationInventory,
+        summary_only: bool,
+        signature_requests: &[ReplicaEnvelopeId],
+    ) -> Result<ReplicationExportResponse> {
+        self.client
+            .post(
+                "/v1/internal/replication/export",
+                &ReplicationExportRequest {
+                    fleet_id: fleet_id.to_owned(),
+                    inventory: inventory.clone(),
+                    summary_only,
+                    modern_only: true,
+                    signature_requests: signature_requests.to_vec(),
+                },
+            )
+            .await
+    }
+
     async fn ready(&self) {
         loop {
             if self.client.get::<serde_json::Value>("/v1/health").await.is_ok() {
@@ -1424,6 +1445,7 @@ impl Backend for MainBackend {
                     fleet_id: fleet_id.to_owned(),
                     inventory: inventory.clone(),
                     summary_only,
+                    modern_only: false,
                     signature_requests: signature_requests.to_vec(),
                 },
             )
