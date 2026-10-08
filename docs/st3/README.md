@@ -23,6 +23,7 @@ Use these documents for implementation details:
 - [0.x compatibility](compatibility.md) states upgrade baselines, independent contracts and current platform proof.
 - [Install/upgrade troubleshooting and support](../when-something-is-wrong.md) provides the diagnostic entry point and sanitized issue path.
 - [Claim backups](backups.md) explains live snapshots, offline restore, and recovered writer identities.
+- [Stable node identity](node-identity.md) explains computer renames, same-state recovery and local ownership diagnostics.
 - [Founder signing audit](founder-signing-audit.md) explains read-only capture, preserved unsealed
   upgrades, and the remaining warnings for already-sealed unsigned delegations.
 - [Fleet replication](replication.md) defines convergence, inspection, and repair.

@@ -948,6 +948,166 @@ async fn a_populated_standalone_daemon_founds_a_fleet_with_verified_person_and_a
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg(target_os = "linux")]
+async fn invalid_admission_preserves_running_daemon_and_never_stops_services() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let mut node = Node::new(root.path(), "orchid");
+    let log = node.root.join("service-commands");
+    let manager = node.root.join("bin/systemctl");
+    fs::write(
+        &manager,
+        format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf 'LoadState=loaded\\nActiveState=active\\nSubState=running\\n'\n", log.display()),
+    ).unwrap();
+    fs::set_permissions(manager, fs::Permissions::from_mode(0o700)).unwrap();
+    node.env.push((
+        "PATH".into(),
+        format!(
+            "{}:{}",
+            node.root.join("bin").display(),
+            std::env::var("PATH").unwrap()
+        ),
+    ));
+    node.start().await;
+    async fn assert_refused(node: &Node, log: &Path, arguments: &[&str], message: &str) {
+        fs::write(log, "").unwrap();
+        let output = node.st(arguments);
+        assert!(!output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(message),
+            "{output:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(log).unwrap(),
+            "",
+            "preconditions must precede even service inspection"
+        );
+        assert_eq!(
+            node.client().get::<Value>("/v1/health").await.unwrap()["node"],
+            node.name
+        );
+    }
+    assert_refused(
+        &node,
+        &log,
+        &["fleet", "create", "--name", "invalid/name"],
+        "cannot name a fleet member",
+    )
+    .await;
+    assert!(!node.state_dir().join("fleet/fleet.toml").exists());
+    let secret = root.path().join("fleet.secret");
+    fs::write(&secret, hex::encode([42_u8; 32])).unwrap();
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+    let fleet = "8f14e45f-ceea-467a-9a2b-5c3d6e7f8091";
+    let peer = [("fern", free_port())];
+    node.legacy_config(fleet, &secret, &peer);
+    assert_refused(
+        &node,
+        &log,
+        &["fleet", "migrate", "--anchor"],
+        "not bound to a fleet yet",
+    )
+    .await;
+    node.restart().await;
+    node.legacy_config("8f14e45f-ceea-467a-9a2b-5c3d6e7f8092", &secret, &peer);
+    assert_refused(
+        &node,
+        &log,
+        &["fleet", "migrate", "--anchor"],
+        "not the configured",
+    )
+    .await;
+    node.legacy_config(fleet, &secret, &peer);
+    node.stop();
+    node.migrate(&["--anchor"]);
+    // A native member no longer needs legacy fleet_id in config.toml. Create must
+    // inspect saved membership before it even asks whether services are installed.
+    fs::write(
+        node.root.join("config/st3/config.toml"),
+        format!("node = \"{}\"\nperson = \"{PERSON}\"\n", node.name),
+    )
+    .unwrap();
+    node.start().await;
+    assert_refused(&node, &log, &["fleet", "create"], "already in a fleet").await;
+    assert_refused(
+        &node,
+        &log,
+        &["fleet", "migrate", "--anchor"],
+        "already has fleet membership settings",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn create_after_standalone_run_records_explicit_name_before_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let mut node = Node::new(root.path(), "orchid-computer");
+    node.start().await;
+    let pin = node.state_dir().join("node-identity.json");
+    assert_eq!(
+        serde_json::from_slice::<String>(&fs::read(&pin).unwrap()).unwrap(),
+        node.name
+    );
+    let blocked = node.st(&[
+        "fleet",
+        "create",
+        "--name",
+        "orchid",
+        "--no-service",
+        "--dial-out",
+    ]);
+    assert!(
+        !blocked.status.success(),
+        "a manual daemon must stop before admission"
+    );
+    assert!(!node.state_dir().join("fleet/fleet.toml").exists());
+    node.stop();
+    node.name = "orchid".into();
+    node.create();
+    assert_eq!(
+        serde_json::from_slice::<String>(&fs::read(&pin).unwrap()).unwrap(),
+        node.name
+    );
+    node.start().await;
+    assert_eq!(node.st_json(&["fleet", "status"])["node"], node.name);
+    node.wait_listening().await;
+    let peer = joined(root.path(), &node, "fern", &[]).await;
+    peer.st_ok(&["fleet", "wait", "--timeout", "90s"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn saved_join_resumes_when_membership_was_saved_before_the_identity_pin() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let sponsor = anchor(root.path(), "orchid").await;
+    let mut node = Node::new(root.path(), "fern");
+    let code = sponsor.invite("fern", &[]);
+    assert!(node.join(&code, &[]).status.success());
+    // Isolated crash-boundary fixture: saved admission exists, but the previous pin remains.
+    let pin = node.state_dir().join("node-identity.json");
+    fs::write(&pin, "\"fern-before-admission\"\n").unwrap();
+    let refused = node.st(&["up"]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("fleet membership pins"));
+    let resumed = node.join(&code, &[]);
+    assert!(resumed.status.success(), "{resumed:?}");
+    assert!(String::from_utf8_lossy(&resumed.stdout).contains("resumed"));
+    assert_eq!(
+        serde_json::from_slice::<String>(&fs::read(pin).unwrap()).unwrap(),
+        "fern"
+    );
+    node.start().await;
+    node.st_ok(&["fleet", "wait", "--timeout", "90s"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn invite_and_join_sync_full_history() {
     if st3::test_support::supervise_test() {
         return;

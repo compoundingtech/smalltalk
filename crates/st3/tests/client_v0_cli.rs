@@ -1093,6 +1093,60 @@ async fn missions_show_missing_mission_fails_but_published_zero_run_mission_succ
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conversation_stage_timings_appear_in_performance_report() {
+    // Reports retain only the top 20 rows; nextest gives this metrics test its own process.
+    st3::performance::reset_for_test();
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("st3.sock");
+    let state = test_state(root.path());
+    let subject = "agent/conversation-timing";
+    state.store.append_claim(&ClaimInput {
+        subject: subject.into(),
+        kind: "runtime.observed".into(),
+        actor: Some(subject.into()),
+        fields: serde_json::from_value(serde_json::json!({
+            "status": "running", "incarnation_id": "timing-runtime"
+        })).unwrap(),
+        evidence: Vec::new(),
+        expected_subject: None,
+        idempotency_key: None,
+    }).unwrap();
+    let index = state.store.index().unwrap();
+    let served = socket.clone();
+    let app = st3::api::router(state.clone());
+    let server = tokio::spawn(async move { st3::api::serve_unix(&served, app).await });
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !socket.exists() {
+        assert!(tokio::time::Instant::now() < deadline, "isolated API did not start");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let client = st3_client::Client::unix_as(&socket, "person/example");
+    let mut stream = client.collection_stream().await.unwrap();
+    stream.subscribe_conversation("timing", subject).await.unwrap();
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await.unwrap().unwrap().unwrap();
+    assert_eq!(frame["kind"], "conversation");
+    assert_eq!(frame["id"], "timing");
+    assert_eq!(frame["replace"], true);
+
+    let http = reqwest::Client::builder().unix_socket(socket).build().unwrap();
+    let response = http.get("http://localhost/v1/performance").send().await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let report: Value = response.json().await.unwrap();
+    let requests = report["value"]["requests"].as_array().unwrap();
+    for label in ["conversation/admission", "conversation/owner", "conversation/first-page"] {
+        let row = requests.iter().find(|row| row["kind"] == label)
+            .unwrap_or_else(|| panic!("missing stage {label}: {report}"));
+        assert!(row["count"].as_u64().unwrap() > 0);
+        assert!(row["total_ms"].as_f64().unwrap() >= 0.0);
+    }
+    assert_eq!(state.store.index().unwrap(), index, "timings must not write graph claims");
+    stream.close().await;
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn operational_cli_lists_outcomes_summarizes_runs_and_reports_performance() {
     // The report keeps only the top 20 client/request pairs. Earlier serial tests must
     // not displace this test's requests; nextest already gives each test its own process.

@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Deliver deduplicated P0 main Performance failures through the shared GitHub observer",
+  "replay": {
+    "status": "changed",
+    "detail": "Adds durable per-recipient repository/run/attempt/head baseline and delivery receipts as custom.github.workflow-failure resources, using existing resource.observed and message.sent claims. The first field snapshot baselines historical failures; restart/re-registration preserves dedupe. Baselines are per recipient/repository, including empty snapshots, so a new recipient receives no historical failure flood. Re-adding after an observation gap re-baselines and suppresses failures first seen in that gap."
+  },
+  "schema": {
+    "status": "changed",
+    "detail": "Adds optional main_performance_failures array to vcs.repository facts and regenerates schema registry documentation. No database tables or migration; only supporting builds may originate the new field. The registry schema digest changes; older readers quarantine unknown-resource-field facts. Upgrade participating readers before enabling the field."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Existing per-resource checkpoint retention and message envelope/evidence rules retain baseline/delivery receipts. No checkpoint rule or digest change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "A direct message subscription on main_performance_failures extends the existing github.repository observer via its existing field union. The field selects only main push perf.yml Performance completed/failure metadata. Existing fields and unconfigured observers retain their behavior. No new polling loop, logs/artifacts or workflow dispatch. Simple standalone direct-message registrations are validated against an already-declared live observer and agent recipient, under existing actor permissions; unrelated top-level runtime declarations remain rejected. Public registration is limited to main_performance_failures and requires recipient==authenticated publication actor, with an immutable existing spec and original-author check; unmanaged main-field claims are validated during replicated projection."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No startup replay or migration. No production timing/performance claim is made."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Deploy supporting daemon source before publishing the standalone subscription to the existing observer and declared recipient; no observer redeclaration or owned-set replacement. The existing shared observer must be healthy. First field snapshot suppresses historical failures. Ten pages/1000 runs is an explicit listing bound; larger listings fail rather than truncate. See docs/github-integration.md. CI prepares the deployment KDL and the recipient agent self-applies after reviewed supporting deployment. A missing/denied workflow, Actions permission failure, or listing overflow also fails other selected fields of the shared observation."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "Before downgrading, stop the new-field subscription so older builds cannot attempt unsupported observation. Graph receipts remain ordinary custom resources and message claims; preserve them to retain run/attempt/head dedupe when the capability returns. Stopping the subscription does not remove historical new-field claims: downgrade to an unsupported schema can quarantine them during replay; retain supporting readers and receipts."
+  }
+}

@@ -22,6 +22,11 @@ impl Ui {
             return;
         }
         let footer = Rect::new(area.x, area.bottom() - 1, area.width, 1);
+        // Text to read stays quiet: moving over messages leaves the normal keys in the footer
+        // (Nathan, 2026-10-07).
+        if matches!(hit, Hit::Message | Hit::Subject) {
+            return;
+        }
         if rect.intersects(footer)
             || self
                 .frame
@@ -41,7 +46,7 @@ impl Ui {
             Hit::Usage => "show/hide Usage".into(),
             Hit::Connection => "connection details".into(),
             Hit::Row(_) => "select row".into(),
-            Hit::Message | Hit::Subject => "drag to select/copy text".into(),
+            Hit::Message | Hit::Subject => String::new(),
             Hit::Resize => "drag resize; double-click equalize".into(),
             Hit::Key('s') if self.glasses.is_none() && self.popover.is_none() => {
                 "show/hide list [s]".into()
@@ -68,8 +73,6 @@ impl Ui {
             Hit::PaletteSection(2) => "missions [Ctrl+3]".into(),
             Hit::PaletteSection(3) => "fleet [Ctrl+4]".into(),
             Hit::PaletteSection(_) => format!("open {label}"),
-            Hit::NewAgent => "new agent [Ctrl+N]".into(),
-            Hit::Repository(_) => "choose repository".into(),
             Hit::Home => "show/hide Now [Ctrl+H]".into(),
             Hit::Link(_) => "copy link".into(),
             Hit::Split(true) => "split right [Ctrl+V]".into(),
@@ -293,8 +296,8 @@ mod tests {
         let buf = draw(&ui);
         let footer = line(&buf, 47);
         assert!(
-            footer.contains("drag to select/copy text") && footer.contains("Right:"),
-            "{footer}"
+            !footer.contains("Click:") && footer.contains("Keys:"),
+            "the normal keys stay under the pointer: {footer}"
         );
         pointer(
             &mut ui,
@@ -391,7 +394,7 @@ mod tests {
         draw(&ui);
         let subject = target(&ui, |hit| matches!(hit, Hit::Subject));
         pointer(&mut ui, MouseEventKind::Moved, subject.x, subject.y);
-        assert!(line(&draw(&ui), 47).contains("drag to select/copy text"));
+        assert!(!line(&draw(&ui), 47).contains("Click:"), "text keeps the normal footer");
         let divider = target(&ui, |hit| matches!(hit, Hit::Resize));
         pointer(&mut ui, MouseEventKind::Moved, divider.x, divider.y);
         assert!(line(&draw(&ui), 47).contains("drag resize; double-click equalize"));

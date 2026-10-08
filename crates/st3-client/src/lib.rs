@@ -122,6 +122,105 @@ fn client_name() -> Option<&'static str> {
     CLIENT_NAME.get().map(String::as_str)
 }
 
+/// One thing the client did, timed, for a test utility that asked to see them with
+/// [`set_observer`]. It names the route without its query, the status, the sizes and the
+/// durations, and never a body, a header or a credential. Observing sends nothing to st.
+#[derive(Clone, Debug)]
+pub enum Observation<'a> {
+    /// An HTTP request: its method, route, how it ended, its status when one came, and how long
+    /// it ran. A request its caller stopped waiting for is reported once, as `Cancelled`, with
+    /// the time it had run; those ages are censored and never a completion time.
+    Request {
+        method: &'a str,
+        route: &'a str,
+        outcome: RequestOutcome,
+        status: Option<u16>,
+        took: Duration,
+    },
+    /// A collections-stream frame: the subscription, the frame kind, its size, and for the
+    /// first frame of a subscription how long after the subscribe command it arrived.
+    Frame {
+        id: &'a str,
+        kind: &'a str,
+        bytes: usize,
+        since_subscribe: Option<Duration>,
+    },
+}
+
+/// How an observed request ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestOutcome {
+    /// A response came, whatever its status.
+    Completed,
+    /// The client's own request deadline passed.
+    TransportTimeout,
+    /// The transport failed before a response.
+    Failed,
+    /// The caller dropped the request (an outer timeout or a cancelled task) before it ended.
+    Cancelled,
+}
+
+/// Reports one request when it ends or is dropped, so a request the caller stopped waiting for
+/// still leaves its age. Created only while observed.
+struct RequestGuard {
+    method: Method,
+    route: String,
+    began: std::time::Instant,
+    reported: bool,
+}
+
+impl RequestGuard {
+    /// `None` unless an observer was set: nothing is timed or copied otherwise.
+    fn begin(method: &Method, path: &str) -> Option<Self> {
+        OBSERVER.get().is_some().then(|| RequestGuard {
+            method: method.clone(),
+            route: path.split('?').next().unwrap_or(path).to_owned(),
+            began: std::time::Instant::now(),
+            reported: false,
+        })
+    }
+
+    fn finish(mut self, outcome: RequestOutcome, status: Option<u16>) {
+        self.reported = true;
+        observe(Observation::Request {
+            method: self.method.as_str(),
+            route: &self.route,
+            outcome,
+            status,
+            took: self.began.elapsed(),
+        });
+    }
+}
+
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        if !self.reported {
+            observe(Observation::Request {
+                method: self.method.as_str(),
+                route: &self.route,
+                outcome: RequestOutcome::Cancelled,
+                status: None,
+                took: self.began.elapsed(),
+            });
+        }
+    }
+}
+
+type ObserverFn = Box<dyn Fn(&Observation<'_>) + Send + Sync>;
+static OBSERVER: std::sync::OnceLock<ObserverFn> = std::sync::OnceLock::new();
+
+/// Report each request and collections frame of this process to `observer`, once; later calls
+/// are ignored. Without it nothing is measured and nothing is allocated.
+pub fn set_observer(observer: impl Fn(&Observation<'_>) + Send + Sync + 'static) {
+    let _ = OBSERVER.set(Box::new(observer));
+}
+
+fn observe(observation: Observation<'_>) {
+    if let Some(observer) = OBSERVER.get() {
+        observer(&observation);
+    }
+}
+
 #[derive(Clone)]
 pub struct Client {
     endpoint: Endpoint,
@@ -256,11 +355,16 @@ pub struct ConversationStream {
     limit: usize,
 }
 
+/// The most first-frame timers one stream keeps: a socket holds eight subscriptions.
+const OBSERVED_SUBSCRIPTIONS: usize = 8;
+
 /// Multiplexed current-collection subscriptions on one connection.
 pub struct CollectionStream {
     socket: TerminalSocket,
     limit: usize,
     heard: Heard,
+    /// When each subscription was asked for, until its first frame; kept only when observed.
+    subscribed: std::collections::HashMap<String, std::time::Instant>,
 }
 
 /// When anything last arrived on a stream, a frame or a WebSocket pong alike. A clone of it
@@ -357,11 +461,32 @@ impl CollectionStream {
     async fn send(&mut self, command: &serde_json::Value) -> Result<(), ClientError> {
         let payload = serde_json::to_string(command)
             .map_err(|error| ClientError::Protocol(error.to_string()))?;
-        match &mut self.socket {
+        let observed_id = (OBSERVER.get().is_some())
+            .then(|| command["id"].as_str().map(str::to_owned))
+            .flatten();
+        let sent = match &mut self.socket {
             TerminalSocket::Unix(socket) => socket.send(WsMessage::Text(payload.into())).await,
             TerminalSocket::Remote(socket) => socket.send(WsMessage::Text(payload.into())).await,
         }
-        .map_err(|error| ClientError::Transport(error.to_string()))
+        .map_err(|error| ClientError::Transport(error.to_string()));
+        // Pending first-frame timers follow the subscriptions: a replacement restarts one, an
+        // unsubscribe or a failed send drops it, and no more are kept than a socket allows.
+        if let Some(id) = observed_id {
+            match (command["kind"].as_str(), &sent) {
+                (Some("subscribe"), Ok(())) => {
+                    if self.subscribed.contains_key(&id)
+                        || self.subscribed.len() < OBSERVED_SUBSCRIPTIONS
+                    {
+                        self.subscribed.insert(id, std::time::Instant::now());
+                    }
+                }
+                (Some("subscribe"), Err(_)) | (Some("unsubscribe"), _) => {
+                    self.subscribed.remove(&id);
+                }
+                _ => {}
+            }
+        }
+        sent
     }
     pub async fn next(&mut self) -> Result<Option<serde_json::Value>, ClientError> {
         let heard = self.heard.clone();
@@ -373,12 +498,31 @@ impl CollectionStream {
                 next_websocket_payload_noting(socket, self.limit, &heard).await?
             }
         };
-        payload
+        let frame = payload
+            .as_ref()
             .map(|bytes| {
-                serde_json::from_slice(&bytes)
+                serde_json::from_slice::<serde_json::Value>(bytes)
                     .map_err(|error| ClientError::Protocol(error.to_string()))
             })
-            .transpose()
+            .transpose()?;
+        if let (Some(frame), Some(bytes)) = (&frame, &payload)
+            && OBSERVER.get().is_some()
+        {
+            let id = frame["id"].as_str().unwrap_or("");
+            let since_subscribe = self.subscribed.remove(id).map(|at| at.elapsed());
+            observe(Observation::Frame {
+                id,
+                kind: frame["kind"].as_str().unwrap_or(""),
+                bytes: bytes.len(),
+                since_subscribe,
+            });
+        }
+        Ok(frame)
+    }
+    /// How many subscriptions are waiting for their first frame to be timed; for tests.
+    #[doc(hidden)]
+    pub fn observed_pending(&self) -> usize {
+        self.subscribed.len()
     }
     /// Where the stream last heard anything: a clone to read while the stream is being waited on.
     pub fn heard(&self) -> Heard {
@@ -2520,6 +2664,23 @@ impl Client {
             .stream)
     }
 
+    /// Open read-only PTY observation directly on an authenticated upgrade, without issuing
+    /// a capability or durable attachment. The caller sends PEEK and renews foreground use
+    /// explicitly with `activity.selected_use()`; normal lease deadlines and revocation apply.
+    pub async fn raw_terminal_peek(
+        &self,
+        terminal_id: &str,
+        runtime_incarnation: &str,
+    ) -> Result<RawTerminalStream, ClientError> {
+        self.open_raw_terminal(
+            terminal_id,
+            runtime_incarnation,
+            RawTerminalMode::Peek,
+            None,
+        )
+        .await
+    }
+
     /// Consume a capability and return unchanged PTY bytes plus explicit selected-use control.
     ///
     /// Renewal is WebSocket text, never injected into the PTY byte stream. There is no
@@ -2529,11 +2690,27 @@ impl Client {
         &self,
         attachment: &RawTerminalAttachment,
     ) -> Result<RawTerminalStream, ClientError> {
+        self.open_raw_terminal(
+            &attachment.terminal_id,
+            &attachment.runtime_incarnation,
+            attachment.mode,
+            Some(&attachment.stream_capability),
+        )
+        .await
+    }
+
+    async fn open_raw_terminal(
+        &self,
+        terminal_id: &str,
+        runtime_incarnation: &str,
+        mode: RawTerminalMode,
+        capability: Option<&str>,
+    ) -> Result<RawTerminalStream, ClientError> {
         let path = format!(
             "/v1/client/terminals/{}/raw-stream?incarnation={}&mode={}",
-            percent_encode_segment(attachment.terminal_id.trim_start_matches("terminal/")),
-            percent_encode(&attachment.runtime_incarnation),
-            attachment.mode.as_str(),
+            percent_encode_segment(terminal_id.trim_start_matches("terminal/")),
+            percent_encode(runtime_incarnation),
+            mode.as_str(),
         );
         let request_for = |base: &str| -> Result<Request<()>, ClientError> {
             let mut request = websocket_request(
@@ -2542,13 +2719,14 @@ impl Client {
                 self.local_person.as_deref(),
                 None,
             )?;
+            let protocols = capability.map_or_else(
+                || RAW_TERMINAL_SUBPROTOCOL.to_owned(),
+                |capability| format!("{RAW_TERMINAL_SUBPROTOCOL}, st3.cap.{capability}"),
+            );
             request.headers_mut().insert(
                 hyper::header::SEC_WEBSOCKET_PROTOCOL,
-                hyper::header::HeaderValue::from_str(&format!(
-                    "{RAW_TERMINAL_SUBPROTOCOL}, st3.cap.{}",
-                    attachment.stream_capability
-                ))
-                .map_err(|error| ClientError::Protocol(error.to_string()))?,
+                hyper::header::HeaderValue::from_str(&protocols)
+                    .map_err(|error| ClientError::Protocol(error.to_string()))?,
             );
             Ok(request)
         };
@@ -2580,7 +2758,7 @@ impl Client {
                 })?
                 .map_err(|error| ClientError::Transport(error.to_string()))?;
                 validate_raw_terminal_subprotocol(&response)?;
-                raw_terminal_connector(websocket, attachment.mode == RawTerminalMode::Peek)
+                raw_terminal_connector(websocket, mode == RawTerminalMode::Peek)
             }
             Endpoint::FabricLoopback(base) => {
                 let websocket_base = if let Some(base) = base.strip_prefix("https://") {
@@ -2602,7 +2780,7 @@ impl Client {
                 })?
                 .map_err(|error| ClientError::Transport(error.to_string()))?;
                 validate_raw_terminal_subprotocol(&response)?;
-                raw_terminal_connector(websocket, attachment.mode == RawTerminalMode::Peek)
+                raw_terminal_connector(websocket, mode == RawTerminalMode::Peek)
             }
         }
     }
@@ -2752,6 +2930,7 @@ impl Client {
             socket,
             limit: self.response_limit(),
             heard,
+            subscribed: std::collections::HashMap::new(),
         })
     }
 
@@ -2954,6 +3133,8 @@ impl Client {
         content_type: &str,
     ) -> Result<T, ClientError> {
         let limit = self.response_limit();
+        // Measured only when someone asked: no timer and no copy otherwise.
+        let guard = RequestGuard::begin(&method, path);
         let request = async {
             match &self.endpoint {
                 Endpoint::Unix(socket) => {
@@ -3008,9 +3189,18 @@ impl Client {
                 }
             }
         };
-        let (status, bytes) = tokio::time::timeout(REQUEST_DEADLINE, request)
-            .await
-            .map_err(|_| ClientError::Transport("client-v0 request deadline exceeded".into()))??;
+        let outcome = tokio::time::timeout(REQUEST_DEADLINE, request).await;
+        if let Some(guard) = guard {
+            match &outcome {
+                Ok(Ok((status, _))) => guard.finish(RequestOutcome::Completed, Some(*status)),
+                Ok(Err(_)) => guard.finish(RequestOutcome::Failed, None),
+                Err(_) => guard.finish(RequestOutcome::TransportTimeout, None),
+            }
+        }
+        let outcome = outcome
+            .map_err(|_| ClientError::Transport("client-v0 request deadline exceeded".into()))
+            .and_then(|result| result);
+        let (status, bytes) = outcome?;
         if !(200..300).contains(&status) {
             if status == 404 && bytes.is_empty() && path.starts_with("/v1/client/launches/") {
                 let error = ErrorEnvelope {
@@ -4097,5 +4287,17 @@ mod device_stream_policy_tests {
                 assert!(!error.contains("stream-bearer-never-sent"));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod observer_tests {
+    use super::*;
+
+    // This test binary never sets an observer, so it sees the disabled path.
+    #[test]
+    fn without_an_observer_a_request_keeps_no_timing_state() {
+        assert!(OBSERVER.get().is_none());
+        assert!(RequestGuard::begin(&Method::GET, "/v1/client/usage?since_ms=1").is_none());
     }
 }

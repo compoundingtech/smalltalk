@@ -133,3 +133,7 @@ retention and commit-inclusive writer cost are not bounded by the correctness re
 Integrators must measure relevant unchanged-answer history growth, genuine fanout, SQL/VM
 work, retained bytes and writer wait/hold before activating a reader. Each reader migration
 is a separate PR; this crate addition does not activate one.
+
+The opt-in [read-after-write API](IVM_AFTER_WRITE.md) returns database-bound receipts and waits reactively for certified source processing plus view readiness.
+
+[Explicit asynchronous catch-up](IVM_ASYNCHRONOUS.md) captures admitted claims transactionally and processes bounded pages on an owner-scheduled worker, with certified prefix/readiness evidence. It does not convert existing stores or migrate production readers.

@@ -142,8 +142,47 @@ every subject's status read into a scan of its historical JSON bodies. The opera
 TEXT affinity is removed in that join so SQLite can seek the JSON-expression index.
 
 The agent-card cache holds its mutex only while selecting or publishing immutable cached
-rows, not while building cards. A request's SQLite snapshot therefore does not wait at that
-mutex behind another request's disk reads.
+rows, not while building cards. HTTP agent pages and WS roster windows share one asynchronous
+admission per store, acquired before opening SQLite snapshots. Followers therefore pin no old
+WAL read mark while another reader builds the projection. The worker retains admission through
+completion even if its caller disconnects.
+
+Eight immutable graph-index/local-frontier/history cuts are retained. HTTP pages lazily fill missing subjects into
+the same projection used by the complete WS roster, without reducing unrelated cards. Local
+agent observations update only affected cards; daemon diagnostics reuse rows; other claims
+conservatively invalidate the projection. Authorization is checked before reuse, and local
+delivery presence stays a per-read overlay rather than graph-cached authority.
+Shared cards are built only from current, independently time-fenced queue metadata. A
+pagination continuation applies its frozen ordering/host/queue refs to the response clone
+after reading the shared cards; frozen pagination cuts must never seed the shared projection.
+The shallow HTTP membership/order/queue refs have the same bounded graph-cut retention.
+Warm pages reuse those refs rather than scanning all fleet work. An explicit allow-list of
+existing-agent harness observations and daemon diagnostics leaves them valid; every other
+claim rebuilds them. Runtime status can move an undeclared or stopped agent into history,
+so even an existing agent's `runtime.observed` rebuilds shallow refs.
+Both shallow refs and the full-card projection also expire at the earliest current-generation
+work-lease deadline. Expired work becomes ready (or disappears from a revision-draining queue)
+without a new claim; an expired entry must rebuild, not advance incrementally from stale queues.
+The deadline scan runs only on full rebuilds and reads unfinished steps; safe card-local
+advances carry the prior deadline forward. Warm hits add no SQL. The outer shared agents
+WS window inherits the same fence, so it cannot hide an expired full-card projection.
+HTTP reads see expiry immediately; live WS subscribers see the transition on the next
+existing 30-second authority/freshness tick. That existing live-stream bound is unchanged.
+
+The local-observation frontier is read by an indexed seek inside the same SQLite snapshot.
+A same-index local transcript append updates the affected card's `last_activity_at` for both
+HTTP and WS; ignoring local rows here would make a shared warm roster instant but stale.
+
+The performance report exposes each roster stage under bounded task labels:
+`roster/admission-wait` (waiting for the shared admission or an in-flight build),
+`roster/frontier-read`, `roster/cache-hit`, `roster/build` (incremental advance or cold build),
+`roster/card-projection` (refolding changed cards) and `agent_work_queues`.
+
+The focused 70-agent, 20-session fixture reports card-status, usage, repeated-projection and
+incremental-update costs with `cargo test -p st3 --lib agent_roster_snapshot_fixture_timing --
+--ignored --nocapture`. It is a serial fixture micro-measure, not a load benchmark. CI's
+`perf-load` workload holds concurrent agents WS subscribers and measures first-snapshot
+latency against the roster's 300 ms budget.
 
 Every five seconds a dedicated native thread attempts a passive WAL checkpoint outside the
 writer queue. Once every frame is backfilled, it attempts `TRUNCATE` with zero busy timeout.

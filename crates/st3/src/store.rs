@@ -11,8 +11,11 @@ pub mod owned_sets;
 #[cfg(test)]
 mod owned_sets_tests;
 mod resources;
+mod github_workflow_failures;
+pub(crate) mod message_subscriptions;
 mod rollouts;
 mod seat_status;
+pub(crate) mod step_labels;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 #[cfg(test)]
@@ -101,6 +104,7 @@ mod checkpoint_rules;
 pub(crate) mod delegation;
 mod limits;
 mod person_work;
+pub(crate) mod work_summaries_ivm;
 mod subagents;
 mod watches;
 pub use checkpoint_rules::{RULES_VERSION, plan_drops, rules_digest};
@@ -302,6 +306,17 @@ ON claims(
 )
 WHERE json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
     THEN '$.incarnation_id' ELSE '$.fields.incarnation_id' END) IS NOT NULL;
+
+-- A legacy observation without a text incarnation remains eligible for the current
+-- runtime's optional-field fold. Keep those rare rows separate: checking their JSON
+-- predicate against every named heartbeat made attached agent windows scan whole epochs.
+CREATE INDEX IF NOT EXISTS claims_harness_unnamed_accepted_index
+ON claims(subject, length(accepted_at_unix_ms), accepted_at_unix_ms)
+WHERE kind='harness.observed'
+    AND (json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
+        THEN '$.incarnation_id' ELSE '$.fields.incarnation_id' END) IS NULL
+        OR typeof(json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
+            THEN '$.incarnation_id' ELSE '$.fields.incarnation_id' END))!='text');
 
 -- Attachment checks must not walk a quiet seat's accumulated hook and work history.
 -- Only phase transitions publish these diagnostics, so a current-runtime lookup stays small.
@@ -1048,7 +1063,6 @@ enum SubjectStatusMode {
     /// conflicts. Provenance is only the last canonical claim, and only without a declaration.
     AgentCard,
 }
-
 /// One subject's status at `at_index`, and the action it asks of its host when it is current and
 /// differs from what is declared. With `owner_filter`, a subject another run owns is skipped.
 fn subject_status_at(
@@ -2652,6 +2666,31 @@ impl Store {
         Ok(Some(subjects))
     }
 
+    /// An allow-list for shallow refs, narrower than card-local invalidation: runtime status
+    /// can move an undeclared or stopped agent into history, so runtime.observed is not safe.
+    fn agent_page_refs_unchanged(&self, after: u64, through: u64, refs: &[Value]) -> Result<bool> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare_cached(
+            "SELECT subject, kind FROM claims WHERE store_index>?1 AND store_index<=?2",
+        )?;
+        for row in statement.query_map(params![after, through], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })? {
+            let (subject, kind) = row?;
+            let unchanged = match kind.as_str() {
+                "daemon.diagnostic" => true,
+                "harness.observed" | "harness.diagnostic" | "harness.timeline"
+                    | "harness.todo.observed" | "harness.session-file" | "harness.usage" => {
+                    subject.starts_with("agent/")
+                        && refs.iter().any(|item| item["id"].as_str() == Some(subject.as_str()))
+                }
+                _ => false,
+            };
+            if !unchanged { return Ok(false); }
+        }
+        Ok(true)
+    }
+
     /// The last claim that can change an agent's status: one about an agent, or about the run
     /// or generation that owns it, whose row decides the agent's projection layer. Steps,
     /// gates, subscriptions and diagnostics commit far more often and change no agent status.
@@ -2667,79 +2706,224 @@ impl Store {
             .unwrap_or_default())
     }
 
-    /// Keep bounded immutable snapshots. Advance the nearest older snapshot by rebuilding
-    /// only cards whose local observations changed; historical reads never advance backwards.
+    /// One physical roster reader across HTTP pages and differently authorized WS windows.
+    /// Waiting happens before SQLite snapshot acquisition, so followers pin no old WAL mark.
+    pub(crate) async fn admit_agent_resources(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        let started = std::time::Instant::now();
+        let guard = self.smalltalk.agent_resources_admission.clone().lock_owned().await;
+        // Waiting here is waiting for the shared admission or for another reader's in-flight
+        // build; the holder keeps the admission until its projection is published.
+        crate::performance::record_request("roster/admission-wait", None, started.elapsed());
+        guard
+    }
+
+    #[cfg(test)]
+    pub(crate) fn agent_resources_builds_for_test(&self) -> usize {
+        self.smalltalk.agent_resources_builds.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub(crate) fn cached_agent_resources(
         &self,
         index: u64,
         history: bool,
         build: impl FnOnce(Option<(&BTreeSet<String>, &[Value])>) -> Result<Vec<Value>>,
     ) -> Result<Vec<Value>> {
-        let cache = self
-            .smalltalk
-            .agent_resources_cache
-            .lock()
-            .expect("agent resources cache poisoned");
-        if let Some(items) = cache
-            .iter()
-            .find(|(at, all, _)| *at == index && *all == history)
-            .map(|(_, _, items)| Arc::clone(items))
-        {
+        self.cached_agent_resources_for(index, history, None, build)
+    }
+
+    /// The complete agents WS window inherits the queue deadline from its shared projection.
+    pub(crate) fn agent_roster_valid_until(&self, index: u64) -> Option<u128> {
+        self.smalltalk.agent_resources_cache.lock()
+            .expect("agent resources cache poisoned").iter().rev()
+            .find(|entry| entry.index == index && !entry.history && entry.covered.is_none())
+            .and_then(|entry| entry.valid_until_unix_ms)
+    }
+
+    /// Queue selection changes at lease expiry even when the claim frontier is unchanged.
+    /// Scan only on a cache miss, inside the same SQLite snapshot as the queue projection.
+    fn agent_queue_valid_until(&self, now: u128) -> Result<Option<u128>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare_cached(
+            "SELECT lease_expires_at_unix_ms FROM step_runs
+             WHERE agentless=0 AND status IN ('claimed','working','verifying')
+               AND status NOT IN ('completed','failed','cancelled')
+               AND lease_expires_at_unix_ms IS NOT NULL
+               AND generation_id=(SELECT current_generation_id FROM mission_runs WHERE id=step_runs.run_id)",
+        )?;
+        let mut deadline = None;
+        for row in statement.query_map([], |row| row.get::<_, String>(0))? {
+            if let Some(expiry) = row?.parse::<u128>().ok().filter(|expiry| *expiry > now) {
+                deadline = Some(deadline.map_or(expiry, |previous: u128| previous.min(expiry)));
+            }
+        }
+        Ok(deadline)
+    }
+
+    /// Membership/order/queue refs contain no local timeline data. Reuse them for unchanged
+    /// graph cuts and agent-only observations, so a warm HTTP page does not scan fleet work.
+    pub(crate) fn cached_agent_page_refs(
+        &self,
+        index: u64,
+        history: bool,
+        build: impl FnOnce() -> Result<Vec<Value>>,
+    ) -> Result<Vec<Value>> {
+        let now = now_ms();
+        let valid = |entry: &&runtime::AgentResourcesEntry| {
+            entry.valid_until_unix_ms.is_none_or(|expiry| now < expiry)
+        };
+        let cache = self.smalltalk.agent_page_refs_cache.lock()
+            .expect("agent page refs cache poisoned");
+        if let Some(entry) = cache.iter().filter(valid).find(|entry| entry.index == index && entry.history == history) {
+            let items = Arc::clone(&entry.items);
             drop(cache);
             return Ok((*items).clone());
         }
-        let previous = cache
-            .iter()
-            .filter(|(at, all, _)| *at < index && *all == history)
-            .max_by_key(|(at, _, _)| *at)
-            .map(|(at, _, items)| (*at, Arc::clone(items)));
-        // A caller already holds a SQLite snapshot. Waiting behind another card build here
-        // pins that old WAL read mark for the whole build, starving checkpoints.
+        let previous = cache.iter().filter(valid).filter(|entry| entry.index < index && entry.history == history)
+            .max_by_key(|entry| entry.index).cloned();
         drop(cache);
-        let items = if let Some((at, previous)) = previous {
-            match self.changed_agent_resources(at, index)? {
-                Some(changed) if changed.is_empty() => (*previous).clone(),
-                Some(changed) => {
-                    let fresh = build(Some((&changed, &previous)))?;
-                    let mut items = previous
-                        .iter()
-                        .filter(|item| !changed.contains(item["id"].as_str().unwrap_or_default()))
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    items.extend(fresh);
-                    items.sort_by(|a, b| {
-                        a["name"]
-                            .as_str()
-                            .cmp(&b["name"].as_str())
-                            .then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
-                    });
-                    items
-                }
-                None => build(None)?,
+        let (items, valid_until_unix_ms) = match previous {
+            Some(previous) if self.agent_page_refs_unchanged(previous.index, index, &previous.items)? => {
+                (previous.items, previous.valid_until_unix_ms)
             }
-        } else {
-            build(None)?
+            _ => (Arc::new(build()?), self.agent_queue_valid_until(now)?),
         };
-        let mut cache = self
-            .smalltalk
-            .agent_resources_cache
-            .lock()
-            .expect("agent resources cache poisoned");
-        let (items, evicted) = if let Some((_, _, published)) = cache
-            .iter()
-            .find(|(at, all, _)| *at == index && *all == history)
-        {
-            // Concurrent builds still return one immutable result for this snapshot.
-            (Arc::clone(published), None)
-        } else {
-            let items = Arc::new(items);
-            cache.push_back((index, history, Arc::clone(&items)));
-            let evicted = if cache.len() > 8 { cache.pop_front() } else { None };
-            (items, evicted)
-        };
+        let mut cache = self.smalltalk.agent_page_refs_cache.lock()
+            .expect("agent page refs cache poisoned");
+        cache.push_back(runtime::AgentResourcesEntry {
+            index, local: 0, history, covered: None, valid_until_unix_ms, items: Arc::clone(&items),
+        });
+        let evicted = if cache.len() > 8 { cache.pop_front() } else { None };
         drop(cache);
         drop(evicted);
         Ok((*items).clone())
+    }
+
+    /// Bounded immutable projections shared by pages and streams. Pages fill only missing
+    /// subjects; a complete stream projection subsumes them. Local observations advance only
+    /// affected cards, and historical cuts never borrow newer rows.
+    pub(crate) fn cached_agent_resources_for(
+        &self,
+        index: u64,
+        history: bool,
+        selected: Option<&BTreeSet<String>>,
+        build: impl FnOnce(Option<(&BTreeSet<String>, &[Value])>) -> Result<Vec<Value>>,
+    ) -> Result<Vec<Value>> {
+        let now = now_ms();
+        let valid = |entry: &&runtime::AgentResourcesEntry| {
+            entry.valid_until_unix_ms.is_none_or(|expiry| now < expiry)
+        };
+        // Local timeline rows do not advance the graph index, but do change last_activity.
+        // Read their frontier inside the caller's SQLite snapshot, never from a future atomic
+        // generation that could race this cut. The ordinary warm read is one primary-key seek.
+        let local = crate::performance::task("roster/frontier-read", || -> Result<u64> {
+            let connection = self.readers.get();
+            let local = connection.query_row(
+                "SELECT COALESCE((SELECT id FROM local_observations WHERE after_store_index<=?1
+                 ORDER BY id DESC LIMIT 1), 0)", [index], |row| row.get::<_, u64>(0),
+            )?;
+            drop(connection);
+            Ok(local)
+        })?;
+        let select = |items: &[Value]| items.iter().filter(|item| {
+            selected.is_none_or(|names| names.contains(item["id"].as_str().unwrap_or_default()))
+        }).cloned().collect::<Vec<_>>();
+        let cache = self.smalltalk.agent_resources_cache.lock()
+            .expect("agent resources cache poisoned");
+        let satisfies = |entry: &runtime::AgentResourcesEntry| {
+            entry.covered.as_ref().is_none_or(|covered| {
+                selected.is_some_and(|names| names.is_subset(covered))
+            })
+        };
+        if let Some(entry) = cache.iter().filter(valid).find(|entry| {
+            entry.index == index && entry.local == local && entry.history == history && satisfies(entry)
+        }) {
+            let items = Arc::clone(&entry.items);
+            drop(cache);
+            return crate::performance::task("roster/cache-hit", || Ok(select(&items)));
+        }
+        let previous = cache.iter().filter(valid)
+            .filter(|entry| entry.index <= index && entry.local <= local && entry.history == history)
+            .max_by_key(|entry| (entry.index, entry.local)).cloned();
+        drop(cache);
+        let entry = crate::performance::task("roster/build",
+        || -> Result<runtime::AgentResourcesEntry> {
+        let previous = match previous {
+            Some(entry) if entry.index == index => Some((entry, BTreeSet::new())),
+            Some(entry) => self.changed_agent_resources(entry.index, index)?
+                .map(|changed| (entry, changed)),
+            None => None,
+        };
+        let (mut items, covered, valid_until_unix_ms) = match previous {
+            Some((previous, mut changed)) => {
+                if previous.local != local {
+                    let connection = self.readers.get();
+                    let mut statement = connection.prepare_cached(
+                        "SELECT DISTINCT subject FROM local_observations WHERE id>?1 AND id<=?2
+                         AND after_store_index<=?3 AND kind='harness.timeline' AND subject LIKE 'agent/%'",
+                    )?;
+                    changed.extend(statement.query_map(params![previous.local, local, index],
+                        |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<BTreeSet<_>>>()?);
+                }
+                let covered = match (&previous.covered, selected) {
+                    (None, _) => None,
+                    (Some(covered), Some(names)) => {
+                        changed.retain(|name| covered.contains(name));
+                        changed.extend(names.difference(covered).cloned());
+                        Some(covered.union(names).cloned().collect())
+                    }
+                    (Some(covered), None) => {
+                        let connection = self.readers.get();
+                        let names = connection.prepare_cached(RANGE_SUBJECTS)?
+                            .query_map(params![index, "agent/", "agent0"], |row| row.get::<_, String>(0))?
+                            .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+                        let names = if history { names } else {
+                            self.current_view_candidates(&connection, names, index, true)?
+                        };
+                        changed.extend(names.difference(covered).cloned());
+                        None
+                    }
+                };
+                let mut items = previous.items.iter()
+                    .filter(|item| !changed.contains(item["id"].as_str().unwrap_or_default()))
+                    .cloned().collect::<Vec<_>>();
+                if !changed.is_empty() {
+                    #[cfg(test)]
+                    self.smalltalk.agent_resources_builds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    items.extend(crate::performance::task("roster/card-projection",
+                        || build(Some((&changed, &previous.items))))?);
+                }
+                (items, covered, previous.valid_until_unix_ms)
+            }
+            _ => {
+                #[cfg(test)]
+                self.smalltalk.agent_resources_builds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                (crate::performance::task("roster/card-projection",
+                    || build(selected.map(|names| (names, &[][..]))))?, selected.cloned(),
+                    self.agent_queue_valid_until(now)?)
+            }
+        };
+        items.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str())
+            .then_with(|| a["id"].as_str().cmp(&b["id"].as_str())));
+        Ok(runtime::AgentResourcesEntry {
+            index, local, history, covered, valid_until_unix_ms, items: Arc::new(items),
+        })
+        })?;
+        let mut cache = self.smalltalk.agent_resources_cache.lock()
+            .expect("agent resources cache poisoned");
+        // All endpoint callers hold admission. Direct internal readers may still race; never
+        // replace a complete published projection with a partial one.
+        let published = cache.iter().filter(valid).find(|entry| {
+            entry.index == index && entry.local == local && entry.history == history && satisfies(entry)
+        }).map(|entry| Arc::clone(&entry.items));
+        let items = if let Some(published) = published { published } else {
+            cache.retain(|entry| entry.index != index || entry.local != local || entry.history != history);
+            let items = Arc::clone(&entry.items);
+            cache.push_back(entry);
+            if cache.len() > 8 { cache.pop_front(); }
+            items
+        };
+        drop(cache);
+        Ok(select(&items))
     }
 
     /// Rebuild the operation projection when it no longer matches the claim log, and say
@@ -2954,43 +3138,7 @@ impl Store {
             return Ok(BTreeMap::new());
         }
         let connection = self.readers.get();
-        let mut statement = connection.prepare(
-            "SELECT s.subject, s.run_id, r.mission_id, s.step_path, s.title, s.goals, s.status,
-                    s.updated_at_unix_ms
-             FROM step_runs s
-             JOIN mission_runs r ON r.id=s.run_id
-             WHERE s.subject IN (SELECT value FROM json_each(?1))",
-        )?;
-        statement
-            .query_map([serde_json::to_string(subjects)?], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, String>(7)?,
-                ))
-            })?
-            .map(|row| {
-                let (subject, run, mission, path, title, goals, status, updated_at) = row?;
-                let goals: Vec<String> = serde_json::from_str(&goals)?;
-                Ok((
-                    subject,
-                    StepLabel {
-                        run: format!("mission-run/{run}"),
-                        mission: format!("mission/{mission}"),
-                        path,
-                        title,
-                        goal: goals.into_iter().next(),
-                        status,
-                        updated_at_unix_ms: updated_at.parse()?,
-                    },
-                ))
-            })
-            .collect()
+        step_labels::read(&connection, subjects)
     }
 
     /// The mission behind each of these runs, in one read.
@@ -6411,6 +6559,7 @@ impl Store {
     /// One current-step scan for the whole roster. This avoids replaying wake
     /// history or querying the step table separately for every agent card.
     pub fn agent_work_queues(&self) -> Result<BTreeMap<String, AgentWorkQueue>> {
+        crate::performance::task("agent_work_queues", || -> Result<BTreeMap<String, AgentWorkQueue>> {
         let connection = self.readers.get();
         let orders = seat_run_orders_tx(&connection, None)?;
         let rows = seat_step_rows_tx(&connection, None)?;
@@ -6454,6 +6603,7 @@ impl Store {
             );
         }
         Ok(queues)
+        })
     }
 
     /// The live mission runs queued for every seat, in seat-queue order.
@@ -7853,6 +8003,9 @@ impl Store {
         let mut actions = Vec::new();
         let mut blockers = Vec::new();
         let mut warnings = Vec::new();
+        if let Err(error) = message_subscriptions::validate(&connection, intent, store_index) {
+            blockers.push(format!("{}: {}", error.code, error.message));
+        }
         if let Err(error) = crate::provenance::validate_publication(&connection, intent) {
             blockers.push(format!("{}: {}", error.code, error.message));
         }
@@ -8393,6 +8546,7 @@ impl Store {
     ) -> Result<ApplyResponse, St3Error> {
         self.connection
             .batched(|transaction| -> Result<ApplyResponse, St3Error> {
+                message_subscriptions::validate_publisher(transaction, intent, actor)?;
                 if let Some(options) = owned {
                     let digest = canonical_hash(&(intent, options, actor)).map_err(internal)?;
                     let cache_key = opaque_cache_key(&format!("owned-set-request:{idempotency_key}"));
@@ -8408,6 +8562,7 @@ impl Store {
                         serde_json::from_str(&response).map_err(internal)?,local_receipt,idempotency_key);
                 }
                 crate::provenance::validate_publication(transaction, intent)?;
+                message_subscriptions::validate(transaction, intent, current_index_tx(transaction).map_err(internal)?)?;
                 let owned_plan = owned.map(|options| owned_sets::plan_tx(transaction, intent, options)).transpose()?;
                 let mut one_shot_sets = BTreeMap::new();
                 if let (Some(plan), Some(options)) = (&owned_plan, owned) {
@@ -8433,6 +8588,20 @@ impl Store {
                 }
                 let intent = owned_plan.as_ref().map_or(intent, |p| &p.intent);
                 let expected = owned_plan.as_ref().map_or(expected, |p| &p.preview.expected_subjects);
+                for desired in intent.subjects.values() {
+                    crate::terminal_binding::validate_declaration(desired, actor)?;
+                    if let Some(binding) = desired.member.as_ref().and_then(|m| m.terminal_binding.as_ref()) {
+                        let terminal = current_desired_row_tx(transaction, &binding.subject).map_err(internal)?
+                            .filter(|row| row.kind == "pty")
+                            .and_then(|row| row.member)
+                            .and_then(|member| serde_json::from_str::<crate::model::MemberSpec>(&member).ok())
+                            .ok_or_else(|| St3Error::new("invalid-terminal-binding", "the terminal must already be declared"))?;
+                        let member = desired.member.as_ref().expect("binding member");
+                        if terminal.host != member.host || terminal.runtime_id != member.runtime_id {
+                            return Err(St3Error::new("invalid-terminal-binding", "the bound seat must use its terminal's host and runtime"));
+                        }
+                    }
+                }
                 validate_documents(transaction, &intent.document_refs)?;
                 for desired in intent
                     .subjects
@@ -10000,6 +10169,7 @@ impl Store {
     /// The fields used by live terminal fences, with the same authority decisions as `status`.
     pub(crate) fn runtime_authority(&self, subject: &str) -> Result<Option<RuntimeAuthority>> {
         smallclaims::touched::note_read(|| subject.to_owned());
+
         let connection = self.readers.get();
         // Eligibility, inherited fields and unknown claims must share one snapshot: a rival
         // arriving between SELECTs must not be paired with the earlier single origin.
@@ -10934,6 +11104,7 @@ impl Store {
         desired.set_display_name(name)?;
         let normalized = json!({ "agent": subject, "display_name": name });
         let intent = NormalizedIntent {
+            direct_message_registrations: BTreeSet::new(),
             schema: "st3.v1".into(),
             source_hash: canonical_hash(&normalized).map_err(internal)?,
             subjects: BTreeMap::from([(subject.to_owned(), desired)]),
@@ -11119,6 +11290,7 @@ impl Store {
         };
         let normalized = json!({ "agent": subject, "start": ended.token });
         let intent = NormalizedIntent {
+            direct_message_registrations: BTreeSet::new(),
             schema: "st3.v1".into(),
             source_hash: canonical_hash(&normalized).map_err(internal)?,
             subjects: BTreeMap::from([(subject.to_owned(), declaration)]),
@@ -13383,6 +13555,37 @@ impl Store {
                     }
                 }
                 let mut message_subjects = Vec::new();
+                // Workflow failure deliveries share this observation transaction. Their keys
+                // survive observer/subscription replacement and checkpointing as resources.
+                if let Some(failures) = current_object
+                    .get(crate::resource::github_workflows::PERFORMANCE_FAILURES_FIELD)
+                    .and_then(Value::as_array)
+                {
+                    let workflow_baseline = previous_object.is_none_or(|previous| {
+                        !previous.contains_key(crate::resource::github_workflows::PERFORMANCE_FAILURES_FIELD)
+                    });
+                    for (subject, subscription) in &active_subscriptions {
+                        if subscription.delivery != "message"
+                            || subscription.batch_every_ms.is_some()
+                            || subscription.watch.is_some()
+                            || !subscription.fields.iter().any(|field| field == crate::resource::github_workflows::PERFORMANCE_FAILURES_FIELD)
+                            || subscription.condition.as_ref().is_some_and(|condition| {
+                                !subscription_condition_matches(condition, &repository_facts)
+                            })
+                        {
+                            continue;
+                        }
+                        if !workflow_baseline && !available_subscriptions.contains(subject) {
+                            continue;
+                        }
+                        message_subjects.extend(github_workflow_failures::deliver_tx(
+                            transaction, &self.origin, &batch_id, observer, resource,
+                            subject, &subscription.to,
+                            current_object.get("repository_id").unwrap_or(&Value::Null),
+                            failures, workflow_baseline,
+                        )?);
+                    }
+                }
                 // Each watch on an item this observation changed hears the comments and reviews it
                 // did not know, a move of the required checks into pass or fail, and the close
                 // that ends it, each as one wake. The baseline tells no watch anything.
@@ -13503,6 +13706,7 @@ impl Store {
                         }
                         let selected = changed_fields
                             .iter()
+                            .filter(|field| field.as_str() != crate::resource::github_workflows::PERFORMANCE_FAILURES_FIELD)
                             .filter(|field| subscription.fields.contains(field))
                             .cloned()
                             .collect::<Vec<_>>();
@@ -19791,6 +19995,7 @@ pub(crate) fn append_claim_tx(
     if matches!(kind, "intent.desired" | "mission.published") {
         owned_sets::refuse_unmanaged(transaction, subject).map_err(anyhow::Error::new)?;
     }
+    crate::terminal_binding::validate_claim(kind, body, actor).map_err(anyhow::Error::new)?;
     st3_schema::owned_terminals::validate_declaration_owner(subject, kind, actor)
         .map_err(anyhow::Error::new)?;
     st3_schema::glasses::validate_owner(subject, actor).map_err(anyhow::Error::new)?;
@@ -20526,7 +20731,7 @@ fn harness_observations_of_incarnation_query() -> String {
 fn harness_observations_without_incarnation_query() -> String {
     format!(
         "SELECT claims.id, claims.body, claims.accepted_at_unix_ms
-         FROM claims INDEXED BY claims_subject_kind_accepted_index
+         FROM claims INDEXED BY claims_harness_unnamed_accepted_index
          JOIN batches ON batches.id=claims.batch_id
          WHERE claims.subject=?1 AND claims.kind='harness.observed' AND +claims.store_index<=?2
            AND (length(claims.accepted_at_unix_ms)>length(?3)
@@ -25686,6 +25891,7 @@ fn classify_replicated_claim_with_registry(
             ),
         ));
     }
+    crate::terminal_binding::validate_claim(&claim.kind, &claim.body, claim.actor.as_deref())?;
     if claim.kind == "owned-set.revised" { owned_sets::validate_receipt(&claim.subject, &claim.body)?; }
     st3_schema::owned_terminals::validate_declaration_owner(
         &claim.subject,
@@ -25706,6 +25912,48 @@ fn classify_replicated_claim_with_registry(
         ));
     }
     Ok(ReplicatedClaimAdmission::Valid)
+}
+
+#[cfg(test)]
+#[test]
+fn terminal_binding_replica_admission_rejects_a_foreign_actor() {
+    let store = Store::open_memory("orchid").unwrap();
+    for (key, source) in [
+        (
+            "terminal",
+            "version 2\nterminal \"person/avery/019a0000-0000-7000-8000-000000000001\" { command \"shell\"; restart \"never\"; }",
+        ),
+        (
+            "binding",
+            "version 2\nagent \"example/bound\" { harness \"claude\" {}; bind-terminal \"pty/person/avery/019a0000-0000-7000-8000-000000000001\" incarnation=\"shell:created\" id=\"019a0000-0000-7000-8000-000000000002\"; }",
+        ),
+    ] {
+        let intent = crate::parse_intent(source, "orchid").unwrap();
+        let expected = intent
+            .subjects
+            .keys()
+            .map(|subject| (subject.clone(), Vec::new()))
+            .collect();
+        store
+            .apply_as(&intent, &expected, key, Some("person/avery"))
+            .unwrap();
+    }
+    let mut claim = store
+        .latest_claim("agent/example/bound", Some("intent.desired"))
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        classify_replicated_claim_with_registry(&claim, st3_schema::registry()),
+        Ok(ReplicatedClaimAdmission::Valid)
+    ));
+    claim.actor = Some("person/intruder".into());
+    assert_eq!(
+        classify_replicated_claim_with_registry(&claim, st3_schema::registry())
+            .err()
+            .unwrap()
+            .code,
+        "terminal-owner-forbidden"
+    );
 }
 
 /// Reapply this host's lease renewals that have not replicated yet after a projection replay,
@@ -26262,7 +26510,7 @@ fn rebuild_base_aggregate_tx(
 /// Identify the claim being processed, without copying its fields, payload or authority data.
 fn incremental_claim_error(error: St3Error, claim: &ClaimRecord, stage: &'static str) -> St3Error {
     let operation = operation_parts(&claim.body).map(|(operation, _)| operation);
-    let truncated = [&claim.id, &claim.subject]
+    let truncated = [&claim.id, &claim.subject, &claim.kind]
         .into_iter()
         .any(|value| value.chars().take(257).count() > 256)
         || operation.is_some_and(|value| value.chars().take(257).count() > 256);
@@ -26271,6 +26519,7 @@ fn incremental_claim_error(error: St3Error, claim: &ClaimRecord, stage: &'static
         .with_detail("projection_stage", stage)
         .with_detail("projection_claim_id", bounded(&claim.id))
         .with_detail("projection_subject", bounded(&claim.subject))
+        .with_detail("projection_claim_kind", bounded(&claim.kind))
         .with_detail("projection_context_truncated", truncated);
     match operation {
         Some(operation) => error.with_detail("projection_operation_id", bounded(operation)),
@@ -26412,11 +26661,10 @@ fn try_project_simple_replication_tx(
     }
     for claim in &claims {
         let has_operation = claim.body.get("_operation").is_some();
-        // Local response associations identify the work claim already applied by its writer;
-        // they are not compound publication operations that need canonical replay selection.
-        // Malformed metadata and non-cache work operations still take their existing guards.
-        let work_publication_operation = claim.kind.starts_with("work.")
-            && operation_parts(&claim.body).is_some_and(|(id, _)| !id.starts_with("cache/"));
+        // Supported work transitions already share canonical ordering and affected-tree
+        // repair with replay. An operation identity alone changes neither the work fields
+        // nor that ordering. Validate its shape here and its digest/state in the registry
+        // below; do not force a full-store replay based on the identity's prefix.
         if claim.kind.starts_with("planning-session.") {
             rebuild_planning = true;
         }
@@ -26443,19 +26691,22 @@ fn try_project_simple_replication_tx(
                     | "step-run.state"
                     | "step-run.retried"
             )
-            || (has_operation
-                && (work_publication_operation || operation_parts(&claim.body).is_none()))
+            || (has_operation && operation_parts(&claim.body).is_none())
         {
-            let reason = if !Store::simple_replication_kind(&claim.kind) && !has_operation {
-                "non-incremental-kind"
-            } else if work_publication_operation {
-                "work-operation"
-            } else if operation_parts(&claim.body).is_none() && has_operation {
+            let reason = if operation_parts(&claim.body).is_none() && has_operation {
                 "malformed-operation"
             } else {
                 "non-incremental-kind"
             };
-            return Ok(replay_needed(reason));
+            crate::profile::note(&format!("replay: {reason}"));
+            return Ok(IncrementalProjection::ReplayWithContext {
+                reason,
+                details: incremental_claim_error(
+                    St3Error::new(reason, "claim requires canonical replay"),
+                    claim,
+                    "incremental-guard",
+                ).details,
+            });
         }
         // Person asks add steps (and sometimes a whole run) in their own claim. Their response
         // also resumes an originating step. Rebuild the affected tree so a response received
@@ -27145,6 +27396,7 @@ fn select_replicated_desired(
     if !select {
         return Ok(());
     }
+    message_subscriptions::validate_replicated(transaction, claim, desired)?;
     transaction
         .execute(
             "INSERT INTO desired(subject, kind, revision, claim_id, body, member, owner_run, owner_generation, owner_step) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
@@ -33402,7 +33654,6 @@ agent "test/empty" { command "true" }
             "unhealthy-projection",
             "frontier-ahead",
             "non-incremental-kind",
-            "work-operation",
             "malformed-operation",
             "operation-conflict",
             "incremental-error:internal",
@@ -33419,7 +33670,6 @@ agent "test/empty" { command "true" }
                 let operation = json!({"id":"op/replay-test", "request_digest":"digest-a"});
                 let (kind, body) = match reason {
                     "non-incremental-kind" => ("work.unknown", json!({"fields":{}})),
-                    "work-operation" => ("work.claimed", json!({"fields":{}, "_operation":operation})),
                     "malformed-operation" => (
                         "harness.observed",
                         json!({"fields":{"state":"ready"}, "_operation":{"id":"op/malformed"}}),
@@ -33503,7 +33753,8 @@ agent "test/empty" { command "true" }
                 .filter_map(|line| line.strip_prefix("st: projection failure detail "))
                 .map(|line| serde_json::from_str::<Value>(line).unwrap())
                 .collect::<Vec<_>>();
-            if reason == "incremental-error:internal" || reason == "operation-conflict" {
+            if matches!(reason, "incremental-error:internal" | "operation-conflict"
+                | "malformed-operation" | "non-incremental-kind") {
                 assert_eq!(details.len(), 1, "{reason}");
                 assert_eq!(details[0]["subject"], "agent/node.test");
                 assert!(
@@ -33515,13 +33766,26 @@ agent "test/empty" { command "true" }
                 if reason == "operation-conflict" {
                     assert_eq!(details[0]["operation_id"], "op/replay-test");
                     assert!(details[0]["error"].as_str().unwrap().contains("digest_matches=false"));
-                } else {
+                } else if reason == "incremental-error:internal" {
                     assert!(
                         details[0]["error"]
                             .as_str()
                             .unwrap()
                             .contains("missing field")
                     );
+                } else {
+                    assert_eq!(details[0]["stage"], "incremental-guard");
+                    assert_eq!(details[0]["code"], reason);
+                    let expected_kind = match reason {
+                        "malformed-operation" => "harness.observed",
+                        _ => "work.unknown",
+                    };
+                    assert_eq!(details[0]["claim_kind"], expected_kind);
+                    let detail_position = lines.iter().position(|line|
+                        line.starts_with("st: projection failure detail ")).unwrap();
+                    let replay_position = lines.iter().position(|line|
+                        line.starts_with("st: projection full replay ")).unwrap();
+                    assert!(detail_position < replay_position);
                 }
             } else {
                 assert!(details.is_empty(), "{reason}");
@@ -37942,6 +38206,130 @@ version 2
     }
 
     #[test]
+    fn supported_work_operations_do_not_require_a_cache_prefix() {
+        for operation in ["op/invented-work", "cache/invented-work"] {
+            let (controller, worker, step) = replicated_step_pair();
+            worker_work(&worker, &step, "claim", None, "work-operation-source");
+            let original = worker
+                .claims_for(&step, Some("work.claimed"))
+                .unwrap()
+                .pop()
+                .unwrap();
+            let mut body = original.body.clone();
+            body["_operation"] = json!({"id": operation, "request_digest": "invented-digest"});
+            {
+                let mut connection = controller.connection.lock().unwrap();
+                let transaction = connection.transaction().unwrap();
+                // Historical admitted input with the actual endpoint's transition fields;
+                // changing metadata here is not a production admission bypass.
+                append_claim_record_tx(
+                    &transaction,
+                    "worker",
+                    &step,
+                    "work.claimed",
+                    original.actor.as_deref(),
+                    &body,
+                    &[],
+                    None,
+                )
+                .unwrap();
+                transaction.commit().unwrap();
+            }
+            FULL_REPLAYS.with(|count| count.set(0));
+            assert!(controller.project_replication_backlog().unwrap());
+            assert_eq!(FULL_REPLAYS.with(std::cell::Cell::get), 0, "{operation}");
+            assert_eq!(
+                controller.step_run(&step).unwrap().unwrap().status,
+                "claimed"
+            );
+            assert!(controller.operation_projection_drift().unwrap().is_empty());
+            let incremental = graph_digest_of(&controller);
+            controller.replay_replication_graph().unwrap();
+            assert_eq!(incremental, graph_digest_of(&controller), "{operation}");
+
+            // A conflicting identity still requires canonical replay and names its work claim.
+            body["_operation"]["request_digest"] = json!("different-digest");
+            let incoming = {
+                let mut connection = controller.connection.lock().unwrap();
+                let transaction = connection.transaction().unwrap();
+                let claim = append_claim_record_tx(
+                    &transaction,
+                    "worker",
+                    &step,
+                    "work.claimed",
+                    original.actor.as_deref(),
+                    &body,
+                    &[],
+                    None,
+                )
+                .unwrap();
+                transaction.commit().unwrap();
+                claim
+            };
+            FULL_REPLAYS.with(|count| count.set(0));
+            let mut lines = Vec::new();
+            assert!(
+                controller
+                    .project_replication_backlog_with_log("test", |line| lines.push(line.to_owned()))
+                    .unwrap()
+            );
+            assert_eq!(FULL_REPLAYS.with(std::cell::Cell::get), 1);
+            let detail: Value = serde_json::from_str(
+                lines
+                    .iter()
+                    .find_map(|line| line.strip_prefix("st: projection failure detail "))
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(detail["code"], "operation-conflict");
+            assert_eq!(detail["claim_kind"], "work.claimed");
+            assert_eq!(detail["claim_id"], incoming.id);
+            assert_eq!(detail["operation_id"], operation);
+            assert!(controller.operation_projection_drift().unwrap().is_empty());
+            let conflicted = graph_digest_of(&controller);
+            controller.replay_replication_graph().unwrap();
+            assert_eq!(conflicted, graph_digest_of(&controller));
+        }
+    }
+
+    #[test]
+    fn cache_receipt_work_lifecycle_matches_replay_on_updated_peers() {
+        for action in ["renew", "progress", "release", "fail", "complete"] {
+            let (controller, worker, step) = replicated_step_pair();
+            worker_work(&worker, &step, "claim", None, "receipt-claim");
+            assert!(!projection_replayed(&controller, "worker", &worker));
+            worker_work(
+                &worker,
+                &step,
+                action,
+                Some("invented lifecycle"),
+                "receipt-action",
+            );
+            assert!(
+                !projection_replayed(&worker, "controller", &controller),
+                "local {action}"
+            );
+            assert!(
+                !projection_replayed(&controller, "worker", &worker),
+                "remote {action}"
+            );
+            let incremental = graph_digest_of(&controller);
+            assert_eq!(
+                incremental,
+                graph_digest_of(&worker),
+                "peer parity {action}"
+            );
+            controller.replay_replication_graph().unwrap();
+            assert_eq!(
+                incremental,
+                graph_digest_of(&controller),
+                "canonical parity {action}"
+            );
+            assert!(controller.operation_projection_drift().unwrap().is_empty());
+        }
+    }
+
+    #[test]
     fn work_extensions_project_locally_and_remotely_without_full_replay() {
         let (controller, worker, step) = replicated_step_pair();
         worker_work(&worker, &step, "claim", None, "extension-claim");
@@ -42307,6 +42695,162 @@ version 2
         let after = work();
         assert_eq!(after.0, before.0);
         assert!(after.1 <= before.1 + 20, "attachment lookup grew with unrelated history: {before:?} -> {after:?}");
+    }
+
+    #[test]
+    fn unnamed_harness_seek_preserves_legacy_candidates_and_snapshot_cut() {
+        let store = Store::open_memory("legacy-seek").unwrap();
+        let mut connection = store.connection.write();
+        let transaction = connection.transaction().unwrap();
+        transaction
+            .execute(
+                "INSERT INTO batches(id,origin,replica_sequence,hash,accepted_at_unix_ms)
+             VALUES ('legacy-batch','legacy-seek',1,'synthetic','1')",
+                [],
+            )
+            .unwrap();
+        let bodies = [
+            json!({"fields":{"state":"idle"}}),
+            json!({"state":"working","incarnation_id":null}),
+            json!({"fields":{"state":"idle","incarnation_id":7}}),
+            json!({"fields":{"state":"idle","incarnation_id":false}}),
+            json!({"fields":{"state":"idle","incarnation_id":"current"}}),
+            json!({"state":"idle","incarnation_id":"current"}),
+            json!({"fields":{"state":"idle","incarnation_id":[7]}}),
+            json!({"fields":null,"state":"idle","incarnation_id":"current"}),
+            json!({"fields":{"reason":"sparse legacy fields"}}),
+        ];
+        for (position, body) in bodies.iter().enumerate() {
+            let index = position + 1;
+            transaction.execute(
+                "INSERT INTO claims(store_index,id,batch_id,subject,kind,origin,body,predecessors,accepted_at_unix_ms)
+                 VALUES (?1,?2,'legacy-batch','agent/legacy-seek','harness.observed','legacy-seek',?3,'[]',?4)",
+                params![index as i64,format!("legacy-{index}"),body.to_string(),index.to_string()],
+            ).unwrap();
+        }
+        transaction.commit().unwrap();
+        let read = |sql: &str, cut: i64, since: &str| {
+            connection
+                .prepare(sql)
+                .unwrap()
+                .query_map(params!["agent/legacy-seek", cut, since], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let query = harness_observations_without_incarnation_query();
+        // The retained pre-change SQL is an independent candidate oracle; only its index differs.
+        let oracle = query.replace(
+            "claims_harness_unnamed_accepted_index",
+            "claims_subject_kind_accepted_index",
+        );
+        for (cut, since, expected) in [
+            (
+                9,
+                "1",
+                vec![
+                    "legacy-9", "legacy-8", "legacy-4", "legacy-3", "legacy-2", "legacy-1",
+                ],
+            ),
+            (4, "1", vec!["legacy-4", "legacy-3", "legacy-2", "legacy-1"]),
+            (9, "4", vec!["legacy-9", "legacy-8", "legacy-4"]),
+            (9, "10", vec![]),
+        ] {
+            assert_eq!(read(&query, cut, since), expected);
+            assert_eq!(read(&query, cut, since), read(&oracle, cut, since));
+        }
+        // The partial index also follows updates/deletes; repaired observation bodies cannot
+        // leave a stale legacy candidate, and becoming unnamed must make a new candidate.
+        connection.execute("UPDATE claims SET body=json_set(body,'$.fields.incarnation_id','current') WHERE id='legacy-3'",[]).unwrap();
+        connection.execute("UPDATE claims SET body=json_remove(body,'$.fields.incarnation_id') WHERE id='legacy-5'",[]).unwrap();
+        connection
+            .execute("DELETE FROM claims WHERE id='legacy-2'", [])
+            .unwrap();
+        assert_eq!(
+            read(&query, 9, "1"),
+            vec!["legacy-9", "legacy-8", "legacy-5", "legacy-4", "legacy-1"]
+        );
+        assert_eq!(read(&query, 9, "1"), read(&oracle, 9, "1"));
+    }
+
+    #[test]
+    fn unnamed_harness_seek_cost_ignores_named_heartbeat_growth() {
+        let measure = |named: usize| {
+            let store = Store::open_memory("legacy-cost").unwrap();
+            let mut connection = store.connection.write();
+            let transaction = connection.transaction().unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO batches(id,origin,replica_sequence,hash,accepted_at_unix_ms)
+                VALUES ('cost-batch','legacy-cost',1,'synthetic','1')",
+                    [],
+                )
+                .unwrap();
+            for index in 1..=named {
+                let body = json!({"fields":{"incarnation_id":"current","state":"idle","status_transition":false}});
+                transaction.execute("INSERT INTO claims(store_index,id,batch_id,subject,kind,origin,body,predecessors,accepted_at_unix_ms)
+                    VALUES (?1,?2,'cost-batch','agent/legacy-cost','harness.observed','legacy-cost',?3,'[]',?4)",
+                    params![index as i64,format!("named-{index}"),body.to_string(),index.to_string()]).unwrap();
+            }
+            transaction.execute("INSERT INTO claims(store_index,id,batch_id,subject,kind,origin,body,predecessors,accepted_at_unix_ms)
+                VALUES (100000,'legacy-tail','cost-batch','agent/legacy-cost','harness.observed','legacy-cost',?1,'[]','100000')",[json!({"fields":{"state":"idle"}}).to_string()]).unwrap();
+            // Native claims have a recorded canonical position. Without it, the unchanged
+            // legacy-position fallback counts this synthetic batch's preceding rows, a
+            // separate ordering cost from selecting unnamed candidates.
+            transaction.execute(
+                "INSERT INTO replica_records(record_ref,writer,sequence,envelope_hash,position,raw,state,claim_id,updated_at_unix_ms)
+                 VALUES ('cost-record','legacy-cost',1,'synthetic',0,X'', 'valid','legacy-tail','1')",
+                [],
+            ).unwrap();
+            transaction.commit().unwrap();
+            let query = harness_observations_without_incarnation_query();
+            let plans = connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+                .unwrap()
+                .query_map(params!["agent/legacy-cost", 100000, "1"], |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert!(
+                plans
+                    .iter()
+                    .any(|p| p.contains("claims_harness_unnamed_accepted_index")),
+                "{plans:?}"
+            );
+            let work = |sql: &str| {
+                let mut statement = connection.prepare(sql).unwrap();
+                let ids = statement
+                    .query_map(params!["agent/legacy-cost", 100000, "1"], |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                assert_eq!(ids, vec!["legacy-tail"]);
+                statement.get_status(rusqlite::StatementStatus::VmStep)
+            };
+            let new = work(&query);
+            let old = work(&query.replace(
+                "claims_harness_unnamed_accepted_index",
+                "claims_subject_kind_accepted_index",
+            ));
+            println!("unnamed seek: named={named} new_vm_steps={new} old_vm_steps={old}");
+            (new, old)
+        };
+        let small = measure(128);
+        let large = measure(4096);
+        assert!(
+            small.0 > 0 && large.0 <= small.0 + 20,
+            "{small:?} -> {large:?}"
+        );
+        assert!(
+            large.1 > small.1 * 8,
+            "the retained old query must demonstrate the scan: {small:?} -> {large:?}"
+        );
     }
 
     #[test]
