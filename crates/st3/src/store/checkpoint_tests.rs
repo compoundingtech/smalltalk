@@ -344,8 +344,8 @@ fn limits_keep_source_observations_even_when_the_same_seat_publishes_again() {
 
 #[test]
 fn a_sealed_set_read_in_pages_is_the_same_set_whatever_the_page() {
-    // Each page of the read is a read of its own, so the WAL is free between pages. The set must
-    // not depend on how the pages fall: one row to a page, a few, and one page for everything.
+    // Pages bound each query within one consistent capture snapshot. The set must not depend
+    // on how the pages fall: one row to a page, a few, and one page for everything.
     let store = Store::open_memory("alder").unwrap();
     store
         .append_claim_outcome(&input(
@@ -533,6 +533,102 @@ fn a_usage_trim_keeps_lifetime_usage_and_the_proof_guards_it() {
     assert!(
         !proof.passed,
         "dropping a series total changes lifetime usage"
+    );
+}
+
+#[test]
+fn sealed_capture_keeps_one_snapshot_when_trim_commits_between_metadata_and_bodies() {
+    use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}, mpsc};
+    struct Pause {
+        fired: AtomicBool,
+        reached: mpsc::SyncSender<()>,
+        resume: Mutex<mpsc::Receiver<()>>,
+    }
+    unsafe extern "C" fn pause_before_body(
+        _: std::ffi::c_uint,
+        context: *mut std::ffi::c_void,
+        statement: *mut std::ffi::c_void,
+        _: *mut std::ffi::c_void,
+    ) -> std::ffi::c_int {
+        let pause = unsafe { &*context.cast::<Pause>() };
+        let sql = unsafe {
+            std::ffi::CStr::from_ptr(rusqlite::ffi::sqlite3_sql(statement.cast()))
+        };
+        if sql.to_bytes().ends_with(b"FROM claims WHERE id=?1")
+            && !pause.fired.swap(true, Ordering::AcqRel)
+        {
+            let _ = pause.reached.send(());
+            if let Ok(resume) = pause.resume.lock() {
+                let _ = resume.recv();
+            }
+        }
+        0
+    }
+    let scratch = tempfile::tempdir().unwrap();
+    // WAL lets the trim commit while the capture still holds its read snapshot.
+    let store = Arc::new(Store::open(&scratch.path().join("claims.sqlite3"), "alder").unwrap());
+    store.append_claim(&input(
+        AGENT, "harness.observed", Some(AGENT),
+        json!({"state":"idle","incarnation_id":"one"}), "harness",
+    )).unwrap();
+    let old = now_ms() - 9 * DAY_MS;
+    for n in 0..3 {
+        store.append_claim(&input(
+            AGENT, "harness.usage", Some(AGENT),
+            rollup("claude/aaaa", old + n * DAY_MS / 4, 100 * (n as u64 + 1)),
+            &format!("rollup-{n}"),
+        )).unwrap();
+    }
+    let cut = now_ms() + 1_000;
+    let expected = store.checkpoint_sealed_set(cut).unwrap();
+    let plan = plan_drops(&expected);
+    assert_eq!(plan.claims.len(), 2);
+    let (reached, at_body) = mpsc::sync_channel(1);
+    let (resume, continue_body) = mpsc::sync_channel(1);
+    let pause = Arc::new(Pause {
+        fired: AtomicBool::new(false),
+        reached,
+        resume: Mutex::new(continue_body),
+    });
+    for connection in store.readers.idle.lock().unwrap().iter() {
+        // The Arc outlives the installed callback and the joined capture worker.
+        unsafe {
+            rusqlite::ffi::sqlite3_trace_v2(
+                connection.handle(), rusqlite::ffi::SQLITE_TRACE_STMT as u32,
+                Some(pause_before_body), Arc::as_ptr(&pause).cast_mut().cast(),
+            );
+        }
+    }
+    let reader = store.clone();
+    let reader_pause = pause.clone();
+    let capture = std::thread::spawn(move || {
+        let _pause = reader_pause;
+        reader.checkpoint_sealed_set_paged(cut, None, 1, 1)
+    });
+    at_body.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+    {
+        let mut connection = store.connection.write();
+        let transaction = connection.transaction().unwrap();
+        record_checkpoint_tombstones_tx(
+            &transaction, &checkpoint_name(cut), &plan.envelopes, &plan.claims,
+        ).unwrap();
+        delete_dropped_rows_tx(&transaction, &plan.envelopes, &plan.claims).unwrap();
+        transaction.commit().unwrap();
+    }
+    resume.send(()).unwrap();
+    let captured = capture.join().unwrap();
+    for connection in store.readers.idle.lock().unwrap().iter() {
+        unsafe {
+            rusqlite::ffi::sqlite3_trace_v2(connection.handle(), 0, None, std::ptr::null_mut());
+        }
+    }
+    let captured = captured.expect("a concurrent trim must not invalidate queued body reads");
+    assert_eq!(format!("{:?}", captured.claims), format!("{:?}", expected.claims));
+    assert_eq!(SealedIdentities::of(&captured), SealedIdentities::of(&expected));
+    assert_eq!(
+        store.claims_for(AGENT, Some("harness.usage")).unwrap().len(),
+        1,
+        "the trim really committed while capture was paused"
     );
 }
 

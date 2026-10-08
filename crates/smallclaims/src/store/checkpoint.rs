@@ -769,12 +769,10 @@ impl Store {
     }
 
     /// `checkpoint_sealed_set_through`, reading `envelope_page` envelopes and `record_page`
-    /// records per read. Each page is a read of its own, so its snapshot ends with it and the WAL
-    /// can be checkpointed between pages; one transaction over the whole set pinned the WAL for
-    /// the 20 to 40 seconds a large store took. The set stays the same set: the envelopes are
-    /// those up to `seal_rowid`, and a claim is kept only if its envelope is among them, so what
-    /// arrives between pages is read and left out. Only a record changing state (a repair)
-    /// between two pages of one call could differ from a single snapshot.
+    /// records per query within one pinned snapshot. The pages bound working batches, not
+    /// transaction lifetimes: queued body IDs must survive a concurrent trim, and repairs,
+    /// protection and tombstones must describe the same captured set. Sealing happens before
+    /// the read snapshot starts. The WAL stays pinned until capture completes.
     pub fn checkpoint_sealed_set_paged(
         &self,
         cut_unix_ms: u128,
@@ -786,6 +784,20 @@ impl Store {
         // Seal only new batches. A full history scan under the writer stalls live requests
         // every time a checkpoint is reconsidered, even when no new envelope is needed.
         self.seal_local_batches()?;
+        self.read_snapshot(|_| {
+            self.checkpoint_sealed_set_snapshot(
+                cut_unix_ms, through_rowid, envelope_page, record_page,
+            )
+        })
+    }
+
+    fn checkpoint_sealed_set_snapshot(
+        &self,
+        cut_unix_ms: u128,
+        through_rowid: Option<i64>,
+        envelope_page: i64,
+        record_page: i64,
+    ) -> Result<SealedSet> {
         let seal_rowid: i64 = {
             let connection = self.readers.get();
             let high: i64 = connection.query_row(
@@ -900,7 +912,7 @@ impl Store {
         let mut records = keyed.into_iter().peekable();
         let claim_sql = format!("SELECT {CLAIM_COLUMNS} FROM claims WHERE id=?1");
         while records.peek().is_some() {
-            // Close each body-read snapshot too: a large sealed set must not pin the WAL.
+            // Bound body loading by pages while inheriting the capture's pinned snapshot.
             let connection = self.readers.get();
             let mut statement = connection.prepare_cached(&claim_sql)?;
             for _ in 0..record_page {
@@ -922,8 +934,8 @@ impl Store {
                 }
             }
         }
-        // Read after the record pages, so it is at least as new as the claims: a claim that became
-        // protected while the pages were read is protected here, and the set errs toward keeping.
+        // Protection and tombstones use the same snapshot as the bodies, rather than mixing
+        // a concurrent trim or repair with the already captured identities.
         let connection = self.readers.get();
         let protected = connection
             .prepare(

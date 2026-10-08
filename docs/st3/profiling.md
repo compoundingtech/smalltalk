@@ -107,8 +107,10 @@ session, person, and mode binding, expiry, and owner/incarnation checks remain u
 ## Checkpoint scratch memory
 
 Checkpoint capture filters envelope cuts in SQLite and sorts only claim identities and canonical
-keys. It decodes the retained claim bodies afterward, with a separate read snapshot for each
-page; neither metadata capture nor body loading pins the WAL for the entire checkpoint.
+keys, then decodes retained bodies in bounded pages. Envelope identities, sort keys, bodies,
+protection and tombstones all come from one pinned read snapshot: a concurrent trim cannot
+remove a queued body's row halfway through capture. The WAL stays pinned until capture ends,
+so sustained writes can grow the WAL during that interval.
 Mission-run and planning replay retain the canonical list of IDs and load one claim body at a
 time. Base replay uses a temporary ID order and bounded body pages. Both close their ordering
 or body statements before projection savepoints.
