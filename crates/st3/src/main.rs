@@ -4611,11 +4611,18 @@ fn main() -> ExitCode {
         std::io::stdout().is_terminal(),
         std::env::var_os("ST_AGENT").is_some(),
     ) {
-        if let Err(error) = st3::setup::prepare_plain_ui() {
-            eprintln!("st: {}", plain_error(&error));
-            return ExitCode::FAILURE;
-        }
-        return run_terminal_ui(stui::Args::default(), None);
+        let subject = match st3::setup::prepare_plain_ui() {
+            Ok(subject) => subject,
+            Err(error) => {
+                eprintln!("st: {}", plain_error(&error));
+                return ExitCode::FAILURE;
+            }
+        };
+        let options = match subject {
+            Some(subject) => stui::Args::default().with_initial_subject(subject),
+            None => stui::Args::default(),
+        };
+        return run_terminal_ui(options, None);
     }
     if cli_help::all_help_requested(&arguments) {
         print!("{}", cli_help::root_help(true));
