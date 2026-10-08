@@ -1555,8 +1555,11 @@ complete native body. An identifiable full tool body (same call identity), or a
 payload whose preview was clipped while metadata/view were not, uses the existing
 typed output adapter without its preview line limit. Ambiguous metadata/view
 subtrees and unknown values keep a lossless raw JSON fallback. Loading is explicit
-for that block; restoring expansion state or expanding all previews does not fetch
-full native values automatically.
+for that block or through stui's expand-all keypress. Expand-all loads only visible
+clipped tool values, with one owner content read active at a time; newly visible
+rows load next without prefetching offscreen rows. Loaded values remain in memory
+when scrolled away and are released on collapse. Restoring saved expansion state
+does not fetch full native values automatically.
 `continuation.size`, when present, describes that original value's encoded byte size.
 Native image refs initially use `application/octet-stream` and may omit size; the
 fetched chunks report the detected passive image media type and exact byte count.

@@ -151,10 +151,50 @@ pub struct Content {
     groups: BTreeMap<(String, String), Vec<Group>>,
     sources: BTreeMap<String, BTreeMap<String, st3_client::TimelineEntry>>,
     loaded: BTreeMap<Key, Loaded>,
+    /// Explicit expand-all intent, never restored from saved expansion state.
+    pub expanded_all: HashSet<String>,
     shown: BTreeSet<Key>,
     protocols: RefCell<BTreeMap<Key, (u16, u16, ratatui_image::protocol::Protocol)>>,
     pub scroll_to: RefCell<BTreeMap<String, String>>,
     pub focused: BTreeMap<String, String>,
+}
+
+/// One owner content read at a time, including all chunks of its value.
+#[derive(Default)]
+pub struct Reads {
+    queued: std::collections::VecDeque<Key>,
+    active: Option<Key>,
+}
+
+impl Reads {
+    pub fn enqueue(&mut self, key: Key) {
+        if self.active.as_ref() != Some(&key) && !self.queued.contains(&key) {
+            self.queued.push_back(key);
+        }
+    }
+
+    pub fn idle(&self) -> bool {
+        self.active.is_none() && self.queued.is_empty()
+    }
+
+    pub fn next(&mut self, content: &Content) -> Option<Key> {
+        if self.active.is_some() {
+            return None;
+        }
+        while let Some(key) = self.queued.pop_front() {
+            if content.is_loading(&key) {
+                self.active = Some(key.clone());
+                return Some(key);
+            }
+        }
+        None
+    }
+
+    pub fn complete(&mut self, key: &Key) {
+        if self.active.as_ref() == Some(key) {
+            self.active = None;
+        }
+    }
 }
 
 fn image_refs(value: &Value, out: &mut Vec<ConversationContentRef>) {
@@ -323,6 +363,25 @@ impl Content {
             .map(|(key, _)| key.clone())
             .collect();
         refs.into_iter().filter(|key| self.request(key)).collect()
+    }
+
+    pub fn request_next_visible_tool(&mut self, conversation: &str, entry: &str) -> Option<Key> {
+        let key = self
+            .groups
+            .get(&(conversation.to_owned(), entry.to_owned()))?
+            .iter()
+            .flat_map(|group| &group.refs)
+            .find(|(key, reference)| {
+                reference.reason.as_deref() != Some("on-demand")
+                    && !reference.media_type.starts_with("image/")
+                    && !self.loaded.contains_key(key)
+            })
+            .map(|(key, _)| key.clone())?;
+        self.request(&key).then_some(key)
+    }
+
+    pub fn is_loading(&self, key: &Key) -> bool {
+        matches!(self.loaded.get(key), Some(Loaded::Loading))
     }
 
     /// Closing a row releases its full values, pixels and terminal encodings.
@@ -882,6 +941,10 @@ mod tests {
     fn persisted_expansion_does_not_fetch_or_show_full_content() {
         let (content, _, entries) = fixture(false);
         let shown = words(&render(&content, &entries, true));
+        assert!(
+            content.expanded_all.is_empty(),
+            "restored rows have no loading intent"
+        );
         assert!(shown.contains("load full output"));
         assert!(!shown.contains("payload / metadata / view"));
         assert!(!shown.contains("collapse full content"));

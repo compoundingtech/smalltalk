@@ -333,6 +333,7 @@ pub fn run(context: Context) -> Result<()> {
     let mut cursor_style: Option<crossterm::cursor::SetCursorStyle> = None;
     // The tab shown on the last pass: opening a tab loads what only it needs.
     let mut shown_tab = usize::MAX;
+    let mut content_reads = super::content::Reads::default();
     let mut repositories_asked: Option<String> = None;
     // When usage was last asked for and over how many hours, and whether that read is out.
     let mut usage_read: Option<(Instant, u64)> = None;
@@ -540,6 +541,7 @@ pub fn run(context: Context) -> Result<()> {
         while let Ok(result) = fetched.try_recv() {
             match result {
                 Fetched::Content(key, result) => {
+                    content_reads.complete(&key);
                     ui.content.complete(key, result);
                 }
                 Fetched::Read(id, result) => {
@@ -1007,12 +1009,7 @@ pub fn run(context: Context) -> Result<()> {
             }
             match effect {
                 Effect::LoadContent(key) => {
-                    let client = client.clone();
-                    let tx = fetched_tx.clone();
-                    runtime.spawn(async move {
-                        let result = super::content::fetch(&client, &key).await;
-                        let _ = tx.send(Fetched::Content(key, result));
-                    });
+                    content_reads.enqueue(key);
                 }
                 Effect::OpenTerminal { agent } => {
                     // The PTY session's own bytes, through st's raw stream to whichever host owns
@@ -1299,6 +1296,16 @@ pub fn run(context: Context) -> Result<()> {
         ui.step_voice();
         execute!(io::stdout(), BeginSynchronizedUpdate)?;
         terminal.draw(|frame| ui.render(frame))?;
+        if extras.live
+            && let Some(key) = ui.next_content_read(&mut content_reads)
+        {
+            let client = client.clone();
+            let tx = fetched_tx.clone();
+            runtime.spawn(async move {
+                let result = super::content::fetch(&client, &key).await;
+                let _ = tx.send(Fetched::Content(key, result));
+            });
+        }
         // The attached terminal's cursor shape (vim's bar while inserting), and the person's
         // own shape back once it is gone.
         let style = ui.cursor_style();

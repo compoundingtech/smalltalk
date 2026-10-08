@@ -83,6 +83,32 @@ struct FramePane {
     layer: usize,
 }
 
+impl FramePane {
+    fn entry_visible(&self, start: usize, end: usize, covers: &[(Rect, usize)]) -> bool {
+        let start = start.max(self.top);
+        let end = end.min(self.top.saturating_add(self.rect.height as usize));
+        for row in start..end {
+            let y = self.rect.y + (row - self.top) as u16;
+            let mut x = self.rect.x;
+            while x < self.rect.right() {
+                let covered_to = covers
+                    .iter()
+                    .skip(self.layer)
+                    .filter(|(rect, _)| {
+                        rect.y <= y && y < rect.bottom() && rect.x <= x && x < rect.right()
+                    })
+                    .map(|(rect, _)| rect.right())
+                    .max();
+                let Some(right) = covered_to else {
+                    return true;
+                };
+                x = right.min(self.rect.right());
+            }
+        }
+        false
+    }
+}
+
 #[derive(Default)]
 struct FrameInfo {
     area: Rect,
@@ -486,6 +512,54 @@ impl Ui {
         }
         self.frame.borrow().read_messages.clone()
     }
+
+    /// Use the last presented viewport, not every row in the conversation.
+    pub(crate) fn next_content_read(&mut self, reads: &mut content::Reads) -> Option<content::Key> {
+        if reads.idle()
+            && let Some(key) = self.request_visible_content()
+        {
+            reads.enqueue(key);
+        }
+        reads.next(&self.content)
+    }
+
+    fn request_visible_content(&mut self) -> Option<content::Key> {
+        if self.help
+            || self.popover.is_some()
+            || self
+                .glasses
+                .as_ref()
+                .is_some_and(|glasses| glasses.palette_open())
+        {
+            return None;
+        }
+        let frame = self.frame.borrow();
+        for pane in &frame.panes {
+            let Some(conversation) = pane.key.strip_prefix("chat:") else {
+                continue;
+            };
+            if !self.content.expanded_all.contains(conversation)
+                || pane.rect.width == 0
+                || pane.rect.height == 0
+            {
+                continue;
+            }
+            for (index, (entry, start)) in pane.entries.iter().enumerate() {
+                let end = pane
+                    .entries
+                    .get(index + 1)
+                    .map_or(pane.total, |(_, line)| *line);
+                if self.conversation_state.expanded.contains(entry)
+                    && pane.entry_visible(*start, end, &frame.covers)
+                    && let Some(key) = self.content.request_next_visible_tool(conversation, entry)
+                {
+                    return Some(key);
+                }
+            }
+        }
+        None
+    }
+
     pub fn new(world: World) -> Self {
         Self {
             world,
@@ -3109,7 +3183,10 @@ impl Ui {
                     "ctrl+a",
                     "the agent's actions: restart, suspend, retire, terminal…",
                 ),
-                ("ctrl+e", "expand or collapse tool output"),
+                (
+                    "o / ctrl+e",
+                    "expand all; load visible clipped output one at a time; collapse releases",
+                ),
                 ("ctrl+↑ ctrl+↓", "focus the previous or next tool"),
                 ("ctrl+enter", "expand/collapse the focused tool; read its full content"),
                 ("ctrl+u", "load/hide focused tool images inline (outside a draft)"),
@@ -4000,7 +4077,9 @@ impl Ui {
     }
 
     fn toggle_all_tools(&mut self) {
-        let Some(id) = self.selected_id() else { return };
+        let Some(id) = self.content_conversation() else {
+            return;
+        };
         let Some(Load::Ready(entries)) = self.world.conversations.get(&id) else {
             return;
         };
@@ -4013,12 +4092,15 @@ impl Ui {
             .iter()
             .all(|tool| self.conversation_state.expanded.contains(tool))
         {
+            self.content.expanded_all.remove(&id);
             for tool in tools {
                 self.conversation_state.expanded.remove(&tool);
                 self.content.release_tool(&id, &tool);
             }
         } else {
             self.conversation_state.expanded.extend(tools);
+            self.content.expanded_all.insert(id.clone());
+            self.reveal_tool_bundles(&id);
         }
     }
 
@@ -6212,6 +6294,160 @@ fn dump(args: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn expand_all_viewport_fixture() -> (Ui, String) {
+        let mut ui = Ui::new(demo::world());
+        ui.tab = 1;
+        let conversation = ui.selected_id().unwrap();
+        let items = [
+            ("one", Some("size-limit")),
+            ("ordinary", None),
+            ("two", Some("size-limit")),
+            ("image", Some("on-demand")),
+            ("offscreen", Some("size-limit")),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(sequence, (id, reason))| {
+            let mut block = serde_json::json!({
+                "id":id,"kind":"tool_call","source_type":"native","payload":"clipped"
+            });
+            if let Some(reason) = reason {
+                block["continuation"] = serde_json::json!({
+                    "ref":id,"media_type":"application/json","reason":reason
+                });
+            }
+            serde_json::from_value(serde_json::json!({
+                "id":id,"sequence":sequence,"revision":1,
+                "timestamp":"2026-10-08T10:00:00Z","role":"assistant",
+                "type":"tool_call","final":true,
+                "body":{"call_id":id,"name":"tool","arguments":{},"blocks":[block]}
+            }))
+            .unwrap()
+        })
+        .collect::<Vec<st3_client::TimelineEntry>>();
+        let entries = adapt::conversation(&items, &std::collections::BTreeMap::new());
+        ui.world
+            .conversations
+            .insert(conversation.clone(), Load::Ready(entries));
+        ui.content.index(&std::collections::BTreeMap::from([(
+            conversation.clone(),
+            st3_conversation_ui::Timeline {
+                items,
+                session_id: Some("session/expand-all".into()),
+                ..Default::default()
+            },
+        )]));
+        ui.frame.borrow_mut().panes.push(FramePane {
+            key: format!("chat:{conversation}"),
+            rect: Rect::new(0, 0, 40, 4),
+            top: 0,
+            total: 6,
+            lines: Rc::new(Vec::new()),
+            entries: vec![
+                ("one".into(), 0),
+                ("ordinary".into(), 1),
+                ("two".into(), 2),
+                ("image".into(), 3),
+                ("offscreen".into(), 5),
+            ],
+            layer: 0,
+        });
+        (ui, conversation)
+    }
+
+    #[test]
+    fn expand_all_loads_visible_clipped_blocks_sequentially_and_collapse_releases() {
+        let (mut ui, conversation) = expand_all_viewport_fixture();
+        let mut reads = content::Reads::default();
+        // Restoring expanded rows is not an expand-all loading request.
+        ui.conversation_state.expanded.extend(
+            ui.world.conversations[&conversation]
+                .items()
+                .iter()
+                .map(|entry| entry.id.clone()),
+        );
+        assert!(ui.next_content_read(&mut reads).is_none());
+        ui.conversation_state.expanded.clear();
+        ui.key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+        let first = ui.next_content_read(&mut reads).unwrap();
+        assert_eq!(first.reference, "one");
+        assert!(ui.next_content_read(&mut reads).is_none());
+        reads.complete(&first);
+        ui.content.complete(
+            first.clone(),
+            Ok(("application/json".into(), b"{}".to_vec())),
+        );
+        let second = ui.next_content_read(&mut reads).unwrap();
+        assert_eq!(
+            second.reference, "two",
+            "ordinary output and images are not fetched"
+        );
+        assert!(ui.next_content_read(&mut reads).is_none());
+        // Scrolling updates the next candidate, never starts a concurrent read.
+        {
+            let mut frame = ui.frame.borrow_mut();
+            frame.panes[0].top = 5;
+            frame.panes[0].rect.height = 1;
+        }
+        assert!(ui.next_content_read(&mut reads).is_none());
+        reads.complete(&second);
+        ui.content.complete(
+            second.clone(),
+            Ok(("application/json".into(), b"{}".to_vec())),
+        );
+        let third = ui.next_content_read(&mut reads).unwrap();
+        assert_eq!(
+            third.reference, "offscreen",
+            "load only after it scrolls into view"
+        );
+        assert!(ui.content.request_tool(&conversation, "one").is_empty());
+        ui.key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+        assert!(!ui.content.is_loading(&third));
+        assert!(ui.next_content_read(&mut reads).is_none());
+        reads.complete(&third);
+        ui.content
+            .complete(third, Ok(("application/json".into(), b"{}".to_vec())));
+        assert!(ui.next_content_read(&mut reads).is_none());
+        assert_eq!(ui.content.request_tool(&conversation, "one").len(), 1);
+        assert_eq!(ui.content.request_tool(&conversation, "two").len(), 1);
+        assert_eq!(ui.content.request_tool(&conversation, "offscreen").len(), 1);
+    }
+
+    #[test]
+    fn glasses_ctrl_e_loads_visible_clipped_output_and_collapse_releases_it() {
+        let (mut ui, conversation) = expand_all_viewport_fixture();
+        let mut reads = content::Reads::default();
+        ui.glasses = Some(glass::Glasses::open(None, None));
+        ui.open_in_glass(Pane::Agent(Some(conversation.clone())), glass::Open::Tab);
+        ui.key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        assert!(ui.content.expanded_all.contains(&conversation));
+        let first = ui.next_content_read(&mut reads).unwrap();
+        assert_eq!(first.reference, "one");
+        assert!(ui.next_content_read(&mut reads).is_none());
+        reads.complete(&first);
+        ui.content
+            .complete(first, Ok(("application/json".into(), b"{}".to_vec())));
+        ui.key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        assert!(!ui.content.expanded_all.contains(&conversation));
+        assert!(ui.next_content_read(&mut reads).is_none());
+        assert_eq!(ui.content.request_tool(&conversation, "one").len(), 1);
+    }
+
+    #[test]
+    fn expand_all_does_not_load_a_viewport_hidden_by_an_opaque_layer() {
+        let (mut ui, _) = expand_all_viewport_fixture();
+        let mut reads = content::Reads::default();
+        ui.key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+        {
+            let mut frame = ui.frame.borrow_mut();
+            let rect = frame.panes[0].rect;
+            frame.covers.push((rect, 0));
+        }
+        assert!(ui.next_content_read(&mut reads).is_none());
+        ui.frame.borrow_mut().covers.clear();
+        assert_eq!(ui.next_content_read(&mut reads).unwrap().reference, "one");
+    }
 
     #[test]
     fn mail_image_click_keeps_the_existing_blob_open_effect() {
