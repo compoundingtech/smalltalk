@@ -657,4 +657,73 @@ describe('optimistic conversation sends', () => {
       }),
     ),
   )
+
+  it.live('never duplicates mail an idempotent resubmission already shows', () =>
+    withGateway((live, gateway) =>
+      Effect.gen(function* () {
+        const key = 'resend-stable-key'
+        const hash = new Uint8Array(yield* Effect.promise(() => crypto.subtle.digest('SHA-256', new TextEncoder().encode(key))))
+        const resent = `message/${[...hash.slice(0, 8)].map((byte) => byte.toString(16).padStart(2, '0')).join('')}`
+        live.registry.mount(live.source.conversationInterest!(agent.id))
+        const conversation = live.source.conversation(agent.id)
+        live.registry.mount(conversation)
+        yield* settle
+        gateway.send({
+          kind: 'conversation', id: gateway.subscription('conversation').id,
+          collection: 'conversation', session_id: 'session/example',
+          replace: true, has_more: false,
+          items: [
+            { id: 'timeline-entry/resent/message', sequence: 1, revision: 1,
+              type: 'message', role: 'user', final: true, timestamp: snapshot.created_at,
+              body: { message_id: resent, from: 'person/operator', to: agent.id } },
+            { id: 'timeline-entry/resent/content', sequence: 2, revision: 1,
+              type: 'content', role: 'user', final: true, timestamp: snapshot.created_at,
+              body: { media_type: 'text/plain', text: 'hello' } },
+          ],
+        })
+        yield* settle
+        let resolvePost!: () => void
+        gateway.sendGate = new Promise<void>((resolve) => { resolvePost = resolve })
+        const sending = live.source.attachments!.send({ ...request, idempotency_key: key })
+        yield* Effect.promise(() => gateway.nextAction())
+        yield* settle
+        // The authoritative copy is already in the window: no second, pending copy.
+        const feed = live.registry.get(conversation)
+        expect(feed).toMatchObject({ _tag: 'Observed' })
+        if (feed._tag !== 'Observed') return
+        expect(feed.value.items.map((item) => item._tag)).toEqual(['Message', 'Text'])
+        resolvePost()
+        expect((yield* Effect.promise(() => sending))._tag).toBe('Success')
+        yield* settle
+        expect(live.registry.get(conversation)).toMatchObject({
+          _tag: 'Observed', value: { items: [
+            { _tag: 'Message', messageId: resent },
+            { _tag: 'Text', id: 'timeline-entry/resent/content' },
+          ] },
+        })
+      }),
+    ),
+  )
+
+  it.live('publishes an unseen idempotent resubmission as pending before the POST resolves', () =>
+    withGateway((live, gateway) =>
+      Effect.gen(function* () {
+        live.registry.mount(live.source.conversationInterest!(agent.id))
+        live.registry.mount(live.source.conversation(agent.id))
+        yield* settle
+        let resolvePost!: () => void
+        gateway.sendGate = new Promise<void>((resolve) => { resolvePost = resolve })
+        const sending = live.source.attachments!.send({ ...request, idempotency_key: 'unseen-resend-key' })
+        yield* Effect.promise(() => gateway.nextAction())
+        yield* settle
+        expect(live.registry.get(live.source.conversation(agent.id))).toMatchObject({
+          _tag: 'Observed', value: { items: [
+            { _tag: 'Text', text: 'hello', sendState: { _tag: 'Pending' } },
+          ] },
+        })
+        resolvePost()
+        expect((yield* Effect.promise(() => sending))._tag).toBe('Success')
+      }),
+    ),
+  )
 })
