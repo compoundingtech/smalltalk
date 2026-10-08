@@ -73,7 +73,9 @@ Before expecting a Claude expert to be ready, run `claude` in a normal terminal 
 the same user and with the same profile (`CLAUDE_CONFIG_DIR`, if set) used by the
 daemon. Complete Claude's native welcome, text style/theme selection and account
 login or explicit API-key confirmation. Successful `claude auth status` or a print
-request alone does not establish that this interactive setup is complete. See
+request alone does not establish that the interactive seat can authenticate or that
+this setup is complete. Complete any native permission-bypass consent required for
+unattended operation too. See
 [Claude's authentication instructions](https://code.claude.com/docs/en/authentication#authentication-precedence).
 
 If `agent/st/expert` is already waiting at those screens, complete native Claude
