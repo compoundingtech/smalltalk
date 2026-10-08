@@ -39,12 +39,13 @@ export interface EmbraceThreadProps {
   readonly toolbar?: React.ReactNode
   readonly composerProps?: Omit<EmbraceComposerProps, 'variant'>
   readonly onCommit?: React.ProfilerOnRenderCallback
+  readonly onRetrySend?: (itemId: string) => void
   /** Caller-owned workbench layout overrides the workshop's default frame. */
   readonly style?: stylex.StyleXStyles
   /** Copy for a thread with no messages; defaults to a neutral "No messages yet". */
   readonly emptyState?: React.ReactNode | TranscriptEmptyState
 }
-interface DisplayOptions { embrace: EmbraceLevel; senders: SenderVariant; showSender: boolean }
+interface DisplayOptions { embrace: EmbraceLevel; senders: SenderVariant; showSender: boolean; onRetrySend?: (itemId: string) => void }
 const DisplayContext = React.createContext<DisplayOptions>({ embrace: 'E1', senders: 'S2', showSender: true })
 
 function Attachment() {
@@ -73,7 +74,7 @@ export function EmbraceMessage() {
       {options.senders === 'S1' ? null : <span aria-hidden="true" data-testid="sender-avatar" {...stylex.props(styles.avatar)}>{label.slice(0, 2).toUpperCase()}</span>}
       <strong {...stylex.props(styles.senderName)}>{label}</strong>
     </header> : null}
-    {editing ? <ComposerPrimitive.Root {...stylex.props(styles.edit)}><ComposerPrimitive.Input aria-label="Edit message" {...stylex.props(styles.input)} /><ComposerPrimitive.Send {...stylex.props(styles.button)}>Save edit</ComposerPrimitive.Send><ComposerPrimitive.Cancel {...stylex.props(styles.button)}>Cancel edit</ComposerPrimitive.Cancel></ComposerPrimitive.Root> : <><MessagePrimitive.Parts components={{ Text: TextPart, Reasoning: ReasoningPart, tools: { Fallback: EmbraceToolCall } }} />{item?._tag === 'Text' && item.role === 'user' && item.sendState?._tag === 'Failed' && <SendFailure state={item.sendState} />}</>}
+    {editing ? <ComposerPrimitive.Root {...stylex.props(styles.edit)}><ComposerPrimitive.Input aria-label="Edit message" {...stylex.props(styles.input)} /><ComposerPrimitive.Send {...stylex.props(styles.button)}>Save edit</ComposerPrimitive.Send><ComposerPrimitive.Cancel {...stylex.props(styles.button)}>Cancel edit</ComposerPrimitive.Cancel></ComposerPrimitive.Root> : <><MessagePrimitive.Parts components={{ Text: TextPart, Reasoning: ReasoningPart, tools: { Fallback: EmbraceToolCall } }} />{item?._tag === 'Text' && item.role === 'user' && item.sendState?._tag === 'Failed' && <SendFailure state={item.sendState} onRetry={options.onRetrySend === undefined ? undefined : () => options.onRetrySend?.(item.id)} />}</>}
     {options.embrace !== 'E1' ? <>
       <MessagePrimitive.Attachments components={{ Attachment }} />
       <MessagePrimitive.Error><ErrorPrimitive.Root {...stylex.props(styles.error)}><ErrorPrimitive.Message /></ErrorPrimitive.Root></MessagePrimitive.Error>
@@ -115,7 +116,7 @@ function rowsFor(items: readonly ConversationItem[], tools: ToolVariant, workLog
 }
 const noWorkLogs: readonly WorkLogProjection[] = []
 /** Render under AssistantRuntimeProvider. The app keeps ownership of stores and callbacks. */
-export function EmbraceThread({ items: snapshot, workLogs, readingColumn = false, embrace = 'E1', tools = 'rows', senders = 'S2', composer = 'C1', history, targetLabel, disabledReason, threadList, toolbar, composerProps, onCommit, emptyState, style }: EmbraceThreadProps) {
+export function EmbraceThread({ items: snapshot, workLogs, readingColumn = false, embrace = 'E1', tools = 'rows', senders = 'S2', composer = 'C1', history, targetLabel, disabledReason, threadList, toolbar, composerProps, onCommit, onRetrySend, emptyState, style }: EmbraceThreadProps) {
   const messages = useAuiState(state => state.thread.messages)
   // The adapter commits after React renders its new input snapshot. Use the
   // runtime's committed identities and source references so RAC never measures
@@ -134,7 +135,7 @@ export function EmbraceThread({ items: snapshot, workLogs, readingColumn = false
     const previous = items[index - 1]
     const repeatToolSender = tools === 'grouped' && item._tag === 'ToolCall' && previous?._tag === 'ToolCall' && participant(previous) === participant(item)
     const showSender = (senders !== 'S3' || index === 0 || participant(previous!) !== participant(item)) && !repeatToolSender
-    return <DisplayContext.Provider key={item.id} value={{ embrace, senders, showSender }}>
+    return <DisplayContext.Provider key={item.id} value={{ embrace, senders, showSender, onRetrySend }}>
       <ThreadPrimitive.Unstable_MessageById messageId={item.id} components={messageComponents} />
     </DisplayContext.Provider>
   }
