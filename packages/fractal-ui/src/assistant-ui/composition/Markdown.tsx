@@ -3,7 +3,7 @@ import * as stylex from '@stylexjs/stylex'
 import { Button, Link, Tooltip, TooltipTrigger, VisuallyHidden } from 'react-aria-components'
 import ReactMarkdown from 'react-markdown'
 import type { Components, ExtraProps } from 'react-markdown'
-import type { RootContent as SyntaxNode } from 'hast'
+import type { Root, RootContent as SyntaxNode } from 'hast'
 import type { Syntax } from 'refractor/core'
 import remarkGfm from 'remark-gfm'
 import { surfaceVars as surface, textVars as textColor, borderVars as border, accentVars as accent, statusVars as status, typeVars as t, radiusVars as r, spaceVars as s, geometryVars as g } from '../composition-tokens.stylex'
@@ -13,15 +13,36 @@ export type InlineReferenceRenderer = (path: string) => React.ReactNode | undefi
 export interface MarkdownProps { text: string; streaming?: boolean; resources?: readonly InlineResource[]; onOpenResource?: (path?: string) => void; renderInlineReference?: InlineReferenceRenderer }
 const EMPTY_RESOURCES: readonly InlineResource[] = []
 const REMARK_PLUGINS = [remarkGfm]
+const STREAMING_PLUGINS = [markStreamingTail]
 type ReferenceOptions = Omit<MarkdownProps, 'text' | 'streaming'>
 const EMPTY_REFERENCES: ReferenceOptions = {}
 const ReferenceContext = React.createContext<ReferenceOptions>(EMPTY_REFERENCES)
+/** Paragraphs keep the caret on their final line; every other terminal block gets an inline fallback. */
+function markStreamingTail() {
+  return (tree: Root) => {
+    for (let index = tree.children.length - 1; index >= 0; index--) {
+      const last = tree.children[index]!
+      if (last.type !== 'element') continue
+      if (last.tagName === 'p') {
+        last.properties['data-streaming-tail'] = true
+        return
+      }
+      break
+    }
+    tree.children.push({ type: 'element', tagName: 'span', properties: { 'data-streaming-tail': true, 'aria-hidden': true }, children: [] })
+  }
+}
 
 export const Markdown = React.memo(function Markdown({ text, streaming = false, resources = EMPTY_RESOURCES, onOpenResource, renderInlineReference }: MarkdownProps) {
   const references = React.useMemo(() => ({ resources, onOpenResource, renderInlineReference }), [resources, onOpenResource, renderInlineReference])
   const source = React.useMemo(() => streaming ? completeStreamingTail(text) : text, [text, streaming])
-  return <ReferenceContext.Provider value={references}><div data-testid="markdown" {...stylex.props(styles.markdown)}><ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={MARKDOWN_COMPONENTS}>{source}</ReactMarkdown></div></ReferenceContext.Provider>
+  return <ReferenceContext.Provider value={references}><div data-testid="markdown" {...stylex.props(styles.markdown)}><ReactMarkdown remarkPlugins={REMARK_PLUGINS} rehypePlugins={streaming ? STREAMING_PLUGINS : undefined} components={MARKDOWN_COMPONENTS}>{source}</ReactMarkdown></div></ReferenceContext.Provider>
 })
+
+function Paragraph({ children, node }: React.ComponentProps<'p'> & ExtraProps) {
+  const live = node?.properties['data-streaming-tail'] === true
+  return <p data-streaming-tail={live || undefined} {...stylex.props(styles.paragraph, styles.prose, live && styles.streamingTail)}><InlineText>{children}</InlineText></p>
+}
 
 function renderReference(path: string, options: ReferenceOptions): React.ReactNode | undefined {
   const rendered = options.renderInlineReference?.(path)
@@ -92,7 +113,7 @@ function SyntaxToken({ node }: { node: SyntaxNode }): React.ReactNode {
   )}>{node.children.map((child, index) => <SyntaxToken key={index} node={child} />)}</span>
 }
 
-function HighlightedSource({ code, language }: { code: string; language: string }) {
+export function HighlightedSource({ code, language }: { code: string; language: string }) {
   const normalized = language.toLowerCase()
   const canonical = Object.hasOwn(languageAliases, normalized) ? languageAliases[normalized]! : normalized
   const Highlighter = Object.hasOwn(highlighters, canonical) ? highlighters[canonical] : undefined
@@ -138,7 +159,8 @@ const heading = (Tag: 'h1' | 'h2' | 'h3' | 'h4' | 'h5' | 'h6') => function Headi
 }
 const MARKDOWN_COMPONENTS: Components = {
   h1: heading('h1'), h2: heading('h2'), h3: heading('h3'), h4: heading('h4'), h5: heading('h5'), h6: heading('h6'),
-  p: ({ children }) => <p {...stylex.props(styles.paragraph, styles.prose)}><InlineText>{children}</InlineText></p>,
+  p: Paragraph,
+  span: ({ children, node }) => <span data-streaming-tail={node?.properties['data-streaming-tail'] || undefined} aria-hidden={node?.properties['aria-hidden'] === true || undefined} {...stylex.props(node?.properties['data-streaming-tail'] === true && styles.streamingTail)}>{children}</span>,
   strong: ({ children }) => <strong {...stylex.props(styles.strong)}><InlineText>{children}</InlineText></strong>,
   em: ({ children }) => <em {...stylex.props(styles.emphasis)}><InlineText>{children}</InlineText></em>,
   ul: ({ children }) => <ul {...stylex.props(styles.list, styles.prose, styles.unorderedList)}>{children}</ul>,
@@ -279,6 +301,7 @@ const styles = stylex.create({
   codeBlock: { minWidth: 0, maxWidth: '100%', margin: 0, marginBlockEnd: s.proseGap, backgroundColor: surface.codeBg, borderWidth: g.hairline, borderStyle: 'solid', borderColor: border.border, borderRadius: r.md, overflow: 'hidden' },
   codeText: { fontFamily: t.fontMono, fontSize: t.codeSize, lineHeight: t.uiLeading, color: textColor.fgSoft },
   paragraph: { margin: 0, marginBlockEnd: s.proseGap, fontSize: t.bodySize, lineHeight: t.bodyLeading, color: textColor.fgSoft, overflowWrap: 'anywhere' },
+  streamingTail: { '::after': { content: '""', display: 'inline-block', width: g.caret, height: t.bodySize, marginInlineStart: s.xs, verticalAlign: 'text-bottom', backgroundColor: textColor.fgMuted } },
   inlineCode: { fontFamily: t.fontMono, fontSize: t.metaSize, color: textColor.fg, backgroundColor: surface.codeBg, borderWidth: g.hairline, borderStyle: 'solid', borderColor: border.border, borderRadius: r.sm, paddingInline: s.xs },
   link: { color: status.runningFg, textDecorationLine: 'none', ':hover': { textDecorationLine: 'underline' }, ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: accent.primary, outlineOffset: g.focusOffset } },
   resource: { display: 'inline', fontFamily: t.fontMono, fontSize: t.metaSize, color: textColor.fg, backgroundColor: surface.controlFill, borderWidth: g.hairline, borderStyle: 'solid', borderColor: border.borderStrong, borderRadius: r.sm, paddingInline: s.xs, paddingBlock: 0, cursor: 'pointer', ':hover': { backgroundColor: surface.rowHover }, ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: accent.primary, outlineOffset: g.hairline } }, hoverCard: { maxWidth: g.tooltipMax, padding: s.lg, borderRadius: r.md, borderWidth: g.hairline, borderStyle: 'solid', borderColor: border.borderStrong, backgroundColor: surface.raised, color: textColor.fg, fontSize: t.metaSize, lineHeight: t.metaLeading }, resourceTitle: { display: 'flex', alignItems: 'center', gap: s.md, fontFamily: t.fontMono }, added: { color: status.diffAdded }, removed: { color: status.diffRemoved }, preview: { margin: 0, marginTop: s.md, fontFamily: t.fontMono, fontSize: t.denseSize, lineHeight: t.metaLeading, color: textColor.fgMuted, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' },

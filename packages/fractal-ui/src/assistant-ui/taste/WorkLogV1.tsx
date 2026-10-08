@@ -4,42 +4,72 @@ import { Button, Tooltip, TooltipTrigger } from 'react-aria-components'
 import { surfaceVars as surface, textVars as ink, borderVars as border, accentVars as accent, statusVars as status, typeVars as t, radiusVars as r, spaceVars as s, geometryVars as g } from '../composition-tokens.stylex'
 import { Icon } from '../composition/Icons'
 import { ErrorOverlay, useErrorOverlaySurface } from '../composition/ErrorOverlay'
+import { HighlightedSource } from '../composition/Markdown'
 import type { WorkLogCall, WorkLogTurn } from './work-log'
-import { formatWorkDuration } from './work-log'
-/** Controlled work log. The host supplies verified facts; there is no demo fallback and no actions. */
+import { formatWorkDuration, workLogOutputLanguage } from './work-log'
+
 export type WorkLogCallDetailRenderer = (call: WorkLogCall) => React.ReactNode
 const CallDetailRenderer = React.createContext<WorkLogCallDetailRenderer | undefined>(undefined)
-export function WorkLogV1({ turn, listStyle, renderCallDetail }: {
+const PreviewCallDetail = React.createContext(false)
+const timeFormat = new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' })
+/** Host-owned facts and actions; incomplete, running and failed work never folds. */
+export function WorkLogV1({ turn, listStyle, renderCallDetail, previewCallDetail = false, hideLiveRow = false, expandedBody, ariaLabel = 'Work log', onRetry, onOpenOutput }: {
   readonly turn: WorkLogTurn
   readonly listStyle?: stylex.StyleXStyles
   readonly renderCallDetail?: WorkLogCallDetailRenderer
+  readonly previewCallDetail?: boolean
+  readonly hideLiveRow?: boolean
+  readonly expandedBody?: React.ReactNode
+  readonly ariaLabel?: string
+  readonly onRetry?: () => void
+  readonly onOpenOutput?: (call: WorkLogCall) => void
 }) {
   const overlayLayer = useErrorOverlaySurface()
-  const settled = !turn.running && !turn.failed && !turn.interrupted
+  const settled = !turn.running && !turn.failed && !turn.interrupted && turn.foldable !== false
   const durationLabel = formatWorkDuration(turn.durationMs)
   const [open, setOpen] = React.useState(false)
-  const workLabel = `Worked${durationLabel ? ` for ${durationLabel}` : ''}`
-  return <CallDetailRenderer.Provider value={renderCallDetail}><section aria-label="Work log" data-testid="work-log">
-    {turn.running ? <div data-testid="live-work" {...stylex.props(styles.live)}><Icon name="spinner" spinning /><span>Working</span></div> : <>
-      <Button isDisabled={!settled} aria-expanded={!settled || open} onPress={() => setOpen(value => !value)} {...stylex.props(styles.summary)}><span>{settled ? workLabel : turn.failed ? 'Run failed' : 'Run stopped'}</span><Icon name={!settled || open ? 'chevron-down' : 'chevron-right'} size={12} /></Button>
-      {(!settled || open) && <CallList calls={turn.calls} listStyle={listStyle} />}
-    </>}
-    {turn.failed && turn.failureNote !== undefined ? (overlayLayer !== null
-      ? <ErrorOverlay id={`work-failure-${turn.calls[0]?.id ?? 'turn'}`} title="Run failed." detail={turn.failureNote} />
-      : <div role="alert" {...stylex.props(styles.promoted)}><span {...stylex.props(styles.error)}><Icon name="x" size={14} /></span><span>{turn.failureNote}</span></div>) : null}
-  </section></CallDetailRenderer.Provider>
+  const failedCall = turn.calls.find(call => call.status === 'error')
+  const failed = turn.failed || failedCall !== undefined
+  const workLabel = turn.running ? 'Working' : settled ? `Worked${durationLabel ? ` for ${durationLabel}` : ''}` : failed ? 'Run failed' : turn.interrupted ? 'Run interrupted' : 'Work · completion unverified'
+  const summary = [workLabel, settled && turn.commands ? `${turn.commands} ${turn.commands === 1 ? 'command' : 'commands'}` : undefined, settled && turn.changedFiles ? `${turn.changedFiles} ${turn.changedFiles === 1 ? 'file changed' : 'files changed'}` : undefined].filter(value => value !== undefined).join(' · ')
+  const started = turn.running ? NaN : Date.parse(turn.startedAt ?? '')
+  const failedCommand = failedCall?.kind === 'run' ? failedCall.argsSummary ?? failedCall.title : undefined
+  const detail = [failedCommand, failedCall?.detail, turn.failureNote].filter((value, index, values) => value !== undefined && values.indexOf(value) === index).join('\n') || undefined
+  return <CallDetailRenderer.Provider value={renderCallDetail}><PreviewCallDetail.Provider value={previewCallDetail}><section aria-label={ariaLabel} data-testid="work-log">
+    {turn.running && !hideLiveRow && <div data-testid="live-work" role="status" aria-label="Response in progress" {...stylex.props(styles.live)}><Icon name="spinner" spinning /><span>Working</span></div>}
+    <Button isDisabled={!settled} aria-expanded={!settled || open} onPress={() => setOpen(value => !value)} {...stylex.props(styles.summary, failed && styles.failureInk)}><Icon name={!settled || open ? 'chevron-down' : 'chevron-right'} size={12} /><span {...stylex.props(styles.summaryLabel)}>{summary}</span>{Number.isFinite(started) && <time dateTime={new Date(started).toISOString()} {...stylex.props(styles.time)}>{timeFormat.format(started)}</time>}</Button>
+    {(!settled || open) && <><div {...stylex.props(styles.list, listStyle)}>{turn.calls.map(call => <TimelineCall key={call.id} call={call} />)}</div>{expandedBody}<hr data-testid="work-log-divider" {...stylex.props(styles.divider)} /></>}
+    {failed && (overlayLayer !== null ? <ErrorOverlay id={`work-failure-${turn.calls[0]?.id ?? 'turn'}`} title={failedCommand === undefined ? 'Run failed.' : 'Command did not complete'} detail={detail} onRetry={onRetry} onOpenOutput={failedCall === undefined || onOpenOutput === undefined ? undefined : () => onOpenOutput(failedCall)} /> : <div role="alert" {...stylex.props(styles.promoted, styles.failed)}><Icon name="x" size={14} /><span>{failedCall?.detail ?? turn.failureNote ?? 'Run failed.'}</span></div>)}
+    {turn.interrupted && <div {...stylex.props(styles.promoted)}><Icon name="stop" size={14} /><span>Run interrupted.</span></div>}
+  </section></PreviewCallDetail.Provider></CallDetailRenderer.Provider>
 }
-function CallList({ calls: items, listStyle }: { calls: readonly WorkLogCall[]; listStyle?: stylex.StyleXStyles }) { return <div {...stylex.props(styles.list, listStyle)}>{items.map(call => <TimelineCall key={call.id} call={call} />)}</div> }
 function TimelineCall({ call }: { call: WorkLogCall }) {
   const [open, setOpen] = React.useState(false)
   const renderDetail = React.useContext(CallDetailRenderer)
-  const result = call.detail ?? call.argsSummary ?? (call.status === 'running' ? 'Running…' : '')
+  const preview = React.useContext(PreviewCallDetail)
+  const hasOutput = call.detail !== undefined && call.detail.length > 0
+  const displayed = hasOutput && (open || preview && call.status !== 'error')
+  const result = call.detail ?? (call.status === 'running' ? 'Running…' : 'No output')
   const label = call.argsSummary === undefined ? call.title : `${call.title} ${call.argsSummary}`
-  return <div><TooltipTrigger delay={150}><Button aria-expanded={open} onPress={() => setOpen(value => !value)} {...stylex.props(styles.call)}><span {...stylex.props(styles.dot)} /><Icon name={call.kind === 'read' ? 'search' : call.kind === 'run' ? 'drawer' : 'pencil'} size={14} /><span {...stylex.props(styles.callLabel)}>{label}</span><Icon name={open ? 'chevron-down' : 'chevron-right'} size={12} /></Button><Tooltip {...stylex.props(styles.hover)}><div>{label}</div><div>{result}</div></Tooltip></TooltipTrigger>{open && (renderDetail === undefined ? <div {...stylex.props(styles.output)}>{result}</div> : renderDetail(call))}</div>
+  const start = Date.parse(call.startedAt), end = Date.parse(call.endedAt ?? '')
+  const duration = Number.isFinite(start) && Number.isFinite(end) && end >= start ? formatWorkDuration(end - start) || '<1s' : undefined
+  const state = call.status === 'running' ? 'Running' : call.status === 'error' ? 'Failed' : call.status === 'interrupted' ? 'Interrupted' : 'OK'
+  const row = <><Icon name={call.status === 'running' ? 'spinner' : call.status === 'error' ? 'alert' : call.status === 'success' ? 'check' : 'stop'} spinning={call.status === 'running'} size={14} /><Icon name={call.kind === 'read' ? 'search' : call.kind === 'run' ? 'drawer' : 'pencil'} size={14} /><span {...stylex.props(styles.callLabel)}>{call.kind === 'run' ? <code {...stylex.props(styles.mono)}><HighlightedSource code={label} language="bash" /></code> : <>{call.title}{call.argsSummary === undefined ? null : <>{' '}<code {...stylex.props(styles.mono)}>{call.argsSummary}</code></>}</>}</span>{hasOutput && <span data-row-disclosure={displayed ? 'open' : 'closed'} {...stylex.props(styles.disclosure)}><Icon name={displayed ? 'chevron-down' : 'chevron-right'} size={12} /></span>}<span {...stylex.props(styles.callState)}>{state}{!hasOutput && call.status !== 'running' ? ' · No output' : ''}{duration === undefined ? '' : ` · ${duration}`}</span></>
+  return <div data-tool-status={call.status}>{hasOutput ? <TooltipTrigger delay={150}><Button aria-expanded={displayed} onPress={() => setOpen(value => !value)} {...stylex.props(styles.call, open && styles.expanded, call.status === 'error' && styles.failureInk)}>{row}</Button><Tooltip {...stylex.props(styles.hover)}><div>{label}</div><div>{result}</div></Tooltip></TooltipTrigger> : <div {...stylex.props(styles.call, styles.staticCall, call.status === 'error' && styles.failureInk)}>{row}</div>}{displayed && (renderDetail === undefined ? <pre data-testid="work-call-output" {...stylex.props(styles.output)}><code><HighlightedSource code={result} language={workLogOutputLanguage(call)} /></code></pre> : renderDetail(call))}</div>
 }
 const styles = stylex.create({
-  summary: { display: 'flex', alignItems: 'center', gap: s.sm, width: '100%', minHeight: g.toolRow, borderWidth: 0, borderBottomWidth: 1, borderBottomStyle: 'solid', borderBottomColor: border.border, backgroundColor: surface.transparent, color: ink.fgMuted, fontFamily: t.fontSans, fontSize: t.uiSize, padding: 0, cursor: 'pointer', ':focus-visible': { outline: `2px solid ${accent.primary}` } },
-  list: { maxHeight: g.workExpandedMax, overflowY: 'auto', overscrollBehavior: 'contain' }, call: { display: 'flex', alignItems: 'center', gap: s.sm, width: '100%', minHeight: g.toolRow, paddingInline: s.xs, borderWidth: 0, borderRadius: r.sm, backgroundColor: surface.transparent, color: ink.fgMuted, fontFamily: t.fontSans, fontSize: t.uiSize, textAlign: 'left', cursor: 'pointer', ':hover': { backgroundColor: surface.rowHover }, ':focus-visible': { outline: `2px solid ${accent.primary}` } }, callLabel: { flexGrow: 1, minWidth: 0, overflowWrap: 'anywhere' }, dot: { height: 6, width: 6, borderRadius: '50%', backgroundColor: ink.fgMuted, flexShrink: 0 },
-  output: { paddingInline: s.xxl, paddingBlock: s.xs, color: ink.fgMuted, fontFamily: t.fontMono, fontSize: t.metaSize, lineHeight: t.metaLeading },
-  live: { minHeight: g.toolRow, display: 'flex', alignItems: 'center', gap: s.md, color: ink.fgMuted, fontSize: t.metaSize }, promoted: { display: 'flex', alignItems: 'center', gap: s.md, marginTop: s.md, padding: s.md, backgroundColor: surface.washSubtle, borderRadius: r.md, color: ink.fgSoft, fontSize: t.metaSize, lineHeight: t.uiLeading }, error: { color: status.dangerFg }, hover: { maxWidth: 360, padding: s.md, borderRadius: r.md, backgroundColor: surface.raised, color: ink.fg, borderWidth: 1, borderStyle: 'solid', borderColor: border.borderStrong, fontFamily: t.fontSans, fontSize: t.metaSize, lineHeight: t.uiLeading, zIndex: 10 },
+  summary: { display: 'flex', alignItems: 'center', gap: s.sm, width: '100%', minHeight: g.toolRow, borderWidth: 0, borderBottomWidth: g.hairline, borderBottomStyle: 'solid', borderBottomColor: border.border, backgroundColor: surface.transparent, color: ink.fgMuted, fontFamily: t.fontSans, fontSize: t.uiSize, padding: 0, cursor: 'pointer', ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: accent.primary } },
+  summaryLabel: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+  list: { maxHeight: g.workExpandedMax, overflowY: 'auto', overscrollBehavior: 'contain' },
+  call: { display: 'flex', alignItems: 'center', gap: s.sm, width: '100%', minHeight: g.toolRow, paddingInline: s.xs, borderWidth: 0, borderRadius: r.sm, backgroundColor: surface.transparent, color: ink.fgMuted, fontFamily: t.fontSans, fontSize: t.uiSize, textAlign: 'left', cursor: 'pointer', ':hover': { backgroundColor: surface.rowHover, color: ink.fg }, ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: accent.primary } },
+  callLabel: { minWidth: 0, overflowWrap: 'anywhere' }, callState: { marginLeft: 'auto', flexShrink: 0, color: 'inherit', fontSize: t.metaSize },
+  expanded: { backgroundColor: surface.rowActive, color: ink.fg }, staticCall: { cursor: 'default' }, disclosure: { display: 'inline-flex', flexShrink: 0 },
+  mono: { fontFamily: t.fontMono, fontSize: t.metaSize },
+  output: { marginBlock: 0, paddingInline: s.xxl, paddingBlock: s.xs, color: ink.fgMuted, fontFamily: t.fontMono, fontSize: t.metaSize, lineHeight: t.metaLeading, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' },
+  divider: { height: 0, margin: 0, borderWidth: 0, borderTopWidth: g.hairline, borderTopStyle: 'solid', borderTopColor: border.border },
+  time: { flexShrink: 0, color: ink.fgMuted, fontSize: t.metaSize, marginLeft: 'auto' },
+  live: { minHeight: g.toolRow, display: 'flex', alignItems: 'center', gap: s.md, color: ink.fgMuted, fontSize: t.metaSize },
+  promoted: { display: 'flex', alignItems: 'center', gap: s.md, marginTop: s.md, padding: s.md, backgroundColor: surface.washSubtle, borderRadius: r.md, color: ink.fgSoft, fontSize: t.metaSize, lineHeight: t.uiLeading },
+  failed: { backgroundColor: status.diffRemovedWash, color: status.dangerFg }, failureInk: { color: status.dangerFg },
+  hover: { maxWidth: g.tooltipMax, padding: s.md, borderRadius: r.md, backgroundColor: surface.raised, color: ink.fg, borderWidth: g.hairline, borderStyle: 'solid', borderColor: border.borderStrong, fontFamily: t.fontSans, fontSize: t.metaSize, lineHeight: t.uiLeading, zIndex: 10 },
 })
