@@ -718,13 +718,21 @@ async fn conversation_open_value(
 
 #[cfg(test)]
 thread_local! {
+    static AFTER_CONVERSATION_SNAPSHOT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static BEFORE_CONVERSATION_PAGE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 fn conversation_open_local(
     state: &AppState, session: &ClientSession, session_id: &str,
 ) -> Result<(Value, Value), ApiError> {
+    // Local rows follow a graph position. Capture their high-water first: a row newer than
+    // the graph cut must never be excluded from both this page and its replay cursor.
+    let local_position = local_latest_position(state)?;
     let snapshot = new_client_snapshot(state);
+    #[cfg(test)]
+    AFTER_CONVERSATION_SNAPSHOT.with(|pause| {
+        if let Some(pause) = pause.borrow_mut().take() { pause(); }
+    });
     let mark = ConversationMark::new(state, session_id)?;
     #[cfg(test)]
     BEFORE_CONVERSATION_PAGE.with(|pause| {
@@ -736,7 +744,7 @@ fn conversation_open_local(
     )?.0;
     let native = native_latest_sequence(&page);
     let cursor = conversation_cursor(
-        state, session_id, snapshot.store_index, mark.local_position, native,
+        state, session_id, snapshot.store_index, local_position, native,
     );
     remember_cursor(&cursor, mark.transcript_seen);
     Ok((json!({"next_cursor":cursor}), page))
@@ -14305,6 +14313,59 @@ mission "example/zero-run" state="ready" {
         assert!(!page["items"].as_array().unwrap().iter().any(|item| item["body"]["text"] == "committed during OPEN"));
         let delta = conversation_changes_local(&state, &session, &session_id, start["next_cursor"].as_str(), 0).await.unwrap();
         assert!(delta["items"].as_array().unwrap().iter().any(|item| item["body"]["text"] == "committed during OPEN"), "{delta}");
+    }
+
+    #[tokio::test]
+    async fn conversation_open_replays_local_rows_that_follow_a_newer_graph_cut() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "open-local-frontier");
+        let owner = "agent/open-local-frontier";
+        let incarnation = "local-frontier-runtime:i1";
+        state.store.append_claim(&ClaimInput {
+            subject: owner.into(), kind: "runtime.observed".into(), actor: Some(owner.into()),
+            fields: serde_json::from_value(json!({"status":"running", "runtime_id":"local-frontier-runtime", "incarnation_id":incarnation})).unwrap(),
+            evidence: vec![], expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let session_id = managed_session_id(owner, incarnation);
+        let session = ClientSession::local(Some("person/example")).unwrap();
+        let writer = state.clone();
+        AFTER_CONVERSATION_SNAPSHOT.with(|pause| {
+            *pause.borrow_mut() = Some(Box::new(move || {
+                // The unrelated commit advances the graph, so the following local row is
+                // outside the first page's graph cut, even though the later mark can see it.
+                writer.store.append_claim(&ClaimInput {
+                    subject: "message/unrelated-local-frontier".into(), kind: "message.sent".into(),
+                    actor: Some("person/other".into()),
+                    fields: serde_json::from_value(json!({"from":"person/other", "to":"agent/other",
+                        "status":"sent", "content":"unrelated commit"})).unwrap(),
+                    evidence: vec![], expected_subject: None, idempotency_key: None,
+                }).unwrap();
+                writer.store.append_local_observations_for_test(&[ClaimInput {
+                    subject: owner.into(), kind: "harness.timeline".into(), actor: Some(owner.into()),
+                    fields: serde_json::from_value(json!({"operation":"append",
+                        "entry_id":"timeline-entry/open-local-frontier", "sequence":1,
+                        "revision":1, "role":"assistant", "entry_type":"content", "final":true,
+                        "body":{"media_type":"text/plain", "text":"local row across graph cut"},
+                        "driver":"codex", "incarnation_id":incarnation})).unwrap(),
+                    evidence: vec![], expected_subject: None, idempotency_key: None,
+                }]);
+            }));
+        });
+        let (start, page) = conversation_open_local(&state, &session, &session_id).unwrap();
+        let contains_local = |value: &Value| value["items"].as_array().unwrap().iter()
+            .any(|item| item["id"] == "timeline-entry/open-local-frontier");
+        assert!(!contains_local(&page));
+        let cursor = start["next_cursor"].as_str().unwrap();
+        let (graph, local, native) = conversation_position(&state, &session_id, cursor).unwrap();
+        let latest_local = local_latest_position(&state).unwrap();
+        assert!(latest_local > local);
+        // Control: the former post-snapshot local high-water silently skips this exact row.
+        let skipped = conversation_cursor(&state, &session_id, graph, latest_local, native);
+        remember_cursor(&skipped, issued_transcript(cursor).unwrap());
+        let lost = conversation_changes_local(&state, &session, &session_id, Some(&skipped), 0).await.unwrap();
+        assert!(!contains_local(&lost));
+        let replay = conversation_changes_local(&state, &session, &session_id, Some(cursor), 0).await.unwrap();
+        assert!(contains_local(&replay), "{replay}");
     }
 
     #[tokio::test]
