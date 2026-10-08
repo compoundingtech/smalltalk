@@ -624,6 +624,22 @@ the normalized `tool_output` block's optional open `metadata`, preserving `wallT
 `source_record` block. Legacy tool-result blocks inside message content remain supported and
 use the same block metadata shape.
 
+When a native user turn retains an exact delivery identity, the graph message and its content
+remain the canonical timeline entries; the native echo and its parts are suppressed. The graph
+entries keep their IDs, sequences, and `message_id` across pages, stream updates, and reconnects.
+The conversation cursor still advances past suppressed native entries. Correlation uses the
+existing delivery marker at the beginning of a user prompt, or a persisted native client ID
+bound to the exact thread and recipient. No content-text, adjacency, or queue-order matching is
+used. Extension-based harnesses retain both entries: exact correlation requires their delivery
+API to propagate a delivery token to the native user-message event.
+
+A transcript without a supported delivery identity retains both entries. This does not alter
+timeline ordering or sequence allocation, and no client idempotency-key field is exposed. If
+the native read sees a send beyond its graph snapshot, its echo is withheld until the next graph
+delta supplies the canonical rows. Post-snapshot client-ID reconciliation reads at most 256
+indexed conversation rows; if that window is exhausted without establishing correlation, the
+torn read requests a full conversation resync rather than guessing.
+
 External process sessions remain listed even when st cannot identify a native transcript.
 Opening their timeline returns a non-retryable `unsupported-capability` error with
 `details.reason: native-session-unidentified` and `details.session_id`, explaining that the

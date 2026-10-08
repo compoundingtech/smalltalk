@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Keep graph sends canonical when native conversations echo a correlated user message",
+  "replay": {
+    "status": "none",
+    "detail": "No durable replay or migration. Native timeline reads suppress exactly correlated user echoes while retaining the original graph message and content entries."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database or public client schema changes. Delivery correlations and native replay high-water marks remain internal."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Claim admission, message delivery, lifecycle transitions, and replication authority are unchanged."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Existing graph row IDs, message IDs, sequences, finality, HTTP pagination snapshots, and conversation cursor encoding are unchanged. Native user rows with an exact supported delivery identity and all their parts are omitted, and the stream still advances over them. Extension-based harnesses and uncorrelated native messages retain previous behavior."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No service outage or restart migration is required."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No operator action. No raw client idempotency key is persisted or exposed by this change."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "Reconnects resume past suppressed native echoes without replacement or deletion events. Exact graph sends beyond a read's snapshot suppress their echoes until the next graph delta supplies the rows. Post-snapshot client-identity reconciliation reads at most 256 conversation rows and requests resync if that window cannot establish correlation. Historical transcripts without supported delivery identities remain unchanged. Ordering remains unchanged."
+  }
+}
