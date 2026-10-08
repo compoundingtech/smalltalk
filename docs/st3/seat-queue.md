@@ -145,6 +145,11 @@ claims, so every replica computes the same order. Terminal runs are read only wh
 them. A run that never receives or anchors a move cannot change the relative order of the
 others.
 
+The per-agent HTTP queue read checks existence with the indexed newest-claim ID lookup. It
+does not deserialize a full claim or sort the agent's observation history merely to decide
+whether to return a queue or `404`. Queue joins, current work and canonical move replay are
+still read from the current store; no queue cache is introduced.
+
 ## Tests
 
 - `seat_queue::tests`: replay order, each placement, writer clock skew, ignored moves, and nested
@@ -170,6 +175,12 @@ others.
   - moves must name queued runs and valid anchors.
 - `client_v0_contract::agent_queue_read_and_person_move_share_one_seat_order`: the read, the
   person action, the agent-filtered work list order, validation errors, and an unknown agent.
+- `api::client_v0::tests::agent_queue_history_preserves_output_and_missing_agent` and
+  `agent_queue_nonempty_matches_previous_handler`: full JSON parity with the previous handler,
+  short/full IDs, missing agents, ready/waiting runs and move history.
+- `api::client_v0::tests::agent_queue_history_cost` (ignored): isolated fixture comparison with
+  4,096, 32,768 and 262,144 observations, exact existence-query plans and VM steps, and ten alternating
+  before/after handler samples. This measures local fixture reads, not production HTTP tails.
 - `mission::tests::queue_authority_still_parses_and_rejects_invalid_rules`: a `queue-authority`
   block still parses, and empty, prefixed, wildcard, duplicate, and unknown rules are refused.
 - `client_v0_cli::agents_queue_cli_shows_seat_order_and_records_person_and_agent_moves`: human
