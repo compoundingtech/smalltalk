@@ -4580,6 +4580,7 @@ pub(super) fn timeline_value(
     require_scope(session, "read.projections")?;
     let session_id = client_detail_id("session", id);
     if query.cursor.is_some() {
+        let _span = crate::profile::span("timeline/cached-page");
         let mut page = client_page(
             state,
             snapshot,
@@ -4622,6 +4623,7 @@ fn timeline_first_page(
         .map_err(ApiError::internal)?;
         let items = match conversation {
             Some(crate::external_sessions::ExternalConversation::Readable(external)) => {
+                let _span = crate::profile::span("timeline/native-read");
                 conversation_blocks::read(&external, session, &session_id)?
             }
             other => external_conversation_items(other, &session_id)?,
@@ -4636,13 +4638,16 @@ fn timeline_first_page(
     if let Some(incarnation) = incarnation
         && let Some(managed) = managed_transcript(state, owner, incarnation)?
     {
-        let read = match managed.transcript.as_ref() {
-            Ok(external) => match conversation_blocks::read(external, session, &session_id) {
-                Ok(items) => Ok(items),
-                Err(error) if error.status == StatusCode::TOO_MANY_REQUESTS => return Err(error),
-                Err(error) => Err(format!("the transcript could not be read: {}", error.message)),
-            },
-            Err(missing) => Err(missing.reason.clone()),
+        let read = {
+            let _span = crate::profile::span("timeline/native-read");
+            match managed.transcript.as_ref() {
+                Ok(external) => match conversation_blocks::read(external, session, &session_id) {
+                    Ok(items) => Ok(items),
+                    Err(error) if error.status == StatusCode::TOO_MANY_REQUESTS => return Err(error),
+                    Err(error) => Err(format!("the transcript could not be read: {}", error.message)),
+                },
+                Err(missing) => Err(missing.reason.clone()),
+            }
         };
         match read {
             Ok(items) => return native_timeline_page(state, snapshot, &session_id, query, items),
@@ -4651,7 +4656,9 @@ fn timeline_first_page(
             }
         }
     }
-    let desired = state.store.desired_subjects().map_err(ApiError::internal)?;
+    let _fallback_span = crate::profile::span("timeline/stored-fallback");
+    let desired = state.store.desired_subjects_named(&[owner.to_owned()])
+        .map_err(ApiError::internal)?;
     let attribution = timeline_attribution(owner, &desired);
     let before = snapshot.store_index.checked_add(1);
     let timeline_page = if let Some(incarnation) = incarnation {
@@ -4742,11 +4749,9 @@ fn timeline_first_page(
     });
     let mut owner_claims = state
         .store
-        .claims_page(Some(owner), None, 0, before, true, 10_000)
-        .map_err(ApiError::internal)?
-        .claims;
+        .conversation_timeline_owner_claims_at(owner, before)
+        .map_err(ApiError::internal)?;
     owner_claims.reverse();
-    owner_claims.retain(|claim| claim.kind != "harness.timeline");
     let mut message_claims = session_messages(state, owner, &session_id, incarnation, before)?;
     message_claims.reverse();
     let mut claims = timeline_claims;

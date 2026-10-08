@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Bound stored session timeline graph payload reads and expose native versus fallback profile stages",
+  "replay": {
+    "status": "none",
+    "detail": "No replay or retained data change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Existing subject and claim identity indexes are reused; no table or index change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No claim, retention, checkpoint or projection rule change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Visible timeline entries, physical history window, attribution, errors and cursor behavior are preserved; no client contract change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Normal rolling deployment; no additional startup work."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No operator or user action required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Existing repair and cache invalidation behavior remains unchanged."
+  }
+}
