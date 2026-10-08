@@ -51,6 +51,12 @@ pub struct World {
     /// contract while empty: the phone shows this on its own.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub stale: Vec<String>,
+    /// Whether the missions window is followed now. Not part of the shared contract.
+    #[serde(skip)]
+    pub missions_followed: bool,
+    /// The number of active missions st reports, when the mission rows are not followed.
+    #[serde(skip)]
+    pub active_missions: Option<usize>,
     pub attention: Load<Vec<Attention>>,
     pub agents: Load<Vec<Agent>>,
     pub missions: Load<Vec<Mission>>,

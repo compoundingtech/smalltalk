@@ -4191,7 +4191,9 @@ pub(super) async fn agent_queue(
     let store = state.store.clone();
     let lookup = agent.clone();
     let queue = blocking_store(move || {
-        if store.latest_claim(&lookup, None)?.is_none() {
+        // Only existence matters here. Reading the newest full claim sorts and decodes
+        // the agent's entire observation history before an otherwise empty queue read.
+        if store.latest_claim_id(&lookup)?.is_none() {
             return Ok(None);
         }
         store.seat_queue(&lookup).map(Some)
@@ -10350,6 +10352,193 @@ mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt as _;
     use std::sync::Barrier;
+
+    fn agent_queue_history_fixture(root: &std::path::Path, observations: usize) -> AppState {
+        let state = test_state(root);
+        let agent = "agent/queue-history";
+        let seed = state.store.append_claim(&ClaimInput {
+            subject: agent.into(),
+            kind: "harness.observed".into(),
+            actor: Some(agent.into()),
+            fields: BTreeMap::from([("state".into(), json!("idle"))]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        }).unwrap();
+        let mut connection = state.store.connection.write();
+        let transaction = connection.transaction().unwrap();
+        transaction.execute(
+            "WITH RECURSIVE numbers(n) AS (
+                SELECT 1 UNION ALL SELECT n+1 FROM numbers WHERE n<?1
+             )
+             INSERT INTO claims(id,batch_id,subject,kind,origin,actor,body,
+                                predecessors,accepted_at_unix_ms)
+             SELECT printf('queue-history-%08d',n),c.batch_id,c.subject,c.kind,c.origin,
+                    c.actor,c.body,c.predecessors,CAST(n AS TEXT)
+             FROM numbers CROSS JOIN claims c WHERE c.id=?2",
+            rusqlite::params![observations, seed.id],
+        ).unwrap();
+        // Model native wire positions, rather than making the synthetic single batch
+        // exercise the separate legacy-position fallback.
+        transaction.execute(
+            "INSERT INTO replica_records(record_ref,writer,sequence,envelope_hash,position,
+                                         raw,state,claim_id,updated_at_unix_ms)
+             SELECT id,origin,1,'queue-history-fixture',store_index,X'','valid',id,'1'
+             FROM claims WHERE id LIKE 'queue-history-%'",
+            [],
+        ).unwrap();
+        transaction.commit().unwrap();
+        drop(connection);
+        state
+    }
+
+    fn old_agent_queue_value(store: &Store, agent: &str) -> Option<Value> {
+        // Retain the exact previous handler's read as the equivalence/timing oracle.
+        store.latest_claim(agent, None).unwrap()?;
+        Some(agent_queue_value(&store.seat_queue(agent).unwrap()))
+    }
+
+    #[tokio::test]
+    async fn agent_queue_history_preserves_output_and_missing_agent() {
+        let root = tempfile::tempdir().unwrap();
+        let state = agent_queue_history_fixture(root.path(), 1024);
+        for id in ["agent/queue-history", "queue-history"] {
+            let Json(actual) = agent_queue(State(state.clone()), AxumPath(id.into())).await.unwrap();
+            assert_eq!(Some(actual), old_agent_queue_value(&state.store, "agent/queue-history"));
+        }
+        assert!(old_agent_queue_value(&state.store, "agent/absent").is_none());
+        assert_eq!(
+            agent_queue(State(state), AxumPath("absent".into())).await.unwrap_err().status,
+            StatusCode::NOT_FOUND,
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_queue_nonempty_matches_previous_handler() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let source = r#"
+version 2
+mission "queue-parity" state="ready" {
+  concurrent-runs
+  goal "Keep the complete queue response unchanged."
+  step "work" { assigned-to "agent/example/queue-parity" }
+}
+"#;
+        let intent = crate::graph::parse_intent(source, &state.node).unwrap();
+        let planned = state.store.mission(&intent, IntentInput {
+            kdl: source.into(),
+            source_name: None,
+        }).unwrap();
+        state.store.apply(&intent, &planned.subject_tokens, "queue-parity-fixture").unwrap();
+        let agent = "agent/example/queue-parity";
+        state.store.append_claim(&ClaimInput {
+            subject: agent.into(),
+            kind: "harness.observed".into(),
+            actor: Some(agent.into()),
+            fields: BTreeMap::from([("state".into(), json!("idle"))]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        }).unwrap();
+        for index in 0..2 {
+            let run = state.store.create_mission_run(&MissionRunRequest {
+                mission: "queue-parity".into(),
+                revision: None,
+                workspace: root.path().display().to_string(),
+                requester: Some("person/alex".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: format!("queue-parity-run-{index}"),
+            }).unwrap();
+            if index == 0 {
+                state.store.set_step_state(&run.steps[0].subject, "ready", None).unwrap();
+            } else {
+                state.store.move_seat_queue_run(&crate::model::SeatQueueMoveRequest {
+                    agent: agent.into(),
+                    run: run.subject.clone(),
+                    placement: "top".into(),
+                    anchor: None,
+                    reason: Some("Exercise move history parity.".into()),
+                    actor: "person/alex".into(),
+                    idempotency_key: "queue-parity-move".into(),
+                }).unwrap();
+            }
+        }
+        let expected = old_agent_queue_value(&state.store, agent).unwrap();
+        assert_eq!(expected["runs"].as_array().unwrap().len(), 2);
+        assert!(expected["next_work_id"].is_string());
+        assert_eq!(expected["move_count"], 1);
+        assert_eq!(expected["moves"].as_array().unwrap().len(), 1);
+        let Json(actual) = agent_queue(State(state), AxumPath(agent.into())).await.unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    #[ignore = "isolated before/after queue-history measurement"]
+    async fn agent_queue_history_cost() {
+        use std::time::Instant;
+        for observations in [4096, 32768, 262144] {
+            let root = tempfile::tempdir().unwrap();
+            let state = agent_queue_history_fixture(root.path(), observations);
+            let agent = "agent/queue-history";
+            let expected = old_agent_queue_value(&state.store, agent).unwrap();
+            {
+                use smallclaims::store::{CLAIM_COLUMNS, CANONICAL_ORDER_DESC};
+                let connection = state.store.connection.write();
+                let before_sql = format!(
+                    "SELECT {CLAIM_COLUMNS} FROM claims JOIN batches ON batches.id=claims.batch_id
+                     WHERE claims.subject=?1 AND ?2 IS NULL ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
+                );
+                let after_sql = smallclaims::store::canonical_sql(smallclaims::store::LATEST_CLAIM_QUERY);
+                let mut before = connection.prepare(&before_sql).unwrap();
+                let old_id: String = before.query_row(
+                    rusqlite::params![agent, Option::<String>::None], |row| row.get(0),
+                ).unwrap();
+                let mut after = connection.prepare(&after_sql).unwrap();
+                let new_id: String = after.query_row([agent], |row| row.get(0)).unwrap();
+                assert_eq!(old_id, new_id);
+                let before_steps = before.get_status(rusqlite::StatementStatus::VmStep);
+                let after_steps = after.get_status(rusqlite::StatementStatus::VmStep);
+                assert!(after_steps * 10 < before_steps);
+                println!("agent queue existence profile: observations={observations} before_vm_steps={before_steps} after_vm_steps={after_steps}");
+                for (label, sql) in [("before", before_sql), ("after", after_sql)] {
+                    let mut statement = connection.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+                    let parameters = if label == "before" {
+                        vec![rusqlite::types::Value::Text(agent.into()), rusqlite::types::Value::Null]
+                    } else {
+                        vec![rusqlite::types::Value::Text(agent.into())]
+                    };
+                    let plan = statement.query_map(rusqlite::params_from_iter(parameters), |row| {
+                        row.get::<_, String>(3)
+                    }).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+                    println!("agent queue existence {label} plan: {}", plan.join("; "));
+                }
+            }
+            let mut old = Vec::new();
+            let mut new = Vec::new();
+            // Alternate order to avoid assigning all cold reads to one implementation.
+            for sample in 0..10 {
+                for before in if sample % 2 == 0 { [true, false] } else { [false, true] } {
+                    let start = Instant::now();
+                    let actual = if before {
+                        old_agent_queue_value(&state.store, agent).unwrap()
+                    } else {
+                        agent_queue(State(state.clone()), AxumPath(agent.into())).await.unwrap().0
+                    };
+                    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+                    assert_eq!(actual, expected);
+                    if before { old.push(elapsed); } else { new.push(elapsed); }
+                }
+            }
+            old.sort_by(f64::total_cmp);
+            new.sort_by(f64::total_cmp);
+            println!(
+                "agent queue history: observations={observations} samples=10 before_p50_ms={:.3} before_p95_ms={:.3} after_p50_ms={:.3} after_p95_ms={:.3}",
+                (old[4] + old[5]) / 2.0, old[9], (new[4] + new[5]) / 2.0, new[9],
+            );
+        }
+    }
 
     #[tokio::test]
     async fn collections_socket_ping_pong_does_not_read_held_windows() {
