@@ -1099,9 +1099,15 @@ impl Ui {
                         self.world.diverged.join(", ")
                     ));
                 }
+                if !self.world.stale.is_empty() {
+                    self.flash(format!(
+                        "Out of date: st stopped serving {}",
+                        self.world.stale.join("; ")
+                    ));
+                }
                 if known {
                     self.open(&machine);
-                } else if self.world.diverged.is_empty() {
+                } else if self.world.diverged.is_empty() && self.world.stale.is_empty() {
                     self.flash(format!(
                         "Connected to {} as {}",
                         self.world.host, self.world.person
@@ -1472,6 +1478,7 @@ impl Ui {
         let (glyph, word, color) = match &self.world.link {
             // Live, but showing a graph that exchanges cannot correct.
             Link::Live if !self.world.diverged.is_empty() => ("⚠", "diverged", theme::RED),
+            Link::Live if !self.world.stale.is_empty() => ("◐", "stale", theme::YELLOW),
             Link::Live => ("●", "live", theme::GREEN),
             Link::Connecting => (self.spinner(), "connecting", theme::YELLOW),
             Link::Offline(_) => ("○", "offline", theme::RED),
@@ -6981,6 +6988,20 @@ mod tests {
         let after_press = ui.selected[0];
         ui.key(key(KeyCode::Down, KeyModifiers::NONE, KeyEventKind::Repeat));
         assert_eq!(ui.selected[0], after_press + 1);
+    }
+
+    #[test]
+    fn a_list_st_stopped_serving_after_it_loaded_marks_the_connection_stale_and_says_why() {
+        let mut world = demo::world();
+        world.stale = vec!["Agents: collection source is unavailable".into()];
+        let mut ui = Ui::new(world);
+        ui.live = true;
+        let top = frame(&ui, 140, 50)[0].clone();
+        assert!(top.contains("stale") && !top.contains("live"), "{top}");
+        // Clicking the connection word says why, and the rows stay.
+        ui.show_connection();
+        assert!(ui.flash.as_ref().is_some_and(|(text, _)| text.contains("collection source is unavailable")));
+        assert!(!ui.world.agents.items().is_empty());
     }
 
     #[test]
