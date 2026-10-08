@@ -2027,6 +2027,21 @@ async fn perform(
                 id,
             ))
         }
+        Effect::OpenImage { image } => {
+            let bytes = client.blob(&image.sha256, Some(&image.message)).await?;
+            let dir = super::attach::dir()
+                .ok_or_else(|| anyhow::anyhow!("No place to keep the image (HOME is not set)"))?;
+            let path = super::attach::received(&dir, &image, &bytes)?;
+            let shown = super::attach::show(&path);
+            Ok((
+                if shown {
+                    format!("Opened {}", path.display())
+                } else {
+                    format!("Saved to {}", path.display())
+                },
+                None,
+            ))
+        }
         Effect::CancelRun { mission } => {
             let found = model
                 .missions()

@@ -78,21 +78,6 @@ impl Content {
     pub fn index(&mut self, timelines: &BTreeMap<String, st3_conversation_ui::Timeline>) {
         self.groups.clear();
         for (conversation, timeline) in timelines {
-            for entry in &timeline.items {
-                let TimelineBody::Message(message) = &entry.body else { continue };
-                let refs: Vec<_> = message.attachments.iter().filter(|image| image.media_type.starts_with("image/"))
-                    .map(|image| {
-                        let reference = format!("mail:{}", image.sha256);
-                        (Key { conversation: timeline.session_id.clone().unwrap_or_else(|| conversation.clone()),
-                            entry: message.message_id.clone(), revision: entry.revision, reference: reference.clone() },
-                            ConversationContentRef { reference, media_type: image.media_type.clone(),
-                                size: Some(image.size), reason: Some("on-demand".into()) })
-                    }).collect();
-                if !refs.is_empty() {
-                    self.groups.entry((conversation.clone(), message.message_id.clone())).or_default()
-                        .push(Group { preview: String::new(), refs });
-                }
-            }
             let calls: BTreeMap<_, _> = timeline.items.iter().filter_map(|entry| {
                 if let TimelineBody::ToolCall(call) = &entry.body {
                     Some((call.call_id.as_str(), entry.id.as_str()))
@@ -146,12 +131,6 @@ impl Content {
     pub fn image_owner(&self, key: &Key) -> Option<(String, String)> {
         self.groups.iter().find(|(_, groups)| groups.iter().any(|group| group.refs.iter().any(|(candidate, _)| candidate == key)))
             .map(|(owner, _)| owner.clone())
-    }
-
-    pub fn mail_key(&self, image: &st3_conversation_ui::MailImage) -> Option<Key> {
-        self.groups.values().flatten().flat_map(|group| &group.refs)
-            .find(|(key, _)| key.entry == image.message && key.reference == format!("mail:{}", image.sha256))
-            .map(|(key, _)| key.clone())
     }
 
     pub fn request_expanded(&mut self, expanded: &HashSet<String>) -> Vec<Key> {
@@ -322,10 +301,6 @@ pub async fn fetch(client: &Client, key: &Key) -> Result<(String, Vec<u8>), Stri
     let mut bytes = Vec::new();
     let mut offset = 0;
     let mut identity = None;
-    if let Some(sha256) = key.reference.strip_prefix("mail:") {
-        return client.blob(sha256, Some(&key.entry)).await.map(|bytes| ("application/octet-stream".into(), bytes))
-            .map_err(|error| error.plain());
-    }
     loop {
         let chunk = client.conversation_content_chunk(&key.conversation, &key.reference, offset)
             .await.map_err(|error| error.plain())?.value;

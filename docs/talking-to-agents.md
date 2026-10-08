@@ -20,8 +20,9 @@ output; **Ctrl+U**, outside the composer, loads or hides its native images inlin
 using the terminal's image renderer. **Ctrl+O** keeps its pane-zoom action. On the phone,
 **Show all** loads the clipped result and **Show less** collapses it; **Load image**
 displays the fetched image inline. Image media type and byte size
-become exact after loading. Expanded output and fetched images stay in memory
-only: viewing a conversation does not write its contents to files or device storage.
+become exact after loading. Expanded native output and fetched native images stay
+in memory only. This does not change mail attachment opening: stui still saves a
+received mail image under its attachment directory and opens the machine's viewer.
 
 ## From the CLI
 

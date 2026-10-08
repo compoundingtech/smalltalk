@@ -165,6 +165,10 @@ impl AgentControl {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
+    /// Read an image a message carries from st, keep it here, and show it.
+    OpenImage {
+        image: st3_conversation_ui::MailImage,
+    },
     /// Read complete conversation content into the memory-only UI cache.
     LoadContent(content::Key),
     Attention {
@@ -5601,10 +5605,11 @@ impl Ui {
             Hit::InlineImage(_) => {}
             Hit::Pane(PaneIntent::Open(id)) => self.open(&id),
             Hit::Pane(PaneIntent::Image(image)) => {
-                if let Some(key) = self.content.mail_key(&image) {
-                    self.conversation_state.expanded.insert(image.message);
-                    if self.content.toggle_image(&key) { self.effects.push(Effect::LoadContent(key)); }
-                }
+                self.flash(format!(
+                    "Reading {} from st…",
+                    image.name.as_deref().unwrap_or("the image")
+                ));
+                self.effects.push(Effect::OpenImage { image });
             }
             Hit::Pane(PaneIntent::Send(text)) => {
                 if let Some(key) = self.draft_key() {
@@ -6192,6 +6197,20 @@ fn dump(args: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mail_image_click_keeps_the_existing_blob_open_effect() {
+        let mut ui = Ui::new(demo::world());
+        let image = st3_conversation_ui::MailImage {
+            sha256: "cd".repeat(32),
+            message: "message/picture".into(),
+            media_type: "image/jpeg".into(),
+            name: Some("photo.jpg".into()),
+            size: 3,
+        };
+        ui.click(Hit::Pane(PaneIntent::Image(image.clone())));
+        assert_eq!(ui.effects, vec![Effect::OpenImage { image }]);
+    }
 
     #[test]
     fn focused_tool_chords_expand_and_collapse_without_toggling_all_tools() {
