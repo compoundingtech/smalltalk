@@ -1,0 +1,17 @@
+test_archive_traversal_rejected (__main__.RigChecks.test_archive_traversal_rejected) ... ok
+test_bad_hash_rejected_before_machine_creation (__main__.RigChecks.test_bad_hash_rejected_before_machine_creation) ... ok
+test_fixture_cannot_start_before_consent (__main__.RigChecks.test_fixture_cannot_start_before_consent) ... ok
+test_focus_probe_accepts_focused_expert_before_navigation (__main__.RigChecks.test_focus_probe_accepts_focused_expert_before_navigation) ... ok
+test_focus_probe_rejects_sidebar_and_unfocused_composer (__main__.RigChecks.test_focus_probe_rejects_sidebar_and_unfocused_composer) ... ok
+test_history_counts_single_unwrapped_and_multiple_runs (__main__.RigChecks.test_history_counts_single_unwrapped_and_multiple_runs) ... ok
+test_managed_claude_transcript_can_resume_after_restart (__main__.RigChecks.test_managed_claude_transcript_can_resume_after_restart) ... ok
+test_mission_identity_ignores_runtime_changes (__main__.RigChecks.test_mission_identity_ignores_runtime_changes) ... ok
+test_packaged_selectors_resolve_the_native_mcp_after_consent (__main__.RigChecks.test_packaged_selectors_resolve_the_native_mcp_after_consent) ... ok
+test_read_receipt_must_match_wake_and_new_incarnation (__main__.RigChecks.test_read_receipt_must_match_wake_and_new_incarnation) ... ok
+test_restart_waiting_requires_exact_subject_and_message (__main__.RigChecks.test_restart_waiting_requires_exact_subject_and_message) ... ok
+test_vm_refused_in_ci_before_output_creation (__main__.RigChecks.test_vm_refused_in_ci_before_output_creation) ... ok
+
+----------------------------------------------------------------------
+Ran 12 tests in 5.422s
+
+OK

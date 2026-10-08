@@ -209,6 +209,19 @@ def successful_read(records,reference,incarnation=None):
     return any(r.get("event")=="read" and r.get("reference")==reference and r.get("exit")==0
         and (incarnation is None or r.get("incarnation")==incarnation) for r in records)
 
+def onboarding_history(view):
+    # missions show unwraps a named mission with exactly one historical run.
+    if not isinstance(view,dict): return None
+    if "total_runs" in view: return view
+    subject=view.get("subject","")
+    if view.get("mission")=="mission/st/onboarding" and (subject=="mission-run/st/onboarding" or subject.startswith("mission-run/st/onboarding/")):
+        return {"total_runs":1,"newest":[{"id":view["subject"],"status":view.get("status")}]}
+    return None
+
+def restart_requested(result,subject):
+    waiting=f"st: `{subject}` restarted and is waiting for your input; attach with `st terminals attach {subject}`"
+    return result["exit"]==0 or (result["exit"]==2 and result["stderr"].strip()==waiting)
+
 class Run:
     def __init__(self,machine,out,archive,metadata):
         self.m,self.out,self.archive,self.metadata=machine,out,archive,metadata
@@ -339,7 +352,7 @@ class Run:
             r=self.execute("Setup flags",shlex.join(argv)); ok=r["exit"]==0; text=self.output(r)
         if not self.check("setup-success",ok,"real candidate setup completed"): return
         if scenario=="claude-pre-channel":
-            self.check("setup-inline-route","server:st3" in text and "--dangerously-load-development-channels" in text,"declining plugin installation retains Claude and explains inline development route")
+            self.check("setup-inline-route","server:st3" in text and "development channel" in text,"declining plugin installation retains Claude and explains inline development route")
         if scenario in ("claude-policy-absent","claude-policy-present","codex","both","no-gh","gh-logged-out","gh-broken","expert-lifecycle","claude-pre-channel"):
             expected="claude" if scenario.startswith("claude-") or scenario=="both" else "codex"
             selected=re.findall(r"^Selected harness: (claude|codex|opencode|pi|omp)\s*$",text,re.M)
@@ -481,7 +494,7 @@ class Run:
                 if ready or time.monotonic()>=deadline: break
                 time.sleep(1)
             self.check("expert-incarnation",ready,"expert has a reachable observed incarnation without a fault")
-            runs=self.json_cli("Onboarding runs","missions","show","mission/st/onboarding")
+            runs=onboarding_history(self.json_cli("Onboarding runs","missions","show","mission/st/onboarding"))
             self.check("onboarding-once",isinstance(runs,dict) and runs.get("total_runs")==1 and isinstance(runs.get("newest"),list) and len(runs["newest"])==1 and runs["newest"][0]["id"]=="mission-run/st/onboarding","one historical built-in onboarding run with the automatic ID")
             read,records,reference=self.wake_and_read("agent/st/expert","Expert mailbox fixture")
             self.check("expert-read-message",read,"native fixture successfully reads the exact graph wake "+str(reference))
@@ -496,7 +509,7 @@ class Run:
             if self.m.args.require_wrap_up:
                 deadline=time.monotonic()+self.m.args.mission_timeout
                 while True:
-                    runs=self.json_cli("Mission completion","missions","show","mission/st/onboarding")
+                    runs=onboarding_history(self.json_cli("Mission completion","missions","show","mission/st/onboarding"))
                     done=isinstance(runs,dict) and any(x.get("status")=="completed" for x in runs.get("newest",[]))
                     if done or time.monotonic()>=deadline: break
                     time.sleep(2)
@@ -509,8 +522,8 @@ class Run:
         while True:
             seat=self.json_cli("Observe "+subject,"agents","show",subject,"--all")
             incarnation=seat_incarnation(seat)
-            ready=isinstance(seat,dict) and (seat.get("state")=="stopped" and seat.get("reachability")!="reachable" if stopped else
-                bool(incarnation and incarnation!=previous and seat.get("reachability")=="reachable" and not seat.get("fault")))
+            ready=isinstance(seat,dict) and (seat.get("state")=="stopped" and seat.get("operational",{}).get("layer")=="history" and seat.get("operational",{}).get("actionable") is False if stopped else
+                bool(incarnation and incarnation!=previous and seat.get("operational",{}).get("layer")=="current" and seat.get("reachability")=="reachable" and not seat.get("fault")))
             if ready or time.monotonic()>=deadline: return seat,bool(ready)
             time.sleep(1)
 
@@ -537,11 +550,11 @@ class Run:
         previous=seat_incarnation(original)
         r=self.cli("Stop built-in expert","agents","stop",subject,"--as","person/ada")
         stopped,ready=self.wait_seat(subject,stopped=True)
-        if not self.check("expert-stopped",r["exit"]==0 and ready,"explicit stop leaves expert stopped and unreachable"): return
+        if not self.check("expert-stopped",r["exit"]==0 and ready,"explicit stop leaves expert stopped and non-actionable in history"): return
         r=self.cli("Cancel original onboarding run","missions","cancel","mission-run/st/onboarding","--reason","fixture","--as","person/ada")
         deadline=time.monotonic()+35
         while True:
-            overview=self.json_cli("Cancelled historical onboarding run","missions","show","mission/st/onboarding")
+            overview=onboarding_history(self.json_cli("Cancelled historical onboarding run","missions","show","mission/st/onboarding"))
             cancelled=isinstance(overview,dict) and overview.get("total_runs")==1 and any(x.get("id")=="mission-run/st/onboarding" and x.get("status")=="cancelled" for x in overview.get("newest",[]))
             if r["exit"] or cancelled or time.monotonic()>=deadline: break
             time.sleep(1)
@@ -549,12 +562,12 @@ class Run:
         for n in (1,2):
             r=self.cli("Repeat setup with stopped expert "+str(n),"setup","--person","ada","--node","studio","--yes","--service","true")
             seat,stopped=self.wait_seat(subject,stopped=True)
-            overview=self.json_cli("Historical runs after stopped setup "+str(n),"missions","show","mission/st/onboarding")
+            overview=onboarding_history(self.json_cli("Historical runs after stopped setup "+str(n),"missions","show","mission/st/onboarding"))
             self.check("stopped-setup-"+str(n),r["exit"]==0 and stopped and isinstance(overview,dict) and overview.get("total_runs")==1 and any(x.get("id")=="mission-run/st/onboarding" for x in overview.get("newest",[])),"ordinary setup neither restarts stopped expert nor creates a run")
         r=self.cli("Explicit onboarding rerun","setup","--person","ada","--node","studio","--yes","--service","true","--onboarding")
         seat,ready=self.wait_seat(subject,previous=previous)
         self.check("explicit-expert-restart",r["exit"]==0 and ready,"explicit onboarding restores expert with a different observed incarnation")
-        overview=self.json_cli("Historical runs after explicit onboarding","missions","show","mission/st/onboarding")
+        overview=onboarding_history(self.json_cli("Historical runs after explicit onboarding","missions","show","mission/st/onboarding"))
         ids=[x["id"] for x in overview.get("newest",[])] if isinstance(overview,dict) else []
         self.check("explicit-onboarding-run",isinstance(overview,dict) and overview.get("total_runs")==2 and len(ids)==2 and "mission-run/st/onboarding" in ids and any(x.startswith("mission-run/st/onboarding/") for x in ids),"explicit rerun adds exactly one UUID run alongside cancelled history")
         read,records,reference=self.wake_and_read(subject,"Expert explicit-rerun mailbox fixture")
@@ -574,7 +587,7 @@ class Run:
         if not self.check("pre-channel-user-install",r["exit"]==0,"ordinary user installs channel without sudo policy"): return
         r=self.cli("Restart existing Claude expert","agents","restart",subject,"--as","person/ada",timeout=45)
         current,ready=self.wait_seat(subject,previous=previous)
-        if not self.check("pre-channel-new-incarnation",r["exit"]==0 and ready,"restart produces a different reachable incarnation without a fault"): return
+        if not self.check("pre-channel-new-incarnation",restart_requested(r,subject) and ready,"restart produces a different current reachable incarnation without a fault; interactive waiting exit is followed by exact read proof"): return
         incarnation=seat_incarnation(current)
         read,records,reference=self.wake_and_read(subject,"Post-install restarted Claude mailbox fixture",incarnation)
         self.check("pre-channel-new-read",read,"exact post-install wake is read by the new incarnation "+str(reference))
