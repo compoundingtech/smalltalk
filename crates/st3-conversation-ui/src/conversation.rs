@@ -116,7 +116,7 @@ impl Cache {
             // A run of tool calls, or one other entry drawn as in full.
             let run = entries[index..]
                 .iter()
-                .take_while(|entry| matches!(&entry.body, Body::Tool { title, .. } if !title.starts_with("assistant error") && !title.starts_with("compaction") && !title.starts_with("write ")))
+                .take_while(|entry| crate::entry::bundles(&entry.body))
                 .count();
             if run == 0 {
                 let entry = &entries[index];

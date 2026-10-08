@@ -188,6 +188,9 @@ existing 8 KiB display bound and authenticated continuation. Typed view-only ref
 are reattached to their original blocks and passed through the same adapter on
 expansion; metadata and unknown subtrees keep a raw JSON fallback. The written
 line count describes the complete source, not the bounded preview.
+Simplified rendering and history auto-fill share the same bundling predicate:
+write, compaction and assistant-error preview cards remain separate rather than
+being counted as one ordinary-tool run.
 
 
 Timeline pages and delta responses (when `conversation-blocks.v1` is negotiated) MAY
