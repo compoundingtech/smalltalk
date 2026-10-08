@@ -63,10 +63,17 @@ class Gateway {
   readonly decodeMs: number[] = []
   /** Advertise the st main's `collections` v1 capability (subscription cap 16) when set. */
   collectionsV1 = false
+  onUnsubscribe: (() => void) | undefined
+  denyReads = false
 
   readonly fetch: typeof fetch = async (input) => {
     const path = new URL(String(input)).pathname
     if (path !== '/v1/client/capabilities') throw new Error(`Unexpected request ${path}`)
+    if (this.denyReads) return new Response(JSON.stringify({
+      api_version: 'st3.client.v0', error_version: 'st3.client.error.v0',
+      code: 'forbidden', message: 'Access denied', retryable: false,
+      request_id: 'request/refused', details: {},
+    }), { status: 403, headers: { 'content-type': 'application/json' } })
     return new Response(
       JSON.stringify({
         api_version: 'st3.client.v0',
@@ -101,7 +108,11 @@ class Gateway {
       onmessage: null,
       onclose: null,
       onerror: null,
-      send: (text: string) => this.commands.push(JSON.parse(text)),
+      send: (text: string) => {
+        const command: CollectionCommand = JSON.parse(text)
+        this.commands.push(command)
+        if (command.kind === 'unsubscribe') this.onUnsubscribe?.()
+      },
       close: () => {},
     }
     this.socket = socket
@@ -199,8 +210,9 @@ const until = async (check: () => boolean, maxRounds = 400) => {
   if (!check()) throw new Error('condition not reached before the drain budget ran out')
 }
 
-const openLive = ({ maxFollows, conversationSlots }: { maxFollows: number; conversationSlots?: number | 'advertised' }) => {
+const openLive = ({ maxFollows, conversationSlots, denyReads = false }: { maxFollows: number; conversationSlots?: number | 'advertised'; denyReads?: boolean }) => {
   const gateway = new Gateway()
+  gateway.denyReads = denyReads
   const options = {
     baseUrl: 'http://gateway.test',
     maxFollows,
@@ -390,6 +402,232 @@ describe('warm conversation switching at the data layer', () => {
     } finally {
       await live.dispose()
     }
+  })
+
+  it('re-acquires a cold conversation while its evicted follow is still finalizing', async () => {
+    const { live, gateway } = openLive({ maxFollows: 8, conversationSlots: 1 })
+    try {
+      const ref = 'agent/cold'
+      const releaseCold = live.registry.mount(live.source.conversationInterest!(ref))
+      await until(() => gateway.subscribesFor(ref) === 1)
+      releaseCold()
+      await drain()
+      let releaseReplacement = () => {}
+      let releaseReacquired = () => {}
+      let reacquired = false
+      // The unsubscribe is the deterministic barrier: the SDK has evicted the cold
+      // follow, but its source stream/freshness finalizers have not finished yet.
+      gateway.onUnsubscribe = () => {
+        if (reacquired) return
+        reacquired = true
+        releaseReplacement()
+        releaseReacquired = live.registry.mount(live.source.conversationInterest!(ref))
+      }
+      releaseReplacement = live.registry.mount(live.source.conversationInterest!('agent/replacement'))
+      await until(() => reacquired)
+      await until(() => gateway.subscribesFor(ref) === 2)
+      gateway.conversationFrame(ref, snapshotRows(1), true)
+      await until(() => items(live.registry.get(live.source.conversation(ref)))?.length === 1)
+      releaseReacquired()
+    } finally {
+      await live.dispose()
+    }
+  })
+
+  it('does not automatically refresh a visible conversation after connection rejection', async () => {
+    const { live, gateway } = openLive({ maxFollows: 8, denyReads: true })
+    const refresh = vi.spyOn(live.registry, 'refresh')
+    const writes = vi.spyOn(live.registry, 'set')
+    const queued: VoidFunction[] = []
+    let restoreMicrotasks = () => {}
+    try {
+      await live.ready
+      await until(() => getDebug('Wf.socketErrors') === 1)
+      // Drain each handoff explicitly so a broken microtask loop is observable
+      // as a growing counter instead of hanging the test runner.
+      const microtasks = vi.spyOn(globalThis, 'queueMicrotask').mockImplementation(callback => queued.push(callback))
+      restoreMicrotasks = () => microtasks.mockRestore()
+      live.registry.mount(live.source.conversationInterest!('agent/refused'))
+      await drain()
+      // Every controller run creates one new refused Feed identity; its frame
+      // publication reuses that identity and therefore does not inflate this count.
+      const runs = () => new Set(writes.mock.calls.map(([, value]) => value).filter(value =>
+        typeof value === 'object' && value !== null && '_tag' in value && value._tag === 'Unavailable',
+      )).size
+      const runCounts = [runs()]
+      const counts = [refresh.mock.calls.length]
+      for (let round = 0; round < 4; round += 1) {
+        const pending = queued.splice(0)
+        for (const callback of pending) callback()
+        await drain()
+        counts.push(refresh.mock.calls.length)
+        runCounts.push(runs())
+      }
+      console.log(`connection-refused-refresh-counts ${JSON.stringify(counts)}`)
+      console.log(`connection-refused-run-counts ${JSON.stringify(runCounts)}`)
+      expect(counts).toEqual([0, 0, 0, 0, 0])
+      expect(runCounts).toEqual([1, 1, 1, 1, 1])
+      expect(gateway.commands).toHaveLength(0)
+      expect(live.registry.get(live.source.conversation('agent/refused'))).toMatchObject({
+        _tag: 'Unavailable', reason: 'ungranted',
+      })
+    } finally {
+      restoreMicrotasks()
+      refresh.mockRestore()
+      writes.mockRestore()
+      await live.dispose()
+    }
+  })
+
+  it('re-follows a conversation whose follow ended in Failed when interest is re-acquired, keeping the last verified page', async () => {
+    const { live, gateway } = openLive({ maxFollows: 8, conversationSlots: 4 })
+    try {
+      const closeWindows = mountWindows(live)
+      const ref = 'agent/flaky'
+      await viewConversation(live, gateway, ref, snapshotRows(2))
+      // A non-authorization failure ends the follow; the retained page stays as trusted stale content.
+      gateway.send({
+        kind: 'error', id: gateway.conversationSubscription(ref).id,
+        collection: 'conversation', code: 'unavailable',
+        message: 'Owner host unavailable', retryable: false,
+      })
+      await until(() => live.registry.get(live.source.sync!.conversation(ref)).sync.status._tag === 'Failed')
+      expect(live.registry.get(live.source.conversation(ref))).toMatchObject({
+        _tag: 'Observed',
+        freshness: 'stale',
+        error: { reason: 'failed', detail: 'Owner host unavailable' },
+      })
+
+      // Switching back to this conversation is a fresh switch: re-acquired interest must
+      // re-open the follow instead of showing the terminal failure until a reload.
+      const unmount = live.registry.mount(live.source.conversationInterest!(ref))
+      await until(() => gateway.subscribesFor(ref) === 2)
+      expect(live.registry.get(live.source.sync!.conversation(ref)).sync.status._tag).not.toBe('Failed')
+      gateway.conversationFrame(ref, snapshotRows(3), true)
+      await until(() => items(live.registry.get(live.source.conversation(ref)))?.length === 3)
+      expect(live.registry.get(live.source.conversation(ref))).toMatchObject({ _tag: 'Observed', freshness: 'live' })
+      expect(live.registry.get(live.source.sync!.conversation(ref)).sync.status).toEqual({
+        _tag: 'Live',
+        since: expect.any(Number),
+      })
+      unmount()
+      closeWindows()
+    } finally {
+      await live.dispose()
+    }
+  })
+
+  describe('explicit conversation retry', () => {
+    const subscriptionIds = (gateway: Gateway, ref: string) =>
+      gateway.commands.flatMap((command) =>
+        command.kind === 'subscribe' && command.collection === 'conversation' && command.conversation === ref ? [command.id] : [])
+    const failFollow = async (live: LiveSource, gateway: Gateway, ref: string) => {
+      gateway.send({
+        kind: 'error', id: gateway.conversationSubscription(ref).id,
+        collection: 'conversation', code: 'unavailable', message: 'Owner host unavailable', retryable: false,
+      })
+      await until(() => live.registry.get(live.source.sync!.conversation(ref)).sync.status._tag === 'Failed')
+    }
+
+    it('re-subscribes a failed follow exactly once for repeated synchronous retries', async () => {
+      const { live, gateway } = openLive({ maxFollows: 8, conversationSlots: 4 })
+      try {
+        const closeWindows = mountWindows(live)
+        const ref = 'agent/failing'
+        const unmount = live.registry.mount(live.source.conversationInterest!(ref))
+        await until(() => gateway.subscribesFor(ref) === 1)
+        await failFollow(live, gateway, ref)
+        expect(live.registry.get(live.source.conversation(ref))).toMatchObject({ _tag: 'Unavailable', reason: 'failed' })
+
+        for (let index = 0; index < 5; index += 1) live.source.retryConversation!(ref)
+        await until(() => gateway.subscribesFor(ref) === 2)
+        // Barrier: the renewed follow is Live, so every forked re-subscribe has reached the socket.
+        gateway.conversationFrame(ref, snapshotRows(2), true)
+        await until(() => live.registry.get(live.source.sync!.conversation(ref)).sync.status._tag === 'Live')
+        expect(gateway.subscribesFor(ref)).toBe(2)
+        expect(gateway.unsubscribedIds()).not.toContain(gateway.conversationSubscription(ref).id)
+        expect(items(live.registry.get(live.source.conversation(ref)))).toHaveLength(2)
+        unmount()
+        closeWindows()
+      } finally {
+        await live.dispose()
+      }
+    })
+
+    it('leaves a healthy follow untouched: no unsubscribe, no new subscribe, no Waiting flash', async () => {
+      const { live, gateway } = openLive({ maxFollows: 8, conversationSlots: 4 })
+      try {
+        const closeWindows = mountWindows(live)
+        const ref = 'agent/healthy'
+        const unmount = live.registry.mount(live.source.conversationInterest!(ref))
+        await until(() => gateway.subscribesFor(ref) === 1)
+        gateway.conversationFrame(ref, snapshotRows(2), true)
+        await until(() => live.registry.get(live.source.sync!.conversation(ref)).sync.status._tag === 'Live')
+        const seen: Array<Feed<ConversationPage>['_tag']> = []
+        const stopWatching = live.registry.subscribe(live.source.conversation(ref), (feed) => seen.push(feed._tag), { immediate: true })
+
+        for (let index = 0; index < 3; index += 1) live.source.retryConversation!(ref)
+        // Barrier: a later frame on the same subscription lands, so any retry side effect has run.
+        gateway.conversationFrame(ref, snapshotRows(3), true)
+        await until(() => items(live.registry.get(live.source.conversation(ref)))?.length === 3)
+        expect(gateway.subscribesFor(ref)).toBe(1)
+        expect(gateway.unsubscribedIds()).toEqual([])
+        expect(seen).not.toContain('Waiting')
+        expect(seen.every((tag) => tag === 'Observed')).toBe(true)
+        expect(live.registry.get(live.source.conversation(ref))).toMatchObject({ _tag: 'Observed', freshness: 'live' })
+        stopWatching()
+        unmount()
+        closeWindows()
+      } finally {
+        await live.dispose()
+      }
+    })
+
+    it('releases a retried follow on eviction and re-follows it on a later re-acquire and retry', async () => {
+      const { live, gateway } = openLive({ maxFollows: 8, conversationSlots: 2 })
+      try {
+        const closeWindows = mountWindows(live)
+        const ref = 'agent/retried'
+        let unmount = live.registry.mount(live.source.conversationInterest!(ref))
+        await until(() => gateway.subscribesFor(ref) === 1)
+        await failFollow(live, gateway, ref)
+        live.source.retryConversation!(ref)
+        await until(() => gateway.subscribesFor(ref) === 2)
+        gateway.conversationFrame(ref, snapshotRows(2), true)
+        await until(() => live.registry.get(live.source.sync!.conversation(ref)).sync.status._tag === 'Live')
+        const [failedId, retriedId] = subscriptionIds(gateway, ref)
+        unmount()
+        await drain()
+
+        // Two newer conversations fill the two slots: the retried follow is evicted with a real unsubscribe.
+        await viewConversation(live, gateway, 'agent/n1', snapshotRows(2))
+        await viewConversation(live, gateway, 'agent/n2', snapshotRows(2))
+        await until(() => gateway.unsubscribedIds().includes(retriedId!))
+        await until(() => live.registry.get(live.source.sync!.conversation(ref)).sync.status._tag === 'Stale')
+        // Balance: every subscription opened for this conversation, failed or retried, is released.
+        expect(gateway.unsubscribedIds().filter((id) => subscriptionIds(gateway, ref).includes(id))).toEqual([failedId, retriedId])
+        expect(getDebug('Wf.activeFollows')).toBe(5)
+
+        // Re-acquired interest re-follows the evicted conversation.
+        unmount = live.registry.mount(live.source.conversationInterest!(ref))
+        await until(() => gateway.subscribesFor(ref) === 3)
+        gateway.conversationFrame(ref, snapshotRows(3), true)
+        await until(() => items(live.registry.get(live.source.conversation(ref)))?.length === 3)
+        expect(live.registry.get(live.source.sync!.conversation(ref)).sync.status._tag).toBe('Live')
+
+        // A renewed failure recovers through retry again.
+        await failFollow(live, gateway, ref)
+        live.source.retryConversation!(ref)
+        await until(() => gateway.subscribesFor(ref) === 4)
+        gateway.conversationFrame(ref, snapshotRows(4), true)
+        await until(() => items(live.registry.get(live.source.conversation(ref)))?.length === 4)
+        expect(live.registry.get(live.source.sync!.conversation(ref)).sync.status._tag).toBe('Live')
+        unmount()
+        closeWindows()
+      } finally {
+        await live.dispose()
+      }
+    })
   })
 
   it('shows Reconnecting and never Live while the socket is down, keeping the last value', async () => {

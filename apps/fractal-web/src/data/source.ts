@@ -63,6 +63,8 @@ export type Feed<A> =
       /** `ungranted`: the paired device lacks the scope (the read-only dev device); `unsupported`: the gateway lacks the capability. */
       readonly reason: 'ungranted' | 'unsupported' | 'failed'
       readonly detail: string
+      /** The read error's machine code (for example `not-found`): classification and data-wf-* diagnostics only, never display copy. */
+      readonly code?: string
     }
 
 /** Which adapter feeds the tree: the deterministic fixture world or the st gateway. */
@@ -236,6 +238,8 @@ export interface DataSource {
   readonly conversationInterest?: (agentRef: string) => Atom.Atom<void>
   /** Explicit pointer/focus intent; live admits it only after a visible thread's first-page frame. */
   readonly prefetchConversation?: (agentRef: string) => void
+  /** Explicit recovery: re-acquire a failed or ended conversation follow; a healthy follow is untouched. */
+  readonly retryConversation?: (agentRef: string) => void
   /** Keyed by terminal ref; live attaches a read-only viewer. */
   readonly terminal: (terminalRef: string) => Atom.Atom<Feed<TerminalScreen>>
   readonly terminalInterest?: (terminalRef: string) => Atom.Atom<void>
@@ -277,17 +281,20 @@ export const observed = <A>({
 })
 /** The feed before the first observation arrives. */
 export const waiting: Feed<never> = { _tag: 'Waiting' }
-/** A feed the source cannot serve; `detail` is the user-facing explanation. */
+/** A feed the source cannot serve; `detail` and `code` are diagnostics, never display copy. */
 export const unavailable = ({
   reason,
   detail,
+  code,
 }: {
   readonly reason: 'ungranted' | 'unsupported' | 'failed'
   readonly detail: string
+  readonly code?: string | undefined
 }): Feed<never> => ({
   _tag: 'Unavailable',
   reason,
   detail,
+  ...(code === undefined ? {} : { code }),
 })
 
 /** Live sources' clock for ages and countdowns; ticks once a second while observed. */

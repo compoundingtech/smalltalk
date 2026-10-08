@@ -29,6 +29,7 @@ export const ConversationPane = ({
     () => transcriptRuntimeOptions(state._tag === 'Observed' ? state.items : [], state._tag === 'Observed' && state.isRunning),
     [state],
   )
+  const retryConversation = source.retryConversation
   return <div style={{ display: 'contents' }}
     data-wf-unavailable={state._tag === 'Unavailable' ? state.classification : undefined}
     data-wf-unavailable-code={state._tag === 'Unavailable' ? state.code : undefined}>
@@ -40,7 +41,7 @@ export const ConversationPane = ({
       now={now}
       observedAt={transcriptObservedAt(observation, now)}
       onOpenTool={onOpenTool}
-
+      onRetrySync={retryConversation === undefined ? undefined : () => retryConversation(agentRef)}
       {...(state._tag === 'Unavailable' ? { availability: state.availability } : {})}
       {...(state._tag === 'Observed' && state.history._tag === 'HasOlder' ? { history: state.history } : {})}
       {...(state._tag === 'Observed' && state.emptyState !== undefined ? { emptyState: state.emptyState } : {})}

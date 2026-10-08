@@ -77,6 +77,8 @@ interface RetainedFeed<A> {
   /** Whether the value became visible; `false` means the feed is not publishable. */
   readonly publish: (value: A) => boolean
   readonly prefetch: () => void
+  /** Re-acquire a failed or ended follow; a healthy follow is untouched. */
+  readonly retry: () => void
   readonly release: () => void
 }
 
@@ -289,6 +291,7 @@ export const liveSource = ({
           // Release the old socket slot before binding the replacement owner.
           if (previous !== undefined) yield* Fiber.interrupt(previous)
           if (readRejection !== undefined) {
+            terminalFailure = true
             setSync({
               _tag: 'Failed',
               cause: {
@@ -333,7 +336,8 @@ export const liveSource = ({
                   latest = observed({ value: event.value })
                   syncLatest = observeFeedSync(syncLatest, event.value, Date.now())
                 } else if (event._tag === 'Failed') {
-                  syncLatest = transitionFeedSync(syncLatest, syncStatusFromFailure(event.error), Date.now())
+                  const failure = syncStatusFromFailure(event.error)
+                  syncLatest = transitionFeedSync(syncLatest, failure, Date.now())
                   terminalFailure = true
                   // Keep trusted content for failed reads, never authorization-revoked rows.
                   const authorizationRefusal =
@@ -353,6 +357,7 @@ export const liveSource = ({
                       : unavailable({
                           reason: authorizationRefusal ? 'ungranted' : 'failed',
                           detail: event.error.message,
+                          code: failure._tag === 'Failed' && failure.cause._tag === 'Server' ? failure.cause.code : undefined,
                         })
                 } else {
                   // SDK sync status owns the verdict; this event only degrades retained content.
@@ -368,12 +373,16 @@ export const liveSource = ({
               if (!active || readRejection !== undefined) return
 
               terminalFailure = true
-              syncLatest = transitionFeedSync(syncLatest, syncStatusFromFailure(error), Date.now())
+              const failure = syncStatusFromFailure(error)
+              syncLatest = transitionFeedSync(syncLatest, failure, Date.now())
               const authorizationRefusal =
                 error.authorizationRefused === true || error.code === 'forbidden' || error.status === 401 || error.status === 403
               latest = latest._tag === 'Observed' && !authorizationRefusal
                 ? { ...latest, freshness: 'stale', error: { reason: 'failed', detail: error.message } }
-                : unavailable({ reason: authorizationRefusal ? 'ungranted' : 'failed', detail: error.message })
+                : unavailable({
+                  reason: authorizationRefusal ? 'ungranted' : 'failed', detail: error.message,
+                  code: failure._tag === 'Failed' && failure.cause._tag === 'Server' ? failure.cause.code : undefined,
+                })
               ingest.accept({ key: commit, value: commit })
             }),
           ),
@@ -382,7 +391,16 @@ export const liveSource = ({
               (freshnessFiber === undefined ? Effect.void : Fiber.interrupt(freshnessFiber)).pipe(
                 Effect.andThen(
                   Effect.sync(() => {
-                    if (active) ended = true
+                    if (!active) return
+                    ended = true
+                    // Interest can return between SDK eviction and this finalizer. Its
+                    // acquisition saw ended=false, so completion must hand demand back
+                    // to a new run too. Wait until this fiber finishes before refreshing.
+                    if (visible && !terminalFailure && readRejection === undefined) queueMicrotask(() => {
+                      if (!active || !visible || !ended || terminalFailure || readRejection !== undefined) return
+                      ingest.flush()
+                      registry.refresh(following)
+                    })
                   }),
                 ),
               ),
@@ -405,7 +423,10 @@ export const liveSource = ({
       visible = true
       onVisibilityChange?.(true)
       if (explicitInterest) unmount ??= registry.mount(following)
-      if (ended && !terminalFailure) {
+      // An ended follow holds no socket subscription: re-acquired interest re-opens it as
+      // a fresh switch, whatever ended it. A Failed run re-runs and re-fails on its own
+      // verdict (an authorization refusal stays Unavailable), so this cannot loop.
+      if (ended && readRejection === undefined) {
         ingest.flush()
         get.refresh(following)
       }
@@ -447,10 +468,17 @@ export const liveSource = ({
       },
       prefetch: () => {
         unmount ??= registry.mount(following)
-        if (ended && !terminalFailure) {
+        if (ended) {
           ingest.flush()
           registry.refresh(following)
         }
+      },
+      retry: () => {
+        if (!ended && !terminalFailure) return
+        // The explicit retry shows its own pending read; a renewed failure returns its verdict.
+        if (latest._tag === 'Unavailable') latest = waiting
+        ingest.flush()
+        registry.refresh(following)
       },
       release: () => {
         unmount?.()
@@ -841,6 +869,7 @@ export const liveSource = ({
           if (!painted) return
         retainConversation(ref).prefetch()
       },
+      retryConversation: (ref) => retainConversation(ref).retry(),
       resources,
       terminal,
       terminalInterest: (ref) => terminalFamily(ref).interest,

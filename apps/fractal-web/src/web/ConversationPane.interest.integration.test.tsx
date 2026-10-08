@@ -329,7 +329,7 @@ describe('ConversationPane conversation demand', () => {
     expect(gateway!.unsubscribedRefs()).toEqual([])
   })
 
-  it('classifies a not-found read by its code and shows one fixed reason', async () => {
+  it('classifies a not-found read by its code, shows one fixed reason, and its recovery action re-acquires the follow', async () => {
     open()
     mountPane('agent/route')
     await until(() => gateway!.subscribesFor('agent/route') === 1)
@@ -344,5 +344,15 @@ describe('ConversationPane conversation demand', () => {
     expect(paneText()).toContain('Conversation not found')
     expect(container.innerHTML).not.toContain(sentinel)
     expect(container.innerHTML).not.toContain('Unknown')
+    // The kit renders the host's onRetrySync; today in its sync line, after the kit change as 'Try again'.
+    const recovery = [...container.querySelectorAll<HTMLButtonElement>('[data-testid="transcript-unavailable"] button')]
+      .filter(button => button.getAttribute('aria-label') === 'Retry loading conversation' || button.textContent === 'Try again')
+    expect(recovery).toHaveLength(1)
+    expect(recovery[0]!.disabled).toBe(false)
+    flushSync(() => recovery[0]!.click())
+    await until(() => gateway!.subscribesFor('agent/route') === 2)
+    gateway!.conversationFrame('agent/route', [prompt(1, 'Recovered ask'), entry(2, 'Recovered thread')])
+    await until(() => paneText().includes('Recovered thread'))
+    expect(container.querySelector('[data-wf-unavailable]')).toBeNull()
   })
 })
