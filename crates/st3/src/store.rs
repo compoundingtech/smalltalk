@@ -2755,6 +2755,7 @@ impl Store {
         })? {
             let (subject, kind, actor) = row?;
             if self.smalltalk.claim_registry().claim(&kind).is_none() {
+                crate::profile::note(&format!("roster/cold-input:{kind}:{subject}"));
                 crate::performance::record_request(
                     "roster/cold/unknown-kind", None, std::time::Duration::ZERO,
                 );
@@ -2808,6 +2809,7 @@ impl Store {
                 // pending-delivery blocker, including replies through message ancestors.
                 // Receipts lack endpoints, so use the same message projection blockers read.
                 let Some(message) = self.message(&subject)? else {
+                    crate::profile::note(&format!("roster/cold-missing-message:{subject}"));
                     return Ok(None);
                 };
                 delta.subjects.extend([message.from, message.to].into_iter()
@@ -2829,6 +2831,7 @@ impl Store {
                 _ => false,
             };
             if !irrelevant {
+                crate::profile::note(&format!("roster/cold-input:{kind}:{subject}"));
                 crate::performance::record_request(
                     &format!("roster/cold/{kind}"), None, std::time::Duration::ZERO,
                 );

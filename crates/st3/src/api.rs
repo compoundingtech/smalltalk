@@ -22890,7 +22890,8 @@ mission "wake" state="ready" {
     #[test]
     fn agent_roster_stale_never_borrows_future_local_rows() {
         let root = tempfile::tempdir().unwrap();
-        let state = state(root.path());
+        let mut state = state(root.path());
+        state.store = Arc::new(Store::open(&root.path().join("local-cut.sqlite3"), "node").unwrap());
         let source = "version 2\nagent \"amber\" { command \"true\" }\n";
         let intent = crate::graph::parse_test_intent(source, "node").unwrap();
         roster_fixture_apply(&state.store, &intent, "stale-local-cut");
