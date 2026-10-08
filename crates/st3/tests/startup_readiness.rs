@@ -106,7 +106,9 @@ fn replay_is_visible_before_the_api_serves_and_stale_files_are_ignored() {
     assert_eq!(readiness.frontier, Some(0));
     assert!(readiness.target.unwrap() >= 3);
     assert_eq!(readiness.processed, Some(0));
-    assert!(readiness.total.unwrap() >= 3);
+    // This fixture contains only harness observations. Base progress counts bodies with
+    // a base projection, while target still names the full uncommitted source frontier.
+    assert_eq!(readiness.total, Some(0));
     let early_log = std::fs::read_to_string(&log_path).unwrap();
     assert!(early_log.contains("st: projection full replay phase=startup/project-replication-backlog reason=missing-health"), "fallback must be logged before the replay finishes: {early_log}");
     // Old clients receive an immediate kernel connection refusal, never an accepted but stalled
