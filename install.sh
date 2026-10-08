@@ -29,7 +29,8 @@ if [ -n "$tag" ]; then channel=download/$tag; else channel=latest/download; fi
 package=smalltalk-$target
 archive=$package.tar.gz
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT HUP INT TERM
+trap 'rm -rf "$work"' EXIT
+trap 'exit 1' HUP INT TERM
 for name in "$archive" "$archive.sha256"; do
     curl --fail --silent --show-error --location --proto "=$protocol" --proto-redir "=$protocol" \
         "$base/$channel/$name" --output "$work/$name"

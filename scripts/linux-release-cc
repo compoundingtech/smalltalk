@@ -1,4 +1,13 @@
-#!/usr/bin/env sh
-# Use the oldest supported Linux libc for both C dependencies and the Rust linker.
-set -eu
-exec zig cc -target x86_64-linux-gnu.2.35 "$@"
+#!/usr/bin/env bash
+# Use the oldest supported Linux libc for C dependencies and the Rust linker.
+set -euo pipefail
+arguments=()
+for argument in "$@"; do
+  case "$argument" in
+    # cc-rs detects Clang and supplies the Rust triple. Zig uses its own spelling.
+    --target=x86_64-unknown-linux-gnu) ;;
+    --target=*) echo 'linux-release-cc: unsupported compiler target' >&2; exit 1 ;;
+    *) arguments+=("$argument") ;;
+  esac
+done
+exec zig cc -target x86_64-linux-gnu.2.35 "${arguments[@]}"

@@ -44,7 +44,8 @@ PY
 pty_rev=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["rev"])' "$work/pin.json")
 pty_url=$(python3 -c 'import json,sys; p=json.load(open(sys.argv[1])); print("https://github.com/"+p["owner"]+"/"+p["repo"]+".git")' "$work/pin.json")
 # Stamp the exact clean source, replacing any inherited stamp from a different checkout.
-export CLI_BUILD_STAMP=$(python3 scripts/release-build-stamp.py)
+CLI_BUILD_STAMP=$(python3 scripts/release-build-stamp.py)
+export CLI_BUILD_STAMP
 # Ignore local mold flags. Linux links against the oldest supported glibc, including
 # C dependencies and PTY, so optional newer Rust symbols stay unversioned weak imports.
 export CARGO_ENCODED_RUSTFLAGS=
